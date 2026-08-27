@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
@@ -168,18 +169,6 @@ func visibleIndexes(btx *btree.ReadTx, idxs []*index) []*index {
 	return out
 }
 
-// reportCandidates builds the CBO candidate list for Explain's index report
-// on the fts/vector paths, where compilation never consults the CBO. Nil for
-// every other verb.
-func (q *collQuery) reportCandidates(btx *btree.ReadTx, opts planOpts) []qplanner.CBOIndex {
-	if !opts.wantCandidates {
-		return nil
-	}
-	idxs := visibleIndexes(btx, q.c.loadIndexes())
-	br := q.buildBoundsResult(idxs)
-	return q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
-}
-
 // planOpts are the only per-verb compilation knobs. Everything else about
 // access-path selection is shared — a divergence here needs written rationale
 // (the SQLite shape: one WHERE/ORDER BY code generator, verb-specific only at
@@ -282,7 +271,10 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 		if err = q.c.db.flushAmbientFtsPending(ctx); err != nil {
 			return nil, nil, err
 		}
-		ftsSpec.NeedScores = opts.needSidecars
+		// The score sidecar/decoration is needed by the public iterator, or by
+		// a residual that reads the _score virtual field on any verb.
+		ftsSpec.NeedScores = opts.needSidecars || filterRefsField(ftsResidual, qplanner.ScoreField) ||
+			sortRefsField(q.sort, qplanner.ScoreField)
 		// countOnly is sound without ordering: FtsIter emits one aggregate per
 		// doc (duplicate-free), and the distinct count is order-invariant.
 		sorter := ftsSorter(q.writeSorter(opts))
@@ -808,9 +800,12 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 		// paths so the index report never silently shrinks. Vector queries
 		// are honestly explained as their ANN plan now, exactly what Iter and
 		// the write verbs execute.
+		// needSidecars mirrors Iter so the described chain (rank vs stream
+		// probe form) is exactly the one Rows(Q) executes.
 		plan, cboIndexes, perr := q.compilePlan(ctx, tx, buf, qb.idBounds, planOpts{
 			exactTotalDocs: true,
 			wantCandidates: true,
+			needSidecars:   true,
 		})
 		if perr != nil {
 			return perr
@@ -825,8 +820,7 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 		// NOT CBO candidates though — the optimizer never costed them — so
 		// they carry a cost only when they actually drive the plan; a phantom
 		// plan.Cost on an unconsidered index would read as a costed candidate.
-		addIndex := func(name string, cost float64) {
-			used := name == plan.IndexName
+		addIndex := func(name string, cost float64, used bool) {
 			ie := IndexExplain{
 				Name: name,
 				Cost: cost,
@@ -839,7 +833,7 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 			}
 		}
 		for _, idx := range cboIndexes {
-			addIndex(idx.Info.Name, plan.Cost)
+			addIndex(idx.Info.Name, plan.Cost, idx.Info.Name == plan.IndexName)
 		}
 		sourceCost := func(name string) float64 {
 			if name == plan.IndexName {
@@ -855,18 +849,45 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 			if _, ferr := vi.forTx(tx); ferr != nil {
 				continue
 			}
-			addIndex(vi.info.Name, sourceCost(vi.info.Name))
+			// A probe plan enforces the $knn clause through this index's
+			// distance kernel even when a range index drives the enumeration.
+			used := vi.info.Name == plan.IndexName ||
+				(strings.HasPrefix(plan.Name, "Knn") && q.knnIndexName() == vi.info.Name)
+			addIndex(vi.info.Name, sourceCost(vi.info.Name), used)
 		}
 		for _, fx := range q.c.loadFtsIndexes() {
 			// Same gate the executed $text goes through.
 			if !fx.visibleTo(tx) {
 				continue
 			}
-			addIndex(fx.info.Name, sourceCost(fx.info.Name))
+			// Same rule: a $text probe plan verifies every row against this
+			// index even when it does not drive.
+			used := fx.info.Name == plan.IndexName ||
+				(strings.HasPrefix(plan.Name, "Fts") && q.ftsIndexName() == fx.info.Name)
+			addIndex(fx.info.Name, sourceCost(fx.info.Name), used)
 		}
 		return nil
 	})
 	return
+}
+
+// ftsIndexName returns the index a $text predicate resolves to (the first
+// visible full-text index — detectFtsQuery's rule), or "".
+func (q *collQuery) ftsIndexName() string {
+	if fxs := q.c.loadFtsIndexes(); len(fxs) > 0 {
+		return fxs[0].info.Name
+	}
+	return ""
+}
+
+// knnIndexName returns the vector index the query's $knn clause resolves to,
+// or "" for a non-$knn query.
+func (q *collQuery) knnIndexName() string {
+	spec, _, err := q.detectKnnQuery()
+	if err != nil || spec == nil {
+		return ""
+	}
+	return spec.IndexName
 }
 
 func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {

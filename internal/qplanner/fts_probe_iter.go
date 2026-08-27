@@ -99,7 +99,11 @@ func (it *FtsProbeIter) init() error {
 		return err
 	}
 	it.prober = prober
-	if it.Plan != nil && it.Plan.Scores == nil {
+	// The sidecar is allocated only when scores are consumed — the public
+	// iterator's Score(), or a residual referencing _score (the query layer
+	// forces NeedScores on for that). Count/unbounded writes skip it, like
+	// the driver plan does; it would otherwise grow O(matched docs).
+	if it.Plan != nil && it.Plan.Scores == nil && it.Spec.NeedScores {
 		it.Plan.Scores = &FloatSidecar{}
 	}
 	if !it.Rank {
@@ -160,7 +164,7 @@ func (it *FtsProbeIter) Next() (key []byte, docId []byte, multiKey bool, err err
 		e := it.entries[it.idx]
 		it.idx++
 		id := it.arena[e.off : e.off+e.ln]
-		if it.Plan != nil {
+		if it.Plan != nil && it.Plan.Scores != nil {
 			it.Plan.Scores.Set(id, e.score)
 		}
 		return id, id, false, nil
@@ -177,7 +181,7 @@ func (it *FtsProbeIter) Next() (key []byte, docId []byte, multiKey bool, err err
 		if !ok {
 			continue
 		}
-		if it.Plan != nil {
+		if it.Plan != nil && it.Plan.Scores != nil {
 			it.Plan.Scores.Set(docId, score)
 		}
 		return key, docId, multiKey, nil

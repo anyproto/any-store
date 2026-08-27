@@ -73,18 +73,26 @@ func buildKnnPlan(params *PlanParams) *Plan {
 		if ef < 1 {
 			ef = 1
 		}
-		var searchCost float64
+		var searchCost, stream float64
 		if spec.BruteDriver {
-			searchCost = totalDocs * (CostSeqRead + scoreCost)
+			// Brute-force scans and scores the whole collection; with a
+			// residual it returns every doc ranked (topK=0) and the k-cut
+			// consumes candidates until K survivors, without one exactly K.
+			searchCost = totalDocs * (CostSeqRead + CostKnnBruteDoc + scoreCost)
+			stream = totalDocs
+			if !needFilter {
+				stream = float64(spec.K)
+			}
 		} else {
 			perCand := spec.SearchCostPerCand
 			if perCand <= 0 {
 				perCand = CostKnnSearchPerCand
 			}
 			searchCost = ef * perCand
+			stream = ef
 		}
 		// The k-cut stops consumption after K residual survivors.
-		consumed := ef
+		consumed := stream
 		if needFilter {
 			if need := float64(spec.K) / max(pResidual, 0.0001); need < consumed {
 				consumed = need
@@ -94,7 +102,7 @@ func buildKnnPlan(params *PlanParams) *Plan {
 		}
 		cands = append(cands, knnCandidate{
 			name: "KnnSearch", cost: searchCost + consumed*(CostDocFetch+CostFilter),
-			est: min(ef, float64(spec.K)), kind: knnPlanDriver,
+			est: min(consumed, float64(spec.K)), kind: knnPlanDriver,
 		})
 	}
 
@@ -212,8 +220,11 @@ func buildKnnProbePlan(params *PlanParams, cand *knnCandidate) *Plan {
 		if len(idx.Bounds) > 0 {
 			idx.Bounds = AdjustBoundsForNonUnique(idx.Bounds)
 		}
-		finalizeIndexBounds(idx)
 		if idx.Info.Unique && idx.fullKeyPointBound() {
+			// CoverIter takes the UN-finalized bounds — it seeks the raw
+			// prefix itself; the reverse-tail pad would double-pad and
+			// MergeOverlappingBounds would collapse distinct point probes
+			// (see buildIndexSeekChain).
 			root = &CoverIter{
 				Source:  &CursorSource{Tx: params.Tx, Ns: idx.Info.Ns},
 				IdxInfo: idx.Info,
@@ -223,6 +234,7 @@ func buildKnnProbePlan(params *PlanParams, cand *knnCandidate) *Plan {
 				root = &DocDedupIter{Source: root}
 			}
 		} else {
+			finalizeIndexBounds(idx)
 			root = &IndexIter{
 				Source:       &CursorSource{Tx: params.Tx, Ns: idx.Info.Ns},
 				IdxInfo:      idx.Info,

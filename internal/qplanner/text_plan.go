@@ -372,10 +372,13 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 		if len(idx.Bounds) > 0 {
 			idx.Bounds = AdjustBoundsForNonUnique(idx.Bounds)
 		}
-		dedupB := finalizeIndexBounds(idx)
 		reverse := shouldReverse(params.Sorter, idx)
 
 		if idx.Info.Unique && idx.fullKeyPointBound() {
+			// CoverIter must get the UN-finalized bounds: it seeks the raw
+			// prefix and applies HasExactFieldPrefix itself, so the reverse-
+			// tail pad would double-pad the seek, and MergeOverlappingBounds
+			// would collapse distinct point probes (see buildIndexSeekChain).
 			root = &CoverIter{
 				Source:  &CursorSource{Tx: params.Tx, Ns: idx.Info.Ns},
 				IdxInfo: idx.Info,
@@ -385,6 +388,7 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 				root = &DocDedupIter{Source: root}
 			}
 		} else {
+			dedupB := finalizeIndexBounds(idx)
 			root = &IndexIter{
 				Source:       &CursorSource{Tx: params.Tx, Ns: idx.Info.Ns},
 				IdxInfo:      idx.Info,
@@ -428,26 +432,30 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 
 	if params.CountOnly && countCovered {
 		// Count of the probed stream: distinct docIds, no fetches at all.
-		plan := &Plan{Root: root, Name: cand.name, IndexName: indexName}
-		setPlanRef(root, plan)
-		return plan
-	}
-
-	root = &FetchIter{Source: root, Data: dataCS, Buf: params.Buf}
-	root = &ScoreInjectIter{Source: root}
-	if needFilter {
-		root = &FilterIter{Source: root, Data: dataCS, Filter: params.Filter, Buf: params.Buf}
-	}
-	if canonicalWrap != nil {
-		root = canonicalWrap(root)
-	}
-	if needSort && (cand.idx == nil || !cand.idx.ExactSort) {
-		root = &SortIter{
-			Source: root,
-			Data:   dataCS,
-			Sorter: params.Sorter,
-			Buf:    params.Buf,
-			TopK:   sortTopK(params),
+		// The Limit/Offset wrap below still applies — countPlanRoot's
+		// LimitIter.CountDistinct is what windows the distinct count.
+	} else {
+		root = &FetchIter{Source: root, Data: dataCS, Buf: params.Buf}
+		// _score decoration is only needed when someone reads it: the public
+		// iterator (NeedScores) or a residual referencing the virtual field
+		// (the query layer forces NeedScores on for that).
+		if params.Fts.NeedScores {
+			root = &ScoreInjectIter{Source: root}
+		}
+		if needFilter {
+			root = &FilterIter{Source: root, Data: dataCS, Filter: params.Filter, Buf: params.Buf}
+		}
+		if canonicalWrap != nil {
+			root = canonicalWrap(root)
+		}
+		if needSort && (cand.idx == nil || !cand.idx.ExactSort) {
+			root = &SortIter{
+				Source: root,
+				Data:   dataCS,
+				Sorter: params.Sorter,
+				Buf:    params.Buf,
+				TopK:   sortTopK(params),
+			}
 		}
 	}
 	if params.Limit > 0 || params.Offset > 0 {

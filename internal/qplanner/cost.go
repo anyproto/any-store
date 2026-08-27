@@ -42,6 +42,10 @@ const (
 	CostVecScoreBase     = 0.1
 	CostVecScoreDim      = 0.0005
 	CostKnnSearchPerCand = 4.0
+	// CostKnnBruteDoc is the brute-force backend's per-document overhead on
+	// top of the sequential read: the raw-path vector decode (~0.7 µs
+	// measured on 20k docs / dim 64).
+	CostKnnBruteDoc = 0.8
 
 	// Fallback Heuristics
 	DefaultRangeSelectivity = 0.5 // Default assumption: a range predicate matches ~50% of the collection

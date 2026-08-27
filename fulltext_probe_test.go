@@ -192,12 +192,17 @@ func assertSamePlanResults(t *testing.T, coll Collection, cond map[string]any, l
 				"plan %s: score not bit-identical for %v row %d (%s): %v vs %v", p.name, cond, i, ids[i], baseScores[i], scores[i])
 		}
 
-		// Count must agree with the row count of the unwindowed query.
-		if limit == 0 && offset == 0 {
-			n, err := coll.Find(cond).IndexHint(p.hint...).Count(ctx)
-			require.NoError(t, err)
-			assert.Equal(t, len(baseIds), n, "plan %s: count diverged for %v", p.name, cond)
+		// Count must agree with the row count of the same (windowed) query.
+		cq := coll.Find(cond).IndexHint(p.hint...)
+		if limit > 0 {
+			cq = cq.Limit(limit)
 		}
+		if offset > 0 {
+			cq = cq.Offset(offset)
+		}
+		n, err := cq.Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, len(baseIds), n, "plan %s: count diverged for %v limit=%d offset=%d", p.name, cond, limit, offset)
 	}
 }
 
@@ -372,6 +377,33 @@ func TestFtsProbe_RequiredBitExhaustion(t *testing.T) {
 		"id":    map[string]any{"$in": manyIds(40)},
 	}
 	assertSamePlanResults(t, coll, cond, 0, 0, nil)
+}
+
+// A REVERSE-declared unique index chosen as the probe driver goes through
+// CoverIter, which must receive un-finalized bounds — the reverse-tail pad
+// would double-pad its seek and silently return zero rows.
+func TestFtsProbe_ReverseUniqueCoverDriver(t *testing.T) {
+	fx := newFixture(t)
+	defer fx.finish()
+	coll, err := fx.CreateCollection(ctx, "revcover")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ft", Kind: IndexKindFulltext, Fields: []string{"body"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "sku", Fields: []string{"-sku"}, Unique: true}))
+	var docs []string
+	for i := 0; i < 40; i++ {
+		docs = append(docs, fmt.Sprintf(`{"id":"r%02d","sku":"s%02d","body":"alpha common text"}`, i, i))
+	}
+	insertJSON(t, coll, docs...)
+
+	for _, cond := range []map[string]any{
+		{"$text": map[string]any{"$search": "alpha"}, "sku": "s07"},
+		{"$text": map[string]any{"$search": "alpha"}, "sku": map[string]any{"$in": []any{"s03", "s11", "s25"}}},
+	} {
+		driverIds, _ := collectIter(t, coll.Find(cond).IndexHint(IndexHint{IndexName: "ft", Boost: ftsProbeBoost}))
+		probeIds, _ := collectIter(t, coll.Find(cond).IndexHint(IndexHint{IndexName: "sku", Boost: ftsProbeBoost}))
+		require.NotEmpty(t, driverIds)
+		assert.Equal(t, driverIds, probeIds, "reverse-unique cover probe lost rows for %v", cond)
+	}
 }
 
 // Logical-work guard: a Count whose residual is covered by the probe driver

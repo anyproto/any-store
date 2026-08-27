@@ -611,3 +611,33 @@ func TestKnnProbe_DeleteMatchesIterSelection(t *testing.T) {
 		assert.ErrorIs(t, gerr, ErrDocNotFound, "doc %d must be deleted", id)
 	}
 }
+
+// A REVERSE-declared unique index chosen as the $knn probe driver goes
+// through CoverIter, which must receive un-finalized bounds — the
+// reverse-tail pad would double-pad its seek and silently select nothing.
+func TestKnnProbe_ReverseUniqueCoverDriver(t *testing.T) {
+	const dim = 8
+	fx := newFixture(t)
+	t.Cleanup(fx.finish)
+	coll, err := fx.CreateCollection(ctx, "knnrev")
+	require.NoError(t, err)
+	makeVectorIndex(t, coll, VectorModeBruteForce, dim)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "u", Fields: []string{"-u"}, Unique: true}))
+	vecs := vrand(60, dim, 21)
+	for i, vc := range vecs {
+		doc := anyenc.MustParseJson(vecDocJSON(i, vc))
+		doc.Set("u", anyenc.MustParseJson(fmt.Sprintf("%d", i)))
+		require.NoError(t, coll.Insert(ctx, doc))
+	}
+	for _, extra := range []query.Filter{
+		query.MustParseCondition(`{"u":9}`),
+		query.MustParseCondition(`{"u":{"$in":[3,17,42,99]}}`),
+	} {
+		cond := knnCond(vecs[9], 3, extra)
+		driverIds, driverDists := collectKnn(t, coll.Find(cond).IndexHint(IndexHint{IndexName: "emb", Boost: 1 << 30}))
+		probeIds, probeDists := collectKnn(t, coll.Find(cond).IndexHint(IndexHint{IndexName: "u", Boost: 1 << 30}))
+		require.NotEmpty(t, driverIds)
+		assert.Equal(t, driverIds, probeIds, "reverse-unique cover probe lost rows")
+		assert.Equal(t, driverDists, probeDists)
+	}
+}

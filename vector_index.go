@@ -704,6 +704,9 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 		// distance. ef is the re-rank depth / candidate count; nprobe is fixed
 		// in the index.
 		spec.Ef = knnEf(knn.Ef, captured.ivf.NProbe()*8, knn.K, hasResidual)
+		// ~2.2 cost units per ef candidate measured on the vector_restrict
+		// IVFSQ benchmark (cell scans + exact rerank, amortized).
+		spec.SearchCostPerCand = 2.5
 		spec.Search = func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
 			svi, err := captured.forTx(tx)
 			if err != nil {
@@ -737,7 +740,9 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 			return q.c.bruteVectorCandidates(tx, svi, qv, topK)
 		}
 	default:
-		// HNSW: ef is the beam width.
+		// HNSW: ef is the beam width. Graph traversal touches ~M neighbours
+		// per accepted candidate, so it prices above IVF's linear cell scans.
+		spec.SearchCostPerCand = 4.0
 		spec.Ef = knnEf(knn.Ef, vi.ix.EfSearch(), knn.K, hasResidual)
 		spec.Search = func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
 			svi, err := captured.forTx(tx)
