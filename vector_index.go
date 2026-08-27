@@ -1157,7 +1157,10 @@ func sortRefsField(s query.Sort, field string) bool {
 // a query executes single-threaded.
 func knnDistFromDoc(vi *vectorIndex, qv []float32) func(doc *anyenc.Value) (float32, bool) {
 	dist := vindex.DistanceFor(vi.info.Vector.Metric.toVindex())
-	buf := make([]float32, 0, vi.dim)
+	// Scratch for the numeric-array representation only, allocated lazily:
+	// packed TypeVectorF32 storage (the normal case) reads zero-copy, and
+	// detectKnnQuery builds one discarded spec per query (validateSources).
+	var buf []float32
 	return func(doc *anyenc.Value) (float32, bool) {
 		v := doc.Get(vi.fieldPath...)
 		if v == nil {
@@ -1174,6 +1177,9 @@ func knnDistFromDoc(vi *vectorIndex, qv []float32) func(doc *anyenc.Value) (floa
 			arr, err := v.Array()
 			if err != nil || len(arr) != vi.dim {
 				return 0, false
+			}
+			if buf == nil {
+				buf = make([]float32, 0, vi.dim)
 			}
 			buf = buf[:0]
 			for _, el := range arr {

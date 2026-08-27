@@ -294,9 +294,24 @@ type VectorScoreIter struct {
 	inited bool
 	kept   []scoredVecCand
 	arena  []byte
-	idx    int
+	// keptBytes tracks the live id bytes in arena; evictions strand their
+	// incumbent's bytes until compact reclaims them.
+	keptBytes int
+	idx       int
 
 	injArena anyenc.Arena
+}
+
+// compact rewrites arena to hold only the kept entries' id bytes.
+func (it *VectorScoreIter) compact() {
+	fresh := make([]byte, 0, it.keptBytes)
+	for i := range it.kept {
+		e := &it.kept[i]
+		off := uint32(len(fresh))
+		fresh = append(fresh, it.arena[e.off:e.off+e.ln]...)
+		e.off = off
+	}
+	it.arena = fresh
 }
 
 type scoredVecCand struct {
@@ -346,20 +361,32 @@ func (it *VectorScoreIter) init() error {
 		if it.Filter != nil && !it.Filter.Ok(doc, it.Buf) {
 			continue
 		}
-		nc := scoredVecCand{off: uint32(len(it.arena)), ln: uint32(len(docId)), dist: dist}
 		if k > 0 && len(it.kept) == k {
-			// Max-heap replacement: on a tie the incumbent wins only when its
-			// docId is smaller — the total order decides, not arrival.
-			it.arena = append(it.arena, docId...)
-			if it.less(nc, it.kept[0]) {
-				it.kept[0] = nc
-				it.siftDown(0)
-			} else {
-				it.arena = it.arena[:nc.off] // rejected: reclaim the id bytes
+			// Compared against the worst kept BEFORE any arena append: on a
+			// tie the incumbent wins only when its docId is smaller — the
+			// total order decides, not arrival.
+			root := &it.kept[0]
+			if dist > root.dist ||
+				(dist == root.dist && bytes.Compare(docId, it.arena[root.off:root.off+root.ln]) >= 0) {
+				continue
 			}
+			// An eviction strands the incumbent's id bytes; compact when the
+			// waste dominates (an enumeration order correlated with distance
+			// would otherwise grow the arena with every candidate).
+			if len(it.arena) > 1<<16 && len(it.arena) > 4*it.keptBytes {
+				it.compact()
+				root = &it.kept[0]
+			}
+			it.keptBytes += len(docId) - int(root.ln)
+			nc := scoredVecCand{off: uint32(len(it.arena)), ln: uint32(len(docId)), dist: dist}
+			it.arena = append(it.arena, docId...)
+			it.kept[0] = nc
+			it.siftDown(0)
 			continue
 		}
+		nc := scoredVecCand{off: uint32(len(it.arena)), ln: uint32(len(docId)), dist: dist}
 		it.arena = append(it.arena, docId...)
+		it.keptBytes += len(docId)
 		it.kept = append(it.kept, nc)
 		if k > 0 {
 			it.siftUp(len(it.kept) - 1)

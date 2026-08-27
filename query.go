@@ -281,37 +281,35 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 		// CBO inputs for the driver/probe cost decision: the residual's index
 		// candidates and the exact per-term stats of the $text predicate.
 		// Bounds are computed over q.cond — Text contributes none, so the
-		// residual predicates' bounds come out identical.
-		idxs := visibleIndexes(btx, q.c.loadIndexes())
-		br := q.buildBoundsResult(idxs)
-		cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
-		totalDocs := q.docCountForPlan(btx, idxs)
-		if ftsSpec.StatsFn != nil {
+		// residual predicates' bounds come out identical. A query that can
+		// have no probe candidate (no residual to bound an index, no fixed pk
+		// restriction) skips all of it — the unrestricted hot shape pays
+		// nothing over the pre-CBO driver path.
+		params := &qplanner.PlanParams{
+			Tx:         btx,
+			DataNs:     q.c.ns,
+			Filter:     ftsResidual,
+			Sorter:     sorter,
+			IDBounds:   idBounds,
+			PrimaryKey: q.c.primaryKey,
+			Limit:      int(q.limit),
+			Offset:     int(q.offset),
+			Buf:        buf,
+			IndexHints: q.buildIndexHints(),
+			CountOnly:  opts.countOnly,
+			Fts:        ftsSpec,
+		}
+		probePossible := q.fillProbeInputs(btx, ftsResidual, sorter != nil, opts, params)
+		if probePossible && ftsSpec.StatsFn != nil {
 			// A stats failure only disables the probe form (Valid stays
 			// false); the driver plan needs none of it.
 			if st, serr := ftsSpec.StatsFn(btx); serr == nil {
 				ftsSpec.Stats = st
 			}
 		}
-		plan = qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:          btx,
-			DataNs:      q.c.ns,
-			Filter:      ftsResidual,
-			Sorter:      sorter,
-			IDBounds:    idBounds,
-			PrimaryKey:  q.c.primaryKey,
-			Limit:       int(q.limit),
-			Offset:      int(q.offset),
-			Buf:         buf,
-			TotalDocs:   totalDocs,
-			Indexes:     cboIndexes,
-			IndexHints:  q.buildIndexHints(),
-			CountOnly:   opts.countOnly,
-			FieldBounds: &br,
-			Fts:         ftsSpec,
-		})
+		plan = qplanner.BuildPlan(params)
 		if opts.wantCandidates {
-			cbo = cboIndexes
+			cbo = params.Indexes
 		}
 		return plan, cbo, nil
 	}
@@ -329,30 +327,25 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	if vspec != nil {
 		vspec.NeedDistances = opts.needSidecars
 		// CBO inputs for the ANN-driver / exact-probe cost decision — same
-		// assembly as the $text branch.
-		idxs := visibleIndexes(btx, q.c.loadIndexes())
-		br := q.buildBoundsResult(idxs)
-		cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
-		totalDocs := q.docCountForPlan(btx, idxs)
-		plan = qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:          btx,
-			DataNs:      q.c.ns,
-			Filter:      residual,
-			Sorter:      q.writeSorter(opts),
-			IDBounds:    idBounds,
-			PrimaryKey:  q.c.primaryKey,
-			Limit:       int(q.limit),
-			Offset:      int(q.offset),
-			Buf:         buf,
-			TotalDocs:   totalDocs,
-			Indexes:     cboIndexes,
-			IndexHints:  q.buildIndexHints(),
-			CountOnly:   opts.countOnly,
-			FieldBounds: &br,
-			Vector:      vspec,
-		})
+		// assembly and same no-candidate skip as the $text branch.
+		params := &qplanner.PlanParams{
+			Tx:         btx,
+			DataNs:     q.c.ns,
+			Filter:     residual,
+			Sorter:     q.writeSorter(opts),
+			IDBounds:   idBounds,
+			PrimaryKey: q.c.primaryKey,
+			Limit:      int(q.limit),
+			Offset:     int(q.offset),
+			Buf:        buf,
+			IndexHints: q.buildIndexHints(),
+			CountOnly:  opts.countOnly,
+			Vector:     vspec,
+		}
+		q.fillProbeInputs(btx, residual, false, opts, params)
+		plan = qplanner.BuildPlan(params)
 		if opts.wantCandidates {
-			cbo = cboIndexes
+			cbo = params.Indexes
 		}
 		return plan, cbo, nil
 	}
@@ -869,6 +862,36 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 		return nil
 	})
 	return
+}
+
+// fillProbeInputs assembles the CBO inputs the $text/$knn driver-probe cost
+// decision needs — index candidates, per-field bounds, doc count — into
+// params, and reports whether ANY probe candidate can exist. A query with no
+// residual to bound an index, no fixed pk restriction, and no sort to cover
+// skips the whole assembly: the unrestricted hot shape pays nothing over the
+// pre-CBO driver path. Explain (wantCandidates) always assembles, for its
+// index report.
+func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, residual query.Filter, needSort bool, opts planOpts, params *qplanner.PlanParams) (probePossible bool) {
+	idFixed := len(params.IDBounds) > 0 && qplanner.AllBoundsFixed(params.IDBounds)
+	hasResidual := residual != nil && !isAllQueryFilter(residual)
+	if !idFixed && !hasResidual && !needSort && !opts.wantCandidates {
+		return false
+	}
+	idxs := visibleIndexes(btx, q.c.loadIndexes())
+	probePossible = idFixed
+	if len(idxs) > 0 {
+		br := q.buildBoundsResult(idxs)
+		params.Indexes = q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
+		params.FieldBounds = &br
+		for i := range params.Indexes {
+			if len(params.Indexes[i].Bounds) > 0 || (needSort && params.Indexes[i].ExactSort) {
+				probePossible = true
+				break
+			}
+		}
+	}
+	params.TotalDocs = q.docCountForPlan(btx, idxs)
+	return probePossible
 }
 
 // ftsIndexName returns the index a $text predicate resolves to (the first

@@ -61,11 +61,45 @@ type ftsProber struct {
 	// matching the driver's empty candidate stream.
 	hasPositive bool
 
-	keyBuf  []byte
-	valBuf  []byte
-	fwdBuf  []byte
-	posBufs [][]uint32
-	posBufB [][]uint32
+	keyBuf    []byte
+	valBuf    []byte
+	fwdBuf    []byte
+	mapValBuf []byte
+	posBufs   [][]uint32
+	posBufB   [][]uint32
+
+	// per-Probe scoring state (fields, not closures: Probe runs once per
+	// candidate in the planner's inner loop and must not allocate).
+	curScore    float64
+	curMask     uint64
+	curMatched  bool
+	curDl       float64
+	curDlLoaded bool
+}
+
+// curDocLen returns the probed document's token length, loading it once.
+func (p *ftsProber) curDocLen(intId uint64) (float64, error) {
+	if !p.curDlLoaded {
+		dl, err := p.e.docLen(intId)
+		if err != nil {
+			return 0, err
+		}
+		p.curDl = float64(dl)
+		p.curDlLoaded = true
+	}
+	return p.curDl, nil
+}
+
+// addContribution mirrors the driver's addScore for the probed document.
+func (p *ftsProber) addContribution(intId uint64, idf, tf float64, reqBit uint64) error {
+	d, err := p.curDocLen(intId)
+	if err != nil {
+		return err
+	}
+	p.curScore += p.e.bm25(idf, tf, d)
+	p.curMask |= reqBit
+	p.curMatched = true
+	return nil
 }
 
 // newFtsProber compiles the $text predicate for probing on the given snapshot.
@@ -269,39 +303,12 @@ func (p *ftsProber) Probe(docId []byte) (score float64, intId uint64, ok bool, e
 		return 0, 0, false, nil
 	}
 	p.fwdBuf = ftsMapForwardKey(p.fwdBuf, docId)
-	intId, found, err := ftsGetUintOk(p.tx, p.fx.nsMap, p.fwdBuf)
+	var found bool
+	intId, found, p.mapValBuf, err = ftsGetUintOkBuf(p.tx, p.fx.nsMap, p.fwdBuf, p.mapValBuf)
 	if err != nil || !found {
 		return 0, 0, false, err
 	}
-
-	// Doc length: fetched once; identical value to the driver's per-posting
-	// docLen reads.
-	var dl uint32
-	dlLoaded := false
-	docLen := func() (float64, error) {
-		if !dlLoaded {
-			var derr error
-			dl, derr = p.e.docLen(intId)
-			if derr != nil {
-				return 0, derr
-			}
-			dlLoaded = true
-		}
-		return float64(dl), nil
-	}
-
-	var mask uint64
-	matched := false
-	add := func(idf, tf float64, reqBit uint64) error {
-		d, derr := docLen()
-		if derr != nil {
-			return derr
-		}
-		score += p.e.bm25(idf, tf, d)
-		mask |= reqBit
-		matched = true
-		return nil
-	}
+	p.curScore, p.curMask, p.curMatched, p.curDlLoaded = 0, 0, false, false
 
 	// Positive contributions, in the driver's exact order: plain terms
 	// (first-seen order), then groups (each prefix expansion in order).
@@ -317,7 +324,7 @@ func (p *ftsProber) Probe(docId []byte) (score float64, intId uint64, ok bool, e
 		if hit {
 			// Presence-gated like scanTerm: a zero-weight-field posting still
 			// enters the doc (score += 0) and sets the required bit.
-			if err = add(pt.idf, tf, pt.reqBit); err != nil {
+			if err = p.addContribution(intId, pt.idf, tf, pt.reqBit); err != nil {
 				return 0, 0, false, err
 			}
 		}
@@ -333,7 +340,7 @@ func (p *ftsProber) Probe(docId []byte) (score float64, intId uint64, ok bool, e
 				return 0, 0, false, cerr
 			}
 			if cnt > 0 {
-				if err = add(g.idfSum, float64(cnt), g.reqBit); err != nil {
+				if err = p.addContribution(intId, g.idfSum, float64(cnt), g.reqBit); err != nil {
 					return 0, 0, false, err
 				}
 			}
@@ -349,13 +356,13 @@ func (p *ftsProber) Probe(docId []byte) (score float64, intId uint64, ok bool, e
 				return 0, 0, false, terr
 			}
 			if hit {
-				if err = add(pt.idf, tf, g.reqBit); err != nil {
+				if err = p.addContribution(intId, pt.idf, tf, g.reqBit); err != nil {
 					return 0, 0, false, err
 				}
 			}
 		}
 	}
-	if !matched {
+	if !p.curMatched {
 		return 0, 0, false, nil
 	}
 
@@ -391,10 +398,10 @@ func (p *ftsProber) Probe(docId []byte) (score float64, intId uint64, ok bool, e
 	}
 
 	// Required-clause gate (the driver's appendTo mask check).
-	if p.requiredAll != 0 && mask&p.requiredAll != p.requiredAll {
+	if p.requiredAll != 0 && p.curMask&p.requiredAll != p.requiredAll {
 		return 0, 0, false, nil
 	}
-	return score, intId, true, nil
+	return p.curScore, intId, true, nil
 }
 
 func (p *ftsProber) Close() {}

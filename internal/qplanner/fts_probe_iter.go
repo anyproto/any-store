@@ -75,14 +75,76 @@ type FtsProbeIter struct {
 	Tx     *btree.ReadTx
 	Plan   *Plan
 	Rank   bool
+	// TopK, when > 0, bounds the rank-mode materialization to the best K
+	// matches under the driver order (K = Limit + Offset, like SortIter's
+	// bounded heap); 0 keeps every match (no limit, or offset-only).
+	TopK int
 
 	prober FtsProber
 	inited bool
 
 	// rank state: docId bytes live in arena, entries reference spans.
-	entries []probeEntry
-	arena   []byte
-	idx     int
+	entries   []probeEntry
+	arena     []byte
+	keptBytes int
+	idx       int
+}
+
+// rankBetter is the driver's candidate order: score desc, IntDocID asc.
+func rankBetter(aScore float64, aInt uint64, bScore float64, bInt uint64) bool {
+	if aScore != bScore {
+		return aScore > bScore
+	}
+	return aInt < bInt
+}
+
+// worse reports that entries[i] is strictly worse than entries[j] under the
+// driver order. The bounded heap keeps its WORST entry at the root, so a new
+// candidate only needs one comparison against the root to be accepted.
+func (it *FtsProbeIter) worse(i, j int) bool {
+	return rankBetter(it.entries[j].score, it.entries[j].intId, it.entries[i].score, it.entries[i].intId)
+}
+
+func (it *FtsProbeIter) siftUp(i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if !it.worse(i, parent) {
+			return
+		}
+		it.entries[parent], it.entries[i] = it.entries[i], it.entries[parent]
+		i = parent
+	}
+}
+
+func (it *FtsProbeIter) siftDown(i int) {
+	n := len(it.entries)
+	for {
+		l, r := 2*i+1, 2*i+2
+		worst := i
+		if l < n && it.worse(l, worst) {
+			worst = l
+		}
+		if r < n && it.worse(r, worst) {
+			worst = r
+		}
+		if worst == i {
+			return
+		}
+		it.entries[i], it.entries[worst] = it.entries[worst], it.entries[i]
+		i = worst
+	}
+}
+
+// compact rewrites arena to hold only the kept entries' id bytes.
+func (it *FtsProbeIter) compact() {
+	fresh := make([]byte, 0, it.keptBytes)
+	for i := range it.entries {
+		e := &it.entries[i]
+		off := uint32(len(fresh))
+		fresh = append(fresh, it.arena[e.off:e.off+e.ln]...)
+		e.off = off
+	}
+	it.arena = fresh
 }
 
 type probeEntry struct {
@@ -110,6 +172,8 @@ func (it *FtsProbeIter) init() error {
 		return nil
 	}
 	// Rank mode: drain, probe distinct candidates, order like the driver.
+	// With a TopK bound only the best K matches are materialized (bounded
+	// worst-at-root heap, exactly like SortIter's TopK).
 	var dedup DocDedup
 	for {
 		_, docId, mk, serr := it.Source.Next()
@@ -129,9 +193,31 @@ func (it *FtsProbeIter) init() error {
 		if !ok {
 			continue
 		}
+		if it.TopK > 0 && len(it.entries) == it.TopK {
+			root := &it.entries[0]
+			if !rankBetter(score, intId, root.score, root.intId) {
+				continue
+			}
+			// Evictions strand the incumbent's id bytes; compact when the
+			// waste dominates.
+			if len(it.arena) > 1<<16 && len(it.arena) > 4*it.keptBytes {
+				it.compact()
+				root = &it.entries[0]
+			}
+			it.keptBytes += len(docId) - int(root.ln)
+			off := uint32(len(it.arena))
+			it.arena = append(it.arena, docId...)
+			it.entries[0] = probeEntry{off: off, ln: uint32(len(docId)), intId: intId, score: score}
+			it.siftDown(0)
+			continue
+		}
 		off := uint32(len(it.arena))
 		it.arena = append(it.arena, docId...)
+		it.keptBytes += len(docId)
 		it.entries = append(it.entries, probeEntry{off: off, ln: uint32(len(docId)), intId: intId, score: score})
+		if it.TopK > 0 {
+			it.siftUp(len(it.entries) - 1)
+		}
 	}
 	slices.SortFunc(it.entries, func(a, b probeEntry) int {
 		if a.score > b.score {

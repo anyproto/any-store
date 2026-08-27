@@ -930,15 +930,23 @@ func ftsGetUint(tx *btree.ReadTx, ns *btree.Namespace, key []byte) (uint64, erro
 
 // ftsGetUintOk is ftsGetUint reporting existence: an absent key is (0, false, nil).
 func ftsGetUintOk(tx *btree.ReadTx, ns *btree.Namespace, key []byte) (uint64, bool, error) {
-	v, err := tx.Get(ns, key)
+	n, ok, _, err := ftsGetUintOkBuf(tx, ns, key, nil)
+	return n, ok, err
+}
+
+// ftsGetUintOkBuf is ftsGetUintOk with a caller-owned value buffer — the
+// prober calls it once per candidate, and tx.Get's nil-buffer AppendValue
+// would allocate every time (same rationale as ftsDocLenBuf).
+func ftsGetUintOkBuf(tx *btree.ReadTx, ns *btree.Namespace, key, buf []byte) (uint64, bool, []byte, error) {
+	v, err := tx.AppendValue(ns, key, buf[:0])
 	if err != nil {
 		if errors.Is(err, btree.ErrKeyNotFound) {
-			return 0, false, nil
+			return 0, false, buf, nil
 		}
-		return 0, false, err
+		return 0, false, buf, err
 	}
 	n, _ := binary.Uvarint(v)
-	return n, true, nil
+	return n, true, v, nil
 }
 
 // ftsDocLenBuf returns the stored document length, using a caller-owned value buffer: the BM25

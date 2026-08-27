@@ -428,6 +428,12 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 		Tx:     params.Tx,
 		Rank:   rankMode && !params.CountOnly,
 	}
+	// The rank materialization can be bounded by the result window (like
+	// SortIter's heap) ONLY when no downstream stage rejects rows — a
+	// residual filter after the probe would turn the bound into row loss.
+	if !needFilter {
+		probe.TopK = sortTopK(params)
+	}
 	root = probe
 
 	if params.CountOnly && countCovered {
