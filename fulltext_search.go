@@ -255,22 +255,36 @@ func (e *ftsExec) analyze(raw string) []string {
 	return terms
 }
 
-// run compiles and executes the clauses. Positive clauses (should/must) are
-// scored first — plain terms in first-seen order, so a pure-OR query keeps the
-// exact v1 summation order — then phrases and prefixes; negated clauses run last
-// (tombstones only affect docs already scored).
-func (e *ftsExec) run(clauses []query.TextClause, defaultAnd bool) error {
-	// Ordered, deduped positive plain terms (preserves v1 scan order + parity).
-	var plainOrder []string
-	plainBit := map[string]uint64{}
-	type group struct {
-		terms  []string // >1 ⇒ phrase
-		stem   string   // prefix clause stem (Prefix only)
-		prefix bool
-		reqBit uint64
-	}
-	var posGroups, negGroups []group
+// ftsClauseGroup is one compiled non-plain clause: a phrase (len(terms) > 1),
+// or a prefix clause (prefix == true, stem set).
+type ftsClauseGroup struct {
+	terms  []string // >1 ⇒ phrase
+	stem   string   // prefix clause stem (Prefix only)
+	prefix bool
+	reqBit uint64
+}
 
+// ftsCompiledQuery is the compiled clause set of one $text predicate. It is
+// the SINGLE source of clause order and required-bit assignment for both
+// evaluation strategies — the driver scan (ftsExec.runCompiled) and the
+// per-document prober (ftsProber) — so their per-doc float summation order and
+// match semantics can never drift apart.
+type ftsCompiledQuery struct {
+	// plainOrder holds positive single-term clauses in first-seen order (v1
+	// scan-order parity); plainBit maps each to its OR-ed required bits.
+	plainOrder []string
+	plainBit   map[string]uint64
+	posGroups  []ftsClauseGroup
+	negGroups  []ftsClauseGroup
+	// requiredAll is the OR of every allocated required-clause bit.
+	requiredAll uint64
+}
+
+// compileClauses analyzes and classifies the clauses. Scoring order is fixed
+// here: plain positive terms first (first-seen order), then phrases/prefixes in
+// clause order, then negations.
+func (e *ftsExec) compileClauses(clauses []query.TextClause, defaultAnd bool) ftsCompiledQuery {
+	cq := ftsCompiledQuery{plainBit: map[string]uint64{}}
 	for _, c := range clauses {
 		terms := e.analyze(c.Raw)
 		if len(terms) == 0 {
@@ -281,19 +295,19 @@ func (e *ftsExec) run(clauses []query.TextClause, defaultAnd bool) error {
 
 		switch {
 		case c.Prefix && len(terms) == 1 && !c.Phrase:
-			g := group{stem: terms[0], prefix: true}
+			g := ftsClauseGroup{stem: terms[0], prefix: true}
 			if negated {
-				negGroups = append(negGroups, g)
+				cq.negGroups = append(cq.negGroups, g)
 			} else {
 				if required {
 					g.reqBit = e.allocReqBit()
 				}
-				posGroups = append(posGroups, g)
+				cq.posGroups = append(cq.posGroups, g)
 			}
 		case len(terms) == 1 && !c.Phrase:
 			term := terms[0]
 			if negated {
-				negGroups = append(negGroups, group{terms: terms})
+				cq.negGroups = append(cq.negGroups, ftsClauseGroup{terms: terms})
 				continue
 			}
 			var reqBit uint64
@@ -301,40 +315,50 @@ func (e *ftsExec) run(clauses []query.TextClause, defaultAnd bool) error {
 				reqBit = e.allocReqBit()
 			}
 			// Dedup a repeated positive term: score once, union its bits.
-			if _, seen := plainBit[term]; seen {
-				plainBit[term] |= reqBit
+			if _, seen := cq.plainBit[term]; seen {
+				cq.plainBit[term] |= reqBit
 			} else {
-				plainBit[term] = reqBit
-				plainOrder = append(plainOrder, term)
+				cq.plainBit[term] = reqBit
+				cq.plainOrder = append(cq.plainOrder, term)
 			}
 		default:
 			// Multi-token: explicit phrase, or an implicit phrase (CJK / joined word).
-			g := group{terms: terms}
+			g := ftsClauseGroup{terms: terms}
 			if negated {
-				negGroups = append(negGroups, g)
+				cq.negGroups = append(cq.negGroups, g)
 			} else {
 				if required {
 					g.reqBit = e.allocReqBit()
 				}
-				posGroups = append(posGroups, g)
+				cq.posGroups = append(cq.posGroups, g)
 			}
 		}
 	}
+	cq.requiredAll = e.requiredAll
+	return cq
+}
+
+// run compiles and executes the clauses. Positive clauses (should/must) are
+// scored first — plain terms in first-seen order, so a pure-OR query keeps the
+// exact v1 summation order — then phrases and prefixes; negated clauses run last
+// (tombstones only affect docs already scored).
+func (e *ftsExec) run(clauses []query.TextClause, defaultAnd bool) error {
+	cq := e.compileClauses(clauses, defaultAnd)
 
 	// 1) Plain positive terms, in first-seen order (v1 parity).
-	for _, term := range plainOrder {
-		if err := e.scanTerm(term, plainBit[term], false); err != nil {
+	for _, term := range cq.plainOrder {
+		if err := e.scanTerm(term, cq.plainBit[term], false); err != nil {
 			return err
 		}
 	}
 	// 2) Positive phrases and prefixes.
-	for _, g := range posGroups {
+	for _, g := range cq.posGroups {
 		if err := e.scoreGroup(g.terms, g.stem, g.prefix, g.reqBit, false); err != nil {
 			return err
 		}
 	}
 	// 3) Negated clauses (tombstone only docs already present).
-	for _, g := range negGroups {
+	for _, g := range cq.negGroups {
 		if err := e.scoreGroup(g.terms, g.stem, g.prefix, 0, true); err != nil {
 			return err
 		}
@@ -906,15 +930,23 @@ func ftsGetUint(tx *btree.ReadTx, ns *btree.Namespace, key []byte) (uint64, erro
 
 // ftsGetUintOk is ftsGetUint reporting existence: an absent key is (0, false, nil).
 func ftsGetUintOk(tx *btree.ReadTx, ns *btree.Namespace, key []byte) (uint64, bool, error) {
-	v, err := tx.Get(ns, key)
+	n, ok, _, err := ftsGetUintOkBuf(tx, ns, key, nil)
+	return n, ok, err
+}
+
+// ftsGetUintOkBuf is ftsGetUintOk with a caller-owned value buffer — the
+// prober calls it once per candidate, and tx.Get's nil-buffer AppendValue
+// would allocate every time (same rationale as ftsDocLenBuf).
+func ftsGetUintOkBuf(tx *btree.ReadTx, ns *btree.Namespace, key, buf []byte) (uint64, bool, []byte, error) {
+	v, err := tx.AppendValue(ns, key, buf[:0])
 	if err != nil {
 		if errors.Is(err, btree.ErrKeyNotFound) {
-			return 0, false, nil
+			return 0, false, buf, nil
 		}
-		return 0, false, err
+		return 0, false, buf, err
 	}
 	n, _ := binary.Uvarint(v)
-	return n, true, nil
+	return n, true, v, nil
 }
 
 // ftsDocLenBuf returns the stored document length, using a caller-owned value buffer: the BM25
@@ -965,6 +997,19 @@ func (q *collQuery) detectFtsQuery() (*qplanner.FtsQuerySpec, query.Filter, erro
 				return nil, ErrNoFulltextIndex
 			}
 			return fx.searchCandidates(tx, text)
+		},
+		Probe: func(tx *btree.ReadTx) (qplanner.FtsProber, error) {
+			// Same visibility gate as Search.
+			if !fx.visibleTo(tx) {
+				return nil, ErrNoFulltextIndex
+			}
+			return fx.newFtsProber(tx, text)
+		},
+		StatsFn: func(tx *btree.ReadTx) (qplanner.FtsPlanStats, error) {
+			if !fx.visibleTo(tx) {
+				return qplanner.FtsPlanStats{}, ErrNoFulltextIndex
+			}
+			return fx.planStats(tx, text)
 		},
 	}
 	residual := ftsResidualFilter(q.cond)

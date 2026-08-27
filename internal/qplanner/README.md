@@ -14,6 +14,9 @@ Query → BuildPlan (CBO) → Iterator Chain → Results
 2. **Plan Selection**: Generate three candidate plans (FullScan, IndexSeek, IndexScan) and pick the one with the lowest cost.
 3. **Execution**: The root iterator is called repeatedly via `Next()` to produce `(key, docId)` pairs.
 
+`$text` and `$knn` queries go through their own cost-based selection
+(`text_plan.go`, `knn_plan.go`) — see **Full-text and vector plans** below.
+
 ---
 
 ### Cost Model
@@ -154,6 +157,35 @@ This reduces the final sort from O(N log N) to O(K log K) and keeps the entries 
 `DedupIter` is one of `CanonicalKeyDedupIter` (single-field) or `SeenSetDedupIter` (compound); see the Multi-Key Index Deduplication section above.
 
 ---
+
+### Full-text and vector plans
+
+A `$text` predicate has two enforcement forms, chosen by cost (`text_plan.go`):
+
+| form | chain | cost shape |
+|---|---|---|
+| driver | `FtsIter → Fetch → Filter → …` | `Σ df × CostFtsPosting` + consumed fetches |
+| probe | `IdBounds/IndexIter → FtsProbeIter → Fetch → ScoreInject → Filter → …` | candidates × `(CostFtsProbeDoc + terms × CostFtsProbeTerm)` |
+
+The driver walks the posting lists (cost is exact: per-term document
+frequencies are read from the index at plan time) and additionally gates
+candidates against the query's primary-key bounds before the fetch. The probe
+verifies each candidate of another access path against the text index
+individually. Both produce bit-identical matches and scores; when relevance
+order is observable, `FtsProbeIter` runs in rank mode and re-emits matches in
+the driver's `(score desc, IntDocID asc)` order. A `Count` whose residual is
+covered by the probe's driver fetches no documents.
+
+A `$knn` clause means "the K nearest among filter-passing documents". The ANN
+driver (`VectorIter`) approximates this by post-filtering ef candidates; the
+probe form (`knn_plan.go`, `VectorScoreIter`) enumerates the filter candidates
+from a bounded access path, scores each stored vector directly, and keeps the
+exact K nearest survivors — under a selective filter it is both cheaper and
+more accurate, and the cost model switches automatically.
+
+Index hints force plans in both selectors: the fts/vector index name boosts
+the driver, the primary-key field name the pk probe, a secondary index name
+its probe.
 
 ### IndexSketch
 

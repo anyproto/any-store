@@ -307,15 +307,17 @@ func (idx *CBOIndex) fullKeyPointBound() bool {
 // BuildPlan constructs an iterator chain using the Cost-Based Optimizer.
 // It evaluates full scan, index seek, and index scan plans, then picks the cheapest.
 func BuildPlan(params *PlanParams) *Plan {
-	// Vector query: the ANN search is the sole source. Bypass the CBO entirely —
-	// no range-index selection, no cost comparison, no full-scan fallback.
+	// Vector query: the $knn clause is enforced by the ANN driver (VectorIter)
+	// or the exact pre-filter probe (VectorScoreIter); buildKnnPlan costs both
+	// against the query's other access paths and picks the cheapest.
 	if params.Vector != nil {
-		return buildVectorPlan(params)
+		return buildKnnPlan(params)
 	}
-	// Full-text query: the $text search is the sole source. Same rationale — a
-	// $text predicate must drive, so there is no cost decision to make.
+	// Full-text query: the $text predicate is enforced by the driver (FtsIter)
+	// or the probe (FtsProbeIter) form; buildTextPlan costs both against the
+	// query's other access paths and picks the cheapest.
 	if params.Fts != nil {
-		return buildFtsPlan(params)
+		return buildTextPlan(params)
 	}
 
 	needSort := params.Sorter != nil
@@ -757,9 +759,10 @@ func buildVectorPlan(params *PlanParams) *Plan {
 func buildFtsPlan(params *PlanParams) *Plan {
 	dataCS := &CursorSource{Tx: params.Tx, Ns: params.DataNs}
 	source := &FtsIter{
-		Spec: params.Fts,
-		Data: dataCS,
-		Buf:  params.Buf,
+		Spec:     params.Fts,
+		Data:     dataCS,
+		Buf:      params.Buf,
+		IDBounds: params.IDBounds,
 	}
 	return buildSearchPlan(params, dataCS, source, 0, "FtsSearch", params.Fts.IndexName)
 }
@@ -1641,6 +1644,17 @@ func setPlanRef(it Iterator, plan *Plan) {
 	case *FtsIter:
 		v.Plan = plan
 		// leaf — no upstream source
+	case *FtsProbeIter:
+		v.Plan = plan
+		setPlanRef(v.Source, plan)
+	case *ScoreInjectIter:
+		v.Plan = plan
+		setPlanRef(v.Source, plan)
+	case *VectorScoreIter:
+		v.Plan = plan
+		setPlanRef(v.Source, plan)
+	case *VerifyIter:
+		setPlanRef(v.Source, plan)
 	}
 }
 

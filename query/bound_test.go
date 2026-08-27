@@ -313,3 +313,86 @@ func TestBounds_Intersect(t *testing.T) {
 	}
 }
 
+func TestBounds_SortedDisjoint(t *testing.T) {
+	mk := func(start, end string, si, ei bool) Bound {
+		return Bound{Start: []byte(start), End: []byte(end), StartInclude: si, EndInclude: ei}
+	}
+	assert.True(t, Bounds(nil).SortedDisjoint())
+	assert.True(t, Bounds{mk("a", "a", true, true)}.SortedDisjoint())
+	assert.True(t, Bounds{mk("a", "a", true, true), mk("c", "c", true, true)}.SortedDisjoint())
+	// Touching at a shared endpoint is treated as non-canonical either way —
+	// SortAndMerge coalesces adjacent bounds, so a canonical set never
+	// contains them, and rejecting them here only routes the caller to the
+	// assumption-free linear Contains.
+	assert.False(t, Bounds{mk("a", "b", true, true), mk("b", "c", true, true)}.SortedDisjoint())
+	assert.False(t, Bounds{mk("a", "b", true, false), mk("b", "c", true, true)}.SortedDisjoint())
+	// Out of order.
+	assert.False(t, Bounds{mk("c", "c", true, true), mk("a", "a", true, true)}.SortedDisjoint())
+	// Genuine overlap.
+	assert.False(t, Bounds{mk("a", "m", true, true), mk("d", "z", true, true)}.SortedDisjoint())
+	// Unbounded end overlaps everything after it.
+	assert.False(t, Bounds{{Start: []byte("a"), StartInclude: true}, mk("c", "d", true, true)}.SortedDisjoint())
+}
+
+// ContainsSorted must agree with the linear Contains on every canonical set —
+// its precondition (SortedDisjoint) is what the fuzz below relies on.
+func TestBounds_ContainsSorted(t *testing.T) {
+	mk := func(start, end string, si, ei bool) Bound {
+		return Bound{Start: []byte(start), End: []byte(end), StartInclude: si, EndInclude: ei}
+	}
+	sets := []Bounds{
+		nil,
+		{mk("a", "a", true, true)},
+		{mk("a", "a", true, true), mk("c", "c", true, true), mk("e", "e", true, true)},
+		{mk("a", "c", false, false), mk("e", "g", true, true)},
+		{{End: []byte("c"), EndInclude: false}, mk("e", "g", true, true), {Start: []byte("m"), StartInclude: false}},
+	}
+	vals := []string{"", "a", "a0", "b", "c", "d", "e", "f", "g", "h", "m", "n", "z"}
+	for si, bs := range sets {
+		if !bs.SortedDisjoint() {
+			t.Fatalf("set %d not canonical", si)
+		}
+		for _, v := range vals {
+			assert.Equal(t, bs.Contains([]byte(v)), bs.ContainsSorted([]byte(v)),
+				"set %d, val %q", si, v)
+		}
+	}
+}
+
+// Randomized agreement between Contains and ContainsSorted over canonical sets
+// built by SortAndMerge from arbitrary point/range bounds.
+func TestBounds_ContainsSorted_Randomized(t *testing.T) {
+	rnd := uint64(12345)
+	next := func(n int) int {
+		rnd = rnd*6364136223846793005 + 1442695040888963407
+		return int((rnd >> 33) % uint64(n))
+	}
+	letters := "abcdefghij"
+	for iter := 0; iter < 500; iter++ {
+		var bs Bounds
+		for i := 0; i < 1+next(5); i++ {
+			a := letters[next(len(letters))]
+			b := letters[next(len(letters))]
+			if a > b {
+				a, b = b, a
+			}
+			bs = append(bs, Bound{
+				Start: []byte{a}, End: []byte{b},
+				StartInclude: next(2) == 0 || a == b, EndInclude: next(2) == 0 || a == b,
+			})
+		}
+		bs = bs.SortAndMerge()
+		if !bs.SortedDisjoint() {
+			// SortAndMerge can leave touching-but-not-overlapping neighbors
+			// that SortedDisjoint accepts; a set it rejects must use the
+			// linear path — which is exactly what the runtime gate does.
+			continue
+		}
+		for c := byte('a'); c <= 'k'; c++ {
+			v := []byte{c}
+			if bs.Contains(v) != bs.ContainsSorted(v) {
+				t.Fatalf("iter %d: divergence on %q for %v", iter, v, bs)
+			}
+		}
+	}
+}

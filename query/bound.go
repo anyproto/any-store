@@ -230,6 +230,50 @@ func (b Bound) contains(val []byte) bool {
 	return true
 }
 
+// SortedDisjoint reports whether bs is in canonical form: sorted ascending by
+// Start with pairwise non-overlapping ranges — the precondition of
+// ContainsSorted. IndexBounds results are canonical (SortAndMerge), but a
+// caller holding bounds of unknown provenance must check before switching from
+// the linear Contains to the binary-search path.
+func (bs Bounds) SortedDisjoint() bool {
+	for i := 1; i < len(bs); i++ {
+		if bytes.Compare(bs[i-1].Start, bs[i].Start) > 0 {
+			return false
+		}
+		if isOverlap(bs[i-1], bs[i]) && isOverlap(bs[i], bs[i-1]) {
+			return false
+		}
+	}
+	return true
+}
+
+// ContainsSorted reports whether val lies within any range of a CANONICAL
+// (sorted, disjoint — see SortedDisjoint) bound set, by binary search. On a
+// non-canonical set the answer is unsound BY DESIGN — the caller owns the
+// precondition; this is the hot-loop variant of Contains (which stays linear
+// and assumption-free).
+func (bs Bounds) ContainsSorted(val []byte) bool {
+	lo, hi := 0, len(bs)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		b := &bs[mid]
+		if len(b.Start) > 0 {
+			if c := bytes.Compare(val, b.Start); c < 0 || (c == 0 && !b.StartInclude) {
+				hi = mid
+				continue
+			}
+		}
+		if len(b.End) > 0 {
+			if c := bytes.Compare(val, b.End); c > 0 || (c == 0 && !b.EndInclude) {
+				lo = mid + 1
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
 // Intersect returns the lex-intersection of this bound set with other.
 // A bound set is a union of value ranges; the intersection is the set of
 // values present in BOTH unions. Used by TightIndexBounds to combine the

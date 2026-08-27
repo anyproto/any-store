@@ -688,6 +688,15 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 		K:              knn.K,
 		IndexName:      vi.info.Name,
 		TotallyOrdered: true, // all three backends return (distance, docId) ascending
+		// Probe (exact pre-filter) form: score a candidate's stored vector
+		// directly from the parsed document — the same vector source and
+		// distance kernel as the brute-force backend, so exact-mode distances
+		// are bit-identical to brute-driver distances.
+		DistFromDoc: knnDistFromDoc(vi, knn.Query),
+		CheckTx: func(tx *btree.ReadTx) error {
+			_, cerr := captured.forTx(tx)
+			return cerr
+		},
 	}
 	switch {
 	case vi.isIVF():
@@ -695,6 +704,9 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 		// distance. ef is the re-rank depth / candidate count; nprobe is fixed
 		// in the index.
 		spec.Ef = knnEf(knn.Ef, captured.ivf.NProbe()*8, knn.K, hasResidual)
+		// ~2.2 cost units per ef candidate measured on the vector_restrict
+		// IVFSQ benchmark (cell scans + exact rerank, amortized).
+		spec.SearchCostPerCand = 2.5
 		spec.Search = func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
 			svi, err := captured.forTx(tx)
 			if err != nil {
@@ -715,6 +727,7 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 		// so it can rank and cut to k itself — but ONLY when no residual will
 		// discard candidates downstream (it is the one backend that can
 		// guarantee k post-residual survivors, by returning everything).
+		spec.BruteDriver = true
 		topK := 0
 		if !hasResidual {
 			topK = knn.K
@@ -727,7 +740,9 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 			return q.c.bruteVectorCandidates(tx, svi, qv, topK)
 		}
 	default:
-		// HNSW: ef is the beam width.
+		// HNSW: ef is the beam width. Graph traversal touches ~M neighbours
+		// per accepted candidate, so it prices above IVF's linear cell scans.
+		spec.SearchCostPerCand = 4.0
 		spec.Ef = knnEf(knn.Ef, vi.ix.EfSearch(), knn.K, hasResidual)
 		spec.Search = func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
 			svi, err := captured.forTx(tx)
@@ -1133,6 +1148,53 @@ func sortRefsField(s query.Sort, field string) bool {
 // the cursor key itself (the data namespace is keyed by encoded id). All
 // per-document state lives in reused buffers; the candidates' ids share one
 // arena.
+// knnDistFromDoc builds the probe-form distance closure: extract the field's
+// vector from a PARSED document (both representations — the packed
+// TypeVectorF32 blob and a plain numeric array, mirroring anyenc's
+// AppendFloat32s) and score it with the index's metric kernel. ok=false when
+// the field is absent, not a vector, or mis-dimensioned — exactly the
+// documents the ANN backends never index. The closure owns a scratch buffer;
+// a query executes single-threaded.
+func knnDistFromDoc(vi *vectorIndex, qv []float32) func(doc *anyenc.Value) (float32, bool) {
+	dist := vindex.DistanceFor(vi.info.Vector.Metric.toVindex())
+	// Scratch for the numeric-array representation only, allocated lazily:
+	// packed TypeVectorF32 storage (the normal case) reads zero-copy, and
+	// detectKnnQuery builds one discarded spec per query (validateSources).
+	var buf []float32
+	return func(doc *anyenc.Value) (float32, bool) {
+		v := doc.Get(vi.fieldPath...)
+		if v == nil {
+			return 0, false
+		}
+		switch v.Type() {
+		case anyenc.TypeVectorF32:
+			vec, err := v.VectorF32()
+			if err != nil || len(vec) != vi.dim {
+				return 0, false
+			}
+			return dist(qv, vec), true
+		case anyenc.TypeArray:
+			arr, err := v.Array()
+			if err != nil || len(arr) != vi.dim {
+				return 0, false
+			}
+			if buf == nil {
+				buf = make([]float32, 0, vi.dim)
+			}
+			buf = buf[:0]
+			for _, el := range arr {
+				f, ferr := el.Float64()
+				if ferr != nil {
+					return 0, false
+				}
+				buf = append(buf, float32(f))
+			}
+			return dist(qv, buf), true
+		}
+		return 0, false
+	}
+}
+
 func (c *collection) bruteVectorCandidates(tx *btree.ReadTx, vi *vectorIndex, qv []float32, topK int) ([]qplanner.VectorCandidate, error) {
 	dist := vindex.DistanceFor(vi.info.Vector.Metric.toVindex())
 	cursor := tx.NewCursor(c.ns)

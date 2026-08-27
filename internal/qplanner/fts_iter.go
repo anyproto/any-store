@@ -3,6 +3,7 @@ package qplanner
 import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
 
@@ -37,11 +38,21 @@ type FtsCandidateStream interface {
 // VectorSearchFunc). A nil stream means no matches.
 type FtsSearchFunc func(tx *btree.ReadTx) (FtsCandidateStream, error)
 
-// FtsQuerySpec directs BuildPlan to build a full-text-search plan. When present
-// it is the SOLE source — all range-index/CBO selection is bypassed (a $text
-// predicate must drive the query).
+// FtsQuerySpec directs BuildPlan to build a full-text-search plan: the $text
+// predicate is enforced either by an FtsIter source (driver form) or by an
+// FtsProbeIter over another access path (probe form); buildTextPlan picks the
+// cheaper by cost.
 type FtsQuerySpec struct {
 	Search FtsSearchFunc
+	// Probe opens the per-document verifier for the probe form; nil means only
+	// the driver plan is legal.
+	Probe FtsProbeFunc
+	// StatsFn fills Stats on the plan's read tx (called once by the query
+	// compiler); a failure leaves Stats zero (Valid == false) and the plan
+	// degrades to driver-only rather than erroring.
+	StatsFn FtsStatsFunc
+	// Stats feed the driver/probe cost comparison (see FtsPlanStats.Valid).
+	Stats FtsPlanStats
 	// IndexName is the driving full-text index, reported by Explain.
 	IndexName string
 	// Ordered is true when Search streams candidates already sorted by score
@@ -67,9 +78,17 @@ type FtsIter struct {
 	Buf  *syncpool.DocBuffer
 	Plan *Plan
 
-	arena  anyenc.Arena
-	stream FtsCandidateStream
-	inited bool
+	// IDBounds, when set, gate each candidate's docId against the query's
+	// primary-key bounds BEFORE the document fetch: a candidate outside the
+	// bounds costs a byte comparison instead of a page read (+ parse). The
+	// bounds over-approximate the pk predicate by contract and the residual
+	// FilterIter still decides every row, so the gate only removes work.
+	IDBounds query.Bounds
+
+	arena    anyenc.Arena
+	stream   FtsCandidateStream
+	inited   bool
+	idSorted bool
 }
 
 func (it *FtsIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
@@ -82,6 +101,10 @@ func (it *FtsIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 		if it.stream != nil && it.Plan != nil && it.Plan.Scores == nil && it.Spec.NeedScores {
 			it.Plan.Scores = &FloatSidecar{}
 		}
+		// One canonical-form check enables the binary-search gate; a
+		// non-canonical set (never produced by IndexBounds, but the contract
+		// is the caller's) falls back to the linear Contains.
+		it.idSorted = it.IDBounds.SortedDisjoint()
 	}
 	if it.stream == nil {
 		return nil, nil, false, nil
@@ -94,6 +117,17 @@ func (it *FtsIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 		}
 		if !ok {
 			return nil, nil, false, nil
+		}
+
+		// Primary-key gate: reject out-of-bounds candidates before the fetch.
+		if len(it.IDBounds) > 0 {
+			if it.idSorted {
+				if !it.IDBounds.ContainsSorted(cDocId) {
+					continue
+				}
+			} else if !it.IDBounds.Contains(cDocId) {
+				continue
+			}
 		}
 
 		it.Buf.DocBuf, err = it.Data.AppendValue(cDocId, it.Buf.DocBuf[:0])
