@@ -286,18 +286,42 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 		// countOnly is sound without ordering: FtsIter emits one aggregate per
 		// doc (duplicate-free), and the distinct count is order-invariant.
 		sorter := ftsSorter(q.writeSorter(opts))
+		// CBO inputs for the driver/probe cost decision: the residual's index
+		// candidates and the exact per-term stats of the $text predicate.
+		// Bounds are computed over q.cond — Text contributes none, so the
+		// residual predicates' bounds come out identical.
+		idxs := visibleIndexes(btx, q.c.loadIndexes())
+		br := q.buildBoundsResult(idxs)
+		cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
+		totalDocs := q.docCountForPlan(btx, idxs)
+		if ftsSpec.StatsFn != nil {
+			// A stats failure only disables the probe form (Valid stays
+			// false); the driver plan needs none of it.
+			if st, serr := ftsSpec.StatsFn(btx); serr == nil {
+				ftsSpec.Stats = st
+			}
+		}
 		plan = qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:        btx,
-			DataNs:    q.c.ns,
-			Filter:    ftsResidual,
-			Sorter:    sorter,
-			Limit:     int(q.limit),
-			Offset:    int(q.offset),
-			Buf:       buf,
-			CountOnly: opts.countOnly,
-			Fts:       ftsSpec,
+			Tx:          btx,
+			DataNs:      q.c.ns,
+			Filter:      ftsResidual,
+			Sorter:      sorter,
+			IDBounds:    idBounds,
+			PrimaryKey:  q.c.primaryKey,
+			Limit:       int(q.limit),
+			Offset:      int(q.offset),
+			Buf:         buf,
+			TotalDocs:   totalDocs,
+			Indexes:     cboIndexes,
+			IndexHints:  q.buildIndexHints(),
+			CountOnly:   opts.countOnly,
+			FieldBounds: &br,
+			Fts:         ftsSpec,
 		})
-		return plan, q.reportCandidates(btx, opts), nil
+		if opts.wantCandidates {
+			cbo = cboIndexes
+		}
+		return plan, cbo, nil
 	}
 
 	// $knn drives the query when present (CBO bypassed): the ANN search is the
@@ -312,18 +336,33 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	}
 	if vspec != nil {
 		vspec.NeedDistances = opts.needSidecars
+		// CBO inputs for the ANN-driver / exact-probe cost decision — same
+		// assembly as the $text branch.
+		idxs := visibleIndexes(btx, q.c.loadIndexes())
+		br := q.buildBoundsResult(idxs)
+		cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
+		totalDocs := q.docCountForPlan(btx, idxs)
 		plan = qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:        btx,
-			DataNs:    q.c.ns,
-			Filter:    residual,
-			Sorter:    q.writeSorter(opts),
-			Limit:     int(q.limit),
-			Offset:    int(q.offset),
-			Buf:       buf,
-			CountOnly: opts.countOnly,
-			Vector:    vspec,
+			Tx:          btx,
+			DataNs:      q.c.ns,
+			Filter:      residual,
+			Sorter:      q.writeSorter(opts),
+			IDBounds:    idBounds,
+			PrimaryKey:  q.c.primaryKey,
+			Limit:       int(q.limit),
+			Offset:      int(q.offset),
+			Buf:         buf,
+			TotalDocs:   totalDocs,
+			Indexes:     cboIndexes,
+			IndexHints:  q.buildIndexHints(),
+			CountOnly:   opts.countOnly,
+			FieldBounds: &br,
+			Vector:      vspec,
 		})
-		return plan, q.reportCandidates(btx, opts), nil
+		if opts.wantCandidates {
+			cbo = cboIndexes
+		}
+		return plan, cbo, nil
 	}
 
 	// CBO path. Bounds and candidates are built against btx: the

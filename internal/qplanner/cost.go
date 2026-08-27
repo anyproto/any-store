@@ -20,6 +20,29 @@ const (
 	// full-scan sort path.
 	CostMaterialize = 1.0
 
+	// Full-text cost weights — calibrated against the 50k-doc fts_restrict
+	// benchmarks (≈0.9 µs per cost unit, anchored by CostDocFetch ≈ 2.7 µs
+	// for a 4 KB fetch+parse).
+	//
+	// CostFtsPosting prices one posting visited by the driver scan: chunk
+	// decode + BM25 + amortized rank sort (~340 ns measured).
+	CostFtsPosting = 0.4
+	// CostFtsProbeTerm prices one per-term postings-chunk point-get during a
+	// document probe; CostFtsProbeDoc is the per-document overhead (docmap +
+	// docinfo point-gets). A full probe of one doc for a q-term query costs
+	// CostFtsProbeDoc + q×CostFtsProbeTerm (~1–3 µs measured for one term).
+	CostFtsProbeTerm = 1.5
+	CostFtsProbeDoc  = 1.0
+
+	// Vector cost weights. Exact per-candidate scoring reads the vector
+	// zero-copy from the already-parsed document, so it costs a dim-scaled
+	// SIMD kernel on top of the fetch (256d ≈ 0.2 units). The ANN driver's
+	// per-ef-candidate cost covers graph/list traversal + rerank, amortized;
+	// backends override it via VectorQuerySpec.SearchCostPerCand.
+	CostVecScoreBase     = 0.1
+	CostVecScoreDim      = 0.0005
+	CostKnnSearchPerCand = 4.0
+
 	// Fallback Heuristics
 	DefaultRangeSelectivity = 0.5 // Default assumption: a range predicate matches ~50% of the collection
 
