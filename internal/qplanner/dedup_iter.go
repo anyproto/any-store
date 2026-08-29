@@ -90,44 +90,48 @@ func (it *CanonicalKeyDedupIter) Next() (key []byte, docId []byte, multiKey bool
 			return key, docId, false, nil
 		}
 
-		items, _ := v.Array()
-		it.best = it.best[:0]
-		noBounds := len(it.Bounds) == 0
-		for _, item := range items {
-			// Encode in the same byte space as fieldVal and Bounds: inverted
-			// (stored) for a reverse field, plain ascending otherwise.
-			if it.FieldReverse {
-				it.keyBuf = anyenc.Tuple(it.keyBuf[:0]).AppendInverted(item)
-			} else {
-				it.keyBuf = item.MarshalTo(it.keyBuf[:0])
-			}
-			if !noBounds {
-				it.keyBuf = append(it.keyBuf, 0x01)
-				in := it.Bounds.Contains(it.keyBuf)
-				it.keyBuf = it.keyBuf[:len(it.keyBuf)-1]
-				if !in {
-					continue
-				}
-			}
-			if len(it.best) == 0 {
-				it.best = append(it.best[:0], it.keyBuf...)
-				continue
-			}
-			cmp := bytes.Compare(it.keyBuf, it.best)
-			if (!it.Reverse && cmp < 0) || (it.Reverse && cmp > 0) {
-				it.best = append(it.best[:0], it.keyBuf...)
-			}
-		}
-		if len(it.best) == 0 {
-			// No array element hits the bounds — upstream shouldn't have
-			// emitted this doc, but pass through conservatively.
-			return key, docId, false, nil
-		}
-		if bytes.Equal(fieldVal, it.best) {
+		if it.isCanonical(v, fieldVal) {
 			return key, docId, false, nil
 		}
 		// Not the canonical hit — skip.
 	}
+}
+
+// isCanonical elects the array's canonical in-bounds element and reports
+// whether fieldVal is it. Kept out of Next so the scalar pass-through — every
+// row of a single-field index scan — stays a short loop.
+func (it *CanonicalKeyDedupIter) isCanonical(v *anyenc.Value, fieldVal []byte) bool {
+	items, _ := v.Array()
+	it.best = it.best[:0]
+	noBounds := len(it.Bounds) == 0
+	for _, item := range items {
+		// Encode in the same byte space as fieldVal and Bounds: inverted
+		// (stored) for a reverse field, plain ascending otherwise.
+		if it.FieldReverse {
+			it.keyBuf = anyenc.Tuple(it.keyBuf[:0]).AppendInverted(item)
+		} else {
+			it.keyBuf = item.MarshalTo(it.keyBuf[:0])
+		}
+		if !noBounds {
+			it.keyBuf = append(it.keyBuf, 0x01)
+			in := it.Bounds.Contains(it.keyBuf)
+			it.keyBuf = it.keyBuf[:len(it.keyBuf)-1]
+			if !in {
+				continue
+			}
+		}
+		if len(it.best) == 0 {
+			it.best = append(it.best[:0], it.keyBuf...)
+			continue
+		}
+		cmp := bytes.Compare(it.keyBuf, it.best)
+		if (!it.Reverse && cmp < 0) || (it.Reverse && cmp > 0) {
+			it.best = append(it.best[:0], it.keyBuf...)
+		}
+	}
+	// No array element hits the bounds — upstream shouldn't have emitted
+	// this doc, but pass through conservatively.
+	return len(it.best) == 0 || bytes.Equal(fieldVal, it.best)
 }
 
 // skipOffset delegates a cursor-level offset skip to the source. This is
