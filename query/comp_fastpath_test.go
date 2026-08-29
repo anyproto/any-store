@@ -9,20 +9,41 @@ import (
 	"github.com/anyproto/any-store/v2/syncpool"
 )
 
-// compReference is the pre-fast-path implementation: always marshal the probe
-// and bytes.Compare against EqValue. okScalar must agree with it bit-for-bit
-// for every operator and every value pairing.
-//
-// It carries one deliberate divergence from raw bytes.Compare: Rule V.
-// The vector values stay in the matrix below precisely so the divergence stays
-// pinned — a vector is not a point on the scalar order, so an ordering op
-// against one is false on either side rather than resolving on the type tag.
-func compReference(e *Comp, v *anyenc.Value, buf *syncpool.DocBuffer) bool {
-	if e.isOrderingOp() && (v.Type() == anyenc.TypeVectorF32 || e.eqIsVector()) {
-		return false
+// refBracket is the oracle's own copy of the bracket rule (MongoDB type
+// bracketing): the type tag, with false/true folded into one bracket.
+func refBracket(tag byte) byte {
+	if tag == byte(anyenc.TypeTrue) {
+		return byte(anyenc.TypeFalse)
 	}
+	return tag
+}
+
+// refComp is the pre-fast-path comparison: bytes.Compare of the marshaled
+// operands, with ordering ops restricted to one bracket — a probe outside the
+// operand's bracket (or a degenerate empty side) is never less or greater.
+// Rule V is the one divergence from pure bracketing: a vector is not
+// orderable even against itself (docs/query-filter-contract.md item 6).
+func refComp(e *Comp, probe []byte) bool {
+	switch e.CompOp {
+	case CompOpGt, CompOpGte, CompOpLt, CompOpLte:
+		if len(e.EqValue) == 0 || len(probe) == 0 || refBracket(e.EqValue[0]) != refBracket(probe[0]) {
+			return false
+		}
+		if e.EqValue[0] == byte(anyenc.TypeVectorF32) {
+			return false
+		}
+	}
+	return e.compResult(bytes.Compare(e.EqValue, probe))
+}
+
+// compReference marshals the probe and compares it with refComp. okScalar must
+// agree with it bit-for-bit for every operator and every value pairing.
+//
+// The vector values stay in the matrix below so Rule V stays pinned — a vector
+// is its own bracket, so an ordering op against one is false on either side.
+func compReference(e *Comp, v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	buf.SmallBuf = v.MarshalTo(buf.SmallBuf[:0])
-	return e.compResult(bytes.Compare(e.EqValue, buf.SmallBuf))
+	return refComp(e, buf.SmallBuf)
 }
 
 func TestCompOkScalar_MatchesMarshalReference(t *testing.T) {
@@ -51,6 +72,11 @@ func TestCompOkScalar_MatchesMarshalReference(t *testing.T) {
 		a.NewNull(),
 		a.NewBinary([]byte{0, 1, 2}),
 		a.NewVectorF32([]float32{1, 2}),
+		a.NewObjectID(anyenc.ObjectID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}),
+		a.NewObjectID(anyenc.ObjectID{0xff, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}),
+		a.NewDateTimeMillis(0),
+		a.NewDateTimeMillis(1756058400000),
+		a.NewDateTimeMillis(-1),
 		anyenc.MustParseJson(`{"x":1}`),
 		anyenc.MustParseJson(`[1,2]`),
 	}
@@ -66,14 +92,10 @@ func TestCompOkScalar_MatchesMarshalReference(t *testing.T) {
 					t.Errorf("op=%d eq=%s probe=%s: okScalar=%v, reference=%v", op, eqV, probe, got, want)
 				}
 			}
-			// nil probe (absent field) must equal comparing against encoded null —
-			// except under Rule V, where an ordering op against a vector operand is
-			// false. This row IS the bug: null's tag (1) sorts below a vector's (10),
-			// so {"absentField":{"$lt":{"$vector":[..]}}} used to match every document.
-			wantNil := cmp.compResult(bytes.Compare(cmp.EqValue, valueNull.MarshalTo(nil)))
-			if cmp.isOrderingOp() && cmp.eqIsVector() {
-				wantNil = false
-			}
+			// nil probe (absent field) must equal comparing against encoded null:
+			// null is its own bracket, so an ordering op with any non-null operand
+			// is false for an absent field, and {"$gte":null}/{"$lte":null} match it.
+			wantNil := refComp(cmp, valueNull.MarshalTo(nil))
 			if got := cmp.Ok(nil, buf); got != wantNil {
 				t.Errorf("op=%d eq=%s probe=nil: Ok=%v, reference=%v", op, eqV, got, wantNil)
 			}
@@ -92,7 +114,7 @@ func okReference(e *Comp, v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 		if e.CompOp == CompOpNe {
 			if !e.notArray {
 				buf.SmallBuf = v.MarshalTo(buf.SmallBuf[:0])
-				if !e.comp(buf.SmallBuf) {
+				if !refComp(e, buf.SmallBuf) {
 					return false
 				}
 			}
@@ -105,7 +127,7 @@ func okReference(e *Comp, v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 		}
 		if !e.notArray {
 			buf.SmallBuf = v.MarshalTo(buf.SmallBuf[:0])
-			if e.comp(buf.SmallBuf) {
+			if refComp(e, buf.SmallBuf) {
 				return true
 			}
 		}

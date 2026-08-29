@@ -2343,7 +2343,7 @@ Audit tests for the "single-index" domain (any-store-tests:docs/any-store/qplann
           null/missing (non-sparse): the index IS used (IndexScan, not FullScan),
           value 5 is excluded, and null/missing docs survive the residual Filter.
   act-03  Cross-type ordering: equality is type-strict (number 5 != string "5");
-          $gte:0 sweeps strings/bools because number-0 sorts before them; the
+          ordering ops are type-bracketed ($gte:0 matches only numbers); the
           ascending sort order is Null<Number<String<False<True.
   act-04  Negative numbers round-trip through the order-preserving encoding for
           equality, two-sided range and asc/desc sort.
@@ -2458,10 +2458,19 @@ func TestIndex_Single_MixedTypeOrdering(t *testing.T) {
 	assert.Equal(t, 1, cnt)
 	assert.Equal(t, []string{"2"}, collectIdsString(t, coll.Find(`{"a":"5"}`)))
 
-	// $gte:0 sweeps all four docs (number 0 sorts before all strings/bools).
+	// Ordering ops are type-bracketed: $gte:0 matches only the numeric doc,
+	// never the strings/bools that sort above it.
 	cnt, err = coll.Find(`{"a":{"$gte":0}}`).Count(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 4, cnt)
+	assert.Equal(t, 1, cnt)
+	assert.Equal(t, []string{"1"}, collectIdsString(t, coll.Find(`{"a":{"$gte":0}}`)))
+	// Strings compare only with strings, bools only with bools.
+	assert.Equal(t, []string{"2", "3"}, collectIdsString(t, coll.Find(`{"a":{"$gte":"5"}}`).Sort("id")))
+	assert.Equal(t, []string{"4"}, collectIdsString(t, coll.Find(`{"a":{"$gte":false}}`)))
+	assert.Equal(t, []string{"4"}, collectIdsString(t, coll.Find(`{"a":{"$gt":false}}`)))
+	cnt, err = coll.Find(`{"a":{"$lt":"5"}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, cnt)
 
 	// Ascending sort order: Number(5) < String("5") < String("hello") < True.
 	assert.Equal(t,
@@ -2679,7 +2688,7 @@ func TestIndex_LimitOffset_FilterOffset_InMemorySort_SkipsFilteredRows(t *testin
 	ex, err := coll.Find(filter).Sort("b").Offset(5).Limit(5).Explain(ctx)
 	require.NoError(t, err)
 	assert.Equal(t,
-		"IndexScan(a)[bounds=Bounds{['20',inf]}] -> Fetch -> Filter -> Dedup(canonical) -> TopK(10) -> Limit(offset=5,limit=5)",
+		"IndexScan(a)[bounds=Bounds{['20','<string>')}] -> Fetch -> Filter -> Dedup(canonical) -> TopK(10) -> Limit(offset=5,limit=5)",
 		ex.Sql)
 	assert.NotContains(t, ex.Sql, "skip=")
 	assert.Contains(t, ex.Sql, "TopK")

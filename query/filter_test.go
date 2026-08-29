@@ -104,6 +104,7 @@ func TestComp(t *testing.T) {
 			assert.Equal(t, Bounds{
 				{
 					Start: anyenc.AppendAnyValue(nil, 1),
+					End:   []byte{byte(anyenc.TypeNumber) + 1},
 				},
 			}, bs)
 		})
@@ -124,6 +125,7 @@ func TestComp(t *testing.T) {
 				{
 					Start:        anyenc.AppendAnyValue(nil, 1),
 					StartInclude: true,
+					End:          []byte{byte(anyenc.TypeNumber) + 1},
 				},
 			}, bs)
 		})
@@ -143,7 +145,9 @@ func TestComp(t *testing.T) {
 			bs := cmp.IndexBounds("", nil)
 			assert.Equal(t, Bounds{
 				{
-					End: anyenc.AppendAnyValue(nil, 1),
+					Start:        []byte{byte(anyenc.TypeNumber)},
+					StartInclude: true,
+					End:          anyenc.AppendAnyValue(nil, 1),
 				},
 			}, bs)
 		})
@@ -162,8 +166,10 @@ func TestComp(t *testing.T) {
 			bs := cmp.IndexBounds("", nil)
 			assert.Equal(t, Bounds{
 				{
-					End:        anyenc.AppendAnyValue(nil, 1),
-					EndInclude: true,
+					Start:        []byte{byte(anyenc.TypeNumber)},
+					StartInclude: true,
+					End:          anyenc.AppendAnyValue(nil, 1),
+					EndInclude:   true,
 				},
 			}, bs)
 		})
@@ -221,7 +227,8 @@ func TestAnd(t *testing.T) {
 // returns a SOUND OVER-APPROXIMATION (the first contributing conjunct's bounds),
 // NOT the intersection. Intersecting would be unsound for array/multi-key fields
 // (see And.IndexBounds and TestQueryCount_ArrayTwoSidedRange). Here two range
-// conjuncts on "a" yield just the first, [5,+inf), a superset a FilterIter trims.
+// conjuncts on "a" yield just the first, [5, <number-bracket-end>), a superset a
+// FilterIter trims.
 func TestAndIndexBounds_SameFieldOverApprox(t *testing.T) {
 	f, err := ParseCondition(`{"$and":[{"a":{"$gte":5}},{"a":{"$lte":10}}]}`)
 	require.NoError(t, err)
@@ -229,7 +236,9 @@ func TestAndIndexBounds_SameFieldOverApprox(t *testing.T) {
 	require.Len(t, bs, 1)
 	assert.Equal(t, []byte(newBoundKey(5)), []byte(bs[0].Start))
 	assert.True(t, bs[0].StartInclude)
-	assert.Empty(t, []byte(bs[0].End), "over-approx keeps the first conjunct's open upper bound (+inf), not the $lte")
+	assert.Equal(t, []byte{byte(anyenc.TypeNumber) + 1}, []byte(bs[0].End),
+		"over-approx keeps the first conjunct's bracket-open upper bound, not the $lte")
+	assert.False(t, bs[0].EndInclude)
 }
 
 // TestAndIndexBounds_InAndRange_OverApprox pins that an $in conjoined with a
@@ -783,14 +792,16 @@ func TestOr_IndexBounds_NonOverlapping(t *testing.T) {
 	require.NoError(t, err)
 	bs := f.IndexBounds("a", nil)
 	require.Len(t, bs, 2)
-	// first: (-inf, 5]
-	assert.Nil(t, bs[0].Start)
+	// first: [number, 5]
+	assert.Equal(t, anyenc.Tuple{byte(anyenc.TypeNumber)}, bs[0].Start)
+	assert.True(t, bs[0].StartInclude)
 	assert.Equal(t, anyenc.Tuple(anyenc.AppendAnyValue(nil, 5)), bs[0].End)
 	assert.True(t, bs[0].EndInclude)
-	// second: [10, inf)
+	// second: [10, number-bracket-end)
 	assert.Equal(t, anyenc.Tuple(anyenc.AppendAnyValue(nil, 10)), bs[1].Start)
 	assert.True(t, bs[1].StartInclude)
-	assert.Nil(t, bs[1].End)
+	assert.Equal(t, anyenc.Tuple{byte(anyenc.TypeNumber) + 1}, bs[1].End)
+	assert.False(t, bs[1].EndInclude)
 }
 
 func BenchmarkIndexBounds(b *testing.B) {
@@ -902,11 +913,12 @@ func TestSize_Coverage_IndexBoundsComposition(t *testing.T) {
 
 	t.Run("bounds on id include the id range", func(t *testing.T) {
 		bs := f.IndexBounds("id", nil)
-		// id > 10 → one open-ended Bound with Start set, no End.
+		// id > 10 → one Bound from 10 (exclusive) to the number bracket's end.
 		require.Len(t, bs, 1, "id > 10 must contribute exactly one Bound")
 		assert.NotEmpty(t, bs[0].Start, "id > 10 Bound must have a Start value")
 		assert.False(t, bs[0].StartInclude, "$gt is exclusive — StartInclude must be false")
-		assert.Empty(t, bs[0].End, "id > 10 Bound must be open-ended (no End)")
+		assert.Equal(t, anyenc.Tuple{byte(anyenc.TypeNumber) + 1}, bs[0].End, "id > 10 Bound ends at the number bracket's edge")
+		assert.False(t, bs[0].EndInclude)
 	})
 
 	t.Run("bounds on arr do not include the $size term", func(t *testing.T) {
@@ -939,5 +951,118 @@ func TestSize_Coverage_IndexBoundsComposition(t *testing.T) {
 			got := f.Ok(doc, nil)
 			assert.Equal(t, c.want, got, "doc=%s", c.json)
 		}
+	})
+}
+
+// TestComp_TypeBracketing pins MongoDB type bracketing for the ordering ops:
+// a probe outside the operand's bracket is never less or greater, false/true
+// share a bracket, a missing field is null (its own bracket), and the index
+// bounds are the exact key image of each predicate.
+func TestComp_TypeBracketing(t *testing.T) {
+	a := &anyenc.Arena{}
+	buf := &syncpool.DocBuffer{}
+	date := a.NewDateTimeMillis(1756058400000)
+	// cond is a field-level condition object ({"$gt":5}); parseCompObj
+	// yields the filter a Key would wrap.
+	ok := func(cond string, v *anyenc.Value) bool {
+		f, err := parseCompObj(anyenc.MustParseJson(cond))
+		require.NoError(t, err, cond)
+		return f.Ok(v, buf)
+	}
+	docOk := func(cond, doc string) bool {
+		return ok(cond, anyenc.MustParseJson(doc))
+	}
+
+	t.Run("dateTime field vs number literal", func(t *testing.T) {
+		for _, cond := range []string{`{"$gt":1756058400}`, `{"$gte":1756058400}`, `{"$lt":1756058400}`, `{"$lte":1756058400}`, `{"$eq":1756058400}`} {
+			assert.False(t, ok(cond, date), cond)
+			assert.False(t, ok(cond, nil), cond+" absent field")
+		}
+		assert.True(t, ok(`{"$ne":1756058400}`, date))
+		assert.True(t, ok(`{"$gte":{"$date":"2025-08-24T18:00:00Z"}}`, date))
+		assert.False(t, ok(`{"$lt":{"$date":"2025-08-24T18:00:00Z"}}`, date))
+	})
+	t.Run("number vs string vs bool", func(t *testing.T) {
+		assert.False(t, ok(`{"$gt":0}`, a.NewString("5")))
+		assert.False(t, ok(`{"$gte":0}`, a.NewTrue()))
+		assert.False(t, ok(`{"$lt":"a"}`, a.NewNumberInt(1)))
+		assert.False(t, ok(`{"$lte":"a"}`, a.NewNull()))
+		assert.True(t, ok(`{"$lt":"b"}`, a.NewString("a")))
+		assert.True(t, ok(`{"$gt":0}`, a.NewNumberFloat64(0.5)))
+		assert.False(t, ok(`{"$gt":0}`, a.NewObjectID(anyenc.ObjectID{})))
+		assert.False(t, ok(`{"$gt":0}`, a.NewBinary([]byte{9})))
+	})
+	t.Run("bool is one bracket", func(t *testing.T) {
+		assert.True(t, ok(`{"$gt":false}`, a.NewTrue()))
+		assert.False(t, ok(`{"$gt":false}`, a.NewFalse()))
+		assert.True(t, ok(`{"$gte":false}`, a.NewFalse()))
+		assert.True(t, ok(`{"$lt":true}`, a.NewFalse()))
+		assert.False(t, ok(`{"$lt":true}`, a.NewTrue()))
+		assert.True(t, ok(`{"$lte":true}`, a.NewTrue()))
+		assert.False(t, ok(`{"$lt":false}`, a.NewFalse()))
+		assert.False(t, ok(`{"$gt":true}`, a.NewTrue()))
+		assert.False(t, ok(`{"$gt":false}`, a.NewNumberInt(1)))
+	})
+	t.Run("null operand", func(t *testing.T) {
+		for _, cond := range []string{`{"$gte":null}`, `{"$lte":null}`} {
+			assert.True(t, ok(cond, nil), cond+" missing")
+			assert.True(t, ok(cond, a.NewNull()), cond+" null")
+			assert.False(t, ok(cond, a.NewNumberInt(0)), cond+" number")
+			assert.False(t, ok(cond, a.NewFalse()), cond+" false")
+		}
+		for _, cond := range []string{`{"$gt":null}`, `{"$lt":null}`} {
+			assert.False(t, ok(cond, nil), cond+" missing")
+			assert.False(t, ok(cond, a.NewNull()), cond+" null")
+			assert.False(t, ok(cond, a.NewNumberInt(0)), cond+" number")
+		}
+	})
+	t.Run("arrays bracket per element", func(t *testing.T) {
+		assert.True(t, docOk(`{"$lt":"y"}`, `[1,"x"]`))
+		assert.False(t, docOk(`{"$lt":"y"}`, `[1,"z"]`))
+		assert.False(t, docOk(`{"$gt":5}`, `["6",[6]]`))
+		assert.True(t, docOk(`{"$gt":[1]}`, `[2]`), "array operand compares the whole array")
+		assert.True(t, docOk(`{"$gt":[1]}`, `[0,[2]]`), "array operand compares array elements")
+		assert.False(t, docOk(`{"$lt":5}`, `[]`))
+		assert.False(t, docOk(`{"$gte":null}`, `[]`))
+		assert.True(t, docOk(`{"$gte":null}`, `[null,1]`))
+	})
+	t.Run("not of an unsatisfiable comparison is true", func(t *testing.T) {
+		assert.True(t, ok(`{"$not":{"$gt":5}}`, a.NewString("x")))
+		assert.True(t, ok(`{"$not":{"$gt":5}}`, nil))
+		assert.False(t, ok(`{"$not":{"$gt":5}}`, a.NewNumberInt(6)))
+	})
+	t.Run("degenerate operand", func(t *testing.T) {
+		for _, op := range []CompOp{CompOpGt, CompOpGte, CompOpLt, CompOpLte} {
+			c := &Comp{CompOp: op}
+			assert.False(t, c.Ok(a.NewNumberInt(1), buf))
+			assert.False(t, c.Ok(nil, buf))
+			assert.Empty(t, c.IndexBounds("a", nil))
+		}
+	})
+	t.Run("bounds are the bracket-clamped image", func(t *testing.T) {
+		null, num, str, fals, tru := byte(anyenc.TypeNull), byte(anyenc.TypeNumber), byte(anyenc.TypeString), byte(anyenc.TypeFalse), byte(anyenc.TypeTrue)
+		bounds := func(cond string) Bounds { return MustParseCondition(cond).IndexBounds("a", nil) }
+		assert.Equal(t, Bounds{{Start: []byte{null}, End: []byte{num}, StartInclude: true}}, bounds(`{"a":{"$gte":null}}`))
+		assert.Equal(t, Bounds{{Start: []byte{null}, End: []byte{null}, StartInclude: true, EndInclude: true}}, bounds(`{"a":{"$lte":null}}`))
+		assert.Equal(t, Bounds{{Start: []byte{null}, End: []byte{num}}}, bounds(`{"a":{"$gt":null}}`))
+		assert.Empty(t, bounds(`{"a":{"$lt":null}}`), "[null, null) is empty: no bounds, filter decides")
+		assert.Empty(t, bounds(`{"a":{"$lt":false}}`))
+		assert.Equal(t, Bounds{{Start: []byte{fals}, End: []byte{tru + 1}}}, bounds(`{"a":{"$gt":false}}`))
+		assert.Equal(t, Bounds{{Start: []byte{fals}, End: []byte{tru}, StartInclude: true}}, bounds(`{"a":{"$lt":true}}`))
+		assert.Equal(t, Bounds{{Start: []byte{tru}, End: []byte{tru + 1}}}, bounds(`{"a":{"$gt":true}}`))
+		assert.Equal(t, Bounds{{Start: []byte{str}, End: anyenc.AppendAnyValue(nil, "m"), StartInclude: true}}, bounds(`{"a":{"$lt":"m"}}`))
+		dt := date.MarshalTo(nil)
+		assert.Equal(t, Bounds{{Start: dt, End: []byte{byte(anyenc.TypeDateTime) + 1}, StartInclude: true}}, bounds(`{"a":{"$gte":{"$date":"2025-08-24T18:00:00Z"}}}`))
+		// Cross-bracket conjunctions intersect to nothing in the tight channel.
+		_, empty := TightIndexBounds(MustParseCondition(`{"a":{"$gt":5,"$lt":"a"}}`), "a")
+		assert.True(t, empty)
+		// $ne stays unbracketed: it matches every other type.
+		assert.Equal(t, 2, len(bounds(`{"a":{"$ne":5}}`)))
+		assert.Empty(t, bounds(`{"a":{"$ne":5}}`)[0].Start)
+		assert.Empty(t, bounds(`{"a":{"$ne":5}}`)[1].End)
+	})
+	t.Run("explain renders bracket edges by type name", func(t *testing.T) {
+		assert.Equal(t, "Bounds{('5','<string>')}", MustParseCondition(`{"a":{"$gt":5}}`).IndexBounds("a", nil).String())
+		assert.Equal(t, "Bounds{['<number>','5')}", MustParseCondition(`{"a":{"$lt":5}}`).IndexBounds("a", nil).String())
 	})
 }

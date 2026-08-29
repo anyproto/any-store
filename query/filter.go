@@ -90,14 +90,72 @@ func (e *Comp) eqIsVector() bool {
 	return len(e.EqValue) > 0 && e.EqValue[0] == byte(anyenc.TypeVectorF32)
 }
 
+// bracket maps a type tag to its comparison bracket. Ordering ops compare only
+// inside a bracket (MongoDB type bracketing: a probe of another type is never
+// less or greater, it is simply not matched). The bracket is the anyenc type
+// tag, except that false and true share one — Mongo has a single bool type, so
+// {"$gt":false} matches true. Numbers already share TypeNumber. A missing field
+// probes as null, so it is in no non-null bracket: {"$lt":5} never matches an
+// absent field, {"$gte":null} matches null and missing, {"$gt":null} nothing.
+// Sort keeps the full tag order, exactly as Mongo's sort keeps full BSON order.
+func bracket(tag byte) byte {
+	if tag == byte(anyenc.TypeTrue) {
+		return byte(anyenc.TypeFalse)
+	}
+	return tag
+}
+
+// bracketHi returns the first tag ABOVE the bracket holding tag: the exclusive
+// upper edge of the bracket's key range.
+func bracketHi(tag byte) byte {
+	if tag == byte(anyenc.TypeFalse) {
+		return byte(anyenc.TypeTrue) + 1
+	}
+	return tag + 1
+}
+
+// tagBound holds the single-byte bracket edges IndexBounds clamps ordering ops
+// with. Read-only and cap == len, so planner bound extension reallocates
+// (docs/query-filter-contract.md item 3).
+var tagBound = func() (t [256][]byte) {
+	for i := range t {
+		t[i] = []byte{byte(i)}
+	}
+	return t
+}()
+
+// sameBracket reports whether the operand and an encoded probe share a
+// bracket. False for a degenerate (empty) operand or probe.
+func (e *Comp) sameBracket(b []byte) bool {
+	return len(e.EqValue) > 0 && len(b) > 0 && bracket(e.EqValue[0]) == bracket(b[0])
+}
+
+// tagMismatch resolves a scalar probe whose type tag differs from the
+// operand's. Equality is decided by the tag alone; an ordering op is false
+// across brackets and falls back to tag order inside one (only false/true —
+// their tags ARE the value order).
+func (e *Comp) tagMismatch(tag byte) bool {
+	switch e.CompOp {
+	case CompOpEq:
+		return false
+	case CompOpNe:
+		return true
+	}
+	if bracket(e.EqValue[0]) != bracket(tag) {
+		return false
+	}
+	return e.compResult(compareBytes(e.EqValue[0], tag))
+}
+
 // Rule V: a vector is not a point on the scalar order.
 //
-// anyenc resolves a cross-type comparison on the type tag, and TypeVectorF32 (10)
-// sorts above every scalar tag (1..9). So an ordering op with a vector on either
-// side used to be true for EVERY document — {"v":{"$gt":1}} on a vector field, and
-// symmetrically {"anyField":{"$lt":{"$vector":[..]}}} on any field at all, even an
-// absent one. On Query.Delete that emptied the collection with err=nil, no vector
-// index required. $eq/$ne are unaffected: byte equality is well-defined for a vector.
+// Bracketing already makes an ordering op against a vector false (a vector is
+// its own bracket). These guards predate it and stay as defense in depth: before
+// them, TypeVectorF32 (10) sorting above every scalar tag made {"v":{"$gt":1}}
+// on a vector field — and {"anyField":{"$lt":{"$vector":[..]}}} on any field,
+// even an absent one — true for EVERY document, which on Query.Delete emptied
+// the collection with err=nil. $eq/$ne are unaffected: byte equality is
+// well-defined for a vector.
 //
 // The parser rejects the operand-side spelling outright (ErrVectorNotOrderable);
 // these guards are what protect hand-built filters, which never see the parser.
@@ -156,7 +214,7 @@ func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 // okScalar compares one non-array value against EqValue, equivalent to
 // e.comp(v.MarshalTo(...)) but skipping the marshal whenever the comparison is
 // decidable from the value alone: the encoding starts with the type tag, so
-// mismatched tags resolve on the first byte; same-type numbers compare as the
+// mismatched tags resolve on the first byte (tagMismatch); same-type numbers compare as the
 // monotonic uint64 the encoding is built from (see encodeFloatBits);
 // null/true/false encode as the bare tag. Strings, binary, and nested
 // containers fall back to marshal + bytes.Compare.
@@ -180,7 +238,7 @@ func (e *Comp) okScalar(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 			// e.g. an array EqValue and an array probe share the tag byte
 		case anyenc.TypeNumber:
 			if tag := byte(t); e.EqValue[0] != tag {
-				return e.compResult(compareBytes(e.EqValue[0], tag))
+				return e.tagMismatch(tag)
 			}
 			if len(e.EqValue) == 1+8 {
 				f, _ := v.Float64()
@@ -191,7 +249,7 @@ func (e *Comp) okScalar(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 			}
 		case anyenc.TypeNull, anyenc.TypeTrue, anyenc.TypeFalse:
 			if tag := byte(t); e.EqValue[0] != tag {
-				return e.compResult(compareBytes(e.EqValue[0], tag))
+				return e.tagMismatch(tag)
 			}
 			// single-byte encoding: equal unless EqValue carries extra bytes
 			if len(e.EqValue) == 1 {
@@ -200,7 +258,7 @@ func (e *Comp) okScalar(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 			return e.compResult(1)
 		case anyenc.TypeString:
 			if tag := byte(t); e.EqValue[0] != tag {
-				return e.compResult(compareBytes(e.EqValue[0], tag))
+				return e.tagMismatch(tag)
 			}
 			// Plain (NUL-free) probe strings encode as tag + raw bytes + EOS
 			// (0x00 inside a string is escaped as the pair (0x00, 0xFF)), so
@@ -228,9 +286,9 @@ func (e *Comp) okScalar(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 				}
 			}
 		default:
-			// binary/vector: the tag still decides cross-type comparisons
+			// binary/vector/objectId/dateTime: a differing tag decides
 			if tag := byte(t); e.EqValue[0] != tag {
-				return e.compResult(compareBytes(e.EqValue[0], tag))
+				return e.tagMismatch(tag)
 			}
 		}
 	}
@@ -273,12 +331,17 @@ func compareUint64(a, b uint64) int {
 	return 0
 }
 
-// IndexBounds stays a sound over-approximation under Rule V: it may select keys
-// that Ok now rejects (an ordering op against a vector selects a tag range and
-// then matches nothing), never the reverse. Every plan that uses these bounds
-// still runs the residual filter — the covering CountOnly shortcuts require a
-// PointLookup with FIXED bounds, and an ordering op is neither — so a stricter
-// Ok cannot make a plan return rows it should not.
+// IndexBounds emits the EXACT key image of the predicate: an ordering op's
+// range is clamped to the operand's bracket ($gt X is (X, hi), $lt X is [lo,
+// X)), so the bounds admit exactly the keys Ok accepts. Exactness is load-
+// bearing — the planner elides the residual filter where a single predicate's
+// bounds cover it (indexScanCoversFilter) — and it is what keeps a wrong-typed
+// literal from walking a whole index: a number-tagged $gte on a dateTime index
+// is an empty range, not a full scan, and interpolation prices it as such.
+// Degenerate shapes contribute no bounds rather than an unsatisfiable one: an
+// empty operand, and a half-open range that is empty because the operand IS
+// its bracket's lower edge ({"$lt":null}, {"$lt":false}) — Start == End would
+// read as a fixed point.
 func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	// Clip spare capacity: a built Comp is shared by concurrent queries, and
 	// the planner extends bound bytes with appends (AdjustBoundsForNonUnique,
@@ -286,6 +349,9 @@ func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	// of writing into EqValue's backing array shared across queries (In gives
 	// the same guarantee via inBoundBytes).
 	ev := e.EqValue[:len(e.EqValue):len(e.EqValue)]
+	if len(ev) == 0 && e.CompOp != CompOpEq && e.CompOp != CompOpNe {
+		return bs
+	}
 	switch e.CompOp {
 	case CompOpEq:
 		return bs.Append(Bound{
@@ -297,20 +363,30 @@ func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	case CompOpGt:
 		return bs.Append(Bound{
 			Start: ev,
+			End:   tagBound[bracketHi(ev[0])],
 		})
 	case CompOpGte:
 		return bs.Append(Bound{
 			Start:        ev,
 			StartInclude: true,
+			End:          tagBound[bracketHi(ev[0])],
 		})
 	case CompOpLt:
+		lo := tagBound[bracket(ev[0])]
+		if bytes.Equal(lo, ev) {
+			return bs // [lo, lo): nothing below the bracket's first value
+		}
 		return bs.Append(Bound{
-			End: ev,
+			Start:        lo,
+			StartInclude: true,
+			End:          ev,
 		})
 	case CompOpLte:
 		return bs.Append(Bound{
-			End:        ev,
-			EndInclude: true,
+			Start:        tagBound[bracket(ev[0])],
+			StartInclude: true,
+			End:          ev,
+			EndInclude:   true,
 		})
 	case CompOpNe:
 		return bs.Append(Bound{
@@ -323,7 +399,14 @@ func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	}
 }
 
+// comp compares an encoded probe against EqValue. Ordering ops are bracketed
+// here too (the marshal fallbacks, whole-array probes and the nil probe all
+// arrive through comp), so a same-bracket probe is the only one that reaches
+// bytes.Compare.
 func (e *Comp) comp(b []byte) bool {
+	if e.isOrderingOp() && !e.sameBracket(b) {
+		return false
+	}
 	return e.compResult(bytes.Compare(e.EqValue, b))
 }
 

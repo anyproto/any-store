@@ -63,12 +63,12 @@ build per query and carry no such guarantee.
 
 6. **`TypeVectorF32` is not orderable (Rule V).** In `Comp`, an ordering op
    (`$gt`/`$gte`/`$lt`/`$lte`) evaluates to `false` whenever either side is a
-   packed vector — including vector-vs-vector. `$eq` is byte equality, `$ne`
-   its negation. The parser additionally rejects an ordering op whose OPERAND
-   is a `$vector` literal (`ErrVectorNotOrderable`), which also keeps it out
-   of `$not`. Consequence (deliberate, Mongo-style type bracketing):
-   `{"v":{"$not":{"$gt":1}}}` matches a vector-valued `v` — `$not` of an
-   unsatisfiable comparison is true.
+   packed vector — including vector-vs-vector, which is stricter than item 13's
+   bracketing. `$eq` is byte equality, `$ne` its negation. The parser
+   additionally rejects an ordering op whose OPERAND is a `$vector` literal
+   (`ErrVectorNotOrderable`), which also keeps it out of `$not`. Consequence
+   (item 13 again): `{"v":{"$not":{"$gt":1}}}` matches a vector-valued `v` —
+   `$not` of an unsatisfiable comparison is true.
 
 7. **`$vector`, `$oid` and `$binary` are forbidden as option-key names**
    inside any operator's options object. anyenc decodes a single-key
@@ -160,3 +160,24 @@ build per query and carry no such guarantee.
     `TestParseConditionErrorsAreStructured`, `TestOperators`,
     `TestModifierOperators`) and `internal/aggregate/pipeline_parse_test.go`
     (`TestPipelineParseError`, `TestStages`, `TestAccumulators`).
+
+13. **Ordering predicates are type-bracketed; sort is not.** `$gt`/`$gte`/
+    `$lt`/`$lte` compare only inside one type bracket, as MongoDB's query
+    operators do: a value of another type is never less or greater, it is not
+    matched. A bracket is the anyenc type tag, except that `false`/`true` form
+    one bracket (`{"$gt":false}` matches `true`); numbers already share one
+    type. A missing field is `null` and so in no other bracket:
+    `{"$lt":5}` never matches an absent field, `{"$gte":null}`/`{"$lte":null}`
+    match null and missing, `{"$gt":null}`/`{"$lt":null}` match nothing.
+    Array fields bracket per element (a whole-array comparison needs an array
+    operand). `$eq`/`$ne`/`$in`/`$nin` were already type-strict and are
+    unchanged (`$ne 5` still matches a string, as in Mongo). `Comp.IndexBounds`
+    emits the bracket-clamped range — `$gt X` is `(X, <next tag>)`, `$lt X` is
+    `[<tag>, X)` — so bounds stay the exact key image of the predicate (the
+    planner's residual elisions depend on that) and a wrong-typed literal is an
+    empty seek, not an index walk. `Sort`, index-order scans and the aggregation
+    expression operators (`$gt`, `$cmp`, `$min`/`$max`, `$sort`) keep the full
+    anyenc tag order, exactly as Mongo's sort and `$expr` keep full BSON order.
+    Pinned by `TestComp_TypeBracketing`, `TestCompOkScalar_MatchesMarshalReference`
+    (the oracle carries the rule) and `TestGuaranteesPresence` (`$lt`/`$lte`
+    now guarantee presence: they reject null and missing).

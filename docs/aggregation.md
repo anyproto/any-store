@@ -123,8 +123,11 @@ A single non-array operand is Mongo's shorthand for a one-element list
 > field-order-sensitive, consistent with `$group` key equality. A missing
 > operand compares as `null` (`{"$eq": ["$nope", null]}` is `true`), and
 > `-0` equals `0`. Vector values order by their encoded bytes too (aligned
-> with `$sort`) — unlike query filters, where ordering operators against a
-> vector are always false (Rule V).
+> with `$sort`). Query filters differ: their ordering operators are
+> type-bracketed (`docs/query-filter-contract.md` item 13), so a `$match`
+> `{"a":{"$gt":5}}` never matches a string `a`, while the expression
+> `{"$gt":["$a",5]}` is `true` for one — the same split as Mongo's query
+> operators versus `$expr`.
 
 > **Null instead of runtime errors** (divergence from Mongo): evaluation is
 > streaming with no per-document error channel, so conditions Mongo reports as

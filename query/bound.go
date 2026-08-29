@@ -26,7 +26,15 @@ func (b Bound) String() string {
 	stripPrefixString := func(k anyenc.Tuple) string {
 		k = stripTrailing0xff(k)
 		if len(b.prefix) != 0 && len(k) > len(b.prefix) {
-			return k[len(b.prefix):].String()
+			k = k[len(b.prefix):]
+		}
+		if len(k) == 1 {
+			// A bare type tag is a bracket edge (Comp.IndexBounds), not a value;
+			// a reverse index stores it inverted.
+			if k[0] >= 0x80 {
+				return "<^" + anyenc.Type(^k[0]).String() + ">"
+			}
+			return "<" + anyenc.Type(k[0]).String() + ">"
 		}
 		return k.String()
 	}
