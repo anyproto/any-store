@@ -35,7 +35,9 @@ func (b Bound) String() string {
 	if len(b.Start) == 0 || bytes.Equal(b.prefix, b.Start) || bytes.Equal(append(b.prefix, 255), b.Start) {
 		as = "[-inf"
 	} else {
-		if b.StartInclude {
+		// An inclusive Start ending in 0xFF is the planner's exclusive-Start
+		// pad (padForwardBounds): render the logical bound, not the key.
+		if b.StartInclude && b.Start[len(b.Start)-1] != 0xff {
 			as = "['" + stripPrefixString(b.Start) + "'"
 		} else {
 			as = "('" + stripPrefixString(b.Start) + "'"

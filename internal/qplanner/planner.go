@@ -2306,23 +2306,65 @@ func compareInvertedStart(a, b []byte) int {
 // leaves the padded, merged bounds on idx.Bounds for IndexIter.
 func finalizeIndexBounds(idx *CBOIndex) (dedupBounds query.Bounds) {
 	dedupBounds = idx.Bounds
-	idx.Bounds = padBoundsForReverseTail(idx)
+	idx.Bounds = padBoundsForTail(idx)
 	if idx.BoundFields > 1 {
 		idx.Bounds = MergeOverlappingBounds(idx.Bounds)
 	}
 	return dedupBounds
 }
 
-// padBoundsForReverseTail applies padReverseBounds when the final field of the
-// bound chain is reverse-flagged. Call it only for the CHOSEN index, after
-// AdjustBoundsForNonUnique and after PointLookup/sketch estimation (both read
-// the raw bound bytes).
-func padBoundsForReverseTail(idx *CBOIndex) query.Bounds {
+// padBoundsForTail pads the bound chain's final field for exact full-key
+// scans: padReverseBounds when that field is reverse-flagged, padForwardBounds
+// otherwise. Call it only for the CHOSEN index, after AdjustBoundsForNonUnique
+// and after PointLookup/sketch estimation (both read the raw bound bytes).
+func padBoundsForTail(idx *CBOIndex) query.Bounds {
 	n := idx.BoundFields
-	if n == 0 || n > len(idx.Reverse) || !idx.Reverse[n-1] || len(idx.Bounds) == 0 {
+	if n == 0 || len(idx.Bounds) == 0 {
 		return idx.Bounds
 	}
-	return padReverseBounds(idx.Bounds)
+	if n <= len(idx.Reverse) && idx.Reverse[n-1] {
+		return padReverseBounds(idx.Bounds)
+	}
+	return padForwardBounds(idx.Bounds)
+}
+
+// padForwardBounds makes an ascending-space EXCLUSIVE Start exact on full
+// keys. Every entry key is enc(v) followed by more bytes (next field or
+// docId), so a bare exclusive Start at enc(v) admits the whole v group:
+// IndexIter's seek lands on enc(v)‖suffix, which is not byte-equal to the
+// bound and is never skipped. That is harmless under a residual FilterIter and
+// WRONG where the residual is elided (indexScanCoversFilter): $gt v and $ne v
+// returned the v rows. Pad to enc(v)‖0xFF inclusive: v's own entries continue
+// with a type tag or docId byte (< 0xFF) and fall below the pad; the escape
+// continuations enc(v)‖0xFF… (ascending values GREATER than v, see
+// anyenc/escape.go) stay admitted; every other greater value diverges from
+// enc(v) earlier. Mirrors padReverseBounds' exclusive-Start rule. Inclusive
+// Starts and Ends are already exact (AdjustBoundsForNonUnique pads the
+// inclusive End).
+func padForwardBounds(bs query.Bounds) query.Bounds {
+	padded := false
+	for i := range bs {
+		if len(bs[i].Start) > 0 && !bs[i].StartInclude {
+			padded = true
+			break
+		}
+	}
+	if !padded {
+		return bs
+	}
+	// Fresh Bound structs: callers keep the unpadded slice for consumers that
+	// test bare field values (CanonicalKeyDedupIter). The append extends or
+	// reallocates, never rewriting the original Start bytes.
+	out := make(query.Bounds, len(bs))
+	copy(out, bs)
+	for i := range out {
+		b := &out[i]
+		if len(b.Start) > 0 && !b.StartInclude {
+			b.Start = append(b.Start, 0xff)
+			b.StartInclude = true
+		}
+	}
+	return out
 }
 
 func padReverseBounds(bs query.Bounds) query.Bounds {
