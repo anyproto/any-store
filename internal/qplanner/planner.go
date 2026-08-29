@@ -2234,6 +2234,21 @@ func transformReverseBounds(bs query.Bounds) query.Bounds {
 			nb.End = query.PrefixSuccessor(nb.End)
 			nb.EndInclude = false
 		}
+		// The mirror image for an EXCLUSIVE ascending End that is a bare type
+		// tag — a bracket edge (Comp.IndexBounds: $gt X ends at <next tag>) or
+		// TypeFilter's upper edge. As an exclusive inverted Start the bare
+		// inv(tag) admits every key extending it, i.e. the whole excluded
+		// type; the exclusive-Start 0xFF pad narrows the SCAN back, but the
+		// pre-pad bounds also feed CanonicalKeyDedupIter, which would then
+		// elect an element of that type as a doc's canonical entry and wait
+		// for a key the scan never yields — dropping the doc. The exact
+		// stored-space form is the successor of the inverted tag, inclusive:
+		// every key of the admitted types and nothing else, with no pad
+		// needed (padReverseBounds leaves a bare-tag Start alone).
+		if !b.EndInclude && len(b.End) == 1 {
+			nb.Start = query.PrefixSuccessor(nb.Start)
+			nb.StartInclude = true
+		}
 		out = append(out, nb)
 	}
 	slices.SortStableFunc(out, func(a, b query.Bound) int {
@@ -2377,7 +2392,12 @@ func padReverseBounds(bs query.Bounds) query.Bounds {
 	bs = out
 	for i := range bs {
 		b := &bs[i]
-		if len(b.Start) > 0 {
+		// A one-byte Start is a bare inverted type tag (the successor form
+		// transformReverseBounds emits for a bracket/type edge) or a one-byte
+		// value (null/false/true), never a string: there is no escape
+		// continuation to separate from, and the +0x01 pad would drop keys
+		// whose first inverted payload byte is 0x00.
+		if len(b.Start) > 1 || (len(b.Start) == 1 && !b.StartInclude) {
 			if b.StartInclude {
 				b.Start = append(b.Start, 0x01)
 			} else {

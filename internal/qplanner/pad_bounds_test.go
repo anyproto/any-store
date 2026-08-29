@@ -51,6 +51,22 @@ func TestFinalizeIndexBounds_ForwardExclusiveStartPad(t *testing.T) {
 		assert.Equal(t, append(append([]byte{}, k...), 0xff), []byte(idx.Bounds[1].Start))
 		assert.True(t, idx.Bounds[1].StartInclude)
 	})
+	t.Run("reverse tail leaves a bare-tag Start unpadded", func(t *testing.T) {
+		// The successor form of an inverted bracket edge admits exactly the
+		// keys of the remaining types; a +0x01 pad would drop the ones whose
+		// first inverted payload byte is 0x00.
+		rev := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a"}, Reverse: []bool{true}},
+			Reverse:     []bool{true},
+			BoundFields: 1,
+			Bounds:      query.Bounds{{Start: []byte{0xFD}, StartInclude: true, End: invAll(k)}},
+		}
+		finalizeIndexBounds(rev)
+		require.Len(t, rev.Bounds, 1)
+		assert.Equal(t, []byte{0xFD}, []byte(rev.Bounds[0].Start))
+		assert.True(t, rev.Bounds[0].StartInclude)
+		assert.Equal(t, append(invAll(k), 0x01), []byte(rev.Bounds[0].End))
+	})
 	t.Run("reverse tail keeps the reverse rule", func(t *testing.T) {
 		rev := &CBOIndex{
 			Info:        &IndexInfo{FieldNames: []string{"a"}, Reverse: []bool{true}},

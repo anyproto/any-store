@@ -712,8 +712,10 @@ func TestTransformReverseBounds_PrefixStart(t *testing.T) {
 	require.Len(t, bs, 1)
 	assert.Equal(t, anyenc.Tuple{0xf5}, bs[0].End) // succ(^0x0b = 0xf4)
 	assert.False(t, bs[0].EndInclude)
-	assert.Equal(t, anyenc.Tuple{0xf3}, bs[0].Start)
-	assert.False(t, bs[0].StartInclude)
+	// The bare-tag exclusive End maps the same way on the Start side:
+	// succ(^0x0c = 0xf3) = 0xf4, inclusive — exactly the keys of tag 0x0b.
+	assert.Equal(t, anyenc.Tuple{0xf4}, bs[0].Start)
+	assert.True(t, bs[0].StartInclude)
 
 	// The $regex shape, taken from the real emitter so this test pins what
 	// Regexp.IndexBounds actually produces (prefix-successor exclusive End).
