@@ -48,6 +48,17 @@ type CanonicalKeyDedupIter struct {
 	// canonical-element selection happens in the same space the cursor walks.
 	FieldReverse bool
 
+	// Bounds are the SCAN bounds — padded for full keys exactly as IndexIter
+	// walks them — and an element is tested as the least key it can have,
+	// enc(elem)‖0x01 (every real suffix starts with a type tag or docId byte
+	// >= 0x01). That makes membership exact under the escape continuation
+	// (enc(v) is a prefix of enc(v‖"\x00…")) in both byte spaces, and, more
+	// importantly, a SUBSET of what the scan yields: an element elected
+	// canonical here is always an entry the scan emits. Testing the bare
+	// encoding against unpadded bounds admitted continuation elements the
+	// padded scan skips, so the doc was elected on an entry never seen and
+	// dropped — or, with the continuation on the other side, emitted twice.
+
 	keyBuf []byte // reusable encode buffer for min/max comparison
 	best   []byte // reusable buffer for the canonical element
 }
@@ -90,8 +101,13 @@ func (it *CanonicalKeyDedupIter) Next() (key []byte, docId []byte, multiKey bool
 			} else {
 				it.keyBuf = item.MarshalTo(it.keyBuf[:0])
 			}
-			if !noBounds && !it.Bounds.Contains(it.keyBuf) {
-				continue
+			if !noBounds {
+				it.keyBuf = append(it.keyBuf, 0x01)
+				in := it.Bounds.Contains(it.keyBuf)
+				it.keyBuf = it.keyBuf[:len(it.keyBuf)-1]
+				if !in {
+					continue
+				}
 			}
 			if len(it.best) == 0 {
 				it.best = append(it.best[:0], it.keyBuf...)

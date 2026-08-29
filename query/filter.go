@@ -118,8 +118,10 @@ func bracketHi(tag byte) byte {
 // with. Read-only and cap == len, so planner bound extension reallocates
 // (docs/query-filter-contract.md item 3).
 var tagBound = func() (t [256][]byte) {
+	all := make([]byte, 256)
 	for i := range t {
-		t[i] = []byte{byte(i)}
+		all[i] = byte(i)
+		t[i] = all[i : i+1 : i+1]
 	}
 	return t
 }()
@@ -349,7 +351,10 @@ func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	// of writing into EqValue's backing array shared across queries (In gives
 	// the same guarantee via inBoundBytes).
 	ev := e.EqValue[:len(e.EqValue):len(e.EqValue)]
-	if len(ev) == 0 && e.CompOp != CompOpEq && e.CompOp != CompOpNe {
+	if e.isOrderingOp() && (len(ev) == 0 || e.eqIsVector() || bracketHi(ev[0]) == 0) {
+		// Nothing to seek: a degenerate operand, an ordering op against a
+		// vector (Rule V — Ok is false, and a vector-tag range would let a
+		// residual-elided scan return rows), or a corrupt tag with no bracket.
 		return bs
 	}
 	switch e.CompOp {
@@ -1175,10 +1180,12 @@ func (e TypeFilter) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	// {tag, 0xff} end under-approximates — a payload whose first byte is
 	// 0xff sorts past it).
 	return bs.Append(Bound{
-		Start:        []byte{byte(e.Type)},
-		End:          []byte{byte(e.Type) + 1},
+		Start:        tagBound[byte(e.Type)],
+		End:          tagBound[byte(e.Type)+1],
 		StartInclude: true,
 		EndInclude:   false,
+		startEdge:    true,
+		endEdge:      true,
 	})
 }
 

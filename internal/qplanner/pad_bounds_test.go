@@ -27,10 +27,8 @@ func TestFinalizeIndexBounds_ForwardExclusiveStartPad(t *testing.T) {
 		assert.Equal(t, append(append([]byte{}, k...), 0xff), []byte(idx.Bounds[0].Start))
 		assert.True(t, idx.Bounds[0].StartInclude)
 		assert.Empty(t, idx.Bounds[0].End)
-		// Pre-pad bounds are handed to CanonicalKeyDedupIter untouched.
-		require.Len(t, dedup, 1)
-		assert.Equal(t, k, []byte(dedup[0].Start))
-		assert.False(t, dedup[0].StartInclude)
+		// CanonicalKeyDedupIter tests least keys against the same padded set.
+		assert.Equal(t, idx.Bounds, dedup)
 	})
 	t.Run("gte and ends untouched", func(t *testing.T) {
 		in := query.Bounds{
@@ -59,7 +57,7 @@ func TestFinalizeIndexBounds_ForwardExclusiveStartPad(t *testing.T) {
 			Info:        &IndexInfo{FieldNames: []string{"a"}, Reverse: []bool{true}},
 			Reverse:     []bool{true},
 			BoundFields: 1,
-			Bounds:      query.Bounds{{Start: []byte{0xFD}, StartInclude: true, End: invAll(k)}},
+			Bounds:      query.Bounds{query.Bound{Start: []byte{0xFD}, StartInclude: true, End: invAll(k)}.WithTypeEdges(true, false)},
 		}
 		finalizeIndexBounds(rev)
 		require.Len(t, rev.Bounds, 1)
@@ -85,7 +83,9 @@ func TestFinalizeIndexBounds_ForwardExclusiveStartPad(t *testing.T) {
 // exclusive bound.
 func TestBoundString_ExclusiveStartPadRendersExclusive(t *testing.T) {
 	k := encNum(5)
-	padded := query.Bound{Start: append(append([]byte{}, k...), 0xff), StartInclude: true}
+	padded := query.Bound{Start: k}.PadExclusiveStart()
 	assert.Equal(t, query.Bound{Start: k}.String(), padded.String())
 	assert.Contains(t, padded.String(), "('5'")
+	// A genuine inclusive Start ending in 0xFF stays inclusive.
+	assert.Contains(t, query.Bound{Start: []byte{2, 0xff}, StartInclude: true}.String(), "['")
 }

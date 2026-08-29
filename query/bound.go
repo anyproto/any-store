@@ -20,8 +20,13 @@ type Bound struct {
 	// may open such an endpoint back up when it needs the index's own order
 	// over possibly-multikey data — widening to the pre-bracketing range is
 	// sound and costs nothing that range did not already cost, while opening
-	// a VALUE cut could turn a point seek into a scan.
+	// a VALUE cut could turn a point seek into a scan. The planner keeps the
+	// marks through its stored-space transform: an edge endpoint is exact as
+	// it stands (no key-suffix pad) and orders bytewise among inverted Starts.
 	startEdge, endEdge bool
+	// startPad/endPad record the planner's key-suffix pads (enc(v)‖0xFF) so
+	// Explain renders the logical bound rather than the padded key.
+	startPad, endPad bool
 }
 
 // StartIsTypeEdge reports whether Start is a bracket edge (see Bound).
@@ -29,6 +34,30 @@ func (b Bound) StartIsTypeEdge() bool { return b.startEdge }
 
 // EndIsTypeEdge reports whether End is a bracket edge (see Bound).
 func (b Bound) EndIsTypeEdge() bool { return b.endEdge }
+
+// WithTypeEdges returns b with its edge marks set (planner use: the marks must
+// follow an endpoint through inversion and tuple concatenation).
+func (b Bound) WithTypeEdges(start, end bool) Bound {
+	b.startEdge, b.endEdge = start, end
+	return b
+}
+
+// PadExclusiveStart makes an exclusive Start exact on full keys: entry keys
+// are enc(v)‖suffix, so (enc(v) becomes [enc(v)‖0xFF — v's own entries
+// (suffix byte < 0xFF) fall below it, the escape continuations enc(v)‖0xFF…
+// stay admitted. The append reallocates (bound bytes are cap == len).
+func (b Bound) PadExclusiveStart() Bound {
+	b.Start = append(b.Start, 0xff)
+	b.StartInclude, b.startPad = true, true
+	return b
+}
+
+// PadInclusiveEnd extends an inclusive End to every key suffix: enc(v)‖0xFF.
+func (b Bound) PadInclusiveEnd() Bound {
+	b.End = append(b.End, 0xff)
+	b.endPad = true
+	return b
+}
 
 // OpenStart returns b with an open lower side.
 func (b Bound) OpenStart() Bound {
@@ -49,14 +78,13 @@ func (b Bound) String() string {
 		}
 		return k
 	}
-	stripPrefixString := func(k anyenc.Tuple) string {
-		k = stripTrailing0xff(k)
+	// edge: a bare type tag is a bracket edge (Comp.IndexBounds), not a value;
+	// a reverse index stores it inverted.
+	render := func(k anyenc.Tuple, edge bool) string {
 		if len(b.prefix) != 0 && len(k) > len(b.prefix) {
 			k = k[len(b.prefix):]
 		}
-		if len(k) == 1 {
-			// A bare type tag is a bracket edge (Comp.IndexBounds), not a value;
-			// a reverse index stores it inverted.
+		if edge && len(k) == 1 {
 			if k[0] >= 0x80 {
 				return "<^" + anyenc.Type(^k[0]).String() + ">"
 			}
@@ -69,21 +97,22 @@ func (b Bound) String() string {
 	if len(b.Start) == 0 || bytes.Equal(b.prefix, b.Start) || bytes.Equal(append(b.prefix, 255), b.Start) {
 		as = "[-inf"
 	} else {
-		// An inclusive Start ending in 0xFF is the planner's exclusive-Start
-		// pad (padForwardBounds): render the logical bound, not the key.
-		if b.StartInclude && b.Start[len(b.Start)-1] != 0xff {
-			as = "['" + stripPrefixString(b.Start) + "'"
-		} else {
-			as = "('" + stripPrefixString(b.Start) + "'"
+		switch {
+		case b.startPad: // logical bound is exclusive at the unpadded key
+			as = "('" + render(stripTrailing0xff(b.Start), b.startEdge) + "'"
+		case b.StartInclude:
+			as = "['" + render(b.Start, b.startEdge) + "'"
+		default:
+			as = "('" + render(b.Start, b.startEdge) + "'"
 		}
 	}
 	if len(b.End) == 0 || bytes.Equal(b.prefix, b.End) || bytes.Equal(append(b.prefix, 255), b.End) {
 		bs = "inf]"
 	} else {
 		if b.EndInclude {
-			bs = "'" + stripPrefixString(b.End) + "']"
+			bs = "'" + render(stripTrailing0xff(b.End), b.endEdge) + "']"
 		} else {
-			bs = "'" + stripPrefixString(b.End) + "')"
+			bs = "'" + render(stripTrailing0xff(b.End), b.endEdge) + "')"
 		}
 	}
 	return fmt.Sprintf("%s,%s", as, bs)
@@ -214,10 +243,14 @@ func minStartKey(a, b Bound) ([]byte, bool, bool) {
 	if len(b.Start) == 0 {
 		return b.Start, true, false
 	}
-	if bytes.Compare(a.Start, b.Start) <= 0 {
+	switch bytes.Compare(a.Start, b.Start) {
+	case 0: // a value and an edge can share bytes ([1] is null and the null edge)
+		return a.Start, a.StartInclude, a.startEdge && b.startEdge
+	case -1:
 		return a.Start, a.StartInclude, a.startEdge
+	default:
+		return b.Start, b.StartInclude, b.startEdge
 	}
-	return b.Start, b.StartInclude, b.startEdge
 }
 
 func maxEndKey(a, b Bound) ([]byte, bool, bool) {
@@ -227,10 +260,14 @@ func maxEndKey(a, b Bound) ([]byte, bool, bool) {
 	if len(b.End) == 0 {
 		return b.End, true, false
 	}
-	if bytes.Compare(a.End, b.End) >= 0 {
+	switch bytes.Compare(a.End, b.End) {
+	case 0:
+		return a.End, a.EndInclude, a.endEdge && b.endEdge
+	case 1:
 		return a.End, a.EndInclude, a.endEdge
+	default:
+		return b.End, b.EndInclude, b.endEdge
 	}
-	return b.End, b.EndInclude, b.endEdge
 }
 
 // sortBounds orders bounds by Start key (unstable, Start only).

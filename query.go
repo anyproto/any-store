@@ -1189,8 +1189,12 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		// lazily, only for candidates the gate would demote. When the only cut
 		// on the sort side is a type-bracket edge, the candidate is widened
 		// (widenSortEdges) instead of demoted.
-		if cboIdx.ExactSort && sortRunNeedsScalarProof(&cboIdx, sortFields, br.Lookup) && !scalarProven() {
-			if w, ok := q.widenSortEdges(idx, br, sortFields, &cboIdx); ok && !countOnly {
+		if cboIdx.ExactSort && sortRunNeedsScalarProof(&cboIdx, sortFields, br) && !scalarProven() {
+			w, ok := qplanner.CBOIndex{}, false
+			if !countOnly {
+				w, ok = q.widenSortEdges(br, sortFields, &cboIdx)
+			}
+			if ok {
 				cboIdx = w
 			} else {
 				cboIdx.ExactSort = false
@@ -1226,7 +1230,7 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 //
 // Bounds here are the field's logical (plain-space) bounds from the wide
 // Lookup — presence of a predicate is channel-independent.
-func sortRunNeedsScalarProof(idx *qplanner.CBOIndex, sortFields []query.SortField, lookup func(string) (query.Bounds, bool, bool)) bool {
+func sortRunNeedsScalarProof(idx *qplanner.CBOIndex, sortFields []query.SortField, br *qplanner.BoundsResult) bool {
 	if len(idx.Info.FieldNames) > 1 {
 		return true
 	}
@@ -1235,7 +1239,7 @@ func sortRunNeedsScalarProof(idx *qplanner.CBOIndex, sortFields []query.SortFiel
 		if fi >= len(idx.Info.FieldNames) {
 			break
 		}
-		bs, _, _ := lookup(idx.Info.FieldNames[fi])
+		bs, _, _ := br.Lookup(idx.Info.FieldNames[fi])
 		for _, b := range bs {
 			if !sf.Reverse && len(b.Start) > 0 {
 				return true
@@ -1255,35 +1259,35 @@ func sortRunNeedsScalarProof(idx *qplanner.CBOIndex, sortFields []query.SortFiel
 // ascending scan must meet each doc's global MIN element first and any lower
 // cut can hide it (descending: MAX, upper cut). Opening the edge restores the
 // pre-bracketing scan range — the extra lower-bracket entries are rejected by
-// the residual FilterIter — so the index order is the sort order again: sound
-// by the gate's own argument (an open side cannot exclude the extremum) and
-// no dearer than the un-bracketed plan was. The bracket-exact bounds stay in
-// EstBounds so the match fraction is still rated on the real range. A VALUE
-// cut ($gte 5 ascending, {a:false}) is never opened: demotion is the right
-// price there, and opening could turn a point seek into a scan.
-func (q *collQuery) widenSortEdges(idx *index, br *qplanner.BoundsResult, sortFields []query.SortField, base *qplanner.CBOIndex) (qplanner.CBOIndex, bool) {
-	info := idx.cboInfo
+// the residual FilterIter, always present on a single-field scan — so the
+// index order is the sort order again: sound by the gate's own argument (an
+// open side cannot exclude the extremum) and no dearer than the un-bracketed
+// plan was. The bracket-exact bounds stay in EstBounds so the match fraction
+// is still rated on the real range. A VALUE cut ($gte 5 ascending, {a:false})
+// is never opened: demotion is the right price there, and opening could turn
+// a point seek into a scan.
+func (q *collQuery) widenSortEdges(br *qplanner.BoundsResult, sortFields []query.SortField, base *qplanner.CBOIndex) (qplanner.CBOIndex, bool) {
+	info := base.Info
 	if len(info.FieldNames) != 1 || len(sortFields) == 0 || base.SortMatchStart != 0 {
 		return qplanner.CBOIndex{}, false
 	}
-	field := info.FieldNames[0]
-	bs, _, found := br.Lookup(field)
+	bs, _, found := br.Lookup(info.FieldNames[0])
 	if !found || len(bs) == 0 {
 		return qplanner.CBOIndex{}, false
 	}
 	reverse := sortFields[0].Reverse
+	// Decide before allocating: a value cut anywhere means demotion.
+	for _, b := range bs {
+		if !reverse && len(b.Start) > 0 && !b.StartIsTypeEdge() ||
+			reverse && len(b.End) > 0 && !b.EndIsTypeEdge() {
+			return qplanner.CBOIndex{}, false
+		}
+	}
 	widened := make(query.Bounds, len(bs))
 	for i, b := range bs {
-		switch {
-		case !reverse && len(b.Start) > 0:
-			if !b.StartIsTypeEdge() {
-				return qplanner.CBOIndex{}, false
-			}
+		if !reverse {
 			b = b.OpenStart()
-		case reverse && len(b.End) > 0:
-			if !b.EndIsTypeEdge() {
-				return qplanner.CBOIndex{}, false
-			}
+		} else {
 			b = b.OpenEnd()
 		}
 		widened[i] = b
@@ -1291,17 +1295,17 @@ func (q *collQuery) widenSortEdges(idx *index, br *qplanner.BoundsResult, sortFi
 	// Opened sides overlap where the clamped ranges did not; IndexIter needs
 	// the list ordered and disjoint.
 	widened = widened.SortAndMerge()
-	lookup := func(f string) (query.Bounds, bool, bool) {
-		if f == field {
-			return widened, false, true
-		}
-		return br.Lookup(f)
-	}
-	w := q.buildCBOIndexWith(idx, lookup, sortFields)
-	if !w.ExactSort || sortRunNeedsScalarProof(&w, sortFields, lookup) {
+	// Every bounds-derived flag is rebuilt for the opened range: it is no
+	// point (a side is open) and pins no equality prefix, so the sort match is
+	// the plain single-field one.
+	w := *base
+	w.Bounds = qplanner.ComputeSingleFieldBounds(info, widened)
+	w.BoundFields = 1
+	w.PointLookup = false
+	w.ExactSort, w.PartialSort, w.SortMatchStart = qplanner.IndexSortMatch(info, sortFields, 0)
+	if !w.ExactSort || w.SortMatchStart != 0 {
 		return qplanner.CBOIndex{}, false
 	}
-	w.EstBounds = base.EstBounds
 	if w.EstBounds == nil {
 		w.EstBounds = base.Bounds
 	}
@@ -1312,18 +1316,18 @@ func (q *collQuery) widenSortEdges(idx *index, br *qplanner.BoundsResult, sortFi
 // bounds-derived flags taken consistently from a single channel (wide or
 // tight) — see buildCBOIndexesInto for why mixing channels is forbidden.
 func (q *collQuery) buildCBOIndex(idx *index, br *qplanner.BoundsResult, sortFields []query.SortField, tight bool) qplanner.CBOIndex {
-	if tight {
-		return q.buildCBOIndexWith(idx, br.LookupTight, sortFields)
-	}
-	return q.buildCBOIndexWith(idx, br.Lookup, sortFields)
-}
-
-// buildCBOIndexWith is buildCBOIndex over an explicit per-field lookup; every
-// bounds-derived flag comes from that one lookup.
-func (q *collQuery) buildCBOIndexWith(idx *index, lookup func(string) (query.Bounds, bool, bool), sortFields []query.SortField) qplanner.CBOIndex {
 	info := idx.cboInfo
 
-	bounds, chainLen := qplanner.ComputeIndexBoundsWith(info, lookup)
+	// Compute bounds for this index
+	var bounds query.Bounds
+	var chainLen int
+	lookup := br.Lookup
+	if tight {
+		bounds, chainLen = qplanner.ComputeIndexBoundsTight(info, br)
+		lookup = br.LookupTight
+	} else {
+		bounds, chainLen = qplanner.ComputeIndexBounds(info, br)
+	}
 
 	pointLookup := qplanner.AllBoundsFixed(bounds)
 	// Note: AdjustBoundsForNonUnique is deferred to BuildPlan's

@@ -1091,3 +1091,22 @@ func TestComp_TypeBracketing(t *testing.T) {
 		assert.Equal(t, "Bounds{['<number>','5')}", MustParseCondition(`{"a":{"$lt":5}}`).IndexBounds("a", nil).String())
 	})
 }
+
+// Rule V operands and container operands: an ordering op against a vector
+// contributes no bounds (Ok is false, and a vector-tag range could feed a
+// residual-elided scan); array and object operands get their own bracket.
+func TestComp_IndexBounds_VectorAndContainerOperands(t *testing.T) {
+	a := &anyenc.Arena{}
+	vec := &Comp{CompOp: CompOpGte, EqValue: a.NewVectorF32([]float32{1, 2}).MarshalTo(nil)}
+	assert.Empty(t, vec.IndexBounds("a", nil))
+	eq := &Comp{CompOp: CompOpEq, EqValue: a.NewVectorF32([]float32{1, 2}).MarshalTo(nil)}
+	assert.Len(t, eq.IndexBounds("a", nil), 1, "$eq on a vector is a byte-equality point")
+
+	arr := MustParseCondition(`{"a":{"$gt":[1]}}`).IndexBounds("a", nil)
+	require.Len(t, arr, 1)
+	assert.Equal(t, []byte{byte(anyenc.TypeArray) + 1}, []byte(arr[0].End))
+	obj := MustParseCondition(`{"a":{"$lt":{"x":0}}}`).IndexBounds("a", nil)
+	require.Len(t, obj, 1)
+	assert.Equal(t, []byte{byte(anyenc.TypeObject)}, []byte(obj[0].Start))
+	assert.True(t, obj[0].StartIsTypeEdge())
+}

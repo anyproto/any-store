@@ -1327,6 +1327,7 @@ func TestQuery_SortEdgeWidening(t *testing.T) {
 		sql := explain(q)
 		assert.Contains(t, sql, `IndexScan(a)[bounds=Bounds{[-inf,'"y"')}]`, sql)
 		assert.NotContains(t, sql, "-> Sort", sql)
+		assert.Contains(t, sql, "-> Filter", "the widened scan relies on the residual filter: %s", sql)
 		// [1,"x"] sorts by its minimum element (1), ahead of "m".
 		assert.Equal(t, []string{"1", "2"}, collectIdsString(t, q))
 		assertQueryCount(t, coll.Find(`{"a":{"$lt":"y"}}`), 2)

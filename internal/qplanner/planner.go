@@ -274,8 +274,10 @@ type CBOIndex struct {
 	// fall back to DefaultRangeSelectivity. Planner-internal; not set by callers.
 	rangeSel float64
 
-	// EstBounds is the tight-channel tuple bounds (ComputeIndexBoundsTight),
-	// set only when they differ from Bounds. DOC-SELECTIVITY ESTIMATION ONLY:
+	// EstBounds is the tuple bounds to RATE — the tight channel
+	// (ComputeIndexBoundsTight) when it differs from Bounds, or the
+	// bracket-exact bounds a sort-edge widening opened up in Bounds.
+	// DOC-SELECTIVITY ESTIMATION ONLY:
 	// rangeSelTight ranks them so a two-sided range's match fraction is rated
 	// (lo,hi) instead of (lo,+inf). Seeks — and the SCAN-COST estimate, which
 	// must price the entries the chain actually visits — keep Bounds unless
@@ -353,11 +355,7 @@ func BuildPlan(params *PlanParams) *Plan {
 			// rangeSel prices the SCAN (the bounds the chain seeks with);
 			// rangeSelTight rates the MATCH fraction (tight channel). They
 			// differ only for unproven indexes carrying EstBounds.
-			idx.rangeSel = interpolateRangeSel(params.Tx, idx, idx.Bounds)
-			idx.rangeSelTight = idx.rangeSel
-			if idx.EstBounds != nil {
-				idx.rangeSelTight = interpolateRangeSel(params.Tx, idx, idx.EstBounds)
-			}
+			idx.rangeSel, idx.rangeSelTight = interpolateRangeSels(params.Tx, idx)
 		}
 	}
 
@@ -1027,9 +1025,20 @@ func indexPopulation(idx *CBOIndex, totalDocs float64) float64 {
 // bounds of a $ne are a two-piece union ((-inf,v) ∪ (v,+inf)), so the per-bound
 // fractions are summed. Returns 0 (→ caller falls back to DefaultRangeSelectivity)
 // on any read error, leaving the planner's degraded behavior unchanged.
-func interpolateRangeSel(tx *btree.ReadTx, idx *CBOIndex, bounds query.Bounds) float64 {
+// interpolateRangeSels rates the scan bounds and, when they differ, the
+// estimation bounds (EstBounds) with one cursor.
+func interpolateRangeSels(tx *btree.ReadTx, idx *CBOIndex) (sel, tight float64) {
 	cur := tx.NewCursor(idx.Ns)
 	defer cur.Close()
+	sel = rangeFraction(cur, idx.Bounds)
+	tight = sel
+	if idx.EstBounds != nil {
+		tight = rangeFraction(cur, idx.EstBounds)
+	}
+	return sel, tight
+}
+
+func rangeFraction(cur *btree.Cursor, bounds query.Bounds) float64 {
 	var f float64
 	for _, b := range bounds {
 		bf, err := cur.RangeFraction(b.Start, b.End)
@@ -1668,9 +1677,12 @@ func idBoundsPreferred(idBounds query.Bounds) bool {
 }
 
 // AllBoundsFixed returns true if all bounds have Start == End (point lookups).
+// A point needs both sides inclusive: Start == End with an exclusive side is
+// an EMPTY range (a bracket edge inverted onto itself, e.g. {"$gt":null} on a
+// descending index), which the point paths would read as an equality.
 func AllBoundsFixed(bounds query.Bounds) bool {
 	for _, b := range bounds {
-		if len(b.Start) == 0 || !bytes.Equal(b.Start, b.End) {
+		if len(b.Start) == 0 || !b.StartInclude || !b.EndInclude || !bytes.Equal(b.Start, b.End) {
 			return false
 		}
 	}
@@ -2069,7 +2081,7 @@ func allBoundsFixedNonEmpty(bs []query.Bound) bool {
 		return false
 	}
 	for _, b := range bs {
-		if len(b.Start) == 0 || !bytes.Equal(b.Start, b.End) {
+		if len(b.Start) == 0 || !b.StartInclude || !b.EndInclude || !bytes.Equal(b.Start, b.End) {
 			return false
 		}
 	}
@@ -2163,11 +2175,35 @@ func invertBytes(b []byte) []byte {
 	if len(b) == 0 {
 		return nil
 	}
+	if len(b) == 1 {
+		return invTag[b[0]]
+	}
 	out := make([]byte, len(b))
 	for i, c := range b {
 		out[i] = ^c
 	}
 	return out
+}
+
+// invTag[t] is the one-byte inverted form of tag t and succTag[t] its
+// successor — the two shapes a bracket/type edge takes in stored space. Static
+// so a descending-index plan does not allocate per edge; cap == len, so the
+// pad appends downstream reallocate instead of writing into the table.
+var invTag, succTag = func() (inv, succ [256][]byte) {
+	for i := range inv {
+		inv[i] = []byte{^byte(i)}
+		succ[i] = []byte{byte(i) + 1}
+	}
+	return inv, succ
+}()
+
+// prefixSuccessor is query.PrefixSuccessor with the one-byte case served
+// from succTag (an all-0xFF one-byte prefix has no successor, as there).
+func prefixSuccessor(p []byte) []byte {
+	if len(p) == 1 && p[0] != 0xff {
+		return succTag[p[0]]
+	}
+	return query.PrefixSuccessor(p)
 }
 
 // transformReverseBounds maps per-field bounds from ascending value space into
@@ -2230,9 +2266,11 @@ func transformReverseBounds(bs query.Bounds) query.Bounds {
 		// adjacent-value keys can enter the scan and are rejected by the
 		// residual FilterIter. Any future exactness-based residual elision
 		// must therefore treat prefix-derived bounds as INEXACT.
+		startEdge, endEdge := false, false
 		if b.StartInclude && len(b.Start) > 0 && anyenc.ValidateRaw(b.Start) != nil {
-			nb.End = query.PrefixSuccessor(nb.End)
+			nb.End = prefixSuccessor(nb.End)
 			nb.EndInclude = false
+			endEdge = len(b.Start) == 1 // a bare tag's successor is exact as-is
 		}
 		// The mirror image for an EXCLUSIVE ascending End that is a bare type
 		// tag — a bracket edge (Comp.IndexBounds: $gt X ends at <next tag>) or
@@ -2243,17 +2281,20 @@ func transformReverseBounds(bs query.Bounds) query.Bounds {
 		// elect an element of that type as a doc's canonical entry and wait
 		// for a key the scan never yields — dropping the doc. The exact
 		// stored-space form is the successor of the inverted tag, inclusive:
-		// every key of the admitted types and nothing else, with no pad
-		// needed (padReverseBounds leaves a bare-tag Start alone).
+		// every key of the admitted types and nothing else. It is marked as a
+		// type edge: padReverseBounds must not append its key-suffix pad
+		// (a +0x01 would drop keys whose first inverted payload byte is 0x00,
+		// including after tuple concatenation) and compareInvertedStart must
+		// order it bytewise — it is a prefix of every key of the admitted
+		// type, not of an escape-continuation group.
 		if !b.EndInclude && len(b.End) == 1 {
-			nb.Start = query.PrefixSuccessor(nb.Start)
+			nb.Start = prefixSuccessor(nb.Start)
 			nb.StartInclude = true
+			startEdge = true
 		}
-		out = append(out, nb)
+		out = append(out, nb.WithTypeEdges(startEdge, endEdge))
 	}
-	slices.SortStableFunc(out, func(a, b query.Bound) int {
-		return compareInvertedStart(a.Start, b.Start)
-	})
+	slices.SortStableFunc(out, compareInvertedStart)
 	return out
 }
 
@@ -2262,7 +2303,11 @@ func transformReverseBounds(bs query.Bounds) query.Bounds {
 // smaller stored keys (the escape-continuation group sorts below the base
 // value's own entries in inverted space) and therefore comes first; diverging
 // Starts compare bytewise as usual.
-func compareInvertedStart(a, b []byte) int {
+// A type-edge Start (the successor form transformReverseBounds emits) is a
+// prefix of every key of the admitted type and sits at that region's
+// beginning, so it compares bytewise like any other key.
+func compareInvertedStart(ab, bb query.Bound) int {
+	a, b := ab.Start, bb.Start
 	switch {
 	case len(a) == 0 && len(b) == 0:
 		return 0
@@ -2271,7 +2316,7 @@ func compareInvertedStart(a, b []byte) int {
 	case len(b) == 0:
 		return 1
 	}
-	if len(a) != len(b) {
+	if len(a) != len(b) && !ab.StartIsTypeEdge() && !bb.StartIsTypeEdge() {
 		if bytes.HasPrefix(b, a) {
 			return 1 // a is the shorter prefix: its group starts above b's
 		}
@@ -2316,16 +2361,15 @@ func compareInvertedStart(a, b []byte) int {
 //	the pad is its plain byte sort stored-key order — a bare inverted Start
 //	is a byte-prefix of its escape-continuation group and would sort wrongly).
 //
-// Returns the PRE-pad bounds for consumers that test bare field values
-// (CanonicalKeyDedupIter; the +0x01 Start pad would wrongly exclude them) and
-// leaves the padded, merged bounds on idx.Bounds for IndexIter.
+// Returns the padded bounds, which CanonicalKeyDedupIter tests elements
+// against as least keys (enc(elem)‖0x01) — the same key set IndexIter walks,
+// so a canonical election is always an entry the scan emits.
 func finalizeIndexBounds(idx *CBOIndex) (dedupBounds query.Bounds) {
-	dedupBounds = idx.Bounds
 	idx.Bounds = padBoundsForTail(idx)
 	if idx.BoundFields > 1 {
 		idx.Bounds = MergeOverlappingBounds(idx.Bounds)
 	}
-	return dedupBounds
+	return idx.Bounds
 }
 
 // padBoundsForTail pads the bound chain's final field for exact full-key
@@ -2371,13 +2415,11 @@ func padForwardBounds(bs query.Bounds) query.Bounds {
 	// test bare field values (CanonicalKeyDedupIter). The append extends or
 	// reallocates, never rewriting the original Start bytes.
 	out := make(query.Bounds, len(bs))
-	copy(out, bs)
-	for i := range out {
-		b := &out[i]
+	for i, b := range bs {
 		if len(b.Start) > 0 && !b.StartInclude {
-			b.Start = append(b.Start, 0xff)
-			b.StartInclude = true
+			b = b.PadExclusiveStart()
 		}
+		out[i] = b
 	}
 	return out
 }
@@ -2392,12 +2434,11 @@ func padReverseBounds(bs query.Bounds) query.Bounds {
 	bs = out
 	for i := range bs {
 		b := &bs[i]
-		// A one-byte Start is a bare inverted type tag (the successor form
-		// transformReverseBounds emits for a bracket/type edge) or a one-byte
-		// value (null/false/true), never a string: there is no escape
-		// continuation to separate from, and the +0x01 pad would drop keys
-		// whose first inverted payload byte is 0x00.
-		if len(b.Start) > 1 || (len(b.Start) == 1 && !b.StartInclude) {
+		// A type-edge endpoint (transformReverseBounds' successor form) is
+		// exact as it stands: there is no escape continuation to separate
+		// from, and a +0x01 pad would drop keys whose first inverted payload
+		// byte is 0x00 — after tuple concatenation as much as on its own.
+		if len(b.Start) > 0 && !b.StartIsTypeEdge() {
 			if b.StartInclude {
 				b.Start = append(b.Start, 0x01)
 			} else {
@@ -2405,7 +2446,7 @@ func padReverseBounds(bs query.Bounds) query.Bounds {
 				b.StartInclude = true
 			}
 		}
-		if len(b.End) > 0 && !b.EndInclude {
+		if len(b.End) > 0 && !b.EndInclude && !b.EndIsTypeEdge() {
 			b.End = append(b.End, 0x01)
 		}
 	}
@@ -2426,11 +2467,15 @@ func ComputeIndexBoundsTight(idx *IndexInfo, br *BoundsResult) (query.Bounds, in
 	return computeIndexBounds(idx, br.LookupTight)
 }
 
-// ComputeIndexBoundsWith builds the chain from an arbitrary per-field lookup —
-// the query layer's sort-edge widening substitutes an opened view of one
-// field over BoundsResult.Lookup. The lookup owns the soundness argument.
-func ComputeIndexBoundsWith(idx *IndexInfo, lookup func(string) (query.Bounds, bool, bool)) (query.Bounds, int) {
-	return computeIndexBounds(idx, lookup)
+// ComputeSingleFieldBounds is the single-field chain for explicit logical
+// bounds: the stored-space transform when the field is reverse-declared, the
+// bounds as given otherwise. The query layer's sort-edge widening feeds it an
+// opened view of the sort field; the caller owns the soundness argument.
+func ComputeSingleFieldBounds(idx *IndexInfo, bs query.Bounds) query.Bounds {
+	if len(idx.Reverse) > 0 && idx.Reverse[0] {
+		return transformReverseBounds(bs)
+	}
+	return bs
 }
 
 func computeIndexBounds(idx *IndexInfo, lookup func(string) (query.Bounds, bool, bool)) (query.Bounds, int) {
@@ -2534,6 +2579,9 @@ func computeIndexBounds(idx *IndexInfo, lookup func(string) (query.Bounds, bool,
 					n := len(arena) - off
 					arena = append(arena, 0)
 					eb.End = anyenc.Tuple(arena[off : off+n : off+n+1])
+					// The last field's edge marks are the tuple's: the pads and
+					// the inverted-Start order key on them (see padReverseBounds).
+					eb = eb.WithTypeEdges(len(cur.Start) > 0 && cur.StartIsTypeEdge(), cur.EndIsTypeEdge())
 				} else {
 					off := len(arena)
 					arena = append(arena, prev.End...)
@@ -2579,7 +2627,7 @@ func HasExactFieldPrefix(k, p []byte, lastFieldInverted bool) bool {
 func AdjustBoundsForNonUnique(bounds query.Bounds) query.Bounds {
 	for i := range bounds {
 		if len(bounds[i].End) > 0 && bounds[i].EndInclude {
-			bounds[i].End = append(bounds[i].End, 0xff)
+			bounds[i] = bounds[i].PadInclusiveEnd()
 		}
 	}
 	return bounds
@@ -2652,6 +2700,7 @@ func MergeOverlappingBounds(bounds query.Bounds) query.Bounds {
 		default:
 			if c := bytes.Compare(next.End, cur.End); c > 0 {
 				cur.End, cur.EndInclude = next.End, next.EndInclude
+				*cur = cur.WithTypeEdges(cur.StartIsTypeEdge(), next.EndIsTypeEdge())
 			} else if c == 0 {
 				cur.EndInclude = cur.EndInclude || next.EndInclude
 			}

@@ -81,7 +81,7 @@ func TestCanonicalKeyDedupIter_SingleDocMultipleMatches(t *testing.T) {
 	it := &CanonicalKeyDedupIter{
 		Source:    upstream,
 		Plan:      plan,
-		Bounds:    bs,
+		Bounds:    scanPad(bs),
 		FieldPath: []string{"tags"},
 	}
 
@@ -126,7 +126,7 @@ func TestCanonicalKeyDedupIter_ReverseScan(t *testing.T) {
 	}
 
 	it := &CanonicalKeyDedupIter{
-		Source: upstream, Plan: plan, Bounds: bs,
+		Source: upstream, Plan: plan, Bounds: scanPad(bs),
 		FieldPath: []string{"tags"}, Reverse: true,
 	}
 
@@ -191,7 +191,7 @@ func TestCanonicalKeyDedupIter_RangeBounds(t *testing.T) {
 		{key: encodeKey(a.NewString("b"), "p1"), docId: []byte("p1"), doc: doc},
 		{key: encodeKey(a.NewString("c"), "p1"), docId: []byte("p1"), doc: doc},
 	}}
-	it := &CanonicalKeyDedupIter{Source: upstream, Plan: plan, Bounds: bs, FieldPath: []string{"tags"}}
+	it := &CanonicalKeyDedupIter{Source: upstream, Plan: plan, Bounds: scanPad(bs), FieldPath: []string{"tags"}}
 
 	var got []string
 	for {
@@ -271,7 +271,7 @@ func TestCanonicalKeyDedupIter_MultipleDocs(t *testing.T) {
 		{key: encodeKey(a.NewString("c"), "p1"), docId: []byte("p1"), doc: p1},
 	}}
 	it := &CanonicalKeyDedupIter{
-		Source: upstream, Plan: plan, Bounds: bs,
+		Source: upstream, Plan: plan, Bounds: scanPad(bs),
 		FieldPath: []string{"tags"},
 	}
 
@@ -427,7 +427,7 @@ func TestCanonicalKeyDedupIter_Coverage_EmptyArrayWithBounds(t *testing.T) {
 	it := &CanonicalKeyDedupIter{
 		Source:    upstream,
 		Plan:      plan,
-		Bounds:    bs,
+		Bounds:    scanPad(bs),
 		FieldPath: []string{"tags"},
 	}
 
@@ -477,7 +477,7 @@ func TestCanonicalKeyDedupIter_Coverage_ArrayAllOutsideBounds(t *testing.T) {
 	it := &CanonicalKeyDedupIter{
 		Source:    upstream,
 		Plan:      plan,
-		Bounds:    bs,
+		Bounds:    scanPad(bs),
 		FieldPath: []string{"tags"},
 	}
 
@@ -535,7 +535,7 @@ func TestCanonicalKeyDedupIter_Coverage_ReverseExclusiveBounds(t *testing.T) {
 	it := &CanonicalKeyDedupIter{
 		Source:    upstream,
 		Plan:      plan,
-		Bounds:    bs,
+		Bounds:    scanPad(bs),
 		FieldPath: []string{"tags"},
 		Reverse:   true,
 	}
@@ -683,4 +683,13 @@ func TestDocDedupIter(t *testing.T) {
 		it := &DocDedupIter{Source: &mkIter{}}
 		assert.Equal(t, "mk -> Dedup(docid)", it.String())
 	})
+}
+
+// scanPad applies the planner's full-key pads (AdjustBoundsForNonUnique,
+// padForwardBounds): the iterator tests elements as least keys against the
+// SCAN bounds, exactly as it is wired in the plan.
+func scanPad(bs query.Bounds) query.Bounds {
+	out := make(query.Bounds, len(bs))
+	copy(out, bs)
+	return padForwardBounds(AdjustBoundsForNonUnique(out))
 }

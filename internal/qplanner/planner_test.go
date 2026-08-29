@@ -636,7 +636,11 @@ func TestAllBoundsFixed(t *testing.T) {
 	})
 	t.Run("point lookup", func(t *testing.T) {
 		assert.True(t, AllBoundsFixed(query.Bounds{
-			{Start: []byte{1}, End: []byte{1}},
+			{Start: []byte{1}, End: []byte{1}, StartInclude: true, EndInclude: true},
+		}))
+		// Start == End with an exclusive side is an empty range, not a point.
+		assert.False(t, AllBoundsFixed(query.Bounds{
+			{Start: []byte{1}, End: []byte{1}, StartInclude: true},
 		}))
 	})
 	t.Run("range", func(t *testing.T) {
@@ -4324,7 +4328,7 @@ func TestIdBoundsPreferred(t *testing.T) {
 		assert.False(t, idBoundsPreferred(query.Bounds{b}))
 	})
 	t.Run("fixed_bound", func(t *testing.T) {
-		b := query.Bound{Start: []byte{1, 2, 3}, End: []byte{1, 2, 3}}
+		b := query.Bound{Start: []byte{1, 2, 3}, End: []byte{1, 2, 3}, StartInclude: true, EndInclude: true}
 		assert.True(t, idBoundsPreferred(query.Bounds{b}))
 	})
 }
