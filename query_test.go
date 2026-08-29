@@ -1355,3 +1355,21 @@ func TestQuery_SortEdgeWidening(t *testing.T) {
 		assertQueryCount(t, coll.Find(`{"a":{"$gte":"n"}}`).Sort("-a"), 2)
 	})
 }
+
+// TestQuery_OrOverlappingRangesUseIndex pins the plan for an $or whose
+// branches overlap on the indexed field: one merged seek, not a full scan.
+func TestQuery_OrOverlappingRangesUseIndex(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+	for i := 0; i < 200; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"%d","a":%d}`, i, i))))
+	}
+	q := coll.Find(`{"$or":[{"a":{"$lt":5}},{"a":{"$lt":7}}]}`)
+	ex, err := q.Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, ex.Sql, `IndexScan(a)[bounds=Bounds{['<number>','7')}]`, ex.Sql)
+	assertQueryCount(t, q, 7)
+	assert.Equal(t, []string{"0", "1", "2", "3", "4", "5", "6"}, collectIdsString(t, coll.Find(`{"$or":[{"a":{"$lt":5}},{"a":{"$lt":7}}]}`).Sort("a")))
+}

@@ -1110,3 +1110,33 @@ func TestComp_IndexBounds_VectorAndContainerOperands(t *testing.T) {
 	assert.Equal(t, []byte{byte(anyenc.TypeObject)}, []byte(obj[0].Start))
 	assert.True(t, obj[0].StartIsTypeEdge())
 }
+
+// TestOr_IndexBounds_OverlappingBranches pins that a branch whose range merges
+// into a sibling's still counts as constraining the field: the union is one
+// merged bound, not "no bounds".
+func TestOr_IndexBounds_OverlappingBranches(t *testing.T) {
+	num := []byte{byte(anyenc.TypeNumber)}
+	bs := MustParseCondition(`{"$or":[{"a":{"$lt":5}},{"a":{"$lt":7}}]}`).IndexBounds("a", nil)
+	require.Len(t, bs, 1)
+	assert.Equal(t, num, []byte(bs[0].Start))
+	assert.Equal(t, anyenc.AppendAnyValue(nil, 7), []byte(bs[0].End))
+	assert.False(t, bs[0].EndInclude)
+
+	bs = MustParseCondition(`{"$or":[{"a":{"$lt":5}},{"a":{"$gte":3}}]}`).IndexBounds("a", nil)
+	require.Len(t, bs, 1, "two ranges covering the whole number bracket merge")
+	assert.Equal(t, num, []byte(bs[0].Start))
+	assert.Equal(t, []byte{byte(anyenc.TypeNumber) + 1}, []byte(bs[0].End))
+
+	bs = MustParseCondition(`{"$or":[{"a":{"$in":[1,2]}},{"a":2},{"a":{"$gt":1,"$lt":3}}]}`).IndexBounds("a", nil)
+	require.Len(t, bs, 1, "points inside a range merge into it")
+
+	// A branch that cannot constrain the field still disables the union.
+	assert.Empty(t, MustParseCondition(`{"$or":[{"a":{"$lt":5}},{"b":1}]}`).IndexBounds("a", nil))
+	assert.Empty(t, MustParseCondition(`{"$or":[{"a":{"$lt":5}},{"a":{"$exists":true}}]}`).IndexBounds("a", nil))
+	// Incoming bounds are kept in front of the union.
+	in := Bounds{{Start: anyenc.AppendAnyValue(nil, 100), End: anyenc.AppendAnyValue(nil, 100), StartInclude: true, EndInclude: true}}
+	bs = MustParseCondition(`{"$or":[{"a":{"$lt":5}},{"a":{"$lt":7}}]}`).IndexBounds("a", in)
+	require.Len(t, bs, 2)
+	assert.Equal(t, anyenc.AppendAnyValue(nil, 7), []byte(bs[0].End))
+	assert.Equal(t, anyenc.AppendAnyValue(nil, 100), []byte(bs[1].Start))
+}

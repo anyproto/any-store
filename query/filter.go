@@ -716,6 +716,12 @@ func (e Or) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	return false
 }
 
+// IndexBounds is the union of the branches' bounds. Every branch must
+// constrain fieldName, or the disjunction cannot narrow at all and bs is
+// returned unchanged. Each branch is asked on its own (against nil): judging a
+// branch by whether it grew the accumulated list misreads a range that merges
+// into a sibling's — {"$or":[{"a":{"$lt":5}},{"a":{"$lt":7}}]} — as "no
+// bounds", which dropped the index for the whole $or.
 func (e Or) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	if len(e) > orExpressionLimit {
 		return bs
@@ -723,11 +729,11 @@ func (e Or) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	result := make(Bounds, len(bs), len(bs)+len(e))
 	copy(result, bs)
 	for _, f := range e {
-		beforeLen := len(result)
-		result = f.IndexBounds(fieldName, result)
-		if len(result) == beforeLen {
-			return bs // branch produced no bounds → can't narrow
+		sub := f.IndexBounds(fieldName, nil)
+		if len(sub) == 0 {
+			return bs // branch has no bounds on this field → can't narrow
 		}
+		result = append(result, sub...)
 	}
 	return result.SortAndMerge()
 }
@@ -911,9 +917,7 @@ const (
 func (k Knn) Ok(*anyenc.Value, *syncpool.DocBuffer) bool { return false }
 
 // IndexBounds returns bs verbatim: a Knn clause contributes no range-index
-// bounds. Verbatim matters — Or.IndexBounds detects "this branch contributed
-// nothing" by comparing lengths, and a shorter return silently discards
-// accumulated sibling bounds.
+// bounds, which Or.IndexBounds reads as "cannot narrow".
 func (k Knn) IndexBounds(_ string, bs Bounds) Bounds { return bs }
 
 // String renders the clause losslessly: MustParseCondition round-trips it.
