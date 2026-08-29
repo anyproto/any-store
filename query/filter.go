@@ -362,14 +362,16 @@ func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 		})
 	case CompOpGt:
 		return bs.Append(Bound{
-			Start: ev,
-			End:   tagBound[bracketHi(ev[0])],
+			Start:   ev,
+			End:     tagBound[bracketHi(ev[0])],
+			endEdge: true,
 		})
 	case CompOpGte:
 		return bs.Append(Bound{
 			Start:        ev,
 			StartInclude: true,
 			End:          tagBound[bracketHi(ev[0])],
+			endEdge:      true,
 		})
 	case CompOpLt:
 		lo := tagBound[bracket(ev[0])]
@@ -380,6 +382,7 @@ func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 			Start:        lo,
 			StartInclude: true,
 			End:          ev,
+			startEdge:    true,
 		})
 	case CompOpLte:
 		return bs.Append(Bound{
@@ -387,6 +390,7 @@ func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 			StartInclude: true,
 			End:          ev,
 			EndInclude:   true,
+			startEdge:    true,
 		})
 	case CompOpNe:
 		return bs.Append(Bound{

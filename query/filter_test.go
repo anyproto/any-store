@@ -103,8 +103,9 @@ func TestComp(t *testing.T) {
 			bs := cmp.IndexBounds("", nil)
 			assert.Equal(t, Bounds{
 				{
-					Start: anyenc.AppendAnyValue(nil, 1),
-					End:   []byte{byte(anyenc.TypeNumber) + 1},
+					Start:   anyenc.AppendAnyValue(nil, 1),
+					End:     []byte{byte(anyenc.TypeNumber) + 1},
+					endEdge: true,
 				},
 			}, bs)
 		})
@@ -126,6 +127,7 @@ func TestComp(t *testing.T) {
 					Start:        anyenc.AppendAnyValue(nil, 1),
 					StartInclude: true,
 					End:          []byte{byte(anyenc.TypeNumber) + 1},
+					endEdge:      true,
 				},
 			}, bs)
 		})
@@ -148,6 +150,7 @@ func TestComp(t *testing.T) {
 					Start:        []byte{byte(anyenc.TypeNumber)},
 					StartInclude: true,
 					End:          anyenc.AppendAnyValue(nil, 1),
+					startEdge:    true,
 				},
 			}, bs)
 		})
@@ -170,6 +173,7 @@ func TestComp(t *testing.T) {
 					StartInclude: true,
 					End:          anyenc.AppendAnyValue(nil, 1),
 					EndInclude:   true,
+					startEdge:    true,
 				},
 			}, bs)
 		})
@@ -1042,17 +1046,38 @@ func TestComp_TypeBracketing(t *testing.T) {
 	t.Run("bounds are the bracket-clamped image", func(t *testing.T) {
 		null, num, str, fals, tru := byte(anyenc.TypeNull), byte(anyenc.TypeNumber), byte(anyenc.TypeString), byte(anyenc.TypeFalse), byte(anyenc.TypeTrue)
 		bounds := func(cond string) Bounds { return MustParseCondition(cond).IndexBounds("a", nil) }
-		assert.Equal(t, Bounds{{Start: []byte{null}, End: []byte{num}, StartInclude: true}}, bounds(`{"a":{"$gte":null}}`))
-		assert.Equal(t, Bounds{{Start: []byte{null}, End: []byte{null}, StartInclude: true, EndInclude: true}}, bounds(`{"a":{"$lte":null}}`))
-		assert.Equal(t, Bounds{{Start: []byte{null}, End: []byte{num}}}, bounds(`{"a":{"$gt":null}}`))
+		assert.Equal(t, Bounds{{Start: []byte{null}, End: []byte{num}, StartInclude: true, endEdge: true}}, bounds(`{"a":{"$gte":null}}`))
+		assert.Equal(t, Bounds{{Start: []byte{null}, End: []byte{null}, StartInclude: true, EndInclude: true, startEdge: true}}, bounds(`{"a":{"$lte":null}}`))
+		assert.Equal(t, Bounds{{Start: []byte{null}, End: []byte{num}, endEdge: true}}, bounds(`{"a":{"$gt":null}}`))
 		assert.Empty(t, bounds(`{"a":{"$lt":null}}`), "[null, null) is empty: no bounds, filter decides")
 		assert.Empty(t, bounds(`{"a":{"$lt":false}}`))
-		assert.Equal(t, Bounds{{Start: []byte{fals}, End: []byte{tru + 1}}}, bounds(`{"a":{"$gt":false}}`))
-		assert.Equal(t, Bounds{{Start: []byte{fals}, End: []byte{tru}, StartInclude: true}}, bounds(`{"a":{"$lt":true}}`))
-		assert.Equal(t, Bounds{{Start: []byte{tru}, End: []byte{tru + 1}}}, bounds(`{"a":{"$gt":true}}`))
-		assert.Equal(t, Bounds{{Start: []byte{str}, End: anyenc.AppendAnyValue(nil, "m"), StartInclude: true}}, bounds(`{"a":{"$lt":"m"}}`))
+		assert.Equal(t, Bounds{{Start: []byte{fals}, End: []byte{tru + 1}, endEdge: true}}, bounds(`{"a":{"$gt":false}}`))
+		assert.Equal(t, Bounds{{Start: []byte{fals}, End: []byte{tru}, StartInclude: true, startEdge: true}}, bounds(`{"a":{"$lt":true}}`))
+		assert.Equal(t, Bounds{{Start: []byte{tru}, End: []byte{tru + 1}, endEdge: true}}, bounds(`{"a":{"$gt":true}}`))
+		assert.Equal(t, Bounds{{Start: []byte{str}, End: anyenc.AppendAnyValue(nil, "m"), StartInclude: true, startEdge: true}}, bounds(`{"a":{"$lt":"m"}}`))
 		dt := date.MarshalTo(nil)
-		assert.Equal(t, Bounds{{Start: dt, End: []byte{byte(anyenc.TypeDateTime) + 1}, StartInclude: true}}, bounds(`{"a":{"$gte":{"$date":"2025-08-24T18:00:00Z"}}}`))
+		assert.Equal(t, Bounds{{Start: dt, End: []byte{byte(anyenc.TypeDateTime) + 1}, StartInclude: true, endEdge: true}}, bounds(`{"a":{"$gte":{"$date":"2025-08-24T18:00:00Z"}}}`))
+		// Edges survive merge and intersection; a value endpoint never becomes one.
+		two := MustParseCondition(`{"$or":[{"a":{"$lt":5}},{"a":{"$gt":7}}]}`).IndexBounds("a", nil)
+		require.Len(t, two, 2)
+		assert.True(t, two[0].StartIsTypeEdge())
+		assert.False(t, two[0].EndIsTypeEdge())
+		assert.False(t, two[1].StartIsTypeEdge())
+		assert.True(t, two[1].EndIsTypeEdge())
+		merged := Bounds{
+			{Start: []byte{num}, End: anyenc.AppendAnyValue(nil, 5), StartInclude: true, startEdge: true},
+			{Start: []byte{num}, End: anyenc.AppendAnyValue(nil, 7), StartInclude: true, startEdge: true},
+		}.SortAndMerge()
+		require.Len(t, merged, 1)
+		assert.True(t, merged[0].StartIsTypeEdge())
+		assert.False(t, merged[0].EndIsTypeEdge())
+		tight, _ := TightIndexBounds(MustParseCondition(`{"a":{"$gt":5,"$lt":7}}`), "a")
+		require.Len(t, tight, 1)
+		assert.False(t, tight[0].StartIsTypeEdge())
+		assert.False(t, tight[0].EndIsTypeEdge())
+		open := tight[0].OpenStart()
+		assert.Empty(t, open.Start)
+		assert.False(t, open.StartInclude)
 		// Cross-bracket conjunctions intersect to nothing in the tight channel.
 		_, empty := TightIndexBounds(MustParseCondition(`{"a":{"$gt":5,"$lt":"a"}}`), "a")
 		assert.True(t, empty)

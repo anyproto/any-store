@@ -14,6 +14,32 @@ type Bound struct {
 	prefix       anyenc.Tuple
 	StartInclude bool
 	EndInclude   bool
+	// startEdge/endEdge mark an endpoint that is a type-bracket edge rather
+	// than a value: Comp.IndexBounds clamps every ordering op to its operand's
+	// bracket ($lt X gets a [<tag> Start, $gt X a <next tag>) End). The planner
+	// may open such an endpoint back up when it needs the index's own order
+	// over possibly-multikey data — widening to the pre-bracketing range is
+	// sound and costs nothing that range did not already cost, while opening
+	// a VALUE cut could turn a point seek into a scan.
+	startEdge, endEdge bool
+}
+
+// StartIsTypeEdge reports whether Start is a bracket edge (see Bound).
+func (b Bound) StartIsTypeEdge() bool { return b.startEdge }
+
+// EndIsTypeEdge reports whether End is a bracket edge (see Bound).
+func (b Bound) EndIsTypeEdge() bool { return b.endEdge }
+
+// OpenStart returns b with an open lower side.
+func (b Bound) OpenStart() Bound {
+	b.Start, b.StartInclude, b.startEdge = nil, false, false
+	return b
+}
+
+// OpenEnd returns b with an open upper side.
+func (b Bound) OpenEnd() Bound {
+	b.End, b.EndInclude, b.endEdge = nil, false, false
+	return b
 }
 
 func (b Bound) String() string {
@@ -168,41 +194,43 @@ func isOverlap(a, b Bound) bool {
 }
 
 func mergeBounds(a, b Bound) Bound {
-	start, startInclude := minStartKey(a, b)
-	end, endInclude := maxEndKey(a, b)
+	start, startInclude, startEdge := minStartKey(a, b)
+	end, endInclude, endEdge := maxEndKey(a, b)
 	merged := Bound{
 		Start:        start,
 		End:          end,
 		StartInclude: startInclude,
 		EndInclude:   endInclude,
+		startEdge:    startEdge,
+		endEdge:      endEdge,
 	}
 	return merged
 }
 
-func minStartKey(a, b Bound) ([]byte, bool) {
+func minStartKey(a, b Bound) ([]byte, bool, bool) {
 	if len(a.Start) == 0 {
-		return a.Start, true
+		return a.Start, true, false
 	}
 	if len(b.Start) == 0 {
-		return b.Start, true
+		return b.Start, true, false
 	}
 	if bytes.Compare(a.Start, b.Start) <= 0 {
-		return a.Start, a.StartInclude
+		return a.Start, a.StartInclude, a.startEdge
 	}
-	return b.Start, b.StartInclude
+	return b.Start, b.StartInclude, b.startEdge
 }
 
-func maxEndKey(a, b Bound) ([]byte, bool) {
+func maxEndKey(a, b Bound) ([]byte, bool, bool) {
 	if len(a.End) == 0 {
-		return a.End, true
+		return a.End, true, false
 	}
 	if len(b.End) == 0 {
-		return b.End, true
+		return b.End, true, false
 	}
 	if bytes.Compare(a.End, b.End) >= 0 {
-		return a.End, a.EndInclude
+		return a.End, a.EndInclude, a.endEdge
 	}
-	return b.End, b.EndInclude
+	return b.End, b.EndInclude, b.endEdge
 }
 
 // sortBounds orders bounds by Start key (unstable, Start only).
@@ -320,8 +348,8 @@ func (bs Bounds) Intersect(other Bounds) Bounds {
 // is non-empty. The intersection's lower bound is the tighter (greater) of the
 // two starts; its upper bound the tighter (lesser) of the two ends.
 func intersectPair(a, b Bound) (Bound, bool) {
-	start, startInclude := maxStartKey(a, b)
-	end, endInclude := minEndKey(a, b)
+	start, startInclude, startEdge := maxStartKey(a, b)
+	end, endInclude, endEdge := minEndKey(a, b)
 	// With both ends finite, a start past the end is empty, and a start equal
 	// to the end is a single point only if both sides include it.
 	if len(start) > 0 && len(end) > 0 {
@@ -339,45 +367,47 @@ func intersectPair(a, b Bound) (Bound, bool) {
 		End:          end,
 		StartInclude: startInclude,
 		EndInclude:   endInclude,
+		startEdge:    startEdge,
+		endEdge:      endEdge,
 	}, true
 }
 
 // maxStartKey returns the tighter (greater) lower bound of a and b — the
 // inverse of minStartKey. An empty Start means -∞, so the other side wins.
 // At equal starts the point is included only if both sides include it.
-func maxStartKey(a, b Bound) ([]byte, bool) {
+func maxStartKey(a, b Bound) ([]byte, bool, bool) {
 	if len(a.Start) == 0 {
-		return b.Start, b.StartInclude
+		return b.Start, b.StartInclude, b.startEdge
 	}
 	if len(b.Start) == 0 {
-		return a.Start, a.StartInclude
+		return a.Start, a.StartInclude, a.startEdge
 	}
 	switch bytes.Compare(a.Start, b.Start) {
 	case 0:
-		return a.Start, a.StartInclude && b.StartInclude
+		return a.Start, a.StartInclude && b.StartInclude, a.startEdge && b.startEdge
 	case 1: // a.Start > b.Start
-		return a.Start, a.StartInclude
+		return a.Start, a.StartInclude, a.startEdge
 	default: // a.Start < b.Start
-		return b.Start, b.StartInclude
+		return b.Start, b.StartInclude, b.startEdge
 	}
 }
 
 // minEndKey returns the tighter (lesser) upper bound of a and b — the inverse
 // of maxEndKey. An empty End means +∞, so the other side wins. At equal ends
 // the point is included only if both sides include it.
-func minEndKey(a, b Bound) ([]byte, bool) {
+func minEndKey(a, b Bound) ([]byte, bool, bool) {
 	if len(a.End) == 0 {
-		return b.End, b.EndInclude
+		return b.End, b.EndInclude, b.endEdge
 	}
 	if len(b.End) == 0 {
-		return a.End, a.EndInclude
+		return a.End, a.EndInclude, a.endEdge
 	}
 	switch bytes.Compare(a.End, b.End) {
 	case 0:
-		return a.End, a.EndInclude && b.EndInclude
+		return a.End, a.EndInclude && b.EndInclude, a.endEdge && b.endEdge
 	case -1: // a.End < b.End
-		return a.End, a.EndInclude
+		return a.End, a.EndInclude, a.endEdge
 	default: // a.End > b.End
-		return b.End, b.EndInclude
+		return b.End, b.EndInclude, b.endEdge
 	}
 }

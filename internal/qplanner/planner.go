@@ -2406,6 +2406,13 @@ func ComputeIndexBoundsTight(idx *IndexInfo, br *BoundsResult) (query.Bounds, in
 	return computeIndexBounds(idx, br.LookupTight)
 }
 
+// ComputeIndexBoundsWith builds the chain from an arbitrary per-field lookup —
+// the query layer's sort-edge widening substitutes an opened view of one
+// field over BoundsResult.Lookup. The lookup owns the soundness argument.
+func ComputeIndexBoundsWith(idx *IndexInfo, lookup func(string) (query.Bounds, bool, bool)) (query.Bounds, int) {
+	return computeIndexBounds(idx, lookup)
+}
+
 func computeIndexBounds(idx *IndexInfo, lookup func(string) (query.Bounds, bool, bool)) (query.Bounds, int) {
 	type fieldBound struct {
 		bounds query.Bounds
