@@ -15,10 +15,11 @@ or the exported constructors (`NewComp`, `NewCompValue`, `NewInValue`):
 
 3. **Read-only bound bytes.** `IndexBounds` may return bounds whose
    `Start`/`End` alias filter-owned memory (`Comp.EqValue`, `In`'s interned
-   keys). These slices are clipped to `cap == len`, so planner bound-extension
-   appends (`AdjustBoundsForNonUnique`, `padReverseBounds`) reallocate instead
-   of writing into memory shared across queries. Code consuming bounds must
-   never write `Start`/`End` in place.
+   keys, the static type-edge table). These slices are clipped to
+   `cap == len`, so planner bound-extension appends
+   (`AdjustBoundsForNonUnique`, `padForwardBounds`, `padReverseBounds`)
+   reallocate instead of writing into memory shared across queries. Code
+   consuming bounds must never write `Start`/`End` in place.
 
 4. **Two bound channels.** `Filter.IndexBounds` is the WIDE channel: a sound
    over-approximation (superset of every matching doc's index entries) —
@@ -63,12 +64,12 @@ build per query and carry no such guarantee.
 
 6. **`TypeVectorF32` is not orderable (Rule V).** In `Comp`, an ordering op
    (`$gt`/`$gte`/`$lt`/`$lte`) evaluates to `false` whenever either side is a
-   packed vector — including vector-vs-vector. `$eq` is byte equality, `$ne`
-   its negation. The parser additionally rejects an ordering op whose OPERAND
-   is a `$vector` literal (`ErrVectorNotOrderable`), which also keeps it out
-   of `$not`. Consequence (deliberate, Mongo-style type bracketing):
-   `{"v":{"$not":{"$gt":1}}}` matches a vector-valued `v` — `$not` of an
-   unsatisfiable comparison is true.
+   packed vector — including vector-vs-vector, which is stricter than item 13's
+   bracketing. `$eq` is byte equality, `$ne` its negation. The parser
+   additionally rejects an ordering op whose OPERAND is a `$vector` literal
+   (`ErrVectorNotOrderable`), which also keeps it out of `$not`. Consequence
+   (item 13 again): `{"v":{"$not":{"$gt":1}}}` matches a vector-valued `v` —
+   `$not` of an unsatisfiable comparison is true.
 
 7. **`$vector`, `$oid` and `$binary` are forbidden as option-key names**
    inside any operator's options object. anyenc decodes a single-key
@@ -105,7 +106,10 @@ build per query and carry no such guarantee.
     entries can precede the key element in either direction, since element
     types tagged above `TypeArray` exist — or a single-field sort field with
     a lower cut ascending / an upper cut descending — unless the index is
-    scalar-proven via its sticky multikey flag).
+    scalar-proven via its sticky multikey flag. A cut that is only a type
+    bracket edge (item 13) is opened back up instead of demoting: the scan
+    then covers the pre-bracketing range, whose open side cannot hide the
+    extremum element, and the residual filter still applies the bracket).
     Documented divergences from Mongo, both deliberate: an EMPTY array sorts
     by its whole-array encoding (after scalars, where the index stores its
     only entry; Mongo sorts `[]` before null — matching that would need a key
@@ -160,3 +164,30 @@ build per query and carry no such guarantee.
     `TestParseConditionErrorsAreStructured`, `TestOperators`,
     `TestModifierOperators`) and `internal/aggregate/pipeline_parse_test.go`
     (`TestPipelineParseError`, `TestStages`, `TestAccumulators`).
+
+13. **Ordering predicates are type-bracketed; sort is not.** `$gt`/`$gte`/
+    `$lt`/`$lte` compare only inside one type bracket, as MongoDB's query
+    operators do: a value of another type is never less or greater, it is not
+    matched. A bracket is the anyenc type tag, except that `false`/`true` form
+    one bracket (`{"$gt":false}` matches `true`); numbers already share one
+    type. A missing field is `null` and so in no other bracket:
+    `{"$lt":5}` never matches an absent field, `{"$gte":null}`/`{"$lte":null}`
+    match null and missing, `{"$gt":null}`/`{"$lt":null}` match nothing.
+    Array fields bracket per element (a whole-array comparison needs an array
+    operand). `$eq`/`$ne`/`$in`/`$nin` were already type-strict and are
+    unchanged (`$ne 5` still matches a string, as in Mongo). `Comp.IndexBounds`
+    emits the bracket-clamped range — `$gt X` is `(X, <next tag>)`, `$lt X` is
+    `[<tag>, X)` — so bounds stay the exact value image of the predicate (the
+    planner's residual elisions depend on that, together with its key-suffix
+    pads) and a wrong-typed literal is an empty seek, not an index walk. The
+    bracket edges are marked on the `Bound` (`StartIsTypeEdge`/`EndIsTypeEdge`)
+    so the planner can tell an edge from a value cut. Shapes with nothing to
+    seek contribute no bounds: an empty half-open range (`{"$lt":null}`,
+    `{"$lt":false}`), an empty operand, and an ordering op against a vector
+    (Rule V). `$pull` conditions are query predicates and bracket the same
+    way. `Sort`, index-order scans and the aggregation
+    expression operators (`$gt`, `$cmp`, `$min`/`$max`, `$sort`) keep the full
+    anyenc tag order, exactly as Mongo's sort and `$expr` keep full BSON order.
+    Pinned by `TestComp_TypeBracketing`, `TestCompOkScalar_MatchesMarshalReference`
+    (the oracle carries the rule) and `TestGuaranteesPresence` (`$lt`/`$lte`
+    with a non-null operand guarantee presence: they reject null and missing).

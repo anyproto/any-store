@@ -607,3 +607,16 @@ func BenchmarkModifier(b *testing.B) {
 		bench(b, `{"$addToSet":{"b":[1,2,5]}}`)
 	})
 }
+
+// $pull with a condition uses query semantics: ordering ops are type-bracketed,
+// so {"$gt":5} removes only numbers above 5, never a string element.
+func TestPullConditionIsTypeBracketed(t *testing.T) {
+	m, err := ParseModifier(`{"$pull":{"tags":{"$gt":5}}}`)
+	require.NoError(t, err)
+	a := &anyenc.Arena{}
+	v := anyenc.MustParseJson(`{"tags":["a",3,7,true,null]}`)
+	res, modified, err := m.Modify(a, v)
+	require.NoError(t, err)
+	assert.True(t, modified)
+	assert.Equal(t, `{"tags":["a",3,true,null]}`, res.String())
+}

@@ -41,35 +41,47 @@ func TestComputeIndexBounds_ReverseSingleField(t *testing.T) {
 		assert.True(t, bounds[0].StartInclude)
 		assert.True(t, bounds[0].EndInclude)
 	})
-	t.Run("gt_becomes_open_start_to_inv_excl_end", func(t *testing.T) {
-		// Gt 5 ascending = (5, +inf). Inverted+swapped = [-inf, ^5).
+	// Ordering ops are clamped to the operand's type bracket: the number
+	// bracket is [0x02, 0x03) in ascending space. Both edges are mid-value
+	// prefixes in inverted space and map to the successor of the inverted
+	// tag: the upper edge 0x03 to succ(^0x03) = 0xFD as an INCLUSIVE Start
+	// (every number key extends it, nothing else does), the lower edge 0x02
+	// to succ(^0x02) = 0xFE as an exclusive End.
+	hiEdgeSucc := []byte{^byte(anyenc.TypeNumber+1) + 1}
+	loEdgeSucc := []byte{^byte(anyenc.TypeNumber) + 1}
+	t.Run("gt_becomes_hi_edge_start_to_inv_excl_end", func(t *testing.T) {
+		// Gt 5 ascending = (5, 0x03). Inverted+swapped = [succ(^0x03), ^5).
 		bounds, _ := ComputeIndexBounds(idx, buildBoundsResult(idx, query.MustParseCondition(`{"b":{"$gt":5}}`)))
 		require.Len(t, bounds, 1)
-		assert.Empty(t, bounds[0].Start, "open start (-inf) in stored space")
+		assert.Equal(t, hiEdgeSucc, []byte(bounds[0].Start))
+		assert.True(t, bounds[0].StartInclude)
 		assert.Equal(t, invAll(k), []byte(bounds[0].End))
 		assert.False(t, bounds[0].EndInclude)
 	})
-	t.Run("gte_becomes_open_start_to_inv_incl_end", func(t *testing.T) {
+	t.Run("gte_becomes_hi_edge_start_to_inv_incl_end", func(t *testing.T) {
 		bounds, _ := ComputeIndexBounds(idx, buildBoundsResult(idx, query.MustParseCondition(`{"b":{"$gte":5}}`)))
 		require.Len(t, bounds, 1)
-		assert.Empty(t, bounds[0].Start)
+		assert.Equal(t, hiEdgeSucc, []byte(bounds[0].Start))
+		assert.True(t, bounds[0].StartInclude)
 		assert.Equal(t, invAll(k), []byte(bounds[0].End))
 		assert.True(t, bounds[0].EndInclude)
 	})
-	t.Run("lt_becomes_inv_excl_start_to_open_end", func(t *testing.T) {
-		// Lt 5 ascending = [-inf, 5). Inverted+swapped = (^5, +inf].
+	t.Run("lt_becomes_inv_excl_start_to_lo_edge_end", func(t *testing.T) {
+		// Lt 5 ascending = [0x02, 5). Inverted+swapped = (^5, succ(^0x02)).
 		bounds, _ := ComputeIndexBounds(idx, buildBoundsResult(idx, query.MustParseCondition(`{"b":{"$lt":5}}`)))
 		require.Len(t, bounds, 1)
 		assert.Equal(t, invAll(k), []byte(bounds[0].Start))
 		assert.False(t, bounds[0].StartInclude)
-		assert.Empty(t, bounds[0].End, "open end (+inf) in stored space")
+		assert.Equal(t, loEdgeSucc, []byte(bounds[0].End))
+		assert.False(t, bounds[0].EndInclude)
 	})
-	t.Run("lte_becomes_inv_incl_start_to_open_end", func(t *testing.T) {
+	t.Run("lte_becomes_inv_incl_start_to_lo_edge_end", func(t *testing.T) {
 		bounds, _ := ComputeIndexBounds(idx, buildBoundsResult(idx, query.MustParseCondition(`{"b":{"$lte":5}}`)))
 		require.Len(t, bounds, 1)
 		assert.Equal(t, invAll(k), []byte(bounds[0].Start))
 		assert.True(t, bounds[0].StartInclude)
-		assert.Empty(t, bounds[0].End)
+		assert.Equal(t, loEdgeSucc, []byte(bounds[0].End))
+		assert.False(t, bounds[0].EndInclude)
 	})
 	t.Run("two_sided_is_transform_of_forward", func(t *testing.T) {
 		// query/filter.go And.IndexBounds over-approximates a two-sided scalar
@@ -83,11 +95,11 @@ func TestComputeIndexBounds_ReverseSingleField(t *testing.T) {
 		rev, _ := ComputeIndexBounds(idx, buildBoundsResult(idx, cond))
 		require.Len(t, fwd, 1)
 		require.Len(t, rev, 1)
-		// rev.Start == invert(fwd.End); rev.End == invert(fwd.Start), with the
-		// open ends swapping sides (empty <-> empty).
-		assert.Equal(t, invertBytes(fwd[0].End), []byte(rev[0].Start))
+		// rev.End == invert(fwd.Start); rev.Start is the successor of the
+		// inverted bracket edge fwd.End (bare tag), inclusive.
+		assert.Equal(t, query.PrefixSuccessor(invertBytes(fwd[0].End)), []byte(rev[0].Start))
+		assert.True(t, rev[0].StartInclude)
 		assert.Equal(t, invertBytes(fwd[0].Start), []byte(rev[0].End))
-		assert.Equal(t, fwd[0].EndInclude, rev[0].StartInclude)
 		assert.Equal(t, fwd[0].StartInclude, rev[0].EndInclude)
 	})
 	t.Run("in_sorted_after_transform", func(t *testing.T) {
@@ -143,8 +155,9 @@ func TestComputeIndexBounds_ReverseSingleField_FreshSlice(t *testing.T) {
 func TestComputeIndexBounds_CompoundReverseTrailing(t *testing.T) {
 	idx := &IndexInfo{FieldNames: []string{"a", "b"}, Reverse: []bool{false, true}}
 	// a == 1 (equality prefix, ascending), range on b (reverse, inverted).
-	// And.IndexBounds over-approximates the two-sided b range to [2,+inf), so
-	// after transform the b segment is (-inf, ^2]: empty stored Start, End=^2.
+	// And.IndexBounds over-approximates the two-sided b range to the first
+	// conjunct, [2, 0x03) (the number bracket's upper edge), so after transform
+	// the b segment is [succ(^0x03), ^2]: Start = 0xFD inclusive, End = ^2.
 	cond := query.MustParseCondition(`{"a":1,"b":{"$gte":2,"$lte":8}}`)
 	bounds, chainLen := ComputeIndexBounds(idx, buildBoundsResult(idx, cond))
 	require.Equal(t, 2, chainLen)
@@ -154,8 +167,9 @@ func TestComputeIndexBounds_CompoundReverseTrailing(t *testing.T) {
 	// The a segment must stay ascending (forward-declared equality prefix).
 	assert.True(t, bytes.HasPrefix(bounds[0].Start, encA), "a segment must be ascending")
 	assert.True(t, bytes.HasPrefix(bounds[0].End, encA), "a segment must be ascending")
-	// b's transformed bound has empty Start (open) → combined Start == a only.
-	assert.Equal(t, encA, []byte(bounds[0].Start))
+	// b's transformed Start is the inverted bracket edge's successor → a ++ 0xFD, inclusive.
+	assert.Equal(t, append(append([]byte{}, encA...), ^byte(anyenc.TypeNumber+1)+1), []byte(bounds[0].Start))
+	assert.True(t, bounds[0].StartInclude)
 	// b's transformed End == ^encNum(2) → combined End == a ++ ^2.
 	wantEnd := append(append([]byte{}, encA...), invAll(encNum(2))...)
 	assert.Equal(t, wantEnd, []byte(bounds[0].End))

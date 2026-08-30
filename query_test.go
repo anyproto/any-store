@@ -183,8 +183,8 @@ func TestQueryCount_ArrayTwoSidedRange(t *testing.T) {
 	// The index has seen arrays (multikey flag set), so the executed bounds
 	// must stay the sound half-open over-approximation — tight seeks on this
 	// index would drop doc 1 entirely.
-	require.Contains(t, explain.Sql, "inf]",
-		"a multikey index must serve wide bounds; got: %s", explain.Sql)
+	require.Contains(t, explain.Sql, "'<string>')",
+		"a multikey index must serve wide (bracket-open) bounds; got: %s", explain.Sql)
 
 	assertQueryCount(t, coll.Find(filter).IndexHint(hint), 3)
 
@@ -1298,4 +1298,78 @@ func TestQueryCount_LimitOffsetMultiKey(t *testing.T) {
 			assertQueryCount(t, q(), tc.want)
 		})
 	}
+}
+
+// TestQuery_SortEdgeWidening pins widenSortEdges: over a possibly-multikey
+// index, a bracket edge on the sort side is opened instead of demoting the
+// index-order plan, while a value cut still demotes.
+func TestQuery_SortEdgeWidening(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"1","a":[1,"x"]}`), // array write: the index is no longer scalar-proven
+		anyenc.MustParseJson(`{"id":"2","a":"m"}`),
+		anyenc.MustParseJson(`{"id":"3","a":"z"}`),
+		anyenc.MustParseJson(`{"id":"4","a":5}`),
+		anyenc.MustParseJson(`{"id":"5","a":false}`),
+		anyenc.MustParseJson(`{"id":"6"}`),
+	))
+	explain := func(q Query) string {
+		ex, err := q.Explain(ctx)
+		require.NoError(t, err)
+		return ex.Sql
+	}
+
+	t.Run("lt asc opens the lower edge", func(t *testing.T) {
+		q := coll.Find(`{"a":{"$lt":"y"}}`).Sort("a")
+		sql := explain(q)
+		assert.Contains(t, sql, `IndexScan(a)[bounds=Bounds{[-inf,'"y"')}]`, sql)
+		assert.NotContains(t, sql, "-> Sort", sql)
+		assert.Contains(t, sql, "-> Filter", "the widened scan relies on the residual filter: %s", sql)
+		// [1,"x"] sorts by its minimum element (1), ahead of "m".
+		assert.Equal(t, []string{"1", "2"}, collectIdsString(t, q))
+		assertQueryCount(t, coll.Find(`{"a":{"$lt":"y"}}`), 2)
+	})
+	t.Run("gte desc opens the upper edge", func(t *testing.T) {
+		q := coll.Find(`{"a":{"$gte":"n"}}`).Sort("-a")
+		sql := explain(q)
+		assert.Contains(t, sql, `[bounds=Bounds{['"n"',inf]}]`, sql)
+		assert.NotContains(t, sql, "-> Sort", sql)
+		// [1,"x"] matches via "x" and sorts by its maximum element, after "z".
+		assert.Equal(t, []string{"3", "1"}, collectIdsString(t, q))
+	})
+	t.Run("value cut still demotes", func(t *testing.T) {
+		for _, tc := range []struct{ filter, sort string }{
+			{`{"a":{"$gte":"n"}}`, "a"},
+			{`{"a":{"$lt":"y"}}`, "-a"},
+			{`{"a":false}`, "a"},
+		} {
+			sql := explain(coll.Find(tc.filter).Sort(tc.sort))
+			assert.Contains(t, sql, "-> Sort", "%s sort %s: %s", tc.filter, tc.sort, sql)
+		}
+	})
+	t.Run("count agrees", func(t *testing.T) {
+		assertQueryCount(t, coll.Find(`{"a":{"$lt":"y"}}`).Sort("a"), 2)
+		assertQueryCount(t, coll.Find(`{"a":{"$gte":"n"}}`).Sort("-a"), 2)
+	})
+}
+
+// TestQuery_OrOverlappingRangesUseIndex pins the plan for an $or whose
+// branches overlap on the indexed field: one merged seek, not a full scan.
+func TestQuery_OrOverlappingRangesUseIndex(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+	for i := 0; i < 200; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"%d","a":%d}`, i, i))))
+	}
+	q := coll.Find(`{"$or":[{"a":{"$lt":5}},{"a":{"$lt":7}}]}`)
+	ex, err := q.Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, ex.Sql, `IndexScan(a)[bounds=Bounds{['<number>','7')}]`, ex.Sql)
+	assertQueryCount(t, q, 7)
+	assert.Equal(t, []string{"0", "1", "2", "3", "4", "5", "6"}, collectIdsString(t, coll.Find(`{"$or":[{"a":{"$lt":5}},{"a":{"$lt":7}}]}`).Sort("a")))
 }

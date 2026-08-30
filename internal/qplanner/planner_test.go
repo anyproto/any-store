@@ -636,7 +636,11 @@ func TestAllBoundsFixed(t *testing.T) {
 	})
 	t.Run("point lookup", func(t *testing.T) {
 		assert.True(t, AllBoundsFixed(query.Bounds{
-			{Start: []byte{1}, End: []byte{1}},
+			{Start: []byte{1}, End: []byte{1}, StartInclude: true, EndInclude: true},
+		}))
+		// Start == End with an exclusive side is an empty range, not a point.
+		assert.False(t, AllBoundsFixed(query.Bounds{
+			{Start: []byte{1}, End: []byte{1}, StartInclude: true},
 		}))
 	})
 	t.Run("range", func(t *testing.T) {
@@ -712,8 +716,10 @@ func TestTransformReverseBounds_PrefixStart(t *testing.T) {
 	require.Len(t, bs, 1)
 	assert.Equal(t, anyenc.Tuple{0xf5}, bs[0].End) // succ(^0x0b = 0xf4)
 	assert.False(t, bs[0].EndInclude)
-	assert.Equal(t, anyenc.Tuple{0xf3}, bs[0].Start)
-	assert.False(t, bs[0].StartInclude)
+	// The bare-tag exclusive End maps the same way on the Start side:
+	// succ(^0x0c = 0xf3) = 0xf4, inclusive — exactly the keys of tag 0x0b.
+	assert.Equal(t, anyenc.Tuple{0xf4}, bs[0].Start)
+	assert.True(t, bs[0].StartInclude)
 
 	// The $regex shape, taken from the real emitter so this test pins what
 	// Regexp.IndexBounds actually produces (prefix-successor exclusive End).
@@ -4322,7 +4328,7 @@ func TestIdBoundsPreferred(t *testing.T) {
 		assert.False(t, idBoundsPreferred(query.Bounds{b}))
 	})
 	t.Run("fixed_bound", func(t *testing.T) {
-		b := query.Bound{Start: []byte{1, 2, 3}, End: []byte{1, 2, 3}}
+		b := query.Bound{Start: []byte{1, 2, 3}, End: []byte{1, 2, 3}, StartInclude: true, EndInclude: true}
 		assert.True(t, idBoundsPreferred(query.Bounds{b}))
 	})
 }

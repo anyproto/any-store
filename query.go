@@ -1186,10 +1186,20 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		// the per-entry cartesian fan-out keeps every suffix combination
 		// inside the prefix run — but compound is gated wholesale above.
 		// Scalar-proven indexes keep ExactSort unchanged; the proof is read
-		// lazily, only for candidates the gate would demote.
+		// lazily, only for candidates the gate would demote. When the only cut
+		// on the sort side is a type-bracket edge, the candidate is widened
+		// (widenSortEdges) instead of demoted.
 		if cboIdx.ExactSort && sortRunNeedsScalarProof(&cboIdx, sortFields, br) && !scalarProven() {
-			cboIdx.ExactSort = false
-			cboIdx.PartialSort = false
+			w, ok := qplanner.CBOIndex{}, false
+			if !countOnly {
+				w, ok = q.widenSortEdges(br, sortFields, &cboIdx)
+			}
+			if ok {
+				cboIdx = w
+			} else {
+				cboIdx.ExactSort = false
+				cboIdx.PartialSort = false
+			}
 		}
 		cboIdx.ScalarProven = proven
 		result = append(result, cboIdx)
@@ -1240,6 +1250,66 @@ func sortRunNeedsScalarProof(idx *qplanner.CBOIndex, sortFields []query.SortFiel
 		}
 	}
 	return false
+}
+
+// widenSortEdges keeps a single-field index order-providing over possibly-
+// multikey data when every cut on the sort direction's side is a type-bracket
+// edge (Comp.IndexBounds clamps each ordering op: $lt X carries a [<tag> Start,
+// $gt X a <next tag>) End). The gate demotes such a candidate because an
+// ascending scan must meet each doc's global MIN element first and any lower
+// cut can hide it (descending: MAX, upper cut). Opening the edge restores the
+// pre-bracketing scan range — the extra lower-bracket entries are rejected by
+// the residual FilterIter, always present on a single-field scan — so the
+// index order is the sort order again: sound by the gate's own argument (an
+// open side cannot exclude the extremum) and no dearer than the un-bracketed
+// plan was. The bracket-exact bounds stay in EstBounds so the match fraction
+// is still rated on the real range. A VALUE cut ($gte 5 ascending, {a:false})
+// is never opened: demotion is the right price there, and opening could turn
+// a point seek into a scan.
+func (q *collQuery) widenSortEdges(br *qplanner.BoundsResult, sortFields []query.SortField, base *qplanner.CBOIndex) (qplanner.CBOIndex, bool) {
+	info := base.Info
+	if len(info.FieldNames) != 1 || len(sortFields) == 0 || base.SortMatchStart != 0 {
+		return qplanner.CBOIndex{}, false
+	}
+	bs, _, found := br.Lookup(info.FieldNames[0])
+	if !found || len(bs) == 0 {
+		return qplanner.CBOIndex{}, false
+	}
+	reverse := sortFields[0].Reverse
+	// Decide before allocating: a value cut anywhere means demotion.
+	for _, b := range bs {
+		if !reverse && len(b.Start) > 0 && !b.StartIsTypeEdge() ||
+			reverse && len(b.End) > 0 && !b.EndIsTypeEdge() {
+			return qplanner.CBOIndex{}, false
+		}
+	}
+	widened := make(query.Bounds, len(bs))
+	for i, b := range bs {
+		if !reverse {
+			b = b.OpenStart()
+		} else {
+			b = b.OpenEnd()
+		}
+		widened[i] = b
+	}
+	// Opened sides overlap where the clamped ranges did not; IndexIter needs
+	// the list ordered and disjoint.
+	widened = widened.SortAndMerge()
+	// Every bounds-derived flag is rebuilt for the opened range: it is no
+	// point (a side is open) and pins no equality prefix, so the sort match is
+	// the plain single-field one.
+	w := *base
+	w.Bounds = qplanner.ComputeSingleFieldBounds(info, widened)
+	w.BoundFields = 1
+	w.PointLookup = false
+	w.ExactSort, w.PartialSort, w.SortMatchStart = qplanner.IndexSortMatch(info, sortFields, 0)
+	if !w.ExactSort || w.SortMatchStart != 0 {
+		return qplanner.CBOIndex{}, false
+	}
+	if w.EstBounds == nil {
+		w.EstBounds = base.Bounds
+	}
+	return w, true
 }
 
 // buildCBOIndex builds one candidate's CBOIndex with bounds AND all

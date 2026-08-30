@@ -30,7 +30,7 @@ func assertTightBounds(t *testing.T, coll Collection, filter string) {
 	t.Helper()
 	sql := explainSQL(t, coll, filter)
 	require.Contains(t, sql, "IndexScan(a)", "plan: %s", sql)
-	assert.NotContains(t, sql, "inf]", "expected tight (two-sided) bounds, got: %s", sql)
+	assert.Contains(t, sql, "'5')", "expected tight (two-sided) bounds, got: %s", sql)
 }
 
 // assertWideBounds asserts the hinted index scan kept the sound half-open
@@ -39,7 +39,7 @@ func assertWideBounds(t *testing.T, coll Collection, filter string) {
 	t.Helper()
 	sql := explainSQL(t, coll, filter)
 	require.Contains(t, sql, "IndexScan(a)", "plan: %s", sql)
-	assert.Contains(t, sql, "inf]", "expected wide (half-open) bounds, got: %s", sql)
+	assert.Contains(t, sql, "'<string>')", "expected wide (bracket-open) bounds, got: %s", sql)
 }
 
 const twoSided = `{"a":{"$gt":2,"$lt":5}}`
