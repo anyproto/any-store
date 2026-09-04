@@ -56,6 +56,10 @@ const (
 	// Regexp, never by makeCompFilter. Appended at the end for the same
 	// iota-stability reason as opKnn.
 	opOptions
+
+	// opElemMatch: {"$elemMatch": …}, field-level (> _opVal); appended for the
+	// same iota-stability reason.
+	opElemMatch
 )
 
 var opBytesPrefix = []byte("$")
@@ -500,6 +504,8 @@ func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
 		return parseRegexp(v, "")
 	case opSize:
 		return parseSize(v)
+	case opElemMatch:
+		return parseElemMatch(v)
 	case opKnn:
 		// This arm is critical: without it a $knn value would fall through to
 		// makeArrComp, whose default arm panics on an unrecognized op.
@@ -842,6 +848,10 @@ func makeArrComp(op Operator, v *anyenc.Value) (Filter, error) {
 	case opNin:
 		return Nor(makeEqArray(v)), nil
 	case opAll:
+		vals, _ := v.Array()
+		if f, ok, err := parseAllElemMatch(vals); err != nil || ok {
+			return f, err
+		}
 		return And(makeEqArray(v)), nil
 	default:
 		panic(fmt.Errorf("unexpected operator: %v", op))

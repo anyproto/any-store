@@ -29,6 +29,8 @@ var operators = map[string]Operator{
 	"$options": opOptions,
 	"$size":    opSize,
 
+	"$elemMatch": opElemMatch,
+
 	"$knn": opKnn,
 }
 

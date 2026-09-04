@@ -1844,11 +1844,24 @@ func countInnerPreds(f query.Filter) int {
 	}
 }
 
+// keyBoundsExact reports whether a Key's index bounds are the exact value
+// image of its predicate — the premise of every FilterIter-skipping path. A
+// $elemMatch breaks it: its bounds are element-level (value form) or
+// re-keyed sub-field bounds (object form), and a scalar or an object with
+// that value sits in the same bounds without matching. Such a Key always
+// keeps its residual filter.
+func keyBoundsExact(k query.Key) bool {
+	return !query.ContainsElemMatch(k.Filter)
+}
+
 // filterFieldsCoveredBy walks the filter tree and checks that every referenced
 // field name is present in idxFields. Zero-allocation.
 func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) bool {
 	switch ft := f.(type) {
 	case query.Key:
+		if !keyBoundsExact(ft) {
+			return false
+		}
 		name := strings.Join(ft.Path, ".")
 		if slices.Contains(idxFields, name) {
 			*hasFields = true
@@ -1884,6 +1897,9 @@ func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) 
 func collectUncoveredFilterFields(f query.Filter, coveredFields []string) []string {
 	switch ft := f.(type) {
 	case query.Key:
+		if !keyBoundsExact(ft) {
+			return nil
+		}
 		name := strings.Join(ft.Path, ".")
 		if slices.Contains(coveredFields, name) {
 			return []string{} // covered
