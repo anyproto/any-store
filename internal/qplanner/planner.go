@@ -1318,8 +1318,9 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 				Tx: params.Tx,
 				Ns: idx.Info.Ns,
 			},
-			IdxInfo: idx.Info,
-			Bounds:  idx.Bounds,
+			IdxInfo:      idx.Info,
+			Bounds:       idx.Bounds,
+			ScalarProven: idx.ScalarProven,
 		}
 
 		// A unique index can still be multikey (each array element unique
@@ -1482,6 +1483,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 			FieldPath:    idx.Info.FieldPaths[0],
 			Reverse:      reverse,
 			FieldReverse: len(idx.Info.Reverse) > 0 && idx.Info.Reverse[0],
+			Sparse:       idx.Info.Sparse,
 		}
 	}
 
@@ -1581,6 +1583,7 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 			FieldPath:    idx.Info.FieldPaths[0],
 			Reverse:      reverse,
 			FieldReverse: len(idx.Info.Reverse) > 0 && idx.Info.Reverse[0],
+			Sparse:       idx.Info.Sparse,
 		}
 	}
 

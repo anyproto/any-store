@@ -138,10 +138,16 @@ func TestCoverIter_MultiBound_MultiKey_SetsMultiKeyFlag(t *testing.T) {
 		rtx, err := db.BeginRead()
 		require.NoError(t, err)
 		defer func() { _ = rtx.Rollback() }()
-		it := &CoverIter{Source: &CursorSource{Tx: rtx, Ns: ns}, IdxInfo: info, Bounds: twoBounds}
+		it := &CoverIter{Source: &CursorSource{Tx: rtx, Ns: ns}, IdxInfo: info, Bounds: twoBounds, ScalarProven: true}
 		_, docID, multiKey, err := it.Next()
 		require.NoError(t, err)
 		require.NotNil(t, docID)
-		assert.False(t, multiKey, "pure-scalar index → probe false → multiKey=false")
+		assert.False(t, multiKey, "scalar-proven index → multiKey=false")
+
+		unproven := &CoverIter{Source: &CursorSource{Tx: rtx, Ns: ns}, IdxInfo: info, Bounds: twoBounds}
+		_, docID, multiKey, err = unproven.Next()
+		require.NoError(t, err)
+		require.NotNil(t, docID)
+		assert.True(t, multiKey, "unproven index (legacy marker, or fan-out without a whole-array key) → multiKey=true")
 	})
 }

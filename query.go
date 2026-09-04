@@ -1169,6 +1169,15 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 			cboIdx.BoundFields < len(idx.cboInfo.FieldNames) {
 			scalarProven()
 		}
+		// Multi-bound single-field counts (CountEntries' page-batch branch)
+		// and multi-bound unique lookups (CoverIter) need it too: a fan-out
+		// through an array of objects leaves no whole-array key to probe, so
+		// the proof alone spares them a per-entry dedup.
+		if len(cboIdx.Bounds) > 1 && cboIdx.PointLookup &&
+			((countOnly && len(idx.cboInfo.FieldPaths) == 1) ||
+				(idx.cboInfo.Unique && cboIdx.BoundFields == len(idx.cboInfo.FieldNames))) {
+			scalarProven()
+		}
 		// Order-providing gate (Mongo array-sort semantics): an index scan's
 		// intrinsic order equals the min/max-element sort key only when the
 		// traversal is guaranteed to meet each doc's key element first. Over

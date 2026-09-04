@@ -374,7 +374,12 @@ type index struct {
 	// curBounds is scratch (len == number of index fields) holding the field-end
 	// offsets of the key currently being built by writeValues; copied into
 	// keyBoundsBuf at each leaf.
-	curBounds   []int
+	curBounds []int
+	// leafBuf and valBuf are the path-resolution stacks of writeValues: each
+	// field level appends its leaves / index values above the caller's and
+	// truncates back on return.
+	leafBuf     []anyenc.Leaf
+	valBuf      []*anyenc.Value
 	uniqBuf     [][]anyenc.Tuple
 	fullKeyBuf  anyenc.Tuple // reusable buffer for full keys (key+docId)
 	seekBuf     anyenc.Tuple // reusable buffer for unique constraint seek results
@@ -680,14 +685,42 @@ func (idx *index) writeKey() {
 	idx.keyBoundsBuf[nl-1] = append(idx.keyBoundsBuf[nl-1][:0], idx.curBounds...)
 }
 
+// writeValues appends, for field i, one key per value the field stores for
+// this document — anyenc.AppendIndexValues over the path's leaf set, so a
+// path through an array of objects fans out one entry per element the same
+// way a leaf array does — each continued into field i+1 depth-first. It
+// reports whether any full key was written: a sparse index drops a BRANCH
+// whose leaf is null or missing, and a document goes unindexed only when no
+// branch survives.
 func (idx *index) writeValues(d *anyenc.Value, i int) bool {
 	if i == len(idx.fieldPaths) {
 		idx.writeKey()
 		return true
 	}
-	v := d.Get(idx.fieldPaths[i]...)
-	if idx.info.Sparse && (v == nil || v.Type() == anyenc.TypeNull) {
-		return false
+	// One scalar leaf — the common field — needs no leaf/value buffers.
+	var one [1]*anyenc.Value
+	var vals []*anyenc.Value
+	lb, vb := len(idx.leafBuf), len(idx.valBuf)
+	if leaf, single := d.GetLeaf(idx.fieldPaths[i]...); single && (leaf == nil || leaf.Type() != anyenc.TypeArray) {
+		if idx.info.Sparse && (leaf == nil || leaf.Type() == anyenc.TypeNull) {
+			return false
+		}
+		one[0] = leaf
+		vals = one[:]
+	} else {
+		idx.leafBuf = d.AppendLeaves(idx.leafBuf, idx.fieldPaths[i]...)
+		leaves := idx.leafBuf[lb:]
+		if idx.info.Sparse {
+			kept := leaves[:0]
+			for _, l := range leaves {
+				if l.Value != nil && l.Value.Type() != anyenc.TypeNull {
+					kept = append(kept, l)
+				}
+			}
+			leaves = kept
+		}
+		idx.valBuf = anyenc.AppendIndexValues(idx.valBuf, leaves)
+		vals = idx.valBuf[vb:]
 	}
 
 	// Reverse-flagged fields are stored bitwise-inverted so a single forward
@@ -698,34 +731,32 @@ func (idx *index) writeValues(d *anyenc.Value, i int) bool {
 	// dedup (isUnique) and unique-constraint seek still compare correctly.
 	reverse := i < len(idx.reverse) && idx.reverse[i]
 
+	// Several values under one prefix (an array, or fan-out) may repeat —
+	// {"a":[{"b":1},{"b":1}]} — and must yield one entry; a single value
+	// cannot repeat and skips the dedup bookkeeping.
+	dedup := len(vals) > 1
+	if dedup {
+		idx.uniqBuf[i] = idx.uniqBuf[i][:0]
+	}
 	k := idx.keyBuf
-	if v != nil && v.Type() == anyenc.TypeArray {
-		arr, _ := v.Array()
-		if len(arr) != 0 {
-			idx.uniqBuf[i] = idx.uniqBuf[i][:0]
-			for _, av := range arr {
-				if reverse {
-					idx.keyBuf = anyenc.Tuple(k).AppendInverted(av)
-				} else {
-					idx.keyBuf = av.MarshalTo(k)
-				}
-				if idx.isUnique(i, idx.keyBuf) {
-					idx.curBounds[i] = len(idx.keyBuf)
-					if !idx.writeValues(d, i+1) {
-						return false
-					}
-				}
-			}
+	wrote := false
+	for _, v := range vals {
+		if reverse {
+			idx.keyBuf = anyenc.Tuple(k).AppendInverted(v)
+		} else {
+			idx.keyBuf = v.MarshalTo(k)
+		}
+		if dedup && !idx.isUnique(i, idx.keyBuf) {
+			continue
+		}
+		idx.curBounds[i] = len(idx.keyBuf)
+		if idx.writeValues(d, i+1) {
+			wrote = true
 		}
 	}
-
-	if reverse {
-		idx.keyBuf = anyenc.Tuple(k).AppendInverted(v)
-	} else {
-		idx.keyBuf = v.MarshalTo(k)
-	}
-	idx.curBounds[i] = len(idx.keyBuf)
-	return idx.writeValues(d, i+1)
+	idx.leafBuf = idx.leafBuf[:lb]
+	idx.valBuf = idx.valBuf[:vb]
+	return wrote
 }
 
 func (idx *index) fillKeysBuf(it item) {

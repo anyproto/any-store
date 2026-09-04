@@ -2352,7 +2352,6 @@ All helpers used here (newFixture, collectField, collectIdsString, assertIndexLe
 are defined elsewhere in the package test suite and reused as-is.
 */
 
-
 // act-01
 func TestIndex_Single_Ne_TwoBoundSeek_IncludesNullAndMissing(t *testing.T) {
 	// Builds a collection; when withIndex is true a non-sparse index {a} is added.
@@ -2866,7 +2865,7 @@ func TestIndex_ArrayNested_NeOverMultiKey_DedupAndAgreement(t *testing.T) {
 // array; the non-numeric "name" fails -> nil -> one 'null' entry (non-sparse).
 // Positional access (items.0.name) resolves via the numeric index but is a
 // different, unindexed path.
-func TestIndex_ArrayNested_NestedField_IntermediateArray_NotTraversed(t *testing.T) {
+func TestIndex_ArrayNested_NestedField_IntermediateArray_Traversed(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
@@ -2875,29 +2874,34 @@ func TestIndex_ArrayNested_NestedField_IntermediateArray_NotTraversed(t *testing
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"items":[{"name":"a"},{"name":"b"}]}`),
 		anyenc.MustParseJson(`{"id":2,"items":[{"name":"c"}]}`),
+		anyenc.MustParseJson(`{"id":3,"items":[{"name":"a"},{"other":1}]}`),
+		anyenc.MustParseJson(`{"id":4,"items":[]}`),
 	))
 
-	// Each doc contributes exactly one 'null' entry: the array intermediate
-	// stops traversal so the indexed value is null for both docs.
+	// The path maps over the array's objects: one entry per element value
+	// ("a","b" | "c" | "a",null | null) — the doc fans out like a leaf array.
 	idx := coll.GetIndexes()[0]
-	assertIndexLen(t, idx, 2)
+	assertIndexLen(t, idx, 6)
 
-	// No implicit array traversal: items.name="a" finds nothing. This query
-	// still IndexScans the items.name index (which holds only null entries).
-	cnt, err := coll.Find(`{"items.name":"a"}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 0, cnt)
-
-	// Positional access works (resolves via the numeric index). This is a
-	// different, unindexed path -> FullScan; do not assert IndexScan.
-	posCnt, err := coll.Find(`{"items.0.name":"a"}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 1, posCnt)
-
-	// Both docs are findable via the shared 'null' entry.
-	nullCnt, err := coll.Find(`{"items.name":null}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 2, nullCnt)
+	for _, tc := range []struct {
+		filter string
+		want   []int
+	}{
+		{`{"items.name":"a"}`, []int{1, 3}},
+		{`{"items.name":{"$in":["b","c"]}}`, []int{1, 2}},
+		{`{"items.name":{"$ne":"a"}}`, []int{2, 4}},
+		{`{"items.0.name":"a"}`, []int{1, 3}},
+		{`{"items.1.name":"a"}`, nil},
+		// missing on an element that lacks the field, or on an empty array
+		{`{"items.name":null}`, []int{3, 4}},
+		{`{"items.name":{"$exists":false}}`, []int{4}},
+	} {
+		q := coll.Find(tc.filter)
+		assert.ElementsMatch(t, tc.want, collectIntField(t, q, "id"), tc.filter)
+		cnt, err := q.Count(ctx)
+		require.NoError(t, err, tc.filter)
+		assert.Equal(t, len(tc.want), cnt, tc.filter)
+	}
 }
 
 // act-30: Querying by a whole NON-empty array value uses the post-loop
@@ -3745,4 +3749,83 @@ func TestIndex_ArraySortOrderProvidingGate(t *testing.T) {
 		assert.NotContains(t, ex.Sql, "Sort", "no bounds on the sort run: index order == min-element order: %s", ex.Sql)
 		assert.NotContains(t, ex.Sql, "TopK")
 	})
+}
+
+// A sparse index writes no entry for a null/missing leaf; the index-order
+// dedup must elect the canonical entry among the entries that exist.
+func TestIndex_ArrayNested_SparseDedupKeepsDoc(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a.b"}, Sparse: true}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":[{"b":"abc"},{"c":2}]}`),
+		anyenc.MustParseJson(`{"id":2,"a":[{"b":"xbz"},{"b":null}]}`),
+		anyenc.MustParseJson(`{"id":3,"a":[{"c":1}]}`),
+	))
+	assertIndexLen(t, coll.GetIndexes()[0], 2)
+	for _, sort := range []string{"a.b", "-a.b"} {
+		q := coll.Find(`{"a.b":{"$regex":"b"}}`).Sort(sort)
+		assert.Equal(t, 2, len(collectIntField(t, q, "id")), sort)
+		cnt, err := coll.Find(`{"a.b":{"$regex":"b"}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 2, cnt)
+	}
+}
+
+// Several whole-array entries per doc (one per array leaf) must not emit
+// the doc once per entry.
+func TestIndex_ArrayNested_MultipleWholeArrayEntries(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a.b"}}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":[{"b":[1,2]},{"b":[3]}]}`),
+		anyenc.MustParseJson(`{"id":2,"a":[{"b":[4]}]}`),
+		anyenc.MustParseJson(`{"id":3,"a":[{"b":5}]}`),
+	))
+	// entries for doc 1: 1, 2, [1,2], 3, [3]
+	assertIndexLen(t, coll.GetIndexes()[0], 5+2+1)
+	for _, tc := range []struct {
+		filter string
+		want   []int
+	}{
+		{`{"a.b":{"$type":"array"}}`, []int{1, 2}},
+		{`{"a.b":{"$in":[[1,2],[3]]}}`, []int{1}},
+		{`{"$or":[{"a.b":[1,2]},{"a.b":[3]}]}`, []int{1}},
+		{`{"a.b":{"$in":[2,[3]]}}`, []int{1}},
+	} {
+		for _, sort := range []string{"", "a.b", "-a.b"} {
+			q := coll.Find(tc.filter)
+			if sort != "" {
+				q = q.Sort(sort)
+			}
+			assert.ElementsMatch(t, tc.want, collectIntField(t, q, "id"), "%s sort %q", tc.filter, sort)
+		}
+		cnt, err := coll.Find(tc.filter).Count(ctx)
+		require.NoError(t, err, tc.filter)
+		assert.Equal(t, len(tc.want), cnt, tc.filter)
+	}
+}
+
+// Fan-out through an array of objects writes scalar entries with no
+// whole-array key: multi-bound counts must still dedup per document.
+func TestIndex_ArrayNested_CountFanoutWithoutArrayKey(t *testing.T) {
+	fx := newFixture(t)
+	for _, unique := range []bool{false, true} {
+		coll, err := fx.CreateCollection(ctx, fmt.Sprintf("test_%v", unique))
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a.b"}, Unique: unique}))
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":[{"b":1},{"b":2}]}`)))
+		for i := 2; i < 12; i++ {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":[{"b":%d}]}`, i, i+10))))
+		}
+		filter := `{"a.b":{"$in":[1,2,12,13]}}`
+		cnt, err := coll.Find(filter).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 3, cnt, "unique=%v", unique)
+		assert.ElementsMatch(t, []int{1, 2, 3}, collectIntField(t, coll.Find(filter), "id"), "unique=%v", unique)
+		assert.Equal(t, 2, len(collectIntField(t, coll.Find(filter).Offset(1), "id")), "unique=%v", unique)
+	}
 }
