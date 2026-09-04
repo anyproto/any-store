@@ -12,6 +12,8 @@ type CoverIter struct {
 	Source  *CursorSource
 	IdxInfo *IndexInfo
 	Bounds  query.Bounds
+	// ScalarProven mirrors CBOIndex.ScalarProven (see IndexIter).
+	ScalarProven bool
 
 	idx     int
 	keyBuf  []byte // reusable buffer for SeekKey results
@@ -40,11 +42,10 @@ func (it *CoverIter) Next() (key []byte, docId []byte, multiKey bool, err error)
 			// for the (already rare) multi-bound unique compound lookup.
 			it.hasMultiKey = true
 		} else {
-			fieldReverse := len(it.IdxInfo.Reverse) > 0 && it.IdxInfo.Reverse[0]
-			it.hasMultiKey, err = indexProbeAnyMultiKey(it.Source, fieldReverse)
-			if err != nil {
-				return nil, nil, false, err
-			}
+			// A fan-out through an array of objects writes scalar entries
+			// with no whole-array key, so only the sticky scalar-proven flag
+			// can rule multikey out.
+			it.hasMultiKey = !it.ScalarProven
 		}
 		it.multiKeyProbed = true
 	}

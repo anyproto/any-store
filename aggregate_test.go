@@ -333,7 +333,29 @@ func TestCollection_AggregateLookup(t *testing.T) {
 		anyenc.MustParseJson(`{"id":"t1","tags":["x","y"],"ref":"b"}`),
 		anyenc.MustParseJson(`{"id":0,"label":"zero"}`),
 		anyenc.MustParseJson(`{"id":"mix","refs":[7,"a",7,true]}`),
+		anyenc.MustParseJson(`{"id":"nest","items":[{"ref":"b"},{"x":1},{"ref":["c","b"]},{"ref":null}]}`),
+		anyenc.MustParseJson(`{"id":"pos","refs":[["b","c"],["a"]]}`),
 	))
+
+	t.Run("positional local path naming an array", func(t *testing.T) {
+		got := aggRows(t, coll, coll.Aggregate(`[
+			{"$match": {"id": "pos"}},
+			{"$lookup": {"localField": "refs.0", "as": "linked"}},
+			{"$project": {"id": 1, "ids": "$linked.id"}}
+		]`))
+		assert.Equal(t, expectJson(t, `{"id":"pos","ids":["b","c"]}`), got)
+	})
+
+	t.Run("local path through an array of objects", func(t *testing.T) {
+		// items.ref collects every element's ref (a leaf array one level
+		// deep); missing and null contribute nothing; dedup as for arrays.
+		got := aggRows(t, coll, coll.Aggregate(`[
+			{"$match": {"id": "nest"}},
+			{"$lookup": {"localField": "items.ref", "as": "linked"}},
+			{"$project": {"id": 1, "ids": "$linked.id"}}
+		]`))
+		assert.Equal(t, expectJson(t, `{"id":"nest","ids":["b","c"]}`), got)
+	})
 
 	t.Run("single id", func(t *testing.T) {
 		got := aggRows(t, coll, coll.Aggregate(`[

@@ -40,8 +40,14 @@ import (
 func TightIndexBounds(f Filter, fieldName string) (bounds Bounds, empty bool) {
 	switch t := f.(type) {
 	case Key:
-		if strings.Join(t.Path, ".") == fieldName {
+		path := strings.Join(t.Path, ".")
+		if path == fieldName {
 			return TightIndexBounds(t.Filter, fieldName)
+		}
+		// Object-form $elemMatch re-keyed under its sub-fields, as
+		// Key.IndexBounds does for the wide channel.
+		if cond, sub, ok := t.elemMatchSubField(fieldName); ok {
+			return TightIndexBounds(cond, sub)
 		}
 		return nil, false
 	case And:
@@ -90,6 +96,10 @@ func MayTighten(f Filter) bool {
 		return slices.ContainsFunc(t, MayTighten)
 	case *And:
 		return MayTighten(*t)
+	case ElemMatch:
+		return MayTighten(t.Cond)
+	case *ElemMatch:
+		return MayTighten(t.Cond)
 	default:
 		return false
 	}
