@@ -110,7 +110,7 @@ exp, _ := users.Find(`{"name": "Jane"}`).Explain(ctx)
 fmt.Println(exp.Plan) // chosen index, cost breakdown, rejected candidates
 ```
 
-Array fields index every element (multikey). The cost-based planner picks the cheapest index per query; `IndexHint` overrides it.
+Array fields index every element (multikey), and a dotted path through an array of objects (`"items.sku"` over `{"items":[{"sku":1},{"sku":2}]}`) indexes one entry per element — the same MongoDB field-path semantics filters and sorts use; `$elemMatch` binds several predicates to one element. The cost-based planner picks the cheapest index per query; `IndexHint` overrides it.
 
 ## Full-text search
 
