@@ -892,6 +892,11 @@ func parseType(v *anyenc.Value) (f Filter, err error) {
 		return TypeFilter{Type: anyenc.Type(tv)}, err
 	case anyenc.TypeString:
 		bs, _ := v.StringBytes()
+		if string(bs) == "bool" {
+			// Mongo's alias for either boolean; anyenc keeps true and false as
+			// two types, so it is the union of both.
+			return Or{TypeFilter{Type: anyenc.TypeTrue}, TypeFilter{Type: anyenc.TypeFalse}}, nil
+		}
 		tv, ok := stringToType[string(bs)]
 		if !ok {
 			return nil, &ParseError{Op: "$type", Reason: "unexpected type: " + string(bs)}

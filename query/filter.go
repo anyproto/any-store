@@ -468,8 +468,42 @@ type Key struct {
 	Filter
 }
 
+// Ok resolves the path to its leaf set. A path that crosses no array of
+// objects has one leaf (anyenc.Value.GetLeaf) and is evaluated by Ok exactly
+// as a Get result is; otherwise the leaves go through LeafFilter semantics.
+//
+// buf.Leaves is a stack: this frame's leaves live above base and are cut
+// back on return, so a Key nested in the inner filter ($elemMatch) appends
+// its own leaves above ours without disturbing the slice we iterate. The
+// frame is cleared before the cut so a pooled buffer does not pin the
+// document's values.
 func (e Key) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
-	return e.Filter.Ok(v.Get(e.Path...), buf)
+	if leaf, single := v.GetLeaf(e.Path...); single {
+		return e.Filter.Ok(leaf, buf)
+	}
+	if buf == nil {
+		// No per-query scratch (hand-built callers, $pull conditions): a pooled
+		// leaf slice keeps this path alloc-free too.
+		lb := leafBufPool.Get().(*leafBuf)
+		lb.leaves = v.AppendLeaves(lb.leaves[:0], e.Path...)
+		ok := okLeafSet(e.Filter, lb.leaves, nil)
+		clear(lb.leaves)
+		leafBufPool.Put(lb)
+		return ok
+	}
+	base := len(buf.Leaves)
+	buf.Leaves = v.AppendLeaves(buf.Leaves, e.Path...)
+	ok := okLeafSet(e.Filter, buf.Leaves[base:], buf)
+	clear(buf.Leaves[base:])
+	buf.Leaves = buf.Leaves[:base]
+	return ok
+}
+
+func okLeafSet(f Filter, leaves []anyenc.Leaf, buf *syncpool.DocBuffer) bool {
+	if len(leaves) == 1 {
+		return okLeaf(f, leaves[0], buf)
+	}
+	return okLeaves(f, leaves, buf)
 }
 
 func (e Key) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
@@ -1158,11 +1192,26 @@ type TypeFilter struct {
 	Type anyenc.Type
 }
 
+// Ok matches the value's own type or, for an array, any element's type (as
+// MongoDB: {"$type":"number"} on ["x",1] matches, {"$type":"array"} matches
+// the array itself). A missing field has no type: {"$type":"null"} needs an
+// explicit null.
 func (e TypeFilter) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	if v == nil {
 		return false
 	}
-	return v.Type() == e.Type
+	if v.Type() == e.Type {
+		return true
+	}
+	if v.Type() == anyenc.TypeArray {
+		arr, _ := v.Array()
+		for _, el := range arr {
+			if el.Type() == e.Type {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (e TypeFilter) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
