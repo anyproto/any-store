@@ -809,9 +809,9 @@ func parseRegexp(v *anyenc.Value, options string) (Filter, error) {
 			if compiledRegexp, err = regexp.Compile("(?" + options + ")" + pattern); err != nil {
 				return nil, &ParseError{Op: "$regex", Reason: "invalid regular expression: " + err.Error(), Err: err}
 			}
-			return Regexp{Regexp: compiledRegexp, Options: options}, nil
+			return NewRegexp(compiledRegexp, options), nil
 		}
-		return Regexp{Regexp: compiledRegexp}, nil
+		return NewRegexp(compiledRegexp, ""), nil
 	default:
 		return nil, &ParseError{Op: "$regex", Reason: "$regex must be a string, got " + v.String()}
 	}

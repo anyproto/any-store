@@ -534,27 +534,70 @@ func TestRegexp(t *testing.T) {
 		assert.Len(t, bounds, 1)
 		assert.Equal(t, `"prefix.test"`, append(bounds[0].Start, 0).String())
 	})
-	t.Run("index: ^prefix\\.test{1}* - return prefix.test", func(t *testing.T) {
+	t.Run("index: unmatched brace is literal, * binds it", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^prefix\.test{a-zA-z}*"}}`)
 		require.NoError(t, err)
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
-		assert.Equal(t, `"prefix.test"`, append(bounds[0].Start, 0).String())
+		assert.Equal(t, `"prefix.test{a-zA-z"`, append(bounds[0].Start, 0).String())
 	})
-	t.Run("index: ^prefix+ - return prefix", func(t *testing.T) {
+	t.Run("index: ^prefix+ - x+ keeps one x", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^prefix+"}}`)
 		require.NoError(t, err)
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
 		assert.Equal(t, `"prefix"`, append(bounds[0].Start, 0).String())
 	})
-	t.Run("index: ^\\.a* - return prefix", func(t *testing.T) {
+	t.Run("index: ^\\.a* - * drops its literal", func(t *testing.T) {
+		// "." alone matches, so the prefix stops before the quantified a.
 		f, err := ParseCondition(`{"name":{"$regex": "^\.a*"}}`)
 		require.NoError(t, err)
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
-		assert.Equal(t, `".a"`, append(bounds[0].Start, 0).String())
+		assert.Equal(t, `"."`, append(bounds[0].Start, 0).String())
 	})
+}
+
+// TestRegexp_LiteralPrefix pins the seek prefix and its exactness for the
+// pattern shapes the syntax walk must read as the engine does. An
+// under-approximating prefix drops rows the residual filter can never
+// recover; a prefix reported complete lets the planner elide that filter.
+func TestRegexp_LiteralPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		pattern  string
+		prefix   string
+		complete bool
+	}{
+		{`^abc`, "abc", true},
+		{`^a`, "a", true},
+		{`^ab\.c`, "ab.c", true},
+		{`^\Qa.b\E`, "a.b", true},
+		{`^a\x41`, "aA", true},
+		{`^aé`, "aé", true},
+		{`(?s)^ab`, "ab", true},
+		{`^abc$`, "abc", false},
+		{`^ab.*c`, "ab", false},
+		{`^ab[cz]`, "ab", false},
+		{`^a(b|x)`, "a", false},
+		{`^abc(?:d)?`, "abc", false},
+		{`^ab*`, "a", false},
+		{`^ab?`, "a", false},
+		{`^ab+`, "ab", false},
+		{`^ab{0,1}c`, "a", false},
+		{`^ab{2}`, "a", false},
+		{`^a\w{2}$`, "a", false},
+		{`^\d+`, "", false},
+		{`^ab|^xy`, "", false},
+		{`abc`, "", false},
+		{`^`, "", false},
+		{`(?i)^ab`, "", false},
+		{`^(?i)ab`, "", false},
+		{`(?m)^ab`, "", false},
+	} {
+		prefix, complete := literalPrefix(tc.pattern)
+		assert.Equal(t, tc.prefix, prefix, "prefix of %s", tc.pattern)
+		assert.Equal(t, tc.complete, complete, "complete for %s", tc.pattern)
+	}
 }
 
 func TestSize(t *testing.T) {

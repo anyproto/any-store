@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"regexp/syntax"
 	"slices"
 	"strconv"
 	"strings"
@@ -1272,12 +1273,24 @@ func (e TypeFilter) String() string {
 type Regexp struct {
 	Regexp *regexp.Regexp
 	// Options are the Mongo $options flags ("i", "m", "s") the parser baked
-	// into Regexp as a leading (?flags) group. i and m make an anchored
-	// ^literal prefix unsound as an index bound (case folding / any-line
-	// anchoring admit keys outside the literal range), so IndexBounds keeps
-	// the scan wide for them; s cannot affect a literal prefix and keeps the
-	// bounds.
+	// into Regexp as a leading (?flags) group; String renders them back.
 	Options string
+
+	// prefix is the literal every match must start with (the head of an
+	// anchored ^literal pattern) and prefixComplete whether the pattern is
+	// that literal and nothing more, so its match set is exactly the
+	// prefix-continuation group. NewRegexp computes them once; a Regexp
+	// built as a bare literal derives them on demand.
+	prefix         string
+	prefixComplete bool
+	prefixKnown    bool
+}
+
+// NewRegexp builds the $regex predicate for a compiled pattern; options are
+// the $options flags the caller folded into it as a leading (?flags) group.
+func NewRegexp(re *regexp.Regexp, options string) Regexp {
+	prefix, complete := literalPrefix(re.String())
+	return Regexp{Regexp: re, Options: options, prefix: prefix, prefixComplete: complete, prefixKnown: true}
 }
 
 func (r Regexp) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
@@ -1317,13 +1330,20 @@ func (r Regexp) rawPattern() string {
 	return pattern
 }
 
-func (r Regexp) IndexBounds(_ string, bs Bounds) (bounds Bounds) {
-	if strings.ContainsAny(r.Options, "im") {
-		// See Options: a case-folded or any-line-anchored prefix does not
-		// bound the index range.
-		return bs
+func (r Regexp) literalPrefix() (prefix string, complete bool) {
+	if r.prefixKnown {
+		return r.prefix, r.prefixComplete
 	}
-	prefix := extractPrefix(r.rawPattern())
+	return literalPrefix(r.Regexp.String())
+}
+
+// IndexBounds seeks the prefix-continuation group of an anchored literal
+// head: a SOUND superset of the matches (every match starts with the
+// prefix), exact only when the pattern is that literal and nothing more
+// (literalPrefix's complete) — the planner elides the residual filter on
+// that basis alone. No prefix, no bounds.
+func (r Regexp) IndexBounds(_ string, bs Bounds) (bounds Bounds) {
+	prefix, _ := r.literalPrefix()
 	if prefix == "" {
 		return bs
 	}
@@ -1349,54 +1369,43 @@ func (r Regexp) IndexBounds(_ string, bs Bounds) (bounds Bounds) {
 	return bs.Append(bound)
 }
 
-func findPrefix(pattern string) string {
-	var result []rune
-	specialChars := `^$|*+?(){}[]\.`
-	escaped := false
-
-	for i := range len(pattern) {
-		char := pattern[i]
-
-		if escaped {
-			escaped = false
-			result = append(result, rune(char))
-			continue
-		}
-
-		if char == '\\' {
-			escaped = true
-			continue
-		}
-
-		if !isSpecialChar(char, specialChars) {
-			result = append(result, rune(char))
-		} else {
+// literalPrefix returns the literal every match of pattern must begin with
+// — the head of an anchored ^literal… pattern — and whether the pattern is
+// that anchored literal and nothing more, i.e. matches exactly the strings
+// starting with it. Read off the parsed syntax tree so the prefix means what
+// the engine means: a quantifier binds the last literal (^ab* → "a", ^ab+ →
+// "ab"), an
+// escape class is not a literal (^\d → ""), a top-level alternation has no
+// common head (^ab|^xy → ""), and a case-folded literal or a line anchor
+// (i / m flags, inline or via $options) rules the prefix out.
+func literalPrefix(pattern string) (prefix string, complete bool) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return "", false
+	}
+	re = re.Simplify()
+	if re.Op != syntax.OpConcat || len(re.Sub) < 2 || re.Sub[0].Op != syntax.OpBeginText {
+		return "", false
+	}
+	var sb strings.Builder
+	i := 1
+	for ; i < len(re.Sub); i++ {
+		sub := re.Sub[i]
+		if sub.Op == syntax.OpPlus && sub.Sub[0].Op == syntax.OpLiteral && sub.Sub[0].Flags&syntax.FoldCase == 0 {
+			// x+ requires x at least once: it extends the prefix and ends it.
+			for _, c := range sub.Sub[0].Rune {
+				sb.WriteRune(c)
+			}
 			break
 		}
-	}
-	return string(result)
-}
-
-func isSpecialChar(char byte, specialChars string) bool {
-	for i := 0; i < len(specialChars); i++ {
-		if char == specialChars[i] {
-			return true
+		if sub.Op != syntax.OpLiteral || sub.Flags&syntax.FoldCase != 0 {
+			break
+		}
+		for _, c := range sub.Rune {
+			sb.WriteRune(c)
 		}
 	}
-	return false
-}
-
-// extractPrefix returns the literal prefix of an anchored (^…) pattern, "" if
-// none. SOUNDNESS: a pattern under i or m flags must never reach the prefix
-// fast path — Regexp.IndexBounds screens Options before calling, and a flag
-// group inlined in the pattern fails the '^' check here. Do not teach this
-// function to skip a leading (?…) group without consulting the flags.
-func extractPrefix(pattern string) string {
-	if !strings.HasPrefix(pattern, "^") || strings.HasPrefix(pattern, "^(?i)") {
-		return ""
-	}
-	pattern = strings.TrimPrefix(pattern, "^")
-	return findPrefix(pattern)
+	return sb.String(), sb.Len() > 0 && i == len(re.Sub)
 }
 
 func (r Regexp) String() string {
