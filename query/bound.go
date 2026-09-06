@@ -244,8 +244,9 @@ func minStartKey(a, b Bound) ([]byte, bool, bool) {
 		return b.Start, true, false
 	}
 	switch bytes.Compare(a.Start, b.Start) {
-	case 0: // a value and an edge can share bytes ([1] is null and the null edge)
-		return a.Start, a.StartInclude, a.startEdge && b.startEdge
+	case 0: // a value and an edge can share bytes ([1] is null and the null edge);
+		// the union starts closed when either side does: (0, …) ∪ [0, 0] = [0, …)
+		return a.Start, a.StartInclude || b.StartInclude, a.startEdge && b.startEdge
 	case -1:
 		return a.Start, a.StartInclude, a.startEdge
 	default:
@@ -261,8 +262,8 @@ func maxEndKey(a, b Bound) ([]byte, bool, bool) {
 		return b.End, true, false
 	}
 	switch bytes.Compare(a.End, b.End) {
-	case 0:
-		return a.End, a.EndInclude, a.endEdge && b.endEdge
+	case 0: // the union ends closed when either side does
+		return a.End, a.EndInclude || b.EndInclude, a.endEdge && b.endEdge
 	case 1:
 		return a.End, a.EndInclude, a.endEdge
 	default:
