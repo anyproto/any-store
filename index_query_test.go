@@ -2352,7 +2352,6 @@ All helpers used here (newFixture, collectField, collectIdsString, assertIndexLe
 are defined elsewhere in the package test suite and reused as-is.
 */
 
-
 // act-01
 func TestIndex_Single_Ne_TwoBoundSeek_IncludesNullAndMissing(t *testing.T) {
 	// Builds a collection; when withIndex is true a non-sparse index {a} is added.
@@ -2866,7 +2865,7 @@ func TestIndex_ArrayNested_NeOverMultiKey_DedupAndAgreement(t *testing.T) {
 // array; the non-numeric "name" fails -> nil -> one 'null' entry (non-sparse).
 // Positional access (items.0.name) resolves via the numeric index but is a
 // different, unindexed path.
-func TestIndex_ArrayNested_NestedField_IntermediateArray_NotTraversed(t *testing.T) {
+func TestIndex_ArrayNested_NestedField_IntermediateArray_Traversed(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
@@ -2875,29 +2874,34 @@ func TestIndex_ArrayNested_NestedField_IntermediateArray_NotTraversed(t *testing
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"items":[{"name":"a"},{"name":"b"}]}`),
 		anyenc.MustParseJson(`{"id":2,"items":[{"name":"c"}]}`),
+		anyenc.MustParseJson(`{"id":3,"items":[{"name":"a"},{"other":1}]}`),
+		anyenc.MustParseJson(`{"id":4,"items":[]}`),
 	))
 
-	// Each doc contributes exactly one 'null' entry: the array intermediate
-	// stops traversal so the indexed value is null for both docs.
+	// The path maps over the array's objects: one entry per element value
+	// ("a","b" | "c" | "a",null | null) — the doc fans out like a leaf array.
 	idx := coll.GetIndexes()[0]
-	assertIndexLen(t, idx, 2)
+	assertIndexLen(t, idx, 6)
 
-	// No implicit array traversal: items.name="a" finds nothing. This query
-	// still IndexScans the items.name index (which holds only null entries).
-	cnt, err := coll.Find(`{"items.name":"a"}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 0, cnt)
-
-	// Positional access works (resolves via the numeric index). This is a
-	// different, unindexed path -> FullScan; do not assert IndexScan.
-	posCnt, err := coll.Find(`{"items.0.name":"a"}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 1, posCnt)
-
-	// Both docs are findable via the shared 'null' entry.
-	nullCnt, err := coll.Find(`{"items.name":null}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 2, nullCnt)
+	for _, tc := range []struct {
+		filter string
+		want   []int
+	}{
+		{`{"items.name":"a"}`, []int{1, 3}},
+		{`{"items.name":{"$in":["b","c"]}}`, []int{1, 2}},
+		{`{"items.name":{"$ne":"a"}}`, []int{2, 4}},
+		{`{"items.0.name":"a"}`, []int{1, 3}},
+		{`{"items.1.name":"a"}`, nil},
+		// missing on an element that lacks the field, or on an empty array
+		{`{"items.name":null}`, []int{3, 4}},
+		{`{"items.name":{"$exists":false}}`, []int{4}},
+	} {
+		q := coll.Find(tc.filter)
+		assert.ElementsMatch(t, tc.want, collectIntField(t, q, "id"), tc.filter)
+		cnt, err := q.Count(ctx)
+		require.NoError(t, err, tc.filter)
+		assert.Equal(t, len(tc.want), cnt, tc.filter)
+	}
 }
 
 // act-30: Querying by a whole NON-empty array value uses the post-loop
@@ -3745,4 +3749,284 @@ func TestIndex_ArraySortOrderProvidingGate(t *testing.T) {
 		assert.NotContains(t, ex.Sql, "Sort", "no bounds on the sort run: index order == min-element order: %s", ex.Sql)
 		assert.NotContains(t, ex.Sql, "TopK")
 	})
+}
+
+// A sparse index writes no entry for a null/missing leaf; the index-order
+// dedup must elect the canonical entry among the entries that exist.
+func TestIndex_ArrayNested_SparseDedupKeepsDoc(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a.b"}, Sparse: true}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":[{"b":"abc"},{"c":2}]}`),
+		anyenc.MustParseJson(`{"id":2,"a":[{"b":"xbz"},{"b":null}]}`),
+		anyenc.MustParseJson(`{"id":3,"a":[{"c":1}]}`),
+	))
+	assertIndexLen(t, coll.GetIndexes()[0], 2)
+	for _, sort := range []string{"a.b", "-a.b"} {
+		q := coll.Find(`{"a.b":{"$regex":"b"}}`).Sort(sort)
+		assert.Equal(t, 2, len(collectIntField(t, q, "id")), sort)
+		cnt, err := coll.Find(`{"a.b":{"$regex":"b"}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 2, cnt)
+	}
+}
+
+// Several whole-array entries per doc (one per array leaf) must not emit
+// the doc once per entry.
+func TestIndex_ArrayNested_MultipleWholeArrayEntries(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a.b"}}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":[{"b":[1,2]},{"b":[3]}]}`),
+		anyenc.MustParseJson(`{"id":2,"a":[{"b":[4]}]}`),
+		anyenc.MustParseJson(`{"id":3,"a":[{"b":5}]}`),
+	))
+	// entries for doc 1: 1, 2, [1,2], 3, [3]
+	assertIndexLen(t, coll.GetIndexes()[0], 5+2+1)
+	for _, tc := range []struct {
+		filter string
+		want   []int
+	}{
+		{`{"a.b":{"$type":"array"}}`, []int{1, 2}},
+		{`{"a.b":{"$in":[[1,2],[3]]}}`, []int{1}},
+		{`{"$or":[{"a.b":[1,2]},{"a.b":[3]}]}`, []int{1}},
+		{`{"a.b":{"$in":[2,[3]]}}`, []int{1}},
+	} {
+		for _, sort := range []string{"", "a.b", "-a.b"} {
+			q := coll.Find(tc.filter)
+			if sort != "" {
+				q = q.Sort(sort)
+			}
+			assert.ElementsMatch(t, tc.want, collectIntField(t, q, "id"), "%s sort %q", tc.filter, sort)
+		}
+		cnt, err := coll.Find(tc.filter).Count(ctx)
+		require.NoError(t, err, tc.filter)
+		assert.Equal(t, len(tc.want), cnt, tc.filter)
+	}
+}
+
+// Fan-out through an array of objects writes scalar entries with no
+// whole-array key: multi-bound counts must still dedup per document.
+func TestIndex_ArrayNested_CountFanoutWithoutArrayKey(t *testing.T) {
+	fx := newFixture(t)
+	for _, unique := range []bool{false, true} {
+		coll, err := fx.CreateCollection(ctx, fmt.Sprintf("test_%v", unique))
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a.b"}, Unique: unique}))
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":[{"b":1},{"b":2}]}`)))
+		for i := 2; i < 12; i++ {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":[{"b":%d}]}`, i, i+10))))
+		}
+		filter := `{"a.b":{"$in":[1,2,12,13]}}`
+		cnt, err := coll.Find(filter).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 3, cnt, "unique=%v", unique)
+		assert.ElementsMatch(t, []int{1, 2, 3}, collectIntField(t, coll.Find(filter), "id"), "unique=%v", unique)
+		assert.Equal(t, 2, len(collectIntField(t, coll.Find(filter).Offset(1), "id")), "unique=%v", unique)
+	}
+}
+
+// Fields of a compound index that run through the same array of objects
+// iterate it together: one entry per element, never a cross product.
+func TestIndex_ArrayNested_CompoundSharedArray(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "bc", Fields: []string{"a.b", "a.c"}}))
+
+	var elems []string
+	for i := 0; i < 50; i++ {
+		elems = append(elems, fmt.Sprintf(`{"b":%d,"c":%d}`, i, 100+i))
+	}
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":[`+strings.Join(elems, ",")+`]}`),
+		anyenc.MustParseJson(`{"id":2,"a":[{"b":1,"c":2},{"b":3,"c":4},{"c":5},7]}`),
+		anyenc.MustParseJson(`{"id":3,"a":{"b":1,"c":4}}`),
+	))
+	// doc1: 50 element pairs; doc2: (1,2),(3,4),(null,5),(null,null); doc3: (1,4)
+	assertIndexLen(t, coll.GetIndexes()[0], 50+4+1)
+
+	for _, tc := range []struct {
+		filter string
+		want   []int
+	}{
+		{`{"a.b":1,"a.c":2}`, []int{2}},
+		{`{"a.b":1,"a.c":4}`, []int{2, 3}}, // the unbound form matches across elements (doc2) and the plain object (doc3)
+		{`{"a":{"$elemMatch":{"b":1,"c":2}}}`, []int{2}},
+		{`{"a":{"$elemMatch":{"b":1,"c":4}}}`, nil}, // doc3's a is an object, doc2 pairs (1,2),(3,4)
+		{`{"a.b":3,"a.c":4}`, []int{2}},
+		{`{"a.b":null,"a.c":5}`, []int{2}},
+		{`{"a.b":7,"a.c":107}`, []int{1}},
+	} {
+		q := coll.Find(tc.filter)
+		assert.ElementsMatch(t, tc.want, collectIntField(t, q, "id"), tc.filter)
+		cnt, err := q.Count(ctx)
+		require.NoError(t, err, tc.filter)
+		assert.Equal(t, len(tc.want), cnt, tc.filter)
+	}
+
+	// Two arrays (or an array and a scalar path) stay independent.
+	coll2, err := fx.CreateCollection(ctx, "test2")
+	require.NoError(t, err)
+	require.NoError(t, coll2.EnsureIndex(ctx, IndexInfo{Name: "bx", Fields: []string{"a.b", "x.y"}}))
+	require.NoError(t, coll2.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":[{"b":1},{"b":2}],"x":[{"y":1},{"y":2}]}`)))
+	assertIndexLen(t, coll2.GetIndexes()[0], 4)
+
+	// The array itself next to a path through it: the whole-array field fans
+	// out into elements plus the array, the path into the elements' values.
+	coll3, err := fx.CreateCollection(ctx, "test3")
+	require.NoError(t, err)
+	require.NoError(t, coll3.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a", "a.b"}}))
+	require.NoError(t, coll3.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":[{"b":1},{"b":2}]}`)))
+	assertIndexLen(t, coll3.GetIndexes()[0], 3*2)
+
+	// Nested arrays share at every level: (a.b.c, a.b.d) over two levels.
+	coll4, err := fx.CreateCollection(ctx, "test4")
+	require.NoError(t, err)
+	require.NoError(t, coll4.EnsureIndex(ctx, IndexInfo{Name: "cd", Fields: []string{"a.b.c", "a.b.d"}}))
+	require.NoError(t, coll4.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":[{"b":[{"c":1,"d":1},{"c":2,"d":2}]},{"b":[{"c":3,"d":3}]}]}`)))
+	assertIndexLen(t, coll4.GetIndexes()[0], 3)
+	assert.ElementsMatch(t, []int{1}, collectIntField(t, coll4.Find(`{"a.b.c":2,"a.b.d":2}`), "id"))
+	assert.Empty(t, collectIntField(t, coll4.Find(`{"a":{"$elemMatch":{"b":{"$elemMatch":{"c":1,"d":2}}}}}`), "id"))
+}
+
+// A unique compound index over one array of objects constrains element pairs,
+// not cross-product pairs.
+func TestIndex_ArrayNested_UniqueCompoundSharedArray(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "bc", Fields: []string{"a.b", "a.c"}, Unique: true}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":[{"b":1,"c":2},{"b":3,"c":4}]}`)))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":{"b":1,"c":4}}`)))
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":[{"b":3,"c":4}]}`))
+	assert.ErrorIs(t, err, ErrUniqueConstraint)
+}
+
+// A sparse index over a path through an array of objects never provides the
+// sort order: a document with a missing leaf sorts by null (its least leaf)
+// while the index holds only its non-null leaves.
+func TestIndex_ArrayNested_SparseIndexOrderDemoted(t *testing.T) {
+	fx := newFixture(t)
+	mk := func(name string, sparse bool) Collection {
+		coll, err := fx.CreateCollection(ctx, name)
+		require.NoError(t, err)
+		if name != "plain" {
+			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a.b"}, Sparse: sparse}))
+		}
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1,"a":[{"b":2},{"c":1}]}`), // leaves 2, missing → key null
+			anyenc.MustParseJson(`{"id":2,"a":[{"b":1}]}`),
+			anyenc.MustParseJson(`{"id":3,"a":[{"b":3},{"b":0}]}`),
+		))
+		return coll
+	}
+	plain, sparse, dense := mk("plain", false), mk("sparse", true), mk("dense", false)
+	hint := IndexHint{IndexName: "ab", Boost: 1 << 30}
+	for _, sort := range []string{"a.b", "-a.b"} {
+		want := collectIntField(t, plain.Find(nil).Sort(sort), "id")
+		for name, coll := range map[string]Collection{"sparse": sparse, "dense": dense} {
+			assert.Equal(t, want, collectIntField(t, coll.Find(nil).IndexHint(hint).Sort(sort), "id"), "%s %s", name, sort)
+			assert.Equal(t, want[:1], collectIntField(t, coll.Find(nil).IndexHint(hint).Sort(sort).Limit(1), "id"), "%s %s limit", name, sort)
+		}
+	}
+}
+
+// A digit run that overflows an int but ends in other characters is a key,
+// not an array index: the path fans out and the index re-keys under it.
+func TestIndex_ArrayNested_DigitPrefixedKey(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	const key = "1725580800000_x"
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ak", Fields: []string{"a." + key}}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":[{"`+key+`":7}]}`),
+		anyenc.MustParseJson(`{"id":2,"a":[{"`+key+`":8},{"`+key+`":7}]}`),
+		anyenc.MustParseJson(`{"id":3,"a":[{"other":7}]}`),
+	))
+	assertIndexLen(t, coll.GetIndexes()[0], 4)
+	for _, filter := range []string{`{"a.` + key + `":7}`, `{"a":{"$elemMatch":{"` + key + `":7}}}`} {
+		q := coll.Find(filter)
+		assert.ElementsMatch(t, []int{1, 2}, collectIntField(t, q, "id"), filter)
+		cnt, err := q.Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 2, cnt, filter)
+	}
+}
+
+// $elemMatch's condition names object keys inside the element; an index on a
+// positional path stores the element whole, so no bound is re-keyed there.
+func TestIndex_ArrayNested_ElemMatchPositionalIndex(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a0", Fields: []string{"a.0"}}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":[{"0":5}]}`),
+		anyenc.MustParseJson(`{"id":2,"a":[{"0":6},{"0":5}]}`),
+		anyenc.MustParseJson(`{"id":3,"a":[5]}`),
+	))
+	filter := `{"a":{"$elemMatch":{"0":5}}}`
+	assert.Empty(t, query.MustParseCondition(filter).IndexBounds("a.0", nil))
+	q := coll.Find(filter).IndexHint(IndexHint{IndexName: "a0", Boost: 1 << 30})
+	assert.ElementsMatch(t, []int{1, 2}, collectIntField(t, q, "id"))
+	cnt, err := q.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, cnt)
+	res, err := coll.Find(filter).Delete(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.Modified)
+}
+
+// A sparse compound index over one array of objects: a key is written when
+// any of its fields is present in that element, the document when every
+// field is present in some element — so a document matching through
+// different elements stays reachable by the seek on the leading field.
+func TestIndex_ArrayNested_SparseCompoundSharedArray(t *testing.T) {
+	fx := newFixture(t)
+	docs := []string{
+		`{"id":1,"a":[{"b":1,"c":2},{"b":3,"c":4}]}`,
+		`{"id":4,"a":[{"b":1},{"c":2}]}`,
+		`{"id":5,"a":[{"b":1,"c":2}]}`,
+		`{"id":6,"a":[{"b":1,"c":2},{"b":9}]}`,
+		`{"id":7,"a":{"b":1}}`,            // c never present: not indexed
+		`{"id":8,"a":[{"b":null,"c":3}]}`, // b never non-null: not indexed
+	}
+	plain, err := fx.CreateCollection(ctx, "plain")
+	require.NoError(t, err)
+	sparse, err := fx.CreateCollection(ctx, "sparse")
+	require.NoError(t, err)
+	require.NoError(t, sparse.EnsureIndex(ctx, IndexInfo{Name: "bc", Fields: []string{"a.b", "a.c"}, Sparse: true}))
+	for _, d := range docs {
+		require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
+		require.NoError(t, sparse.Insert(ctx, anyenc.MustParseJson(d)))
+	}
+	// doc1: (1,2),(3,4); doc4: (1,null),(null,2); doc5: (1,2); doc6: (1,2),(9,null)
+	assertIndexLen(t, sparse.GetIndexes()[0], 2+2+1+2)
+
+	hint := IndexHint{IndexName: "bc", Boost: 1 << 30}
+	for _, filter := range []string{
+		`{"a.b":1,"a.c":2}`,
+		`{"a.b":9,"a.c":{"$gt":0}}`,
+		`{"a.b":{"$gte":1},"a.c":{"$lte":2}}`,
+	} {
+		want := collectIntField(t, plain.Find(filter), "id")
+		q := sparse.Find(filter).IndexHint(hint)
+		ex, err := q.Explain(ctx)
+		require.NoError(t, err)
+		used := false
+		for _, ix := range ex.Indexes {
+			used = used || ix.Used
+		}
+		require.True(t, used, "%s must plan on the sparse index: %s", filter, ex.Sql)
+		assert.ElementsMatch(t, want, collectIntField(t, q, "id"), filter)
+		cnt, err := q.Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, len(want), cnt, filter)
+	}
 }

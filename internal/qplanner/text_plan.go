@@ -380,9 +380,10 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 			// tail pad would double-pad the seek, and MergeOverlappingBounds
 			// would collapse distinct point probes (see buildIndexSeekChain).
 			root = &CoverIter{
-				Source:  &CursorSource{Tx: params.Tx, Ns: idx.Info.Ns},
-				IdxInfo: idx.Info,
-				Bounds:  idx.Bounds,
+				Source:       &CursorSource{Tx: params.Tx, Ns: idx.Info.Ns},
+				IdxInfo:      idx.Info,
+				Bounds:       idx.Bounds,
+				ScalarProven: idx.ScalarProven,
 			}
 			if len(idx.Bounds) > 1 {
 				root = &DocDedupIter{Source: root}
@@ -414,6 +415,7 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 						FieldPath:    idx.Info.FieldPaths[0],
 						Reverse:      reverse,
 						FieldReverse: fieldReverse,
+						Sparse:       idx.Info.Sparse,
 					}
 				}
 			}

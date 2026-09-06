@@ -244,6 +244,12 @@ type CBOIndex struct {
 	// Sketch estimates are only valid when BoundFields == len(Info.FieldNames).
 	BoundFields int
 
+	// UsableFields is how many leading index fields the bound chain and the
+	// entry-level cover filters may use — len(Info.FieldNames), or
+	// Info.SharedFrom when the index may hold correlated fan-out entries
+	// (0 in hand-built candidates means no cap).
+	UsableFields int
+
 	// PointLookup is true when ALL original bounds are equality (Start == End),
 	// before AdjustBoundsForNonUnique modifies End. This allows correct sketch estimation.
 	PointLookup bool
@@ -1318,8 +1324,9 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 				Tx: params.Tx,
 				Ns: idx.Info.Ns,
 			},
-			IdxInfo: idx.Info,
-			Bounds:  idx.Bounds,
+			IdxInfo:      idx.Info,
+			Bounds:       idx.Bounds,
+			ScalarProven: idx.ScalarProven,
 		}
 
 		// A unique index can still be multikey (each array element unique
@@ -1482,6 +1489,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 			FieldPath:    idx.Info.FieldPaths[0],
 			Reverse:      reverse,
 			FieldReverse: len(idx.Info.Reverse) > 0 && idx.Info.Reverse[0],
+			Sparse:       idx.Info.Sparse,
 		}
 	}
 
@@ -1581,6 +1589,7 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 			FieldPath:    idx.Info.FieldPaths[0],
 			Reverse:      reverse,
 			FieldReverse: len(idx.Info.Reverse) > 0 && idx.Info.Reverse[0],
+			Sparse:       idx.Info.Sparse,
 		}
 	}
 
@@ -1844,11 +1853,24 @@ func countInnerPreds(f query.Filter) int {
 	}
 }
 
+// keyBoundsExact reports whether a Key's index bounds are the exact value
+// image of its predicate — the premise of every FilterIter-skipping path. A
+// $elemMatch breaks it: its bounds are element-level (value form) or
+// re-keyed sub-field bounds (object form), and a scalar or an object with
+// that value sits in the same bounds without matching. Such a Key always
+// keeps its residual filter.
+func keyBoundsExact(k query.Key) bool {
+	return !query.ContainsElemMatch(k.Filter)
+}
+
 // filterFieldsCoveredBy walks the filter tree and checks that every referenced
 // field name is present in idxFields. Zero-allocation.
 func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) bool {
 	switch ft := f.(type) {
 	case query.Key:
+		if !keyBoundsExact(ft) {
+			return false
+		}
 		name := strings.Join(ft.Path, ".")
 		if slices.Contains(idxFields, name) {
 			*hasFields = true
@@ -1884,6 +1906,9 @@ func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) 
 func collectUncoveredFilterFields(f query.Filter, coveredFields []string) []string {
 	switch ft := f.(type) {
 	case query.Key:
+		if !keyBoundsExact(ft) {
+			return nil
+		}
 		name := strings.Join(ft.Path, ".")
 		if slices.Contains(coveredFields, name) {
 			return []string{} // covered
@@ -2456,7 +2481,13 @@ func padReverseBounds(bs query.Bounds) query.Bounds {
 // ComputeIndexBounds computes combined tuple bounds for an index
 // using pre-computed per-field WIDE bounds from BoundsResult.
 func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
-	return computeIndexBounds(idx, br.Lookup)
+	return computeIndexBounds(idx, br.Lookup, len(idx.FieldNames))
+}
+
+// ComputeIndexBoundsCapped is ComputeIndexBounds over the first maxFields
+// index fields only (see IndexInfo.SharedFrom).
+func ComputeIndexBoundsCapped(idx *IndexInfo, br *BoundsResult, maxFields int) (query.Bounds, int) {
+	return computeIndexBounds(idx, br.Lookup, maxFields)
 }
 
 // ComputeIndexBoundsTight is the tight-channel variant, built from
@@ -2464,7 +2495,13 @@ func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
 // EstBounds): feeding it to a seek requires the fan-out-free proof documented
 // on query.TightIndexBounds.
 func ComputeIndexBoundsTight(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
-	return computeIndexBounds(idx, br.LookupTight)
+	return computeIndexBounds(idx, br.LookupTight, len(idx.FieldNames))
+}
+
+// ComputeIndexBoundsTightCapped is ComputeIndexBoundsTight over the first
+// maxFields index fields only.
+func ComputeIndexBoundsTightCapped(idx *IndexInfo, br *BoundsResult, maxFields int) (query.Bounds, int) {
+	return computeIndexBounds(idx, br.LookupTight, maxFields)
 }
 
 // ComputeSingleFieldBounds is the single-field chain for explicit logical
@@ -2478,7 +2515,7 @@ func ComputeSingleFieldBounds(idx *IndexInfo, bs query.Bounds) query.Bounds {
 	return bs
 }
 
-func computeIndexBounds(idx *IndexInfo, lookup func(string) (query.Bounds, bool, bool)) (query.Bounds, int) {
+func computeIndexBounds(idx *IndexInfo, lookup func(string) (query.Bounds, bool, bool), maxFields int) (query.Bounds, int) {
 	type fieldBound struct {
 		bounds query.Bounds
 		fixed  bool
@@ -2486,7 +2523,10 @@ func computeIndexBounds(idx *IndexInfo, lookup func(string) (query.Bounds, bool,
 
 	var chainBuf [4]fieldBound // stack-allocated for typical compound indexes
 	chain := chainBuf[:0]
-	for _, field := range idx.FieldNames {
+	if maxFields > len(idx.FieldNames) {
+		maxFields = len(idx.FieldNames)
+	}
+	for _, field := range idx.FieldNames[:maxFields] {
 		fb, fixed, found := lookup(field)
 		if !found || len(fb) == 0 {
 			break
@@ -2788,7 +2828,11 @@ func coveringFilterFields(idx *CBOIndex, fieldBounds *BoundsResult) []IndexField
 	}
 
 	var filters []IndexFieldFilter
-	for fi := idx.BoundFields; fi < len(idx.Info.FieldNames); fi++ {
+	end := len(idx.Info.FieldNames)
+	if idx.UsableFields > 0 && idx.UsableFields < end {
+		end = idx.UsableFields
+	}
+	for fi := idx.BoundFields; fi < end; fi++ {
 		fieldName := idx.Info.FieldNames[fi]
 		bounds, fixed, found := fieldBounds.Lookup(fieldName)
 		if !found || !fixed || len(bounds) != 1 {

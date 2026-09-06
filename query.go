@@ -1148,13 +1148,21 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 			return proven
 		}
 
-		cboIdx := q.buildCBOIndex(idx, br, sortFields, false)
+		// Fields sharing an array with an earlier field pair with it only
+		// inside one element (index.go resolveField), so their bounds and
+		// cover filters compound with the earlier fields' only when the index
+		// provably holds no fan-out.
+		maxFields := len(idx.cboInfo.FieldNames)
+		if idx.cboInfo.SharedFrom < maxFields && !scalarProven() {
+			maxFields = idx.cboInfo.SharedFrom
+		}
+		cboIdx := q.buildCBOIndex(idx, br, sortFields, false, maxFields)
 		if br.TightDiffers(idx.cboInfo.FieldNames) {
 			if scalarProven() {
-				cboIdx = q.buildCBOIndex(idx, br, sortFields, true)
+				cboIdx = q.buildCBOIndex(idx, br, sortFields, true, maxFields)
 			} else {
 				// Estimation-only tight bounds; seeks keep the wide Bounds.
-				cboIdx.EstBounds, _ = qplanner.ComputeIndexBoundsTight(idx.cboInfo, br)
+				cboIdx.EstBounds, _ = qplanner.ComputeIndexBoundsTightCapped(idx.cboInfo, br, maxFields)
 			}
 		}
 		// A covering Count on a compound index needs the proof to keep
@@ -1167,6 +1175,15 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		if countOnly && len(idx.cboInfo.FieldPaths) > 1 &&
 			cboIdx.PointLookup && len(cboIdx.Bounds) <= 1 &&
 			cboIdx.BoundFields < len(idx.cboInfo.FieldNames) {
+			scalarProven()
+		}
+		// Multi-bound single-field counts (CountEntries' page-batch branch)
+		// and multi-bound unique lookups (CoverIter) need it too: a fan-out
+		// through an array of objects leaves no whole-array key to probe, so
+		// the proof alone spares them a per-entry dedup.
+		if len(cboIdx.Bounds) > 1 && cboIdx.PointLookup &&
+			((countOnly && len(idx.cboInfo.FieldPaths) == 1) ||
+				(idx.cboInfo.Unique && cboIdx.BoundFields == len(idx.cboInfo.FieldNames))) {
 			scalarProven()
 		}
 		// Order-providing gate (Mongo array-sort semantics): an index scan's
@@ -1189,6 +1206,14 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		// lazily, only for candidates the gate would demote. When the only cut
 		// on the sort side is a type-bracket edge, the candidate is widened
 		// (widenSortEdges) instead of demoted.
+		// A SPARSE index holds no entry for a null or missing leaf, so over
+		// fan-out data a document surfaces at its least non-null leaf while
+		// the sort key is the least leaf of all (null wins): demote, no edge
+		// widening can restore that.
+		if cboIdx.ExactSort && idx.cboInfo.Sparse && !scalarProven() {
+			cboIdx.ExactSort = false
+			cboIdx.PartialSort = false
+		}
 		if cboIdx.ExactSort && sortRunNeedsScalarProof(&cboIdx, sortFields, br) && !scalarProven() {
 			w, ok := qplanner.CBOIndex{}, false
 			if !countOnly {
@@ -1315,7 +1340,7 @@ func (q *collQuery) widenSortEdges(br *qplanner.BoundsResult, sortFields []query
 // buildCBOIndex builds one candidate's CBOIndex with bounds AND all
 // bounds-derived flags taken consistently from a single channel (wide or
 // tight) — see buildCBOIndexesInto for why mixing channels is forbidden.
-func (q *collQuery) buildCBOIndex(idx *index, br *qplanner.BoundsResult, sortFields []query.SortField, tight bool) qplanner.CBOIndex {
+func (q *collQuery) buildCBOIndex(idx *index, br *qplanner.BoundsResult, sortFields []query.SortField, tight bool, maxFields int) qplanner.CBOIndex {
 	info := idx.cboInfo
 
 	// Compute bounds for this index
@@ -1323,10 +1348,10 @@ func (q *collQuery) buildCBOIndex(idx *index, br *qplanner.BoundsResult, sortFie
 	var chainLen int
 	lookup := br.Lookup
 	if tight {
-		bounds, chainLen = qplanner.ComputeIndexBoundsTight(info, br)
+		bounds, chainLen = qplanner.ComputeIndexBoundsTightCapped(info, br, maxFields)
 		lookup = br.LookupTight
 	} else {
-		bounds, chainLen = qplanner.ComputeIndexBounds(info, br)
+		bounds, chainLen = qplanner.ComputeIndexBoundsCapped(info, br, maxFields)
 	}
 
 	pointLookup := qplanner.AllBoundsFixed(bounds)
@@ -1352,7 +1377,7 @@ func (q *collQuery) buildCBOIndex(idx *index, br *qplanner.BoundsResult, sortFie
 	// disjoint, and IndexIter consumes it from the top on a reverse scan, so the
 	// concatenated runs are globally ordered in that field.
 	equalityPrefix := 0
-	for _, field := range info.FieldNames {
+	for _, field := range info.FieldNames[:maxFields] {
 		bounds, fixed, found := lookup(field)
 		if !found || len(bounds) != 1 || !fixed {
 			break
@@ -1375,6 +1400,7 @@ func (q *collQuery) buildCBOIndex(idx *index, br *qplanner.BoundsResult, sortFie
 		Ns:             idx.ns,
 		PointLookup:    pointLookup,
 		BoundFields:    chainLen,
+		UsableFields:   maxFields,
 		ExactSort:      exactSort,
 		PartialSort:    partialSort,
 		SortMatchStart: sortMatchStart,

@@ -56,6 +56,10 @@ const (
 	// Regexp, never by makeCompFilter. Appended at the end for the same
 	// iota-stability reason as opKnn.
 	opOptions
+
+	// opElemMatch: {"$elemMatch": …}, field-level (> _opVal); appended for the
+	// same iota-stability reason.
+	opElemMatch
 )
 
 var opBytesPrefix = []byte("$")
@@ -500,6 +504,8 @@ func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
 		return parseRegexp(v, "")
 	case opSize:
 		return parseSize(v)
+	case opElemMatch:
+		return parseElemMatch(v)
 	case opKnn:
 		// This arm is critical: without it a $knn value would fall through to
 		// makeArrComp, whose default arm panics on an unrecognized op.
@@ -842,6 +848,10 @@ func makeArrComp(op Operator, v *anyenc.Value) (Filter, error) {
 	case opNin:
 		return Nor(makeEqArray(v)), nil
 	case opAll:
+		vals, _ := v.Array()
+		if f, ok, err := parseAllElemMatch(vals); err != nil || ok {
+			return f, err
+		}
 		return And(makeEqArray(v)), nil
 	default:
 		panic(fmt.Errorf("unexpected operator: %v", op))
@@ -892,6 +902,11 @@ func parseType(v *anyenc.Value) (f Filter, err error) {
 		return TypeFilter{Type: anyenc.Type(tv)}, err
 	case anyenc.TypeString:
 		bs, _ := v.StringBytes()
+		if string(bs) == "bool" {
+			// Mongo's alias for either boolean; anyenc keeps true and false as
+			// two types, so it is the union of both.
+			return Or{TypeFilter{Type: anyenc.TypeTrue}, TypeFilter{Type: anyenc.TypeFalse}}, nil
+		}
 		tv, ok := stringToType[string(bs)]
 		if !ok {
 			return nil, &ParseError{Op: "$type", Reason: "unexpected type: " + string(bs)}

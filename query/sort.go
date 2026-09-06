@@ -165,58 +165,77 @@ type SortField struct {
 	Reverse bool
 }
 
-func (s *SortField) AppendKey(tuple anyenc.Tuple, v *anyenc.Value) anyenc.Tuple {
-	return s.appendElementKey(tuple, v.Get(s.Path...))
-}
-
-// appendElementKey appends fv's sort key under Mongo array-sort semantics: a
-// non-empty array contributes its MINIMUM element ascending / MAXIMUM element
-// descending — chosen from all elements, independent of any query predicate
-// (MongoDB >= 4.4, SERVER-19402). This is exactly the element an ordered index
-// scan encounters first for the doc (min forward, max reverse — see
-// qplanner.CanonicalKeyDedupIter), so plan choice cannot change the order.
-//
-// An empty array contributes its own whole-array encoding: the index stores an
-// empty array only under that key, so both plans agree; this deliberately
-// diverges from Mongo (which sorts [] before null) — matching that would need
-// a key encoding below TypeNull on disk. A nil/missing value marshals to
-// TypeNull, unchanged.
+// AppendKey appends the document's sort key for this field under Mongo
+// array-sort semantics. The path resolves to its leaf set
+// (anyenc.Value.WalkLeaves) and every non-empty, non-positional array leaf
+// contributes its elements; the key is the MINIMUM candidate ascending /
+// MAXIMUM descending — chosen from all candidates, independent of any query
+// predicate (MongoDB >= 4.4, SERVER-19402). This is exactly the entry an
+// ordered index scan encounters first for the doc (min forward, max reverse
+// — see qplanner.CanonicalKeyDedupIter), so plan choice cannot change the
+// order. A missing leaf is null. An EMPTY array leaf keeps its whole-array
+// key: the index stores an empty array only under that key, so both plans
+// agree; this deliberately diverges from Mongo (which sorts [] before null)
+// — matching that would need a key encoding below TypeNull on disk.
 //
 // Zero-alloc: candidates are marshaled into the tuple's spare tail capacity
 // and the loser is truncated away (copy handles the overlapping move), so the
 // running best lives in the caller's buffer and this method needs no state —
 // a Sort, like a Filter, may be shared by concurrent queries.
+func (s *SortField) AppendKey(tuple anyenc.Tuple, v *anyenc.Value) anyenc.Tuple {
+	if leaf, single := v.GetLeaf(s.Path...); single {
+		return s.appendElementKey(tuple, leaf)
+	}
+	base := len(tuple)
+	v.WalkLeaves(s.Path, func(l anyenc.Leaf) { tuple = s.considerLeaf(tuple, base, l) })
+	return s.finishKey(tuple, base)
+}
+
+// appendElementKey is AppendKey for one already-resolved, non-positional
+// leaf (the raw fast path, whose walk never crosses an array container).
 func (s *SortField) appendElementKey(tuple anyenc.Tuple, fv *anyenc.Value) anyenc.Tuple {
-	if fv != nil && fv.Type() == anyenc.TypeArray {
-		if items, _ := fv.Array(); len(items) > 0 {
-			base := len(tuple)
+	base := len(tuple)
+	tuple = s.considerLeaf(tuple, base, anyenc.Leaf{Value: fv})
+	return s.finishKey(tuple, base)
+}
+
+func (s *SortField) considerLeaf(tuple anyenc.Tuple, base int, l anyenc.Leaf) anyenc.Tuple {
+	if l.Value != nil && l.Value.Type() == anyenc.TypeArray && !l.Positional {
+		if items, _ := l.Value.Array(); len(items) > 0 {
 			for _, item := range items {
-				candOff := len(tuple)
-				tuple = item.MarshalTo(tuple)
-				if candOff == base {
-					continue // first element is the initial best
-				}
-				cand, best := tuple[candOff:], tuple[base:candOff]
-				cmp := bytes.Compare(cand, best)
-				if (!s.Reverse && cmp < 0) || (s.Reverse && cmp > 0) {
-					n := copy(tuple[base:], cand) // overlapping move: new best down
-					tuple = tuple[:base+n]
-				} else {
-					tuple = tuple[:candOff] // loser: drop the tail bytes
-				}
-			}
-			if s.Reverse {
-				for i := base; i < len(tuple); i++ {
-					tuple[i] = ^tuple[i]
-				}
+				tuple = s.consider(tuple, base, item)
 			}
 			return tuple
 		}
 	}
-	if !s.Reverse {
-		return tuple.Append(fv)
+	return s.consider(tuple, base, l.Value)
+}
+
+// consider marshals fv after the running best at tuple[base:] and keeps the
+// better of the two.
+func (s *SortField) consider(tuple anyenc.Tuple, base int, fv *anyenc.Value) anyenc.Tuple {
+	candOff := len(tuple)
+	tuple = fv.MarshalTo(tuple)
+	if candOff == base {
+		return tuple // first candidate is the initial best
 	}
-	return tuple.AppendInverted(fv)
+	cand, best := tuple[candOff:], tuple[base:candOff]
+	cmp := bytes.Compare(cand, best)
+	if (!s.Reverse && cmp < 0) || (s.Reverse && cmp > 0) {
+		n := copy(tuple[base:], cand) // overlapping move: new best down
+		return tuple[:base+n]
+	}
+	return tuple[:candOff] // loser: drop the tail bytes
+}
+
+// finishKey inverts the chosen key for a descending field.
+func (s *SortField) finishKey(tuple anyenc.Tuple, base int) anyenc.Tuple {
+	if s.Reverse {
+		for i := base; i < len(tuple); i++ {
+			tuple[i] = ^tuple[i]
+		}
+	}
+	return tuple
 }
 
 func (s *SortField) Fields() []SortField {

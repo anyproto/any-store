@@ -1,6 +1,7 @@
 package syncpool
 
 import (
+	"github.com/anyproto/any-store/v2/anyenc"
 	"runtime"
 	"testing"
 
@@ -34,4 +35,13 @@ func TestSyncPools_GetDocBuf(t *testing.T) {
 		assert.Len(t, buf.DocBuf, 5)
 	}
 	// If a fresh buffer was returned (GC cleared the pool), that's acceptable.
+}
+
+func TestReleaseDocBuf_LeavesCountTowardSizeLimit(t *testing.T) {
+	sp := NewSyncPool(1024)
+	b := sp.GetDocBuf()
+	b.Leaves = make([]anyenc.Leaf, 0, 1024)
+	sp.ReleaseDocBuf(b)
+	got := sp.GetDocBuf()
+	assert.Less(t, cap(got.Leaves)*leafSize, 1024, "an oversized Leaves scratch must not be pooled")
 }
