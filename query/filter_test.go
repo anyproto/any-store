@@ -2,6 +2,7 @@ package query
 
 import (
 	"bytes"
+	"regexp"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -593,6 +594,8 @@ func TestRegexp_LiteralPrefix(t *testing.T) {
 		{`(?i)^ab`, "", false},
 		{`^(?i)ab`, "", false},
 		{`(?m)^ab`, "", false},
+		{`^a\x{FFFD}`, "", false},
+		{`^\x{FFFD}`, "", false},
 	} {
 		prefix, complete := literalPrefix(tc.pattern)
 		assert.Equal(t, tc.prefix, prefix, "prefix of %s", tc.pattern)
@@ -601,37 +604,52 @@ func TestRegexp_LiteralPrefix(t *testing.T) {
 }
 
 // TestIndexBoundsExact pins which predicates the planner may treat as
-// exactly represented by their index bounds (residual filter elidable).
+// exactly represented by their index bounds (residual filter elidable),
+// ascending and on a reverse-flagged field.
 func TestIndexBoundsExact(t *testing.T) {
-	for cond, exact := range map[string]bool{
-		`{"a":1}`:                                 true,
-		`{"a":null}`:                              true,
-		`{"a":{"$in":[1,null]}}`:                  true,
-		`{"a":{"$gt":1}}`:                         true,
-		`{"a":{"$ne":1}}`:                         true,
-		`{"a":{"$gte":1,"$lte":2}}`:               true, // widened by count, screened by predicate count
-		`{"a":{"$type":"string"}}`:                true,
-		`{"a":{"$type":"array"}}`:                 true,
-		`{"a":{"$type":"null"}}`:                  false,
-		`{"a":{"$regex":"^ab"}}`:                  true,
-		`{"a":{"$regex":"^ab\\.c"}}`:              true,
-		`{"a":{"$regex":"^abc$"}}`:                false,
-		`{"a":{"$regex":"^ab.*c"}}`:               false,
-		`{"a":{"$regex":"^ab[cz]"}}`:              false,
-		`{"a":{"$regex":"^a\\w"}}`:                false,
-		`{"a":{"$regex":"ab"}}`:                   false,
-		`{"a":{"$regex":"^ab","$options":"i"}}`:   false,
-		`{"a":{"$elemMatch":{"$gt":1}}}`:          false,
-		`{"a":{"$elemMatch":{"b":1}}}`:            false,
-		`{"a":{"$all":[{"$elemMatch":{"b":1}}]}}`: false,
-		`{"a":{"$not":{"$regex":"^ab.*c"}}}`:      false,
+	for cond, want := range map[string][2]bool{
+		`{"a":1}`:                                 {true, true},
+		`{"a":null}`:                              {true, true},
+		`{"a":{"$in":[1,null]}}`:                  {true, true},
+		`{"a":{"$gt":1}}`:                         {true, true},
+		`{"a":{"$ne":1}}`:                         {true, true},
+		`{"a":{"$gte":1,"$lte":2}}`:               {true, true}, // widened by count, screened by predicate count
+		`{"a":{"$type":"string"}}`:                {true, true},
+		`{"a":{"$type":"array"}}`:                 {true, true},
+		`{"a":{"$type":"null"}}`:                  {false, false},
+		`{"a":{"$regex":"^ab"}}`:                  {true, false},
+		`{"a":{"$regex":"^ab\\.c"}}`:              {true, false},
+		`{"a":{"$regex":"^abc$"}}`:                {false, false},
+		`{"a":{"$regex":"^ab.*c"}}`:               {false, false},
+		`{"a":{"$regex":"^ab[cz]"}}`:              {false, false},
+		`{"a":{"$regex":"^a\\w"}}`:                {false, false},
+		`{"a":{"$regex":"ab"}}`:                   {false, false},
+		`{"a":{"$regex":"^ab","$options":"i"}}`:   {false, false},
+		`{"a":{"$elemMatch":{"$gt":1}}}`:          {false, false},
+		`{"a":{"$elemMatch":{"b":1}}}`:            {false, false},
+		`{"a":{"$all":[{"$elemMatch":{"b":1}}]}}`: {false, false},
+		`{"a":{"$not":{"$gt":1}}}`:                {false, false},
+		`{"a":{"$exists":true}}`:                  {false, false},
+		`{"a":{"$size":2}}`:                       {false, false},
 	} {
 		f, err := ParseCondition(cond)
 		require.NoError(t, err, cond)
 		k, ok := f.(Key)
 		require.True(t, ok, cond)
-		assert.Equal(t, exact, IndexBoundsExact(k.Filter), cond)
+		assert.Equal(t, want[0], IndexBoundsExact(k.Filter, false), "%s ascending", cond)
+		assert.Equal(t, want[1], IndexBoundsExact(k.Filter, true), "%s reverse", cond)
 	}
+}
+
+// A Regexp built by hand carries $options only in the Options field, so the
+// seek prefix must screen i and m from there.
+func TestRegexp_HandBuiltOptions(t *testing.T) {
+	r := Regexp{Regexp: regexp.MustCompile("^ab"), Options: "i"}
+	assert.Empty(t, r.IndexBounds("a", nil))
+	assert.False(t, IndexBoundsExact(r, false))
+	r = Regexp{Regexp: regexp.MustCompile("^ab"), Options: "s"}
+	assert.Len(t, r.IndexBounds("a", nil), 1)
+	assert.True(t, IndexBoundsExact(r, false))
 }
 
 func TestSize(t *testing.T) {

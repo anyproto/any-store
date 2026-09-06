@@ -348,17 +348,16 @@ func TestBuildPlan_LowSelectivity_FullScan(t *testing.T) {
 }
 
 // TestCoverChecks_InexactBounds pins that a covered field whose bounds are a
-// superset of its predicate ($regex beyond an anchored literal, $type null,
-// $elemMatch) never lets a plan skip the residual filter — through the
-// bound prefix (count fast path) or the ordered-scan elision that also
-// counts IndexFilterIter equality fields.
+// superset of its predicate ($regex beyond an anchored literal, or any
+// $regex on a reverse-flagged field, $type null, $elemMatch) never lets a
+// plan skip the residual filter — through the bound prefix (count fast
+// path) or the ordered-scan elision that also counts IndexFilterIter
+// equality fields.
 func TestCoverChecks_InexactBounds(t *testing.T) {
-	idxAZ := func(cond string) *CBOIndex {
-		return &CBOIndex{
-			Info:        &IndexInfo{Name: "az", FieldNames: []string{"a", "z"}},
-			Bounds:      mustParseBounds("a", cond),
-			BoundFields: 1,
-		}
+	idxAZ := func(cond string, reverse bool) *CBOIndex {
+		info := &IndexInfo{Name: "az", FieldNames: []string{"a", "z"}, Reverse: []bool{reverse, false}}
+		bounds, n := ComputeIndexBounds(info, buildBoundsResult(info, query.MustParseCondition(cond)))
+		return &CBOIndex{Info: info, Bounds: bounds, BoundFields: n}
 	}
 	zEq := []IndexFieldFilter{{FieldIdx: 1, MatchValue: anyenc.AppendAnyValue(nil, 1)}}
 	for _, f := range []string{
@@ -368,19 +367,33 @@ func TestCoverChecks_InexactBounds(t *testing.T) {
 		`{"z":1,"a":{"$elemMatch":{"$gt":1}}}`,
 	} {
 		cond := query.MustParseCondition(f)
-		idx := idxAZ(f)
-		require.NotEmpty(t, idx.Bounds, f)
-		assert.False(t, indexScanCoversFilter(idx, zEq, cond), "residual must stay: %s", f)
-		assert.False(t, indexCoversFilter(idx, cond), "count must keep the filter: %s", f)
+		for _, reverse := range []bool{false, true} {
+			idx := idxAZ(f, reverse)
+			require.NotEmpty(t, idx.Bounds, f)
+			assert.False(t, indexScanCoversFilter(idx, zEq, cond), "residual must stay: %s reverse=%v", f, reverse)
+			assert.False(t, indexCoversFilter(idx, cond), "count must keep the filter: %s reverse=%v", f, reverse)
+		}
 	}
+	// A whole anchored literal is exact ascending only: the reverse transform
+	// pads the prefix-derived bound past the group's neighbours.
+	literal := query.MustParseCondition(`{"z":1,"a":{"$regex":"^ab"}}`)
+	assert.True(t, indexScanCoversFilter(idxAZ(`{"z":1,"a":{"$regex":"^ab"}}`, false), zEq, literal))
+	assert.False(t, indexScanCoversFilter(idxAZ(`{"z":1,"a":{"$regex":"^ab"}}`, true), zEq, literal))
 	for _, f := range []string{
-		`{"z":1,"a":{"$regex":"^ab"}}`,
 		`{"z":1,"a":{"$type":"string"}}`,
 		`{"z":1,"a":{"$gt":1}}`,
+		`{"z":1,"a":null}`,
 	} {
 		cond := query.MustParseCondition(f)
-		assert.True(t, indexScanCoversFilter(idxAZ(f), zEq, cond), "exact bounds elide the residual: %s", f)
+		for _, reverse := range []bool{false, true} {
+			assert.True(t, indexScanCoversFilter(idxAZ(f, reverse), zEq, cond), "exact bounds elide the residual: %s reverse=%v", f, reverse)
+		}
 	}
+	// The verify chain sees the same screen, for covered and uncovered
+	// fields alike.
+	assert.Nil(t, collectUncoveredFilterFields(query.MustParseCondition(`{"a":{"$regex":"^ab"},"b":1}`), []string{"b"}, nil))
+	assert.Equal(t, []string{"b"}, collectUncoveredFilterFields(query.MustParseCondition(`{"a":{"$regex":"^ab"},"b":1}`), []string{"a"}, nil))
+	assert.Nil(t, collectUncoveredFilterFields(query.MustParseCondition(`{"a":{"$regex":"^ab"},"b":1}`), []string{"a"}, []bool{true}))
 }
 
 func TestBuildPlan_UniqueIndex_CoverLookup(t *testing.T) {
@@ -2162,14 +2175,14 @@ func TestFilterFieldsCoveredBy(t *testing.T) {
 	t.Run("key_covered", func(t *testing.T) {
 		f := query.MustParseCondition(`{"a": 1}`) // parses to query.Key
 		has := false
-		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, &has)
+		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, nil, &has)
 		assert.True(t, ok)
 		assert.True(t, has)
 	})
 	t.Run("key_not_covered", func(t *testing.T) {
 		f := query.MustParseCondition(`{"z": 1}`)
 		has := false
-		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, &has)
+		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, nil, &has)
 		assert.False(t, ok)
 		assert.False(t, has)
 	})
@@ -2179,7 +2192,7 @@ func TestFilterFieldsCoveredBy(t *testing.T) {
 		inner2 := query.MustParseCondition(`{"b": 2}`)
 		f := query.And{inner1, inner2}
 		has := false
-		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, &has)
+		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, nil, &has)
 		assert.True(t, ok)
 		assert.True(t, has)
 	})
@@ -2188,7 +2201,7 @@ func TestFilterFieldsCoveredBy(t *testing.T) {
 		inner2 := query.MustParseCondition(`{"z": 2}`)
 		f := query.And{inner1, inner2}
 		has := false
-		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, &has)
+		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, nil, &has)
 		assert.False(t, ok, "And must short-circuit on first uncovered child")
 		// The first child matched before the short-circuit, so `has` is true.
 		// Pin the current behavior so a future refactor can't silently drop it.
@@ -2200,7 +2213,7 @@ func TestFilterFieldsCoveredBy(t *testing.T) {
 		// *query.And enjoy the covering-count fast path too.
 		inner := query.And{query.MustParseCondition(`{"a": 1}`)}
 		has := false
-		ok := filterFieldsCoveredBy(&inner, []string{"a"}, &has)
+		ok := filterFieldsCoveredBy(&inner, []string{"a"}, nil, &has)
 		assert.True(t, ok, "pointer-And with covered child should report covered")
 		assert.True(t, has)
 	})
@@ -2208,7 +2221,7 @@ func TestFilterFieldsCoveredBy(t *testing.T) {
 		// Pointer-And with an uncovered child must short-circuit to false.
 		inner := query.And{query.MustParseCondition(`{"z": 1}`)}
 		has := false
-		ok := filterFieldsCoveredBy(&inner, []string{"a"}, &has)
+		ok := filterFieldsCoveredBy(&inner, []string{"a"}, nil, &has)
 		assert.False(t, ok)
 	})
 	t.Run("default_unsupported", func(t *testing.T) {
@@ -2218,7 +2231,7 @@ func TestFilterFieldsCoveredBy(t *testing.T) {
 			query.MustParseCondition(`{"b": 2}`),
 		}
 		has := false
-		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, &has)
+		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, nil, &has)
 		assert.False(t, ok)
 		assert.False(t, has, "default branch must not set hasFields")
 	})
@@ -2230,12 +2243,12 @@ func TestFilterFieldsCoveredBy(t *testing.T) {
 func TestCollectUncoveredFilterFields(t *testing.T) {
 	t.Run("key_covered", func(t *testing.T) {
 		f := query.MustParseCondition(`{"a": 1}`)
-		got := collectUncoveredFilterFields(f, []string{"a"})
+		got := collectUncoveredFilterFields(f, []string{"a"}, nil)
 		assert.Equal(t, []string{}, got)
 	})
 	t.Run("key_uncovered", func(t *testing.T) {
 		f := query.MustParseCondition(`{"z": 1}`)
-		got := collectUncoveredFilterFields(f, []string{"a"})
+		got := collectUncoveredFilterFields(f, []string{"a"}, nil)
 		assert.Equal(t, []string{"z"}, got)
 	})
 	t.Run("and_mixed", func(t *testing.T) {
@@ -2243,13 +2256,13 @@ func TestCollectUncoveredFilterFields(t *testing.T) {
 			query.MustParseCondition(`{"a": 1}`), // covered
 			query.MustParseCondition(`{"z": 2}`), // uncovered → should be returned
 		}
-		got := collectUncoveredFilterFields(f, []string{"a"})
+		got := collectUncoveredFilterFields(f, []string{"a"}, nil)
 		assert.Equal(t, []string{"z"}, got)
 	})
 	t.Run("and_pointer", func(t *testing.T) {
 		// Pointer variant of And exercises the `*query.And` case.
 		a := query.And{query.MustParseCondition(`{"q": 1}`)}
-		got := collectUncoveredFilterFields(&a, []string{"a"})
+		got := collectUncoveredFilterFields(&a, []string{"a"}, nil)
 		assert.Equal(t, []string{"q"}, got)
 	})
 	t.Run("and_propagates_nil", func(t *testing.T) {
@@ -2262,7 +2275,7 @@ func TestCollectUncoveredFilterFields(t *testing.T) {
 				query.MustParseCondition(`{"c": 1}`),
 			},
 		}
-		got := collectUncoveredFilterFields(f, []string{"a"})
+		got := collectUncoveredFilterFields(f, []string{"a"}, nil)
 		assert.Nil(t, got, "nil must propagate out of And when any child returns nil")
 	})
 	t.Run("and_pointer_propagates_nil", func(t *testing.T) {
@@ -2273,12 +2286,12 @@ func TestCollectUncoveredFilterFields(t *testing.T) {
 				query.MustParseCondition(`{"c": 1}`),
 			},
 		}
-		got := collectUncoveredFilterFields(&inner, []string{"a"})
+		got := collectUncoveredFilterFields(&inner, []string{"a"}, nil)
 		assert.Nil(t, got)
 	})
 	t.Run("default_unsupported", func(t *testing.T) {
 		f := query.Or{query.MustParseCondition(`{"a": 1}`)}
-		got := collectUncoveredFilterFields(f, []string{"a"})
+		got := collectUncoveredFilterFields(f, []string{"a"}, nil)
 		assert.Nil(t, got)
 	})
 }
@@ -4377,7 +4390,7 @@ func TestFilterFieldsCoveredBy_PointerAndBranch(t *testing.T) {
 	// MustParseCondition(`{"$and":[{"a":1}]}`) returns *query.And.
 	f := query.MustParseCondition(`{"$and":[{"a":1}]}`)
 	has := false
-	ok := filterFieldsCoveredBy(f, []string{"a"}, &has)
+	ok := filterFieldsCoveredBy(f, []string{"a"}, nil, &has)
 	// The function should recurse into the underlying And slice exactly like
 	// the value-receiver case and report covered=true.
 	assert.True(t, ok, "pointer-And with covered field should report covered")
