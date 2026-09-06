@@ -506,9 +506,16 @@ func okLeafSet(f Filter, leaves []anyenc.Leaf, buf *syncpool.DocBuffer) bool {
 	return okLeaves(f, leaves, buf)
 }
 
+// IndexBounds delegates to the inner filter on this path's own field. An
+// object-form $elemMatch additionally constrains the fields BELOW the path:
+// {"a":{"$elemMatch":{"b":{"$gt":1}}}} bounds "a.b" exactly as
+// {"a.b":{"$gt":1}} would (elemMatchSubField).
 func (e Key) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	if strings.Join(e.Path, ".") == fieldName {
 		return e.Filter.IndexBounds(fieldName, bs)
+	}
+	if cond, sub, ok := e.elemMatchSubField(fieldName); ok {
+		return cond.IndexBounds(sub, bs)
 	}
 	return bs
 }
@@ -1058,6 +1065,10 @@ func FilterTreeAny(f Filter, pred func(Filter) bool) bool {
 		return FilterTreeAny(ft.Filter, pred)
 	case *Key:
 		return FilterTreeAny(ft.Filter, pred)
+	case ElemMatch:
+		return FilterTreeAny(ft.Cond, pred)
+	case *ElemMatch:
+		return FilterTreeAny(ft.Cond, pred)
 	}
 	return false
 }
@@ -1120,6 +1131,18 @@ func ContainsKnn(f Filter) bool {
 // matches nothing.
 func ContainsSourceFilter(f Filter) bool {
 	return FilterTreeAny(f, isSourceLeaf)
+}
+
+// ContainsElemMatch reports whether f contains a $elemMatch anywhere. Index
+// bounds of such a filter are supersets, never the exact value image.
+func ContainsElemMatch(f Filter) bool {
+	return FilterTreeAny(f, func(f Filter) bool {
+		switch f.(type) {
+		case ElemMatch, *ElemMatch:
+			return true
+		}
+		return false
+	})
 }
 
 // presenceNullProbe is an explicit JSON null used by GuaranteesPresence to test

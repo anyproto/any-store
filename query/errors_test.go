@@ -460,7 +460,7 @@ func TestModifierOperators(t *testing.T) {
 func TestOperators(t *testing.T) {
 	ops := Operators()
 	assert.Equal(t, []string{
-		"$all", "$and", "$eq", "$exists", "$gt", "$gte", "$in", "$knn",
+		"$all", "$and", "$elemMatch", "$eq", "$exists", "$gt", "$gte", "$in", "$knn",
 		"$lt", "$lte", "$ne", "$nin", "$nor", "$not", "$options", "$or",
 		"$regex", "$size", "$text", "$type",
 	}, ops)
