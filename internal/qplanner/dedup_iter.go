@@ -48,6 +48,10 @@ type CanonicalKeyDedupIter struct {
 	// canonical-element selection happens in the same space the cursor walks.
 	FieldReverse bool
 
+	// Sparse mirrors the index's Sparse flag: a null or missing leaf then has
+	// no entry and must not be elected canonical.
+	Sparse bool
+
 	// Bounds are the SCAN bounds — padded for full keys exactly as IndexIter
 	// walks them — and an element is tested as the least key it can have,
 	// enc(elem)‖0x01 (every real suffix starts with a type tag or docId byte
@@ -59,8 +63,11 @@ type CanonicalKeyDedupIter struct {
 	// padded scan skips, so the doc was elected on an entry never seen and
 	// dropped — or, with the continuation on the other side, emitted twice.
 
-	keyBuf []byte // reusable encode buffer for min/max comparison
-	best   []byte // reusable buffer for the canonical element
+	keyBuf []byte          // reusable encode buffer for min/max comparison
+	best   []byte          // reusable buffer for the canonical element
+	leaves []anyenc.Leaf   // scratch: the field path's leaf set
+	vals   []*anyenc.Value // scratch: the election candidates (elements)
+	wholes []*anyenc.Value // scratch: the doc's whole-array entries
 }
 
 func (it *CanonicalKeyDedupIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
@@ -84,27 +91,69 @@ func (it *CanonicalKeyDedupIter) Next() (key []byte, docId []byte, multiKey bool
 		if it.Plan == nil || it.Plan.DocParsed == nil {
 			return key, docId, false, nil // no doc available; can't dedup — pass through
 		}
-		v := it.Plan.DocParsed.Get(it.FieldPath...)
-		if v == nil || v.Type() != anyenc.TypeArray {
-			// Scalar field — only one entry per doc, no dedup needed.
+		doc := it.Plan.DocParsed
+		if leaf, single := doc.GetLeaf(it.FieldPath...); single && (leaf == nil || leaf.Type() != anyenc.TypeArray) {
+			// One entry per doc — the common scalar row: pass through.
+			return key, docId, false, nil
+		}
+		// The doc's entries for this field are what index maintenance wrote
+		// (writeValues): none for a null/missing leaf of a sparse index, one
+		// per element plus one for the array itself for a non-positional
+		// array leaf. The canonical entry is elected among the elements —
+		// the sort-key candidates, so an index-order scan yields the min/max
+		// ELEMENT's entry — and only when no element is in bounds does a
+		// whole-array entry stand in, so a doc with several whole-array
+		// entries is still emitted once.
+		it.leaves = doc.AppendLeaves(it.leaves[:0], it.FieldPath...)
+		if it.Sparse {
+			kept := it.leaves[:0]
+			for _, l := range it.leaves {
+				if l.Value != nil && l.Value.Type() != anyenc.TypeNull {
+					kept = append(kept, l)
+				}
+			}
+			it.leaves = kept
+		}
+		it.vals = anyenc.AppendElementValues(it.vals[:0], it.leaves)
+		it.wholes = it.wholes[:0]
+		for _, l := range it.leaves {
+			if l.Value != nil && l.Value.Type() == anyenc.TypeArray && !l.Positional {
+				if arr, _ := l.Value.Array(); len(arr) > 0 {
+					it.wholes = append(it.wholes, l.Value)
+				}
+			}
+		}
+		if len(it.vals)+len(it.wholes) <= 1 {
 			return key, docId, false, nil
 		}
 
-		if it.isCanonical(v, fieldVal) {
+		if it.isCanonical(fieldVal) {
 			return key, docId, false, nil
 		}
 		// Not the canonical hit — skip.
 	}
 }
 
-// isCanonical elects the array's canonical in-bounds element and reports
-// whether fieldVal is it. Kept out of Next so the scalar pass-through — every
-// row of a single-field index scan — stays a short loop.
-func (it *CanonicalKeyDedupIter) isCanonical(v *anyenc.Value, fieldVal []byte) bool {
-	items, _ := v.Array()
+// isCanonical elects the doc's canonical in-bounds entry — among the
+// elements first, the whole-array entries otherwise — and reports whether
+// fieldVal is it. Kept out of Next so the scalar pass-through — every row of
+// a single-field index scan — stays a short loop.
+func (it *CanonicalKeyDedupIter) isCanonical(fieldVal []byte) bool {
+	it.elect(it.vals)
+	if len(it.best) == 0 {
+		it.elect(it.wholes)
+	}
+	// Nothing hits the bounds — upstream shouldn't have emitted this doc,
+	// but pass through conservatively.
+	return len(it.best) == 0 || bytes.Equal(fieldVal, it.best)
+}
+
+// elect leaves the min (forward) / max (reverse) in-bounds candidate's key
+// in it.best, empty when none is in bounds.
+func (it *CanonicalKeyDedupIter) elect(cands []*anyenc.Value) {
 	it.best = it.best[:0]
 	noBounds := len(it.Bounds) == 0
-	for _, item := range items {
+	for _, item := range cands {
 		// Encode in the same byte space as fieldVal and Bounds: inverted
 		// (stored) for a reverse field, plain ascending otherwise.
 		if it.FieldReverse {
@@ -129,9 +178,6 @@ func (it *CanonicalKeyDedupIter) isCanonical(v *anyenc.Value, fieldVal []byte) b
 			it.best = append(it.best[:0], it.keyBuf...)
 		}
 	}
-	// No array element hits the bounds — upstream shouldn't have emitted
-	// this doc, but pass through conservatively.
-	return len(it.best) == 0 || bytes.Equal(fieldVal, it.best)
 }
 
 // skipOffset delegates a cursor-level offset skip to the source. This is

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -656,5 +657,43 @@ func TestAudit01_ValueByte_MultiElementArray(t *testing.T) {
 		require.NotEmptyf(t, e.Value, "entry %d: value must not be empty", i)
 		assert.NotZerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
 			"entry %d: multi-key flag bit must be set", i)
+	}
+}
+
+// fieldScratch is laid out widest first so the per-field scratch stays at
+// one cache line per field.
+func TestFieldScratchLayout(t *testing.T) {
+	assert.Equal(t, uintptr(64), unsafe.Sizeof(fieldScratch{}))
+}
+
+// BenchmarkIndex_fillKeysBuf measures key generation alone, per document
+// shape: the scalar compound field, a leaf array, and a compound index over
+// one array of objects (fields iterated together).
+func BenchmarkIndex_fillKeysBuf(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(b, err)
+	cases := []struct {
+		name   string
+		fields []string
+		doc    string
+	}{
+		{"scalar_compound", []string{"a", "b", "c"}, `{"id":1,"a":1,"b":"x","c":2.5}`},
+		{"leaf_array", []string{"tags"}, `{"id":1,"tags":["a","b","c","d"]}`},
+		{"shared_array_compound", []string{"a.b", "a.c"}, `{"id":1,"a":[{"b":1,"c":2},{"b":3,"c":4},{"b":5},{"c":6}]}`},
+		{"shared_array_sparse", []string{"a.b", "a.c"}, `{"id":1,"a":[{"b":1,"c":2},{"b":3,"c":4},{"b":5},{"c":6}]}`},
+	}
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			info := IndexInfo{Name: c.name, Fields: c.fields, Sparse: strings.HasSuffix(c.name, "_sparse")}
+			idx := &index{info: info, c: coll.(*collection)}
+			require.NoError(b, idx.init())
+			it := mustParseItem(b, c.doc)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				idx.fillKeysBuf(it)
+			}
+		})
 	}
 }

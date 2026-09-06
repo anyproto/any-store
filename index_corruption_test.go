@@ -1940,8 +1940,7 @@ func TestAudit14_LegacyNilValue_AllNilSimulatesPreUpgrade(t *testing.T) {
 	// keys PLUS the canonical whole-array key, all with nil value bytes.
 	// writeValues has emitted the canonical (0x06-prefixed) whole-array key
 	// since before the value byte existed, so real legacy multi-key data
-	// always carries it; the count path's canonical-key probe detects it by
-	// key prefix regardless of the (nil) value byte.
+	// always carries it.
 	for _, kv := range []struct {
 		key string
 		doc string
@@ -1968,6 +1967,12 @@ func TestAudit14_LegacyNilValue_AllNilSimulatesPreUpgrade(t *testing.T) {
 		injectRawIndexEntry(t, c, idx, canonical, nil)
 	}
 
+	// A pre-flag writer never wrote the scalar-proven marker either: drop
+	// the one EnsureIndex wrote so the index reads as legacy (unproven).
+	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		return tx.Delete(c.db.systemNS, multikeyKey(idx.ns.Name()))
+	}))
+
 	post := readRawIndexEntries(t, fx.DB, "audit14_allnil", "tags")
 	require.Equal(t, preLen+6, len(post),
 		"expected %d (pre) + 4 per-element + 2 canonical entries, got %d", preLen, len(post))
@@ -1977,9 +1982,9 @@ func TestAudit14_LegacyNilValue_AllNilSimulatesPreUpgrade(t *testing.T) {
 	}
 
 	// Multi-bound $in over [a,b,c]: d1 matches "a" and "b" (2 hits), d2
-	// matches "b" and "c" (2 hits). Without dedup, count = 4. The canonical
-	// 0x06 keys make the count path's probe report multi-key, routing to the
-	// sort-dedup count, so the distinct-doc count is 2.
+	// matches "b" and "c" (2 hits). Without dedup, count = 4. The missing
+	// scalar-proven marker routes the count path to the dedup walk, so the
+	// distinct-doc count is 2.
 	n, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 2, n,

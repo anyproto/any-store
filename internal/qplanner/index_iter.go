@@ -314,56 +314,6 @@ func (it *IndexIter) skipOffset(n int) (remaining int, err error) {
 	return n - skipped, nil
 }
 
-// arrayPrefix is the anyenc type tag for array-typed values. writeValues
-// emits a key with this leading byte exactly when a doc has an array-typed
-// value for an indexed field (the per-element keys of a nested array, and the
-// whole-value-as-tuple key of any multi-key doc). So a key with this prefix
-// exists in a single-field index iff that index has ever held a multi-key
-// (array) entry.
-var arrayPrefix = []byte{byte(anyenc.TypeArray)}
-
-// arrayPrefixInverted is the array tag for a REVERSE-flagged single-field index.
-// Such an index stores the whole-array key bitwise-inverted (index.go
-// writeValues), so its leading byte is ^TypeArray (0xF9) instead of 0x06.
-var arrayPrefixInverted = []byte{^byte(anyenc.TypeArray)}
-
-// arrayProbePrefix returns the leading byte the probe must seek to detect a
-// multi-key (array) entry: the inverted array tag for a reverse single-field
-// index, the plain array tag otherwise.
-func arrayProbePrefix(reverse bool) []byte {
-	if reverse {
-		return arrayPrefixInverted
-	}
-	return arrayPrefix
-}
-
-// indexProbeAnyMultiKey reports whether the index namespace has any entry whose
-// key begins with the array type tag — i.e. whether any indexed doc had an
-// array-typed value. It is a single btree Seek, snapshot-consistent with the
-// caller's read tx. fieldReverse selects the inverted array tag for a reverse
-// single-field index.
-//
-// PRECONDITION: only valid for single-field indexes. For a compound index the
-// array field's value is not at byte position 0 of the key, so its array tag
-// sits mid-key and the Seek would miss it (false negative). Callers must route
-// compound/non-PointLookup shapes elsewhere before probing.
-func indexProbeAnyMultiKey(cs *CursorSource, fieldReverse bool) (bool, error) {
-	c := cs.NewCursor()
-	defer c.Close()
-	prefix := arrayProbePrefix(fieldReverse)
-	if err := c.Seek(prefix); err != nil {
-		return false, err
-	}
-	if !c.Valid() {
-		return false, nil
-	}
-	k, err := c.Key()
-	if err != nil {
-		return false, err
-	}
-	return len(k) > 0 && k[0] == prefix[0], nil
-}
-
 // CountEntries counts distinct documents matching this index iterator's
 // bounds via a 4-branch dispatch:
 //
@@ -413,7 +363,7 @@ func (it *IndexIter) CountEntries() (int, error) {
 		return it.countEntriesViaSeenSet(true)
 	}
 
-	// Branches 3 & 4: single-field PointLookup — the probe decides.
+	// Branches 3 & 4: single-field PointLookup — the scalar-proven flag decides.
 	hasMultiKey, err := it.probeMultiKey()
 	if err != nil {
 		return 0, err
@@ -424,27 +374,16 @@ func (it *IndexIter) CountEntries() (int, error) {
 	return it.countEntriesViaSeenSet(false) // Branch 4: blind dedup
 }
 
-// probeMultiKey runs the canonical-key probe lazily and caches the result for
-// this iterator. True iff the index holds a multi-key entry — a doc with an
-// array-typed value writes a canonical 0x06 whole-array key (writeValues has
-// done this since before the value-byte feature, so legacy multi-key data is
-// detected too). The caller must have established that this is a single-field
-// index (see indexProbeAnyMultiKey's precondition); CountEntries enforces that
-// by routing compound/non-PointLookup to the seen-set path (Branch 2) first.
+// probeMultiKey reports whether the index may hold several entries for one
+// document. Only the sticky scalar-proven flag can rule that out: a fan-out
+// through an array of objects writes scalar entries with no whole-array key,
+// so no key-shape probe of the namespace could detect it. False means the
+// index is proven scalar for this snapshot (Branch 3); anything else — a
+// multikey index or a legacy index without the marker — dedups (Branch 4).
 func (it *IndexIter) probeMultiKey() (bool, error) {
-	if it.indexHasMultiKeyProbed {
-		return it.indexHasMultiKey, nil
-	}
-	// CountEntries only reaches here for single-field indexes (it gates on
-	// len(FieldNames)==1), so Reverse[0] is the array field's direction.
-	fieldReverse := len(it.IdxInfo.Reverse) > 0 && it.IdxInfo.Reverse[0]
-	has, err := indexProbeAnyMultiKey(it.Source, fieldReverse)
-	if err != nil {
-		return false, err
-	}
-	it.indexHasMultiKey = has
+	it.indexHasMultiKey = !it.ScalarProven
 	it.indexHasMultiKeyProbed = true
-	return has, nil
+	return it.indexHasMultiKey, nil
 }
 
 // countEntriesBatch is the original page-batch fast path, used for
