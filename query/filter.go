@@ -1345,13 +1345,10 @@ func (r Regexp) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 		return false
 	}
 	if v.Type() == anyenc.TypeArray {
+		// Any string element may match; other elements have no text.
 		vals, _ := v.Array()
 		for _, val := range vals {
-			exp, err := val.StringBytes()
-			if err != nil {
-				return false
-			}
-			if r.Regexp.Match(exp) {
+			if exp, err := val.StringBytes(); err == nil && r.Regexp.Match(exp) {
 				return true
 			}
 		}

@@ -461,6 +461,9 @@ func TestRegexp(t *testing.T) {
 		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": ["A", "B", "C"]}`), nil))
 		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": ["baaa"]}`), nil))
 		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": ["baaa", "a"]}`), nil))
+		// A non-string element is skipped, not a rejection of the array.
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": [1, null, "a"]}`), nil))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": [1, null]}`), nil))
 	})
 	t.Run("ok - number", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^a(?i)"}}`)
