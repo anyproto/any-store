@@ -364,7 +364,7 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 		}
 		hasFields := false
 		countCovered = !needFilter ||
-			(filterFieldsCoveredBy(params.Filter, []string{pk}, &hasFields) && hasFields &&
+			(filterFieldsCoveredBy(params.Filter, []string{pk}, nil, &hasFields) && hasFields &&
 				countFilterFieldPreds(params.Filter, pk) <= 1)
 	default:
 		idx := cand.idx

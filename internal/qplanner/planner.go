@@ -1734,7 +1734,7 @@ func indexCoversFilter(idx *CBOIndex, filter query.Filter) bool {
 	// Condition 1: every filter field is within the bounded index prefix.
 	// Returns false on any uncovered field or any complex node (Or/Not/Nor).
 	hasFields := false
-	if ok := filterFieldsCoveredBy(filter, boundedFields, &hasFields); !ok || !hasFields {
+	if ok := filterFieldsCoveredBy(filter, boundedFields, idx.Info.Reverse, &hasFields); !ok || !hasFields {
 		return false
 	}
 	// Condition 2: reject when any covered field carries >1 predicate, because
@@ -1764,14 +1764,20 @@ func indexScanCoversFilter(idx *CBOIndex, coverFilters []IndexFieldFilter, filte
 		return false
 	}
 	var fields []string
+	var reverse []bool
 	if len(idx.Bounds) > 0 {
-		fields = append(fields, idx.Info.FieldNames[:min(idx.BoundFields, len(idx.Info.FieldNames))]...)
+		n := min(idx.BoundFields, len(idx.Info.FieldNames))
+		fields = append(fields, idx.Info.FieldNames[:n]...)
+		for i := range n {
+			reverse = append(reverse, fieldReverse(idx.Info.Reverse, i))
+		}
 	}
 	for _, f := range coverFilters {
 		fields = append(fields, idx.Info.FieldNames[f.FieldIdx])
+		reverse = append(reverse, fieldReverse(idx.Info.Reverse, f.FieldIdx))
 	}
 	hasFields := false
-	if ok := filterFieldsCoveredBy(filter, fields, &hasFields); !ok || !hasFields {
+	if ok := filterFieldsCoveredBy(filter, fields, reverse, &hasFields); !ok || !hasFields {
 		return false
 	}
 	for _, field := range fields {
@@ -1854,32 +1860,36 @@ func countInnerPreds(f query.Filter) int {
 }
 
 // keyBoundsExact reports whether a Key's index bounds are the exact value
-// image of its predicate — the premise of every FilterIter-skipping path. A
-// $elemMatch breaks it: its bounds are element-level (value form) or
-// re-keyed sub-field bounds (object form), and a scalar or an object with
-// that value sits in the same bounds without matching. Such a Key always
+// image of its predicate on a field stored ascending, or inverted when
+// reverse — the premise of every FilterIter-skipping path. The widening
+// predicates are enumerated by query.IndexBoundsExact; such a Key always
 // keeps its residual filter.
-func keyBoundsExact(k query.Key) bool {
-	return !query.ContainsElemMatch(k.Filter)
+func keyBoundsExact(k query.Key, reverse bool) bool {
+	return query.IndexBoundsExact(k.Filter, reverse)
+}
+
+// fieldReverse reports whether index field i is reverse-flagged; reverse is
+// the index's per-field flags, which may be shorter than its field list.
+func fieldReverse(reverse []bool, i int) bool {
+	return i >= 0 && i < len(reverse) && reverse[i]
 }
 
 // filterFieldsCoveredBy walks the filter tree and checks that every referenced
-// field name is present in idxFields. Zero-allocation.
-func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) bool {
+// field name is present in idxFields, with bounds exact for the field's
+// direction (reverse aligns with idxFields). Zero-allocation.
+func filterFieldsCoveredBy(f query.Filter, idxFields []string, reverse []bool, hasFields *bool) bool {
 	switch ft := f.(type) {
 	case query.Key:
-		if !keyBoundsExact(ft) {
+		name := strings.Join(ft.Path, ".")
+		i := slices.Index(idxFields, name)
+		if i < 0 || !keyBoundsExact(ft, fieldReverse(reverse, i)) {
 			return false
 		}
-		name := strings.Join(ft.Path, ".")
-		if slices.Contains(idxFields, name) {
-			*hasFields = true
-			return true
-		}
-		return false
+		*hasFields = true
+		return true
 	case query.And:
 		for _, sub := range ft {
-			if !filterFieldsCoveredBy(sub, idxFields, hasFields) {
+			if !filterFieldsCoveredBy(sub, idxFields, reverse, hasFields) {
 				return false
 			}
 		}
@@ -1890,7 +1900,7 @@ func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) 
 		// (see query/cond_parse.go:103), so without this case the covering-
 		// count fast path is silently disabled for $and-spelled filters.
 		for _, sub := range *ft {
-			if !filterFieldsCoveredBy(sub, idxFields, hasFields) {
+			if !filterFieldsCoveredBy(sub, idxFields, reverse, hasFields) {
 				return false
 			}
 		}
@@ -1901,23 +1911,30 @@ func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) 
 }
 
 // collectUncoveredFilterFields walks the filter tree and returns field names
-// not present in coveredFields. Returns nil if the filter contains complex
-// nodes (Or, Not, Nor) that can't be reliably field-analyzed.
-func collectUncoveredFilterFields(f query.Filter, coveredFields []string) []string {
+// not present in coveredFields (reverse aligns with it). Returns nil if the
+// filter contains complex nodes (Or, Not, Nor) that can't be reliably
+// field-analyzed, or a covered field whose bounds are not exact.
+func collectUncoveredFilterFields(f query.Filter, coveredFields []string, reverse []bool) []string {
 	switch ft := f.(type) {
 	case query.Key:
-		if !keyBoundsExact(ft) {
-			return nil
-		}
 		name := strings.Join(ft.Path, ".")
-		if slices.Contains(coveredFields, name) {
+		if i := slices.Index(coveredFields, name); i >= 0 {
+			if !keyBoundsExact(ft, fieldReverse(reverse, i)) {
+				return nil
+			}
 			return []string{} // covered
+		}
+		// An uncovered field is verified through its own index, whose
+		// direction is unknown here: a predicate inexact either way
+		// disables the chain.
+		if !keyBoundsExact(ft, true) {
+			return nil
 		}
 		return []string{name}
 	case query.And:
 		var result []string
 		for _, sub := range ft {
-			fields := collectUncoveredFilterFields(sub, coveredFields)
+			fields := collectUncoveredFilterFields(sub, coveredFields, reverse)
 			if fields == nil {
 				return nil
 			}
@@ -1927,7 +1944,7 @@ func collectUncoveredFilterFields(f query.Filter, coveredFields []string) []stri
 	case *query.And:
 		var result []string
 		for _, sub := range *ft {
-			fields := collectUncoveredFilterFields(sub, coveredFields)
+			fields := collectUncoveredFilterFields(sub, coveredFields, reverse)
 			if fields == nil {
 				return nil
 			}
@@ -1945,7 +1962,7 @@ func collectUncoveredFilterFields(f query.Filter, coveredFields []string) []stri
 // index and verifies docIds against it instead of fetching full documents.
 // Returns nil if verification is not possible.
 func buildVerifyChain(params *PlanParams, idx *CBOIndex, root Iterator) Iterator {
-	uncovered := collectUncoveredFilterFields(params.Filter, idx.Info.FieldNames[:idx.BoundFields])
+	uncovered := collectUncoveredFilterFields(params.Filter, idx.Info.FieldNames[:idx.BoundFields], idx.Info.Reverse)
 	if len(uncovered) == 0 {
 		return nil
 	}

@@ -2,6 +2,7 @@ package query
 
 import (
 	"bytes"
+	"regexp"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -460,6 +461,9 @@ func TestRegexp(t *testing.T) {
 		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": ["A", "B", "C"]}`), nil))
 		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": ["baaa"]}`), nil))
 		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": ["baaa", "a"]}`), nil))
+		// A non-string element is skipped, not a rejection of the array.
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": [1, null, "a"]}`), nil))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": [1, null]}`), nil))
 	})
 	t.Run("ok - number", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^a(?i)"}}`)
@@ -534,27 +538,121 @@ func TestRegexp(t *testing.T) {
 		assert.Len(t, bounds, 1)
 		assert.Equal(t, `"prefix.test"`, append(bounds[0].Start, 0).String())
 	})
-	t.Run("index: ^prefix\\.test{1}* - return prefix.test", func(t *testing.T) {
+	t.Run("index: unmatched brace is literal, * binds it", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^prefix\.test{a-zA-z}*"}}`)
 		require.NoError(t, err)
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
-		assert.Equal(t, `"prefix.test"`, append(bounds[0].Start, 0).String())
+		assert.Equal(t, `"prefix.test{a-zA-z"`, append(bounds[0].Start, 0).String())
 	})
-	t.Run("index: ^prefix+ - return prefix", func(t *testing.T) {
+	t.Run("index: ^prefix+ - x+ keeps one x", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^prefix+"}}`)
 		require.NoError(t, err)
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
 		assert.Equal(t, `"prefix"`, append(bounds[0].Start, 0).String())
 	})
-	t.Run("index: ^\\.a* - return prefix", func(t *testing.T) {
+	t.Run("index: ^\\.a* - * drops its literal", func(t *testing.T) {
+		// "." alone matches, so the prefix stops before the quantified a.
 		f, err := ParseCondition(`{"name":{"$regex": "^\.a*"}}`)
 		require.NoError(t, err)
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
-		assert.Equal(t, `".a"`, append(bounds[0].Start, 0).String())
+		assert.Equal(t, `"."`, append(bounds[0].Start, 0).String())
 	})
+}
+
+// TestRegexp_LiteralPrefix pins the seek prefix and its exactness for the
+// pattern shapes the syntax walk must read as the engine does. An
+// under-approximating prefix drops rows the residual filter can never
+// recover; a prefix reported complete lets the planner elide that filter.
+func TestRegexp_LiteralPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		pattern  string
+		prefix   string
+		complete bool
+	}{
+		{`^abc`, "abc", true},
+		{`^a`, "a", true},
+		{`^ab\.c`, "ab.c", true},
+		{`^\Qa.b\E`, "a.b", true},
+		{`^a\x41`, "aA", true},
+		{`^aé`, "aé", true},
+		{`(?s)^ab`, "ab", true},
+		{`^abc$`, "abc", false},
+		{`^ab.*c`, "ab", false},
+		{`^ab[cz]`, "ab", false},
+		{`^a(b|x)`, "a", false},
+		{`^abc(?:d)?`, "abc", false},
+		{`^ab*`, "a", false},
+		{`^ab?`, "a", false},
+		{`^ab+`, "ab", false},
+		{`^ab{0,1}c`, "a", false},
+		{`^ab{2}`, "a", false},
+		{`^a\w{2}$`, "a", false},
+		{`^\d+`, "", false},
+		{`^ab|^xy`, "", false},
+		{`abc`, "", false},
+		{`^`, "", false},
+		{`(?i)^ab`, "", false},
+		{`^(?i)ab`, "", false},
+		{`(?m)^ab`, "", false},
+		{`^a\x{FFFD}`, "", false},
+		{`^\x{FFFD}`, "", false},
+	} {
+		prefix, complete := literalPrefix(tc.pattern)
+		assert.Equal(t, tc.prefix, prefix, "prefix of %s", tc.pattern)
+		assert.Equal(t, tc.complete, complete, "complete for %s", tc.pattern)
+	}
+}
+
+// TestIndexBoundsExact pins which predicates the planner may treat as
+// exactly represented by their index bounds (residual filter elidable),
+// ascending and on a reverse-flagged field.
+func TestIndexBoundsExact(t *testing.T) {
+	for cond, want := range map[string][2]bool{
+		`{"a":1}`:                                 {true, true},
+		`{"a":null}`:                              {true, true},
+		`{"a":{"$in":[1,null]}}`:                  {true, true},
+		`{"a":{"$gt":1}}`:                         {true, true},
+		`{"a":{"$ne":1}}`:                         {true, true},
+		`{"a":{"$gte":1,"$lte":2}}`:               {true, true}, // widened by count, screened by predicate count
+		`{"a":{"$type":"string"}}`:                {true, true},
+		`{"a":{"$type":"array"}}`:                 {true, true},
+		`{"a":{"$type":"null"}}`:                  {false, false},
+		`{"a":{"$regex":"^ab"}}`:                  {true, false},
+		`{"a":{"$regex":"^ab\\.c"}}`:              {true, false},
+		`{"a":{"$regex":"^abc$"}}`:                {false, false},
+		`{"a":{"$regex":"^ab.*c"}}`:               {false, false},
+		`{"a":{"$regex":"^ab[cz]"}}`:              {false, false},
+		`{"a":{"$regex":"^a\\w"}}`:                {false, false},
+		`{"a":{"$regex":"ab"}}`:                   {false, false},
+		`{"a":{"$regex":"^ab","$options":"i"}}`:   {false, false},
+		`{"a":{"$elemMatch":{"$gt":1}}}`:          {false, false},
+		`{"a":{"$elemMatch":{"b":1}}}`:            {false, false},
+		`{"a":{"$all":[{"$elemMatch":{"b":1}}]}}`: {false, false},
+		`{"a":{"$not":{"$gt":1}}}`:                {false, false},
+		`{"a":{"$exists":true}}`:                  {false, false},
+		`{"a":{"$size":2}}`:                       {false, false},
+	} {
+		f, err := ParseCondition(cond)
+		require.NoError(t, err, cond)
+		k, ok := f.(Key)
+		require.True(t, ok, cond)
+		assert.Equal(t, want[0], IndexBoundsExact(k.Filter, false), "%s ascending", cond)
+		assert.Equal(t, want[1], IndexBoundsExact(k.Filter, true), "%s reverse", cond)
+	}
+}
+
+// A Regexp built by hand carries $options only in the Options field, so the
+// seek prefix must screen i and m from there.
+func TestRegexp_HandBuiltOptions(t *testing.T) {
+	r := Regexp{Regexp: regexp.MustCompile("^ab"), Options: "i"}
+	assert.Empty(t, r.IndexBounds("a", nil))
+	assert.False(t, IndexBoundsExact(r, false))
+	r = Regexp{Regexp: regexp.MustCompile("^ab"), Options: "s"}
+	assert.Len(t, r.IndexBounds("a", nil), 1)
+	assert.True(t, IndexBoundsExact(r, false))
 }
 
 func TestSize(t *testing.T) {
