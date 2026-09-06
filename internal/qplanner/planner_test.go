@@ -347,6 +347,42 @@ func TestBuildPlan_LowSelectivity_FullScan(t *testing.T) {
 	assert.Equal(t, "FullScan", plan.Name)
 }
 
+// TestCoverChecks_InexactBounds pins that a covered field whose bounds are a
+// superset of its predicate ($regex beyond an anchored literal, $type null,
+// $elemMatch) never lets a plan skip the residual filter — through the
+// bound prefix (count fast path) or the ordered-scan elision that also
+// counts IndexFilterIter equality fields.
+func TestCoverChecks_InexactBounds(t *testing.T) {
+	idxAZ := func(cond string) *CBOIndex {
+		return &CBOIndex{
+			Info:        &IndexInfo{Name: "az", FieldNames: []string{"a", "z"}},
+			Bounds:      mustParseBounds("a", cond),
+			BoundFields: 1,
+		}
+	}
+	zEq := []IndexFieldFilter{{FieldIdx: 1, MatchValue: anyenc.AppendAnyValue(nil, 1)}}
+	for _, f := range []string{
+		`{"z":1,"a":{"$regex":"^ab.*c"}}`,
+		`{"z":1,"a":{"$regex":"^abc$"}}`,
+		`{"z":1,"a":{"$type":"null"}}`,
+		`{"z":1,"a":{"$elemMatch":{"$gt":1}}}`,
+	} {
+		cond := query.MustParseCondition(f)
+		idx := idxAZ(f)
+		require.NotEmpty(t, idx.Bounds, f)
+		assert.False(t, indexScanCoversFilter(idx, zEq, cond), "residual must stay: %s", f)
+		assert.False(t, indexCoversFilter(idx, cond), "count must keep the filter: %s", f)
+	}
+	for _, f := range []string{
+		`{"z":1,"a":{"$regex":"^ab"}}`,
+		`{"z":1,"a":{"$type":"string"}}`,
+		`{"z":1,"a":{"$gt":1}}`,
+	} {
+		cond := query.MustParseCondition(f)
+		assert.True(t, indexScanCoversFilter(idxAZ(f), zEq, cond), "exact bounds elide the residual: %s", f)
+	}
+}
+
 func TestBuildPlan_UniqueIndex_CoverLookup(t *testing.T) {
 	bounds := mustParseBounds("a", `{"a": 42}`)
 	plan := BuildPlan(&PlanParams{

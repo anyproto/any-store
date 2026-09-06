@@ -600,6 +600,40 @@ func TestRegexp_LiteralPrefix(t *testing.T) {
 	}
 }
 
+// TestIndexBoundsExact pins which predicates the planner may treat as
+// exactly represented by their index bounds (residual filter elidable).
+func TestIndexBoundsExact(t *testing.T) {
+	for cond, exact := range map[string]bool{
+		`{"a":1}`:                                 true,
+		`{"a":null}`:                              true,
+		`{"a":{"$in":[1,null]}}`:                  true,
+		`{"a":{"$gt":1}}`:                         true,
+		`{"a":{"$ne":1}}`:                         true,
+		`{"a":{"$gte":1,"$lte":2}}`:               true, // widened by count, screened by predicate count
+		`{"a":{"$type":"string"}}`:                true,
+		`{"a":{"$type":"array"}}`:                 true,
+		`{"a":{"$type":"null"}}`:                  false,
+		`{"a":{"$regex":"^ab"}}`:                  true,
+		`{"a":{"$regex":"^ab\\.c"}}`:              true,
+		`{"a":{"$regex":"^abc$"}}`:                false,
+		`{"a":{"$regex":"^ab.*c"}}`:               false,
+		`{"a":{"$regex":"^ab[cz]"}}`:              false,
+		`{"a":{"$regex":"^a\\w"}}`:                false,
+		`{"a":{"$regex":"ab"}}`:                   false,
+		`{"a":{"$regex":"^ab","$options":"i"}}`:   false,
+		`{"a":{"$elemMatch":{"$gt":1}}}`:          false,
+		`{"a":{"$elemMatch":{"b":1}}}`:            false,
+		`{"a":{"$all":[{"$elemMatch":{"b":1}}]}}`: false,
+		`{"a":{"$not":{"$regex":"^ab.*c"}}}`:      false,
+	} {
+		f, err := ParseCondition(cond)
+		require.NoError(t, err, cond)
+		k, ok := f.(Key)
+		require.True(t, ok, cond)
+		assert.Equal(t, exact, IndexBoundsExact(k.Filter), cond)
+	}
+}
+
 func TestSize(t *testing.T) {
 	t.Run("ok", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$size": 2}}`)

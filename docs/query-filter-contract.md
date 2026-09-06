@@ -129,12 +129,20 @@ build per query and carry no such guarantee.
     `(?flags)`. Inline flag groups in the pattern itself remain legal.
     Duplicate `$options` keys collapse last-wins in the JSON parser (standard
     JSON behavior); the surviving occurrence is validated like any other.
-    Anchored-prefix index bounds (`^literal…`) are suppressed exactly when a
-    flag can widen the match: `i` (case folding) and `m` (any-line anchoring)
-    keep the scan wide — via `$options` or a leading `^(?i)` in the pattern —
-    while `s` only changes what `.` matches and keeps the prefix bounds.
-    Pinned by `TestRegexp` (query/filter_test.go) and the `$options` cases in
-    `TestParseError`.
+    Index bounds seek the prefix range of the pattern's anchored literal
+    head, read off the parsed syntax tree so it means what the engine
+    means: a quantifier binds the literal before it (`^ab*` seeks `a`,
+    `^ab+` seeks `ab`), an escape class is no literal (`^\d` seeks
+    nothing), a top-level alternation has no head, and `i` (case folding)
+    or `m` (any-line anchoring) — via `$options` or an inline flag group —
+    keeps the scan wide, while `s` only changes what `.` matches. The range
+    is the exact match set only when the pattern is that literal and
+    nothing more; any other pattern keeps its residual filter
+    (`query.IndexBoundsExact`). Pinned by `TestRegexp` and
+    `TestRegexp_LiteralPrefix` (query/filter_test.go), the `$options` cases
+    in `TestParseError`, and the oracle runs `TestRegexPrefixBounds_Oracle`
+    and `TestResidualElision_InexactBounds` in the `any-store-tests`
+    repository.
 
 12. **Parse rejections are structured.** Everything `ParseCondition`,
     `ParseModifier`, and the aggregation pipeline parser reject — unknown
@@ -230,7 +238,11 @@ build per query and carry no such guarantee.
     raw fast paths (`OkRaw`, `AppendKeyRaw`) decline at an array container
     and fall back to the parsed document. `$type` matches an array whose
     ELEMENT has the type as well as the array itself (`"array"`), and
-    accepts Mongo's `"bool"` alias.
+    accepts Mongo's `"bool"` alias. `$type: "null"` needs an explicit null:
+    a missing field has no type. Its index bounds cover the null key, which
+    a missing field and an empty array also occupy, so it keeps its
+    residual filter (`query.IndexBoundsExact`); every other `$type` is
+    exactly its type range.
     Deliberate divergences from Mongo, pinned by the MongoDB-fixture replay
     `TestMongoArraySemantics` in the `any-store-tests` repository: (a) the null-equality
     family (`$eq null`, `$in [null]`, and their negations) matches a missing
@@ -267,5 +279,5 @@ build per query and carry no such guarantee.
     object with that value sits in the bounds without matching), so a `Key`
     holding a `$elemMatch` always keeps its residual filter: the planner's
     covering-count, verify-chain and residual-elision paths treat it as
-    uncovered (`keyBoundsExact`). Pinned by `TestElemMatch_Parse`,
+    uncovered (`query.IndexBoundsExact`). Pinned by `TestElemMatch_Parse`,
     `TestElemMatch_Ok` and `TestElemMatch_IndexBoundsAndString`.

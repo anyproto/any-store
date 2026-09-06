@@ -1146,6 +1146,42 @@ func ContainsElemMatch(f Filter) bool {
 	})
 }
 
+// IndexBoundsExact reports whether the index bounds of a Key's inner filter
+// f are the exact key image of its Ok set — the premise of every plan that
+// skips the residual FilterIter for a covered field (indexCoversFilter,
+// indexScanCoversFilter and the verify chain in the planner). IndexBounds
+// is only contracted to be a SUPERSET; three predicates widen it:
+//
+//   - $elemMatch: element-level or re-keyed sub-field bounds — a scalar, or
+//     an object carrying the value, sits inside them without matching;
+//   - $type null: a missing field and an empty array are indexed under the
+//     null key, and Ok rejects both;
+//   - $regex beyond a whole anchored literal: the prefix range admits every
+//     continuation, the pattern only some (^abc$, ^ab.*c, ^a\w).
+//
+// A Key holding any of them anywhere in f must keep its residual filter.
+// Multi-predicate conjunctions widen too and are screened separately by
+// predicate count.
+func IndexBoundsExact(f Filter) bool {
+	return !FilterTreeAny(f, func(f Filter) bool {
+		switch ft := f.(type) {
+		case ElemMatch, *ElemMatch:
+			return true
+		case TypeFilter:
+			return ft.Type == anyenc.TypeNull
+		case *TypeFilter:
+			return ft.Type == anyenc.TypeNull
+		case Regexp:
+			_, complete := ft.literalPrefix()
+			return !complete
+		case *Regexp:
+			_, complete := ft.literalPrefix()
+			return !complete
+		}
+		return false
+	})
+}
+
 // presenceNullProbe is an explicit JSON null used by GuaranteesPresence to test
 // whether a predicate rejects a present-but-null value, as distinct from a
 // missing field (which probes as a nil *anyenc.Value).

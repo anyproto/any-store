@@ -1854,13 +1854,12 @@ func countInnerPreds(f query.Filter) int {
 }
 
 // keyBoundsExact reports whether a Key's index bounds are the exact value
-// image of its predicate — the premise of every FilterIter-skipping path. A
-// $elemMatch breaks it: its bounds are element-level (value form) or
-// re-keyed sub-field bounds (object form), and a scalar or an object with
-// that value sits in the same bounds without matching. Such a Key always
-// keeps its residual filter.
+// image of its predicate — the premise of every FilterIter-skipping path.
+// The widening predicates ($elemMatch, $type null, a $regex beyond its
+// anchored literal) are enumerated by query.IndexBoundsExact; such a Key
+// always keeps its residual filter.
 func keyBoundsExact(k query.Key) bool {
-	return !query.ContainsElemMatch(k.Filter)
+	return query.IndexBoundsExact(k.Filter)
 }
 
 // filterFieldsCoveredBy walks the filter tree and checks that every referenced
