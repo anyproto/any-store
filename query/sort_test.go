@@ -2,6 +2,7 @@ package query
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -93,4 +94,32 @@ func TestSortField_AppendKey_ArrayElements(t *testing.T) {
 		require.NotEmpty(t, got)
 		assert.Equal(t, want, got)
 	})
+}
+
+// Sort keys through arrays of objects: min ascending / max descending over
+// every leaf's elements; a missing leaf is null; a positional leaf is whole.
+func TestSortField_PathThroughArrays(t *testing.T) {
+	key := func(path, doc string, reverse bool) string {
+		s := &SortField{Path: strings.Split(path, "."), Reverse: reverse}
+		k := s.AppendKey(nil, anyenc.MustParseJson(doc))
+		if reverse {
+			for i := range k {
+				k[i] = ^k[i]
+			}
+		}
+		v, err := (&anyenc.Parser{}).Parse(k)
+		require.NoError(t, err)
+		return v.String()
+	}
+	assert.Equal(t, `1`, key("a.b", `{"a":[{"b":3},{"b":1},{"b":2}]}`, false))
+	assert.Equal(t, `3`, key("a.b", `{"a":[{"b":3},{"b":1},{"b":2}]}`, true))
+	assert.Equal(t, `null`, key("a.b", `{"a":[{"b":3},{"c":1}]}`, false))
+	assert.Equal(t, `3`, key("a.b", `{"a":[{"b":3},{"c":1}]}`, true))
+	assert.Equal(t, `null`, key("a.b", `{"a":[]}`, false))
+	assert.Equal(t, `null`, key("a.b", `{"a":[1,2]}`, false))
+	assert.Equal(t, `0`, key("a.b", `{"a":[{"b":[5,0]},{"b":2}]}`, false)) // leaf array elements
+	assert.Equal(t, `[]`, key("a.b", `{"a":[{"b":[]}]}`, false))           // empty leaf array: whole key
+	assert.Equal(t, `[1,2]`, key("a.0", `{"a":[[1,2],[0]]}`, false))       // positional: whole
+	assert.Equal(t, `1`, key("a.0.b", `{"a":[[{"b":1}]]}`, false))
+	assert.Equal(t, `5`, key("a.b.c", `{"a":[{"b":[{"c":9},{"c":5}]},{"b":{"c":7}}]}`, false))
 }

@@ -232,6 +232,13 @@ type IndexInfo struct {
 	// consistent with query matching, where {field: null} matches both a null
 	// and a missing field.
 	//
+	// Over a path through an array of objects the rule is per document: each
+	// indexed field must hold a present value in SOME element. Every key is
+	// then written unless all of its fields are null or missing in that
+	// element — {"a":[{"b":1},{"c":2}]} under (a.b, a.c) has keys (1, null)
+	// and (null, 2) — so a document that matches through different elements
+	// is still reachable by the seek on the leading field.
+	//
 	// As a consequence, the planner only uses a sparse index for a query that
 	// guarantees every indexed field is present and non-null; otherwise it would
 	// silently drop matching documents the index never stored. In particular a
@@ -371,15 +378,17 @@ type index struct {
 	// in keysBuf[k] just past field L's encoding, so keysBuf[k][:keyBoundsBuf[k][L]]
 	// is the level-L prefix fed to the multi-level sketch.
 	keyBoundsBuf [][]int
-	// curBounds is scratch (len == number of index fields) holding the field-end
-	// offsets of the key currently being built by writeValues; copied into
-	// keyBoundsBuf at each leaf.
-	curBounds   []int
-	uniqBuf     [][]anyenc.Tuple
-	fullKeyBuf  anyenc.Tuple // reusable buffer for full keys (key+docId)
-	seekBuf     anyenc.Tuple // reusable buffer for unique constraint seek results
-	uniqSeekBuf anyenc.Tuple // reusable buffer for the padded unique-probe seek key
-	mkBuf       []byte       // reusable buffer for the multikey-flag check-and-put read
+	// fields is writeValues' per-field scratch, indexed by field position and
+	// reset once per document (resetFields).
+	fields      []fieldScratch
+	rebinds     []rebind        // stack of rebound fields across nested fan-outs
+	shared      int             // later fields currently rebound: level dedup is off
+	rebound     bool            // some field was rebound for this document: keys dedup whole
+	valBuf      []*anyenc.Value // stack of a leaf array's index values
+	fullKeyBuf  anyenc.Tuple    // reusable buffer for full keys (key+docId)
+	seekBuf     anyenc.Tuple    // reusable buffer for unique constraint seek results
+	uniqSeekBuf anyenc.Tuple    // reusable buffer for the padded unique-probe seek key
+	mkBuf       []byte          // reusable buffer for the multikey-flag check-and-put read
 }
 
 // loadPubSketch returns the published reader snapshot. Lock-free; the returned
@@ -441,11 +450,8 @@ func (idx *index) cloneWithNs(ns *btree.Namespace, nsName string, catalogKey []b
 		reverse:        idx.reverse,
 		sketch:         idx.sketch,
 		sketchModified: idx.sketchModified,
-		// uniqBuf and curBounds are indexed by field position, not appended —
-		// they must be pre-sized like init does.
-		uniqBuf:   make([][]anyenc.Tuple, len(idx.fieldPaths)),
-		curBounds: make([]int, len(idx.fieldPaths)),
 	}
+	n.initScratch()
 	// cboInfo embeds the namespace handle — rebuild it around the new one.
 	cbo := *idx.cboInfo
 	cbo.Ns = ns
@@ -484,10 +490,18 @@ func (idx *index) init() (err error) {
 		idx.fieldPaths = append(idx.fieldPaths, fields)
 		idx.reverse = append(idx.reverse, reverse)
 	}
-	idx.uniqBuf = make([][]anyenc.Tuple, len(idx.fieldPaths))
-	idx.curBounds = make([]int, len(idx.fieldPaths))
+	idx.initScratch()
 
 	// Build cached CBO index info once (avoids per-query allocation)
+	sharedFrom := len(idx.fieldPaths)
+	for j := 1; j < len(idx.fieldPaths) && sharedFrom == len(idx.fieldPaths); j++ {
+		for i := 0; i < j; i++ {
+			if idx.fieldPaths[i][0] == idx.fieldPaths[j][0] {
+				sharedFrom = j
+				break
+			}
+		}
+	}
 	idx.cboInfo = &qplanner.IndexInfo{
 		Name:       idx.info.Name,
 		FieldNames: idx.fieldNames,
@@ -496,6 +510,7 @@ func (idx *index) init() (err error) {
 		Unique:     idx.info.Unique,
 		Sparse:     idx.info.Sparse,
 		Ns:         idx.ns,
+		SharedFrom: sharedFrom,
 	}
 	return nil
 }
@@ -672,22 +687,194 @@ func (idx *index) applySketch(ki, prevKi int, inc bool) {
 	}
 }
 
-func (idx *index) writeKey() {
+// writeKey appends the key being built and reports whether it was written:
+// a sparse index skips a key whose fields are all null or missing.
+func (idx *index) writeKey() bool {
+	if idx.info.Sparse {
+		any := false
+		for i := range idx.fields {
+			if idx.fields[i].present {
+				any = true
+				idx.fields[i].seen = true
+			}
+		}
+		if !any {
+			return false
+		}
+	}
+	if idx.rebound {
+		for _, k := range idx.keysBuf {
+			if bytes.Equal(k, idx.keyBuf) {
+				return true
+			}
+		}
+	}
 	nl := len(idx.keysBuf) + 1
 	idx.keysBuf = slices.Grow(idx.keysBuf, nl)[:nl]
 	idx.keysBuf[nl-1] = append(idx.keysBuf[nl-1][:0], idx.keyBuf...)
 	idx.keyBoundsBuf = slices.Grow(idx.keyBoundsBuf, nl)[:nl]
-	idx.keyBoundsBuf[nl-1] = append(idx.keyBoundsBuf[nl-1][:0], idx.curBounds...)
+	bounds := idx.keyBoundsBuf[nl-1][:0]
+	for i := range idx.fields {
+		bounds = append(bounds, idx.fields[i].curBound)
+	}
+	idx.keyBoundsBuf[nl-1] = bounds
+	return true
 }
 
-func (idx *index) writeValues(d *anyenc.Value, i int) bool {
+// writeValues appends, for field i, one key per value the field stores for
+// this document, each continued into field i+1 depth-first, and reports
+// whether any full key was written. A sparse index skips a key whose fields
+// are all null or missing, and drops the document when some field is null
+// or missing in every key (fillKeysBuf).
+//
+// Field i resolves from fields[i].root at segment .consumed (the whole document
+// at segment 0 unless an earlier field rebound it — see resolveField): a
+// path through an array of objects fans out one entry per element, like a
+// leaf array does, and fields that run through the SAME array iterate it
+// together, one key per element, never as a cross product.
+func (idx *index) writeValues(i int) bool {
 	if i == len(idx.fieldPaths) {
-		idx.writeKey()
-		return true
+		return idx.writeKey()
 	}
-	v := d.Get(idx.fieldPaths[i]...)
-	if idx.info.Sparse && (v == nil || v.Type() == anyenc.TypeNull) {
+	idx.fields[i].keyPrefix = len(idx.keyBuf)
+	root, seg := idx.fields[i].root, idx.fields[i].consumed
+	// One scalar leaf — the common field — needs no fan-out bookkeeping.
+	if leaf, single := root.GetLeaf(idx.fieldPaths[i][seg:]...); single && (leaf == nil || leaf.Type() != anyenc.TypeArray) {
+		idx.fields[i].dedup = false
+		return idx.emitLeaf(i, anyenc.Leaf{Value: leaf})
+	}
+	// Several values under one prefix (an array, or fan-out) may repeat —
+	// {"a":[{"b":1},{"b":1}]} — and must yield one entry.
+	idx.fields[i].dedup = true
+	idx.fields[i].uniq = idx.fields[i].uniq[:0]
+	return idx.resolveField(i, root, seg)
+}
+
+// resolveField walks field i's path from segment seg at v and emits every
+// leaf (anyenc.Value.AppendLeaves semantics). At an array met by a
+// non-numeric segment, every later field whose path reaches this same array
+// is rebound to the element being visited, so its own walk continues inside
+// that element — MongoDB's key generation for fields sharing an array.
+func (idx *index) resolveField(i int, v *anyenc.Value, seg int) bool {
+	path := idx.fieldPaths[i]
+	for ; seg < len(path); seg++ {
+		if v == nil {
+			return idx.emitLeaf(i, anyenc.Leaf{})
+		}
+		switch v.Type() {
+		case anyenc.TypeObject:
+			v = v.Get(path[seg])
+		case anyenc.TypeArray:
+			arr, _ := v.Array()
+			if n, ok := anyenc.ParseIndexSegment(path[seg]); ok {
+				if n < 0 || n >= len(arr) {
+					return idx.emitLeaf(i, anyenc.Leaf{})
+				}
+				v = arr[n]
+				if seg == len(path)-1 {
+					return idx.emitLeaf(i, anyenc.Leaf{Value: v, Positional: true})
+				}
+				continue
+			}
+			if len(arr) == 0 {
+				return idx.emitLeaf(i, anyenc.Leaf{})
+			}
+			mark := len(idx.rebinds)
+			shared := 0
+			for j := i + 1; j < len(idx.fieldPaths); j++ {
+				if idx.sharesArray(j, i, seg) {
+					idx.rebinds = append(idx.rebinds, rebind{j, idx.fields[j].root, idx.fields[j].consumed})
+					shared++
+				}
+			}
+			// Field i's own context moves into the element too, so a deeper
+			// fan-out compares later fields against where this walk stands.
+			idx.rebinds = append(idx.rebinds, rebind{i, idx.fields[i].root, idx.fields[i].consumed})
+			idx.shared += shared
+			if shared > 0 {
+				idx.rebound = true
+			}
+			wrote := false
+			for _, el := range arr {
+				for _, rb := range idx.rebinds[mark:] {
+					idx.fields[rb.field].root, idx.fields[rb.field].consumed = el, seg
+				}
+				var ok bool
+				if el.Type() == anyenc.TypeObject {
+					ok = idx.resolveField(i, el, seg)
+				} else {
+					ok = idx.emitLeaf(i, anyenc.Leaf{})
+				}
+				wrote = wrote || ok
+			}
+			for _, rb := range idx.rebinds[mark:] {
+				idx.fields[rb.field].root, idx.fields[rb.field].consumed = rb.root, rb.consumed
+			}
+			clear(idx.rebinds[mark:])
+			idx.rebinds = idx.rebinds[:mark]
+			idx.shared -= shared
+			return wrote
+		default:
+			return idx.emitLeaf(i, anyenc.Leaf{})
+		}
+	}
+	return idx.emitLeaf(i, anyenc.Leaf{Value: v})
+}
+
+// fieldScratch is one index field's state while writeValues builds a
+// document's keys. Laid out widest first — pointer, slice header, ints, then
+// the bools — so it packs into 64 bytes with no interior padding.
+type fieldScratch struct {
+	root      *anyenc.Value  // value the field resolves from (rebound inside a shared array)
+	uniq      []anyenc.Tuple // values already written under the current prefix
+	consumed  int            // path segments already resolved by root
+	keyPrefix int            // len(keyBuf) at this field's level
+	curBound  int            // len(keyBuf) past this field's value in the key being built
+	dedup     bool           // the values under one prefix may repeat
+	present   bool           // the value in the key being built is non-null
+	seen      bool           // some key of this document had the field present
+}
+
+// rebind records a later field's root before an array fan-out rebinds it to
+// the element under visit.
+type rebind struct {
+	field    int
+	root     *anyenc.Value
+	consumed int
+}
+
+// sharesArray reports whether field j, resolved from the same root and
+// segment as field i, reaches the array field i fans out on at segment seg
+// and continues into its elements (a numeric segment there would index the
+// array instead, and a path ending at the array names the array itself).
+func (idx *index) sharesArray(j, i, seg int) bool {
+	pj, pi := idx.fieldPaths[j], idx.fieldPaths[i]
+	if len(pj) <= seg || idx.fields[j].root != idx.fields[i].root || idx.fields[j].consumed != idx.fields[i].consumed {
 		return false
+	}
+	for k := idx.fields[i].consumed; k < seg; k++ {
+		if pj[k] != pi[k] {
+			return false
+		}
+	}
+	_, numeric := anyenc.ParseIndexSegment(pj[seg])
+	return !numeric
+}
+
+// emitLeaf writes field i's index values for one leaf — the value, or each
+// element followed by the array itself for a non-positional array leaf
+// (anyenc.AppendIndexValues) — each continued into field i+1.
+func (idx *index) emitLeaf(i int, l anyenc.Leaf) bool {
+	var one [1]*anyenc.Value
+	vals := one[:]
+	one[0] = l.Value
+	vb := len(idx.valBuf)
+	if l.Value != nil && l.Value.Type() == anyenc.TypeArray && !l.Positional {
+		if arr, _ := l.Value.Array(); len(arr) > 0 {
+			idx.valBuf = append(idx.valBuf, arr...)
+			idx.valBuf = append(idx.valBuf, l.Value)
+			vals = idx.valBuf[vb:]
+		}
 	}
 
 	// Reverse-flagged fields are stored bitwise-inverted so a single forward
@@ -697,63 +884,89 @@ func (idx *index) writeValues(d *anyenc.Value, i int) bool {
 	// value flag are NEVER inverted. Inversion is a bijection, so the unique
 	// dedup (isUnique) and unique-constraint seek still compare correctly.
 	reverse := i < len(idx.reverse) && idx.reverse[i]
-
-	k := idx.keyBuf
-	if v != nil && v.Type() == anyenc.TypeArray {
-		arr, _ := v.Array()
-		if len(arr) != 0 {
-			idx.uniqBuf[i] = idx.uniqBuf[i][:0]
-			for _, av := range arr {
-				if reverse {
-					idx.keyBuf = anyenc.Tuple(k).AppendInverted(av)
-				} else {
-					idx.keyBuf = av.MarshalTo(k)
-				}
-				if idx.isUnique(i, idx.keyBuf) {
-					idx.curBounds[i] = len(idx.keyBuf)
-					if !idx.writeValues(d, i+1) {
-						return false
-					}
-				}
-			}
+	k := idx.keyBuf[:idx.fields[i].keyPrefix]
+	wrote := false
+	for _, v := range vals {
+		if reverse {
+			idx.keyBuf = anyenc.Tuple(k).AppendInverted(v)
+		} else {
+			idx.keyBuf = v.MarshalTo(k)
+		}
+		// A value's subtree is fixed by the value alone only while no later
+		// field is rebound (it then resolves from its own root either way);
+		// under a rebind two equal values can head different keys, and
+		// writeKey dedups the whole key instead.
+		if idx.fields[i].dedup && idx.shared == 0 && !idx.isUnique(i, idx.keyBuf) {
+			continue
+		}
+		// Presence is the leaf's: a null element of a present array leaf is
+		// still one of its entries.
+		idx.fields[i].present = l.Value != nil && l.Value.Type() != anyenc.TypeNull
+		idx.fields[i].curBound = len(idx.keyBuf)
+		if idx.writeValues(i + 1) {
+			wrote = true
 		}
 	}
-
-	if reverse {
-		idx.keyBuf = anyenc.Tuple(k).AppendInverted(v)
-	} else {
-		idx.keyBuf = v.MarshalTo(k)
-	}
-	idx.curBounds[i] = len(idx.keyBuf)
-	return idx.writeValues(d, i+1)
+	// Clear the frame before cutting it: the buffer outlives the document.
+	clear(idx.valBuf[vb:])
+	idx.valBuf = idx.valBuf[:vb]
+	return wrote
 }
 
+// keysBufKeep bounds the entry buffers kept between documents: a document
+// that fans out into more entries than this hands its buffers back.
+const keysBufKeep = 4096
+
 func (idx *index) fillKeysBuf(it item) {
+	if cap(idx.keysBuf) > keysBufKeep {
+		idx.keysBuf, idx.keyBoundsBuf = nil, nil
+	}
 	idx.keysBuf = idx.keysBuf[:0]
 	idx.keyBoundsBuf = idx.keyBoundsBuf[:0]
 	idx.keyBuf = idx.keyBuf[:0]
-	idx.resetUnique()
-	if !idx.writeValues(it.Value(), 0) {
+	doc := it.Value()
+	idx.rebound = false
+	idx.resetFields(doc)
+	wrote := idx.writeValues(0)
+	if wrote && idx.info.Sparse {
+		// A sparse index holds a document only when every field is present
+		// and non-null somewhere in it.
+		for i := range idx.fields {
+			wrote = wrote && idx.fields[i].seen
+		}
+	}
+	if !wrote {
 		idx.keysBuf = idx.keysBuf[:0]
 		idx.keyBoundsBuf = idx.keyBoundsBuf[:0]
 	}
+	idx.resetFields(nil)
 }
 
-func (idx *index) resetUnique() {
-	for i := range idx.uniqBuf {
-		idx.uniqBuf[i] = idx.uniqBuf[i][:0]
+// initScratch sizes the per-field scratch (indexed by field position, never
+// appended).
+func (idx *index) initScratch() {
+	idx.fields = make([]fieldScratch, len(idx.fieldPaths))
+}
+
+// resetFields starts every field at doc, segment 0, with nothing seen and
+// no dedup set; the dedup buffers keep their capacity.
+func (idx *index) resetFields(doc *anyenc.Value) {
+	for i := range idx.fields {
+		f := &idx.fields[i]
+		*f = fieldScratch{root: doc, uniq: f.uniq[:0]}
 	}
 }
 
 func (idx *index) isUnique(i int, k anyenc.Tuple) bool {
-	for _, ek := range idx.uniqBuf[i] {
+	f := &idx.fields[i]
+	for _, ek := range f.uniq {
 		if bytes.Equal(k, ek) {
 			return false
 		}
 	}
-	nl := len(idx.uniqBuf[i]) + 1
-	idx.uniqBuf[i] = slices.Grow(idx.uniqBuf[i], nl)[:nl]
-	idx.uniqBuf[i][nl-1] = append(idx.uniqBuf[i][nl-1][:0], k...)
+	nl := len(f.uniq) + 1
+	f.uniq = slices.Grow(f.uniq, nl)[:nl]
+	f.uniq[nl-1] = append(f.uniq[nl-1][:0], k...)
 	return true
 }
 

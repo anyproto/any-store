@@ -242,7 +242,6 @@ func TestFtsCount_MatchesIterAcrossWindows(t *testing.T) {
 	}
 }
 
-
 // $text inside an open write tx must see the tx's own uncommitted full-text
 // writes — the same view on every verb — and a rollback must discard them.
 // Previously Count/Iter matched against stale committed postings while
@@ -283,4 +282,38 @@ func TestFtsReadYourWrites_InsideWriteTx(t *testing.T) {
 	count, err = coll.Find(q).Count(ctx)
 	require.NoError(t, err)
 	assert.Zero(t, count)
+}
+
+// A $text plan driven by a sparse index over a path through an array of
+// objects: the index-order dedup must elect among the entries the sparse
+// index wrote, never a null/missing leaf.
+func TestFtsOps_SparseTraversedIndexKeepsDocs(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		sparse bool
+	}{{"sparse", true}, {"dense", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "ops")
+			require.NoError(t, err)
+			require.NoError(t, coll.EnsureIndex(ctx,
+				IndexInfo{Kind: IndexKindFulltext, Fields: []string{"text"}},
+				IndexInfo{Name: "a.b", Fields: []string{"a.b"}, Sparse: tc.sparse},
+			))
+			insertJSON(t, coll,
+				`{"id":"d1","text":"alpha","a":[{"c":1},{"b":[1,2]}]}`,
+				`{"id":"d2","text":"alpha","a":[{"b":[3,4]},{"c":2}]}`,
+				`{"id":"d3","text":"alpha","a":[{"b":[5,6]},{"b":[7,8]}]}`,
+			)
+			filter := `{"$text":{"$search":"alpha"},"a.b":{"$size":2}}`
+			hint := IndexHint{IndexName: "a.b", Boost: 1_000_000}
+			for _, sort := range []string{"a.b", "-a.b"} {
+				q := coll.Find(filter).IndexHint(hint).Sort(sort)
+				assert.Equal(t, []string{"d1", "d2", "d3"}, sortedIDs(collectIdsString(t, q)), sort)
+			}
+			n, err := coll.Find(filter).IndexHint(hint).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 3, n)
+		})
+	}
 }

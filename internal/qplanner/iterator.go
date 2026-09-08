@@ -171,6 +171,13 @@ type IndexInfo struct {
 	Unique     bool
 	Sparse     bool
 	Ns         *btree.Namespace
+	// SharedFrom is the first field position whose path shares a leading
+	// segment with an earlier field's (len(FieldNames) when none). Fields
+	// that run through the same array of objects iterate it together, one
+	// entry per element, so a bound on such a field pairs with the earlier
+	// fields' bounds only within one element: over data that may fan out,
+	// the planner compounds bounds and cover filters up to this position.
+	SharedFrom int
 }
 
 // AppendIndexKey appends the value for field at position i to the tuple.

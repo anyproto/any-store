@@ -226,9 +226,10 @@ func buildKnnProbePlan(params *PlanParams, cand *knnCandidate) *Plan {
 			// MergeOverlappingBounds would collapse distinct point probes
 			// (see buildIndexSeekChain).
 			root = &CoverIter{
-				Source:  &CursorSource{Tx: params.Tx, Ns: idx.Info.Ns},
-				IdxInfo: idx.Info,
-				Bounds:  idx.Bounds,
+				Source:       &CursorSource{Tx: params.Tx, Ns: idx.Info.Ns},
+				IdxInfo:      idx.Info,
+				Bounds:       idx.Bounds,
+				ScalarProven: idx.ScalarProven,
 			}
 			if len(idx.Bounds) > 1 {
 				root = &DocDedupIter{Source: root}

@@ -1,9 +1,11 @@
 package query
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 )
@@ -395,4 +397,33 @@ func TestBounds_ContainsSorted_Randomized(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A union of bounds that meet at one key is closed there when either side
+// is: (0, …) ∪ [0, 0] = [0, …). Sorting orders by Start only, so both
+// input orders must agree.
+func TestSortAndMerge_TiedKeysKeepInclusion(t *testing.T) {
+	zero := anyenc.Tuple(anyenc.MustParseJson(`0`).MarshalTo(nil))
+	ten := anyenc.Tuple(anyenc.MustParseJson(`10`).MarshalTo(nil))
+	openRange := Bound{Start: zero, End: ten, StartInclude: false, EndInclude: false}
+	point := Bound{Start: zero, End: zero, StartInclude: true, EndInclude: true}
+	endPoint := Bound{Start: ten, End: ten, StartInclude: true, EndInclude: true}
+	for _, in := range []Bounds{
+		{openRange, point, endPoint},
+		{point, openRange, endPoint},
+		{endPoint, openRange, point},
+	} {
+		got := slices.Clone(in).SortAndMerge()
+		require.Len(t, got, 1)
+		assert.True(t, got[0].StartInclude, "start must be closed")
+		assert.True(t, got[0].EndInclude, "end must be closed")
+		assert.Equal(t, zero, got[0].Start)
+		assert.Equal(t, ten, got[0].End)
+	}
+
+	// The filter-level shape the differential fuzz found: {a > 0} ∪ {a = 0}.
+	bs := MustParseCondition(`{"$or":[{"$and":[{"a":{"$gt":0}},{"c":false}]},{"a":0}]}`).IndexBounds("a", nil)
+	require.Len(t, bs, 1)
+	assert.True(t, bs[0].StartInclude)
+	assert.True(t, bs.Contains(zero))
 }

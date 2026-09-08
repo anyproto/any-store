@@ -52,8 +52,10 @@ type LookupStage struct {
 	bufs []*syncpool.DocBuffer // one per matched doc of the current row
 
 	keyScratch []byte
-	keys       []byte // marshaled ids seen in the current row's array
-	keyOffs    []int  // start offsets into keys
+	keys       []byte          // marshaled ids seen in the current row's array
+	keyOffs    []int           // start offsets into keys
+	leaves     []anyenc.Leaf   // scratch: the local path's leaf set
+	vals       []*anyenc.Value // scratch: its lookup values
 
 	prev    *anyenc.Value // previous overlaid row, nil when nothing to undo
 	prevVal *anyenc.Value // its original "as" value (nil = was missing)
@@ -72,33 +74,22 @@ func (s *LookupStage) Next(ctx *Ctx) (*anyenc.Value, error) {
 	}
 	out := ctx.RowArena.NewArray()
 	n := 0
-	lv := v.Get(s.Spec.LocalPath...)
-	if lv != nil {
-		switch lv.Type() {
-		case anyenc.TypeNull:
-			// The pk is never null: no match, empty result.
-		case anyenc.TypeArray:
-			s.keys, s.keyOffs = s.keys[:0], s.keyOffs[:0]
-			for _, el := range lv.GetArray() {
-				if el.Type() == anyenc.TypeNull {
-					continue
-				}
-				s.keyScratch = el.MarshalTo(s.keyScratch[:0])
-				if s.seen(s.keyScratch) {
-					continue // set membership: first occurrence wins
-				}
-				s.keyOffs = append(s.keyOffs, len(s.keys))
-				s.keys = append(s.keys, s.keyScratch...)
-				doc, lerr := s.fetch(n)
-				if lerr != nil {
-					return nil, lerr
-				}
-				if doc != nil {
-					out.SetArrayItem(n, doc)
-					n++
-				}
-			}
-		default:
+	// The local path resolves with field-path semantics (a path through an
+	// array of objects collects every element's value, as Mongo's localField
+	// does) and a leaf array — positional or not — contributes its elements,
+	// one level deep. Null, missing and array values never name a pk: skipped.
+	s.leaves = v.AppendLeaves(s.leaves[:0], s.Spec.LocalPath...)
+	s.vals = s.vals[:0]
+	for _, l := range s.leaves {
+		if l.Value != nil && l.Value.Type() == anyenc.TypeArray {
+			arr, _ := l.Value.Array()
+			s.vals = append(s.vals, arr...)
+			continue
+		}
+		s.vals = append(s.vals, l.Value)
+	}
+	if len(s.vals) == 1 {
+		if lv := s.vals[0]; lv != nil && lv.Type() != anyenc.TypeNull && lv.Type() != anyenc.TypeArray {
 			s.keyScratch = lv.MarshalTo(s.keyScratch[:0])
 			doc, lerr := s.fetch(0)
 			if lerr != nil {
@@ -106,6 +97,27 @@ func (s *LookupStage) Next(ctx *Ctx) (*anyenc.Value, error) {
 			}
 			if doc != nil {
 				out.SetArrayItem(0, doc)
+			}
+		}
+	} else {
+		s.keys, s.keyOffs = s.keys[:0], s.keyOffs[:0]
+		for _, el := range s.vals {
+			if el == nil || el.Type() == anyenc.TypeNull || el.Type() == anyenc.TypeArray {
+				continue
+			}
+			s.keyScratch = el.MarshalTo(s.keyScratch[:0])
+			if s.seen(s.keyScratch) {
+				continue // set membership: first occurrence wins
+			}
+			s.keyOffs = append(s.keyOffs, len(s.keys))
+			s.keys = append(s.keys, s.keyScratch...)
+			doc, lerr := s.fetch(n)
+			if lerr != nil {
+				return nil, lerr
+			}
+			if doc != nil {
+				out.SetArrayItem(n, doc)
+				n++
 			}
 		}
 	}

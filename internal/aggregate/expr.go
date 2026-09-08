@@ -2,7 +2,6 @@ package aggregate
 
 import (
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 
@@ -70,7 +69,7 @@ func resolveFieldPath(a *anyenc.Arena, v *anyenc.Value, path []string) *anyenc.V
 			}
 			continue
 		}
-		if n, numeric := parseIndexSegment(seg); numeric {
+		if n, numeric := anyenc.ParseIndexSegment(seg); numeric {
 			arr, _ := v.Array()
 			if n < 0 || n >= len(arr) {
 				return nil
@@ -93,38 +92,6 @@ func resolveFieldPath(a *anyenc.Arena, v *anyenc.Value, path []string) *anyenc.V
 		return out
 	}
 	return v
-}
-
-// parseIndexSegment reports whether seg is a numeric path segment and its
-// array index. It accepts strconv.Atoi syntax without its allocating error
-// path (Atoi builds a *NumError per miss, and non-numeric segments are the
-// common case): numeric-but-unusable segments (negative, overflowing) return
-// -1, which indexing turns into missing — the same outcome anyenc.Value.Get
-// gives them.
-func parseIndexSegment(seg string) (n int, numeric bool) {
-	i := 0
-	neg := false
-	if len(seg) > 0 && (seg[0] == '+' || seg[0] == '-') {
-		neg = seg[0] == '-'
-		i = 1
-	}
-	if i == len(seg) {
-		return 0, false
-	}
-	for ; i < len(seg); i++ {
-		c := seg[i]
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		if n > (math.MaxInt32-9)/10 { // pre-multiply guard: no int wrap on 32-bit
-			return -1, true
-		}
-		n = n*10 + int(c-'0')
-	}
-	if neg {
-		return -1, true
-	}
-	return n, true
 }
 
 func (e *FieldRefExpr) String() string { return "$" + e.Field }

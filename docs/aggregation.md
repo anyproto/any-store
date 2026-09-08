@@ -253,6 +253,10 @@ resolves the value(s) as primary keys of the **same collection**, and sets
 to the array of matched full documents — always an array (Mongo semantics),
 empty when nothing matches.
 
+- `localField` resolves with field-path semantics: a path through an array
+  of objects (`"items.ref"`) collects every element's value, and a leaf
+  array contributes its elements one level deep; null, missing and array
+  values match nothing.
 - Omitting `from` is the canonical form — the stage is self-join-only, so
   the source collection is implied. When present, `from` must equal the
   aggregated collection's name; anything else fails `Iter`/`Count`/`Explain`

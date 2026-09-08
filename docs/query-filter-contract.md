@@ -129,12 +129,20 @@ build per query and carry no such guarantee.
     `(?flags)`. Inline flag groups in the pattern itself remain legal.
     Duplicate `$options` keys collapse last-wins in the JSON parser (standard
     JSON behavior); the surviving occurrence is validated like any other.
-    Anchored-prefix index bounds (`^literal…`) are suppressed exactly when a
-    flag can widen the match: `i` (case folding) and `m` (any-line anchoring)
-    keep the scan wide — via `$options` or a leading `^(?i)` in the pattern —
-    while `s` only changes what `.` matches and keeps the prefix bounds.
-    Pinned by `TestRegexp` (query/filter_test.go) and the `$options` cases in
-    `TestParseError`.
+    Index bounds seek the prefix range of the pattern's anchored literal
+    head, read off the parsed syntax tree so it means what the engine
+    means: a quantifier binds the literal before it (`^ab*` seeks `a`,
+    `^ab+` seeks `ab`), an escape class is no literal (`^\d` seeks
+    nothing), a top-level alternation has no head, and `i` (case folding)
+    or `m` (any-line anchoring) — via `$options` or an inline flag group —
+    keeps the scan wide, while `s` only changes what `.` matches. The range
+    is the exact match set only when the pattern is that literal and
+    nothing more; any other pattern keeps its residual filter
+    (`query.IndexBoundsExact`). Pinned by `TestRegexp` and
+    `TestRegexp_LiteralPrefix` (query/filter_test.go), the `$options` cases
+    in `TestParseError`, and the oracle runs `TestRegexPrefixBounds_Oracle`
+    and `TestResidualElision_InexactBounds` in the `any-store-tests`
+    repository.
 
 12. **Parse rejections are structured.** Everything `ParseCondition`,
     `ParseModifier`, and the aggregation pipeline parser reject — unknown
@@ -191,3 +199,85 @@ build per query and carry no such guarantee.
     Pinned by `TestComp_TypeBracketing`, `TestCompOkScalar_MatchesMarshalReference`
     (the oracle carries the rule) and `TestGuaranteesPresence` (`$lt`/`$lte`
     with a non-null operand guarantee presence: they reject null and missing).
+
+14. **Dotted paths traverse arrays of objects (MongoDB field-path
+    semantics).** A path resolves to a LEAF SET (`anyenc.Value.AppendLeaves`):
+    an object descends by key; an array met by a non-numeric segment maps the
+    rest of the path over its elements — an object element continues, an
+    element that cannot carry the path (scalar, null, nested array, object
+    lacking the key) is a MISSING leaf, and an empty array is one missing
+    leaf; a scalar met mid-path is a missing leaf. `{"a.b":1}` matches
+    `{"a":[{"b":1},{"b":2}]}`; traversal repeats at every array level. A leaf
+    that is itself an array keeps the element-wise rules of item 13 (whole
+    array for an array operand, per element otherwise).
+    Quantification is per operator, as in Mongo: a positive predicate
+    (`$eq`, ranges, `$in`, `$regex`, `$exists`, `$type`, `$size`) matches when
+    ANY leaf satisfies it; a negation (`$ne`, `$nin`, `$not`, `$nor`) when NO
+    leaf satisfies the negated predicate; sibling operators on one path pick
+    their witnesses independently — `{"a.b":{"$gt":1,"$lt":3}}` matches
+    `[{"b":1},{"b":5}]`. `$elemMatch` (item 15) binds them.
+    A NUMERIC segment indexes an array (`"a.0"`, engine extension over
+    Mongo's positional-or-key ambiguity) and the leaf it picks is POSITIONAL:
+    compared whole even when it is an array (`{"a.0":1}` does not match
+    `{"a":[[1,2]]}`; `{"a.0":[1,2]}` does), stored whole by an index, and its
+    whole value is its sort key. Traversal resumes on later segments.
+    One definition feeds every consumer: `Key.Ok` (`LeafFilter`), index
+    entries (one per `anyenc.AppendIndexValues` value, fanning out like a
+    leaf array — the multikey flag, per-doc dedup and sparse handling follow;
+    a sparse index holds a document only when every field has a present,
+    non-null value somewhere in it, and then writes every key that has at
+    least one present field — `{"a":[{"b":1},{"c":2}]}` under a sparse
+    `(a.b, a.c)` has keys `(1, null)` and `(null, 2)`; fields of a COMPOUND
+    index that run
+    through the same array iterate it together, one entry per element, as
+    Mongo generates them — never a cross product — so the planner compounds
+    bounds and entry-level cover filters across such fields only on a
+    scalar-proven index and seeks the first of them otherwise), sort keys
+    (min/max over
+    `anyenc.AppendElementValues`, item 10) and `CanonicalKeyDedupIter`. The
+    raw fast paths (`OkRaw`, `AppendKeyRaw`) decline at an array container
+    and fall back to the parsed document. `$type` matches an array whose
+    ELEMENT has the type as well as the array itself (`"array"`), and
+    accepts Mongo's `"bool"` alias. `$type: "null"` needs an explicit null:
+    a missing field has no type. Its index bounds cover the null key, which
+    a missing field and an empty array also occupy, so it keeps its
+    residual filter (`query.IndexBoundsExact`); every other `$type` is
+    exactly its type range.
+    Deliberate divergences from Mongo, pinned by the MongoDB-fixture replay
+    `TestMongoArraySemantics` in the `any-store-tests` repository: (a) the null-equality
+    family (`$eq null`, `$in [null]`, and their negations) matches a missing
+    leaf produced by an element that cannot carry the path or by an empty
+    array — Mongo's matcher skips those elements, though its sort and index
+    keys treat them as null; any-store keeps filter, sort and index on one
+    answer; (b) numeric segments never match an object element keyed by the
+    numeral; (c) an empty leaf array sorts by its whole-array key (item 10)
+    and cross-type order is anyenc tag order (item 13) — Mongo sorts `[]`
+    before null and orders objects type-first, then by field name.
+    Pinned by `TestKey_PathThroughArrays`, `TestKey_PathThroughArrays_AllocFree`
+    (item 2 holds for traversal), `anyenc.TestAppendLeaves` and
+    `TestIndex_ArrayNested_NestedField_IntermediateArray_Traversed`.
+
+15. **`$elemMatch` binds predicates to one element.** `{"a":{"$elemMatch":
+    C}}` matches when `a` is an array with an element satisfying `C` as a
+    whole. The operand's first key decides the form (Mongo's rule): a
+    field-level operator (`$gt`, `$in`, `$not`, `$elemMatch`, …) makes the
+    VALUE form — `C` is an operator set applied to each element as ONE value
+    (`ElemFilter`: an element that is itself an array is compared whole, as a
+    positional leaf is); anything else (a field name, `{}`, `$or`/`$and`/
+    `$nor`) makes the OBJECT form — `C` is a document condition applied to
+    each OBJECT element (Mongo also admits array elements, viewed as objects
+    keyed by position; here they never match). `$all` accepts a list made
+    only of `{"$elemMatch": …}` objects (a conjunction of element matches;
+    mixing with values is a `ParseError`). `$text` and `$knn` are rejected
+    inside either form. Through a dotted path it applies to every leaf array,
+    positional leaves included.
+    Bounds: the value form contributes `C`'s own bounds on the field (an
+    element's value is one of the field's entries) unless the path is
+    positional; the object form re-keys `C` under the sub-fields —
+    `{"a":{"$elemMatch":{"b":{"$gt":1}}}}` bounds `a.b` as `{"a.b":{"$gt":1}}`
+    would. Both are supersets, never the exact value image (a scalar or an
+    object with that value sits in the bounds without matching), so a `Key`
+    holding a `$elemMatch` always keeps its residual filter: the planner's
+    covering-count, verify-chain and residual-elision paths treat it as
+    uncovered (`query.IndexBoundsExact`). Pinned by `TestElemMatch_Parse`,
+    `TestElemMatch_Ok` and `TestElemMatch_IndexBoundsAndString`.

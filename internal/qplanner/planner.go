@@ -244,6 +244,12 @@ type CBOIndex struct {
 	// Sketch estimates are only valid when BoundFields == len(Info.FieldNames).
 	BoundFields int
 
+	// UsableFields is how many leading index fields the bound chain and the
+	// entry-level cover filters may use — len(Info.FieldNames), or
+	// Info.SharedFrom when the index may hold correlated fan-out entries
+	// (0 in hand-built candidates means no cap).
+	UsableFields int
+
 	// PointLookup is true when ALL original bounds are equality (Start == End),
 	// before AdjustBoundsForNonUnique modifies End. This allows correct sketch estimation.
 	PointLookup bool
@@ -1318,8 +1324,9 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 				Tx: params.Tx,
 				Ns: idx.Info.Ns,
 			},
-			IdxInfo: idx.Info,
-			Bounds:  idx.Bounds,
+			IdxInfo:      idx.Info,
+			Bounds:       idx.Bounds,
+			ScalarProven: idx.ScalarProven,
 		}
 
 		// A unique index can still be multikey (each array element unique
@@ -1482,6 +1489,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 			FieldPath:    idx.Info.FieldPaths[0],
 			Reverse:      reverse,
 			FieldReverse: len(idx.Info.Reverse) > 0 && idx.Info.Reverse[0],
+			Sparse:       idx.Info.Sparse,
 		}
 	}
 
@@ -1581,6 +1589,7 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 			FieldPath:    idx.Info.FieldPaths[0],
 			Reverse:      reverse,
 			FieldReverse: len(idx.Info.Reverse) > 0 && idx.Info.Reverse[0],
+			Sparse:       idx.Info.Sparse,
 		}
 	}
 
@@ -1725,7 +1734,7 @@ func indexCoversFilter(idx *CBOIndex, filter query.Filter) bool {
 	// Condition 1: every filter field is within the bounded index prefix.
 	// Returns false on any uncovered field or any complex node (Or/Not/Nor).
 	hasFields := false
-	if ok := filterFieldsCoveredBy(filter, boundedFields, &hasFields); !ok || !hasFields {
+	if ok := filterFieldsCoveredBy(filter, boundedFields, idx.Info.Reverse, &hasFields); !ok || !hasFields {
 		return false
 	}
 	// Condition 2: reject when any covered field carries >1 predicate, because
@@ -1755,14 +1764,20 @@ func indexScanCoversFilter(idx *CBOIndex, coverFilters []IndexFieldFilter, filte
 		return false
 	}
 	var fields []string
+	var reverse []bool
 	if len(idx.Bounds) > 0 {
-		fields = append(fields, idx.Info.FieldNames[:min(idx.BoundFields, len(idx.Info.FieldNames))]...)
+		n := min(idx.BoundFields, len(idx.Info.FieldNames))
+		fields = append(fields, idx.Info.FieldNames[:n]...)
+		for i := range n {
+			reverse = append(reverse, fieldReverse(idx.Info.Reverse, i))
+		}
 	}
 	for _, f := range coverFilters {
 		fields = append(fields, idx.Info.FieldNames[f.FieldIdx])
+		reverse = append(reverse, fieldReverse(idx.Info.Reverse, f.FieldIdx))
 	}
 	hasFields := false
-	if ok := filterFieldsCoveredBy(filter, fields, &hasFields); !ok || !hasFields {
+	if ok := filterFieldsCoveredBy(filter, fields, reverse, &hasFields); !ok || !hasFields {
 		return false
 	}
 	for _, field := range fields {
@@ -1844,20 +1859,37 @@ func countInnerPreds(f query.Filter) int {
 	}
 }
 
+// keyBoundsExact reports whether a Key's index bounds are the exact value
+// image of its predicate on a field stored ascending, or inverted when
+// reverse — the premise of every FilterIter-skipping path. The widening
+// predicates are enumerated by query.IndexBoundsExact; such a Key always
+// keeps its residual filter.
+func keyBoundsExact(k query.Key, reverse bool) bool {
+	return query.IndexBoundsExact(k.Filter, reverse)
+}
+
+// fieldReverse reports whether index field i is reverse-flagged; reverse is
+// the index's per-field flags, which may be shorter than its field list.
+func fieldReverse(reverse []bool, i int) bool {
+	return i >= 0 && i < len(reverse) && reverse[i]
+}
+
 // filterFieldsCoveredBy walks the filter tree and checks that every referenced
-// field name is present in idxFields. Zero-allocation.
-func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) bool {
+// field name is present in idxFields, with bounds exact for the field's
+// direction (reverse aligns with idxFields). Zero-allocation.
+func filterFieldsCoveredBy(f query.Filter, idxFields []string, reverse []bool, hasFields *bool) bool {
 	switch ft := f.(type) {
 	case query.Key:
 		name := strings.Join(ft.Path, ".")
-		if slices.Contains(idxFields, name) {
-			*hasFields = true
-			return true
+		i := slices.Index(idxFields, name)
+		if i < 0 || !keyBoundsExact(ft, fieldReverse(reverse, i)) {
+			return false
 		}
-		return false
+		*hasFields = true
+		return true
 	case query.And:
 		for _, sub := range ft {
-			if !filterFieldsCoveredBy(sub, idxFields, hasFields) {
+			if !filterFieldsCoveredBy(sub, idxFields, reverse, hasFields) {
 				return false
 			}
 		}
@@ -1868,7 +1900,7 @@ func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) 
 		// (see query/cond_parse.go:103), so without this case the covering-
 		// count fast path is silently disabled for $and-spelled filters.
 		for _, sub := range *ft {
-			if !filterFieldsCoveredBy(sub, idxFields, hasFields) {
+			if !filterFieldsCoveredBy(sub, idxFields, reverse, hasFields) {
 				return false
 			}
 		}
@@ -1879,20 +1911,30 @@ func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) 
 }
 
 // collectUncoveredFilterFields walks the filter tree and returns field names
-// not present in coveredFields. Returns nil if the filter contains complex
-// nodes (Or, Not, Nor) that can't be reliably field-analyzed.
-func collectUncoveredFilterFields(f query.Filter, coveredFields []string) []string {
+// not present in coveredFields (reverse aligns with it). Returns nil if the
+// filter contains complex nodes (Or, Not, Nor) that can't be reliably
+// field-analyzed, or a covered field whose bounds are not exact.
+func collectUncoveredFilterFields(f query.Filter, coveredFields []string, reverse []bool) []string {
 	switch ft := f.(type) {
 	case query.Key:
 		name := strings.Join(ft.Path, ".")
-		if slices.Contains(coveredFields, name) {
+		if i := slices.Index(coveredFields, name); i >= 0 {
+			if !keyBoundsExact(ft, fieldReverse(reverse, i)) {
+				return nil
+			}
 			return []string{} // covered
+		}
+		// An uncovered field is verified through its own index, whose
+		// direction is unknown here: a predicate inexact either way
+		// disables the chain.
+		if !keyBoundsExact(ft, true) {
+			return nil
 		}
 		return []string{name}
 	case query.And:
 		var result []string
 		for _, sub := range ft {
-			fields := collectUncoveredFilterFields(sub, coveredFields)
+			fields := collectUncoveredFilterFields(sub, coveredFields, reverse)
 			if fields == nil {
 				return nil
 			}
@@ -1902,7 +1944,7 @@ func collectUncoveredFilterFields(f query.Filter, coveredFields []string) []stri
 	case *query.And:
 		var result []string
 		for _, sub := range *ft {
-			fields := collectUncoveredFilterFields(sub, coveredFields)
+			fields := collectUncoveredFilterFields(sub, coveredFields, reverse)
 			if fields == nil {
 				return nil
 			}
@@ -1920,7 +1962,7 @@ func collectUncoveredFilterFields(f query.Filter, coveredFields []string) []stri
 // index and verifies docIds against it instead of fetching full documents.
 // Returns nil if verification is not possible.
 func buildVerifyChain(params *PlanParams, idx *CBOIndex, root Iterator) Iterator {
-	uncovered := collectUncoveredFilterFields(params.Filter, idx.Info.FieldNames[:idx.BoundFields])
+	uncovered := collectUncoveredFilterFields(params.Filter, idx.Info.FieldNames[:idx.BoundFields], idx.Info.Reverse)
 	if len(uncovered) == 0 {
 		return nil
 	}
@@ -2456,7 +2498,13 @@ func padReverseBounds(bs query.Bounds) query.Bounds {
 // ComputeIndexBounds computes combined tuple bounds for an index
 // using pre-computed per-field WIDE bounds from BoundsResult.
 func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
-	return computeIndexBounds(idx, br.Lookup)
+	return computeIndexBounds(idx, br.Lookup, len(idx.FieldNames))
+}
+
+// ComputeIndexBoundsCapped is ComputeIndexBounds over the first maxFields
+// index fields only (see IndexInfo.SharedFrom).
+func ComputeIndexBoundsCapped(idx *IndexInfo, br *BoundsResult, maxFields int) (query.Bounds, int) {
+	return computeIndexBounds(idx, br.Lookup, maxFields)
 }
 
 // ComputeIndexBoundsTight is the tight-channel variant, built from
@@ -2464,7 +2512,13 @@ func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
 // EstBounds): feeding it to a seek requires the fan-out-free proof documented
 // on query.TightIndexBounds.
 func ComputeIndexBoundsTight(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
-	return computeIndexBounds(idx, br.LookupTight)
+	return computeIndexBounds(idx, br.LookupTight, len(idx.FieldNames))
+}
+
+// ComputeIndexBoundsTightCapped is ComputeIndexBoundsTight over the first
+// maxFields index fields only.
+func ComputeIndexBoundsTightCapped(idx *IndexInfo, br *BoundsResult, maxFields int) (query.Bounds, int) {
+	return computeIndexBounds(idx, br.LookupTight, maxFields)
 }
 
 // ComputeSingleFieldBounds is the single-field chain for explicit logical
@@ -2478,7 +2532,7 @@ func ComputeSingleFieldBounds(idx *IndexInfo, bs query.Bounds) query.Bounds {
 	return bs
 }
 
-func computeIndexBounds(idx *IndexInfo, lookup func(string) (query.Bounds, bool, bool)) (query.Bounds, int) {
+func computeIndexBounds(idx *IndexInfo, lookup func(string) (query.Bounds, bool, bool), maxFields int) (query.Bounds, int) {
 	type fieldBound struct {
 		bounds query.Bounds
 		fixed  bool
@@ -2486,7 +2540,10 @@ func computeIndexBounds(idx *IndexInfo, lookup func(string) (query.Bounds, bool,
 
 	var chainBuf [4]fieldBound // stack-allocated for typical compound indexes
 	chain := chainBuf[:0]
-	for _, field := range idx.FieldNames {
+	if maxFields > len(idx.FieldNames) {
+		maxFields = len(idx.FieldNames)
+	}
+	for _, field := range idx.FieldNames[:maxFields] {
 		fb, fixed, found := lookup(field)
 		if !found || len(fb) == 0 {
 			break
@@ -2788,7 +2845,11 @@ func coveringFilterFields(idx *CBOIndex, fieldBounds *BoundsResult) []IndexField
 	}
 
 	var filters []IndexFieldFilter
-	for fi := idx.BoundFields; fi < len(idx.Info.FieldNames); fi++ {
+	end := len(idx.Info.FieldNames)
+	if idx.UsableFields > 0 && idx.UsableFields < end {
+		end = idx.UsableFields
+	}
+	for fi := idx.BoundFields; fi < end; fi++ {
 		fieldName := idx.Info.FieldNames[fi]
 		bounds, fixed, found := fieldBounds.Lookup(fieldName)
 		if !found || !fixed || len(bounds) != 1 {
