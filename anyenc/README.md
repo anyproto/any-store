@@ -48,3 +48,34 @@ Each serialized item starts with a byte that defines its type. Supported data ty
 
 - An ObjectID `0123456789abcdef01234567`:  
   `0x0B + 01 23 45 67 89 ab cd ef 01 23 45 67`
+
+### Streams
+
+A stream is a sequence of encoded values written back to back, with no length prefix or separator: each value is self-delimiting, so a single encoded value, or several concatenated, is a valid stream. `Writer` and `Reader` stream values to an `io.Writer` and from an `io.Reader`:
+
+```go
+w := anyenc.NewWriter(dst)
+for _, doc := range docs {
+	if err := w.Write(doc); err != nil {
+		return err
+	}
+}
+if err := w.Flush(); err != nil {
+	return err
+}
+
+r := anyenc.NewReader(src)
+p := &anyenc.Parser{}
+for {
+	v, err := r.Read(p) // v is valid until the next Read
+	if err == io.EOF {
+		break
+	}
+	if err != nil {
+		return err // io.ErrUnexpectedEOF for a truncated stream
+	}
+	// use v
+}
+```
+
+Errors are final: after one, every later call returns it.
