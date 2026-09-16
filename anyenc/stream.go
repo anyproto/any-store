@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"slices"
 )
 
@@ -19,15 +20,15 @@ const (
 	// streamBufSize is the Writer flush threshold and the Reader's minimum
 	// buffer growth.
 	streamBufSize = 64 << 10
-	// streamBufKeep bounds the buffer a Writer or Reader carries from one value
-	// to the next, so a single huge value does not pin its buffer for the rest
-	// of a long export. Only a small value gives the buffer back: shrinking
-	// while big values keep coming would re-grow it for every one of them.
-	streamBufKeep = 4 * streamBufSize
-	// streamShrinkAfter is how many values a Reader reads from an outsized
-	// buffer before giving it back. Values much smaller than the buffer are
-	// normal mid-value, so waiting a while is what tells a passing large value
-	// from a stream that has moved on to small ones.
+	// streamBufKeep is the buffer size a Writer or Reader keeps without question.
+	// Above it, a buffer grown by one huge value is given back once the stream
+	// has moved on, so the value does not pin it for the rest of a long export.
+	// The bound is generous because re-growing costs a copy per doubling:
+	// ordinary large values never reach it, only outliers do.
+	streamBufKeep = 4 << 20
+	// streamShrinkAfter is how many consecutive small values it takes to call a
+	// large value past. A large value resets the count, so a stream that keeps
+	// producing them never gives its buffer back and never re-grows it.
 	streamShrinkAfter = 64
 	// maxStreamValueSize bounds one value: what a Reader buffers for it and
 	// what a Writer emits for it, so corrupt input (a lost terminator, a bogus
@@ -38,22 +39,27 @@ const (
 	// maxEmptyReads is how many consecutive (0, nil) reads Reader tolerates
 	// before failing with io.ErrNoProgress.
 	maxEmptyReads = 100
-	maxInt        = int64(^uint(0) >> 1)
 )
 
-// ErrValueTooLarge reports a value over the stream limit: written, or declared
-// by a length header in the input.
-var ErrValueTooLarge = errors.New("anyenc: value exceeds stream limit")
+var (
+	// ErrValueTooLarge reports a value over the stream limit: written, or
+	// declared by a length header in the input.
+	ErrValueTooLarge = errors.New("anyenc: value exceeds stream limit")
+	// ErrUnknownValueType reports a value MarshalTo cannot encode, which would
+	// leave nothing in the stream in its place.
+	ErrUnknownValueType = errors.New("anyenc: value of unknown type")
+)
 
 // Writer writes a stream of encoded values to an io.Writer.
 //
 // Values are buffered: call Flush after the last Write. After an error, every
 // call returns that error.
 type Writer struct {
-	w     io.Writer
-	buf   []byte
-	err   error
-	limit int // max bytes for one value
+	w        io.Writer
+	buf      []byte
+	err      error
+	limit    int // max bytes for one value
+	sinceBig int // consecutive small values written
 }
 
 // NewWriter returns a Writer that writes to w.
@@ -62,23 +68,34 @@ func NewWriter(w io.Writer) *Writer {
 }
 
 // Write appends the encoding of v to the stream. Values a Reader could not
-// read back are rejected: one over the size limit, and one of an unknown type,
-// which MarshalTo encodes as nothing at all.
+// read back are rejected and left out of the stream, without ending it: one
+// over the size limit, and one of an unknown type, which MarshalTo encodes as
+// nothing at all. Only v itself is checked for that - a value of unknown type
+// nested inside v encodes as nothing wherever it sits, stream or document.
 func (w *Writer) Write(v *Value) error {
 	if w.err != nil {
 		return w.err
 	}
+	// The size is measured after marshaling, which for an oversized value
+	// allocates it first. Pre-checking with IsSizeBigger costs 40% of Write on
+	// every ordinary value to bound a case the caller already holds in memory:
+	// here the limit keeps dumps readable, it does not fend off hostile input
+	// the way the Reader's does.
 	mark := len(w.buf)
 	w.buf = v.MarshalTo(w.buf)
-	switch n := len(w.buf) - mark; {
+	n := len(w.buf) - mark
+	switch {
 	case n == 0:
 		w.buf = w.buf[:mark]
-		w.err = fmt.Errorf("anyenc: cannot write value of unknown type %d", v.Type())
-		return w.err
+		return fmt.Errorf("%w: type %d", ErrUnknownValueType, v.Type())
 	case n > w.limit:
 		w.buf = w.buf[:mark]
-		w.err = fmt.Errorf("%w: wrote %d bytes, limit %d", ErrValueTooLarge, n, w.limit)
-		return w.err
+		return fmt.Errorf("%w: %d bytes, limit %d", ErrValueTooLarge, n, w.limit)
+	}
+	if n > streamBufSize {
+		w.sinceBig = 0
+	} else {
+		w.sinceBig++
 	}
 	if len(w.buf) >= streamBufSize {
 		return w.Flush()
@@ -95,7 +112,7 @@ func (w *Writer) Flush() error {
 	if err == nil && n < len(w.buf) {
 		err = io.ErrShortWrite
 	}
-	if cap(w.buf) > streamBufKeep && len(w.buf) <= streamBufSize {
+	if cap(w.buf) > streamBufKeep && w.sinceBig >= streamShrinkAfter {
 		w.buf = make([]byte, 0, streamBufSize)
 	} else {
 		w.buf = w.buf[:0]
@@ -118,7 +135,7 @@ type Reader struct {
 	srcErr   error // error from r (io.EOF included), reported once buf is drained
 	err      error
 	limit    int // max bytes buffered for one value
-	sinceBig int // values read since the buffer last grew
+	sinceBig int // consecutive small values read
 }
 
 // NewReader returns a Reader that reads from r.
@@ -140,8 +157,7 @@ func (r *Reader) Read(p *Parser) (*Value, error) {
 			// A top-level string's terminator is settled only by the next byte
 			// (see escape.go), so one ending the buffer goes to the scanner.
 			if err == nil && (len(tail) > 0 || final || v.t != TypeString) {
-				r.off += len(b) - len(tail)
-				r.sinceBig++
+				r.took(len(b) - len(tail))
 				return v, nil
 			}
 			r.scanning = true
@@ -168,12 +184,22 @@ func (r *Reader) Read(p *Parser) (*Value, error) {
 			r.err = err
 			break
 		}
-		r.off += n
+		r.took(n)
 		r.scanning = false
-		r.sinceBig++
 		return v, nil
 	}
 	return nil, r.err
+}
+
+// took consumes the n bytes of the value just returned. A large value resets
+// the small-value run that fill waits for before giving its buffer back.
+func (r *Reader) took(n int) {
+	r.off += n
+	if n > streamBufSize {
+		r.sinceBig = 0
+	} else {
+		r.sinceBig++
+	}
 }
 
 // fill reads more input for the pending value b. It returns the terminal
@@ -186,7 +212,7 @@ func (r *Reader) fill(b []byte) error {
 		return io.ErrUnexpectedEOF
 	case r.srcErr != nil:
 		return r.srcErr
-	case len(b) >= r.limit:
+	case len(b) > r.limit:
 		return fmt.Errorf("%w: buffered %d bytes, limit %d", ErrValueTooLarge, len(b), r.limit)
 	}
 	switch {
@@ -198,6 +224,10 @@ func (r *Reader) fill(b []byte) error {
 		r.buf = r.buf[:copy(r.buf, b)]
 		r.off = 0
 	}
+	// A value of exactly limit bytes is legal, and a top-level string needs one
+	// byte past its terminator to end (see escape.go), so the window is one
+	// byte wider than the limit.
+	window := r.limit + 1
 	if len(r.buf) == cap(r.buf) {
 		grow := max(len(r.buf), streamBufSize)
 		// A length-prefixed value says up front how much it needs: one growth
@@ -205,12 +235,11 @@ func (r *Reader) fill(b []byte) error {
 		if need := r.scan.need - len(r.buf); need > grow {
 			grow = need
 		}
-		r.buf = slices.Grow(r.buf, min(grow, r.limit-len(r.buf)))
-		r.sinceBig = 0
+		r.buf = slices.Grow(r.buf, min(grow, window-len(r.buf)))
 	}
 	// Grow rounds capacity up, so the read window, not the capacity, is what
 	// holds buffering to the limit.
-	end := min(cap(r.buf), r.limit)
+	end := min(cap(r.buf), window)
 	for range maxEmptyReads {
 		n, err := r.r.Read(r.buf[len(r.buf):end])
 		r.buf = r.buf[:len(r.buf)+n]
@@ -288,7 +317,7 @@ func (s *valueScanner) next(b []byte, limit int, final bool) (int, error) {
 				return 0, nil // length header still incomplete
 			}
 			end := int64(s.pos) + n
-			if end > maxInt || (limit > 0 && end > int64(limit)) {
+			if end > math.MaxInt || (limit > 0 && end > int64(limit)) {
 				return 0, fmt.Errorf("%w: header declares %d bytes, limit %d", ErrValueTooLarge, end, limit)
 			}
 			if end > int64(len(b)) {

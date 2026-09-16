@@ -358,39 +358,87 @@ func TestWriter_Errors(t *testing.T) {
 }
 
 func TestWriter_RejectsUnreadableValues(t *testing.T) {
-	// Values no Reader would accept must not reach the stream.
-	t.Run("over_limit", func(t *testing.T) {
-		var out bytes.Buffer
-		w := NewWriter(&out)
-		w.limit = 1 << 10
-		a := &Arena{}
-		err := w.Write(a.NewBinary(make([]byte, 2<<10)))
-		assert.ErrorIs(t, err, ErrValueTooLarge)
-		assert.ErrorIs(t, w.Flush(), ErrValueTooLarge)
-		assert.Zero(t, out.Len())
-	})
-	t.Run("unknown_type", func(t *testing.T) {
-		var out bytes.Buffer
-		w := NewWriter(&out)
-		err := w.Write(&Value{})
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "unknown type")
-		assert.Equal(t, err, w.Flush(), "the error is final")
-		assert.Zero(t, out.Len(), "a value of unknown type would vanish from the stream")
-	})
+	// Values no Reader would accept must not reach the stream, and rejecting
+	// one must not end the stream or lose what is already buffered.
+	a := &Arena{}
+	for name, tc := range map[string]struct {
+		v    *Value
+		want error
+	}{
+		"over_limit":   {a.NewBinary(make([]byte, 2<<10)), ErrValueTooLarge},
+		"unknown_type": {&Value{}, ErrUnknownValueType},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			w := NewWriter(&out)
+			w.limit = 1 << 10
+			good := MustParseJson(`{"a":1}`)
+			for range 100 {
+				require.NoError(t, w.Write(good))
+			}
+			assert.ErrorIs(t, w.Write(tc.v), tc.want)
+			require.NoError(t, w.Write(good), "the writer stays usable")
+			require.NoError(t, w.Flush())
+
+			got := readAll(t, NewReader(&out))
+			assert.Len(t, got, 101, "buffered values survive a rejected one")
+		})
+	}
+}
+
+func TestWriterReader_LimitParity(t *testing.T) {
+	// A value the Writer accepts must read back at the same limit, including a
+	// top-level string of exactly limit bytes, whose end needs one byte more.
+	a := &Arena{}
+	const limit = 1 << 16
+	var out bytes.Buffer
+	w := NewWriter(&out)
+	w.limit = limit
+	v := a.NewString(strings.Repeat("x", limit-2))
+	require.NoError(t, w.Write(v))
+	require.NoError(t, w.Flush())
+	require.Equal(t, limit, out.Len())
+
+	r := NewReader(&out)
+	r.limit = limit
+	got, err := r.Read(&Parser{})
+	require.NoError(t, err)
+	assert.Equal(t, v.MarshalTo(nil), got.MarshalTo(nil))
 }
 
 func TestWriter_BufferShrinks(t *testing.T) {
+	// Write only: a real export never calls Flush until the end, so the shrink
+	// has to happen on the auto-flush path.
 	a := &Arena{}
 	w := NewWriter(io.Discard)
 	require.NoError(t, w.Write(a.NewBinary(make([]byte, 8<<20))))
-	require.NoError(t, w.Flush())
 	require.Greater(t, cap(w.buf), 8<<20, "the big value should have grown the buffer")
-	// A flush of small values gives it back; flushing big ones must not, or
-	// every big value would re-grow the buffer.
-	require.NoError(t, w.Write(MustParseJson(`{"a":1}`)))
-	require.NoError(t, w.Flush())
+	small := MustParseJson(`{"a":1}`)
+	for range streamShrinkAfter * 100 {
+		require.NoError(t, w.Write(small))
+	}
 	assert.LessOrEqual(t, cap(w.buf), streamBufKeep)
+
+	// A stream of big values keeps its buffer instead of re-growing it.
+	w = NewWriter(io.Discard)
+	for range streamShrinkAfter * 2 {
+		require.NoError(t, w.Write(a.NewBinary(make([]byte, 8<<20))))
+	}
+	assert.Greater(t, cap(w.buf), 8<<20)
+}
+
+func TestParse_HugeLengthHeader(t *testing.T) {
+	// int(l) is negative for these headers where int is 32 bits: they must be
+	// rejected, not panic inside the parser.
+	for _, in := range [][]byte{
+		{byte(TypeBinary), 0xff, 0xff, 0xff, 0xff, 1, 2, 3},
+		{byte(TypeVectorF32), 0xff, 0xff, 0xff, 0xfc, 1, 2, 3},
+	} {
+		_, err := Parse(in)
+		assert.Error(t, err, "%x", in)
+		_, err = NewReader(bytes.NewReader(in)).Read(&Parser{})
+		assert.Error(t, err, "%x", in)
+	}
 }
 
 type chunkReader struct {

@@ -362,7 +362,9 @@ func parseBinary(b []byte, c *cache, inverted bool) (*Value, []byte, error) {
 	} else {
 		l = binary.BigEndian.Uint32(b)
 	}
-	if len(b[4:]) < int(l) {
+	// uint64 on both sides: int(l) is negative for a length header above 2 GiB
+	// where int is 32 bits, which passes this guard and then panics in Grow.
+	if uint64(len(b)-4) < uint64(l) {
 		return nil, nil, fmt.Errorf("expected %d bytes to read binary, but got %d", l, len(b)-4)
 	}
 	if c != nil {
@@ -396,7 +398,7 @@ func parseVectorF32(b []byte, c *cache, inverted bool) (*Value, []byte, error) {
 	if l%4 != 0 {
 		return nil, nil, fmt.Errorf("vectorF32 byte length %d is not a multiple of 4", l)
 	}
-	if len(b[4:]) < int(l) {
+	if uint64(len(b)-4) < uint64(l) { // see parseBinary
 		return nil, nil, fmt.Errorf("expected %d bytes to read vectorF32, but got %d", l, len(b)-4)
 	}
 	if c != nil {
