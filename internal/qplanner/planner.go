@@ -568,7 +568,12 @@ func BuildPlan(params *PlanParams) *Plan {
 			// one reads them back from the catalog in name order, so without it an
 			// exact cost tie resolved differently before and after a restart
 			// (GO-7510). Names are unique within a collection, so this is a total
-			// order — every session picks the same plan.
+			// order — an exact tie resolves identically in every session.
+			//
+			// This rung fixes exact ties ONLY. Index order still reaches the plan
+			// through calculateSelectivity, which prices each filter field by
+			// whichever index claims it first, so two sessions can compute
+			// different costs and never reach a tie at all. See GO-7510.
 			switch {
 			case bestPlanName == "FullScan":
 				isBetter = true

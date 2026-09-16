@@ -282,12 +282,15 @@ func buildTextPlan(params *PlanParams) *Plan {
 			best = c
 			continue
 		}
-		// Break an exact tie between two per-index probe candidates on the index
-		// name: those are appended in index order, which differs between a live
-		// and a reopened collection (GO-7510). Candidates with no index sit at
-		// fixed positions in the slice, so first-wins is already deterministic
-		// for them and their plan-shape preference is preserved.
-		if c.cost == best.cost && c.idx != nil && best.idx != nil &&
+		// Break an exact tie between two per-index probe candidates OF THE SAME
+		// KIND on the index name: those are appended in index order, which differs
+		// between a live and a reopened collection (GO-7510). Everything else was
+		// already deterministic and keeps its existing preference — candidates
+		// with no index sit at fixed positions, and the seek group is appended
+		// before the scan group, so a seek still wins a cross-shape tie (the same
+		// rule Plan C follows in planner.go).
+		if c.cost == best.cost && c.kind == best.kind &&
+			c.idx != nil && best.idx != nil &&
 			c.idx.Info.Name < best.idx.Info.Name {
 			best = c
 		}

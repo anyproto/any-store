@@ -23,8 +23,10 @@ import (
 //
 // The v1 fixture: 24 docs — 20 without `isUninstalled`, 2 with `true`, 2 with
 // `false`; a sparse index on `isUninstalled`; expected 22 for `$ne: true`.
-// `resolvedLayout` carries the second index so the tie that made v1
-// order-dependent across a reopen is present here too.
+// `resolvedLayout` carries a second index so the two-predicate shape from the
+// issue is reproduced. Note there is no cost TIE in this fixture under v2 — the
+// sparse index is gated out entirely — so these tests pin defect 1 only;
+// defect 2 is pinned separately by TestGO7510_PlanStableAcrossReopen.
 
 type go7510Doc struct {
 	id             int
@@ -66,25 +68,42 @@ func go7510Insert(t *testing.T, coll Collection, docs []go7510Doc) {
 
 func go7510EnsureIndexes(t *testing.T, coll Collection) {
 	t.Helper()
-	// Both single-field, both weight-10 in v1 — a tie. "isUninstalled" sorts
-	// before "resolvedLayout", which is why v1 broke only after a reopen.
+	// Both single-field, both weight-10 in v1 — a tie there, and
+	// "isUninstalled" sorts before "resolvedLayout", which is why v1 broke only
+	// after a reopen. Under v2 the sparse index is not a candidate at all.
 	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
 		Name: "isUninstalled", Fields: []string{"isUninstalled"}, Sparse: true}))
 	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
 		Name: "resolvedLayout", Fields: []string{"resolvedLayout"}}))
 }
 
-// assertGo7510 runs the query through Count and Iter (v1 broke both) and
-// additionally asserts the planner did not answer it from the sparse index —
-// the root cause, as opposed to the row-count symptom.
+// assertGo7510 runs the query through Count and Iter — separate plan builds
+// (CountOnly differs), and v1 broke both — and additionally asserts the planner
+// did not answer it from a sparse index, which is the root cause as opposed to
+// the row-count symptom.
 func assertGo7510(t *testing.T, coll Collection, cond string, want int) {
 	t.Helper()
+	assertGo7510Query(t, coll, cond, func() Query { return coll.Find(cond) }, want)
+}
 
-	count, err := coll.Find(cond).Count(ctx)
+// assertGo7510Sorted is the Plan C (sort-driven) shape. It matters on its own:
+// the sparse gate there is a second call site, and without it an unconstrained
+// Sort over a sparse index drives the scan from an index that never stored the
+// null/missing documents — Count and Iter then disagree.
+func assertGo7510Sorted(t *testing.T, coll Collection, cond, sortField string, want int) {
+	t.Helper()
+	label := cond + " sort " + sortField
+	assertGo7510Query(t, coll, label, func() Query { return coll.Find(cond).Sort(sortField) }, want)
+}
+
+func assertGo7510Query(t *testing.T, coll Collection, label string, build func() Query, want int) {
+	t.Helper()
+
+	count, err := build().Count(ctx)
 	require.NoError(t, err)
-	assert.Equalf(t, want, count, "Count for %s", cond)
+	assert.Equalf(t, want, count, "Count for %s", label)
 
-	iter, err := coll.Find(cond).Iter(ctx)
+	iter, err := build().Iter(ctx)
 	require.NoError(t, err)
 	n := 0
 	for iter.Next() {
@@ -92,14 +111,22 @@ func assertGo7510(t *testing.T, coll Collection, cond string, want int) {
 	}
 	require.NoError(t, iter.Err())
 	require.NoError(t, iter.Close())
-	assert.Equalf(t, want, n, "Iter for %s", cond)
+	assert.Equalf(t, want, n, "Iter for %s", label)
 
-	explain, err := coll.Find(cond).Explain(ctx)
+	// Any sparse index, resolved from the collection — not one hard-coded name,
+	// so the check keeps working for the compound and renamed fixtures.
+	sparse := map[string]bool{}
+	for _, idx := range coll.GetIndexes() {
+		if idx.Info().Sparse {
+			sparse[idx.Info().Name] = true
+		}
+	}
+	explain, err := build().Explain(ctx)
 	require.NoError(t, err)
 	for _, ie := range explain.Indexes {
-		if ie.Used && ie.Name == "isUninstalled" {
+		if ie.Used && sparse[ie.Name] {
 			t.Errorf("planner answered %s from the SPARSE index %q\n%s",
-				cond, ie.Name, explain.Plan)
+				label, ie.Name, explain.Plan)
 		}
 	}
 }
@@ -156,8 +183,43 @@ func TestGO7510_SparsePlannerIgnoresNotEqual(t *testing.T) {
 		assertGo7510(t, coll, `{"resolvedLayout":"note","isUninstalled":{"$ne":true}}`, 24)
 	})
 
+	// Plan C: the sort-driven sparse gate is a second call site with its own
+	// failure mode — an unconstrained Sort over the sparse index drives the
+	// scan from an index that never stored the 20 documents missing the field,
+	// and Count and Iter then disagree.
+	t.Run("sort over the sparse field", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "objects")
+		require.NoError(t, err)
+		go7510EnsureIndexes(t, coll)
+		go7510Insert(t, coll, docs)
+
+		assertGo7510Sorted(t, coll, `{}`, "isUninstalled", 24)
+		assertGo7510Sorted(t, coll, `{"resolvedLayout":"note"}`, "isUninstalled", 12)
+	})
+
+	// Other predicates that can match an absent or null field, each of which
+	// the sparse index would answer wrongly if the gate stopped firing.
+	t.Run("other absent-matching predicates", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "objects")
+		require.NoError(t, err)
+		go7510EnsureIndexes(t, coll)
+		go7510Insert(t, coll, docs)
+
+		assertGo7510(t, coll, `{"isUninstalled":{"$ne":false}}`, 22) // 20 absent + 2 true
+		assertGo7510(t, coll, `{"isUninstalled":{"$ne":"x"}}`, 24)   // every doc
+		assertGo7510(t, coll, `{"isUninstalled":null}`, 20)          // absent only
+		assertGo7510(t, coll, `{"isUninstalled":{"$exists":false}}`, 20)
+		// The issue measured $in:[null,false] as NOT working in v1 (In.Ok
+		// returned false for an absent key). v2 answers it correctly.
+		assertGo7510(t, coll, `{"isUninstalled":{"$in":[null,false]}}`, 22)
+	})
+
 	// The other predicate shapes measured in the issue. All are "not true",
-	// spelled differently; all must agree with $ne.
+	// spelled differently; all must agree with $ne. Only $ne contributes index
+	// bounds — the rest plan as a FullScan, so for them this pins row-count
+	// semantics rather than the sparse gate.
 	t.Run("equivalent predicate shapes", func(t *testing.T) {
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "objects")
@@ -236,6 +298,10 @@ func TestGO7510_PlanStableAcrossReopen(t *testing.T) {
 	freshNames := go7510IndexNames(coll)
 	freshExplain, err := coll.Find(tiedCond).Explain(ctx)
 	require.NoError(t, err)
+	freshCosts := map[string]float64{}
+	for _, ie := range freshExplain.Indexes {
+		freshCosts[ie.Name] = ie.Cost
+	}
 	freshCount, err := coll.Find(tiedCond).Count(ctx)
 	require.NoError(t, err)
 	require.NoError(t, fx1.Close())
@@ -249,12 +315,22 @@ func TestGO7510_PlanStableAcrossReopen(t *testing.T) {
 	reopenedCount, err := coll2.Find(tiedCond).Count(ctx)
 	require.NoError(t, err)
 
-	// The two sessions do see the indexes in different orders — creation order
+	// This test only means something if the three seeks genuinely tie: the
+	// name rung fires on an exact cost tie and nothing else. Assert it, so a
+	// cost-model change that separates the costs fails loudly instead of
+	// turning the test into a silent no-op.
+	require.Len(t, freshCosts, 3)
+	for name, cost := range freshCosts {
+		assert.Equalf(t, freshCosts["aaa"], cost,
+			"index %s must tie with the others for this test to exercise the tie-break", name)
+	}
+
+	// The two sessions see the indexes in different orders — creation order
 	// live, catalog (name) order after a reopen. That is the input the planner
-	// must not be sensitive to, so assert it rather than paper over it.
+	// must not be sensitive to. Logged rather than asserted: normalizing the
+	// load order is a legitimate future fix, and it must not fail this test.
 	assert.ElementsMatch(t, freshNames, reopenedNames)
-	assert.NotEqual(t, freshNames, reopenedNames,
-		"fixture no longer exercises the differing-order case")
+	t.Logf("index order: live=%v reopened=%v", freshNames, reopenedNames)
 
 	assert.Equal(t, freshCount, reopenedCount, "row count must not depend on the session")
 	assert.Equal(t, go7510UsedIndex(t, freshExplain), go7510UsedIndex(t, reopenedExplain),
