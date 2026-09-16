@@ -51,7 +51,7 @@ Each serialized item starts with a byte that defines its type. Supported data ty
 
 ### Streams
 
-A stream is a sequence of encoded values written back to back, with no length prefix or separator: each value is self-delimiting, so a single encoded value, or several concatenated, is a valid stream. `Writer` and `Reader` stream values to an `io.Writer` and from an `io.Reader`:
+A stream is a sequence of encoded values written back to back, with no length prefix or separator: each value delimits itself, so a single encoded value, or several concatenated, is a valid stream. `Writer` and `Reader` stream values to an `io.Writer` and from an `io.Reader`:
 
 ```go
 w := anyenc.NewWriter(dst)
@@ -79,3 +79,9 @@ for {
 ```
 
 Errors are final: after one, every later call returns it.
+
+A value is limited to 1 GiB, the bound the parser puts on a decompressed object. Both sides report `anyenc.ErrValueTooLarge`: the `Writer` rather than emit a dump its `Reader` would refuse, the `Reader` as soon as a length header declares more, before buffering what it claims.
+
+One value does not delimit itself completely: a top-level string ends with `0x00`, and only the following byte says whether that byte terminates the string or opens an escape pair (see the escaping rules above). A `Reader` therefore holds such a string until the next value arrives or the stream ends. That never shows in a file, where EOF settles it, but on a live source — a socket where the peer sends a bare string and waits — `Read` blocks until the peer sends more. Values inside objects and arrays are unaffected, so dumps of documents never hit this.
+
+The format carries no checksum, so corruption is caught only where it breaks the structure. A flipped byte inside a string or binary payload reads back as different data, and a corrupted value terminator can merge two values into one. Where that matters, wrap the stream in a compressor with an integrity check (gzip, zstd), which the dump will want anyway.
