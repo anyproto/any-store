@@ -194,20 +194,20 @@ func TestValueScanner(t *testing.T) {
 		var resumed valueScanner
 		for i := range len(enc) {
 			var fresh valueScanner
-			n, err := fresh.next(enc[:i], false)
+			n, err := fresh.next(enc[:i], 0, false)
 			require.NoError(t, err)
 			require.Zero(t, n, "fresh prefix %x of %x", enc[:i], enc)
-			n, err = resumed.next(enc[:i], false)
+			n, err = resumed.next(enc[:i], 0, false)
 			require.NoError(t, err)
 			require.Zero(t, n, "resumed prefix %x of %x", enc[:i], enc)
 		}
 		// A following value settles a top-level string's terminator.
-		n, err := resumed.next(append(slices.Clip(enc), byte(TypeNull)), false)
+		n, err := resumed.next(append(slices.Clip(enc), byte(TypeNull)), 0, false)
 		require.NoError(t, err)
 		require.Equal(t, len(enc), n, "%x", enc)
 
 		var fresh valueScanner
-		n, err = fresh.next(enc, true)
+		n, err = fresh.next(enc, 0, true)
 		require.NoError(t, err)
 		require.Equal(t, len(enc), n, "%x", enc)
 	}
@@ -238,13 +238,62 @@ func TestReader_SourceError(t *testing.T) {
 
 func TestReader_ValueLimit(t *testing.T) {
 	// A string that never terminates must not be buffered past the limit.
-	src := io.MultiReader(bytes.NewReader([]byte{byte(TypeString)}), infiniteReader{}, iotest.ErrReader(errBoom))
-	r := NewReader(src)
+	counted := &countingReader{r: infiniteReader{}}
+	r := NewReader(io.MultiReader(bytes.NewReader([]byte{byte(TypeString)}), counted))
 	r.limit = 1 << 20
 	_, err := r.Read(&Parser{})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "exceeds")
-	assert.LessOrEqual(t, cap(r.buf), 4<<20)
+	assert.ErrorIs(t, err, ErrValueTooLarge)
+	assert.LessOrEqual(t, counted.n, r.limit+streamBufSize, "read past the limit")
+}
+
+func TestReader_DeclaredLengthOverLimit(t *testing.T) {
+	// A length header over the limit fails where it is read, without pulling
+	// in the bytes it claims.
+	for _, tag := range []Type{TypeBinary, TypeVectorF32, TypeCompressedObjectS2} {
+		counted := &countingReader{r: infiniteReader{}}
+		hdr := append([]byte{byte(tag)}, 0x7f, 0xff, 0xff, 0xff)
+		r := NewReader(io.MultiReader(bytes.NewReader(hdr), counted))
+		_, err := r.Read(&Parser{})
+		assert.ErrorIs(t, err, ErrValueTooLarge, "%s", tag)
+		assert.Zero(t, counted.n, "%s: read %d bytes of a rejected value", tag, counted.n)
+	}
+}
+
+func TestReader_TruncatedAtEscape(t *testing.T) {
+	// An escape pair or a container cut at EOF is truncation, not a value.
+	for _, stream := range [][]byte{
+		{byte(TypeString), 'a', 0, 0xff},
+		{byte(TypeString), 'a', 0, 0xff, 'b'},
+		{byte(TypeObject), 'k', 0, byte(TypeString), 'a', 0},
+		{byte(TypeObject), 'k', 0, byte(TypeString), 'a', 0, 0xff},
+		{byte(TypeArray), byte(TypeString), 'a', 0},
+	} {
+		r := NewReader(bytes.NewReader(stream))
+		_, err := r.Read(&Parser{})
+		assert.ErrorIs(t, err, io.ErrUnexpectedEOF, "%x", stream)
+	}
+}
+
+func TestReader_BufferShrinks(t *testing.T) {
+	a := &Arena{}
+	big := a.NewBinary(make([]byte, 8<<20))
+	small := MustParseJson(`{"a":1}`)
+	var stream []byte
+	stream = big.MarshalTo(stream)
+	const smalls = 20_000
+	for range smalls {
+		stream = small.MarshalTo(stream)
+	}
+	r := NewReader(&chunkReader{r: bytes.NewReader(stream), n: streamBufSize})
+	p := &Parser{}
+	_, err := r.Read(p)
+	require.NoError(t, err)
+	require.Greater(t, cap(r.buf), 8<<20, "the big value should have grown the buffer")
+	for range smalls {
+		_, err = r.Read(p)
+		require.NoError(t, err)
+	}
+	assert.LessOrEqual(t, cap(r.buf), streamBufKeep, "buffer kept after the big value")
 }
 
 func TestReader_NoProgress(t *testing.T) {
@@ -308,6 +357,42 @@ func TestWriter_Errors(t *testing.T) {
 	}
 }
 
+func TestWriter_RejectsUnreadableValues(t *testing.T) {
+	// Values no Reader would accept must not reach the stream.
+	t.Run("over_limit", func(t *testing.T) {
+		var out bytes.Buffer
+		w := NewWriter(&out)
+		w.limit = 1 << 10
+		a := &Arena{}
+		err := w.Write(a.NewBinary(make([]byte, 2<<10)))
+		assert.ErrorIs(t, err, ErrValueTooLarge)
+		assert.ErrorIs(t, w.Flush(), ErrValueTooLarge)
+		assert.Zero(t, out.Len())
+	})
+	t.Run("unknown_type", func(t *testing.T) {
+		var out bytes.Buffer
+		w := NewWriter(&out)
+		err := w.Write(&Value{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unknown type")
+		assert.Equal(t, err, w.Flush(), "the error is final")
+		assert.Zero(t, out.Len(), "a value of unknown type would vanish from the stream")
+	})
+}
+
+func TestWriter_BufferShrinks(t *testing.T) {
+	a := &Arena{}
+	w := NewWriter(io.Discard)
+	require.NoError(t, w.Write(a.NewBinary(make([]byte, 8<<20))))
+	require.NoError(t, w.Flush())
+	require.Greater(t, cap(w.buf), 8<<20, "the big value should have grown the buffer")
+	// A flush of small values gives it back; flushing big ones must not, or
+	// every big value would re-grow the buffer.
+	require.NoError(t, w.Write(MustParseJson(`{"a":1}`)))
+	require.NoError(t, w.Flush())
+	assert.LessOrEqual(t, cap(w.buf), streamBufKeep)
+}
+
 type chunkReader struct {
 	r io.Reader
 	n int
@@ -315,6 +400,17 @@ type chunkReader struct {
 
 func (c *chunkReader) Read(b []byte) (int, error) {
 	return c.r.Read(b[:min(len(b), c.n)])
+}
+
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(b []byte) (int, error) {
+	n, err := c.r.Read(b)
+	c.n += n
+	return n, err
 }
 
 type infiniteReader struct{}

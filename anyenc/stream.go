@@ -3,50 +3,83 @@ package anyenc
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
 )
 
 // A stream is a sequence of encoded values written back to back with nothing
-// between them. Every value is self-delimiting, so one MarshalTo output, or
-// several concatenated, is a valid stream.
+// between them, so one MarshalTo output, or several concatenated, is a valid
+// stream. Values delimit themselves, except that a top-level string needs the
+// byte after its terminator to tell an escape pair from the end of the value
+// (see escape.go), which a Reader gets from the next value or from EOF.
 
 const (
 	// streamBufSize is the Writer flush threshold and the Reader's minimum
 	// buffer growth.
 	streamBufSize = 64 << 10
-	// maxStreamValueSize bounds what a Reader buffers for one value, so corrupt
-	// input (a lost terminator, a bogus length header) fails instead of pulling
-	// the rest of the stream into memory. Same bound the parser puts on a
-	// decompressed object.
+	// streamBufKeep bounds the buffer a Writer or Reader carries from one value
+	// to the next, so a single huge value does not pin its buffer for the rest
+	// of a long export. Only a small value gives the buffer back: shrinking
+	// while big values keep coming would re-grow it for every one of them.
+	streamBufKeep = 4 * streamBufSize
+	// streamShrinkAfter is how many values a Reader reads from an outsized
+	// buffer before giving it back. Values much smaller than the buffer are
+	// normal mid-value, so waiting a while is what tells a passing large value
+	// from a stream that has moved on to small ones.
+	streamShrinkAfter = 64
+	// maxStreamValueSize bounds one value: what a Reader buffers for it and
+	// what a Writer emits for it, so corrupt input (a lost terminator, a bogus
+	// length header) fails instead of pulling the rest of the stream into
+	// memory, and no Writer builds a dump its Reader would reject. Same bound
+	// the parser puts on a decompressed object.
 	maxStreamValueSize = maxDecompressedSize
 	// maxEmptyReads is how many consecutive (0, nil) reads Reader tolerates
 	// before failing with io.ErrNoProgress.
 	maxEmptyReads = 100
+	maxInt        = int64(^uint(0) >> 1)
 )
+
+// ErrValueTooLarge reports a value over the stream limit: written, or declared
+// by a length header in the input.
+var ErrValueTooLarge = errors.New("anyenc: value exceeds stream limit")
 
 // Writer writes a stream of encoded values to an io.Writer.
 //
 // Values are buffered: call Flush after the last Write. After an error, every
 // call returns that error.
 type Writer struct {
-	w   io.Writer
-	buf []byte
-	err error
+	w     io.Writer
+	buf   []byte
+	err   error
+	limit int // max bytes for one value
 }
 
 // NewWriter returns a Writer that writes to w.
 func NewWriter(w io.Writer) *Writer {
-	return &Writer{w: w, buf: make([]byte, 0, streamBufSize)}
+	return &Writer{w: w, buf: make([]byte, 0, streamBufSize), limit: maxStreamValueSize}
 }
 
-// Write appends the encoding of v to the stream.
+// Write appends the encoding of v to the stream. Values a Reader could not
+// read back are rejected: one over the size limit, and one of an unknown type,
+// which MarshalTo encodes as nothing at all.
 func (w *Writer) Write(v *Value) error {
 	if w.err != nil {
 		return w.err
 	}
+	mark := len(w.buf)
 	w.buf = v.MarshalTo(w.buf)
+	switch n := len(w.buf) - mark; {
+	case n == 0:
+		w.buf = w.buf[:mark]
+		w.err = fmt.Errorf("anyenc: cannot write value of unknown type %d", v.Type())
+		return w.err
+	case n > w.limit:
+		w.buf = w.buf[:mark]
+		w.err = fmt.Errorf("%w: wrote %d bytes, limit %d", ErrValueTooLarge, n, w.limit)
+		return w.err
+	}
 	if len(w.buf) >= streamBufSize {
 		return w.Flush()
 	}
@@ -62,7 +95,11 @@ func (w *Writer) Flush() error {
 	if err == nil && n < len(w.buf) {
 		err = io.ErrShortWrite
 	}
-	w.buf = w.buf[:0]
+	if cap(w.buf) > streamBufKeep && len(w.buf) <= streamBufSize {
+		w.buf = make([]byte, 0, streamBufSize)
+	} else {
+		w.buf = w.buf[:0]
+	}
 	w.err = err
 	return err
 }
@@ -81,6 +118,7 @@ type Reader struct {
 	srcErr   error // error from r (io.EOF included), reported once buf is drained
 	err      error
 	limit    int // max bytes buffered for one value
+	sinceBig int // values read since the buffer last grew
 }
 
 // NewReader returns a Reader that reads from r.
@@ -103,13 +141,14 @@ func (r *Reader) Read(p *Parser) (*Value, error) {
 			// (see escape.go), so one ending the buffer goes to the scanner.
 			if err == nil && (len(tail) > 0 || final || v.t != TypeString) {
 				r.off += len(b) - len(tail)
+				r.sinceBig++
 				return v, nil
 			}
 			r.scanning = true
 		}
 		// The parse ran out of input or failed: the scanner tells which,
 		// resuming across reads until the value is complete.
-		n, err := r.scan.next(b, final)
+		n, err := r.scan.next(b, r.limit, final)
 		if err != nil {
 			r.err = err
 			break
@@ -119,13 +158,19 @@ func (r *Reader) Read(p *Parser) (*Value, error) {
 			continue
 		}
 		p.c.reset()
-		v, _, err := parseValue(b[:n], &p.c, 0)
+		v, tail, err := parseValue(b[:n], &p.c, 0)
+		if err == nil && len(tail) != 0 {
+			// The scanner's length rules disagree with the parser's; skipping
+			// the extra bytes would silently drop part of the stream.
+			err = fmt.Errorf("anyenc: scanned %d bytes, parsed %d", n, n-len(tail))
+		}
 		if err != nil {
 			r.err = err
 			break
 		}
 		r.off += n
 		r.scanning = false
+		r.sinceBig++
 		return v, nil
 	}
 	return nil, r.err
@@ -142,17 +187,32 @@ func (r *Reader) fill(b []byte) error {
 	case r.srcErr != nil:
 		return r.srcErr
 	case len(b) >= r.limit:
-		return fmt.Errorf("stream value exceeds %d bytes", r.limit)
+		return fmt.Errorf("%w: buffered %d bytes, limit %d", ErrValueTooLarge, len(b), r.limit)
 	}
-	if r.off > 0 {
+	switch {
+	case cap(r.buf) > streamBufKeep && len(b) <= streamBufSize && r.sinceBig >= streamShrinkAfter:
+		// The big value that grew this buffer is long past; give it back.
+		r.buf = append(make([]byte, 0, streamBufSize), b...)
+		r.off = 0
+	case r.off > 0:
 		r.buf = r.buf[:copy(r.buf, b)]
 		r.off = 0
 	}
 	if len(r.buf) == cap(r.buf) {
-		r.buf = slices.Grow(r.buf, max(len(r.buf), streamBufSize))
+		grow := max(len(r.buf), streamBufSize)
+		// A length-prefixed value says up front how much it needs: one growth
+		// instead of a dozen doublings, each copying the partial value.
+		if need := r.scan.need - len(r.buf); need > grow {
+			grow = need
+		}
+		r.buf = slices.Grow(r.buf, min(grow, r.limit-len(r.buf)))
+		r.sinceBig = 0
 	}
+	// Grow rounds capacity up, so the read window, not the capacity, is what
+	// holds buffering to the limit.
+	end := min(cap(r.buf), r.limit)
 	for range maxEmptyReads {
-		n, err := r.r.Read(r.buf[len(r.buf):cap(r.buf)])
+		n, err := r.r.Read(r.buf[len(r.buf):end])
 		r.buf = r.buf[:len(r.buf)+n]
 		if err != nil {
 			r.srcErr = err
@@ -174,12 +234,16 @@ type valueScanner struct {
 	open   []bool // open containers, innermost last; true for an object
 	atKey  bool   // pos is at an object key or the object's terminator
 	resume int    // where the pending string or key terminator search continues
+	need   int    // total length of the pending value when a header declares it
 }
 
 // next returns the length of the value starting at b[0], or 0 when b ends
 // before the value does. Until a value is returned, each call's b must extend
-// the previous one. final reports that no bytes follow b.
-func (s *valueScanner) next(b []byte, final bool) (int, error) {
+// the previous one. final reports that no bytes follow b. A value whose length
+// header declares more than limit bytes is rejected on the spot, before the
+// caller buffers any of it; limit <= 0 does not limit.
+func (s *valueScanner) next(b []byte, limit int, final bool) (int, error) {
+	s.need = 0
 	for s.pos == 0 || len(s.open) > 0 {
 		if s.pos >= len(b) {
 			return 0, nil
@@ -210,9 +274,7 @@ func (s *valueScanner) next(b []byte, final bool) (int, error) {
 			s.atKey = t == TypeObject
 			continue
 		case TypeString:
-			// Only a top-level string can end at the last byte of the stream;
-			// inside a container more of the value follows every terminator.
-			end, ok := s.term(b, s.pos+1, final && len(s.open) == 0)
+			end, ok := s.term(b, s.pos+1, final)
 			if !ok {
 				return 0, nil
 			}
@@ -222,10 +284,18 @@ func (s *valueScanner) next(b []byte, final bool) (int, error) {
 			if err != nil {
 				return 0, err
 			}
-			if n == 0 || s.pos+n > len(b) {
+			if n == 0 {
+				return 0, nil // length header still incomplete
+			}
+			end := int64(s.pos) + n
+			if end > maxInt || (limit > 0 && end > int64(limit)) {
+				return 0, fmt.Errorf("%w: header declares %d bytes, limit %d", ErrValueTooLarge, end, limit)
+			}
+			if end > int64(len(b)) {
+				s.need = int(end)
 				return 0, nil
 			}
-			s.pos += n
+			s.pos = int(end)
 		}
 		s.atKey = len(s.open) > 0 && s.open[len(s.open)-1]
 	}
@@ -260,8 +330,9 @@ func (s *valueScanner) term(b []byte, start int, final bool) (int, bool) {
 }
 
 // scalarLen returns the encoded length of the non-string scalar at the start
-// of b, or 0 when b is too short to tell.
-func scalarLen(b []byte) (int, error) {
+// of b, or 0 when b is too short to tell. It is int64 because a length header
+// is an untrusted uint32, which overflows int where int is 32 bits.
+func scalarLen(b []byte) (int64, error) {
 	switch Type(b[0]) {
 	case TypeNull, TypeTrue, TypeFalse:
 		return 1, nil
@@ -275,7 +346,7 @@ func scalarLen(b []byte) (int, error) {
 		if len(b) < 5 {
 			return 0, nil
 		}
-		return 5 + int(binary.BigEndian.Uint32(b[1:5])), nil
+		return 5 + int64(binary.BigEndian.Uint32(b[1:5])), nil
 	default:
 		return 0, fmt.Errorf("unknown type %d", b[0])
 	}

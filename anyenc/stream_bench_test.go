@@ -42,23 +42,26 @@ func BenchmarkWriter(b *testing.B) {
 
 // BenchmarkReader reads an endless stream of one repeated document. The
 // parse_* cases are the baseline, Parser.ParseOwned on the document alone, so
-// the gap to the matching reader case is the Reader's own cost.
-// large_4KiB_reads feeds each document in ~140 reads; the scanner resumes
-// across them, so throughput should hold.
+// the gap to the matching reader case is the Reader's own cost. Reads land
+// mid-value as a file's would, except in the *_aligned_reads cases, where every
+// read stops at a value boundary and each value is parsed once, in place.
 func BenchmarkReader(b *testing.B) {
 	small, large := benchStreamDocs()
 	for _, bc := range []struct {
-		name  string
-		doc   *Value
-		chunk int
+		name    string
+		doc     *Value
+		chunk   int
+		aligned bool
 	}{
-		{"small", small, 0},
-		{"large", large, 0},
-		{"large_4KiB_reads", large, 4 << 10},
+		{"small", small, 0, false},
+		{"small_aligned_reads", small, 0, true},
+		{"large", large, 0, false},
+		{"large_aligned_reads", large, 0, true},
+		{"large_4KiB_reads", large, 4 << 10, false},
 	} {
 		enc := bc.doc.MarshalTo(nil)
 		b.Run(bc.name, func(b *testing.B) {
-			var src io.Reader = &repeatReader{data: enc}
+			var src io.Reader = &repeatReader{data: enc, aligned: bc.aligned}
 			if bc.chunk > 0 {
 				src = &chunkReader{r: src, n: bc.chunk}
 			}
@@ -117,14 +120,26 @@ func BenchmarkWriterReaderRoundTrip(b *testing.B) {
 	}
 }
 
-// repeatReader serves data over and over without end.
+// repeatReader serves data over and over without end. It fills the whole
+// buffer, like a file, unless aligned is set, where each read stops at the end
+// of one copy of data.
 type repeatReader struct {
-	data []byte
-	off  int
+	data    []byte
+	off     int
+	aligned bool
 }
 
 func (r *repeatReader) Read(b []byte) (int, error) {
-	n := copy(b, r.data[r.off:])
-	r.off = (r.off + n) % len(r.data)
+	if r.aligned {
+		n := copy(b, r.data[r.off:])
+		r.off = (r.off + n) % len(r.data)
+		return n, nil
+	}
+	var n int
+	for n < len(b) {
+		c := copy(b[n:], r.data[r.off:])
+		n += c
+		r.off = (r.off + c) % len(r.data)
+	}
 	return n, nil
 }
