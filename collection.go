@@ -953,6 +953,9 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		var newVIndexes []*vectorIndex
 		for _, idxInfo := range info {
 			if isFulltext(idxInfo) {
+				if txErr = c.checkSingleFulltextIndex(idxInfo, newFtsIndexes); txErr != nil {
+					return false, txErr
+				}
 				fx, fErr := c.createFtsIndex(ctx, tx, idxInfo)
 				if fErr != nil {
 					if ensure && errors.Is(fErr, ErrIndexExists) {
@@ -1147,6 +1150,38 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 
 // createFtsIndex creates the five namespaces of a full-text index, registers
 // its metadata, and backfills existing documents. Mirrors createIndex.
+// checkSingleFulltextIndex enforces at most one full-text index per collection.
+// A redefinition under the SAME name is not a second index — createFtsIndex
+// decides whether that is idempotent (ErrIndexExists, swallowed under ensure)
+// or a genuine conflict (ErrIndexMismatch) — so only a DIFFERENT name is
+// rejected here. pending covers indexes created earlier in this same batch,
+// which are not published to c.loadFtsIndexes() until the tx commits.
+func (c *collection) checkSingleFulltextIndex(info IndexInfo, pending []*ftsIndex) error {
+	name := info.Name
+	if name == "" {
+		name = info.createName()
+	}
+	existing := ""
+	for _, fx := range c.loadFtsIndexes() {
+		if fx.info.Name != name {
+			existing = fx.info.Name
+			break
+		}
+	}
+	if existing == "" {
+		for _, fx := range pending {
+			if fx.info.Name != name {
+				existing = fx.info.Name
+				break
+			}
+		}
+	}
+	if existing != "" {
+		return fmt.Errorf("%w (have %q, requested %q)", ErrMultipleFulltextIndexes, existing, name)
+	}
+	return nil
+}
+
 func (c *collection) createFtsIndex(ctx context.Context, tx *btree.WriteTx, info IndexInfo) (*ftsIndex, error) {
 	tx.MarkSchemaChanged()
 	if info.Name == "" {
