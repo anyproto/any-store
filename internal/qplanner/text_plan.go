@@ -1,7 +1,6 @@
 package qplanner
 
 import (
-	"cmp"
 	"fmt"
 	"slices"
 )
@@ -278,8 +277,19 @@ func buildTextPlan(params *PlanParams) *Plan {
 
 	best := &cands[0]
 	for ci := 1; ci < len(cands); ci++ {
-		if cands[ci].cost < best.cost {
-			best = &cands[ci]
+		c := &cands[ci]
+		if c.cost < best.cost {
+			best = c
+			continue
+		}
+		// Break an exact tie between two per-index probe candidates on the index
+		// name: those are appended in index order, which differs between a live
+		// and a reopened collection (GO-7510). Candidates with no index sit at
+		// fixed positions in the slice, so first-wins is already deterministic
+		// for them and their plan-shape preference is preserved.
+		if c.cost == best.cost && c.idx != nil && best.idx != nil &&
+			c.idx.Info.Name < best.idx.Info.Name {
+			best = c
 		}
 	}
 
@@ -301,9 +311,7 @@ func buildTextPlan(params *PlanParams) *Plan {
 				Name: c.name, Cost: c.cost, EstRows: c.estRows,
 			})
 		}
-		slices.SortFunc(explainCands, func(a, b CandidatePlan) int {
-			return cmp.Compare(a.Cost, b.Cost)
-		})
+		slices.SortFunc(explainCands, compareCandidates)
 		plan.Explain = ExplainInfo{
 			TotalDocs:   int(totalDocs),
 			Selectivity: selText * pResidual,
