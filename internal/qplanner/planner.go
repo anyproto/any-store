@@ -1974,12 +1974,22 @@ func buildVerifyChain(params *PlanParams, idx *CBOIndex, root Iterator) Iterator
 			return nil
 		}
 
-		// Find a non-unique single-field index for this field
+		// Find a non-unique single-field index for this field.
+		//
+		// Sparse is excluded: a sparse index stores no entry for a document
+		// whose field is missing or null, so probing it for an equality bound
+		// that matches null reports "not there" for exactly the documents the
+		// predicate should match, and Count drops them while Iter keeps them.
+		// This is the same rule Plan B and Plan C apply through
+		// sparseIndexComplete; the verify probe is the third call site and was
+		// missing it. Skipping the index here just means no verify chain, and
+		// the plan falls back to fetching the document and evaluating the
+		// filter -- slower, correct.
 		var verifyNs *btree.Namespace
 		var verifyReverse bool
 		for i := range params.Indexes {
 			info := params.Indexes[i].Info
-			if !info.Unique && len(info.FieldNames) == 1 && info.FieldNames[0] == field {
+			if !info.Unique && !info.Sparse && len(info.FieldNames) == 1 && info.FieldNames[0] == field {
 				verifyNs = info.Ns
 				verifyReverse = len(info.Reverse) > 0 && info.Reverse[0]
 				break
