@@ -14,7 +14,7 @@ import (
 // TestSparseCompoundIndex_PlannerDoesNotDropRows reproduces the alpha.13
 // regression where the CBO would pick a sparse compound index for a query that
 // does not constrain every indexed field. A sparse index omits documents missing
-// (or null in) any of its fields, so seeking it silently dropped matching rows.
+// any of its fields, so seeking it silently dropped matching rows.
 //
 // Layout mirrors the field report: a complete index (sp,q) is declared first and
 // a sparse index (sp,as) — with `as` optional — second. The planner must not
@@ -77,7 +77,7 @@ func assertSparseQueryCount(t *testing.T, coll Collection, cond string, want int
 	require.Equalf(t, want, n, "Iter for %s", cond)
 }
 
-// GO-7510 repro, ported to v2.
+// The v1 sparse-index row loss, as a v2 regression.
 //
 // In any-store v1.0.1 the query planner never read IndexInfo.Sparse, so a
 // negative predicate (`!= true`) was answered by INNER JOINing the sparse index
@@ -90,8 +90,8 @@ func assertSparseQueryCount(t *testing.T, coll Collection, cond string, want int
 // `false`; a sparse index on `isUninstalled`; expected 22 for `$ne: true`.
 // `resolvedLayout` carries a second index so the two-predicate shape from the
 // issue is reproduced. Note there is no cost TIE in this fixture under v2 — the
-// sparse index is gated out entirely — so these tests pin defect 1 only;
-// defect 2 is pinned separately by TestGO7510_PlanStableAcrossReopen.
+// sparse index is gated out entirely — so these tests pin the row loss only;
+// plan stability across a reopen is pinned by TestPlanner_PlanStableAcrossReopen.
 
 type sparseNeDoc struct {
 	id             int
@@ -196,7 +196,8 @@ func assertSparseNotPlannedQuery(t *testing.T, coll Collection, label string, bu
 	}
 }
 
-// TestSparseIndex_NotEqualDoesNotDropRows is defect #1 of GO-7510.
+// TestSparseIndex_NotEqualDoesNotDropRows: a negative predicate must not be
+// answered from a sparse index, which lacks the documents it matches.
 func TestSparseIndex_NotEqualDoesNotDropRows(t *testing.T) {
 	docs := sparseNeFixture()
 
@@ -304,13 +305,13 @@ func TestSparseIndex_NotEqualDoesNotDropRows(t *testing.T) {
 	})
 }
 
-// TestSparseIndex_NotEqualSurvivesReopen is defect #1 combined with defect #2:
-// in v1 the query was correct in the session that created the index and broken
-// in every session after, because a reopened collection loads its indexes in a
-// different order and the tie-break is positional.
+// TestSparseIndex_NotEqualSurvivesReopen combines the row loss with plan
+// instability: in v1 the query was correct in the session that created the
+// index and broken in every session after, because a reopened collection
+// loads its indexes in a different order and the tie-break is positional.
 func TestSparseIndex_NotEqualSurvivesReopen(t *testing.T) {
 	skipIfInMemory(t)
-	tmpDir, err := os.MkdirTemp("", "go7510-*")
+	tmpDir, err := os.MkdirTemp("", "sparse-ne-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 

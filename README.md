@@ -103,7 +103,7 @@ Any operation run with `tx.Context()` joins the transaction. Read transactions (
 _ = users.EnsureIndex(ctx,
     anystore.IndexInfo{Fields: []string{"name", "-createdDate"}},          // compound, mixed order
     anystore.IndexInfo{Fields: []string{"email"}, Unique: true},           // unique
-    anystore.IndexInfo{Fields: []string{"nick"}, Sparse: true},            // skips missing/null
+    anystore.IndexInfo{Fields: []string{"nick"}, Sparse: true},            // skips docs missing the field
 )
 
 exp, _ := users.Find(`{"name": "Jane"}`).Explain(ctx)
