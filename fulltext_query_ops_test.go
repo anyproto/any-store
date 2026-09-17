@@ -472,9 +472,11 @@ func TestFtsOps_SparsePresenceCountSharedArray(t *testing.T) {
 		`{"id":"d","text":"beta","x":[{"y":1,"z":1}]}`,
 	)
 	// Text matches far outnumber the index's documents: the index probes.
+	var filler []string
 	for i := range 2000 {
-		insertJSON(t, coll, fmt.Sprintf(`{"id":"f%04d","text":"alpha"}`, i))
+		filler = append(filler, fmt.Sprintf(`{"id":"f%04d","text":"alpha"}`, i))
 	}
+	insertJSON(t, coll, filler...)
 	filter := `{"$text":{"$search":"alpha"},"x.y":{"$exists":true},"x.z":{"$exists":true}}`
 	explain, err := coll.Find(filter).Explain(ctx)
 	require.NoError(t, err)
