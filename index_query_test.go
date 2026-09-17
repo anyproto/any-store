@@ -4429,3 +4429,73 @@ func TestIndex_Sparse_MissingLeafBesideExisting(t *testing.T) {
 	require.ErrorIs(t, uniq.Insert(ctx, anyenc.MustParseJson(`{"id":2,"x":[{"z":1},{"y":null}]}`)), ErrUniqueConstraint)
 	require.NoError(t, uniq.Insert(ctx, anyenc.MustParseJson(`{"id":3,"x":[{"z":1},{"w":2}]}`)))
 }
+
+// A Count whose filter is nothing but {$exists:true} on a sparse index's
+// fields is the number of documents the index holds: the plan is the bare
+// index, with no fetch and no filter, on scalar and on fan-out data alike.
+func TestIndex_Sparse_PresenceCountFromIndex(t *testing.T) {
+	fx := newFixture(t)
+	for _, tc := range []struct {
+		name   string
+		fields []string
+		filter string
+		docs   []string
+		plan   string // bare: the index alone; fetch: index, then documents; scan: the index cannot serve it
+	}{
+		{"scalar", []string{"a"}, `{"a":{"$exists":true}}`,
+			[]string{`{"id":1,"a":1}`, `{"id":2,"a":null}`, `{"id":3}`, `{"id":4,"a":"s"}`}, "bare"},
+		{"fan-out", []string{"a"}, `{"a":{"$exists":true}}`,
+			[]string{`{"id":1,"a":[1,2,null]}`, `{"id":2,"a":[]}`, `{"id":3}`, `{"id":4,"a":[1]}`}, "bare"},
+		{"traversed", []string{"x.y"}, `{"x.y":{"$exists":true}}`,
+			[]string{`{"id":1,"x":[{"y":1},{"y":2},{"z":3}]}`, `{"id":2,"x":[{"z":1},{"y":null}]}`, `{"id":3,"x":[{"z":1}]}`}, "bare"},
+		{"compound", []string{"a", "b"}, `{"a":{"$exists":true},"b":{"$exists":true}}`,
+			[]string{`{"id":1,"a":[1,2],"b":[3,4]}`, `{"id":2,"a":1}`, `{"id":3,"a":null,"b":null}`, `{"id":4,"b":1}`}, "bare"},
+		{"compound, one field asked", []string{"a", "b"}, `{"a":{"$exists":true}}`,
+			[]string{`{"id":1,"a":1,"b":1}`, `{"id":2,"a":1}`}, "scan"},
+		{"another predicate", []string{"a"}, `{"a":{"$exists":true},"id":{"$gt":1}}`,
+			[]string{`{"id":1,"a":1}`, `{"id":2,"a":1}`, `{"id":3}`}, "fetch"},
+		{"another presence predicate", []string{"a"}, `{"a":{"$type":"null"}}`,
+			[]string{`{"id":1,"a":1}`, `{"id":2,"a":null}`, `{"id":3}`}, "fetch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plain, err := fx.CreateCollection(ctx, tc.name+" plain")
+			require.NoError(t, err)
+			coll, err := fx.CreateCollection(ctx, tc.name)
+			require.NoError(t, err)
+			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: tc.fields, Sparse: true}))
+			for i := 100; i < 400; i++ {
+				tc.docs = append(tc.docs, fmt.Sprintf(`{"id":%d,"z":1}`, i))
+			}
+			for _, d := range tc.docs {
+				require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+			}
+			want, err := plain.Find(tc.filter).Count(ctx)
+			require.NoError(t, err)
+
+			hint := IndexHint{IndexName: "s", Boost: 1 << 30}
+			// Warm plan/visibility state outside the measured window.
+			_, err = coll.Find(tc.filter).IndexHint(hint).Count(ctx)
+			require.NoError(t, err)
+			qplannerEnableCounters(t)
+			got, err := coll.Find(tc.filter).IndexHint(hint).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, want, got)
+			pc := qplannerSnapshot()
+			switch tc.plan {
+			case "bare":
+				assert.Zero(t, pc.FetchNextCalls, "a presence count must not fetch documents")
+				assert.Zero(t, pc.FilterNextCalls, "a presence count must not run the filter")
+			case "fetch":
+				assert.NotZero(t, pc.FetchNextCalls, "the filter asks more than presence")
+			}
+			for _, page := range [][2]uint{{0, 2}, {1, 0}, {1, 1}, {500, 0}} {
+				wantPage, err := plain.Find(tc.filter).Offset(page[0]).Limit(page[1]).Count(ctx)
+				require.NoError(t, err)
+				gotPage, err := coll.Find(tc.filter).IndexHint(IndexHint{IndexName: "s", Boost: 1 << 30}).Offset(page[0]).Limit(page[1]).Count(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, wantPage, gotPage, "offset %d limit %d", page[0], page[1])
+			}
+		})
+	}
+}

@@ -386,11 +386,24 @@ func (it *IndexIter) probeMultiKey() (bool, error) {
 	return it.indexHasMultiKey, nil
 }
 
+// wholeIndex is the single open bound an IndexIter with no Bounds counts:
+// First() to the end of the namespace.
+var wholeIndex = query.Bounds{{}}
+
+// countBounds returns the bounds to count: Bounds, or the whole index when
+// there are none.
+func (it *IndexIter) countBounds() query.Bounds {
+	if len(it.Bounds) == 0 {
+		return wholeIndex
+	}
+	return it.Bounds
+}
+
 // countEntriesBatch is the original page-batch fast path, used for
-// single-bound (or unbounded — len(Bounds)==0 returns 0) counts.
+// single-bound and whole-index counts.
 func (it *IndexIter) countEntriesBatch() (int, error) {
 	total := 0
-	for _, b := range it.Bounds {
+	for _, b := range it.countBounds() {
 		if len(b.Start) > 0 {
 			if err := it.cursor.Seek(b.Start); err != nil {
 				return 0, err

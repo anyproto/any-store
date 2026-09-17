@@ -1177,6 +1177,11 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 			cboIdx.BoundFields < len(idx.cboInfo.FieldNames) {
 			scalarProven()
 		}
+		// A presence count over a bound-less sparse index counts the whole
+		// index: the proof lets CountEntries page-batch it, entries == docs.
+		if countOnly && idx.cboInfo.Sparse && len(cboIdx.Bounds) == 0 {
+			scalarProven()
+		}
 		// Multi-bound single-field counts (CountEntries' page-batch branch)
 		// and multi-bound unique lookups (CoverIter) need it too: a fan-out
 		// through an array of objects leaves no whole-array key to probe, so

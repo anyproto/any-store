@@ -434,7 +434,8 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 			}
 		}
 		countCovered = !needFilter ||
-			(idx.PointLookup && indexCoversFilter(idx, params.Filter))
+			(idx.PointLookup && indexCoversFilter(idx, params.Filter)) ||
+			(len(idx.Bounds) == 0 && presenceCoversFilter(idx, params.Filter))
 	}
 
 	probe := &FtsProbeIter{

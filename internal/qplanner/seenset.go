@@ -117,7 +117,7 @@ func (it *IndexIter) countEntriesViaSeenSet(skipScalar bool) (int, error) {
 	defer seenSetPool.Put(s)
 
 	distinct := 0
-	for _, b := range it.Bounds {
+	for _, b := range it.countBounds() {
 		if err := it.seekBoundStart(b); err != nil {
 			return 0, err
 		}

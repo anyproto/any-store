@@ -1548,6 +1548,16 @@ func BenchmarkExists_SparseIndex_10k(b *testing.B) {
 	benchIter(b, coll.Find(`{"opt": {"$exists": true}}`))
 }
 
+func BenchmarkExistsCount_FullScan_10k(b *testing.B) {
+	coll := setupSparseBenchCollection(b, 10000)
+	benchCount(b, coll, `{"opt": {"$exists": true}}`)
+}
+
+func BenchmarkExistsCount_SparseIndex_10k(b *testing.B) {
+	coll := setupSparseBenchCollection(b, 10000, IndexInfo{Fields: []string{"opt"}, Sparse: true})
+	benchCount(b, coll, `{"opt": {"$exists": true}}`)
+}
+
 // --- Sort Benchmarks ---
 
 func BenchmarkSort_FullScan_1k(b *testing.B) {

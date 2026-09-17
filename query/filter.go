@@ -1292,8 +1292,10 @@ func leafPresence(f Filter, fieldName string) (guaranteed, sound bool) {
 	return false, len(f.IndexBounds(fieldName, nil)) == 0
 }
 
-// pathIs reports whether path joined by "." equals name, without building the
+// PathIs reports whether path joined by "." equals name, without building the
 // joined string.
+func PathIs(path []string, name string) bool { return pathIs(path, name) }
+
 func pathIs(path []string, name string) bool {
 	for i, seg := range path {
 		if i > 0 {
