@@ -4085,6 +4085,8 @@ func TestIndex_Sparse_PresenceSemantics(t *testing.T) {
 		{`{"a":{"$gt":0}}`, true},
 		{`{"a":1}`, true},
 		{`{"a":{"$in":[1,"x"]}}`, true},
+		{`{"a":{"$exists":true,"$ne":1}}`, true},
+		{`{"a":{"$exists":true,"$eq":null}}`, false},
 		{`{"a":{"$exists":false}}`, false},
 		{`{"a":null}`, false},
 		{`{"a":{"$in":[null,1]}}`, false},
@@ -4403,6 +4405,10 @@ func TestIndex_Sparse_MissingLeafBesideExisting(t *testing.T) {
 			`{"x.y":{"$exists":true},"$or":[{"x.y":null},{"x.y":7}]}`,
 			`{"x.y":{"$exists":true,"$eq":null},"x.z":{"$exists":true,"$eq":null}}`,
 			`{"x.y":{"$exists":true},"x.z":{"$exists":true}}`,
+			`{"x.y":{"$exists":true,"$ne":1}}`,
+			`{"x.y":{"$exists":true,"$ne":null}}`,
+			`{"$and":[{"x.y":{"$exists":true}},{"x.y":{"$ne":5}}]}`,
+			`{"x.y":{"$exists":true,"$nin":[1,5]}}`,
 		} {
 			want := collectIntField(t, plain.Find(filter), "id")
 			for _, sort := range []string{"id", "x.y", "-x.y"} {

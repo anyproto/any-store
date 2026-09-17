@@ -56,7 +56,11 @@ func TestGuaranteesPresence(t *testing.T) {
 		{"exists true and eq null", `{"$and":[{"a":{"$exists":true}},{"a":null}]}`, "a", false},
 		{"exists true with gte null", `{"a":{"$exists":true,"$gte":null}}`, "a", false},
 		{"exists true with in null", `{"a":{"$exists":true,"$in":[null,1]}}`, "a", false},
-		{"exists true with ne", `{"a":{"$exists":true,"$ne":5}}`, "a", false},
+		// ...or whose bounds hold every existing leaf: $ne is met by ALL leaves.
+		{"exists true with ne", `{"a":{"$exists":true,"$ne":5}}`, "a", true},
+		{"exists true and ne", `{"$and":[{"a":{"$exists":true}},{"a":{"$ne":5}}]}`, "a", true},
+		{"exists true with nin", `{"a":{"$exists":true,"$nin":[5]}}`, "a", true},
+		{"ne alone", `{"a":{"$ne":5}}`, "a", false},
 		{"exists true beside or", `{"a":{"$exists":true},"$or":[{"a":null},{"a":1}]}`, "a", false},
 		{"exists true beside parent elemMatch", `{"x.y":{"$exists":true},"x":{"$elemMatch":{"y":null}}}`, "x.y", false},
 		// ...while one that contributes no bounds is harmless.

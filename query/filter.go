@@ -1198,11 +1198,13 @@ func IndexBoundsExact(f Filter, reverse bool) bool {
 //     value): {$exists:true}, a range, an equality to a non-null value,
 //     {$type:"null"}, {$ne:null}; and
 //   - no conjunct that admits a missing field contributes bounds on
-//     fieldName. Over a path through an array the conjuncts are satisfied
-//     leaf by leaf, so {"x.y":{"$exists":true,"$eq":null}} matches
-//     {"x":[{"y":1},{"z":2}]} through the missing leaf while its null bound
-//     seeks a key the index never wrote. An $or, an $elemMatch on a parent
-//     path and any other bound source are screened the same way.
+//     fieldName — $ne aside, whose bounds hold every existing leaf of a
+//     matching document. Over a path through an array the conjuncts are
+//     satisfied leaf by leaf, so {"x.y":{"$exists":true,"$eq":null}}
+//     matches {"x":[{"y":1},{"z":2}]} through the missing leaf while its
+//     null bound seeks a key the index never wrote. An $or, an $elemMatch
+//     on a parent path and any other bound source are screened the same
+//     way.
 //
 // Probing the predicates' own Ok keeps this in lockstep with match semantics.
 // An OR, a $exists:false, a negation other than {$ne:null}, an
@@ -1281,6 +1283,11 @@ func leafPresence(f Filter, fieldName string) (guaranteed, sound bool) {
 	var buf syncpool.DocBuffer
 	if !f.Ok(nil, &buf) {
 		return true, true
+	}
+	// $ne holds for EVERY leaf (Comp.OkLeaves), so each existing leaf of a
+	// matching document lies inside its bounds: they can miss no written key.
+	if c, ok := f.(*Comp); ok && c.CompOp == CompOpNe {
+		return false, true
 	}
 	return false, len(f.IndexBounds(fieldName, nil)) == 0
 }
