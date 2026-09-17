@@ -4030,3 +4030,39 @@ func TestIndex_ArrayNested_SparseCompoundSharedArray(t *testing.T) {
 		assert.Equal(t, len(want), cnt, filter)
 	}
 }
+
+// A Count may verify an uncovered equality by probing a single-field index
+// instead of fetching the document. A sparse index has no entry for a
+// document missing the field, so it can verify only a predicate that rejects
+// a missing field — never field == null.
+func TestIndex_Sparse_CountVerifyProbe(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: []string{"s"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "u", Fields: []string{"u"}, Sparse: true}))
+	for i := range 200 {
+		doc := fmt.Sprintf(`{"id":%d,"s":"s%d"}`, i, i)
+		switch {
+		case i%50 == 0:
+			doc = fmt.Sprintf(`{"id":%d,"s":"s%d","u":true}`, i, i)
+		case i%50 == 1:
+			doc = fmt.Sprintf(`{"id":%d,"s":"s%d","u":null}`, i, i)
+		}
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(doc)))
+	}
+	for filter, want := range map[string]int{
+		`{"s":"s7","u":null}`:   1, // missing
+		`{"s":"s51","u":null}`:  1, // explicit null
+		`{"s":"s50","u":null}`:  0,
+		`{"s":"s50","u":true}`:  1,
+		`{"s":"s7","u":true}`:   0,
+		`{"s":"s51","u":true}`:  0,
+		`{"s":"s50","u":false}`: 0,
+	} {
+		cnt, err := coll.Find(filter).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, want, cnt, "Count %s", filter)
+		assert.Len(t, collectIntField(t, coll.Find(filter), "id"), want, "Iter %s", filter)
+	}
+}

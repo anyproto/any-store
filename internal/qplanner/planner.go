@@ -2011,11 +2011,17 @@ func buildVerifyChain(params *PlanParams, idx *CBOIndex, root Iterator) Iterator
 			return nil
 		}
 
-		// Find a non-unique single-field index for this field
+		// Find a non-unique single-field index for this field. A sparse index
+		// holds no entry for a document missing the field, so it can verify
+		// only a predicate that rejects a missing field: probing it for
+		// field == null would report "absent" for the documents that match.
 		var verifyNs *btree.Namespace
 		var verifyReverse bool
 		for i := range params.Indexes {
 			info := params.Indexes[i].Info
+			if info.Sparse && !query.GuaranteesPresence(params.Filter, field) {
+				continue
+			}
 			if !info.Unique && len(info.FieldNames) == 1 && info.FieldNames[0] == field {
 				verifyNs = info.Ns
 				verifyReverse = len(info.Reverse) > 0 && info.Reverse[0]
