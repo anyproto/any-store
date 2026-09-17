@@ -590,14 +590,14 @@ func BuildPlan(params *PlanParams) *Plan {
 			// the choice independent of the order params.Indexes arrives in: a
 			// live collection lists its indexes in creation order while a reopened
 			// one reads them back from the catalog in name order, so without it an
-			// exact cost tie resolved differently before and after a restart
-			// (GO-7510). Names are unique within a collection, so this is a total
-			// order — an exact tie resolves identically in every session.
+			// exact cost tie resolves differently before and after a restart.
+			// Names are unique within a collection, so this is a total order —
+			// an exact tie resolves identically in every session.
 			//
-			// This rung fixes exact ties ONLY. Index order still reaches the plan
+			// This rung covers exact ties ONLY. Index order still reaches the plan
 			// through calculateSelectivity, which prices each filter field by
 			// whichever index claims it first, so two sessions can compute
-			// different costs and never reach a tie at all. See GO-7510.
+			// different costs and never reach a tie at all.
 			switch {
 			case bestPlanName == "FullScan":
 				isBetter = true
@@ -1152,7 +1152,7 @@ func rangeFraction(cur *btree.Cursor, bounds query.Bounds) float64 {
 // compareCandidates orders explain candidates by cost, then by name. The name
 // key keeps the listing identical across sessions: per-index candidates are
 // appended in index order — creation order on a live collection, name order on
-// a reopened one — and slices.SortFunc is not stable (GO-7510).
+// a reopened one — and slices.SortFunc is not stable.
 func compareCandidates(a, b CandidatePlan) int {
 	if c := cmp.Compare(a.Cost, b.Cost); c != 0 {
 		return c

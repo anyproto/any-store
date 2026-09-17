@@ -176,7 +176,7 @@ func buildKnnPlan(params *PlanParams) *Plan {
 		}
 		// Break an exact tie between two per-index probe candidates on the index
 		// name: those are appended in index order, which differs between a live
-		// and a reopened collection (GO-7510). KnnProbeSeek is the only
+		// and a reopened collection. KnnProbeSeek is the only
 		// index-bearing kind here, so this cannot cross plan shapes; the
 		// no-index candidates sit at fixed positions, so first-wins is already
 		// deterministic for them and their preference is preserved.

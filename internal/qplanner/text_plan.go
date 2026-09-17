@@ -289,7 +289,7 @@ func buildTextPlan(params *PlanParams) *Plan {
 		}
 		// Break an exact tie between two per-index probe candidates OF THE SAME
 		// KIND on the index name: those are appended in index order, which differs
-		// between a live and a reopened collection (GO-7510). Everything else was
+		// between a live and a reopened collection. Everything else was
 		// already deterministic and keeps its existing preference — candidates
 		// with no index sit at fixed positions, and the seek group is appended
 		// before the scan group, so a seek still wins a cross-shape tie (the same

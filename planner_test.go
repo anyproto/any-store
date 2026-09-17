@@ -2129,7 +2129,7 @@ func BenchmarkRangeDescLimit_200k(b *testing.B) {
 	})
 }
 
-// TestPlanner_PlanStableAcrossReopen is defect #2 on its own: v1 kept creation
+// TestPlanner_PlanStableAcrossReopen: v1 kept creation
 // order for a freshly created collection and got alphabetical order from the
 // catalog on reopen, so a cost tie resolved differently per session and the
 // query was correct only in the session that created the index.
@@ -2140,7 +2140,7 @@ func BenchmarkRangeDescLimit_200k(b *testing.B) {
 // session picks the same one.
 func TestPlanner_PlanStableAcrossReopen(t *testing.T) {
 	skipIfInMemory(t)
-	tmpDir, err := os.MkdirTemp("", "go7510-order-*")
+	tmpDir, err := os.MkdirTemp("", "plan-order-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
