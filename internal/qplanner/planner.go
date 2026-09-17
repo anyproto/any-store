@@ -1230,8 +1230,7 @@ func existsOnFields(f query.Filter, fields [][]string) bool {
 
 // PresenceScan reports whether idx is a sparse index with no bounds that is
 // complete for filter. Its entries then cover the documents carrying every
-// indexed field (a superset when fields share an array — see
-// presenceCoversFilter), itself a superset of the matching set that is smaller
+// indexed field, a superset of the matching set that is smaller
 // than the collection by the index's presence cut, so scanning it whole is a
 // costed alternative to a full scan ({$exists:true} is the plain case). The
 // query layer calls it to tell whether a $text query has a probe candidate.
@@ -1591,8 +1590,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	}
 
 	// Presence count: a bound-less sparse index holds the documents carrying
-	// its fields — presenceCoversFilter rules out the shared-array superset —
-	// so when that is all the filter asks, counting its documents
+	// its fields, so when that is all the filter asks, counting its documents
 	// (IndexIter.CountEntries over the whole index) is the answer.
 	if params.CountOnly && len(idx.Bounds) == 0 && presenceCoversFilter(idx, params.Filter) {
 		return root
