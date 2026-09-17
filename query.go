@@ -1215,8 +1215,13 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		// A SPARSE index holds no entry for a missing leaf, so over fan-out
 		// data a document surfaces at its least existing leaf while the sort
 		// key is the least leaf of all (a missing leaf sorts as null and
-		// wins): demote, no edge widening can restore that.
-		if cboIdx.ExactSort && idx.cboInfo.Sparse && !scalarProven() {
+		// wins): demote, no edge widening can restore that. Over a path
+		// through objects the scalar proof does not rule this out — a
+		// document fanning out through an array of objects can keep a single
+		// key, {"x":[{"y":5},{"z":0}]} under x.y — so only an index on
+		// top-level fields, where every fan-out writes several keys, keeps
+		// its order on the proof.
+		if cboIdx.ExactSort && idx.cboInfo.Sparse && (sparseTraversed(idx.cboInfo) || !scalarProven()) {
 			cboIdx.ExactSort = false
 			cboIdx.PartialSort = false
 		}
@@ -1236,6 +1241,17 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		result = append(result, cboIdx)
 	}
 	return result
+}
+
+// sparseTraversed reports whether any field of the index is a dotted path,
+// which can cross an array of objects.
+func sparseTraversed(info *qplanner.IndexInfo) bool {
+	for _, path := range info.FieldPaths {
+		if len(path) > 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // sortRunNeedsScalarProof reports whether idx's ExactSort claim is only valid

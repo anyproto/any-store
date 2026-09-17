@@ -306,9 +306,9 @@ func TestSparseIndex_NotEqualDoesNotDropRows(t *testing.T) {
 }
 
 // TestSparseIndex_NotEqualSurvivesReopen combines the row loss with plan
-// instability: in v1 the query was correct in the session that created the index and broken
-// in every session after, because a reopened collection loads its indexes in a
-// different order and the tie-break is positional.
+// instability: in v1 the query was correct in the session that created the
+// index and broken in every session after, because a reopened collection
+// loads its indexes in a different order and the tie-break is positional.
 func TestSparseIndex_NotEqualSurvivesReopen(t *testing.T) {
 	skipIfInMemory(t)
 	tmpDir, err := os.MkdirTemp("", "sparse-ne-*")

@@ -88,7 +88,7 @@ func (s *pooledSeenSet) add(docId []byte) bool {
 	return true
 }
 
-// countEntriesViaSeenSet counts distinct docIds across it.Bounds using the
+// countEntriesViaSeenSet counts distinct docIds across it.countBounds() using the
 // pooled seen-set. It backs CountEntries' two multi-bound dedup branches:
 //
 //   - skipScalar == false (Branch 4: single-field index the probe found to hold

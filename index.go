@@ -228,8 +228,10 @@ type IndexInfo struct {
 	//
 	// Presence is existence, as in MongoDB: a field that is explicitly null is
 	// present and is indexed under the null key; only a missing field keeps a
-	// document out. The index therefore holds exactly the documents matching
-	// {$exists: true} on each of its fields.
+	// document out. The index therefore holds the documents matching
+	// {$exists: true} on each of its fields — exactly those, except that
+	// fields sharing an array are keyed one array level deeper than a dotted
+	// path matches, so such an index can hold more.
 	//
 	// A COMPOUND sparse index diverges from MongoDB, which keeps a document
 	// carrying ANY indexed field: here every indexed field must exist.
@@ -386,6 +388,7 @@ type index struct {
 	rebinds     []rebind        // stack of rebound fields across nested fan-outs
 	shared      int             // later fields currently rebound: level dedup is off
 	rebound     bool            // some field was rebound for this document: keys dedup whole
+	skipped     bool            // the sparse rule dropped a key of this document
 	valBuf      []*anyenc.Value // stack of a leaf array's index values
 	fullKeyBuf  anyenc.Tuple    // reusable buffer for full keys (key+docId)
 	seekBuf     anyenc.Tuple    // reusable buffer for unique constraint seek results
@@ -549,9 +552,13 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 	entryValue := qplanner.IndexValueScalar
 	if len(idx.keysBuf) > 1 {
 		entryValue = qplanner.IndexValueMultiKey
-		// This doc fans out (non-empty array at an indexed field): persist
-		// the sticky index-level multikey flag in this same tx, so any
-		// snapshot that can see these entries sees the flag.
+	}
+	// This doc fans out (non-empty array at an indexed field): persist the
+	// sticky index-level multikey flag in this same tx, so any snapshot that
+	// can see these entries sees the flag. A sparse index can keep a single
+	// key of a document that fans out — the other elements' keys are dropped
+	// — and that document is not scalar either.
+	if len(idx.keysBuf) > 1 || (idx.skipped && len(idx.keysBuf) == 1) {
 		if err := idx.markMultiKey(tx); err != nil {
 			return err
 		}
@@ -649,8 +656,9 @@ func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 			if !errors.Is(err, btree.ErrKeyNotFound) {
 				return err
 			}
-			// A sparse index built before explicit nulls were indexed has
-			// no entry for such a document; it was never counted either.
+			// An absent key was never counted: leave the sketch alone. A
+			// sparse index holding no entry for an explicit null is the
+			// shape this happens on.
 			continue
 		}
 		if idx.sketch != nil {
@@ -704,6 +712,7 @@ func (idx *index) writeKey() bool {
 			}
 		}
 		if !any {
+			idx.skipped = true
 			return false
 		}
 	}
@@ -939,6 +948,7 @@ func (idx *index) fillKeysBuf(it item) {
 	idx.keyBuf = idx.keyBuf[:0]
 	doc := it.Value()
 	idx.rebound = false
+	idx.skipped = false
 	idx.resetFields(doc)
 	wrote := idx.writeValues(0)
 	if wrote && idx.info.Sparse {

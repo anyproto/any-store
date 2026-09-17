@@ -12,8 +12,9 @@ import (
 //     relevance order; everything else is a residual filter. Cost is O(Σ df) —
 //     the length of the involved posting lists — regardless of how selective
 //     the rest of the query is.
-//   - PROBE: another access path (fixed primary-key bounds, or a bounded /
-//     sort-covering secondary index) enumerates candidates and each one is
+//   - PROBE: another access path (fixed primary-key bounds, a bounded or
+//     sort-covering secondary index, or a sparse index whose fields the
+//     residual guarantees) enumerates candidates and each one is
 //     verified against the text index individually (FtsProbeIter). Cost scales
 //     with the candidate count, not the posting lists.
 //
@@ -152,6 +153,9 @@ func buildTextPlan(params *PlanParams) *Plan {
 				matches = 1
 			}
 			fetchN := matches
+			// A presence-covered Count fetches nothing either, yet keeps the
+			// charge: it offsets the probe constants, and the modelled
+			// driver/probe crossover then sits where the measured one does.
 			if params.CountOnly && !needFilter {
 				fetchN = 0
 			} else if orderedOut && params.Limit > 0 {
@@ -176,7 +180,7 @@ func buildTextPlan(params *PlanParams) *Plan {
 			})
 		}
 
-		// ---- Probe from bounded secondary indexes ----------------------
+		// ---- Probe from secondary indexes (bounded, or a sparse presence scan)
 		var fieldSelBuf [8]fieldSelEntry
 		fieldSel := collectFieldSelectivity(params, totalDocs, fieldSelBuf[:0])
 		for i := range params.Indexes {

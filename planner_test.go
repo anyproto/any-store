@@ -2129,15 +2129,9 @@ func BenchmarkRangeDescLimit_200k(b *testing.B) {
 	})
 }
 
-// TestPlanner_PlanStableAcrossReopen: v1 kept creation
-// order for a freshly created collection and got alphabetical order from the
-// catalog on reopen, so a cost tie resolved differently per session and the
-// query was correct only in the session that created the index.
-//
-// v2 loads indexes the same two ways (EnsureIndex appends; a reopen replays the
-// catalog in key order), and that is fine — what must not depend on it is the
-// plan. The planner breaks an exact cost tie on the index name, so every
-// session picks the same one.
+// A cost tie resolves on the index name, not on the order the collection lists
+// its indexes in — creation order when live (EnsureIndex appends), catalog key
+// order after a reopen — so every session picks the same plan.
 func TestPlanner_PlanStableAcrossReopen(t *testing.T) {
 	skipIfInMemory(t)
 	tmpDir, err := os.MkdirTemp("", "plan-order-*")
@@ -2268,4 +2262,41 @@ func plannerIndexUsed(explain Explain, name string) bool {
 		}
 	}
 	return false
+}
+
+// The presence predicate is priced from the sparse index's population
+// in the combined selectivity, so a LIMIT does not make a full scan look
+// cheaper than the index that holds exactly the matching documents.
+func TestPlanner_PresenceScanUnderLimit(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx,
+		IndexInfo{Name: "opt", Fields: []string{"opt"}, Sparse: true},
+		IndexInfo{Name: "n", Fields: []string{"n"}},
+	))
+	var want []int
+	for i := range 2000 {
+		d := fmt.Sprintf(`{"id":%d,"n":%d}`, i, i%100)
+		if i%100 == 0 {
+			d = fmt.Sprintf(`{"id":%d,"n":%d,"opt":%d}`, i, i%100, i)
+			want = append(want, i)
+		}
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+	}
+	for _, q := range []Query{
+		coll.Find(`{"opt":{"$exists":true}}`).Limit(5),
+		coll.Find(`{"opt":{"$exists":true}}`).Sort("n").Limit(5),
+		coll.Find(`{"opt":{"$exists":true},"n":{"$lt":50}}`).Limit(5),
+	} {
+		ex, err := q.Explain(ctx)
+		require.NoError(t, err)
+		used := false
+		for _, ix := range ex.Indexes {
+			used = used || (ix.Used && ix.Name == "opt")
+		}
+		assert.True(t, used, ex.Plan)
+		assert.Len(t, collectIntField(t, q, "id"), 5)
+	}
+	assert.Equal(t, want, collectIntField(t, coll.Find(`{"opt":{"$exists":true}}`).Sort("id"), "id"))
 }

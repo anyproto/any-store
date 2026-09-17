@@ -1202,12 +1202,14 @@ func IndexBoundsExact(f Filter, reverse bool) bool {
 //     matching document. Over a path through an array the conjuncts are
 //     satisfied leaf by leaf, so {"x.y":{"$exists":true,"$eq":null}}
 //     matches {"x":[{"y":1},{"z":2}]} through the missing leaf while its
-//     null bound seeks a key the index never wrote. An $or, an $elemMatch
-//     on a parent path and any other bound source are screened the same
-//     way.
+//     null bound seeks a key the index never wrote. An $or and any other
+//     bound source are screened the same way; an object-form $elemMatch on
+//     a parent path is re-keyed onto the sub-field and evaluated there — a
+//     matching element carries the leaf, so it can guarantee presence
+//     itself.
 //
 // Probing the predicates' own Ok keeps this in lockstep with match semantics.
-// An OR, a $exists:false, a negation other than {$ne:null}, an
+// An OR, a $exists:false, a lone negation other than {$ne:null}, an
 // equality-to-null, an $in containing null, or no predicate on the field at
 // all yield false, keeping that sparse index out of consideration (the planner
 // then falls back to a complete index or scan).

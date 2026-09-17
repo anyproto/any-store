@@ -724,13 +724,12 @@ func BenchmarkIndex_fillKeysBuf(b *testing.B) {
 	}
 }
 
-// A sparse index built before explicit nulls were indexed has no entry for
-// such a document. Deleting that document must not decrement a count
-// that was never incremented. The legacy shape is simulated by removing the
-// raw entry behind the deleting document's back.
+// Deleting a document the index has no entry for must leave the entry count
+// alone. The missing entry is produced by stripping the raw key behind the
+// deleting document's back.
 func TestIndex_Sparse_DeleteMissingEntryKeepsEntryCount(t *testing.T) {
 	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "legacy")
+	coll, err := fx.CreateCollection(ctx, "noentry")
 	require.NoError(t, err)
 	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
 	for i := range 50 {
@@ -739,9 +738,8 @@ func TestIndex_Sparse_DeleteMissingEntryKeepsEntryCount(t *testing.T) {
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":100,"a":null}`)))
 	assertIndexLen(t, coll.GetIndexes()[0], 51)
 
-	// Strip the null entry, as an index built under the old rule would not
-	// have written it.
-	entries := readRawIndexEntries(t, fx.DB, "legacy", "a")
+	// Strip the null entry so the document has none.
+	entries := readRawIndexEntries(t, fx.DB, "noentry", "a")
 	var nullKey []byte
 	for _, e := range entries {
 		if e.Key[0] == byte(anyenc.TypeNull) {
@@ -811,7 +809,9 @@ func randPresenceValue(rnd *rand.Rand, depth int) string {
 
 // A sparse index holds a document exactly when {$exists:true} matches every
 // indexed field, and the keys it builds for one document are distinct
-// (insertKeys Puts and counts each one).
+// (insertKeys Puts and counts each one). Fields sharing an array are keyed
+// one array level deeper than path matching reaches, so such an index holds
+// a superset: never less than the matching documents.
 func TestIndex_fillKeysBuf_SparseMembership(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
@@ -834,7 +834,7 @@ func TestIndex_fillKeysBuf_SparseMembership(t *testing.T) {
 	for n := range 5000 {
 		doc := fmt.Sprintf(`{"id":%d`, n)
 		if rnd.Intn(10) > 0 {
-			doc += `,"a":` + randPresenceValue(rnd, 2)
+			doc += `,"a":` + randPresenceValue(rnd, 3)
 		}
 		if rnd.Intn(3) > 0 {
 			doc += `,"b":` + randPresenceValue(rnd, 1)
@@ -849,12 +849,65 @@ func TestIndex_fillKeysBuf_SparseMembership(t *testing.T) {
 				exists := query.MustParseCondition(fmt.Sprintf(`{%q:{"$exists":true}}`, field))
 				want = want && exists.Ok(v, &buf)
 			}
-			require.Equal(t, want, len(idx.keysBuf) > 0, "%v %s", idx.info.Fields, doc)
+			held := len(idx.keysBuf) > 0
+			if idx.cboInfo.SharedFrom < len(idx.fieldNames) {
+				require.True(t, held || !want, "%v %s", idx.info.Fields, doc)
+			} else {
+				require.Equal(t, want, held, "%v %s", idx.info.Fields, doc)
+			}
 			seen := map[string]bool{}
 			for _, k := range idx.keysBuf {
 				require.False(t, seen[string(k)], "duplicate key: %v %s", idx.info.Fields, doc)
 				seen[string(k)] = true
 			}
 		}
+	}
+}
+
+// The scalar proof says nothing about a sparse index over a dotted path — a
+// document fanning out through an array of objects can keep a single key — so
+// the index does not provide the order even when the marker reads scalar.
+func TestIndex_Sparse_TraversedSortIgnoresScalarProof(t *testing.T) {
+	fx := newFixture(t)
+	plain, err := fx.CreateCollection(ctx, "plain")
+	require.NoError(t, err)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: []string{"x.y"}, Sparse: true}))
+	for _, d := range []string{
+		`{"id":1,"x":[{"y":5},{"z":0}]}`,
+		`{"id":2,"x":{"y":1}}`,
+		`{"id":3,"x":{"y":9}}`,
+		`{"id":4,"x":{"y":3}}`,
+	} {
+		require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+	}
+	// Put the marker back to scalar, as an index whose fan-out documents all
+	// keep one key reads.
+	c := coll.(*collection)
+	var idx *index
+	c.mu.Lock()
+	for _, i := range c.loadIndexes() {
+		if i.info.Name == "s" {
+			idx = i
+		}
+	}
+	c.mu.Unlock()
+	require.NotNil(t, idx)
+	// The write path flags the index itself: document 1 fans out.
+	require.NoError(t, fx.DB.(*db).doReadTx(ctx, func(tx *btree.ReadTx) error {
+		assert.False(t, idx.isScalarProven(tx), "a fan-out keeping one key is not scalar")
+		return nil
+	}))
+	require.NoError(t, fx.DB.(*db).doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		return tx.Put(c.db.systemNS, multikeyKey(idx.ns.Name()), mkValScalar)
+	}))
+
+	filter := `{"x.y":{"$exists":true}}`
+	for _, limit := range []uint{0, 2} {
+		want := collectIntField(t, plain.Find(filter).Sort("x.y").Limit(limit), "id")
+		got := collectIntField(t, coll.Find(filter).Sort("x.y").Limit(limit).IndexHint(IndexHint{IndexName: "s", Boost: 1 << 30}), "id")
+		assert.Equal(t, want, got, "limit %d", limit)
 	}
 }

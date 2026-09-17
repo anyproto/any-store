@@ -315,7 +315,8 @@ func (it *IndexIter) skipOffset(n int) (remaining int, err error) {
 }
 
 // CountEntries counts distinct documents matching this index iterator's
-// bounds via a 4-branch dispatch:
+// bounds — the whole index when it has none (countBounds) — via a 4-branch
+// dispatch:
 //
 //	Branch 1 (len(Bounds) <= 1, and the bound admits no per-doc fan-out):
 //	  page-batch CountUntil. Sound when the single bound pins the FULL key

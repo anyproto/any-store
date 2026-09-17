@@ -4499,3 +4499,167 @@ func TestIndex_Sparse_PresenceCountFromIndex(t *testing.T) {
 		})
 	}
 }
+
+// The count verify probe reads a sparse index when the filter
+// guarantees the field, and falls back to the document when it does not.
+func TestIndex_Sparse_CountVerifyProbeReadsIndex(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: []string{"s"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "u", Fields: []string{"u"}, Sparse: true}))
+	for i := range 200 {
+		doc := fmt.Sprintf(`{"id":%d,"s":"s%d"}`, i, i)
+		switch {
+		case i%50 == 0:
+			doc = fmt.Sprintf(`{"id":%d,"s":"s%d","u":true}`, i, i)
+		case i%50 == 1:
+			doc = fmt.Sprintf(`{"id":%d,"s":"s%d","u":null}`, i, i)
+		}
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(doc)))
+	}
+	for _, tc := range []struct {
+		filter    string
+		want      int
+		probeOnly bool // verified through the index, no document fetched
+	}{
+		{`{"s":"s50","u":true}`, 1, true},
+		{`{"s":"s7","u":true}`, 0, true},
+		{`{"s":"s51","u":null}`, 1, false},
+		{`{"s":"s7","u":null}`, 1, false},
+	} {
+		// Warm the plan and visibility state outside the measured window.
+		_, err := coll.Find(tc.filter).Count(ctx)
+		require.NoError(t, err)
+		qplannerEnableCounters(t)
+		got, err := coll.Find(tc.filter).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, got, tc.filter)
+		pc := qplannerSnapshot()
+		if tc.probeOnly {
+			assert.Zero(t, pc.FetchNextCalls, "%s: a guaranteed field verifies through the sparse index", tc.filter)
+		} else {
+			assert.NotZero(t, pc.FetchNextCalls, "%s: a null-matching predicate must read the document", tc.filter)
+		}
+	}
+}
+
+// A presence count over a sparse index that holds nothing walks an
+// empty namespace (cursor.First on an empty index) and returns 0.
+func TestIndex_Sparse_PresenceCountEmptyIndex(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
+	for i := range 300 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"z":%d}`, i, i))))
+	}
+	hint := IndexHint{IndexName: "a", Boost: 1 << 30}
+	n, err := coll.Find(`{"a":{"$exists":true}}`).IndexHint(hint).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n)
+	assert.Empty(t, collectIntField(t, coll.Find(`{"a":{"$exists":true}}`).IndexHint(hint), "id"))
+
+	// ...and the first document to carry the field is counted at once.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":900,"a":null}`)))
+	n, err = coll.Find(`{"a":{"$exists":true}}`).IndexHint(hint).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+}
+
+// A Count with a Sort (and a paged Sort) over a presence scan returns
+// the same cardinality as the unindexed collection — the presence-count plan
+// drops the sort chain, so the cutoff must still apply to distinct documents.
+func TestIndex_Sparse_PresenceCountWithSort(t *testing.T) {
+	fx := newFixture(t)
+	plain, err := fx.CreateCollection(ctx, "plain")
+	require.NoError(t, err)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
+	docs := []string{`{"id":1,"a":1}`, `{"id":2,"a":null}`, `{"id":3,"a":[5,6,null]}`, `{"id":4}`, `{"id":5,"a":[]}`}
+	for i := 100; i < 400; i++ {
+		docs = append(docs, fmt.Sprintf(`{"id":%d}`, i))
+	}
+	for _, d := range docs {
+		require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+	}
+	hint := IndexHint{IndexName: "a", Boost: 1 << 30}
+	for _, sort := range []string{"a", "-a"} {
+		for _, page := range [][2]uint{{0, 0}, {0, 2}, {1, 2}, {3, 0}, {0, 100}} {
+			want, err := plain.Find(`{"a":{"$exists":true}}`).Sort(sort).Offset(page[0]).Limit(page[1]).Count(ctx)
+			require.NoError(t, err)
+			got, err := coll.Find(`{"a":{"$exists":true}}`).Sort(sort).Offset(page[0]).Limit(page[1]).IndexHint(hint).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, want, got, "sort %s offset %d limit %d", sort, page[0], page[1])
+		}
+	}
+}
+
+// A document fanning out through an array of objects can keep a single key in
+// a sparse index — the elements lacking the field write none — while its sort
+// key is the missing leaf (null). The index does not provide the order then:
+// a Sort+Limit window must hold the rows an unindexed collection returns.
+func TestIndex_Sparse_FanOutSingleKeySortWindow(t *testing.T) {
+	fx := newFixture(t)
+	docs := []string{
+		`{"id":1,"x":[{"y":5,"z":5},{"w":0}]}`,
+		`{"id":2,"x":{"y":1,"z":1}}`,
+		`{"id":3,"x":{"y":9,"z":9}}`,
+		`{"id":4,"x":{"y":3,"z":3}}`,
+	}
+	plain, err := fx.CreateCollection(ctx, "plain")
+	require.NoError(t, err)
+	for _, d := range docs {
+		require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
+	}
+	for _, fields := range [][]string{{"x.y"}, {"x.y", "x.z"}} {
+		coll, err := fx.CreateCollection(ctx, fmt.Sprint(fields))
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: fields, Sparse: true}))
+		for _, d := range docs {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+		}
+		hint := IndexHint{IndexName: "s", Boost: 1 << 30}
+		for _, filter := range []string{
+			`{"x.y":{"$exists":true},"x.z":{"$exists":true}}`,
+			`{"x.y":{"$gte":0},"x.z":{"$gte":0}}`,
+		} {
+			for _, sort := range []string{"x.y", "-x.y"} {
+				for _, limit := range []uint{0, 2} {
+					// One fan-out document: every sort key is distinct, so the
+					// single-field sort has one right answer.
+					want := collectIntField(t, plain.Find(filter).Sort(sort).Limit(limit), "id")
+					for _, q := range []Query{
+						coll.Find(filter).Sort(sort).Limit(limit),
+						coll.Find(filter).Sort(sort).Limit(limit).IndexHint(hint),
+					} {
+						assert.Equal(t, want, collectIntField(t, q, "id"), "%v %s sort %s limit %d", fields, filter, sort, limit)
+					}
+				}
+			}
+		}
+	}
+}
+
+// Fields of a compound sparse index that share an array are keyed one array
+// level deeper than path matching reaches, so the index can hold a document
+// {$exists:true} does not match: a presence Count must not read its size.
+func TestIndex_Sparse_PresenceCountSharedArraySuperset(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: []string{"x.y", "x.z"}, Sparse: true}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"x":[[{"z":1}],{"y":2}]}`),
+		anyenc.MustParseJson(`{"id":2,"x":[{"y":1,"z":1}]}`),
+	))
+	filter := `{"x.y":{"$exists":true},"x.z":{"$exists":true}}`
+	for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(IndexHint{IndexName: "s", Boost: 1 << 30})} {
+		assert.Equal(t, []int{2}, collectIntField(t, q, "id"))
+		cnt, err := q.Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, cnt)
+	}
+}

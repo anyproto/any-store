@@ -521,8 +521,8 @@ func BuildPlan(params *PlanParams) *Plan {
 		seekCost := (nSeeks * CostIndexSeek) + (e * fetchCost) + (e * CostFilter)
 		// A presence scan walks every entry of the index, where a seek lands
 		// inside its bounds. When only counting and the filter is nothing but
-		// {$exists:true} on the index's fields, the entries ARE the answer:
-		// no fetch, no filter.
+		// {$exists:true} on the index's fields, the index's documents ARE the
+		// answer: no fetch, no filter.
 		walkRows := 0.0
 		presenceCount := false
 		if len(idx.Bounds) == 0 {
@@ -1023,39 +1023,49 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 		}
 	}
 
-	// A predicate that only guarantees presence ({$exists:true}, $type, ...) has
-	// no bounds to price. A sparse index complete for the filter holds exactly
+	// A predicate that only guarantees presence ({$exists:true}) has no
+	// bounds to price. A sparse index complete for the filter holds exactly
 	// the documents carrying its fields, so its population is that predicate's
-	// match count. Applied once per index, and only to fields nothing above
-	// priced: a range or equality on a sparse index already includes the cut.
-	for i := range indexes {
-		// With usedFields full, "unclaimed" cannot be proven: leave the cut
-		// out rather than apply it twice.
-		if nUsed == len(usedFields) {
-			break
-		}
-		idx := &indexes[i]
-		if !presenceScan(idx, filter) {
-			continue
-		}
-		claimed := false
-		for _, fieldName := range idx.Info.FieldNames {
-			for j := 0; j < nUsed; j++ {
-				if usedFields[j] == fieldName {
-					claimed = true
+	// match count. Applied only to fields nothing above priced: a range or
+	// equality on a sparse index already includes the cut. Among indexes
+	// sharing a field the smallest population claims it (name breaks a tie),
+	// so the result does not depend on the order the indexes arrive in. With
+	// usedFields full, "unclaimed" cannot be proven and the cut is left out.
+	for nUsed < len(usedFields) {
+		best := -1
+		bestPop := 0.0
+		for i := range indexes {
+			idx := &indexes[i]
+			if !presenceScan(idx, filter) {
+				continue
+			}
+			claimed := false
+			for _, fieldName := range idx.Info.FieldNames {
+				for j := 0; j < nUsed; j++ {
+					if usedFields[j] == fieldName {
+						claimed = true
+					}
 				}
 			}
+			if claimed {
+				continue
+			}
+			pop := indexPopulation(idx, totalDocs)
+			if best < 0 || pop < bestPop ||
+				(pop == bestPop && idx.Info.Name < indexes[best].Info.Name) {
+				best, bestPop = i, pop
+			}
 		}
-		if claimed {
-			continue
+		if best < 0 {
+			break
 		}
-		for _, fieldName := range idx.Info.FieldNames {
+		for _, fieldName := range indexes[best].Info.FieldNames {
 			if nUsed < len(usedFields) {
 				usedFields[nUsed] = fieldName
 				nUsed++
 			}
 		}
-		pTotal *= indexPopulation(idx, totalDocs) / totalDocs
+		pTotal *= bestPop / totalDocs
 	}
 
 	// If no index fields matched the filter, it might have predicates on non-indexed fields
@@ -1184,28 +1194,26 @@ func sparseIndexComplete(idx *CBOIndex, filter query.Filter) bool {
 	return idx.sparseComplete == 1
 }
 
-// presenceCoversFilter reports whether filter is exactly {$exists:true} on
-// fields of the bound-less sparse index idx, with every field of idx among
-// them: index membership is then the match set, document for document.
+// presenceCoversFilter reports whether filter is nothing but {$exists:true}
+// on fields of the bound-less sparse index idx. presenceScan has the filter
+// guarantee every field of idx, so index membership is then the match set,
+// document for document.
+//
+// Fields sharing an array are the exception: key generation rebinds the later
+// field to each element and walks one array level deeper than path matching
+// does ({"x":[[{"z":1}],{"y":2}]} is held by (x.y, x.z) yet x.z does not
+// exist), so membership is only a superset there. Such a document always
+// writes several keys, which the scalar proof rules out.
 func presenceCoversFilter(idx *CBOIndex, filter query.Filter) bool {
-	if !presenceScan(idx, filter) {
+	if idx.Info.SharedFrom < len(idx.Info.FieldNames) && !idx.ScalarProven {
 		return false
 	}
-	var seen [8]bool
-	if len(idx.Info.FieldNames) > len(seen) || !existsOnFields(filter, idx.Info.FieldNames, seen[:]) {
-		return false
-	}
-	for i := range idx.Info.FieldNames {
-		if !seen[i] {
-			return false
-		}
-	}
-	return true
+	return presenceScan(idx, filter) && existsOnFields(filter, idx.Info.FieldNames)
 }
 
 // existsOnFields reports whether f is a conjunction of {$exists:true}
-// predicates on the given fields only, marking each field it meets.
-func existsOnFields(f query.Filter, fields []string, seen []bool) bool {
+// predicates on the given fields only.
+func existsOnFields(f query.Filter, fields []string) bool {
 	switch ft := f.(type) {
 	case query.Key:
 		switch ft.Filter.(type) {
@@ -1213,28 +1221,27 @@ func existsOnFields(f query.Filter, fields []string, seen []bool) bool {
 		default:
 			return false
 		}
-		for i, field := range fields {
+		for _, field := range fields {
 			if query.PathIs(ft.Path, field) {
-				seen[i] = true
 				return true
 			}
 		}
 		return false
 	case query.And:
 		for _, sub := range ft {
-			if !existsOnFields(sub, fields, seen) {
+			if !existsOnFields(sub, fields) {
 				return false
 			}
 		}
 		return len(ft) > 0
 	case *query.And:
-		return existsOnFields(*ft, fields, seen)
+		return existsOnFields(*ft, fields)
 	}
 	return false
 }
 
 // presenceScan reports whether idx is a sparse index with no bounds that is
-// complete for filter. Its entries are then exactly the documents carrying
+// complete for filter. Its entries then cover exactly the documents carrying
 // every indexed field — a superset of the matching set that is smaller than
 // the collection by the index's presence cut, so scanning it whole is a
 // costed alternative to a full scan ({$exists:true} is the plain case).
@@ -2165,10 +2172,10 @@ func buildVerifyChain(params *PlanParams, idx *CBOIndex, root Iterator) Iterator
 		var verifyReverse bool
 		for i := range params.Indexes {
 			info := params.Indexes[i].Info
-			if info.Sparse && !query.GuaranteesPresence(params.Filter, field) {
+			if info.Unique || len(info.FieldNames) != 1 || info.FieldNames[0] != field {
 				continue
 			}
-			if !info.Unique && len(info.FieldNames) == 1 && info.FieldNames[0] == field {
+			if !info.Sparse || query.GuaranteesPresence(params.Filter, field) {
 				verifyNs = info.Ns
 				verifyReverse = len(info.Reverse) > 0 && info.Reverse[0]
 				break
