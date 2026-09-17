@@ -2,7 +2,6 @@ package qplanner
 
 import (
 	"bytes"
-	"cmp"
 	"fmt"
 	"slices"
 
@@ -170,8 +169,20 @@ func buildKnnPlan(params *PlanParams) *Plan {
 
 	best := &cands[0]
 	for ci := 1; ci < len(cands); ci++ {
-		if cands[ci].cost < best.cost {
-			best = &cands[ci]
+		c := &cands[ci]
+		if c.cost < best.cost {
+			best = c
+			continue
+		}
+		// Break an exact tie between two per-index probe candidates on the index
+		// name: those are appended in index order, which differs between a live
+		// and a reopened collection (GO-7510). KnnProbeSeek is the only
+		// index-bearing kind here, so this cannot cross plan shapes; the
+		// no-index candidates sit at fixed positions, so first-wins is already
+		// deterministic for them and their preference is preserved.
+		if c.cost == best.cost && c.idx != nil && best.idx != nil &&
+			c.idx.Info.Name < best.idx.Info.Name {
+			best = c
 		}
 	}
 
@@ -188,9 +199,7 @@ func buildKnnPlan(params *PlanParams) *Plan {
 			c := cands[ci]
 			explainCands = append(explainCands, CandidatePlan{Name: c.name, Cost: c.cost, EstRows: c.est})
 		}
-		slices.SortFunc(explainCands, func(a, b CandidatePlan) int {
-			return cmp.Compare(a.Cost, b.Cost)
-		})
+		slices.SortFunc(explainCands, compareCandidates)
 		plan.Explain = ExplainInfo{
 			TotalDocs:   int(totalDocs),
 			Selectivity: pResidual,

@@ -561,9 +561,29 @@ func BuildPlan(params *PlanParams) *Plan {
 
 		isBetter := seekCost < bestCost
 		if !isBetter && seekCost == bestCost {
-			// Tie-breaking: prefer index seek over full scan, unique over non-unique
-			isBetter = bestPlanName == "FullScan" ||
-				(bestPlanName == "IndexSeek" && idx.Info.Unique && bestIndex != nil && !bestIndex.Info.Unique)
+			// Tie-breaking: prefer index seek over full scan, unique over
+			// non-unique, then the lower index name. The name rung is what makes
+			// the choice independent of the order params.Indexes arrives in: a
+			// live collection lists its indexes in creation order while a reopened
+			// one reads them back from the catalog in name order, so without it an
+			// exact cost tie resolved differently before and after a restart
+			// (GO-7510). Names are unique within a collection, so this is a total
+			// order — an exact tie resolves identically in every session.
+			//
+			// This rung fixes exact ties ONLY. Index order still reaches the plan
+			// through calculateSelectivity, which prices each filter field by
+			// whichever index claims it first, so two sessions can compute
+			// different costs and never reach a tie at all. See GO-7510.
+			switch {
+			case bestPlanName == "FullScan":
+				isBetter = true
+			case bestPlanName == "IndexSeek" && bestIndex != nil:
+				if idx.Info.Unique != bestIndex.Info.Unique {
+					isBetter = idx.Info.Unique
+				} else {
+					isBetter = idx.Info.Name < bestIndex.Info.Name
+				}
+			}
 		}
 		if isBetter {
 			bestCost = seekCost
@@ -662,7 +682,15 @@ func BuildPlan(params *PlanParams) *Plan {
 				})
 			}
 
-			if scanCost < bestCost {
+			isBetter := scanCost < bestCost
+			if !isBetter && scanCost == bestCost &&
+				bestPlanName == "IndexScan" && bestIndex != nil {
+				// Same index-order independence as Plan B. A tie against a
+				// FullScan or IndexSeek incumbent keeps the existing preference;
+				// only scan-vs-scan was decided by slice position.
+				isBetter = idx.Info.Name < bestIndex.Info.Name
+			}
+			if isBetter {
 				bestCost = scanCost
 				bestPlanName = "IndexScan"
 				bestIndex = idx
@@ -700,9 +728,7 @@ func BuildPlan(params *PlanParams) *Plan {
 
 	// Sort candidates by cost ascending (skip when not collecting explain)
 	if collectExplain {
-		slices.SortFunc(candidates, func(a, b CandidatePlan) int {
-			return cmp.Compare(a.Cost, b.Cost)
-		})
+		slices.SortFunc(candidates, compareCandidates)
 	}
 
 	plan := &Plan{
@@ -1060,6 +1086,17 @@ func rangeFraction(cur *btree.Cursor, bounds query.Bounds) float64 {
 		f = 1
 	}
 	return f
+}
+
+// compareCandidates orders explain candidates by cost, then by name. The name
+// key keeps the listing identical across sessions: per-index candidates are
+// appended in index order — creation order on a live collection, name order on
+// a reopened one — and slices.SortFunc is not stable (GO-7510).
+func compareCandidates(a, b CandidatePlan) int {
+	if c := cmp.Compare(a.Cost, b.Cost); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Name, b.Name)
 }
 
 // sparseIndexComplete reports whether idx can represent every document matching
