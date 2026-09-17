@@ -236,14 +236,12 @@ build per query and carry no such guarantee.
     least one present field — `{"a":[{"b":1},{"c":2}]}` under a sparse
     `(a.b, a.c)` has keys `(1, null)` and `(null, 2)`; fields of a COMPOUND
     index that run through the same array iterate it together, one entry per
-    element, as
-    Mongo generates them — never a cross product; an element that cannot
-    carry the path is a missing leaf in every one of them
-    (`{"x":[[{"y":1,"z":2}]]}` under `(x.y, x.z)` has the key `(null, null)`)
-    — so the planner compounds
-    bounds and entry-level cover filters across such fields only on a
-    scalar-proven index and seeks the first of them otherwise), sort keys
-    (min/max over
+    element, as Mongo generates them — never a cross product; a scalar, null
+    or nested-array element is a missing leaf in every one of them
+    (`{"x":[[{"y":1,"z":2}]]}` under `(x.y, x.z)` has the key
+    `(null, null)`) — so the planner compounds bounds and entry-level cover
+    filters across such fields only on a scalar-proven index and seeks the
+    first of them otherwise), sort keys (min/max over
     `anyenc.AppendElementValues`, item 10) and `CanonicalKeyDedupIter`. The
     raw fast paths (`OkRaw`, `AppendKeyRaw`) decline at an array container
     and fall back to the parsed document. `$type` matches an array whose

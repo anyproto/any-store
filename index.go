@@ -825,12 +825,12 @@ func (idx *index) resolveField(i int, v *anyenc.Value, seg int) bool {
 				// array) is a missing leaf for every field bound to it: a nil
 				// root keeps a later field from walking into a nested array.
 				isObj := el.Type() == anyenc.TypeObject
-				root := el
+				elRoot := el
 				if !isObj {
-					root = nil
+					elRoot = nil
 				}
 				for _, rb := range idx.rebinds[mark:] {
-					idx.fields[rb.field].root, idx.fields[rb.field].consumed = root, seg
+					idx.fields[rb.field].root, idx.fields[rb.field].consumed = elRoot, seg
 				}
 				var ok bool
 				if isObj {
@@ -880,6 +880,8 @@ type rebind struct {
 // segment as field i, reaches the array field i fans out on at segment seg
 // and continues into its elements (a numeric segment there would index the
 // array instead, and a path ending at the array names the array itself).
+// Field i's root is never nil here: writeValues emits a nil root's missing
+// leaf without a walk, so two nil roots never compare as one array.
 func (idx *index) sharesArray(j, i, seg int) bool {
 	pj, pi := idx.fieldPaths[j], idx.fieldPaths[i]
 	if len(pj) <= seg || idx.fields[j].root != idx.fields[i].root || idx.fields[j].consumed != idx.fields[i].consumed {
