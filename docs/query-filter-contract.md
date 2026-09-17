@@ -93,9 +93,10 @@ build per query and carry no such guarantee.
    (Mongo's null model). Only a sparse index tells the two apart: it holds
    an explicit null under the `TypeNull` key and has no entry for a missing
    field. Sparse-index selection follows automatically: `GuaranteesPresence`
-   probes `Ok(nil)`, so an operator matching a missing field keeps sparse
-   indexes out of the plan, and `{"$exists":true}` is answered by scanning
-   one whole.
+   probes `Ok(nil)`, so an operator matching a missing field never guarantees
+   presence on its own, and keeps sparse indexes out of the plan when it also
+   contributes bounds — `$ne` aside, whose bounds hold every key the index
+   wrote. `{"$exists":true}` is answered by scanning one whole.
 
 10. **Array sort keys are the min/max element.** A sort field holding a
     non-empty array sorts by its MINIMUM element ascending / MAXIMUM element

@@ -316,8 +316,10 @@ at all, so it could serve a query from a sparse index that did not contain
 every matching document. v2 uses a sparse index only when the filter guarantees
 each indexed field exists — a range, an equality to a non-null value,
 `$exists: true`, `$type`, `$ne: null`. A predicate that matches a missing field
-(`field: null`, `$exists: false`, `$ne: x`) falls back to a complete index or a
-full scan: correct results, sometimes slower.
+— `field: null`, `$exists: false`, a lone `$ne: x` — falls back to a complete
+index or a full scan: correct results, sometimes slower. `$ne` beside a
+guarantee (`{field: {$exists: true, $ne: x}}`) uses the index: its bounds hold
+every key the index wrote.
 
 ## Encoding edge cases
 
