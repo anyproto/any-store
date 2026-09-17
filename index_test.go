@@ -846,6 +846,7 @@ func TestIndex_fillKeysBuf_SparseMembership(t *testing.T) {
 		{"a"}, {"-a"}, {"a.b"}, {"a.c"}, {"a.0"}, {"a.0.b"}, {"a.b.c"},
 		{"a.b", "a.c"}, {"a", "b"}, {"a.b", "b"}, {"b", "a.b"},
 		{"a.b", "a.c", "b"}, {"-a.b", "a.c"}, {"a.d", "a.b"},
+		{"a.b", "a.c", "a.d"}, {"a.b.c", "a.b.d"}, {"a.b", "a.b.c"}, {"a.0.b", "a.0.c"},
 	} {
 		info := IndexInfo{Fields: fields, Sparse: true}
 		info.Name = info.createName()
