@@ -270,6 +270,13 @@ type CBOIndex struct {
 	ExactSort   bool
 	PartialSort bool
 
+	// sparseComplete memoizes sparseIndexComplete for this candidate, valid
+	// only for the filter of the plan the candidate was built for —
+	// candidates are built per plan and never reused across filters. Kept in
+	// the bool run so the struct does not grow. Planner-internal.
+	sparseComplete      bool
+	sparseCompleteKnown bool
+
 	// SortMatchStart is the index-field position where IndexSortMatch aligned
 	// the sort run (0 for a prefix match, or the equality prefix when the
 	// equality-pinned start wins). shouldReverse reads idx.Reverse[SortMatchStart]
@@ -304,12 +311,6 @@ type CBOIndex struct {
 	// seeking wide undercharges the seek and picks index scans that still
 	// walk half the index. Planner-internal.
 	rangeSelTight float64
-
-	// sparseComplete memoizes sparseIndexComplete for this candidate: 0 not
-	// computed, 1 complete, 2 incomplete. Valid only for the filter of the
-	// plan the candidate was built for — candidates are built per plan and
-	// never reused across filters. Planner-internal.
-	sparseComplete uint8
 }
 
 // fullKeyPointBound reports whether the bound chain pins EVERY index field
@@ -485,7 +486,7 @@ func BuildPlan(params *PlanParams) *Plan {
 	// ---- Plan B: Index Seek (Filtering Priority) ----
 	for i := range params.Indexes {
 		idx := &params.Indexes[i]
-		if len(idx.Bounds) == 0 && !presenceScan(idx, params.Filter) {
+		if len(idx.Bounds) == 0 && !PresenceScan(idx, params.Filter) {
 			continue
 		}
 		// A sparse index omits documents missing any of its fields, so it can
@@ -519,16 +520,17 @@ func BuildPlan(params *PlanParams) *Plan {
 			nSeeks = 1
 		}
 		seekCost := (nSeeks * CostIndexSeek) + (e * fetchCost) + (e * CostFilter)
-		// A presence scan walks every entry of the index, where a seek lands
-		// inside its bounds. When only counting and the filter is nothing but
-		// {$exists:true} on the index's fields, the index's documents ARE the
-		// answer: no fetch, no filter.
-		walkRows := 0.0
-		presenceCount := false
+		walkRows, presenceCount := 0.0, false
 		if len(idx.Bounds) == 0 {
+			// A presence scan walks every entry of the index, where a seek
+			// lands inside its bounds.
 			walkRows = e
 			seekCost += walkRows * CostSeqRead
-			if presenceCount = params.CountOnly && presenceCoversFilter(idx, params.Filter); presenceCount {
+			// When only counting and the filter is nothing but {$exists:true}
+			// on the index's fields, the index's documents ARE the answer: no
+			// fetch, no filter.
+			presenceCount = params.CountOnly && presenceCoversFilter(idx, params.Filter)
+			if presenceCount {
 				seekCost = (nSeeks * CostIndexSeek) + (walkRows * CostSeqRead)
 			}
 		}
@@ -647,14 +649,9 @@ func BuildPlan(params *PlanParams) *Plan {
 				scanSel = 0.0001
 			}
 			// Population to scan: bounded by index selectivity
-			scanPopulation := totalDocs
-			if len(idx.Bounds) > 0 || idx.Info.Sparse {
-				// A sparse index with no bounds still scans only its own
-				// population (idxSel is its presence cut).
-				scanPopulation = totalDocs * idxSel
-				if scanPopulation < 1 {
-					scanPopulation = 1
-				}
+			scanPopulation := totalDocs * idxSel
+			if scanPopulation < 1 {
+				scanPopulation = 1
 			}
 
 			// Check if non-bound index fields cover filter conditions.
@@ -1024,8 +1021,8 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 	}
 
 	// A predicate that only guarantees presence ({$exists:true}) has no
-	// bounds to price. A sparse index complete for the filter holds exactly
-	// the documents carrying its fields, so its population is that predicate's
+	// bounds to price. A sparse index complete for the filter holds the
+	// documents carrying its fields, so its population is that predicate's
 	// match count. Applied only to fields nothing above priced: a range or
 	// equality on a sparse index already includes the cut. Among indexes
 	// sharing a field the smallest population claims it (name breaks a tie),
@@ -1036,15 +1033,14 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 		bestPop := 0.0
 		for i := range indexes {
 			idx := &indexes[i]
-			if !presenceScan(idx, filter) {
+			if !PresenceScan(idx, filter) {
 				continue
 			}
 			claimed := false
 			for _, fieldName := range idx.Info.FieldNames {
-				for j := 0; j < nUsed; j++ {
-					if usedFields[j] == fieldName {
-						claimed = true
-					}
+				if slices.Contains(usedFields[:nUsed], fieldName) {
+					claimed = true
+					break
 				}
 			}
 			if claimed {
@@ -1182,38 +1178,40 @@ func sparseIndexComplete(idx *CBOIndex, filter query.Filter) bool {
 	if !idx.Info.Sparse {
 		return true
 	}
-	if idx.sparseComplete == 0 {
-		idx.sparseComplete = 1
+	if !idx.sparseCompleteKnown {
+		idx.sparseCompleteKnown = true
+		idx.sparseComplete = true
 		for _, field := range idx.Info.FieldNames {
 			if !query.GuaranteesPresence(filter, field) {
-				idx.sparseComplete = 2
+				idx.sparseComplete = false
 				break
 			}
 		}
 	}
-	return idx.sparseComplete == 1
+	return idx.sparseComplete
 }
 
 // presenceCoversFilter reports whether filter is nothing but {$exists:true}
-// on fields of the bound-less sparse index idx. presenceScan has the filter
+// on fields of the bound-less sparse index idx. PresenceScan has the filter
 // guarantee every field of idx, so index membership is then the match set,
 // document for document.
 //
 // Fields sharing an array are the exception: key generation rebinds the later
 // field to each element and walks one array level deeper than path matching
 // does ({"x":[[{"z":1}],{"y":2}]} is held by (x.y, x.z) yet x.z does not
-// exist), so membership is only a superset there. Such a document always
-// writes several keys, which the scalar proof rules out.
+// exist), so membership is only a superset there. The scalar proof does not
+// rule such a document out — its keys can collide into one
+// ({"x":[[{"z":null}],{"y":null}]}) — so the index never answers the count.
 func presenceCoversFilter(idx *CBOIndex, filter query.Filter) bool {
-	if idx.Info.SharedFrom < len(idx.Info.FieldNames) && !idx.ScalarProven {
+	if idx.Info.SharedFrom < len(idx.Info.FieldNames) {
 		return false
 	}
-	return presenceScan(idx, filter) && existsOnFields(filter, idx.Info.FieldNames)
+	return PresenceScan(idx, filter) && existsOnFields(filter, idx.Info.FieldPaths)
 }
 
 // existsOnFields reports whether f is a conjunction of {$exists:true}
-// predicates on the given fields only.
-func existsOnFields(f query.Filter, fields []string) bool {
+// predicates on the given field paths only.
+func existsOnFields(f query.Filter, fields [][]string) bool {
 	switch ft := f.(type) {
 	case query.Key:
 		switch ft.Filter.(type) {
@@ -1221,8 +1219,8 @@ func existsOnFields(f query.Filter, fields []string) bool {
 		default:
 			return false
 		}
-		for _, field := range fields {
-			if query.PathIs(ft.Path, field) {
+		for _, path := range fields {
+			if slices.Equal(ft.Path, path) {
 				return true
 			}
 		}
@@ -1240,20 +1238,16 @@ func existsOnFields(f query.Filter, fields []string) bool {
 	return false
 }
 
-// presenceScan reports whether idx is a sparse index with no bounds that is
-// complete for filter. Its entries then cover exactly the documents carrying
-// every indexed field — a superset of the matching set that is smaller than
-// the collection by the index's presence cut, so scanning it whole is a
-// costed alternative to a full scan ({$exists:true} is the plain case).
-func presenceScan(idx *CBOIndex, filter query.Filter) bool {
+// PresenceScan reports whether idx is a sparse index with no bounds that is
+// complete for filter. Its entries then cover the documents carrying every
+// indexed field (a superset when fields share an array — see
+// presenceCoversFilter), itself a superset of the matching set that is smaller
+// than the collection by the index's presence cut, so scanning it whole is a
+// costed alternative to a full scan ({$exists:true} is the plain case). The
+// query layer calls it to tell whether a $text query has a probe candidate.
+func PresenceScan(idx *CBOIndex, filter query.Filter) bool {
 	return idx.Info.Sparse && len(idx.Bounds) == 0 && filter != nil &&
 		sparseIndexComplete(idx, filter)
-}
-
-// PresenceScan reports whether idx can drive filter as a presence scan; the
-// query layer uses it to tell whether a $text query has a probe candidate.
-func PresenceScan(idx *CBOIndex, filter query.Filter) bool {
-	return presenceScan(idx, filter)
 }
 
 // uniqueFullKeyDocs returns the exact row bound for a full-key equality lookup
@@ -1606,9 +1600,10 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 		return root
 	}
 
-	// Presence count: a bound-less sparse index holds exactly the documents
-	// carrying its fields, so when that is all the filter asks, counting its
-	// documents (IndexIter.CountEntries over the whole index) is the answer.
+	// Presence count: a bound-less sparse index holds the documents carrying
+	// its fields — presenceCoversFilter rules out the shared-array superset —
+	// so when that is all the filter asks, counting its documents
+	// (IndexIter.CountEntries over the whole index) is the answer.
 	if params.CountOnly && len(idx.Bounds) == 0 && presenceCoversFilter(idx, params.Filter) {
 		return root
 	}

@@ -363,10 +363,10 @@ func TestFtsOps_SparsePresencePredicates(t *testing.T) {
 	}
 }
 
-// A sorted $text query whose residual guarantees a sparse index's field scans
-// that index in order: the scan is priced from the index's own population,
-// not the collection's.
-func TestFtsOps_SparsePresenceSortDrivesScan(t *testing.T) {
+// A sorted $text query whose residual guarantees a sparse index's field probes
+// from that index, priced from the index's own population, not the
+// collection's.
+func TestFtsOps_SparsePresenceSortedProbe(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "c")
 	require.NoError(t, err)
@@ -388,11 +388,8 @@ func TestFtsOps_SparsePresenceSortDrivesScan(t *testing.T) {
 	q := coll.Find(`{"$text":{"$search":"alpha"},"p":{"$exists":true}}`).Sort("p")
 	explain, err := q.Explain(ctx)
 	require.NoError(t, err)
-	used := false
-	for _, ie := range explain.Indexes {
-		used = used || (ie.Used && ie.Name == "p")
-	}
-	assert.True(t, used, explain.Sql)
+	assert.True(t, plannerIndexUsed(explain, "p"), explain.Sql)
+	assert.Contains(t, explain.Plan, "FtsProbeSeek(p)")
 	assert.Equal(t, want, collectIdsString(t, q))
 }
 
@@ -432,11 +429,7 @@ func TestFtsOps_SparsePresenceDrivesProbe(t *testing.T) {
 	} {
 		explain, err := coll.Find(filter).Explain(ctx)
 		require.NoError(t, err)
-		used := false
-		for _, ie := range explain.Indexes {
-			used = used || (ie.Used && ie.Name == "p")
-		}
-		assert.Equal(t, probes, used, "%s: %s", filter, explain.Sql)
+		assert.Equal(t, probes, plannerIndexUsed(explain, "p"), "%s: %s", filter, explain.Sql)
 
 		want := sortedIDs(collectIdsString(t, plain.Find(filter)))
 		assert.Equal(t, want, sortedIDs(collectIdsString(t, coll.Find(filter))), filter)
@@ -459,4 +452,28 @@ func TestFtsOps_SparsePresenceDrivesProbe(t *testing.T) {
 	require.NoError(t, err)
 	pc := qplannerSnapshot()
 	assert.Zero(t, pc.FetchNextCalls, "a presence-covered probe Count must not fetch documents")
+}
+
+// Fields of a compound sparse index sharing an array can hold a document
+// {$exists:true} does not match, its keys collided into one: a $text Count
+// covered by presence must not read the index's size either.
+func TestFtsOps_SparsePresenceCountSharedArraySuperset(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx,
+		IndexInfo{Kind: IndexKindFulltext, Fields: []string{"text"}},
+		IndexInfo{Name: "xyz", Fields: []string{"x.y", "x.z"}, Sparse: true},
+	))
+	insertJSON(t, coll,
+		`{"id":"a","text":"alpha","x":[{"y":null},[{"z":null}]]}`,
+		`{"id":"b","text":"alpha","x":[{"y":1,"z":1}]}`,
+	)
+	filter := `{"$text":{"$search":"alpha"},"x.y":{"$exists":true},"x.z":{"$exists":true}}`
+	for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(IndexHint{IndexName: "xyz", Boost: 1 << 30})} {
+		assert.Equal(t, []string{"b"}, collectIdsString(t, q))
+		n, err := q.Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+	}
 }

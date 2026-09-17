@@ -248,9 +248,19 @@ type IndexInfo struct {
 	// matching documents the index never stored. {$exists: true}, a range, an
 	// equality to a non-null value, {$type: "null"} and {$ne: null} give that
 	// guarantee; an equality to null, an $in holding null, {$exists: false}
-	// and every other negation match a missing field and do not. For a unique
-	// sparse index, documents missing a field coexist freely, since none of
-	// them are indexed; an explicit null is a value and is held unique.
+	// and any other predicate that matches a missing field do not. A sibling
+	// predicate that admits a missing field and bounds the same field takes
+	// the index back out — {$exists: true, $eq: null} does not use it —
+	// except $ne, whose bounds hold every key the index wrote.
+	//
+	// An index whose fields are all top-level provides its sort order; one
+	// over a DOTTED path never does. A document fanning out through an array
+	// of objects can keep a single key while its sort key is a missing leaf
+	// (which sorts as null), so such a query always sorts the rows itself.
+	//
+	// For a unique sparse index, documents missing a field coexist freely,
+	// since none of them are indexed; an explicit null is a value and is held
+	// unique.
 	Sparse bool `json:"sparse"`
 
 	// Kind selects the index type (range by default, full-text, or vector).
@@ -553,11 +563,13 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 	if len(idx.keysBuf) > 1 {
 		entryValue = qplanner.IndexValueMultiKey
 	}
-	// This doc fans out (non-empty array at an indexed field): persist the
-	// sticky index-level multikey flag in this same tx, so any snapshot that
-	// can see these entries sees the flag. A sparse index can keep a single
-	// key of a document that fans out — the other elements' keys are dropped
-	// — and that document is not scalar either.
+	// Persist the sticky INDEX-LEVEL multikey flag in this same tx, so any
+	// snapshot that can see these entries sees the flag. Several keys mean
+	// this doc fans out (non-empty array at an indexed field); a sparse index
+	// can also keep a SINGLE key of a doc that fans out — the other elements'
+	// keys are dropped — and the index is not scalar then either. entryValue
+	// above is per entry and stays Scalar there: a lone key is still this
+	// doc's only one.
 	if len(idx.keysBuf) > 1 || (idx.skipped && len(idx.keysBuf) == 1) {
 		if err := idx.markMultiKey(tx); err != nil {
 			return err

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -4447,4 +4448,13 @@ func TestCalculateSelectivity_PresenceCutOrderIndependent(t *testing.T) {
 		assert.Equal(t, a, b, names)
 		assert.InDelta(t, 40.0/4000, a, 1e-9, names)
 	}
+}
+
+// A candidate slice is allocated per plan, so a word of padding costs every
+// query: the memo bools live in the struct's bool run.
+func TestCBOIndexSize(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("layout pinned for 64-bit")
+	}
+	assert.Equal(t, uintptr(144), unsafe.Sizeof(CBOIndex{}))
 }

@@ -180,6 +180,17 @@ type IndexInfo struct {
 	SharedFrom int
 }
 
+// HasDottedPath reports whether any field of the index is a dotted path,
+// which can cross an array of objects.
+func (ii *IndexInfo) HasDottedPath() bool {
+	for _, path := range ii.FieldPaths {
+		if len(path) > 1 {
+			return true
+		}
+	}
+	return false
+}
+
 // AppendIndexKey appends the value for field at position i to the tuple.
 // For reverse fields the value is inverted.
 func (ii *IndexInfo) AppendIndexKey(tuple anyenc.Tuple, v *anyenc.Value, fieldIdx int) anyenc.Tuple {

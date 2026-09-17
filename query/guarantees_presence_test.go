@@ -35,6 +35,8 @@ func TestGuaranteesPresence(t *testing.T) {
 		{"type null", `{"a":{"$type":"null"}}`, "a", true},
 		{"type string", `{"a":{"$type":"string"}}`, "a", true},
 		{"ne null", `{"a":{"$ne":null}}`, "a", true},
+		{"nin with null", `{"a":{"$nin":[null,1]}}`, "a", true},
+		{"not eq null", `{"a":{"$not":{"$eq":null}}}`, "a", true},
 
 		// NOT guaranteed: a doc missing the field can match, so a sparse index on
 		// the field would drop rows.

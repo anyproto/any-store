@@ -1221,7 +1221,7 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		// key, {"x":[{"y":5},{"z":0}]} under x.y — so only an index on
 		// top-level fields, where every fan-out writes several keys, keeps
 		// its order on the proof.
-		if cboIdx.ExactSort && idx.cboInfo.Sparse && (sparseTraversed(idx.cboInfo) || !scalarProven()) {
+		if cboIdx.ExactSort && idx.cboInfo.Sparse && (idx.cboInfo.HasDottedPath() || !scalarProven()) {
 			cboIdx.ExactSort = false
 			cboIdx.PartialSort = false
 		}
@@ -1241,17 +1241,6 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		result = append(result, cboIdx)
 	}
 	return result
-}
-
-// sparseTraversed reports whether any field of the index is a dotted path,
-// which can cross an array of objects.
-func sparseTraversed(info *qplanner.IndexInfo) bool {
-	for _, path := range info.FieldPaths {
-		if len(path) > 1 {
-			return true
-		}
-	}
-	return false
 }
 
 // sortRunNeedsScalarProof reports whether idx's ExactSort claim is only valid

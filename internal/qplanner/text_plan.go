@@ -188,7 +188,7 @@ func buildTextPlan(params *PlanParams) *Plan {
 			// A bound-less sparse index complete for the residual is a
 			// candidate too: its entries are the documents carrying its
 			// fields, walked whole (the access term below prices the walk).
-			if len(idx.Bounds) == 0 && !presenceScan(idx, params.Filter) {
+			if len(idx.Bounds) == 0 && !PresenceScan(idx, params.Filter) {
 				continue
 			}
 			if !sparseIndexComplete(idx, params.Filter) {
@@ -231,14 +231,11 @@ func buildTextPlan(params *PlanParams) *Plan {
 				if scanSel <= 0 {
 					scanSel = 0.0001
 				}
-				scanPop := totalDocs
-				if len(idx.Bounds) > 0 || idx.Info.Sparse {
-					// A sparse index with no bounds still scans only its own
-					// population (idxSel is its presence cut).
-					scanPop = totalDocs * idxSel
-					if scanPop < 1 {
-						scanPop = 1
-					}
+				// Population to scan: idxSel is 1 for an unbounded index and
+				// the presence cut for a bound-less sparse one.
+				scanPop := totalDocs * idxSel
+				if scanPop < 1 {
+					scanPop = 1
 				}
 				s := scanPop
 				if params.Limit > 0 {

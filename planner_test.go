@@ -2217,6 +2217,15 @@ func plannerUsedIndex(t *testing.T, explain Explain) string {
 	return strings.Join(used, ",")
 }
 
+func plannerIndexUsed(explain Explain, name string) bool {
+	for _, ie := range explain.Indexes {
+		if ie.Used && ie.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // A presence scan is priced, not preferred: it walks and fetches every entry
 // of the sparse index, so it loses to a full scan once most documents carry
 // the field.
@@ -2255,15 +2264,6 @@ func TestPlanner_PresenceScanCostedAgainstFullScan(t *testing.T) {
 	}
 }
 
-func plannerIndexUsed(explain Explain, name string) bool {
-	for _, ie := range explain.Indexes {
-		if ie.Used && ie.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
 // The presence predicate is priced from the sparse index's population
 // in the combined selectivity, so a LIMIT does not make a full scan look
 // cheaper than the index that holds exactly the matching documents.
@@ -2291,11 +2291,7 @@ func TestPlanner_PresenceScanUnderLimit(t *testing.T) {
 	} {
 		ex, err := q.Explain(ctx)
 		require.NoError(t, err)
-		used := false
-		for _, ix := range ex.Indexes {
-			used = used || (ix.Used && ix.Name == "opt")
-		}
-		assert.True(t, used, ex.Plan)
+		assert.True(t, plannerIndexUsed(ex, "opt"), ex.Plan)
 		assert.Len(t, collectIntField(t, q, "id"), 5)
 	}
 	assert.Equal(t, want, collectIntField(t, coll.Find(`{"opt":{"$exists":true}}`).Sort("id"), "id"))

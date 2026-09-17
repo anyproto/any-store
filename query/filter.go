@@ -1209,7 +1209,8 @@ func IndexBoundsExact(f Filter, reverse bool) bool {
 //     itself.
 //
 // Probing the predicates' own Ok keeps this in lockstep with match semantics.
-// An OR, a $exists:false, a lone negation other than {$ne:null}, an
+// An OR, a $exists:false, a lone negation that matches a missing field
+// ($ne: x, an $nin without null), an
 // equality-to-null, an $in containing null, or no predicate on the field at
 // all yield false, keeping that sparse index out of consideration (the planner
 // then falls back to a complete index or scan).
@@ -1294,42 +1295,36 @@ func leafPresence(f Filter, fieldName string) (guaranteed, sound bool) {
 	return false, len(f.IndexBounds(fieldName, nil)) == 0
 }
 
-// PathIs reports whether path joined by "." equals name, without building the
-// joined string.
-func PathIs(path []string, name string) bool { return pathIs(path, name) }
-
-func pathIs(path []string, name string) bool {
+// pathRest consumes path, joined by ".", from the front of name and returns
+// what is left of name; ok is false when path is not a dotted prefix of name
+// or path is empty. No string is built.
+func pathRest(path []string, name string) (rest string, ok bool) {
 	for i, seg := range path {
 		if i > 0 {
 			if len(name) == 0 || name[0] != '.' {
-				return false
+				return "", false
 			}
 			name = name[1:]
 		}
 		if !strings.HasPrefix(name, seg) {
-			return false
+			return "", false
 		}
 		name = name[len(seg):]
 	}
-	return len(name) == 0 && len(path) > 0
+	return name, len(path) > 0
+}
+
+// pathIs reports whether path joined by "." equals name.
+func pathIs(path []string, name string) bool {
+	rest, ok := pathRest(path, name)
+	return ok && len(rest) == 0
 }
 
 // pathIsParent reports whether path joined by "." is a proper dotted prefix
 // of name.
 func pathIsParent(path []string, name string) bool {
-	for i, seg := range path {
-		if i > 0 {
-			if len(name) == 0 || name[0] != '.' {
-				return false
-			}
-			name = name[1:]
-		}
-		if !strings.HasPrefix(name, seg) {
-			return false
-		}
-		name = name[len(seg):]
-	}
-	return len(path) > 0 && len(name) > 1 && name[0] == '.'
+	rest, ok := pathRest(path, name)
+	return ok && len(rest) > 1 && rest[0] == '.'
 }
 
 type Exists struct{}
