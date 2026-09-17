@@ -454,10 +454,10 @@ func TestFtsOps_SparsePresenceDrivesProbe(t *testing.T) {
 	assert.Zero(t, pc.FetchNextCalls, "a presence-covered probe Count must not fetch documents")
 }
 
-// Fields of a compound sparse index sharing an array can hold a document
-// {$exists:true} does not match, its keys collided into one: a $text Count
-// covered by presence must not read the index's size either.
-func TestFtsOps_SparsePresenceCountSharedArraySuperset(t *testing.T) {
+// A compound sparse index whose fields share an array holds exactly the
+// documents {$exists:true} matches on every field: a $text Count covered by
+// presence agrees with the rows, one per document whatever its fan-out.
+func TestFtsOps_SparsePresenceCountSharedArray(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "c")
 	require.NoError(t, err)
@@ -468,12 +468,27 @@ func TestFtsOps_SparsePresenceCountSharedArraySuperset(t *testing.T) {
 	insertJSON(t, coll,
 		`{"id":"a","text":"alpha","x":[{"y":null},[{"z":null}]]}`,
 		`{"id":"b","text":"alpha","x":[{"y":1,"z":1}]}`,
+		`{"id":"c","text":"alpha","x":[{"y":1,"z":1},{"y":2},{"z":3}]}`,
+		`{"id":"d","text":"beta","x":[{"y":1,"z":1}]}`,
 	)
+	// Text matches far outnumber the index's documents: the index probes.
+	var filler []string
+	for i := range 2000 {
+		filler = append(filler, fmt.Sprintf(`{"id":"f%04d","text":"alpha"}`, i))
+	}
+	insertJSON(t, coll, filler...)
 	filter := `{"$text":{"$search":"alpha"},"x.y":{"$exists":true},"x.z":{"$exists":true}}`
+	explain, err := coll.Find(filter).Explain(ctx)
+	require.NoError(t, err)
+	assert.True(t, plannerIndexUsed(explain, "xyz"), explain.Sql)
 	for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(IndexHint{IndexName: "xyz", Boost: 1 << 30})} {
-		assert.Equal(t, []string{"b"}, collectIdsString(t, q))
+		assert.ElementsMatch(t, []string{"b", "c"}, collectIdsString(t, q))
 		n, err := q.Count(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, 1, n)
+		assert.Equal(t, 2, n)
 	}
+	qplannerEnableCounters(t)
+	_, err = coll.Find(filter).Count(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, qplannerSnapshot().FetchNextCalls, "a presence-covered probe Count must not fetch documents")
 }
