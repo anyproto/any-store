@@ -370,9 +370,20 @@ type indexWithWeight struct {
 
 type weightedIndexes []indexWithWeight
 
-func (w weightedIndexes) Len() int           { return len(w) }
-func (w weightedIndexes) Less(i, j int) bool { return w[i].weight > w[j].weight }
-func (w weightedIndexes) Swap(i, j int)      { w[i], w[j] = w[j], w[i] }
+func (w weightedIndexes) Len() int { return len(w) }
+
+// Less breaks an equal weight on the index name. Without it the winner was
+// whichever index came first in c.indexes, which is creation order for a live
+// collection and catalog order (the _system_indexes read has no ORDER BY) after
+// a reopen -- so a tie resolved differently before and after a restart. Names
+// are unique within a collection, so this is a total order (GO-7510).
+func (w weightedIndexes) Less(i, j int) bool {
+	if w[i].weight != w[j].weight {
+		return w[i].weight > w[j].weight
+	}
+	return w[i].index.info.Name < w[j].index.info.Name
+}
+func (w weightedIndexes) Swap(i, j int) { w[i], w[j] = w[j], w[i] }
 
 func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 	if q.err != nil {
@@ -419,6 +430,16 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 	q.indexesWithWeight = make(weightedIndexes, len(q.c.indexes))
 	for i, idx := range q.c.indexes {
 		q.indexesWithWeight[i].index = idx
+		// A sparse index omits every document missing (or null in) any of its
+		// fields, so it can only answer a query that constrains all of them to
+		// be present. Leaving the weight at 0 drops it below the `weight < 1`
+		// filter below, so it is neither joined for filtering nor used to drive
+		// a sort. Without this a negative predicate such as {"$ne": true} was
+		// answered from the index table, which holds exactly the complement of
+		// what the predicate matches (GO-7510).
+		if !sparseIndexComplete(idx, q.cond) {
+			continue
+		}
 		q.indexesWithWeight[i].weight,
 			q.indexesWithWeight[i].queryFieldsBits = q.indexQueryWeight(idx)
 		if sw, sf := q.indexSortWeight(idx); sw > 0 {
@@ -543,6 +564,23 @@ func (q *collQuery) queryField(field string) (queryField, int) {
 	}
 	q.queryFields = append(q.queryFields, f)
 	return f, len(q.queryFields) - 1
+}
+
+// sparseIndexComplete reports whether idx can represent every document matching
+// filter. A non-sparse index always can: a missing field is indexed as null, so
+// every document gets a key. A SPARSE index drops any key whose field is
+// missing or null, so it is complete only when the query guarantees that every
+// one of its fields is present and non-null.
+func sparseIndexComplete(idx *index, filter query.Filter) bool {
+	if !idx.info.Sparse {
+		return true
+	}
+	for _, field := range idx.fieldNames {
+		if !query.GuaranteesPresence(filter, field) {
+			return false
+		}
+	}
+	return true
 }
 
 func (q *collQuery) indexQueryWeight(idx *index) (weight int, fieldBits bitmap.Bitmap256) {

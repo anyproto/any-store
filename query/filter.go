@@ -23,6 +23,46 @@ type Filter interface {
 	fmt.Stringer
 }
 
+// presenceNullProbe is an explicit JSON null used by GuaranteesPresence to test
+// whether a filter accepts a null value as well as a missing one.
+var presenceNullProbe = anyenc.MustParseJson("null")
+
+// GuaranteesPresence reports whether every document matching f must carry
+// fieldName with a non-null value.
+//
+// It answers the only question a sparse index needs asked of a query: a sparse
+// index stores no key for a document whose field is missing or null, so it can
+// serve a predicate only when the predicate itself excludes both. The test is
+// direct rather than syntactic — probe the leaf filter with a missing value and
+// with an explicit null, and require it to reject both. {"$gt":1} rejects them
+// and guarantees presence; {"$ne":true} accepts a missing field and does not.
+//
+// Only And composes: if ANY conjunct guarantees the field, the conjunction
+// does. Or and Not are conservatively false.
+func GuaranteesPresence(f Filter, fieldName string) bool {
+	switch ft := f.(type) {
+	case Key:
+		if strings.Join(ft.Path, ".") == fieldName {
+			var buf syncpool.DocBuffer
+			return !ft.Filter.Ok(nil, &buf) && !ft.Filter.Ok(presenceNullProbe, &buf)
+		}
+		return false
+	case *Key:
+		return GuaranteesPresence(*ft, fieldName)
+	case And:
+		for _, sub := range ft {
+			if GuaranteesPresence(sub, fieldName) {
+				return true
+			}
+		}
+		return false
+	case *And:
+		return GuaranteesPresence(*ft, fieldName)
+	default:
+		return false
+	}
+}
+
 type CompOp uint8
 
 var orExpressionLimit = 950
