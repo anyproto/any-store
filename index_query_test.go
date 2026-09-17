@@ -4627,3 +4627,68 @@ func TestIndex_Sparse_PresenceCountSharedArraySuperset(t *testing.T) {
 		}
 	}
 }
+
+// A compound index whose fields share an array keys a non-object element of
+// that array (scalar, null, nested array) as a missing leaf in every shared
+// field, as path matching reads it: the index answers like an unindexed
+// collection, alone (scalar marker, compounded bounds) and among fan-out docs.
+func TestIndex_SharedArray_NonObjectElement(t *testing.T) {
+	fx := newFixture(t)
+	docs := []string{
+		`{"id":1,"x":[[{"y":1,"z":2}]]}`,
+		`{"id":2,"x":[[{"z":5}]]}`,
+		`{"id":3,"x":[[{"y":{"z":5}}]]}`,
+		`{"id":4,"x":[[[{"y":1,"z":5}]]]}`,
+		`{"id":5,"x":[[{"y":1,"z":5}]],"b":1}`,
+		`{"id":6,"x":[[{"z":5}],{"y":1,"z":2}]}`,
+		`{"id":7,"x":[5,null,{"z":5}]}`,
+		`{"id":8,"x":[{"y":1,"z":5}]}`,
+	}
+	filters := []string{
+		`{"x.y":null,"x.z":null}`,
+		`{"x.y":null,"x.z":5}`,
+		`{"x.y":1,"x.z":5}`,
+		`{"x.y":1,"x.z":null}`,
+		`{"x.y":null,"x.y.z":5}`,
+		`{"x.y":null,"x.z":5,"b":null}`,
+		`{"x.0.y":null,"x.0.z":5}`,
+		`{"x.0.y":1,"x.0.z":5}`,
+		`{"x.0.y":null,"x.0.z":null}`,
+		`{"x.y":{"$exists":false},"x.z":{"$exists":false}}`,
+		`{"x.z":{"$gte":2},"x.y":{"$lte":1}}`,
+	}
+	colls := 0
+	check := func(fields []string, sparse bool, docs []string) {
+		colls++
+		plain, err := fx.CreateCollection(ctx, fmt.Sprintf("plain%d", colls))
+		require.NoError(t, err)
+		coll, err := fx.CreateCollection(ctx, fmt.Sprintf("idx%d", colls))
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: fields, Sparse: sparse}))
+		for _, d := range docs {
+			require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+		}
+		hint := IndexHint{IndexName: "s", Boost: 1 << 30}
+		for _, filter := range filters {
+			want := collectIntField(t, plain.Find(filter).Sort("id"), "id")
+			for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(hint)} {
+				assert.Equal(t, want, collectIntField(t, q.Sort("id"), "id"), "%v sparse=%v %s %v", fields, sparse, filter, docs)
+				cnt, err := q.Count(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, len(want), cnt, "count %v sparse=%v %s %v", fields, sparse, filter, docs)
+			}
+		}
+	}
+	for _, fields := range [][]string{
+		{"x.y", "x.z"}, {"x.z", "x.y"}, {"-x.y", "x.z"}, {"x.y", "x.y.z"},
+		{"x.y", "x.z", "b"}, {"x.0.y", "x.0.z"},
+	} {
+		for _, sparse := range []bool{false, true} {
+			for _, d := range docs {
+				check(fields, sparse, []string{d})
+			}
+			check(fields, sparse, docs)
+		}
+	}
+}

@@ -780,7 +780,8 @@ func (idx *index) writeValues(i int) bool {
 // leaf (anyenc.Value.AppendLeaves semantics). At an array met by a
 // non-numeric segment, every later field whose path reaches this same array
 // is rebound to the element being visited, so its own walk continues inside
-// that element — MongoDB's key generation for fields sharing an array.
+// that element — MongoDB's key generation for fields sharing an array. A
+// non-object element is a missing leaf for all of them, as in path matching.
 func (idx *index) resolveField(i int, v *anyenc.Value, seg int) bool {
 	path := idx.fieldPaths[i]
 	for ; seg < len(path); seg++ {
@@ -822,11 +823,19 @@ func (idx *index) resolveField(i int, v *anyenc.Value, seg int) bool {
 			}
 			wrote := false
 			for _, el := range arr {
+				// An element that cannot carry the path (scalar, null, nested
+				// array) is a missing leaf for every field bound to it: a nil
+				// root keeps a later field from walking into a nested array.
+				isObj := el.Type() == anyenc.TypeObject
+				root := el
+				if !isObj {
+					root = nil
+				}
 				for _, rb := range idx.rebinds[mark:] {
-					idx.fields[rb.field].root, idx.fields[rb.field].consumed = el, seg
+					idx.fields[rb.field].root, idx.fields[rb.field].consumed = root, seg
 				}
 				var ok bool
-				if el.Type() == anyenc.TypeObject {
+				if isObj {
 					ok = idx.resolveField(i, el, seg)
 				} else {
 					ok = idx.emitLeaf(i, anyenc.Leaf{})
