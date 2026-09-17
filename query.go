@@ -884,7 +884,8 @@ func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, residual query.Filter, ne
 		params.Indexes = q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
 		params.FieldBounds = &br
 		for i := range params.Indexes {
-			if len(params.Indexes[i].Bounds) > 0 || (needSort && params.Indexes[i].ExactSort) {
+			if len(params.Indexes[i].Bounds) > 0 || (needSort && params.Indexes[i].ExactSort) ||
+				qplanner.PresenceScan(&params.Indexes[i], residual) {
 				probePossible = true
 				break
 			}

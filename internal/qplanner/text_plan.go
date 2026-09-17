@@ -181,7 +181,10 @@ func buildTextPlan(params *PlanParams) *Plan {
 		fieldSel := collectFieldSelectivity(params, totalDocs, fieldSelBuf[:0])
 		for i := range params.Indexes {
 			idx := &params.Indexes[i]
-			if len(idx.Bounds) == 0 {
+			// A bound-less sparse index complete for the residual is a
+			// candidate too: its entries are the documents carrying its
+			// fields, walked whole (the access term below prices the walk).
+			if len(idx.Bounds) == 0 && !presenceScan(idx, params.Filter) {
 				continue
 			}
 			if !sparseIndexComplete(idx, params.Filter) {

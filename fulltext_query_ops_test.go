@@ -395,3 +395,68 @@ func TestFtsOps_SparsePresenceSortDrivesScan(t *testing.T) {
 	assert.True(t, used, explain.Sql)
 	assert.Equal(t, want, collectIdsString(t, q))
 }
+
+// Without a sort, a $text query whose residual guarantees a sparse index's
+// field probes the documents that index holds instead of scoring every text
+// match; a Count of it fetches nothing.
+func TestFtsOps_SparsePresenceDrivesProbe(t *testing.T) {
+	fx := newFixture(t)
+	plain, err := fx.CreateCollection(ctx, "plain")
+	require.NoError(t, err)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, plain.EnsureIndex(ctx, IndexInfo{Kind: IndexKindFulltext, Fields: []string{"text"}}))
+	require.NoError(t, coll.EnsureIndex(ctx,
+		IndexInfo{Kind: IndexKindFulltext, Fields: []string{"text"}},
+		IndexInfo{Name: "p", Fields: []string{"p"}, Sparse: true},
+	))
+	var docs []string
+	for i := range 2000 {
+		d := fmt.Sprintf(`{"id":"d%04d","text":"alpha"}`, i)
+		switch i % 100 {
+		case 0:
+			d = fmt.Sprintf(`{"id":"d%04d","text":"alpha","p":[%d,null]}`, i, i)
+		case 1:
+			d = fmt.Sprintf(`{"id":"d%04d","text":"beta","p":null}`, i)
+		}
+		docs = append(docs, d)
+	}
+	insertJSON(t, plain, docs...)
+	insertJSON(t, coll, docs...)
+
+	for filter, probes := range map[string]bool{
+		`{"$text":{"$search":"alpha"},"p":{"$exists":true}}`: true,
+		`{"$text":{"$search":"alpha"},"p":{"$type":"null"}}`: true,
+		// A term rarer than the field: the text driver is the cheaper source.
+		`{"$text":{"$search":"beta"},"p":{"$exists":true}}`: false,
+	} {
+		explain, err := coll.Find(filter).Explain(ctx)
+		require.NoError(t, err)
+		used := false
+		for _, ie := range explain.Indexes {
+			used = used || (ie.Used && ie.Name == "p")
+		}
+		assert.Equal(t, probes, used, "%s: %s", filter, explain.Sql)
+
+		want := sortedIDs(collectIdsString(t, plain.Find(filter)))
+		assert.Equal(t, want, sortedIDs(collectIdsString(t, coll.Find(filter))), filter)
+		n, err := coll.Find(filter).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, len(want), n, filter)
+		for _, page := range [][2]uint{{1, 5}, {3, 0}} {
+			wantN, err := plain.Find(filter).Offset(page[0]).Limit(page[1]).Count(ctx)
+			require.NoError(t, err)
+			gotN, err := coll.Find(filter).Offset(page[0]).Limit(page[1]).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, wantN, gotN, "%s offset %d limit %d", filter, page[0], page[1])
+		}
+	}
+
+	_, err = coll.Find(`{"$text":{"$search":"alpha"},"p":{"$exists":true}}`).Count(ctx)
+	require.NoError(t, err)
+	qplannerEnableCounters(t)
+	_, err = coll.Find(`{"$text":{"$search":"alpha"},"p":{"$exists":true}}`).Count(ctx)
+	require.NoError(t, err)
+	pc := qplannerSnapshot()
+	assert.Zero(t, pc.FetchNextCalls, "a presence-covered probe Count must not fetch documents")
+}

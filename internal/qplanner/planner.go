@@ -1243,6 +1243,12 @@ func presenceScan(idx *CBOIndex, filter query.Filter) bool {
 		sparseIndexComplete(idx, filter)
 }
 
+// PresenceScan reports whether idx can drive filter as a presence scan; the
+// query layer uses it to tell whether a $text query has a probe candidate.
+func PresenceScan(idx *CBOIndex, filter query.Filter) bool {
+	return presenceScan(idx, filter)
+}
+
 // uniqueFullKeyDocs returns the exact row bound for a full-key equality lookup
 // on a UNIQUE index: every bound's key matches at most one entry, hence at most
 // one document, regardless of what the sketch says. The sketch is a shared-
