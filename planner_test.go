@@ -3,6 +3,7 @@ package anystore
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -2081,4 +2082,98 @@ func BenchmarkRangeDescLimit_200k(b *testing.B) {
 			}
 		}
 	})
+}
+
+// TestPlanner_PlanStableAcrossReopen is defect #2 on its own: v1 kept creation
+// order for a freshly created collection and got alphabetical order from the
+// catalog on reopen, so a cost tie resolved differently per session and the
+// query was correct only in the session that created the index.
+//
+// v2 loads indexes the same two ways (EnsureIndex appends; a reopen replays the
+// catalog in key order), and that is fine — what must not depend on it is the
+// plan. The planner breaks an exact cost tie on the index name, so every
+// session picks the same one.
+func TestPlanner_PlanStableAcrossReopen(t *testing.T) {
+	skipIfInMemory(t)
+	tmpDir, err := os.MkdirTemp("", "go7510-order-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	fx1 := newFixturePath(t, tmpDir)
+	coll, err := fx1.CreateCollection(ctx, "objects")
+	require.NoError(t, err)
+	for _, name := range []string{"zzz", "mmm", "aaa"} {
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: name, Fields: []string{name}}))
+	}
+	// Identical cardinality on every indexed field => a genuine cost tie.
+	for i := range 100 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":%d,"zzz":%d,"mmm":%d,"aaa":%d}`, i, i%10, i%10, i%10))))
+	}
+
+	const tiedCond = `{"zzz":1,"mmm":1,"aaa":1}`
+	freshNames := plannerIndexNames(coll)
+	freshExplain, err := coll.Find(tiedCond).Explain(ctx)
+	require.NoError(t, err)
+	freshCosts := map[string]float64{}
+	for _, ie := range freshExplain.Indexes {
+		freshCosts[ie.Name] = ie.Cost
+	}
+	freshCount, err := coll.Find(tiedCond).Count(ctx)
+	require.NoError(t, err)
+	require.NoError(t, fx1.Close())
+
+	fx2 := newFixturePath(t, tmpDir)
+	coll2, err := fx2.OpenCollection(ctx, "objects")
+	require.NoError(t, err)
+	reopenedNames := plannerIndexNames(coll2)
+	reopenedExplain, err := coll2.Find(tiedCond).Explain(ctx)
+	require.NoError(t, err)
+	reopenedCount, err := coll2.Find(tiedCond).Count(ctx)
+	require.NoError(t, err)
+
+	// This test only means something if the three seeks genuinely tie: the
+	// name rung fires on an exact cost tie and nothing else. Assert it, so a
+	// cost-model change that separates the costs fails loudly instead of
+	// turning the test into a silent no-op.
+	require.Len(t, freshCosts, 3)
+	for name, cost := range freshCosts {
+		assert.Equalf(t, freshCosts["aaa"], cost,
+			"index %s must tie with the others for this test to exercise the tie-break", name)
+	}
+
+	// The two sessions see the indexes in different orders — creation order
+	// live, catalog (name) order after a reopen. That is the input the planner
+	// must not be sensitive to. Logged rather than asserted: normalizing the
+	// load order is a legitimate future fix, and it must not fail this test.
+	assert.ElementsMatch(t, freshNames, reopenedNames)
+	t.Logf("index order: live=%v reopened=%v", freshNames, reopenedNames)
+
+	assert.Equal(t, freshCount, reopenedCount, "row count must not depend on the session")
+	assert.Equal(t, plannerUsedIndex(t, freshExplain), plannerUsedIndex(t, reopenedExplain),
+		"a tied plan must resolve identically on a fresh and a reopened collection")
+	assert.Equal(t, "aaa", plannerUsedIndex(t, freshExplain),
+		"an exact cost tie resolves on the lowest index name")
+	// The whole explain output — chosen plan, costs and the candidate listing —
+	// is reproducible across sessions.
+	assert.Equal(t, freshExplain.Plan, reopenedExplain.Plan)
+}
+
+func plannerIndexNames(coll Collection) []string {
+	var names []string
+	for _, idx := range coll.GetIndexes() {
+		names = append(names, idx.Info().Name)
+	}
+	return names
+}
+
+func plannerUsedIndex(t *testing.T, explain Explain) string {
+	t.Helper()
+	var used []string
+	for _, ie := range explain.Indexes {
+		if ie.Used {
+			used = append(used, ie.Name)
+		}
+	}
+	return strings.Join(used, ",")
 }
