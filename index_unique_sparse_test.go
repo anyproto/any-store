@@ -3,7 +3,7 @@ Index/Planner tests inspired by SQLite: index3.test, index4.test
 
 Test scenario:
 Tests unique index constraints (compound, self-update, upsert, delete+reinsert,
-bulk partial failure), sparse index behavior (missing/null fields, field
+bulk partial failure), sparse index behavior (missing fields, field
 appearance via update, compound sparse), sparse+unique combinations,
 index length tracking through mixed mutations, nested field unique indexes,
 and drop-index followed by duplicate insert.
@@ -322,10 +322,10 @@ func TestIndex_UniqueSparse_SparseCompoundBothMissing(t *testing.T) {
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"b":2}`)))
 	// Both present — indexed
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":1,"b":2}`)))
-	// a is null — not indexed
+	// a is null — present, so indexed as (null, 2)
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":null,"b":2}`)))
 
-	assertIndexLen(t, coll.GetIndexes()[0], 1)
+	assertIndexLen(t, coll.GetIndexes()[0], 2)
 	assertCollCount(t, coll, 4)
 }
 
@@ -357,8 +357,8 @@ func TestIndex_UniqueSparse_SparseNullField(t *testing.T) {
 		anyenc.MustParseJson(`{"id":3}`),
 	))
 
-	// Only doc with a=10 is indexed
-	assertIndexLen(t, coll.GetIndexes()[0], 1)
+	// The missing-field doc is the only one left out
+	assertIndexLen(t, coll.GetIndexes()[0], 2)
 }
 
 // --- Coverage tests from unique_array_coverage_test.go ---
@@ -543,34 +543,13 @@ func TestIndex_SparseNested_Coverage_MissingIntermediate(t *testing.T) {
 // TestAudit12_SparseEmptyArray_* — focused edge-case audit for the
 // interaction between a SPARSE index and an EMPTY ARRAY (e.g. {tags: []}).
 //
-// Background — index.go::writeValues (around line 213/227):
+// A sparse index skips a document only when the indexed field is MISSING
+// (index.go writeKey/emitLeaf). An explicit null and an empty array both
+// exist: null is written under the null key, the empty array under its
+// whole-array key, which makes Find({tags:[]}) work via the index.
 //
-//	v := d.Get(idx.fieldPaths[i]...)
-//	if idx.info.Sparse && (v == nil || v.Type() == anyenc.TypeNull) {
-//	    return false
-//	}
-//
-//	k := idx.keyBuf
-//	if v != nil && v.Type() == anyenc.TypeArray {
-//	    arr, _ := v.Array()
-//	    if len(arr) != 0 {
-//	        ... per-element loop ...
-//	    }
-//	}
-//	idx.keyBuf = v.MarshalTo(k)
-//	return idx.writeValues(d, i+1)
-//
-// Sparse-index semantics (matches MongoDB): "skip docs where the
-// indexed field is MISSING or NULL". An empty array is neither — it
-// is a present, queryable value. So the guard correctly only skips
-// nil and TypeNull, and an empty array slips through to be indexed.
-// The whole-array marshalled key is written, which makes
-// Find({tags:[]}) work via the index.
-//
-// These tests pin the (intentional) behaviour: 0 entries for missing
-// or null, exactly 1 entry for an empty array. If anybody changes the
-// sparse guard to also skip empty arrays, they'd silently break
-// Find({tags:[]}) queries against sparse indexes.
+// These tests pin that: 0 entries for a missing field, exactly 1 entry for
+// null and for an empty array.
 
 // TestAudit12_SparseEmptyArray_NoFieldZeroEntries: doc with no `tags`
 // field at all. Sparse guard short-circuits on v == nil → 0 entries.
@@ -595,10 +574,10 @@ func TestAudit12_SparseEmptyArray_NoFieldZeroEntries(t *testing.T) {
 	assertIndexLen(t, coll.GetIndexes()[0], 0)
 }
 
-// TestAudit12_SparseEmptyArray_NullFieldZeroEntries: doc with explicit
-// `tags: null`. Sparse guard short-circuits on TypeNull → 0 entries.
-// Baseline #2 — sparse semantics as documented.
-func TestAudit12_SparseEmptyArray_NullFieldZeroEntries(t *testing.T) {
+// TestAudit12_SparseEmptyArray_NullFieldOneEntry: doc with explicit
+// `tags: null`. The field exists, so the sparse index holds it under the
+// null key.
+func TestAudit12_SparseEmptyArray_NullFieldOneEntry(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit12_null_field")
 	require.NoError(t, err)
@@ -608,19 +587,18 @@ func TestAudit12_SparseEmptyArray_NullFieldZeroEntries(t *testing.T) {
 		Sparse: true,
 	}))
 
-	// Doc with explicit `tags: null` — sparse guard hits TypeNull branch.
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":null}`)))
 
 	entries := readRawIndexEntries(t, fx.DB, "audit12_null_field", "ix_tags")
-	require.Empty(t, entries,
-		"sparse index over null field must produce zero entries (TypeNull branch)")
+	require.Len(t, entries, 1, "an explicit null is present and gets the null key")
+	assert.Equal(t, byte(anyenc.TypeNull), entries[0].Key[0])
 
-	assertIndexLen(t, coll.GetIndexes()[0], 0)
+	assertIndexLen(t, coll.GetIndexes()[0], 1)
 }
 
 // TestAudit12_SparseEmptyArray_EmptyArrayBehaviour: doc with `tags: []`
-// — empty array. Pins that an empty array IS indexed (sparse only
-// skips missing/null, not empty values), and confirms the entry uses
+// — empty array. Pins that an empty array IS indexed (sparse skips only
+// a missing field), and confirms the entry uses
 // the whole-empty-array marshalled key with IndexValueScalar (because
 // len(keysBuf) == 1 at insertKeys time — no per-element entries since
 // the array has no elements).
@@ -642,12 +620,11 @@ func TestAudit12_SparseEmptyArray_EmptyArrayBehaviour(t *testing.T) {
 	entries := readRawIndexEntries(t, fx.DB, "audit12_empty_arr_sparse", "ix_tags")
 
 	// Empty array IS indexed — exactly 1 entry, the whole-empty-array
-	// marshal. Matches MongoDB's sparse-index semantics: sparse skips
-	// missing/null only, empty arrays are present queryable values.
+	// marshal. Matches MongoDB's sparse-index semantics: sparse skips a
+	// missing field only, empty arrays are present queryable values.
 	require.Len(t, entries, 1,
 		"empty array on sparse index produces exactly 1 entry — the "+
-			"whole-empty-array marshal. Sparse only skips missing/null per "+
-			"the guard at index.go:227, which is intended.")
+			"whole-empty-array marshal. Sparse skips only a missing field.")
 
 	// keysBuf had exactly one entry → IndexValueScalar (0x00).
 	require.NotEmpty(t, entries[0].Value)
@@ -1201,18 +1178,21 @@ func TestIndex_UniqueSparse_NonSparseUniqueNullCollision(t *testing.T) {
 		assertIndexLen(t, coll.GetIndexes()[0], 2)
 	})
 
-	t.Run("sparse-unique allows multiple missing/null", func(t *testing.T) {
+	t.Run("sparse-unique allows multiple missing, holds null unique", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "sparse")
 		require.NoError(t, err)
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Sparse: true, Unique: true}))
 
+		// missing-field docs emit no entry and coexist freely.
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"b":1}`)))
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"c":1}`)))
+		// an explicit null is a value: the first takes the 'null' key, the
+		// second collides on it.
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":null}`)))
+		require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":5,"a":null}`)), ErrUniqueConstraint)
 
 		assertCollCount(t, coll, 3)
-		// all three emit zero entries on a sparse index.
-		assertIndexLen(t, coll.GetIndexes()[0], 0)
+		assertIndexLen(t, coll.GetIndexes()[0], 1)
 	})
 }
 
@@ -1431,4 +1411,83 @@ func TestIndex_UniqueSparse_SparseCompoundArrayLeadMissingTrail(t *testing.T) {
 	// (which each contain a=1) are returned via a complete plan.
 	assertQueryCount(t, coll.Find(`{"a":1}`), 2)
 	assert.Equal(t, []string{"1", "2"}, collectIds(coll.Find(`{"a":1}`)))
+}
+
+// A unique sparse index is backfilled by EnsureIndex over documents already
+// in the collection: an explicit null is a value there too, so two of them
+// collide while documents missing the field coexist.
+func TestIndex_UniqueSparse_BackfillNulls(t *testing.T) {
+	t.Run("two missing fields backfill", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "missing")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1,"b":1}`),
+			anyenc.MustParseJson(`{"id":2,"b":2}`),
+			anyenc.MustParseJson(`{"id":3,"a":7}`),
+		))
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Unique: true, Sparse: true}))
+		assertIndexLen(t, coll.GetIndexes()[0], 1)
+	})
+
+	t.Run("two explicit nulls backfill", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "nulls")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1,"a":null}`),
+			anyenc.MustParseJson(`{"id":2,"a":null}`),
+		))
+		err = coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Unique: true, Sparse: true})
+		require.ErrorIs(t, err, ErrUniqueConstraint)
+		// The failed EnsureIndex leaves no index behind.
+		assert.Empty(t, coll.GetIndexes())
+		assertCollCount(t, coll, 2)
+	})
+
+	t.Run("one explicit null backfills", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "one")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1,"a":null}`),
+			anyenc.MustParseJson(`{"id":2}`),
+			anyenc.MustParseJson(`{"id":3,"a":5}`),
+		))
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Unique: true, Sparse: true}))
+		assertIndexLen(t, coll.GetIndexes()[0], 2)
+		require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":null}`)), ErrUniqueConstraint)
+	})
+}
+
+// a unique COMPOUND sparse index with a null component. The key is
+// (null, b): it is unique on the pair, and a document missing either field
+// emits no key at all. Also with a reverse field.
+func TestIndex_UniqueSparse_CompoundNullComponent(t *testing.T) {
+	for _, fields := range [][]string{{"a", "b"}, {"a", "-b"}, {"-a", "b"}} {
+		t.Run(fmt.Sprint(fields), func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: fields, Unique: true, Sparse: true}))
+
+			// (null, 1) and (null, 2) differ.
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":null,"b":1}`)))
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":null,"b":2}`)))
+			// (null, 1) repeats.
+			require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":null,"b":1}`)), ErrUniqueConstraint)
+			// (null, null) once.
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":null,"b":null}`)))
+			require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":5,"a":null,"b":null}`)), ErrUniqueConstraint)
+			// b missing: no key, so any number of them coexist.
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":6,"a":null}`)))
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":7,"a":null}`)))
+			// a missing: likewise.
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":8,"b":null}`)))
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":9,"b":null}`)))
+
+			assertIndexLen(t, coll.GetIndexes()[0], 3)
+			assertCollCount(t, coll, 7)
+		})
+	}
 }

@@ -3763,7 +3763,8 @@ func TestIndex_ArrayNested_SparseDedupKeepsDoc(t *testing.T) {
 		anyenc.MustParseJson(`{"id":2,"a":[{"b":"xbz"},{"b":null}]}`),
 		anyenc.MustParseJson(`{"id":3,"a":[{"c":1}]}`),
 	))
-	assertIndexLen(t, coll.GetIndexes()[0], 2)
+	// doc1: "abc"; doc2: "xbz", null; doc3 never carries a.b
+	assertIndexLen(t, coll.GetIndexes()[0], 3)
 	for _, sort := range []string{"a.b", "-a.b"} {
 		q := coll.Find(`{"a.b":{"$regex":"b"}}`).Sort(sort)
 		assert.Equal(t, 2, len(collectIntField(t, q, "id")), sort)
@@ -3995,7 +3996,7 @@ func TestIndex_ArrayNested_SparseCompoundSharedArray(t *testing.T) {
 		`{"id":5,"a":[{"b":1,"c":2}]}`,
 		`{"id":6,"a":[{"b":1,"c":2},{"b":9}]}`,
 		`{"id":7,"a":{"b":1}}`,            // c never present: not indexed
-		`{"id":8,"a":[{"b":null,"c":3}]}`, // b never non-null: not indexed
+		`{"id":8,"a":[{"b":null,"c":3}]}`, // an explicit null is present
 	}
 	plain, err := fx.CreateCollection(ctx, "plain")
 	require.NoError(t, err)
@@ -4006,8 +4007,9 @@ func TestIndex_ArrayNested_SparseCompoundSharedArray(t *testing.T) {
 		require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
 		require.NoError(t, sparse.Insert(ctx, anyenc.MustParseJson(d)))
 	}
-	// doc1: (1,2),(3,4); doc4: (1,null),(null,2); doc5: (1,2); doc6: (1,2),(9,null)
-	assertIndexLen(t, sparse.GetIndexes()[0], 2+2+1+2)
+	// doc1: (1,2),(3,4); doc4: (1,null),(null,2); doc5: (1,2);
+	// doc6: (1,2),(9,null); doc8: (null,3)
+	assertIndexLen(t, sparse.GetIndexes()[0], 2+2+1+2+1)
 
 	hint := IndexHint{IndexName: "bc", Boost: 1 << 30}
 	for _, filter := range []string{

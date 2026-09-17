@@ -378,13 +378,13 @@ func TestIndex_Maintenance_SparseInsertMissingField(t *testing.T) {
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"b":20}`)))
 	assertIndexLen(t, idx, 1)
 
-	// Insert doc with a=null — sparse index should skip it
+	// Insert doc with a=null — the field exists, so it is indexed under null
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":null}`)))
-	assertIndexLen(t, idx, 1)
+	assertIndexLen(t, idx, 2)
 
 	// Insert another with 'a' field
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":40}`)))
-	assertIndexLen(t, idx, 2)
+	assertIndexLen(t, idx, 3)
 
 	assertCollCount(t, coll, 4)
 }

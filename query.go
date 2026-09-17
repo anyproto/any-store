@@ -1206,10 +1206,10 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		// lazily, only for candidates the gate would demote. When the only cut
 		// on the sort side is a type-bracket edge, the candidate is widened
 		// (widenSortEdges) instead of demoted.
-		// A SPARSE index holds no entry for a null or missing leaf, so over
-		// fan-out data a document surfaces at its least non-null leaf while
-		// the sort key is the least leaf of all (null wins): demote, no edge
-		// widening can restore that.
+		// A SPARSE index holds no entry for a missing leaf, so over fan-out
+		// data a document surfaces at its least existing leaf while the sort
+		// key is the least leaf of all (a missing leaf sorts as null and
+		// wins): demote, no edge widening can restore that.
 		if cboIdx.ExactSort && idx.cboInfo.Sparse && !scalarProven() {
 			cboIdx.ExactSort = false
 			cboIdx.PartialSort = false

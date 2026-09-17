@@ -14,7 +14,7 @@ import (
 // TestSparseCompoundIndex_PlannerDoesNotDropRows reproduces the alpha.13
 // regression where the CBO would pick a sparse compound index for a query that
 // does not constrain every indexed field. A sparse index omits documents missing
-// (or null in) any of its fields, so seeking it silently dropped matching rows.
+// any of its fields, so seeking it silently dropped matching rows.
 //
 // Layout mirrors the field report: a complete index (sp,q) is declared first and
 // a sparse index (sp,as) — with `as` optional — second. The planner must not
