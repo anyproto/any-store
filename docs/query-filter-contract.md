@@ -237,7 +237,10 @@ build per query and carry no such guarantee.
     `(a.b, a.c)` has keys `(1, null)` and `(null, 2)`; fields of a COMPOUND
     index that run through the same array iterate it together, one entry per
     element, as
-    Mongo generates them — never a cross product — so the planner compounds
+    Mongo generates them — never a cross product; an element that cannot
+    carry the path is a missing leaf in every one of them
+    (`{"x":[[{"y":1,"z":2}]]}` under `(x.y, x.z)` has the key `(null, null)`)
+    — so the planner compounds
     bounds and entry-level cover filters across such fields only on a
     scalar-proven index and seeks the first of them otherwise), sort keys
     (min/max over
