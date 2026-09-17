@@ -471,11 +471,22 @@ func TestFtsOps_SparsePresenceCountSharedArray(t *testing.T) {
 		`{"id":"c","text":"alpha","x":[{"y":1,"z":1},{"y":2},{"z":3}]}`,
 		`{"id":"d","text":"beta","x":[{"y":1,"z":1}]}`,
 	)
+	// Text matches far outnumber the index's documents: the index probes.
+	for i := range 2000 {
+		insertJSON(t, coll, fmt.Sprintf(`{"id":"f%04d","text":"alpha"}`, i))
+	}
 	filter := `{"$text":{"$search":"alpha"},"x.y":{"$exists":true},"x.z":{"$exists":true}}`
+	explain, err := coll.Find(filter).Explain(ctx)
+	require.NoError(t, err)
+	assert.True(t, plannerIndexUsed(explain, "xyz"), explain.Sql)
 	for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(IndexHint{IndexName: "xyz", Boost: 1 << 30})} {
 		assert.ElementsMatch(t, []string{"b", "c"}, collectIdsString(t, q))
 		n, err := q.Count(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, 2, n)
 	}
+	qplannerEnableCounters(t)
+	_, err = coll.Find(filter).Count(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, qplannerSnapshot().FetchNextCalls, "a presence-covered probe Count must not fetch documents")
 }

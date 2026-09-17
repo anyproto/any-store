@@ -4654,8 +4654,18 @@ func TestIndex_SharedArray_NonObjectElement(t *testing.T) {
 		`{"id":6,"x":[[{"z":5}],{"y":1,"z":2}]}`,
 		`{"id":7,"x":[5,null,{"z":5}]}`,
 		`{"id":8,"x":[{"y":1,"z":5}]}`,
+		`{"id":9,"x":[[]]}`,
+		`{"id":10,"x":[[{"y":1,"z":5,"w":7}]]}`,
+		// The shared array sits one level down.
+		`{"id":11,"x":[{"y":[[{"q":1,"r":2}]]}]}`,
+		`{"id":12,"x":{"y":[[{"r":2}]]}}`,
 	}
 	filters := []string{
+		`{"x.y":null,"x.z":5,"x.w":7}`,
+		`{"x.y":null,"x.z":null,"x.w":null}`,
+		`{"x.y.q":null,"x.y.r":null}`,
+		`{"x.y.q":null,"x.y.r":2}`,
+		`{"x.y.q":1,"x.y.r":2}`,
 		`{"x.y":null,"x.z":null}`,
 		`{"x.y":null,"x.z":5}`,
 		`{"x.y":1,"x.z":5}`,
@@ -4669,14 +4679,14 @@ func TestIndex_SharedArray_NonObjectElement(t *testing.T) {
 		`{"x.z":{"$gte":2},"x.y":{"$lte":1}}`,
 	}
 	colls := 0
-	check := func(fields []string, sparse bool, docs []string) {
+	check := func(fields []string, sparse bool, set []string) {
 		colls++
 		plain, err := fx.CreateCollection(ctx, fmt.Sprintf("plain%d", colls))
 		require.NoError(t, err)
 		coll, err := fx.CreateCollection(ctx, fmt.Sprintf("idx%d", colls))
 		require.NoError(t, err)
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: fields, Sparse: sparse}))
-		for _, d := range docs {
+		for _, d := range set {
 			require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
 		}
@@ -4684,16 +4694,16 @@ func TestIndex_SharedArray_NonObjectElement(t *testing.T) {
 		for _, filter := range filters {
 			want := collectIntField(t, plain.Find(filter).Sort("id"), "id")
 			for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(hint)} {
-				assert.Equal(t, want, collectIntField(t, q.Sort("id"), "id"), "%v sparse=%v %s %v", fields, sparse, filter, docs)
+				assert.Equal(t, want, collectIntField(t, q.Sort("id"), "id"), "%v sparse=%v %s %v", fields, sparse, filter, set)
 				cnt, err := q.Count(ctx)
 				require.NoError(t, err)
-				assert.Equal(t, len(want), cnt, "count %v sparse=%v %s %v", fields, sparse, filter, docs)
+				assert.Equal(t, len(want), cnt, "count %v sparse=%v %s %v", fields, sparse, filter, set)
 			}
 		}
 	}
 	for _, fields := range [][]string{
 		{"x.y", "x.z"}, {"x.z", "x.y"}, {"-x.y", "x.z"}, {"x.y", "x.y.z"},
-		{"x.y", "x.z", "b"}, {"x.0.y", "x.0.z"},
+		{"x.y", "x.z", "b"}, {"x.0.y", "x.0.z"}, {"x.y", "x.z", "x.w"}, {"x.y.q", "x.y.r"},
 	} {
 		for _, sparse := range []bool{false, true} {
 			for _, d := range docs {
