@@ -4601,30 +4601,41 @@ func TestIndex_Sparse_FanOutSingleKeySortWindow(t *testing.T) {
 	}
 }
 
-// Fields of a compound sparse index that share an array are keyed one array
-// level deeper than path matching reaches, so the index can hold a document
-// {$exists:true} does not match: a presence Count must not read its size.
-func TestIndex_Sparse_PresenceCountSharedArraySuperset(t *testing.T) {
+// A compound sparse index whose fields share an array holds exactly the
+// documents {$exists:true} matches on every field — a field inside a nested
+// array element does not exist — so a presence Count reads the index alone,
+// one per document however many keys it fans out into.
+func TestIndex_Sparse_PresenceCountSharedArray(t *testing.T) {
 	fx := newFixture(t)
-	for _, docs := range [][]string{
-		{`{"id":1,"x":[[{"z":1}],{"y":2}]}`, `{"id":2,"x":[{"y":1,"z":1}]}`},
-		// The two keys collide into one, so the index keeps its scalar marker.
-		{`{"id":1,"x":[[{"z":null}],{"y":null}]}`, `{"id":2,"x":[{"y":1,"z":1}]}`},
-		{`{"id":1,"x":[{"y":null},[{"z":null}]]}`, `{"id":2,"x":[{"y":1,"z":1}]}`},
+	for _, first := range []string{
+		`{"id":1,"x":[[{"z":1}],{"y":2}]}`,
+		`{"id":1,"x":[[{"z":null}],{"y":null}]}`,
+		`{"id":1,"x":[{"y":null},[{"z":null}]]}`,
 	} {
-		coll, err := fx.CreateCollection(ctx, docs[0])
+		docs := []string{
+			first,
+			`{"id":2,"x":[{"y":1,"z":1}]}`,
+			`{"id":3,"x":[{"y":1,"z":1},{"y":2,"z":2}]}`,
+			`{"id":4,"x":[{"y":1},{"z":2}]}`,
+		}
+		coll, err := fx.CreateCollection(ctx, first)
 		require.NoError(t, err)
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: []string{"x.y", "x.z"}, Sparse: true}))
 		for _, d := range docs {
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
 		}
 		filter := `{"x.y":{"$exists":true},"x.z":{"$exists":true}}`
-		for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(IndexHint{IndexName: "s", Boost: 1 << 30})} {
-			assert.Equal(t, []int{2}, collectIntField(t, q, "id"), docs[0])
+		hint := IndexHint{IndexName: "s", Boost: 1 << 30}
+		for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(hint)} {
+			assert.Equal(t, []int{2, 3, 4}, collectIntField(t, q.Sort("id"), "id"), first)
 			cnt, err := q.Count(ctx)
 			require.NoError(t, err)
-			assert.Equal(t, 1, cnt, docs[0])
+			assert.Equal(t, 3, cnt, first)
 		}
+		qplannerEnableCounters(t)
+		_, err = coll.Find(filter).IndexHint(hint).Count(ctx)
+		require.NoError(t, err)
+		assert.Zero(t, qplannerSnapshot().FetchNextCalls, "a presence count must not fetch documents: %s", first)
 	}
 }
 

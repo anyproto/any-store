@@ -1195,17 +1195,7 @@ func sparseIndexComplete(idx *CBOIndex, filter query.Filter) bool {
 // on fields of the bound-less sparse index idx. PresenceScan has the filter
 // guarantee every field of idx, so index membership is then the match set,
 // document for document.
-//
-// Fields sharing an array are the exception: key generation rebinds the later
-// field to each element and walks one array level deeper than path matching
-// does ({"x":[[{"z":1}],{"y":2}]} is held by (x.y, x.z) yet x.z does not
-// exist), so membership is only a superset there. The scalar proof does not
-// rule such a document out — its keys can collide into one
-// ({"x":[[{"z":null}],{"y":null}]}) — so the index never answers the count.
 func presenceCoversFilter(idx *CBOIndex, filter query.Filter) bool {
-	if idx.Info.SharedFrom < len(idx.Info.FieldNames) {
-		return false
-	}
 	return PresenceScan(idx, filter) && existsOnFields(filter, idx.Info.FieldPaths)
 }
 
