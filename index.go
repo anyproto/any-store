@@ -228,10 +228,8 @@ type IndexInfo struct {
 	//
 	// Presence is existence, as in MongoDB: a field that is explicitly null is
 	// present and is indexed under the null key; only a missing field keeps a
-	// document out. The index therefore holds the documents matching
-	// {$exists: true} on each of its fields — exactly those, except that
-	// fields sharing an array are keyed one array level deeper than a dotted
-	// path matches, so such an index can hold more.
+	// document out. The index therefore holds exactly the documents matching
+	// {$exists: true} on each of its fields.
 	//
 	// A COMPOUND sparse index diverges from MongoDB, which keeps a document
 	// carrying ANY indexed field: here every indexed field must exist.
