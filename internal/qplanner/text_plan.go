@@ -225,7 +225,9 @@ func buildTextPlan(params *PlanParams) *Plan {
 					scanSel = 0.0001
 				}
 				scanPop := totalDocs
-				if len(idx.Bounds) > 0 {
+				if len(idx.Bounds) > 0 || idx.Info.Sparse {
+					// A sparse index with no bounds still scans only its own
+					// population (idxSel is its presence cut).
 					scanPop = totalDocs * idxSel
 					if scanPop < 1 {
 						scanPop = 1

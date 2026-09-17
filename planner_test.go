@@ -1513,6 +1513,41 @@ func BenchmarkRangeFilter_Index_10k(b *testing.B) {
 	benchCount(b, coll, `{"a": {"$gte": 40, "$lte": 60}}`)
 }
 
+// --- Presence Filter ---
+
+// setupSparseBenchCollection adds n documents of which one in a hundred
+// carries "opt", half of those as an explicit null.
+func setupSparseBenchCollection(b *testing.B, n int, indexes ...IndexInfo) Collection {
+	b.Helper()
+	coll := setupBenchCollection(b, 0, indexes...)
+	var docs []*anyenc.Value
+	for i := range n {
+		doc := fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%100)
+		switch i % 200 {
+		case 0:
+			doc = fmt.Sprintf(`{"id":%d,"a":%d,"opt":%d}`, i, i%100, i)
+		case 100:
+			doc = fmt.Sprintf(`{"id":%d,"a":%d,"opt":null}`, i, i%100)
+		}
+		docs = append(docs, anyenc.MustParseJson(doc))
+		if len(docs) == 500 || i == n-1 {
+			require.NoError(b, coll.Insert(ctx, docs...))
+			docs = docs[:0]
+		}
+	}
+	return coll
+}
+
+func BenchmarkExists_FullScan_10k(b *testing.B) {
+	coll := setupSparseBenchCollection(b, 10000)
+	benchIter(b, coll.Find(`{"opt": {"$exists": true}}`))
+}
+
+func BenchmarkExists_SparseIndex_10k(b *testing.B) {
+	coll := setupSparseBenchCollection(b, 10000, IndexInfo{Fields: []string{"opt"}, Sparse: true})
+	benchIter(b, coll.Find(`{"opt": {"$exists": true}}`))
+}
+
 // --- Sort Benchmarks ---
 
 func BenchmarkSort_FullScan_1k(b *testing.B) {
@@ -2176,4 +2211,51 @@ func plannerUsedIndex(t *testing.T, explain Explain) string {
 		}
 	}
 	return strings.Join(used, ",")
+}
+
+// A presence scan is priced, not preferred: it walks and fetches every entry
+// of the sparse index, so it loses to a full scan once most documents carry
+// the field.
+func TestPlanner_PresenceScanCostedAgainstFullScan(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		every     int // one document in `every` lacks the field
+		wantIndex bool
+	}{
+		{"dense", 400, false},
+		{"rare", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "p", Fields: []string{"p"}, Sparse: true}))
+			want := 0
+			for i := range 400 {
+				doc := fmt.Sprintf(`{"id":%d,"p":%d}`, i, i)
+				if (tc.every == 0 && i%40 != 0) || (tc.every != 0 && i%tc.every == 1) {
+					doc = fmt.Sprintf(`{"id":%d}`, i)
+				} else {
+					want++
+				}
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(doc)))
+			}
+			q := coll.Find(`{"p":{"$exists":true}}`)
+			explain, err := q.Explain(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantIndex, plannerIndexUsed(explain, "p"), explain.Sql)
+			cnt, err := q.Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, want, cnt)
+		})
+	}
+}
+
+func plannerIndexUsed(explain Explain, name string) bool {
+	for _, ie := range explain.Indexes {
+		if ie.Used && ie.Name == name {
+			return true
+		}
+	}
+	return false
 }

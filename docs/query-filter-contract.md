@@ -80,19 +80,22 @@ build per query and carry no such guarantee.
 
 8. **A filter overriding `Ok`'s truth direction must be checked against
    `GuaranteesPresence`.** It probes the inner filter's `Ok` directly
-   (`!Ok(nil) && !Ok(null)` ⇒ "guarantees presence") — a fail-closed `Ok`
-   reads as the AGGRESSIVE answer and feeds sparse-index selection. Source
-   filters get explicit `false` arms there; any future `Ok`-overriding filter
-   needs the same.
+   (`!Ok(nil)` ⇒ "guarantees presence") — a fail-closed `Ok` reads as the
+   AGGRESSIVE answer and feeds sparse-index selection. Source filters get
+   explicit `false` arms there; any future `Ok`-overriding filter needs the
+   same.
 
 9. **Null matches missing.** A missing field evaluates as an explicit `null`
    throughout the filter surface: `Ok` receives a nil `*anyenc.Value`, the
    index stores the doc under the `TypeNull` key, and every equality-family
    operator treats the two identically — `{"$eq":null}`, `{"$in":[…,null,…]}`
    match missing fields; `{"$ne":null}`, `{"$nin":[…,null,…]}` exclude them
-   (Mongo's null model). Sparse-index selection follows automatically:
-   `GuaranteesPresence` probes `Ok(nil)`/`Ok(null)`, so an operator matching
-   either keeps sparse indexes out of the plan.
+   (Mongo's null model). Only a sparse index tells the two apart: it holds
+   an explicit null under the `TypeNull` key and has no entry for a missing
+   field. Sparse-index selection follows automatically: `GuaranteesPresence`
+   probes `Ok(nil)`, so an operator matching a missing field keeps sparse
+   indexes out of the plan, and `{"$exists":true}` is answered by scanning
+   one whole.
 
 10. **Array sort keys are the min/max element.** A sort field holding a
     non-empty array sorts by its MINIMUM element ascending / MAXIMUM element
@@ -224,8 +227,8 @@ build per query and carry no such guarantee.
     One definition feeds every consumer: `Key.Ok` (`LeafFilter`), index
     entries (one per `anyenc.AppendIndexValues` value, fanning out like a
     leaf array — the multikey flag, per-doc dedup and sparse handling follow;
-    a sparse index holds a document only when every field has a present,
-    non-null value somewhere in it, and then writes every key that has at
+    a sparse index holds a document only when every field exists somewhere
+    in it (an explicit null exists), and then writes every key that has at
     least one present field — `{"a":[{"b":1},{"c":2}]}` under a sparse
     `(a.b, a.c)` has keys `(1, null)` and `(null, 2)`; fields of a COMPOUND
     index that run

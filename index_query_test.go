@@ -2942,8 +2942,8 @@ func TestIndex_ArrayNested_WholeArrayEquality_UsesIndex(t *testing.T) {
 }
 
 // act-31: A null ARRAY ELEMENT is indexed as a real element (the sparse
-// guard only short-circuits whole-field null), so it survives even on a
-// sparse index. On a non-sparse index a null element makes a doc
+// guard drops only a missing field), so it survives even on a sparse
+// index. On a non-sparse index a null element makes a doc
 // indistinguishable from a missing-field doc by a {tags:null} query.
 // Duplicate nulls dedup within a doc.
 func TestIndex_ArrayNested_NullElementInArray_IndexedAndQueryable(t *testing.T) {
@@ -2966,8 +2966,8 @@ func TestIndex_ArrayNested_NullElementInArray_IndexedAndQueryable(t *testing.T) 
 	require.NoError(t, err)
 	assert.Equal(t, 1, aA)
 
-	// Sub B: sparse contrast. The null element is still indexed (v is an
-	// array, so the sparse guard does not fire); only the missing-field doc
+	// Sub B: sparse contrast. The null element is still indexed (every
+	// existing leaf is); only the missing-field doc
 	// is skipped from the index. It is NOT, however, skipped from the result:
 	// {tags:null} matches a missing field too (see Sub A), so the planner must
 	// not seek the sparse index here — doing so would silently drop id:2.
@@ -3751,7 +3751,7 @@ func TestIndex_ArraySortOrderProvidingGate(t *testing.T) {
 	})
 }
 
-// A sparse index writes no entry for a null/missing leaf; the index-order
+// A sparse index writes no entry for a missing leaf; the index-order
 // dedup must elect the canonical entry among the entries that exist.
 func TestIndex_ArrayNested_SparseDedupKeepsDoc(t *testing.T) {
 	fx := newFixture(t)
@@ -4033,6 +4033,153 @@ func TestIndex_ArrayNested_SparseCompoundSharedArray(t *testing.T) {
 	}
 }
 
+// A sparse index holds exactly the documents carrying its fields — explicit
+// nulls included — so every predicate that rejects a missing field may plan
+// on it, and {$exists:true} is answered by scanning it whole. Each filter is
+// checked against an unindexed twin, with and without the index forced.
+func TestIndex_Sparse_PresenceSemantics(t *testing.T) {
+	fx := newFixture(t)
+	plain, err := fx.CreateCollection(ctx, "plain")
+	require.NoError(t, err)
+	sparse, err := fx.CreateCollection(ctx, "sparse")
+	require.NoError(t, err)
+	require.NoError(t, sparse.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
+
+	docs := []string{
+		`{"id":1,"a":1}`,
+		`{"id":2,"a":null}`,
+		`{"id":3,"a":[]}`,
+		`{"id":4,"a":[1,null]}`,
+		`{"id":5,"a":"x"}`,
+		`{"id":6,"a":false}`,
+	}
+	for i := 7; i <= 400; i++ {
+		docs = append(docs, fmt.Sprintf(`{"id":%d,"b":%d}`, i, i))
+	}
+	for _, d := range docs {
+		require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
+		require.NoError(t, sparse.Insert(ctx, anyenc.MustParseJson(d)))
+	}
+	// 1; null; []; 1, null, [1,null]; "x"; false
+	assertIndexLen(t, sparse.GetIndexes()[0], 1+1+1+3+1+1)
+
+	hint := IndexHint{IndexName: "a", Boost: 1 << 30}
+	usesIndex := func(q Query) bool {
+		ex, err := q.Explain(ctx)
+		require.NoError(t, err)
+		for _, ix := range ex.Indexes {
+			if ix.Used {
+				return true
+			}
+		}
+		return false
+	}
+	for _, tc := range []struct {
+		filter string
+		usable bool // the sparse index may answer it
+	}{
+		{`{"a":{"$exists":true}}`, true},
+		{`{"a":{"$exists":true},"id":{"$gt":2}}`, true},
+		{`{"a":{"$type":"null"}}`, true},
+		{`{"a":{"$ne":null}}`, true},
+		{`{"a":{"$gt":0}}`, true},
+		{`{"a":1}`, true},
+		{`{"a":{"$in":[1,"x"]}}`, true},
+		{`{"a":{"$exists":false}}`, false},
+		{`{"a":null}`, false},
+		{`{"a":{"$in":[null,1]}}`, false},
+		{`{"a":{"$ne":1}}`, false},
+		{`{"a":{"$nin":[1]}}`, false},
+		{`{"a":{"$not":{"$gt":0}}}`, false},
+		{`{"$or":[{"a":1},{"b":7}]}`, false},
+		{`{"b":{"$gt":390}}`, false},
+	} {
+		want := collectIntField(t, plain.Find(tc.filter), "id")
+		for _, q := range []Query{sparse.Find(tc.filter), sparse.Find(tc.filter).IndexHint(hint)} {
+			assert.ElementsMatch(t, want, collectIntField(t, q, "id"), tc.filter)
+			cnt, err := q.Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, len(want), cnt, tc.filter)
+		}
+		assert.Equal(t, tc.usable, usesIndex(sparse.Find(tc.filter).IndexHint(hint)), tc.filter)
+	}
+
+	// The presence cut is priced, not forced: 6 of 400 documents carry the
+	// field, so the whole-index scan wins on cost alone.
+	assert.True(t, usesIndex(sparse.Find(`{"a":{"$exists":true}}`)))
+
+	// The index provides the order once presence is guaranteed.
+	for _, sort := range []string{"a", "-a"} {
+		q := sparse.Find(`{"a":{"$exists":true}}`).Sort(sort, "id")
+		assert.Equal(t,
+			collectIntField(t, plain.Find(`{"a":{"$exists":true}}`).Sort(sort, "id"), "id"),
+			collectIntField(t, q, "id"), sort)
+	}
+}
+
+// A compound sparse index holds a document only when every field exists, so
+// it answers presence only when the filter guarantees all of them.
+func TestIndex_Sparse_PresenceCompoundAndFanOut(t *testing.T) {
+	fx := newFixture(t)
+	plain, err := fx.CreateCollection(ctx, "plain")
+	require.NoError(t, err)
+	sparse, err := fx.CreateCollection(ctx, "sparse")
+	require.NoError(t, err)
+	require.NoError(t, sparse.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a", "b"}, Sparse: true}))
+	require.NoError(t, sparse.EnsureIndex(ctx, IndexInfo{Name: "xy", Fields: []string{"x.y"}, Sparse: true}))
+
+	docs := []string{
+		`{"id":1,"a":1,"b":2}`,
+		`{"id":2,"a":null,"b":2}`,
+		`{"id":3,"a":1}`,
+		`{"id":4,"b":null}`,
+		`{"id":5,"a":null,"b":null}`,
+		`{"id":6,"x":[{"y":1},{"z":2}]}`,
+		`{"id":7,"x":[{"y":null}]}`,
+		`{"id":8,"x":[{"z":1}]}`,
+		`{"id":9,"x":[]}`,
+		`{"id":10,"x":{"y":[]}}`,
+	}
+	for i := 11; i <= 300; i++ {
+		docs = append(docs, fmt.Sprintf(`{"id":%d}`, i))
+	}
+	for _, d := range docs {
+		require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
+		require.NoError(t, sparse.Insert(ctx, anyenc.MustParseJson(d)))
+	}
+
+	for _, tc := range []struct {
+		filter, index string
+		usable        bool
+	}{
+		{`{"a":{"$exists":true},"b":{"$exists":true}}`, "ab", true},
+		{`{"a":{"$exists":true},"b":2}`, "ab", true},
+		{`{"a":{"$exists":true}}`, "ab", false},
+		{`{"b":{"$exists":true}}`, "ab", false},
+		{`{"a":{"$exists":true},"b":null}`, "ab", false},
+		{`{"x.y":{"$exists":true}}`, "xy", true},
+		{`{"x.y":{"$type":"null"}}`, "xy", true},
+		{`{"x.y":{"$exists":false}}`, "xy", false},
+		{`{"x.y":null}`, "xy", false},
+	} {
+		want := collectIntField(t, plain.Find(tc.filter), "id")
+		hint := IndexHint{IndexName: tc.index, Boost: 1 << 30}
+		for _, q := range []Query{sparse.Find(tc.filter), sparse.Find(tc.filter).IndexHint(hint)} {
+			assert.ElementsMatch(t, want, collectIntField(t, q, "id"), tc.filter)
+			cnt, err := q.Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, len(want), cnt, tc.filter)
+		}
+		ex, err := sparse.Find(tc.filter).IndexHint(hint).Explain(ctx)
+		require.NoError(t, err)
+		used := false
+		for _, ix := range ex.Indexes {
+			used = used || (ix.Used && ix.Name == tc.index)
+		}
+		assert.Equal(t, tc.usable, used, "%s: %s", tc.filter, ex.Sql)
+	}
+}
+
 // A Count may verify an uncovered equality by probing a single-field index
 // instead of fetching the document. A sparse index has no entry for a
 // document missing the field, so it can verify only a predicate that rejects
@@ -4067,4 +4214,212 @@ func TestIndex_Sparse_CountVerifyProbe(t *testing.T) {
 		assert.Equal(t, want, cnt, "Count %s", filter)
 		assert.Len(t, collectIntField(t, coll.Find(filter), "id"), want, "Iter %s", filter)
 	}
+}
+
+// Sort + Limit + Offset over a presence scan, forward and reverse: paging
+// over a bound-less sparse index must yield the window an unindexed
+// collection does.
+func TestIndex_Sparse_PresenceScanSortLimitOffset(t *testing.T) {
+	fx := newFixture(t)
+	plain, err := fx.CreateCollection(ctx, "plain")
+	require.NoError(t, err)
+	sparse, err := fx.CreateCollection(ctx, "sparse")
+	require.NoError(t, err)
+	require.NoError(t, sparse.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
+
+	var docs []string
+	for i := range 40 {
+		docs = append(docs, fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%7))
+	}
+	docs = append(docs,
+		`{"id":100,"a":null}`,
+		`{"id":101,"a":null}`,
+		`{"id":102,"a":[3,null]}`,
+	)
+	for i := 200; i < 600; i++ {
+		docs = append(docs, fmt.Sprintf(`{"id":%d,"z":%d}`, i, i))
+	}
+	for _, d := range docs {
+		require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
+		require.NoError(t, sparse.Insert(ctx, anyenc.MustParseJson(d)))
+	}
+
+	hint := IndexHint{IndexName: "a", Boost: 1 << 30}
+	for _, filter := range []string{`{"a":{"$exists":true}}`, `{"a":{"$ne":null}}`, `{"a":{"$type":"null"}}`} {
+		for _, sort := range []string{"a", "-a"} {
+			for _, off := range []uint{0, 1, 5, 12} {
+				want := collectIntField(t, plain.Find(filter).Sort(sort, "id").Offset(off).Limit(4), "id")
+				for _, q := range []Query{
+					sparse.Find(filter).Sort(sort, "id").Offset(off).Limit(4),
+					sparse.Find(filter).Sort(sort, "id").Offset(off).Limit(4).IndexHint(hint),
+				} {
+					assert.Equal(t, want, collectIntField(t, q, "id"), "%s %s off=%d", filter, sort, off)
+				}
+			}
+		}
+	}
+}
+
+// $exists:true on a sparse index alongside a bounded predicate on a
+// second, dense index. Whichever plan wins must return the same rows.
+func TestIndex_Sparse_PresenceWithBoundedOtherIndex(t *testing.T) {
+	fx := newFixture(t)
+	plain, err := fx.CreateCollection(ctx, "plain")
+	require.NoError(t, err)
+	both, err := fx.CreateCollection(ctx, "both")
+	require.NoError(t, err)
+	require.NoError(t, both.EnsureIndex(ctx,
+		IndexInfo{Name: "opt", Fields: []string{"opt"}, Sparse: true},
+		IndexInfo{Name: "n", Fields: []string{"n"}},
+	))
+	for i := range 600 {
+		d := fmt.Sprintf(`{"id":%d,"n":%d}`, i, i%100)
+		switch i % 50 {
+		case 0:
+			d = fmt.Sprintf(`{"id":%d,"n":%d,"opt":%d}`, i, i%100, i)
+		case 1:
+			d = fmt.Sprintf(`{"id":%d,"n":%d,"opt":null}`, i, i%100)
+		}
+		require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
+		require.NoError(t, both.Insert(ctx, anyenc.MustParseJson(d)))
+	}
+	for _, filter := range []string{
+		`{"opt":{"$exists":true},"n":{"$lt":5}}`,
+		`{"opt":{"$exists":true},"n":0}`,
+		`{"opt":{"$exists":true},"n":{"$gte":0}}`,
+		`{"opt":{"$type":"null"},"n":{"$lt":5}}`,
+		`{"opt":{"$exists":false},"n":0}`,
+	} {
+		want := collectIntField(t, plain.Find(filter), "id")
+		for _, hints := range [][]IndexHint{
+			nil,
+			{{IndexName: "opt", Boost: 1 << 30}},
+			{{IndexName: "n", Boost: 1 << 30}},
+		} {
+			q := both.Find(filter)
+			if hints != nil {
+				q = q.IndexHint(hints...)
+			}
+			assert.ElementsMatch(t, want, collectIntField(t, q, "id"), "%s %v", filter, hints)
+			cnt, err := q.Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, len(want), cnt, "%s %v", filter, hints)
+		}
+	}
+}
+
+// Update and delete transitions value <-> null <-> missing on a
+// COMPOUND sparse index, checked against the raw entry count and an
+// unindexed twin.
+func TestIndex_Sparse_CompoundTransitions(t *testing.T) {
+	fx := newFixture(t)
+	plain, err := fx.CreateCollection(ctx, "plain")
+	require.NoError(t, err)
+	sparse, err := fx.CreateCollection(ctx, "sparse")
+	require.NoError(t, err)
+	require.NoError(t, sparse.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a", "b"}, Sparse: true}))
+
+	apply := func(docs ...string) {
+		t.Helper()
+		for _, d := range docs {
+			v := anyenc.MustParseJson(d)
+			require.NoError(t, plain.UpsertOne(ctx, v))
+			require.NoError(t, sparse.UpsertOne(ctx, anyenc.MustParseJson(d)))
+		}
+	}
+	check := func(step string, entries int) {
+		t.Helper()
+		assert.Equal(t, entries, func() int {
+			n, err := sparse.GetIndexes()[0].Len(ctx)
+			require.NoError(t, err)
+			return n
+		}(), step)
+		for _, filter := range []string{
+			`{"a":{"$exists":true},"b":{"$exists":true}}`,
+			`{"a":{"$type":"null"},"b":{"$exists":true}}`,
+			`{"a":{"$exists":true},"b":{"$ne":null}}`,
+		} {
+			want := collectIntField(t, plain.Find(filter), "id")
+			hint := IndexHint{IndexName: "ab", Boost: 1 << 30}
+			assert.ElementsMatch(t, want, collectIntField(t, sparse.Find(filter).IndexHint(hint), "id"), "%s %s", step, filter)
+			cnt, err := sparse.Find(filter).IndexHint(hint).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, len(want), cnt, "%s %s", step, filter)
+		}
+	}
+
+	apply(`{"id":1,"a":1,"b":1}`, `{"id":2,"a":1}`, `{"id":3,"b":1}`, `{"id":4}`)
+	check("insert", 1)
+
+	apply(`{"id":1,"a":null,"b":1}`) // value -> null, still indexed
+	check("a->null", 1)
+	apply(`{"id":1,"b":1}`) // null -> missing, drops out
+	check("a->missing", 0)
+	apply(`{"id":2,"a":1,"b":null}`) // b appears as null, comes in
+	check("b->null", 1)
+	apply(`{"id":3,"a":[1,null],"b":1}`) // array fan-out, both fields present
+	check("a->array", 1+3)
+
+	require.NoError(t, plain.DeleteId(ctx, 3))
+	require.NoError(t, sparse.DeleteId(ctx, 3))
+	check("delete", 1)
+}
+
+// Over a path through an array a missing leaf sits next to existing ones. An
+// explicit null after a missing sibling is still a key — in the index, for the
+// index-order dedup and for a unique constraint — and a null bound satisfied
+// through the missing leaf must not seek a sparse index that never wrote it.
+func TestIndex_Sparse_MissingLeafBesideExisting(t *testing.T) {
+	fx := newFixture(t)
+	docs := []string{
+		`{"id":1,"x":[{"y":null},{"z":9}]}`,
+		`{"id":2,"x":[{"z":9},{"y":null}]}`,
+		`{"id":3,"x":[{"z":9},{"y":null},{"y":5}]}`,
+		`{"id":4,"x":[{"y":1},{"z":2}]}`,
+		`{"id":5,"x":[{"y":1,"z":2},{"w":9}]}`,
+		`{"id":6,"x":[{"z":1},{"w":2}]}`,
+	}
+	plain, err := fx.CreateCollection(ctx, "plain")
+	require.NoError(t, err)
+	for _, d := range docs {
+		require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
+	}
+	for _, fields := range [][]string{{"x.y"}, {"-x.y"}, {"x.y", "x.z"}} {
+		coll, err := fx.CreateCollection(ctx, fmt.Sprint(fields))
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: fields, Sparse: true}))
+		for _, d := range docs {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+		}
+		hint := IndexHint{IndexName: "s", Boost: 1 << 30}
+		for _, filter := range []string{
+			`{"x.y":{"$exists":true}}`,
+			`{"x.y":{"$type":"null"}}`,
+			`{"x.y":{"$exists":true,"$eq":null}}`,
+			`{"$and":[{"x.y":{"$exists":true}},{"x.y":null}]}`,
+			`{"x.y":{"$exists":true,"$gte":null}}`,
+			`{"x.y":{"$exists":true,"$lte":null}}`,
+			`{"x.y":{"$exists":true},"x":{"$elemMatch":{"y":null}}}`,
+			`{"x.y":{"$exists":true},"$or":[{"x.y":null},{"x.y":7}]}`,
+			`{"x.y":{"$exists":true,"$eq":null},"x.z":{"$exists":true,"$eq":null}}`,
+			`{"x.y":{"$exists":true},"x.z":{"$exists":true}}`,
+		} {
+			want := collectIntField(t, plain.Find(filter), "id")
+			for _, sort := range []string{"id", "x.y", "-x.y"} {
+				q := coll.Find(filter).Sort(sort, "id").IndexHint(hint)
+				assert.Equal(t, collectIntField(t, plain.Find(filter).Sort(sort, "id"), "id"),
+					collectIntField(t, q, "id"), "%v %s sort %s", fields, filter, sort)
+			}
+			cnt, err := coll.Find(filter).IndexHint(hint).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, len(want), cnt, "%v %s", fields, filter)
+		}
+	}
+
+	uniq, err := fx.CreateCollection(ctx, "uniq")
+	require.NoError(t, err)
+	require.NoError(t, uniq.EnsureIndex(ctx, IndexInfo{Fields: []string{"x.y"}, Sparse: true, Unique: true}))
+	require.NoError(t, uniq.Insert(ctx, anyenc.MustParseJson(`{"id":1,"x":[{"z":1},{"y":null}]}`)))
+	require.ErrorIs(t, uniq.Insert(ctx, anyenc.MustParseJson(`{"id":2,"x":[{"z":1},{"y":null}]}`)), ErrUniqueConstraint)
+	require.NoError(t, uniq.Insert(ctx, anyenc.MustParseJson(`{"id":3,"x":[{"z":1},{"w":2}]}`)))
 }

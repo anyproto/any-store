@@ -286,7 +286,7 @@ func TestFtsReadYourWrites_InsideWriteTx(t *testing.T) {
 
 // A $text plan driven by a sparse index over a path through an array of
 // objects: the index-order dedup must elect among the entries the sparse
-// index wrote, never a null/missing leaf.
+// index wrote, never a missing leaf.
 func TestFtsOps_SparseTraversedIndexKeepsDocs(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -316,4 +316,82 @@ func TestFtsOps_SparseTraversedIndexKeepsDocs(t *testing.T) {
 			assert.Equal(t, 3, n)
 		})
 	}
+}
+
+// The $text plan applies the same sparse-completeness gate: a presence
+// predicate admits a sparse index as the text plan's driver, and the rows
+// must match the same query with the index absent.
+func TestFtsOps_SparsePresencePredicates(t *testing.T) {
+	for _, filter := range []string{
+		`{"$text":{"$search":"alpha"},"opt":{"$exists":true}}`,
+		`{"$text":{"$search":"alpha"},"opt":{"$type":"null"}}`,
+		`{"$text":{"$search":"alpha"},"opt":null}`,
+		`{"$text":{"$search":"alpha"},"opt":{"$exists":false}}`,
+	} {
+		fx := newFixture(t)
+		plain, err := fx.CreateCollection(ctx, "plain")
+		require.NoError(t, err)
+		sparse, err := fx.CreateCollection(ctx, "sparse")
+		require.NoError(t, err)
+		require.NoError(t, plain.EnsureIndex(ctx, IndexInfo{Kind: IndexKindFulltext, Fields: []string{"text"}}))
+		require.NoError(t, sparse.EnsureIndex(ctx,
+			IndexInfo{Kind: IndexKindFulltext, Fields: []string{"text"}},
+			IndexInfo{Name: "opt", Fields: []string{"opt"}, Sparse: true},
+		))
+		var docs []string
+		for i := range 200 {
+			d := fmt.Sprintf(`{"id":"d%d","text":"alpha"}`, i)
+			switch i % 40 {
+			case 0:
+				d = fmt.Sprintf(`{"id":"d%d","text":"alpha","opt":%d}`, i, i)
+			case 1:
+				d = fmt.Sprintf(`{"id":"d%d","text":"alpha","opt":null}`, i)
+			}
+			docs = append(docs, d)
+		}
+		insertJSON(t, plain, docs...)
+		insertJSON(t, sparse, docs...)
+
+		want := sortedIDs(collectIdsString(t, plain.Find(filter)))
+		hint := IndexHint{IndexName: "opt", Boost: 1_000_000}
+		for _, q := range []Query{sparse.Find(filter), sparse.Find(filter).IndexHint(hint)} {
+			assert.Equal(t, want, sortedIDs(collectIdsString(t, q)), filter)
+			n, err := q.Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, len(want), n, filter)
+		}
+	}
+}
+
+// A sorted $text query whose residual guarantees a sparse index's field scans
+// that index in order: the scan is priced from the index's own population,
+// not the collection's.
+func TestFtsOps_SparsePresenceSortDrivesScan(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx,
+		IndexInfo{Kind: IndexKindFulltext, Fields: []string{"text"}},
+		IndexInfo{Name: "p", Fields: []string{"p"}, Sparse: true},
+	))
+	var docs, want []string
+	for i := range 2000 {
+		d := fmt.Sprintf(`{"id":"d%04d","text":"alpha"}`, i)
+		if i%50 == 0 {
+			d = fmt.Sprintf(`{"id":"d%04d","text":"alpha","p":%d}`, i, i)
+			want = append(want, fmt.Sprintf("d%04d", i))
+		}
+		docs = append(docs, d)
+	}
+	insertJSON(t, coll, docs...)
+
+	q := coll.Find(`{"$text":{"$search":"alpha"},"p":{"$exists":true}}`).Sort("p")
+	explain, err := q.Explain(ctx)
+	require.NoError(t, err)
+	used := false
+	for _, ie := range explain.Indexes {
+		used = used || (ie.Used && ie.Name == "p")
+	}
+	assert.True(t, used, explain.Sql)
+	assert.Equal(t, want, collectIdsString(t, q))
 }

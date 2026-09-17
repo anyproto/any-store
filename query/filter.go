@@ -1188,56 +1188,137 @@ func IndexBoundsExact(f Filter, reverse bool) bool {
 	})
 }
 
-// presenceNullProbe is an explicit JSON null used by GuaranteesPresence to test
-// whether a predicate rejects a present-but-null value, as distinct from a
-// missing field (which probes as a nil *anyenc.Value).
-var presenceNullProbe = anyenc.MustParseJson("null")
-
-// GuaranteesPresence reports whether every document matching f must carry a
-// present, non-null value at fieldName. It is true only when some top-level
-// conjunct constrains fieldName with a predicate that rejects BOTH a missing
-// field (a nil value) and an explicit null — exactly the two cases a sparse
-// index omits (see index.writeValues: it drops a key when any indexed field is
-// nil or TypeNull).
+// GuaranteesPresence reports whether a SPARSE index on fieldName can serve f:
+// every matching document carries fieldName, and every index bound f puts on
+// fieldName lands on a key the index wrote. A sparse index omits a missing
+// leaf (see index.emitLeaf: presence is the leaf's existence, and an explicit
+// null is indexed), so both hold when
 //
-// The planner uses this to decide whether a SPARSE index can represent the whole
-// matching set: a sparse index that omits some matching document would silently
-// drop rows if seeked. Probing the field's own sub-filter with Ok keeps this in
-// lockstep with match semantics, so it is exact rather than a rule-of-thumb —
-// e.g. {$exists:true} yields false here because an explicit-null document
-// matches $exists:true yet is absent from the sparse index. An OR, a
-// $exists:false, a $ne, an equality-to-null, an $in containing null, or no
-// predicate on the field at all all yield false, keeping that sparse index out
-// of consideration (the planner then falls back to a complete index or scan).
+//   - some top-level conjunct on fieldName rejects a missing field (a nil
+//     value): {$exists:true}, a range, an equality to a non-null value,
+//     {$type:"null"}, {$ne:null}; and
+//   - no conjunct that admits a missing field contributes bounds on
+//     fieldName. Over a path through an array the conjuncts are satisfied
+//     leaf by leaf, so {"x.y":{"$exists":true,"$eq":null}} matches
+//     {"x":[{"y":1},{"z":2}]} through the missing leaf while its null bound
+//     seeks a key the index never wrote. An $or, an $elemMatch on a parent
+//     path and any other bound source are screened the same way.
+//
+// Probing the predicates' own Ok keeps this in lockstep with match semantics.
+// An OR, a $exists:false, a negation other than {$ne:null}, an
+// equality-to-null, an $in containing null, or no predicate on the field at
+// all yield false, keeping that sparse index out of consideration (the planner
+// then falls back to a complete index or scan).
 func GuaranteesPresence(f Filter, fieldName string) bool {
+	guaranteed, sound := sparsePresence(f, fieldName)
+	return guaranteed && sound
+}
+
+// sparsePresence walks the top-level conjunction: guaranteed reports a
+// conjunct on fieldName that rejects a missing field, sound that no conjunct
+// admitting one bounds fieldName.
+func sparsePresence(f Filter, fieldName string) (guaranteed, sound bool) {
 	switch ft := f.(type) {
 	case Key:
 		// Source filters (Knn, Text) are matched by an index, not by Ok, so
 		// their Ok says nothing about presence. Knn is the trap this guard
-		// exists for: its fail-closed Ok would probe !false && !false == true —
-		// the AGGRESSIVE answer, feeding sparse-index selection with a claim
-		// the filter never made. (Text is "safe" only because its Ok fails
-		// open; special-case it anyway rather than lean on that accident.)
+		// exists for: its fail-closed Ok would probe as rejecting a missing
+		// field — the AGGRESSIVE answer, feeding sparse-index selection with
+		// a claim the filter never made. (Text is "safe" only because its Ok
+		// fails open; special-case it anyway rather than lean on that
+		// accident.)
 		if isSourceLeaf(ft.Filter) {
+			return false, true
+		}
+		if pathIs(ft.Path, fieldName) {
+			return leafPresence(ft.Filter, fieldName)
+		}
+		// Only a parent path re-keys bounds onto fieldName: the object form
+		// of $elemMatch constrains the sub-field inside one element.
+		if !pathIsParent(ft.Path, fieldName) {
+			return false, true
+		}
+		if cond, sub, ok := ft.elemMatchSubField(fieldName); ok {
+			return sparsePresence(cond, sub)
+		}
+		return false, true
+	case And:
+		sound = true
+		for _, sub := range ft {
+			g, s := sparsePresence(sub, fieldName)
+			if !s {
+				return false, false
+			}
+			guaranteed = guaranteed || g
+		}
+		return guaranteed, sound
+	case *And:
+		return sparsePresence(*ft, fieldName)
+	case nil:
+		return false, true
+	default:
+		return false, len(f.IndexBounds(fieldName, nil)) == 0
+	}
+}
+
+// leafPresence is sparsePresence for the inner filter of a Key on fieldName,
+// whose conjuncts are quantified over the leaf set independently.
+func leafPresence(f Filter, fieldName string) (guaranteed, sound bool) {
+	switch ft := f.(type) {
+	case And:
+		sound = true
+		for _, sub := range ft {
+			g, s := leafPresence(sub, fieldName)
+			if !s {
+				return false, false
+			}
+			guaranteed = guaranteed || g
+		}
+		return guaranteed, sound
+	case *And:
+		return leafPresence(*ft, fieldName)
+	}
+	var buf syncpool.DocBuffer
+	if !f.Ok(nil, &buf) {
+		return true, true
+	}
+	return false, len(f.IndexBounds(fieldName, nil)) == 0
+}
+
+// pathIs reports whether path joined by "." equals name, without building the
+// joined string.
+func pathIs(path []string, name string) bool {
+	for i, seg := range path {
+		if i > 0 {
+			if len(name) == 0 || name[0] != '.' {
+				return false
+			}
+			name = name[1:]
+		}
+		if !strings.HasPrefix(name, seg) {
 			return false
 		}
-		if strings.Join(ft.Path, ".") == fieldName {
-			var buf syncpool.DocBuffer
-			return !ft.Filter.Ok(nil, &buf) && !ft.Filter.Ok(presenceNullProbe, &buf)
-		}
-		return false
-	case And:
-		for _, sub := range ft {
-			if GuaranteesPresence(sub, fieldName) {
-				return true
-			}
-		}
-		return false
-	case *And:
-		return GuaranteesPresence(*ft, fieldName)
-	default:
-		return false
+		name = name[len(seg):]
 	}
+	return len(name) == 0 && len(path) > 0
+}
+
+// pathIsParent reports whether path joined by "." is a proper dotted prefix
+// of name.
+func pathIsParent(path []string, name string) bool {
+	for i, seg := range path {
+		if i > 0 {
+			if len(name) == 0 || name[0] != '.' {
+				return false
+			}
+			name = name[1:]
+		}
+		if !strings.HasPrefix(name, seg) {
+			return false
+		}
+		name = name[len(seg):]
+	}
+	return len(path) > 0 && len(name) > 1 && name[0] == '.'
 }
 
 type Exists struct{}

@@ -2008,7 +2008,7 @@ func TestPlan_String_NoPlan(t *testing.T) {
 // (with and without seek-sort cost).
 func TestFormatSeekDetails(t *testing.T) {
 	t.Run("no_sort", func(t *testing.T) {
-		s := formatSeekDetails(3, 10, CostDocFetch, 0)
+		s := formatSeekDetails(3, 10, CostDocFetch, 0, 0)
 		assert.Contains(t, s, fmt.Sprintf("3×seek(%.1f)", CostIndexSeek))
 		assert.Contains(t, s, fmt.Sprintf("10×fetch(%.1f)", CostDocFetch))
 		assert.Contains(t, s, fmt.Sprintf("10×filter(%.1f)", CostFilter))
@@ -2021,7 +2021,7 @@ func TestFormatSeekDetails(t *testing.T) {
 	})
 	t.Run("with_sort", func(t *testing.T) {
 		seekSortCost := 42.5
-		s := formatSeekDetails(1, 5, CostDocFetch, seekSortCost)
+		s := formatSeekDetails(1, 5, CostDocFetch, seekSortCost, 0)
 		assert.Contains(t, s, fmt.Sprintf("+ sort=%.1f", seekSortCost))
 		total := 1*CostIndexSeek + 5*CostDocFetch + 5*CostFilter + seekSortCost
 		expectedSuffix := fmt.Sprintf("= %.1f", total)

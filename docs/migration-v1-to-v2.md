@@ -300,18 +300,24 @@ v1 encodes binary values as base64 **strings** in its JSON representation
 value into a string, and the original type cannot be recovered without
 out-of-band schema knowledge. Use the raw `anyenc` bytes as shown above.
 
-## Sparse indexes: same contents, stricter planning
+## Sparse indexes: nulls are indexed, planning is stricter
 
-Index contents migrate one to one. Both versions exclude a document from a
-sparse index when an indexed field is missing **or explicitly null** — the rule
-is unchanged.
+v1 excludes a document from a sparse index when an indexed field is missing
+**or explicitly null**. v2 follows MongoDB: only a missing field keeps a
+document out, and an explicit null is indexed under the null key. The index is
+rebuilt by `EnsureIndex` during migration. A **unique** sparse index holds
+explicit nulls unique in v2 — two documents with `field: null` collide, while
+documents missing the field still coexist — so `EnsureIndex` returns
+`ErrUniqueConstraint` and creates nothing when the v1 data holds two of them.
+Resolve the duplicates before creating the index.
 
-What changed is plan selection. v1's planner did not consider sparse
-completeness at all, so it could serve a query from a sparse index that did not
-contain every matching document. v2 uses a sparse index only when the filter
-guarantees each indexed field is present and non-null, which `$exists: true`
-does not (an explicit null is "present" but unindexed). Such queries now fall
-back to a complete index or a full scan: correct results, sometimes slower.
+Plan selection changed too. v1's planner did not consider sparse completeness
+at all, so it could serve a query from a sparse index that did not contain
+every matching document. v2 uses a sparse index only when the filter guarantees
+each indexed field exists — a range, an equality to a non-null value,
+`$exists: true`, `$type`, `$ne: null`. A predicate that matches a missing field
+(`field: null`, `$exists: false`, `$ne: x`) falls back to a complete index or a
+full scan: correct results, sometimes slower.
 
 ## Encoding edge cases
 
