@@ -109,6 +109,33 @@ var fillKeysCases = []fillKeysCaseIndex{
 		},
 	},
 	{
+		// A non-object element of the shared array is a missing leaf for
+		// every field running through it, as in path matching.
+		name: "shared array non-object element",
+		info: IndexInfo{Fields: []string{"x.y", "x.z"}},
+		cases: []fillKeysCase{
+			{`{"id":1,"x":[[{"y":1,"z":2}]]}`, []string{`null/null`}},
+			{`{"id":1,"x":[[{"z":5}],{"y":1,"z":2}]}`, []string{`null/null`, `1/2`}},
+			{`{"id":1,"x":[3,null,[{"z":5}],{"y":1}]}`, []string{`null/null`, `1/null`}},
+		},
+	},
+	{
+		name: "shared array non-object element positional",
+		info: IndexInfo{Fields: []string{"x.0.y", "x.0.z"}},
+		cases: []fillKeysCase{
+			{`{"id":1,"x":[[{"y":1,"z":2}]]}`, []string{`1/2`}},
+			{`{"id":1,"x":[[[{"y":1,"z":2}]]]}`, []string{`null/null`}},
+		},
+	},
+	{
+		name: "shared array non-object element sparse",
+		info: IndexInfo{Fields: []string{"x.y", "x.z"}, Sparse: true},
+		cases: []fillKeysCase{
+			{`{"id":1,"x":[[{"z":1}],{"y":2}]}`, []string{}},
+			{`{"id":1,"x":[[{"y":1,"z":2}],{"y":3,"z":4}]}`, []string{`3/4`}},
+		},
+	},
+	{
 		// Reverse single-field index: keys are stored bitwise-inverted. Each
 		// `expected` entry is valid JSON; assertIdxKeyBuf detects the reverse
 		// field (idx.reverse[0]) and compares the raw key bytes against the
@@ -809,9 +836,7 @@ func randPresenceValue(rnd *rand.Rand, depth int) string {
 
 // A sparse index holds a document exactly when {$exists:true} matches every
 // indexed field, and the keys it builds for one document are distinct
-// (insertKeys Puts and counts each one). Fields sharing an array are keyed
-// one array level deeper than path matching reaches, so such an index holds
-// a superset: never less than the matching documents.
+// (insertKeys Puts and counts each one).
 func TestIndex_fillKeysBuf_SparseMembership(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
@@ -850,11 +875,7 @@ func TestIndex_fillKeysBuf_SparseMembership(t *testing.T) {
 				want = want && exists.Ok(v, &buf)
 			}
 			held := len(idx.keysBuf) > 0
-			if idx.cboInfo.SharedFrom < len(idx.fieldNames) {
-				require.True(t, held || !want, "%v %s", idx.info.Fields, doc)
-			} else {
-				require.Equal(t, want, held, "%v %s", idx.info.Fields, doc)
-			}
+			require.Equal(t, want, held, "%v %s", idx.info.Fields, doc)
 			seen := map[string]bool{}
 			for _, k := range idx.keysBuf {
 				require.False(t, seen[string(k)], "duplicate key: %v %s", idx.info.Fields, doc)
