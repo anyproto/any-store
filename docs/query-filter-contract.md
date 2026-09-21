@@ -60,7 +60,8 @@ build per query and carry no such guarantee.
    verb, `err == nil`. A custom filter that INVERTS its inner `Ok` reflects
    fail-closed into match-all, exactly like `Not` would — that is arbitrary
    user matching code, outside what any walk can guard. Pinned by
-   `TestKnn_InsideCustomFilterFailsClosed`.
+   `TestKnn_InsideCustomFilterFailsClosed` in the `any-store-tests`
+   repository.
 
 6. **`TypeVectorF32` is not orderable (Rule V).** In `Comp`, an ordering op
    (`$gt`/`$gte`/`$lt`/`$lte`) evaluates to `false` whenever either side is a
@@ -262,8 +263,9 @@ build per query and carry no such guarantee.
     and cross-type order is anyenc tag order (item 13) — Mongo sorts `[]`
     before null and orders objects type-first, then by field name.
     Pinned by `TestKey_PathThroughArrays`, `TestKey_PathThroughArrays_AllocFree`
-    (item 2 holds for traversal), `anyenc.TestAppendLeaves` and
-    `TestIndex_ArrayNested_NestedField_IntermediateArray_Traversed`.
+    (item 2 holds for traversal), `anyenc.TestAppendLeaves`, and
+    `TestIndex_ArrayNested_NestedField_IntermediateArray_Traversed` in the
+    `any-store-tests` repository.
 
 15. **`$elemMatch` binds predicates to one element.** `{"a":{"$elemMatch":
     C}}` matches when `a` is an array with an element satisfying `C` as a

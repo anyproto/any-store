@@ -47,7 +47,7 @@ func TestDb_WriteTx(t *testing.T) {
 			anyenc.MustParseJson(`{"id":2,"a":2}`),
 			anyenc.MustParseJson(`{"id":3,"a":3}`),
 		))
-		assertCollCountCtx(tx.Context(), t, coll, 3)
+		assertCollCountInTx(tx.Context(), t, coll, 3)
 
 		// this insert will fail because id:1 already exists, and should rollback to savepoint
 		require.Error(t, coll.Insert(tx.Context(),
@@ -55,7 +55,7 @@ func TestDb_WriteTx(t *testing.T) {
 			anyenc.MustParseJson(`{"id":5,"a":5}`),
 			anyenc.MustParseJson(`{"id":1,"a":6}`),
 		))
-		assertCollCountCtx(tx.Context(), t, coll, 3)
+		assertCollCountInTx(tx.Context(), t, coll, 3)
 
 		require.NoError(t, tx.Rollback())
 		assertCollCount(t, coll, 0)

@@ -21,8 +21,19 @@ import (
 	"github.com/anyproto/any-store/v2/query"
 )
 
+// ANYSTORE_TEST_PPROF=<addr> serves net/http/pprof for the run. Off by
+// default: an unconditional listener collides between concurrent runs and
+// hides the bind error.
 func init() {
-	go http.ListenAndServe(":6060", nil)
+	addr := os.Getenv("ANYSTORE_TEST_PPROF")
+	if addr == "" {
+		return
+	}
+	go func() {
+		if err := http.ListenAndServe(addr, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "pprof listener on %s: %v\n", addr, err)
+		}
+	}()
 }
 
 func TestQueries(t *testing.T) {

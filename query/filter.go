@@ -1373,8 +1373,9 @@ func (e TypeFilter) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 		// work. The [tag, tag+1) bound below does not survive inversion — on a
 		// DESCENDING index the reverse transform of a tag-10 range selects nothing
 		// at all, so Count and Iter both return 0 (measured; drop this guard and
-		// TestType_VectorF32_AcrossIndexes fails on every "-v" config). Costs a
-		// scan, which is the right price for a type that has no order.
+		// TestType_VectorF32_AcrossIndexes in any-store-tests:apitest fails on
+		// every "-v" config). Costs a scan, which is the right price for a type
+		// that has no order.
 		//
 		// This is separate from — and was masked by — the inverted-vector-tag read
 		// bug fixed in anyenc/parser.go: that one silently dropped vector-valued

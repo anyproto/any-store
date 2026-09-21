@@ -207,7 +207,7 @@ func setIndexRecord(t *testing.T, c *collection, name, field string, val func(a 
 }
 
 func TestIndexFormat_RebuildOnOpen(t *testing.T) {
-	skipIfInMemory(t)
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
 	dir := legacyFixture(t)
 	fx := newFixturePath(t, dir)
 	coll, err := fx.OpenCollection(ctx, "test")
@@ -238,7 +238,7 @@ func TestIndexFormat_RebuildOnOpen(t *testing.T) {
 // The rebuild happens in Open, so opening a collection never starts a write
 // transaction: a caller holding one and opening with a plain ctx returns.
 func TestIndexFormat_OpenCollectionUnderWriteTxReturns(t *testing.T) {
-	skipIfInMemory(t)
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
 	dir := legacyFixture(t)
 	fx := newFixturePath(t, dir)
 	tx, err := fx.WriteTx(ctx)
@@ -260,7 +260,7 @@ func TestIndexFormat_OpenCollectionUnderWriteTxReturns(t *testing.T) {
 // A stamp above the current version (a newer release wrote it) is rebuilt
 // into this release's format, whatever the index shape.
 func TestIndexFormat_NewerStampRebuilt(t *testing.T) {
-	skipIfInMemory(t)
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
 	dir := legacyFixture(t)
 	fx := newFixturePath(t, dir)
 	coll, err := fx.OpenCollection(ctx, "test")
@@ -282,7 +282,7 @@ func TestIndexFormat_NewerStampRebuilt(t *testing.T) {
 // rebuilds it. The peer is simulated on the handle's own db, followed by a
 // forced reconcile pass.
 func TestIndexFormat_OutdatedIndexNotPlanned(t *testing.T) {
-	skipIfInMemory(t)
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
 	dir := legacyFixture(t)
 	fx := newFixturePath(t, dir)
 	coll, err := fx.OpenCollection(ctx, "test")
@@ -332,7 +332,7 @@ func TestIndexFormat_OutdatedIndexNotPlanned(t *testing.T) {
 // no later Open retries, EnsureIndex with the same definition leaves it
 // alone, and dropping and recreating it reports the duplicate.
 func TestIndexFormat_RebuildUniqueViolationQuarantines(t *testing.T) {
-	skipIfInMemory(t)
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
 	dir := t.TempDir()
 	fx := newFixturePath(t, dir)
 	coll, err := fx.CreateCollection(ctx, "test")
@@ -413,7 +413,7 @@ func TestIndexFormat_RebuildUniqueViolationQuarantines(t *testing.T) {
 // the rebuild the same way: quarantine, not a failed Open; the sibling and
 // the other collection are rebuilt in their own transactions.
 func TestIndexFormat_RebuildBadDocumentQuarantines(t *testing.T) {
-	skipIfInMemory(t)
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
 	dir := legacyFixture(t)
 	fx := newFixturePath(t, dir)
 	other, err := fx.CreateCollection(ctx, "other")
@@ -443,7 +443,7 @@ func TestIndexFormat_RebuildBadDocumentQuarantines(t *testing.T) {
 // A collection whose catalog record cannot be parsed does not fail the Open:
 // the other collections are upgraded and opening that one reports it.
 func TestIndexFormat_CorruptRecordDoesNotFailOpen(t *testing.T) {
-	skipIfInMemory(t)
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
 	dir := legacyFixture(t)
 	fx := newFixturePath(t, dir)
 	bad, err := fx.CreateCollection(ctx, "bad")
@@ -465,7 +465,7 @@ func TestIndexFormat_CorruptRecordDoesNotFailOpen(t *testing.T) {
 
 // Full-text indexes are outside the format: no stamp, no rebuild, still answering.
 func TestIndexFormat_FulltextUntouched(t *testing.T) {
-	skipIfInMemory(t)
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
 	dir := legacyFixture(t)
 	fx := newFixturePath(t, dir)
 	coll, err := fx.OpenCollection(ctx, "test")
@@ -493,7 +493,7 @@ func TestIndexFormat_FulltextUntouched(t *testing.T) {
 
 // The private rebuild handle honours a custom primary key.
 func TestIndexFormat_RebuildCustomPrimaryKey(t *testing.T) {
-	skipIfInMemory(t)
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
 	dir := t.TempDir()
 	fx := newFixturePath(t, dir)
 	coll, err := fx.CreateCollection(ctx, "pk", CollectionOptions{PrimaryKey: "uid"})
@@ -517,7 +517,7 @@ func TestIndexFormat_RebuildCustomPrimaryKey(t *testing.T) {
 // A failed attempt recorded by another format does not hold back a rebuild
 // at this one, and a successful rebuild clears the mark.
 func TestIndexFormat_QuarantineFromOtherFormatRetried(t *testing.T) {
-	skipIfInMemory(t)
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
 	dir := legacyFixture(t)
 	fx := newFixturePath(t, dir)
 	coll, err := fx.OpenCollection(ctx, "test")

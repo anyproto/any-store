@@ -122,7 +122,7 @@ func TestCollection_AggregateOut(t *testing.T) {
 		_, err = coll.Aggregate(groupOut("out_snapshot")).Count(ctx)
 		require.NoError(t, err)
 		// The reader's snapshot predates the swap: old contents, atomically.
-		assertCollCountCtx(rtx.Context(), t, target, 1)
+		assertCollCountInTx(rtx.Context(), t, target, 1)
 		require.NoError(t, rtx.Commit())
 		assertCollCount(t, target, 2)
 	})
