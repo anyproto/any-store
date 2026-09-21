@@ -218,10 +218,10 @@ func TestIndexFormat_RebuildOnOpen(t *testing.T) {
 	assertUntouched(t, coll, "plain")
 
 	// The rebuilt indexes answer queries again.
-	n, err := coll.Find(`{"a":{"$exists":true}}`).IndexHint(IndexHint{IndexName: "sparse"}).Count(ctx)
+	n, err := coll.Find(`{"a":{"$exists":true}}`).IndexHint(IndexHint{IndexName: "sparse", Boost: 1000000}).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, legacyDocs, n)
-	n, err = coll.Find(`{"b.c":{"$gte":10}}`).IndexHint(IndexHint{IndexName: "dotted"}).Count(ctx)
+	n, err = coll.Find(`{"b.c":{"$gte":10}}`).IndexHint(IndexHint{IndexName: "dotted", Boost: 1000000}).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, legacyDocs-10, n)
 
@@ -303,7 +303,7 @@ func TestIndexFormat_OutdatedIndexNotPlanned(t *testing.T) {
 	exp, err = coll.Find(`{"a":{"$exists":true}}`).Explain(ctx)
 	require.NoError(t, err)
 	assert.NotContains(t, exp.Plan, "sparse")
-	n, err := coll.Find(`{"a":{"$exists":true}}`).IndexHint(IndexHint{IndexName: "sparse"}).Count(ctx)
+	n, err := coll.Find(`{"a":{"$exists":true}}`).IndexHint(IndexHint{IndexName: "sparse", Boost: 1000000}).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, legacyDocs, n)
 	// Inside a write tx as well.
@@ -370,7 +370,7 @@ func TestIndexFormat_RebuildUniqueViolationQuarantines(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, exp.Plan, "IndexSeek(u)")
 	assert.Contains(t, exp.Indexes, IndexExplain{Name: "u"})
-	n, err := coll.Find(`{"a":{"$exists":true}}`).IndexHint(IndexHint{IndexName: "u"}).Count(ctx)
+	n, err := coll.Find(`{"a":{"$exists":true}}`).IndexHint(IndexHint{IndexName: "u", Boost: 1000000}).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 3, n)
 	exp, err = coll.Find(`{"b":{"$exists":true}}`).Explain(ctx)
@@ -509,7 +509,36 @@ func TestIndexFormat_RebuildCustomPrimaryKey(t *testing.T) {
 	coll, err = fx.OpenCollection(ctx, "pk")
 	require.NoError(t, err)
 	assertRebuilt(t, coll, "sparse")
-	n, err := coll.Find(`{"a":{"$gte":10}}`).IndexHint(IndexHint{IndexName: "sparse"}).Count(ctx)
+	n, err := coll.Find(`{"a":{"$gte":10}}`).IndexHint(IndexHint{IndexName: "sparse", Boost: 1000000}).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, legacyDocs-10, n)
+}
+
+// A failed attempt recorded by another format does not hold back a rebuild
+// at this one, and a successful rebuild clears the mark.
+func TestIndexFormat_QuarantineFromOtherFormatRetried(t *testing.T) {
+	skipIfInMemory(t)
+	dir := legacyFixture(t)
+	fx := newFixturePath(t, dir)
+	coll, err := fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	c := coll.(*collection)
+	legacyIndex(t, c, "sparse")
+	setIndexRecord(t, c, "sparse", "vq", func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewNumberInt(indexFormatVersion + 1)
+	})
+	require.NoError(t, fx.Close())
+
+	fx = newFixturePath(t, dir)
+	coll, err = fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	assertRebuilt(t, coll, "sparse")
+	c = coll.(*collection)
+	var raw []byte
+	require.NoError(t, c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
+		raw, err = tx.AppendValue(c.db.systemNS, indexKey("test", "sparse"), nil)
+		return err
+	}))
+	_, quarantined := indexFormatRecord(raw)
+	assert.Equal(t, 0, quarantined)
 }

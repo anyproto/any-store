@@ -379,11 +379,16 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	idxs := plannableIndexes(visible)
 	br := q.buildBoundsResult(idxs)
 	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
-	// The doc-count estimate may read an outdated index's sketch: advisory,
-	// and better than none when every range index is outdated.
-	totalDocs := q.docCountForPlan(btx, visible)
+	// The estimate reads the candidates' sketches; with every range index
+	// outdated it falls back to an outdated one's, advisory and better than
+	// none.
+	countIdxs := idxs
+	if len(countIdxs) == 0 {
+		countIdxs = visible
+	}
+	totalDocs := q.docCountForPlan(btx, countIdxs)
 	if opts.exactTotalDocs {
-		totalDocs = q.docCountExact(btx, idxs)
+		totalDocs = q.docCountExact(btx, countIdxs)
 	}
 	plan = qplanner.BuildPlan(&qplanner.PlanParams{
 		Tx:          btx,
@@ -997,8 +1002,9 @@ type countTx interface {
 // O(namespace pages) walk before every query on exactly the collections that
 // need no secondary index (pk-ordered schemas) is pure waste — return 0 and
 // let BuildPlan clamp it. Explain uses docCountExact instead. idxs is the
-// caller's loadIndexes() snapshot — the same one its CBO candidates are built
-// from, so the count and the candidates can't disagree about the index set.
+// caller's plannable snapshot — the same one its CBO candidates are built
+// from, so the count and the candidates can't disagree about the index set —
+// or, when that is empty, its visible one.
 func (q *collQuery) docCountForPlan(tx countTx, idxs []*index) int {
 	for _, idx := range idxs {
 		if s := idx.loadPubSketch(); s != nil {

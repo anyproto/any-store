@@ -93,9 +93,9 @@ func (db *db) readIndexFormat(tx *btree.ReadTx, collName, indexName string) (int
 	return indexFormatOf(raw), nil
 }
 
-// setIndexRecordInt rewrites one integer field of an index's catalog record,
-// keeping every other field as stored.
-func (db *db) setIndexRecordInt(tx *btree.WriteTx, collName, indexName, field string, n int) error {
+// editIndexRecord rewrites an index's catalog record through edit, keeping
+// every field edit leaves alone as stored.
+func (db *db) editIndexRecord(tx *btree.WriteTx, collName, indexName string, edit func(v *anyenc.Value, a *anyenc.Arena)) error {
 	key := indexKey(collName, indexName)
 	raw, err := tx.AppendValue(db.systemNS, key, nil)
 	if err != nil {
@@ -107,8 +107,34 @@ func (db *db) setIndexRecordInt(tx *btree.WriteTx, collName, indexName, field st
 		return err
 	}
 	var a anyenc.Arena
-	v.Set(field, a.NewNumberInt(n))
+	edit(v, &a)
 	return tx.Put(db.systemNS, key, v.MarshalTo(nil))
+}
+
+// stampIndexFormat marks an index's catalog record as built under the
+// current format and clears a failed attempt recorded by another format.
+func (db *db) stampIndexFormat(tx *btree.WriteTx, collName, indexName string) error {
+	return db.editIndexRecord(tx, collName, indexName, func(v *anyenc.Value, a *anyenc.Arena) {
+		v.Set("v", a.NewNumberInt(indexFormatVersion))
+		v.Del("vq")
+	})
+}
+
+// quarantineIndex records on an index's catalog record that a rebuild for
+// the current format failed, so no later Open retries it.
+func (db *db) quarantineIndex(tx *btree.WriteTx, collName, indexName string) error {
+	return db.editIndexRecord(tx, collName, indexName, func(v *anyenc.Value, a *anyenc.Arena) {
+		v.Set("vq", a.NewNumberInt(indexFormatVersion))
+	})
+}
+
+// rebuildDefeatedByData reports whether a rebuild failed on the documents
+// themselves, so that retrying at the next Open cannot succeed: a unique
+// index the current format finds duplicate, or a document this release
+// rejects. Any other failure (a page that fails its integrity check, I/O)
+// is left for the next Open to retry.
+func rebuildDefeatedByData(err error) bool {
+	return errors.Is(err, ErrUniqueConstraint) || errors.Is(err, ErrDocWithoutId) || errors.Is(err, ErrArrayPrimaryKey)
 }
 
 // outdatedIndexes lists the range indexes of a collection whose stamp an
@@ -151,14 +177,15 @@ func (db *db) outdatedIndexes(tx *btree.ReadTx, collName string) ([]IndexInfo, e
 // failed at ("vq"): the index stays as it was, the planner never plans an
 // outdated index (plannableIndexes), writes keep maintaining it, Stats and
 // Explain report it, and no Open retries until the index is dropped and
-// recreated or the format changes again.
+// recreated or the format changes again (a successful rebuild under any
+// format clears the mark).
 //
 // Nothing here fails the Open, which must succeed on a file whose damage
 // only a later operation reports (a corrupt page under a collection): a
-// catalog the read pass cannot read is left alone, and a rebuild whose
-// transaction fails to commit is left for the next Open. Both are sound
-// because an outdated index is never planned. Only a cancelled ctx stops
-// the upgrade, and then the Open.
+// catalog the read pass cannot read is left alone, and a rebuild that fails
+// for any other reason than its data is left for the next Open. Both are
+// sound because an outdated index is never planned. Only a cancelled ctx
+// stops the upgrade, and then the Open.
 func (db *db) upgradeIndexFormats(ctx context.Context) error {
 	type work struct{ coll, index string }
 	var todo []work
@@ -179,7 +206,7 @@ func (db *db) upgradeIndexFormats(ctx context.Context) error {
 		return nil
 	})
 	if err != nil {
-		return nil
+		return ctx.Err()
 	}
 	for _, w := range todo {
 		if err = ctx.Err(); err != nil {
@@ -190,9 +217,9 @@ func (db *db) upgradeIndexFormats(ctx context.Context) error {
 			rebuildErr = db.rebuildOutdatedIndex(tx, w.coll, w.index)
 			return rebuildErr
 		})
-		if rebuildErr != nil {
+		if rebuildDefeatedByData(rebuildErr) {
 			_ = db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-				return db.setIndexRecordInt(tx, w.coll, w.index, "vq", indexFormatVersion)
+				return db.quarantineIndex(tx, w.coll, w.index)
 			})
 		}
 	}
@@ -243,7 +270,7 @@ func (c *collection) rebuildIndex(tx *btree.WriteTx, info IndexInfo) (err error)
 	if err = tx.DeleteNamespace(indexNsName(c.name, info.Name)); err != nil && !errors.Is(err, btree.ErrNamespaceNotFound) {
 		return err
 	}
-	if err = c.db.setIndexRecordInt(tx, c.name, info.Name, "v", indexFormatVersion); err != nil {
+	if err = c.db.stampIndexFormat(tx, c.name, info.Name); err != nil {
 		return err
 	}
 	_, err = c.buildRangeIndex(tx, info)

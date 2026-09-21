@@ -26,10 +26,12 @@ type IndexStats struct {
 	// Sparse reports whether the index skips documents missing the fields.
 	Sparse bool
 
-	// Outdated reports that the entries are of an older index format and the
+	// Outdated reports that the entries are of another index format and the
 	// planner does not use the index: Open could not rebuild it (a unique
-	// index whose documents the current format finds duplicate). Drop and
-	// recreate it once the data allows.
+	// index whose documents the current format finds duplicate, a document
+	// this release rejects), or an older release created it while this
+	// process ran. Writes keep maintaining it, so a unique one can reject
+	// writes. Drop and recreate it once the data allows.
 	Outdated bool
 
 	// EntryCount is the number of entries (key/value pairs) in the index B-tree.
