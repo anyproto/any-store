@@ -169,27 +169,25 @@ func visibleIndexes(btx *btree.ReadTx, idxs []*index) []*index {
 	return out
 }
 
-// plannableIndexes is visibleIndexes minus the indexes whose entries are of
-// an outdated format (idx.outdated): those are not what the current code
-// derives, so a seek over them can miss documents. Stats still lists them.
-func plannableIndexes(btx *btree.ReadTx, idxs []*index) []*index {
-	outdated := false
-	for _, idx := range idxs {
-		if idx.outdated {
-			outdated = true
-			break
+// plannableIndexes drops the indexes whose entries are of an outdated format
+// (idx.outdated) from a visible set: those are not what the current code
+// derives, so a seek over them can miss documents. Stats and Explain still
+// report them.
+func plannableIndexes(idxs []*index) []*index {
+	for i, idx := range idxs {
+		if !idx.outdated {
+			continue
 		}
-	}
-	if outdated {
 		kept := make([]*index, 0, len(idxs)-1)
-		for _, idx := range idxs {
+		kept = append(kept, idxs[:i]...)
+		for _, idx := range idxs[i+1:] {
 			if !idx.outdated {
 				kept = append(kept, idx)
 			}
 		}
-		idxs = kept
+		return kept
 	}
-	return visibleIndexes(btx, idxs)
+	return idxs
 }
 
 // planOpts are the only per-verb compilation knobs. Everything else about
@@ -377,10 +375,13 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	// multikey-flag probe gating tight seek bounds must read the same
 	// snapshot the scan executes on.
 	sorter := q.writeSorter(opts)
-	idxs := plannableIndexes(btx, q.c.loadIndexes())
+	visible := visibleIndexes(btx, q.c.loadIndexes())
+	idxs := plannableIndexes(visible)
 	br := q.buildBoundsResult(idxs)
 	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
-	totalDocs := q.docCountForPlan(btx, idxs)
+	// The doc-count estimate may read an outdated index's sketch: advisory,
+	// and better than none when every range index is outdated.
+	totalDocs := q.docCountForPlan(btx, visible)
 	if opts.exactTotalDocs {
 		totalDocs = q.docCountExact(btx, idxs)
 	}
@@ -851,6 +852,14 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 		for _, idx := range cboIndexes {
 			addIndex(idx.Info.Name, plan.Cost, idx.Info.Name == plan.IndexName)
 		}
+		// An outdated index is never a candidate (plannableIndexes); listing
+		// it unused, like the vector and full-text handles below, keeps the
+		// report from silently shrinking.
+		for _, idx := range visibleIndexes(tx, q.c.loadIndexes()) {
+			if idx.outdated {
+				addIndex(idx.info.Name, 0, false)
+			}
+		}
 		sourceCost := func(name string) float64 {
 			if name == plan.IndexName {
 				return plan.Cost
@@ -900,7 +909,7 @@ func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, residual query.Filter, ne
 	if !idFixed && !hasResidual && !needSort && !opts.wantCandidates {
 		return false
 	}
-	idxs := plannableIndexes(btx, q.c.loadIndexes())
+	idxs := plannableIndexes(visibleIndexes(btx, q.c.loadIndexes()))
 	probePossible = idFixed
 	if len(idxs) > 0 {
 		br := q.buildBoundsResult(idxs)

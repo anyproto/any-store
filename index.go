@@ -392,7 +392,7 @@ type index struct {
 	// outdated: the stamp is not the current format and a later change
 	// affects this index (indexFormatOutdated). Open rebuilds such indexes;
 	// one seen afterwards (adopted from a peer, or left by a rebuild the
-	// data defeated) is maintained but never planned (visibleIndexes).
+	// data defeated) is maintained but never planned (plannableIndexes).
 	outdated bool
 
 	keyBuf  anyenc.Tuple

@@ -3,7 +3,6 @@ package anystore
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -62,6 +61,25 @@ func indexFormatOutdated(stored int, info IndexInfo) bool {
 	return false
 }
 
+// indexFormatRecord returns the stamps of a catalog record: the format its
+// entries were built under ("v", 0 when the record predates versioning) and
+// the format a rebuild last failed at ("vq", 0 when none; see
+// upgradeIndexFormats). A record that does not parse reads as 0, 0.
+func indexFormatRecord(raw []byte) (format, quarantined int) {
+	var p anyenc.Parser
+	v, err := p.Parse(raw)
+	if err != nil {
+		return 0, 0
+	}
+	return v.GetInt("v"), v.GetInt("vq")
+}
+
+// indexFormatOf returns the format stamp of a catalog record.
+func indexFormatOf(raw []byte) int {
+	format, _ := indexFormatRecord(raw)
+	return format
+}
+
 // readIndexFormat returns the format stamp of an index's catalog record: 0
 // when the record predates versioning, ErrIndexNotFound when there is none.
 func (db *db) readIndexFormat(tx *btree.ReadTx, collName, indexName string) (int, error) {
@@ -75,20 +93,9 @@ func (db *db) readIndexFormat(tx *btree.ReadTx, collName, indexName string) (int
 	return indexFormatOf(raw), nil
 }
 
-// indexFormatOf returns the format stamp of a catalog record: 0 when the
-// record predates versioning or does not parse.
-func indexFormatOf(raw []byte) int {
-	var p anyenc.Parser
-	v, err := p.Parse(raw)
-	if err != nil {
-		return 0
-	}
-	return v.GetInt("v")
-}
-
-// stampIndexFormat rewrites an index's catalog record with the current format
-// version, keeping every other field as stored.
-func (db *db) stampIndexFormat(tx *btree.WriteTx, collName, indexName string) error {
+// setIndexRecordInt rewrites one integer field of an index's catalog record,
+// keeping every other field as stored.
+func (db *db) setIndexRecordInt(tx *btree.WriteTx, collName, indexName, field string, n int) error {
 	key := indexKey(collName, indexName)
 	raw, err := tx.AppendValue(db.systemNS, key, nil)
 	if err != nil {
@@ -100,13 +107,13 @@ func (db *db) stampIndexFormat(tx *btree.WriteTx, collName, indexName string) er
 		return err
 	}
 	var a anyenc.Arena
-	v.Set("v", a.NewNumberInt(indexFormatVersion))
+	v.Set(field, a.NewNumberInt(n))
 	return tx.Put(db.systemNS, key, v.MarshalTo(nil))
 }
 
 // outdatedIndexes lists the range indexes of a collection whose stamp an
 // intervening format change leaves outdated, as the catalog describes them
-// in this view.
+// in this view, leaving out those a rebuild already failed at this format.
 func (db *db) outdatedIndexes(tx *btree.ReadTx, collName string) ([]IndexInfo, error) {
 	infos, err := db.getIndexInfos(tx, collName)
 	if err != nil {
@@ -117,11 +124,12 @@ func (db *db) outdatedIndexes(tx *btree.ReadTx, collName string) ([]IndexInfo, e
 		if info.Kind != IndexKindRange {
 			continue
 		}
-		format, err := db.readIndexFormat(tx, collName, info.Name)
+		raw, err := tx.AppendValue(db.systemNS, indexKey(collName, info.Name), nil)
 		if err != nil {
 			return nil, err
 		}
-		if indexFormatOutdated(format, info) {
+		format, quarantined := indexFormatRecord(raw)
+		if indexFormatOutdated(format, info) && quarantined != indexFormatVersion {
 			outdated = append(outdated, info)
 		}
 	}
@@ -131,19 +139,29 @@ func (db *db) outdatedIndexes(tx *btree.ReadTx, collName string) ([]IndexInfo, e
 // upgradeIndexFormats runs from Open, before any collection handle or user
 // transaction exists, and rebuilds every range index whose stamp an
 // intervening format change leaves outdated. A read pass finds the work, so
-// a settled file costs no write lock; only then does one write transaction
-// begin, re-reading each collection's catalog through the writer's view,
-// since a peer may have rebuilt, redefined or dropped an index in between.
+// a settled file takes no write lock.
 //
-// Each index rebuilds under its own savepoint. A rebuild the data defeats (a
-// unique index whose documents the current format finds duplicate: explicit
-// nulls under a sparse index, elements fanned out under a dotted path) rolls
-// back to the savepoint and leaves the index as it was, stamp included: the
-// planner never plans an outdated index (visibleIndexes), writes keep
-// maintaining it, DropIndex and EnsureIndex report the duplicate, and the
-// next Open tries again. Any other failure fails the Open with ErrIndexRebuild.
+// Each index rebuilds in its own write transaction, re-reading its record
+// through the writer's view since a peer may have rebuilt, redefined or
+// dropped it in between: progress survives a crash or a cancelled ctx, and
+// peer writers interleave. A rebuild the data defeats — a unique index whose
+// documents the current format finds duplicate (explicit nulls under a
+// sparse index, elements fanned out under a dotted path), a document this
+// release rejects — rolls back and marks the record with the format it
+// failed at ("vq"): the index stays as it was, the planner never plans an
+// outdated index (plannableIndexes), writes keep maintaining it, Stats and
+// Explain report it, and no Open retries until the index is dropped and
+// recreated or the format changes again.
+//
+// Nothing here fails the Open, which must succeed on a file whose damage
+// only a later operation reports (a corrupt page under a collection): a
+// catalog the read pass cannot read is left alone, and a rebuild whose
+// transaction fails to commit is left for the next Open. Both are sound
+// because an outdated index is never planned. Only a cancelled ctx stops
+// the upgrade, and then the Open.
 func (db *db) upgradeIndexFormats(ctx context.Context) error {
-	var collNames []string
+	type work struct{ coll, index string }
+	var todo []work
 	err := db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		names, err := db.collectionNames(tx)
 		if err != nil {
@@ -152,34 +170,52 @@ func (db *db) upgradeIndexFormats(ctx context.Context) error {
 		for _, name := range names {
 			outdated, err := db.outdatedIndexes(tx, name)
 			if err != nil {
-				return err
+				continue
 			}
-			if len(outdated) > 0 {
-				collNames = append(collNames, name)
+			for _, info := range outdated {
+				todo = append(todo, work{name, info.Name})
 			}
 		}
 		return nil
 	})
-	if err != nil || len(collNames) == 0 {
-		return err
+	if err != nil {
+		return nil
 	}
-	return db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-		for _, name := range collNames {
-			if err := db.rebuildOutdatedIndexes(tx, name); err != nil {
-				return err
-			}
+	for _, w := range todo {
+		if err = ctx.Err(); err != nil {
+			return err
 		}
-		return nil
-	})
+		var rebuildErr error
+		_ = db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+			rebuildErr = db.rebuildOutdatedIndex(tx, w.coll, w.index)
+			return rebuildErr
+		})
+		if rebuildErr != nil {
+			_ = db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+				return db.setIndexRecordInt(tx, w.coll, w.index, "vq", indexFormatVersion)
+			})
+		}
+	}
+	return nil
 }
 
-// rebuildOutdatedIndexes rebuilds one collection's outdated range indexes
-// through the write tx (see upgradeIndexFormats). The collection handle it
-// builds is private to the rebuild: nothing is published.
-func (db *db) rebuildOutdatedIndexes(tx *btree.WriteTx, collName string) error {
+// rebuildOutdatedIndex rebuilds one range index through the write tx if the
+// catalog, read through the writer's view, still holds it outdated (see
+// upgradeIndexFormats). The collection handle it builds is private to the
+// rebuild: nothing is published.
+func (db *db) rebuildOutdatedIndex(tx *btree.WriteTx, collName, indexName string) error {
 	outdated, err := db.outdatedIndexes(&tx.ReadTx, collName)
-	if err != nil || len(outdated) == 0 {
+	if err != nil {
 		return err
+	}
+	var info *IndexInfo
+	for i := range outdated {
+		if outdated[i].Name == indexName {
+			info = &outdated[i]
+		}
+	}
+	if info == nil {
+		return nil
 	}
 	ns, err := tx.GetNamespace(collName)
 	if err != nil {
@@ -196,25 +232,7 @@ func (db *db) rebuildOutdatedIndexes(tx *btree.WriteTx, collName string) error {
 	if c.primaryKey == "" {
 		c.primaryKey = "id"
 	}
-	for _, info := range outdated {
-		sp, err := tx.Savepoint()
-		if err != nil {
-			return err
-		}
-		if err = c.rebuildIndex(tx, info); err != nil {
-			if !errors.Is(err, ErrUniqueConstraint) {
-				return fmt.Errorf("%w: %s.%s: %w", ErrIndexRebuild, collName, info.Name, err)
-			}
-			if err = tx.RollbackToSavepoint(sp); err != nil {
-				return err
-			}
-			continue
-		}
-		if err = tx.ReleaseSavepoint(sp); err != nil {
-			return err
-		}
-	}
-	return nil
+	return c.rebuildIndex(tx, *info)
 }
 
 // rebuildIndex drops the index namespace and builds it again from the
@@ -225,7 +243,7 @@ func (c *collection) rebuildIndex(tx *btree.WriteTx, info IndexInfo) (err error)
 	if err = tx.DeleteNamespace(indexNsName(c.name, info.Name)); err != nil && !errors.Is(err, btree.ErrNamespaceNotFound) {
 		return err
 	}
-	if err = c.db.stampIndexFormat(tx, c.name, info.Name); err != nil {
+	if err = c.db.setIndexRecordInt(tx, c.name, info.Name, "v", indexFormatVersion); err != nil {
 		return err
 	}
 	_, err = c.buildRangeIndex(tx, info)

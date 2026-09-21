@@ -227,22 +227,24 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		}
 	}
 
-	// Bring range indexes older releases built up to the current format
-	// before any handle exists (see upgradeIndexFormats).
-	if err = ds.upgradeIndexFormats(ctx); err != nil {
-		if ds.recoveryController != nil {
-			_ = ds.recoveryController.Stop()
-		}
-		_ = ds.btreeDB.Close()
-		return nil, err
-	}
-
 	// Start recovery controller after initialization
 	if ds.recoveryController != nil {
 		if err = ds.recoveryController.Start(ctx); err != nil {
 			_ = ds.btreeDB.Close()
 			return nil, err
 		}
+	}
+
+	// Bring range indexes older releases built up to the current format
+	// before any handle exists (see upgradeIndexFormats). Runs with the
+	// recovery controller started: its writes arm the dirty sentinel like
+	// any other. Only a cancelled ctx fails here.
+	if err = ds.upgradeIndexFormats(ctx); err != nil {
+		if ds.recoveryController != nil {
+			_ = ds.recoveryController.Stop()
+		}
+		_ = ds.btreeDB.Close()
+		return nil, err
 	}
 
 	return ds, nil
@@ -897,13 +899,15 @@ func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string,
 	return
 }
 
-// collectionNames lists the collections the catalog holds in this view.
+// collectionNames lists the collections the catalog holds in this view. A
+// Seek error is a read failure, not an empty catalog (an empty or
+// non-matching prefix leaves the cursor invalid with a nil error).
 func (db *db) collectionNames(tx *btree.ReadTx) (collectionNames []string, err error) {
 	cursor := tx.NewCursor(db.systemNS)
 	defer cursor.Close()
 	prefix := []byte("coll:")
 	if err = cursor.Seek(prefix); err != nil {
-		return nil, nil
+		return nil, err
 	}
 	for cursor.Valid() {
 		key, err := cursor.Key()

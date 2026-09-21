@@ -87,14 +87,6 @@ var (
 	// first, then create it with the new definition.
 	ErrIndexMismatch = errors.New("any-store: index exists with a different definition")
 
-	// ErrIndexRebuild is returned by Open when an index built under an older
-	// index format could not be rebuilt for the current one; the error names
-	// the index and wraps the cause. A rebuild the data defeats (a unique
-	// index whose documents the current format finds duplicate) does not
-	// fail the Open: the index is left as it was and never planned until
-	// dropped and recreated, or the duplicates removed.
-	ErrIndexRebuild = errors.New("any-store: index rebuild failed")
-
 	// ErrTxIsReadOnly is returned when a write operation is attempted in a read-only transaction.
 	ErrTxIsReadOnly = errors.New("any-store: transaction is read-only")
 
