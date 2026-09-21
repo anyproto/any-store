@@ -792,7 +792,7 @@ func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collec
 	db.mu.Lock()
 	if coll, ok := db.openedCollections[collectionName]; ok && !coll.(*collection).closed.Load() {
 		db.mu.Unlock()
-		return coll, nil
+		return db.readyCollection(ctx, coll)
 	}
 	// A CLOSED registered handle is a Drop in an open tx: fall through to the
 	// catalog check, which is ctx-aware — the dropping tx sees its own delete
@@ -803,11 +803,22 @@ func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collec
 	return db.openCollection(ctx, collectionName)
 }
 
+// readyCollection returns a cached handle, first finishing an index-format
+// rebuild that a rolled-back ambient tx re-armed (rebuildOutdatedIndexes).
+func (db *db) readyCollection(ctx context.Context, coll Collection) (Collection, error) {
+	if c := coll.(*collection); c.rebuildPending.Load() {
+		if err := c.rebuildOutdatedIndexes(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return coll, nil
+}
+
 func (db *db) openCollection(ctx context.Context, collectionName string) (Collection, error) {
 	db.mu.Lock()
 	if coll, ok := db.openedCollections[collectionName]; ok && !coll.(*collection).closed.Load() {
 		db.mu.Unlock()
-		return coll, nil
+		return db.readyCollection(ctx, coll)
 	}
 	db.mu.Unlock()
 
@@ -1607,6 +1618,9 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 	}
 	if info.Kind != IndexKindRange {
 		obj.Set("kind", a.NewNumberInt(int(info.Kind)))
+	} else {
+		// The format the entries are built under; see indexFormatVersion.
+		obj.Set("v", a.NewNumberInt(indexFormatVersion))
 	}
 	if info.Kind == IndexKindVector && info.Vector != nil {
 		vobj := a.NewObject()

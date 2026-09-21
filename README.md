@@ -112,6 +112,8 @@ fmt.Println(exp.Plan) // chosen index, cost breakdown, rejected candidates
 
 Array fields index every element (multikey), and a dotted path through an array of objects (`"items.sku"` over `{"items":[{"sku":1},{"sku":2}]}`) indexes one entry per element — the same MongoDB field-path semantics filters and sorts use; `$elemMatch` binds several predicates to one element. The cost-based planner picks the cheapest index per query; `IndexHint` overrides it.
 
+Every index records the format it was built under. When a release changes how an index derives its entries, the first open of a collection by that release rebuilds the indexes the change affects, in one write transaction, before the collection is returned; unaffected indexes are left as they are. A rebuild that fails (a unique index whose data the new format finds duplicate) fails the open with `ErrIndexRebuild`.
+
 ## Full-text search
 
 ```go

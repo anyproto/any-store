@@ -134,6 +134,9 @@ func newCollection(ctx context.Context, db *db, name string, wtx ...*btree.Write
 	if err := coll.init(ctx, tx); err != nil {
 		return nil, err
 	}
+	if err := coll.rebuildOutdatedIndexes(ctx); err != nil {
+		return nil, err
+	}
 	return coll, nil
 }
 
@@ -188,6 +191,15 @@ type collection struct {
 	// per-collection buffer is safe and keeps the stale-reload path from
 	// allocating a fresh read buffer per index.
 	sketchReadBuf []byte
+
+	// outdatedIndexes names the range indexes init found stamped below the
+	// current index format and affected by a later change; newCollection
+	// rebuilds them before the handle is published (rebuildOutdatedIndexes).
+	// Guarded by c.mu. rebuildPending is set when a rolled-back ambient tx
+	// re-armed the list on a published handle; rebuildMu serialises the runs.
+	outdatedIndexes []string
+	rebuildPending  atomic.Bool
+	rebuildMu       sync.Mutex
 
 	// indexSetDDLTxs counts local write transactions with UNCOMMITTED index-set
 	// publications on this collection (guarded by c.mu; incremented in
@@ -383,6 +395,12 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 				return idxErr
 			}
 			idx.validFromCookie = validFrom
+			if idx.format, err = c.db.readIndexFormat(tx, c.name, info.Name); err != nil {
+				return err
+			}
+			if indexFormatOutdated(idx.format, info) {
+				c.outdatedIndexes = append(c.outdatedIndexes, info.Name)
+			}
 			c.loadSketchAtOpen(tx, idx)
 			idxs = append(idxs, idx)
 		}
@@ -1105,8 +1123,13 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 	if err = c.db.registerIndex(tx, c.name, info); err != nil {
 		return nil, err
 	}
+	return c.buildRangeIndex(tx, info)
+}
 
-	// Create index namespace
+// buildRangeIndex creates the index namespace and fills it from the
+// collection's documents; the catalog record is already registered. Shared
+// by createIndex and rebuildIndex.
+func (c *collection) buildRangeIndex(tx *btree.WriteTx, info IndexInfo) (idx *index, err error) {
 	nsName := indexNsName(c.name, info.Name)
 	ns, err := tx.CreateNamespace(nsName)
 	if err != nil {
@@ -1117,6 +1140,7 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 	if err != nil {
 		return nil, err
 	}
+	idx.format = indexFormatVersion
 
 	// Write the scalar-so-far multikey marker BEFORE the backfill: buildIndex
 	// runs through insertKeys, which flips it to multikey in this same tx if
@@ -1842,15 +1866,25 @@ func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
 			}
 			continue
 		}
+		format, fErr := c.db.readIndexFormat(tx, c.name, info.Name)
+		if fErr != nil {
+			if existing, ok := byName[info.Name]; ok {
+				rebuilt = append(rebuilt, existing)
+			} else {
+				changed = true
+			}
+			continue
+		}
 		if existing, ok := byName[info.Name]; ok &&
-			indexInfoEqual(existing.info, info) &&
+			indexInfoEqual(existing.info, info) && existing.format == format &&
 			existing.ns != nil && existing.ns.RootPage() == ns.RootPage() {
 			// Unchanged: reuse the live object (and its loaded sketch).
 			rebuilt = append(rebuilt, existing)
 			continue
 		}
-		// Added or changed (definition differs, or root moved via
-		// drop+recreate): build a fresh index bound to the current namespace.
+		// Added or changed (definition differs, root moved via
+		// drop+recreate, or a peer rebuilt it for a newer format): build a
+		// fresh index bound to the current namespace.
 		idx, idxErr := newIndex(c, info, ns)
 		if idxErr != nil {
 			// Malformed definition on disk: keep any existing object rather than
@@ -1866,6 +1900,7 @@ func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
 		// exceed it) — an older concurrent reader resolves per-snapshot in
 		// visibleTo and correctly skips a peer index its snapshot predates.
 		idx.validFromCookie = tx.SnapshotSchemaCookie()
+		idx.format = format
 		c.loadSketchAtOpen(tx, idx)
 		rebuilt = append(rebuilt, idx)
 		changed = true

@@ -383,6 +383,12 @@ type index struct {
 	// this handle.
 	nsName     string
 	catalogKey []byte
+	// format is the index format stamp of the catalog record this handle was
+	// built from (indexFormatVersion at build). Part of the identity visibleTo
+	// and reconcile check: a rebuild for a newer format keeps the name and
+	// definition and may land on the same root page, so only the stamp tells
+	// an older snapshot's index from the rebuilt one.
+	format int
 
 	keyBuf  anyenc.Tuple
 	keysBuf []anyenc.Tuple
@@ -434,7 +440,7 @@ func (idx *index) visibleTo(tx *btree.ReadTx) bool {
 		return true
 	}
 	raw, err := tx.AppendValue(idx.c.db.systemNS, idx.catalogKey, nil)
-	if err != nil || !indexDefMatches(raw, idx.info) {
+	if err != nil || !indexDefMatches(raw, idx.info) || indexFormatOf(raw) != idx.format {
 		return false
 	}
 	if idx.ns == nil {
@@ -458,6 +464,7 @@ func (idx *index) cloneWithNs(ns *btree.Namespace, nsName string, catalogKey []b
 		ns:             ns,
 		nsName:         nsName,
 		catalogKey:     catalogKey,
+		format:         idx.format,
 		fieldNames:     idx.fieldNames,
 		fieldPaths:     idx.fieldPaths,
 		reverse:        idx.reverse,
