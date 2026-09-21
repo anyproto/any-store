@@ -684,7 +684,7 @@ func TestFts_OneIndexCoversSeveralFields(t *testing.T) {
 // Opening it must keep working, but a $text query must refuse rather than
 // silently search whichever index load order puts first.
 func TestFts_LegacyTwoIndexesRefuseQuery(t *testing.T) {
-	skipIfInMemory(t)
+	skipIfInMemory(t, "a legacy on-disk database is written and reopened")
 	tmpDir, err := os.MkdirTemp("", "fts-legacy-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -728,4 +728,166 @@ func forceSecondFtsIndex(t *testing.T, coll Collection) error {
 		c.storeFtsIndexes(append(c.loadFtsIndexes(), fx))
 		return nil
 	})
+}
+
+func TestFtsBM25_ParamsSurviveReopen(t *testing.T) {
+	tmpDir := t.TempDir()
+	func() {
+		fxLocal := newFixturePath(t, tmpDir)
+		coll, err := fxLocal.CreateCollection(ctx, "docs")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+			Kind: IndexKindFulltext, Fields: []string{"body"}, Fulltext: &FulltextParams{B: 0.33, K1: 1.7},
+		}))
+		insertJSON(t, coll, `{"id":"a","body":"alpha beta"}`)
+		require.NoError(t, fxLocal.Close())
+	}()
+
+	db, err := Open(ctx, tmpDir+"/any-store-test.db", nil)
+	require.NoError(t, err)
+	defer db.Close()
+	collI, err := db.OpenCollection(ctx, "docs")
+	require.NoError(t, err)
+	c := collI.(*collection)
+
+	fxs := c.loadFtsIndexes()
+	require.Len(t, fxs, 1)
+	assert.Equal(t, 0.33, fxs[0].info.Fulltext.B)
+	assert.Equal(t, 1.7, fxs[0].info.Fulltext.K1)
+}
+
+func TestFtsWeights_SurviveReopen(t *testing.T) {
+	tmpDir := t.TempDir()
+	func() {
+		fxLocal := newFixturePath(t, tmpDir)
+		coll, err := fxLocal.CreateCollection(ctx, "docs")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+			Kind: IndexKindFulltext, Fields: []string{"title", "body"},
+			Fulltext: &FulltextParams{Weights: map[string]float64{"title": 4, "body": 1}},
+		}))
+		insertJSON(t, coll, `{"id":"a","title":"alpha","body":"beta"}`)
+		require.NoError(t, fxLocal.Close())
+	}()
+
+	db, err := Open(ctx, tmpDir+"/any-store-test.db", nil)
+	require.NoError(t, err)
+	defer db.Close()
+	collI, err := db.OpenCollection(ctx, "docs")
+	require.NoError(t, err)
+	c := collI.(*collection)
+	fxs := c.loadFtsIndexes()
+	require.Len(t, fxs, 1)
+	assert.Equal(t, 4.0, fxs[0].info.Fulltext.Weights["title"])
+	assert.Equal(t, 1.0, fxs[0].info.Fulltext.Weights["body"])
+}
+
+func ftsPipelineColl(t *testing.T) (*fixture, Collection) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "p")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Kind: IndexKindFulltext, Fields: []string{"body"}}))
+	insertJSON(t, coll,
+		`{"id":"a","body":"london crash report","year":1920,"status":"open"}`,
+		`{"id":"b","body":"london fog landing","year":1937,"status":"closed"}`,
+		`{"id":"c","body":"london london tower","year":1950,"status":"open"}`,
+		`{"id":"d","body":"paris sunshine","year":1960,"status":"open"}`,
+	)
+	return fx, coll
+}
+
+// collectIter runs a query and returns (ids, scores) in result order.
+func collectIter(t *testing.T, q Query) ([]string, []float64) {
+	iter, err := q.Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	var ids []string
+	var scores []float64
+	for iter.Next() {
+		doc, derr := iter.Doc()
+		require.NoError(t, derr)
+		ids = append(ids, doc.Value().GetString("id"))
+		scores = append(scores, iter.Score())
+	}
+	require.NoError(t, iter.Err())
+	return ids, scores
+}
+
+// A concurrent read tx's staleness pass must not rebuild a collection's index
+// sets while a local write tx has uncommitted index DDL published in them —
+// its older snapshot would evict the writer's uncommitted indexes. The
+// indexSetDDLTxs counter carries that in-flight state.
+
+func TestIndexSetDDLTxs_BalancedAcrossCommitAndRollback(t *testing.T) {
+	fx := newFixture(t)
+	collIface, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	coll := collIface.(*collection)
+
+	ddlTxs := func() int {
+		coll.mu.Lock()
+		defer coll.mu.Unlock()
+		return coll.indexSetDDLTxs
+	}
+	require.Zero(t, ddlTxs())
+
+	// Committed DDL: counter is 1 while the tx is open, 0 after commit.
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(tx.Context(), IndexInfo{Fields: []string{"a"}, Kind: IndexKindFulltext}))
+	assert.Equal(t, 1, ddlTxs(), "uncommitted DDL must be marked in flight")
+	require.NoError(t, tx.Commit())
+	assert.Zero(t, ddlTxs(), "commit must release the in-flight marker")
+
+	// Rolled-back DDL: same lifecycle through the undo path.
+	tx2, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(tx2.Context(), IndexInfo{Fields: []string{"b"}}))
+	assert.Equal(t, 1, ddlTxs())
+	require.NoError(t, tx2.Rollback())
+	assert.Zero(t, ddlTxs(), "rollback must release the in-flight marker")
+}
+
+func TestReconcileSkipsWhileLocalIndexDDLInFlight(t *testing.T) {
+	fx := newFixture(t)
+	collIface, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	coll := collIface.(*collection)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"text"}, Kind: IndexKindFulltext}))
+
+	// Plant a ghost fts handle that no on-disk catalog entry backs — the
+	// stand-in for a writer's just-published, not-yet-committed index as seen
+	// by a reconcile running on an older snapshot.
+	ghost := &ftsIndex{c: coll, info: IndexInfo{Name: "ghost", Kind: IndexKindFulltext, Fields: []string{"g"}}}
+	coll.mu.Lock()
+	coll.storeFtsIndexes(append(coll.loadFtsIndexes(), ghost))
+	coll.indexSetDDLTxs++
+	coll.mu.Unlock()
+
+	inSnapshot := func() bool {
+		for _, fxi := range coll.loadFtsIndexes() {
+			if fxi == ghost {
+				return true
+			}
+		}
+		return false
+	}
+
+	// With DDL in flight, reconcile must leave the sets untouched.
+	require.NoError(t, fx.DB.(*db).doReadTx(ctx, func(tx *btree.ReadTx) error {
+		coll.reconcileIndexes(tx)
+		return nil
+	}))
+	assert.True(t, inSnapshot(), "reconcile evicted an index while local DDL was in flight")
+
+	// Once the writer resolved, the same reconcile evicts the ghost by
+	// omission (it has no catalog entry in the snapshot).
+	coll.mu.Lock()
+	coll.indexSetDDLTxs--
+	coll.mu.Unlock()
+	require.NoError(t, fx.DB.(*db).doReadTx(ctx, func(tx *btree.ReadTx) error {
+		coll.reconcileIndexes(tx)
+		return nil
+	}))
+	assert.False(t, inSnapshot(), "reconcile must evict a catalog-less handle once no DDL is in flight")
 }

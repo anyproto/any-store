@@ -1113,7 +1113,7 @@ func (db *db) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *b
 	// so every later write — and Close() — would block forever. Roll back to
 	// release the lock, then re-panic so the caller still sees their bug.
 	// Guarded by TestTxPanic_UpdateIdDoesNotWedgeDB and
-	// TestTxPanic_UpsertIdDoesNotWedgeDB.
+	// TestTxPanic_UpsertIdDoesNotWedgeDB in any-store-tests:apitest.
 	//
 	// Deliberately not armed across Commit: both commit layers mark themselves
 	// done before doing any work (writeTx.Commit consumes the version CAS on

@@ -1,4 +1,4 @@
-package anystore
+package test
 
 import (
 	"context"
@@ -11,17 +11,17 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-
+	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // --- from limit_offset_index_test.go ---
 
 // collectIntField collects an integer field from query results as []int.
-func collectIntField(t testing.TB, q Query, field string) []int {
+func collectIntField(t testing.TB, q anystore.Query, field string) []int {
 	t.Helper()
 	iter, err := q.Iter(ctx)
 	require.NoError(t, err)
@@ -45,7 +45,7 @@ func TestIndex_LimitOffset_FilterSortLimit(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	// Insert 100 docs with a = i%20 (values 0..19, ~5 each)
 	for i := 0; i < 100; i++ {
@@ -95,7 +95,7 @@ func TestIndex_LimitOffset_PaginationConsistency(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	for i := 1; i <= 50; i++ {
 		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))
@@ -130,7 +130,7 @@ func TestIndex_LimitOffset_CompoundSortLimit(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"x", "y"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"x", "y"}}))
 
 	for i := 0; i < 100; i++ {
 		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"x":%d,"y":%d}`, i, i%10, i%7))
@@ -193,7 +193,7 @@ func TestIndex_LimitOffset_LimitOneUniqueIndex(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Unique: true}))
 
 	for i := 1; i <= 100; i++ {
 		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))
@@ -229,7 +229,7 @@ func TestIndex_LimitOffset_IndexedVsUnindexed(t *testing.T) {
 
 	collIdx, err := fx.CreateCollection(ctx, "indexed")
 	require.NoError(t, err)
-	require.NoError(t, collIdx.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, collIdx.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	collNoIdx, err := fx.CreateCollection(ctx, "unindexed")
 	require.NoError(t, err)
@@ -269,7 +269,7 @@ func TestIndex_LimitOffset_FilterSortLimitOffset_FullCombo(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	// Insert 200 docs with a = i%20
 	for i := 0; i < 200; i++ {
@@ -328,7 +328,7 @@ func TestIndex_LimitOffset_WithDuplicateValues(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	// Many docs with same 'a' value
 	for i := 0; i < 30; i++ {
@@ -372,7 +372,7 @@ func TestIndex_SortStability_DuplicateKeysConsistent(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	// Insert docs with duplicate sort key values
 	for i := range 20 {
@@ -398,7 +398,7 @@ func TestIndex_SortStability_SameKeyDifferentIds(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"group"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"group"}}))
 
 	// All docs have same sort key — ordering should be stable
 	for i := range 10 {
@@ -421,7 +421,7 @@ func TestIndex_SortStability_IndexedVsNonIndexed(t *testing.T) {
 	// Create two collections with same data — one indexed, one not
 	collIdx, err := fx.CreateCollection(ctx, "test_idx")
 	require.NoError(t, err)
-	require.NoError(t, collIdx.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, collIdx.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	collNoIdx, err := fx.CreateCollection(ctx, "test_noidx")
 	require.NoError(t, err)
@@ -449,7 +449,7 @@ func TestIndex_SortStability_FilteredWithDuplicateKeys(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	// Insert docs where filtered subset has duplicate sort values
 	for i := range 20 {
@@ -469,7 +469,7 @@ func TestIndex_SortStability_DescendingWithDuplicates(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	for i := range 15 {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
@@ -494,7 +494,7 @@ func TestIndex_SortStability_CompoundSortTiebreaker(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a", "b"}}))
 
 	// Insert docs where primary sort key (a) has duplicates,
 	// second field (b) breaks the tie
@@ -536,7 +536,7 @@ func TestIndex_SortStability_WithLimitAndDuplicates(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	// 20 docs, only 4 distinct values for "a"
 	for i := range 20 {
@@ -563,7 +563,7 @@ func TestIndex_SortStability_ReverseIndexDuplicates(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"-a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"-a"}}))
 
 	for i := range 12 {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
@@ -592,7 +592,7 @@ func TestIndex_SortStability_AfterUpdate(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	for i := range 10 {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
@@ -629,7 +629,7 @@ func TestIndex_SortStability_ManyDuplicates(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	// 500 docs with a = i%5
 	for i := range 500 {
@@ -659,7 +659,7 @@ func TestIndex_DataTypes_LargeNumbers(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"big"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"big"}}))
 
 	// Insert large numbers
 	largeVals := []int64{100001, 500002, 999999, 42, 750003}
@@ -709,7 +709,7 @@ func TestIndex_DataTypes_EmptyString(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"s"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"s"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"s":""}`),
@@ -735,7 +735,7 @@ func TestIndex_DataTypes_UnicodeStrings(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"text"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"text"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"text":"hello"}`),
@@ -796,7 +796,7 @@ func TestIndex_EdgeCases_LargeDataset(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	for i := range 2000 {
 		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%100))
@@ -822,7 +822,7 @@ func TestIndex_EdgeCases_HighlySelective(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	for i := range 1000 {
 		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%100))
@@ -844,7 +844,7 @@ func TestIndex_EdgeCases_WideRange(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test_indexed")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	collNoIdx, err := fx.CreateCollection(ctx, "test_noidx")
 	require.NoError(t, err)
@@ -875,7 +875,7 @@ func TestIndex_EdgeCases_AllSameValue(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	for i := range 100 {
 		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":1}`, i))
@@ -902,7 +902,7 @@ func TestIndex_EdgeCases_NestedFieldIndex(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"meta.score"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"meta.score"}}))
 
 	for i := range 100 {
 		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"meta":{"score":%d}}`, i, i))
@@ -929,7 +929,7 @@ func TestIndex_EdgeCases_ManyDuplicates(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	for i := range 500 {
 		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%5))
@@ -955,7 +955,7 @@ func TestIndex_EdgeCases_CreateDropRecreate(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create index and insert data
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 	for i := range 50 {
 		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
 		require.NoError(t, coll.Insert(ctx, doc))
@@ -984,7 +984,7 @@ func TestIndex_EdgeCases_CreateDropRecreate(t *testing.T) {
 	assert.Contains(t, explain.Sql, "FullScan")
 
 	// Create a new index on a different field
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"b"}}))
 	assert.Len(t, coll.GetIndexes(), 1)
 
 	// Query on new index
@@ -1003,7 +1003,7 @@ func TestIndex_EdgeCases_EnsureIndexIdempotent(t *testing.T) {
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
 
-	idxInfo := IndexInfo{Fields: []string{"a"}}
+	idxInfo := anystore.IndexInfo{Fields: []string{"a"}}
 
 	// Call EnsureIndex twice — no error
 	require.NoError(t, coll.EnsureIndex(ctx, idxInfo))
@@ -1034,8 +1034,8 @@ func TestIndex_EdgeCases_MultipleIndexesDropOne(t *testing.T) {
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
 
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"b"}}))
 
 	for i := range 100 {
 		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
@@ -1073,7 +1073,7 @@ func TestIndex_EdgeCases_EmptyCollection(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	// Query empty collection
 	count, err := coll.Find(`{"a": 1}`).Count(ctx)
@@ -1133,7 +1133,7 @@ func TestIndex_EdgeCases_LargeKeyPanic(t *testing.T) {
 	// EnsureIndex → buildIndex → insertKeys → btree.Put →
 	// splitLeafAndInsertWithPath → rebuildLeafPage → PANIC
 	// (slice bounds out of range [-N:] because the key exceeds maxLocalPayload)
-	err = coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"data"}})
+	err = coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"data"}})
 	require.NoError(t, err, "EnsureIndex on large-value field should not panic")
 }
 
@@ -1150,7 +1150,7 @@ func TestDropRecreateIndexCorruption(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "corrupt.db")
 
-	db, err := Open(ctx, dbPath, nil)
+	db, err := anystore.Open(ctx, dbPath, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1179,7 +1179,7 @@ func TestDropRecreateIndexCorruption(t *testing.T) {
 	// Step 2: Cycle create/update/drop index
 	for cycle := 0; cycle < 10; cycle++ {
 		// EnsureIndex - corruption detected on cycle 4
-		if err := coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"val"}}); err != nil {
+		if err := coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"val"}}); err != nil {
 			t.Fatalf("BUG CONFIRMED - cycle %d: EnsureIndex(val): %v", cycle, err)
 		}
 
@@ -1217,7 +1217,7 @@ func TestIndex_Coverage_UnderscorePrefixedFieldAllowed(t *testing.T) {
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
 
-	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Fields: []string{"_internal"}}),
+	require.NoError(t, coll.CreateIndex(ctx, anystore.IndexInfo{Fields: []string{"_internal"}}),
 		"CreateIndex on '_internal' must succeed")
 
 	require.NoError(t, coll.Insert(ctx,
@@ -1244,7 +1244,7 @@ func TestIndex_Coverage_EmptySegmentInPathRejected(t *testing.T) {
 	cases := []string{"a..b", ".a", "a."}
 	for _, field := range cases {
 		t.Run(field, func(t *testing.T) {
-			err := coll.CreateIndex(ctx, IndexInfo{Fields: []string{field}})
+			err := coll.CreateIndex(ctx, anystore.IndexInfo{Fields: []string{field}})
 			assert.Error(t, err,
 				"CreateIndex with empty path segment %q must return a validation error", field)
 		})
@@ -1277,7 +1277,7 @@ func TestAudit03_MultiBoundOverlap_SingleDocCount(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit03_count_single")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "tags",
 		Fields: []string{"tags"},
 	}))
@@ -1303,7 +1303,7 @@ func TestAudit03_MultiBoundOverlap_SingleDocIter(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit03_iter_single")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "tags",
 		Fields: []string{"tags"},
 	}))
@@ -1331,7 +1331,7 @@ func TestAudit03_MultiBoundOverlap_MultiDocCount(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit03_count_multi")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "tags",
 		Fields: []string{"tags"},
 	}))
@@ -1356,7 +1356,7 @@ func TestAudit03_MultiBoundOverlap_MultiDocIter(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit03_iter_multi")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "tags",
 		Fields: []string{"tags"},
 	}))
@@ -1388,7 +1388,7 @@ func TestAudit03_MultiBoundOverlap_HeavyScale(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit03_heavy")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "tags",
 		Fields: []string{"tags"},
 	}))
@@ -1444,7 +1444,7 @@ func TestAudit05_CompoundMultiKey_Count_SingleDocSameArrayValues(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags", "priority"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags", "priority"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"priority":5}`),
@@ -1466,7 +1466,7 @@ func TestAudit05_CompoundMultiKey_Iter_SingleDocSameArrayValues(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags", "priority"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags", "priority"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"priority":5}`),
@@ -1488,7 +1488,7 @@ func TestAudit05_CompoundMultiKey_Count_TwoDocsOverlappingTags(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags", "priority"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags", "priority"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"priority":5}`),
@@ -1508,7 +1508,7 @@ func TestAudit05_CompoundMultiKey_Iter_TwoDocsOverlappingTags(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags", "priority"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags", "priority"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"priority":5}`),
@@ -1547,7 +1547,7 @@ func TestAudit06_UpdateOnce_OverlappingArray(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":"d1","tags":["a","b","c"],"n":0}`),
@@ -1575,7 +1575,7 @@ func TestAudit06_UpdateOnce_TwoDocs(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"n":0}`),
@@ -1607,7 +1607,7 @@ func TestAudit06_DeleteOnce_OverlappingArray(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":"d1","tags":["a","b","c"]}`),
@@ -1619,7 +1619,7 @@ func TestAudit06_DeleteOnce_OverlappingArray(t *testing.T) {
 	assert.Equal(t, 1, res.Modified, "deleted should be 1 (one doc), not 2 index hits")
 
 	_, err = coll.FindId(ctx, "d1")
-	assert.True(t, errors.Is(err, ErrDocNotFound), "d1 should be gone, got err=%v", err)
+	assert.True(t, errors.Is(err, anystore.ErrDocNotFound), "d1 should be gone, got err=%v", err)
 
 	count, err := coll.Find(nil).Count(ctx)
 	require.NoError(t, err)
@@ -1634,7 +1634,7 @@ func TestAudit06_DeleteOnce_TwoDocs(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"]}`),
@@ -1647,9 +1647,9 @@ func TestAudit06_DeleteOnce_TwoDocs(t *testing.T) {
 	assert.Equal(t, 2, res.Modified, "deleted should be 2 distinct docs (NOT one per matching index entry)")
 
 	_, err = coll.FindId(ctx, "d1")
-	assert.True(t, errors.Is(err, ErrDocNotFound), "d1 should be gone, got err=%v", err)
+	assert.True(t, errors.Is(err, anystore.ErrDocNotFound), "d1 should be gone, got err=%v", err)
 	_, err = coll.FindId(ctx, "d2")
-	assert.True(t, errors.Is(err, ErrDocNotFound), "d2 should be gone, got err=%v", err)
+	assert.True(t, errors.Is(err, anystore.ErrDocNotFound), "d2 should be gone, got err=%v", err)
 
 	count, err := coll.Find(nil).Count(ctx)
 	require.NoError(t, err)
@@ -1673,7 +1673,7 @@ func TestAudit06_DeleteOnce_TwoDocs(t *testing.T) {
 // the multi-key index, the sort, and the consumer-side dedup is correct.
 
 // collectIdsString collects the "id" field (string-typed) from a query.
-func collectIdsString(t testing.TB, q Query) []string {
+func collectIdsString(t testing.TB, q anystore.Query) []string {
 	t.Helper()
 	iter, err := q.Iter(ctx)
 	require.NoError(t, err)
@@ -1682,7 +1682,11 @@ func collectIdsString(t testing.TB, q Query) []string {
 	for iter.Next() {
 		doc, err := iter.Doc()
 		require.NoError(t, err)
-		out = append(out, string(doc.Value().GetStringBytes("id")))
+		idVal := doc.Value().Get("id")
+		require.NotNil(t, idVal, "document without id")
+		require.Equal(t, anyenc.TypeString, idVal.Type(),
+			"collectIdsString needs string ids; GetStringBytes yields \"\" for %s", idVal.Type())
+		out = append(out, string(idVal.GetStringBytes()))
 	}
 	require.NoError(t, iter.Err())
 	return out
@@ -1697,7 +1701,7 @@ func TestAudit07_SortMultiKey_OrderPreserved(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}}))
 
 	// Each doc overlaps with the others on tags, so the $in scan will
 	// emit each docId at least twice via the multi-key index.
@@ -1722,7 +1726,7 @@ func TestAudit07_SortMultiKey_DescendingOrder(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"priority":30}`),
@@ -1746,7 +1750,7 @@ func TestAudit07_SortMultiKey_WithLimit(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"priority":30}`),
@@ -1776,7 +1780,7 @@ func TestAudit07_SortMultiKey_DocAppearsExactlyOnce(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}}))
 
 	for i := 0; i < 50; i++ {
 		doc := anyenc.MustParseJson(fmt.Sprintf(
@@ -1860,62 +1864,6 @@ func TestAudit07_SortMultiKey_DocAppearsExactlyOnce(t *testing.T) {
 //   IndexIter to Count for a non-PointLookup range scan, these tests
 //   will start failing — and that's the regression signal we want.
 
-// TestAudit10_RangeMultiKey_SingleDocCountAndIter verifies subtests 1 & 2:
-//   - Count() on $gte:"a", $lte:"c" against a single doc with tags=[a,b,c]
-//     returns 1 (NOT 3) — dedup happens.
-//   - Iter() over the same range yields d1 exactly once — planIterator's
-//     consumer-side DocDedup gate (or upstream CanonicalKeyDedupIter)
-//     collapses the duplicates.
-func TestAudit10_RangeMultiKey_SingleDocCountAndIter(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "audit10_single")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
-		Name:   "ix_tags",
-		Fields: []string{"tags"},
-	}))
-
-	require.NoError(t, coll.Insert(ctx,
-		anyenc.MustParseJson(`{"id":"d1","tags":["a","b","c"]}`),
-	))
-
-	// Sanity: confirm the raw index actually holds multiple entries for d1
-	// in the range — otherwise the test wouldn't be exercising the case
-	// the audit is about. Expect 4 entries: one per element ("a","b","c")
-	// plus the whole-array entry.
-	rawEntries := readRawIndexEntries(t, fx.DB, "audit10_single", "ix_tags")
-	require.Len(t, rawEntries, 4,
-		"single doc with 3-element array must produce 4 raw index entries "+
-			"(one per element + one whole-array). If this changes, the audit assumptions need re-checking.")
-
-	t.Run("Count over $gte/$lte range collapses to one doc", func(t *testing.T) {
-		count, err := coll.Find(`{"tags":{"$gte":"a","$lte":"c"}}`).Count(ctx)
-		require.NoError(t, err)
-		// PINNED behaviour: Count returns 1 (the number of distinct
-		// matching docs), NOT 3 (the number of in-range raw index entries
-		// for d1) and NOT 4 (3 elements + whole-array entry).
-		//
-		// If this assertion ever fails with count==3 or count==4, it
-		// means a planner change has exposed the raw IndexIter (or its
-		// countEntriesBatch fast path) to Count for a range scan,
-		// bypassing the CanonicalKeyDedupIter wrap. That would be a
-		// correctness regression — Count() must report distinct docs.
-		assert.Equal(t, 1, count,
-			"$gte/$lte range over [a,c] on tags=[a,b,c] must count d1 exactly once, "+
-				"not once per matching array element")
-	})
-
-	t.Run("Iter over $gte/$lte range yields the doc once", func(t *testing.T) {
-		ids := collectIdsString(t, coll.Find(`{"tags":{"$gte":"a","$lte":"c"}}`))
-		// PINNED behaviour: planIterator's dedup (either via
-		// CanonicalKeyDedupIter wrap or the consumer-side DocDedup gate
-		// in planIterator.Next) collapses the multiple in-range hits for
-		// d1 to a single emission.
-		assert.Equal(t, []string{"d1"}, ids,
-			"Iter over $gte/$lte range must yield d1 exactly once, not once per matching array element")
-	})
-}
-
 // TestAudit10_RangeMultiKey_PointRange covers subtest 3: a point lookup
 // expressed as a degenerate range [b, b]. d1 has tags=[a,b], d2 has
 // tags=[b,c], d3 has tags=[x,y]. The range [b,b] hits d1 (via "b") and
@@ -1934,7 +1882,7 @@ func TestAudit10_RangeMultiKey_PointRange(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit10_point")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "ix_tags",
 		Fields: []string{"tags"},
 	}))
@@ -1968,61 +1916,6 @@ func TestAudit10_RangeMultiKey_PointRange(t *testing.T) {
 	})
 }
 
-// TestAudit10_RangeMultiKey_RangeAcrossMultipleDocs covers subtest 4:
-// the canonical multi-doc range case. Range [a, c]: d1 (tags=[a,b])
-// matches via "a" and "b"; d2 (tags=[b,c]) matches via "b" and "c"; d3
-// (tags=[x,y]) does not match. Count must be 2 distinct docs (NOT 4
-// raw entries: a/d1, b/d1, b/d2, c/d2 + whole-array entries).
-func TestAudit10_RangeMultiKey_RangeAcrossMultipleDocs(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "audit10_range_multi")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
-		Name:   "ix_tags",
-		Fields: []string{"tags"},
-	}))
-
-	require.NoError(t, coll.Insert(ctx,
-		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"]}`),
-		anyenc.MustParseJson(`{"id":"d2","tags":["b","c"]}`),
-		anyenc.MustParseJson(`{"id":"d3","tags":["x","y"]}`),
-	))
-
-	// Sanity: verify that a naive count of raw entries in the range
-	// would over-report. d1 contributes entries at keys "a" and "b"
-	// (plus whole-array entry — but the whole-array entry is ["a","b"]
-	// which sorts AFTER "b" in any-enc array encoding, so it may or may
-	// not fall in [a,c]). We don't pin the exact raw count here — it's
-	// fine for that to evolve — we just verify it's >2 (more than one
-	// per doc) so the test is meaningful.
-	rawEntries := readRawIndexEntries(t, fx.DB, "audit10_range_multi", "ix_tags")
-	// d1: 2 elements + 1 whole = 3 entries
-	// d2: 2 elements + 1 whole = 3 entries
-	// d3: 2 elements + 1 whole = 3 entries
-	// total: 9
-	require.Len(t, rawEntries, 9,
-		"3 docs with 2-element arrays each must produce 9 raw index entries "+
-			"(per doc: 2 elements + 1 whole-array)")
-
-	t.Run("Count over [a,c] returns 2 distinct docs", func(t *testing.T) {
-		count, err := coll.Find(`{"tags":{"$gte":"a","$lte":"c"}}`).Count(ctx)
-		require.NoError(t, err)
-		// PINNED: 2 distinct docs. Both d1 and d2 have multiple matching
-		// entries in the range; if dedup failed we'd see ≥4. This is
-		// the canonical assertion of the audit.
-		assert.Equal(t, 2, count,
-			"$gte/$lte range [a,c] must count d1 and d2 exactly once each "+
-				"(got %d) — d3 has no matching tags", count)
-	})
-
-	t.Run("Iter over [a,c] yields d1 and d2 exactly once each", func(t *testing.T) {
-		ids := collectIdsString(t, coll.Find(`{"tags":{"$gte":"a","$lte":"c"}}`))
-		assert.ElementsMatch(t, []string{"d1", "d2"}, ids,
-			"Iter over [a,c] must yield exactly {d1, d2}")
-		assert.Len(t, ids, 2, "Iter must dedup; no duplicates allowed")
-	})
-}
-
 // TestAudit10_RangeMultiKey_ReverseRange covers subtest 5: reverse
 // direction (Sort("-tags")) — the dedup must work in reverse too.
 //
@@ -2034,7 +1927,7 @@ func TestAudit10_RangeMultiKey_ReverseRange(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit10_reverse")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "ix_tags",
 		Fields: []string{"tags"},
 	}))
@@ -2094,7 +1987,7 @@ func TestAudit10_RangeMultiKey_LargeArray(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit10_large_array")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "ix_tags",
 		Fields: []string{"tags"},
 	}))
@@ -2162,7 +2055,7 @@ func TestAudit11_EmptyIn_Count(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit11_empty_count")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "tags",
 		Fields: []string{"tags"},
 	}))
@@ -2190,7 +2083,7 @@ func TestAudit11_EmptyIn_Iter(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit11_empty_iter")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "tags",
 		Fields: []string{"tags"},
 	}))
@@ -2217,7 +2110,7 @@ func TestAudit11_SingletonIn_Count_MultiKeyDoc(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit11_singleton_count")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "tags",
 		Fields: []string{"tags"},
 	}))
@@ -2243,7 +2136,7 @@ func TestAudit11_SingletonIn_Iter_MultiKeyDoc(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit11_singleton_iter")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "tags",
 		Fields: []string{"tags"},
 	}))
@@ -2267,7 +2160,7 @@ func TestAudit11_SingletonIn_NoMatch(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit11_singleton_nomatch")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "tags",
 		Fields: []string{"tags"},
 	}))
@@ -2300,7 +2193,7 @@ func TestAudit11_SingletonIn_MultipleDocs(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit11_singleton_multidoc")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "tags",
 		Fields: []string{"tags"},
 	}))
@@ -2355,12 +2248,12 @@ are defined elsewhere in the package test suite and reused as-is.
 // act-01
 func TestIndex_Single_Ne_TwoBoundSeek_IncludesNullAndMissing(t *testing.T) {
 	// Builds a collection; when withIndex is true a non-sparse index {a} is added.
-	mk := func(withIndex bool, docs ...string) Collection {
+	mk := func(withIndex bool, docs ...string) anystore.Collection {
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "c")
 		require.NoError(t, err)
 		if withIndex {
-			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+			require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 		}
 		for _, d := range docs {
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
@@ -2368,7 +2261,7 @@ func TestIndex_Single_Ne_TwoBoundSeek_IncludesNullAndMissing(t *testing.T) {
 		return coll
 	}
 
-	sortedIds := func(c Collection, filter string) []string {
+	sortedIds := func(c anystore.Collection, filter string) []string {
 		ids := collectIdsString(t, c.Find(filter).Sort("id"))
 		sort.Strings(ids)
 		return ids
@@ -2436,7 +2329,7 @@ func TestIndex_Single_MixedTypeOrdering(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "c")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":"1","a":5}`),
@@ -2488,7 +2381,7 @@ func TestIndex_Single_NegativeNumbers(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "c")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	for _, v := range []int{-5, -3, -1, 0, 2, 4} {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
@@ -2536,7 +2429,7 @@ func TestIndex_LimitOffset_OffsetLargerThanResultSet_InMemorySort(t *testing.T) 
 	}
 
 	// local closure: collect the int "a" field, asserting no iterator error.
-	collectA := func(q Query) []int {
+	collectA := func(q anystore.Query) []int {
 		t.Helper()
 		iter, err := q.Iter(ctx)
 		require.NoError(t, err)
@@ -2600,7 +2493,7 @@ func TestIndex_LimitOffset_TopKStability_DuplicateKeys_NonIndexedSort(t *testing
 			anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i/10))))
 	}
 
-	collectIDs := func(q Query) []int {
+	collectIDs := func(q anystore.Query) []int {
 		t.Helper()
 		iter, err := q.Iter(ctx)
 		require.NoError(t, err)
@@ -2657,7 +2550,7 @@ func TestIndex_LimitOffset_FilterOffset_InMemorySort_SkipsFilteredRows(t *testin
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
 	// Index only on "a"; the sort field "b" is intentionally unindexed.
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	// 40 docs: a=i, b=40-i. Filter a>=20 keeps a=20..39 -> b=1..20.
 	for i := 0; i < 40; i++ {
@@ -2704,7 +2597,7 @@ func TestIndex_LimitOffset_ExplainTokens_TopKvsSort(t *testing.T) {
 	t.Run("indexed_sort_limit_no_topk_no_sort", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "idx")
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 		for i := 0; i < 50; i++ {
 			require.NoError(t, coll.Insert(ctx,
 				anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
@@ -2791,7 +2684,7 @@ func TestIndex_ArrayNested_NeOverMultiKey_DedupAndAgreement(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "tags", Fields: []string{"tags"}}))
 
 	// id3 straddles the negated value "a": "A" < "a" < "z", so both the
 	// lower bound [-inf,"a") and the upper bound ("a",inf] visit it.
@@ -2812,7 +2705,7 @@ func TestIndex_ArrayNested_NeOverMultiKey_DedupAndAgreement(t *testing.T) {
 	assert.Contains(t, neExplain.Sql, `[-inf,'"a"'),('"a"',inf]`)
 
 	neHintExplain, err := coll.Find(`{"tags":{"$ne":"a"}}`).
-		IndexHint(IndexHint{IndexName: "tags", Boost: 1000000}).Explain(ctx)
+		IndexHint(anystore.IndexHint{IndexName: "tags", Boost: 1000000}).Explain(ctx)
 	require.NoError(t, err)
 	assert.Contains(t, neHintExplain.Sql, "IndexScan(tags)")
 	assert.Contains(t, neHintExplain.Sql, "Dedup(canonical)")
@@ -2847,7 +2740,7 @@ func TestIndex_ArrayNested_NeOverMultiKey_DedupAndAgreement(t *testing.T) {
 
 	// $nin desugars to Nor: NO index bounds, must FullScan even when hinted.
 	ninExplain, err := coll.Find(`{"tags":{"$nin":["a"]}}`).
-		IndexHint(IndexHint{IndexName: "tags", Boost: 1000000}).Explain(ctx)
+		IndexHint(anystore.IndexHint{IndexName: "tags", Boost: 1000000}).Explain(ctx)
 	require.NoError(t, err)
 	assert.Contains(t, ninExplain.Sql, "FullScan")
 	assert.NotContains(t, ninExplain.Sql, "IndexScan")
@@ -2869,7 +2762,7 @@ func TestIndex_ArrayNested_NestedField_IntermediateArray_Traversed(t *testing.T)
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "items.name", Fields: []string{"items.name"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "items.name", Fields: []string{"items.name"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"items":[{"name":"a"},{"name":"b"}]}`),
@@ -2910,7 +2803,7 @@ func TestIndex_ArrayNested_WholeArrayEquality_UsesIndex(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "tags", Fields: []string{"tags"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":"1","tags":["a","b"]}`),
@@ -2951,7 +2844,7 @@ func TestIndex_ArrayNested_NullElementInArray_IndexedAndQueryable(t *testing.T) 
 	fxA := newFixture(t)
 	collA, err := fxA.CreateCollection(ctx, "ns")
 	require.NoError(t, err)
-	require.NoError(t, collA.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+	require.NoError(t, collA.EnsureIndex(ctx, anystore.IndexInfo{Name: "tags", Fields: []string{"tags"}}))
 	require.NoError(t, collA.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"tags":["a",null,"b"]}`), // null,a,b,whole-array = 4
 		anyenc.MustParseJson(`{"id":2}`),                       // missing -> 1 null
@@ -2974,7 +2867,7 @@ func TestIndex_ArrayNested_NullElementInArray_IndexedAndQueryable(t *testing.T) 
 	fxB := newFixture(t)
 	collB, err := fxB.CreateCollection(ctx, "sp")
 	require.NoError(t, err)
-	require.NoError(t, collB.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}, Sparse: true}))
+	require.NoError(t, collB.EnsureIndex(ctx, anystore.IndexInfo{Name: "tags", Fields: []string{"tags"}, Sparse: true}))
 	require.NoError(t, collB.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"tags":["a",null,"b"]}`), // null,a,b,whole-array = 4
 		anyenc.MustParseJson(`{"id":2}`),                       // missing -> skipped
@@ -2988,7 +2881,7 @@ func TestIndex_ArrayNested_NullElementInArray_IndexedAndQueryable(t *testing.T) 
 	fxC := newFixture(t)
 	collC, err := fxC.CreateCollection(ctx, "dup")
 	require.NoError(t, err)
-	require.NoError(t, collC.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+	require.NoError(t, collC.EnsureIndex(ctx, anystore.IndexInfo{Name: "tags", Fields: []string{"tags"}}))
 	require.NoError(t, collC.Insert(ctx,
 		anyenc.MustParseJson(`{"id":3,"tags":[null,null,"a"]}`), // null + a + whole-array = 3
 	))
@@ -3002,7 +2895,7 @@ func TestIndex_ArrayNested_NestedLeafArray_MultiKeyFanout(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "abc", Fields: []string{"a.b.c"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "abc", Fields: []string{"a.b.c"}}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"a":{"b":{"c":["x","y"]}}}`),
@@ -3068,7 +2961,7 @@ func TestIndex_ArrayNested_NestedLeafArray_MultiKeyFanout(t *testing.T) {
 func TestIndex_ComplexFilter_NorIsSoundAndFullScans(t *testing.T) {
 	// Local closure: build a collection of 100 docs (a=i%10, b=i%7), optionally
 	// indexed on "a". Twin (unindexed) collection is built by passing nil.
-	build := func(t *testing.T, indexes ...IndexInfo) Collection {
+	build := func(t *testing.T, indexes ...anystore.IndexInfo) anystore.Collection {
 		t.Helper()
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "test")
@@ -3083,7 +2976,7 @@ func TestIndex_ComplexFilter_NorIsSoundAndFullScans(t *testing.T) {
 		return coll
 	}
 
-	idx := build(t, IndexInfo{Fields: []string{"a"}})
+	idx := build(t, anystore.IndexInfo{Fields: []string{"a"}})
 	noidx := build(t)
 
 	t.Run("pure nor fullscans and agrees with unindexed", func(t *testing.T) {
@@ -3140,7 +3033,7 @@ func TestIndex_ComplexFilter_NorIsSoundAndFullScans(t *testing.T) {
 
 // act-34: $not operator form over an index is sound and fullscans.
 func TestIndex_ComplexFilter_NotOperatorSound(t *testing.T) {
-	build := func(t *testing.T, indexes ...IndexInfo) Collection {
+	build := func(t *testing.T, indexes ...anystore.IndexInfo) anystore.Collection {
 		t.Helper()
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "test")
@@ -3155,7 +3048,7 @@ func TestIndex_ComplexFilter_NotOperatorSound(t *testing.T) {
 		return coll
 	}
 
-	idx := build(t, IndexInfo{Fields: []string{"a"}})
+	idx := build(t, anystore.IndexInfo{Fields: []string{"a"}})
 	noidx := build(t)
 
 	t.Run("not eq fullscans, 90 docs, agrees with unindexed", func(t *testing.T) {
@@ -3213,12 +3106,12 @@ func TestIndex_ComplexFilter_NotOperatorSound(t *testing.T) {
 // the exact count of 50 are the load-bearing assertions.
 func TestIndex_ComplexFilter_ExistsFalseAndNonSparse(t *testing.T) {
 	// Local closure: 100 docs; even i has "opt", odd i does not. Index on "opt".
-	build := func(t *testing.T, sparse bool) Collection {
+	build := func(t *testing.T, sparse bool) anystore.Collection {
 		t.Helper()
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"opt"}, Sparse: sparse}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"opt"}, Sparse: sparse}))
 		for i := 0; i < 100; i++ {
 			var doc *anyenc.Value
 			if i%2 == 0 {
@@ -3232,7 +3125,7 @@ func TestIndex_ComplexFilter_ExistsFalseAndNonSparse(t *testing.T) {
 	}
 
 	// Unindexed baseline (no index at all) for parity.
-	baseline := func(t *testing.T) Collection {
+	baseline := func(t *testing.T) anystore.Collection {
 		t.Helper()
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "test")
@@ -3249,7 +3142,7 @@ func TestIndex_ComplexFilter_ExistsFalseAndNonSparse(t *testing.T) {
 		return coll
 	}
 
-	idxLen := func(t *testing.T, c Collection) int {
+	idxLen := func(t *testing.T, c anystore.Collection) int {
 		t.Helper()
 		n, err := c.GetIndexes()[0].Len(ctx)
 		require.NoError(t, err)
@@ -3334,7 +3227,7 @@ func TestIndex_ComplexFilter_ExistsFalseAndNonSparse(t *testing.T) {
 // returns 0. And.IndexBounds yields only the first conjunct's over-approx seek
 // bounds ('5',inf]; the residual FilterIter rejects every row.
 func TestIndex_ComplexFilter_ContradictoryRangeAnd(t *testing.T) {
-	coll := setupTestCollection(t, 100, IndexInfo{Fields: []string{"a"}})
+	coll := setupTestCollection(t, 100, anystore.IndexInfo{Fields: []string{"a"}})
 
 	// Both the explicit $and form and the inline two-operator form must behave
 	// identically: seek the first conjunct, re-filter to empty.
@@ -3375,14 +3268,14 @@ func TestIndex_ComplexFilter_ContradictoryRangeAnd(t *testing.T) {
 // silently drops the other branch.
 func TestIndex_ComplexFilter_OrTwoIndexedFieldsUnion(t *testing.T) {
 	// Local closure: 100 docs (a=i%10, b=i%7); optionally index BOTH a and b.
-	build := func(t *testing.T, indexed bool) Collection {
+	build := func(t *testing.T, indexed bool) anystore.Collection {
 		t.Helper()
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
 		if indexed {
-			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b"}}))
+			require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
+			require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"b"}}))
 		}
 		for i := 0; i < 100; i++ {
 			doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
@@ -3434,11 +3327,11 @@ func TestIndex_ComplexFilter_OrTwoIndexedFieldsUnion(t *testing.T) {
 func TestIndex_InNullMatchesMissingField(t *testing.T) {
 	fx := newFixture(t)
 
-	build := func(t *testing.T, withIndex bool) Collection {
+	build := func(t *testing.T, withIndex bool) anystore.Collection {
 		coll, err := fx.CreateCollection(ctx, fmt.Sprintf("innull_%v", withIndex))
 		require.NoError(t, err)
 		if withIndex {
-			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+			require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 		}
 		for _, doc := range []string{
 			`{"id":1}`,
@@ -3454,7 +3347,7 @@ func TestIndex_InNullMatchesMissingField(t *testing.T) {
 	noidx := build(t, false)
 
 	check := func(t *testing.T, filter string, wantIds []int) {
-		for name, coll := range map[string]Collection{"indexed": idx, "fullscan": noidx} {
+		for name, coll := range map[string]anystore.Collection{"indexed": idx, "fullscan": noidx} {
 			cnt, err := coll.Find(filter).Count(ctx)
 			require.NoError(t, err)
 			assert.Equal(t, len(wantIds), cnt, "%s Count %s", name, filter)
@@ -3474,12 +3367,12 @@ func TestIndex_InNullMatchesMissingField(t *testing.T) {
 // below Sort/Limit/Offset and the covering Count, so raw entries never consume
 // result slots: every verb agrees with the FullScan oracle.
 func TestIndex_CompoundMultikeyDedupBelowCutoffs(t *testing.T) {
-	newColl := func(t *testing.T, name string, withIndex bool) Collection {
+	newColl := func(t *testing.T, name string, withIndex bool) anystore.Collection {
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, name)
 		require.NoError(t, err)
 		if withIndex {
-			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "tb", Fields: []string{"tags", "b"}}))
+			require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "tb", Fields: []string{"tags", "b"}}))
 		}
 		require.NoError(t, coll.Insert(ctx,
 			anyenc.MustParseJson(`{"id":1,"tags":[1,2],"b":1}`),
@@ -3491,7 +3384,7 @@ func TestIndex_CompoundMultikeyDedupBelowCutoffs(t *testing.T) {
 		return coll
 	}
 
-	hint := IndexHint{IndexName: "tb", Boost: 1 << 30}
+	hint := anystore.IndexHint{IndexName: "tb", Boost: 1 << 30}
 	filter := `{"tags":{"$in":[1,2]}}`
 
 	t.Run("limit counts documents not entries", func(t *testing.T) {
@@ -3548,7 +3441,7 @@ func TestIndex_CompoundCoveringCountMultikey(t *testing.T) {
 	t.Run("array suffix fan-out counts one doc", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "fanout")
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a", "b"}}))
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":-1,"b":[1,2,3]}`)))
 
 		cnt, err := coll.Find(`{"a":-1}`).Count(ctx)
@@ -3560,7 +3453,7 @@ func TestIndex_CompoundCoveringCountMultikey(t *testing.T) {
 	t.Run("multi-bound in over array leading field", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "multibound")
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags", "b"}}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags", "b"}}))
 		require.NoError(t, coll.Insert(ctx,
 			anyenc.MustParseJson(`{"id":1,"tags":[1,2],"b":1}`),
 			anyenc.MustParseJson(`{"id":2,"tags":[2],"b":2}`)))
@@ -3573,7 +3466,7 @@ func TestIndex_CompoundCoveringCountMultikey(t *testing.T) {
 	t.Run("scalar-only compound stays exact", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "scalar")
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a", "b"}}))
 		for i := 0; i < 10; i++ {
 			require.NoError(t, coll.Insert(ctx,
 				anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%3, i))))
@@ -3591,7 +3484,7 @@ func TestIndex_UniqueMultikeyCoverLookupDedup(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "uniqmk")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a", "b"}, Unique: true}))
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"a":[1,2],"b":5}`),
 		anyenc.MustParseJson(`{"id":2,"a":[3],"b":5}`)))
@@ -3613,7 +3506,7 @@ func TestIndex_UniqueMultikeyCoverLookupDedup(t *testing.T) {
 	// for compound lookups rather than trust the probe.
 	sfx, err := fx.CreateCollection(ctx, "uniqmk_suffix")
 	require.NoError(t, err)
-	require.NoError(t, sfx.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}, Unique: true}))
+	require.NoError(t, sfx.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a", "b"}, Unique: true}))
 	require.NoError(t, sfx.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"a":1,"b":[2,3]}`),
 		anyenc.MustParseJson(`{"id":2,"a":1,"b":[4]}`)))
@@ -3637,13 +3530,13 @@ func TestIndex_ArraySortPlanIndependence(t *testing.T) {
 	fx := newFixture(t)
 	seq := 0
 
-	build := func(t *testing.T, indexFields []string, docs ...string) (idx, plain Collection) {
+	build := func(t *testing.T, indexFields []string, docs ...string) (idx, plain anystore.Collection) {
 		seq++
-		mk := func(name string, fields []string) Collection {
+		mk := func(name string, fields []string) anystore.Collection {
 			coll, err := fx.CreateCollection(ctx, fmt.Sprintf("%s_%d", name, seq))
 			require.NoError(t, err)
 			if fields != nil {
-				require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "srt", Fields: fields}))
+				require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "srt", Fields: fields}))
 			}
 			for _, d := range docs {
 				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
@@ -3653,8 +3546,8 @@ func TestIndex_ArraySortPlanIndependence(t *testing.T) {
 		return mk("idx", indexFields), mk("plain", nil)
 	}
 
-	hint := IndexHint{IndexName: "srt", Boost: 1 << 30}
-	check := func(t *testing.T, idx, plain Collection, filter any, want []int, sorts ...any) {
+	hint := anystore.IndexHint{IndexName: "srt", Boost: 1 << 30}
+	check := func(t *testing.T, idx, plain anystore.Collection, filter any, want []int, sorts ...any) {
 		pOrder := collectIntField(t, plain.Find(filter).Sort(sorts...), "id")
 		iOrder := collectIntField(t, idx.Find(filter).IndexHint(hint).Sort(sorts...), "id")
 		assert.Equal(t, want, pOrder, "plain order")
@@ -3717,16 +3610,16 @@ func TestIndex_ArraySortPlanIndependence(t *testing.T) {
 func TestIndex_ArraySortOrderProvidingGate(t *testing.T) {
 	fx := newFixture(t)
 
-	mk := func(t *testing.T, name string, docs ...string) Collection {
+	mk := func(t *testing.T, name string, docs ...string) anystore.Collection {
 		coll, err := fx.CreateCollection(ctx, name)
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "srt", Fields: []string{"x"}}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "srt", Fields: []string{"x"}}))
 		for _, d := range docs {
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
 		}
 		return coll
 	}
-	hint := IndexHint{IndexName: "srt", Boost: 1 << 30}
+	hint := anystore.IndexHint{IndexName: "srt", Boost: 1 << 30}
 
 	t.Run("scalar-proven keeps the order-providing scan", func(t *testing.T) {
 		coll := mk(t, "scalar", `{"id":1,"x":1}`, `{"id":2,"x":2}`)
@@ -3757,7 +3650,7 @@ func TestIndex_ArrayNested_SparseDedupKeepsDoc(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a.b"}, Sparse: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "ab", Fields: []string{"a.b"}, Sparse: true}))
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"a":[{"b":"abc"},{"c":2}]}`),
 		anyenc.MustParseJson(`{"id":2,"a":[{"b":"xbz"},{"b":null}]}`),
@@ -3780,7 +3673,7 @@ func TestIndex_ArrayNested_MultipleWholeArrayEntries(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a.b"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "ab", Fields: []string{"a.b"}}))
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"a":[{"b":[1,2]},{"b":[3]}]}`),
 		anyenc.MustParseJson(`{"id":2,"a":[{"b":[4]}]}`),
@@ -3817,7 +3710,7 @@ func TestIndex_ArrayNested_CountFanoutWithoutArrayKey(t *testing.T) {
 	for _, unique := range []bool{false, true} {
 		coll, err := fx.CreateCollection(ctx, fmt.Sprintf("test_%v", unique))
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a.b"}, Unique: unique}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "ab", Fields: []string{"a.b"}, Unique: unique}))
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":[{"b":1},{"b":2}]}`)))
 		for i := 2; i < 12; i++ {
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":[{"b":%d}]}`, i, i+10))))
@@ -3837,7 +3730,7 @@ func TestIndex_ArrayNested_CompoundSharedArray(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "bc", Fields: []string{"a.b", "a.c"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "bc", Fields: []string{"a.b", "a.c"}}))
 
 	var elems []string
 	for i := 0; i < 50; i++ {
@@ -3873,7 +3766,7 @@ func TestIndex_ArrayNested_CompoundSharedArray(t *testing.T) {
 	// Two arrays (or an array and a scalar path) stay independent.
 	coll2, err := fx.CreateCollection(ctx, "test2")
 	require.NoError(t, err)
-	require.NoError(t, coll2.EnsureIndex(ctx, IndexInfo{Name: "bx", Fields: []string{"a.b", "x.y"}}))
+	require.NoError(t, coll2.EnsureIndex(ctx, anystore.IndexInfo{Name: "bx", Fields: []string{"a.b", "x.y"}}))
 	require.NoError(t, coll2.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":[{"b":1},{"b":2}],"x":[{"y":1},{"y":2}]}`)))
 	assertIndexLen(t, coll2.GetIndexes()[0], 4)
 
@@ -3881,14 +3774,14 @@ func TestIndex_ArrayNested_CompoundSharedArray(t *testing.T) {
 	// out into elements plus the array, the path into the elements' values.
 	coll3, err := fx.CreateCollection(ctx, "test3")
 	require.NoError(t, err)
-	require.NoError(t, coll3.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a", "a.b"}}))
+	require.NoError(t, coll3.EnsureIndex(ctx, anystore.IndexInfo{Name: "ab", Fields: []string{"a", "a.b"}}))
 	require.NoError(t, coll3.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":[{"b":1},{"b":2}]}`)))
 	assertIndexLen(t, coll3.GetIndexes()[0], 3*2)
 
 	// Nested arrays share at every level: (a.b.c, a.b.d) over two levels.
 	coll4, err := fx.CreateCollection(ctx, "test4")
 	require.NoError(t, err)
-	require.NoError(t, coll4.EnsureIndex(ctx, IndexInfo{Name: "cd", Fields: []string{"a.b.c", "a.b.d"}}))
+	require.NoError(t, coll4.EnsureIndex(ctx, anystore.IndexInfo{Name: "cd", Fields: []string{"a.b.c", "a.b.d"}}))
 	require.NoError(t, coll4.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":[{"b":[{"c":1,"d":1},{"c":2,"d":2}]},{"b":[{"c":3,"d":3}]}]}`)))
 	assertIndexLen(t, coll4.GetIndexes()[0], 3)
 	assert.ElementsMatch(t, []int{1}, collectIntField(t, coll4.Find(`{"a.b.c":2,"a.b.d":2}`), "id"))
@@ -3901,11 +3794,11 @@ func TestIndex_ArrayNested_UniqueCompoundSharedArray(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "bc", Fields: []string{"a.b", "a.c"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "bc", Fields: []string{"a.b", "a.c"}, Unique: true}))
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":[{"b":1,"c":2},{"b":3,"c":4}]}`)))
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":{"b":1,"c":4}}`)))
 	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":[{"b":3,"c":4}]}`))
-	assert.ErrorIs(t, err, ErrUniqueConstraint)
+	assert.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 }
 
 // A sparse index over a path through an array of objects never provides the
@@ -3913,11 +3806,11 @@ func TestIndex_ArrayNested_UniqueCompoundSharedArray(t *testing.T) {
 // while the index holds only its non-null leaves.
 func TestIndex_ArrayNested_SparseIndexOrderDemoted(t *testing.T) {
 	fx := newFixture(t)
-	mk := func(name string, sparse bool) Collection {
+	mk := func(name string, sparse bool) anystore.Collection {
 		coll, err := fx.CreateCollection(ctx, name)
 		require.NoError(t, err)
 		if name != "plain" {
-			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a.b"}, Sparse: sparse}))
+			require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "ab", Fields: []string{"a.b"}, Sparse: sparse}))
 		}
 		require.NoError(t, coll.Insert(ctx,
 			anyenc.MustParseJson(`{"id":1,"a":[{"b":2},{"c":1}]}`), // leaves 2, missing → key null
@@ -3927,10 +3820,10 @@ func TestIndex_ArrayNested_SparseIndexOrderDemoted(t *testing.T) {
 		return coll
 	}
 	plain, sparse, dense := mk("plain", false), mk("sparse", true), mk("dense", false)
-	hint := IndexHint{IndexName: "ab", Boost: 1 << 30}
+	hint := anystore.IndexHint{IndexName: "ab", Boost: 1 << 30}
 	for _, sort := range []string{"a.b", "-a.b"} {
 		want := collectIntField(t, plain.Find(nil).Sort(sort), "id")
-		for name, coll := range map[string]Collection{"sparse": sparse, "dense": dense} {
+		for name, coll := range map[string]anystore.Collection{"sparse": sparse, "dense": dense} {
 			assert.Equal(t, want, collectIntField(t, coll.Find(nil).IndexHint(hint).Sort(sort), "id"), "%s %s", name, sort)
 			assert.Equal(t, want[:1], collectIntField(t, coll.Find(nil).IndexHint(hint).Sort(sort).Limit(1), "id"), "%s %s limit", name, sort)
 		}
@@ -3944,7 +3837,7 @@ func TestIndex_ArrayNested_DigitPrefixedKey(t *testing.T) {
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
 	const key = "1725580800000_x"
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ak", Fields: []string{"a." + key}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "ak", Fields: []string{"a." + key}}))
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"a":[{"`+key+`":7}]}`),
 		anyenc.MustParseJson(`{"id":2,"a":[{"`+key+`":8},{"`+key+`":7}]}`),
@@ -3966,7 +3859,7 @@ func TestIndex_ArrayNested_ElemMatchPositionalIndex(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a0", Fields: []string{"a.0"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a0", Fields: []string{"a.0"}}))
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"a":[{"0":5}]}`),
 		anyenc.MustParseJson(`{"id":2,"a":[{"0":6},{"0":5}]}`),
@@ -3974,7 +3867,7 @@ func TestIndex_ArrayNested_ElemMatchPositionalIndex(t *testing.T) {
 	))
 	filter := `{"a":{"$elemMatch":{"0":5}}}`
 	assert.Empty(t, query.MustParseCondition(filter).IndexBounds("a.0", nil))
-	q := coll.Find(filter).IndexHint(IndexHint{IndexName: "a0", Boost: 1 << 30})
+	q := coll.Find(filter).IndexHint(anystore.IndexHint{IndexName: "a0", Boost: 1 << 30})
 	assert.ElementsMatch(t, []int{1, 2}, collectIntField(t, q, "id"))
 	cnt, err := q.Count(ctx)
 	require.NoError(t, err)
@@ -4002,7 +3895,7 @@ func TestIndex_ArrayNested_SparseCompoundSharedArray(t *testing.T) {
 	require.NoError(t, err)
 	sparse, err := fx.CreateCollection(ctx, "sparse")
 	require.NoError(t, err)
-	require.NoError(t, sparse.EnsureIndex(ctx, IndexInfo{Name: "bc", Fields: []string{"a.b", "a.c"}, Sparse: true}))
+	require.NoError(t, sparse.EnsureIndex(ctx, anystore.IndexInfo{Name: "bc", Fields: []string{"a.b", "a.c"}, Sparse: true}))
 	for _, d := range docs {
 		require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
 		require.NoError(t, sparse.Insert(ctx, anyenc.MustParseJson(d)))
@@ -4011,7 +3904,7 @@ func TestIndex_ArrayNested_SparseCompoundSharedArray(t *testing.T) {
 	// doc6: (1,2),(9,null); doc8: (null,3)
 	assertIndexLen(t, sparse.GetIndexes()[0], 2+2+1+2+1)
 
-	hint := IndexHint{IndexName: "bc", Boost: 1 << 30}
+	hint := anystore.IndexHint{IndexName: "bc", Boost: 1 << 30}
 	for _, filter := range []string{
 		`{"a.b":1,"a.c":2}`,
 		`{"a.b":9,"a.c":{"$gt":0}}`,
@@ -4043,7 +3936,7 @@ func TestIndex_Sparse_PresenceSemantics(t *testing.T) {
 	require.NoError(t, err)
 	sparse, err := fx.CreateCollection(ctx, "sparse")
 	require.NoError(t, err)
-	require.NoError(t, sparse.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
+	require.NoError(t, sparse.EnsureIndex(ctx, anystore.IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
 
 	docs := []string{
 		`{"id":1,"a":1}`,
@@ -4063,8 +3956,8 @@ func TestIndex_Sparse_PresenceSemantics(t *testing.T) {
 	// 1; null; []; 1, null, [1,null]; "x"; false
 	assertIndexLen(t, sparse.GetIndexes()[0], 1+1+1+3+1+1)
 
-	hint := IndexHint{IndexName: "a", Boost: 1 << 30}
-	usesIndex := func(q Query) bool {
+	hint := anystore.IndexHint{IndexName: "a", Boost: 1 << 30}
+	usesIndex := func(q anystore.Query) bool {
 		ex, err := q.Explain(ctx)
 		require.NoError(t, err)
 		return plannerIndexUsed(ex, "a")
@@ -4092,7 +3985,7 @@ func TestIndex_Sparse_PresenceSemantics(t *testing.T) {
 		{`{"b":{"$gt":390}}`, false},
 	} {
 		want := collectIntField(t, plain.Find(tc.filter), "id")
-		for _, q := range []Query{sparse.Find(tc.filter), sparse.Find(tc.filter).IndexHint(hint)} {
+		for _, q := range []anystore.Query{sparse.Find(tc.filter), sparse.Find(tc.filter).IndexHint(hint)} {
 			assert.ElementsMatch(t, want, collectIntField(t, q, "id"), tc.filter)
 			cnt, err := q.Count(ctx)
 			require.NoError(t, err)
@@ -4122,8 +4015,8 @@ func TestIndex_Sparse_PresenceCompoundAndFanOut(t *testing.T) {
 	require.NoError(t, err)
 	sparse, err := fx.CreateCollection(ctx, "sparse")
 	require.NoError(t, err)
-	require.NoError(t, sparse.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a", "b"}, Sparse: true}))
-	require.NoError(t, sparse.EnsureIndex(ctx, IndexInfo{Name: "xy", Fields: []string{"x.y"}, Sparse: true}))
+	require.NoError(t, sparse.EnsureIndex(ctx, anystore.IndexInfo{Name: "ab", Fields: []string{"a", "b"}, Sparse: true}))
+	require.NoError(t, sparse.EnsureIndex(ctx, anystore.IndexInfo{Name: "xy", Fields: []string{"x.y"}, Sparse: true}))
 
 	docs := []string{
 		`{"id":1,"a":1,"b":2}`,
@@ -4160,8 +4053,8 @@ func TestIndex_Sparse_PresenceCompoundAndFanOut(t *testing.T) {
 		{`{"x.y":null}`, "xy", false},
 	} {
 		want := collectIntField(t, plain.Find(tc.filter), "id")
-		hint := IndexHint{IndexName: tc.index, Boost: 1 << 30}
-		for _, q := range []Query{sparse.Find(tc.filter), sparse.Find(tc.filter).IndexHint(hint)} {
+		hint := anystore.IndexHint{IndexName: tc.index, Boost: 1 << 30}
+		for _, q := range []anystore.Query{sparse.Find(tc.filter), sparse.Find(tc.filter).IndexHint(hint)} {
 			assert.ElementsMatch(t, want, collectIntField(t, q, "id"), tc.filter)
 			cnt, err := q.Count(ctx)
 			require.NoError(t, err)
@@ -4182,7 +4075,7 @@ func TestIndex_Sparse_PresenceScanSortLimitOffset(t *testing.T) {
 	require.NoError(t, err)
 	sparse, err := fx.CreateCollection(ctx, "sparse")
 	require.NoError(t, err)
-	require.NoError(t, sparse.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
+	require.NoError(t, sparse.EnsureIndex(ctx, anystore.IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
 
 	var docs []string
 	for i := range 40 {
@@ -4201,12 +4094,12 @@ func TestIndex_Sparse_PresenceScanSortLimitOffset(t *testing.T) {
 		require.NoError(t, sparse.Insert(ctx, anyenc.MustParseJson(d)))
 	}
 
-	hint := IndexHint{IndexName: "a", Boost: 1 << 30}
+	hint := anystore.IndexHint{IndexName: "a", Boost: 1 << 30}
 	for _, filter := range []string{`{"a":{"$exists":true}}`, `{"a":{"$ne":null}}`, `{"a":{"$type":"null"}}`} {
 		for _, sort := range []string{"a", "-a"} {
 			for _, off := range []uint{0, 1, 5, 12} {
 				want := collectIntField(t, plain.Find(filter).Sort(sort, "id").Offset(off).Limit(4), "id")
-				for _, q := range []Query{
+				for _, q := range []anystore.Query{
 					sparse.Find(filter).Sort(sort, "id").Offset(off).Limit(4),
 					sparse.Find(filter).Sort(sort, "id").Offset(off).Limit(4).IndexHint(hint),
 				} {
@@ -4226,8 +4119,8 @@ func TestIndex_Sparse_PresenceWithBoundedOtherIndex(t *testing.T) {
 	both, err := fx.CreateCollection(ctx, "both")
 	require.NoError(t, err)
 	require.NoError(t, both.EnsureIndex(ctx,
-		IndexInfo{Name: "opt", Fields: []string{"opt"}, Sparse: true},
-		IndexInfo{Name: "n", Fields: []string{"n"}},
+		anystore.IndexInfo{Name: "opt", Fields: []string{"opt"}, Sparse: true},
+		anystore.IndexInfo{Name: "n", Fields: []string{"n"}},
 	))
 	for i := range 600 {
 		d := fmt.Sprintf(`{"id":%d,"n":%d}`, i, i%100)
@@ -4248,7 +4141,7 @@ func TestIndex_Sparse_PresenceWithBoundedOtherIndex(t *testing.T) {
 		`{"opt":{"$exists":false},"n":0}`,
 	} {
 		want := collectIntField(t, plain.Find(filter), "id")
-		for _, hints := range [][]IndexHint{
+		for _, hints := range [][]anystore.IndexHint{
 			nil,
 			{{IndexName: "opt", Boost: 1 << 30}},
 			{{IndexName: "n", Boost: 1 << 30}},
@@ -4274,7 +4167,7 @@ func TestIndex_Sparse_CompoundTransitions(t *testing.T) {
 	require.NoError(t, err)
 	sparse, err := fx.CreateCollection(ctx, "sparse")
 	require.NoError(t, err)
-	require.NoError(t, sparse.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: []string{"a", "b"}, Sparse: true}))
+	require.NoError(t, sparse.EnsureIndex(ctx, anystore.IndexInfo{Name: "ab", Fields: []string{"a", "b"}, Sparse: true}))
 
 	apply := func(docs ...string) {
 		t.Helper()
@@ -4297,7 +4190,7 @@ func TestIndex_Sparse_CompoundTransitions(t *testing.T) {
 			`{"a":{"$exists":true},"b":{"$ne":null}}`,
 		} {
 			want := collectIntField(t, plain.Find(filter), "id")
-			hint := IndexHint{IndexName: "ab", Boost: 1 << 30}
+			hint := anystore.IndexHint{IndexName: "ab", Boost: 1 << 30}
 			assert.ElementsMatch(t, want, collectIntField(t, sparse.Find(filter).IndexHint(hint), "id"), "%s %s", step, filter)
 			cnt, err := sparse.Find(filter).IndexHint(hint).Count(ctx)
 			require.NoError(t, err)
@@ -4344,11 +4237,11 @@ func TestIndex_Sparse_MissingLeafBesideExisting(t *testing.T) {
 	for _, fields := range [][]string{{"x.y"}, {"-x.y"}, {"x.y", "x.z"}} {
 		coll, err := fx.CreateCollection(ctx, fmt.Sprint(fields))
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: fields, Sparse: true}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "s", Fields: fields, Sparse: true}))
 		for _, d := range docs {
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
 		}
-		hint := IndexHint{IndexName: "s", Boost: 1 << 30}
+		hint := anystore.IndexHint{IndexName: "s", Boost: 1 << 30}
 		for _, filter := range []string{
 			`{"x.y":{"$exists":true}}`,
 			`{"x.y":{"$type":"null"}}`,
@@ -4379,9 +4272,9 @@ func TestIndex_Sparse_MissingLeafBesideExisting(t *testing.T) {
 
 	uniq, err := fx.CreateCollection(ctx, "uniq")
 	require.NoError(t, err)
-	require.NoError(t, uniq.EnsureIndex(ctx, IndexInfo{Fields: []string{"x.y"}, Sparse: true, Unique: true}))
+	require.NoError(t, uniq.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"x.y"}, Sparse: true, Unique: true}))
 	require.NoError(t, uniq.Insert(ctx, anyenc.MustParseJson(`{"id":1,"x":[{"z":1},{"y":null}]}`)))
-	require.ErrorIs(t, uniq.Insert(ctx, anyenc.MustParseJson(`{"id":2,"x":[{"z":1},{"y":null}]}`)), ErrUniqueConstraint)
+	require.ErrorIs(t, uniq.Insert(ctx, anyenc.MustParseJson(`{"id":2,"x":[{"z":1},{"y":null}]}`)), anystore.ErrUniqueConstraint)
 	require.NoError(t, uniq.Insert(ctx, anyenc.MustParseJson(`{"id":3,"x":[{"z":1},{"w":2}]}`)))
 }
 
@@ -4417,7 +4310,7 @@ func TestIndex_Sparse_PresenceCountFromIndex(t *testing.T) {
 			require.NoError(t, err)
 			coll, err := fx.CreateCollection(ctx, tc.name)
 			require.NoError(t, err)
-			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: tc.fields, Sparse: true}))
+			require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "s", Fields: tc.fields, Sparse: true}))
 			for i := 100; i < 400; i++ {
 				tc.docs = append(tc.docs, fmt.Sprintf(`{"id":%d,"z":1}`, i))
 			}
@@ -4428,7 +4321,7 @@ func TestIndex_Sparse_PresenceCountFromIndex(t *testing.T) {
 			want, err := plain.Find(tc.filter).Count(ctx)
 			require.NoError(t, err)
 
-			hint := IndexHint{IndexName: "s", Boost: 1 << 30}
+			hint := anystore.IndexHint{IndexName: "s", Boost: 1 << 30}
 			// Warm plan/visibility state outside the measured window.
 			_, err = coll.Find(tc.filter).IndexHint(hint).Count(ctx)
 			require.NoError(t, err)
@@ -4436,7 +4329,7 @@ func TestIndex_Sparse_PresenceCountFromIndex(t *testing.T) {
 			got, err := coll.Find(tc.filter).IndexHint(hint).Count(ctx)
 			require.NoError(t, err)
 			assert.Equal(t, want, got)
-			pc := qplannerSnapshot()
+			pc := qplannerSnapshot().Planner
 			switch tc.plan {
 			case "bare":
 				assert.Zero(t, pc.FetchNextCalls, "a presence count must not fetch documents")
@@ -4447,7 +4340,7 @@ func TestIndex_Sparse_PresenceCountFromIndex(t *testing.T) {
 			for _, page := range [][2]uint{{0, 2}, {1, 0}, {1, 1}, {500, 0}} {
 				wantPage, err := plain.Find(tc.filter).Offset(page[0]).Limit(page[1]).Count(ctx)
 				require.NoError(t, err)
-				gotPage, err := coll.Find(tc.filter).IndexHint(IndexHint{IndexName: "s", Boost: 1 << 30}).Offset(page[0]).Limit(page[1]).Count(ctx)
+				gotPage, err := coll.Find(tc.filter).IndexHint(anystore.IndexHint{IndexName: "s", Boost: 1 << 30}).Offset(page[0]).Limit(page[1]).Count(ctx)
 				require.NoError(t, err)
 				assert.Equal(t, wantPage, gotPage, "offset %d limit %d", page[0], page[1])
 			}
@@ -4464,8 +4357,8 @@ func TestIndex_Sparse_CountVerifyProbe(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "c")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: []string{"s"}}))
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "u", Fields: []string{"u"}, Sparse: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "s", Fields: []string{"s"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "u", Fields: []string{"u"}, Sparse: true}))
 	for i := range 200 {
 		doc := fmt.Sprintf(`{"id":%d,"s":"s%d"}`, i, i)
 		switch {
@@ -4497,7 +4390,7 @@ func TestIndex_Sparse_CountVerifyProbe(t *testing.T) {
 		got, err := coll.Find(tc.filter).Count(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, tc.want, got, "Count %s", tc.filter)
-		pc := qplannerSnapshot()
+		pc := qplannerSnapshot().Planner
 		assert.Equal(t, tc.fetches, pc.FetchNextCalls > 0, "%s: fetches %d", tc.filter, pc.FetchNextCalls)
 	}
 }
@@ -4508,11 +4401,11 @@ func TestIndex_Sparse_PresenceCountEmptyIndex(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "c")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
 	for i := range 300 {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"z":%d}`, i, i))))
 	}
-	hint := IndexHint{IndexName: "a", Boost: 1 << 30}
+	hint := anystore.IndexHint{IndexName: "a", Boost: 1 << 30}
 	n, err := coll.Find(`{"a":{"$exists":true}}`).IndexHint(hint).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 0, n)
@@ -4534,7 +4427,7 @@ func TestIndex_Sparse_PresenceCountWithSort(t *testing.T) {
 	require.NoError(t, err)
 	coll, err := fx.CreateCollection(ctx, "c")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
 	docs := []string{`{"id":1,"a":1}`, `{"id":2,"a":null}`, `{"id":3,"a":[5,6,null]}`, `{"id":4}`, `{"id":5,"a":[]}`}
 	for i := 100; i < 400; i++ {
 		docs = append(docs, fmt.Sprintf(`{"id":%d}`, i))
@@ -4543,7 +4436,7 @@ func TestIndex_Sparse_PresenceCountWithSort(t *testing.T) {
 		require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
 	}
-	hint := IndexHint{IndexName: "a", Boost: 1 << 30}
+	hint := anystore.IndexHint{IndexName: "a", Boost: 1 << 30}
 	for _, sort := range []string{"a", "-a"} {
 		for _, page := range [][2]uint{{0, 0}, {0, 2}, {1, 2}, {3, 0}, {0, 100}} {
 			want, err := plain.Find(`{"a":{"$exists":true}}`).Sort(sort).Offset(page[0]).Limit(page[1]).Count(ctx)
@@ -4575,11 +4468,11 @@ func TestIndex_Sparse_FanOutSingleKeySortWindow(t *testing.T) {
 	for _, fields := range [][]string{{"x.y"}, {"x.y", "x.z"}} {
 		coll, err := fx.CreateCollection(ctx, fmt.Sprint(fields))
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: fields, Sparse: true}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "s", Fields: fields, Sparse: true}))
 		for _, d := range docs {
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
 		}
-		hint := IndexHint{IndexName: "s", Boost: 1 << 30}
+		hint := anystore.IndexHint{IndexName: "s", Boost: 1 << 30}
 		for _, filter := range []string{
 			`{"x.y":{"$exists":true},"x.z":{"$exists":true}}`,
 			`{"x.y":{"$gte":0},"x.z":{"$gte":0}}`,
@@ -4589,7 +4482,7 @@ func TestIndex_Sparse_FanOutSingleKeySortWindow(t *testing.T) {
 					// One fan-out document: every sort key is distinct, so the
 					// single-field sort has one right answer.
 					want := collectIntField(t, plain.Find(filter).Sort(sort).Limit(limit), "id")
-					for _, q := range []Query{
+					for _, q := range []anystore.Query{
 						coll.Find(filter).Sort(sort).Limit(limit),
 						coll.Find(filter).Sort(sort).Limit(limit).IndexHint(hint),
 					} {
@@ -4620,13 +4513,13 @@ func TestIndex_Sparse_PresenceCountSharedArray(t *testing.T) {
 		}
 		coll, err := fx.CreateCollection(ctx, first)
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: []string{"x.y", "x.z"}, Sparse: true}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "s", Fields: []string{"x.y", "x.z"}, Sparse: true}))
 		for _, d := range docs {
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
 		}
 		filter := `{"x.y":{"$exists":true},"x.z":{"$exists":true}}`
-		hint := IndexHint{IndexName: "s", Boost: 1 << 30}
-		for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(hint)} {
+		hint := anystore.IndexHint{IndexName: "s", Boost: 1 << 30}
+		for _, q := range []anystore.Query{coll.Find(filter), coll.Find(filter).IndexHint(hint)} {
 			assert.Equal(t, []int{2, 3, 4}, collectIntField(t, q.Sort("id"), "id"), first)
 			cnt, err := q.Count(ctx)
 			require.NoError(t, err)
@@ -4635,7 +4528,7 @@ func TestIndex_Sparse_PresenceCountSharedArray(t *testing.T) {
 		qplannerEnableCounters(t)
 		_, err = coll.Find(filter).IndexHint(hint).Count(ctx)
 		require.NoError(t, err)
-		assert.Zero(t, qplannerSnapshot().FetchNextCalls, "a presence count must not fetch documents: %s", first)
+		assert.Zero(t, qplannerSnapshot().Planner.FetchNextCalls, "a presence count must not fetch documents: %s", first)
 	}
 }
 
@@ -4685,15 +4578,15 @@ func TestIndex_SharedArray_NonObjectElement(t *testing.T) {
 		require.NoError(t, err)
 		coll, err := fx.CreateCollection(ctx, fmt.Sprintf("idx%d", colls))
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: fields, Sparse: sparse}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "s", Fields: fields, Sparse: sparse}))
 		for _, d := range set {
 			require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
 		}
-		hint := IndexHint{IndexName: "s", Boost: 1 << 30}
+		hint := anystore.IndexHint{IndexName: "s", Boost: 1 << 30}
 		for _, filter := range filters {
 			want := collectIntField(t, plain.Find(filter).Sort("id"), "id")
-			for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(hint)} {
+			for _, q := range []anystore.Query{coll.Find(filter), coll.Find(filter).IndexHint(hint)} {
 				assert.Equal(t, want, collectIntField(t, q.Sort("id"), "id"), "%v sparse=%v %s %v", fields, sparse, filter, set)
 				cnt, err := q.Count(ctx)
 				require.NoError(t, err)

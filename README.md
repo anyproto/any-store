@@ -234,9 +234,15 @@ An independent Go implementation following design conventions from [SQLCipher](h
 ## Contributing
 
 1. Fork & clone
-2. `make test` — run unit tests
+2. `make test` — the whole suite; `make cover` for library coverage
 3. Create your feature branch
 4. Open a PR and sign the CLA
+
+Unit tests live beside the code they cover (`db.go` + `db_test.go`). The
+behaviour suites that drive the library through its exported API — query
+semantics, planner, index lifecycle, vector and full-text — live in `test/`.
+Long-running crash, multiprocess and fuzz harnesses run in a separate internal
+repo; a pull request does not need those green locally.
 
 Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 

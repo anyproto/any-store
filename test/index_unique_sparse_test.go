@@ -1,36 +1,21 @@
-/*
-Index/Planner tests inspired by SQLite: index3.test, index4.test
-
-Test scenario:
-Tests unique index constraints (compound, self-update, upsert, delete+reinsert,
-bulk partial failure), sparse index behavior (missing fields, field
-appearance via update, compound sparse), sparse+unique combinations,
-index length tracking through mixed mutations, nested field unique indexes,
-and drop-index followed by duplicate insert.
-
-These tests verify our custom index and query planner implementation.
-While inspired by SQLite test patterns, our system has a different
-architecture (document-oriented with weight-based planner vs SQL VDBE).
-*/
-package anystore
+package test
 
 import (
 	"fmt"
+	"sort"
 	"testing"
 
+	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/internal/qplanner"
-	"sort"
 )
 
 func TestIndex_UniqueSparse_CompoundUnique(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a", "b"}, Unique: true}))
 
 	// Same a, different b — should succeed
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1,"b":1}`)))
@@ -39,7 +24,7 @@ func TestIndex_UniqueSparse_CompoundUnique(t *testing.T) {
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":2,"b":1}`)))
 	// Same a+b combo — should fail
 	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":1,"b":1}`))
-	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 
 	assertCollCount(t, coll, 3)
 	assertIndexLen(t, coll.GetIndexes()[0], 3)
@@ -49,7 +34,7 @@ func TestIndex_UniqueSparse_UpdateToNewValue(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Unique: true}))
 
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":2}`)))
@@ -72,7 +57,7 @@ func TestIndex_UniqueSparse_UpdateSameValue(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Unique: true}))
 
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1,"b":10}`)))
 
@@ -89,7 +74,7 @@ func TestIndex_UniqueSparse_UpsertDuplicate(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Unique: true}))
 
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":10}`)))
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":20}`)))
@@ -103,7 +88,7 @@ func TestIndex_UniqueSparse_UpsertDuplicate(t *testing.T) {
 
 	// Upsert new doc with value that conflicts with existing doc — should fail
 	err = coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":3,"a":20}`))
-	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 	assertCollCount(t, coll, 2)
 }
 
@@ -111,7 +96,7 @@ func TestIndex_UniqueSparse_SparseQuery(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Sparse: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Sparse: true}))
 
 	// Mix of docs with and without the field
 	require.NoError(t, coll.Insert(ctx,
@@ -138,7 +123,7 @@ func TestIndex_UniqueSparse_SparseUpdateFieldAppears(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Sparse: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Sparse: true}))
 
 	// Insert doc without field "a"
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"b":5}`)))
@@ -157,7 +142,7 @@ func TestIndex_UniqueSparse_SparseUniqueNoConflict(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Sparse: true, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Sparse: true, Unique: true}))
 
 	// Multiple docs without field "a" — all succeed (sparse skips them)
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
@@ -168,7 +153,7 @@ func TestIndex_UniqueSparse_SparseUniqueNoConflict(t *testing.T) {
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":10}`)))
 	// Another doc with same "a" value — should fail unique constraint
 	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":5,"a":10}`))
-	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 
 	// Different "a" value — success
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":6,"a":20}`)))
@@ -181,14 +166,14 @@ func TestIndex_UniqueSparse_UniqueNestedField(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"meta.email"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"meta.email"}, Unique: true}))
 
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"meta":{"email":"a@b.com"}}`)))
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"meta":{"email":"c@d.com"}}`)))
 
 	// Duplicate nested value — should fail
 	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"meta":{"email":"a@b.com"}}`))
-	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 
 	assertCollCount(t, coll, 2)
 	assertIndexLen(t, coll.GetIndexes()[0], 2)
@@ -198,7 +183,7 @@ func TestIndex_UniqueSparse_BulkInsertPartialDuplicate(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Unique: true}))
 
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
 
@@ -219,7 +204,7 @@ func TestIndex_UniqueSparse_IndexLenMixedMutations(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 	idx := coll.GetIndexes()[0]
 
 	// Insert 5 docs
@@ -254,13 +239,13 @@ func TestIndex_UniqueSparse_DropUniqueThenInsertDuplicate(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Unique: true}))
 
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
 
 	// Duplicate fails while index exists
 	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":1}`))
-	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 
 	// Drop the unique index
 	require.NoError(t, coll.DropIndex(ctx, "a"))
@@ -275,7 +260,7 @@ func TestIndex_UniqueSparse_DeleteAndReinsert(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Unique: true}))
 
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":42}`)))
 
@@ -300,7 +285,7 @@ func TestIndex_UniqueSparse_CreateUniqueOnExistingDuplicates(t *testing.T) {
 	))
 
 	// Attempting to create unique index should fail
-	err = coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true})
+	err = coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Unique: true})
 	require.Error(t, err)
 
 	// No index should have been created
@@ -314,7 +299,7 @@ func TestIndex_UniqueSparse_SparseCompoundBothMissing(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}, Sparse: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a", "b"}, Sparse: true}))
 
 	// Only "a" present — not indexed (b missing)
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
@@ -333,7 +318,7 @@ func TestIndex_UniqueSparse_NonSparseNullIndexed(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}}))
 
 	// Non-sparse index indexes everything, including null/missing
 	require.NoError(t, coll.Insert(ctx,
@@ -349,7 +334,7 @@ func TestIndex_UniqueSparse_SparseNullField(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Sparse: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Sparse: true}))
 
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"a":null}`),
@@ -372,7 +357,7 @@ func TestIndex_UniqueArray_Coverage_WithinDocDuplicates(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Fields: []string{"x"},
 		Unique: true,
 	}))
@@ -411,7 +396,7 @@ func TestIndex_UniqueArray_Coverage_ScalarVsArrayCollision(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Fields: []string{"x"},
 		Unique: true,
 	}))
@@ -421,7 +406,7 @@ func TestIndex_UniqueArray_Coverage_ScalarVsArrayCollision(t *testing.T) {
 
 	// Array insert whose elements include "a" — must fail on key "a".
 	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":"d2","x":["a","b"]}`))
-	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 
 	// Only d1 is in the collection.
 	assertCollCount(t, coll, 1)
@@ -429,13 +414,13 @@ func TestIndex_UniqueArray_Coverage_ScalarVsArrayCollision(t *testing.T) {
 	// And symmetric: array first, scalar second.
 	coll2, err := fx.CreateCollection(ctx, "test2")
 	require.NoError(t, err)
-	require.NoError(t, coll2.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll2.EnsureIndex(ctx, anystore.IndexInfo{
 		Fields: []string{"x"},
 		Unique: true,
 	}))
 	require.NoError(t, coll2.Insert(ctx, anyenc.MustParseJson(`{"id":"d1","x":["a","b"]}`)))
 	err = coll2.Insert(ctx, anyenc.MustParseJson(`{"id":"d2","x":"b"}`))
-	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 	assertCollCount(t, coll2, 1)
 }
 
@@ -447,7 +432,7 @@ func TestIndex_UniqueArray_Coverage_CompoundTrailingField(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Fields: []string{"a", "b"},
 		Unique: true,
 	}))
@@ -457,7 +442,7 @@ func TestIndex_UniqueArray_Coverage_CompoundTrailingField(t *testing.T) {
 
 	// Different id, but exact same (a,b) tuple as id:1 — must fail.
 	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":1,"b":2}`))
-	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 
 	assertCollCount(t, coll, 2)
 	assertIndexLen(t, coll.GetIndexes()[0], 2)
@@ -472,14 +457,14 @@ func TestIndex_UniqueArray_Coverage_BooleanField(t *testing.T) {
 	t.Run("two trues collide", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test_bool_collision")
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 			Fields: []string{"active"},
 			Unique: true,
 		}))
 
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"active":true}`)))
 		err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"active":true}`))
-		require.ErrorIs(t, err, ErrUniqueConstraint)
+		require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 
 		assertCollCount(t, coll, 1)
 	})
@@ -487,7 +472,7 @@ func TestIndex_UniqueArray_Coverage_BooleanField(t *testing.T) {
 	t.Run("true and false both accepted", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test_bool_mix")
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 			Fields: []string{"active"},
 			Unique: true,
 		}))
@@ -509,7 +494,7 @@ func TestIndex_SparseNested_Coverage_MissingIntermediate(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Fields: []string{"meta.tags.name"},
 		Sparse: true,
 	}))
@@ -551,123 +536,6 @@ func TestIndex_SparseNested_Coverage_MissingIntermediate(t *testing.T) {
 // These tests pin that: 0 entries for a missing field, exactly 1 entry for
 // null and for an empty array.
 
-// TestAudit12_SparseEmptyArray_NoFieldZeroEntries: doc with no `tags`
-// field at all. Sparse guard short-circuits on v == nil → 0 entries.
-// Baseline for what "sparse" is supposed to do.
-func TestAudit12_SparseEmptyArray_NoFieldZeroEntries(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "audit12_no_field")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
-		Name:   "ix_tags",
-		Fields: []string{"tags"},
-		Sparse: true,
-	}))
-
-	// Doc with NO `tags` field — sparse guard hits v == nil branch.
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
-
-	entries := readRawIndexEntries(t, fx.DB, "audit12_no_field", "ix_tags")
-	require.Empty(t, entries,
-		"sparse index over missing field must produce zero entries (v == nil branch)")
-
-	assertIndexLen(t, coll.GetIndexes()[0], 0)
-}
-
-// TestAudit12_SparseEmptyArray_NullFieldOneEntry: doc with explicit
-// `tags: null`. The field exists, so the sparse index holds it under the
-// null key.
-func TestAudit12_SparseEmptyArray_NullFieldOneEntry(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "audit12_null_field")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
-		Name:   "ix_tags",
-		Fields: []string{"tags"},
-		Sparse: true,
-	}))
-
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":null}`)))
-
-	entries := readRawIndexEntries(t, fx.DB, "audit12_null_field", "ix_tags")
-	require.Len(t, entries, 1, "an explicit null is present and gets the null key")
-	assert.Equal(t, byte(anyenc.TypeNull), entries[0].Key[0])
-
-	assertIndexLen(t, coll.GetIndexes()[0], 1)
-}
-
-// TestAudit12_SparseEmptyArray_EmptyArrayBehaviour: doc with `tags: []`
-// — empty array. Pins that an empty array IS indexed (sparse skips only
-// a missing field), and confirms the entry uses
-// the whole-empty-array marshalled key with IndexValueScalar (because
-// len(keysBuf) == 1 at insertKeys time — no per-element entries since
-// the array has no elements).
-//
-// This makes Find({tags:[]}) work via the index — see
-// TestAudit12_SparseEmptyArray_EmptyArrayQueryable below.
-func TestAudit12_SparseEmptyArray_EmptyArrayBehaviour(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "audit12_empty_arr_sparse")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
-		Name:   "ix_tags",
-		Fields: []string{"tags"},
-		Sparse: true,
-	}))
-
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":[]}`)))
-
-	entries := readRawIndexEntries(t, fx.DB, "audit12_empty_arr_sparse", "ix_tags")
-
-	// Empty array IS indexed — exactly 1 entry, the whole-empty-array
-	// marshal. Matches MongoDB's sparse-index semantics: sparse skips a
-	// missing field only, empty arrays are present queryable values.
-	require.Len(t, entries, 1,
-		"empty array on sparse index produces exactly 1 entry — the "+
-			"whole-empty-array marshal. Sparse skips only a missing field.")
-
-	// keysBuf had exactly one entry → IndexValueScalar (0x00).
-	require.NotEmpty(t, entries[0].Value)
-	assert.Equal(t, qplanner.IndexValueScalar, entries[0].Value,
-		"len(keysBuf)==1 at insertKeys time → empty-array entry tagged IndexValueScalar (0x00)")
-	assert.Zero(t, entries[0].Value[0]&qplanner.IndexEntryFlagMultiKey,
-		"multi-key flag bit must be cleared (single key in keysBuf)")
-
-	assertIndexLen(t, coll.GetIndexes()[0], 1)
-}
-
-// TestAudit12_SparseEmptyArray_NonSparse: same empty-array doc, but on
-// a NON-sparse index. Behaviour matches the sparse case for this
-// input: 1 entry (the whole-array marshal). Confirms the empty-array
-// handling is a property of writeValues, not of the sparse flag.
-func TestAudit12_SparseEmptyArray_NonSparse(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "audit12_empty_arr_nonsparse")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
-		Name:   "ix_tags",
-		Fields: []string{"tags"},
-		// Sparse: false (default).
-	}))
-
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":[]}`)))
-
-	entries := readRawIndexEntries(t, fx.DB, "audit12_empty_arr_nonsparse", "ix_tags")
-
-	require.Len(t, entries, 1,
-		"non-sparse index + empty array also produces exactly 1 entry "+
-			"(whole-array marshal). Confirms empty-array indexing is "+
-			"independent of the sparse flag.")
-
-	require.NotEmpty(t, entries[0].Value)
-	assert.Equal(t, qplanner.IndexValueScalar, entries[0].Value,
-		"len(keysBuf)==1 → empty-array entry on non-sparse index also tagged IndexValueScalar")
-	assert.Zero(t, entries[0].Value[0]&qplanner.IndexEntryFlagMultiKey,
-		"multi-key flag bit must be cleared (single key in keysBuf)")
-
-	assertIndexLen(t, coll.GetIndexes()[0], 1)
-}
-
 // TestAudit12_SparseEmptyArray_QueryReturnsZero: per-element queries
 // against an empty-array doc return 0 — the stored entry is the
 // whole-empty-array key, not any element key. Find({tags:"anything"})
@@ -677,7 +545,7 @@ func TestAudit12_SparseEmptyArray_QueryReturnsZero(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit12_empty_arr_query")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "ix_tags",
 		Fields: []string{"tags"},
 		Sparse: true,
@@ -709,7 +577,7 @@ func TestAudit12_SparseEmptyArray_EmptyArrayQueryable(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit12_empty_arr_findable")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "ix_tags",
 		Fields: []string{"tags"},
 		Sparse: true,
@@ -797,50 +665,6 @@ func TestAudit12_SparseEmptyArray_EmptyArrayQueryable(t *testing.T) {
 //  6. QueryFindByElement: confirms the unique compound + array index is
 //     queryable per-element via the standard Find pipeline.
 
-// TestAudit13_UniqueCompoundArray_NoCollision: d1 (x,[a,b]) + d2 (x,[c,d]).
-// No shared (category, tag) tuple. Both inserts succeed; verify entry counts
-// and that ALL entries carry IndexValueMultiKey (because each doc's keysBuf
-// has > 1 entries from the array expansion).
-func TestAudit13_UniqueCompoundArray_NoCollision(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "audit13_no_collision")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
-		Name:   "ix_cat_tags",
-		Fields: []string{"category", "tags"},
-		Unique: true,
-	}))
-
-	// d1: tags=["a","b"] → keysBuf entries (x,a), (x,b), (x,["a","b"]) = 3
-	require.NoError(t, coll.Insert(ctx,
-		anyenc.MustParseJson(`{"id":"d1","category":"x","tags":["a","b"]}`)))
-	// d2: tags=["c","d"] → keysBuf entries (x,c), (x,d), (x,["c","d"]) = 3
-	// No shared (x,*) tuple with d1 → no unique conflict.
-	require.NoError(t, coll.Insert(ctx,
-		anyenc.MustParseJson(`{"id":"d2","category":"x","tags":["c","d"]}`)))
-
-	assertCollCount(t, coll, 2)
-	idx := coll.GetIndexes()[0]
-	// 3 entries per doc * 2 docs = 6 entries.
-	assertIndexLen(t, idx, 6)
-
-	entries := readRawIndexEntries(t, fx.DB, "audit13_no_collision", "ix_cat_tags")
-	require.Len(t, entries, 6,
-		"compound + array: 2 docs * 3 keys/doc = 6 entries")
-
-	// Every entry must carry IndexValueMultiKey because each doc's keysBuf
-	// has 3 entries (>1) — the array dimension forces the multi-key tag on
-	// EVERY emitted key for that doc, including the whole-array fall-through.
-	for i, e := range entries {
-		assert.Equalf(t, qplanner.IndexValueMultiKey, e.Value,
-			"entry %d: compound + array insert must write IndexValueMultiKey "+
-				"because keysBuf > 1 from array expansion", i)
-		require.NotEmptyf(t, e.Value, "entry %d: value must not be empty", i)
-		assert.NotZerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
-			"entry %d: multi-key flag bit must be set", i)
-	}
-}
-
 // TestAudit13_UniqueCompoundArray_CollisionRejected: d1 (x,[a,b]) succeeds;
 // d2 (x,[b,c]) must fail with ErrUniqueConstraint because d2's per-element
 // emit of (x,b,d2) collides with d1's existing (x,b,d1) row on the unique
@@ -849,7 +673,7 @@ func TestAudit13_UniqueCompoundArray_CollisionRejected(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit13_collision_rejected")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "ix_cat_tags",
 		Fields: []string{"category", "tags"},
 		Unique: true,
@@ -862,82 +686,8 @@ func TestAudit13_UniqueCompoundArray_CollisionRejected(t *testing.T) {
 	// differ → ErrUniqueConstraint.
 	err = coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":"d2","category":"x","tags":["b","c"]}`))
-	require.ErrorIs(t, err, ErrUniqueConstraint,
+	require.ErrorIs(t, err, anystore.ErrUniqueConstraint,
 		"compound (x,b) tuple must collide with d1 across docIds")
-}
-
-// TestAudit13_UniqueCompoundArray_CollisionRollsBack: after the failed d2
-// insert, the collection must contain only d1; assert via Count and via
-// raw-entry inspection (d2's partial entries — including any per-element
-// Put() that succeeded BEFORE the colliding one — must NOT linger).
-//
-// This is the critical rollback-safety assertion: insertKeys returns the
-// error to insertItem, which returns it to db.doWriteTx, which calls
-// tx.Rollback(). If the namespace ever shows a stray d2 entry post-rollback,
-// that's a bug in the transaction layer, not in insertKeys itself.
-func TestAudit13_UniqueCompoundArray_CollisionRollsBack(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "audit13_rollback")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
-		Name:   "ix_cat_tags",
-		Fields: []string{"category", "tags"},
-		Unique: true,
-	}))
-
-	require.NoError(t, coll.Insert(ctx,
-		anyenc.MustParseJson(`{"id":"d1","category":"x","tags":["a","b"]}`)))
-
-	// Snapshot pre-collision: 3 entries for d1.
-	idx := coll.GetIndexes()[0]
-	assertIndexLen(t, idx, 3)
-	preEntries := readRawIndexEntries(t, fx.DB, "audit13_rollback", "ix_cat_tags")
-	require.Len(t, preEntries, 3,
-		"pre-collision baseline: d1 must have exactly 3 index entries (a, b, [a,b])")
-
-	// Trigger the collision. d2 emits (x,a) [no conflict] then (x,b)
-	// [conflict with d1] OR (x,b) [conflict immediately] depending on
-	// array iteration order — either way the whole tx must roll back.
-	err = coll.Insert(ctx,
-		anyenc.MustParseJson(`{"id":"d2","category":"x","tags":["b","c"]}`))
-	require.ErrorIs(t, err, ErrUniqueConstraint)
-
-	// Doc-level assertion: only d1 in the collection.
-	assertCollCount(t, coll, 1)
-
-	// Index-level assertion: still exactly 3 entries (d1's), no orphans.
-	assertIndexLen(t, idx, 3)
-	postEntries := readRawIndexEntries(t, fx.DB, "audit13_rollback", "ix_cat_tags")
-	require.Len(t, postEntries, 3,
-		"post-rollback: namespace must hold ONLY d1's 3 entries — "+
-			"any additional row would prove a partial d2 write leaked through rollback")
-
-	// Stronger check: the entry bytes must be identical to the pre-collision
-	// snapshot — same keys, same values. If d2 partially wrote anything, the
-	// post-set wouldn't equal the pre-set.
-	require.Equal(t, len(preEntries), len(postEntries),
-		"entry count must be unchanged across the rolled-back tx")
-	for i := range preEntries {
-		assert.Equalf(t, preEntries[i].Key, postEntries[i].Key,
-			"entry %d key changed after rolled-back collision", i)
-		assert.Equalf(t, preEntries[i].Value, postEntries[i].Value,
-			"entry %d value changed after rolled-back collision", i)
-	}
-
-	// Sanity: queries still find d1 by every original element of its array.
-	count, err := coll.Find(`{"category":"x","tags":"a"}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 1, count, "d1 must still match (category=x, tags=a)")
-	count, err = coll.Find(`{"category":"x","tags":"b"}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 1, count, "d1 must still match (category=x, tags=b)")
-
-	// And the colliding tag value "c" (which only d2 had) must NOT match
-	// anything — confirming d2 left no trace.
-	count, err = coll.Find(`{"category":"x","tags":"c"}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 0, count,
-		"tag 'c' belonged only to the rolled-back d2 — must match nothing")
 }
 
 // TestAudit13_UniqueCompoundArray_DifferentCategoriesNoCollide: d1 (x,[b])
@@ -948,7 +698,7 @@ func TestAudit13_UniqueCompoundArray_DifferentCategoriesNoCollide(t *testing.T) 
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit13_diff_categories")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "ix_cat_tags",
 		Fields: []string{"category", "tags"},
 		Unique: true,
@@ -978,102 +728,6 @@ func TestAudit13_UniqueCompoundArray_DifferentCategoriesNoCollide(t *testing.T) 
 	assert.Equal(t, 1, count, "(category=y, tags=b) must match only d2")
 }
 
-// TestAudit13_UniqueCompoundArray_IdempotentSelfReinsert exercises the
-// `continue` branch in insertKeys (seekBuf == fullKeyBuf path).
-//
-// Two-pronged coverage:
-//
-//  1. User-facing UpdateOne(d1) -> d1 with same data. The collection.update
-//     fast-path short-circuits via anyencutil.Equal BEFORE insertKeys runs,
-//     so the operation is a no-op. We assert it succeeds and changes
-//     nothing — entry count unchanged, every entry still IndexValueMultiKey.
-//
-//  2. Direct double insertKeys() in a single write-tx. This is the only way
-//     to actually reach the `continue` branch — second invocation finds the
-//     existing entry whose (key, docId) matches fullKeyBuf bytewise and
-//     skips the Put without erroring.
-func TestAudit13_UniqueCompoundArray_IdempotentSelfReinsert(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "audit13_idempotent")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
-		Name:   "ix_cat_tags",
-		Fields: []string{"category", "tags"},
-		Unique: true,
-	}))
-
-	docJSON := `{"id":"d1","category":"x","tags":["a","b"]}`
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(docJSON)))
-
-	idx := coll.GetIndexes()[0]
-	// 3 entries: (x,a), (x,b), (x,["a","b"]).
-	assertIndexLen(t, idx, 3)
-
-	preEntries := readRawIndexEntries(t, fx.DB, "audit13_idempotent", "ix_cat_tags")
-	require.Len(t, preEntries, 3)
-	for i, e := range preEntries {
-		require.Equalf(t, qplanner.IndexValueMultiKey, e.Value,
-			"pre-update entry %d must already be IndexValueMultiKey "+
-				"(array dimension >1 keysBuf entries)", i)
-	}
-
-	// === Prong 1: UpdateOne to itself ===
-	// collection.update short-circuits on anyencutil.Equal BEFORE insertKeys,
-	// so this is effectively a no-op — but the public contract is that it
-	// MUST succeed without raising ErrUniqueConstraint.
-	require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(docJSON)),
-		"updating d1 to identical data must succeed (short-circuit, no error)")
-
-	// Entry count unchanged.
-	assertIndexLen(t, idx, 3)
-
-	postEntries := readRawIndexEntries(t, fx.DB, "audit13_idempotent", "ix_cat_tags")
-	require.Len(t, postEntries, 3,
-		"self-update must not alter the index entry count")
-
-	// Every post-update entry must still carry IndexValueMultiKey, and the
-	// raw bytes must match the pre-update snapshot exactly (no churn).
-	for i, e := range postEntries {
-		assert.Equalf(t, qplanner.IndexValueMultiKey, e.Value,
-			"post-update entry %d must still be IndexValueMultiKey", i)
-		assert.Equalf(t, preEntries[i].Key, e.Key,
-			"entry %d key changed across self-update", i)
-		assert.Equalf(t, preEntries[i].Value, e.Value,
-			"entry %d value changed across self-update", i)
-	}
-
-	// === Prong 2: Directly invoke insertKeys twice in one tx ===
-	// This actually exercises the `continue` branch. We re-fetch the index
-	// pointer because GetIndexes() returns the public Index interface; we
-	// need the concrete *index for insertKeys.
-	idxImpl := idx.(*index)
-	it, itErr := newItem(anyenc.MustParseJson(docJSON))
-	require.NoError(t, itErr)
-
-	wrTx, err := coll.WriteTx(ctx)
-	require.NoError(t, err)
-	btWtx := wrTx.btreeWriteTx()
-
-	// First call: would normally fail because the entries already exist
-	// — but the unique check sees seekBuf == fullKeyBuf for the SAME docId
-	// and takes `continue` instead of returning ErrUniqueConstraint.
-	require.NoError(t, idxImpl.insertKeys(btWtx, it),
-		"re-inserting the same (key, docId) tuples must hit `continue`, "+
-			"not raise ErrUniqueConstraint")
-
-	// Second consecutive call inside the same tx — still idempotent.
-	require.NoError(t, idxImpl.insertKeys(btWtx, it),
-		"second back-to-back insertKeys must also be a no-op via `continue`")
-
-	// Namespace count must still be exactly 3 — no duplicates were added.
-	count, err := btWtx.Count(idxImpl.ns)
-	require.NoError(t, err)
-	assert.Equal(t, 3, count,
-		"idempotent re-insert(s) must not add any duplicate index rows")
-
-	require.NoError(t, wrTx.Rollback())
-}
-
 // TestAudit13_UniqueCompoundArray_QueryFindByElement: insert d1, query
 // Find({category:"x", tags:"a"}) → 1 doc; Find({category:"x", tags:"b"}) →
 // 1 doc (same d1). Confirms the unique compound + array index is queryable
@@ -1082,7 +736,7 @@ func TestAudit13_UniqueCompoundArray_QueryFindByElement(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit13_query")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "ix_cat_tags",
 		Fields: []string{"category", "tags"},
 		Unique: true,
@@ -1133,14 +787,14 @@ func TestIndex_Maintenance_FindUpdateUniqueConstraintEnforced(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Unique: true}))
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"a":1}`),
 		anyenc.MustParseJson(`{"id":2,"a":2}`),
 	))
 
 	res, err := coll.Find(`{"a":2}`).Update(ctx, `{"$set":{"a":1}}`)
-	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 	// matched before the constraint check fired; nothing committed.
 	assert.Equal(t, 1, res.Matched)
 	assert.Equal(t, 0, res.Modified)
@@ -1164,15 +818,15 @@ func TestIndex_UniqueSparse_NonSparseUniqueNullCollision(t *testing.T) {
 	t.Run("non-sparse collides on null", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "nonsparse")
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Unique: true}))
 
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":5}`)))
 		// first missing-field doc -> first 'null' key, ok.
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"b":1}`)))
 		// second missing-field doc -> collides on the shared 'null' key.
-		require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"c":1}`)), ErrUniqueConstraint)
+		require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"c":1}`)), anystore.ErrUniqueConstraint)
 		// explicit null also marshals to the same 'null' key -> collides.
-		require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":null}`)), ErrUniqueConstraint)
+		require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":null}`)), anystore.ErrUniqueConstraint)
 
 		assertCollCount(t, coll, 2)
 		assertIndexLen(t, coll.GetIndexes()[0], 2)
@@ -1181,7 +835,7 @@ func TestIndex_UniqueSparse_NonSparseUniqueNullCollision(t *testing.T) {
 	t.Run("sparse-unique allows multiple missing, holds null unique", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "sparse")
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Sparse: true, Unique: true}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Sparse: true, Unique: true}))
 
 		// missing-field docs emit no entry and coexist freely.
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"b":1}`)))
@@ -1189,7 +843,7 @@ func TestIndex_UniqueSparse_NonSparseUniqueNullCollision(t *testing.T) {
 		// an explicit null is a value: the first takes the 'null' key, the
 		// second collides on it.
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":null}`)))
-		require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":5,"a":null}`)), ErrUniqueConstraint)
+		require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":5,"a":null}`)), anystore.ErrUniqueConstraint)
 
 		assertCollCount(t, coll, 3)
 		assertIndexLen(t, coll.GetIndexes()[0], 1)
@@ -1210,8 +864,8 @@ func TestIndex_UniqueSparse_CreateUniqueOnNullDuplicatesFailsButSparseSucceeds(t
 			anyenc.MustParseJson(`{"id":2,"c":2}`),
 		))
 
-		err = coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true})
-		require.ErrorIs(t, err, ErrUniqueConstraint)
+		err = coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Unique: true})
+		require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 		// backfill rolled back fully: no index registered, data intact.
 		assert.Len(t, coll.GetIndexes(), 0)
 		assertCollCount(t, coll, 2)
@@ -1225,7 +879,7 @@ func TestIndex_UniqueSparse_CreateUniqueOnNullDuplicatesFailsButSparseSucceeds(t
 			anyenc.MustParseJson(`{"id":2,"c":2}`),
 		))
 
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Sparse: true, Unique: true}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Sparse: true, Unique: true}))
 		require.Len(t, coll.GetIndexes(), 1)
 		// missing fields write zero 'null' keys -> empty index.
 		assertIndexLen(t, coll.GetIndexes()[0], 0)
@@ -1238,7 +892,7 @@ func TestIndex_UniqueSparse_CompoundUpdateToDuplicateRollback(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a", "b"}, Unique: true}))
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"a":1,"b":1}`),
 		anyenc.MustParseJson(`{"id":2,"a":1,"b":2}`),
@@ -1246,7 +900,7 @@ func TestIndex_UniqueSparse_CompoundUpdateToDuplicateRollback(t *testing.T) {
 
 	// drive (1,2) onto the existing (1,1) -> compound collision.
 	err = coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":2,"a":1,"b":1}`))
-	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 
 	// doc 2 byte-for-byte unchanged.
 	doc2, err := coll.FindId(ctx, 2)
@@ -1264,7 +918,7 @@ func TestIndex_UniqueSparse_SparseUniqueUpdateFreesSlot(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Sparse: true, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a"}, Sparse: true, Unique: true}))
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"a":10}`),
 		anyenc.MustParseJson(`{"id":2,"b":1}`),
@@ -1274,7 +928,7 @@ func TestIndex_UniqueSparse_SparseUniqueUpdateFreesSlot(t *testing.T) {
 
 	// (1) doc2 cannot claim 10 while doc1 holds it.
 	err = coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":2,"a":10}`))
-	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 	assertIndexLen(t, coll.GetIndexes()[0], 1) // rollback-safe.
 
 	// (2) drop the sparse field from doc1, freeing the unique value 10.
@@ -1285,7 +939,7 @@ func TestIndex_UniqueSparse_SparseUniqueUpdateFreesSlot(t *testing.T) {
 	require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":2,"a":10}`)))
 	assertIndexLen(t, coll.GetIndexes()[0], 1)
 
-	collectIds := func(q Query) []string {
+	collectIds := func(q anystore.Query) []string {
 		iter, iterErr := q.Iter(ctx)
 		require.NoError(t, iterErr)
 		defer func() { _ = iter.Close() }()
@@ -1313,7 +967,7 @@ func TestIndex_UniqueSparse_FindUpdateMultiDocCollisionRollsBack(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"u"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"u"}, Unique: true}))
 	require.NoError(t, coll.Insert(ctx,
 		anyenc.MustParseJson(`{"id":1,"grp":1,"u":1}`),
 		anyenc.MustParseJson(`{"id":2,"grp":1,"u":2}`),
@@ -1322,7 +976,7 @@ func TestIndex_UniqueSparse_FindUpdateMultiDocCollisionRollsBack(t *testing.T) {
 
 	// id:1 increments u 1->100, colliding with id:3.u==100.
 	_, err = coll.Find(`{"grp":1}`).Update(ctx, `{"$inc":{"u":99}}`)
-	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 
 	// no partial commit: every doc reverted / untouched.
 	doc1, err := coll.FindId(ctx, 1)
@@ -1346,14 +1000,14 @@ func TestIndex_UniqueSparse_UniqueArrayCollisionThenDeleteReinsert(t *testing.T)
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"x"}, Unique: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"x"}, Unique: true}))
 
 	// (1) id:1 -> 3 entries: "a","b",["a","b"].
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"x":["a","b"]}`)))
 	assertIndexLen(t, coll.GetIndexes()[0], 3)
 
 	// (2) id:2 shares element "b" -> ErrUniqueConstraint, nothing committed.
-	require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"x":["b","c"]}`)), ErrUniqueConstraint)
+	require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"x":["b","c"]}`)), anystore.ErrUniqueConstraint)
 	assertIndexLen(t, coll.GetIndexes()[0], 3)
 	assertCollCount(t, coll, 1)
 
@@ -1376,7 +1030,7 @@ func TestIndex_UniqueSparse_SparseCompoundArrayLeadMissingTrail(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}, Sparse: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"a", "b"}, Sparse: true}))
 
 	// array lead, trailing field b missing -> every branch hits the sparse guard.
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":[1,2],"c":9}`)))
@@ -1390,7 +1044,7 @@ func TestIndex_UniqueSparse_SparseCompoundArrayLeadMissingTrail(t *testing.T) {
 	// MATCHES any query that doesn't require b — its a=[1,2] contains 1. The
 	// planner must therefore not seek the sparse index for a b-unconstrained query,
 	// or it would silently drop id:1.
-	collectIds := func(q Query) []string {
+	collectIds := func(q anystore.Query) []string {
 		iter, iterErr := q.Iter(ctx)
 		require.NoError(t, iterErr)
 		defer func() { _ = iter.Close() }()
@@ -1426,7 +1080,7 @@ func TestIndex_UniqueSparse_BackfillNulls(t *testing.T) {
 			anyenc.MustParseJson(`{"id":2,"b":2}`),
 			anyenc.MustParseJson(`{"id":3,"a":7}`),
 		))
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Unique: true, Sparse: true}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a", Fields: []string{"a"}, Unique: true, Sparse: true}))
 		assertIndexLen(t, coll.GetIndexes()[0], 1)
 	})
 
@@ -1438,8 +1092,8 @@ func TestIndex_UniqueSparse_BackfillNulls(t *testing.T) {
 			anyenc.MustParseJson(`{"id":1,"a":null}`),
 			anyenc.MustParseJson(`{"id":2,"a":null}`),
 		))
-		err = coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Unique: true, Sparse: true})
-		require.ErrorIs(t, err, ErrUniqueConstraint)
+		err = coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a", Fields: []string{"a"}, Unique: true, Sparse: true})
+		require.ErrorIs(t, err, anystore.ErrUniqueConstraint)
 		// The failed EnsureIndex leaves no index behind.
 		assert.Empty(t, coll.GetIndexes())
 		assertCollCount(t, coll, 2)
@@ -1454,9 +1108,9 @@ func TestIndex_UniqueSparse_BackfillNulls(t *testing.T) {
 			anyenc.MustParseJson(`{"id":2}`),
 			anyenc.MustParseJson(`{"id":3,"a":5}`),
 		))
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Unique: true, Sparse: true}))
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a", Fields: []string{"a"}, Unique: true, Sparse: true}))
 		assertIndexLen(t, coll.GetIndexes()[0], 2)
-		require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":null}`)), ErrUniqueConstraint)
+		require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":null}`)), anystore.ErrUniqueConstraint)
 	})
 }
 
@@ -1469,16 +1123,16 @@ func TestIndex_UniqueSparse_CompoundNullComponent(t *testing.T) {
 			fx := newFixture(t)
 			coll, err := fx.CreateCollection(ctx, "c")
 			require.NoError(t, err)
-			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ab", Fields: fields, Unique: true, Sparse: true}))
+			require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "ab", Fields: fields, Unique: true, Sparse: true}))
 
 			// (null, 1) and (null, 2) differ.
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":null,"b":1}`)))
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":null,"b":2}`)))
 			// (null, 1) repeats.
-			require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":null,"b":1}`)), ErrUniqueConstraint)
+			require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":null,"b":1}`)), anystore.ErrUniqueConstraint)
 			// (null, null) once.
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":null,"b":null}`)))
-			require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":5,"a":null,"b":null}`)), ErrUniqueConstraint)
+			require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":5,"a":null,"b":null}`)), anystore.ErrUniqueConstraint)
 			// b missing: no key, so any number of them coexist.
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":6,"a":null}`)))
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":7,"a":null}`)))
@@ -1491,3 +1145,14 @@ func TestIndex_UniqueSparse_CompoundNullComponent(t *testing.T) {
 		})
 	}
 }
+
+/*
+Index/Planner tests inspired by SQLite: concurrent access patterns
+Test scenario:
+Tests concurrent goroutine access with indexes — parallel reads,
+reads during writes, concurrent queries on indexed fields, and
+concurrent inserts with unique index constraint enforcement.
+These tests verify our custom index and query planner implementation.
+While inspired by SQLite test patterns, our system has a different
+architecture (document-oriented with weight-based planner vs SQL VDBE).
+*/

@@ -1,4 +1,4 @@
-.PHONY: build test deps
+.PHONY: build test cover deps
 SHELL=/bin/bash
 export GOPRIVATE=github.com/anyproto
 export PATH:=deps:$(PATH)
@@ -17,6 +17,14 @@ build:
 
 test:
 	go test ./... --cover $(TAGS)
+
+# statement coverage of the library, counting the test/ suites that drive it
+# from outside the package
+cover:
+	rm -rf .coverdata && mkdir .coverdata
+	go test . ./test/ -coverpkg=github.com/anyproto/any-store/v2 $(TAGS) \
+		-args -test.gocoverdir=$(CURDIR)/.coverdata
+	go tool covdata percent -i=.coverdata
 
 deps:
 	go mod download
