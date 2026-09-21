@@ -1,5 +1,5 @@
-github.com/anyproto/any-store/v2 v2.1.0 h1:PsR+p7lMl6uR+Ej1HjKMq+shv3MBBpIDt5qeqWBSdrw=
-github.com/anyproto/any-store/v2 v2.1.0/go.mod h1:Mw/A48qIY3anKfv4jaiTEvv/JhuMpPEp6VuxHn6lAeM=
+github.com/anyproto/any-store/v2 v2.2.0 h1:Bs8/puuSbIK7tPY0Kfs6oLc4YUytnR0woGWx8qMS+TI=
+github.com/anyproto/any-store/v2 v2.2.0/go.mod h1:Nt1BmO/WMYiTZ1MlbCwuVuPtKWXDpjCz3dNewRF0xLE=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/clipperhouse/uax29/v2 v2.7.0 h1:+gs4oBZ2gPfVrKPthwbMzWZDaAFPGYK72F0NJv2v7Vk=
