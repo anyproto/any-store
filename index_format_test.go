@@ -1,9 +1,10 @@
 package anystore
 
 import (
+	"context"
 	"fmt"
-	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,7 +32,8 @@ func TestIndexFormat_Outdated(t *testing.T) {
 		{"unversioned dotted", 0, dotted, true},
 		{"current sparse", indexFormatVersion, sparse, false},
 		{"current dotted", indexFormatVersion, dotted, false},
-		{"newer build", indexFormatVersion + 1, sparse, false},
+		{"newer build", indexFormatVersion + 1, sparse, true},
+		{"newer build plain", indexFormatVersion + 1, plain, true},
 	} {
 		assert.Equal(t, tc.want, indexFormatOutdated(tc.stored, tc.info), tc.name)
 	}
@@ -40,7 +42,8 @@ func TestIndexFormat_Outdated(t *testing.T) {
 // legacyIndex makes an index look built by a pre-versioning release: the
 // catalog record loses its stamp, the entries are cleared (so a rebuild is
 // observable through Len), and the multikey marker is set (a rebuild resets
-// it from the data).
+// it from the data). The tx marks the schema changed, so another handle on
+// the file reconciles like after a peer's DDL.
 func legacyIndex(t *testing.T, c *collection, name string) {
 	t.Helper()
 	var idx *index
@@ -51,6 +54,7 @@ func legacyIndex(t *testing.T, c *collection, name string) {
 	}
 	require.NotNil(t, idx)
 	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		tx.MarkSchemaChanged()
 		key := indexKey(c.name, name)
 		raw, err := tx.AppendValue(c.db.systemNS, key, nil)
 		if err != nil {
@@ -114,7 +118,7 @@ const legacyDocs = 20
 
 // legacyFixture builds a collection with a sparse, a dotted-path and a plain
 // index, all made to look pre-versioning, and closes the db. The caller
-// reopens it.
+// reopens it, which rebuilds the sparse and dotted-path ones.
 func legacyFixture(t *testing.T) (dir string) {
 	dir = t.TempDir()
 	fx := newFixturePath(t, dir)
@@ -163,9 +167,7 @@ func assertUntouched(t *testing.T, coll Collection, name string) {
 }
 
 func TestIndexFormat_RebuildOnOpen(t *testing.T) {
-	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
-		t.Skip("reopens a file-backed db")
-	}
+	skipIfInMemory(t)
 	dir := legacyFixture(t)
 	fx := newFixturePath(t, dir)
 	coll, err := fx.OpenCollection(ctx, "test")
@@ -183,108 +185,151 @@ func TestIndexFormat_RebuildOnOpen(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, legacyDocs-10, n)
 
-	// A second open in the same process is a cache hit: nothing to redo.
-	again, err := fx.OpenCollection(ctx, "test")
-	require.NoError(t, err)
-	assert.Same(t, coll, again)
-
-	// The stamp persists: a fresh process finds nothing outdated.
+	// The stamp persists: the next Open finds nothing to do and the plain
+	// index is still as the old release left it.
 	require.NoError(t, fx.Close())
 	fx = newFixturePath(t, dir)
 	coll, err = fx.OpenCollection(ctx, "test")
 	require.NoError(t, err)
-	assert.Empty(t, coll.(*collection).outdatedIndexes)
 	assertRebuilt(t, coll, "sparse")
 	assertUntouched(t, coll, "plain")
 }
 
-func TestIndexFormat_RebuildInsideWriteTx(t *testing.T) {
-	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
-		t.Skip("reopens a file-backed db")
-	}
-	t.Run("rollback re-arms, next open rebuilds", func(t *testing.T) {
-		dir := legacyFixture(t)
-		fx := newFixturePath(t, dir)
-		tx, err := fx.WriteTx(ctx)
-		require.NoError(t, err)
-		coll, err := fx.OpenCollection(tx.Context(), "test")
-		require.NoError(t, err)
-		c := coll.(*collection)
-		for _, idx := range c.loadIndexes() {
-			if idx.info.Name == "sparse" {
-				n, lErr := idx.Len(tx.Context())
-				require.NoError(t, lErr)
-				assert.Equal(t, legacyDocs, n)
-			}
-		}
-		require.NoError(t, tx.Rollback())
-
-		assert.True(t, c.rebuildPending.Load())
-		assert.Equal(t, 0, readIndexFormat(t, c, "sparse"))
-		again, err := fx.OpenCollection(ctx, "test")
-		require.NoError(t, err)
-		assert.Same(t, coll, again)
-		assert.False(t, c.rebuildPending.Load())
-		assertRebuilt(t, coll, "sparse")
-		assertRebuilt(t, coll, "dotted")
-		assertUntouched(t, coll, "plain")
-	})
-	t.Run("commit", func(t *testing.T) {
-		dir := legacyFixture(t)
-		fx := newFixturePath(t, dir)
-		tx, err := fx.WriteTx(ctx)
-		require.NoError(t, err)
-		coll, err := fx.OpenCollection(tx.Context(), "test")
-		require.NoError(t, err)
-		require.NoError(t, tx.Commit())
-		assertRebuilt(t, coll, "sparse")
-		assertRebuilt(t, coll, "dotted")
-		assertUntouched(t, coll, "plain")
-	})
-}
-
-func TestIndexFormat_RebuildInsideReadTx(t *testing.T) {
-	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
-		t.Skip("reopens a file-backed db")
-	}
+// The rebuild happens in Open, so opening a collection never starts a write
+// transaction: a caller holding one and opening with a plain ctx returns.
+func TestIndexFormat_OpenCollectionUnderWriteTxReturns(t *testing.T) {
+	skipIfInMemory(t)
 	dir := legacyFixture(t)
 	fx := newFixturePath(t, dir)
-	rtx, err := fx.ReadTx(ctx)
+	tx, err := fx.WriteTx(ctx)
 	require.NoError(t, err)
-	coll, err := fx.OpenCollection(rtx.Context(), "test")
-	require.NoError(t, err)
-	// The reader's snapshot predates the rebuild: it still answers, without
-	// the rebuilt index.
-	n, err := coll.Find(`{"a":{"$exists":true}}`).Count(rtx.Context())
-	require.NoError(t, err)
-	assert.Equal(t, legacyDocs, n)
-	exp, err := coll.Find(`{"a":{"$exists":true}}`).Explain(rtx.Context())
-	require.NoError(t, err)
-	assert.NotContains(t, exp.Plan, "sparse")
-	require.NoError(t, rtx.Commit())
-
-	assertRebuilt(t, coll, "sparse")
-	assertRebuilt(t, coll, "dotted")
-	assertUntouched(t, coll, "plain")
-	exp, err = coll.Find(`{"a":{"$exists":true}}`).Explain(ctx)
-	require.NoError(t, err)
-	assert.Contains(t, exp.Plan, "sparse")
+	done := make(chan error, 1)
+	go func() {
+		_, oErr := fx.OpenCollection(context.Background(), "test")
+		done <- oErr
+	}()
+	select {
+	case err = <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("OpenCollection blocked behind the caller's own write tx")
+	}
+	require.NoError(t, tx.Rollback())
 }
 
-func TestIndexFormat_RebuildUniqueViolationFailsOpen(t *testing.T) {
-	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
-		t.Skip("reopens a file-backed db")
+// A stamp above the current version (a newer release wrote it) is rebuilt
+// into this release's format, whatever the index shape.
+func TestIndexFormat_NewerStampRebuilt(t *testing.T) {
+	skipIfInMemory(t)
+	dir := legacyFixture(t)
+	fx := newFixturePath(t, dir)
+	coll, err := fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	c := coll.(*collection)
+	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		key := indexKey(c.name, "plain")
+		raw, err := tx.AppendValue(c.db.systemNS, key, nil)
+		if err != nil {
+			return err
+		}
+		var p anyenc.Parser
+		v, err := p.Parse(raw)
+		if err != nil {
+			return err
+		}
+		var a anyenc.Arena
+		v.Set("v", a.NewNumberInt(indexFormatVersion+1))
+		return tx.Put(c.db.systemNS, key, v.MarshalTo(nil))
+	}))
+	require.NoError(t, fx.Close())
+
+	fx = newFixturePath(t, dir)
+	coll, err = fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	assertRebuilt(t, coll, "plain")
+}
+
+// An outdated index a running handle adopts after Open (a peer's
+// pre-versioning DDL, reconciled at the next tx) is never planned; the query
+// falls back to a scan, writes keep maintaining it, and the next Open
+// rebuilds it. The peer is simulated on the handle's own db, followed by a
+// forced reconcile pass.
+func TestIndexFormat_OutdatedIndexNotPlanned(t *testing.T) {
+	skipIfInMemory(t)
+	dir := legacyFixture(t)
+	fx := newFixturePath(t, dir)
+	coll, err := fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	c := coll.(*collection)
+	assertRebuilt(t, coll, "sparse")
+	exp, err := coll.Find(`{"a":{"$exists":true}}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, exp.Plan, "sparse")
+
+	legacyIndex(t, c, "sparse")
+	require.NoError(t, c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		c.reconcileIndexes(tx)
+		return nil
+	}))
+	for _, idx := range c.loadIndexes() {
+		if idx.info.Name == "sparse" {
+			assert.True(t, idx.outdated)
+		}
 	}
+
+	exp, err = coll.Find(`{"a":{"$exists":true}}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.NotContains(t, exp.Plan, "sparse")
+	n, err := coll.Find(`{"a":{"$exists":true}}`).IndexHint(IndexHint{IndexName: "sparse"}).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, legacyDocs, n)
+	// Inside a write tx as well.
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	exp, err = coll.Find(`{"a":{"$exists":true}}`).Explain(wtx.Context())
+	require.NoError(t, err)
+	assert.NotContains(t, exp.Plan, "sparse")
+	require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":100,"a":100}`)))
+	require.NoError(t, wtx.Commit())
+	for _, idx := range c.loadIndexes() {
+		if idx.info.Name == "sparse" {
+			assertIndexLen(t, idx, 1)
+		}
+	}
+	require.NoError(t, fx.Close())
+
+	fx = newFixturePath(t, dir)
+	coll, err = fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	for _, idx := range coll.(*collection).loadIndexes() {
+		if idx.info.Name == "sparse" {
+			assertIndexLen(t, idx, legacyDocs+1)
+			assert.False(t, idx.outdated)
+		}
+	}
+	assert.Equal(t, indexFormatVersion, readIndexFormat(t, coll.(*collection), "sparse"))
+}
+
+// A unique sparse index over documents with duplicate explicit nulls cannot
+// be rebuilt: Open still succeeds, the index stays as the old release left it
+// and is never planned, its siblings are rebuilt, and the duplicate surfaces
+// from EnsureIndex once the index is dropped.
+func TestIndexFormat_RebuildUniqueViolationQuarantines(t *testing.T) {
+	skipIfInMemory(t)
 	dir := t.TempDir()
 	fx := newFixturePath(t, dir)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "u", Fields: []string{"a"}, Sparse: true}))
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":null}`)))
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":null}`)))
+	require.NoError(t, coll.EnsureIndex(ctx,
+		IndexInfo{Name: "u", Fields: []string{"a"}, Sparse: true},
+		IndexInfo{Name: "s", Fields: []string{"b"}, Sparse: true},
+	))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1,"b":1}`)))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":null,"b":2}`)))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":null,"b":3}`)))
 	c := coll.(*collection)
 	legacyIndex(t, c, "u")
+	legacyIndex(t, c, "s")
 	// A pre-versioning unique sparse index skipped the two explicit nulls; the
 	// current format holds them and finds them duplicate.
 	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
@@ -305,8 +350,40 @@ func TestIndexFormat_RebuildUniqueViolationFailsOpen(t *testing.T) {
 	require.NoError(t, fx.Close())
 
 	fx = newFixturePath(t, dir)
-	_, err = fx.OpenCollection(ctx, "test")
-	require.ErrorIs(t, err, ErrIndexRebuild)
+	coll, err = fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	c = coll.(*collection)
+	assert.Equal(t, 0, readIndexFormat(t, c, "u"))
+	assert.Equal(t, mkValMultiKey, readMultikey(t, c, "u"))
+	assert.Equal(t, indexFormatVersion, readIndexFormat(t, c, "s"))
+	for _, idx := range c.loadIndexes() {
+		switch idx.info.Name {
+		case "u":
+			assert.True(t, idx.outdated)
+			assert.True(t, idx.info.Unique)
+		case "s":
+			assert.False(t, idx.outdated)
+			assertIndexLen(t, idx, 3)
+		}
+	}
+	exp, err := coll.Find(`{"a":{"$exists":true}}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.NotContains(t, exp.Plan, "IndexSeek(u)")
+	n, err := coll.Find(`{"a":{"$exists":true}}`).IndexHint(IndexHint{IndexName: "u"}).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 3, n)
+	exp, err = coll.Find(`{"b":{"$exists":true}}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, exp.Plan, "IndexSeek(s)")
+
+	// The duplicate is reported where the index is recreated.
+	require.NoError(t, coll.DropIndex(ctx, "u"))
+	err = coll.EnsureIndex(ctx, IndexInfo{Name: "u", Fields: []string{"a"}, Unique: true, Sparse: true})
 	require.ErrorIs(t, err, ErrUniqueConstraint)
-	assert.Contains(t, err.Error(), "test.u")
+	require.NoError(t, coll.DeleteId(ctx, 3))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "u", Fields: []string{"a"}, Unique: true, Sparse: true}))
+	exp, err = coll.Find(`{"a":{"$exists":true}}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, exp.Plan, "IndexSeek(u)")
+	assert.Equal(t, indexFormatVersion, readIndexFormat(t, c, "u"))
 }

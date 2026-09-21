@@ -389,6 +389,11 @@ type index struct {
 	// definition and may land on the same root page, so only the stamp tells
 	// an older snapshot's index from the rebuilt one.
 	format int
+	// outdated: the stamp is not the current format and a later change
+	// affects this index (indexFormatOutdated). Open rebuilds such indexes;
+	// one seen afterwards (adopted from a peer, or left by a rebuild the
+	// data defeated) is maintained but never planned (visibleIndexes).
+	outdated bool
 
 	keyBuf  anyenc.Tuple
 	keysBuf []anyenc.Tuple
@@ -465,6 +470,7 @@ func (idx *index) cloneWithNs(ns *btree.Namespace, nsName string, catalogKey []b
 		nsName:         nsName,
 		catalogKey:     catalogKey,
 		format:         idx.format,
+		outdated:       idx.outdated,
 		fieldNames:     idx.fieldNames,
 		fieldPaths:     idx.fieldPaths,
 		reverse:        idx.reverse,

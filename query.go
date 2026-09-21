@@ -169,6 +169,29 @@ func visibleIndexes(btx *btree.ReadTx, idxs []*index) []*index {
 	return out
 }
 
+// plannableIndexes is visibleIndexes minus the indexes whose entries are of
+// an outdated format (idx.outdated): those are not what the current code
+// derives, so a seek over them can miss documents. Stats still lists them.
+func plannableIndexes(btx *btree.ReadTx, idxs []*index) []*index {
+	outdated := false
+	for _, idx := range idxs {
+		if idx.outdated {
+			outdated = true
+			break
+		}
+	}
+	if outdated {
+		kept := make([]*index, 0, len(idxs)-1)
+		for _, idx := range idxs {
+			if !idx.outdated {
+				kept = append(kept, idx)
+			}
+		}
+		idxs = kept
+	}
+	return visibleIndexes(btx, idxs)
+}
+
 // planOpts are the only per-verb compilation knobs. Everything else about
 // access-path selection is shared — a divergence here needs written rationale
 // (the SQLite shape: one WHERE/ORDER BY code generator, verb-specific only at
@@ -354,7 +377,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	// multikey-flag probe gating tight seek bounds must read the same
 	// snapshot the scan executes on.
 	sorter := q.writeSorter(opts)
-	idxs := visibleIndexes(btx, q.c.loadIndexes())
+	idxs := plannableIndexes(btx, q.c.loadIndexes())
 	br := q.buildBoundsResult(idxs)
 	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
 	totalDocs := q.docCountForPlan(btx, idxs)
@@ -877,7 +900,7 @@ func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, residual query.Filter, ne
 	if !idFixed && !hasResidual && !needSort && !opts.wantCandidates {
 		return false
 	}
-	idxs := visibleIndexes(btx, q.c.loadIndexes())
+	idxs := plannableIndexes(btx, q.c.loadIndexes())
 	probePossible = idFixed
 	if len(idxs) > 0 {
 		br := q.buildBoundsResult(idxs)

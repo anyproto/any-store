@@ -227,6 +227,16 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		}
 	}
 
+	// Bring range indexes older releases built up to the current format
+	// before any handle exists (see upgradeIndexFormats).
+	if err = ds.upgradeIndexFormats(ctx); err != nil {
+		if ds.recoveryController != nil {
+			_ = ds.recoveryController.Stop()
+		}
+		_ = ds.btreeDB.Close()
+		return nil, err
+	}
+
 	// Start recovery controller after initialization
 	if ds.recoveryController != nil {
 		if err = ds.recoveryController.Start(ctx); err != nil {
@@ -792,7 +802,7 @@ func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collec
 	db.mu.Lock()
 	if coll, ok := db.openedCollections[collectionName]; ok && !coll.(*collection).closed.Load() {
 		db.mu.Unlock()
-		return db.readyCollection(ctx, coll)
+		return coll, nil
 	}
 	// A CLOSED registered handle is a Drop in an open tx: fall through to the
 	// catalog check, which is ctx-aware — the dropping tx sees its own delete
@@ -803,22 +813,11 @@ func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collec
 	return db.openCollection(ctx, collectionName)
 }
 
-// readyCollection returns a cached handle, first finishing an index-format
-// rebuild that a rolled-back ambient tx re-armed (rebuildOutdatedIndexes).
-func (db *db) readyCollection(ctx context.Context, coll Collection) (Collection, error) {
-	if c := coll.(*collection); c.rebuildPending.Load() {
-		if err := c.rebuildOutdatedIndexes(ctx); err != nil {
-			return nil, err
-		}
-	}
-	return coll, nil
-}
-
 func (db *db) openCollection(ctx context.Context, collectionName string) (Collection, error) {
 	db.mu.Lock()
 	if coll, ok := db.openedCollections[collectionName]; ok && !coll.(*collection).closed.Load() {
 		db.mu.Unlock()
-		return db.readyCollection(ctx, coll)
+		return coll, nil
 	}
 	db.mu.Unlock()
 
@@ -891,32 +890,35 @@ func (db *db) Collection(ctx context.Context, collectionName string, opts ...Col
 }
 
 func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string, err error) {
-	err = db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		cursor := tx.NewCursor(db.systemNS)
-		defer cursor.Close()
-		prefix := []byte("coll:")
-		if err := cursor.Seek(prefix); err != nil {
-			return nil
-		}
-		for cursor.Valid() {
-			key, err := cursor.Key()
-			if err != nil {
-				return err
-			}
-			if !strings.HasPrefix(string(key), "coll:") {
-				break
-			}
-			collectionNames = append(collectionNames, string(key[5:]))
-			if err := cursor.Next(); err != nil {
-				return err
-			}
-		}
-		return nil
+	err = db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
+		collectionNames, err = db.collectionNames(tx)
+		return err
 	})
-	if err != nil {
-		return nil, err
-	}
 	return
+}
+
+// collectionNames lists the collections the catalog holds in this view.
+func (db *db) collectionNames(tx *btree.ReadTx) (collectionNames []string, err error) {
+	cursor := tx.NewCursor(db.systemNS)
+	defer cursor.Close()
+	prefix := []byte("coll:")
+	if err = cursor.Seek(prefix); err != nil {
+		return nil, nil
+	}
+	for cursor.Valid() {
+		key, err := cursor.Key()
+		if err != nil {
+			return nil, err
+		}
+		if !strings.HasPrefix(string(key), "coll:") {
+			break
+		}
+		collectionNames = append(collectionNames, string(key[5:]))
+		if err = cursor.Next(); err != nil {
+			return nil, err
+		}
+	}
+	return collectionNames, nil
 }
 
 func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
