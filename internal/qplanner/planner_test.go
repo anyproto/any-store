@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -2008,7 +2009,7 @@ func TestPlan_String_NoPlan(t *testing.T) {
 // (with and without seek-sort cost).
 func TestFormatSeekDetails(t *testing.T) {
 	t.Run("no_sort", func(t *testing.T) {
-		s := formatSeekDetails(3, 10, CostDocFetch, 0)
+		s := formatSeekDetails(3, 10, CostDocFetch, 0, 0)
 		assert.Contains(t, s, fmt.Sprintf("3×seek(%.1f)", CostIndexSeek))
 		assert.Contains(t, s, fmt.Sprintf("10×fetch(%.1f)", CostDocFetch))
 		assert.Contains(t, s, fmt.Sprintf("10×filter(%.1f)", CostFilter))
@@ -2021,9 +2022,17 @@ func TestFormatSeekDetails(t *testing.T) {
 	})
 	t.Run("with_sort", func(t *testing.T) {
 		seekSortCost := 42.5
-		s := formatSeekDetails(1, 5, CostDocFetch, seekSortCost)
+		s := formatSeekDetails(1, 5, CostDocFetch, seekSortCost, 0)
 		assert.Contains(t, s, fmt.Sprintf("+ sort=%.1f", seekSortCost))
 		total := 1*CostIndexSeek + 5*CostDocFetch + 5*CostFilter + seekSortCost
+		expectedSuffix := fmt.Sprintf("= %.1f", total)
+		assert.True(t, strings.HasSuffix(s, expectedSuffix),
+			"expected suffix %q, got %q", expectedSuffix, s)
+	})
+	t.Run("with_walk", func(t *testing.T) {
+		s := formatSeekDetails(1, 40, CostDocFetch, 0, 40)
+		assert.Contains(t, s, fmt.Sprintf("40×walk(%.2f)", CostSeqRead))
+		total := 1*CostIndexSeek + 40*CostDocFetch + 40*CostFilter + 40*CostSeqRead
 		expectedSuffix := fmt.Sprintf("= %.1f", total)
 		assert.True(t, strings.HasSuffix(s, expectedSuffix),
 			"expected suffix %q, got %q", expectedSuffix, s)
@@ -4413,4 +4422,39 @@ func TestBoundsResult_AllFixed_ZeroBoundsField(t *testing.T) {
 	// constraint is present.
 	assert.False(t, br.AllFixed(),
 		"AllFixed should not treat a zero-bounds field as fixed")
+}
+
+// The presence cut of overlapping sparse indexes is claimed by the smallest
+// population, whatever order the candidates arrive in.
+func TestCalculateSelectivity_PresenceCutOrderIndependent(t *testing.T) {
+	filter := query.MustParseCondition(`{"p":{"$exists":true},"q":{"$exists":true}}`)
+	sparse := func(name string, entries int, fields ...string) CBOIndex {
+		sk := NewIndexSketch(DefaultSketchSize, len(fields))
+		for i := range entries {
+			for level := range fields {
+				sk.Increment(level, []byte(fmt.Sprint(i)))
+			}
+		}
+		return CBOIndex{
+			Info:   &IndexInfo{Name: name, FieldNames: fields, Sparse: true},
+			Sketch: sk,
+		}
+	}
+	for _, names := range [][2]string{{"zz_p", "aa_pq"}, {"aa_p", "zz_pq"}} {
+		wide := func() CBOIndex { return sparse(names[0], 2000, "p") }
+		narrow := func() CBOIndex { return sparse(names[1], 40, "p", "q") }
+		a := calculateSelectivity(filter, []CBOIndex{wide(), narrow()}, 4000, nil)
+		b := calculateSelectivity(filter, []CBOIndex{narrow(), wide()}, 4000, nil)
+		assert.Equal(t, a, b, names)
+		assert.InDelta(t, 40.0/4000, a, 1e-9, names)
+	}
+}
+
+// A candidate slice is allocated per plan, so a word of padding costs every
+// query: the memo bools live in the struct's bool run.
+func TestCBOIndexSize(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("layout pinned for 64-bit")
+	}
+	assert.Equal(t, uintptr(144), unsafe.Sizeof(CBOIndex{}))
 }

@@ -48,8 +48,8 @@ type CanonicalKeyDedupIter struct {
 	// canonical-element selection happens in the same space the cursor walks.
 	FieldReverse bool
 
-	// Sparse mirrors the index's Sparse flag: a null or missing leaf then has
-	// no entry and must not be elected canonical.
+	// Sparse mirrors the index's Sparse flag: a missing leaf then has no entry
+	// and must not be elected canonical.
 	Sparse bool
 
 	// Bounds are the SCAN bounds — padded for full keys exactly as IndexIter
@@ -97,7 +97,7 @@ func (it *CanonicalKeyDedupIter) Next() (key []byte, docId []byte, multiKey bool
 			return key, docId, false, nil
 		}
 		// The doc's entries for this field are what index maintenance wrote
-		// (writeValues): none for a null/missing leaf of a sparse index, one
+		// (writeValues): none for a missing leaf of a sparse index, one
 		// per element plus one for the array itself for a non-positional
 		// array leaf. The canonical entry is elected among the elements —
 		// the sort-key candidates, so an index-order scan yields the min/max
@@ -108,7 +108,7 @@ func (it *CanonicalKeyDedupIter) Next() (key []byte, docId []byte, multiKey bool
 		if it.Sparse {
 			kept := it.leaves[:0]
 			for _, l := range it.leaves {
-				if l.Value != nil && l.Value.Type() != anyenc.TypeNull {
+				if l.Value != nil {
 					kept = append(kept, l)
 				}
 			}

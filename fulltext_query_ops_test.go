@@ -286,7 +286,7 @@ func TestFtsReadYourWrites_InsideWriteTx(t *testing.T) {
 
 // A $text plan driven by a sparse index over a path through an array of
 // objects: the index-order dedup must elect among the entries the sparse
-// index wrote, never a null/missing leaf.
+// index wrote, never a missing leaf.
 func TestFtsOps_SparseTraversedIndexKeepsDocs(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -315,5 +315,165 @@ func TestFtsOps_SparseTraversedIndexKeepsDocs(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, 3, n)
 		})
+	}
+}
+
+// The $text plan applies the same sparse-completeness gate: a presence
+// predicate admits a sparse index as the text plan's driver, and the rows
+// must match the same query with the index absent.
+func TestFtsOps_SparsePresencePredicates(t *testing.T) {
+	for _, filter := range []string{
+		`{"$text":{"$search":"alpha"},"opt":{"$exists":true}}`,
+		`{"$text":{"$search":"alpha"},"opt":{"$type":"null"}}`,
+		`{"$text":{"$search":"alpha"},"opt":null}`,
+		`{"$text":{"$search":"alpha"},"opt":{"$exists":false}}`,
+	} {
+		fx := newFixture(t)
+		plain, err := fx.CreateCollection(ctx, "plain")
+		require.NoError(t, err)
+		sparse, err := fx.CreateCollection(ctx, "sparse")
+		require.NoError(t, err)
+		require.NoError(t, plain.EnsureIndex(ctx, IndexInfo{Kind: IndexKindFulltext, Fields: []string{"text"}}))
+		require.NoError(t, sparse.EnsureIndex(ctx,
+			IndexInfo{Kind: IndexKindFulltext, Fields: []string{"text"}},
+			IndexInfo{Name: "opt", Fields: []string{"opt"}, Sparse: true},
+		))
+		var docs []string
+		for i := range 200 {
+			d := fmt.Sprintf(`{"id":"d%d","text":"alpha"}`, i)
+			switch i % 40 {
+			case 0:
+				d = fmt.Sprintf(`{"id":"d%d","text":"alpha","opt":%d}`, i, i)
+			case 1:
+				d = fmt.Sprintf(`{"id":"d%d","text":"alpha","opt":null}`, i)
+			}
+			docs = append(docs, d)
+		}
+		insertJSON(t, plain, docs...)
+		insertJSON(t, sparse, docs...)
+
+		want := sortedIDs(collectIdsString(t, plain.Find(filter)))
+		hint := IndexHint{IndexName: "opt", Boost: 1_000_000}
+		for _, q := range []Query{sparse.Find(filter), sparse.Find(filter).IndexHint(hint)} {
+			assert.Equal(t, want, sortedIDs(collectIdsString(t, q)), filter)
+			n, err := q.Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, len(want), n, filter)
+		}
+	}
+}
+
+// A sorted $text query whose residual guarantees a sparse index's field probes
+// from that index, priced from the index's own population, not the
+// collection's.
+func TestFtsOps_SparsePresenceSortedProbe(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx,
+		IndexInfo{Kind: IndexKindFulltext, Fields: []string{"text"}},
+		IndexInfo{Name: "p", Fields: []string{"p"}, Sparse: true},
+	))
+	var docs, want []string
+	for i := range 2000 {
+		d := fmt.Sprintf(`{"id":"d%04d","text":"alpha"}`, i)
+		if i%50 == 0 {
+			d = fmt.Sprintf(`{"id":"d%04d","text":"alpha","p":%d}`, i, i)
+			want = append(want, fmt.Sprintf("d%04d", i))
+		}
+		docs = append(docs, d)
+	}
+	insertJSON(t, coll, docs...)
+
+	q := coll.Find(`{"$text":{"$search":"alpha"},"p":{"$exists":true}}`).Sort("p")
+	explain, err := q.Explain(ctx)
+	require.NoError(t, err)
+	assert.True(t, plannerIndexUsed(explain, "p"), explain.Sql)
+	assert.Contains(t, explain.Plan, "FtsProbeSeek(p)")
+	assert.Equal(t, want, collectIdsString(t, q))
+}
+
+// Without a sort, a $text query whose residual guarantees a sparse index's
+// field probes the documents that index holds instead of scoring every text
+// match; a Count of it fetches nothing.
+func TestFtsOps_SparsePresenceDrivesProbe(t *testing.T) {
+	fx := newFixture(t)
+	plain, err := fx.CreateCollection(ctx, "plain")
+	require.NoError(t, err)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, plain.EnsureIndex(ctx, IndexInfo{Kind: IndexKindFulltext, Fields: []string{"text"}}))
+	require.NoError(t, coll.EnsureIndex(ctx,
+		IndexInfo{Kind: IndexKindFulltext, Fields: []string{"text"}},
+		IndexInfo{Name: "p", Fields: []string{"p"}, Sparse: true},
+	))
+	var docs []string
+	for i := range 2000 {
+		d := fmt.Sprintf(`{"id":"d%04d","text":"alpha"}`, i)
+		switch i % 100 {
+		case 0:
+			d = fmt.Sprintf(`{"id":"d%04d","text":"alpha","p":[%d,null]}`, i, i)
+		case 1:
+			d = fmt.Sprintf(`{"id":"d%04d","text":"beta","p":null}`, i)
+		}
+		docs = append(docs, d)
+	}
+	insertJSON(t, plain, docs...)
+	insertJSON(t, coll, docs...)
+
+	for filter, probes := range map[string]bool{
+		`{"$text":{"$search":"alpha"},"p":{"$exists":true}}`: true,
+		`{"$text":{"$search":"alpha"},"p":{"$type":"null"}}`: true,
+		// A term rarer than the field: the text driver is the cheaper source.
+		`{"$text":{"$search":"beta"},"p":{"$exists":true}}`: false,
+	} {
+		explain, err := coll.Find(filter).Explain(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, probes, plannerIndexUsed(explain, "p"), "%s: %s", filter, explain.Sql)
+
+		want := sortedIDs(collectIdsString(t, plain.Find(filter)))
+		assert.Equal(t, want, sortedIDs(collectIdsString(t, coll.Find(filter))), filter)
+		n, err := coll.Find(filter).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, len(want), n, filter)
+		for _, page := range [][2]uint{{1, 5}, {3, 0}} {
+			wantN, err := plain.Find(filter).Offset(page[0]).Limit(page[1]).Count(ctx)
+			require.NoError(t, err)
+			gotN, err := coll.Find(filter).Offset(page[0]).Limit(page[1]).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, wantN, gotN, "%s offset %d limit %d", filter, page[0], page[1])
+		}
+	}
+
+	_, err = coll.Find(`{"$text":{"$search":"alpha"},"p":{"$exists":true}}`).Count(ctx)
+	require.NoError(t, err)
+	qplannerEnableCounters(t)
+	_, err = coll.Find(`{"$text":{"$search":"alpha"},"p":{"$exists":true}}`).Count(ctx)
+	require.NoError(t, err)
+	pc := qplannerSnapshot()
+	assert.Zero(t, pc.FetchNextCalls, "a presence-covered probe Count must not fetch documents")
+}
+
+// Fields of a compound sparse index sharing an array can hold a document
+// {$exists:true} does not match, its keys collided into one: a $text Count
+// covered by presence must not read the index's size either.
+func TestFtsOps_SparsePresenceCountSharedArraySuperset(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx,
+		IndexInfo{Kind: IndexKindFulltext, Fields: []string{"text"}},
+		IndexInfo{Name: "xyz", Fields: []string{"x.y", "x.z"}, Sparse: true},
+	))
+	insertJSON(t, coll,
+		`{"id":"a","text":"alpha","x":[{"y":null},[{"z":null}]]}`,
+		`{"id":"b","text":"alpha","x":[{"y":1,"z":1}]}`,
+	)
+	filter := `{"$text":{"$search":"alpha"},"x.y":{"$exists":true},"x.z":{"$exists":true}}`
+	for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(IndexHint{IndexName: "xyz", Boost: 1 << 30})} {
+		assert.Equal(t, []string{"b"}, collectIdsString(t, q))
+		n, err := q.Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
 	}
 }

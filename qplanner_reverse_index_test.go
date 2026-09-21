@@ -580,7 +580,7 @@ func TestQRM_SparseAndNull_ReverseIndexes(t *testing.T) {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"b":2}`)))
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":9}`)))    // no b
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"b":null}`))) // null b
-		assertIndexLen(t, coll.GetIndexes()[0], 2)                                      // missing AND null excluded
+		assertIndexLen(t, coll.GetIndexes()[0], 3)                                      // missing excluded, null kept
 	})
 
 	t.Run("compound_nonsparse_inverted_null", func(t *testing.T) {

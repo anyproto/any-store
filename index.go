@@ -224,29 +224,43 @@ type IndexInfo struct {
 	Unique bool `json:"unique"`
 
 	// Sparse indicates whether the index is sparse, indexing only documents
-	// with a present, non-null value for every indexed field.
+	// that carry every indexed field.
 	//
-	// Null is treated the same as missing: a document whose indexed field is
-	// explicitly null is NOT indexed (this differs from MongoDB, where a sparse
-	// index stores present-but-null values). The choice keeps sparse indexing
-	// consistent with query matching, where {field: null} matches both a null
-	// and a missing field.
+	// Presence is existence, as in MongoDB: a field that is explicitly null is
+	// present and is indexed under the null key; only a missing field keeps a
+	// document out. The index therefore holds the documents matching
+	// {$exists: true} on each of its fields — exactly those, except that
+	// fields sharing an array are keyed one array level deeper than a dotted
+	// path matches, so such an index can hold more.
+	//
+	// A COMPOUND sparse index diverges from MongoDB, which keeps a document
+	// carrying ANY indexed field: here every indexed field must exist.
 	//
 	// Over a path through an array of objects the rule is per document: each
-	// indexed field must hold a present value in SOME element. Every key is
-	// then written unless all of its fields are null or missing in that
-	// element — {"a":[{"b":1},{"c":2}]} under (a.b, a.c) has keys (1, null)
-	// and (null, 2) — so a document that matches through different elements
-	// is still reachable by the seek on the leading field.
+	// indexed field must exist in SOME element. Every key is then written
+	// unless all of its fields are missing in that element —
+	// {"a":[{"b":1},{"c":2}]} under (a.b, a.c) has keys (1, null) and
+	// (null, 2) — so a document that matches through different elements is
+	// still reachable by the seek on the leading field.
 	//
 	// As a consequence, the planner only uses a sparse index for a query that
-	// guarantees every indexed field is present and non-null; otherwise it would
-	// silently drop matching documents the index never stored. In particular a
-	// query whose only constraint on a field is {$exists: true} cannot use a
-	// sparse index here, because an explicit-null document matches $exists:true
-	// yet is absent from the index — such a query falls back to a complete index
-	// or a full scan. For a unique sparse index, several documents with a missing
-	// or null field coexist freely, since none of them are indexed.
+	// guarantees every indexed field exists; otherwise it would silently drop
+	// matching documents the index never stored. {$exists: true}, a range, an
+	// equality to a non-null value, {$type: "null"} and {$ne: null} give that
+	// guarantee; an equality to null, an $in holding null, {$exists: false}
+	// and any other predicate that matches a missing field do not. A sibling
+	// predicate that admits a missing field and bounds the same field takes
+	// the index back out — {$exists: true, $eq: null} does not use it —
+	// except $ne, whose bounds hold every key the index wrote.
+	//
+	// An index whose fields are all top-level provides its sort order; one
+	// over a DOTTED path never does. A document fanning out through an array
+	// of objects can keep a single key while its sort key is a missing leaf
+	// (which sorts as null), so such a query always sorts the rows itself.
+	//
+	// For a unique sparse index, documents missing a field coexist freely,
+	// since none of them are indexed; an explicit null is a value and is held
+	// unique.
 	Sparse bool `json:"sparse"`
 
 	// Kind selects the index type (range by default, full-text, or vector).
@@ -384,6 +398,7 @@ type index struct {
 	rebinds     []rebind        // stack of rebound fields across nested fan-outs
 	shared      int             // later fields currently rebound: level dedup is off
 	rebound     bool            // some field was rebound for this document: keys dedup whole
+	skipped     bool            // the sparse rule dropped a key of this document
 	valBuf      []*anyenc.Value // stack of a leaf array's index values
 	fullKeyBuf  anyenc.Tuple    // reusable buffer for full keys (key+docId)
 	seekBuf     anyenc.Tuple    // reusable buffer for unique constraint seek results
@@ -547,9 +562,15 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 	entryValue := qplanner.IndexValueScalar
 	if len(idx.keysBuf) > 1 {
 		entryValue = qplanner.IndexValueMultiKey
-		// This doc fans out (non-empty array at an indexed field): persist
-		// the sticky index-level multikey flag in this same tx, so any
-		// snapshot that can see these entries sees the flag.
+	}
+	// Persist the sticky INDEX-LEVEL multikey flag in this same tx, so any
+	// snapshot that can see these entries sees the flag. Several keys mean
+	// this doc fans out (non-empty array at an indexed field); a sparse index
+	// can also keep a SINGLE key of a doc that fans out — the other elements'
+	// keys are dropped — and the index is not scalar then either. entryValue
+	// above is per entry and stays Scalar there: a lone key is still this
+	// doc's only one.
+	if len(idx.keysBuf) > 1 || (idx.skipped && len(idx.keysBuf) == 1) {
 		if err := idx.markMultiKey(tx); err != nil {
 			return err
 		}
@@ -647,6 +668,10 @@ func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 			if !errors.Is(err, btree.ErrKeyNotFound) {
 				return err
 			}
+			// An absent key was never counted: leave the sketch alone. A
+			// sparse index holding no entry for an explicit null is the
+			// shape this happens on.
+			continue
 		}
 		if idx.sketch != nil {
 			idx.applySketch(ki, prevKi, false)
@@ -688,7 +713,7 @@ func (idx *index) applySketch(ki, prevKi int, inc bool) {
 }
 
 // writeKey appends the key being built and reports whether it was written:
-// a sparse index skips a key whose fields are all null or missing.
+// a sparse index skips a key whose fields are all missing.
 func (idx *index) writeKey() bool {
 	if idx.info.Sparse {
 		any := false
@@ -699,6 +724,7 @@ func (idx *index) writeKey() bool {
 			}
 		}
 		if !any {
+			idx.skipped = true
 			return false
 		}
 	}
@@ -724,8 +750,8 @@ func (idx *index) writeKey() bool {
 // writeValues appends, for field i, one key per value the field stores for
 // this document, each continued into field i+1 depth-first, and reports
 // whether any full key was written. A sparse index skips a key whose fields
-// are all null or missing, and drops the document when some field is null
-// or missing in every key (fillKeysBuf).
+// are all missing, and drops the document when some field is missing in
+// every key (fillKeysBuf).
 //
 // Field i resolves from fields[i].root at segment .consumed (the whole document
 // at segment 0 unless an earlier field rebound it — see resolveField): a
@@ -826,12 +852,12 @@ func (idx *index) resolveField(i int, v *anyenc.Value, seg int) bool {
 // the bools — so it packs into 64 bytes with no interior padding.
 type fieldScratch struct {
 	root      *anyenc.Value  // value the field resolves from (rebound inside a shared array)
-	uniq      []anyenc.Tuple // values already written under the current prefix
+	uniq      []anyenc.Tuple // values already written under the current prefix, each with a trailing presence byte
 	consumed  int            // path segments already resolved by root
 	keyPrefix int            // len(keyBuf) at this field's level
 	curBound  int            // len(keyBuf) past this field's value in the key being built
 	dedup     bool           // the values under one prefix may repeat
-	present   bool           // the value in the key being built is non-null
+	present   bool           // the leaf behind the key being built exists
 	seen      bool           // some key of this document had the field present
 }
 
@@ -892,16 +918,24 @@ func (idx *index) emitLeaf(i int, l anyenc.Leaf) bool {
 		} else {
 			idx.keyBuf = v.MarshalTo(k)
 		}
+		// Presence is the leaf's existence: an explicit null is present, and
+		// an element of a present array leaf is one of its entries.
+		present := l.Value != nil
 		// A value's subtree is fixed by the value alone only while no later
 		// field is rebound (it then resolves from its own root either way);
 		// under a rebind two equal values can head different keys, and
 		// writeKey dedups the whole key instead.
-		if idx.fields[i].dedup && idx.shared == 0 && !idx.isUnique(i, idx.keyBuf) {
-			continue
+		if idx.fields[i].dedup && idx.shared == 0 {
+			switch idx.noteValue(i, idx.keyBuf, present) {
+			case valueRepeat:
+				continue
+			case valueNowPresent:
+				// The keys under this value may exist already, written
+				// through another field's presence: dedup them whole.
+				idx.rebound = true
+			}
 		}
-		// Presence is the leaf's: a null element of a present array leaf is
-		// still one of its entries.
-		idx.fields[i].present = l.Value != nil && l.Value.Type() != anyenc.TypeNull
+		idx.fields[i].present = present
 		idx.fields[i].curBound = len(idx.keyBuf)
 		if idx.writeValues(i + 1) {
 			wrote = true
@@ -926,11 +960,12 @@ func (idx *index) fillKeysBuf(it item) {
 	idx.keyBuf = idx.keyBuf[:0]
 	doc := it.Value()
 	idx.rebound = false
+	idx.skipped = false
 	idx.resetFields(doc)
 	wrote := idx.writeValues(0)
 	if wrote && idx.info.Sparse {
-		// A sparse index holds a document only when every field is present
-		// and non-null somewhere in it.
+		// A sparse index holds a document only when every field exists
+		// somewhere in it.
 		for i := range idx.fields {
 			wrote = wrote && idx.fields[i].seen
 		}
@@ -957,17 +992,38 @@ func (idx *index) resetFields(doc *anyenc.Value) {
 	}
 }
 
-func (idx *index) isUnique(i int, k anyenc.Tuple) bool {
+// noteValue outcomes.
+const (
+	valueNew        = iota // first occurrence under the current prefix
+	valueRepeat            // seen before: its keys are already built
+	valueNowPresent        // seen before only through missing leaves, now through one that exists
+)
+
+// noteValue records field i's encoded value k under the current prefix. A
+// missing leaf and an explicit null encode alike, yet only the null makes a
+// sparse index hold the key, so a value first met through a missing leaf is
+// built again when a leaf that exists carries it. Each recorded value ends in
+// a presence byte.
+func (idx *index) noteValue(i int, k anyenc.Tuple, present bool) int {
 	f := &idx.fields[i]
 	for _, ek := range f.uniq {
-		if bytes.Equal(k, ek) {
-			return false
+		last := len(ek) - 1
+		if bytes.Equal(k, ek[:last]) {
+			if idx.info.Sparse && present && ek[last] == 0 {
+				ek[last] = 1
+				return valueNowPresent
+			}
+			return valueRepeat
 		}
+	}
+	var flag byte
+	if present {
+		flag = 1
 	}
 	nl := len(f.uniq) + 1
 	f.uniq = slices.Grow(f.uniq, nl)[:nl]
-	f.uniq[nl-1] = append(f.uniq[nl-1][:0], k...)
-	return true
+	f.uniq[nl-1] = append(append(f.uniq[nl-1][:0], k...), flag)
+	return valueNew
 }
 
 func (idx *index) Close() (err error) {

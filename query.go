@@ -884,7 +884,8 @@ func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, residual query.Filter, ne
 		params.Indexes = q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
 		params.FieldBounds = &br
 		for i := range params.Indexes {
-			if len(params.Indexes[i].Bounds) > 0 || (needSort && params.Indexes[i].ExactSort) {
+			if len(params.Indexes[i].Bounds) > 0 || (needSort && params.Indexes[i].ExactSort) ||
+				qplanner.PresenceScan(&params.Indexes[i], residual) {
 				probePossible = true
 				break
 			}
@@ -1177,6 +1178,11 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 			cboIdx.BoundFields < len(idx.cboInfo.FieldNames) {
 			scalarProven()
 		}
+		// A presence count over a bound-less sparse index counts the whole
+		// index: the proof lets CountEntries page-batch it, entries == docs.
+		if countOnly && idx.cboInfo.Sparse && len(cboIdx.Bounds) == 0 {
+			scalarProven()
+		}
 		// Multi-bound single-field counts (CountEntries' page-batch branch)
 		// and multi-bound unique lookups (CoverIter) need it too: a fan-out
 		// through an array of objects leaves no whole-array key to probe, so
@@ -1206,11 +1212,16 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		// lazily, only for candidates the gate would demote. When the only cut
 		// on the sort side is a type-bracket edge, the candidate is widened
 		// (widenSortEdges) instead of demoted.
-		// A SPARSE index holds no entry for a null or missing leaf, so over
-		// fan-out data a document surfaces at its least non-null leaf while
-		// the sort key is the least leaf of all (null wins): demote, no edge
-		// widening can restore that.
-		if cboIdx.ExactSort && idx.cboInfo.Sparse && !scalarProven() {
+		// A SPARSE index holds no entry for a missing leaf, so over fan-out
+		// data a document surfaces at its least existing leaf while the sort
+		// key is the least leaf of all (a missing leaf sorts as null and
+		// wins): demote, no edge widening can restore that. Over a path
+		// through objects the scalar proof does not rule this out — a
+		// document fanning out through an array of objects can keep a single
+		// key, {"x":[{"y":5},{"z":0}]} under x.y — so only an index on
+		// top-level fields, where every fan-out writes several keys, keeps
+		// its order on the proof.
+		if cboIdx.ExactSort && idx.cboInfo.Sparse && (idx.cboInfo.HasDottedPath() || !scalarProven()) {
 			cboIdx.ExactSort = false
 			cboIdx.PartialSort = false
 		}

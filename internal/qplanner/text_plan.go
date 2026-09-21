@@ -12,8 +12,9 @@ import (
 //     relevance order; everything else is a residual filter. Cost is O(Σ df) —
 //     the length of the involved posting lists — regardless of how selective
 //     the rest of the query is.
-//   - PROBE: another access path (fixed primary-key bounds, or a bounded /
-//     sort-covering secondary index) enumerates candidates and each one is
+//   - PROBE: another access path (fixed primary-key bounds, a bounded or
+//     sort-covering secondary index, or a sparse index whose fields the
+//     residual guarantees) enumerates candidates and each one is
 //     verified against the text index individually (FtsProbeIter). Cost scales
 //     with the candidate count, not the posting lists.
 //
@@ -152,6 +153,9 @@ func buildTextPlan(params *PlanParams) *Plan {
 				matches = 1
 			}
 			fetchN := matches
+			// A presence-covered Count fetches nothing either, yet keeps the
+			// charge: it offsets the probe constants, and the modelled
+			// driver/probe crossover then sits where the measured one does.
 			if params.CountOnly && !needFilter {
 				fetchN = 0
 			} else if orderedOut && params.Limit > 0 {
@@ -176,12 +180,15 @@ func buildTextPlan(params *PlanParams) *Plan {
 			})
 		}
 
-		// ---- Probe from bounded secondary indexes ----------------------
+		// ---- Probe from secondary indexes (bounded, or a sparse presence scan)
 		var fieldSelBuf [8]fieldSelEntry
 		fieldSel := collectFieldSelectivity(params, totalDocs, fieldSelBuf[:0])
 		for i := range params.Indexes {
 			idx := &params.Indexes[i]
-			if len(idx.Bounds) == 0 {
+			// A bound-less sparse index complete for the residual is a
+			// candidate too: its entries are the documents carrying its
+			// fields, walked whole (the access term below prices the walk).
+			if len(idx.Bounds) == 0 && !PresenceScan(idx, params.Filter) {
 				continue
 			}
 			if !sparseIndexComplete(idx, params.Filter) {
@@ -224,12 +231,11 @@ func buildTextPlan(params *PlanParams) *Plan {
 				if scanSel <= 0 {
 					scanSel = 0.0001
 				}
-				scanPop := totalDocs
-				if len(idx.Bounds) > 0 {
-					scanPop = totalDocs * idxSel
-					if scanPop < 1 {
-						scanPop = 1
-					}
+				// Population to scan: idxSel is 1 for an unbounded index and
+				// the presence cut for a bound-less sparse one.
+				scanPop := totalDocs * idxSel
+				if scanPop < 1 {
+					scanPop = 1
 				}
 				s := scanPop
 				if params.Limit > 0 {
@@ -284,7 +290,7 @@ func buildTextPlan(params *PlanParams) *Plan {
 		}
 		// Break an exact tie between two per-index probe candidates OF THE SAME
 		// KIND on the index name: those are appended in index order, which differs
-		// between a live and a reopened collection (GO-7510). Everything else was
+		// between a live and a reopened collection. Everything else was
 		// already deterministic and keeps its existing preference — candidates
 		// with no index sit at fixed positions, and the seek group is appended
 		// before the scan group, so a seek still wins a cross-shape tie (the same
@@ -432,7 +438,8 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 			}
 		}
 		countCovered = !needFilter ||
-			(idx.PointLookup && indexCoversFilter(idx, params.Filter))
+			(idx.PointLookup && indexCoversFilter(idx, params.Filter)) ||
+			(len(idx.Bounds) == 0 && presenceCoversFilter(idx, params.Filter))
 	}
 
 	probe := &FtsProbeIter{

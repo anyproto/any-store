@@ -2,6 +2,8 @@ package anystore
 
 import (
 	"context"
+	"fmt"
+	"math/rand"
 	"strings"
 	"testing"
 	"unsafe"
@@ -12,6 +14,8 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
+	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 func mustParseItem(t testing.TB, s string) item {
@@ -79,7 +83,29 @@ var fillKeysCases = []fillKeysCaseIndex{
 			{`{"id":1,"a":["b","c"]}`, []string{`"b"`, `"c"`, `["b","c"]`}},
 			{`{"id":1,"a":["a", "a", "b", "c", "b"]}`, []string{`"a"`, `"b"`, `"c"`, `["a","a","b","c","b"]`}},
 			{`{"id":1}`, []string{}},
-			{`{"id":1,"a":null}`, []string{}},
+			{`{"id":1,"a":null}`, []string{`null`}},
+			{`{"id":1,"a":[]}`, []string{`[]`}},
+		},
+	},
+	{
+		// A missing leaf and an explicit null encode alike; only the null is
+		// a key, whichever element comes first.
+		name: "traversed sparse",
+		info: IndexInfo{Fields: []string{"x.y"}, Sparse: true},
+		cases: []fillKeysCase{
+			{`{"id":1,"x":[{"y":null},{"z":9}]}`, []string{`null`}},
+			{`{"id":1,"x":[{"z":9},{"y":null}]}`, []string{`null`}},
+			{`{"id":1,"x":[{"z":9},{"y":null},{"y":5},{"y":null}]}`, []string{`null`, `5`}},
+			{`{"id":1,"x":[{"z":9},{"w":1}]}`, []string{}},
+		},
+	},
+	{
+		name: "traversed compound sparse",
+		info: IndexInfo{Fields: []string{"x.y", "x.z"}, Sparse: true},
+		cases: []fillKeysCase{
+			{`{"id":1,"x":[{"z":2},{"y":null,"z":2}]}`, []string{`null/2`}},
+			{`{"id":1,"x":[{"y":null,"z":2},{"z":2}]}`, []string{`null/2`}},
+			{`{"id":1,"x":[{"w":1},{"y":null},{"z":3}]}`, []string{`null/null`, `null/3`}},
 		},
 	},
 	{
@@ -695,5 +721,193 @@ func BenchmarkIndex_fillKeysBuf(b *testing.B) {
 				idx.fillKeysBuf(it)
 			}
 		})
+	}
+}
+
+// Deleting a document the index has no entry for must leave the entry count
+// alone. The missing entry is produced by stripping the raw key behind the
+// deleting document's back.
+func TestIndex_Sparse_DeleteMissingEntryKeepsEntryCount(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "noentry")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}, Sparse: true}))
+	for i := range 50 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+	}
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":100,"a":null}`)))
+	assertIndexLen(t, coll.GetIndexes()[0], 51)
+
+	// Strip the null entry so the document has none.
+	entries := readRawIndexEntries(t, fx.DB, "noentry", "a")
+	var nullKey []byte
+	for _, e := range entries {
+		if e.Key[0] == byte(anyenc.TypeNull) {
+			nullKey = e.Key
+		}
+	}
+	require.NotNil(t, nullKey)
+	impl := fx.DB.(*db)
+	c := coll.(*collection)
+	var ns *btree.Namespace
+	c.mu.Lock()
+	for _, i := range c.loadIndexes() {
+		if i.info.Name == "a" {
+			ns = i.ns
+		}
+	}
+	c.mu.Unlock()
+	require.NoError(t, impl.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		return tx.Delete(ns, nullKey)
+	}))
+	assertIndexLen(t, coll.GetIndexes()[0], 50)
+
+	sketchEntries := func() uint64 {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for _, i := range c.loadIndexes() {
+			if i.info.Name == "a" && i.sketch != nil {
+				return i.sketch.EntryCount(0)
+			}
+		}
+		return 0
+	}
+	before := sketchEntries()
+
+	require.NoError(t, coll.DeleteId(ctx, 100))
+	assertIndexLen(t, coll.GetIndexes()[0], 50)
+	assert.Equal(t, before, sketchEntries(), "deleting a document with no entry must not move the entry count")
+
+	// The surviving rows are still all reachable through the index.
+	got := collectIntField(t, coll.Find(`{"a":{"$exists":true}}`).IndexHint(IndexHint{IndexName: "a", Boost: 1 << 30}), "id")
+	assert.Len(t, got, 50)
+}
+
+// randPresenceValue builds a random JSON value from the shapes that decide
+// presence: nulls, empty and nested arrays, objects with and without the keys
+// the indexes below use.
+func randPresenceValue(rnd *rand.Rand, depth int) string {
+	switch pick := rnd.Intn(10); {
+	case depth <= 0 || pick < 3:
+		return []string{"null", "null", "0", "1", `"s"`, "true"}[rnd.Intn(6)]
+	case pick < 6:
+		keys := []string{"b", "c", "0", "d"}
+		rnd.Shuffle(len(keys), func(i, j int) { keys[i], keys[j] = keys[j], keys[i] })
+		var parts []string
+		for _, k := range keys[:rnd.Intn(len(keys)+1)] {
+			parts = append(parts, fmt.Sprintf("%q:%s", k, randPresenceValue(rnd, depth-1)))
+		}
+		return "{" + strings.Join(parts, ",") + "}"
+	default:
+		var parts []string
+		for range rnd.Intn(4) {
+			parts = append(parts, randPresenceValue(rnd, depth-1))
+		}
+		return "[" + strings.Join(parts, ",") + "]"
+	}
+}
+
+// A sparse index holds a document exactly when {$exists:true} matches every
+// indexed field, and the keys it builds for one document are distinct
+// (insertKeys Puts and counts each one). Fields sharing an array are keyed
+// one array level deeper than path matching reaches, so such an index holds
+// a superset: never less than the matching documents.
+func TestIndex_fillKeysBuf_SparseMembership(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	var idxs []*index
+	for _, fields := range [][]string{
+		{"a"}, {"-a"}, {"a.b"}, {"a.c"}, {"a.0"}, {"a.0.b"}, {"a.b.c"},
+		{"a.b", "a.c"}, {"a", "b"}, {"a.b", "b"}, {"b", "a.b"},
+		{"a.b", "a.c", "b"}, {"-a.b", "a.c"}, {"a.d", "a.b"},
+	} {
+		info := IndexInfo{Fields: fields, Sparse: true}
+		info.Name = info.createName()
+		idx := &index{info: info, c: coll.(*collection)}
+		require.NoError(t, idx.init())
+		idxs = append(idxs, idx)
+	}
+
+	rnd := rand.New(rand.NewSource(1))
+	var buf syncpool.DocBuffer
+	for n := range 5000 {
+		doc := fmt.Sprintf(`{"id":%d`, n)
+		if rnd.Intn(10) > 0 {
+			doc += `,"a":` + randPresenceValue(rnd, 3)
+		}
+		if rnd.Intn(3) > 0 {
+			doc += `,"b":` + randPresenceValue(rnd, 1)
+		}
+		doc += "}"
+		v := anyenc.MustParseJson(doc)
+		it := mustParseItem(t, doc)
+		for _, idx := range idxs {
+			idx.fillKeysBuf(it)
+			want := true
+			for _, field := range idx.fieldNames {
+				exists := query.MustParseCondition(fmt.Sprintf(`{%q:{"$exists":true}}`, field))
+				want = want && exists.Ok(v, &buf)
+			}
+			held := len(idx.keysBuf) > 0
+			if idx.cboInfo.SharedFrom < len(idx.fieldNames) {
+				require.True(t, held || !want, "%v %s", idx.info.Fields, doc)
+			} else {
+				require.Equal(t, want, held, "%v %s", idx.info.Fields, doc)
+			}
+			seen := map[string]bool{}
+			for _, k := range idx.keysBuf {
+				require.False(t, seen[string(k)], "duplicate key: %v %s", idx.info.Fields, doc)
+				seen[string(k)] = true
+			}
+		}
+	}
+}
+
+// The scalar proof says nothing about a sparse index over a dotted path — a
+// document fanning out through an array of objects can keep a single key — so
+// the index does not provide the order even when the marker reads scalar.
+func TestIndex_Sparse_TraversedSortIgnoresScalarProof(t *testing.T) {
+	fx := newFixture(t)
+	plain, err := fx.CreateCollection(ctx, "plain")
+	require.NoError(t, err)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: []string{"x.y"}, Sparse: true}))
+	for _, d := range []string{
+		`{"id":1,"x":[{"y":5},{"z":0}]}`,
+		`{"id":2,"x":{"y":1}}`,
+		`{"id":3,"x":{"y":9}}`,
+		`{"id":4,"x":{"y":3}}`,
+	} {
+		require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+	}
+	// Put the marker back to scalar, as an index whose fan-out documents all
+	// keep one key reads.
+	c := coll.(*collection)
+	var idx *index
+	c.mu.Lock()
+	for _, i := range c.loadIndexes() {
+		if i.info.Name == "s" {
+			idx = i
+		}
+	}
+	c.mu.Unlock()
+	require.NotNil(t, idx)
+	// The write path flags the index itself: document 1 fans out.
+	require.NoError(t, fx.DB.(*db).doReadTx(ctx, func(tx *btree.ReadTx) error {
+		assert.False(t, idx.isScalarProven(tx), "a fan-out keeping one key is not scalar")
+		return nil
+	}))
+	require.NoError(t, fx.DB.(*db).doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		return tx.Put(c.db.systemNS, multikeyKey(idx.ns.Name()), mkValScalar)
+	}))
+
+	filter := `{"x.y":{"$exists":true}}`
+	for _, limit := range []uint{0, 2} {
+		want := collectIntField(t, plain.Find(filter).Sort("x.y").Limit(limit), "id")
+		got := collectIntField(t, coll.Find(filter).Sort("x.y").Limit(limit).IndexHint(IndexHint{IndexName: "s", Boost: 1 << 30}), "id")
+		assert.Equal(t, want, got, "limit %d", limit)
 	}
 }
