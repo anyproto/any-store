@@ -1195,17 +1195,7 @@ func sparseIndexComplete(idx *CBOIndex, filter query.Filter) bool {
 // on fields of the bound-less sparse index idx. PresenceScan has the filter
 // guarantee every field of idx, so index membership is then the match set,
 // document for document.
-//
-// Fields sharing an array are the exception: key generation rebinds the later
-// field to each element and walks one array level deeper than path matching
-// does ({"x":[[{"z":1}],{"y":2}]} is held by (x.y, x.z) yet x.z does not
-// exist), so membership is only a superset there. The scalar proof does not
-// rule such a document out — its keys can collide into one
-// ({"x":[[{"z":null}],{"y":null}]}) — so the index never answers the count.
 func presenceCoversFilter(idx *CBOIndex, filter query.Filter) bool {
-	if idx.Info.SharedFrom < len(idx.Info.FieldNames) {
-		return false
-	}
 	return PresenceScan(idx, filter) && existsOnFields(filter, idx.Info.FieldPaths)
 }
 
@@ -1240,8 +1230,7 @@ func existsOnFields(f query.Filter, fields [][]string) bool {
 
 // PresenceScan reports whether idx is a sparse index with no bounds that is
 // complete for filter. Its entries then cover the documents carrying every
-// indexed field (a superset when fields share an array — see
-// presenceCoversFilter), itself a superset of the matching set that is smaller
+// indexed field, a superset of the matching set that is smaller
 // than the collection by the index's presence cut, so scanning it whole is a
 // costed alternative to a full scan ({$exists:true} is the plain case). The
 // query layer calls it to tell whether a $text query has a probe candidate.
@@ -1601,8 +1590,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	}
 
 	// Presence count: a bound-less sparse index holds the documents carrying
-	// its fields — presenceCoversFilter rules out the shared-array superset —
-	// so when that is all the filter asks, counting its documents
+	// its fields, so when that is all the filter asks, counting its documents
 	// (IndexIter.CountEntries over the whole index) is the answer.
 	if params.CountOnly && len(idx.Bounds) == 0 && presenceCoversFilter(idx, params.Filter) {
 		return root

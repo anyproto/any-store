@@ -4601,29 +4601,115 @@ func TestIndex_Sparse_FanOutSingleKeySortWindow(t *testing.T) {
 	}
 }
 
-// Fields of a compound sparse index that share an array are keyed one array
-// level deeper than path matching reaches, so the index can hold a document
-// {$exists:true} does not match: a presence Count must not read its size.
-func TestIndex_Sparse_PresenceCountSharedArraySuperset(t *testing.T) {
+// A compound sparse index whose fields share an array holds exactly the
+// documents {$exists:true} matches on every field — a field inside a nested
+// array element does not exist — so a presence Count reads the index alone,
+// one per document however many keys it fans out into.
+func TestIndex_Sparse_PresenceCountSharedArray(t *testing.T) {
 	fx := newFixture(t)
-	for _, docs := range [][]string{
-		{`{"id":1,"x":[[{"z":1}],{"y":2}]}`, `{"id":2,"x":[{"y":1,"z":1}]}`},
-		// The two keys collide into one, so the index keeps its scalar marker.
-		{`{"id":1,"x":[[{"z":null}],{"y":null}]}`, `{"id":2,"x":[{"y":1,"z":1}]}`},
-		{`{"id":1,"x":[{"y":null},[{"z":null}]]}`, `{"id":2,"x":[{"y":1,"z":1}]}`},
+	for _, first := range []string{
+		`{"id":1,"x":[[{"z":1}],{"y":2}]}`,
+		`{"id":1,"x":[[{"z":null}],{"y":null}]}`,
+		`{"id":1,"x":[{"y":null},[{"z":null}]]}`,
 	} {
-		coll, err := fx.CreateCollection(ctx, docs[0])
+		docs := []string{
+			first,
+			`{"id":2,"x":[{"y":1,"z":1}]}`,
+			`{"id":3,"x":[{"y":1,"z":1},{"y":2,"z":2}]}`,
+			`{"id":4,"x":[{"y":1},{"z":2}]}`,
+		}
+		coll, err := fx.CreateCollection(ctx, first)
 		require.NoError(t, err)
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: []string{"x.y", "x.z"}, Sparse: true}))
 		for _, d := range docs {
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
 		}
 		filter := `{"x.y":{"$exists":true},"x.z":{"$exists":true}}`
-		for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(IndexHint{IndexName: "s", Boost: 1 << 30})} {
-			assert.Equal(t, []int{2}, collectIntField(t, q, "id"), docs[0])
+		hint := IndexHint{IndexName: "s", Boost: 1 << 30}
+		for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(hint)} {
+			assert.Equal(t, []int{2, 3, 4}, collectIntField(t, q.Sort("id"), "id"), first)
 			cnt, err := q.Count(ctx)
 			require.NoError(t, err)
-			assert.Equal(t, 1, cnt, docs[0])
+			assert.Equal(t, 3, cnt, first)
+		}
+		qplannerEnableCounters(t)
+		_, err = coll.Find(filter).IndexHint(hint).Count(ctx)
+		require.NoError(t, err)
+		assert.Zero(t, qplannerSnapshot().FetchNextCalls, "a presence count must not fetch documents: %s", first)
+	}
+}
+
+// A compound index whose fields share an array keys a non-object element of
+// that array (scalar, null, nested array) as a missing leaf in every shared
+// field, as path matching reads it: the index answers like an unindexed
+// collection, alone (scalar marker, compounded bounds) and among fan-out docs.
+func TestIndex_SharedArray_NonObjectElement(t *testing.T) {
+	fx := newFixture(t)
+	docs := []string{
+		`{"id":1,"x":[[{"y":1,"z":2}]]}`,
+		`{"id":2,"x":[[{"z":5}]]}`,
+		`{"id":3,"x":[[{"y":{"z":5}}]]}`,
+		`{"id":4,"x":[[[{"y":1,"z":5}]]]}`,
+		`{"id":5,"x":[[{"y":1,"z":5}]],"b":1}`,
+		`{"id":6,"x":[[{"z":5}],{"y":1,"z":2}]}`,
+		`{"id":7,"x":[5,null,{"z":5}]}`,
+		`{"id":8,"x":[{"y":1,"z":5}]}`,
+		`{"id":9,"x":[[]]}`,
+		`{"id":10,"x":[[{"y":1,"z":5,"w":7}]]}`,
+		// The shared array sits one level down.
+		`{"id":11,"x":[{"y":[[{"q":1,"r":2}]]}]}`,
+		`{"id":12,"x":{"y":[[{"r":2}]]}}`,
+	}
+	filters := []string{
+		`{"x.y":null,"x.z":5,"x.w":7}`,
+		`{"x.y":null,"x.z":null,"x.w":null}`,
+		`{"x.y.q":null,"x.y.r":null}`,
+		`{"x.y.q":null,"x.y.r":2}`,
+		`{"x.y.q":1,"x.y.r":2}`,
+		`{"x.y":null,"x.z":null}`,
+		`{"x.y":null,"x.z":5}`,
+		`{"x.y":1,"x.z":5}`,
+		`{"x.y":1,"x.z":null}`,
+		`{"x.y":null,"x.y.z":5}`,
+		`{"x.y":null,"x.z":5,"b":null}`,
+		`{"x.0.y":null,"x.0.z":5}`,
+		`{"x.0.y":1,"x.0.z":5}`,
+		`{"x.0.y":null,"x.0.z":null}`,
+		`{"x.y":{"$exists":false},"x.z":{"$exists":false}}`,
+		`{"x.z":{"$gte":2},"x.y":{"$lte":1}}`,
+	}
+	colls := 0
+	check := func(fields []string, sparse bool, set []string) {
+		colls++
+		plain, err := fx.CreateCollection(ctx, fmt.Sprintf("plain%d", colls))
+		require.NoError(t, err)
+		coll, err := fx.CreateCollection(ctx, fmt.Sprintf("idx%d", colls))
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "s", Fields: fields, Sparse: sparse}))
+		for _, d := range set {
+			require.NoError(t, plain.Insert(ctx, anyenc.MustParseJson(d)))
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+		}
+		hint := IndexHint{IndexName: "s", Boost: 1 << 30}
+		for _, filter := range filters {
+			want := collectIntField(t, plain.Find(filter).Sort("id"), "id")
+			for _, q := range []Query{coll.Find(filter), coll.Find(filter).IndexHint(hint)} {
+				assert.Equal(t, want, collectIntField(t, q.Sort("id"), "id"), "%v sparse=%v %s %v", fields, sparse, filter, set)
+				cnt, err := q.Count(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, len(want), cnt, "count %v sparse=%v %s %v", fields, sparse, filter, set)
+			}
+		}
+	}
+	for _, fields := range [][]string{
+		{"x.y", "x.z"}, {"x.z", "x.y"}, {"-x.y", "x.z"}, {"x.y", "x.y.z"},
+		{"x.y", "x.z", "b"}, {"x.0.y", "x.0.z"}, {"x.y", "x.z", "x.w"}, {"x.y.q", "x.y.r"},
+	} {
+		for _, sparse := range []bool{false, true} {
+			for _, d := range docs {
+				check(fields, sparse, []string{d})
+			}
+			check(fields, sparse, docs)
 		}
 	}
 }

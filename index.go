@@ -228,10 +228,8 @@ type IndexInfo struct {
 	//
 	// Presence is existence, as in MongoDB: a field that is explicitly null is
 	// present and is indexed under the null key; only a missing field keeps a
-	// document out. The index therefore holds the documents matching
-	// {$exists: true} on each of its fields — exactly those, except that
-	// fields sharing an array are keyed one array level deeper than a dotted
-	// path matches, so such an index can hold more.
+	// document out. The index therefore holds exactly the documents matching
+	// {$exists: true} on each of its fields.
 	//
 	// A COMPOUND sparse index diverges from MongoDB, which keeps a document
 	// carrying ANY indexed field: here every indexed field must exist.
@@ -780,7 +778,8 @@ func (idx *index) writeValues(i int) bool {
 // leaf (anyenc.Value.AppendLeaves semantics). At an array met by a
 // non-numeric segment, every later field whose path reaches this same array
 // is rebound to the element being visited, so its own walk continues inside
-// that element — MongoDB's key generation for fields sharing an array.
+// that element — MongoDB's key generation for fields sharing an array. A
+// non-object element is a missing leaf for all of them, as in path matching.
 func (idx *index) resolveField(i int, v *anyenc.Value, seg int) bool {
 	path := idx.fieldPaths[i]
 	for ; seg < len(path); seg++ {
@@ -822,11 +821,19 @@ func (idx *index) resolveField(i int, v *anyenc.Value, seg int) bool {
 			}
 			wrote := false
 			for _, el := range arr {
+				// An element that cannot carry the path (scalar, null, nested
+				// array) is a missing leaf for every field bound to it: a nil
+				// root keeps a later field from walking into a nested array.
+				isObj := el.Type() == anyenc.TypeObject
+				elRoot := el
+				if !isObj {
+					elRoot = nil
+				}
 				for _, rb := range idx.rebinds[mark:] {
-					idx.fields[rb.field].root, idx.fields[rb.field].consumed = el, seg
+					idx.fields[rb.field].root, idx.fields[rb.field].consumed = elRoot, seg
 				}
 				var ok bool
-				if el.Type() == anyenc.TypeObject {
+				if isObj {
 					ok = idx.resolveField(i, el, seg)
 				} else {
 					ok = idx.emitLeaf(i, anyenc.Leaf{})
@@ -873,6 +880,8 @@ type rebind struct {
 // segment as field i, reaches the array field i fans out on at segment seg
 // and continues into its elements (a numeric segment there would index the
 // array instead, and a path ending at the array names the array itself).
+// Field i's root is never nil here: writeValues emits a nil root's missing
+// leaf without a walk, so two nil roots never compare as one array.
 func (idx *index) sharesArray(j, i, seg int) bool {
 	pj, pi := idx.fieldPaths[j], idx.fieldPaths[i]
 	if len(pj) <= seg || idx.fields[j].root != idx.fields[i].root || idx.fields[j].consumed != idx.fields[i].consumed {
