@@ -235,6 +235,18 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		}
 	}
 
+	// Bring range indexes older releases built up to the current format
+	// before any handle exists (see upgradeIndexFormats). Runs with the
+	// recovery controller started: its writes arm the dirty sentinel like
+	// any other. Only a cancelled ctx fails here.
+	if err = ds.upgradeIndexFormats(ctx); err != nil {
+		if ds.recoveryController != nil {
+			_ = ds.recoveryController.Stop()
+		}
+		_ = ds.btreeDB.Close()
+		return nil, err
+	}
+
 	return ds, nil
 }
 
@@ -880,32 +892,37 @@ func (db *db) Collection(ctx context.Context, collectionName string, opts ...Col
 }
 
 func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string, err error) {
-	err = db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		cursor := tx.NewCursor(db.systemNS)
-		defer cursor.Close()
-		prefix := []byte("coll:")
-		if err := cursor.Seek(prefix); err != nil {
-			return nil
-		}
-		for cursor.Valid() {
-			key, err := cursor.Key()
-			if err != nil {
-				return err
-			}
-			if !strings.HasPrefix(string(key), "coll:") {
-				break
-			}
-			collectionNames = append(collectionNames, string(key[5:]))
-			if err := cursor.Next(); err != nil {
-				return err
-			}
-		}
-		return nil
+	err = db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
+		collectionNames, err = db.collectionNames(tx)
+		return err
 	})
-	if err != nil {
+	return
+}
+
+// collectionNames lists the collections the catalog holds in this view. A
+// Seek error is a read failure, not an empty catalog (an empty or
+// non-matching prefix leaves the cursor invalid with a nil error).
+func (db *db) collectionNames(tx *btree.ReadTx) (collectionNames []string, err error) {
+	cursor := tx.NewCursor(db.systemNS)
+	defer cursor.Close()
+	prefix := []byte("coll:")
+	if err = cursor.Seek(prefix); err != nil {
 		return nil, err
 	}
-	return
+	for cursor.Valid() {
+		key, err := cursor.Key()
+		if err != nil {
+			return nil, err
+		}
+		if !strings.HasPrefix(string(key), "coll:") {
+			break
+		}
+		collectionNames = append(collectionNames, string(key[5:]))
+		if err = cursor.Next(); err != nil {
+			return nil, err
+		}
+	}
+	return collectionNames, nil
 }
 
 func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
@@ -1607,6 +1624,9 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 	}
 	if info.Kind != IndexKindRange {
 		obj.Set("kind", a.NewNumberInt(int(info.Kind)))
+	} else {
+		// The format the entries are built under; see indexFormatVersion.
+		obj.Set("v", a.NewNumberInt(indexFormatVersion))
 	}
 	if info.Kind == IndexKindVector && info.Vector != nil {
 		vobj := a.NewObject()

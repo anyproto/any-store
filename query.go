@@ -169,6 +169,27 @@ func visibleIndexes(btx *btree.ReadTx, idxs []*index) []*index {
 	return out
 }
 
+// plannableIndexes drops the indexes whose entries are of an outdated format
+// (idx.outdated) from a visible set: those are not what the current code
+// derives, so a seek over them can miss documents. Stats and Explain still
+// report them.
+func plannableIndexes(idxs []*index) []*index {
+	for i, idx := range idxs {
+		if !idx.outdated {
+			continue
+		}
+		kept := make([]*index, 0, len(idxs)-1)
+		kept = append(kept, idxs[:i]...)
+		for _, idx := range idxs[i+1:] {
+			if !idx.outdated {
+				kept = append(kept, idx)
+			}
+		}
+		return kept
+	}
+	return idxs
+}
+
 // planOpts are the only per-verb compilation knobs. Everything else about
 // access-path selection is shared — a divergence here needs written rationale
 // (the SQLite shape: one WHERE/ORDER BY code generator, verb-specific only at
@@ -354,12 +375,20 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	// multikey-flag probe gating tight seek bounds must read the same
 	// snapshot the scan executes on.
 	sorter := q.writeSorter(opts)
-	idxs := visibleIndexes(btx, q.c.loadIndexes())
+	visible := visibleIndexes(btx, q.c.loadIndexes())
+	idxs := plannableIndexes(visible)
 	br := q.buildBoundsResult(idxs)
 	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
-	totalDocs := q.docCountForPlan(btx, idxs)
+	// The estimate reads the candidates' sketches; with every range index
+	// outdated it falls back to an outdated one's, advisory and better than
+	// none.
+	countIdxs := idxs
+	if len(countIdxs) == 0 {
+		countIdxs = visible
+	}
+	totalDocs := q.docCountForPlan(btx, countIdxs)
 	if opts.exactTotalDocs {
-		totalDocs = q.docCountExact(btx, idxs)
+		totalDocs = q.docCountExact(btx, countIdxs)
 	}
 	plan = qplanner.BuildPlan(&qplanner.PlanParams{
 		Tx:          btx,
@@ -828,6 +857,14 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 		for _, idx := range cboIndexes {
 			addIndex(idx.Info.Name, plan.Cost, idx.Info.Name == plan.IndexName)
 		}
+		// An outdated index is never a candidate (plannableIndexes); listing
+		// it unused, like the vector and full-text handles below, keeps the
+		// report from silently shrinking.
+		for _, idx := range visibleIndexes(tx, q.c.loadIndexes()) {
+			if idx.outdated {
+				addIndex(idx.info.Name, 0, false)
+			}
+		}
 		sourceCost := func(name string) float64 {
 			if name == plan.IndexName {
 				return plan.Cost
@@ -877,7 +914,7 @@ func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, residual query.Filter, ne
 	if !idFixed && !hasResidual && !needSort && !opts.wantCandidates {
 		return false
 	}
-	idxs := visibleIndexes(btx, q.c.loadIndexes())
+	idxs := plannableIndexes(visibleIndexes(btx, q.c.loadIndexes()))
 	probePossible = idFixed
 	if len(idxs) > 0 {
 		br := q.buildBoundsResult(idxs)
@@ -965,8 +1002,9 @@ type countTx interface {
 // O(namespace pages) walk before every query on exactly the collections that
 // need no secondary index (pk-ordered schemas) is pure waste — return 0 and
 // let BuildPlan clamp it. Explain uses docCountExact instead. idxs is the
-// caller's loadIndexes() snapshot — the same one its CBO candidates are built
-// from, so the count and the candidates can't disagree about the index set.
+// caller's plannable snapshot — the same one its CBO candidates are built
+// from, so the count and the candidates can't disagree about the index set —
+// or, when that is empty, its visible one.
 func (q *collQuery) docCountForPlan(tx countTx, idxs []*index) int {
 	for _, idx := range idxs {
 		if s := idx.loadPubSketch(); s != nil {
