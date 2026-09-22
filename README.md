@@ -103,7 +103,7 @@ Any operation run with `tx.Context()` joins the transaction. Read transactions (
 _ = users.EnsureIndex(ctx,
     anystore.IndexInfo{Fields: []string{"name", "-createdDate"}},          // compound, mixed order
     anystore.IndexInfo{Fields: []string{"email"}, Unique: true},           // unique
-    anystore.IndexInfo{Fields: []string{"nick"}, Sparse: true},            // skips missing/null
+    anystore.IndexInfo{Fields: []string{"nick"}, Sparse: true},            // skips docs missing the field
 )
 
 exp, _ := users.Find(`{"name": "Jane"}`).Explain(ctx)
@@ -111,6 +111,10 @@ fmt.Println(exp.Plan) // chosen index, cost breakdown, rejected candidates
 ```
 
 Array fields index every element (multikey), and a dotted path through an array of objects (`"items.sku"` over `{"items":[{"sku":1},{"sku":2}]}`) indexes one entry per element — the same MongoDB field-path semantics filters and sorts use; `$elemMatch` binds several predicates to one element. The cost-based planner picks the cheapest index per query; `IndexHint` overrides it.
+
+Every range index this release creates records the format it was built under. When a release changes how an index derives its entries, opening the database with that release rebuilds the indexes the change affects, one write transaction per index, before `Open` returns; unaffected indexes are left as they are. The rebuild takes as long as creating those indexes would and blocks `Open` for that time; a crash in between keeps the indexes already rebuilt. An index the rebuild cannot produce from the data (a unique index whose documents the new format finds duplicate: explicit nulls under a sparse index, elements of an array under a dotted path; or a document this release rejects) is left as it was: `Stats` and `Explain` report it outdated, the planner never uses it, and writes keep maintaining it with entries of the new format, so a unique one checks new writes against a mixed set and can reject an insert or update it should accept. Drop and recreate it once the data allows; `EnsureIndex` with the same definition leaves it alone.
+
+Once a release has opened a file, older releases must not write to it: they do not stamp what they write, so entries in the older format would sit under a current stamp that nothing re-checks. An older release opening the file reads it (the stamp is ignored) and, if its own format differs, rebuilds every range index in its own format at open.
 
 ## Full-text search
 
@@ -230,9 +234,15 @@ An independent Go implementation following design conventions from [SQLCipher](h
 ## Contributing
 
 1. Fork & clone
-2. `make test` — run unit tests
+2. `make test` — the whole suite; `make cover` for library coverage
 3. Create your feature branch
 4. Open a PR and sign the CLA
+
+Unit tests live beside the code they cover (`db.go` + `db_test.go`). The
+behaviour suites that drive the library through its exported API — query
+semantics, planner, index lifecycle, vector and full-text — live in `test/`.
+Long-running crash, multiprocess and fuzz harnesses run in a separate internal
+repo; a pull request does not need those green locally.
 
 Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 

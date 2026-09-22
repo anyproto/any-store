@@ -7,11 +7,15 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/anyproto/any-store/v2/anyenc"
 )
+
+// Cipher round-trips and the passphrase-derived key path behind Config.
+// The end-to-end encryption behaviour these drive is codec.go's public
+// surface: NewAESCodec, NewChaCha20Poly1305Codec, NewXChaCha20Poly1305Codec
+// and DeriveKey.
 
 func TestEncryption_RoundTrip(t *testing.T) {
 	dir, err := os.MkdirTemp("", "anystore-enc-*")
@@ -172,11 +176,6 @@ func TestEncryption_BringYourOwnCodec(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, `{"id":"k","v":"hello"}`, got.Value().String())
 }
-
-// Each benchmark opens a fresh DB, then times b.N transactions of
-// 100 InsertOne operations each — representative of a small-write
-// workload. NoCommitSync = !CommitSync (default false) means we
-// skip fsync and measure pure CPU + buffered I/O cost.
 
 func BenchmarkAnystore_Insert_Plain(b *testing.B) {
 	benchAnystoreInsert(b, EncryptionConfig{})

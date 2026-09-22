@@ -3,6 +3,7 @@ package anystore
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -586,4 +587,307 @@ func TestFtsPendingSurvivesCollectionCloseMidTx(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 1, count, "reopened collection's buffer must flush")
 	})
+}
+
+// A $text clause names no index. So if a collection carried two full-text
+// indexes, detectFtsQuery's `fxs[0]` would search whichever one came first in
+// the collection's slice — creation order in the session that created them,
+// catalog (name) order after a reopen. The same query then returned different
+// rows before and after a restart, and a term that WAS indexed could come back
+// empty with no error:
+//
+//	LIVE      order=[zbody atitle]   $text "alpha" -> 0    $text "beta" -> 50
+//	REOPENED  order=[atitle zbody]   $text "alpha" -> 50   $text "beta" -> 0
+//
+// The ambiguity is now unrepresentable: a second full-text index is rejected at
+// creation. Multiple fields belong in ONE full-text index, with per-field
+// Weights — which is what BM25F is for.
+
+func TestFts_SecondIndexRejected(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name: "zbody", Fields: []string{"body"}, Kind: IndexKindFulltext}))
+
+	err = coll.EnsureIndex(ctx, IndexInfo{
+		Name: "atitle", Fields: []string{"title"}, Kind: IndexKindFulltext})
+	require.ErrorIs(t, err, ErrMultipleFulltextIndexes)
+
+	// Rejected, not half-created: the collection still has exactly one.
+	var fts []string
+	for _, idx := range coll.GetIndexes() {
+		if idx.Info().Kind == IndexKindFulltext {
+			fts = append(fts, idx.Info().Name)
+		}
+	}
+	assert.Equal(t, []string{"zbody"}, fts)
+}
+
+// Two full-text indexes in a single EnsureIndex call are rejected too — the
+// second is not yet published to the collection when the first is created.
+func TestFts_SecondIndexRejectedInSameBatch(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+
+	err = coll.EnsureIndex(ctx,
+		IndexInfo{Name: "zbody", Fields: []string{"body"}, Kind: IndexKindFulltext},
+		IndexInfo{Name: "atitle", Fields: []string{"title"}, Kind: IndexKindFulltext})
+	require.ErrorIs(t, err, ErrMultipleFulltextIndexes)
+}
+
+// The guard must not break the idempotent and conflicting redefinition paths,
+// which are about ONE index, not two.
+func TestFts_SameNameRedefinitionUnaffected(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+
+	info := IndexInfo{Name: "ft", Fields: []string{"title", "body"}, Kind: IndexKindFulltext}
+	require.NoError(t, coll.EnsureIndex(ctx, info))
+	// Same name, same definition: idempotent.
+	require.NoError(t, coll.EnsureIndex(ctx, info))
+	// Same name, different definition: still a mismatch, not an ambiguity.
+	err = coll.EnsureIndex(ctx, IndexInfo{
+		Name: "ft", Fields: []string{"title"}, Kind: IndexKindFulltext})
+	require.ErrorIs(t, err, ErrIndexMismatch)
+
+	// Dropping frees the slot.
+	require.NoError(t, coll.DropIndex(ctx, "ft"))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name: "other", Fields: []string{"body"}, Kind: IndexKindFulltext}))
+}
+
+// One full-text index over several fields is the supported way to search more
+// than one field, and it finds terms from every field it covers.
+func TestFts_OneIndexCoversSeveralFields(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name: "ft", Fields: []string{"title", "body"}, Kind: IndexKindFulltext}))
+	for i := range 50 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(
+			`{"id":%d,"title":"alpha doc %d","body":"beta text %d"}`, i, i, i))))
+	}
+
+	for _, search := range []string{"alpha", "beta"} {
+		count, err := coll.Find(fmt.Sprintf(`{"$text":{"$search":%q}}`, search)).Count(ctx)
+		require.NoError(t, err)
+		assert.Equalf(t, 50, count, "$text %q", search)
+	}
+}
+
+// A database written before the guard can still carry two full-text indexes.
+// Opening it must keep working, but a $text query must refuse rather than
+// silently search whichever index load order puts first.
+func TestFts_LegacyTwoIndexesRefuseQuery(t *testing.T) {
+	skipIfInMemory(t, "a legacy on-disk database is written and reopened")
+	tmpDir, err := os.MkdirTemp("", "fts-legacy-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	fx1 := newFixturePath(t, tmpDir)
+	coll, err := fx1.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name: "zbody", Fields: []string{"body"}, Kind: IndexKindFulltext}))
+	// Bypass the DDL guard to forge the pre-guard on-disk state.
+	require.NoError(t, forceSecondFtsIndex(t, coll))
+	require.NoError(t, fx1.Close())
+
+	fx2 := newFixturePath(t, tmpDir)
+	coll2, err := fx2.OpenCollection(ctx, "docs")
+	require.NoError(t, err)
+
+	_, err = coll2.Find(`{"$text":{"$search":"alpha"}}`).Count(ctx)
+	require.ErrorIs(t, err, ErrMultipleFulltextIndexes)
+
+	// Non-$text queries on such a collection keep working.
+	count, err := coll2.Find(`{}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count)
+}
+
+// forceSecondFtsIndex creates a second full-text index bypassing
+// checkSingleFulltextIndex, to reproduce the on-disk state a database written
+// before that guard can have. Test-only.
+func forceSecondFtsIndex(t *testing.T, coll Collection) error {
+	t.Helper()
+	c := coll.(*collection)
+	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		fx, err := c.createFtsIndex(ctx, tx, IndexInfo{
+			Name: "atitle", Fields: []string{"title"}, Kind: IndexKindFulltext})
+		if err != nil {
+			return err
+		}
+		c.storeFtsIndexes(append(c.loadFtsIndexes(), fx))
+		return nil
+	})
+}
+
+func TestFtsBM25_ParamsSurviveReopen(t *testing.T) {
+	tmpDir := t.TempDir()
+	func() {
+		fxLocal := newFixturePath(t, tmpDir)
+		coll, err := fxLocal.CreateCollection(ctx, "docs")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+			Kind: IndexKindFulltext, Fields: []string{"body"}, Fulltext: &FulltextParams{B: 0.33, K1: 1.7},
+		}))
+		insertJSON(t, coll, `{"id":"a","body":"alpha beta"}`)
+		require.NoError(t, fxLocal.Close())
+	}()
+
+	db, err := Open(ctx, tmpDir+"/any-store-test.db", nil)
+	require.NoError(t, err)
+	defer db.Close()
+	collI, err := db.OpenCollection(ctx, "docs")
+	require.NoError(t, err)
+	c := collI.(*collection)
+
+	fxs := c.loadFtsIndexes()
+	require.Len(t, fxs, 1)
+	assert.Equal(t, 0.33, fxs[0].info.Fulltext.B)
+	assert.Equal(t, 1.7, fxs[0].info.Fulltext.K1)
+}
+
+func TestFtsWeights_SurviveReopen(t *testing.T) {
+	tmpDir := t.TempDir()
+	func() {
+		fxLocal := newFixturePath(t, tmpDir)
+		coll, err := fxLocal.CreateCollection(ctx, "docs")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+			Kind: IndexKindFulltext, Fields: []string{"title", "body"},
+			Fulltext: &FulltextParams{Weights: map[string]float64{"title": 4, "body": 1}},
+		}))
+		insertJSON(t, coll, `{"id":"a","title":"alpha","body":"beta"}`)
+		require.NoError(t, fxLocal.Close())
+	}()
+
+	db, err := Open(ctx, tmpDir+"/any-store-test.db", nil)
+	require.NoError(t, err)
+	defer db.Close()
+	collI, err := db.OpenCollection(ctx, "docs")
+	require.NoError(t, err)
+	c := collI.(*collection)
+	fxs := c.loadFtsIndexes()
+	require.Len(t, fxs, 1)
+	assert.Equal(t, 4.0, fxs[0].info.Fulltext.Weights["title"])
+	assert.Equal(t, 1.0, fxs[0].info.Fulltext.Weights["body"])
+}
+
+func ftsPipelineColl(t *testing.T) (*fixture, Collection) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "p")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Kind: IndexKindFulltext, Fields: []string{"body"}}))
+	insertJSON(t, coll,
+		`{"id":"a","body":"london crash report","year":1920,"status":"open"}`,
+		`{"id":"b","body":"london fog landing","year":1937,"status":"closed"}`,
+		`{"id":"c","body":"london london tower","year":1950,"status":"open"}`,
+		`{"id":"d","body":"paris sunshine","year":1960,"status":"open"}`,
+	)
+	return fx, coll
+}
+
+// collectIter runs a query and returns (ids, scores) in result order.
+func collectIter(t *testing.T, q Query) ([]string, []float64) {
+	iter, err := q.Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	var ids []string
+	var scores []float64
+	for iter.Next() {
+		doc, derr := iter.Doc()
+		require.NoError(t, derr)
+		ids = append(ids, doc.Value().GetString("id"))
+		scores = append(scores, iter.Score())
+	}
+	require.NoError(t, iter.Err())
+	return ids, scores
+}
+
+// A concurrent read tx's staleness pass must not rebuild a collection's index
+// sets while a local write tx has uncommitted index DDL published in them —
+// its older snapshot would evict the writer's uncommitted indexes. The
+// indexSetDDLTxs counter carries that in-flight state.
+
+func TestIndexSetDDLTxs_BalancedAcrossCommitAndRollback(t *testing.T) {
+	fx := newFixture(t)
+	collIface, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	coll := collIface.(*collection)
+
+	ddlTxs := func() int {
+		coll.mu.Lock()
+		defer coll.mu.Unlock()
+		return coll.indexSetDDLTxs
+	}
+	require.Zero(t, ddlTxs())
+
+	// Committed DDL: counter is 1 while the tx is open, 0 after commit.
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(tx.Context(), IndexInfo{Fields: []string{"a"}, Kind: IndexKindFulltext}))
+	assert.Equal(t, 1, ddlTxs(), "uncommitted DDL must be marked in flight")
+	require.NoError(t, tx.Commit())
+	assert.Zero(t, ddlTxs(), "commit must release the in-flight marker")
+
+	// Rolled-back DDL: same lifecycle through the undo path.
+	tx2, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(tx2.Context(), IndexInfo{Fields: []string{"b"}}))
+	assert.Equal(t, 1, ddlTxs())
+	require.NoError(t, tx2.Rollback())
+	assert.Zero(t, ddlTxs(), "rollback must release the in-flight marker")
+}
+
+func TestReconcileSkipsWhileLocalIndexDDLInFlight(t *testing.T) {
+	fx := newFixture(t)
+	collIface, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	coll := collIface.(*collection)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"text"}, Kind: IndexKindFulltext}))
+
+	// Plant a ghost fts handle that no on-disk catalog entry backs — the
+	// stand-in for a writer's just-published, not-yet-committed index as seen
+	// by a reconcile running on an older snapshot.
+	ghost := &ftsIndex{c: coll, info: IndexInfo{Name: "ghost", Kind: IndexKindFulltext, Fields: []string{"g"}}}
+	coll.mu.Lock()
+	coll.storeFtsIndexes(append(coll.loadFtsIndexes(), ghost))
+	coll.indexSetDDLTxs++
+	coll.mu.Unlock()
+
+	inSnapshot := func() bool {
+		for _, fxi := range coll.loadFtsIndexes() {
+			if fxi == ghost {
+				return true
+			}
+		}
+		return false
+	}
+
+	// With DDL in flight, reconcile must leave the sets untouched.
+	require.NoError(t, fx.DB.(*db).doReadTx(ctx, func(tx *btree.ReadTx) error {
+		coll.reconcileIndexes(tx)
+		return nil
+	}))
+	assert.True(t, inSnapshot(), "reconcile evicted an index while local DDL was in flight")
+
+	// Once the writer resolved, the same reconcile evicts the ghost by
+	// omission (it has no catalog entry in the snapshot).
+	coll.mu.Lock()
+	coll.indexSetDDLTxs--
+	coll.mu.Unlock()
+	require.NoError(t, fx.DB.(*db).doReadTx(ctx, func(tx *btree.ReadTx) error {
+		coll.reconcileIndexes(tx)
+		return nil
+	}))
+	assert.False(t, inSnapshot(), "reconcile must evict a catalog-less handle once no DDL is in flight")
 }

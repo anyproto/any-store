@@ -29,6 +29,15 @@ const (
 // that has no full-text index.
 var ErrNoFulltextIndex = errors.New("any-store: collection has no full-text index for $text")
 
+// ErrMultipleFulltextIndexes is returned when a collection would end up with
+// more than one full-text index. A $text clause names no index, so a second one
+// makes every $text query on the collection ambiguous: which index is searched
+// — and therefore which documents match — would depend on index load order,
+// which is creation order in the session that created them and catalog (name)
+// order after a reopen. Index several fields from ONE full-text index instead,
+// with per-field Weights.
+var ErrMultipleFulltextIndexes = errors.New("any-store: collection already has a fulltext index; index multiple fields from one")
+
 // ErrFtsFormatOutdated is returned when a full-text index's postings were written
 // by an older build (a different on-disk format version). The fix is to drop and
 // recreate the index. any-store makes no on-disk back-compatibility promise for
@@ -983,6 +992,13 @@ func (q *collQuery) detectFtsQuery() (*qplanner.FtsQuerySpec, query.Filter, erro
 	fxs := q.c.loadFtsIndexes()
 	if len(fxs) == 0 {
 		return nil, nil, ErrNoFulltextIndex
+	}
+	// Creating a second full-text index is rejected (ErrMultipleFulltextIndexes),
+	// but a database written before that guard can still carry two. Refuse the
+	// query rather than silently searching whichever one load order puts first.
+	if len(fxs) > 1 {
+		return nil, nil, fmt.Errorf("%w (%q and %q)",
+			ErrMultipleFulltextIndexes, fxs[0].info.Name, fxs[1].info.Name)
 	}
 	fx := fxs[0]
 	spec := &qplanner.FtsQuerySpec{

@@ -340,7 +340,7 @@ as a later recall-per-byte upgrade. Always with an **exact re-rank** stage over 
   (physical delete, no tombstones). Wired into the collection as **`VectorModeIVFPQ`** (`index.go`),
   dispatched in `vector_index.go` (build/open/insert/delete/update/search/stats), and search plugs into
   the **existing `qplanner.VectorQuerySpec.Search` closure** so the normal FilterIter→SortIter→LimitIter
-  pipeline finishes the query unchanged. Validated end-to-end through `Find()` (`vector_ivfpq_test.go`):
+  pipeline finishes the query unchanged. Validated end-to-end through `Find()` (`TestVectorMode_IVFPQ_EndToEnd` in any-store-tests:apitest):
   recall@10 = 1.000 on realistic queries, residual metadata filters, `_distance` ordering, update/delete,
   and reopen-persistence; race-clean. Store-level recall on the real export = **0.963 @ nprobe=16**
   (`internal/vivf/store_test.go`), matching the prototype. Remaining: benchmark btree-reads/query vs HNSW
@@ -357,7 +357,7 @@ as a later recall-per-byte upgrade. Always with an **exact re-rank** stage over 
   `Rebuild`, and `Collection.CompactVectorIndex` triggers it manually. (Required one fix: `Insert` now
   also calls `maybeAutoCompactVectors`, since for IVF — unlike HNSW — inserts are what cause drift.)
   Tested: drift score rises on a distribution shift, auto-rebuild recovers recall a frozen index loses
-  (0.67 → 1.00, `vector_ivfpq_test.go`), `Rebuild` clears drift and restores store-level recall
+  (0.67 → 1.00, `TestVectorMode_IVFPQ_AutoRebuild` in any-store-tests:apitest), `Rebuild` clears drift and restores store-level recall
   0.58 → 1.00 (`internal/vivf/drift_test.go`).
 - **Search-path allocation pass. ✅ DONE.** `SearchCandidates` now allocates ~3 (result + cursor)
   instead of ~339/query: a pooled `searcher` (sync.Pool, mirroring `internal/vindex`) holds all

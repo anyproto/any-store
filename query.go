@@ -169,6 +169,27 @@ func visibleIndexes(btx *btree.ReadTx, idxs []*index) []*index {
 	return out
 }
 
+// plannableIndexes drops the indexes whose entries are of an outdated format
+// (idx.outdated) from a visible set: those are not what the current code
+// derives, so a seek over them can miss documents. Stats and Explain still
+// report them.
+func plannableIndexes(idxs []*index) []*index {
+	for i, idx := range idxs {
+		if !idx.outdated {
+			continue
+		}
+		kept := make([]*index, 0, len(idxs)-1)
+		kept = append(kept, idxs[:i]...)
+		for _, idx := range idxs[i+1:] {
+			if !idx.outdated {
+				kept = append(kept, idx)
+			}
+		}
+		return kept
+	}
+	return idxs
+}
+
 // planOpts are the only per-verb compilation knobs. Everything else about
 // access-path selection is shared — a divergence here needs written rationale
 // (the SQLite shape: one WHERE/ORDER BY code generator, verb-specific only at
@@ -354,12 +375,20 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	// multikey-flag probe gating tight seek bounds must read the same
 	// snapshot the scan executes on.
 	sorter := q.writeSorter(opts)
-	idxs := visibleIndexes(btx, q.c.loadIndexes())
+	visible := visibleIndexes(btx, q.c.loadIndexes())
+	idxs := plannableIndexes(visible)
 	br := q.buildBoundsResult(idxs)
 	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
-	totalDocs := q.docCountForPlan(btx, idxs)
+	// The estimate reads the candidates' sketches; with every range index
+	// outdated it falls back to an outdated one's, advisory and better than
+	// none.
+	countIdxs := idxs
+	if len(countIdxs) == 0 {
+		countIdxs = visible
+	}
+	totalDocs := q.docCountForPlan(btx, countIdxs)
 	if opts.exactTotalDocs {
-		totalDocs = q.docCountExact(btx, idxs)
+		totalDocs = q.docCountExact(btx, countIdxs)
 	}
 	plan = qplanner.BuildPlan(&qplanner.PlanParams{
 		Tx:          btx,
@@ -828,6 +857,14 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 		for _, idx := range cboIndexes {
 			addIndex(idx.Info.Name, plan.Cost, idx.Info.Name == plan.IndexName)
 		}
+		// An outdated index is never a candidate (plannableIndexes); listing
+		// it unused, like the vector and full-text handles below, keeps the
+		// report from silently shrinking.
+		for _, idx := range visibleIndexes(tx, q.c.loadIndexes()) {
+			if idx.outdated {
+				addIndex(idx.info.Name, 0, false)
+			}
+		}
 		sourceCost := func(name string) float64 {
 			if name == plan.IndexName {
 				return plan.Cost
@@ -877,14 +914,15 @@ func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, residual query.Filter, ne
 	if !idFixed && !hasResidual && !needSort && !opts.wantCandidates {
 		return false
 	}
-	idxs := visibleIndexes(btx, q.c.loadIndexes())
+	idxs := plannableIndexes(visibleIndexes(btx, q.c.loadIndexes()))
 	probePossible = idFixed
 	if len(idxs) > 0 {
 		br := q.buildBoundsResult(idxs)
 		params.Indexes = q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
 		params.FieldBounds = &br
 		for i := range params.Indexes {
-			if len(params.Indexes[i].Bounds) > 0 || (needSort && params.Indexes[i].ExactSort) {
+			if len(params.Indexes[i].Bounds) > 0 || (needSort && params.Indexes[i].ExactSort) ||
+				qplanner.PresenceScan(&params.Indexes[i], residual) {
 				probePossible = true
 				break
 			}
@@ -964,8 +1002,9 @@ type countTx interface {
 // O(namespace pages) walk before every query on exactly the collections that
 // need no secondary index (pk-ordered schemas) is pure waste — return 0 and
 // let BuildPlan clamp it. Explain uses docCountExact instead. idxs is the
-// caller's loadIndexes() snapshot — the same one its CBO candidates are built
-// from, so the count and the candidates can't disagree about the index set.
+// caller's plannable snapshot — the same one its CBO candidates are built
+// from, so the count and the candidates can't disagree about the index set —
+// or, when that is empty, its visible one.
 func (q *collQuery) docCountForPlan(tx countTx, idxs []*index) int {
 	for _, idx := range idxs {
 		if s := idx.loadPubSketch(); s != nil {
@@ -1177,6 +1216,11 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 			cboIdx.BoundFields < len(idx.cboInfo.FieldNames) {
 			scalarProven()
 		}
+		// A presence count over a bound-less sparse index counts the whole
+		// index: the proof lets CountEntries page-batch it, entries == docs.
+		if countOnly && idx.cboInfo.Sparse && len(cboIdx.Bounds) == 0 {
+			scalarProven()
+		}
 		// Multi-bound single-field counts (CountEntries' page-batch branch)
 		// and multi-bound unique lookups (CoverIter) need it too: a fan-out
 		// through an array of objects leaves no whole-array key to probe, so
@@ -1206,11 +1250,16 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		// lazily, only for candidates the gate would demote. When the only cut
 		// on the sort side is a type-bracket edge, the candidate is widened
 		// (widenSortEdges) instead of demoted.
-		// A SPARSE index holds no entry for a null or missing leaf, so over
-		// fan-out data a document surfaces at its least non-null leaf while
-		// the sort key is the least leaf of all (null wins): demote, no edge
-		// widening can restore that.
-		if cboIdx.ExactSort && idx.cboInfo.Sparse && !scalarProven() {
+		// A SPARSE index holds no entry for a missing leaf, so over fan-out
+		// data a document surfaces at its least existing leaf while the sort
+		// key is the least leaf of all (a missing leaf sorts as null and
+		// wins): demote, no edge widening can restore that. Over a path
+		// through objects the scalar proof does not rule this out — a
+		// document fanning out through an array of objects can keep a single
+		// key, {"x":[{"y":5},{"z":0}]} under x.y — so only an index on
+		// top-level fields, where every fan-out writes several keys, keeps
+		// its order on the proof.
+		if cboIdx.ExactSort && idx.cboInfo.Sparse && (idx.cboInfo.HasDottedPath() || !scalarProven()) {
 			cboIdx.ExactSort = false
 			cboIdx.PartialSort = false
 		}

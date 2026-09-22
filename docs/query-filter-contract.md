@@ -60,7 +60,8 @@ build per query and carry no such guarantee.
    verb, `err == nil`. A custom filter that INVERTS its inner `Ok` reflects
    fail-closed into match-all, exactly like `Not` would — that is arbitrary
    user matching code, outside what any walk can guard. Pinned by
-   `TestKnn_InsideCustomFilterFailsClosed`.
+   `TestKnn_InsideCustomFilterFailsClosed` in the `any-store-tests`
+   repository.
 
 6. **`TypeVectorF32` is not orderable (Rule V).** In `Comp`, an ordering op
    (`$gt`/`$gte`/`$lt`/`$lte`) evaluates to `false` whenever either side is a
@@ -80,19 +81,26 @@ build per query and carry no such guarantee.
 
 8. **A filter overriding `Ok`'s truth direction must be checked against
    `GuaranteesPresence`.** It probes the inner filter's `Ok` directly
-   (`!Ok(nil) && !Ok(null)` ⇒ "guarantees presence") — a fail-closed `Ok`
-   reads as the AGGRESSIVE answer and feeds sparse-index selection. Source
-   filters get explicit `false` arms there; any future `Ok`-overriding filter
-   needs the same.
+   (`!Ok(nil)` ⇒ "guarantees presence") — a fail-closed `Ok` reads as the
+   AGGRESSIVE answer and feeds sparse-index selection. Source filters get
+   explicit `false` arms there; any future `Ok`-overriding filter needs the
+   same.
 
 9. **Null matches missing.** A missing field evaluates as an explicit `null`
    throughout the filter surface: `Ok` receives a nil `*anyenc.Value`, the
    index stores the doc under the `TypeNull` key, and every equality-family
    operator treats the two identically — `{"$eq":null}`, `{"$in":[…,null,…]}`
    match missing fields; `{"$ne":null}`, `{"$nin":[…,null,…]}` exclude them
-   (Mongo's null model). Sparse-index selection follows automatically:
-   `GuaranteesPresence` probes `Ok(nil)`/`Ok(null)`, so an operator matching
-   either keeps sparse indexes out of the plan.
+   (Mongo's null model). Only a sparse index tells the two apart: it holds
+   an explicit null under the `TypeNull` key and has no entry for a missing
+   field. Sparse-index selection follows automatically: `GuaranteesPresence`
+   probes `Ok(nil)`, so an operator matching a missing field never guarantees
+   presence on its own, and keeps sparse indexes out of the plan when it also
+   contributes bounds — `$ne` aside, whose bounds hold every key the index
+   wrote. A sparse index complete for the filter answers `{"$exists":true}`
+   by a whole-index scan. One over a dotted path never provides sort order:
+   a document fanning out through an array of objects can keep a single key
+   while its sort key is a missing leaf.
 
 10. **Array sort keys are the min/max element.** A sort field holding a
     non-empty array sorts by its MINIMUM element ascending / MAXIMUM element
@@ -224,16 +232,17 @@ build per query and carry no such guarantee.
     One definition feeds every consumer: `Key.Ok` (`LeafFilter`), index
     entries (one per `anyenc.AppendIndexValues` value, fanning out like a
     leaf array — the multikey flag, per-doc dedup and sparse handling follow;
-    a sparse index holds a document only when every field has a present,
-    non-null value somewhere in it, and then writes every key that has at
+    a sparse index holds a document only when every field exists somewhere
+    in it (an explicit null exists), and then writes every key that has at
     least one present field — `{"a":[{"b":1},{"c":2}]}` under a sparse
     `(a.b, a.c)` has keys `(1, null)` and `(null, 2)`; fields of a COMPOUND
-    index that run
-    through the same array iterate it together, one entry per element, as
-    Mongo generates them — never a cross product — so the planner compounds
-    bounds and entry-level cover filters across such fields only on a
-    scalar-proven index and seeks the first of them otherwise), sort keys
-    (min/max over
+    index that run through the same array iterate it together, one entry per
+    element, as Mongo generates them — never a cross product; a scalar, null
+    or nested-array element is a missing leaf in every one of them
+    (`{"x":[[{"y":1,"z":2}]]}` under `(x.y, x.z)` has the key
+    `(null, null)`) — so the planner compounds bounds and entry-level cover
+    filters across such fields only on a scalar-proven index and seeks the
+    first of them otherwise), sort keys (min/max over
     `anyenc.AppendElementValues`, item 10) and `CanonicalKeyDedupIter`. The
     raw fast paths (`OkRaw`, `AppendKeyRaw`) decline at an array container
     and fall back to the parsed document. `$type` matches an array whose
@@ -254,8 +263,9 @@ build per query and carry no such guarantee.
     and cross-type order is anyenc tag order (item 13) — Mongo sorts `[]`
     before null and orders objects type-first, then by field name.
     Pinned by `TestKey_PathThroughArrays`, `TestKey_PathThroughArrays_AllocFree`
-    (item 2 holds for traversal), `anyenc.TestAppendLeaves` and
-    `TestIndex_ArrayNested_NestedField_IntermediateArray_Traversed`.
+    (item 2 holds for traversal), `anyenc.TestAppendLeaves`, and
+    `TestIndex_ArrayNested_NestedField_IntermediateArray_Traversed` in the
+    `any-store-tests` repository.
 
 15. **`$elemMatch` binds predicates to one element.** `{"a":{"$elemMatch":
     C}}` matches when `a` is an array with an element satisfying `C` as a
@@ -281,3 +291,11 @@ build per query and carry no such guarantee.
     covering-count, verify-chain and residual-elision paths treat it as
     uncovered (`query.IndexBoundsExact`). Pinned by `TestElemMatch_Parse`,
     `TestElemMatch_Ok` and `TestElemMatch_IndexBoundsAndString`.
+
+16. **Rows with equal sort keys have no specified order.** An in-memory sort
+    orders a tie group by document id; an index that provides the order yields
+    it as its own keys run — by the index's remaining fields, then by id, and
+    in a reverse scan backwards — so the same query can order a tie group
+    differently under two plans, and a `Limit` that cuts through the group
+    returns different rows. A total order needs a unique last sort field:
+    `Sort("field", "id")`.

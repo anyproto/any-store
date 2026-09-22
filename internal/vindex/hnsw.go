@@ -580,7 +580,8 @@ func (ix *Index) tombstoneLabel(wtx *btree.WriteTx, label uint32, mt *meta) erro
 	// tombstoning the entry without repointing leaves a dead start — in the
 	// degenerate case (entry with no live neighbour, e.g. a one-document
 	// collection being updated) every subsequent search returned empty
-	// forever (guarded by TestVectorEntryRepoint_SingleDocUpsert).
+	// forever (guarded by TestVectorEntryRepoint_SingleDocUpsert in
+	// any-store-tests:apitest).
 	if mt.hasEntry && label == mt.entryLabel {
 		return ix.repointEntry(wtx, mt, nbrs)
 	}

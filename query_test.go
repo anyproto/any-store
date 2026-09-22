@@ -1143,9 +1143,9 @@ func TestQueryCount_IdFastPathExactShapesOnly(t *testing.T) {
 		{`{"id":{"$in":[1,5]}}`, 1},
 		{`{"$and":[{"id":2}]}`, 1},
 		// Extra predicates beyond the first contributor: wrong before the gate.
-		{`{"id":{"$gt":1,"$lt":5}}`, 2},          // was 1 (Has on exclusive Start)
-		{`{"id":{"$in":[1,2,3],"$nin":[2]}}`, 2}, // was 3
-		{`{"id":{"$in":[1,2,3],"$gt":1}}`, 2},    // was 3
+		{`{"id":{"$gt":1,"$lt":5}}`, 2},                // was 1 (Has on exclusive Start)
+		{`{"id":{"$in":[1,2,3],"$nin":[2]}}`, 2},       // was 3
+		{`{"id":{"$in":[1,2,3],"$gt":1}}`, 2},          // was 3
 		{`{"id":{"$in":[1,2,3],"$type":"string"}}`, 0}, // was 3; $type adds no bounds
 		{`{"id":{"$gt":1}}`, 2},
 		{`{"id":{"$ne":2}}`, 2},
@@ -1372,4 +1372,24 @@ func TestQuery_OrOverlappingRangesUseIndex(t *testing.T) {
 	assert.Contains(t, ex.Sql, `IndexScan(a)[bounds=Bounds{['<number>','7')}]`, ex.Sql)
 	assertQueryCount(t, q, 7)
 	assert.Equal(t, []string{"0", "1", "2", "3", "4", "5", "6"}, collectIdsString(t, coll.Find(`{"$or":[{"a":{"$lt":5}},{"a":{"$lt":7}}]}`).Sort("a")))
+}
+
+// collectIdsString collects the "id" field (string-typed) from a query.
+func collectIdsString(t testing.TB, q Query) []string {
+	t.Helper()
+	iter, err := q.Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	var out []string
+	for iter.Next() {
+		doc, err := iter.Doc()
+		require.NoError(t, err)
+		idVal := doc.Value().Get("id")
+		require.NotNil(t, idVal, "document without id")
+		require.Equal(t, anyenc.TypeString, idVal.Type(),
+			"collectIdsString needs string ids; GetStringBytes yields \"\" for %s", idVal.Type())
+		out = append(out, string(idVal.GetStringBytes()))
+	}
+	require.NoError(t, iter.Err())
+	return out
 }

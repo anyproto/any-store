@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
@@ -751,4 +752,241 @@ func benchSpillHeavyRepeatedDirty(b *testing.B) {
 	}
 	b.ReportMetric(float64(btree.DiagReuseFrames.Load()-reuseStart), "reuse")
 	b.ReportMetric(float64(btree.DiagAppendFrames.Load()-appendStart), "append")
+}
+
+// Index DDL after a rename must register/deregister metadata under the SAME
+// world as the renamed namespaces — no split between idx:new:* and ix:old:*.
+func TestRename_PostRenameIndexDDL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	store, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	coll, err := store.CreateCollection(ctx, "before")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "old_idx", Fields: []string{"a"}}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"1","a":10,"b":20}`)))
+
+	require.NoError(t, coll.Rename(ctx, "after"))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "new_idx", Fields: []string{"b"}}))
+	require.NoError(t, coll.DropIndex(ctx, "old_idx"))
+	require.NoError(t, store.Close())
+
+	store, err = Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer store.Close()
+	reopened, err := store.OpenCollection(ctx, "after")
+	require.NoError(t, err)
+	idxs := reopened.GetIndexes()
+	require.Len(t, idxs, 1)
+	assert.Equal(t, "new_idx", idxs[0].Info().Name)
+	cnt, err := reopened.Find(`{"b":20}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+
+	// No orphan namespaces from either world.
+	nsNames, err := store.(*db).btreeDB.ListNamespaces()
+	require.NoError(t, err)
+	for _, ns := range nsNames {
+		assert.NotContains(t, ns, "before", "orphan namespace %q", ns)
+		assert.NotContains(t, ns, "old_idx", "orphan namespace %q", ns)
+	}
+	require.NoError(t, store.IntegrityCheck(ctx))
+}
+
+// Drop after rename must delete the REAL namespaces (pre-fix it derived the
+// names from the new name and orphaned the old-name data + index trees).
+func TestRename_ThenDrop_NoOrphans(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "before")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx,
+		IndexInfo{Name: "a", Fields: []string{"a"}},
+		IndexInfo{Name: "txt", Kind: IndexKindFulltext, Fields: []string{"body"}},
+		IndexInfo{Name: "emb", Kind: IndexKindVector, Vector: &VectorParams{Field: "v", Dim: 4, Metric: VectorL2}},
+	))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"1","a":10,"body":"text","v":[1,0,0,0]}`)))
+
+	require.NoError(t, coll.Rename(ctx, "after"))
+	require.NoError(t, coll.Drop(ctx))
+
+	nsNames, err := fx.DB.(*db).btreeDB.ListNamespaces()
+	require.NoError(t, err)
+	assert.Equal(t, []string{systemNamespace}, nsNames,
+		"drop after rename must leave only the system namespace, got %v", nsNames)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// Rename inside a rolled-back tx must restore the in-memory name, the
+// openedCollections key, the index generation and (via the btree rollback)
+// the namespaces themselves.
+func TestRenameRollback_RestoresName(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "old")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.Rename(tx.Context(), "new"))
+	require.NoError(t, tx.Rollback())
+
+	assert.Equal(t, "old", coll.Name())
+	names, err := fx.GetCollectionNames(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, names, "old")
+	assert.NotContains(t, names, "new")
+
+	// Map key restored: the cached handle answers for the old name, nothing
+	// answers for the new one.
+	sameColl, err := fx.OpenCollection(ctx, "old")
+	require.NoError(t, err)
+	assert.Same(t, coll, sameColl, "rolled-back rename must keep the handle keyed by the old name")
+	_, err = fx.OpenCollection(ctx, "new")
+	assert.ErrorIs(t, err, ErrCollectionNotFound)
+
+	// Namespace restore comes from the btree rollback — assert it, don't
+	// assume it.
+	nsNames, err := fx.DB.(*db).btreeDB.ListNamespaces()
+	require.NoError(t, err)
+	assert.Contains(t, nsNames, "old")
+	assert.Contains(t, nsNames, "ix:old:a")
+	assert.NotContains(t, nsNames, "new")
+	assert.NotContains(t, nsNames, "ix:new:a")
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"1"}`)))
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// Same-tx write + Drop + commit: the commit-time sketch sweep must skip the
+// dropped (closed, still-registered) handle — persisting its dirty sketches
+// would durably resurrect the stat_data rows removeCollection deleted in this
+// very tx, and a later same-named index would adopt the stale sketch.
+func TestDropInTxDoesNotResurrectSketches(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "x")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	for i := 0; i < 10; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+	}
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	// Dirty the sketch inside the tx, then drop.
+	require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":100,"a":100}`)))
+	require.NoError(t, coll.Drop(tx.Context()))
+	require.NoError(t, tx.Commit())
+
+	// No stat_data leftovers for the dropped collection.
+	dbi := fx.DB.(*db)
+	require.NoError(t, dbi.doReadTx(ctx, func(btx *btree.ReadTx) error {
+		_, gErr := btx.Get(dbi.systemNS, sketchKey("x", "a"))
+		assert.ErrorIs(t, gErr, btree.ErrKeyNotFound)
+		return nil
+	}))
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// TestDropOrphanStaleIndexesRepro reproduces the Drop orphan bug: collection.Drop
+// must delete index namespaces enumerated from the SAME on-disk source
+// (idx:<coll>: keys) that removeCollection deletes, not from the in-memory index
+// snapshot, which can lag the on-disk metadata (a peer handle's create, or this
+// handle's own create that committed but is not yet reflected in the snapshot).
+//
+// Scenario (matches the forensic mechanism):
+//  1. Handle A creates collection + EnsureIndex{val}; in-memory set == [val].
+//  2. A second index exists on disk that A's in-memory set does not know about
+//     (here we force that stale state directly; in the wild it is produced by
+//     another OS process creating the index, since any-store uses InProcess:false
+//     and the open lock forbids a second in-process handle).
+//  3. Handle A drops the collection. removeCollection deletes BOTH index metadata
+//     keys (on-disk scan); the namespace-delete must also delete BOTH namespaces,
+//     including the one A never learned about.
+//  4. After reopen there must be NO orphaned ix:<coll>: namespace.
+//
+// On the unpatched code the loop iterated the stale in-memory set and skipped the
+// second index's namespace, leaving an orphan -> reopen + EnsureIndex on the
+// recreated collection fails with "btree: namespace already exists". With the fix
+// (enumerate idx: keys on disk) no orphan can survive.
+func TestDropOrphanStaleIndexesRepro(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+
+	const collName = "dropcoll_a"
+
+	dbA, err := Open(ctx, path, nil)
+	if err != nil {
+		t.Fatalf("open A: %v", err)
+	}
+	collA, err := dbA.Collection(ctx, collName)
+	if err != nil {
+		t.Fatalf("A.Collection: %v", err)
+	}
+	if err = collA.EnsureIndex(ctx, IndexInfo{Fields: []string{"val"}}); err != nil {
+		t.Fatalf("A.EnsureIndex(val): %v", err)
+	}
+	if err = collA.EnsureIndex(ctx, IndexInfo{Fields: []string{"other"}}); err != nil {
+		t.Fatalf("A.EnsureIndex(other): %v", err)
+	}
+
+	// Force A's in-memory snapshot stale: drop "other" from the snapshot ONLY
+	// (its idx: metadata key and ix: namespace remain on disk), simulating an
+	// index this handle never learned about.
+	cImpl := collA.(*collection)
+	cImpl.mu.Lock()
+	var kept []*index
+	for _, idx := range cImpl.loadIndexes() {
+		if idx.info.createName() != "other" {
+			kept = append(kept, idx)
+		}
+	}
+	cImpl.storeIndexes(kept)
+	cImpl.mu.Unlock()
+
+	if got := len(collA.GetIndexes()); got != 1 {
+		t.Fatalf("precondition: expected A to know about exactly 1 index (stale), got %d", got)
+	}
+
+	// Operation under test.
+	if err = collA.Drop(ctx); err != nil {
+		t.Fatalf("A.Drop: %v", err)
+	}
+
+	// The second index namespace must NOT survive on disk.
+	d := dbA.(*db)
+	names, err := d.btreeDB.ListNamespaces()
+	if err != nil {
+		t.Fatalf("ListNamespaces: %v", err)
+	}
+	ixPrefix := "ix:" + collName + ":"
+	var orphans []string
+	for _, n := range names {
+		if strings.HasPrefix(n, ixPrefix) {
+			orphans = append(orphans, n)
+		}
+	}
+	if len(orphans) != 0 {
+		t.Fatalf("ORPHAN index namespace(s) survived Drop: %v (all namespaces: %v)", orphans, names)
+	}
+
+	if err = dbA.Close(); err != nil {
+		t.Fatalf("A.Close: %v", err)
+	}
+
+	// Reopen + recreate: with an orphan this fails "btree: namespace already exists".
+	dbC, err := Open(ctx, path, nil)
+	if err != nil {
+		t.Fatalf("reopen C: %v", err)
+	}
+	defer dbC.Close()
+	collC, err := dbC.Collection(ctx, collName)
+	if err != nil {
+		t.Fatalf("C.Collection: %v", err)
+	}
+	if err = collC.EnsureIndex(ctx, IndexInfo{Fields: []string{"val"}}); err != nil {
+		t.Fatalf("C.EnsureIndex(val) after drop+reopen failed (orphan namespace?): %v", err)
+	}
+	if err = collC.EnsureIndex(ctx, IndexInfo{Fields: []string{"other"}}); err != nil {
+		t.Fatalf("C.EnsureIndex(other) after drop+reopen failed (orphan namespace?): %v", err)
+	}
 }

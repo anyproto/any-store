@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -39,9 +40,11 @@ func vecDocJSON(id int, vec []float32) string {
 
 // idBytesOf returns the stored document-id bytes for an integer id.
 func idBytesOf(id int) []byte {
-	doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, id))
-	it, _ := newItem(doc)
-	return it.appendId(nil)
+	idVal := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, id)).Get("id")
+	if idVal == nil {
+		panic("idBytesOf: document without id")
+	}
+	return idVal.MarshalTo(nil)
 }
 
 // vhit mirrors the old VectorHit result for tests.
@@ -641,3 +644,131 @@ func TestKnnProbe_ReverseUniqueCoverDriver(t *testing.T) {
 		assert.Equal(t, driverDists, probeDists)
 	}
 }
+
+// TestVectorIndex_CompactMovesRootAndDetects checks the cross-process plumbing:
+// compaction must move the index's namespace root pages, and the pre-compaction
+// vectorIndex object must detect that (rootUnchanged == false) so a peer's
+// reconcile reopens it with fresh handles instead of reading freed pages.
+func TestVectorIndex_CompactMovesRootAndDetects(t *testing.T) {
+	const dim = 16
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64},
+	}))
+	vecs := vrand(300, dim, 7)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+	for i := 0; i < 100; i++ { // create tombstones so compaction isn't a no-op
+		require.NoError(t, coll.DeleteId(ctx, i))
+	}
+
+	c := coll.(*collection)
+	oldVI := c.loadVectorIndexes()[0]
+	oldRoot := oldVI.ix.MetaRoot()
+
+	require.NoError(t, coll.CompactVectorIndex(ctx, "emb"))
+
+	newVI := c.loadVectorIndexes()[0]
+	require.NotEqual(t, oldRoot, newVI.ix.MetaRoot(), "compaction must move the meta root page")
+
+	require.NoError(t, c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		assert.False(t, oldVI.rootUnchanged(tx, c.name), "stale object must detect the moved root")
+		assert.True(t, newVI.rootUnchanged(tx, c.name), "fresh object must be current")
+		return nil
+	}))
+}
+
+// TestKnnResidual_NoKnnSurvives is the hard post-condition behind the
+// fail-closed design: for every legal placement, the residual handed to the
+// FilterIter contains no Knn (a leaked Knn rejects every candidate — 0 rows,
+// no-op Delete, err == nil — silently, on all verbs).
+func TestKnnResidual_NoKnnSurvives(t *testing.T) {
+	for _, cond := range []string{
+		fmt.Sprintf(`{"v":%s}`, kd),
+		fmt.Sprintf(`{"v":%s,"a":1}`, kd),
+		fmt.Sprintf(`{"$and":[{"v":%s}]}`, kd),
+		fmt.Sprintf(`{"$and":[{"v":%s},{"a":1}]}`, kd),
+		fmt.Sprintf(`{"$and":[{"$and":[{"v":%s},{"a":1}]},{"b":2}]}`, kd),
+		fmt.Sprintf(`{"$and":[{"$and":[{"v":%s}]},{"$and":[{"a":1},{"b":2}]}]}`, kd),
+	} {
+		f := query.MustParseCondition(cond)
+		require.True(t, query.ContainsKnn(f), cond)
+		residual := knnResidualFilter(f)
+		assert.False(t, residual != nil && query.ContainsKnn(residual),
+			"the Knn must be stripped from the residual: %s -> %v", cond, residual)
+	}
+
+	// Empty residual collapses to nil, NOT All{}: ef sizing and the
+	// brute-force topK both key off "no residual" — All{} would flip every
+	// bare $knn onto the ×10 over-fetch / full-ranking path invisibly.
+	assert.Nil(t, knnResidualFilter(query.MustParseCondition(fmt.Sprintf(`{"v":%s}`, kd))))
+	assert.Nil(t, knnResidualFilter(query.MustParseCondition(fmt.Sprintf(`{"$and":[{"v":%s}]}`, kd))))
+}
+
+// CompactRatio (and the IVF tuning params) must survive a DB reopen: they used
+// to be dropped by registerIndex/getIndexInfos, permanently disabling
+// auto-compaction after any restart.
+func TestVectorParams_PersistAcrossReopen(t *testing.T) {
+	const dim = 8
+	tmpDir := t.TempDir()
+	fx := newFixturePath(t, tmpDir)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	want := &VectorParams{
+		Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64,
+		CompactRatio: 0.5, NProbe: 8,
+	}
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Name: "emb", Kind: IndexKindVector, Vector: want}))
+	require.NoError(t, fx.Close())
+
+	db2, err := Open(ctx, filepath.Join(tmpDir, "any-store-test.db"), nil)
+	require.NoError(t, err)
+	defer db2.Close()
+	coll, err = db2.OpenCollection(ctx, "docs")
+	require.NoError(t, err)
+	vidxs := coll.(*collection).loadVectorIndexes()
+	require.Len(t, vidxs, 1)
+	require.NotNil(t, vidxs[0].info.Vector)
+	assert.Equal(t, *want, *vidxs[0].info.Vector)
+	assert.Equal(t, want.CompactRatio, vidxs[0].compactRatio)
+}
+
+// makeVectorIndex creates a vector index of the given mode on field "v".
+func makeVectorIndex(t *testing.T, coll Collection, mode VectorMode, dim int) {
+	t.Helper()
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+		Name:   "emb",
+		Kind:   IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64, Mode: mode},
+	}))
+}
+
+// vectorKnnFilter builds the programmatic $knn filter (query.NewKnn) used to
+// issue a vector query through the normal Find pipeline — the same construction
+// the downstream indexer uses (no JSON involved).
+func vectorKnnFilter(qv []float32, k int) query.Filter {
+	return query.Key{Path: []string{"v"}, Filter: query.NewKnn(qv, k)}
+}
+
+func vqJSON(vec []float32) string {
+	parts := make([]string, len(vec))
+	for i, f := range vec {
+		parts[i] = fmt.Sprintf("%g", f)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+// vknnJSON renders the $knn clause value: {"$knn":{"$query":[...],"$k":k}}.
+// ef<=0 omits $ef (the index default applies).
+func vknnJSON(vec []float32, k, ef int) string {
+	if ef > 0 {
+		return fmt.Sprintf(`{"$knn":{"$query":%s,"$k":%d,"$ef":%d}}`, vqJSON(vec), k, ef)
+	}
+	return fmt.Sprintf(`{"$knn":{"$query":%s,"$k":%d}}`, vqJSON(vec), k)
+}
+
+const kd = `{"$knn":{"$query":[3,1,2],"$k":4}}`
