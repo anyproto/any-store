@@ -68,3 +68,21 @@ func Test_ExecPrintsAllResults(t *testing.T) {
 	n, _ = docLines(`db.coll.aggregate([{"$match":{}}])`)
 	assert.Equal(t, 45, n)
 }
+
+// Test_ExecTrimsCommand: a command may span lines and carry surrounding
+// whitespace, as a quoted multi-line -e argument does.
+func Test_ExecTrimsCommand(t *testing.T) {
+	require.NoError(t, openConn(filepath.Join(t.TempDir(), "test.db")))
+	defer func() {
+		conn.closeLastIter()
+		require.NoError(t, conn.db.Close())
+		conn = nil
+	}()
+	_, err := conn.Exec(`db.createCollection("coll")`)
+	require.NoError(t, err)
+	_, err = conn.Exec("\n  db.coll.insert(\n    {\"id\":\"a\"},\n    {\"id\":\"b\"}\n  )\n")
+	require.NoError(t, err)
+	res, err := conn.Exec("\n  db.coll.count()\n")
+	require.NoError(t, err)
+	assert.Equal(t, "2", res)
+}
