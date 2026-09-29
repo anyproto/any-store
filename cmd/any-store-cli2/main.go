@@ -12,7 +12,7 @@ func main() {
 		os.Exit(2)
 	}
 	if *fHelp {
-		printUsage()
+		printHelp(os.Stdout, helpName(), os.Getenv(helpForAgentEnv) == "1")
 		return
 	}
 	if *fVersion {
