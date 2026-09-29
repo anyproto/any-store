@@ -10,7 +10,7 @@ import (
 func main() {
 	pflag.Parse()
 	if *fHelp {
-		printUsage()
+		printHelp(os.Stdout, helpName(), os.Getenv(helpForAgentEnv) == "1")
 		return
 	}
 	if *fVersion {
