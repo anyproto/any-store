@@ -25,7 +25,7 @@ func main() {
 	}
 
 	if err := openConn(path); err != nil {
-		fmt.Fprintf(os.Stderr, "error while opening database: %v", err)
+		fmt.Fprintf(os.Stderr, "error while opening database: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -41,7 +41,7 @@ func main() {
 		conn.pageSize = 0
 		result, err := conn.Exec(*fExec)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error while executiong command: %v", err)
+			fmt.Fprintf(os.Stderr, "error while executing command: %v\n", err)
 			os.Exit(1)
 		}
 		if result != "" {

@@ -78,6 +78,7 @@ func (c *Conn) makeAutocomplete() (err error) {
 }
 
 func (c *Conn) Exec(cmdLine string) (result string, err error) {
+	cmdLine = strings.TrimSpace(cmdLine)
 	var cmd Cmd
 	if strings.HasPrefix(cmdLine, "help") {
 		cmd.Cmd = "help"
