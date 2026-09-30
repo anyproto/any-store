@@ -73,13 +73,11 @@ func TestController_StartStop(t *testing.T) {
 		},
 	})
 
-	ctx := context.Background()
-
-	err := controller.Start(ctx)
+	err := controller.Start()
 	require.NoError(t, err)
 	assert.Equal(t, int32(0), tracker.dirtyCount.Load(), "Should not mark dirty on Start()")
 
-	err = controller.Start(ctx)
+	err = controller.Start()
 	assert.Error(t, err)
 
 	err = controller.Stop()
@@ -108,8 +106,7 @@ func TestController_IdleFlush(t *testing.T) {
 		},
 	})
 
-	ctx := context.Background()
-	err := controller.Start(ctx)
+	err := controller.Start()
 	require.NoError(t, err)
 	defer controller.Stop()
 
@@ -147,8 +144,7 @@ func TestController_RaceConditionWriteDuringFlush(t *testing.T) {
 		},
 	})
 
-	ctx := context.Background()
-	err := controller.Start(ctx)
+	err := controller.Start()
 	require.NoError(t, err)
 
 	controller.OnWriteEvent()
@@ -195,8 +191,7 @@ func TestController_FlushAfterWriteDelay(t *testing.T) {
 		},
 	})
 
-	ctx := context.Background()
-	err := controller.Start(ctx)
+	err := controller.Start()
 	require.NoError(t, err)
 	defer controller.Stop()
 
@@ -242,8 +237,7 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 		},
 	})
 
-	ctx := context.Background()
-	err := controller.Start(ctx)
+	err := controller.Start()
 	require.NoError(t, err)
 	defer controller.Stop()
 
@@ -286,8 +280,7 @@ func TestController_FlushDoesNotResetWriteTime(t *testing.T) {
 
 	controller = NewController(opts)
 
-	ctx := context.Background()
-	err := controller.Start(ctx)
+	err := controller.Start()
 	require.NoError(t, err)
 	defer controller.Stop()
 
@@ -295,7 +288,7 @@ func TestController_FlushDoesNotResetWriteTime(t *testing.T) {
 
 	time.Sleep(60 * time.Millisecond)
 
-	flushed, err := controller.performFlushInternal(ctx, 50*time.Millisecond)
+	flushed, err := controller.performFlushInternal(context.Background(), 50*time.Millisecond)
 	require.NoError(t, err)
 	assert.True(t, flushed, "Should have flushed")
 	assert.Equal(t, int32(1), flushCount.Load(), "Should have flushed once")
