@@ -194,7 +194,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 
 	// Start recovery controller after initialization
 	if ds.recoveryController != nil {
-		if err = ds.recoveryController.Start(ctx); err != nil {
+		if err = ds.recoveryController.Start(); err != nil {
 			_ = ds.cm.Close()
 			return nil, err
 		}
