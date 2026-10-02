@@ -2283,6 +2283,14 @@ func (p *pager) pagerStress(pg *page) error {
 }
 
 // commit writes all dirty pages to WAL and commits the transaction.
+// hasChanges reports whether the write transaction has anything to commit:
+// dirty pages, header changes (freelist, size) or spilled WAL frames. A
+// transaction without changes commits empty, leaving the counters alone.
+func (p *pager) hasChanges() bool {
+	return p.writerCache.nDirty > 0 || p.header != p.savedHeader ||
+		p.wal.nFrame.Load() > p.savedWalFrame.Load()
+}
+
 // dataChanged/schemaChanged control whether FileChangeCount/SchemaCookie are
 // incremented. Returns the WAL frame count and the new counter values.
 // DRIFT: FileChangeCount bumped only on dataChanged=true, not every data-page commit See docs/btree/NOTES.md#drift-77-filechangecount-bumped-conditionally-not-unconditionally
@@ -2345,8 +2353,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// nDirty (post dontWrite-filter) counts the pages that would be collected.
 	// The nFrame check catches transactions where all dirty pages were spilled
 	// (making nDirty zero) but a commit frame is still needed.
-	hasRealChanges := p.writerCache.nDirty > 0 || p.header != p.savedHeader ||
-		p.wal.nFrame.Load() > p.savedWalFrame.Load()
+	hasRealChanges := p.hasChanges()
 
 	if !hasRealChanges {
 		// Empty transaction — counters not incremented.

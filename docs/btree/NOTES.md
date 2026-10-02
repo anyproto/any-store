@@ -2438,6 +2438,17 @@ write transactions from a peer-created index) and the index-visibility fast path
 cookie admits an index whose namespace the snapshot cannot resolve, returning silently wrong
 query results).
 
+The rest of the surface follows SQLite's behavior with a different mechanism: the local
+counter cache records the counters the caller's in-memory state reflects and moves only
+forward (`AdvanceLocalCounters`; `UpdateLocalCounters` stays a raw store for tests), and
+`ReadTx.LocalCaughtUp` lets a caller whose begin-time verdict is stale skip its reload once
+the cache has reached the counters the tx read from disk, which only a commit of this
+process can bring about. In SQLite a connection's own DDL updates the cookie its schema was
+loaded from (`OP_SetCookie`, `vdbe.c`) as it executes, so `OP_Transaction` never reloads a
+schema change of the connection's own, and nothing winds the cached cookie back; here the
+cache is updated at commit and advanced by readers from their snapshot, with the same two
+outcomes.
+
 <a id="drift-47-checkpoint-omits-open-transaction-guard"></a>
 ### Drift: Checkpoint Omits Open Transaction Guard
 - **Category:** changed-logic  -  **Severity:** low

@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -220,6 +221,36 @@ func TestCacheInvalidation_UpdateLocalCounters(t *testing.T) {
 	assert.False(t, rtx.IsDataStale(), "should not be stale after UpdateLocalCounters")
 	assert.False(t, rtx.IsSchemaStale(), "schema should not be stale after UpdateLocalCounters")
 	require.NoError(t, rtx.Rollback())
+}
+
+// AdvanceLocalCounters never moves a counter back, and compares modulo 2^32
+// so a wrapped counter still counts as newer; LocalCaughtUp applies the same
+// comparison between the cache and a tx's begin-time disk counters.
+func TestCacheInvalidation_AdvanceLocalCounters(t *testing.T) {
+	db := &DB{}
+	db.UpdateLocalCounters(10, 5)
+	db.AdvanceLocalCounters(8, 7)
+	fcc, sc := db.LocalCounters()
+	assert.Equal(t, [2]uint32{10, 7}, [2]uint32{fcc, sc})
+	db.AdvanceLocalCounters(12, 3)
+	fcc, sc = db.LocalCounters()
+	assert.Equal(t, [2]uint32{12, 7}, [2]uint32{fcc, sc})
+	db.UpdateLocalCounters(math.MaxUint32, math.MaxUint32)
+	db.AdvanceLocalCounters(0, 1)
+	fcc, sc = db.LocalCounters()
+	assert.Equal(t, [2]uint32{0, 1}, [2]uint32{fcc, sc})
+
+	caughtUp := func(localFCC, localSC, diskFCC, diskSC uint32) bool {
+		db.UpdateLocalCounters(localFCC, localSC)
+		tx := &ReadTx{db: db, diskFileChangeCounter: diskFCC, diskSchemaCookie: diskSC}
+		return tx.LocalCaughtUp()
+	}
+	assert.True(t, caughtUp(6, 6, 6, 6))
+	assert.True(t, caughtUp(7, 6, 6, 6))
+	assert.False(t, caughtUp(5, 6, 6, 6))
+	assert.False(t, caughtUp(6, 5, 6, 6))
+	assert.True(t, caughtUp(0, 0, math.MaxUint32, math.MaxUint32))
+	assert.False(t, caughtUp(math.MaxUint32, 0, 0, 0))
 }
 
 // TestCacheInvalidation_Rollback_NoCounterChange verifies that rolling

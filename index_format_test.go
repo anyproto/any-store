@@ -3,6 +3,7 @@ package anystore
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -41,12 +42,65 @@ func TestIndexFormat_Outdated(t *testing.T) {
 	}
 }
 
-// legacyIndex makes an index look built by a pre-versioning release: the
-// catalog record loses its stamp, the entries are cleared (so a rebuild is
-// observable through Len), and the multikey marker is set (a rebuild resets
-// it from the data). The tx marks the schema changed, so another handle on
-// the file reconciles like after a peer's DDL.
+// A ddlTx commits catalog edits as schema-changing DDL of some build.
+type ddlTx func(t *testing.T, d *db, do func(tx *btree.WriteTx) error)
+
+// thisBuildTx commits through this build's commit path: the index format
+// stamp follows the schema cookie, so the next Open trusts it.
+func thisBuildTx(t *testing.T, d *db, do func(tx *btree.WriteTx) error) {
+	t.Helper()
+	require.NoError(t, d.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		tx.MarkSchemaChanged()
+		return do(tx)
+	}))
+}
+
+// otherBuildTx commits as a build that does not maintain the index format
+// stamp: a raw btree transaction bumps the schema cookie without the commit
+// hook, leaving the stamp behind, so the next Open walks the catalog.
+func otherBuildTx(t *testing.T, d *db, do func(tx *btree.WriteTx) error) {
+	t.Helper()
+	tx, err := d.btreeDB.BeginWrite()
+	require.NoError(t, err)
+	tx.MarkSchemaChanged()
+	if err = do(tx); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	require.NoError(t, tx.Commit())
+}
+
+// readSettled returns the format settled record.
+func readSettled(t *testing.T, d *db) (format int, cookie uint32, ok bool) {
+	t.Helper()
+	require.NoError(t, d.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
+		format, cookie, ok, err = d.readFormatSettled(tx)
+		return err
+	}))
+	return format, cookie, ok
+}
+
+// assertSettled checks that the settled record holds the current format at
+// the database's current schema cookie, so the next Open skips the walk.
+func assertSettled(t *testing.T, fx *fixture) {
+	t.Helper()
+	format, cookie, ok := readSettled(t, fx.DB.(*db))
+	require.True(t, ok, "no settled record")
+	assert.Equal(t, indexFormatVersion, format)
+	assert.Equal(t, schemaCookie(t, fx), cookie)
+}
+
+// legacyIndex makes an index look built by a pre-versioning release, as DDL
+// of a build without the stamp (otherBuildTx): the catalog record loses its
+// stamp, the entries are cleared (so a rebuild is observable through Len),
+// and the multikey marker is set (a rebuild resets it from the data).
 func legacyIndex(t *testing.T, c *collection, name string) {
+	t.Helper()
+	legacyIndexBy(t, c, name, otherBuildTx)
+}
+
+// legacyIndexBy is legacyIndex committing through the given build.
+func legacyIndexBy(t *testing.T, c *collection, name string, commit ddlTx) {
 	t.Helper()
 	var idx *index
 	for _, i := range c.loadIndexes() {
@@ -55,8 +109,7 @@ func legacyIndex(t *testing.T, c *collection, name string) {
 		}
 	}
 	require.NotNil(t, idx)
-	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-		tx.MarkSchemaChanged()
+	commit(t, c.db, func(tx *btree.WriteTx) error {
 		key := indexKey(c.name, name)
 		raw, err := tx.AppendValue(c.db.systemNS, key, nil)
 		if err != nil {
@@ -93,7 +146,7 @@ func legacyIndex(t *testing.T, c *collection, name string) {
 			}
 		}
 		return nil
-	}))
+	})
 }
 
 func readIndexFormat(t *testing.T, c *collection, name string) int {
@@ -186,10 +239,11 @@ func schemaCookie(t *testing.T, fx *fixture) uint32 {
 	return cookie
 }
 
-// setIndexRecord rewrites one field of an index's catalog record.
+// setIndexRecord rewrites one field of an index's catalog record as DDL of
+// a build without the stamp.
 func setIndexRecord(t *testing.T, c *collection, name, field string, val func(a *anyenc.Arena) *anyenc.Value) {
 	t.Helper()
-	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+	otherBuildTx(t, c.db, func(tx *btree.WriteTx) error {
 		key := indexKey(c.name, name)
 		raw, err := tx.AppendValue(c.db.systemNS, key, nil)
 		if err != nil {
@@ -203,7 +257,7 @@ func setIndexRecord(t *testing.T, c *collection, name, field string, val func(a 
 		var a anyenc.Arena
 		v.Set(field, val(&a))
 		return tx.Put(c.db.systemNS, key, v.MarshalTo(nil))
-	}))
+	})
 }
 
 func TestIndexFormat_RebuildOnOpen(t *testing.T) {
@@ -225,14 +279,243 @@ func TestIndexFormat_RebuildOnOpen(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, legacyDocs-10, n)
 
-	// The stamp persists: the next Open finds nothing to do and the plain
-	// index is still as the old release left it.
+	// The stamps persist: the next Open finds the database stamped at its
+	// cookie and the plain index is still as the old release left it.
+	assertSettled(t, fx)
 	require.NoError(t, fx.Close())
 	fx = newFixturePath(t, dir)
 	coll, err = fx.OpenCollection(ctx, "test")
 	require.NoError(t, err)
 	assertRebuilt(t, coll, "sparse")
 	assertUntouched(t, coll, "plain")
+	assertSettled(t, fx)
+}
+
+// The database stamp follows this build's own DDL, so the next Open skips
+// the catalog walk: a record made to look pre-versioning through this
+// build's commit path is left alone (and, as a backstop, never planned).
+func TestIndexFormat_StampFollowsOwnDDL(t *testing.T) {
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
+	dir := legacyFixture(t)
+	fx := newFixturePath(t, dir)
+	coll, err := fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	assertRebuilt(t, coll, "sparse")
+	assertSettled(t, fx)
+
+	other, err := fx.CreateCollection(ctx, "other")
+	require.NoError(t, err)
+	require.NoError(t, other.EnsureIndex(ctx, IndexInfo{Name: "sparse", Fields: []string{"a"}, Sparse: true}))
+	require.NoError(t, other.DropIndex(ctx, "sparse"))
+	require.NoError(t, other.Rename(ctx, "renamed"))
+	assertSettled(t, fx)
+
+	legacyIndexBy(t, coll.(*collection), "sparse", thisBuildTx)
+	assertSettled(t, fx)
+	require.NoError(t, fx.Close())
+
+	fx = newFixturePath(t, dir)
+	coll, err = fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	assertUntouched(t, coll, "sparse")
+	assert.True(t, formatIndex(t, coll, "sparse").outdated)
+	assertSettled(t, fx)
+}
+
+// DDL of a build without the stamp moves the cookie past it: the next Open
+// walks the catalog (here finding nothing) and stamps again.
+func TestIndexFormat_StampGapWalks(t *testing.T) {
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
+	dir := legacyFixture(t)
+	fx := newFixturePath(t, dir)
+	coll, err := fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	c := coll.(*collection)
+	assertSettled(t, fx)
+	_, stampedAt, _ := readSettled(t, c.db)
+
+	otherBuildTx(t, c.db, func(tx *btree.WriteTx) error {
+		return tx.Put(c.db.systemNS, multikeyKey(indexNsName("test", "plain")), mkValMultiKey)
+	})
+	_, at, ok := readSettled(t, c.db)
+	require.True(t, ok)
+	assert.Equal(t, stampedAt, at)
+	assert.NotEqual(t, schemaCookie(t, fx), at)
+	require.NoError(t, fx.Close())
+
+	fx = newFixturePath(t, dir)
+	coll, err = fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	assertRebuilt(t, coll, "sparse")
+	assertUntouched(t, coll, "plain")
+	assertSettled(t, fx)
+	_, at, _ = readSettled(t, coll.(*collection).db)
+	assert.NotEqual(t, stampedAt, at)
+}
+
+// A stamp at another format version (a newer build's) is not trusted even
+// at the current cookie: the walk runs and restamps at this version.
+func TestIndexFormat_StampOtherVersionWalks(t *testing.T) {
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
+	dir := legacyFixture(t)
+	fx := newFixturePath(t, dir)
+	coll, err := fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	c := coll.(*collection)
+	legacyIndexBy(t, c, "sparse", thisBuildTx)
+	assertSettled(t, fx)
+	cookie := schemaCookie(t, fx)
+	var a anyenc.Arena
+	obj := a.NewObject()
+	obj.Set("v", a.NewNumberInt(indexFormatVersion+1))
+	obj.Set("sc", a.NewNumberInt(int(cookie)))
+	rawPut(t, c.db, formatSettledKey, obj.MarshalTo(nil))
+	format, at, ok := readSettled(t, c.db)
+	require.True(t, ok)
+	require.Equal(t, [2]uint32{uint32(indexFormatVersion + 1), cookie}, [2]uint32{uint32(format), at})
+	// This build's DDL leaves the other version's record alone.
+	_, err = fx.CreateCollection(ctx, "other")
+	require.NoError(t, err)
+	format, at, ok = readSettled(t, c.db)
+	require.True(t, ok)
+	assert.Equal(t, indexFormatVersion+1, format)
+	assert.Equal(t, cookie, at)
+	require.NoError(t, fx.Close())
+
+	fx = newFixturePath(t, dir)
+	coll, err = fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	assertRebuilt(t, coll, "sparse")
+	assertSettled(t, fx)
+}
+
+// A schema-changing tx that writes nothing (EnsureIndex of an existing
+// index) commits empty: no cookie bump, no stamp rewrite.
+func TestIndexFormat_EmptyDDLCommitLeavesStamp(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+	assertSettled(t, fx)
+	cookie := schemaCookie(t, fx)
+	_, at, _ := readSettled(t, fx.DB.(*db))
+	for i := 0; i < 3; i++ {
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+	}
+	assert.Equal(t, cookie, schemaCookie(t, fx))
+	_, after, _ := readSettled(t, fx.DB.(*db))
+	assert.Equal(t, at, after)
+	assertSettled(t, fx)
+}
+
+// A rebuild that fails for a reason the next Open may not meet again (here
+// a collection config that does not parse) leaves the file unstamped, so
+// the next Open retries.
+func TestIndexFormat_RetriableFailureNotStamped(t *testing.T) {
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
+	dir := legacyFixture(t)
+	fx := newFixturePath(t, dir)
+	coll, err := fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	c := coll.(*collection)
+	assertRebuilt(t, coll, "sparse")
+	legacyIndex(t, c, "sparse")
+	otherBuildTx(t, c.db, func(tx *btree.WriteTx) error {
+		return tx.Put(c.db.systemNS, collConfigKey("test"), []byte{0xfe, 0xfe, 0xfe})
+	})
+	require.NoError(t, fx.Close())
+
+	fx = newFixturePath(t, dir)
+	dbi := fx.DB.(*db)
+	_, at, ok := readSettled(t, dbi)
+	require.True(t, ok)
+	assert.NotEqual(t, schemaCookie(t, fx), at, "settled over a failed rebuild")
+	var format int
+	require.NoError(t, dbi.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
+		format, err = dbi.readIndexFormat(tx, "test", "sparse")
+		return err
+	}))
+	assert.Equal(t, 0, format)
+}
+
+// A gap a build without the record left survives this build's own DDL:
+// the record moves along only while it holds the tx's begin cookie.
+func TestIndexFormat_GapSurvivesOwnDDL(t *testing.T) {
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
+	dir := legacyFixture(t)
+	fx := newFixturePath(t, dir)
+	coll, err := fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	c := coll.(*collection)
+	assertRebuilt(t, coll, "sparse")
+	assertSettled(t, fx)
+
+	legacyIndex(t, c, "sparse")
+	_, err = fx.CreateCollection(ctx, "own")
+	require.NoError(t, err)
+	_, at, ok := readSettled(t, c.db)
+	require.True(t, ok)
+	assert.NotEqual(t, schemaCookie(t, fx), at, "own DDL closed the gap")
+	require.NoError(t, fx.Close())
+
+	fx = newFixturePath(t, dir)
+	coll, err = fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	assertRebuilt(t, coll, "sparse")
+	assertSettled(t, fx)
+}
+
+// Several DDL operations in one tx, a rolled-back DDL tx and a dropped
+// collection all leave the record current.
+func TestIndexFormat_SettledFollowsDDLTx(t *testing.T) {
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	assertSettled(t, fx)
+
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	coll, err := fx.CreateCollection(wtx.Context(), "a")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(wtx.Context(),
+		IndexInfo{Name: "x", Fields: []string{"x"}}, IndexInfo{Name: "y", Fields: []string{"y"}}))
+	require.NoError(t, coll.DropIndex(wtx.Context(), "x"))
+	require.NoError(t, wtx.Commit())
+	assertSettled(t, fx)
+
+	_, at, _ := readSettled(t, dbi)
+	wtx, err = fx.WriteTx(ctx)
+	require.NoError(t, err)
+	_, err = fx.CreateCollection(wtx.Context(), "b")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Rollback())
+	_, after, _ := readSettled(t, dbi)
+	assert.Equal(t, at, after)
+	assertSettled(t, fx)
+
+	require.NoError(t, coll.Drop(ctx))
+	assertSettled(t, fx)
+}
+
+// A backup is a database of its own: the copy's first Open walks the
+// catalog, while the source keeps trusting its record.
+func TestIndexFormat_BackupNotStamped(t *testing.T) {
+	skipIfInMemory(t, "the index format stamp is written and the database reopened")
+	dir := legacyFixture(t)
+	fx := newFixturePath(t, dir)
+	coll, err := fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	assertRebuilt(t, coll, "sparse")
+	legacyIndexBy(t, coll.(*collection), "sparse", thisBuildTx)
+	assertSettled(t, fx)
+
+	backupDir := t.TempDir()
+	require.NoError(t, fx.Backup(ctx, filepath.Join(backupDir, "any-store-test.db")))
+	bfx := newFixturePath(t, backupDir)
+	bcoll, err := bfx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	assertRebuilt(t, bcoll, "sparse")
+	assertSettled(t, bfx)
+	assertUntouched(t, coll, "sparse")
 }
 
 // The rebuild happens in Open, so opening a collection never starts a write
@@ -365,6 +648,8 @@ func TestIndexFormat_RebuildUniqueViolationQuarantines(t *testing.T) {
 	assert.False(t, s.outdated)
 	assertIndexLen(t, s, 3)
 	assert.Equal(t, indexFormatVersion, readIndexFormat(t, c, "s"))
+	// A quarantined index does not keep the file unsettled.
+	assertSettled(t, fx)
 
 	exp, err := coll.Find(`{"a":{"$exists":true}}`).Explain(ctx)
 	require.NoError(t, err)
@@ -450,17 +735,26 @@ func TestIndexFormat_CorruptRecordDoesNotFailOpen(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, bad.EnsureIndex(ctx, IndexInfo{Name: "plain", Fields: []string{"a"}}))
 	c := bad.(*collection)
-	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+	otherBuildTx(t, c.db, func(tx *btree.WriteTx) error {
 		return tx.Put(c.db.systemNS, indexKey("bad", "plain"), []byte{0xfe, 0xfe, 0xfe})
-	}))
+	})
+	// The same pass has a rebuild to do.
+	coll, err := fx.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	legacyIndex(t, coll.(*collection), "sparse")
 	require.NoError(t, fx.Close())
 
 	fx = newFixturePath(t, dir)
-	coll, err := fx.OpenCollection(ctx, "test")
+	coll, err = fx.OpenCollection(ctx, "test")
 	require.NoError(t, err)
 	assertRebuilt(t, coll, "sparse")
 	_, err = fx.OpenCollection(ctx, "bad")
 	require.Error(t, err)
+	// A catalog the walk could not read in full is not settled: the next
+	// Open walks again.
+	_, at, ok := readSettled(t, coll.(*collection).db)
+	require.True(t, ok)
+	assert.NotEqual(t, schemaCookie(t, fx), at, "settled over an unread collection")
 }
 
 // Full-text indexes are outside the format: no stamp, no rebuild, still answering.
