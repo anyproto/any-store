@@ -247,6 +247,14 @@ func (w writeTx) Commit() error {
 				return err
 			}
 		}
+		if w.writeTx.SchemaChanged() && w.writeTx.HasChanges() {
+			// See formatSettledKey. An empty commit (EnsureIndex of an
+			// existing index) bumps no cookie and must stay empty.
+			if err := w.db.advanceFormatSettled(w.writeTx); err != nil {
+				_ = w.unwind()
+				return err
+			}
+		}
 		// The btree commit releases the global write lock before returning an
 		// error, so a failed-commit unwind would run outside the critical
 		// section — hold the DDL-unwind gate (paired with newWriteTx) across

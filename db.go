@@ -236,9 +236,10 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	}
 
 	// Bring range indexes older releases built up to the current format
-	// before any handle exists (see upgradeIndexFormats). Runs with the
-	// recovery controller started: its writes arm the dirty sentinel like
-	// any other. Only a cancelled ctx fails here.
+	// before any handle exists (see upgradeIndexFormats); a settled file
+	// skips the catalog walk. Runs with the recovery controller started: its
+	// writes arm the dirty sentinel like any other. Only a cancelled ctx
+	// fails here.
 	if err = ds.upgradeIndexFormats(ctx); err != nil {
 		if ds.recoveryController != nil {
 			_ = ds.recoveryController.Stop()
@@ -363,8 +364,8 @@ func indexKeyPrefix(collName string) string {
 // name, so a name like "ix:x:y" could alias a derived index namespace.
 //
 // ":" inside a name is allowed: every catalog key family is prefixed
-// ("coll:", "collcfg:", "idx:", "stat_data:", "idx_mk:") so families can't
-// cross-collide, and the residual within-family ambiguity (collection "A:b"
+// ("coll:", "collcfg:", "idx:", "stat_data:", "idx_mk:"; "idx_format" is a
+// single record) so families can't cross-collide, and the residual within-family ambiguity (collection "A:b"
 // index "c" vs collection "A" index "b:c" both deriving ix:A:b:c) fails loudly
 // with ErrNamespaceExists at index-create or rename time — it can never
 // corrupt silently. Rejecting ":" would also strand pre-validation files whose
@@ -1088,12 +1089,18 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 		}
 		serr := b.Step(batch)
 		if errors.Is(serr, btree.ErrBackupDone) {
-			return nil
+			break
 		}
 		if serr != nil {
 			return serr
 		}
 	}
+	if err = b.Finish(); err != nil {
+		return err
+	}
+	// The copy is a database of its own for the format settled record (see
+	// dropFormatSettled).
+	return dropFormatSettled(dstDB)
 }
 
 func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {

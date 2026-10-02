@@ -17,7 +17,8 @@ import (
 // Bump it, and append an entry to indexFormatChanges, whenever a change alters
 // the entries an existing index would hold for the same documents. Open
 // compares each range index's stamp against the table and rebuilds the
-// indexes an intervening change affects (upgradeIndexFormats).
+// indexes an intervening change affects (upgradeIndexFormats); the bump also
+// retires the settled record every file carries (formatSettledKey).
 const indexFormatVersion = 1
 
 // indexFormatChanges describes every key-derivation change, oldest first: the
@@ -93,6 +94,60 @@ func (db *db) readIndexFormat(tx *btree.ReadTx, collName, indexName string) (int
 	return indexFormatOf(raw), nil
 }
 
+// formatSettledKey is the system-namespace key of the settled record, the
+// database-wide {"v": indexFormatVersion, "sc": schemaCookie} that says the
+// catalog at that schema cookie holds no range index left to rebuild for
+// that format. upgradeIndexFormats writes it once a pass settles the whole
+// catalog and skips its catalog walk while the record holds the current
+// version and the schema cookie of the catalog it reads. Every
+// schema-changing commit of this build moves "sc" along with the commit
+// (advanceFormatSettled), so the record stays valid across this build's own
+// DDL; once a build that does not maintain the record commits DDL, the
+// cookie moves past the record and the next Open walks the catalog once and
+// writes it again.
+var formatSettledKey = []byte("idx_format")
+
+// readFormatSettled returns the settled record: ok is false when there is
+// none or it does not parse.
+func (db *db) readFormatSettled(tx *btree.ReadTx) (format int, cookie uint32, ok bool, err error) {
+	raw, err := tx.AppendValue(db.systemNS, formatSettledKey, nil)
+	if err != nil {
+		if errors.Is(err, btree.ErrKeyNotFound) {
+			return 0, 0, false, nil
+		}
+		return 0, 0, false, err
+	}
+	var p anyenc.Parser
+	v, err := p.Parse(raw)
+	if err != nil {
+		return 0, 0, false, nil
+	}
+	return v.GetInt("v"), uint32(v.GetInt("sc")), true, nil
+}
+
+// writeFormatSettled records that the catalog at the given schema cookie
+// holds no range index left to rebuild (an outdated one is quarantined).
+func (db *db) writeFormatSettled(tx *btree.WriteTx, cookie uint32) error {
+	var a anyenc.Arena
+	obj := a.NewObject()
+	obj.Set("v", a.NewNumberInt(indexFormatVersion))
+	obj.Set("sc", a.NewNumberInt(int(cookie)))
+	return tx.Put(db.systemNS, formatSettledKey, obj.MarshalTo(nil))
+}
+
+// advanceFormatSettled runs in every schema-changing commit of this build
+// that has changes to write (an empty commit bumps no cookie) and moves the
+// settled record's cookie along with the commit, which advances it by
+// exactly one. The record is rewritten only while it still carries this
+// tx's begin cookie (see formatSettledKey).
+func (db *db) advanceFormatSettled(tx *btree.WriteTx) error {
+	format, cookie, ok, err := db.readFormatSettled(&tx.ReadTx)
+	if err != nil || !ok || format != indexFormatVersion || cookie != tx.SnapshotSchemaCookie() {
+		return err
+	}
+	return db.writeFormatSettled(tx, cookie+1)
+}
+
 // editIndexRecord rewrites an index's catalog record through edit, keeping
 // every field edit leaves alone as stored.
 func (db *db) editIndexRecord(tx *btree.WriteTx, collName, indexName string, edit func(v *anyenc.Value, a *anyenc.Arena)) error {
@@ -126,6 +181,31 @@ func (db *db) quarantineIndex(tx *btree.WriteTx, collName, indexName string) err
 	return db.editIndexRecord(tx, collName, indexName, func(v *anyenc.Value, a *anyenc.Arena) {
 		v.Set("vq", a.NewNumberInt(indexFormatVersion))
 	})
+}
+
+// dropFormatSettled removes the settled record from a database this process
+// holds but does not serve: a backup destination. The copy carries the
+// source's record while its schema cookie restarts, so cookie bumps of a
+// build that does not maintain the record could meet it again; dropped, the
+// copy's first Open walks the catalog once and writes its own.
+func dropFormatSettled(dst *btree.DB) error {
+	tx, err := dst.BeginWrite()
+	if err != nil {
+		return err
+	}
+	ns, err := tx.GetNamespace(systemNamespace)
+	if err != nil {
+		_ = tx.Rollback()
+		if errors.Is(err, btree.ErrNamespaceNotFound) {
+			return nil
+		}
+		return err
+	}
+	if err = tx.Delete(ns, formatSettledKey); err != nil && !errors.Is(err, btree.ErrKeyNotFound) {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 // rebuildDefeatedByData reports whether a rebuild failed on the documents
@@ -164,8 +244,10 @@ func (db *db) outdatedIndexes(tx *btree.ReadTx, collName string) ([]IndexInfo, e
 
 // upgradeIndexFormats runs from Open, before any collection handle or user
 // transaction exists, and rebuilds every range index whose stamp an
-// intervening format change leaves outdated. A read pass finds the work, so
-// a settled file takes no write lock.
+// intervening format change leaves outdated. A read pass finds the work; a
+// file whose settled record (formatSettledKey) is current skips the walk
+// outright, so a settled file costs one point read, and the first Open under
+// a build that keeps the record writes it once.
 //
 // Each index rebuilds in its own write transaction, re-reading its record
 // through the writer's view since a peer may have rebuilt, redefined or
@@ -186,10 +268,29 @@ func (db *db) outdatedIndexes(tx *btree.ReadTx, collName string) ([]IndexInfo, e
 // for any other reason than its data is left for the next Open. Both are
 // sound because an outdated index is never planned. Only a cancelled ctx
 // stops the upgrade, and then the Open.
+//
+// The settled record is written only when the pass settled the whole
+// catalog it read: every collection was read, every rebuild committed or was
+// quarantined, and the schema cookie moved only by this pass's own rebuilds
+// — a peer's DDL in between may have added indexes the read pass never saw,
+// and then the next Open walks again.
 func (db *db) upgradeIndexFormats(ctx context.Context) error {
 	type work struct{ coll, index string }
-	var todo []work
+	var (
+		todo    []work
+		stamped bool
+		cookie  uint32 // the schema cookie of the catalog read, moved along with each rebuild
+		settled = true
+	)
 	err := db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		cookie = tx.SnapshotSchemaCookie()
+		format, at, ok, err := db.readFormatSettled(tx)
+		if err != nil {
+			return err
+		}
+		if stamped = ok && format == indexFormatVersion && at == cookie; stamped {
+			return nil
+		}
 		names, err := db.collectionNames(tx)
 		if err != nil {
 			return err
@@ -197,6 +298,7 @@ func (db *db) upgradeIndexFormats(ctx context.Context) error {
 		for _, name := range names {
 			outdated, err := db.outdatedIndexes(tx, name)
 			if err != nil {
+				settled = false
 				continue
 			}
 			for _, info := range outdated {
@@ -208,21 +310,50 @@ func (db *db) upgradeIndexFormats(ctx context.Context) error {
 	if err != nil {
 		return ctx.Err()
 	}
+	if stamped {
+		return nil
+	}
 	for _, w := range todo {
 		if err = ctx.Err(); err != nil {
 			return err
 		}
-		var rebuildErr error
-		_ = db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		var (
+			rebuildErr error
+			rebuilt    bool
+		)
+		err = db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+			if tx.SnapshotSchemaCookie() != cookie {
+				settled = false
+			}
 			rebuildErr = db.rebuildOutdatedIndex(tx, w.coll, w.index)
+			rebuilt = rebuildErr == nil && tx.SchemaChanged()
 			return rebuildErr
 		})
-		if rebuildDefeatedByData(rebuildErr) {
-			_ = db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		switch {
+		case err == nil:
+			if rebuilt {
+				cookie++
+			}
+		case rebuildDefeatedByData(rebuildErr):
+			if db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
 				return db.quarantineIndex(tx, w.coll, w.index)
-			})
+			}) != nil {
+				settled = false
+			}
+		default:
+			settled = false
 		}
 	}
+	if !settled {
+		return nil
+	}
+	// Best effort: without the record the next Open walks again.
+	_ = db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		if tx.SnapshotSchemaCookie() != cookie {
+			return nil
+		}
+		return db.writeFormatSettled(tx, cookie)
+	})
 	return nil
 }
 

@@ -2127,6 +2127,13 @@ func (tx *WriteTx) MarkSchemaChanged() {
 	tx.schemaChanged = true
 }
 
+// HasChanges reports whether the transaction has written anything so far.
+// A commit without changes is empty: FileChangeCount and SchemaCookie stay
+// as they are whatever MarkDataChanged and MarkSchemaChanged said.
+func (tx *WriteTx) HasChanges() bool {
+	return tx.pager.hasChanges()
+}
+
 // Put inserts or updates a key-value pair in the given namespace.
 func (tx *WriteTx) Put(ns *Namespace, key, value []byte) error {
 	if tx.closed {
