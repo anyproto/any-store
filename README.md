@@ -183,6 +183,8 @@ db.Flush(ctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive)
 
 **Sentinel:** when enabled, a `.lock` file marks not-explicitly-persisted writes so an unclean shutdown triggers an integrity quick check on open.
 
+**Lifetime:** the idle flush runs until `Close`. It is not bound to the context passed to `Open`, which only bounds the open itself; a DB that is never closed keeps the flush goroutine alive.
+
 ## Integrity
 
 Every non-encrypted database carries an XXH3-128 page-trailer checksum (16 bytes/page) by default — corruption is caught on read. There is no opt-out; the cost is <1% on writes and effectively zero on reads. Encrypted databases derive integrity from the cipher's AEAD tag instead. File state is authoritative on reopen — existing plain databases stay plain, existing checksum databases auto-install the codec regardless of caller config.

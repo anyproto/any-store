@@ -77,12 +77,17 @@ func (c *Controller) MarkCleanAfterCheck() {
 	}
 }
 
-func (c *Controller) Start(ctx context.Context) error {
+// Start runs the idle-flush loop. Only Stop (db.Close) ends it: the
+// loop is not tied to the opener's context, which is typically
+// call-scoped and cancelled right after Open returns, while the DB
+// needs flushing for as long as it is open. A DB that is never closed
+// keeps the loop goroutine and its timer alive.
+func (c *Controller) Start() error {
 	if !c.running.CompareAndSwap(false, true) {
 		return fmt.Errorf("controller already running")
 	}
 
-	c.autoFlushCtx, c.autoFlushCancel = context.WithCancel(ctx)
+	c.autoFlushCtx, c.autoFlushCancel = context.WithCancel(context.Background())
 
 	if c.opts.AutoFlushEnable {
 		c.autoFlushWG.Add(1)
