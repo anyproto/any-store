@@ -109,6 +109,8 @@ db.Flush(ctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive)
 
 **Sentinel:** When enabled, creates a `.lock` file to detect not explicitly persisted writes and run integrity check on open.
 
+**Lifetime:** the idle flush runs until `Close`. It is not bound to the context passed to `Open`, which only bounds the open itself; a DB that is never closed keeps the flush goroutine alive.
+
 
 ## Contributing
 
