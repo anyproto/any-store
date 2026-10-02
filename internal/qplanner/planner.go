@@ -143,25 +143,22 @@ func formatFullScanDetails(totalDocs, estimatedYield float64, needSort, idBounds
 		perDocCost = CostScanDoc
 		label = "scan"
 	}
-	s := fmt.Sprintf("%.0f×%s(%.2f) + %.0f×filter(%.1f)", totalDocs, label, perDocCost, totalDocs, CostFilter)
+	s := fmt.Sprintf("%.0f×%s(%g) + %.0f×filter(%g)", totalDocs, label, perDocCost, totalDocs, CostFilter)
 	if needSort {
-		s += fmt.Sprintf(" + sort(%.0f)=%.1f", estimatedYield, sortCost(estimatedYield))
+		s += fmt.Sprintf(" + sort(%.0f)=%.1f + %.0f×materialize(%g)",
+			estimatedYield, sortCost(estimatedYield), estimatedYield, CostMaterialize)
 	}
-	base := (totalDocs * perDocCost) + (totalDocs * CostFilter)
-	if needSort {
-		base += sortCost(estimatedYield)
-	}
-	s += fmt.Sprintf(" = %.1f", base)
+	s += fmt.Sprintf(" = %.1f", computeFullScanCost(totalDocs, estimatedYield, needSort, idBoundsSeek))
 	return s
 }
 
 // formatSeekDetails returns a cost formula string for an index seek plan.
 // walkRows is the entry walk of a whole-index presence scan, 0 for a seek.
 func formatSeekDetails(nSeeks, estRows, fetchCost, seekSortCost, walkRows float64) string {
-	s := fmt.Sprintf("%.0f×seek(%.1f) + %.0f×fetch(%.1f) + %.0f×filter(%.1f)",
+	s := fmt.Sprintf("%.0f×seek(%g) + %.0f×fetch(%g) + %.0f×filter(%g)",
 		nSeeks, CostIndexSeek, estRows, fetchCost, estRows, CostFilter)
 	if walkRows > 0 {
-		s += fmt.Sprintf(" + %.0f×walk(%.2f)", walkRows, CostSeqRead)
+		s += fmt.Sprintf(" + %.0f×walk(%g)", walkRows, CostSeqRead)
 	}
 	if seekSortCost > 0 {
 		s += fmt.Sprintf(" + sort=%.1f", seekSortCost)
@@ -173,7 +170,7 @@ func formatSeekDetails(nSeeks, estRows, fetchCost, seekSortCost, walkRows float6
 
 // formatScanDetails returns a cost formula string for an index scan plan.
 func formatScanDetails(scanRows, fetchCost float64, hasLimit bool) string {
-	s := fmt.Sprintf("%.0f×seek(%.1f) + %.0f×fetch(%.1f) + %.0f×filter(%.1f)",
+	s := fmt.Sprintf("%.0f×seek(%g) + %.0f×fetch(%g) + %.0f×filter(%g)",
 		scanRows, CostIndexSeek, scanRows, fetchCost, scanRows, CostFilter)
 	if hasLimit {
 		s += " [limit-optimized]"
@@ -299,7 +296,11 @@ type CBOIndex struct {
 	// (lo,hi) instead of (lo,+inf). Seeks — and the SCAN-COST estimate, which
 	// must price the entries the chain actually visits — keep Bounds unless
 	// the index is proven fan-out-free (then Bounds IS tight and EstBounds is
-	// nil). Built through the same reverse-flag transform as Bounds, so
+	// nil). An index whose entries outnumber the documents gets no tight
+	// EstBounds either (query.go buildCBOIndexesInto, FanOut): a document can
+	// satisfy each conjunct through a different element, so the intersection
+	// describes no document set and only the wide bounds bound the matches
+	// from above. Built through the same reverse-flag transform as Bounds, so
 	// RangeFraction ranks them in stored-key space.
 	EstBounds query.Bounds
 
@@ -326,6 +327,10 @@ func (idx *CBOIndex) fullKeyPointBound() bool {
 // BuildPlan constructs an iterator chain using the Cost-Based Optimizer.
 // It evaluates full scan, index seek, and index scan plans, then picks the cheapest.
 func BuildPlan(params *PlanParams) *Plan {
+	// Every path prices range candidates from a measurement, not a guess —
+	// the $text and $knn probe/driver decisions included.
+	measureRanges(params)
+
 	// Vector query: the $knn clause is enforced by the ANN driver (VectorIter)
 	// or the exact pre-filter probe (VectorScoreIter); buildKnnPlan costs both
 	// against the query's other access paths and picks the cheapest.
@@ -346,36 +351,6 @@ func BuildPlan(params *PlanParams) *Plan {
 		totalDocs = 1
 	}
 
-	// Range selectivity via B-tree page interpolation. A range predicate
-	// ($gt/$lt/$ne/...) has no point estimate — the hash sketch is unordered — so
-	// for each non-equality index we interpolate the fraction of index entries its
-	// bounds cover directly from the live index B-tree (one descent per endpoint).
-	// This is what lets a selective range on a dense index beat a full scan; for a
-	// sparse index it composes with the EntryCount bound as e = rangeSel·EntryCount.
-	// Runs BEFORE calculateSelectivity so pTotal's range terms can adopt the
-	// interpolated fraction. Interpolation ranks the tight-channel bounds
-	// (estBounds) so a two-sided range is rated (lo,hi), not (lo,+inf).
-	//
-	// The fraction counts index ENTRIES, and entries are what a seek pays
-	// for: a multikey index holds one entry per array element, and the chain
-	// fetches a document once per in-range entry (the canonical dedup runs on
-	// the fetched document). So rangeSel·EntryCount prices the seek on a
-	// fan-out index exactly, and the matched documents are at most that many
-	// (rangeDocs caps at the collection). Guessing a flat default there sent
-	// every selective range over an array field to a full scan.
-	if params.Tx != nil {
-		for i := range params.Indexes {
-			idx := &params.Indexes[i]
-			if idx.PointLookup || idx.Ns == nil || len(idx.Bounds) == 0 {
-				continue
-			}
-			// rangeSel prices the SCAN (the bounds the chain seeks with);
-			// rangeSelTight rates the MATCH fraction (tight channel). They
-			// differ only for unproven indexes carrying EstBounds.
-			idx.rangeSel, idx.rangeSelTight = interpolateRangeSels(params.Tx, idx)
-		}
-	}
-
 	// Calculate combined selectivity for all filter predicates
 	pTotal := calculateSelectivity(params.Filter, params.Indexes, totalDocs, params.FieldBounds)
 
@@ -389,14 +364,27 @@ func BuildPlan(params *PlanParams) *Plan {
 	}
 
 	// ---- Plan A: Full Collection Scan ----
-	// When idBounds are present with point lookups, FullScan only reads those specific docs.
+	// Primary-key bounds restrict the scan itself (FullScanIter.nextWithBounds):
+	// fixed ids are point lookups, a range seeks the data B-tree to its start
+	// and stops at its end, so the scan reads only the fraction the range
+	// covers — measured the same way as an index range.
 	fullScanDocs := totalDocs
 	idBoundsSeek := false
-	if len(params.IDBounds) > 0 && AllBoundsFixed(params.IDBounds) {
-		fullScanDocs = float64(len(params.IDBounds))
-		idBoundsSeek = true
-		if fullScanDocs < estimatedYield {
-			estimatedYield = fullScanDocs
+	if len(params.IDBounds) > 0 {
+		if AllBoundsFixed(params.IDBounds) {
+			fullScanDocs = float64(len(params.IDBounds))
+			idBoundsSeek = true
+			if fullScanDocs < estimatedYield {
+				estimatedYield = fullScanDocs
+			}
+		} else if params.Tx != nil && params.DataNs != nil {
+			cur := params.Tx.NewCursor(params.DataNs)
+			f := rangeFraction(cur, params.IDBounds)
+			cur.Close()
+			if f > 0 {
+				fullScanDocs = max(f*totalDocs, 1)
+				estimatedYield = max(fullScanDocs*pTotal, 1)
+			}
 		}
 	}
 	// FullScan naturally reads in primary-key order, so sorting by the primary
@@ -659,6 +647,21 @@ func BuildPlan(params *PlanParams) *Plan {
 			if scanPopulation < 1 {
 				scanPopulation = 1
 			}
+			// idxSel counts documents; the walk is over ENTRIES, each fetched
+			// on a single-field chain (see estimateIndexDocsWithFieldSel), so a
+			// fan-out index scans more rows than documents, and a LIMIT needs
+			// proportionally more of them.
+			entriesPerDoc := 1.0
+			entries := scanPopulation
+			if len(idx.Bounds) == 0 {
+				entries = indexEntries(idx, totalDocs)
+			} else if idx.rangeSel > 0 {
+				entries = idx.rangeSel * indexEntries(idx, totalDocs)
+			}
+			if entries > scanPopulation {
+				entriesPerDoc = entries / scanPopulation
+				scanPopulation = entries
+			}
 
 			// Check if non-bound index fields cover filter conditions.
 			// When they do, IndexFilterIter can check values from the key tuple
@@ -669,8 +672,9 @@ func BuildPlan(params *PlanParams) *Plan {
 			var scanCost float64
 			var scanRows float64
 			if params.Limit > 0 {
-				// With LIMIT: expected docs to scan = LIMIT / scanSel, capped at scanPopulation
-				s := float64(params.Limit+params.Offset) / scanSel
+				// With LIMIT: expected rows to scan = LIMIT / scanSel entries per
+				// matching document, capped at scanPopulation
+				s := float64(params.Limit+params.Offset) / scanSel * entriesPerDoc
 				if s > scanPopulation {
 					s = scanPopulation
 				}
@@ -863,7 +867,7 @@ func buildSearchPlan(params *PlanParams, dataCS *CursorSource, source Iterator, 
 // For collections above the sequential-read threshold, cursor reads are cheaper
 // than random B-tree point lookups, so we use CostScanDoc instead of CostDocFetch.
 // For small collections, B-tree depth is shallow and both access patterns
-// have similar cost, so we use CostDocFetch (preserving original behavior).
+// have similar cost, so we use CostDocFetch.
 // When idBoundsSeek is true, the scan does random point lookups (not sequential),
 // so CostDocFetch is used regardless of collection size.
 func computeFullScanCost(totalDocs, estimatedYield float64, needSort, idBoundsSeek bool) float64 {
@@ -998,8 +1002,9 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 					}
 					pTotal *= p
 				} else if isEquality {
-					// Equality on a field but can't use sketch directly (compound index)
-					// Use a more selective estimate than default range
+					// Equality on a non-leading compound field: no sketch level
+					// holds its count alone, so it is priced like an unmeasured
+					// range.
 					pTotal *= DefaultRangeSelectivity
 				} else {
 					// Range predicate: the interpolated fraction of THIS field's
@@ -1096,11 +1101,13 @@ func sketchLevelTrusted(s *IndexSketch, level int) bool {
 // selectivity cut, so a range fallback measured against it (rather than
 // totalDocs) lets a sparse index win natively — e.g. {a:{$ne:""}} on an index
 // where only a few percent of docs have `a` touches only those entries. A
-// multikey/array index reports more entries than documents (one per element,
-// deduped per document at the shallow prefix levels), and a seek fetches once
-// per in-range entry, so the count is NOT capped at the collection here. Falls
-// back to totalDocs when the sketch is absent or the level is untrusted
-// (legacy blob pending rebuild).
+// multikey/array index reports more entries than documents (one per element;
+// the sketch dedups a document's entries at the prefix levels above the
+// fan-out, so a chain bound on a scalar leading field counts documents while
+// one bound on the array field counts elements), and a single-field chain
+// fetches once per in-range entry, so the count is NOT capped at the
+// collection here. Falls back to totalDocs when the sketch is absent or the
+// level is untrusted (legacy blob pending rebuild).
 func indexEntries(idx *CBOIndex, totalDocs float64) float64 {
 	if idx.Sketch == nil {
 		return totalDocs
@@ -1117,6 +1124,15 @@ func indexEntries(idx *CBOIndex, totalDocs float64) float64 {
 	return n
 }
 
+// FanOut reports whether the index holds more entries than the collection has
+// documents — array elements fanned out into entries of their own. The tight
+// channel's intersection then describes no document set (a document can
+// satisfy each conjunct through a different element), so such an index is
+// rated on its wide seek bounds, which bound its matches from above.
+func FanOut(sk *IndexSketch, totalDocs int) bool {
+	return sk != nil && sk.EntryCount(0) > uint64(max(totalDocs, 0))
+}
+
 // indexPopulation returns the number of documents reachable through this
 // index: indexEntries capped at the collection, since matching DOCUMENTS can
 // never exceed it however many entries a fan-out index holds.
@@ -1129,6 +1145,41 @@ func indexPopulation(idx *CBOIndex, totalDocs float64) float64 {
 // collection — the in-range entries of one fan-out document collapse to it.
 func rangeDocs(idx *CBOIndex, f, totalDocs float64) float64 {
 	return min(f*indexEntries(idx, totalDocs), totalDocs)
+}
+
+// measureRanges estimates range selectivity via B-tree page interpolation. A
+// range predicate ($gt/$lt/$ne/...) has no point estimate — the hash sketch is
+// unordered — so for each non-equality index it interpolates the fraction of
+// index entries the bounds cover directly from the live index B-tree (one
+// descent per endpoint). This is what lets a selective range on a dense index
+// beat a full scan; for a sparse index it composes with the EntryCount bound
+// as e = rangeSel·EntryCount. Runs BEFORE calculateSelectivity so pTotal's
+// range terms can adopt the interpolated fraction. Interpolation ranks the
+// tight-channel bounds (EstBounds) so a two-sided range is rated (lo,hi), not
+// (lo,+inf).
+//
+// The fraction counts index ENTRIES, and entries are what a seek pays for: a
+// multikey index holds one entry per array element, a single-field chain
+// fetches a document once per in-range entry (the canonical dedup runs on the
+// fetched document) and a compound chain dedups by document first, so entries
+// bound its fetches from above. rangeSel·EntryCount therefore prices the seek
+// on a fan-out index, and the matched documents are at most that many
+// (rangeDocs caps at the collection). A flat default there would send every
+// selective range over an array field to a full scan.
+func measureRanges(params *PlanParams) {
+	if params.Tx == nil {
+		return
+	}
+	for i := range params.Indexes {
+		idx := &params.Indexes[i]
+		if idx.PointLookup || idx.Ns == nil || len(idx.Bounds) == 0 {
+			continue
+		}
+		// rangeSel prices the SCAN (the bounds the chain seeks with);
+		// rangeSelTight rates the MATCH fraction (tight channel). They
+		// differ only for unproven indexes carrying EstBounds.
+		idx.rangeSel, idx.rangeSelTight = interpolateRangeSels(params.Tx, idx)
+	}
 }
 
 // interpolateRangeSel estimates the fraction of this index's entries that its
@@ -1149,6 +1200,13 @@ func interpolateRangeSels(tx *btree.ReadTx, idx *CBOIndex) (sel, tight float64) 
 	return sel, tight
 }
 
+// minRangeFraction is the smallest MEASURED fraction. A range the index holds
+// nothing of (both endpoints rank past the same key — {$gt: max}) is a
+// measurement of a near-empty range, not a missing one, so it prices as a
+// handful of entries instead of the unmeasured default. Zero stays reserved
+// for "not measured" (read error, no read tx).
+const minRangeFraction = 1e-6
+
 func rangeFraction(cur *btree.Cursor, bounds query.Bounds) float64 {
 	var f float64
 	for _, b := range bounds {
@@ -1158,13 +1216,7 @@ func rangeFraction(cur *btree.Cursor, bounds query.Bounds) float64 {
 		}
 		f += bf
 	}
-	if f <= 0 {
-		return 0
-	}
-	if f > 1 {
-		f = 1
-	}
-	return f
+	return min(max(f, minRangeFraction), 1)
 }
 
 // compareCandidates orders explain candidates by cost, then by name. The name
@@ -1322,12 +1374,15 @@ func selectivityForIndex(idx *CBOIndex, totalDocs float64) float64 {
 	return DefaultRangeSelectivity * indexPopulation(idx, totalDocs) / totalDocs
 }
 
-// estimateIndexDocsWithFieldSel estimates the number of documents an index seek will return,
-// using per-field selectivity from single-field indexes for compound indexes with partial bounds.
+// estimateIndexDocsWithFieldSel estimates the rows an index seek fetches — the
+// in-range ENTRIES of a range chain, which exceed the documents on a fan-out
+// index — using per-field selectivity from single-field indexes for compound
+// indexes with partial bounds.
 func estimateIndexDocsWithFieldSel(idx *CBOIndex, totalDocs float64, fieldSel []fieldSelEntry) float64 {
 	if len(idx.Bounds) == 0 {
 		if idx.Info.Sparse {
-			return indexPopulation(idx, totalDocs)
+			// A presence scan walks and fetches every entry of the index.
+			return indexEntries(idx, totalDocs)
 		}
 		return totalDocs
 	}

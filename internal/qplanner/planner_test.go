@@ -157,10 +157,13 @@ func TestBuildPlan_SparseIndex_NeUsesIndex(t *testing.T) {
 	filter := query.MustParseCondition(`{"a": {"$ne": ""}}`)
 
 	t.Run("sparse index (500/50000 present) uses index", func(t *testing.T) {
+		idx := newIdx(500)
+		// A measured $ne spans the whole sparse index: 500 fetches.
+		idx.rangeSel, idx.rangeSelTight = 1, 1
 		plan := BuildPlan(&PlanParams{
 			Filter:    filter,
 			TotalDocs: totalDocs,
-			Indexes:   []CBOIndex{newIdx(500)},
+			Indexes:   []CBOIndex{idx},
 		})
 		assert.Equal(t, "IndexSeek", plan.Name,
 			"sparse index presence cut must beat full scan")
@@ -209,6 +212,113 @@ func TestRangeEstimates_MultikeyEntries(t *testing.T) {
 	idx.rangeSel = 0.5
 	assert.InDelta(t, 1000.0, rangeDocs(idx, idx.rangeSel, totalDocs), 1e-9,
 		"1500 in-range entries collapse to at most the collection")
+}
+
+// TestBuildPlan_RangeBreakEven pins the full-scan price against the index
+// path: a measured range below the 50% break-even seeks, one above it scans.
+func TestBuildPlan_RangeBreakEven(t *testing.T) {
+	const totalDocs = 10000
+	filter := query.MustParseCondition(`{"a": {"$gt": 5}}`)
+	plan := func(f float64) *Plan {
+		idx := CBOIndex{
+			Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Bounds:      mustParseBounds("a", `{"a": {"$gt": 5}}`),
+			BoundFields: 1,
+		}
+		idx.rangeSel, idx.rangeSelTight = f, f
+		return BuildPlan(&PlanParams{Filter: filter, TotalDocs: totalDocs, Indexes: []CBOIndex{idx}})
+	}
+	assert.Equal(t, "IndexSeek", plan(0.3).Name, "a 30% range is cheaper through the index")
+	assert.Equal(t, "FullScan", plan(0.7).Name, "a 70% range is cheaper as a scan")
+}
+
+// TestRangeEstimates_MeasuredBroadRange: a measured fraction is adopted as it
+// is, above the unmeasured default too — the break-even, not a cap on the
+// estimate, keeps a broad range off the index.
+func TestRangeEstimates_MeasuredBroadRange(t *testing.T) {
+	const totalDocs = 1000
+	filter := query.MustParseCondition(`{"a": {"$gt": 5}}`)
+	idx := CBOIndex{
+		Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+		Bounds:      mustParseBounds("a", `{"a": {"$gt": 5}}`),
+		BoundFields: 1,
+	}
+	idx.rangeSel, idx.rangeSelTight = 0.8, 0.8
+	assert.InDelta(t, 0.8, selectivityForIndex(&idx, totalDocs), 1e-9)
+	assert.InDelta(t, 800, estimateIndexDocsWithFieldSel(&idx, totalDocs, nil), 1e-9)
+	br := &BoundsResult{}
+	br.Build([]*IndexInfo{idx.Info}, filter)
+	assert.InDelta(t, 0.8, calculateSelectivity(filter, []CBOIndex{idx}, totalDocs, br), 1e-9)
+}
+
+// TestBuildPlan_OrderedScanPricesEntries: an ordered index scan walks and
+// fetches ENTRIES, so on a fan-out index its population is the in-range entry
+// count, not the capped document count, and a LIMIT needs proportionally more
+// rows.
+func TestBuildPlan_OrderedScanPricesEntries(t *testing.T) {
+	const totalDocs = 1000
+	sk := NewIndexSketch(DefaultSketchSize, 1)
+	for i := 0; i < 3*totalDocs; i++ {
+		sk.Increment(0, []byte{byte(i), byte(i >> 8)})
+	}
+	filter := query.MustParseCondition(`{"tags": {"$gt": 5}}`)
+	build := func(limit int) *Plan {
+		idx := CBOIndex{
+			Info:        &IndexInfo{Name: "tags", FieldNames: []string{"tags"}},
+			Sketch:      sk,
+			Bounds:      mustParseBounds("tags", `{"tags": {"$gt": 5}}`),
+			BoundFields: 1,
+			ExactSort:   true,
+		}
+		idx.rangeSel, idx.rangeSelTight = 0.5, 0.5 // 1500 of 3000 entries, every document
+		return BuildPlan(&PlanParams{
+			Filter:    filter,
+			Sorter:    mustParseSort("tags"),
+			TotalDocs: totalDocs,
+			Limit:     limit,
+			Indexes:   []CBOIndex{idx},
+		})
+	}
+	scanCost := func(p *Plan) float64 {
+		for _, c := range p.Explain.Candidates {
+			if c.Name == "IndexScan(tags)" {
+				return c.Cost
+			}
+		}
+		t.Fatalf("no IndexScan candidate in %v", p.Explain.Candidates)
+		return 0
+	}
+	assert.InDelta(t, 1500*(CostIndexSeek+CostDocFetch+CostFilter), scanCost(build(0)), 1e-9,
+		"no LIMIT: every in-range entry is walked and fetched")
+	assert.InDelta(t, 15*(CostIndexSeek+CostDocFetch+CostFilter), scanCost(build(10)), 1e-9,
+		"LIMIT 10 over 1.5 entries per document walks 15 rows")
+}
+
+// TestBuildPlan_PresenceScanPricesEntries: a presence scan over a sparse
+// fan-out index walks and fetches every entry, more than the documents it
+// holds.
+func TestBuildPlan_PresenceScanPricesEntries(t *testing.T) {
+	const totalDocs = 100
+	sk := NewIndexSketch(DefaultSketchSize, 1)
+	for i := 0; i < 300; i++ {
+		sk.Increment(0, []byte{byte(i), byte(i >> 8)})
+	}
+	idx := CBOIndex{
+		Info:   &IndexInfo{Name: "tags", FieldNames: []string{"tags"}, FieldPaths: [][]string{{"tags"}}, Sparse: true},
+		Sketch: sk,
+	}
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.MustParseCondition(`{"tags": {"$exists": true}}`),
+		TotalDocs: totalDocs,
+		Indexes:   []CBOIndex{idx},
+	})
+	for _, c := range plan.Explain.Candidates {
+		if c.Name == "IndexSeek(tags)" {
+			assert.InDelta(t, CostIndexSeek+300*(CostDocFetch+CostFilter+CostSeqRead), c.Cost, 1e-9)
+			return
+		}
+	}
+	t.Fatalf("no presence-scan candidate in %v", plan.Explain.Candidates)
 }
 
 // TestIndexCoversFilter_RejectsUncoveredField is the defensive regression for
@@ -515,7 +625,7 @@ func TestBuildPlan_UniqueIndexPointLookup_OrderIndependent(t *testing.T) {
 	assert.Equal(t, "IndexSeek", plan.Name)
 	assert.Equal(t, "id", plan.IndexName)
 	// Without the unique-first pass the compound index claims `id` at
-	// DefaultRangeSelectivity (0.5); the unique claim prices it 1/totalDocs.
+	// DefaultRangeSelectivity; the unique claim prices it 1/totalDocs.
 	assert.Less(t, plan.Explain.Selectivity, 1e-4)
 }
 
@@ -2044,9 +2154,9 @@ func TestPlan_String_NoPlan(t *testing.T) {
 func TestFormatSeekDetails(t *testing.T) {
 	t.Run("no_sort", func(t *testing.T) {
 		s := formatSeekDetails(3, 10, CostDocFetch, 0, 0)
-		assert.Contains(t, s, fmt.Sprintf("3×seek(%.1f)", CostIndexSeek))
-		assert.Contains(t, s, fmt.Sprintf("10×fetch(%.1f)", CostDocFetch))
-		assert.Contains(t, s, fmt.Sprintf("10×filter(%.1f)", CostFilter))
+		assert.Contains(t, s, fmt.Sprintf("3×seek(%g)", CostIndexSeek))
+		assert.Contains(t, s, fmt.Sprintf("10×fetch(%g)", CostDocFetch))
+		assert.Contains(t, s, fmt.Sprintf("10×filter(%g)", CostFilter))
 		assert.NotContains(t, s, "+ sort=")
 
 		total := 3*CostIndexSeek + 10*CostDocFetch + 10*CostFilter
@@ -2065,7 +2175,7 @@ func TestFormatSeekDetails(t *testing.T) {
 	})
 	t.Run("with_walk", func(t *testing.T) {
 		s := formatSeekDetails(1, 40, CostDocFetch, 0, 40)
-		assert.Contains(t, s, fmt.Sprintf("40×walk(%.2f)", CostSeqRead))
+		assert.Contains(t, s, fmt.Sprintf("40×walk(%g)", CostSeqRead))
 		total := 1*CostIndexSeek + 40*CostDocFetch + 40*CostFilter + 40*CostSeqRead
 		expectedSuffix := fmt.Sprintf("= %.1f", total)
 		assert.True(t, strings.HasSuffix(s, expectedSuffix),
@@ -2078,9 +2188,9 @@ func TestFormatSeekDetails(t *testing.T) {
 func TestFormatScanDetails(t *testing.T) {
 	t.Run("no_limit", func(t *testing.T) {
 		s := formatScanDetails(12, CostDocFetch, false)
-		assert.Contains(t, s, fmt.Sprintf("12×seek(%.1f)", CostIndexSeek))
-		assert.Contains(t, s, fmt.Sprintf("12×fetch(%.1f)", CostDocFetch))
-		assert.Contains(t, s, fmt.Sprintf("12×filter(%.1f)", CostFilter))
+		assert.Contains(t, s, fmt.Sprintf("12×seek(%g)", CostIndexSeek))
+		assert.Contains(t, s, fmt.Sprintf("12×fetch(%g)", CostDocFetch))
+		assert.Contains(t, s, fmt.Sprintf("12×filter(%g)", CostFilter))
 		assert.NotContains(t, s, "[limit-optimized]")
 		total := 12*CostIndexSeek + 12*CostDocFetch + 12*CostFilter
 		assert.True(t, strings.HasSuffix(s, fmt.Sprintf("= %.1f", total)),
@@ -2795,33 +2905,35 @@ func TestComputeIndexBounds(t *testing.T) {
 }
 
 // TestFormatFullScanDetails covers all branches of formatFullScanDetails:
-// small-table fetch label, large-table seq label (totalDocs > 500), needSort
-// toggle, and idBoundsSeek override (large but still uses fetch).
+// small-table fetch label, large-table scan label (totalDocs > 500), needSort
+// toggle, and idBoundsSeek override (large but still uses fetch). Every total
+// printed must be the cost the plan is chosen by.
 func TestFormatFullScanDetails(t *testing.T) {
+	total := func(docs, yield float64, needSort, idSeek bool) string {
+		return fmt.Sprintf("= %.1f", computeFullScanCost(docs, yield, needSort, idSeek))
+	}
 	t.Run("small_no_sort", func(t *testing.T) {
 		s := formatFullScanDetails(100, 50, false, false)
-		assert.Contains(t, s, fmt.Sprintf("100×fetch(%.2f)", CostDocFetch))
+		assert.Contains(t, s, fmt.Sprintf("100×fetch(%g)", CostDocFetch))
 		assert.NotContains(t, s, "× sort")
-		total := 100*CostDocFetch + 100*CostFilter
-		assert.True(t, strings.HasSuffix(s, fmt.Sprintf("= %.1f", total)),
-			"unexpected total in %q", s)
+		assert.True(t, strings.HasSuffix(s, total(100, 50, false, false)), "unexpected total in %q", s)
 	})
-	t.Run("large_seq_label", func(t *testing.T) {
+	t.Run("large_scan_label", func(t *testing.T) {
 		s := formatFullScanDetails(1000, 1000, false, false)
-		assert.Contains(t, s, fmt.Sprintf("1000×scan(%.2f)", CostScanDoc))
-		total := 1000*CostScanDoc + 1000*CostFilter
-		assert.True(t, strings.HasSuffix(s, fmt.Sprintf("= %.1f", total)))
+		assert.Contains(t, s, fmt.Sprintf("1000×scan(%g)", CostScanDoc))
+		assert.True(t, strings.HasSuffix(s, total(1000, 1000, false, false)), "unexpected total in %q", s)
 	})
 	t.Run("large_with_idBoundsSeek_keeps_fetch", func(t *testing.T) {
 		s := formatFullScanDetails(1000, 1000, false, true)
-		assert.Contains(t, s, fmt.Sprintf("1000×fetch(%.2f)", CostDocFetch),
-			"idBoundsSeek=true must override large-table scan label")
+		assert.Contains(t, s, fmt.Sprintf("1000×fetch(%g)", CostDocFetch),
+			"idBoundsSeek=true must override the large-table scan label")
+		assert.True(t, strings.HasSuffix(s, total(1000, 1000, false, true)), "unexpected total in %q", s)
 	})
 	t.Run("with_sort", func(t *testing.T) {
 		s := formatFullScanDetails(100, 50, true, false)
 		assert.Contains(t, s, fmt.Sprintf("sort(%.0f)=%.1f", 50.0, sortCost(50)))
-		total := 100*CostDocFetch + 100*CostFilter + sortCost(50)
-		assert.True(t, strings.HasSuffix(s, fmt.Sprintf("= %.1f", total)))
+		assert.Contains(t, s, fmt.Sprintf("50×materialize(%g)", CostMaterialize))
+		assert.True(t, strings.HasSuffix(s, total(100, 50, true, false)), "unexpected total in %q", s)
 	})
 }
 
@@ -2958,11 +3070,11 @@ func TestSelectivityForIndex(t *testing.T) {
 		idx := &CBOIndex{
 			Info:        &IndexInfo{FieldNames: []string{"a"}},
 			Bounds:      query.Bounds{{Start: []byte{1}, End: []byte{1}}},
-			Sketch:      mockSketch(25),
+			Sketch:      mockSketch(30),
 			PointLookup: true,
 			BoundFields: 1,
 		}
-		assert.InDelta(t, 0.25, selectivityForIndex(idx, 100), 1e-9)
+		assert.InDelta(t, 0.30, selectivityForIndex(idx, 100), 1e-9)
 	})
 	t.Run("sketch_clamp_low", func(t *testing.T) {
 		idx := &CBOIndex{
@@ -3789,8 +3901,8 @@ func TestBuildPlan_IndexHintBoost(t *testing.T) {
 // TestBuildPlan_FilteredYieldClamp_LowHits pins the IndexSeek(idxB) cost
 // formula at planner.go:350 when e=1 and filteredYield<1 clamp fires (line
 // 336-338). Setup: idxA's sketch(1) makes fieldSel[a]=0.01 so idxB's e=100×0.01=1
-// (exact). idxB's PointLookup=false forces idxSel=DefaultRangeSelectivity=0.5.
-// filteredYield = 1 × (pTotal/idxSel) = 1 × (0.01/0.5) = 0.02 → clamp to 1.
+// (exact). idxB's PointLookup=false forces idxSel=DefaultRangeSelectivity.
+// filteredYield = 1 × (pTotal/idxSel) = 1 × (0.01/0.25) = 0.04 → clamp to 1.
 // No sort: cost = nSeeks×CostIndexSeek + e×fetchCost + e×CostFilter
 // = 1×0.5 + 1×3.0 + 1×0.5 = 4.0.
 func TestBuildPlan_FilteredYieldClamp_LowHits(t *testing.T) {
@@ -3804,7 +3916,7 @@ func TestBuildPlan_FilteredYieldClamp_LowHits(t *testing.T) {
 	}
 	// idxB iterates Plan-B loop. BoundFields=1 enables the fieldSel lookup,
 	// which yields e=100*0.01=1. No sketch + PointLookup=false forces
-	// selectivityForIndex to return DefaultRangeSelectivity=0.5.
+	// selectivityForIndex to return DefaultRangeSelectivity.
 	idxB := CBOIndex{
 		Info:        &IndexInfo{Name: "idxB", FieldNames: []string{"a"}},
 		Bounds:      mustParseBounds("a", `{"a": 1}`),
@@ -3931,7 +4043,7 @@ func TestBuildPlan_PlanC_ScanDetailsRendered(t *testing.T) {
 // Setup: compound index (a,b) with BoundFields=1 (only a bound, b is trailing
 // fixed equality → coverFilters has 1 entry). idxSel comes from the level-0
 // prefix sketch: Estimate(0, a=5)/totalDocs = 10/100 = 0.1. coverSel is
-// DefaultRangeSelectivity=0.5 (no fieldSel because compound index doesn't
+// DefaultRangeSelectivity (no fieldSel because compound index doesn't
 // contribute to fieldSelectivity). scanPopulation = totalDocs × idxSel =
 // 100 × 0.1 = 10.
 func TestBuildPlan_PlanC_CoverFiltersNoLimit(t *testing.T) {
@@ -4134,9 +4246,10 @@ func TestBuildPlan_PlanC_HintBoost_CoversAllScanBoostLine(t *testing.T) {
 // where s = (Limit+Offset)/scanSel, capped at scanPopulation. Setup: filter
 // {"a":5,"b":10}, compound index (a,b) with BoundFields=1. idxSel from the
 // level-0 prefix sketch = Estimate(0, a=5)/100 = 5/100 = 0.05. pTotal = leading
-// field sketch (0.05) × b compound-equality DefaultRange (0.5) = 0.025. scanSel =
-// 0.025/0.05 = 0.5. raw s = 10/0.5 = 20, but scanPopulation = 100×0.05 = 5 caps
-// it to s = 5. coverSel=0.5. Cost = 5×0.1 + 5×0.5×3.0 + 5×0.5 = 10.5.
+// field sketch (0.05) × b compound-equality DefaultRangeSelectivity (0.25) =
+// 0.0125. scanSel = 0.0125/0.05 = 0.25. raw s = 10/0.25 = 40, but
+// scanPopulation = 100×0.05 = 5 caps it to s = 5. coverSel = 0.25.
+// Cost = 5×0.1 + 5×0.25×3.0 + 5×0.5 = 6.75.
 func TestBuildPlan_PlanC_CoverFiltersWithLimit(t *testing.T) {
 	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
 	filter := query.MustParseCondition(`{"a": 5, "b": 10}`)
@@ -4209,8 +4322,8 @@ func TestBuildPlan_PlanB_DetailsClosureFires(t *testing.T) {
 // at planner.go:336-338. Setup: totalDocs=100_000. idxA's sketch(1) makes
 // fieldSel[a]=1/100000=0.00001 and pTotal=0.00001. idxB has BoundFields=1
 // so estimateIndexDocsWithFieldSel yields e = 100000×0.00001 = 1.0 (exact).
-// idxSel = DefaultRangeSelectivity=0.5 (PointLookup=false). filteredYield
-// = 1 × (0.00001/0.5) = 0.00002 → clamps to 1 at line 337. No sort so the
+// idxSel = DefaultRangeSelectivity (PointLookup=false). filteredYield
+// = 1 × (0.00001/0.25) = 0.00004 → clamps to 1 at line 337. No sort so the
 // clamp doesn't alter cost directly, but cost = 1×CostIndexSeek + 1×fetchCost
 // + 1×CostFilter = 0.5 + 3.0 + 0.5 = 4.0 matches ONLY when e is correctly
 // computed and nSeeks=1 (i.e., the Plan-B loop entered for idxB).
@@ -4374,9 +4487,9 @@ func TestCoveringFilterSelectivity(t *testing.T) {
 	t.Run("with_sketch", func(t *testing.T) {
 		idx := &CBOIndex{Info: &IndexInfo{FieldNames: []string{"a", "b"}}}
 		filters := []IndexFieldFilter{{FieldIdx: 1}} // references field "b"
-		fieldSel := []fieldSelEntry{{field: "b", sel: 0.25}}
+		fieldSel := []fieldSelEntry{{field: "b", sel: 0.1}}
 		sel := coveringFilterSelectivity(filters, idx, fieldSel)
-		assert.Equal(t, 0.25, sel)
+		assert.Equal(t, 0.1, sel)
 	})
 	t.Run("missing_sketch_uses_default", func(t *testing.T) {
 		idx := &CBOIndex{Info: &IndexInfo{FieldNames: []string{"x"}}}
@@ -4393,10 +4506,10 @@ func TestCoveringFilterSelectivity(t *testing.T) {
 		}
 		fieldSel := []fieldSelEntry{
 			{field: "a", sel: 0.5},
-			{field: "b", sel: 0.25},
+			{field: "b", sel: 0.1},
 		}
 		sel := coveringFilterSelectivity(filters, idx, fieldSel)
-		assert.InDelta(t, 0.125, sel, 1e-9)
+		assert.InDelta(t, 0.05, sel, 1e-9)
 	})
 }
 

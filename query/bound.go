@@ -353,9 +353,11 @@ func (bs Bounds) ContainsSorted(val []byte) bool {
 // Intersect returns the lex-intersection of this bound set with other.
 // A bound set is a union of value ranges; the intersection is the set of
 // values present in BOTH unions. Used by TightIndexBounds to combine the
-// bounds contributed by multiple conjuncts on the same field — NEVER by
-// IndexBounds itself, whose over-approximation contract (see And.IndexBounds)
-// is what keeps array/multi-key seeks sound.
+// bounds contributed by multiple conjuncts on the same field — never by a
+// field-level IndexBounds, whose over-approximation contract (see
+// And.IndexBounds) is what keeps array/multi-key seeks sound; a value-form
+// $elemMatch is the one IndexBounds that intersects, because its operators
+// hold for a single element.
 //
 // An empty result (returned as a zero-length Bounds) means the two sets
 // share no values — distinct from "no narrowing", which preserves the input.
