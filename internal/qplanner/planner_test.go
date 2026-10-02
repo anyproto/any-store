@@ -177,6 +177,36 @@ func TestBuildPlan_SparseIndex_NeUsesIndex(t *testing.T) {
 	})
 }
 
+// TestRangeEstimates_MultikeyEntries pins the entries-vs-documents split for an
+// interpolated range on a fan-out index (three entries per document): the seek
+// estimate is the in-range ENTRY count (one fetch per entry, dedup follows the
+// fetch), while the document-side estimates cap it at the collection.
+func TestRangeEstimates_MultikeyEntries(t *testing.T) {
+	const totalDocs = 1000
+	sk := NewIndexSketch(DefaultSketchSize, 1)
+	for i := 0; i < 3*totalDocs; i++ {
+		sk.Increment(0, []byte{byte(i), byte(i >> 8)})
+	}
+	idx := &CBOIndex{
+		Info:        &IndexInfo{Name: "tags", FieldNames: []string{"tags"}},
+		Sketch:      sk,
+		Bounds:      mustParseBounds("tags", `{"tags": {"$gt": 5}}`),
+		BoundFields: 1,
+	}
+	assert.Equal(t, 3000.0, indexEntries(idx, totalDocs))
+	assert.Equal(t, 1000.0, indexPopulation(idx, totalDocs), "documents never exceed the collection")
+
+	idx.rangeSel = 0.01
+	assert.InDelta(t, 30.0, estimateIndexDocsWithFieldSel(idx, totalDocs, nil), 1e-9,
+		"seek pays one fetch per in-range entry")
+	assert.InDelta(t, 0.03, selectivityForIndex(idx, totalDocs), 1e-9,
+		"up to 30 of 1000 documents match")
+
+	idx.rangeSel = 0.5
+	assert.InDelta(t, 1000.0, rangeDocs(idx, idx.rangeSel, totalDocs), 1e-9,
+		"1500 in-range entries collapse to at most the collection")
+}
+
 // TestIndexCoversFilter_RejectsUncoveredField is the defensive regression for
 // the field-coverage check: a filter touching a field not in the index is
 // never reported as covered, and empty index bounds are never covered.

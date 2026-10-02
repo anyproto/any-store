@@ -2513,6 +2513,60 @@ func TestCBO_RangeInterpolation_DenseIndex(t *testing.T) {
 	})
 }
 
+// TestCBO_RangeInterpolation_MultikeyIndex: a range over an ARRAY field must be
+// priced from the interpolated entry fraction too. A multikey index holds one
+// entry per element, and the seek fetches once per in-range entry, so the
+// fraction times the entry count prices the seek exactly and bounds the
+// matched documents from above. Before, every such index skipped interpolation
+// and fell back to the flat 0.5 default, sending a ~1% range to a full scan.
+func TestCBO_RangeInterpolation_MultikeyIndex(t *testing.T) {
+	fx := newFixture(t)
+	const n = 5000
+
+	run := func(t *testing.T, coll anystore.Collection, selective, broad string, want int) {
+		explain, err := coll.Find(selective).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, explain.Sql, "Index",
+			"selective range over an array field must use the index, got: %s", explain.Sql)
+		assert.NotContains(t, explain.Plan, "Selectivity: 0.50",
+			"selectivity must be interpolated, not the flat default:\n%s", explain.Plan)
+		count, err := coll.Find(selective).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, want, count)
+
+		explain, err = coll.Find(broad).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, explain.Sql, "FullScan",
+			"broad range over an array field must stay on full scan, got: %s", explain.Sql)
+	}
+
+	t.Run("top-level array", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "tags")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+		docs := make([]*anyenc.Value, 0, n)
+		for i := 0; i < n; i++ {
+			// Three entries per doc over [0, 3n): the top 1.3% of entries
+			// belong to the 200 docs with i >= 4800.
+			docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"tags":[%d,%d,%d]}`, i, i, i+n, i+2*n)))
+		}
+		require.NoError(t, coll.Insert(ctx, docs...))
+		run(t, coll, `{"tags":{"$gt":14799}}`, `{"tags":{"$gt":1000}}`, 200)
+	})
+
+	t.Run("array of objects path", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "items")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "items.v", Fields: []string{"items.v"}}))
+		docs := make([]*anyenc.Value, 0, n)
+		for i := 0; i < n; i++ {
+			docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"items":[{"v":%d},{"v":%d}]}`, i, i, i+n)))
+		}
+		require.NoError(t, coll.Insert(ctx, docs...))
+		run(t, coll, `{"items.v":{"$gt":9899}}`, `{"items.v":{"$gt":500}}`, 100)
+	})
+}
+
 // queryIdsHinted runs Find(filter).Sort(sortSpec).Limit(limit).Offset(offset)
 // forcing the named index so the IndexScan/IndexSeek path (the one the
 // offset fast-skip optimizes) is exercised regardless of the cost model.

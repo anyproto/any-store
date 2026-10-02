@@ -355,18 +355,18 @@ func BuildPlan(params *PlanParams) *Plan {
 	// Runs BEFORE calculateSelectivity so pTotal's range terms can adopt the
 	// interpolated fraction. Interpolation ranks the tight-channel bounds
 	// (estBounds) so a two-sided range is rated (lo,hi), not (lo,+inf).
+	//
+	// The fraction counts index ENTRIES, and entries are what a seek pays
+	// for: a multikey index holds one entry per array element, and the chain
+	// fetches a document once per in-range entry (the canonical dedup runs on
+	// the fetched document). So rangeSel·EntryCount prices the seek on a
+	// fan-out index exactly, and the matched documents are at most that many
+	// (rangeDocs caps at the collection). Guessing a flat default there sent
+	// every selective range over an array field to a full scan.
 	if params.Tx != nil {
 		for i := range params.Indexes {
 			idx := &params.Indexes[i]
 			if idx.PointLookup || idx.Ns == nil || len(idx.Bounds) == 0 {
-				continue
-			}
-			// Interpolation counts index ENTRIES. For a multikey/array index an
-			// entry-fraction no longer maps to a document-fraction (one document
-			// fans out to many entries, and dedup collapses them), so the estimate
-			// would be biased; fall back to the EntryCount-bounded default there.
-			// Entries == documents (no fan-out) is exactly EntryCount(0) <= totalDocs.
-			if idx.Sketch != nil && idx.Sketch.EntryCount(0) > uint64(params.TotalDocs) {
 				continue
 			}
 			// rangeSel prices the SCAN (the bounds the chain seeks with);
@@ -502,7 +502,10 @@ func BuildPlan(params *PlanParams) *Plan {
 			e = 1
 		}
 
-		// Remaining filter selectivity after index seek
+		// Remaining filter selectivity after index seek. e counts fetched
+		// entries and may exceed the collection on a multikey index; the rows
+		// that reach a sort are deduped documents, so the yield is capped at
+		// the collection too.
 		idxSel := selectivityForIndex(idx, totalDocs)
 		filteredYield := e * (pTotal / idxSel)
 		if filteredYield < 1 {
@@ -510,6 +513,9 @@ func BuildPlan(params *PlanParams) *Plan {
 		}
 		if filteredYield > e {
 			filteredYield = e
+		}
+		if filteredYield > totalDocs {
+			filteredYield = totalDocs
 		}
 
 		// Index seek cost: B-tree seeks (one per bound) + fetch only matching docs + evaluate filter
@@ -999,19 +1005,13 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 					// Range predicate: prefer the interpolated fraction of THIS
 					// field's own bound chain (BoundFields==1 means the chain is
 					// exactly this leading field) over the flat default — this is
-					// what moves a two-sided range from 0.50 to its real ~0.005
+					// what moves a two-sided range from 0.50 to its real ~0.005.
 					// Same one-way ratchet as selectivityForIndex, same
-					// entries→docs conversion via the index population; the
-					// interpolation loop already skipped multikey indexes, whose
-					// entry fractions don't map to doc fractions.
+					// entries→docs conversion (rangeDocs).
 					p := DefaultRangeSelectivity
-					if fi == 0 && idx.BoundFields == 1 && idx.rangeSelTight > 0 && idx.rangeSelTight < p {
-						p = idx.rangeSelTight * indexPopulation(idx, totalDocs) / totalDocs
-						if p <= 0 {
-							p = 0.0001
-						}
-						if p > 1 {
-							p = 1
+					if fi == 0 && idx.BoundFields == 1 && idx.rangeSelTight > 0 {
+						if ip := rangeDocs(idx, idx.rangeSelTight, totalDocs) / totalDocs; ip < p {
+							p = max(ip, 0.0001)
 						}
 					}
 					pTotal *= p
@@ -1094,16 +1094,18 @@ func sketchLevelTrusted(s *IndexSketch, level int) bool {
 	return level == s.NumLevels()-1
 }
 
-// indexPopulation returns the number of documents reachable through this index:
-// its live entry count at the deepest bound level. For a SPARSE index this count
-// is far below the collection size and is itself a selectivity cut, so a range
-// fallback measured against it (rather than totalDocs) lets a sparse index win
-// natively — e.g. {a:{$ne:""}} on an index where only a few percent of docs have
-// `a` touches only those entries. Falls back to totalDocs when the sketch is
-// absent or the level is untrusted (legacy blob pending rebuild). Multikey/array
-// indexes can report more entries than documents; matching DOCUMENTS can never
-// exceed the collection, so the result is capped at totalDocs.
-func indexPopulation(idx *CBOIndex, totalDocs float64) float64 {
+// indexEntries returns the live entry count of this index at the deepest
+// bound level — the population an interpolated range fraction applies to. For
+// a SPARSE index this count is far below the collection size and is itself a
+// selectivity cut, so a range fallback measured against it (rather than
+// totalDocs) lets a sparse index win natively — e.g. {a:{$ne:""}} on an index
+// where only a few percent of docs have `a` touches only those entries. A
+// multikey/array index reports more entries than documents (one per element,
+// deduped per document at the shallow prefix levels), and a seek fetches once
+// per in-range entry, so the count is NOT capped at the collection here. Falls
+// back to totalDocs when the sketch is absent or the level is untrusted
+// (legacy blob pending rebuild).
+func indexEntries(idx *CBOIndex, totalDocs float64) float64 {
 	if idx.Sketch == nil {
 		return totalDocs
 	}
@@ -1112,11 +1114,25 @@ func indexPopulation(idx *CBOIndex, totalDocs float64) float64 {
 	if !sketchLevelTrusted(idx.Sketch, level) {
 		return totalDocs
 	}
-	pop := float64(idx.Sketch.EntryCount(level))
-	if pop <= 0 || pop > totalDocs {
+	n := float64(idx.Sketch.EntryCount(level))
+	if n <= 0 {
 		return totalDocs
 	}
-	return pop
+	return n
+}
+
+// indexPopulation returns the number of documents reachable through this
+// index: indexEntries capped at the collection, since matching DOCUMENTS can
+// never exceed it however many entries a fan-out index holds.
+func indexPopulation(idx *CBOIndex, totalDocs float64) float64 {
+	return min(indexEntries(idx, totalDocs), totalDocs)
+}
+
+// rangeDocs estimates the documents a range chain matches: the interpolated
+// entry fraction f of the chain level's live entries, capped at the
+// collection — the in-range entries of one fan-out document collapse to it.
+func rangeDocs(idx *CBOIndex, f, totalDocs float64) float64 {
+	return min(f*indexEntries(idx, totalDocs), totalDocs)
 }
 
 // interpolateRangeSel estimates the fraction of this index's entries that its
@@ -1300,15 +1316,16 @@ func selectivityForIndex(idx *CBOIndex, totalDocs float64) float64 {
 	// Range / non-equality fallback: bound by the index's own population so a
 	// sparse index (EntryCount << totalDocs) is credited its presence cut instead
 	// of being charged the full collection. Interpolation acts as a one-way
-	// ratchet: the real interpolated rangeSel is adopted only when it is MORE
-	// selective than the conservative default — it refines a genuinely selective
-	// range downward (so the index wins) but never penalizes an index above the
-	// default for a broad range (so no previously-indexed plan regresses).
-	f := DefaultRangeSelectivity
-	if idx.rangeSel > 0 && idx.rangeSel < f {
-		f = idx.rangeSel
+	// ratchet: the interpolated estimate (rangeDocs) is adopted only when it is
+	// MORE selective than the conservative default — it refines a genuinely
+	// selective range downward (so the index wins) but never penalizes an index
+	// above the default for a broad range (so no previously-indexed plan
+	// regresses).
+	docs := DefaultRangeSelectivity * indexPopulation(idx, totalDocs)
+	if idx.rangeSel > 0 {
+		docs = min(docs, rangeDocs(idx, idx.rangeSel, totalDocs))
 	}
-	return f * indexPopulation(idx, totalDocs) / totalDocs
+	return docs / totalDocs
 }
 
 // estimateIndexDocsWithFieldSel estimates the number of documents an index seek will return,
@@ -1343,9 +1360,14 @@ func estimateIndexDocsWithFieldSel(idx *CBOIndex, totalDocs float64, fieldSel []
 	// one-way ratchet (see selectivityForIndex): a selective range is refined down
 	// so the index wins, a broad range never inflates e above the default. rangeSel
 	// already spans the whole bound union (e.g. both halves of a $ne), so it is
-	// applied directly to the population rather than multiplied per field.
-	if idx.rangeSel > 0 && idx.rangeSel < DefaultRangeSelectivity {
-		return idx.rangeSel * indexPopulation(idx, totalDocs)
+	// applied directly to the population rather than multiplied per field. The
+	// population is ENTRIES, uncapped: on a multikey index the seek fetches a
+	// document once per in-range element (dedup follows the fetch), so entries,
+	// not documents, are what it pays for.
+	if idx.rangeSel > 0 {
+		if e := idx.rangeSel * indexEntries(idx, totalDocs); e < DefaultRangeSelectivity*indexPopulation(idx, totalDocs) {
+			return e
+		}
 	}
 
 	// Fallback for partial bounds: use per-field selectivity from single-field indexes
