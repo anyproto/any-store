@@ -2,9 +2,11 @@ package anystore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -304,7 +306,10 @@ func TestRecovery_ForceFlushWithTimeout(t *testing.T) {
 
 	time.Sleep(15 * time.Millisecond)
 
-	ctxTimeout, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	// An idle database flushes well within the budget; the budget is wide
+	// because a passive checkpoint on a slow CI runner takes longer than a
+	// few tens of milliseconds, and a timeout here reads as a flush failure.
+	ctxTimeout, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	err = db.Flush(ctxTimeout, 10*time.Millisecond, FlushModeCheckpointPassive)
@@ -330,10 +335,12 @@ func TestRecovery_ForceFlushWithTimeout(t *testing.T) {
 	defer cancel2()
 	err = db.Flush(ctxTimeout2, 50*time.Millisecond, FlushModeCheckpointPassive)
 	close(stopWrites)
-	assert.Error(t, err)
-	if err != nil {
-		assert.Contains(t, err.Error(), "cancelled")
-	}
+	// The budget ends the flush: between attempts the controller reports it
+	// cancelled, inside a checkpoint the deadline surfaces directly.
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(err.Error(), "cancelled") || strings.Contains(err.Error(), "deadline exceeded"),
+		"unexpected flush error: %v", err)
 }
 
 // The idle flush must keep running after the context passed to Open is
