@@ -244,16 +244,37 @@ func (s *IndexSketch) UnmarshalBinary(data []byte) {
 	s.unmarshalLegacy(data)
 }
 
+// v2Shape parses a V2 blob's header into its levels and size. ok is false
+// for a blob without the magic, a corrupt header or a truncated body: none of
+// these loads into a sketch with a reshape.
+func v2Shape(data []byte) (levels, size int, ok bool) {
+	if len(data) < sketchHeaderLen || [4]byte{data[0], data[1], data[2], data[3]} != sketchMagic {
+		return 0, 0, false
+	}
+	levels = int(binary.LittleEndian.Uint32(data[4:]))
+	size = int(binary.LittleEndian.Uint32(data[8:]))
+	if levels < 1 || size < 1 || len(data) < sketchHeaderLen+8*size*levels+8*levels+8 {
+		return 0, 0, false
+	}
+	return levels, size, true
+}
+
+// SameShape reports whether UnmarshalBinary would load data without
+// reshaping the sketch: a V2 blob of its size and levels, or bytes that load
+// into the existing shape or leave it alone (legacy, corrupt, truncated). A
+// published sketch may be reloaded in place only when this holds, since a
+// reshape replaces slices a concurrent reader holds.
+func (s *IndexSketch) SameShape(data []byte) bool {
+	levels, size, ok := v2Shape(data)
+	return !ok || (levels == s.Levels && size == s.Size)
+}
+
 func (s *IndexSketch) unmarshalV2(data []byte) {
-	levels := int(binary.LittleEndian.Uint32(data[4:]))
-	size := int(binary.LittleEndian.Uint32(data[8:]))
-	if levels < 1 || size < 1 {
-		return // corrupt header: preserve current state
+	levels, size, ok := v2Shape(data)
+	if !ok {
+		return // corrupt header or truncated body: preserve current state
 	}
 	nb := size * levels
-	if len(data) < sketchHeaderLen+8*nb+8*levels+8 {
-		return // truncated: preserve current state
-	}
 	if size != s.Size || levels != s.Levels {
 		s.Buckets = make([]uint64, nb)
 		s.levelTotals = make([]uint64, levels)

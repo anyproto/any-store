@@ -1,6 +1,7 @@
 package qplanner
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -263,4 +264,21 @@ func TestIndexSketch_Distribution(t *testing.T) {
 		// The hot bucket sits in the top percentile.
 		assert.Equal(t, uint64(200), d.P99)
 	})
+}
+
+func TestIndexSketch_SameShape(t *testing.T) {
+	s := NewIndexSketch(64, 2)
+	same := NewIndexSketch(64, 2).MarshalBinary(nil)
+	otherLevels := NewIndexSketch(64, 1).MarshalBinary(nil)
+	otherSize := NewIndexSketch(32, 2).MarshalBinary(nil)
+	assert.True(t, s.SameShape(same))
+	assert.False(t, s.SameShape(otherLevels))
+	assert.False(t, s.SameShape(otherSize))
+	// Bytes UnmarshalBinary loads into the existing shape or leaves alone.
+	assert.True(t, s.SameShape(make([]byte, 8*64)), "legacy")
+	assert.True(t, s.SameShape(nil))
+	assert.True(t, s.SameShape(otherSize[:len(otherSize)-1]), "truncated")
+	corrupt := append([]byte(nil), otherLevels...)
+	binary.LittleEndian.PutUint32(corrupt[4:], 0)
+	assert.True(t, s.SameShape(corrupt), "corrupt header")
 }

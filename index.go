@@ -347,11 +347,12 @@ type index struct {
 	// inserts).
 	sketch *qplanner.IndexSketch
 
-	// sketchPub is the READER-VISIBLE copy-on-write snapshot — the per-index
+	// sketchPub is the READER-VISIBLE published sketch — the per-index
 	// analog of collection.indexes. The query/Stats path reads it lock-free via
-	// loadPubSketch(); the advisory staleness tier publishes a freshly decoded
-	// sketch into it on a stale READ (build-fresh, never mutate-in-place); the
-	// writer republishes its live object into it at commit (a pointer Store, no
+	// loadPubSketch(); the advisory staleness tier decodes the disk bytes into
+	// it on a stale READ (in place while it is a reader-owned object, a fresh
+	// one while it is the live sketch — never into live); the writer
+	// republishes its live object into it at commit (a pointer Store, no
 	// clone). Non-nil once the index is published to readers.
 	sketchPub atomic.Pointer[qplanner.IndexSketch]
 
@@ -415,9 +416,10 @@ type index struct {
 	mkBuf       []byte          // reusable buffer for the multikey-flag check-and-put read
 }
 
-// loadPubSketch returns the published reader snapshot. Lock-free; the returned
-// pointer is valid for the caller's transaction (a concurrent reload swaps a new
-// object in, leaving this one untouched). Mirrors collection.loadIndexes().
+// loadPubSketch returns the published reader snapshot. Lock-free; the pointer
+// stays valid for the caller's transaction. A concurrent reload may decode
+// newer bytes into this object or swap a new one in: plan-time estimates
+// only, see IndexSketch. Mirrors collection.loadIndexes().
 func (idx *index) loadPubSketch() *qplanner.IndexSketch { return idx.sketchPub.Load() }
 
 // storePubSketch publishes a reader snapshot. Callers hold c.mu (publisher

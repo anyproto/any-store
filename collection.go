@@ -1725,14 +1725,19 @@ func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, idx *index) {
 //	WRITE tx (writable): the calling goroutine holds the btree writeMu and is the
 //	  SOLE mutator of idx.sketch, so it reloads IN PLACE into the live object (0
 //	  alloc) — catching up to a peer's committed counts BEFORE applying its own
-//	  deltas, which keeps sequential cross-process counts exact for free — then
+//	  deltas (a reader that consumed the peer's commit first leaves live
+//	  behind until the next stale verdict: advisory, see IndexSketch) — then
 //	  republishes live so readers see the peer's state immediately.
 //
 //	READ tx (!writable): a concurrent in-process writer may be incrementing
-//	  idx.sketch right now, so we NEVER touch it. We decode the disk bytes into a
-//	  FRESH sketch and swap it into sketchPub (copy-on-write). The writer's live
-//	  object is untouched; its in-flight increments can never be lost. This is the
-//	  fix for the reader-clobbers-writer count loss.
+//	  idx.sketch right now, so we NEVER touch it. The disk bytes are decoded
+//	  into the reader-owned published sketch — in place, as the writer path
+//	  does with its own: every field is read and written atomically and a
+//	  planner tolerates a mix of two reloads (plan-time only, see IndexSketch)
+//	  — and a fresh one is allocated only while the published sketch IS the
+//	  live object (initially, and again after each commit republishes it).
+//	  The writer's live object is untouched; its in-flight increments can
+//	  never be lost.
 func (c *collection) reloadSketch(tx *btree.ReadTx, idx *index, writable bool) {
 	key := sketchKey(c.name, idx.info.Name)
 	data, err := tx.AppendValue(c.db.systemNS, key, c.sketchReadBuf[:0])
@@ -1752,9 +1757,18 @@ func (c *collection) reloadSketch(tx *btree.ReadTx, idx *index, writable bool) {
 		idx.sketchModified = false
 		return
 	}
-	fresh := qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
-	fresh.UnmarshalBinary(data)
-	idx.storePubSketch(fresh) // copy-on-write swap; live object untouched
+	// idx.sketch is only replaced under c.mu (held here) or before the index
+	// is published, so the identity check is race-free; a commit that
+	// republishes live concurrently (persistSketches runs under db.mu) is
+	// overtaken by this snapshot's bytes, as a fresh object would be. Bytes
+	// of another shape (a snapshot older than this handle's definition) go
+	// into a fresh object: a published one is never reshaped.
+	pub := idx.loadPubSketch()
+	if pub == nil || pub == idx.sketch || !pub.SameShape(data) {
+		pub = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
+	}
+	pub.UnmarshalBinary(data)
+	idx.storePubSketch(pub)
 }
 
 // reconcileIndexes rebuilds the collection's index set from on-disk metadata
@@ -1782,10 +1796,10 @@ func (c *collection) reloadSketch(tx *btree.ReadTx, idx *index, writable bool) {
 // schema-stale tx will retry. The whole operation is best-effort and never
 // surfaces an error to the caller — a failed reconcile must not break an
 // otherwise valid read/write transaction.
-func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
+func (c *collection) reconcileIndexes(tx *btree.ReadTx) (complete bool) {
 	infos, err := c.db.getIndexInfos(tx, c.name)
 	if err != nil {
-		return
+		return false
 	}
 
 	c.mu.Lock()
@@ -1793,14 +1807,16 @@ func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
 
 	if c.indexSetDDLTxs > 0 {
 		// A local write tx has uncommitted index DDL published in these sets.
-		// The cookie bump this pass reacts to predates that writer's begin (it
-		// holds the cross-process write lock), so the writer's own begin-time
-		// checkStale already reconciled it; rebuilding here from this tx's
-		// OLDER snapshot would evict the writer's uncommitted indexes (its
-		// same-tx inserts would silently stop being indexed, and buffered fts
-		// postings would never flush). Skip — the same argument as the
+		// While that writer holds the cross-process write lock the cookie
+		// bump this pass reacts to predates its begin, and its own begin-time
+		// checkStale reconciled it; rebuilding here from this tx's OLDER
+		// snapshot would evict the writer's uncommitted indexes (its same-tx
+		// inserts would silently stop being indexed, and buffered fts
+		// postings would never flush). Skip, consuming nothing: a peer's
+		// bump between the writer's btree commit and its commit publication
+		// waits for the next begin — the same argument as the
 		// renameInFlight guard in reconcileIndexSet.
-		return
+		return false
 	}
 
 	snapSC := tx.SnapshotSchemaCookie()
@@ -1808,8 +1824,8 @@ func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
 		// Publication ratchet (see the field): the published sets are newer
 		// than this pass's snapshot — republishing from the older catalog
 		// would resurrect dropped indexes or evict fresher ones. Skip; a
-		// fresher begin reconciles.
-		return
+		// fresher begin reconciles, and the sets already cover this snapshot.
+		return true
 	}
 	c.indexSetCookie = snapSC
 
@@ -1895,9 +1911,10 @@ func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
 
 	if !changed {
 		// Fast path: same set, same definitions, same roots — nothing to publish.
-		return
+		return true
 	}
 	c.storeIndexes(rebuilt)
+	return true
 }
 
 // indexInfoEqual reports whether two IndexInfo values describe the same index

@@ -502,16 +502,37 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 // as reconciled that never was — later txs (including writers) would trust an
 // index set missing a peer's index and stop maintaining it. Left short, the
 // verdict stays stale and the next begin (with a newer snapshot) converges.
+//
+// A pass that could not reconcile a collection — a local DDL commit still
+// publishing, a rename between its name flip and its commit, a catalog read
+// that failed — consumes nothing either: the verdict stays stale and the next
+// begin converges, like after a short snapshot. So the local counters only
+// ever record a state the in-memory sets fully reflect.
+//
+// A verdict a commit of THIS process produced — it landed between the begin's
+// read of the local counters and its read of the disk ones — has nothing to
+// reload: the writer published its index sets and sketches in-process and
+// recorded the committed counters. The pass returns once the local counters
+// have reached the counters this tx saw on disk (LocalCaughtUp), and the
+// consumption below never moves them back (AdvanceLocalCounters), so under a
+// steady write load a read begin stays a counter comparison instead of a
+// reload of every open collection's sketches.
 func (db *db) checkStale(tx *btree.ReadTx) {
 	if !tx.IsSchemaStale() && !tx.IsDataStale() {
 		return
 	}
+	if tx.LocalCaughtUp() {
+		return
+	}
 	snapFCC, snapSC := tx.SnapshotFileChangeCounter(), tx.SnapshotSchemaCookie()
+	complete := true
 	if tx.IsSchemaStale() {
-		db.reconcileIndexSet(tx, snapSC)
+		complete = db.reconcileIndexSet(tx, snapSC)
 	}
 	db.reloadSketches(tx)
-	db.btreeDB.UpdateLocalCounters(snapFCC, snapSC)
+	if complete {
+		db.btreeDB.AdvanceLocalCounters(snapFCC, snapSC)
+	}
 }
 
 // reconcileIndexSet rebuilds the in-memory index set of every open collection
@@ -523,8 +544,11 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 // Each surviving
 // collection is reconciled under its own c.mu and the result published
 // atomically (copy-on-write), so lock-free query readers always observe a
-// complete index generation.
-func (db *db) reconcileIndexSet(tx *btree.ReadTx, snapCookie uint32) {
+// complete index generation. complete reports that every collection was
+// judged against this snapshot; a skipped one leaves the pass unconsumed
+// (see checkStale).
+func (db *db) reconcileIndexSet(tx *btree.ReadTx, snapCookie uint32) (complete bool) {
+	complete = true
 	type namedColl struct {
 		name string
 		c    *collection
@@ -542,12 +566,15 @@ func (db *db) reconcileIndexSet(tx *btree.ReadTx, snapCookie uint32) {
 		nc.c.mu.Unlock()
 		if renameInFlight {
 			// A local Rename is between its name flip and its commit (the
-			// registry re-keys only at commit). Skip: the renaming writer
-			// holds the cross-process write lock, so the cookie bump this
-			// pass consumes predates its begin and was reconciled there;
-			// checking c.name against this tx's older snapshot would
-			// spuriously invalidate the handle, and reconciling its index
-			// set under the flipped name would publish an empty one.
+			// registry re-keys only at commit). Skip, consuming nothing:
+			// while the renaming writer holds the cross-process write lock
+			// the cookie bump predates its begin and was reconciled there,
+			// and a peer's bump between its btree commit and its re-key
+			// waits for the next begin. Checking c.name against this tx's
+			// older snapshot would spuriously invalidate the handle, and
+			// reconciling its index set under the flipped name would publish
+			// an empty one.
+			complete = false
 			continue
 		}
 		if !tx.IsWriteTx() && snapCookie < nc.c.validFromCookie.Load() {
@@ -567,8 +594,11 @@ func (db *db) reconcileIndexSet(tx *btree.ReadTx, snapCookie uint32) {
 			db.invalidateCollection(nc.c)
 			continue
 		}
-		nc.c.reconcileIndexes(tx)
+		if !nc.c.reconcileIndexes(tx) {
+			complete = false
+		}
 	}
+	return complete
 }
 
 // collectionVanished reports whether the collection this handle points at no
@@ -626,8 +656,9 @@ func (db *db) invalidateCollection(c *collection) {
 // reloadSketches reloads all sketch data from the _system namespace for opened
 // collections (the advisory Tier-2 of checkStale). The per-index leaf branches
 // on whether this tx is the writer: a write tx (sole mutator under writeMu)
-// reloads in place into the live sketch; a read tx swaps a fresh copy-on-write
-// snapshot so it can never clobber a concurrent writer's in-flight increments.
+// reloads in place into the live sketch; a read tx reloads the reader-owned
+// published copy so it can never clobber a concurrent writer's in-flight
+// increments.
 func (db *db) reloadSketches(tx *btree.ReadTx) {
 	writable := tx.IsWriteTx()
 	db.mu.Lock()

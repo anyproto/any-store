@@ -1100,13 +1100,45 @@ func (db *DB) Checkpoint(mode CheckpointMode) error {
 	return db.pager.checkpointWithMode(mode)
 }
 
-// UpdateLocalCounters manually sets the local counter cache. This is used by
-// a process that has detected staleness and rebuilt its in-memory state: after
-// rebuilding, call this to record the new baseline so subsequent transactions
-// no longer report as stale. Uses atomic stores, safe to call concurrently.
+// UpdateLocalCounters sets the local counter cache: the page-1 counters the
+// in-memory state is known to reflect. Commit sets them to the committed
+// values; a caller that rebuilt its in-memory state from a snapshot records
+// that snapshot with AdvanceLocalCounters. This raw store exists for tests,
+// which also wind the cache back to model a peer's commit.
 func (db *DB) UpdateLocalCounters(fileChangeCounter, schemaCookie uint32) {
 	db.localFileChangeCounter.Store(fileChangeCounter)
 	db.localSchemaCookie.Store(schemaCookie)
+}
+
+// AdvanceLocalCounters records that the in-memory state reflects the given
+// counters, never moving either one back: a commit that landed meanwhile
+// already recorded newer values, and the state it published must not be
+// reported stale again by the next transaction.
+func (db *DB) AdvanceLocalCounters(fileChangeCounter, schemaCookie uint32) {
+	advanceCounter(&db.localFileChangeCounter, fileChangeCounter)
+	advanceCounter(&db.localSchemaCookie, schemaCookie)
+}
+
+// LocalCounters returns the local counter cache.
+func (db *DB) LocalCounters() (fileChangeCounter, schemaCookie uint32) {
+	return db.localFileChangeCounter.Load(), db.localSchemaCookie.Load()
+}
+
+// advanceCounter stores v unless c already holds v or a later value; the
+// counters increment per commit and are compared modulo 2^32.
+func advanceCounter(c *atomic.Uint32, v uint32) {
+	for {
+		old := c.Load()
+		if int32(v-old) <= 0 || c.CompareAndSwap(old, v) {
+			return
+		}
+	}
+}
+
+// counterReached reports whether have has reached target, comparing
+// modulo 2^32 like advanceCounter.
+func counterReached(have, target uint32) bool {
+	return int32(have-target) >= 0
 }
 
 // CreateNamespace creates a new namespace. Must be called within a write transaction.
@@ -1962,9 +1994,19 @@ func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 // the sole in-process mutator and can see this tx's own uncommitted pages). It is
 // false for a standalone read-only transaction. The advisory sketch tier uses
 // this to choose an in-place reload (write-tx path, safe to mutate the live
-// sketch) vs a fresh copy-on-write swap (read-tx path).
+// sketch) vs a reload of the reader-owned published copy (read-tx path).
 func (tx *ReadTx) IsWriteTx() bool {
 	return tx.writable
+}
+
+// LocalCaughtUp reports whether the local counter cache has reached the
+// counters this tx read from disk at begin: the state the cache stands for
+// already covers everything the tx can see. With the cache moving only
+// forward, a stale verdict can then only have come from a commit of this
+// process that landed during the begin and recorded its counters since.
+func (tx *ReadTx) LocalCaughtUp() bool {
+	fcc, sc := tx.db.LocalCounters()
+	return counterReached(fcc, tx.diskFileChangeCounter) && counterReached(sc, tx.diskSchemaCookie)
 }
 
 // IsDataStale returns true if the on-disk FileChangeCount differs from the
