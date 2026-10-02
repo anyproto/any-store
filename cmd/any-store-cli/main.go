@@ -10,7 +10,7 @@ import (
 func main() {
 	pflag.Parse()
 	if *fHelp {
-		printUsage()
+		printHelp(os.Stdout, helpName(), os.Getenv(helpForAgentEnv) == "1")
 		return
 	}
 	if *fVersion {
@@ -25,7 +25,7 @@ func main() {
 	}
 
 	if err := openConn(path); err != nil {
-		fmt.Fprintf(os.Stderr, "error while opening database: %v", err)
+		fmt.Fprintf(os.Stderr, "error while opening database: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -37,12 +37,16 @@ func main() {
 	}
 
 	if *fExec != "" {
+		// A single command has no "it" to page with: print every result.
+		conn.pageSize = 0
 		result, err := conn.Exec(*fExec)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error while executiong command: %v", err)
+			fmt.Fprintf(os.Stderr, "error while executing command: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println(result)
+		if result != "" {
+			fmt.Println(result)
+		}
 		return
 	}
 

@@ -21,7 +21,7 @@ func openConn(path string) (err error) {
 	if err != nil {
 		return err
 	}
-	conn = &Conn{db: db, js: j}
+	conn = &Conn{db: db, js: j, pageSize: 30}
 	if err = conn.makeAutocomplete(); err != nil {
 		_ = db.Close()
 		return
@@ -45,6 +45,10 @@ type Conn struct {
 
 	lastIter  anystore.Iterator
 	lastQuery Query
+
+	// pageSize is how many documents a query prints before asking for "it";
+	// 0 prints them all.
+	pageSize int
 }
 
 func (c *Conn) closeLastIter() {
@@ -74,6 +78,7 @@ func (c *Conn) makeAutocomplete() (err error) {
 }
 
 func (c *Conn) Exec(cmdLine string) (result string, err error) {
+	cmdLine = strings.TrimSpace(cmdLine)
 	var cmd Cmd
 	if strings.HasPrefix(cmdLine, "help") {
 		cmd.Cmd = "help"
@@ -641,7 +646,6 @@ func (c *Conn) printDoc(doc anystore.Doc, query Query) error {
 }
 
 func (c *Conn) printIter(iter anystore.Iterator, query Query, first bool) (string, error) {
-	batchSize := 30
 	count := 0
 
 	if !first {
@@ -655,7 +659,7 @@ func (c *Conn) printIter(iter anystore.Iterator, query Query, first bool) (strin
 		count++
 	}
 
-	for (query.Limit == 0 || count < query.Limit) && count < batchSize && iter.Next() {
+	for (query.Limit == 0 || count < query.Limit) && (c.pageSize == 0 || count < c.pageSize) && iter.Next() {
 		doc, err := iter.Doc()
 		if err != nil {
 			return "", err
@@ -666,7 +670,7 @@ func (c *Conn) printIter(iter anystore.Iterator, query Query, first bool) (strin
 		count++
 	}
 
-	if count == batchSize && (query.Limit == 0 || (query.Limit > 0 && count < query.Limit)) && iter.Next() {
+	if c.pageSize > 0 && count == c.pageSize && (query.Limit == 0 || count < query.Limit) && iter.Next() {
 		fmt.Println("Type \"it\" for more")
 		c.lastIter = iter
 		c.lastQuery = query
