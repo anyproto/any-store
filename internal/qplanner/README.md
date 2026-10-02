@@ -27,23 +27,50 @@ Constants defined in `cost.go`:
 |---|---|---|
 | `CostIndexSeek` | 0.5 | Cost of a B-tree traversal to find a key (per bound/seek) |
 | `CostDocFetch` | 3.0 | Cost of a random point lookup in the data B-tree (index → data) |
-| `CostSeqRead` | 0.1 | Cost of a sequential cursor read per doc (full scan) |
+| `CostScanDoc` | 1.25 | Cost of reading one document on a full scan: sequential page walk plus decompress and decode to the point of rejection |
+| `CostSeqRead` | 0.1 | Cost of a sequential cursor read per index entry |
 | `CostFilter` | 0.5 | Cost of in-memory predicate evaluation |
 | `CostSortSwap` | 0.25 | Cost of an in-memory sort swap (includes re-fetch overhead) |
-| `DefaultRangeSelectivity` | 0.5 | Default fraction for range queries |
+| `DefaultRangeSelectivity` | 0.25 | Fraction for a range the planner cannot measure (SQLite's one-bound factor) |
+
+`CostScanDoc + CostFilter` is half of `CostDocFetch + CostFilter`, so above 500
+documents a filter matching under 50% of the collection is served from an
+index. Measured on the index path against the scan, a random fetch costs about
+3× a scanned document at ~700 B, 1.8× at 1 KB with twenty fields and about 1× at
+4 KB; the model errs toward the index because a full scan chosen for a range
+that turns out selective costs 10–20× while an index chosen for a broad one
+costs 1.3–1.6× on small documents and nothing on 1 KB ones.
 
 #### Selectivity Estimation
 
 - **Equality** (`a = 1`): `P = sketch.Estimate(encodedValue) / TotalDocs`
-- **Range** (`a > 5`): `P = DefaultRangeSelectivity`
+- **Range** (`a > 5`): `f = Cursor.RangeFraction(bounds)` — the fraction of the
+  index's entries inside the bounds, interpolated from the live index B-tree
+  (one descent per endpoint; a range the index holds nothing of measures as
+  `1e-6`, not as unmeasured). The seek is priced at `f × EntryCount` entries:
+  a multikey index holds one entry per array element plus the whole-array
+  entry, a single-field chain fetches once per in-range entry and a compound
+  chain dedups by document before the fetch, so entries bound it from above.
+  The documents matched are `min(f × EntryCount, TotalDocs)`. An index whose
+  entries outnumber the documents is rated on its wide seek bounds, never on
+  a conjunction's intersection: a document can satisfy each conjunct through
+  a different element. `DefaultRangeSelectivity` applies only when nothing
+  was measured. The `$text` and `$knn` planners measure the same way.
+- **Primary-key range** (`id > cursor`): the fraction of the data B-tree the
+  range covers, measured the same way; the full scan reads only that part.
 - **Combined** (AND): `P_total = P(a) * P(b)` (independence assumption)
 
 #### Plan Cost Formulas
 
 **Plan A: Full Collection Scan**
 ```
-Cost = (EffectiveDocs × CostSeqRead) + (EffectiveDocs × CostFilter) + sortCost(EstimatedYield)
+Cost = (EffectiveDocs × CostScanDoc) + (EffectiveDocs × CostFilter)
+     [+ sortCost(EstimatedYield) + EstimatedYield × CostMaterialize   when the scan must sort]
 ```
+`EffectiveDocs` is the collection, the fraction a primary-key range covers, or
+the point lookups of fixed primary-key bounds. At 500 effective documents or
+fewer the read is priced at `CostDocFetch` (shallow tree, no sequential
+advantage).
 When idBounds are present (point lookups on the primary key), `EffectiveDocs` is replaced with `len(idBounds)`.
 
 **primary-key-sort optimization**: Sorting by the primary key (asc or desc) is free — FullScan naturally reads in primary-key order. When the sort is primary-key-only, `fullScanNeedSort` is false and no SortIter is created. The `Reverse` flag on FullScanIter handles descending order. This works with or without a filter. (The primary key is the collection's configured key field, default `id`.)
@@ -56,7 +83,7 @@ This accounts for early termination — e.g. `Find({"a":5}).Sort("id").Limit(10)
 
 **Plan B: Index Seek (Filtering Priority)**
 ```
-E = sketch.Estimate(value)  // estimated matching docs
+E = sketch.Estimate(value)  // equality: estimated matching docs; range: f × EntryCount fetched entries
 Cost = nSeeks × CostIndexSeek + (E × CostDocFetch) + (E × CostFilter) + sortCost(FilteredYield)
 ```
 Sort cost is zero if the index covers the sort order.
@@ -71,11 +98,14 @@ This avoids charging for fetching all E docs when only a few are needed.
 
 **Plan C: Index Scan (Sorting Priority)**
 ```
-With LIMIT: S = min((LIMIT + OFFSET) / P_total, TotalDocs)
-Without LIMIT: S = TotalDocs
+scanSel = P_total / idxSel            // fraction of the index range that passes the residual
+Population = max(TotalDocs × idxSel, entries in the range)
+With LIMIT: S = min((LIMIT + OFFSET) / scanSel × entriesPerDoc, Population)
+Without LIMIT: S = Population
 Cost = (S × CostIndexSeek) + (S × CostDocFetch) + (S × CostFilter)
 ```
-No sort cost since the index provides order.
+No sort cost since the index provides order. With covering filter fields the
+seek term becomes `S × CostSeqRead` and only `S × coverSel` rows are fetched.
 
 ---
 

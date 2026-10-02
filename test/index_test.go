@@ -656,7 +656,9 @@ func TestQRM_Array_SingleField_Reverse(t *testing.T) {
 	// Filtered Sort drives the index path -> CanonicalKeyDedupIter w/ FieldReverse.
 	t.Run("filtered_sort_index_dedup", func(t *testing.T) {
 		f := `{"tags":{"$gte":1}}`
-		sql := qrmExplain(t, idx.Find(f).Sort("-tags"))
+		// On a handful of documents the ordered scan over fan-out entries
+		// prices above the scan+sort; the hint forces the path under test.
+		sql := qrmExplain(t, idx.Find(f).Sort("-tags").IndexHint(anystore.IndexHint{IndexName: "-tags", Boost: 1000000}))
 		assert.Contains(t, sql, "IndexScan(-tags)")
 		assert.Contains(t, sql, "Dedup(canonical)")
 		assert.NotContains(t, sql, "(reverse)") // declared direction

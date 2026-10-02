@@ -1961,7 +1961,10 @@ func TestAudit10_RangeMultiKey_ReverseRange(t *testing.T) {
 	})
 
 	t.Run("explain confirms IndexScan + dedup wrap on the reverse scan", func(t *testing.T) {
-		explain, err := coll.Find(`{"tags":{"$gte":"a","$lte":"c"}}`).Sort("-tags").Explain(ctx)
+		// On a handful of documents the ordered scan over fan-out entries
+		// prices above the scan+sort; the hint forces the path under test.
+		explain, err := coll.Find(`{"tags":{"$gte":"a","$lte":"c"}}`).Sort("-tags").
+			IndexHint(anystore.IndexHint{IndexName: "ix_tags", Boost: 1000000}).Explain(ctx)
 		require.NoError(t, err)
 		// The plan should use the index (IndexScan or IndexSeek), not a
 		// full-collection scan + sort. We don't pin the exact SQL string
@@ -2233,8 +2236,9 @@ func TestAudit11_SingletonIn_MultipleDocs(t *testing.T) {
 Audit tests for the "single-index" domain (any-store-tests:docs/any-store/qplanner/audit/actionable_by_domain.json).
 
   act-01  $ne on an indexed scalar uses a two-bound seek and still includes
-          null/missing (non-sparse): the index IS used (IndexScan, not FullScan),
-          value 5 is excluded, and null/missing docs survive the residual Filter.
+          null/missing (non-sparse): the seek is forced by a hint ($ne spans
+          the whole index, so the planner scans), value 5 is excluded, and
+          null/missing docs survive the residual Filter.
   act-03  Cross-type ordering: equality is type-strict (number 5 != string "5");
           ordering ops are type-bracketed ($gte:0 matches only numbers); the
           ascending sort order is Null<Number<String<False<True.
@@ -2261,11 +2265,12 @@ func TestIndex_Single_Ne_TwoBoundSeek_IncludesNullAndMissing(t *testing.T) {
 		return coll
 	}
 
-	sortedIds := func(c anystore.Collection, filter string) []string {
-		ids := collectIdsString(t, c.Find(filter).Sort("id"))
+	sortedIds := func(c anystore.Collection, filter string, hints ...anystore.IndexHint) []string {
+		ids := collectIdsString(t, c.Find(filter).IndexHint(hints...).Sort("id"))
 		sort.Strings(ids)
 		return ids
 	}
+	seek := anystore.IndexHint{IndexName: "a", Boost: 1000000}
 
 	t.Run("null and missing survive $ne", func(t *testing.T) {
 		// id values are JSON strings so collectIdsString (GetStringBytes) resolves them.
@@ -2278,24 +2283,24 @@ func TestIndex_Single_Ne_TwoBoundSeek_IncludesNullAndMissing(t *testing.T) {
 		idx := mk(true, docs...)
 		noidx := mk(false, docs...)
 
-		// (1) Count == 3, identical with and without the index.
-		idxCount, err := idx.Find(`{"a":{"$ne":5}}`).Count(ctx)
+		// (1) Count == 3 through the seek and through the scan.
+		idxCount, err := idx.Find(`{"a":{"$ne":5}}`).IndexHint(seek).Count(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, 3, idxCount)
 		noidxCount, err := noidx.Find(`{"a":{"$ne":5}}`).Count(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, idxCount, noidxCount)
 
-		// (2) Same id set for indexed and unindexed: 2 (a=7), 3 (null), 4 (missing).
+		// (2) Same id set for the seek and the scan: 2 (a=7), 3 (null), 4 (missing).
 		want := []string{"2", "3", "4"}
-		assert.ElementsMatch(t, want, sortedIds(idx, `{"a":{"$ne":5}}`))
+		assert.ElementsMatch(t, want, sortedIds(idx, `{"a":{"$ne":5}}`, seek))
 		assert.ElementsMatch(t, want, sortedIds(noidx, `{"a":{"$ne":5}}`))
 
 		// (3) Both null and missing are indexed (non-sparse) => 4 entries.
 		assertIndexLen(t, idx.GetIndexes()[0], 4)
 
-		// (4) Explain: index IS used via the two-bound seek, with a residual Filter.
-		explain, err := idx.Find(`{"a":{"$ne":5}}`).Explain(ctx)
+		// (4) Explain: the two-bound seek carries a residual Filter.
+		explain, err := idx.Find(`{"a":{"$ne":5}}`).IndexHint(seek).Explain(ctx)
 		require.NoError(t, err)
 		assert.Contains(t, explain.Sql, "IndexScan(a)")
 		assert.Contains(t, explain.Sql, "[-inf,'5'),('5',inf]")
@@ -2312,13 +2317,13 @@ func TestIndex_Single_Ne_TwoBoundSeek_IncludesNullAndMissing(t *testing.T) {
 		noidx := mk(false, docs...)
 
 		// $ne:5 excludes exactly a=5; ascending a-values are 0,1,2,3,4,6,7,8,9.
-		gotIdx := collectField(t, idx.Find(`{"a":{"$ne":5}}`).Sort("a"), "a")
+		gotIdx := collectField(t, idx.Find(`{"a":{"$ne":5}}`).IndexHint(seek).Sort("a"), "a")
 		gotNoidx := collectField(t, noidx.Find(`{"a":{"$ne":5}}`).Sort("a"), "a")
 		want := []string{"0", "1", "2", "3", "4", "6", "7", "8", "9"}
 		assert.Equal(t, want, gotIdx)
 		assert.Equal(t, want, gotNoidx)
 
-		cnt, err := idx.Find(`{"a":{"$ne":5}}`).Count(ctx)
+		cnt, err := idx.Find(`{"a":{"$ne":5}}`).IndexHint(seek).Count(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, 9, cnt)
 	})
@@ -2696,14 +2701,8 @@ func TestIndex_ArrayNested_NeOverMultiKey_DedupAndAgreement(t *testing.T) {
 		anyenc.MustParseJson(`{"id":"5","tags":"d"}`),
 	))
 
-	// (a) Explain: index IS used with the two-bound split, and the chain
-	// ends in Dedup(canonical). Identical with and without an IndexHint.
-	neExplain, err := coll.Find(`{"tags":{"$ne":"a"}}`).Explain(ctx)
-	require.NoError(t, err)
-	assert.Contains(t, neExplain.Sql, "IndexScan(tags)")
-	assert.Contains(t, neExplain.Sql, "Dedup(canonical)")
-	assert.Contains(t, neExplain.Sql, `[-inf,'"a"'),('"a"',inf]`)
-
+	// (a) Explain: the two-bound split ends in Dedup(canonical). $ne spans
+	// the whole index, so the hint forces the path under test.
 	neHintExplain, err := coll.Find(`{"tags":{"$ne":"a"}}`).
 		IndexHint(anystore.IndexHint{IndexName: "tags", Boost: 1000000}).Explain(ctx)
 	require.NoError(t, err)
@@ -2711,8 +2710,9 @@ func TestIndex_ArrayNested_NeOverMultiKey_DedupAndAgreement(t *testing.T) {
 	assert.Contains(t, neHintExplain.Sql, "Dedup(canonical)")
 	assert.Contains(t, neHintExplain.Sql, `[-inf,'"a"'),('"a"',inf]`)
 
-	// (b) Count == 3 and == fullscan count (no-index twin).
-	neCount, err := coll.Find(`{"tags":{"$ne":"a"}}`).Count(ctx)
+	// (b) Count == 3 through the seek and == fullscan count (no-index twin).
+	neCount, err := coll.Find(`{"tags":{"$ne":"a"}}`).
+		IndexHint(anystore.IndexHint{IndexName: "tags", Boost: 1000000}).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 3, neCount)
 
@@ -2732,7 +2732,8 @@ func TestIndex_ArrayNested_NeOverMultiKey_DedupAndAgreement(t *testing.T) {
 
 	// (c) Iter ids: raw scan order is 3,2,5; compare as a sorted set.
 	// id3 the straddler appears exactly once; id1 and id4 (contain "a") excluded.
-	neIds := collectIdsString(t, coll.Find(`{"tags":{"$ne":"a"}}`))
+	neIds := collectIdsString(t, coll.Find(`{"tags":{"$ne":"a"}}`).
+		IndexHint(anystore.IndexHint{IndexName: "tags", Boost: 1000000}))
 	assert.Len(t, neIds, 3) // exactly once each — no duplicate straddler
 	assert.Equal(t, []string{"2", "3", "5"}, sortedIds(neIds))
 	neIdsNo := collectIdsString(t, collNo.Find(`{"tags":{"$ne":"a"}}`))

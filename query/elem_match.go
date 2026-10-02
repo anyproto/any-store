@@ -47,19 +47,31 @@ func (e ElemMatch) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	return false
 }
 
-// IndexBounds for the value form are Cond's own bounds on the field: a
-// matching element's value is one of the field's fan-out entries, so the
-// element-level bounds are a sound (wide-channel) superset — except when the
-// field is a positional path, whose leaf is stored whole (no element
-// entries), or when Cond nests another $elemMatch, which looks inside an
-// element the index stores whole; both contribute nothing. The object form
-// contributes nothing on its own field; Key.IndexBounds re-keys its Cond
-// under the sub-fields (elemMatchSubField).
+// IndexBounds for the value form are Cond's bounds on the field: a matching
+// element's value is one of the field's fan-out entries, so element-level
+// bounds are a sound superset. Cond's operators all hold for that SAME
+// element, so their bounds are intersected (TightIndexBounds): the
+// intersection is a sound seek range even on a multikey index, unlike the
+// first-conjunct superset And.IndexBounds must settle for at field level,
+// where each conjunct may be satisfied by a different element. Nothing is
+// contributed when the field is a positional path, whose leaf is stored
+// whole (no element entries), when Cond nests another $elemMatch, which
+// looks inside an element the index stores whole, or when the intersection
+// is provably empty (no element can satisfy Cond; the residual rejects every
+// row). The object form contributes nothing on its own field;
+// Key.IndexBounds re-keys its Cond under the sub-fields (elemMatchSubField).
 func (e ElemMatch) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	if !e.ValueForm || lastSegmentNumeric(fieldName) || ContainsElemMatch(e.Cond) {
 		return bs
 	}
-	return e.Cond.IndexBounds(fieldName, bs)
+	tight, empty := TightIndexBounds(e.Cond, fieldName)
+	if empty {
+		return bs
+	}
+	for _, b := range tight {
+		bs = bs.Append(b)
+	}
+	return bs
 }
 
 // elemMatchSubField reports whether the Key holds an object-form $elemMatch

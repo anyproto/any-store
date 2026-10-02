@@ -1,13 +1,32 @@
 package qplanner
 
 const (
-	// Query Cost Weights — calibrated against 50K-doc benchmarks.
-	// Ratio of random fetch to sequential read (~8x) matches measured performance.
+	// Query Cost Weights. CostDocFetch is anchored at ~2.7 µs for a 4 KB
+	// fetch+parse on a 50K-doc collection; the full-text and vector weights
+	// below are calibrated against it. CostDocFetch is 2.4× CostScanDoc
+	// (measured 1–3× by document size, see there); CostSeqRead prices one
+	// sequential cursor step over an index entry (the brute-force vector scan
+	// adds its own per-document decode on top).
 	CostIndexSeek = 0.5  // Cost of a B-tree traversal to find a key (per bound/seek)
 	CostDocFetch  = 3.0  // Cost of a random point lookup in the data B-tree (index -> data)
-	CostSeqRead   = 0.1  // Cost of a sequential cursor read per doc (full scan)
+	CostSeqRead   = 0.1  // Cost of a sequential cursor step (index entry)
 	CostFilter    = 0.5  // Cost of in-memory evaluation of a predicate
 	CostSortSwap  = 0.25 // Cost of in-memory sort (includes re-fetch overhead after sorting)
+
+	// CostScanDoc is the per-document cost of a filtered full scan's read: the
+	// sequential page walk plus decompressing and decoding the document far
+	// enough to reject it. The work grows with document size, so it sits far
+	// above CostSeqRead: measured against the index path on the same data, a
+	// random fetch costs about 3× a scanned document at ~700 B, 1.8× at 1 KB
+	// with twenty fields and about 1× at 4 KB, so the index keeps winning up to
+	// 35–100% selectivity. The value puts the break-even at 50%
+	// (CostScanDoc + CostFilter = (CostDocFetch + CostFilter) / 2) and errs
+	// toward the index on purpose: a full scan chosen for a range that turns
+	// out 5%-selective costs 10–20×, an index chosen for a 50% range costs
+	// 1.3–1.6× end to end (700 B down to 80 B documents) and nothing at 1 KB
+	// and above — the asymmetry SQLite prices with its 3× full-table-scan
+	// penalty.
+	CostScanDoc = 1.25
 
 	// CostMaterialize is the per-document cost of buffering a row into the slice a
 	// full-scan sort must build before it can order anything. It models what the
@@ -47,8 +66,15 @@ const (
 	// measured on 20k docs / dim 64).
 	CostKnnBruteDoc = 0.8
 
-	// Fallback Heuristics
-	DefaultRangeSelectivity = 0.5 // Default assumption: a range predicate matches ~50% of the collection
+	// DefaultRangeSelectivity prices a predicate the planner cannot measure:
+	// SQLite's factor for one inequality bound (each bound quarters the search
+	// space). B-tree interpolation rates every range over a live index, so
+	// this is reached only where nothing measures the predicate — no read tx
+	// or an interpolation read error, an equality on a non-leading compound
+	// field or without a trusted sketch level, a covering filter with no
+	// per-field sketch, and predicates on unindexed fields. Under the
+	// CostScanDoc break-even it sends an unmeasured range to the index.
+	DefaultRangeSelectivity = 0.25
 
 	// Default sketch size (number of buckets)
 	DefaultSketchSize = 1024

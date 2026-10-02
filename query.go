@@ -378,7 +378,6 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	visible := visibleIndexes(btx, q.c.loadIndexes())
 	idxs := plannableIndexes(visible)
 	br := q.buildBoundsResult(idxs)
-	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
 	// The estimate reads the candidates' sketches; with every range index
 	// outdated it falls back to an outdated one's, advisory and better than
 	// none.
@@ -390,6 +389,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	if opts.exactTotalDocs {
 		totalDocs = q.docCountExact(btx, countIdxs)
 	}
+	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly, totalDocs)
 	plan = qplanner.BuildPlan(&qplanner.PlanParams{
 		Tx:          btx,
 		DataNs:      q.c.ns,
@@ -916,9 +916,10 @@ func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, residual query.Filter, ne
 	}
 	idxs := plannableIndexes(visibleIndexes(btx, q.c.loadIndexes()))
 	probePossible = idFixed
+	params.TotalDocs = q.docCountForPlan(btx, idxs)
 	if len(idxs) > 0 {
 		br := q.buildBoundsResult(idxs)
-		params.Indexes = q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
+		params.Indexes = q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly, params.TotalDocs)
 		params.FieldBounds = &br
 		for i := range params.Indexes {
 			if len(params.Indexes[i].Bounds) > 0 || (needSort && params.Indexes[i].ExactSort) ||
@@ -928,7 +929,6 @@ func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, residual query.Filter, ne
 			}
 		}
 	}
-	params.TotalDocs = q.docCountForPlan(btx, idxs)
 	return probePossible
 }
 
@@ -1164,8 +1164,11 @@ func (q *collQuery) buildBoundsResult(idxs []*index) qplanner.BoundsResult {
 // (a stale PointLookup routes a multikey unique index into CoverIter, which
 // ignores End; a stale ExactSort skips the SortIter). An unproven index keeps
 // the wide variant and carries the tight bounds in EstBounds for estimation
-// only. tx == nil (unit tests) means no proof — wide seeks.
-func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult, idxs []*index, tx *btree.ReadTx, countOnly bool) []qplanner.CBOIndex {
+// only, and only while its entries do not outnumber the documents
+// (qplanner.FanOut): over fan-out data the intersection describes no document
+// set, so the index is rated on the wide bounds it seeks with. tx == nil (unit
+// tests) means no proof — wide seeks.
+func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult, idxs []*index, tx *btree.ReadTx, countOnly bool, totalDocs int) []qplanner.CBOIndex {
 	result := buf
 
 	var sortFields []query.SortField
@@ -1199,7 +1202,7 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		if br.TightDiffers(idx.cboInfo.FieldNames) {
 			if scalarProven() {
 				cboIdx = q.buildCBOIndex(idx, br, sortFields, true, maxFields)
-			} else {
+			} else if !qplanner.FanOut(cboIdx.Sketch, totalDocs) {
 				// Estimation-only tight bounds; seeks keep the wide Bounds.
 				cboIdx.EstBounds, _ = qplanner.ComputeIndexBoundsTightCapped(idx.cboInfo, br, maxFields)
 			}

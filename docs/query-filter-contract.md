@@ -28,9 +28,11 @@ or the exported constructors (`NewComp`, `NewCompValue`, `NewInValue`):
    `TightIndexBounds` (query/tight_bounds.go) is the TIGHT channel: same-field
    conjuncts interval-intersected via `Bounds.Intersect`, plus an explicit
    `empty` flag for provably-empty value sets. Tight bounds are safe for cost
-   estimation always, and for seeks/emptiness decisions only where fan-out
-   entries provably cannot exist (pk namespace, scalar-proven indexes) — see
-   the `TightIndexBounds` doc comment. Rules 1-3 apply to both channels.
+   estimation on an index whose entries do not outnumber its documents, and
+   for seeks/emptiness decisions only where fan-out entries provably cannot
+   exist (pk namespace, scalar-proven indexes) or where the conjuncts are
+   bound to one element by a value-form `$elemMatch` (item 15) — see the
+   `TightIndexBounds` doc comment. Rules 1-3 apply to both channels.
 
 Pinned by `query/filter_contract_test.go`: `TestFilterConcurrentReuse` (run
 under `-race`), `TestFilterOkAllocFree`, and
@@ -281,16 +283,21 @@ build per query and carry no such guarantee.
     mixing with values is a `ParseError`). `$text` and `$knn` are rejected
     inside either form. Through a dotted path it applies to every leaf array,
     positional leaves included.
-    Bounds: the value form contributes `C`'s own bounds on the field (an
-    element's value is one of the field's entries) unless the path is
-    positional; the object form re-keys `C` under the sub-fields —
+    Bounds: the value form contributes the intersection of `C`'s bounds on
+    the field (an element's value is one of the field's entries, and every
+    operator of `C` holds for that one element, so the intersection is a
+    sound seek range even over an array); it contributes nothing when the
+    path is positional, when `C` nests another `$elemMatch`, or when the
+    intersection is provably empty (no element can satisfy `C`; the residual
+    rejects every row). The object form re-keys `C` under the sub-fields —
     `{"a":{"$elemMatch":{"b":{"$gt":1}}}}` bounds `a.b` as `{"a.b":{"$gt":1}}`
     would. Both are supersets, never the exact value image (a scalar or an
     object with that value sits in the bounds without matching), so a `Key`
     holding a `$elemMatch` always keeps its residual filter: the planner's
     covering-count, verify-chain and residual-elision paths treat it as
     uncovered (`query.IndexBoundsExact`). Pinned by `TestElemMatch_Parse`,
-    `TestElemMatch_Ok` and `TestElemMatch_IndexBoundsAndString`.
+    `TestElemMatch_Ok`, `TestElemMatch_IndexBoundsAndString` and
+    `TestCBO_ElemMatch_RangeOnArrayIndex`.
 
 16. **Rows with equal sort keys have no specified order.** An in-memory sort
     orders a tie group by document id; an index that provides the order yields

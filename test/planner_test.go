@@ -2313,11 +2313,43 @@ func fillRange(t *testing.T, fx *fixture, name, indexField string, n int) anysto
 	return coll
 }
 
-// TestCBO_TightBounds_TwoSidedRange: the estimation channel must rate a
-// two-sided range by BOTH ends. Before the tight channel, And.IndexBounds
-// dropped the $lt end, interpolation ranked (lo,+inf) (~60% for a mid-keyspace
-// lo), the <0.5 adoption ratchet rejected it, and the flat 0.5 default sent a
-// ~2%-selective query to a full scan.
+// planSelectivity reads the filter-wide selectivity Explain prints
+// ("Selectivity: 0.02 (…)").
+func planSelectivity(t *testing.T, plan string) float64 {
+	t.Helper()
+	for _, l := range strings.Split(plan, "\n") {
+		var sel float64
+		if _, err := fmt.Sscanf(strings.TrimSpace(l), "Selectivity: %f", &sel); err == nil {
+			return sel
+		}
+	}
+	t.Fatalf("no selectivity line in plan:\n%s", plan)
+	return 0
+}
+
+// candidateEstRows reads the est_rows Explain prints for the named candidate
+// ("1. IndexSeek(tags)  cost=… est_rows=808").
+func candidateEstRows(t *testing.T, plan, candidate string) float64 {
+	t.Helper()
+	for _, l := range strings.Split(plan, "\n") {
+		if !strings.Contains(l, candidate+" ") {
+			continue
+		}
+		if i := strings.Index(l, "est_rows="); i >= 0 {
+			var rows float64
+			if _, err := fmt.Sscanf(l[i:], "est_rows=%f", &rows); err == nil {
+				return rows
+			}
+		}
+	}
+	t.Fatalf("no candidate %s in plan:\n%s", candidate, plan)
+	return 0
+}
+
+// TestCBO_TightBounds_TwoSidedRange: the estimation channel rates a two-sided
+// range by BOTH ends — (lo,hi), not the (lo,+inf) that And.IndexBounds keeps
+// for the seek on an unproven index — so a ~2%-selective query is priced as
+// such.
 func TestCBO_TightBounds_TwoSidedRange(t *testing.T) {
 	fx := newFixture(t)
 
@@ -2327,10 +2359,10 @@ func TestCBO_TightBounds_TwoSidedRange(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, explain.Sql, "Index",
 			"mid-keyspace two-sided range must use the index, got: %s", explain.Sql)
-		// The coarse per-field estimate (the "Selectivity:" header) must adopt
-		// the interpolated fraction instead of the flat 0.50 default.
-		assert.NotContains(t, explain.Plan, "Selectivity: 0.50",
-			"two-sided range selectivity must not be the 0.5 default:\n%s", explain.Plan)
+		// The coarse per-field estimate (the "Selectivity:" header) is the
+		// interpolated two-sided fraction, not (lo,+inf) and not the default.
+		assert.Less(t, planSelectivity(t, explain.Plan), 0.1,
+			"two-sided range selectivity must be rated by both ends:\n%s", explain.Plan)
 
 		// Broad two-sided range (~98%) must still favor the full scan.
 		explain, err = coll.Find(`{"a":{"$gt":50,"$lt":4950}}`).Explain(ctx)
@@ -2444,9 +2476,9 @@ func TestQuery_ArrayContradiction_MustMatch(t *testing.T) {
 
 // TestCBO_TightBounds_AscAndDescIndexesOneField pins calculateSelectivity's
 // usedFields dedup when BOTH an ascending and a descending index cover the
-// same field: whichever index enumerates first, the two-sided range must not
-// fall back to the flat 0.5 default (each index's tight estimation bounds go
-// through its own reverse-flag transform).
+// same field: whichever index enumerates first, the two-sided range is rated
+// by both ends (each index's tight estimation bounds go through its own
+// reverse-flag transform).
 func TestCBO_TightBounds_AscAndDescIndexesOneField(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "ascdesc")
@@ -2464,15 +2496,15 @@ func TestCBO_TightBounds_AscAndDescIndexesOneField(t *testing.T) {
 	explain, err := coll.Find(`{"a":{"$gt":2000,"$lt":2100}}`).Explain(ctx)
 	require.NoError(t, err)
 	assert.Contains(t, explain.Sql, "Index", "plan: %s", explain.Sql)
-	assert.NotContains(t, explain.Plan, "Selectivity: 0.50",
+	assert.Less(t, planSelectivity(t, explain.Plan), 0.1,
 		"two-sided range selectivity must be interpolated regardless of index order:\n%s", explain.Plan)
 }
 
 // TestCBO_RangeInterpolation_DenseIndex exercises the end-to-end plan-time
 // B-tree page interpolation: on a DENSE index (every doc indexed), a selective
-// range must use the index while a broad range must stay on a full scan. Before
-// interpolation, every range fell back to DefaultRangeSelectivity (0.5) and the
-// selective case wrongly chose a full scan.
+// range is rated at its measured ~1% and uses the index, while a broad range
+// is rated broad and stays on a full scan — neither at the unmeasured
+// default, which would also pick the index.
 func TestCBO_RangeInterpolation_DenseIndex(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
@@ -2493,6 +2525,7 @@ func TestCBO_RangeInterpolation_DenseIndex(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, explain.Sql, "Index",
 			"selective range must use the index, got: %s", explain.Sql)
+		assert.Less(t, planSelectivity(t, explain.Plan), 0.05, "measured, not the default:\n%s", explain.Plan)
 	})
 
 	t.Run("selective high range uses index", func(t *testing.T) {
@@ -2501,6 +2534,7 @@ func TestCBO_RangeInterpolation_DenseIndex(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, explain.Sql, "Index",
 			"selective one-sided range must use the index, got: %s", explain.Sql)
+		assert.Less(t, planSelectivity(t, explain.Plan), 0.05, "measured, not the default:\n%s", explain.Plan)
 	})
 
 	t.Run("broad range stays full scan", func(t *testing.T) {
@@ -2511,6 +2545,238 @@ func TestCBO_RangeInterpolation_DenseIndex(t *testing.T) {
 		assert.Contains(t, explain.Sql, "FullScan",
 			"broad range must stay on full scan, got: %s", explain.Sql)
 	})
+}
+
+// TestCBO_RangeInterpolation_MultikeyIndex: a range over an ARRAY field is
+// priced from the interpolated entry fraction too. A multikey index holds one
+// entry per element, and the seek fetches once per in-range entry, so the
+// fraction times the entry count prices the seek exactly and bounds the
+// matched documents from above; the unmeasured default would price it at a
+// quarter of the collection.
+func TestCBO_RangeInterpolation_MultikeyIndex(t *testing.T) {
+	fx := newFixture(t)
+	const n = 5000
+
+	run := func(t *testing.T, coll anystore.Collection, index, selective, broad string, want int) {
+		explain, err := coll.Find(selective).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, explain.Sql, "IndexScan("+index+")",
+			"selective range over an array field must use the index, got: %s", explain.Sql)
+		assert.Less(t, planSelectivity(t, explain.Plan), 0.1,
+			"selectivity must be interpolated, not the default:\n%s", explain.Plan)
+		// One in-range element per matching doc: the seek's rows are the
+		// in-range entries, within interpolation error.
+		rows := candidateEstRows(t, explain.Plan, "IndexSeek("+index+")")
+		assert.Greater(t, rows, float64(want)/2, "est_rows far below the in-range entries:\n%s", explain.Plan)
+		assert.Less(t, rows, float64(want)*2, "est_rows far above the in-range entries:\n%s", explain.Plan)
+		count, err := coll.Find(selective).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, want, count)
+
+		explain, err = coll.Find(broad).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, explain.Sql, "FullScan",
+			"broad range over an array field must stay on full scan, got: %s", explain.Sql)
+	}
+
+	t.Run("top-level array", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "tags")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+		docs := make([]*anyenc.Value, 0, n)
+		for i := 0; i < n; i++ {
+			// Three entries per doc over [0, 3n): the top 1.3% of entries
+			// belong to the 200 docs with i >= 4800.
+			docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"tags":[%d,%d,%d]}`, i, i, i+n, i+2*n)))
+		}
+		require.NoError(t, coll.Insert(ctx, docs...))
+		run(t, coll, "tags", `{"tags":{"$gt":14799}}`, `{"tags":{"$gt":1000}}`, 200)
+	})
+
+	t.Run("array of objects path", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "items")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "items.v", Fields: []string{"items.v"}}))
+		docs := make([]*anyenc.Value, 0, n)
+		for i := 0; i < n; i++ {
+			docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"items":[{"v":%d},{"v":%d}]}`, i, i, i+n)))
+		}
+		require.NoError(t, coll.Insert(ctx, docs...))
+		run(t, coll, "items.v", `{"items.v":{"$gt":9899}}`, `{"items.v":{"$gt":500}}`, 100)
+	})
+}
+
+// TestCBO_ElemMatch_RangeOnArrayIndex: a value-form $elemMatch binds its
+// operators to one element, so a two-sided range inside it seeks the array
+// index with BOTH ends — the plain {$gte,$lt} spelling can only seek one end,
+// because each operator may be satisfied by a different element.
+func TestCBO_ElemMatch_RangeOnArrayIndex(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "toks")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx,
+		anystore.IndexInfo{Name: "toks", Fields: []string{"toks"}},
+		anystore.IndexInfo{Name: "rtoks", Fields: []string{"-toks"}},
+	))
+	const n = 5000
+	docs := make([]*anyenc.Value, 0, n)
+	for i := 0; i < n; i++ {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"toks":["w%05d","x%05d"]}`, i, i, i)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+	hint := func(name string, boost int) anystore.IndexHint {
+		return anystore.IndexHint{IndexName: name, Boost: boost}
+	}
+	countWith := func(q string, hints ...anystore.IndexHint) int {
+		c, err := coll.Find(q).IndexHint(hints...).Count(ctx)
+		require.NoError(t, err)
+		return c
+	}
+
+	q := `{"toks":{"$elemMatch":{"$gte":"w04900","$lt":"w04950"}}}`
+	explain, err := coll.Find(q).IndexHint(hint("toks", 1000000)).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "IndexScan(toks)", "plan: %s", explain.Sql)
+	assert.Contains(t, explain.Sql, `['"w04900"','"w04950"')`, "both ends must bound the seek: %s", explain.Sql)
+	assert.Equal(t, 50, countWith(q, hint("toks", 1000000)))
+	// The reverse-declared index seeks the same range in inverted key space.
+	explain, err = coll.Find(q).IndexHint(hint("rtoks", 1000000)).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "IndexScan(rtoks)", "plan: %s", explain.Sql)
+	assert.Equal(t, 50, countWith(q, hint("rtoks", 1000000)))
+	// Unhinted, the planner's own choice seeks one of them.
+	explain, err = coll.Find(q).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "IndexScan(", "plan: %s", explain.Sql)
+	assert.Equal(t, 50, countWith(q))
+	scan, err := coll.Find(q).IndexHint(hint("toks", -1000000), hint("rtoks", -1000000)).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, scan.Sql, "FullScan", "plan: %s", scan.Sql)
+	assert.Equal(t, 50, countWith(q, hint("toks", -1000000), hint("rtoks", -1000000)))
+
+	// No element can satisfy an empty intersection: nothing to seek, no match.
+	empty := `{"toks":{"$elemMatch":{"$gt":"w04950","$lt":"w04900"}}}`
+	assert.Equal(t, 0, countWith(empty))
+	assert.Equal(t, 0, countWith(empty, hint("toks", 1000000)))
+
+	// Without $elemMatch the operators range over different elements: every
+	// doc's "x…" token satisfies $gte, and the "w…" token of every doc below
+	// 4950 satisfies $lt. The seek keeps the first operator's half-open range
+	// and the residual does the rest, so the index agrees with the scan.
+	plain := `{"toks":{"$gte":"w04900","$lt":"w04950"}}`
+	assert.Equal(t, 4950, countWith(plain))
+	assert.Equal(t, 4950, countWith(plain, hint("toks", 1000000)))
+	assert.Equal(t, 4950, countWith(plain, hint("rtoks", 1000000)))
+}
+
+// TestCBO_FanOutIndex_RatesSeekBounds: on an index whose entries outnumber
+// the documents, a conjunction's intersection describes no document set (each
+// operator may hold through a different element), so the filter-wide
+// selectivity comes from the wide bounds the seek uses. Rating the
+// intersection there would call a ~99% filter ~1% and send a LIMIT'd ordered
+// scan on another index to a full scan of everything.
+func TestCBO_FanOutIndex_RatesSeekBounds(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "toks")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx,
+		anystore.IndexInfo{Name: "toks", Fields: []string{"toks"}},
+		anystore.IndexInfo{Name: "n", Fields: []string{"n"}},
+	))
+	const n = 5000
+	docs := make([]*anyenc.Value, 0, n)
+	for i := 0; i < n; i++ {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"n":%d,"toks":["w%05d","x%05d"]}`, i, i, i, i)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+
+	plain := `{"toks":{"$gte":"w04900","$lt":"w04950"}}`
+	explain, err := coll.Find(plain).Explain(ctx)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, planSelectivity(t, explain.Plan), 0.5,
+		"a two-sided range over an array field matches through different elements:\n%s", explain.Plan)
+
+	explain, err = coll.Find(plain).Sort("n").Limit(50).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "IndexScan(n)",
+		"an ordered scan that stops after ~50 rows must beat a full scan: %s", explain.Sql)
+}
+
+// TestCBO_PkRange_CreditsFullScan: a primary-key range restricts the scan
+// itself, so it is priced at the fraction it covers — a 2% id range with a
+// 30% indexed range is a short scan, not an index seek over 30%.
+func TestCBO_PkRange_CreditsFullScan(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "pk")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "s", Fields: []string{"s"}}))
+	const n = 20000
+	docs := make([]*anyenc.Value, 0, n)
+	for i := 0; i < n; i++ {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"s":%d}`, i, (i*7)%100)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+
+	q := `{"id":{"$gt":19599},"s":{"$gte":70}}`
+	explain, err := coll.Find(q).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "FullScan", "plan: %s", explain.Sql)
+	assert.Contains(t, explain.Sql, "idBounds=", "the scan must carry the pk range: %s", explain.Sql)
+	count, err := coll.Find(q).Count(ctx)
+	require.NoError(t, err)
+	seek, err := coll.Find(q).IndexHint(anystore.IndexHint{IndexName: "s", Boost: 1000000}).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, seek, count)
+	assert.Equal(t, 120, count)
+
+	// Without the pk range the 30% seek loses to the scan of everything.
+	explain, err = coll.Find(`{"s":{"$gte":70}}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "IndexScan(s)", "plan: %s", explain.Sql)
+}
+
+// TestCBO_MeasuredEmptyRange: a range the index holds nothing of is a
+// measurement (a few entries at most), not an unmeasured range, so a LIMIT'd
+// query seeks instead of scanning the collection for rows that are not there.
+func TestCBO_MeasuredEmptyRange(t *testing.T) {
+	fx := newFixture(t)
+	coll := fillRange(t, fx, "empty", "a", 5000)
+	explain, err := coll.Find(`{"a":{"$gt":100000}}`).Limit(10).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "IndexScan(a)", "plan: %s", explain.Sql)
+	count, err := coll.Find(`{"a":{"$gt":100000}}`).Limit(10).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count)
+}
+
+// TestCBO_KnnRangeResidualMeasured: the $knn driver/probe decision prices a
+// range residual from the same interpolation as every other plan. A selective
+// range probes the few candidates exactly; a broad one lets the ANN driver
+// run. An unmeasured default would send both to the driver.
+func TestCBO_KnnRangeResidualMeasured(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "knn_range")
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(ctx, anystore.IndexInfo{
+		Name: "emb", Kind: anystore.IndexKindVector,
+		Vector: &anystore.VectorParams{Field: "v", Dim: 3, Metric: anystore.VectorL2, EfSearch: 64},
+	}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a", Fields: []string{"a"}}))
+	const n = 3000
+	docs := make([]*anyenc.Value, 0, n)
+	for i := 0; i < n; i++ {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":[%d,1,2],"a":%d}`, i, i%50, i)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+
+	knn := `"v":{"$knn":{"$query":[3,1,2],"$k":4}}`
+	explain, err := coll.Find(`{` + knn + `,"a":{"$gt":2970}}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "VectorScore(", "a one-percent range probes its candidates: %s", explain.Sql)
+
+	explain, err = coll.Find(`{` + knn + `,"a":{"$gt":300}}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "KnnSearch(", "a ninety-percent range lets the driver run: %s", explain.Sql)
 }
 
 // queryIdsHinted runs Find(filter).Sort(sortSpec).Limit(limit).Offset(offset)

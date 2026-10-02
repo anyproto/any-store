@@ -21,7 +21,9 @@ import (
 //   - actual SEEKS: only when the scanned namespace provably holds no
 //     fan-out (multi-key) entries — the primary-key namespace (array pks are
 //     rejected on write, see ErrArrayPrimaryKey) or a secondary index whose
-//     persisted multikey flag proves it scalar-only.
+//     persisted multikey flag proves it scalar-only — or when the conjuncts
+//     are bound to one element by a value-form $elemMatch, whose IndexBounds
+//     intersects them for exactly that reason.
 //
 // empty=true reports that the intersection is PROVABLY EMPTY as a value set
 // ({"f":{"$gt":5,"$lt":3}}). It does NOT mean the filter is unsatisfiable:
