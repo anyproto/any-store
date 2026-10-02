@@ -2294,8 +2294,10 @@ func TestIndex_Single_Ne_TwoBoundSeek_IncludesNullAndMissing(t *testing.T) {
 		// (3) Both null and missing are indexed (non-sparse) => 4 entries.
 		assertIndexLen(t, idx.GetIndexes()[0], 4)
 
-		// (4) Explain: index IS used via the two-bound seek, with a residual Filter.
-		explain, err := idx.Find(`{"a":{"$ne":5}}`).Explain(ctx)
+		// (4) Explain: the two-bound seek carries a residual Filter. $ne spans
+		// the whole index, so the hint forces the path under test.
+		explain, err := idx.Find(`{"a":{"$ne":5}}`).
+			IndexHint(anystore.IndexHint{IndexName: "a", Boost: 1000000}).Explain(ctx)
 		require.NoError(t, err)
 		assert.Contains(t, explain.Sql, "IndexScan(a)")
 		assert.Contains(t, explain.Sql, "[-inf,'5'),('5',inf]")
@@ -2696,14 +2698,8 @@ func TestIndex_ArrayNested_NeOverMultiKey_DedupAndAgreement(t *testing.T) {
 		anyenc.MustParseJson(`{"id":"5","tags":"d"}`),
 	))
 
-	// (a) Explain: index IS used with the two-bound split, and the chain
-	// ends in Dedup(canonical). Identical with and without an IndexHint.
-	neExplain, err := coll.Find(`{"tags":{"$ne":"a"}}`).Explain(ctx)
-	require.NoError(t, err)
-	assert.Contains(t, neExplain.Sql, "IndexScan(tags)")
-	assert.Contains(t, neExplain.Sql, "Dedup(canonical)")
-	assert.Contains(t, neExplain.Sql, `[-inf,'"a"'),('"a"',inf]`)
-
+	// (a) Explain: the two-bound split ends in Dedup(canonical). $ne spans
+	// the whole index, so the hint forces the path under test.
 	neHintExplain, err := coll.Find(`{"tags":{"$ne":"a"}}`).
 		IndexHint(anystore.IndexHint{IndexName: "tags", Boost: 1000000}).Explain(ctx)
 	require.NoError(t, err)
@@ -2711,8 +2707,9 @@ func TestIndex_ArrayNested_NeOverMultiKey_DedupAndAgreement(t *testing.T) {
 	assert.Contains(t, neHintExplain.Sql, "Dedup(canonical)")
 	assert.Contains(t, neHintExplain.Sql, `[-inf,'"a"'),('"a"',inf]`)
 
-	// (b) Count == 3 and == fullscan count (no-index twin).
-	neCount, err := coll.Find(`{"tags":{"$ne":"a"}}`).Count(ctx)
+	// (b) Count == 3 through the seek and == fullscan count (no-index twin).
+	neCount, err := coll.Find(`{"tags":{"$ne":"a"}}`).
+		IndexHint(anystore.IndexHint{IndexName: "tags", Boost: 1000000}).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 3, neCount)
 
@@ -2732,7 +2729,8 @@ func TestIndex_ArrayNested_NeOverMultiKey_DedupAndAgreement(t *testing.T) {
 
 	// (c) Iter ids: raw scan order is 3,2,5; compare as a sorted set.
 	// id3 the straddler appears exactly once; id1 and id4 (contain "a") excluded.
-	neIds := collectIdsString(t, coll.Find(`{"tags":{"$ne":"a"}}`))
+	neIds := collectIdsString(t, coll.Find(`{"tags":{"$ne":"a"}}`).
+		IndexHint(anystore.IndexHint{IndexName: "tags", Boost: 1000000}))
 	assert.Len(t, neIds, 3) // exactly once each — no duplicate straddler
 	assert.Equal(t, []string{"2", "3", "5"}, sortedIds(neIds))
 	neIdsNo := collectIdsString(t, collNo.Find(`{"tags":{"$ne":"a"}}`))

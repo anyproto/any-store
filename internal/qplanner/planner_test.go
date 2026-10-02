@@ -167,10 +167,14 @@ func TestBuildPlan_SparseIndex_NeUsesIndex(t *testing.T) {
 	})
 
 	t.Run("dense index ($ne ~ all) stays full scan", func(t *testing.T) {
+		idx := newIdx(totalDocs)
+		// What interpolation measures for $ne on a live index: both halves
+		// together span the whole key space.
+		idx.rangeSel, idx.rangeSelTight = 1, 1
 		plan := BuildPlan(&PlanParams{
 			Filter:    filter,
 			TotalDocs: totalDocs,
-			Indexes:   []CBOIndex{newIdx(totalDocs)},
+			Indexes:   []CBOIndex{idx},
 		})
 		assert.Equal(t, "FullScan", plan.Name,
 			"$ne on a dense index genuinely touches ~all docs; full scan is correct")
@@ -2796,7 +2800,7 @@ func TestComputeIndexBounds(t *testing.T) {
 func TestFormatFullScanDetails(t *testing.T) {
 	t.Run("small_no_sort", func(t *testing.T) {
 		s := formatFullScanDetails(100, 50, false, false)
-		assert.Contains(t, s, fmt.Sprintf("100×fetch(%.1f)", CostDocFetch))
+		assert.Contains(t, s, fmt.Sprintf("100×fetch(%.2f)", CostDocFetch))
 		assert.NotContains(t, s, "× sort")
 		total := 100*CostDocFetch + 100*CostFilter
 		assert.True(t, strings.HasSuffix(s, fmt.Sprintf("= %.1f", total)),
@@ -2804,14 +2808,14 @@ func TestFormatFullScanDetails(t *testing.T) {
 	})
 	t.Run("large_seq_label", func(t *testing.T) {
 		s := formatFullScanDetails(1000, 1000, false, false)
-		assert.Contains(t, s, fmt.Sprintf("1000×seq(%.1f)", CostSeqRead))
-		total := 1000*CostSeqRead + 1000*CostFilter
+		assert.Contains(t, s, fmt.Sprintf("1000×scan(%.2f)", CostScanDoc))
+		total := 1000*CostScanDoc + 1000*CostFilter
 		assert.True(t, strings.HasSuffix(s, fmt.Sprintf("= %.1f", total)))
 	})
 	t.Run("large_with_idBoundsSeek_keeps_fetch", func(t *testing.T) {
 		s := formatFullScanDetails(1000, 1000, false, true)
-		assert.Contains(t, s, fmt.Sprintf("1000×fetch(%.1f)", CostDocFetch),
-			"idBoundsSeek=true must override large-table seq label")
+		assert.Contains(t, s, fmt.Sprintf("1000×fetch(%.2f)", CostDocFetch),
+			"idBoundsSeek=true must override large-table scan label")
 	})
 	t.Run("with_sort", func(t *testing.T) {
 		s := formatFullScanDetails(100, 50, true, false)

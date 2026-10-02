@@ -140,10 +140,10 @@ func formatFullScanDetails(totalDocs, estimatedYield float64, needSort, idBounds
 	perDocCost := CostDocFetch
 	label := "fetch"
 	if totalDocs > 500 && !idBoundsSeek {
-		perDocCost = CostSeqRead
-		label = "seq"
+		perDocCost = CostScanDoc
+		label = "scan"
 	}
-	s := fmt.Sprintf("%.0f×%s(%.1f) + %.0f×filter(%.1f)", totalDocs, label, perDocCost, totalDocs, CostFilter)
+	s := fmt.Sprintf("%.0f×%s(%.2f) + %.0f×filter(%.1f)", totalDocs, label, perDocCost, totalDocs, CostFilter)
 	if needSort {
 		s += fmt.Sprintf(" + sort(%.0f)=%.1f", estimatedYield, sortCost(estimatedYield))
 	}
@@ -860,8 +860,8 @@ func buildSearchPlan(params *PlanParams, dataCS *CursorSource, source Iterator, 
 }
 
 // computeFullScanCost computes the cost for a full collection scan.
-// For collections above the sequential-read threshold, cursor reads are much cheaper
-// than random B-tree point lookups, so we use CostSeqRead instead of CostDocFetch.
+// For collections above the sequential-read threshold, cursor reads are cheaper
+// than random B-tree point lookups, so we use CostScanDoc instead of CostDocFetch.
 // For small collections, B-tree depth is shallow and both access patterns
 // have similar cost, so we use CostDocFetch (preserving original behavior).
 // When idBoundsSeek is true, the scan does random point lookups (not sequential),
@@ -869,7 +869,7 @@ func buildSearchPlan(params *PlanParams, dataCS *CursorSource, source Iterator, 
 func computeFullScanCost(totalDocs, estimatedYield float64, needSort, idBoundsSeek bool) float64 {
 	perDocCost := CostDocFetch
 	if totalDocs > 500 && !idBoundsSeek {
-		perDocCost = CostSeqRead
+		perDocCost = CostScanDoc
 	}
 	cost := (totalDocs * perDocCost) + (totalDocs * CostFilter)
 	if needSort {
@@ -1002,17 +1002,13 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 					// Use a more selective estimate than default range
 					pTotal *= DefaultRangeSelectivity
 				} else {
-					// Range predicate: prefer the interpolated fraction of THIS
-					// field's own bound chain (BoundFields==1 means the chain is
-					// exactly this leading field) over the flat default — this is
-					// what moves a two-sided range from 0.50 to its real ~0.005.
-					// Same one-way ratchet as selectivityForIndex, same
-					// entries→docs conversion (rangeDocs).
+					// Range predicate: the interpolated fraction of THIS field's
+					// own bound chain (BoundFields==1 means the chain is exactly
+					// this leading field) converted to documents (rangeDocs);
+					// the flat default only when nothing was measured.
 					p := DefaultRangeSelectivity
 					if fi == 0 && idx.BoundFields == 1 && idx.rangeSelTight > 0 {
-						if ip := rangeDocs(idx, idx.rangeSelTight, totalDocs) / totalDocs; ip < p {
-							p = max(ip, 0.0001)
-						}
+						p = max(rangeDocs(idx, idx.rangeSelTight, totalDocs)/totalDocs, 0.0001)
 					}
 					pTotal *= p
 				}
@@ -1313,19 +1309,17 @@ func selectivityForIndex(idx *CBOIndex, totalDocs float64) float64 {
 		return p
 	}
 
-	// Range / non-equality fallback: bound by the index's own population so a
-	// sparse index (EntryCount << totalDocs) is credited its presence cut instead
-	// of being charged the full collection. Interpolation acts as a one-way
-	// ratchet: the interpolated estimate (rangeDocs) is adopted only when it is
-	// MORE selective than the conservative default — it refines a genuinely
-	// selective range downward (so the index wins) but never penalizes an index
-	// above the default for a broad range (so no previously-indexed plan
-	// regresses).
-	docs := DefaultRangeSelectivity * indexPopulation(idx, totalDocs)
+	// Range / non-equality: the interpolated fraction of the index's entries,
+	// converted to documents (rangeDocs). A measured broad range is priced as
+	// broad; the CostScanDoc break-even, not a cap on the estimate, is what
+	// keeps a selective range on the index. Without a measurement the default
+	// applies to the index's own population, so a sparse index (EntryCount <<
+	// totalDocs) is credited its presence cut instead of being charged the
+	// full collection.
 	if idx.rangeSel > 0 {
-		docs = min(docs, rangeDocs(idx, idx.rangeSel, totalDocs))
+		return rangeDocs(idx, idx.rangeSel, totalDocs) / totalDocs
 	}
-	return docs / totalDocs
+	return DefaultRangeSelectivity * indexPopulation(idx, totalDocs) / totalDocs
 }
 
 // estimateIndexDocsWithFieldSel estimates the number of documents an index seek will return,
@@ -1355,19 +1349,15 @@ func estimateIndexDocsWithFieldSel(idx *CBOIndex, totalDocs float64, fieldSel []
 		return total
 	}
 
-	// Range bounds: adopt the interpolated within-index fraction (a real ordered
-	// B-tree estimate) only when it is MORE selective than the default — the
-	// one-way ratchet (see selectivityForIndex): a selective range is refined down
-	// so the index wins, a broad range never inflates e above the default. rangeSel
-	// already spans the whole bound union (e.g. both halves of a $ne), so it is
-	// applied directly to the population rather than multiplied per field. The
-	// population is ENTRIES, uncapped: on a multikey index the seek fetches a
-	// document once per in-range element (dedup follows the fetch), so entries,
-	// not documents, are what it pays for.
+	// Range bounds: the interpolated within-index fraction (a real ordered
+	// B-tree estimate). rangeSel already spans the whole bound union (e.g.
+	// both halves of a $ne), so it is applied directly to the population
+	// rather than multiplied per field. The population is ENTRIES, uncapped:
+	// on a multikey index the seek fetches a document once per in-range
+	// element (dedup follows the fetch), so entries, not documents, are what
+	// it pays for.
 	if idx.rangeSel > 0 {
-		if e := idx.rangeSel * indexEntries(idx, totalDocs); e < DefaultRangeSelectivity*indexPopulation(idx, totalDocs) {
-			return e
-		}
+		return idx.rangeSel * indexEntries(idx, totalDocs)
 	}
 
 	// Fallback for partial bounds: use per-field selectivity from single-field indexes

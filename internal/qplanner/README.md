@@ -27,23 +27,38 @@ Constants defined in `cost.go`:
 |---|---|---|
 | `CostIndexSeek` | 0.5 | Cost of a B-tree traversal to find a key (per bound/seek) |
 | `CostDocFetch` | 3.0 | Cost of a random point lookup in the data B-tree (index → data) |
-| `CostSeqRead` | 0.1 | Cost of a sequential cursor read per doc (full scan) |
+| `CostScanDoc` | 1.25 | Cost of reading one document on a full scan: sequential page walk plus decompress and decode to the point of rejection |
+| `CostSeqRead` | 0.1 | Cost of a sequential cursor read per index entry |
 | `CostFilter` | 0.5 | Cost of in-memory predicate evaluation |
 | `CostSortSwap` | 0.25 | Cost of an in-memory sort swap (includes re-fetch overhead) |
-| `DefaultRangeSelectivity` | 0.5 | Default fraction for range queries |
+| `DefaultRangeSelectivity` | 0.25 | Fraction for a range the planner cannot measure (SQLite's one-bound factor) |
+
+`CostScanDoc + CostFilter` is half of `CostDocFetch + CostFilter`, so a filter
+matching under 50% of the collection is served from an index. Measured on the
+index path against the scan, a random fetch costs about 3× a scanned document
+at ~700 B, 1.8× at 1 KB with twenty fields and about 1× at 4 KB; the model errs
+toward the index because a full scan chosen for a selective range costs 10–20×
+while an index chosen for a broad one costs at most 1.5×.
 
 #### Selectivity Estimation
 
 - **Equality** (`a = 1`): `P = sketch.Estimate(encodedValue) / TotalDocs`
-- **Range** (`a > 5`): `P = DefaultRangeSelectivity`
+- **Range** (`a > 5`): `f = Cursor.RangeFraction(bounds)` — the fraction of the
+  index's entries inside the bounds, interpolated from the live index B-tree
+  (one descent per endpoint). The seek is priced at `f × EntryCount` entries
+  (a multikey index holds one entry per array element, and the chain fetches
+  once per in-range entry); the documents matched are `min(f × EntryCount,
+  TotalDocs)`. `DefaultRangeSelectivity` applies only when nothing was
+  measured.
 - **Combined** (AND): `P_total = P(a) * P(b)` (independence assumption)
 
 #### Plan Cost Formulas
 
 **Plan A: Full Collection Scan**
 ```
-Cost = (EffectiveDocs × CostSeqRead) + (EffectiveDocs × CostFilter) + sortCost(EstimatedYield)
+Cost = (EffectiveDocs × CostScanDoc) + (EffectiveDocs × CostFilter) + sortCost(EstimatedYield) + EstimatedYield × CostMaterialize
 ```
+Collections of 500 documents or fewer price the read at `CostDocFetch` (shallow tree, no sequential advantage).
 When idBounds are present (point lookups on the primary key), `EffectiveDocs` is replaced with `len(idBounds)`.
 
 **primary-key-sort optimization**: Sorting by the primary key (asc or desc) is free — FullScan naturally reads in primary-key order. When the sort is primary-key-only, `fullScanNeedSort` is false and no SortIter is created. The `Reverse` flag on FullScanIter handles descending order. This works with or without a filter. (The primary key is the collection's configured key field, default `id`.)
