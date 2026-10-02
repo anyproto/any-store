@@ -2567,6 +2567,42 @@ func TestCBO_RangeInterpolation_MultikeyIndex(t *testing.T) {
 	})
 }
 
+// TestCBO_ElemMatch_RangeOnArrayIndex: a value-form $elemMatch binds its
+// operators to one element, so a two-sided range inside it seeks the array
+// index with BOTH ends — the plain {$gte,$lt} spelling can only seek one end,
+// because each operator may be satisfied by a different element.
+func TestCBO_ElemMatch_RangeOnArrayIndex(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "toks")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "toks", Fields: []string{"toks"}}))
+	const n = 5000
+	docs := make([]*anyenc.Value, 0, n)
+	for i := 0; i < n; i++ {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"toks":["w%05d","x%05d"]}`, i, i, i)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+
+	q := `{"toks":{"$elemMatch":{"$gte":"w04900","$lt":"w04950"}}}`
+	explain, err := coll.Find(q).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "IndexScan(toks)", "plan: %s", explain.Sql)
+	assert.Contains(t, explain.Sql, `['"w04900"','"w04950"')`, "both ends must bound the seek: %s", explain.Sql)
+	count, err := coll.Find(q).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 50, count)
+	scanCount, err := coll.Find(q).IndexHint(anystore.IndexHint{IndexName: "toks", Boost: -1000000}).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, scanCount, count)
+
+	// Without $elemMatch the operators range over different elements: every
+	// doc's "x…" token satisfies $gte, and the "w…" token of every doc below
+	// 4950 satisfies $lt.
+	plain, err := coll.Find(`{"toks":{"$gte":"w04900","$lt":"w04950"}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 4950, plain)
+}
+
 // queryIdsHinted runs Find(filter).Sort(sortSpec).Limit(limit).Offset(offset)
 // forcing the named index so the IndexScan/IndexSeek path (the one the
 // offset fast-skip optimizes) is exercised regardless of the cost model.

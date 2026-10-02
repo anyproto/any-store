@@ -281,9 +281,11 @@ build per query and carry no such guarantee.
     mixing with values is a `ParseError`). `$text` and `$knn` are rejected
     inside either form. Through a dotted path it applies to every leaf array,
     positional leaves included.
-    Bounds: the value form contributes `C`'s own bounds on the field (an
-    element's value is one of the field's entries) unless the path is
-    positional; the object form re-keys `C` under the sub-fields —
+    Bounds: the value form contributes the intersection of `C`'s bounds on
+    the field (an element's value is one of the field's entries, and every
+    operator of `C` holds for that one element, so the intersection is a
+    sound seek range even over an array) unless the path is positional; the
+    object form re-keys `C` under the sub-fields —
     `{"a":{"$elemMatch":{"b":{"$gt":1}}}}` bounds `a.b` as `{"a.b":{"$gt":1}}`
     would. Both are supersets, never the exact value image (a scalar or an
     object with that value sits in the bounds without matching), so a `Key`

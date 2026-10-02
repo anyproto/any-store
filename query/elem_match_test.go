@@ -124,12 +124,18 @@ func TestElemMatch_Ok(t *testing.T) {
 }
 
 func TestElemMatch_IndexBoundsAndString(t *testing.T) {
-	// value form: the element-level bounds on the field itself
+	// value form: the element-level bounds on the field itself, intersected
+	// across the operators (one element satisfies all of them)
 	f := MustParseCondition(`{"a":{"$elemMatch":{"$gt":1,"$lt":3}}}`)
 	bs := f.IndexBounds("a", nil)
 	require.Len(t, bs, 1)
-	assert.Equal(t, anyenc.Tuple(anyenc.MustParseJson(`1`).MarshalTo(nil)), bs[0].Start) // first conjunct, wide channel
+	assert.Equal(t, anyenc.Tuple(anyenc.MustParseJson(`1`).MarshalTo(nil)), bs[0].Start)
+	assert.Equal(t, anyenc.Tuple(anyenc.MustParseJson(`3`).MarshalTo(nil)), bs[0].End)
+	assert.False(t, bs[0].StartInclude)
+	assert.False(t, bs[0].EndInclude)
 	assert.Empty(t, f.IndexBounds("a.b", nil))
+	// a provably empty intersection contributes nothing (the residual rejects every row)
+	assert.Empty(t, MustParseCondition(`{"a":{"$elemMatch":{"$gt":5,"$lt":3}}}`).IndexBounds("a", nil))
 	// positional path: the leaf is stored whole, no element bounds
 	assert.Empty(t, MustParseCondition(`{"a.0":{"$elemMatch":{"$gt":1}}}`).IndexBounds("a.0", nil))
 	// a nested $elemMatch looks inside elements the index stores whole
