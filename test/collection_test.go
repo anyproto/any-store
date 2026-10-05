@@ -1766,3 +1766,57 @@ func TestCloseAfterDDL(t *testing.T) {
 		})
 	}
 }
+
+// A collection is renamed twice in one write tx and a new collection takes
+// the name in between. Each handle is its collection's registered handle
+// after the commit, and after a rollback the tx left no trace.
+func TestRenameTwiceThenCreateIntermediateName(t *testing.T) {
+	setup := func(t *testing.T) (fx *fixture, a, b anystore.Collection, tx anystore.WriteTx) {
+		fx = newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+		tx, err = fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.Rename(tx.Context(), "b"))
+		require.NoError(t, a.Rename(tx.Context(), "c"))
+		b, err = fx.CreateCollection(tx.Context(), "b")
+		require.NoError(t, err)
+		return fx, a, b, tx
+	}
+
+	t.Run("commit", func(t *testing.T) {
+		fx, a, b, tx := setup(t)
+		require.NoError(t, tx.Commit())
+
+		assert.Equal(t, "c", a.Name())
+		reg, err := fx.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		assert.True(t, reg == a, "the renamed handle must be registered under its last name")
+		reg, err = fx.OpenCollection(ctx, "b")
+		require.NoError(t, err)
+		assert.True(t, reg == b, "the created handle must keep the intermediate name")
+		_, err = fx.OpenCollection(ctx, "a")
+		assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+
+		require.NoError(t, reg.EnsureIndex(ctx, ddlFtIdx))
+		require.NoError(t, b.Insert(ctx, ddlDoc(1)))
+		assertIndexesHold(t, fx, b, "b", 1, "ft")
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		fx, a, b, tx := setup(t)
+		require.NoError(t, tx.Rollback())
+
+		assert.Equal(t, "a", a.Name())
+		reg, err := fx.OpenCollection(ctx, "a")
+		require.NoError(t, err)
+		assert.True(t, reg == a, "the renamed handle must be registered under its old name")
+		_, err = b.Count(ctx)
+		assert.ErrorIs(t, err, anystore.ErrCollectionClosed)
+		for _, name := range []string{"b", "c"} {
+			_, err = fx.OpenCollection(ctx, name)
+			assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+		}
+		require.NoError(t, fx.IntegrityCheck(ctx))
+	})
+}

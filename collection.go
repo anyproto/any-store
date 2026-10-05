@@ -1513,20 +1513,27 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 		// through those handles into the renamed namespaces.
 		renameValidFrom := tx.DiskSchemaCookie() + 1
 		wtx.onCommitPublish(func() {
-			// The registry key flips to newName, which resolves only in
+			// The registry key flips to the new name, which resolves only in
 			// snapshots at or past this commit: raise the handle's visibility
 			// bound so an older-snapshot staleness pass skips it instead of
 			// invalidating a just-renamed live handle (keyNotFound on the new
 			// name). See reconcileIndexSet.
 			c.validFromCookie.Store(renameValidFrom)
 			c.db.renameResolved(c)
+			// The key flips to the name the handle commits with, not to
+			// newName: after a further rename in this tx newName is an
+			// intermediate name, free for a collection created since, and
+			// that collection's handle holds the entry.
+			c.mu.Lock()
+			committed := c.name
+			c.mu.Unlock()
 			c.db.mu.Lock()
 			if cur, ok := c.db.openedCollections[oldName]; ok && cur == Collection(c) {
 				delete(c.db.openedCollections, oldName)
 				// A Rename→Drop in the same tx closed and evicted the handle
 				// already; don't resurrect it under the new name.
 				if !c.closed.Load() {
-					c.db.openedCollections[newName] = c
+					c.db.openedCollections[committed] = c
 				}
 			}
 			c.db.mu.Unlock()
