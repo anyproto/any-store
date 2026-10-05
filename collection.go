@@ -1533,6 +1533,13 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 				// A Rename→Drop in the same tx closed and evicted the handle
 				// already; don't resurrect it under the new name.
 				if !c.closed.Load() {
+					// An open of the new name between the btree commit and
+					// this publication missed the registry and registered a
+					// handle of its own. Displaced it would stay live outside
+					// the registry: retire it.
+					if other, ok := c.db.openedCollections[committed]; ok && other != Collection(c) {
+						other.(*collection).closed.Store(true)
+					}
 					c.db.openedCollections[committed] = c
 				}
 			}

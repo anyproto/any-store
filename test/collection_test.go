@@ -1820,3 +1820,43 @@ func TestRenameTwiceThenCreateIntermediateName(t *testing.T) {
 		require.NoError(t, fx.IntegrityCheck(ctx))
 	})
 }
+
+// An OpenCollection of the new name races the commit of a Rename: the btree
+// commit shows the name to readers before the registry holds it. Whatever the
+// open returns, the renamed handle is the collection's one live handle.
+func TestRenameCommit_ConcurrentOpenOfNewName(t *testing.T) {
+	// A checkpoint after every commit widens the window.
+	fx := newFixture(t, &anystore.Config{AutoCheckpointAfter: 1})
+	for i := range 200 {
+		from, to := fmt.Sprintf("a%d", i), fmt.Sprintf("b%d", i)
+		c, err := fx.CreateCollection(ctx, from)
+		require.NoError(t, err)
+
+		renamed := make(chan struct{})
+		opened := make(chan anystore.Collection, 1)
+		go func() {
+			for {
+				if h, err := fx.OpenCollection(ctx, to); err == nil {
+					opened <- h
+					return
+				}
+				select {
+				case <-renamed:
+					opened <- nil
+					return
+				default:
+				}
+			}
+		}()
+		require.NoError(t, c.Rename(ctx, to))
+		close(renamed)
+
+		reg, err := fx.OpenCollection(ctx, to)
+		require.NoError(t, err)
+		require.True(t, reg == c, "the renamed handle must be registered under the new name")
+		if h := <-opened; h != nil && h != c {
+			_, err = h.Count(ctx)
+			require.ErrorIs(t, err, anystore.ErrCollectionClosed, "a second handle of the renamed collection must not stay live")
+		}
+	}
+}
