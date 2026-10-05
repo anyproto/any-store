@@ -399,6 +399,248 @@ func TestCollection_PrimaryKey_ArrayRejected_CustomPk(t *testing.T) {
 // raw Open on a temp path (not newFixture) because they must survive a real
 // close/open cycle.
 
+// A handle opened through a read transaction is not built from that
+// transaction's snapshot for everyone else: a schema change this process
+// committed after the snapshot is in force for every later transaction.
+
+// An index created after the snapshot is maintained by writes through the
+// handle.
+func TestOpenThroughOlderReadTx_IndexCreatedSince(t *testing.T) {
+	for _, kind := range []string{"range", "fulltext"} {
+		t.Run(kind, func(t *testing.T) {
+			fx := newFixture(t)
+			a, err := fx.CreateCollection(ctx, "a")
+			require.NoError(t, err)
+			require.NoError(t, a.Close())
+
+			rtx, err := fx.ReadTx(ctx)
+			require.NoError(t, err)
+			h0, err := fx.OpenCollection(ctx, "a")
+			require.NoError(t, err)
+			info := anystore.IndexInfo{Name: "ix", Fields: []string{"body"}}
+			find := `{"body":"alpha"}`
+			if kind == "fulltext" {
+				info.Kind = anystore.IndexKindFulltext
+				find = `{"$text":{"$search":"alpha"}}`
+			}
+			require.NoError(t, h0.EnsureIndex(ctx, info))
+			require.NoError(t, h0.Close())
+
+			h, err := fx.OpenCollection(rtx.Context(), "a")
+			require.NoError(t, err)
+			// The reader's own view has neither the index nor a document.
+			n, err := h.Count(rtx.Context())
+			require.NoError(t, err)
+			assert.Zero(t, n)
+			require.NoError(t, rtx.Commit())
+
+			require.NoError(t, h.Insert(ctx, anyenc.MustParseJson(`{"id":1,"body":"alpha"}`)))
+			require.Len(t, h.GetIndexes(), 1)
+			n, err = h.Find(find).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 1, n, "the document was committed without its index entry")
+
+			require.NoError(t, h.Close())
+			fresh, err := fx.OpenCollection(ctx, "a")
+			require.NoError(t, err)
+			n, err = fresh.Find(find).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 1, n)
+			require.NoError(t, fx.IntegrityCheck(ctx))
+		})
+	}
+}
+
+// An index dropped after the snapshot is not written to: its root pages are
+// free, or another tree's by now.
+func TestOpenThroughOlderReadTx_IndexDroppedSince(t *testing.T) {
+	fx := newFixture(t)
+	a, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	require.NoError(t, a.EnsureIndex(ctx, anystore.IndexInfo{Name: "k", Fields: []string{"k"}}))
+	for i := range 5 {
+		require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"k":%d}`, i, i))))
+	}
+	require.NoError(t, a.Close())
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	h0, err := fx.OpenCollection(ctx, "a")
+	require.NoError(t, err)
+	require.NoError(t, h0.DropIndex(ctx, "k"))
+	require.NoError(t, h0.Close())
+
+	h, err := fx.OpenCollection(rtx.Context(), "a")
+	require.NoError(t, err)
+	// The reader's snapshot still has the index, and plans with it.
+	n, err := h.Find(`{"k":{"$gte":3}}`).IndexHint(anystore.IndexHint{IndexName: "k", Boost: 1_000_000}).Count(rtx.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+	require.NoError(t, rtx.Commit())
+	assert.Empty(t, h.GetIndexes())
+
+	// Whatever reuses the freed pages must stay intact.
+	other, err := fx.CreateCollection(ctx, "other")
+	require.NoError(t, err)
+	require.NoError(t, other.EnsureIndex(ctx, anystore.IndexInfo{Name: "k", Fields: []string{"k"}}))
+	for i := range 5 {
+		require.NoError(t, other.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"k":%d}`, i, i))))
+	}
+	for i := 5; i < 10; i++ {
+		require.NoError(t, h.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"k":%d}`, i, i))))
+	}
+	n, err = other.Find(`{"k":{"$gte":0}}`).IndexHint(anystore.IndexHint{IndexName: "k", Boost: 1_000_000}).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 5, n)
+	n, err = h.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 10, n)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// The collection was dropped and another one created under its name after
+// the snapshot: the handle the older transaction opens stands for the
+// collection of its snapshot and for nothing else. It never carries that
+// collection's primary key and indexes over the new collection's data.
+func TestOpenThroughOlderReadTx_RecreatedSince(t *testing.T) {
+	fx := newFixture(t)
+	a, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	require.NoError(t, a.EnsureIndex(ctx, anystore.IndexInfo{Name: "k", Fields: []string{"k"}}))
+	require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(`{"id":1,"k":5}`)))
+	require.NoError(t, a.Close())
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	h0, err := fx.OpenCollection(ctx, "a")
+	require.NoError(t, err)
+	require.NoError(t, h0.Drop(ctx))
+	n, err := fx.CreateCollection(ctx, "a", anystore.CollectionOptions{PrimaryKey: "uid"})
+	require.NoError(t, err)
+	require.NoError(t, n.Insert(ctx, anyenc.MustParseJson(`{"uid":"x","k":7}`)))
+	require.NoError(t, n.Close())
+
+	h, err := fx.OpenCollection(rtx.Context(), "a")
+	require.NoError(t, err)
+	doc, err := h.FindId(rtx.Context(), 1)
+	require.NoError(t, err, "the reader's snapshot has the dropped collection")
+	assert.Equal(t, 5, doc.Value().GetInt("k"))
+	require.NoError(t, rtx.Commit())
+
+	// Outside that snapshot the collection it stands for is gone.
+	err = h.Insert(ctx, anyenc.MustParseJson(`{"id":2,"uid":"y","k":9}`))
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+
+	fresh, err := fx.OpenCollection(ctx, "a")
+	require.NoError(t, err)
+	assert.Equal(t, "uid", fresh.PrimaryKey())
+	assert.Empty(t, fresh.GetIndexes())
+	cnt, err := fresh.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// A transaction older than a collection does not find it, whoever holds it
+// open, and reads nothing through a handle to it.
+func TestOlderReadTx_CollectionCreatedSince(t *testing.T) {
+	fx := newFixture(t)
+	pad, err := fx.CreateCollection(ctx, "pad")
+	require.NoError(t, err)
+	require.NoError(t, pad.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { _ = rtx.Commit() }()
+
+	n, err := fx.CreateCollection(ctx, "n")
+	require.NoError(t, err)
+	require.NoError(t, n.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+
+	// Held open by someone, or not: the answer is the snapshot's.
+	_, err = fx.OpenCollection(rtx.Context(), "n")
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	_, err = n.FindId(rtx.Context(), 1)
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	_, err = n.Count(rtx.Context())
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	_, err = n.Find(nil).Iter(rtx.Context())
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	require.NoError(t, n.Close())
+	_, err = fx.OpenCollection(rtx.Context(), "n")
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+
+	// The handle is fine for everyone at the present state.
+	n, err = fx.OpenCollection(ctx, "n")
+	require.NoError(t, err)
+	cnt, err := n.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+}
+
+// The handle of a collection recreated under the same name does not serve the
+// documents of the one an older transaction still sees there.
+func TestOlderReadTx_CollectionRecreatedSince(t *testing.T) {
+	fx := newFixture(t)
+	a, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	for i := range 3 {
+		require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i))))
+	}
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { _ = rtx.Commit() }()
+
+	require.NoError(t, a.Drop(ctx))
+	n, err := fx.CreateCollection(ctx, "a", anystore.CollectionOptions{PrimaryKey: "uid"})
+	require.NoError(t, err)
+	require.NoError(t, n.Insert(ctx, anyenc.MustParseJson(`{"uid":1}`)))
+
+	_, err = n.FindId(rtx.Context(), 1)
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	_, err = n.Count(rtx.Context())
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	_, err = fx.OpenCollection(rtx.Context(), "a")
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+
+	cnt, err := n.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+}
+
+// A collection created in an open write transaction is that transaction's
+// alone until it commits: a caller around the transaction finds nothing
+// under a handle to it, and no page of an uncommitted tree.
+func TestReadAroundWriteTx_CollectionCreatedInIt(t *testing.T) {
+	fx := newFixture(t)
+	pad, err := fx.CreateCollection(ctx, "pad")
+	require.NoError(t, err)
+	require.NoError(t, pad.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	n, err := fx.CreateCollection(wtx.Context(), "n")
+	require.NoError(t, err)
+	require.NoError(t, n.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":1}`)))
+
+	_, err = n.FindId(ctx, 1)
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	_, err = n.Count(ctx)
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	_, err = n.Find(`{"id":{"$gte":0}}`).Count(ctx)
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	// The transaction itself reads what it wrote.
+	cnt, err := n.Count(wtx.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+
+	require.NoError(t, wtx.Commit())
+	cnt, err = n.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+}
+
 // A read transaction that began before a rename keeps reading through the
 // handle it holds: the data tree and the documents are the ones its snapshot
 // has, whatever the collection is called by now.

@@ -1419,10 +1419,10 @@ func TestCreateVectorIndexUncommitted_ConcurrentReader(t *testing.T) {
 		Vector: &anystore.VectorParams{Field: "v", Dim: dim, Metric: anystore.VectorL2, EfSearch: 32},
 	}))
 
-	// Concurrent reader: exactly the pre-DDL behavior — no vector index
-	// (prev == nil, nothing to substitute).
+	// Concurrent reader: exactly the pre-DDL behavior — its snapshot has no
+	// vector index on the field.
 	_, err = vsearch(coll, "v", vecs[0], 3, 32)
-	assert.ErrorIs(t, err, anystore.ErrIndexNotFound)
+	assert.ErrorIs(t, err, anystore.ErrNoVectorIndex)
 
 	// The creating tx searches its own uncommitted index.
 	fq := coll.Find(fmt.Sprintf(`{"v":%s}`, vknnJSON(vecs[7], 3, 32)))
@@ -1574,10 +1574,10 @@ func TestStaleReaderAcrossVectorCreateCommit(t *testing.T) {
 		Vector: &anystore.VectorParams{Field: "v", Dim: dim, Metric: anystore.VectorL2, EfSearch: 32},
 	}))
 
-	// Stale reader: the graph namespaces do not exist in its snapshot —
-	// exactly the pre-DDL behavior.
+	// Stale reader: the index does not exist in its snapshot — exactly the
+	// pre-DDL behavior.
 	_, err = vsearchCtx(rtx.Context(), coll, "v", vecs[0], 3, 32)
-	assert.ErrorIs(t, err, anystore.ErrIndexNotFound)
+	assert.ErrorIs(t, err, anystore.ErrNoVectorIndex)
 
 	hits, err := vsearch(coll, "v", vecs[0], 3, 32)
 	require.NoError(t, err)
@@ -1630,9 +1630,9 @@ func TestStaleReaderAcrossVectorCompactCommit(t *testing.T) {
 
 // A same-tx drop+recreate under one name can land the recreated tree on the
 // freed old root's page number (freelist-first allocation), so root-page
-// equality alone would admit the pending handle to a concurrent reader whose
-// snapshot holds the OLD tree at that page — the catalog-identity half of the
-// slow path must exclude it (the snapshot's row carries the old definition).
+// equality alone would hand the pending handle to a concurrent reader whose
+// snapshot holds the OLD tree at that page. The reader works with the index
+// its own snapshot defines: fields a, not the pending fields b.
 func TestConcurrentReaderAcrossDropRecreateSameTx(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
@@ -1653,16 +1653,24 @@ func TestConcurrentReaderAcrossDropRecreateSameTx(t *testing.T) {
 
 	// Concurrent reader during the window: the pending fields-b handle must
 	// not serve a fields-a query even if its recreated root reuses the freed
-	// page number the reader's snapshot still maps to the fields-a tree.
+	// page number the reader's snapshot still maps to the fields-a tree. The
+	// index of that name the reader does plan with is its snapshot's, over a.
 	const filter = `{"a":"x"}`
 	hint := anystore.IndexHint{IndexName: "nm", Boost: 1_000_000}
 	cnt, err := coll.Find(filter).IndexHint(hint).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 30, cnt)
-	explain, err := coll.Find(filter).Explain(ctx)
+	explain, err := coll.Find(filter).IndexHint(hint).Explain(ctx)
 	require.NoError(t, err)
-	assert.False(t, explainHasIndex(explain, "nm"),
-		"a pending redefinition must not be a candidate for a concurrent reader")
+	assert.True(t, explainHasIndex(explain, "nm"), "the reader's snapshot has nm over a")
+	assert.Contains(t, explain.Plan, "nm")
+	cnt, err = coll.Find(`{"b":"y3"}`).IndexHint(hint).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 29, cnt)
+	explain, err = coll.Find(`{"b":"y3"}`).IndexHint(hint).Explain(ctx)
+	require.NoError(t, err)
+	assert.NotContains(t, explain.Plan, "IndexScan",
+		"a pending redefinition over b must not serve a concurrent reader")
 
 	require.NoError(t, tx.Commit())
 
@@ -1677,7 +1685,7 @@ func TestConcurrentReaderAcrossDropRecreateSameTx(t *testing.T) {
 // Fts flavor of the same hazard: the five recreated namespaces can reuse
 // freed page numbers, and a partial or full root coincidence must never let
 // a concurrent reader search old postings through the new handle's field
-// configuration — the definition mismatch excludes it (ErrNoFulltextIndex).
+// configuration. The reader searches the index its own snapshot defines.
 func TestConcurrentReaderAcrossFtsDropRecreateSameTx(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
@@ -1691,19 +1699,13 @@ func TestConcurrentReaderAcrossFtsDropRecreateSameTx(t *testing.T) {
 	require.NoError(t, coll.DropIndex(tx.Context(), "t"))
 	require.NoError(t, coll.CreateIndex(tx.Context(), anystore.IndexInfo{Name: "t", Kind: anystore.IndexKindFulltext, Fields: []string{"title"}}))
 
-	iter, err := coll.Find(`{"$text":{"$search":"london"}}`).Iter(ctx)
-	if err == nil {
-		for iter.Next() {
-		}
-		err = iter.Err()
-		require.NoError(t, iter.Close())
-	}
-	assert.ErrorIs(t, err, anystore.ErrNoFulltextIndex,
-		"a pending fts redefinition must be invisible, never garbled results")
+	ids, _ := collectIter(t, coll.Find(`{"$text":{"$search":"london"}}`))
+	assert.Equal(t, []string{"a"}, ids,
+		"a concurrent reader searches the body index of its snapshot, never the pending one")
 
 	require.NoError(t, tx.Commit())
 
-	ids, _ := collectIter(t, coll.Find(`{"$text":{"$search":"london"}}`))
+	ids, _ = collectIter(t, coll.Find(`{"$text":{"$search":"london"}}`))
 	assert.Equal(t, []string{"b"}, ids, "committed: the title index answers")
 }
 
@@ -1818,10 +1820,10 @@ func TestAmbientReopenPendingVectorInvisible(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, hitsTx, 3)
 
-	// A concurrent reader must not: the graph exists only in the writer's
+	// A concurrent reader must not: the index exists only in the writer's
 	// uncommitted view.
 	_, err = vsearchCtx(ctx, coll2, "v", vecs[0], 3, 32)
-	assert.ErrorIs(t, err, anystore.ErrIndexNotFound)
+	assert.ErrorIs(t, err, anystore.ErrNoVectorIndex)
 
 	require.NoError(t, tx.Rollback())
 
@@ -1831,9 +1833,9 @@ func TestAmbientReopenPendingVectorInvisible(t *testing.T) {
 }
 
 // A stale reader on a redefined index (drop+recreate same name, different
-// definition) fails noisy: its snapshot's catalog row no longer matches the
-// current handle, and old data must never be served under a new definition
-// (the SQLITE_SCHEMA posture).
+// definition) searches the index its own snapshot defines: old data is never
+// served under the new definition, nor the other way round (SQLite reloads
+// the schema of a statement's transaction through that transaction).
 func TestStaleReaderAcrossVectorDropRecreateDef(t *testing.T) {
 	const dim = 8
 	fx := newFixture(t)
@@ -1860,9 +1862,11 @@ func TestStaleReaderAcrossVectorDropRecreateDef(t *testing.T) {
 		Vector: &anystore.VectorParams{Field: "v", Dim: dim, Metric: anystore.VectorL2, Mode: anystore.VectorModeBruteForce},
 	}))
 
-	_, err = vsearchCtx(rtx.Context(), coll, "v", vecs[0], 3, 32)
-	assert.ErrorIs(t, err, anystore.ErrIndexNotFound,
-		"a redefined index must fail noisy for a reader on the old definition's snapshot")
+	// The reader's snapshot has the index under its old definition, and that
+	// is the one it searches.
+	stale, err := vsearchCtx(rtx.Context(), coll, "v", vecs[0], 3, 32)
+	require.NoError(t, err)
+	assert.Len(t, stale, 3)
 
 	hits, err := vsearch(coll, "v", vecs[0], 3, 0)
 	require.NoError(t, err)

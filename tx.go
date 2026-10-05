@@ -97,8 +97,7 @@ type commonTx struct {
 	// Rename's openedCollections re-key lives here: re-keying at execution
 	// time would let a concurrent OpenCollection(oldName) miss the map, pass
 	// the committed-snapshot catalog check, and register a duplicate live
-	// handle under the vacated name — one the in-process staleness pass never
-	// invalidates (own commits update localSchemaCookie). Pubs run in
+	// handle under the vacated name. Pubs run in
 	// registration order after a successful btree commit and are dropped
 	// unrun on any rollback or failed commit; savepoint scoping mirrors
 	// undo (savepointTx records a mark, rollback-to-savepoint drops its
@@ -202,6 +201,10 @@ func (tx *commonTx) dbRef() *db {
 	return tx.db
 }
 
+// testHookAfterBtreeCommit, when set, runs after the btree commit of a
+// top-level write tx and before anything that follows it. Tests only.
+var testHookAfterBtreeCommit func()
+
 var txPool = &sync.Pool{
 	New: func() any {
 		return &commonTx{}
@@ -298,7 +301,21 @@ func (w writeTx) Commit() error {
 			w.db.ddlUnwindGate.Lock()
 			defer w.db.ddlUnwindGate.Unlock()
 		}
+		schemaChange := w.writeTx.SchemaChanged()
+		if schemaChange {
+			w.db.announceCookie(w.writeTx.DiskSchemaCookie() + 1)
+		}
 		err := w.writeTx.Commit()
+		if testHookAfterBtreeCommit != nil {
+			testHookAfterBtreeCommit()
+		}
+		if schemaChange {
+			// The heads this tx changed are in place since the verbs ran
+			// (collection.publish): the epoch follows the cookie, before the
+			// publications below let a changed handle out of the registry
+			// (see collection.since).
+			w.db.schemaCommitted(err == nil)
+		}
 		if err == nil {
 			if w.modified {
 				w.db.recoveryController.OnWriteEvent()

@@ -312,16 +312,16 @@ func indexNsName(collName, indexName string) string {
 	return "ix:" + collName + ":" + indexName
 }
 
-func newIndex(c *collection, info IndexInfo, ns *btree.Namespace) (idx *index, err error) {
-	// Every construction site (init, reconcile, createIndex) runs on the
-	// writer or under c.mu, so reading c.name here is race-free; the captured
-	// identity is immutable afterwards (see the field comment).
+// newIndex binds an index of the collection, under the name collName that the
+// view it is read from has for it. The captured identity is immutable
+// afterwards (see the field comment).
+func newIndex(c *collection, collName string, info IndexInfo, ns *btree.Namespace) (idx *index, err error) {
 	idx = &index{
 		info:       info,
 		c:          c,
 		ns:         ns,
-		nsName:     indexNsName(c.cur().name, info.Name),
-		catalogKey: indexKey(c.cur().name, info.Name),
+		nsName:     indexNsName(collName, info.Name),
+		catalogKey: indexKey(collName, info.Name),
 	}
 	if err = idx.init(); err != nil {
 		return nil, err

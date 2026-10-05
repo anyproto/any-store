@@ -195,11 +195,11 @@ func (val *aggStageValidator) validate(p aggregate.Pipeline) error {
 			// $lookup is scoped to a self-join on the primary key: "from" may
 			// only name the aggregated collection (the parser can't know its
 			// name), and the "id" foreign field must actually be the pk.
-			if sp.From != "" && sp.From != q.c.cur().name {
-				return fmt.Errorf("%w: from %q, aggregating %q", errAggLookupFrom, sp.From, q.c.cur().name)
+			if name := q.c.Name(); sp.From != "" && sp.From != name {
+				return fmt.Errorf("%w: from %q, aggregating %q", errAggLookupFrom, sp.From, name)
 			}
 			if q.c.primaryKey != "id" {
-				return fmt.Errorf("%w: collection %q's primary key is %q", errAggLookupPrimaryKey, q.c.cur().name, q.c.primaryKey)
+				return fmt.Errorf("%w: collection %q's primary key is %q", errAggLookupPrimaryKey, q.c.Name(), q.c.primaryKey)
 			}
 		case aggregate.MatchSpec:
 			if query.ContainsText(sp.Filter) {

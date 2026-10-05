@@ -1032,15 +1032,13 @@ func TestDropOrphanStaleIndexesRepro(t *testing.T) {
 	// (its idx: metadata key and ix: namespace remain on disk), simulating an
 	// index this handle never learned about.
 	cImpl := collA.(*collection)
-	cImpl.mu.Lock()
 	var kept []*index
 	for _, idx := range cImpl.loadIndexes() {
 		if idx.info.createName() != "other" {
 			kept = append(kept, idx)
 		}
 	}
-	cImpl.storeIndexes(kept)
-	cImpl.mu.Unlock()
+	setHead(cImpl, func(s *collSchema) { s.indexes = kept })
 
 	if got := len(collA.GetIndexes()); got != 1 {
 		t.Fatalf("precondition: expected A to know about exactly 1 index (stale), got %d", got)

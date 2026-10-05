@@ -314,19 +314,16 @@ func (vi *vectorIndex) update(tx *btree.WriteTx, prevIt, it item) error {
 
 func (vi *vectorIndex) Info() IndexInfo { return vi.info }
 
-// rootUnchanged reports whether the index's on-disk :meta namespace still has the
-// btree root page this object was opened against. It returns false after a
-// compaction recreated the namespaces (root moved), which means the object's
-// handles are stale and it must be reopened. Brute-force indexes (no namespaces)
-// are always "unchanged". A transient resolution failure returns true so a
-// working index is not dropped over a momentary view.
-func (vi *vectorIndex) rootUnchanged(tx *btree.ReadTx, collName string) bool {
+// boundIn reports that the view of tx has the index of the collection
+// collName at the :meta root this object was opened against. Brute-force
+// indexes have no namespaces and are bound in any view that lists them.
+func (vi *vectorIndex) boundIn(tx *btree.ReadTx, collName string) bool {
 	if vi.ix == nil && vi.ivf == nil {
 		return true
 	}
 	ns, err := tx.GetNamespace(vectorIndexNsPrefix(collName, vi.info.Name) + ":meta")
 	if err != nil {
-		return true
+		return false
 	}
 	if vi.isIVF() {
 		return ns.RootPage() == vi.ivf.MetaRoot()
@@ -387,8 +384,6 @@ func (vi *vectorIndex) overThreshold(tx *btree.ReadTx) (bool, error) {
 	return deleted > 0 && float64(deleted) >= vi.compactRatio*float64(live), nil
 }
 
-// loadVectorIndex resolves an existing vector index from persisted info using
-// the provided read transaction (no nested read tx).
 // bindIdentity stamps the immutable generation identity (see the field
 // comments): every constructor funnel calls it before the handle is returned
 // or published, so forTx's lock-free slow path never reads c.name.
@@ -397,14 +392,11 @@ func (vi *vectorIndex) bindIdentity(collName string) {
 	vi.catalogKey = indexKey(collName, vi.info.Name)
 }
 
-func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorIndex, error) {
-	return c.loadVectorIndexAs(tx, c.cur().name, info)
-}
-
 // loadVectorIndexAs opens the index from the given snapshot under collName —
-// the collection's name AS THAT SNAPSHOT knows it. forTx's transient rebuild
-// passes the handle's captured name, which may legitimately differ from
-// c.name (a later rename); init and reconcile go through loadVectorIndex.
+// the collection's name AS THAT SNAPSHOT knows it: the loader passes the name
+// its view has, forTx's transient rebuild the handle's captured one, which
+// may legitimately differ from the collection's present name (a later
+// rename).
 func (c *collection) loadVectorIndexAs(tx *btree.ReadTx, collName string, info IndexInfo) (*vectorIndex, error) {
 	if err := validateVectorParams(info.Vector); err != nil {
 		return nil, err
@@ -537,56 +529,6 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	ix.SetHybrid(hybrid)
 	ix.SetVectorCache(hybrid && info.Vector.HybridCacheVectors)
 	return newVectorIndexFromVindex(c, info, ix), nil
-}
-
-// reconcileVectorIndexesLocked rebuilds the vector-index set from on-disk infos
-// after a peer committed vector-index DDL. Caller holds c.mu. Tolerant of
-// transient resolution failures (keeps the existing object) so a working index
-// is never dropped over a stale view.
-func (c *collection) reconcileVectorIndexesLocked(tx *btree.ReadTx, infos []IndexInfo) {
-	cur := c.loadVectorIndexes()
-	byName := make(map[string]*vectorIndex, len(cur))
-	for _, vi := range cur {
-		byName[vi.info.Name] = vi
-	}
-
-	var want int
-	for _, info := range infos {
-		if info.Kind == IndexKindVector {
-			want++
-		}
-	}
-	rebuilt := make([]*vectorIndex, 0, want)
-	changed := want != len(cur)
-	for _, info := range infos {
-		if info.Kind != IndexKindVector {
-			continue
-		}
-		if existing, ok := byName[info.Name]; ok && existing.rootUnchanged(tx, c.cur().name) {
-			rebuilt = append(rebuilt, existing)
-			continue
-		}
-		// New index, or a compaction recreated the namespaces under the same name
-		// (root page moved) so the existing object's handles are stale — reopen
-		// with fresh handles. This mirrors the range-index reconcile's
-		// root-moved-via-drop+recreate path.
-		vi, err := c.loadVectorIndex(tx, info)
-		if err != nil {
-			// not resolvable in this snapshot — keep any existing object rather than
-			// dropping a working index over a transient view; retry next round.
-			if existing, ok := byName[info.Name]; ok {
-				rebuilt = append(rebuilt, existing)
-			} else {
-				changed = true
-			}
-			continue
-		}
-		rebuilt = append(rebuilt, vi)
-		changed = true
-	}
-	if changed {
-		c.storeVectorIndexes(rebuilt)
-	}
 }
 
 // ErrMultipleVectorClauses is returned when a query carries more than one $knn
@@ -1339,11 +1281,11 @@ const vectorEfCap = 4096
 // with that name exists.
 func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) error {
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) error {
-		c.mu.Lock()
-		defer c.mu.Unlock()
 		if err := c.beginDDL(wtx); err != nil {
 			return err
 		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
 		cur := c.loadVectorIndexes()
 		idx := -1
 		for i, vi := range cur {
@@ -1372,11 +1314,8 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 		// this one) reverts the namespace recreation and frees the compacted
 		// roots, so the pre-compaction snapshot must be restored — a handle
 		// left pointing at freed pages fails every subsequent vector op with
-		// "btree: key not found" until reopen. The restore undo also raises
-		// indexSetDDLTxs, so a concurrent read tx's reconcile (reacting to
-		// the cookie bump above) cannot rebuild the set from its older
-		// snapshot mid-tx.
-		c.registerIndexSetRestore(wtx)
+		// "btree: key not found" until reopen.
+		c.registerHeadRestore(wtx)
 		// Visibility (see forTx): until commit, the compacted roots exist
 		// only in this tx's view. The stamp is the cookie this commit will
 		// publish (MarkSchemaChanged above guarantees the bump) — a
@@ -1407,7 +1346,7 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 		next := make([]*vectorIndex, len(cur))
 		copy(next, cur)
 		next[idx] = nvi
-		c.storeVectorIndexes(next)
+		c.publish(tx, func(s *collSchema) { s.vindexes = next })
 		return nil
 	})
 }
@@ -1433,14 +1372,17 @@ func (c *collection) maybeAutoCompactVectors(ctx context.Context) {
 		return
 	}
 	// The threshold check only reads each index's meta record (live/deleted
-	// counts), so a fast read tx — no checkStale/reconcile/sketch-reload — is
-	// enough. A momentarily stale count at worst defers a compaction by one write,
+	// counts), so a fast read tx — no sketch reload — is enough. A
+	// momentarily stale count at worst defers a compaction by one write,
 	// which is harmless for this heuristic.
 	var due []string
 	if rtx, rerr := c.db.btreeDB.BeginReadFast(); rerr == nil {
-		for _, vi := range vidxs {
-			if over, err := vi.overThreshold(rtx); err == nil && over {
-				due = append(due, vi.info.Name)
+		c.db.observeCookie(rtx)
+		if s, err := c.resolve(rtx); err == nil {
+			for _, vi := range s.vindexes {
+				if over, err := vi.overThreshold(rtx); err == nil && over {
+					due = append(due, vi.info.Name)
+				}
 			}
 		}
 		_ = rtx.Rollback()

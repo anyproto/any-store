@@ -560,10 +560,9 @@ func TestIndexFormat_NewerStampRebuilt(t *testing.T) {
 }
 
 // An outdated index a running handle adopts after Open (a peer's
-// pre-versioning DDL, reconciled at the next tx) is never planned; the query
-// falls back to a scan, writes keep maintaining it, and the next Open
-// rebuilds it. The peer is simulated on the handle's own db, followed by a
-// forced reconcile pass.
+// pre-versioning DDL, noticed by the next tx that uses the handle) is never
+// planned; the query falls back to a scan, writes keep maintaining it, and
+// the next Open rebuilds it. The peer is simulated on the handle's own db.
 func TestIndexFormat_OutdatedIndexNotPlanned(t *testing.T) {
 	skipIfInMemory(t, "the index format stamp is written and the database reopened")
 	dir := legacyFixture(t)
@@ -577,10 +576,9 @@ func TestIndexFormat_OutdatedIndexNotPlanned(t *testing.T) {
 	assert.Contains(t, exp.Plan, "sparse")
 
 	legacyIndex(t, c, "sparse")
-	require.NoError(t, c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		c.reconcileIndexes(tx)
-		return nil
-	}))
+	peerSchemaChangeNow(t, c.db)
+	_, err = coll.Count(ctx)
+	require.NoError(t, err)
 	assert.True(t, formatIndex(t, coll, "sparse").outdated)
 
 	exp, err = coll.Find(`{"a":{"$exists":true}}`).Explain(ctx)

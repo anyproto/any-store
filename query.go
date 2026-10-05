@@ -215,7 +215,12 @@ func (q *collQuery) validateSources() error {
 	if q.srcValidated {
 		return nil
 	}
-	s := q.c.cur()
+	// Before a transaction exists the newest version stands in; the plan is
+	// compiled against the transaction's own (compilePlan).
+	s := q.c.committed()
+	if s == nil {
+		return ErrCollectionNotFound
+	}
 	if err := rejectLegacyVectorClause(q.cond, s.vindexes); err != nil {
 		return err
 	}
@@ -443,9 +448,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return
 	}
 
-	// Resolved inside the tx scope: the begin-time staleness pass may have
-	// just invalidated the handle (a peer's drop frees the pages this
-	// snapshot would walk through the stale root).
+	// Resolved inside the tx scope, for its snapshot (collection.resolve).
 	btx := tx.btreeReadTx()
 	s, err := q.c.resolve(btx)
 	if err != nil {
@@ -601,9 +604,9 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(btWtx *btree.Writ
 		}
 	}()
 
-	// Resolved inside the tx scope: the begin-time staleness pass may have
-	// just invalidated the handle (see collection.alive) — the entry check
-	// alone would let this bulk write proceed through a stale handle.
+	// Resolved inside the tx scope, for its view (collection.resolve) — the
+	// entry check alone would let this bulk write proceed through a handle
+	// another process's schema change retired.
 	btWtx := tx.btreeWriteTx()
 	btx := tx.btreeReadTx()
 	s, err := q.c.resolve(btx)
