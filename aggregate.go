@@ -273,12 +273,15 @@ func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.P
 		lookupTx ReadTx
 	)
 	if aggregate.HasLookup(rest) {
-		var btx *btree.ReadTx
-		if btx, lookupTx, err = q.lookupBtreeTx(ctx, inner); err != nil {
+		var (
+			btx *btree.ReadTx
+			s   *collSchema
+		)
+		if btx, s, lookupTx, err = q.lookupBtreeTx(ctx, inner); err != nil {
 			_ = inner.Close()
 			return nil, err
 		}
-		env.Lookup = q.c.lookupFunc(btx)
+		env.Lookup = q.c.lookupFunc(btx, s)
 	}
 
 	limits := q.limits.WithDefaults()
@@ -309,35 +312,37 @@ func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.P
 	}, nil
 }
 
-// lookupBtreeTx returns the btree read tx $lookup point reads run against:
-// the streaming iterator's own tx (same snapshot; the iterator holds it open
-// until Close, which happens after every stage — blocking ones included —
-// has finished). When the pushdown prefix is provably empty the iterator has
-// no tx at all, yet a $count downstream can still synthesize rows whose
-// fields feed $lookup — then a dedicated read tx is opened, returned as held
-// for aggIterator to release on Close.
-func (q *aggQuery) lookupBtreeTx(ctx context.Context, inner Iterator) (btx *btree.ReadTx, held ReadTx, err error) {
+// lookupBtreeTx returns the btree read tx $lookup point reads run against,
+// with the schema version resolved for it: the streaming iterator's own tx
+// (same snapshot; the iterator holds it open until Close, which happens after
+// every stage — blocking ones included — has finished). When the pushdown
+// prefix is provably empty the iterator has no tx at all, yet a $count
+// downstream can still synthesize rows whose fields feed $lookup — then a
+// dedicated read tx is opened, returned as held for aggIterator to release on
+// Close.
+func (q *aggQuery) lookupBtreeTx(ctx context.Context, inner Iterator) (btx *btree.ReadTx, s *collSchema, held ReadTx, err error) {
 	if pi, ok := inner.(*planIterator); ok {
-		return pi.tx.btreeReadTx(), nil, nil
+		return pi.tx.btreeReadTx(), pi.s, nil, nil
 	}
 	tx, err := q.c.db.getReadTx(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	if err = q.c.alive(); err != nil {
+	if s, err = q.c.resolve(tx.btreeReadTx()); err != nil {
 		_ = tx.Commit()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return tx.btreeReadTx(), tx, nil
+	return tx.btreeReadTx(), s, tx, nil
 }
 
-// lookupFunc serves $lookup point reads against btx. A missing key is a
-// non-match, not an error. The document is parsed owned into buf (stage-owned
-// scratch): valid until the stage reuses the same buf.
-func (c *collection) lookupFunc(btx *btree.ReadTx) aggregate.LookupFunc {
+// lookupFunc serves $lookup point reads against btx, s being the version
+// resolved for it. A missing key is a non-match, not an error. The document
+// is parsed owned into buf (stage-owned scratch): valid until the stage
+// reuses the same buf.
+func (c *collection) lookupFunc(btx *btree.ReadTx, s *collSchema) aggregate.LookupFunc {
 	return func(key []byte, buf *syncpool.DocBuffer) (*anyenc.Value, error) {
 		var err error
-		buf.DocBuf, err = btx.AppendValue(c.cur().ns, key, buf.DocBuf[:0])
+		buf.DocBuf, err = btx.AppendValue(s.ns, key, buf.DocBuf[:0])
 		if err != nil {
 			if errors.Is(err, btree.ErrKeyNotFound) {
 				return nil, nil

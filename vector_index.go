@@ -647,7 +647,7 @@ var ErrDistanceWithoutVector = errors.New("any-store: _distance is only availabl
 // short-circuit) would search a peer-rebuilt index through its dead gen-0
 // namespaces (caught by the multiprocess IVF consistency test). compilePlan
 // re-detects after the tx begins, on the handle set the plan executes on.
-func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, error) {
+func (q *collQuery) detectKnnQuery(s *collSchema) (*qplanner.VectorQuerySpec, query.Filter, error) {
 	if q.cond == nil || !query.ContainsKnn(q.cond) {
 		return nil, q.cond, nil
 	}
@@ -664,7 +664,7 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 		return nil, nil, fmt.Errorf("%w: %s", ErrInvalidVectorQuery, verr)
 	}
 	field := strings.Join(node.Path, ".")
-	vi, err := resolveKnnIndex(q.c.loadVectorIndexes(), field, knn.Index)
+	vi, err := resolveKnnIndex(s.vindexes, field, knn.Index)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -737,7 +737,7 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 			if err != nil {
 				return nil, err
 			}
-			return q.c.bruteVectorCandidates(tx, svi, qv, topK)
+			return q.c.bruteVectorCandidates(tx, s.ns, svi, qv, topK)
 		}
 	default:
 		// HNSW: ef is the beam width. Graph traversal touches ~M neighbours
@@ -1195,9 +1195,9 @@ func knnDistFromDoc(vi *vectorIndex, qv []float32) func(doc *anyenc.Value) (floa
 	}
 }
 
-func (c *collection) bruteVectorCandidates(tx *btree.ReadTx, vi *vectorIndex, qv []float32, topK int) ([]qplanner.VectorCandidate, error) {
+func (c *collection) bruteVectorCandidates(tx *btree.ReadTx, dataNs *btree.Namespace, vi *vectorIndex, qv []float32, topK int) ([]qplanner.VectorCandidate, error) {
 	dist := vindex.DistanceFor(vi.info.Vector.Metric.toVindex())
-	cursor := tx.NewCursor(c.cur().ns)
+	cursor := tx.NewCursor(dataNs)
 	defer cursor.Close()
 	if err := cursor.First(); err != nil {
 		return nil, err

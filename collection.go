@@ -535,34 +535,15 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 
 	buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], docId)
 	if ctx.Value(ctxKeyTx) == nil {
-		tx, txErr := c.db.btreeDB.BeginReadFast()
-		if txErr != nil {
-			return nil, txErr
-		}
-		defer func() {
-			if rbErr := tx.Rollback(); rbErr != nil && err == nil {
-				err = rbErr
-			}
-		}()
-		buf.DocBuf, err = tx.AppendValue(c.cur().ns, buf.SmallBuf, buf.DocBuf[:0])
-		if err != nil {
-			if errors.Is(err, btree.ErrKeyNotFound) {
-				return nil, ErrDocNotFound
-			}
-			return nil, err
-		}
-		data, pErr := p.Parse(buf.DocBuf)
-		if pErr != nil {
-			return nil, pErr
-		}
-		return item{val: data}, nil
+		return c.findIdOwnTx(p, buf)
 	}
 
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
-		if err = c.alive(); err != nil {
+		s, err := c.resolve(tx)
+		if err != nil {
 			return err
 		}
-		buf.DocBuf, err = tx.AppendValue(c.cur().ns, buf.SmallBuf, buf.DocBuf[:0])
+		buf.DocBuf, err = tx.AppendValue(s.ns, buf.SmallBuf, buf.DocBuf[:0])
 		if err != nil {
 			if errors.Is(err, btree.ErrKeyNotFound) {
 				return ErrDocNotFound
@@ -574,6 +555,37 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 		return
 	})
 	return doc, err
+}
+
+// findIdOwnTx is the point lookup of a caller without a transaction: one
+// fast read tx around the fetch of the key in buf.SmallBuf. A function of
+// its own to keep its return count low: past returns x defers = 15 the
+// compiler stops open-coding defers, which costs this path about 3%.
+func (c *collection) findIdOwnTx(p *anyenc.Parser, buf *syncpool.DocBuffer) (doc Doc, err error) {
+	tx, err := c.db.btreeDB.BeginReadFast()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && err == nil {
+			err = rbErr
+		}
+	}()
+	s, err := c.resolve(tx)
+	if err != nil {
+		return nil, err
+	}
+	if buf.DocBuf, err = tx.AppendValue(s.ns, buf.SmallBuf, buf.DocBuf[:0]); err != nil {
+		if errors.Is(err, btree.ErrKeyNotFound) {
+			err = ErrDocNotFound
+		}
+		return nil, err
+	}
+	data, err := p.Parse(buf.DocBuf)
+	if err != nil {
+		return nil, err
+	}
+	return item{val: data}, nil
 }
 
 func (c *collection) Find(filter any) Query {
@@ -602,7 +614,8 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	err = c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		s, txErr := c.resolve(&tx.ReadTx)
+		if txErr != nil {
 			return txErr
 		}
 		var it item
@@ -611,7 +624,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 			if it, txErr = c.newItem(doc); txErr != nil {
 				return txErr
 			}
-			if txErr = c.insertItem(tx, buf, it); txErr != nil {
+			if txErr = c.insertItem(tx, s, buf, it); txErr != nil {
 				return txErr
 			}
 		}
@@ -621,7 +634,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 	return
 }
 
-func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it item) (err error) {
+func (c *collection) insertItem(tx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, it item) (err error) {
 	buf.SmallBuf = c.appendId(buf.SmallBuf[:0], it.Value())
 	if c.compressionDisabled() {
 		buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
@@ -630,26 +643,26 @@ func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it i
 	}
 
 	// Check if key already exists
-	if _, err := tx.Get(c.cur().ns, buf.SmallBuf); err == nil {
+	if _, err := tx.Get(s.ns, buf.SmallBuf); err == nil {
 		return ErrDocExists
 	}
 
-	if err = tx.Put(c.cur().ns, buf.SmallBuf, buf.DocBuf); err != nil {
+	if err = tx.Put(s.ns, buf.SmallBuf, buf.DocBuf); err != nil {
 		return err
 	}
 
 	// Insert index entries
-	for _, idx := range c.loadIndexes() {
+	for _, idx := range s.indexes {
 		if err = idx.insertKeys(tx, it); err != nil {
 			return err
 		}
 	}
-	for _, fx := range c.loadFtsIndexes() {
+	for _, fx := range s.ftsIndexes {
 		if err = fx.insertDoc(tx, it); err != nil {
 			return err
 		}
 	}
-	for _, vi := range c.loadVectorIndexes() {
+	for _, vi := range s.vindexes {
 		if err = vi.insert(tx, it, nil); err != nil {
 			return err
 		}
@@ -674,10 +687,11 @@ func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err erro
 	}
 
 	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		s, txErr := c.resolve(&tx.ReadTx)
+		if txErr != nil {
 			return false, txErr
 		}
-		return c.update(tx, it, item{})
+		return c.update(tx, s, it, item{})
 	})
 	returned = true
 	return
@@ -700,11 +714,12 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
 	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		s, txErr := c.resolve(&tx.ReadTx)
+		if txErr != nil {
 			return false, txErr
 		}
 		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
-		it, txErr := c.loadById(tx, buf, buf.SmallBuf)
+		it, txErr := c.loadById(tx, s, buf, buf.SmallBuf)
 		if txErr != nil {
 			return
 		}
@@ -723,7 +738,7 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 		if vErr != nil {
 			return false, vErr
 		}
-		return c.update(tx, newIt, it)
+		return c.update(tx, s, newIt, it)
 	})
 	returned = true
 	if err != nil {
@@ -747,7 +762,8 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
 	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		s, txErr := c.resolve(&tx.ReadTx)
+		if txErr != nil {
 			return false, txErr
 		}
 		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
@@ -756,7 +772,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 			modValue *anyenc.Value
 			prevItem item
 		)
-		it, loadErr := c.loadById(tx, buf, buf.SmallBuf)
+		it, loadErr := c.loadById(tx, s, buf, buf.SmallBuf)
 		if loadErr != nil {
 			if errors.Is(loadErr, ErrDocNotFound) {
 				var idVal *anyenc.Value
@@ -793,11 +809,11 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 			return false, vErr
 		}
 		if isInsert {
-			txErr = c.insertItem(tx, buf2, newIt)
+			txErr = c.insertItem(tx, s, buf2, newIt)
 			return true, txErr
 		} else {
 			res.Matched = 1
-			return c.update(tx, newIt, prevItem)
+			return c.update(tx, s, newIt, prevItem)
 		}
 	})
 	returned = true
@@ -807,13 +823,13 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 	return
 }
 
-func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, err error) {
+func (c *collection) update(tx *btree.WriteTx, s *collSchema, it, prevIt item) (modified bool, err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	buf.SmallBuf = c.appendId(buf.SmallBuf[:0], it.Value())
 	if prevIt.val == nil {
-		prevIt, err = c.loadById(tx, buf, buf.SmallBuf)
+		prevIt, err = c.loadById(tx, s, buf, buf.SmallBuf)
 		if err != nil {
 			return
 		}
@@ -831,7 +847,7 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 	}
 
 	// Update index entries: delete old, insert new
-	for _, idx := range c.loadIndexes() {
+	for _, idx := range s.indexes {
 		if err = idx.deleteKeys(tx, prevIt); err != nil {
 			return
 		}
@@ -839,13 +855,13 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 			return
 		}
 	}
-	for _, fx := range c.loadFtsIndexes() {
+	for _, fx := range s.ftsIndexes {
 		if err = fx.updateDoc(tx, prevIt, it); err != nil {
 			return
 		}
 	}
 	// Vector indexes: only touch the graph when the embedding actually changed.
-	for _, vi := range c.loadVectorIndexes() {
+	for _, vi := range s.vindexes {
 		if err = vi.update(tx, prevIt, it); err != nil {
 			return
 		}
@@ -856,15 +872,15 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 	} else {
 		buf.DocBuf, buf.ScratchBuf = it.Value().MarshalCompressed(buf.DocBuf[:0], buf.ScratchBuf)
 	}
-	if err = tx.Put(c.cur().ns, buf.SmallBuf, buf.DocBuf); err != nil {
+	if err = tx.Put(s.ns, buf.SmallBuf, buf.DocBuf); err != nil {
 		return
 	}
 
 	return true, nil
 }
 
-func (c *collection) loadById(tx *btree.WriteTx, buf *syncpool.DocBuffer, id anyenc.Tuple) (it item, err error) {
-	buf.DocBuf, err = tx.AppendValue(c.cur().ns, id, buf.DocBuf[:0])
+func (c *collection) loadById(tx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, id anyenc.Tuple) (it item, err error) {
+	buf.DocBuf, err = tx.AppendValue(s.ns, id, buf.DocBuf[:0])
 	if err != nil {
 		if errors.Is(err, btree.ErrKeyNotFound) {
 			return item{}, ErrDocNotFound
@@ -895,12 +911,13 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 	}
 
 	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		s, txErr := c.resolve(&tx.ReadTx)
+		if txErr != nil {
 			return false, txErr
 		}
-		insErr := c.insertItem(tx, buf, it)
+		insErr := c.insertItem(tx, s, buf, it)
 		if errors.Is(insErr, ErrDocExists) {
-			return c.update(tx, it, item{})
+			return c.update(tx, s, it, item{})
 		}
 		if insErr != nil {
 			return false, insErr
@@ -923,29 +940,28 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		s, txErr := c.resolve(&tx.ReadTx)
+		if txErr != nil {
 			return false, txErr
 		}
 		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
 		// Verify document exists
-		_, txErr = c.loadById(tx, buf, buf.SmallBuf)
+		_, txErr = c.loadById(tx, s, buf, buf.SmallBuf)
 		if txErr != nil {
 			return
 		}
-		return true, c.deleteItem(tx, buf, buf.SmallBuf)
+		return true, c.deleteItem(tx, s, buf, buf.SmallBuf)
 	})
 	returned = true
 	return err
 }
 
-func (c *collection) deleteItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, id []byte) (err error) {
+func (c *collection) deleteItem(tx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, id []byte) (err error) {
 	// Delete index entries. The document is loaded once and reused for the range,
 	// full-text and vector index removals (all need the field values).
-	idxs := c.loadIndexes()
-	ftsIdxs := c.loadFtsIndexes()
-	vidxs := c.loadVectorIndexes()
+	idxs, ftsIdxs, vidxs := s.indexes, s.ftsIndexes, s.vindexes
 	if len(idxs) > 0 || len(ftsIdxs) > 0 || len(vidxs) > 0 {
-		it, loadErr := c.loadById(tx, buf, id)
+		it, loadErr := c.loadById(tx, s, buf, id)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -965,16 +981,16 @@ func (c *collection) deleteItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, id [
 			}
 		}
 	}
-	return tx.Delete(c.cur().ns, id)
+	return tx.Delete(s.ns, id)
 }
 
 func (c *collection) Count(ctx context.Context) (count int, err error) {
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		if aErr := c.alive(); aErr != nil {
-			return aErr
+		s, txErr := c.resolve(tx)
+		if txErr != nil {
+			return txErr
 		}
-		var txErr error
-		count, txErr = tx.Count(c.cur().ns)
+		count, txErr = tx.Count(s.ns)
 		return txErr
 	})
 	return
@@ -1735,6 +1751,17 @@ func (c *collection) alive() error {
 		return ErrCollectionClosed
 	}
 	return nil
+}
+
+// resolve returns the schema version an operation in tx works with, or the
+// error alive gives. Everything the operation reads of the schema comes from
+// the one version returned, so it sees a single generation whatever is
+// published meanwhile.
+func (c *collection) resolve(tx *btree.ReadTx) (*collSchema, error) {
+	if err := c.alive(); err != nil {
+		return nil, err
+	}
+	return c.cur(), nil
 }
 
 // buildIndex populates index entries from all existing documents in the collection.

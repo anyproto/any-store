@@ -183,18 +183,20 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 	if err = c.alive(); err != nil {
 		return
 	}
-	c.mu.Lock()
-	name := c.cur().name
-	indexes := append([]*index(nil), c.loadIndexes()...)
-	vindexes := append([]*vectorIndex(nil), c.loadVectorIndexes()...)
-	ftsindexes := append([]*ftsIndex(nil), c.loadFtsIndexes()...)
-	c.mu.Unlock()
-
-	stats.Name = name
 	stats.CompressionEnabled = !c.compressionDisabled()
 	pageSize := int(c.db.btreeDB.PageSize())
 
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		s, rErr := c.resolve(tx)
+		if rErr != nil {
+			return rErr
+		}
+		stats.Name = s.name
+		// Copies: the gates below filter in place.
+		indexes := append([]*index(nil), s.indexes...)
+		vindexes := append([]*vectorIndex(nil), s.vindexes...)
+		ftsindexes := append([]*ftsIndex(nil), s.ftsIndexes...)
+
 		// Visibility gate, like the query path: a handle whose creating DDL
 		// tx has not committed resolves to nothing in this tx's snapshot —
 		// NamespaceSize on it would fail the whole Stats call. Vector handles
@@ -218,7 +220,7 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 
 		// Documents: scan the collection B-tree summing stored and
 		// uncompressed value sizes.
-		cursor := tx.NewCursor(c.cur().ns)
+		cursor := tx.NewCursor(s.ns)
 		defer cursor.Close()
 		if cErr := cursor.First(); cErr != nil {
 			return cErr
@@ -241,7 +243,7 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 		}
 
 		// Physical size of the document B-tree.
-		docSize, dErr := tx.NamespaceSize(c.cur().ns)
+		docSize, dErr := tx.NamespaceSize(s.ns)
 		if dErr != nil {
 			return dErr
 		}

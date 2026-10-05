@@ -46,7 +46,9 @@ type Iterator interface {
 
 // planIterator wraps a qplanner.Plan to implement the public Iterator interface.
 type planIterator struct {
-	tx         ReadTx
+	tx ReadTx
+	// s is the schema version the plan was compiled against, resolved for tx.
+	s          *collSchema
 	err        error
 	plan       *qplanner.Plan
 	buf        *syncpool.DocBuffer

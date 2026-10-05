@@ -981,7 +981,7 @@ func ftsDocLenBuf(tx *btree.ReadTx, ns *btree.Namespace, docID uint64, buf []byt
 // $text clause). If absent, it returns (nil, q.cond, nil). Mirrors
 // detectVectorQuery. An error is returned for invalid placement or a missing
 // full-text index.
-func (q *collQuery) detectFtsQuery() (*qplanner.FtsQuerySpec, query.Filter, error) {
+func (q *collQuery) detectFtsQuery(s *collSchema) (*qplanner.FtsQuerySpec, query.Filter, error) {
 	text, hasText, err := findTextFilter(q.cond)
 	if err != nil {
 		return nil, nil, err
@@ -989,7 +989,7 @@ func (q *collQuery) detectFtsQuery() (*qplanner.FtsQuerySpec, query.Filter, erro
 	if !hasText {
 		return nil, q.cond, nil
 	}
-	fxs := q.c.loadFtsIndexes()
+	fxs := s.ftsIndexes
 	if len(fxs) == 0 {
 		return nil, nil, ErrNoFulltextIndex
 	}

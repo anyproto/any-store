@@ -215,8 +215,8 @@ func (q *collQuery) validateSources() error {
 	if q.srcValidated {
 		return nil
 	}
-	vidxs := q.c.loadVectorIndexes()
-	if err := rejectLegacyVectorClause(q.cond, vidxs); err != nil {
+	s := q.c.cur()
+	if err := rejectLegacyVectorClause(q.cond, s.vindexes); err != nil {
 		return err
 	}
 	hasKnn := query.ContainsKnn(q.cond)
@@ -230,7 +230,7 @@ func (q *collQuery) validateSources() error {
 		if query.ContainsText(q.cond) {
 			return ErrKnnWithText
 		}
-		if _, _, err := q.detectKnnQuery(); err != nil {
+		if _, _, err := q.detectKnnQuery(s); err != nil {
 			return err
 		}
 	}
@@ -263,10 +263,11 @@ func (q *collQuery) writeSorter(opts planOpts) query.Sort {
 // reachable at all.
 //
 // btx MUST be the snapshot the plan executes on: the multikey-flag probe in
-// buildCBOIndexesInto and the bounds interpolation read it. The caller owns
-// alive()/unsatisfiable() gating, tx and buf lifetimes, and the sink. cbo is
-// non-nil only when opts.wantCandidates (Explain's index report).
-func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syncpool.DocBuffer,
+// buildCBOIndexesInto and the bounds interpolation read it. s is the schema
+// version resolved for btx. The caller owns resolve()/unsatisfiable() gating,
+// tx and buf lifetimes, and the sink. cbo is non-nil only when
+// opts.wantCandidates (Explain's index report).
+func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collSchema, buf *syncpool.DocBuffer,
 	idBounds query.Bounds, opts planOpts) (plan *qplanner.Plan, cbo []qplanner.CBOIndex, err error) {
 
 	// The unconditional source guards. The verbs already ran these (before
@@ -279,7 +280,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	// $text drives the query when present (CBO bypassed). The residual filter
 	// runs as a downstream FilterIter; a relevance/textScore sort is the
 	// FtsIter's intrinsic order, a real-field sort inserts a SortIter.
-	ftsSpec, ftsResidual, err := q.detectFtsQuery()
+	ftsSpec, ftsResidual, err := q.detectFtsQuery(s)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -308,7 +309,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 		// nothing over the pre-CBO driver path.
 		params := &qplanner.PlanParams{
 			Tx:         btx,
-			DataNs:     q.c.cur().ns,
+			DataNs:     s.ns,
 			Filter:     ftsResidual,
 			Sorter:     sorter,
 			IDBounds:   idBounds,
@@ -320,7 +321,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 			CountOnly:  opts.countOnly,
 			Fts:        ftsSpec,
 		}
-		probePossible := q.fillProbeInputs(btx, ftsResidual, sorter != nil, opts, params)
+		probePossible := q.fillProbeInputs(btx, s, ftsResidual, sorter != nil, opts, params)
 		if probePossible && ftsSpec.StatsFn != nil {
 			// A stats failure only disables the probe form (Valid stays
 			// false); the driver plan needs none of it.
@@ -341,7 +342,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	// verb rejects $knn. No default distance SortIter: the source is
 	// TotallyOrdered ((distance, docId) ascending), so with no explicit sort
 	// the k-cut streams straight through.
-	vspec, residual, err := q.detectKnnQuery()
+	vspec, residual, err := q.detectKnnQuery(s)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -351,7 +352,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 		// assembly and same no-candidate skip as the $text branch.
 		params := &qplanner.PlanParams{
 			Tx:         btx,
-			DataNs:     q.c.cur().ns,
+			DataNs:     s.ns,
 			Filter:     residual,
 			Sorter:     q.writeSorter(opts),
 			IDBounds:   idBounds,
@@ -363,7 +364,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 			CountOnly:  opts.countOnly,
 			Vector:     vspec,
 		}
-		q.fillProbeInputs(btx, residual, false, opts, params)
+		q.fillProbeInputs(btx, s, residual, false, opts, params)
 		plan = qplanner.BuildPlan(params)
 		if opts.wantCandidates {
 			cbo = params.Indexes
@@ -375,7 +376,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	// multikey-flag probe gating tight seek bounds must read the same
 	// snapshot the scan executes on.
 	sorter := q.writeSorter(opts)
-	visible := visibleIndexes(btx, q.c.loadIndexes())
+	visible := visibleIndexes(btx, s.indexes)
 	idxs := plannableIndexes(visible)
 	br := q.buildBoundsResult(idxs)
 	// The estimate reads the candidates' sketches; with every range index
@@ -385,14 +386,14 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	if len(countIdxs) == 0 {
 		countIdxs = visible
 	}
-	totalDocs := q.docCountForPlan(btx, countIdxs)
+	totalDocs := q.docCountForPlan(btx, s, countIdxs)
 	if opts.exactTotalDocs {
-		totalDocs = q.docCountExact(btx, countIdxs)
+		totalDocs = q.docCountExact(btx, s, countIdxs)
 	}
 	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly, totalDocs)
 	plan = qplanner.BuildPlan(&qplanner.PlanParams{
 		Tx:          btx,
-		DataNs:      q.c.cur().ns,
+		DataNs:      s.ns,
 		Filter:      q.cond,
 		Sorter:      sorter,
 		IDBounds:    idBounds,
@@ -442,19 +443,20 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return
 	}
 
-	// Re-checked inside the tx scope: the begin-time staleness pass may have
+	// Resolved inside the tx scope: the begin-time staleness pass may have
 	// just invalidated the handle (a peer's drop frees the pages this
 	// snapshot would walk through the stale root).
-	if err = q.c.alive(); err != nil {
+	btx := tx.btreeReadTx()
+	s, err := q.c.resolve(btx)
+	if err != nil {
 		_ = tx.Commit()
 		qb.Close()
 		return
 	}
 
 	buf := q.c.db.syncPool.GetDocBuf()
-	btx := tx.btreeReadTx()
 
-	plan, _, err := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{needSidecars: true})
+	plan, _, err := q.compilePlan(ctx, btx, s, buf, qb.idBounds, planOpts{needSidecars: true})
 	if err != nil {
 		q.c.db.syncPool.ReleaseDocBuf(buf)
 		_ = tx.Commit()
@@ -465,9 +467,10 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	return &planIterator{
 		plan: plan,
 		tx:   tx,
+		s:    s,
 		buf:  buf,
 		qb:   qb,
-		data: &qplanner.CursorSource{Tx: btx, Ns: q.c.cur().ns},
+		data: &qplanner.CursorSource{Tx: btx, Ns: s.ns},
 	}, nil
 }
 
@@ -481,13 +484,13 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	}
 	// The modifier is parsed above so a malformed one is surfaced even when
 	// the filter is unsatisfiable.
-	return q.bulkWrite(ctx, func(btWtx *btree.WriteTx, btx *btree.ReadTx, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error {
+	return q.bulkWrite(ctx, func(btWtx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error {
 		modBuf := q.c.db.syncPool.GetDocBuf()
 		defer q.c.db.syncPool.ReleaseDocBuf(modBuf)
 
 		for _, id := range ids {
 			var getErr error
-			buf.DocBuf, getErr = btx.AppendValue(q.c.cur().ns, id, buf.DocBuf[:0])
+			buf.DocBuf, getErr = btWtx.AppendValue(s.ns, id, buf.DocBuf[:0])
 			if getErr != nil {
 				return getErr
 			}
@@ -516,7 +519,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 			if itemErr != nil {
 				return itemErr
 			}
-			if _, uErr := q.c.update(btWtx, it, oldItem); uErr != nil {
+			if _, uErr := q.c.update(btWtx, s, it, oldItem); uErr != nil {
 				return uErr
 			}
 			result.Modified++
@@ -526,9 +529,9 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 }
 
 func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error) {
-	return q.bulkWrite(ctx, func(btWtx *btree.WriteTx, _ *btree.ReadTx, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error {
+	return q.bulkWrite(ctx, func(btWtx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error {
 		for _, id := range ids {
-			if err := q.c.deleteItem(btWtx, buf, id); err != nil {
+			if err := q.c.deleteItem(btWtx, s, buf, id); err != nil {
 				return err
 			}
 			result.Matched++
@@ -542,7 +545,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 // it compiles the query plan inside a write tx, materializes the distinct
 // target ids, releases the plan's cursors and hands the ids to mutate, which
 // applies the per-id mutation and accumulates result.
-func (q *collQuery) bulkWrite(ctx context.Context, mutate func(btWtx *btree.WriteTx, btx *btree.ReadTx, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error) (result ModifyResult, err error) {
+func (q *collQuery) bulkWrite(ctx context.Context, mutate func(btWtx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error) (result ModifyResult, err error) {
 	if err = q.c.alive(); err != nil {
 		return
 	}
@@ -598,15 +601,15 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(btWtx *btree.Writ
 		}
 	}()
 
-	// Re-checked inside the tx scope: the begin-time staleness pass may have
+	// Resolved inside the tx scope: the begin-time staleness pass may have
 	// just invalidated the handle (see collection.alive) — the entry check
 	// alone would let this bulk write proceed through a stale handle.
-	if err = q.c.alive(); err != nil {
-		return
-	}
-
 	btWtx := tx.btreeWriteTx()
 	btx := tx.btreeReadTx()
+	s, err := q.c.resolve(btx)
+	if err != nil {
+		return
+	}
 
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
@@ -615,7 +618,7 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(btWtx *btree.Writ
 	// the equivalent Iter returns — same sorter, same access-path detection
 	// ($text AND vector; an invalid vector clause errors here like it does on
 	// Iter instead of degrading to a literal filter).
-	plan, _, ferr := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{forWrite: true})
+	plan, _, ferr := q.compilePlan(ctx, btx, s, buf, qb.idBounds, planOpts{forWrite: true})
 	if ferr != nil {
 		err = ferr
 		return
@@ -645,7 +648,7 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(btWtx *btree.Writ
 	}
 	closePlan()
 
-	if err = mutate(btWtx, btx, buf, ids, &result); err != nil {
+	if err = mutate(btWtx, s, buf, ids, &result); err != nil {
 		return
 	}
 	if result.Modified > 0 {
@@ -696,8 +699,12 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	// Skip CBO/planner entirely — just check key existence in data namespace.
 	if len(idBounds) > 0 && q.isIDOnlyFilter() && q.offset == 0 && q.limit == 0 {
 		err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+			s, rerr := q.c.resolve(tx)
+			if rerr != nil {
+				return rerr
+			}
 			for i := range idBounds {
-				found, gerr := tx.Has(q.c.cur().ns, idBounds[i].Start)
+				found, gerr := tx.Has(s.ns, idBounds[i].Start)
 				if gerr != nil {
 					return gerr
 				}
@@ -711,6 +718,10 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	}
 
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		s, rerr := q.c.resolve(tx)
+		if rerr != nil {
+			return rerr
+		}
 		buf := q.c.db.syncPool.GetDocBuf()
 		defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -718,7 +729,7 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		// fast paths, the sorter is dropped (a count is order-invariant), and
 		// $text/vector queries count their native plans — the same document
 		// set Iter yields, without the score sidecar or a public iterator.
-		plan, _, perr := q.compilePlan(ctx, tx, buf, idBounds, planOpts{countOnly: true})
+		plan, _, perr := q.compilePlan(ctx, tx, s, buf, idBounds, planOpts{countOnly: true})
 		if perr != nil {
 			return perr
 		}
@@ -814,7 +825,8 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		if aErr := q.c.alive(); aErr != nil {
+		s, aErr := q.c.resolve(tx)
+		if aErr != nil {
 			return aErr
 		}
 		// The shared compiler, in report mode: exact TotalDocs (a human reads
@@ -824,7 +836,7 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 		// the write verbs execute.
 		// needSidecars mirrors Iter so the described chain (rank vs stream
 		// probe form) is exactly the one Rows(Q) executes.
-		plan, cboIndexes, perr := q.compilePlan(ctx, tx, buf, qb.idBounds, planOpts{
+		plan, cboIndexes, perr := q.compilePlan(ctx, tx, s, buf, qb.idBounds, planOpts{
 			exactTotalDocs: true,
 			wantCandidates: true,
 			needSidecars:   true,
@@ -860,7 +872,7 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 		// An outdated index is never a candidate (plannableIndexes); listing
 		// it unused, like the vector and full-text handles below, keeps the
 		// report from silently shrinking.
-		for _, idx := range visibleIndexes(tx, q.c.loadIndexes()) {
+		for _, idx := range visibleIndexes(tx, s.indexes) {
 			if idx.outdated {
 				addIndex(idx.info.Name, 0, false)
 			}
@@ -871,7 +883,7 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 			}
 			return 0
 		}
-		for _, vi := range q.c.loadVectorIndexes() {
+		for _, vi := range s.vindexes {
 			// forTx is the gate the executed $knn goes through: a handle it
 			// resolves (directly or via the pre-compaction prev, same name)
 			// must be listed, one it errors on must not — Explain may never
@@ -882,10 +894,10 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 			// A probe plan enforces the $knn clause through this index's
 			// distance kernel even when a range index drives the enumeration.
 			used := vi.info.Name == plan.IndexName ||
-				(strings.HasPrefix(plan.Name, "Knn") && q.knnIndexName() == vi.info.Name)
+				(strings.HasPrefix(plan.Name, "Knn") && q.knnIndexName(s) == vi.info.Name)
 			addIndex(vi.info.Name, sourceCost(vi.info.Name), used)
 		}
-		for _, fx := range q.c.loadFtsIndexes() {
+		for _, fx := range s.ftsIndexes {
 			// Same gate the executed $text goes through.
 			if !fx.visibleTo(tx) {
 				continue
@@ -893,7 +905,7 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 			// Same rule: a $text probe plan verifies every row against this
 			// index even when it does not drive.
 			used := fx.info.Name == plan.IndexName ||
-				(strings.HasPrefix(plan.Name, "Fts") && q.ftsIndexName() == fx.info.Name)
+				(strings.HasPrefix(plan.Name, "Fts") && ftsIndexName(s) == fx.info.Name)
 			addIndex(fx.info.Name, sourceCost(fx.info.Name), used)
 		}
 		return nil
@@ -908,15 +920,15 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 // skips the whole assembly: the unrestricted hot shape pays nothing over the
 // pre-CBO driver path. Explain (wantCandidates) always assembles, for its
 // index report.
-func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, residual query.Filter, needSort bool, opts planOpts, params *qplanner.PlanParams) (probePossible bool) {
+func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, s *collSchema, residual query.Filter, needSort bool, opts planOpts, params *qplanner.PlanParams) (probePossible bool) {
 	idFixed := len(params.IDBounds) > 0 && qplanner.AllBoundsFixed(params.IDBounds)
 	hasResidual := residual != nil && !isAllQueryFilter(residual)
 	if !idFixed && !hasResidual && !needSort && !opts.wantCandidates {
 		return false
 	}
-	idxs := plannableIndexes(visibleIndexes(btx, q.c.loadIndexes()))
+	idxs := plannableIndexes(visibleIndexes(btx, s.indexes))
 	probePossible = idFixed
-	params.TotalDocs = q.docCountForPlan(btx, idxs)
+	params.TotalDocs = q.docCountForPlan(btx, s, idxs)
 	if len(idxs) > 0 {
 		br := q.buildBoundsResult(idxs)
 		params.Indexes = q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly, params.TotalDocs)
@@ -934,8 +946,8 @@ func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, residual query.Filter, ne
 
 // ftsIndexName returns the index a $text predicate resolves to (the first
 // visible full-text index — detectFtsQuery's rule), or "".
-func (q *collQuery) ftsIndexName() string {
-	if fxs := q.c.loadFtsIndexes(); len(fxs) > 0 {
+func ftsIndexName(s *collSchema) string {
+	if fxs := s.ftsIndexes; len(fxs) > 0 {
 		return fxs[0].info.Name
 	}
 	return ""
@@ -943,8 +955,8 @@ func (q *collQuery) ftsIndexName() string {
 
 // knnIndexName returns the vector index the query's $knn clause resolves to,
 // or "" for a non-$knn query.
-func (q *collQuery) knnIndexName() string {
-	spec, _, err := q.detectKnnQuery()
+func (q *collQuery) knnIndexName(s *collSchema) string {
+	spec, _, err := q.detectKnnQuery(s)
 	if err != nil || spec == nil {
 		return ""
 	}
@@ -1005,7 +1017,7 @@ type countTx interface {
 // caller's plannable snapshot — the same one its CBO candidates are built
 // from, so the count and the candidates can't disagree about the index set —
 // or, when that is empty, its visible one.
-func (q *collQuery) docCountForPlan(tx countTx, idxs []*index) int {
+func (q *collQuery) docCountForPlan(tx countTx, s *collSchema, idxs []*index) int {
 	for _, idx := range idxs {
 		if s := idx.loadPubSketch(); s != nil {
 			return int(s.GetDocCount())
@@ -1014,19 +1026,19 @@ func (q *collQuery) docCountForPlan(tx countTx, idxs []*index) int {
 	if len(idxs) == 0 {
 		return 0
 	}
-	count, _ := tx.Count(q.c.cur().ns)
+	count, _ := tx.Count(s.ns)
 	return count
 }
 
 // docCountExact is docCountForPlan without the no-indexes shortcut: Explain
 // reports TotalDocs to humans, so it pays the walk for a real number.
-func (q *collQuery) docCountExact(tx countTx, idxs []*index) int {
+func (q *collQuery) docCountExact(tx countTx, s *collSchema, idxs []*index) int {
 	for _, idx := range idxs {
 		if s := idx.loadPubSketch(); s != nil {
 			return int(s.GetDocCount())
 		}
 	}
-	count, _ := tx.Count(q.c.cur().ns)
+	count, _ := tx.Count(s.ns)
 	return count
 }
 

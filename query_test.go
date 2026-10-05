@@ -41,10 +41,10 @@ func TestCollQuery_DocCountSkipsWalkWithoutIndexes(t *testing.T) {
 	var calls int
 	tx := fixedCountTx{count: 42, calls: &calls}
 
-	assert.Equal(t, 0, q.docCountForPlan(tx, idxs))
+	assert.Equal(t, 0, q.docCountForPlan(tx, q.c.cur(), idxs))
 	assert.Equal(t, 0, calls, "plan-path docCount must skip the namespace walk with no secondary indexes")
 
-	assert.Equal(t, 42, q.docCountExact(tx, idxs), "explain-path docCount must stay exact")
+	assert.Equal(t, 42, q.docCountExact(tx, q.c.cur(), idxs), "explain-path docCount must stay exact")
 	assert.Equal(t, 1, calls)
 }
 
