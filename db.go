@@ -478,6 +478,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	tx.modified = false
 	tx.undo = tx.undo[:0]
 	tx.pubs = tx.pubs[:0]
+	tx.savepoints = tx.savepoints[:0]
 	tx.version.Store(version)
 	wTx := writeTx{commonTx: tx, version: version}
 	tx.ctx = context.WithValue(ctx, ctxKeyTx, wTx)
@@ -662,7 +663,7 @@ func (db *db) collectionVanished(tx *btree.ReadTx, name string, c *collection) b
 // invalidateCollection retires a handle whose collection a peer process
 // renamed or dropped (SQLite re-prepare style: subsequent operations fail with
 // ErrCollectionClosed and the caller re-opens). Modeled on the CreateCollection
-// rollback undo, NOT on close(): a closed handle's fts pending buffers still
+// rollback undo, NOT on Close(): a closed handle's fts pending buffers still
 // flush at commit, and a dead handle's buffered writes must never flush into
 // the renamed/dropped collection's namespaces — reset them instead. The CAS
 // makes concurrent invalidations (multiple tx begins observing the same
@@ -836,30 +837,46 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 			return err
 		}
 
+		c := coll.(*collection)
 		db.mu.Lock()
-		// Plain assignment: a same-tx Drop's closed handle may still occupy
-		// the slot (its deferred eviction then finds nothing to evict).
+		// A same-tx Drop's closed handle may still occupy the slot: its
+		// eviction waits for the commit and then finds nothing to evict. A
+		// rollback puts it back. Only a handle that carries this tx's Drop
+		// qualifies (ddlTxs): one a staleness pass is retiring is on its
+		// way out of the registry.
+		dropped, hadDropped := db.openedCollections[collectionName]
+		hadDropped = hadDropped && dropped.(*collection).ddlTxs > 0
 		db.openedCollections[collectionName] = coll
+		// The creation is this handle's first uncommitted schema change.
+		c.ddlTxs++
 		db.mu.Unlock()
+		c.registerDDLEnd(wtx)
 
 		// A rollback of this scope reverts the namespace + catalog entries
 		// created above, but not the registration — a later write through the
-		// cached handle would land on the freed root page. Evict on rollback.
-		// Deliberately NOT close(): a closed handle's fts pending buffers
+		// cached handle would land on the freed root page. Evict on rollback,
+		// restoring the dropped handle this one replaced: the Drop's undo
+		// un-closes a handle only if it finds it registered. Left out of
+		// the registry, a collection this tx created earlier and dropped in
+		// the rolled-back scope would be opened a second time.
+		// Deliberately NOT Close(): a closed handle's fts pending buffers
 		// still flush at commit — but this collection's fts writes belong to
 		// the rolled-back tx and must never flush. Reset them and mark
 		// closed so the handle's own Close is a no-op.
 		wtx.onRollbackUndo(func() {
 			db.mu.Lock()
 			if cur, ok := db.openedCollections[collectionName]; ok && cur == coll {
-				delete(db.openedCollections, collectionName)
+				if hadDropped {
+					db.openedCollections[collectionName] = dropped
+				} else {
+					delete(db.openedCollections, collectionName)
+				}
 			}
 			db.mu.Unlock()
-			cc := coll.(*collection)
-			for _, fx := range cc.loadFtsIndexes() {
+			for _, fx := range c.loadFtsIndexes() {
 				fx.pending.reset()
 			}
-			cc.closed.Store(true)
+			c.closed.Store(true)
 		})
 
 		return nil
@@ -871,27 +888,75 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 }
 
 func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collection, error) {
-	db.mu.Lock()
-	if coll, ok := db.openedCollections[collectionName]; ok && !coll.(*collection).closed.Load() {
-		db.mu.Unlock()
-		return coll, nil
+	coll, err := db.openCollection(ctx, collectionName)
+	if err != nil {
+		return nil, err
 	}
-	// A CLOSED registered handle is a Drop in an open tx: fall through to the
-	// catalog check, which is ctx-aware — the dropping tx sees its own delete
-	// (ErrCollectionNotFound, the correct same-tx answer), while a concurrent
-	// caller sees the committed row and gets the closed handle back below
-	// (fail-safe: ops error until the drop resolves).
-	db.mu.Unlock()
-	return db.openCollection(ctx, collectionName)
+	return db.handOut(coll), nil
+}
+
+// handOut returns coll to a caller that keeps it. That cancels a Close() an
+// uncommitted schema change deferred (see collection.closePending): the
+// handle has a user again. An open the library makes for itself, or one that
+// ends in an error, hands nothing out. The unlocked read may miss a Close()
+// racing with the open; that close then stands, as if it came second.
+func (db *db) handOut(coll Collection) Collection {
+	if c := coll.(*collection); c.closePending.Load() {
+		db.mu.Lock()
+		c.closePending.Store(false)
+		db.mu.Unlock()
+	}
+	return coll
+}
+
+// registered returns the live handle the registry holds under name, as the
+// caller of ctx sees it. The registry is keyed by committed names: a
+// collection renamed by the open write tx stays under its old name until the
+// commit, which is right for every caller but that tx. For the renaming tx
+// the old name is gone, as a table's old name is after ALTER TABLE RENAME in
+// the same SQLite transaction, and the catalog check that follows a miss,
+// read through the writer's view, answers for it.
+func (db *db) registered(ctx context.Context, name string) (Collection, bool) {
+	if db.renamedAway(ctx, name) {
+		return nil, false
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.liveLocked(name)
+}
+
+// renamedAway reports that ctx carries the open write tx and that tx renamed
+// the collection registered under name to another name.
+func (db *db) renamedAway(ctx context.Context, name string) bool {
+	if _, ok := db.ambientWriteTx(ctx); !ok {
+		return false
+	}
+	for _, c := range db.renaming {
+		c.mu.Lock()
+		current := c.name
+		c.mu.Unlock()
+		if current == name {
+			continue
+		}
+		db.mu.Lock()
+		reg := db.openedCollections[name] == Collection(c)
+		db.mu.Unlock()
+		if reg {
+			return true
+		}
+	}
+	return false
 }
 
 func (db *db) openCollection(ctx context.Context, collectionName string) (Collection, error) {
-	db.mu.Lock()
-	if coll, ok := db.openedCollections[collectionName]; ok && !coll.(*collection).closed.Load() {
-		db.mu.Unlock()
+	if coll, ok := db.registered(ctx, collectionName); ok {
 		return coll, nil
 	}
-	db.mu.Unlock()
+	// A CLOSED registered handle is a Drop in an open tx: the catalog check
+	// below is ctx-aware — the dropping tx sees its own delete
+	// (ErrCollectionNotFound, the correct same-tx answer), while a concurrent
+	// caller sees the committed row and gets the closed handle back
+	// (fail-safe: ops error until the drop resolves).
 
 	if _, ok := db.ambientWriteTx(ctx); ok {
 		if c := db.renamedTo(collectionName); c != nil {
@@ -934,9 +999,12 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if live, ok := db.liveLocked(collectionName); ok {
+		return live, nil
+	}
 	if existing, ok := db.openedCollections[collectionName]; ok {
-		// Includes a CLOSED drop-in-flight handle: registering the fresh one
-		// over it would revive the dangling-handle corruption Drop's deferred
+		// A CLOSED drop-in-flight handle: registering the fresh one over it
+		// would revive the dangling-handle corruption Drop's deferred
 		// eviction closes — return the closed handle instead (fail-safe).
 		return existing, nil
 	}
@@ -944,8 +1012,28 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 	return coll, nil
 }
 
+// liveLocked returns the live handle registered under name. The caller holds
+// db.mu.
+func (db *db) liveLocked(name string) (Collection, bool) {
+	coll, ok := db.openedCollections[name]
+	if !ok || coll.(*collection).closed.Load() {
+		return nil, false
+	}
+	return coll, true
+}
+
 func (db *db) Collection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error) {
-	coll, err := db.OpenCollection(ctx, collectionName)
+	coll, err := db.collection(ctx, collectionName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return db.handOut(coll), nil
+}
+
+// collection opens or creates the collection without handing it out (see
+// handOut): for a caller inside the library that keeps no handle.
+func (db *db) collection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error) {
+	coll, err := db.openCollection(ctx, collectionName)
 	if err == nil {
 		// Existing collection: a conflicting PrimaryKey option is a misuse, not a
 		// silent no-op — the primary key is immutable after creation.
@@ -964,7 +1052,7 @@ func (db *db) Collection(ctx context.Context, collectionName string, opts ...Col
 	if !errors.Is(err, ErrCollectionExists) {
 		return nil, err
 	}
-	return db.OpenCollection(ctx, collectionName)
+	return db.openCollection(ctx, collectionName)
 }
 
 func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string, err error) {
@@ -1295,7 +1383,7 @@ func (db *db) Close() error {
 	}
 	db.mu.Unlock()
 	for _, c := range collToClose {
-		if cErr := c.(*collection).close(); cErr != nil {
+		if cErr := c.(*collection).close(true); cErr != nil {
 			log.Printf("collection close error: %v", cErr)
 		}
 	}
@@ -1370,19 +1458,33 @@ func (db *db) renameResolved(c *collection) {
 	}
 }
 
-func (db *db) onCollectionClose(c *collection) {
-	db.mu.Lock()
-	// Identity scan, not a delete by c.name: c.name is read here without c.mu
-	// (taking it would deadlock — Drop holds it when calling close()), so a
-	// name-keyed delete races with Rename's name flip and could evict a
-	// same-named successor handle or miss the entry entirely.
+// evictLocked removes c from the registry. Identity scan, not a delete by
+// c.name: a Rename flips the name before the registry is re-keyed, so a
+// name-keyed delete could evict a same-named successor handle or miss the
+// entry. The caller holds db.mu.
+func (db *db) evictLocked(c *collection) {
 	for name, cur := range db.openedCollections {
 		if cur == Collection(c) {
 			delete(db.openedCollections, name)
 			break
 		}
 	}
-	db.mu.Unlock()
+}
+
+// ddlEnd releases one uncommitted schema change of c (see collection.ddlTxs):
+// its scope committed or rolled back. With the last one a Close() deferred
+// meanwhile takes effect.
+func (db *db) ddlEnd(c *collection) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	c.ddlTxs--
+	if c.ddlTxs > 0 || !c.closePending.Load() {
+		return
+	}
+	c.closePending.Store(false)
+	if c.closed.CompareAndSwap(false, true) {
+		db.evictLocked(c)
+	}
 }
 
 // persistAllDirtySketches writes the modified sketches of the collections in

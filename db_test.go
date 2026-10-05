@@ -2140,3 +2140,33 @@ func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 		})
 	}
 }
+
+// CreateCollection's rollback puts back the registry entry it replaced only
+// if that handle carries this tx's Drop. A closed handle found there
+// otherwise is one a staleness pass is retiring — closed already, evicted
+// next — and put back it would answer for the name for good.
+func TestCreateCollectionRollback_RestoresOnlyADroppedHandle(t *testing.T) {
+	fx := newFixture(t)
+	d := fx.DB.(*db)
+	registered := func(name string) bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		_, ok := d.openedCollections[name]
+		return ok
+	}
+
+	retiring, err := fx.CreateCollection(ctx, "x")
+	require.NoError(t, err)
+	require.NoError(t, retiring.Drop(ctx))
+	require.False(t, registered("x"))
+	d.mu.Lock()
+	d.openedCollections["x"] = retiring
+	d.mu.Unlock()
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	_, err = fx.CreateCollection(tx.Context(), "x")
+	require.NoError(t, err)
+	require.NoError(t, tx.Rollback())
+	assert.False(t, registered("x"))
+}

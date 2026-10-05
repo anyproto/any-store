@@ -2,6 +2,7 @@ package anystore
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -42,6 +43,12 @@ type WriteTx interface {
 	onCommitPublish(f func())
 	pubLen() int
 	dropPubs(from int)
+
+	// The stack of open savepoints; see commonTx.savepoints.
+	// Unexported: savepoint-internal.
+	savepointOpened(version uint32)
+	savepointOpen(version uint32) bool
+	savepointEnded(version uint32)
 }
 
 // ReadTx represents a read-only transaction.
@@ -97,6 +104,30 @@ type commonTx struct {
 	// undo (savepointTx records a mark, rollback-to-savepoint drops its
 	// scope's entries). Single-writer state, like undo.
 	pubs []func()
+
+	// savepoints is the stack of open savepoints, outermost first, each by
+	// its version. A savepoint that ends takes the savepoints opened inside
+	// it with it — SQLite destroys every savepoint nested inside the one a
+	// RELEASE or ROLLBACK TO names (vdbe.c, OP_Savepoint). One that is no
+	// longer on the stack is gone: its btree savepoint id may name another
+	// savepoint by now, and its undo and publication marks cut the lists at
+	// positions that pair nothing. Single-writer state, like undo.
+	savepoints []uint32
+}
+
+func (tx *commonTx) savepointOpened(version uint32) {
+	tx.savepoints = append(tx.savepoints, version)
+}
+
+func (tx *commonTx) savepointOpen(version uint32) bool {
+	return slices.Contains(tx.savepoints, version)
+}
+
+// savepointEnded pops the savepoint and every savepoint opened inside it.
+func (tx *commonTx) savepointEnded(version uint32) {
+	if i := slices.Index(tx.savepoints, version); i >= 0 {
+		tx.savepoints = tx.savepoints[:i]
+	}
 }
 
 func (tx *commonTx) onRollbackUndo(f func()) {
@@ -319,7 +350,9 @@ func newSavepointTx(ctx context.Context, wrTx WriteTx) (WriteTx, error) {
 	}
 	tx := savepointPool.Get().(*savepointTx)
 	tx.reset(wrTx, spId)
-	return savepointWrapper{savepointTx: tx, version: tx.version.Load()}, nil
+	version := tx.version.Load()
+	wrTx.savepointOpened(version)
+	return savepointWrapper{savepointTx: tx, version: version}, nil
 }
 
 type savepointWrapper struct {
@@ -349,13 +382,15 @@ func (tx *savepointTx) reset(wtx WriteTx, spId int) {
 	tx.version.Store(newTxVersion())
 }
 
-// orphaned reports that the transaction this savepoint belongs to has ended.
-// The savepoint ended with it — SQLite frees every savepoint when the
-// transaction ends (sqlite3CloseSavepoints) and a later RELEASE or ROLLBACK TO
-// fails with "no such savepoint". The parent's pooled state, the btree tx and
-// the writer's buffers may already serve another transaction: touch nothing.
+// orphaned reports that the savepoint no longer exists: the transaction it
+// belongs to has ended, or a savepoint enclosing it has. SQLite frees every
+// savepoint when the transaction ends (sqlite3CloseSavepoints) and the nested
+// ones when a savepoint ends (see commonTx.savepoints); a later RELEASE or
+// ROLLBACK TO fails with "no such savepoint". The parent's pooled state, the
+// btree tx and the writer's buffers may already serve another transaction,
+// and the btree savepoint id another savepoint: touch nothing.
 func (w savepointWrapper) orphaned() bool {
-	return w.WriteTx.Done()
+	return w.WriteTx.Done() || !w.WriteTx.savepointOpen(w.version)
 }
 
 func (w savepointWrapper) Commit() error {
@@ -364,6 +399,7 @@ func (w savepointWrapper) Commit() error {
 			savepointPool.Put(w.savepointTx)
 			return ErrTxIsUsed
 		}
+		w.WriteTx.savepointEnded(w.version)
 		btWtx := w.WriteTx.btreeWriteTx()
 		if err := btWtx.ReleaseSavepoint(w.savepointId); err != nil {
 			return err
@@ -379,6 +415,7 @@ func (w savepointWrapper) Rollback() error {
 			savepointPool.Put(w.savepointTx)
 			return ErrTxIsUsed
 		}
+		w.WriteTx.savepointEnded(w.version)
 		btWtx := w.WriteTx.btreeWriteTx()
 		db := w.WriteTx.dbRef()
 		err := btWtx.RollbackToSavepoint(w.savepointId)

@@ -89,6 +89,61 @@ func TestDb_WriteTx(t *testing.T) {
 			assert.Equal(t, 1, n)
 		}
 	})
+	// A savepoint ends with the savepoint that encloses it: finishing it
+	// afterwards fails and undoes nothing the transaction has done since.
+	t.Run("savepoint outlives its enclosing savepoint", func(t *testing.T) {
+		ends := map[string]func(WriteTx) error{"commit": WriteTx.Commit, "rollback": WriteTx.Rollback}
+		for outerName, endOuter := range ends {
+			for innerName, endInner := range ends {
+				t.Run(outerName+" then "+innerName, func(t *testing.T) {
+					fx := newFixture(t)
+					dropped, err := fx.CreateCollection(ctx, "dropped")
+					require.NoError(t, err)
+
+					tx, err := fx.WriteTx(ctx)
+					require.NoError(t, err)
+					outer, err := fx.WriteTx(tx.Context())
+					require.NoError(t, err)
+					// A schema change leaves the undo log and the publication
+					// list at different lengths for the inner savepoint to mark.
+					_, err = fx.CreateCollection(tx.Context(), "inOuter")
+					require.NoError(t, err)
+					inner, err := fx.WriteTx(tx.Context())
+					require.NoError(t, err)
+					assert.False(t, inner.Done())
+					require.NoError(t, endOuter(outer))
+					assert.True(t, inner.Done())
+
+					// A savepoint opened now takes the btree savepoint id the
+					// inner one had.
+					fresh, err := fx.WriteTx(tx.Context())
+					require.NoError(t, err)
+					created, err := fx.CreateCollection(tx.Context(), "created")
+					require.NoError(t, err)
+					require.NoError(t, created.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1}`)))
+					require.NoError(t, dropped.Drop(tx.Context()))
+
+					assert.ErrorIs(t, endInner(inner), ErrTxIsUsed)
+					assert.False(t, fresh.Done())
+					require.NoError(t, fresh.Commit())
+					require.NoError(t, tx.Commit())
+
+					assertCollCount(t, created, 1)
+					_, err = dropped.Count(ctx)
+					assert.ErrorIs(t, err, ErrCollectionClosed)
+					_, err = fx.OpenCollection(ctx, "dropped")
+					assert.ErrorIs(t, err, ErrCollectionNotFound)
+					_, err = fx.OpenCollection(ctx, "inOuter")
+					if outerName == "commit" {
+						require.NoError(t, err)
+					} else {
+						assert.ErrorIs(t, err, ErrCollectionNotFound)
+					}
+					require.NoError(t, fx.IntegrityCheck(ctx))
+				})
+			}
+		}
+	})
 	t.Run("rollback - commit race", func(t *testing.T) {
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "test")

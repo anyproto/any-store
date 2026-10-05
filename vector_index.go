@@ -1341,7 +1341,7 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if err := c.alive(); err != nil {
+		if err := c.beginDDL(wtx); err != nil {
 			return err
 		}
 		cur := c.loadVectorIndexes()

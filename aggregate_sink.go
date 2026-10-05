@@ -133,7 +133,7 @@ func (q *aggQuery) materialize(ctx context.Context, cq *collQuery, rest aggregat
 	err = q.c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) error {
 		// wtx.Context carries the tx: a missing target is created inside
 		// this same transaction, so a failed apply leaves no empty shell.
-		target, terr := q.c.db.Collection(wtx.Context(), targetName)
+		target, terr := q.c.db.collection(wtx.Context(), targetName)
 		if terr != nil {
 			return terr
 		}

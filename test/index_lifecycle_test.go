@@ -1744,11 +1744,11 @@ func TestStaleReaderBruteForceAfterReopen(t *testing.T) {
 	assert.Len(t, hits, 3)
 }
 
-// A mid-tx collection reopen through an ambient write tx that already ran DDL
-// sees that tx's own uncommitted index: the reloaded handle must be stamped
-// for the COMMIT's cookie (init's SchemaChanged branch), or a concurrent
-// reader at the begin cookie would seek a namespace that exists only in the
-// writer's view — the phantom would even survive a rollback.
+// A collection closed and opened again inside a write tx that already ran
+// DDL on it: the open returns the handle that carries the uncommitted index.
+// The tx uses the index; a concurrent reader at the begin cookie does not —
+// it would seek a namespace that exists only in the writer's view — and a
+// rollback takes the index off the handle.
 func TestAmbientReopenPendingRangeInvisible(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "docs")
@@ -1789,10 +1789,9 @@ func TestAmbientReopenPendingRangeInvisible(t *testing.T) {
 	assert.False(t, explainHasIndex(explain, "nm"))
 }
 
-// The vector flavor of the mid-tx reopen: writable-aware namespace
-// resolution lets the reopen see the tx's own uncommitted graph namespaces,
-// and init's SchemaChanged stamp keeps the reloaded handle invisible to
-// concurrent readers — the phantom never escapes, even across a rollback.
+// The vector flavor of the mid-tx reopen: the tx searches its own uncommitted
+// graph through the handle the open returns, a concurrent reader cannot, and
+// a rollback takes the index off the handle.
 func TestAmbientReopenPendingVectorInvisible(t *testing.T) {
 	const dim = 8
 	fx := newFixture(t)
@@ -1826,9 +1825,9 @@ func TestAmbientReopenPendingVectorInvisible(t *testing.T) {
 
 	require.NoError(t, tx.Rollback())
 
-	// The rolled-back index never becomes visible.
+	// The rollback takes the index off the handle.
 	_, err = vsearchCtx(ctx, coll2, "v", vecs[0], 3, 32)
-	assert.ErrorIs(t, err, anystore.ErrIndexNotFound)
+	assert.ErrorIs(t, err, anystore.ErrNoVectorIndex)
 }
 
 // A stale reader on a redefined index (drop+recreate same name, different
