@@ -541,6 +541,49 @@ func TestOpenThroughOlderReadTx_RecreatedSince(t *testing.T) {
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
 
+// One collection has one handle, whatever name a transaction knows it by. An
+// older read transaction knows the collection under the name the open write
+// transaction has just renamed it back to: a second handle registered under
+// that name would be used by the writer beside the first, and each would
+// miss the other's schema changes.
+func TestOpenThroughOlderReadTx_NameTheOpenWriteTxGaveIt(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	for i := range 5 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"k":%d}`, i, i))))
+	}
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { _ = rtx.Commit() }()
+	require.NoError(t, coll.Rename(ctx, "b"))
+
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.Rename(wtx.Context(), "a"))
+	require.NoError(t, coll.EnsureIndex(wtx.Context(), anystore.IndexInfo{Name: "k", Fields: []string{"k"}}))
+
+	h, err := fx.OpenCollection(rtx.Context(), "a")
+	require.NoError(t, err)
+	require.True(t, h == coll, "a second handle for the collection")
+	n, err := h.Count(rtx.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 5, n)
+
+	// The writer changes the schema through one and writes through the other.
+	require.NoError(t, h.EnsureIndex(wtx.Context(), anystore.IndexInfo{Name: "j", Fields: []string{"j"}}))
+	require.NoError(t, coll.DropIndex(wtx.Context(), "k"))
+	require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":5,"k":5,"j":5}`)))
+	require.NoError(t, h.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":6,"k":6,"j":6}`)))
+	require.NoError(t, wtx.Commit())
+
+	n, err = coll.Find(`{"j":{"$gte":5}}`).IndexHint(anystore.IndexHint{IndexName: "j", Boost: 1_000_000}).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
 // A transaction older than a collection does not find it, whoever holds it
 // open, and reads nothing through a handle to it.
 func TestOlderReadTx_CollectionCreatedSince(t *testing.T) {

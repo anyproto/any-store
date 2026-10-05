@@ -163,6 +163,9 @@ type collection struct {
 	// is the second check for the entries of old files that share one token.
 	catalogID []byte
 	dataRoot  uint32
+	// identity is the two as one key: what the registry knows a collection
+	// by, besides its name (db.byIdentity).
+	identity string
 
 	// openName is the name the handle was opened under: what the collection
 	// is called while no version is installed.
@@ -1310,13 +1313,17 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 			return nil
 		}
 		// A foreign live handle under the new name implies the name is taken
-		// even if some stale state made the catalog check below miss it.
+		// — if this tx has the collection it stands for: one left behind by
+		// an older snapshot may answer for a name that is free by now, and
+		// retires when resolved here.
 		c.db.mu.Lock()
-		if cur, ok := c.db.openedCollections[newName]; ok && cur != Collection(c) {
-			c.db.mu.Unlock()
-			return ErrCollectionExists
-		}
+		foreign, _ := c.db.openedCollections[newName].(*collection)
 		c.db.mu.Unlock()
+		if foreign != nil && foreign != c {
+			if _, fErr := foreign.resolve(&tx.ReadTx); fErr == nil || !errors.Is(fErr, ErrCollectionNotFound) {
+				return ErrCollectionExists
+			}
+		}
 
 		// Re-keys the catalog metadata AND every derived btree namespace
 		// (data, per-index) in this tx.
@@ -1395,6 +1402,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 					// the registry: retire it.
 					if other, ok := c.db.openedCollections[committed]; ok && other != Collection(c) {
 						other.(*collection).closed.Store(true)
+						c.db.forgetLocked(other.(*collection))
 					}
 					c.db.openedCollections[committed] = c
 				}

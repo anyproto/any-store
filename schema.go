@@ -2,6 +2,7 @@ package anystore
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"sync/atomic"
 
@@ -230,6 +231,14 @@ func (s *collSchema) current(e *schemaEpoch, cookie uint32, writer bool) bool {
 // Any other transaction — older than the head, in the gap between a commit
 // and known, or the first of a generation — goes through resolveSlow.
 func (c *collection) resolve(tx *btree.ReadTx) (*collSchema, error) {
+	return c.resolveAs(tx, "")
+}
+
+// resolveAs is resolve by a caller that knows the name the collection has in
+// tx's view (it just read the catalog there): a transaction older than the
+// handle looks the collection up under it, where the handle may only know
+// later names.
+func (c *collection) resolveAs(tx *btree.ReadTx, name string) (*collSchema, error) {
 	if err := c.alive(); err != nil {
 		return nil, err
 	}
@@ -244,7 +253,7 @@ func (c *collection) resolve(tx *btree.ReadTx) (*collSchema, error) {
 			return b, nil
 		}
 	}
-	return c.resolveSlow(tx)
+	return c.resolveSlow(tx, name)
 }
 
 // resolveSlow loads the collection's schema through tx's own view. A
@@ -257,7 +266,7 @@ func (c *collection) resolve(tx *btree.ReadTx) (*collSchema, error) {
 //
 // Loads of one handle are serialized under c.mu, with the schema changes
 // published through it.
-func (c *collection) resolveSlow(tx *btree.ReadTx) (*collSchema, error) {
+func (c *collection) resolveSlow(tx *btree.ReadTx, asName string) (*collSchema, error) {
 	if s := memoGet(tx, c); s != nil {
 		return s, nil
 	}
@@ -274,9 +283,12 @@ func (c *collection) resolveSlow(tx *btree.ReadTx) (*collSchema, error) {
 	}
 	speaks := cookieLE(e.start, cookie) && cookieLE(cookie, e.known) && cookieLE(c.since, cookie) &&
 		(head == nil || cookieLE(head.validFrom, cookie))
-	name := c.openName
-	if head != nil {
-		name = head.nameAt(cookie)
+	name := asName
+	if name == "" {
+		name = c.openName
+		if head != nil {
+			name = head.nameAt(cookie)
+		}
 	}
 	s, err := c.loadSchema(tx, name, head)
 	if err != nil {
@@ -421,6 +433,9 @@ func (c *collection) identify(tx *btree.ReadTx, name string, token []byte, ns *b
 	}
 	c.dataRoot = ns.RootPage()
 	c.catalogID = token
+	// The root tells apart the collections of old files that share one
+	// token; no two live collections share a root.
+	c.identity = string(binary.BigEndian.AppendUint32(append([]byte(nil), token...), c.dataRoot))
 	return nil
 }
 

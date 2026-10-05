@@ -128,6 +128,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		config:            config,
 		syncPool:          sPool,
 		openedCollections: make(map[string]Collection),
+		byIdentity:        make(map[string]*collection),
 	}
 
 	var quickCheckNeeded bool
@@ -279,6 +280,12 @@ type db struct {
 	ddlUnwindGate sync.Mutex
 
 	openedCollections map[string]Collection
+	// byIdentity holds the registered handles by the collection they stand
+	// for (collection.identity): one collection has one handle, whatever
+	// names transactions at different snapshots know it by — the one of an
+	// older snapshot, or the one the open write tx just gave it. Under mu,
+	// like openedCollections.
+	byIdentity map[string]*collection
 
 	// epoch is what this process knows of the schema cookie's history, and
 	// ownCookie the cookie a commit of this process is producing right now
@@ -734,10 +741,12 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 		if hadDropped {
 			if dc := dropped.(*collection); dc.ddlTxs == 0 {
 				dc.closed.Store(true)
+				db.forgetLocked(dc)
 				hadDropped = false
 			}
 		}
 		db.openedCollections[collectionName] = coll
+		db.byIdentity[c.identity] = c
 		c.since = db.epoch.Load().known
 		// The creation is this handle's first uncommitted schema change.
 		c.ddlTxs++
@@ -764,6 +773,7 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 					delete(db.openedCollections, collectionName)
 				}
 			}
+			db.forgetLocked(c)
 			db.mu.Unlock()
 			for _, fx := range c.loadFtsIndexes() {
 				fx.pending.reset()
@@ -901,6 +911,15 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 			opened = live
 			return db.resolveIn(tx, live.(*collection), collectionName)
 		}
+		// The collection tx has under this name has a handle already, under
+		// another name: the one the newest state gives it, or the open write
+		// tx. That is its handle; a second one would not follow the schema
+		// changes made through the first.
+		if other := db.byIdentity[c.identity]; other != nil && !other.closed.Load() {
+			db.mu.Unlock()
+			opened = other
+			return db.resolveIn(tx, other, collectionName)
+		}
 		if existing, ok := db.openedCollections[collectionName]; ok {
 			// A CLOSED drop-in-flight handle: registering the fresh one over
 			// it would revive the dangling-handle corruption Drop's deferred
@@ -911,6 +930,7 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 		}
 		c.since = db.epoch.Load().known
 		db.openedCollections[collectionName] = c
+		db.byIdentity[c.identity] = c
 		db.mu.Unlock()
 		opened = c
 		c.adopt(tx, schema)
@@ -936,9 +956,11 @@ func (db *db) resolveOpened(ctx context.Context, c *collection, name string) err
 	})
 }
 
-// resolveIn reports whether tx has the collection of c under name.
+// resolveIn reports whether tx has the collection of c under name. The name
+// is also where a transaction older than the handle looks the collection up
+// when the handle itself does not know what it was called then.
 func (db *db) resolveIn(tx *btree.ReadTx, c *collection, name string) error {
-	s, err := c.resolve(tx)
+	s, err := c.resolveAs(tx, name)
 	if err != nil {
 		if c.closed.Load() && !db.closed.Load() {
 			return errHandleGone
@@ -1408,6 +1430,14 @@ func (db *db) evictLocked(c *collection) {
 			delete(db.openedCollections, name)
 			break
 		}
+	}
+	db.forgetLocked(c)
+}
+
+// forgetLocked takes c out of byIdentity. The caller holds db.mu.
+func (db *db) forgetLocked(c *collection) {
+	if db.byIdentity[c.identity] == c {
+		delete(db.byIdentity, c.identity)
 	}
 }
 
