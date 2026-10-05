@@ -237,9 +237,9 @@ type collection struct {
 	// Guarded by db.mu.
 	ddlTxs int
 	// closePending records a Close() that waits for ddlTxs to reach zero
-	// (db.ddlEnd). An open of the collection in between hands this handle
-	// out again and clears it. Guarded by db.mu.
-	closePending bool
+	// (db.ddlEnd). An open that hands this handle to a caller in between
+	// clears it (db.handOut). Written under db.mu.
+	closePending atomic.Bool
 
 	closed atomic.Bool
 	mu     sync.Mutex
@@ -1677,15 +1677,20 @@ func (c *collection) ReadTx(ctx context.Context) (ReadTx, error) {
 	return c.db.ReadTx(ctx)
 }
 
-// Close evicts the handle from the registry and fails its later operations.
-// While the handle carries an uncommitted schema change (see ddlTxs) the
-// close waits until the last of them is committed or rolled back; the handle
-// stays usable until then.
 func (c *collection) Close() error {
+	return c.close(false)
+}
+
+// close evicts the handle from the registry and fails its later operations.
+// While the handle carries an uncommitted schema change (see ddlTxs) the
+// close waits until the last of them is committed or rolled back, and the
+// handle stays usable until then — unless force: the database is closing and
+// no transaction will end.
+func (c *collection) close(force bool) error {
 	c.db.mu.Lock()
 	defer c.db.mu.Unlock()
-	if c.ddlTxs > 0 {
-		c.closePending = true
+	if c.ddlTxs > 0 && !force {
+		c.closePending.Store(true)
 		return nil
 	}
 	if c.closed.CompareAndSwap(false, true) {

@@ -1558,6 +1558,33 @@ func TestCloseDuringDDLTx(t *testing.T) {
 		assertIndexesHold(t, fx, fresh, "a", 1, "k")
 	})
 
+	// Only an open that hands the handle to a caller keeps it open: one that
+	// ends in an error does not, nor does the open an aggregation makes of
+	// its $out target.
+	t.Run("opens that hand nothing out", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+		src, err := fx.CreateCollection(ctx, "src")
+		require.NoError(t, err)
+		require.NoError(t, src.Insert(ctx, ddlDoc(1)))
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(tx.Context(), ddlKIdx))
+		require.NoError(t, a.Close())
+		_, err = fx.Collection(tx.Context(), "a", anystore.CollectionOptions{PrimaryKey: "other"})
+		require.ErrorIs(t, err, anystore.ErrPrimaryKeyMismatch)
+		_, err = src.Aggregate(`[{"$out":"a"}]`).Count(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+
+		assert.ErrorIs(t, a.Insert(ctx, ddlDoc(2)), anystore.ErrCollectionClosed)
+		fresh, err := fx.OpenCollection(ctx, "a")
+		require.NoError(t, err)
+		assertIndexesHold(t, fx, fresh, "a", 1, "k")
+	})
+
 	// The savepoint's change was the handle's only one: its rollback leaves
 	// nothing uncommitted and the close takes effect inside the tx.
 	t.Run("savepoint rollback of the only change", func(t *testing.T) {
@@ -1616,6 +1643,32 @@ func TestCloseAndReopenFromAnotherGoroutineDuringDDL(t *testing.T) {
 	h, err := fx.OpenCollection(ctx, "a")
 	require.NoError(t, err)
 	assertIndexesHold(t, fx, h, "a", 1, "ft", "k")
+}
+
+// db.Close() closes every handle at once, also one whose schema change sits
+// in a write tx nobody has finished: an operation through that tx fails, it
+// does not read a closed database.
+func TestDBCloseDuringDDLTx(t *testing.T) {
+	fx := newFixture(t)
+	a, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	for i := range 5 {
+		require.NoError(t, a.Insert(ctx, ddlDoc(i)))
+	}
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, a.EnsureIndex(tx.Context(), ddlKIdx))
+	require.NoError(t, a.Insert(tx.Context(), ddlDoc(100)))
+	require.NoError(t, fx.Close())
+
+	_, err = a.FindId(tx.Context(), 100)
+	assert.ErrorIs(t, err, anystore.ErrDBIsClosed)
+	_, err = a.Count(tx.Context())
+	assert.ErrorIs(t, err, anystore.ErrDBIsClosed)
+	_, err = a.Find(nil).Iter(tx.Context())
+	assert.ErrorIs(t, err, anystore.ErrDBIsClosed)
+	assert.ErrorIs(t, a.Insert(tx.Context(), ddlDoc(101)), anystore.ErrDBIsClosed)
 }
 
 // Once the transaction of a schema change has ended — whatever the change and
