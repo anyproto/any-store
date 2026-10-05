@@ -478,6 +478,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	tx.modified = false
 	tx.undo = tx.undo[:0]
 	tx.pubs = tx.pubs[:0]
+	tx.savepoints = tx.savepoints[:0]
 	tx.version.Store(version)
 	wTx := writeTx{commonTx: tx, version: version}
 	tx.ctx = context.WithValue(ctx, ctxKeyTx, wTx)
