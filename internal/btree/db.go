@@ -667,10 +667,10 @@ func Open(path string, opts Options) (*DB, error) {
 	// pager.commit finds its counters remembered: the pager has them in its
 	// header before the frames are written. The dataVersion is the one such
 	// a reader loads.
-	p.wal.onPublish = func(hdr *WalIndexHdr) {
-		db.snapCounters.put(db.dataVersion.Load(), hdr, p.header.FileChangeCount, p.header.SchemaCookie)
+	p.wal.onPublish = func(hdr WalIndexHdr) {
+		db.snapCounters.put(db.dataVersion.Load(), &hdr, p.header.FileChangeCount, p.header.SchemaCookie)
 		if hdr.synthesized() {
-			db.published, db.hasPublished = *hdr, true
+			db.published, db.hasPublished = hdr, true
 		}
 		if f := db.commitHook; f != nil {
 			f(p.header.FileChangeCount, p.header.SchemaCookie)

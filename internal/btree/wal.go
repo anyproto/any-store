@@ -1377,7 +1377,7 @@ type wal struct {
 	// onPublish, when set, runs as a commit becomes visible to readers, with
 	// the header they pin from then on (as DB.beginRead normalizes it). The
 	// write lock is held.
-	onPublish func(hdr *WalIndexHdr)
+	onPublish func(hdr WalIndexHdr)
 
 	mu       sync.RWMutex // protects memFrames slice; readers use RLock, writer uses Lock
 	file     fileHandle
@@ -2364,7 +2364,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		mxCommit := w.index.maxFrame.Load()
 		w.index.mxCommitFrame.Store(mxCommit)
 		if w.inProcess && w.onPublish != nil {
-			w.onPublish(&WalIndexHdr{isInit: 1, mxFrame: mxCommit})
+			w.onPublish(WalIndexHdr{isInit: 1, mxFrame: mxCommit})
 		}
 		if !w.inProcess {
 			// Use dbSize directly instead of maxPage.Load() because a
@@ -2385,8 +2385,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 			// commits (53f68eb fix).
 			w.writerHdr = w.index.hdr
 			if w.onPublish != nil {
-				hdr := w.index.hdr
-				w.onPublish(&hdr)
+				w.onPublish(w.index.hdr)
 			}
 		}
 	}
@@ -2505,7 +2504,7 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 			w.index.maxPage.Store(dbSize)
 		}
 		if w.onPublish != nil {
-			w.onPublish(&WalIndexHdr{isInit: 1, mxFrame: mxCommit})
+			w.onPublish(WalIndexHdr{isInit: 1, mxFrame: mxCommit})
 		}
 	}
 
