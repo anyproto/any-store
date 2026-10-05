@@ -346,8 +346,21 @@ func (tx *savepointTx) reset(wtx WriteTx, spId int) {
 	tx.version.Store(newTxVersion())
 }
 
+// orphaned reports that the transaction this savepoint belongs to has ended.
+// The savepoint ended with it — SQLite frees every savepoint when the
+// transaction ends (sqlite3CloseSavepoints) and a later RELEASE or ROLLBACK TO
+// fails with "no such savepoint". The parent's pooled state, the btree tx and
+// the writer's buffers may already serve another transaction: touch nothing.
+func (w savepointWrapper) orphaned() bool {
+	return w.WriteTx.Done()
+}
+
 func (w savepointWrapper) Commit() error {
 	if w.savepointTx.version.CompareAndSwap(w.version, 0) {
+		if w.orphaned() {
+			savepointPool.Put(w.savepointTx)
+			return ErrTxIsUsed
+		}
 		btWtx := w.WriteTx.btreeWriteTx()
 		if err := btWtx.ReleaseSavepoint(w.savepointId); err != nil {
 			return err
@@ -359,6 +372,10 @@ func (w savepointWrapper) Commit() error {
 
 func (w savepointWrapper) Rollback() error {
 	if w.savepointTx.version.CompareAndSwap(w.version, 0) {
+		if w.orphaned() {
+			savepointPool.Put(w.savepointTx)
+			return ErrTxIsUsed
+		}
 		btWtx := w.WriteTx.btreeWriteTx()
 		db := w.WriteTx.dbRef()
 		err := btWtx.RollbackToSavepoint(w.savepointId)
@@ -383,7 +400,7 @@ func (w savepointWrapper) Rollback() error {
 }
 
 func (w savepointWrapper) Done() bool {
-	return w.savepointTx.version.Load() != w.version
+	return w.savepointTx.version.Load() != w.version || w.orphaned()
 }
 
 type noOpTx struct {
