@@ -292,6 +292,10 @@ type db struct {
 	// (flag in the high half); see schemaEpoch and observeCookie.
 	epoch     atomic.Pointer[schemaEpoch]
 	ownCookie atomic.Uint64
+	// sketchEpoch counts the commits of other processes this one noticed:
+	// each may have moved the sketches of any collection (see
+	// collection.refreshSketches).
+	sketchEpoch atomic.Uint64
 
 	// sketchDirty and ftsDirty list the collections whose writer state the
 	// end of a transaction has to visit: an index whose live sketch may hold
@@ -535,10 +539,15 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 //	  stale schema is never used; nothing is read for the handles nobody
 //	  touches.
 //
-//	STATISTICAL (advisory): reloadSketches refreshes the selectivity sketches
-//	  after another process committed. A stale sketch only affects which
-//	  index the planner CHOOSES, never query RESULTS (the any-store analog of
-//	  sqlite_stat1).
+//	STATISTICAL (advisory): a commit of another process may have moved the
+//	  selectivity sketches of any collection. sketchEpoch records that one
+//	  was noticed, and each handle reloads its sketches when a transaction
+//	  next plans with them or writes through it (collection.refreshSketches).
+//	  A stale sketch only affects which index the planner CHOOSES, never
+//	  query RESULTS (the any-store analog of sqlite_stat1).
+//
+// Neither tier reads anything here: what a begin costs does not depend on how
+// many collections are open.
 //
 // The begin-time disk counters driving the sketch verdict are RAISED to the
 // newest committed frame (see btree.ReadTx.SnapshotHeaderCounters), so a read
@@ -547,13 +556,11 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 // stale and the next begin converges.
 //
 // A verdict a commit of THIS process produced — it landed between the begin's
-// read of the local counters and its read of the disk ones — has nothing to
-// reload: the writer published its sketches in-process and recorded the
-// committed counters. The pass returns once the local counters have reached
-// the counters this tx saw on disk (LocalCaughtUp), and the consumption below
-// never moves them back (AdvanceLocalCounters), so under a steady write load
-// a read begin stays a counter comparison instead of a reload of every open
-// collection's sketches.
+// read of the local counters and its read of the disk ones — is none: the
+// writer published its sketches in-process and recorded the committed
+// counters. The pass returns once the local counters have reached the
+// counters this tx saw on disk (LocalCaughtUp), and the consumption below
+// never moves them back (AdvanceLocalCounters).
 func (db *db) checkStale(tx *btree.ReadTx) {
 	db.observeCookie(tx)
 	if !tx.IsSchemaStale() && !tx.IsDataStale() {
@@ -562,32 +569,8 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 	if tx.LocalCaughtUp() {
 		return
 	}
-	db.reloadSketches(tx)
+	db.sketchEpoch.Add(1)
 	db.btreeDB.AdvanceLocalCounters(tx.SnapshotFileChangeCounter(), tx.SnapshotSchemaCookie())
-}
-
-// reloadSketches reloads all sketch data from the _system namespace for opened
-// collections (the advisory Tier-2 of checkStale). The per-index leaf branches
-// on whether this tx is the writer: a write tx (sole mutator under writeMu)
-// reloads in place into the live sketch; a read tx reloads the reader-owned
-// published copy so it can never clobber a concurrent writer's in-flight
-// increments.
-func (db *db) reloadSketches(tx *btree.ReadTx) {
-	writable := tx.IsWriteTx()
-	db.mu.Lock()
-	colls := make([]*collection, 0, len(db.openedCollections))
-	for _, coll := range db.openedCollections {
-		colls = append(colls, coll.(*collection))
-	}
-	db.mu.Unlock()
-
-	for _, c := range colls {
-		c.mu.Lock()
-		for _, idx := range c.loadIndexes() {
-			c.reloadSketch(tx, idx, writable)
-		}
-		c.mu.Unlock()
-	}
 }
 
 // resetUncommittedSketches discards leftover, never-committed sketch deltas at
@@ -619,7 +602,7 @@ func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
 					// reloadSketch (writable) rebases live to the committed bytes and
 					// clears sketchModified; if there are no committed bytes yet
 					// (brand-new pre-commit index) it preserves the built sketch.
-					c.reloadSketch(tx, idx, true)
+					c.reloadSketch(tx, c.cur().name, idx, true)
 					flagged = flagged || idx.sketchModified
 				}
 			}

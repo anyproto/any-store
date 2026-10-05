@@ -192,6 +192,7 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 			return rErr
 		}
 		stats.Name = s.name
+		c.refreshSketches(tx, s)
 		indexes, vindexes, ftsindexes := s.indexes, s.vindexes, s.ftsIndexes
 
 		// Documents: scan the collection B-tree summing stored and

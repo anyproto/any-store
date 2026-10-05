@@ -245,9 +245,13 @@ func (c *collection) resolveAs(tx *btree.ReadTx, name string) (*collSchema, erro
 	if err := c.alive(); err != nil {
 		return nil, err
 	}
+	writer := tx.IsWriteTx()
 	if s := c.head.Load(); s != nil {
-		e, cookie, writer := c.db.epoch.Load(), tx.SnapshotSchemaCookie(), tx.IsWriteTx()
+		e, cookie := c.db.epoch.Load(), tx.SnapshotSchemaCookie()
 		if s.current(e, cookie, writer) {
+			if writer {
+				c.refreshSketches(tx, s)
+			}
 			return s, nil
 		}
 		// A head the open write tx published is that tx's until it commits:
@@ -256,7 +260,11 @@ func (c *collection) resolveAs(tx *btree.ReadTx, name string) (*collSchema, erro
 			return b, nil
 		}
 	}
-	return c.resolveSlow(tx, name)
+	s, err := c.resolveSlow(tx, name)
+	if err == nil && writer {
+		c.refreshSketches(tx, s)
+	}
+	return s, err
 }
 
 // resolveSlow loads the collection's schema through tx's own view. A

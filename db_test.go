@@ -1539,11 +1539,14 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 	rewindLocalCounters := func() {
 		dbi.btreeDB.UpdateLocalCounters(fcc-1, sc)
 	}
+	// stalePass is a reader that notices the peer's commit at its begin and
+	// then plans with the collection.
 	stalePass := func() {
 		reader, err := dbi.btreeDB.BeginRead()
 		require.NoError(t, err)
 		stale := reader.IsDataStale()
 		dbi.checkStale(reader)
+		c.refreshSketches(reader, c.cur())
 		require.NoError(t, reader.Rollback())
 		require.True(t, stale)
 	}
@@ -1554,6 +1557,7 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 	stale := reader.IsDataStale()
 	insertErr := coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":2}`))
 	dbi.checkStale(reader)
+	c.refreshSketches(reader, c.cur())
 	require.NoError(t, reader.Rollback())
 	require.NoError(t, insertErr)
 	require.True(t, stale)
@@ -1607,6 +1611,52 @@ func rawPut(t *testing.T, dbi *db, key, val []byte) {
 	}
 	wtx.MarkDataChanged()
 	require.NoError(t, wtx.Commit())
+}
+
+// A commit of another process is noticed at a begin without a read per open
+// collection: a collection's sketches are reloaded when it is next planned
+// with, or written to.
+func TestCheckStale_SketchesReloadOnUse(t *testing.T) {
+	skipIfInMemory(t, "staleness counters model cross-process commits; not applicable in-memory")
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	open := func(name string) (Collection, *index) {
+		coll, err := fx.CreateCollection(ctx, name)
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
+		return coll, coll.(*collection).loadIndexes()[0]
+	}
+	used, usedIdx := open("used")
+	written, writtenIdx := open("written")
+	_, idleIdx := open("idle")
+
+	// The other process: new sketch bytes for all three, and a commit this
+	// process has not counted.
+	peer := qplanner.NewIndexSketch(qplanner.DefaultSketchSize, 1)
+	for range 42 {
+		peer.IncrementDocCount()
+	}
+	for _, name := range []string{"used", "written", "idle"} {
+		rawPut(t, dbi, sketchKey(name, usedIdx.info.Name), peer.MarshalBinary(nil))
+	}
+	rtx, err := dbi.btreeDB.BeginRead()
+	require.NoError(t, err)
+	fcc, sc := rtx.DiskFileChangeCounter(), rtx.DiskSchemaCookie()
+	require.NoError(t, rtx.Rollback())
+	dbi.btreeDB.UpdateLocalCounters(fcc-1, sc)
+
+	n, err := used.Find(`{"a":1}`).Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	assert.Equal(t, uint64(42), usedIdx.loadPubSketch().GetDocCount(), "planned with: reloaded")
+	assert.Equal(t, uint64(1), writtenIdx.loadPubSketch().GetDocCount(), "not used yet")
+	assert.Equal(t, uint64(1), idleIdx.loadPubSketch().GetDocCount(), "not used yet")
+
+	// A write catches up before it adds its own.
+	require.NoError(t, written.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":2}`)))
+	assert.Equal(t, uint64(43), writtenIdx.loadPubSketch().GetDocCount())
+	assert.Equal(t, uint64(1), idleIdx.loadPubSketch().GetDocCount())
 }
 
 // Another process's schema change noticed while a local tx has uncommitted

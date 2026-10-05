@@ -138,6 +138,8 @@ type Collection interface {
 // transaction alone (see resolveSlow).
 func newCollection(db *db, name string, tx *btree.ReadTx) (*collection, *collSchema, error) {
 	c := &collection{db: db, openName: name}
+	// The sketches are about to be read: as of the epoch before that.
+	c.sketchSeen.Store(db.sketchEpoch.Load())
 	s, err := c.loadSchema(tx, name, nil)
 	if err != nil {
 		return nil, nil, err
@@ -190,6 +192,10 @@ type collection struct {
 	// per-collection buffer is safe and keeps the stale-reload path from
 	// allocating a fresh read buffer per index.
 	sketchReadBuf []byte
+
+	// sketchSeen is the db.sketchEpoch the sketches of this handle were last
+	// brought up to (refreshSketches).
+	sketchSeen atomic.Uint64
 
 	// sketchDirty and ftsDirty record membership in db.sketchDirty and
 	// db.ftsDirty; writer-owned like the lists.
@@ -1659,8 +1665,34 @@ func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, collName string, idx *in
 	idx.storePubSketch(idx.sketch)
 }
 
+// refreshSketches reloads the sketches of the version s, resolved for tx, if
+// another process committed since they were last loaded (db.sketchEpoch).
+// Called where sketches are used: a reader's plan, and a writer's first
+// operation on the collection, before its own deltas go on top. A reader at
+// a snapshot older than the newest this process has consumed loads nothing:
+// what it would publish is older than what is published.
+func (c *collection) refreshSketches(tx *btree.ReadTx, s *collSchema) {
+	epoch := c.db.sketchEpoch.Load()
+	if c.sketchSeen.Load() == epoch {
+		return
+	}
+	writable := tx.IsWriteTx()
+	if fcc, _ := c.db.btreeDB.LocalCounters(); !writable && !cookieLE(fcc, tx.SnapshotFileChangeCounter()) {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sketchSeen.Load() == epoch {
+		return
+	}
+	for _, idx := range s.indexes {
+		c.reloadSketch(tx, s.name, idx, writable)
+	}
+	c.sketchSeen.Store(epoch)
+}
+
 // reloadSketch refreshes one already-published index's sketch from the _system
-// namespace during the advisory staleness tier (checkStale -> reloadSketches).
+// namespace (refreshSketches, and the rebase of resetUncommittedSketches).
 // It is the sqlite_stat1 reload analog and is advisory/fail-soft: a missing key
 // or decode error leaves current state intact and never aborts the transaction.
 //
@@ -1680,8 +1712,8 @@ func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, collName string, idx *in
 //	  live object (initially, and again after each commit republishes it).
 //	  The writer's live object is untouched; its in-flight increments can
 //	  never be lost.
-func (c *collection) reloadSketch(tx *btree.ReadTx, idx *index, writable bool) {
-	key := sketchKey(c.cur().name, idx.info.Name)
+func (c *collection) reloadSketch(tx *btree.ReadTx, collName string, idx *index, writable bool) {
+	key := sketchKey(collName, idx.info.Name)
 	data, err := tx.AppendValue(c.db.systemNS, key, c.sketchReadBuf[:0])
 	if err != nil {
 		return // no persisted bytes: preserve current state (advisory)
