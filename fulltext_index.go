@@ -154,11 +154,22 @@ func newFtsIndex(c *collection, collName string, info IndexInfo) (*ftsIndex, err
 // Len returns the number of indexed documents — the maintained N counter, not
 // a namespace scan; documents with no indexable text are excluded (Index
 // interface).
+// Len is the document count of the index of this name as the transaction of
+// ctx has it (see index.Len).
 func (fx *ftsIndex) Len(ctx context.Context) (count int, err error) {
 	err = fx.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		n, txErr := ftsGetUint(tx, fx.nsMeta, ftsMetaCount)
-		count = int(n)
-		return txErr
+		s, txErr := fx.c.resolve(tx)
+		if txErr != nil {
+			return txErr
+		}
+		for _, cur := range s.ftsIndexes {
+			if cur.info.Name == fx.info.Name {
+				n, nErr := ftsGetUint(tx, cur.nsMeta, ftsMetaCount)
+				count = int(n)
+				return nErr
+			}
+		}
+		return ErrIndexNotFound
 	})
 	return
 }

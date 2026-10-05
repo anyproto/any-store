@@ -686,6 +686,43 @@ func TestAccessorsReportCommittedSchema(t *testing.T) {
 	}
 }
 
+// An Index stands for a name: its length is that of the index the caller's
+// transaction has under it — not of the trees it was listed with, which a
+// drop frees.
+func TestIndexLen_OfTheCallersTransaction(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a", Fields: []string{"a"}}))
+	for i := range 3 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+	}
+	listed := coll.GetIndexes()
+	require.Len(t, listed, 1)
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { _ = rtx.Commit() }()
+
+	require.NoError(t, coll.DropIndex(ctx, "a"))
+	// Whatever takes the freed pages is not this index.
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "b", Fields: []string{"b"}}))
+	for i := 3; i < 10; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"b":%d}`, i, i))))
+	}
+
+	_, err = listed[0].Len(ctx)
+	assert.ErrorIs(t, err, anystore.ErrIndexNotFound)
+	n, err := listed[0].Len(rtx.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 3, n, "the older transaction still has the index")
+
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a", Fields: []string{"a"}}))
+	n, err = listed[0].Len(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 10, n, "the index of that name as it is now: an entry per document")
+}
+
 // A read transaction that began before a rename keeps reading through the
 // handle it holds: the data tree and the documents are the ones its snapshot
 // has, whatever the collection is called by now.

@@ -304,7 +304,8 @@ type Index interface {
 	// Info returns the IndexInfo for this index.
 	Info() IndexInfo
 
-	// Len returns the length of the index.
+	// Len returns the length of the index as the transaction of ctx has it;
+	// ErrIndexNotFound if that transaction has no index of this name.
 	Len(ctx context.Context) (int, error)
 }
 
@@ -504,11 +505,22 @@ func (idx *index) Info() IndexInfo {
 	return idx.info
 }
 
+// Len counts the entries of the index of this name as the transaction of ctx
+// has it: an Index stands for a name, not for the trees one schema version
+// bound to it.
 func (idx *index) Len(ctx context.Context) (count int, err error) {
 	err = idx.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		var txErr error
-		count, txErr = tx.Count(idx.ns)
-		return txErr
+		s, txErr := idx.c.resolve(tx)
+		if txErr != nil {
+			return txErr
+		}
+		for _, cur := range s.indexes {
+			if cur.info.Name == idx.info.Name {
+				count, txErr = tx.Count(cur.ns)
+				return txErr
+			}
+		}
+		return ErrIndexNotFound
 	})
 	return
 }
