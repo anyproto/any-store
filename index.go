@@ -361,32 +361,16 @@ type index struct {
 
 	cboInfo *qplanner.IndexInfo // cached CBO index info, built once during init
 
-	// validFromCookie is the earliest schema cookie at which this handle is
-	// KNOWN visible: a reader whose snapshot cookie reaches it is guaranteed
-	// the index committed before its snapshot (SchemaCookie bumps exactly once
-	// per schema-changing commit, atomically with the DDL — the OP_Transaction
-	// analog). A DDL publishing mid-tx stamps its begin cookie + 1; handles
-	// built from a committed view (init, reconcile) stamp that view's cookie.
-	// An OLDER reader is not necessarily excluded — it falls back to resolving
-	// the handle's namespace in its own snapshot (see visibleTo).
-	//
-	// Set before the CoW publish, immutable after (clones copy it); a rollback
-	// discards the handle itself (registerIndexSetRestore). Read lock-free by
-	// concurrent planners — a plain load, no atomics needed for an immutable
-	// field published via the CoW slice swap.
-	validFromCookie uint32
 	// nsName and catalogKey are the identity of the generation this handle was
-	// built from, captured at construction and immutable: visibleTo's slow
-	// path reads them lock-free, so it must never consult c.name, which a
-	// concurrent Rename mutates under c.mu. Rename clones carry the renamed
-	// identity (cloneWithNs); handles from before a rename keep the old one —
-	// correct for the only readers that consult it, whose snapshots predate
-	// this handle.
+	// built from, captured at construction and immutable: the loader carries
+	// a handle over to another version only under the same names
+	// (loadRangeIndex). Rename clones carry the renamed identity
+	// (cloneWithNs); handles from before a rename keep the old one.
 	nsName     string
 	catalogKey []byte
 	// format is the index format stamp of the catalog record this handle was
-	// built from (indexFormatVersion at build). Part of the identity visibleTo
-	// and reconcile check: a rebuild for a newer format keeps the name and
+	// built from (indexFormatVersion at build). Part of the identity the
+	// loader checks: a rebuild for a newer format keeps the name and
 	// definition and may land on the same root page, so only the stamp tells
 	// an older snapshot's index from the rebuilt one.
 	format int
@@ -433,37 +417,6 @@ func (idx *index) markSketchModified() {
 	idx.c.markSketchDirty()
 }
 
-// visibleTo reports whether the given tx may plan with this handle. Fast
-// path: any write-tx view is the single writer's own (which must see its
-// uncommitted DDL for same-tx maintenance and queries), and a snapshot cookie
-// at or past validFromCookie proves the index committed before the snapshot.
-// Slow path: an older reader admits the handle only if its OWN snapshot still
-// carries this exact index — the catalog row at catalogKey matches the
-// handle's full definition AND the index namespace resolves at the bound
-// root. Both checks are required: root equality alone is a defeatable
-// identity proxy (freelist reuse can land a recreated tree on the freed old
-// root's page number), and definition equality alone does not prove the
-// handle's bound root means anything in the reader's snapshot. When both
-// hold, the tree at that root IS the reader's own generation of this
-// definition, so planning with it is exact even if the handle was built from
-// a later state. Anything less → invisible; the planner scans, which is
-// always correct. The stamp is a fast-path bound, not the exact commit point.
-func (idx *index) visibleTo(tx *btree.ReadTx) bool {
-	// Snapshot cookie, not the raised begin-time one — see visibleIndexes.
-	if tx.IsWriteTx() || tx.SnapshotSchemaCookie() >= idx.validFromCookie {
-		return true
-	}
-	raw, err := tx.AppendValue(idx.c.db.systemNS, idx.catalogKey, nil)
-	if err != nil || !indexDefMatches(raw, idx.info) || indexFormatOf(raw) != idx.format {
-		return false
-	}
-	if idx.ns == nil {
-		return false
-	}
-	ns, nsErr := tx.GetNamespace(idx.nsName)
-	return nsErr == nil && ns.RootPage() == idx.ns.RootPage()
-}
-
 // cloneWithNs returns a copy of the index bound to a different namespace
 // handle; Rename publishes clones copy-on-write (via storeIndexes) because
 // concurrent readers access idx.ns lock-free, so the field can't be mutated
@@ -492,9 +445,6 @@ func (idx *index) cloneWithNs(ns *btree.Namespace, nsName string, catalogKey []b
 	cbo.Ns = ns
 	n.cboInfo = &cbo
 	n.sketchPub.Store(idx.loadPubSketch())
-	// A rename in the same tx as an uncommitted create keeps the pending
-	// visibility bound; the field is immutable, so a plain copy suffices.
-	n.validFromCookie = idx.validFromCookie
 	return n
 }
 

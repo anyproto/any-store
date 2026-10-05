@@ -220,16 +220,31 @@ func (c *collection) cur() *collSchema {
 }
 
 // publish makes a copy of the head with edit applied the head: the schema
-// change of the open write transaction tx, valid from the cookie tx commits
-// with. Transactions at older snapshots — every reader until the commit —
-// load their own version meanwhile (resolve). The caller holds c.mu and has
-// registered the restore of the previous head for a rollback
+// change of the open write transaction wtx, valid from the cookie it commits
+// with. Until then the readers, all at older snapshots, are served the
+// committed version the change stands on (collSchema.base). The caller holds
+// c.mu and has registered the restore of the previous head for a rollback
 // (registerHeadRestore).
-func (c *collection) publish(tx *btree.WriteTx, edit func(s *collSchema)) {
-	next := c.cur().clone()
+func (c *collection) publish(wtx WriteTx, edit func(s *collSchema)) {
+	tx := wtx.btreeWriteTx()
+	prev := c.cur()
+	next := prev.clone()
 	edit(next)
 	next.validFrom = tx.DiskSchemaCookie() + 1
 	next.gen.Store(c.db.epoch.Load().gen)
+	// The committed version: prev, or the one prev stands on if this tx
+	// published prev too. None under a collection this tx created.
+	base := prev
+	if b := prev.base.Load(); b != nil {
+		base = b
+	}
+	if cookieLE(base.validFrom, tx.DiskSchemaCookie()) {
+		next.base.Store(base)
+		// Committed, the head serves the transactions from its cookie on;
+		// the older ones load their version, and base no longer holds the
+		// index objects the change replaced.
+		wtx.onCommitPublish(func() { next.base.Store(nil) })
+	}
 	c.head.Store(next)
 }
 
@@ -895,24 +910,16 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		defer c.mu.Unlock()
 		c.registerHeadRestore(wtx)
 		// The new handles' namespaces exist only in this tx's uncommitted
-		// view: stamp them valid from the cookie this commit will publish —
-		// every create path MarkSchemaChanged, and SchemaCookie bumps exactly
-		// once per schema-changing commit, atomically with the DDL (the
-		// OP_Transaction analog, vdbe.c:4091-4192 in SQLite), so there is no
-		// commit→publication gap for readers to fall into. A rollback
-		// discards the handles themselves with the version they are in.
-		validFrom := tx.DiskSchemaCookie() + 1
-		for _, idx := range newIndexes {
-			idx.validFromCookie = validFrom
-		}
-		for _, fx := range newFtsIndexes {
-			fx.validFromCookie = validFrom
-		}
+		// view: the version they are published in is valid from the cookie
+		// this commit produces — every create path MarkSchemaChanged, and
+		// SchemaCookie bumps exactly once per schema-changing commit,
+		// atomically with the DDL (the OP_Transaction analog,
+		// vdbe.c:4091-4192 in SQLite). A rollback discards the handles with
+		// that version.
 		for _, vi := range newVIndexes {
 			vi.bindIdentity(name)
-			vi.validFromCookie = validFrom
 		}
-		c.publish(tx, func(s *collSchema) {
+		c.publish(wtx, func(s *collSchema) {
 			s.indexes = append(s.indexes[:len(s.indexes):len(s.indexes)], newIndexes...)
 			s.ftsIndexes = append(s.ftsIndexes[:len(s.ftsIndexes):len(s.ftsIndexes)], newFtsIndexes...)
 			s.vindexes = append(s.vindexes[:len(s.vindexes):len(s.vindexes)], newVIndexes...)
@@ -1147,7 +1154,7 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 					next = append(next, v)
 				}
 			}
-			c.publish(tx, func(s *collSchema) { s.vindexes = next })
+			c.publish(wtx, func(s *collSchema) { s.vindexes = next })
 			return nil
 		}
 
@@ -1196,7 +1203,7 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 					next = append(next, fx)
 				}
 			}
-			c.publish(tx, func(s *collSchema) { s.ftsIndexes = next })
+			c.publish(wtx, func(s *collSchema) { s.ftsIndexes = next })
 			return nil
 		}
 
@@ -1230,23 +1237,27 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 				next = append(next, idx)
 			}
 		}
-		c.publish(tx, func(s *collSchema) { s.indexes = next })
+		c.publish(wtx, func(s *collSchema) { s.indexes = next })
 		return nil
 	})
 }
 
-// committed returns the head, loading one first if none is installed yet (a
-// handle opened through a transaction too old to speak for it, see
-// resolveSlow); nil if that fails. For the accessors that take no context.
+// committed returns the head, brought up to date first if it is not known to
+// be: none installed yet (a handle opened through a transaction too old to
+// speak for it, see resolveSlow), or not verified since another process
+// changed the schema. nil if the collection is gone. For the accessors that
+// take no context: the schema as committed, as far as this process has
+// looked.
 func (c *collection) committed() *collSchema {
-	if s := c.cur(); s != nil {
+	if s := c.cur(); s != nil && s.gen.Load() == c.db.epoch.Load().gen {
 		return s
 	}
-	_ = c.db.doReadTx(context.Background(), func(tx *btree.ReadTx) error {
-		_, err := c.resolve(tx)
+	var s *collSchema
+	_ = c.db.doReadTx(context.Background(), func(tx *btree.ReadTx) (err error) {
+		s, err = c.resolve(tx)
 		return err
 	})
-	return c.cur()
+	return s
 }
 
 func (c *collection) GetIndexes() (indexes []Index) {
@@ -1323,7 +1334,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 			return err
 		}
 		renameCookie := tx.DiskSchemaCookie() + 1
-		c.publish(tx, func(s *collSchema) {
+		c.publish(wtx, func(s *collSchema) {
 			s.indexes, s.name, s.ns = next, newName, ns
 			names := s.names
 			if names == nil {
@@ -1605,9 +1616,9 @@ func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
 
 // loadSketchAtOpen populates a brand-new (not-yet-reader-visible) index's live
 // sketch from the _system namespace and publishes it as the reader snapshot.
-// Called from init, createIndex, and reconcile's rebuild arm — in every case the
-// index is not yet in the index set, so filling live in place and publishing it is
-// unobservable to readers (no copy-on-write ceremony needed).
+// Called from the loader and createIndex — in both the index is not yet in a
+// published set, so filling live in place and publishing it is unobservable
+// to readers (no copy-on-write ceremony needed).
 func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, collName string, idx *index) {
 	if idx.sketch == nil {
 		idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))

@@ -63,9 +63,7 @@ type ftsIndex struct {
 	// nsNames holds the five namespace names in bindNamespaces order, and
 	// catalogKey the index's system-namespace key — the identity of the
 	// generation this handle was built from, captured at construction/bind and
-	// immutable: visibleTo's slow path reads them lock-free, so it must never
-	// consult c.name, which a concurrent Rename mutates under c.mu (see
-	// index.nsName).
+	// immutable (see index.nsName).
 	nsNames    [5]string
 	catalogKey []byte
 
@@ -74,11 +72,6 @@ type ftsIndex struct {
 	// pending is the per-tx write-back buffer (postings + vocab deltas), flushed
 	// at commit. See fulltext_pending.go.
 	pending ftsPending
-
-	// validFromCookie: earliest schema cookie at which this handle is KNOWN
-	// visible. Same contract as index.validFromCookie — see there, visibleTo
-	// and visibleIndexes.
-	validFromCookie uint32
 
 	// nFields is the number of indexed fields (== len(fieldPaths)); each token's
 	// field index keys into the FieldMask / per-field TF of the v2 postings.
@@ -206,41 +199,6 @@ func (fx *ftsIndex) sameRoots(o *ftsIndex) bool {
 	for i := range mine {
 		if mine[i] == nil || theirs[i] == nil || fx.nsNames[i] != o.nsNames[i] ||
 			mine[i].RootPage() != theirs[i].RootPage() {
-			return false
-		}
-	}
-	return true
-}
-
-// visibleTo reports whether the given tx may search through this handle — the
-// visibility gate of visibleIndexes, fts-shaped (see index.visibleTo): fast
-// path on the write-tx view or a snapshot cookie at or past validFromCookie;
-// an older reader admits the handle only if its OWN snapshot still carries
-// this exact index — the catalog row matches the handle's full definition
-// AND all five namespaces resolve at the bound roots. All five, not just
-// meta: freelist reuse can land one recreated root on its freed predecessor's
-// page number, and a partial match would search this generation's postings
-// through another generation's vocab/docinfo. When everything matches, the
-// trees are the reader's own generation of this definition — exact. Anything
-// less → invisible → ErrNoFulltextIndex at the call sites, exactly as before
-// the CreateIndex began. (metaRootUnchanged has the opposite error bias —
-// keep a working index over a transient view — so the two checks stay
-// separate.)
-func (fx *ftsIndex) visibleTo(tx *btree.ReadTx) bool {
-	// Snapshot cookie, not the raised begin-time one — see visibleIndexes.
-	if tx.IsWriteTx() || tx.SnapshotSchemaCookie() >= fx.validFromCookie {
-		return true
-	}
-	raw, err := tx.AppendValue(fx.c.db.systemNS, fx.catalogKey, nil)
-	if err != nil || !indexDefMatches(raw, fx.info) {
-		return false
-	}
-	for i, bound := range [...]*btree.Namespace{fx.nsMap, fx.nsMeta, fx.nsVocab, fx.nsDocinfo, fx.nsPost} {
-		if bound == nil || fx.nsNames[i] == "" {
-			return false
-		}
-		ns, nsErr := tx.GetNamespace(fx.nsNames[i])
-		if nsErr != nil || ns.RootPage() != bound.RootPage() {
 			return false
 		}
 	}

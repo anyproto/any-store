@@ -89,8 +89,8 @@ type collQuery struct {
 	// the flag a $knn query would pay the guard walks (and a throwaway
 	// detection) twice more per verb. Only the VERDICT is cached, never the
 	// detected spec: the spec's Search closure captures the resolved index
-	// handle, which is only reconciled (multi-process staleness) when the
-	// verb's read tx begins — see detectKnnQuery. A collQuery is a single-use
+	// handle, and which one that is depends on the verb's transaction — see
+	// detectKnnQuery. A collQuery is a single-use
 	// builder (never shared across goroutines), so a plain field suffices.
 	srcValidated bool
 
@@ -128,49 +128,8 @@ func (q *collQuery) Sort(sorts ...any) Query {
 	return q
 }
 
-// visibleIndexes filters the CoW index snapshot down to the handles the given
-// tx may plan with — decided against the READER'S OWN snapshot, never
-// wall-clock publication state (the OP_Transaction analog; see
-// index.validFromCookie). A handle the snapshot does not contain would scan
-// an empty or foreign namespace and return wrong results with no error
-// (Count = 0 while Iter finds rows): a mid-DDL handle for every concurrent
-// reader, and equally a committed or reconcile-adopted handle for a reader
-// whose snapshot predates it — stale local readers across a local DDL commit
-// or a peer's. The common case (write-tx view, or every handle's stamp at or
-// below the snapshot cookie) returns the snapshot unchanged; only a reader
-// older than some stamp pays the per-handle namespace resolution in
-// visibleTo.
-func visibleIndexes(btx *btree.ReadTx, idxs []*index) []*index {
-	if btx.IsWriteTx() {
-		return idxs
-	}
-	// SNAPSHOT cookie, not DiskSchemaCookie: the begin-time disk read is
-	// raised past the snapshot when the begin races a commit or the reader
-	// slot pinned behind — judging with it admits an index whose namespace
-	// this snapshot cannot resolve, and the scan silently returns wrong
-	// results. Same bound as reconcileIndexSet's handle guard.
-	cookie := btx.SnapshotSchemaCookie()
-	pending := false
-	for _, idx := range idxs {
-		if cookie < idx.validFromCookie {
-			pending = true
-			break
-		}
-	}
-	if !pending {
-		return idxs
-	}
-	out := make([]*index, 0, len(idxs)-1)
-	for _, idx := range idxs {
-		if idx.visibleTo(btx) {
-			out = append(out, idx)
-		}
-	}
-	return out
-}
-
 // plannableIndexes drops the indexes whose entries are of an outdated format
-// (idx.outdated) from a visible set: those are not what the current code
+// (idx.outdated) from a version's set: those are not what the current code
 // derives, so a seek over them can miss documents. Stats and Explain still
 // report them.
 func plannableIndexes(idxs []*index) []*index {
@@ -381,7 +340,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 	// multikey-flag probe gating tight seek bounds must read the same
 	// snapshot the scan executes on.
 	sorter := q.writeSorter(opts)
-	visible := visibleIndexes(btx, s.indexes)
+	visible := s.indexes
 	idxs := plannableIndexes(visible)
 	br := q.buildBoundsResult(idxs)
 	// The estimate reads the candidates' sketches; with every range index
@@ -875,7 +834,7 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 		// An outdated index is never a candidate (plannableIndexes); listing
 		// it unused, like the vector and full-text handles below, keeps the
 		// report from silently shrinking.
-		for _, idx := range visibleIndexes(tx, s.indexes) {
+		for _, idx := range s.indexes {
 			if idx.outdated {
 				addIndex(idx.info.Name, 0, false)
 			}
@@ -887,13 +846,6 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 			return 0
 		}
 		for _, vi := range s.vindexes {
-			// forTx is the gate the executed $knn goes through: a handle it
-			// resolves (directly or via the pre-compaction prev, same name)
-			// must be listed, one it errors on must not — Explain may never
-			// contradict execution.
-			if _, ferr := vi.forTx(tx); ferr != nil {
-				continue
-			}
 			// A probe plan enforces the $knn clause through this index's
 			// distance kernel even when a range index drives the enumeration.
 			used := vi.info.Name == plan.IndexName ||
@@ -901,10 +853,6 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 			addIndex(vi.info.Name, sourceCost(vi.info.Name), used)
 		}
 		for _, fx := range s.ftsIndexes {
-			// Same gate the executed $text goes through.
-			if !fx.visibleTo(tx) {
-				continue
-			}
 			// Same rule: a $text probe plan verifies every row against this
 			// index even when it does not drive.
 			used := fx.info.Name == plan.IndexName ||
@@ -929,7 +877,7 @@ func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, s *collSchema, residual q
 	if !idFixed && !hasResidual && !needSort && !opts.wantCandidates {
 		return false
 	}
-	idxs := plannableIndexes(visibleIndexes(btx, s.indexes))
+	idxs := plannableIndexes(s.indexes)
 	probePossible = idFixed
 	params.TotalDocs = q.docCountForPlan(btx, s, idxs)
 	if len(idxs) > 0 {
@@ -1153,7 +1101,7 @@ func isIDOnlyFilterNode(f query.Filter, pk string) bool {
 // buildBoundsResult computes IndexBounds once per unique field across all
 // indexes. idxs is the index-set snapshot for this planning pass; the caller
 // passes the SAME snapshot to buildCBOIndexesInto so bounds and CBOIndex entries
-// stay positionally consistent even if a concurrent reconcile swaps the set.
+// stay positionally consistent.
 func (q *collQuery) buildBoundsResult(idxs []*index) qplanner.BoundsResult {
 	var br qplanner.BoundsResult
 	var idxInfoBuf [8]*qplanner.IndexInfo

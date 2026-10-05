@@ -1005,26 +1005,14 @@ func (q *collQuery) detectFtsQuery(s *collSchema) (*qplanner.FtsQuerySpec, query
 		IndexName:  fx.info.Name,
 		Ordered:    true, // searchCandidates returns score-descending
 		NeedScores: true, // compilePlan sets this from planOpts (Iter only)
+		// fx is of the version resolved for the transaction the plan runs in.
 		Search: func(tx *btree.ReadTx) (qplanner.FtsCandidateStream, error) {
-			// Visibility gate: the index exists only in its creating write
-			// tx's uncommitted view; every other tx must behave exactly as
-			// before the CreateIndex began.
-			if !fx.visibleTo(tx) {
-				return nil, ErrNoFulltextIndex
-			}
 			return fx.searchCandidates(tx, text)
 		},
 		Probe: func(tx *btree.ReadTx) (qplanner.FtsProber, error) {
-			// Same visibility gate as Search.
-			if !fx.visibleTo(tx) {
-				return nil, ErrNoFulltextIndex
-			}
 			return fx.newFtsProber(tx, text)
 		},
 		StatsFn: func(tx *btree.ReadTx) (qplanner.FtsPlanStats, error) {
-			if !fx.visibleTo(tx) {
-				return qplanner.FtsPlanStats{}, ErrNoFulltextIndex
-			}
 			return fx.planStats(tx, text)
 		},
 	}

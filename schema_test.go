@@ -273,3 +273,60 @@ func TestFindId_NoticesPeerSchemaChange(t *testing.T) {
 	_, err = coll.FindId(ctx, 1)
 	assert.ErrorIs(t, err, ErrCollectionClosed)
 }
+
+// While a write tx has a schema change in flight, the readers of that time
+// are served the committed version it stands on — the index the tx is
+// dropping included, the one it is creating not — without a catalog read.
+// The tx itself works with what it made.
+func TestResolve_ReadersDuringUncommittedDDLUseCommittedVersion(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+	for i := range 10 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i, i))))
+	}
+	c := coll.(*collection)
+	committed := c.cur()
+	candidates := func(tctx context.Context) []string {
+		exp, err := coll.Find(`{"a":{"$gte":5},"b":{"$gte":5}}`).Explain(tctx)
+		require.NoError(t, err)
+		var names []string
+		for _, ie := range exp.Indexes {
+			names = append(names, ie.Name)
+		}
+		return names
+	}
+	loads := countSchemaLoads(t)
+
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(wtx.Context(), IndexInfo{Name: "b", Fields: []string{"b"}}))
+	require.NoError(t, coll.DropIndex(wtx.Context(), "a"))
+	require.False(t, committed == c.cur())
+	*loads = 0
+	for range 3 {
+		n, err := coll.Find(`{"a":{"$gte":5}}`).IndexHint(IndexHint{IndexName: "a", Boost: 1_000_000}).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 5, n)
+		_, err = coll.FindId(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"a"}, candidates(ctx))
+	}
+	assert.Zero(t, *loads, "a reader beside an open DDL tx read the catalog")
+	assert.Equal(t, []string{"b"}, candidates(wtx.Context()))
+	require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":10,"a":10,"b":10}`)))
+
+	require.NoError(t, wtx.Rollback())
+	require.True(t, committed == c.cur(), "the rollback restores the committed head")
+	assert.Equal(t, []string{"a"}, candidates(ctx))
+
+	wtx, err = fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(wtx.Context(), IndexInfo{Name: "b", Fields: []string{"b"}}))
+	require.NoError(t, wtx.Commit())
+	*loads = 0
+	assert.ElementsMatch(t, []string{"a", "b"}, candidates(ctx))
+	assert.Zero(t, *loads, "a reader past the commit works with the head")
+	assert.Nil(t, c.cur().base.Load(), "the committed head still holds the version it replaced")
+}

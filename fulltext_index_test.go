@@ -725,7 +725,7 @@ func forceSecondFtsIndex(t *testing.T, coll Collection) error {
 		if err != nil {
 			return err
 		}
-		c.publish(tx, func(s *collSchema) {
+		c.publish(wtx, func(s *collSchema) {
 			s.ftsIndexes = append(s.ftsIndexes[:len(s.ftsIndexes):len(s.ftsIndexes)], fx)
 		})
 		return nil

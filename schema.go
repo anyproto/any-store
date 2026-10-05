@@ -41,6 +41,10 @@ type collSchema struct {
 	// gen is the peer generation (schemaEpoch.gen) the version is proven
 	// for: installed or verified by a transaction of that generation.
 	gen atomic.Uint64
+	// base is the committed version under this one, while the write
+	// transaction that published this one is open: what every reader of
+	// that time works with. Set by publish, dropped at the commit.
+	base atomic.Pointer[collSchema]
 	// names lists the names the collection went by, oldest first, each with
 	// the cookie it took effect at; nil for a collection never renamed
 	// through this handle. A transaction older than a rename finds the
@@ -66,7 +70,7 @@ func (s *collSchema) nameAt(cookie uint32) string {
 	return s.name
 }
 
-// clone returns a copy to edit and publish; gen starts unset.
+// clone returns a copy to edit and publish; gen and base start unset.
 func (s *collSchema) clone() *collSchema {
 	return &collSchema{
 		name:       s.name,
@@ -221,15 +225,24 @@ func (s *collSchema) current(e *schemaEpoch, cookie uint32, writer bool) bool {
 // comes from the one version returned.
 //
 // The head serves the transactions it is proven for: those of its generation
-// at a cookie from validFrom through the epoch's known. Any other — older
-// than the head, in the gap between a commit and known, or the first of a
-// generation — goes through resolveSlow.
+// at a cookie from validFrom through the epoch's known. A head published by
+// the open write tx carries the committed version for everyone else (base).
+// Any other transaction — older than the head, in the gap between a commit
+// and known, or the first of a generation — goes through resolveSlow.
 func (c *collection) resolve(tx *btree.ReadTx) (*collSchema, error) {
 	if err := c.alive(); err != nil {
 		return nil, err
 	}
-	if s := c.head.Load(); s != nil && s.current(c.db.epoch.Load(), tx.SnapshotSchemaCookie(), tx.IsWriteTx()) {
-		return s, nil
+	if s := c.head.Load(); s != nil {
+		e, cookie, writer := c.db.epoch.Load(), tx.SnapshotSchemaCookie(), tx.IsWriteTx()
+		if s.current(e, cookie, writer) {
+			return s, nil
+		}
+		// A head the open write tx published is that tx's until it commits:
+		// everyone else is served the committed version it stands on.
+		if b := s.base.Load(); b != nil && !writer && b.current(e, cookie, false) {
+			return b, nil
+		}
 	}
 	return c.resolveSlow(tx)
 }
@@ -268,7 +281,10 @@ func (c *collection) resolveSlow(tx *btree.ReadTx) (*collSchema, error) {
 	s, err := c.loadSchema(tx, name, head)
 	if err != nil {
 		if speaks && errors.Is(err, ErrCollectionNotFound) {
+			// Gone for everyone from here on, this operation included: the
+			// error of a handle that is no longer live.
 			c.retire()
+			return nil, c.alive()
 		}
 		return nil, err
 	}
@@ -430,7 +446,6 @@ func (c *collection) loadRangeIndex(tx *btree.ReadTx, name string, info IndexInf
 	if err != nil {
 		return nil, err
 	}
-	idx.validFromCookie = tx.SnapshotSchemaCookie()
 	idx.format = format
 	idx.outdated = indexFormatOutdated(format, info)
 	c.loadSketchAtOpen(tx, name, idx)
@@ -452,7 +467,6 @@ func (c *collection) loadFtsIndex(tx *btree.ReadTx, name string, info IndexInfo,
 			}
 		}
 	}
-	fx.validFromCookie = tx.SnapshotSchemaCookie()
 	return fx, nil
 }
 

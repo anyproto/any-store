@@ -1443,14 +1443,12 @@ func TestCreateVectorIndexUncommitted_ConcurrentReader(t *testing.T) {
 	assert.Len(t, hits, 3)
 }
 
-// These tests guard the snapshot side of the DDL visibility gate: visibility
-// is decided against the READER'S OWN snapshot (validFromCookie fast path +
-// per-snapshot namespace resolution), so a read tx opened BEFORE a DDL commit
-// that plans AFTER it behaves exactly as if the DDL never happened — for a
-// local commit, a compaction, and a peer process's commit adopted by
-// reconcile. A wall-clock publication flag cannot pass these: after the
-// commit the flag is down for everyone, including readers whose snapshots
-// predate the index.
+// These tests guard the snapshot side of DDL visibility: a transaction works
+// with the schema of its OWN snapshot, so a read tx opened BEFORE a DDL
+// commit that plans AFTER it behaves exactly as if the DDL never happened —
+// for a local commit, a compaction, and a peer process's commit. A
+// wall-clock publication flag cannot pass these: after the commit the flag
+// is down for everyone, including readers whose snapshots predate the index.
 
 // vsearchCtx is vsearch through an explicit context (an open tx's view).
 func vsearchCtx(qctx context.Context, coll anystore.Collection, field string, q []float32, k, ef int) ([]vhit, error) {

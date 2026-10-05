@@ -192,31 +192,7 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 			return rErr
 		}
 		stats.Name = s.name
-		// Copies: the gates below filter in place.
-		indexes := append([]*index(nil), s.indexes...)
-		vindexes := append([]*vectorIndex(nil), s.vindexes...)
-		ftsindexes := append([]*ftsIndex(nil), s.ftsIndexes...)
-
-		// Visibility gate, like the query path: a handle whose creating DDL
-		// tx has not committed resolves to nothing in this tx's snapshot —
-		// NamespaceSize on it would fail the whole Stats call. Vector handles
-		// go through forTx so a compaction window reports the committed
-		// (pre-compaction) index instead of dropping it from the report.
-		indexes = visibleIndexes(tx, indexes)
-		keptV := vindexes[:0]
-		for _, vi := range vindexes {
-			if svi, ferr := vi.forTx(tx); ferr == nil {
-				keptV = append(keptV, svi)
-			}
-		}
-		vindexes = keptV
-		keptF := ftsindexes[:0]
-		for _, fx := range ftsindexes {
-			if fx.visibleTo(tx) {
-				keptF = append(keptF, fx)
-			}
-		}
-		ftsindexes = keptF
+		indexes, vindexes, ftsindexes := s.indexes, s.vindexes, s.ftsIndexes
 
 		// Documents: scan the collection B-tree summing stored and
 		// uncompressed value sizes.
