@@ -184,7 +184,7 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 		return
 	}
 	c.mu.Lock()
-	name := c.name
+	name := c.cur().name
 	indexes := append([]*index(nil), c.loadIndexes()...)
 	vindexes := append([]*vectorIndex(nil), c.loadVectorIndexes()...)
 	ftsindexes := append([]*ftsIndex(nil), c.loadFtsIndexes()...)
@@ -218,7 +218,7 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 
 		// Documents: scan the collection B-tree summing stored and
 		// uncompressed value sizes.
-		cursor := tx.NewCursor(c.ns)
+		cursor := tx.NewCursor(c.cur().ns)
 		defer cursor.Close()
 		if cErr := cursor.First(); cErr != nil {
 			return cErr
@@ -241,7 +241,7 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 		}
 
 		// Physical size of the document B-tree.
-		docSize, dErr := tx.NamespaceSize(c.ns)
+		docSize, dErr := tx.NamespaceSize(c.cur().ns)
 		if dErr != nil {
 			return dErr
 		}

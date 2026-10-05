@@ -123,7 +123,7 @@ func newFtsIndex(c *collection, info IndexInfo) (*ftsIndex, error) {
 	// Construction sites (init, reconcile, createFtsIndex) run on the writer
 	// or under c.mu, so reading c.name here is race-free (see catalogKey).
 	fx := &ftsIndex{c: c, info: info, az: fts.NewAnalyzer(),
-		catalogKey: indexKey(c.name, info.Name)}
+		catalogKey: indexKey(c.cur().name, info.Name)}
 	for _, field := range info.Fields {
 		fields, _ := parseIndexField(field)
 		if slices.Contains(fields, "") {
@@ -183,7 +183,7 @@ func (fx *ftsIndex) bindNamespaces(resolve func(name string) (*btree.Namespace, 
 		{ftsPartPost, &fx.nsPost},
 	}
 	for i, p := range parts {
-		name := ftsNsName(fx.c.name, fx.info.Name, p.name)
+		name := ftsNsName(fx.c.cur().name, fx.info.Name, p.name)
 		ns, e := resolve(name)
 		if e != nil {
 			return e

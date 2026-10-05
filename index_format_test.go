@@ -110,7 +110,7 @@ func legacyIndexBy(t *testing.T, c *collection, name string, commit ddlTx) {
 	}
 	require.NotNil(t, idx)
 	commit(t, c.db, func(tx *btree.WriteTx) error {
-		key := indexKey(c.name, name)
+		key := indexKey(c.cur().name, name)
 		raw, err := tx.AppendValue(c.db.systemNS, key, nil)
 		if err != nil {
 			return err
@@ -153,7 +153,7 @@ func readIndexFormat(t *testing.T, c *collection, name string) int {
 	t.Helper()
 	var format int
 	require.NoError(t, c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
-		format, err = c.db.readIndexFormat(tx, c.name, name)
+		format, err = c.db.readIndexFormat(tx, c.cur().name, name)
 		return err
 	}))
 	return format
@@ -163,7 +163,7 @@ func readMultikey(t *testing.T, c *collection, name string) []byte {
 	t.Helper()
 	var mk []byte
 	require.NoError(t, c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
-		mk, err = tx.AppendValue(c.db.systemNS, multikeyKey(indexNsName(c.name, name)), nil)
+		mk, err = tx.AppendValue(c.db.systemNS, multikeyKey(indexNsName(c.cur().name, name)), nil)
 		return err
 	}))
 	return mk
@@ -244,7 +244,7 @@ func schemaCookie(t *testing.T, fx *fixture) uint32 {
 func setIndexRecord(t *testing.T, c *collection, name, field string, val func(a *anyenc.Arena) *anyenc.Value) {
 	t.Helper()
 	otherBuildTx(t, c.db, func(tx *btree.WriteTx) error {
-		key := indexKey(c.name, name)
+		key := indexKey(c.cur().name, name)
 		raw, err := tx.AppendValue(c.db.systemNS, key, nil)
 		if err != nil {
 			return err
@@ -710,7 +710,7 @@ func TestIndexFormat_RebuildBadDocumentQuarantines(t *testing.T) {
 	legacyIndex(t, other.(*collection), "sparse")
 	c := other.(*collection)
 	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-		return tx.Put(c.ns, []byte("zzz"), anyenc.MustParseJson(`{"a":1}`).MarshalTo(nil))
+		return tx.Put(c.cur().ns, []byte("zzz"), anyenc.MustParseJson(`{"a":1}`).MarshalTo(nil))
 	}))
 	require.NoError(t, fx.Close())
 

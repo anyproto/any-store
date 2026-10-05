@@ -320,8 +320,8 @@ func newIndex(c *collection, info IndexInfo, ns *btree.Namespace) (idx *index, e
 		info:       info,
 		c:          c,
 		ns:         ns,
-		nsName:     indexNsName(c.name, info.Name),
-		catalogKey: indexKey(c.name, info.Name),
+		nsName:     indexNsName(c.cur().name, info.Name),
+		catalogKey: indexKey(c.cur().name, info.Name),
 	}
 	if err = idx.init(); err != nil {
 		return nil, err
@@ -348,7 +348,7 @@ type index struct {
 	sketch *qplanner.IndexSketch
 
 	// sketchPub is the READER-VISIBLE published sketch — the per-index
-	// analog of collection.indexes. The query/Stats path reads it lock-free via
+	// analog of the collection's index set. The query/Stats path reads it lock-free via
 	// loadPubSketch(); the advisory staleness tier decodes the disk bytes into
 	// it on a stale READ (in place while it is a reader-owned object, a fresh
 	// one while it is the live sketch — never into live); the writer

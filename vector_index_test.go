@@ -676,8 +676,8 @@ func TestVectorIndex_CompactMovesRootAndDetects(t *testing.T) {
 	require.NotEqual(t, oldRoot, newVI.ix.MetaRoot(), "compaction must move the meta root page")
 
 	require.NoError(t, c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		assert.False(t, oldVI.rootUnchanged(tx, c.name), "stale object must detect the moved root")
-		assert.True(t, newVI.rootUnchanged(tx, c.name), "fresh object must be current")
+		assert.False(t, oldVI.rootUnchanged(tx, c.cur().name), "stale object must detect the moved root")
+		assert.True(t, newVI.rootUnchanged(tx, c.cur().name), "fresh object must be current")
 		return nil
 	}))
 }

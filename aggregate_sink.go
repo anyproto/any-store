@@ -180,7 +180,7 @@ func applyOut(tx *btree.WriteTx, tc *collection, slab []byte, offs []int) (writt
 		keySlab []byte
 		keyOffs []int
 	)
-	cursor := tx.NewCursor(tc.ns)
+	cursor := tx.NewCursor(tc.cur().ns)
 	if err = cursor.First(); err != nil {
 		cursor.Close()
 		return 0, err
@@ -251,7 +251,7 @@ func applyMerge(tx *btree.WriteTx, tc *collection, slab []byte, offs []int, spec
 			return written, ierr
 		}
 		buf.SmallBuf = tc.appendId(buf.SmallBuf[:0], doc)
-		_, gerr := tx.Get(tc.ns, buf.SmallBuf)
+		_, gerr := tx.Get(tc.cur().ns, buf.SmallBuf)
 		if gerr != nil && !errors.Is(gerr, btree.ErrKeyNotFound) {
 			return written, gerr
 		}

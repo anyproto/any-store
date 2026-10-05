@@ -195,11 +195,11 @@ func (val *aggStageValidator) validate(p aggregate.Pipeline) error {
 			// $lookup is scoped to a self-join on the primary key: "from" may
 			// only name the aggregated collection (the parser can't know its
 			// name), and the "id" foreign field must actually be the pk.
-			if sp.From != "" && sp.From != q.c.name {
-				return fmt.Errorf("%w: from %q, aggregating %q", errAggLookupFrom, sp.From, q.c.name)
+			if sp.From != "" && sp.From != q.c.cur().name {
+				return fmt.Errorf("%w: from %q, aggregating %q", errAggLookupFrom, sp.From, q.c.cur().name)
 			}
 			if q.c.primaryKey != "id" {
-				return fmt.Errorf("%w: collection %q's primary key is %q", errAggLookupPrimaryKey, q.c.name, q.c.primaryKey)
+				return fmt.Errorf("%w: collection %q's primary key is %q", errAggLookupPrimaryKey, q.c.cur().name, q.c.primaryKey)
 			}
 		case aggregate.MatchSpec:
 			if query.ContainsText(sp.Filter) {
@@ -337,7 +337,7 @@ func (q *aggQuery) lookupBtreeTx(ctx context.Context, inner Iterator) (btx *btre
 func (c *collection) lookupFunc(btx *btree.ReadTx) aggregate.LookupFunc {
 	return func(key []byte, buf *syncpool.DocBuffer) (*anyenc.Value, error) {
 		var err error
-		buf.DocBuf, err = btx.AppendValue(c.ns, key, buf.DocBuf[:0])
+		buf.DocBuf, err = btx.AppendValue(c.cur().ns, key, buf.DocBuf[:0])
 		if err != nil {
 			if errors.Is(err, btree.ErrKeyNotFound) {
 				return nil, nil

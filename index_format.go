@@ -386,7 +386,8 @@ func (db *db) rebuildOutdatedIndex(tx *btree.WriteTx, collName, indexName string
 	if err != nil {
 		return err
 	}
-	c := &collection{name: collName, db: db, ns: ns, primaryKey: cfg.PrimaryKey}
+	c := &collection{db: db, primaryKey: cfg.PrimaryKey}
+	c.head.Store(&collSchema{name: collName, ns: ns})
 	if c.primaryKey == "" {
 		c.primaryKey = "id"
 	}
@@ -398,10 +399,10 @@ func (db *db) rebuildOutdatedIndex(tx *btree.WriteTx, collName, indexName string
 // record.
 func (c *collection) rebuildIndex(tx *btree.WriteTx, info IndexInfo) (err error) {
 	tx.MarkSchemaChanged()
-	if err = tx.DeleteNamespace(indexNsName(c.name, info.Name)); err != nil && !errors.Is(err, btree.ErrNamespaceNotFound) {
+	if err = tx.DeleteNamespace(indexNsName(c.cur().name, info.Name)); err != nil && !errors.Is(err, btree.ErrNamespaceNotFound) {
 		return err
 	}
-	if err = c.db.stampIndexFormat(tx, c.name, info.Name); err != nil {
+	if err = c.db.stampIndexFormat(tx, c.cur().name, info.Name); err != nil {
 		return err
 	}
 	_, err = c.buildRangeIndex(tx, info)

@@ -308,7 +308,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 		// nothing over the pre-CBO driver path.
 		params := &qplanner.PlanParams{
 			Tx:         btx,
-			DataNs:     q.c.ns,
+			DataNs:     q.c.cur().ns,
 			Filter:     ftsResidual,
 			Sorter:     sorter,
 			IDBounds:   idBounds,
@@ -351,7 +351,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 		// assembly and same no-candidate skip as the $text branch.
 		params := &qplanner.PlanParams{
 			Tx:         btx,
-			DataNs:     q.c.ns,
+			DataNs:     q.c.cur().ns,
 			Filter:     residual,
 			Sorter:     q.writeSorter(opts),
 			IDBounds:   idBounds,
@@ -392,7 +392,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly, totalDocs)
 	plan = qplanner.BuildPlan(&qplanner.PlanParams{
 		Tx:          btx,
-		DataNs:      q.c.ns,
+		DataNs:      q.c.cur().ns,
 		Filter:      q.cond,
 		Sorter:      sorter,
 		IDBounds:    idBounds,
@@ -467,7 +467,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		tx:   tx,
 		buf:  buf,
 		qb:   qb,
-		data: &qplanner.CursorSource{Tx: btx, Ns: q.c.ns},
+		data: &qplanner.CursorSource{Tx: btx, Ns: q.c.cur().ns},
 	}, nil
 }
 
@@ -487,7 +487,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 
 		for _, id := range ids {
 			var getErr error
-			buf.DocBuf, getErr = btx.AppendValue(q.c.ns, id, buf.DocBuf[:0])
+			buf.DocBuf, getErr = btx.AppendValue(q.c.cur().ns, id, buf.DocBuf[:0])
 			if getErr != nil {
 				return getErr
 			}
@@ -697,7 +697,7 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	if len(idBounds) > 0 && q.isIDOnlyFilter() && q.offset == 0 && q.limit == 0 {
 		err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 			for i := range idBounds {
-				found, gerr := tx.Has(q.c.ns, idBounds[i].Start)
+				found, gerr := tx.Has(q.c.cur().ns, idBounds[i].Start)
 				if gerr != nil {
 					return gerr
 				}
@@ -1014,7 +1014,7 @@ func (q *collQuery) docCountForPlan(tx countTx, idxs []*index) int {
 	if len(idxs) == 0 {
 		return 0
 	}
-	count, _ := tx.Count(q.c.ns)
+	count, _ := tx.Count(q.c.cur().ns)
 	return count
 }
 
@@ -1026,7 +1026,7 @@ func (q *collQuery) docCountExact(tx countTx, idxs []*index) int {
 			return int(s.GetDocCount())
 		}
 	}
-	count, _ := tx.Count(q.c.ns)
+	count, _ := tx.Count(q.c.cur().ns)
 	return count
 }
 

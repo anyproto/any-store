@@ -398,7 +398,7 @@ func (vi *vectorIndex) bindIdentity(collName string) {
 }
 
 func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorIndex, error) {
-	return c.loadVectorIndexAs(tx, c.name, info)
+	return c.loadVectorIndexAs(tx, c.cur().name, info)
 }
 
 // loadVectorIndexAs opens the index from the given snapshot under collName —
@@ -457,7 +457,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	if err := validateIndexName(info.Name); err != nil {
 		return nil, err
 	}
-	if err := c.db.registerIndex(tx, c.name, info); err != nil {
+	if err := c.db.registerIndex(tx, c.cur().name, info); err != nil {
 		return nil, err
 	}
 	if info.Vector.Mode.isBruteForce() {
@@ -465,7 +465,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 		// The persisted metadata above is the entire index.
 		return newVectorIndexFromVindex(c, info, nil), nil
 	}
-	prefix := vectorIndexNsPrefix(c.name, info.Name)
+	prefix := vectorIndexNsPrefix(c.cur().name, info.Name)
 
 	// Collect (id, vector) from existing documents, then build the index in RAM
 	// and flush it in one bulk pass (vindex.BulkBuild) — far faster than inserting
@@ -477,7 +477,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	tmpVI := newVectorIndexFromVindex(c, info, nil) // extractVector needs fieldPath/dim
 	var ids [][]byte
 	var vecs [][]float32
-	cursor := tx.NewCursor(c.ns)
+	cursor := tx.NewCursor(c.cur().ns)
 	defer cursor.Close()
 	if err := cursor.First(); err != nil {
 		return nil, err
@@ -529,7 +529,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	// Parallel in-RAM build (graph constructed concurrently in RAM, then flushed
 	// single-threaded) — ~17x faster than per-insert at scale. threads=0 → GOMAXPROCS.
 	// The parallel phase touches only RAM; tx is used single-threaded in the flush.
-	ix, err := vindex.BulkBuildParallel(tx, prefix, p, vectorIndexSeed(c.name, info.Name), ids, vecs, 0)
+	ix, err := vindex.BulkBuildParallel(tx, prefix, p, vectorIndexSeed(c.cur().name, info.Name), ids, vecs, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -562,7 +562,7 @@ func (c *collection) reconcileVectorIndexesLocked(tx *btree.ReadTx, infos []Inde
 		if info.Kind != IndexKindVector {
 			continue
 		}
-		if existing, ok := byName[info.Name]; ok && existing.rootUnchanged(tx, c.name) {
+		if existing, ok := byName[info.Name]; ok && existing.rootUnchanged(tx, c.cur().name) {
 			rebuilt = append(rebuilt, existing)
 			continue
 		}
@@ -1197,7 +1197,7 @@ func knnDistFromDoc(vi *vectorIndex, qv []float32) func(doc *anyenc.Value) (floa
 
 func (c *collection) bruteVectorCandidates(tx *btree.ReadTx, vi *vectorIndex, qv []float32, topK int) ([]qplanner.VectorCandidate, error) {
 	dist := vindex.DistanceFor(vi.info.Vector.Metric.toVindex())
-	cursor := tx.NewCursor(c.ns)
+	cursor := tx.NewCursor(c.cur().ns)
 	defer cursor.Close()
 	if err := cursor.First(); err != nil {
 		return nil, err
@@ -1363,7 +1363,7 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 		// peers reconcile and reopen the index with fresh handles. (For IVF this
 		// re-trains the codebooks from the live set — see vectorIndex.compact.)
 		tx.MarkSchemaChanged()
-		nvi, err := vi.compact(tx, c.name)
+		nvi, err := vi.compact(tx, c.cur().name)
 		if err != nil {
 			return err
 		}
@@ -1382,7 +1382,7 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 		// publish (MarkSchemaChanged above guarantees the bump) — a
 		// concurrent reader fails the generation-interval walk on this
 		// handle and is served through prev instead.
-		nvi.bindIdentity(c.name)
+		nvi.bindIdentity(c.cur().name)
 		nvi.validFromCookie = tx.DiskSchemaCookie() + 1
 		// prev must be a COMMITTED fallback: with chained same-tx DDL (create
 		// then compact, or compact twice) the replaced handle is itself

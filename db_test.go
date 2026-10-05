@@ -1846,7 +1846,7 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 	names := func(cs []*collection) []string {
 		ns := make([]string, len(cs))
 		for i, c := range cs {
-			ns[i] = c.name
+			ns[i] = c.cur().name
 		}
 		return ns
 	}
@@ -1998,7 +1998,7 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		require.NoError(t, err)
 		for i, c := range colls {
 			require.NoError(t, c.Insert(tx.Context(), doc(i)))
-			assert.Equal(t, []string{c.name}, names(dbi.ftsDirty))
+			assert.Equal(t, []string{c.cur().name}, names(dbi.ftsDirty))
 		}
 		assert.Equal(t, names(colls), names(dbi.sketchDirty))
 		require.NoError(t, tx.Commit())

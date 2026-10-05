@@ -2434,7 +2434,7 @@ func TestIndex_Corruption_StaleIndexEntry(t *testing.T) {
 	idKey := anyenc.Tuple(nil)
 	idKey = anyenc.AppendAnyValue(idKey, 5)
 	err = c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-		return tx.Delete(c.ns, idKey)
+		return tx.Delete(c.cur().ns, idKey)
 	})
 	require.NoError(t, err)
 
@@ -2641,7 +2641,7 @@ func TestIndex_Corruption_CountMismatch(t *testing.T) {
 		idKey := anyenc.Tuple(nil)
 		idKey = anyenc.AppendAnyValue(idKey, i)
 		err := c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-			return tx.Delete(c.ns, idKey)
+			return tx.Delete(c.cur().ns, idKey)
 		})
 		require.NoError(t, err)
 	}
@@ -2737,7 +2737,7 @@ func TestIndex_Corruption_EnsureIndexRecoversStaleEntries(t *testing.T) {
 		idKey := anyenc.Tuple(nil)
 		idKey = anyenc.AppendAnyValue(idKey, docId)
 		err := c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-			return tx.Delete(c.ns, idKey)
+			return tx.Delete(c.cur().ns, idKey)
 		})
 		require.NoError(t, err)
 	}
@@ -3018,7 +3018,7 @@ func TestIndex_Corruption_InsertAfterStaleCorruption(t *testing.T) {
 	idKey := anyenc.Tuple(nil)
 	idKey = anyenc.AppendAnyValue(idKey, 3)
 	err = c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-		return tx.Delete(c.ns, idKey)
+		return tx.Delete(c.cur().ns, idKey)
 	})
 	require.NoError(t, err)
 
@@ -3107,7 +3107,7 @@ func TestIndex_Corruption_LargeScaleRecovery(t *testing.T) {
 		idKey := anyenc.Tuple(nil)
 		idKey = anyenc.AppendAnyValue(idKey, i)
 		err := c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-			return tx.Delete(c.ns, idKey)
+			return tx.Delete(c.cur().ns, idKey)
 		})
 		require.NoError(t, err)
 	}
@@ -4538,7 +4538,7 @@ func TestIndex_Corruption_UniqueStaleEntryBlocksReinsert(t *testing.T) {
 	c := coll.(*collection)
 	idKey := anyenc.AppendAnyValue(anyenc.Tuple(nil), 1)
 	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-		return tx.Delete(c.ns, idKey)
+		return tx.Delete(c.cur().ns, idKey)
 	}))
 
 	// Unique insertKeys trusts the index entry (no data-liveness check) → false reject.
@@ -4593,7 +4593,7 @@ func TestIndex_Corruption_DeleteIdAfterDataRowGone(t *testing.T) {
 	c := coll.(*collection)
 	idKey := anyenc.AppendAnyValue(anyenc.Tuple(nil), 2)
 	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-		return tx.Delete(c.ns, idKey)
+		return tx.Delete(c.cur().ns, idKey)
 	}))
 	assertIndexLen(t, coll.GetIndexes()[0], 3)
 

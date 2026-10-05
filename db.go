@@ -594,7 +594,7 @@ func (db *db) reconcileIndexSet(tx *btree.ReadTx, snapCookie uint32) (complete b
 
 	for _, nc := range colls {
 		nc.c.mu.Lock()
-		renameInFlight := nc.c.name != nc.name
+		renameInFlight := nc.c.cur().name != nc.name
 		nc.c.mu.Unlock()
 		if renameInFlight {
 			// A local Rename is between its name flip and its commit (the
@@ -657,7 +657,7 @@ func (db *db) collectionVanished(tx *btree.ReadTx, name string, c *collection) b
 	if err != nil {
 		return errors.Is(err, btree.ErrNamespaceNotFound)
 	}
-	return ns.RootPage() != c.ns.RootPage()
+	return ns.RootPage() != c.cur().ns.RootPage()
 }
 
 // invalidateCollection retires a handle whose collection a peer process
@@ -933,7 +933,7 @@ func (db *db) renamedAway(ctx context.Context, name string) bool {
 	}
 	for _, c := range db.renaming {
 		c.mu.Lock()
-		current := c.name
+		current := c.cur().name
 		c.mu.Unlock()
 		if current == name {
 			continue
@@ -1438,7 +1438,7 @@ func (db *db) Flush(ctx context.Context, waitIdleTime time.Duration, mode FlushM
 func (db *db) renamedTo(name string) *collection {
 	for _, c := range db.renaming {
 		c.mu.Lock()
-		match := c.name == name
+		match := c.cur().name == name
 		c.mu.Unlock()
 		if match && !c.closed.Load() {
 			return c
