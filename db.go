@@ -276,14 +276,6 @@ type db struct {
 	ddlUnwindGate sync.Mutex
 
 	openedCollections map[string]Collection
-	// orphanFtsPending holds fts indexes of collections closed mid-write-tx
-	// with a non-empty pending buffer. flushAllFtsPending / resetAllFtsPending
-	// enumerate openedCollections, so without this registry a Close() between
-	// Insert and Commit would silently drop the buffered postings — the doc
-	// commits but stays invisible to $text forever (guarded by
-	// TestFtsPendingSurvivesCollectionCloseMidTx).
-	// Guarded by db.mu; drained by the next flush or reset.
-	orphanFtsPending []*ftsIndex
 
 	// sketchDirty and ftsDirty list the collections holding writer state to
 	// persist, flush or discard: an index whose live sketch has unpersisted
@@ -301,7 +293,9 @@ type db struct {
 	// Writer-owned, no mutex: every access holds the btree write lock, or
 	// ddlUnwindGate while a failed commit unwinds (newWriteTx passes the gate
 	// before reading them). Nothing touches them after a btree commit
-	// succeeded. A closed collection stays listed.
+	// succeeded. A closed collection stays listed: postings buffered before
+	// a Close() in mid-tx still flush at commit (guarded by
+	// TestFtsPendingSurvivesCollectionCloseMidTx).
 	sketchDirty []*collection
 	ftsDirty    []*collection
 
@@ -653,11 +647,11 @@ func (db *db) collectionVanished(tx *btree.ReadTx, name string, c *collection) b
 // invalidateCollection retires a handle whose collection a peer process
 // renamed or dropped (SQLite re-prepare style: subsequent operations fail with
 // ErrCollectionClosed and the caller re-opens). Modeled on the CreateCollection
-// rollback undo, NOT on close(): onCollectionClose would orphan non-empty fts
-// pending buffers for the commit-time flush, and a dead handle's buffered
-// writes must never flush into the renamed/dropped collection's namespaces —
-// reset them instead. The CAS makes concurrent invalidations (multiple tx
-// begins observing the same cookie bump) idempotent.
+// rollback undo, NOT on close(): a closed handle's fts pending buffers still
+// flush at commit, and a dead handle's buffered writes must never flush into
+// the renamed/dropped collection's namespaces — reset them instead. The CAS
+// makes concurrent invalidations (multiple tx begins observing the same
+// cookie bump) idempotent.
 func (db *db) invalidateCollection(c *collection) {
 	if !c.closed.CompareAndSwap(false, true) {
 		return
@@ -838,8 +832,8 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 		// cached handle would land on the freed root page. Evict on rollback.
 		// Deliberately NOT close(): onCollectionClose unconditionally deletes
 		// by name (the guarded delete here spares a same-name handle
-		// re-registered after the rollback) and orphans non-empty fts pending
-		// buffers for the commit-time flush — but this collection's fts writes
+		// re-registered after the rollback) and leaves the fts pending
+		// buffers to the commit-time flush — but this collection's fts writes
 		// belong to the rolled-back tx and must never flush. Reset them and
 		// mark closed so the handle's own Close is a no-op.
 		wtx.onRollbackUndo(func() {
@@ -1344,14 +1338,6 @@ func (db *db) onCollectionClose(c *collection) {
 			break
 		}
 	}
-	// Keep non-empty fts pending buffers reachable for the commit-time flush
-	// (or the next tx-begin reset). The buffer is only ever non-empty inside
-	// an open write tx, so outside a tx this appends nothing.
-	for _, fx := range c.loadFtsIndexes() {
-		if !fx.pending.empty() {
-			db.orphanFtsPending = append(db.orphanFtsPending, fx)
-		}
-	}
 	db.mu.Unlock()
 }
 
@@ -1416,18 +1402,16 @@ func (db *db) ambientWriteTx(ctx context.Context) (WriteTx, bool) {
 // complete, consistent index; a crash leaves no doc without its postings).
 // The buffer never survives the commit boundary. A failed flush leaves the
 // list as it was.
+//
+// The list is in first-write order: a collection closed in mid-tx flushes
+// before a same-name handle reopened after the close, so for a document
+// touched on both sides of the close the later postings win. An empty list
+// is left unwritten — $text reads sharing one write tx may get here
+// concurrently.
 func (db *db) flushAllFtsPending(tx *btree.WriteTx) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	// Orphans first: their writes chronologically precede anything buffered
-	// by a same-name collection reopened after the close, so for a document
-	// touched on both sides of the close the later postings win.
-	for _, fx := range db.orphanFtsPending {
-		if err := fx.flushPending(tx); err != nil {
-			return err
-		}
+	if len(db.ftsDirty) == 0 {
+		return nil
 	}
-	db.orphanFtsPending = db.orphanFtsPending[:0]
 	for _, c := range db.ftsDirty {
 		for _, fx := range c.loadFtsIndexes() {
 			if err := fx.flushPending(tx); err != nil {
@@ -1443,12 +1427,9 @@ func (db *db) flushAllFtsPending(tx *btree.WriteTx) error {
 // rolled-back transaction. Called at the start of every write tx so a new tx
 // begins with an empty buffer.
 func (db *db) resetAllFtsPending() {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	for _, fx := range db.orphanFtsPending {
-		fx.pending.reset()
+	if len(db.ftsDirty) == 0 {
+		return
 	}
-	db.orphanFtsPending = db.orphanFtsPending[:0]
 	for _, c := range db.ftsDirty {
 		for _, fx := range c.loadFtsIndexes() {
 			fx.pending.reset()

@@ -1591,9 +1591,7 @@ func (c *collection) Drop(ctx context.Context) error {
 		// The eviction is onCollectionClose verbatim (identity scan — a
 		// Rename earlier in this tx re-keys the entry in its own, earlier
 		// publication and declines to resurrect a closed handle; a same-tx
-		// recreate replaced it, making this a no-op). Its orphan-fts append
-		// is dead weight here: the buffers were reset above and the closed
-		// handle cannot repopulate them.
+		// recreate replaced it, making this a no-op).
 		wtx.onCommitPublish(func() {
 			c.db.onCollectionClose(c)
 		})
