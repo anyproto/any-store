@@ -888,9 +888,7 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 }
 
 func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collection, error) {
-	db.mu.Lock()
-	if coll, ok := db.liveLocked(collectionName); ok {
-		db.mu.Unlock()
+	if coll, ok := db.registered(ctx, collectionName); ok {
 		return coll, nil
 	}
 	// A CLOSED registered handle is a Drop in an open tx: fall through to the
@@ -898,17 +896,52 @@ func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collec
 	// (ErrCollectionNotFound, the correct same-tx answer), while a concurrent
 	// caller sees the committed row and gets the closed handle back below
 	// (fail-safe: ops error until the drop resolves).
-	db.mu.Unlock()
 	return db.openCollection(ctx, collectionName)
 }
 
-func (db *db) openCollection(ctx context.Context, collectionName string) (Collection, error) {
+// registered returns the live handle the registry holds under name, as the
+// caller of ctx sees it. The registry is keyed by committed names: a
+// collection renamed by the open write tx stays under its old name until the
+// commit, which is right for every caller but that tx. For the renaming tx
+// the old name is gone, as a table's old name is after ALTER TABLE RENAME in
+// the same SQLite transaction, and the catalog check that follows a miss,
+// read through the writer's view, answers for it.
+func (db *db) registered(ctx context.Context, name string) (Collection, bool) {
+	if db.renamedAway(ctx, name) {
+		return nil, false
+	}
 	db.mu.Lock()
-	if coll, ok := db.liveLocked(collectionName); ok {
+	defer db.mu.Unlock()
+	return db.liveLocked(name)
+}
+
+// renamedAway reports that ctx carries the open write tx and that tx renamed
+// the collection registered under name to another name.
+func (db *db) renamedAway(ctx context.Context, name string) bool {
+	if _, ok := db.ambientWriteTx(ctx); !ok {
+		return false
+	}
+	for _, c := range db.renaming {
+		c.mu.Lock()
+		current := c.name
+		c.mu.Unlock()
+		if current == name {
+			continue
+		}
+		db.mu.Lock()
+		reg := db.openedCollections[name] == Collection(c)
 		db.mu.Unlock()
+		if reg {
+			return true
+		}
+	}
+	return false
+}
+
+func (db *db) openCollection(ctx context.Context, collectionName string) (Collection, error) {
+	if coll, ok := db.registered(ctx, collectionName); ok {
 		return coll, nil
 	}
-	db.mu.Unlock()
 
 	if _, ok := db.ambientWriteTx(ctx); ok {
 		if c := db.renamedTo(collectionName); c != nil {

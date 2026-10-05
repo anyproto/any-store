@@ -1860,3 +1860,47 @@ func TestRenameCommit_ConcurrentOpenOfNewName(t *testing.T) {
 		}
 	}
 }
+
+// Inside the tx that renamed a collection its old name is gone, whether or
+// not the handle was closed since; other callers keep the committed name
+// until the commit.
+func TestRename_OldNameInSameTx(t *testing.T) {
+	for _, closed := range []bool{false, true} {
+		name := "handle open"
+		if closed {
+			name = "handle closed"
+		}
+		t.Run(name, func(t *testing.T) {
+			fx := newFixture(t)
+			a, err := fx.CreateCollection(ctx, "a")
+			require.NoError(t, err)
+
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			require.NoError(t, a.Rename(tx.Context(), "b"))
+			if closed {
+				require.NoError(t, a.Close())
+			}
+
+			_, err = fx.OpenCollection(tx.Context(), "a")
+			assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+			// Open-or-create must not hand out the renamed collection for
+			// the old name. The name stays taken until the commit.
+			_, err = fx.Collection(tx.Context(), "a")
+			require.Error(t, err)
+
+			around, err := fx.OpenCollection(ctx, "a")
+			require.NoError(t, err)
+			assert.True(t, around == a, "outside the tx the committed name resolves to the handle")
+			b, err := fx.OpenCollection(tx.Context(), "b")
+			require.NoError(t, err)
+			assert.True(t, b == a, "inside the tx the new name resolves to the handle")
+			require.NoError(t, b.Insert(tx.Context(), ddlDoc(1)))
+			require.NoError(t, tx.Commit())
+
+			_, err = fx.OpenCollection(ctx, "a")
+			assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+			assertIndexesHold(t, fx, b, "b", 1)
+		})
+	}
+}
