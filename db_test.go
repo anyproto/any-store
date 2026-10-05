@@ -2141,6 +2141,106 @@ func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 	}
 }
 
+// BenchmarkRead_DuringSchemaCommits reads one collection while another
+// goroutine keeps creating and dropping others: a schema commit that does not
+// touch a collection must not slow the reads of it.
+func BenchmarkRead_DuringSchemaCommits(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "hot")
+	require.NoError(b, err)
+	require.NoError(b, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(b, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":0}`)))
+
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				done <- nil
+				return
+			default:
+			}
+			c, cErr := fx.CreateCollection(ctx, fmt.Sprintf("n%07d", i))
+			if cErr == nil {
+				cErr = c.Drop(ctx)
+			}
+			if cErr != nil {
+				done <- cErr
+				return
+			}
+		}
+	}()
+
+	b.Run("FindId", func(b *testing.B) {
+		p := &anyenc.Parser{}
+		b.ReportAllocs()
+		for range b.N {
+			_, err := coll.FindIdWithParser(ctx, p, 1)
+			require.NoError(b, err)
+		}
+	})
+	b.Run("Count", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			_, err := coll.Count(ctx)
+			require.NoError(b, err)
+		}
+	})
+	b.Run("FindByIndex", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			_, err := coll.Find(`{"a":0}`).Count(ctx)
+			require.NoError(b, err)
+		}
+	})
+	close(stop)
+	require.NoError(b, <-done)
+}
+
+// BenchmarkPeerSchemaChange_OpenCollections reads one collection right after
+// another process changed the schema, with n collections open: the cost of
+// noticing the change must not depend on n.
+func BenchmarkPeerSchemaChange_OpenCollections(b *testing.B) {
+	skipIfInMemory(b, "staleness counters model cross-process commits; not applicable in-memory")
+	for _, n := range []int{1, 1000, 20000} {
+		b.Run(fmt.Sprintf("open=%d", n), func(b *testing.B) {
+			fx := newFixture(b)
+			dbi := fx.DB.(*db)
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(b, err)
+			colls := make([]Collection, n)
+			for i := range colls {
+				colls[i], err = fx.CreateCollection(tx.Context(), fmt.Sprintf("c%05d", i))
+				require.NoError(b, err)
+				require.NoError(b, colls[i].EnsureIndex(tx.Context(), IndexInfo{Fields: []string{"a"}}))
+			}
+			coll := colls[0]
+			require.NoError(b, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1,"a":0}`)))
+			require.NoError(b, tx.Commit())
+
+			rtx, err := dbi.btreeDB.BeginRead()
+			require.NoError(b, err)
+			fcc, sc := rtx.DiskFileChangeCounter(), rtx.DiskSchemaCookie()
+			require.NoError(b, rtx.Rollback())
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				modelPeerSchemaChange(dbi, fcc, sc)
+				_, err := coll.Count(ctx)
+				require.NoError(b, err)
+			}
+		})
+	}
+}
+
+// modelPeerSchemaChange leaves the process as it is after another process
+// committed a schema change it has not noticed yet.
+func modelPeerSchemaChange(d *db, fcc, sc uint32) {
+	d.btreeDB.UpdateLocalCounters(fcc, sc-1)
+}
+
 // CreateCollection's rollback puts back the registry entry it replaced only
 // if that handle carries this tx's Drop. A closed handle found there
 // otherwise is one a staleness pass is retiring — closed already, evicted

@@ -399,6 +399,38 @@ func TestCollection_PrimaryKey_ArrayRejected_CustomPk(t *testing.T) {
 // raw Open on a temp path (not newFixture) because they must survive a real
 // close/open cycle.
 
+// A read transaction that began before a rename keeps reading through the
+// handle it holds: the data tree and the documents are the ones its snapshot
+// has, whatever the collection is called by now.
+func TestRename_OlderReaderKeepsReadingHeldHandle(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "before")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a", Fields: []string{"a"}}))
+	for i := range 3 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i*10))))
+	}
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { _ = rtx.Commit() }()
+
+	require.NoError(t, coll.Rename(ctx, "after"))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":30}`)))
+
+	cnt, err := coll.Count(rtx.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 3, cnt, "the reader's snapshot predates the fourth document")
+	doc, err := coll.FindId(rtx.Context(), 1)
+	require.NoError(t, err)
+	assert.Equal(t, 10, doc.Value().GetInt("a"))
+	cnt, err = coll.Find(`{"a":{"$gte":10}}`).Count(rtx.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 2, cnt)
+	_, err = coll.FindId(rtx.Context(), 3)
+	assert.ErrorIs(t, err, anystore.ErrDocNotFound)
+}
+
 func TestRename_ReopenAfterEviction(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "before")
