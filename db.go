@@ -299,6 +299,16 @@ type db struct {
 	sketchDirty []*collection
 	ftsDirty    []*collection
 
+	// renaming lists the collections renamed by the open write tx. They stay
+	// registered under the old name until commit, so inside that tx
+	// OpenCollection resolves the new name through this list to the same
+	// handle — one handle per collection, as SQLite's schema reload inside
+	// ALTER TABLE RENAME (alter.c renameReloadSchema) leaves one Table under
+	// the new name. A second handle would be displaced from the registry at
+	// commit and escape every later staleness pass. Writer-owned, like the
+	// lists above.
+	renaming []*collection
+
 	closed atomic.Bool
 
 	dirtyOnOpen             bool
@@ -880,6 +890,12 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 	}
 	db.mu.Unlock()
 
+	if _, ok := db.ambientWriteTx(ctx); ok {
+		if c := db.renamedTo(collectionName); c != nil {
+			return c, nil
+		}
+	}
+
 	err := db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		key := collKey(collectionName)
 		_, err := tx.Get(db.systemNS, key)
@@ -1324,6 +1340,31 @@ func (db *db) Flush(ctx context.Context, waitIdleTime time.Duration, mode FlushM
 	}
 
 	return db.recoveryController.Flush(ctx, waitIdleTime, mode.toRecoveryFlushMode())
+}
+
+// renamedTo returns the live collection the open write tx renamed to name
+// (see db.renaming). Writer only.
+func (db *db) renamedTo(name string) *collection {
+	for _, c := range db.renaming {
+		c.mu.Lock()
+		match := c.name == name
+		c.mu.Unlock()
+		if match && !c.closed.Load() {
+			return c
+		}
+	}
+	return nil
+}
+
+// renameResolved drops one entry of c from db.renaming: its rename committed
+// or rolled back. Writer only.
+func (db *db) renameResolved(c *collection) {
+	for i := len(db.renaming) - 1; i >= 0; i-- {
+		if db.renaming[i] == c {
+			db.renaming = append(db.renaming[:i], db.renaming[i+1:]...)
+			return
+		}
+	}
 }
 
 func (db *db) onCollectionClose(c *collection) {

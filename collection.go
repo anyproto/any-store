@@ -1474,6 +1474,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 		c.storeIndexes(next)
 
 		c.name = newName
+		c.db.renaming = append(c.db.renaming, c)
 
 		// The handle registry is re-keyed only at COMMIT (see commonTx.pubs):
 		// re-keying here would open a window where a concurrent
@@ -1496,6 +1497,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 			// invalidating a just-renamed live handle (keyNotFound on the new
 			// name). See reconcileIndexSet.
 			c.validFromCookie.Store(renameValidFrom)
+			c.db.renameResolved(c)
 			c.db.mu.Lock()
 			if cur, ok := c.db.openedCollections[oldName]; ok && cur == Collection(c) {
 				delete(c.db.openedCollections, oldName)
@@ -1515,6 +1517,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 		// through the clones: propagate their modified flags so the next tx
 		// begin rebases the restored sketches to committed bytes.
 		wtx.onRollbackUndo(func() {
+			c.db.renameResolved(c)
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			c.name = oldName

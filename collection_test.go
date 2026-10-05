@@ -815,6 +815,105 @@ func TestRename_ThenDrop_NoOrphans(t *testing.T) {
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
 
+// OpenCollection of the new name inside the renaming tx returns the renamed
+// handle. A second handle would be displaced from the registry when the
+// rename commits and keep writing through index handles no staleness pass
+// reconciles.
+func TestRename_OpenNewNameInSameTx(t *testing.T) {
+	ft := IndexInfo{Name: "ft", Kind: IndexKindFulltext, Fields: []string{"body"}}
+	k := IndexInfo{Name: "k", Fields: []string{"k"}}
+	setup := func(t *testing.T) (*fixture, *db, Collection) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(ctx, ft, k))
+		require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(`{"id":1,"k":1,"body":"alpha"}`)))
+		return fx, fx.DB.(*db), a
+	}
+
+	t.Run("commit", func(t *testing.T) {
+		fx, dbi, a := setup(t)
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.Rename(tx.Context(), "b"))
+		h, err := fx.OpenCollection(tx.Context(), "b")
+		require.NoError(t, err)
+		assert.True(t, h == a, "the renamed handle itself")
+		require.NoError(t, tx.Commit())
+		assert.Empty(t, dbi.renaming)
+
+		// The fts namespaces are freed and reused by another collection; a
+		// write through h must not reach them.
+		require.NoError(t, a.DropIndex(ctx, "ft"))
+		other, err := fx.CreateCollection(ctx, "other")
+		require.NoError(t, err)
+		require.NoError(t, other.EnsureIndex(ctx, ft, k))
+		for i := range 5 {
+			require.NoError(t, other.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"k":1,"body":"x"}`, 100+i))))
+		}
+		require.NoError(t, h.Insert(ctx, anyenc.MustParseJson(`{"id":2,"k":1,"body":"bravo two"}`)))
+
+		ids, _ := collectIter(t, other.Find(nil))
+		assert.Len(t, ids, 5)
+		n, err := other.Find(`{"$text":{"$search":"x"}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 5, n)
+		require.NoError(t, fx.IntegrityCheck(ctx))
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		fx, dbi, a := setup(t)
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.Rename(tx.Context(), "b"))
+		h, err := fx.OpenCollection(tx.Context(), "b")
+		require.NoError(t, err)
+		assert.True(t, h == a, "the renamed handle itself")
+		require.NoError(t, tx.Rollback())
+		assert.Empty(t, dbi.renaming)
+
+		assert.Equal(t, "a", a.Name())
+		_, err = fx.OpenCollection(ctx, "b")
+		assert.ErrorIs(t, err, ErrCollectionNotFound)
+		h, err = fx.OpenCollection(ctx, "a")
+		require.NoError(t, err)
+		assert.True(t, h == a, "the renamed handle itself")
+	})
+
+	t.Run("savepoint rollback", func(t *testing.T) {
+		fx, dbi, a := setup(t)
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, a.Rename(tx.Context(), "b"))
+		require.NoError(t, sp.Rollback())
+		assert.Empty(t, dbi.renaming)
+		_, err = fx.OpenCollection(tx.Context(), "b")
+		assert.ErrorIs(t, err, ErrCollectionNotFound)
+		require.NoError(t, tx.Commit())
+		assert.Equal(t, "a", a.Name())
+	})
+
+	t.Run("renamed twice, then dropped", func(t *testing.T) {
+		fx, dbi, a := setup(t)
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.Rename(tx.Context(), "b"))
+		require.NoError(t, a.Rename(tx.Context(), "c"))
+		_, err = fx.OpenCollection(tx.Context(), "b")
+		assert.ErrorIs(t, err, ErrCollectionNotFound)
+		h, err := fx.OpenCollection(tx.Context(), "c")
+		require.NoError(t, err)
+		assert.True(t, h == a, "the renamed handle itself")
+		require.NoError(t, a.Drop(tx.Context()))
+		_, err = fx.OpenCollection(tx.Context(), "c")
+		assert.ErrorIs(t, err, ErrCollectionNotFound)
+		require.NoError(t, tx.Commit())
+		assert.Empty(t, dbi.renaming)
+	})
+}
+
 // Rename inside a rolled-back tx must restore the in-memory name, the
 // openedCollections key, the index generation and (via the btree rollback)
 // the namespaces themselves.
