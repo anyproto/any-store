@@ -134,10 +134,11 @@ func TestResolve_PeerSchemaChangeVerifiesOnFirstUse(t *testing.T) {
 	assert.Equal(t, 1, *loads)
 }
 
-// A reader that begins between a commit and the moment the epoch has caught
-// up with it reads the committed schema through its own view — the index
-// the commit dropped is not in its plan — and leaves the head to the
-// committer.
+// A reader that begins between a commit becoming visible and the epoch
+// catching up with it — instructions apart, inside the btree commit — reads
+// the committed schema through its own view: the index the commit dropped is
+// not in its plan. It neither replaces the head nor takes the commit for
+// another process's.
 func TestResolve_ReaderBetweenCommitAndEpoch(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "c")
@@ -152,34 +153,42 @@ func TestResolve_ReaderBetweenCommitAndEpoch(t *testing.T) {
 	c := coll.(*collection)
 	dbi := fx.DB.(*db)
 
-	ran := false
-	testHookAfterBtreeCommit = func() {
-		if ran {
-			return
-		}
-		ran = true
-		head, gen := c.cur(), dbi.epoch.Load().gen
-		n, err := coll.Find(`{"a":{"$gte":5}}`).IndexHint(IndexHint{IndexName: "a", Boost: 1_000_000}).Count(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, 5, n)
-		exp, err := coll.Find(`{"a":{"$gte":5}}`).Explain(ctx)
-		require.NoError(t, err)
-		for _, ie := range exp.Indexes {
-			assert.NotEqual(t, "a", ie.Name, "the dropped index is a candidate for a reader past the commit")
-		}
-		n, err = other.Count(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, 1, n)
-		assert.True(t, head == c.cur(), "a reader in the gap replaced the head")
-		assert.Equal(t, gen, dbi.epoch.Load().gen, "an own commit was taken for another process's")
-	}
-	t.Cleanup(func() { testHookAfterBtreeCommit = nil })
-
+	// The commit, and the epoch put back where that reader finds it: the
+	// cookie announced, known one behind.
+	before := dbi.epoch.Load()
 	require.NoError(t, coll.DropIndex(ctx, "a"))
-	require.True(t, ran)
-	n, err := coll.Find(`{"a":{"$gte":5}}`).Count(ctx)
+	after := dbi.epoch.Load()
+	require.Equal(t, before.known+1, after.known)
+	dbi.epoch.Store(before)
+	dbi.announceCookie(after.known)
+
+	head := c.cur()
+	loads := countSchemaLoads(t)
+	n, err := coll.Find(`{"a":{"$gte":5}}`).IndexHint(IndexHint{IndexName: "a", Boost: 1_000_000}).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 5, n)
+	exp, err := coll.Find(`{"a":{"$gte":5}}`).Explain(ctx)
+	require.NoError(t, err)
+	for _, ie := range exp.Indexes {
+		assert.NotEqual(t, "a", ie.Name, "the dropped index is a candidate for a reader past the commit")
+	}
+	_, err = coll.FindId(ctx, 1)
+	require.NoError(t, err)
+	n, err = other.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	assert.NotZero(t, *loads, "the reader trusted a head the epoch does not cover yet")
+	assert.True(t, head == c.cur(), "a reader in the gap replaced the head")
+	assert.Equal(t, before.gen, dbi.epoch.Load().gen, "an own commit was taken for another process's")
+
+	// The commit hook, as the btree commit runs it.
+	dbi.schemaCommitted(0, after.known)
+	*loads = 0
+	n, err = coll.Find(`{"a":{"$gte":5}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 5, n)
+	assert.Zero(t, *loads)
+	assert.Equal(t, after.known, dbi.epoch.Load().known)
 }
 
 // A version is not trusted between two cookies at which it merely checks out

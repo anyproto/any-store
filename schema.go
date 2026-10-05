@@ -143,9 +143,9 @@ func (db *db) observeCookie(tx *btree.ReadTx) {
 			return
 		}
 		if own := db.ownCookie.Load(); own>>32 != 0 && uint32(own) == cookie {
-			// The commit of this process that is being published: known
-			// follows (schemaCommitted), and until then this transaction
-			// loads what it uses through its own view.
+			// The commit of this process becoming visible: known follows
+			// within instructions (schemaCommitted), and until then this
+			// transaction loads what it uses through its own view.
 			return
 		}
 		if db.epoch.CompareAndSwap(e, &schemaEpoch{gen: e.gen + 1, start: cookie, known: cookie}) {
@@ -161,21 +161,24 @@ func (db *db) announceCookie(cookie uint32) {
 	db.ownCookie.Store(1<<32 | uint64(cookie))
 }
 
-// schemaCommitted ends the announcement and, after a commit that changed the
-// schema, moves known to its cookie. The heads the commit changed are in
-// place by then.
-func (db *db) schemaCommitted(committed bool) {
-	if committed {
-		_, cookie := db.btreeDB.LocalCounters()
-		for {
-			e := db.epoch.Load()
-			if cookieLE(cookie, e.known) ||
-				db.epoch.CompareAndSwap(e, &schemaEpoch{gen: e.gen, start: e.start, known: cookie}) {
-				break
-			}
+// schemaCommitted moves known to the cookie of the commit that is becoming
+// visible and ends its announcement. It runs inside the btree commit
+// (btree.WriteTx.OnCommitted), with the heads the commit changed in place.
+func (db *db) schemaCommitted(_, cookie uint32) {
+	for {
+		e := db.epoch.Load()
+		if cookieLE(cookie, e.known) ||
+			db.epoch.CompareAndSwap(e, &schemaEpoch{gen: e.gen, start: e.start, known: cookie}) {
+			break
 		}
 	}
-	db.ownCookie.Store(0)
+	db.endAnnouncement(cookie)
+}
+
+// endAnnouncement withdraws the announcement of cookie, unless the next
+// commit has announced its own by now.
+func (db *db) endAnnouncement(cookie uint32) {
+	db.ownCookie.CompareAndSwap(1<<32|uint64(cookie), 0)
 }
 
 // schemaMemo holds the versions a transaction loaded for itself; it lives in

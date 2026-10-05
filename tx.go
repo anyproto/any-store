@@ -201,10 +201,6 @@ func (tx *commonTx) dbRef() *db {
 	return tx.db
 }
 
-// testHookAfterBtreeCommit, when set, runs after the btree commit of a
-// top-level write tx and before anything that follows it. Tests only.
-var testHookAfterBtreeCommit func()
-
 var txPool = &sync.Pool{
 	New: func() any {
 		return &commonTx{}
@@ -303,18 +299,19 @@ func (w writeTx) Commit() error {
 		}
 		schemaChange := w.writeTx.SchemaChanged()
 		if schemaChange {
+			// The heads this tx changed are in place since the verbs ran
+			// (collection.publish): the epoch follows the cookie as the
+			// commit becomes visible, so that next to no reader finds the
+			// new cookie ahead of it — and before the publications below
+			// let a changed handle out of the registry (see
+			// collection.since).
 			w.db.announceCookie(w.writeTx.DiskSchemaCookie() + 1)
+			w.writeTx.OnCommitted(w.db.schemaCommitted)
 		}
 		err := w.writeTx.Commit()
-		if testHookAfterBtreeCommit != nil {
-			testHookAfterBtreeCommit()
-		}
 		if schemaChange {
-			// The heads this tx changed are in place since the verbs ran
-			// (collection.publish): the epoch follows the cookie, before the
-			// publications below let a changed handle out of the registry
-			// (see collection.since).
-			w.db.schemaCommitted(err == nil)
+			// For a commit that failed or wrote nothing.
+			w.db.endAnnouncement(w.readTx.DiskSchemaCookie() + 1)
 		}
 		if err == nil {
 			if w.modified {
