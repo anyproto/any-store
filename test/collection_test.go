@@ -641,6 +641,51 @@ func TestReadAroundWriteTx_CollectionCreatedInIt(t *testing.T) {
 	assert.Equal(t, 1, cnt)
 }
 
+// Name and GetIndexes take no context, so they cannot answer for a
+// transaction: they report the committed schema. A rename or an index made
+// in an open transaction shows once it commits, and never if it rolls back.
+func TestAccessorsReportCommittedSchema(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "before")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a", Fields: []string{"a"}}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1,"b":1}`)))
+	indexNames := func() []string {
+		var names []string
+		for _, idx := range coll.GetIndexes() {
+			names = append(names, idx.Info().Name)
+		}
+		return names
+	}
+
+	for _, commit := range []bool{false, true} {
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(tx.Context(), anystore.IndexInfo{Name: "b", Fields: []string{"b"}}))
+		require.NoError(t, coll.DropIndex(tx.Context(), "a"))
+		require.NoError(t, coll.Rename(tx.Context(), "after"))
+		assert.Equal(t, "before", coll.Name())
+		assert.Equal(t, []string{"a"}, indexNames())
+		// The transaction works with what it made.
+		n, err := coll.Find(`{"b":1}`).IndexHint(anystore.IndexHint{IndexName: "b", Boost: 1_000_000}).Count(tx.Context())
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+		reopened, err := fx.OpenCollection(tx.Context(), "after")
+		require.NoError(t, err)
+		assert.True(t, reopened == coll)
+
+		if !commit {
+			require.NoError(t, tx.Rollback())
+			assert.Equal(t, "before", coll.Name())
+			assert.Equal(t, []string{"a"}, indexNames())
+			continue
+		}
+		require.NoError(t, tx.Commit())
+		assert.Equal(t, "after", coll.Name())
+		assert.Equal(t, []string{"b"}, indexNames())
+	}
+}
+
 // A read transaction that began before a rename keeps reading through the
 // handle it holds: the data tree and the documents are the ones its snapshot
 // has, whatever the collection is called by now.

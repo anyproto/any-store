@@ -161,24 +161,19 @@ type planOpts struct {
 	wantCandidates bool // Explain only: return the CBO candidate report even on fts/vector paths
 }
 
-// validateSources runs the source-detection guards that need no transaction:
-// the legacy-clause rejection, the _distance placement rule, the $knn/$text
-// exclusion, and the full $knn detection walk (placement, argument validation,
-// index resolution, dim check — detection is the ONLY validation programmatic
-// consumers ever see).
+// validateSources runs the source-detection guards against the schema
+// version s: the legacy-clause rejection, the _distance placement rule, the
+// $knn/$text exclusion, and the full $knn detection walk (placement, argument
+// validation, index resolution, dim check — detection is the ONLY validation
+// programmatic consumers ever see).
 //
-// The verbs call this BEFORE their unsatisfiable() short-circuit: an invalid
-// source must error identically on every verb, not return 0/nil wherever an
-// unrelated $in:[] happens to make the filter unsatisfiable.
-func (q *collQuery) validateSources() error {
+// The verbs call this BEFORE their unsatisfiable() short-circuit, and so
+// before their transaction (validateSourcesIn): an invalid source must error
+// identically on every verb, not return 0/nil wherever an unrelated $in:[]
+// happens to make the filter unsatisfiable.
+func (q *collQuery) validateSources(s *collSchema) error {
 	if q.srcValidated {
 		return nil
-	}
-	// Before a transaction exists the newest version stands in; the plan is
-	// compiled against the transaction's own (compilePlan).
-	s := q.c.committed()
-	if s == nil {
-		return ErrCollectionNotFound
 	}
 	if err := rejectLegacyVectorClause(q.cond, s.vindexes); err != nil {
 		return err
@@ -200,6 +195,25 @@ func (q *collQuery) validateSources() error {
 	}
 	q.srcValidated = true
 	return nil
+}
+
+// validateSourcesIn is validateSources for a verb about to run in ctx, with
+// the schema that verb will work with: the version of the transaction ctx
+// carries, else the committed one its own transaction is about to see.
+func (q *collQuery) validateSourcesIn(ctx context.Context) error {
+	if q.srcValidated {
+		return nil
+	}
+	var s *collSchema
+	if tx, ok := ctx.Value(ctxKeyTx).(ReadTx); ok && !tx.Done() && tx.instanceId() == q.c.db.instanceId {
+		var err error
+		if s, err = q.c.resolve(tx.btreeReadTx()); err != nil {
+			return err
+		}
+	} else if s = q.c.committed(); s == nil {
+		return ErrCollectionNotFound
+	}
+	return q.validateSources(s)
 }
 
 // writeSorter applies the write-verb sorter rule: ordering decides WHICH
@@ -237,7 +251,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 	// The unconditional source guards. The verbs already ran these (before
 	// their unsatisfiable() short-circuit); re-run here so compilePlan is safe
 	// for any future caller — the guards are cheap tree walks.
-	if err = q.validateSources(); err != nil {
+	if err = q.validateSources(s); err != nil {
 		return nil, nil, err
 	}
 
@@ -389,7 +403,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	// Source validation precedes the unsatisfiable() short-circuit: an invalid
 	// $knn/_distance/legacy clause must error here exactly as it would with a
 	// satisfiable filter.
-	if err = q.validateSources(); err != nil {
+	if err = q.validateSourcesIn(ctx); err != nil {
 		qb.Close()
 		return
 	}
@@ -518,7 +532,7 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(btWtx *btree.Writ
 	defer qb.Close()
 
 	// Source validation precedes the unsatisfiable() short-circuit (see Iter).
-	if err = q.validateSources(); err != nil {
+	if err = q.validateSourcesIn(ctx); err != nil {
 		return
 	}
 
@@ -643,7 +657,7 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	}
 
 	// Source validation precedes the unsatisfiable() short-circuit (see Iter).
-	if err = q.validateSources(); err != nil {
+	if err = q.validateSourcesIn(ctx); err != nil {
 		return 0, err
 	}
 
@@ -774,7 +788,7 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	// unsatisfiable short-circuit — Explain(Q) describes the plan producing
 	// Rows(Q), and for an unsatisfiable filter that is the empty plan the other
 	// verbs short-circuit to, not a plan that will never run.
-	if err = q.validateSources(); err != nil {
+	if err = q.validateSourcesIn(ctx); err != nil {
 		return
 	}
 	if q.unsatisfiable() {

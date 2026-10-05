@@ -291,6 +291,11 @@ func (c *collection) loadVectorIndexes() []*vectorIndex {
 
 func (c *collection) Name() string {
 	if s := c.cur(); s != nil {
+		// The committed name: a rename is the renaming tx's own until it
+		// commits.
+		if b := s.base.Load(); b != nil {
+			return b.name
+		}
 		return s.name
 	}
 	return c.openName
@@ -1250,6 +1255,10 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 // looked.
 func (c *collection) committed() *collSchema {
 	if s := c.cur(); s != nil && s.gen.Load() == c.db.epoch.Load().gen {
+		// Under a head the open write tx published lies the committed one.
+		if b := s.base.Load(); b != nil {
+			return b
+		}
 		return s
 	}
 	var s *collSchema
