@@ -31,6 +31,8 @@ type DB interface {
 	CreateCollection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error)
 
 	// OpenCollection opens an existing collection with the specified name.
+	// With a transaction in ctx the collection is looked up in that
+	// transaction's view.
 	// Returns the opened Collection or an error if the collection does not exist.
 	// Possible errors:
 	// - ErrCollectionNotFound: if the collection does not exist.

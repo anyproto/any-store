@@ -18,8 +18,16 @@ import (
 )
 
 // Collection represents a collection of documents.
+//
+// A handle is shared by every caller that opens the collection and serves
+// transactions at different snapshots. Each operation works with the schema
+// of the transaction it runs in: the indexes that transaction has, under the
+// name it has. A transaction that does not have the collection — it began
+// before the collection was created, or the collection was dropped or
+// replaced since — gets ErrCollectionNotFound.
 type Collection interface {
-	// Name returns the name of the collection.
+	// Name returns the committed name of the collection: a rename made in an
+	// open write transaction shows once it commits.
 	Name() string
 
 	// PrimaryKey returns the document field used as this collection's primary key.
@@ -83,7 +91,9 @@ type Collection interface {
 
 	// GetIndexes returns a list of indexes on the collection: range indexes
 	// followed by full-text indexes (a full-text Len is the number of indexed
-	// documents). Vector indexes are not listed yet.
+	// documents). Vector indexes are not listed yet. The list is the
+	// committed one: an index created or dropped in an open write
+	// transaction shows once it commits.
 	GetIndexes() (indexes []Index)
 
 	// CompactVectorIndex rebuilds the named vector index from its live vectors,
