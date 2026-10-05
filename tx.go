@@ -207,14 +207,17 @@ func (w writeTx) Context() context.Context {
 	return w.ctx
 }
 
-// unwind reverts this tx's in-memory schema publications, then rolls the
-// btree tx back. The order matters: the btree releases the global write lock
-// inside Rollback, and a writer acquiring it in the gap would still see the
-// phantom state — or commit its own index-set swaps that a late undo would
-// then clobber. Running the undos first is safe: this tx's writes were never
-// reader-visible, so the restored snapshots match the committed on-disk state
-// throughout.
+// unwind discards this tx's buffered full-text postings, reverts its
+// in-memory schema publications, then rolls the btree tx back. The postings
+// go at rollback, as FTS5 discards its pending data in xRollback, and before
+// the undos, as on a savepoint rollback. The order of the rest matters: the
+// btree releases the global write lock inside Rollback, and a writer
+// acquiring it in the gap would still see the phantom state — or commit its
+// own index-set swaps that a late undo would then clobber. Running the undos
+// first is safe: this tx's writes were never reader-visible, so the restored
+// snapshots match the committed on-disk state throughout.
 func (w writeTx) unwind() error {
+	w.db.resetAllFtsPending()
 	w.commonTx.runUndo(0)
 	w.commonTx.dropPubs(0)
 	return w.writeTx.Rollback()
@@ -346,8 +349,21 @@ func (tx *savepointTx) reset(wtx WriteTx, spId int) {
 	tx.version.Store(newTxVersion())
 }
 
+// orphaned reports that the transaction this savepoint belongs to has ended.
+// The savepoint ended with it — SQLite frees every savepoint when the
+// transaction ends (sqlite3CloseSavepoints) and a later RELEASE or ROLLBACK TO
+// fails with "no such savepoint". The parent's pooled state, the btree tx and
+// the writer's buffers may already serve another transaction: touch nothing.
+func (w savepointWrapper) orphaned() bool {
+	return w.WriteTx.Done()
+}
+
 func (w savepointWrapper) Commit() error {
 	if w.savepointTx.version.CompareAndSwap(w.version, 0) {
+		if w.orphaned() {
+			savepointPool.Put(w.savepointTx)
+			return ErrTxIsUsed
+		}
 		btWtx := w.WriteTx.btreeWriteTx()
 		if err := btWtx.ReleaseSavepoint(w.savepointId); err != nil {
 			return err
@@ -359,6 +375,10 @@ func (w savepointWrapper) Commit() error {
 
 func (w savepointWrapper) Rollback() error {
 	if w.savepointTx.version.CompareAndSwap(w.version, 0) {
+		if w.orphaned() {
+			savepointPool.Put(w.savepointTx)
+			return ErrTxIsUsed
+		}
 		btWtx := w.WriteTx.btreeWriteTx()
 		db := w.WriteTx.dbRef()
 		err := btWtx.RollbackToSavepoint(w.savepointId)
@@ -383,7 +403,7 @@ func (w savepointWrapper) Rollback() error {
 }
 
 func (w savepointWrapper) Done() bool {
-	return w.savepointTx.version.Load() != w.version
+	return w.savepointTx.version.Load() != w.version || w.orphaned()
 }
 
 type noOpTx struct {

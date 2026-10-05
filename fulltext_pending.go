@@ -174,6 +174,7 @@ func (fx *ftsIndex) removePostingPending(term string, docID uint64) {
 }
 
 func (fx *ftsIndex) pendingChunkFor(term string, docID uint64) *pendingChunk {
+	fx.c.markFtsDirty()
 	if fx.pending.chunks == nil {
 		fx.pending.chunks = make(map[string]*pendingChunk, 16)
 	}
@@ -191,6 +192,7 @@ func (fx *ftsIndex) pendingChunkFor(term string, docID uint64) *pendingChunk {
 }
 
 func (fx *ftsIndex) vocabDeltaPending(term string, delta int64) {
+	fx.c.markFtsDirty()
 	if fx.pending.vocab == nil {
 		fx.pending.vocab = make(map[string]int64, 16)
 	}

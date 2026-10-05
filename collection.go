@@ -209,6 +209,11 @@ type collection struct {
 	// the verdict stays stale and a fresher begin converges.
 	indexSetCookie uint32
 
+	// sketchDirty and ftsDirty record membership in db.sketchDirty and
+	// db.ftsDirty; writer-owned like the lists.
+	sketchDirty bool
+	ftsDirty    bool
+
 	closed atomic.Bool
 	// userClosed records that Close() was explicitly requested. Drop flips
 	// closed itself (CAS), which makes a Close() racing in AFTER the flip a
@@ -246,6 +251,22 @@ func (c *collection) loadFtsIndexes() []*ftsIndex {
 // storeFtsIndexes publishes a new full-text index snapshot. Callers hold c.mu.
 func (c *collection) storeFtsIndexes(idxs []*ftsIndex) {
 	c.ftsIndexes.Store(&idxs)
+}
+
+// markSketchDirty lists the collection in db.sketchDirty. Writer only.
+func (c *collection) markSketchDirty() {
+	if !c.sketchDirty {
+		c.sketchDirty = true
+		c.db.sketchDirty = append(c.db.sketchDirty, c)
+	}
+}
+
+// markFtsDirty lists the collection in db.ftsDirty. Writer only.
+func (c *collection) markFtsDirty() {
+	if !c.ftsDirty {
+		c.ftsDirty = true
+		c.db.ftsDirty = append(c.db.ftsDirty, c)
+	}
 }
 
 // loadVectorIndexes returns the current vector-index snapshot (lock-free).
@@ -1453,6 +1474,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 		c.storeIndexes(next)
 
 		c.name = newName
+		c.db.renaming = append(c.db.renaming, c)
 
 		// The handle registry is re-keyed only at COMMIT (see commonTx.pubs):
 		// re-keying here would open a window where a concurrent
@@ -1475,6 +1497,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 			// invalidating a just-renamed live handle (keyNotFound on the new
 			// name). See reconcileIndexSet.
 			c.validFromCookie.Store(renameValidFrom)
+			c.db.renameResolved(c)
 			c.db.mu.Lock()
 			if cur, ok := c.db.openedCollections[oldName]; ok && cur == Collection(c) {
 				delete(c.db.openedCollections, oldName)
@@ -1494,12 +1517,13 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 		// through the clones: propagate their modified flags so the next tx
 		// begin rebases the restored sketches to committed bytes.
 		wtx.onRollbackUndo(func() {
+			c.db.renameResolved(c)
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			c.name = oldName
 			for i, idx := range prevIdxs {
 				if next[i] != idx && next[i].sketchModified {
-					idx.sketchModified = true
+					idx.markSketchModified()
 				}
 			}
 			c.storeIndexes(prevIdxs)
@@ -1570,9 +1594,7 @@ func (c *collection) Drop(ctx context.Context) error {
 		// The eviction is onCollectionClose verbatim (identity scan — a
 		// Rename earlier in this tx re-keys the entry in its own, earlier
 		// publication and declines to resurrect a closed handle; a same-tx
-		// recreate replaced it, making this a no-op). Its orphan-fts append
-		// is dead weight here: the buffers were reset above and the closed
-		// handle cannot repopulate them.
+		// recreate replaced it, making this a no-op).
 		wtx.onCommitPublish(func() {
 			c.db.onCollectionClose(c)
 		})
@@ -1759,7 +1781,7 @@ func (c *collection) reloadSketch(tx *btree.ReadTx, idx *index, writable bool) {
 	}
 	// idx.sketch is only replaced under c.mu (held here) or before the index
 	// is published, so the identity check is race-free; a commit that
-	// republishes live concurrently (persistSketches runs under db.mu) is
+	// republishes live concurrently (persistSketches takes no c.mu) is
 	// overtaken by this snapshot's bytes, as a fresh object would be. Bytes
 	// of another shape (a snapshot older than this handle's definition) go
 	// into a fresh object: a published one is never reshaped.

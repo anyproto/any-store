@@ -426,6 +426,13 @@ func (idx *index) loadPubSketch() *qplanner.IndexSketch { return idx.sketchPub.L
 // serialisation, like storeIndexes); readers need no lock.
 func (idx *index) storePubSketch(s *qplanner.IndexSketch) { idx.sketchPub.Store(s) }
 
+// markSketchModified flags the live sketch as holding unpersisted deltas and
+// lists the collection for the commit persist and the begin-time rebase.
+func (idx *index) markSketchModified() {
+	idx.sketchModified = true
+	idx.c.markSketchDirty()
+}
+
 // visibleTo reports whether the given tx may plan with this handle. Fast
 // path: any write-tx view is the single writer's own (which must see its
 // uncommitted DDL for same-tx maintenance and queries), and a snapshot cookie
@@ -623,13 +630,13 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 		}
 		if idx.sketch != nil {
 			idx.applySketch(ki, prevKi, true)
-			idx.sketchModified = true
+			idx.markSketchModified()
 		}
 		prevKi = ki
 	}
 	if idx.sketch != nil {
 		idx.sketch.IncrementDocCount()
-		idx.sketchModified = true
+		idx.markSketchModified()
 	}
 	return nil
 }
@@ -688,13 +695,13 @@ func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 		}
 		if idx.sketch != nil {
 			idx.applySketch(ki, prevKi, false)
-			idx.sketchModified = true
+			idx.markSketchModified()
 		}
 		prevKi = ki
 	}
 	if idx.sketch != nil {
 		idx.sketch.DecrementDocCount()
-		idx.sketchModified = true
+		idx.markSketchModified()
 	}
 	return nil
 }
