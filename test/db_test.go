@@ -628,6 +628,55 @@ func TestSketchNoAccumulatingDriftAcrossRolledBackTxs(t *testing.T) {
 	assert.Equal(t, uint64(N+1), st.Indexes[0].SketchDocCount, "in-memory sketch == true N+1")
 }
 
+// A rolled-back write to one collection is cleaned up by the next write tx
+// even when that tx writes another collection: the phantom deltas neither stay
+// in memory nor reach disk with the other collection's commit.
+func TestSketchRollbackCleanedByWriteToAnotherCollection(t *testing.T) {
+	const N = 10
+
+	fx := newFixture(t)
+	insp := fx.DB.(anystore.IndexSketchInspector)
+	create := func(name string) anystore.Collection {
+		coll, err := fx.CreateCollection(ctx, name)
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"k"}}))
+		for i := 0; i < N; i++ {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"k":%d}`, i, i))))
+		}
+		return coll
+	}
+	sketchCounts := func(coll anystore.Collection, name string) (live, disk uint64) {
+		st, err := coll.Stats(ctx)
+		require.NoError(t, err)
+		require.Len(t, st.Indexes, 1)
+		on, err := insp.InspectIndexSketch(ctx, name, "k")
+		require.NoError(t, err)
+		return st.Indexes[0].SketchDocCount, on.DocCount
+	}
+	a, b := create("a"), create("b")
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	for j := 0; j < 3; j++ {
+		require.NoError(t, a.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"k":%d}`, 1000+j, 1000+j))))
+	}
+	require.NoError(t, tx.Rollback())
+
+	require.NoError(t, b.Insert(ctx, anyenc.MustParseJson(`{"id":2000,"k":2000}`)))
+
+	live, disk := sketchCounts(a, "a")
+	assert.Equal(t, uint64(N), live, "a: live sketch rebased by a tx that wrote only b")
+	assert.Equal(t, uint64(N), disk, "a: rolled-back deltas never persisted")
+	live, disk = sketchCounts(b, "b")
+	assert.Equal(t, uint64(N+1), live)
+	assert.Equal(t, uint64(N+1), disk)
+
+	require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(`{"id":3000,"k":3000}`)))
+	live, disk = sketchCounts(a, "a")
+	assert.Equal(t, uint64(N+1), live)
+	assert.Equal(t, uint64(N+1), disk)
+}
+
 // TestSketchNoDriftOnUniqueViolationRollback covers the most common real trigger
 // of the rolled-back-sketch-delta class (case C1): a batch Insert whose later doc
 // violates a unique constraint auto-rolls-back the whole tx (doWriteTx), leaving

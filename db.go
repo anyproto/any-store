@@ -284,7 +284,28 @@ type db struct {
 	// TestFtsPendingSurvivesCollectionCloseMidTx).
 	// Guarded by db.mu; drained by the next flush or reset.
 	orphanFtsPending []*ftsIndex
-	closed           atomic.Bool
+
+	// sketchDirty and ftsDirty list the collections holding writer state to
+	// persist, flush or discard: an index whose live sketch has unpersisted
+	// deltas (index.sketchModified), and buffered full-text postings
+	// (ftsIndex.pending). A collection joins when that state is created, so
+	// begin, commit and savepoints visit only what was written — the analog
+	// of SQLite's db->aVTrans, the virtual tables that joined the transaction
+	// (vtab.c). Two deliberate differences: an fts entry leaves at each
+	// flush rather than at transaction end, so a verb in a long tx visits
+	// the non-empty buffers only; and what a rolled-back tx leaves behind is
+	// discarded at the next write-tx begin rather than at rollback, because
+	// the committed sketch bytes are readable only once the btree rollback
+	// has released the write lock.
+	//
+	// Writer-owned, no mutex: every access holds the btree write lock, or
+	// ddlUnwindGate while a failed commit unwinds (newWriteTx passes the gate
+	// before reading them). Nothing touches them after a btree commit
+	// succeeded. A closed collection stays listed.
+	sketchDirty []*collection
+	ftsDirty    []*collection
+
+	closed atomic.Bool
 
 	dirtyOnOpen             bool
 	dirtyQuickCheckDuration time.Duration
@@ -691,26 +712,36 @@ func (db *db) reloadSketches(tx *btree.ReadTx) {
 // tx begin, with zero cost on the all-commit happy path (sketchModified is
 // false there, so the reload is skipped). Write-tx only: the caller holds the
 // btree write lock, so the live sketch has a single mutator.
+//
+// Only db.sketchDirty is visited, and this is where a collection leaves it:
+// once closed, or once none of its indexes is flagged. An index with no
+// committed bytes keeps its flag through the rebase and stays listed for the
+// next commit to persist.
 func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
-	db.mu.Lock()
-	colls := make([]*collection, 0, len(db.openedCollections))
-	for _, coll := range db.openedCollections {
-		colls = append(colls, coll.(*collection))
-	}
-	db.mu.Unlock()
-
-	for _, c := range colls {
-		c.mu.Lock()
-		for _, idx := range c.loadIndexes() {
-			if idx.sketchModified {
-				// reloadSketch (writable) rebases live to the committed bytes and
-				// clears sketchModified; if there are no committed bytes yet
-				// (brand-new pre-commit index) it preserves the built sketch.
-				c.reloadSketch(tx, idx, true)
+	kept := db.sketchDirty[:0]
+	for _, c := range db.sketchDirty {
+		flagged := false
+		if !c.closed.Load() {
+			c.mu.Lock()
+			for _, idx := range c.loadIndexes() {
+				if idx.sketchModified {
+					// reloadSketch (writable) rebases live to the committed bytes and
+					// clears sketchModified; if there are no committed bytes yet
+					// (brand-new pre-commit index) it preserves the built sketch.
+					c.reloadSketch(tx, idx, true)
+					flagged = flagged || idx.sketchModified
+				}
 			}
+			c.mu.Unlock()
 		}
-		c.mu.Unlock()
+		if flagged {
+			kept = append(kept, c)
+		} else {
+			c.sketchDirty = false
+		}
 	}
+	clear(db.sketchDirty[len(kept):])
+	db.sketchDirty = kept
 }
 
 func mergeCollOpts(opts []CollectionOptions) CollectionOptions {
@@ -1324,18 +1355,18 @@ func (db *db) onCollectionClose(c *collection) {
 	db.mu.Unlock()
 }
 
-// persistAllDirtySketches writes all modified sketches for all open collections.
-// Called once per write transaction commit to batch sketch persistence.
+// persistAllDirtySketches writes the modified sketches of the collections in
+// db.sketchDirty. Called once per write transaction commit to batch sketch
+// persistence. It removes nothing from the list: the next write-tx begin
+// does (resetUncommittedSketches), which also reaches a collection a failed
+// commit's undo un-closed.
 func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	for _, coll := range db.openedCollections {
-		c := coll.(*collection)
+	for _, c := range db.sketchDirty {
 		if c.closed.Load() {
-			// A Drop in this tx (eviction deferred to its commit
-			// publication): its stat_data rows were deleted with the
-			// collection — persisting the still-dirty sketches would durably
-			// resurrect orphaned rows a later same-named index would adopt.
+			// Closed in this tx. For a Drop, the stat_data rows were deleted
+			// with the collection — persisting the still-dirty sketches would
+			// durably resurrect orphaned rows a later same-named index would
+			// adopt.
 			continue
 		}
 		if err := c.persistSketches(tx); err != nil {
@@ -1377,13 +1408,14 @@ func (db *db) ambientWriteTx(ctx context.Context) (WriteTx, bool) {
 	return wtx, true
 }
 
-// flushAllFtsPending flushes every open collection's full-text write-back
-// buffer into the B-tree. Called once per write-tx commit, BEFORE the btree
-// commit, so the buffered postings land in the SAME atomic transaction as the
-// document writes — preserving strong cross-process consistency (another
-// process opening a read tx after commit sees a complete, consistent index; a
-// crash leaves no doc without its postings). The buffer never survives the
-// commit boundary.
+// flushAllFtsPending flushes the full-text write-back buffers of the
+// collections in db.ftsDirty into the B-tree. Called once per write-tx commit,
+// BEFORE the btree commit, so the buffered postings land in the SAME atomic
+// transaction as the document writes — preserving strong cross-process
+// consistency (another process opening a read tx after commit sees a
+// complete, consistent index; a crash leaves no doc without its postings).
+// The buffer never survives the commit boundary. A failed flush leaves the
+// list as it was.
 func (db *db) flushAllFtsPending(tx *btree.WriteTx) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -1396,14 +1428,14 @@ func (db *db) flushAllFtsPending(tx *btree.WriteTx) error {
 		}
 	}
 	db.orphanFtsPending = db.orphanFtsPending[:0]
-	for _, coll := range db.openedCollections {
-		c := coll.(*collection)
+	for _, c := range db.ftsDirty {
 		for _, fx := range c.loadFtsIndexes() {
 			if err := fx.flushPending(tx); err != nil {
 				return err
 			}
 		}
 	}
+	db.clearFtsDirty()
 	return nil
 }
 
@@ -1417,12 +1449,21 @@ func (db *db) resetAllFtsPending() {
 		fx.pending.reset()
 	}
 	db.orphanFtsPending = db.orphanFtsPending[:0]
-	for _, coll := range db.openedCollections {
-		c := coll.(*collection)
+	for _, c := range db.ftsDirty {
 		for _, fx := range c.loadFtsIndexes() {
 			fx.pending.reset()
 		}
 	}
+	db.clearFtsDirty()
+}
+
+// clearFtsDirty empties db.ftsDirty once its buffers are flushed or reset.
+func (db *db) clearFtsDirty() {
+	for i, c := range db.ftsDirty {
+		c.ftsDirty = false
+		db.ftsDirty[i] = nil
+	}
+	db.ftsDirty = db.ftsDirty[:0]
 }
 
 // getIndexInfos reads all index metadata for a collection from the system namespace

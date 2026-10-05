@@ -21,6 +21,7 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
+	"github.com/anyproto/any-store/v2/query"
 )
 
 // ANYSTORE_TEST_PPROF=<addr> serves net/http/pprof for the run, e.g.
@@ -1824,4 +1825,211 @@ func TestReconcileRatchet_RollbackLeavesRatchetUntouched(t *testing.T) {
 	require.Equal(t, 10, n)
 	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
 	require.NoError(t, coll.DropIndex(ctx, "a"))
+}
+
+// The writer lists only the collections it wrote (db.sketchDirty,
+// db.ftsDirty); begin, commit and savepoints visit those and nothing else.
+func TestWriteTx_DirtyLists(t *testing.T) {
+	create := func(t *testing.T, fx *fixture, name string, infos ...IndexInfo) *collection {
+		coll, err := fx.CreateCollection(ctx, name)
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, infos...))
+		return coll.(*collection)
+	}
+	rangeIdx := IndexInfo{Fields: []string{"a"}}
+	ftsIdx := IndexInfo{Kind: IndexKindFulltext, Fields: []string{"body"}}
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"body":"word%d here"}`, id, id, id))
+	}
+
+	t.Run("sketches: joined on write, left at the next begin", func(t *testing.T) {
+		fx := newFixture(t)
+		dbi := fx.DB.(*db)
+		a, b := create(t, fx, "a", rangeIdx), create(t, fx, "b", rangeIdx)
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		assert.Empty(t, dbi.sketchDirty, "begin drains what earlier txs left")
+		require.NoError(t, a.Insert(tx.Context(), doc(1)))
+		assert.Equal(t, []*collection{a}, dbi.sketchDirty)
+		require.NoError(t, tx.Commit())
+		assert.Equal(t, []*collection{a}, dbi.sketchDirty, "commit persists and removes nothing")
+		assert.False(t, a.loadIndexes()[0].sketchModified)
+
+		require.NoError(t, b.Insert(ctx, doc(1)))
+		assert.Equal(t, []*collection{b}, dbi.sketchDirty)
+		assert.False(t, a.sketchDirty)
+	})
+
+	t.Run("sketches: a rollback is rebased by a tx writing another collection", func(t *testing.T) {
+		fx := newFixture(t)
+		dbi := fx.DB.(*db)
+		a, b := create(t, fx, "a", rangeIdx), create(t, fx, "b", rangeIdx)
+		require.NoError(t, a.Insert(ctx, doc(1)))
+		idx := a.loadIndexes()[0]
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.Insert(tx.Context(), doc(2), doc(3)))
+		require.NoError(t, tx.Rollback())
+		assert.Equal(t, []*collection{a}, dbi.sketchDirty)
+		assert.True(t, idx.sketchModified)
+		assert.EqualValues(t, 3, idx.sketch.GetDocCount())
+
+		require.NoError(t, b.Insert(ctx, doc(1)))
+		assert.False(t, idx.sketchModified)
+		assert.EqualValues(t, 1, idx.sketch.GetDocCount())
+		assert.Equal(t, []*collection{b}, dbi.sketchDirty)
+		on, err := dbi.InspectIndexSketch(ctx, "a", "a")
+		require.NoError(t, err)
+		assert.EqualValues(t, 1, on.DocCount)
+	})
+
+	// reloadSketch has nothing to rebase to and keeps the flag: the collection
+	// stays listed until a commit writes the row.
+	t.Run("sketches: no committed row keeps the collection listed", func(t *testing.T) {
+		fx := newFixture(t)
+		dbi := fx.DB.(*db)
+		a, b := create(t, fx, "a", rangeIdx), create(t, fx, "b", rangeIdx)
+		require.NoError(t, a.Insert(ctx, doc(1)))
+		require.NoError(t, dbi.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+			return tx.Delete(dbi.systemNS, sketchKey("a", "a"))
+		}))
+		idx := a.loadIndexes()[0]
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.Insert(tx.Context(), doc(2)))
+		require.NoError(t, tx.Rollback())
+
+		tx, err = fx.WriteTx(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []*collection{a}, dbi.sketchDirty)
+		assert.True(t, idx.sketchModified)
+		require.NoError(t, b.Insert(tx.Context(), doc(1)))
+		require.NoError(t, tx.Commit())
+		assert.False(t, idx.sketchModified)
+		_, err = dbi.InspectIndexSketch(ctx, "a", "a")
+		require.NoError(t, err, "the commit persisted the row")
+
+		require.NoError(t, b.Insert(ctx, doc(2)))
+		assert.Equal(t, []*collection{b}, dbi.sketchDirty)
+	})
+
+	t.Run("fulltext: listed while postings are buffered", func(t *testing.T) {
+		fx := newFixture(t)
+		dbi := fx.DB.(*db)
+		a, b := create(t, fx, "a", ftsIdx), create(t, fx, "b", rangeIdx)
+		pending := &a.loadFtsIndexes()[0].pending
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.Insert(tx.Context(), doc(1)))
+		assert.Equal(t, []*collection{a}, dbi.ftsDirty)
+		assert.False(t, pending.empty())
+
+		// The next verb's savepoint flushes first.
+		require.NoError(t, b.Insert(tx.Context(), doc(1)))
+		assert.Empty(t, dbi.ftsDirty)
+		assert.False(t, a.ftsDirty)
+		assert.True(t, pending.empty())
+
+		require.NoError(t, a.Insert(tx.Context(), doc(2)))
+		assert.Equal(t, []*collection{a}, dbi.ftsDirty)
+		require.NoError(t, tx.Rollback())
+		assert.Equal(t, []*collection{a}, dbi.ftsDirty)
+
+		tx, err = fx.WriteTx(ctx)
+		require.NoError(t, err)
+		assert.Empty(t, dbi.ftsDirty, "begin discards what the rollback left")
+		assert.True(t, pending.empty())
+		require.NoError(t, a.Insert(tx.Context(), doc(3)))
+		require.NoError(t, tx.Commit())
+		assert.Empty(t, dbi.ftsDirty)
+
+		n, err := a.Find(`{"$text":{"$search":"word3"}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+		n, err = a.Find(`{"$text":{"$search":"word1 word2"}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 0, n, "rolled-back postings must not surface")
+	})
+
+	t.Run("fulltext: a long tx keeps one entry", func(t *testing.T) {
+		fx := newFixture(t)
+		dbi := fx.DB.(*db)
+		colls := make([]*collection, 8)
+		for i := range colls {
+			colls[i] = create(t, fx, fmt.Sprintf("c%d", i), ftsIdx, rangeIdx)
+		}
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		for i, c := range colls {
+			require.NoError(t, c.Insert(tx.Context(), doc(i)))
+			assert.Equal(t, []*collection{c}, dbi.ftsDirty)
+		}
+		assert.Equal(t, colls, dbi.sketchDirty)
+		require.NoError(t, tx.Commit())
+		assert.Empty(t, dbi.ftsDirty)
+
+		for i, c := range colls {
+			n, err := c.Find(fmt.Sprintf(`{"$text":{"$search":"word%d"}}`, i)).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 1, n)
+		}
+	})
+}
+
+// BenchmarkWriteTx_OpenCollections writes to one collection of a db holding n
+// open ones: the cost of a write must not depend on n.
+func BenchmarkWriteTx_OpenCollections(b *testing.B) {
+	for _, n := range []int{1, 1000, 20000} {
+		b.Run(fmt.Sprintf("open=%d", n), func(b *testing.B) {
+			fx := newFixture(b)
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(b, err)
+			colls := make([]Collection, n)
+			for i := range colls {
+				colls[i], err = fx.CreateCollection(tx.Context(), fmt.Sprintf("c%05d", i))
+				require.NoError(b, err)
+				require.NoError(b, colls[i].EnsureIndex(tx.Context(), IndexInfo{Fields: []string{"a"}}))
+			}
+			coll := colls[0]
+			require.NoError(b, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1,"a":0,"v":0}`)))
+			require.NoError(b, tx.Commit())
+
+			inc := query.MustParseModifier(`{"$inc":{"v":1}}`)
+			same := query.MustParseModifier(`{"$set":{"a":0}}`)
+
+			b.Run("UpdateId", func(b *testing.B) {
+				b.ReportAllocs()
+				for range b.N {
+					_, err := coll.UpdateId(ctx, 1, inc)
+					require.NoError(b, err)
+				}
+			})
+			// Nothing modified: the tx begins and commits without writing.
+			b.Run("UpdateIdNoChange", func(b *testing.B) {
+				b.ReportAllocs()
+				for range b.N {
+					_, err := coll.UpdateId(ctx, 1, same)
+					require.NoError(b, err)
+				}
+			})
+			// Ten verbs in one tx: each opens a savepoint.
+			b.Run("Tx10", func(b *testing.B) {
+				b.ReportAllocs()
+				for range b.N {
+					tx, err := fx.WriteTx(ctx)
+					require.NoError(b, err)
+					for range 10 {
+						_, err = coll.UpdateId(tx.Context(), 1, inc)
+						require.NoError(b, err)
+					}
+					require.NoError(b, tx.Commit())
+				}
+			})
+		})
+	}
 }
