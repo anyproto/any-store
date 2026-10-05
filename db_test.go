@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -1841,24 +1842,36 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 	doc := func(id int) *anyenc.Value {
 		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"body":"word%d here"}`, id, id, id))
 	}
+	// Names, not handles: a failed assertion on handles prints the whole db.
+	names := func(cs []*collection) []string {
+		ns := make([]string, len(cs))
+		for i, c := range cs {
+			ns[i] = c.name
+		}
+		return ns
+	}
 
 	t.Run("sketches: joined on write, left at the next begin", func(t *testing.T) {
 		fx := newFixture(t)
 		dbi := fx.DB.(*db)
 		a, b := create(t, fx, "a", rangeIdx), create(t, fx, "b", rangeIdx)
 
+		assert.Empty(t, names(dbi.sketchDirty), "creating a collection and an index over no documents lists nothing")
 		tx, err := fx.WriteTx(ctx)
 		require.NoError(t, err)
-		assert.Empty(t, dbi.sketchDirty, "begin drains what earlier txs left")
 		require.NoError(t, a.Insert(tx.Context(), doc(1)))
-		assert.Equal(t, []*collection{a}, dbi.sketchDirty)
+		assert.Equal(t, []string{"a"}, names(dbi.sketchDirty))
 		require.NoError(t, tx.Commit())
-		assert.Equal(t, []*collection{a}, dbi.sketchDirty, "commit persists and removes nothing")
+		assert.Equal(t, []string{"a"}, names(dbi.sketchDirty), "commit persists and removes nothing")
 		assert.False(t, a.loadIndexes()[0].sketchModified)
 
-		require.NoError(t, b.Insert(ctx, doc(1)))
-		assert.Equal(t, []*collection{b}, dbi.sketchDirty)
+		tx, err = fx.WriteTx(ctx)
+		require.NoError(t, err)
+		assert.Empty(t, names(dbi.sketchDirty), "begin drains what the commit left")
 		assert.False(t, a.sketchDirty)
+		require.NoError(t, b.Insert(tx.Context(), doc(1)))
+		assert.Equal(t, []string{"b"}, names(dbi.sketchDirty))
+		require.NoError(t, tx.Commit())
 	})
 
 	t.Run("sketches: a rollback is rebased by a tx writing another collection", func(t *testing.T) {
@@ -1872,14 +1885,14 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, a.Insert(tx.Context(), doc(2), doc(3)))
 		require.NoError(t, tx.Rollback())
-		assert.Equal(t, []*collection{a}, dbi.sketchDirty)
+		assert.Equal(t, []string{"a"}, names(dbi.sketchDirty))
 		assert.True(t, idx.sketchModified)
 		assert.EqualValues(t, 3, idx.sketch.GetDocCount())
 
 		require.NoError(t, b.Insert(ctx, doc(1)))
 		assert.False(t, idx.sketchModified)
 		assert.EqualValues(t, 1, idx.sketch.GetDocCount())
-		assert.Equal(t, []*collection{b}, dbi.sketchDirty)
+		assert.Equal(t, []string{"b"}, names(dbi.sketchDirty))
 		on, err := dbi.InspectIndexSketch(ctx, "a", "a")
 		require.NoError(t, err)
 		assert.EqualValues(t, 1, on.DocCount)
@@ -1904,7 +1917,7 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 
 		tx, err = fx.WriteTx(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, []*collection{a}, dbi.sketchDirty)
+		assert.Equal(t, []string{"a"}, names(dbi.sketchDirty))
 		assert.True(t, idx.sketchModified)
 		require.NoError(t, b.Insert(tx.Context(), doc(1)))
 		require.NoError(t, tx.Commit())
@@ -1913,7 +1926,28 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		require.NoError(t, err, "the commit persisted the row")
 
 		require.NoError(t, b.Insert(ctx, doc(2)))
-		assert.Equal(t, []*collection{b}, dbi.sketchDirty)
+		assert.Equal(t, []string{"b"}, names(dbi.sketchDirty))
+	})
+
+	// The rebase finds no row for a dropped collection either; being closed
+	// is what takes it off the list.
+	t.Run("sketches: a collection dropped after a write leaves at the next begin", func(t *testing.T) {
+		fx := newFixture(t)
+		dbi := fx.DB.(*db)
+		a := create(t, fx, "a", rangeIdx)
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.Insert(tx.Context(), doc(1)))
+		require.NoError(t, a.Drop(tx.Context()))
+		require.NoError(t, tx.Commit())
+		assert.Equal(t, []string{"a"}, names(dbi.sketchDirty))
+
+		tx, err = fx.WriteTx(ctx)
+		require.NoError(t, err)
+		assert.Empty(t, names(dbi.sketchDirty))
+		assert.False(t, a.sketchDirty)
+		require.NoError(t, tx.Rollback())
 	})
 
 	t.Run("fulltext: listed while postings are buffered", func(t *testing.T) {
@@ -1925,27 +1959,24 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		tx, err := fx.WriteTx(ctx)
 		require.NoError(t, err)
 		require.NoError(t, a.Insert(tx.Context(), doc(1)))
-		assert.Equal(t, []*collection{a}, dbi.ftsDirty)
+		assert.Equal(t, []string{"a"}, names(dbi.ftsDirty))
 		assert.False(t, pending.empty())
 
 		// The next verb's savepoint flushes first.
 		require.NoError(t, b.Insert(tx.Context(), doc(1)))
-		assert.Empty(t, dbi.ftsDirty)
+		assert.Empty(t, names(dbi.ftsDirty))
 		assert.False(t, a.ftsDirty)
 		assert.True(t, pending.empty())
 
 		require.NoError(t, a.Insert(tx.Context(), doc(2)))
-		assert.Equal(t, []*collection{a}, dbi.ftsDirty)
+		assert.Equal(t, []string{"a"}, names(dbi.ftsDirty))
 		require.NoError(t, tx.Rollback())
-		assert.Equal(t, []*collection{a}, dbi.ftsDirty)
-
-		tx, err = fx.WriteTx(ctx)
-		require.NoError(t, err)
-		assert.Empty(t, dbi.ftsDirty, "begin discards what the rollback left")
+		assert.Empty(t, names(dbi.ftsDirty), "the rollback discards the buffer")
+		assert.False(t, a.ftsDirty)
 		assert.True(t, pending.empty())
-		require.NoError(t, a.Insert(tx.Context(), doc(3)))
-		require.NoError(t, tx.Commit())
-		assert.Empty(t, dbi.ftsDirty)
+
+		require.NoError(t, a.Insert(ctx, doc(3)))
+		assert.Empty(t, names(dbi.ftsDirty))
 
 		n, err := a.Find(`{"$text":{"$search":"word3"}}`).Count(ctx)
 		require.NoError(t, err)
@@ -1967,17 +1998,93 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		require.NoError(t, err)
 		for i, c := range colls {
 			require.NoError(t, c.Insert(tx.Context(), doc(i)))
-			assert.Equal(t, []*collection{c}, dbi.ftsDirty)
+			assert.Equal(t, []string{c.name}, names(dbi.ftsDirty))
 		}
-		assert.Equal(t, colls, dbi.sketchDirty)
+		assert.Equal(t, names(colls), names(dbi.sketchDirty))
 		require.NoError(t, tx.Commit())
-		assert.Empty(t, dbi.ftsDirty)
+		assert.Empty(t, names(dbi.ftsDirty))
 
 		for i, c := range colls {
 			n, err := c.Find(fmt.Sprintf(`{"$text":{"$search":"word%d"}}`, i)).Count(ctx)
 			require.NoError(t, err)
 			assert.Equal(t, 1, n)
 		}
+	})
+
+	// Reordering words rewrites postings without touching a vocab entry:
+	// the postings alone must list the collection for the commit flush.
+	t.Run("fulltext: an update that only reorders words is flushed", func(t *testing.T) {
+		fx := newFixture(t)
+		a := create(t, fx, "a", ftsIdx)
+		require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(`{"id":1,"body":"alpha beta"}`)))
+		require.NoError(t, a.UpdateOne(ctx, anyenc.MustParseJson(`{"id":1,"body":"beta alpha"}`)))
+
+		n, err := a.Find(`{"$text":{"$search":"\"beta alpha\""}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+		n, err = a.Find(`{"$text":{"$search":"\"alpha beta\""}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 0, n)
+	})
+
+	// A flush that fails leaves the collection listed, so the rollback still
+	// finds and discards the postings the flush did not write.
+	t.Run("fulltext: a failed flush keeps the collection listed", func(t *testing.T) {
+		fx := newFixture(t)
+		dbi := fx.DB.(*db)
+		a := create(t, fx, "a", ftsIdx)
+		require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(`{"id":1,"body":"term"}`)))
+		nsPost := a.loadFtsIndexes()[0].nsPost
+		// rewritePostings replaces every stored chunk with an undecodable
+		// one, or deletes them all.
+		rewritePostings := func(del bool) {
+			require.NoError(t, dbi.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+				var keys [][]byte
+				cur := tx.NewCursor(nsPost)
+				defer cur.Close()
+				if err := cur.First(); err != nil {
+					return err
+				}
+				for cur.Valid() {
+					k, err := cur.Key()
+					if err != nil {
+						return err
+					}
+					keys = append(keys, bytes.Clone(k))
+					if err = cur.Next(); err != nil {
+						return err
+					}
+				}
+				for _, k := range keys {
+					var err error
+					if del {
+						err = tx.Delete(nsPost, k)
+					} else {
+						err = tx.Put(nsPost, k, []byte{0xEE})
+					}
+					if err != nil {
+						return err
+					}
+				}
+				return nil
+			}))
+		}
+		rewritePostings(false)
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.Insert(tx.Context(), anyenc.MustParseJson(`{"id":2,"body":"term ghostword"}`)))
+		_, err = fx.CreateCollection(tx.Context(), "b")
+		require.Error(t, err, "the verb's savepoint flush reads the undecodable chunk")
+		assert.Equal(t, []string{"a"}, names(dbi.ftsDirty))
+		require.NoError(t, tx.Rollback())
+		assert.Empty(t, names(dbi.ftsDirty))
+
+		rewritePostings(true)
+		require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(`{"id":3,"body":"fresh"}`)))
+		n, err := a.Find(`{"$text":{"$search":"ghostword"}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 0, n, "postings of the rolled-back tx must not surface")
 	})
 }
 

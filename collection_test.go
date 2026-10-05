@@ -840,7 +840,7 @@ func TestRename_OpenNewNameInSameTx(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, h == a, "the renamed handle itself")
 		require.NoError(t, tx.Commit())
-		assert.Empty(t, dbi.renaming)
+		assert.Equal(t, 0, len(dbi.renaming))
 
 		// The fts namespaces are freed and reused by another collection; a
 		// write through h must not reach them.
@@ -870,7 +870,7 @@ func TestRename_OpenNewNameInSameTx(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, h == a, "the renamed handle itself")
 		require.NoError(t, tx.Rollback())
-		assert.Empty(t, dbi.renaming)
+		assert.Equal(t, 0, len(dbi.renaming))
 
 		assert.Equal(t, "a", a.Name())
 		_, err = fx.OpenCollection(ctx, "b")
@@ -888,7 +888,7 @@ func TestRename_OpenNewNameInSameTx(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, a.Rename(tx.Context(), "b"))
 		require.NoError(t, sp.Rollback())
-		assert.Empty(t, dbi.renaming)
+		assert.Equal(t, 0, len(dbi.renaming))
 		_, err = fx.OpenCollection(tx.Context(), "b")
 		assert.ErrorIs(t, err, ErrCollectionNotFound)
 		require.NoError(t, tx.Commit())
@@ -910,7 +910,7 @@ func TestRename_OpenNewNameInSameTx(t *testing.T) {
 		_, err = fx.OpenCollection(tx.Context(), "c")
 		assert.ErrorIs(t, err, ErrCollectionNotFound)
 		require.NoError(t, tx.Commit())
-		assert.Empty(t, dbi.renaming)
+		assert.Equal(t, 0, len(dbi.renaming))
 	})
 }
 

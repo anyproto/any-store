@@ -207,14 +207,17 @@ func (w writeTx) Context() context.Context {
 	return w.ctx
 }
 
-// unwind reverts this tx's in-memory schema publications, then rolls the
-// btree tx back. The order matters: the btree releases the global write lock
-// inside Rollback, and a writer acquiring it in the gap would still see the
-// phantom state — or commit its own index-set swaps that a late undo would
-// then clobber. Running the undos first is safe: this tx's writes were never
-// reader-visible, so the restored snapshots match the committed on-disk state
-// throughout.
+// unwind discards this tx's buffered full-text postings, reverts its
+// in-memory schema publications, then rolls the btree tx back. The postings
+// go at rollback, as FTS5 discards its pending data in xRollback, and before
+// the undos, as on a savepoint rollback. The order of the rest matters: the
+// btree releases the global write lock inside Rollback, and a writer
+// acquiring it in the gap would still see the phantom state — or commit its
+// own index-set swaps that a late undo would then clobber. Running the undos
+// first is safe: this tx's writes were never reader-visible, so the restored
+// snapshots match the committed on-disk state throughout.
 func (w writeTx) unwind() error {
+	w.db.resetAllFtsPending()
 	w.commonTx.runUndo(0)
 	w.commonTx.dropPubs(0)
 	return w.writeTx.Rollback()

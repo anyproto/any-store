@@ -277,18 +277,23 @@ type db struct {
 
 	openedCollections map[string]Collection
 
-	// sketchDirty and ftsDirty list the collections holding writer state to
-	// persist, flush or discard: an index whose live sketch has unpersisted
-	// deltas (index.sketchModified), and buffered full-text postings
-	// (ftsIndex.pending). A collection joins when that state is created, so
-	// begin, commit and savepoints visit only what was written — the analog
-	// of SQLite's db->aVTrans, the virtual tables that joined the transaction
-	// (vtab.c). Two deliberate differences: an fts entry leaves at each
-	// flush rather than at transaction end, so a verb in a long tx visits
-	// the non-empty buffers only; and what a rolled-back tx leaves behind is
-	// discarded at the next write-tx begin rather than at rollback, because
-	// the committed sketch bytes are readable only once the btree rollback
-	// has released the write lock.
+	// sketchDirty and ftsDirty list the collections whose writer state the
+	// end of a transaction has to visit: an index whose live sketch may hold
+	// unpersisted deltas (index.sketchModified), and buffered full-text
+	// postings (ftsIndex.pending). A collection joins when that state is
+	// created, so begin, commit, rollback and savepoints visit only what was
+	// written — the analog of SQLite's db->aVTrans, the virtual tables that
+	// joined the transaction (vtab.c).
+	//
+	// ftsDirty is emptied whenever the whole list is flushed or discarded,
+	// not at transaction end as aVTrans is: a verb in a long tx visits the
+	// non-empty buffers only.
+	//
+	// sketchDirty is a superset: a commit persists the listed collections
+	// and removes none; a collection leaves at the next write-tx begin,
+	// which also rebases what a rollback left. SQLite drops such state at
+	// rollback; here the committed sketch bytes are readable only once the
+	// btree rollback has released the write lock.
 	//
 	// Writer-owned, no mutex: every access holds the btree write lock, or
 	// ddlUnwindGate while a failed commit unwinds (newWriteTx passes the gate
@@ -840,12 +845,10 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 		// A rollback of this scope reverts the namespace + catalog entries
 		// created above, but not the registration — a later write through the
 		// cached handle would land on the freed root page. Evict on rollback.
-		// Deliberately NOT close(): onCollectionClose unconditionally deletes
-		// by name (the guarded delete here spares a same-name handle
-		// re-registered after the rollback) and leaves the fts pending
-		// buffers to the commit-time flush — but this collection's fts writes
-		// belong to the rolled-back tx and must never flush. Reset them and
-		// mark closed so the handle's own Close is a no-op.
+		// Deliberately NOT close(): a closed handle's fts pending buffers
+		// still flush at commit — but this collection's fts writes belong to
+		// the rolled-back tx and must never flush. Reset them and mark
+		// closed so the handle's own Close is a no-op.
 		wtx.onRollbackUndo(func() {
 			db.mu.Lock()
 			if cur, ok := db.openedCollections[collectionName]; ok && cur == coll {
@@ -1442,13 +1445,7 @@ func (db *db) ambientWriteTx(ctx context.Context) (WriteTx, bool) {
 // consistency (another process opening a read tx after commit sees a
 // complete, consistent index; a crash leaves no doc without its postings).
 // The buffer never survives the commit boundary. A failed flush leaves the
-// list as it was.
-//
-// The list is in first-write order: a collection closed in mid-tx flushes
-// before a same-name handle reopened after the close, so for a document
-// touched on both sides of the close the later postings win. An empty list
-// is left unwritten — $text reads sharing one write tx may get here
-// concurrently.
+// list as it was, for the rollback to discard.
 func (db *db) flushAllFtsPending(tx *btree.WriteTx) error {
 	if len(db.ftsDirty) == 0 {
 		return nil
@@ -1464,9 +1461,10 @@ func (db *db) flushAllFtsPending(tx *btree.WriteTx) error {
 	return nil
 }
 
-// resetAllFtsPending discards any buffered full-text writes left over from a
-// rolled-back transaction. Called at the start of every write tx so a new tx
-// begins with an empty buffer.
+// resetAllFtsPending discards the buffered full-text writes of the
+// collections in db.ftsDirty: when the tx or one of its savepoints rolls
+// back, and at the start of every write tx, which finds the list empty unless
+// a tx ended without either.
 func (db *db) resetAllFtsPending() {
 	if len(db.ftsDirty) == 0 {
 		return
