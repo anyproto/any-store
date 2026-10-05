@@ -1204,8 +1204,9 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 		if err := c.beginDDL(wtx); err != nil {
 			return err
 		}
-		c.mu.Lock()
-		defer c.mu.Unlock()
+		// The head is the writer's from beginDDL on: the set is read and the
+		// index rebuilt without c.mu, which a reader that has to load its own
+		// version would wait on for the whole compaction.
 		cur := c.loadVectorIndexes()
 		idx := -1
 		for i, vi := range cur {
@@ -1235,6 +1236,8 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 		// roots, so the pre-compaction snapshot must be restored — a handle
 		// left pointing at freed pages fails every subsequent vector op with
 		// "btree: key not found" until reopen.
+		c.mu.Lock()
+		defer c.mu.Unlock()
 		c.registerHeadRestore(wtx)
 		nvi.bindIdentity(c.cur().name)
 		next := make([]*vectorIndex, len(cur))

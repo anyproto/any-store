@@ -240,7 +240,9 @@ func (c *collection) resolve(tx *btree.ReadTx) (*collSchema, error) {
 // resolveAs is resolve by a caller that knows the name the collection has in
 // tx's view (it just read the catalog there): a transaction older than the
 // handle looks the collection up under it, where the handle may only know
-// later names.
+// later names. A transaction that speaks for the handle (resolveSlow) looks
+// under the handle's own name all the same: a collection another process
+// renamed has a handle to retire, not one to carry over to the new name.
 func (c *collection) resolveAs(tx *btree.ReadTx, name string) (*collSchema, error) {
 	if err := c.alive(); err != nil {
 		return nil, err
@@ -294,12 +296,12 @@ func (c *collection) resolveSlow(tx *btree.ReadTx, asName string) (*collSchema, 
 	}
 	speaks := cookieLE(e.start, cookie) && cookieLE(cookie, e.known) && cookieLE(c.since, cookie) &&
 		(head == nil || cookieLE(head.validFrom, cookie))
-	name := asName
-	if name == "" {
-		name = c.openName
-		if head != nil {
-			name = head.nameAt(cookie)
-		}
+	name := c.openName
+	if head != nil {
+		name = head.nameAt(cookie)
+	}
+	if asName != "" && !speaks {
+		name = asName
 	}
 	s, err := c.loadSchema(tx, name, head)
 	if err != nil {
