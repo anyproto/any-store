@@ -838,8 +838,13 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 
 		c := coll.(*collection)
 		db.mu.Lock()
-		// Plain assignment: a same-tx Drop's closed handle may still occupy
-		// the slot (its deferred eviction then finds nothing to evict).
+		// A same-tx Drop's closed handle may still occupy the slot: its
+		// eviction waits for the commit and then finds nothing to evict. A
+		// rollback puts it back. Only a handle that carries this tx's Drop
+		// qualifies (ddlTxs): one a staleness pass is retiring is on its
+		// way out of the registry.
+		dropped, hadDropped := db.openedCollections[collectionName]
+		hadDropped = hadDropped && dropped.(*collection).ddlTxs > 0
 		db.openedCollections[collectionName] = coll
 		// The creation is this handle's first uncommitted schema change.
 		c.ddlTxs++
@@ -848,7 +853,11 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 
 		// A rollback of this scope reverts the namespace + catalog entries
 		// created above, but not the registration — a later write through the
-		// cached handle would land on the freed root page. Evict on rollback.
+		// cached handle would land on the freed root page. Evict on rollback,
+		// restoring the dropped handle this one replaced: the Drop's undo
+		// un-closes a handle only if it finds it registered. Left out of
+		// the registry, a collection this tx created earlier and dropped in
+		// the rolled-back scope would be opened a second time.
 		// Deliberately NOT Close(): a closed handle's fts pending buffers
 		// still flush at commit — but this collection's fts writes belong to
 		// the rolled-back tx and must never flush. Reset them and mark
@@ -856,7 +865,11 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 		wtx.onRollbackUndo(func() {
 			db.mu.Lock()
 			if cur, ok := db.openedCollections[collectionName]; ok && cur == coll {
-				delete(db.openedCollections, collectionName)
+				if hadDropped {
+					db.openedCollections[collectionName] = dropped
+				} else {
+					delete(db.openedCollections, collectionName)
+				}
 			}
 			db.mu.Unlock()
 			for _, fx := range c.loadFtsIndexes() {

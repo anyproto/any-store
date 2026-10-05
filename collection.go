@@ -1565,8 +1565,9 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 // writes through that handle land inside the wrong collection. Deferring the
 // eviction keeps the closed handle registered through the window, so a
 // concurrent open returns it and fails fail-safe instead. A rollback un-closes
-// the handle: the btree restored the on-disk catalog, the map entry was never
-// touched, and Drop mutates no in-memory index set — so the handle is whole
+// the handle: the btree restored the on-disk catalog, the map entry is the
+// handle again (a same-tx recreate that replaced it put it back in its own
+// undo), and Drop mutates no in-memory index set — so the handle is whole
 // again.
 func (c *collection) Drop(ctx context.Context) error {
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
@@ -1586,12 +1587,9 @@ func (c *collection) Drop(ctx context.Context) error {
 			wtx.onRollbackUndo(func() {
 				// A Close() requested meanwhile stays pending: ddlEnd applies
 				// it once the handle's last schema change resolves.
-				// Un-close only while still registered: a same-tx recreate of
-				// the name replaced this map entry, and its own undo evicted
-				// the replacement — reviving an unregistered handle would let
-				// it dangle past future peer DDL (the staleness pass only
-				// walks the registry). Callers re-obtain via db.Collection,
-				// as before.
+				// Un-close only while registered: a handle outside the
+				// registry would dangle past future peer DDL (the staleness
+				// pass only walks the registry).
 				c.db.mu.Lock()
 				for _, cur := range c.db.openedCollections {
 					if cur == Collection(c) {

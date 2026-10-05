@@ -1024,10 +1024,8 @@ func TestDropThenRecreateSameTx(t *testing.T) {
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
 
-// Drop-then-recreate whose tx rolls back: reverse-order undos evict the
-// replacement and leave the original handle closed and unregistered (a revived
-// unregistered handle would escape the staleness pass); a fresh open finds the
-// original data.
+// Drop-then-recreate whose tx rolls back: the replacement is closed and the
+// original handle is whole again, as after any rolled-back Drop.
 func TestDropThenRecreateRollback(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "x")
@@ -1042,18 +1040,46 @@ func TestDropThenRecreateRollback(t *testing.T) {
 	require.NoError(t, coll2.Insert(tx.Context(), anyenc.MustParseJson(`{"id":"new"}`)))
 	require.NoError(t, tx.Rollback())
 
-	// Both tx-scoped handles are dead; a fresh open serves the old data.
 	_, err = coll2.FindId(ctx, "new")
 	assert.ErrorIs(t, err, anystore.ErrCollectionClosed)
+	_, err = coll.FindId(ctx, "old")
+	require.NoError(t, err)
 	reopened, err := fx.OpenCollection(ctx, "x")
 	require.NoError(t, err)
-	assert.NotSame(t, coll, reopened)
-	assert.NotSame(t, coll2, reopened)
-	_, err = reopened.FindId(ctx, "old")
+	assert.True(t, reopened == coll, "the original handle must be registered again")
+	assertCollCount(t, reopened, 1)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// A collection created in a write tx is dropped and recreated inside a
+// savepoint that rolls back. The creating handle is the collection's handle
+// again, so the rollback of the tx closes whatever was opened meanwhile.
+func TestDropThenRecreateInSavepointRollback(t *testing.T) {
+	fx := newFixture(t)
+	tx, err := fx.WriteTx(ctx)
 	require.NoError(t, err)
-	cnt, err := reopened.Count(ctx)
+	r, err := fx.CreateCollection(tx.Context(), "r")
 	require.NoError(t, err)
-	assert.Equal(t, 1, cnt)
+
+	sp, err := fx.WriteTx(tx.Context())
+	require.NoError(t, err)
+	require.NoError(t, r.Drop(sp.Context()))
+	_, err = fx.CreateCollection(sp.Context(), "r")
+	require.NoError(t, err)
+	require.NoError(t, sp.Rollback())
+
+	h, err := fx.OpenCollection(tx.Context(), "r")
+	require.NoError(t, err)
+	assert.True(t, h == r, "the creating handle must be the one opened")
+	require.NoError(t, h.Insert(tx.Context(), ddlDoc(1)))
+	require.NoError(t, tx.Rollback())
+
+	other, err := fx.CreateCollection(ctx, "other")
+	require.NoError(t, err)
+	assert.ErrorIs(t, h.Insert(ctx, ddlDoc(2)), anystore.ErrCollectionClosed)
+	_, err = fx.OpenCollection(ctx, "r")
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	assertCollCount(t, other, 0)
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
 
