@@ -977,7 +977,7 @@ func testFastBeginSnapshotCounters(t *testing.T, db *DB) {
 	// A peer's commit: the local cache lags, and nothing here remembers the
 	// snapshot's counters.
 	db.UpdateLocalCounters(fcc-1, sc-1)
-	db.snapCounters.put(0, &WalIndexHdr{}, 0, 0)
+	db.snapCounters.put(0, &WalIndexHdr{aSalt: [2]uint32{1, 1}}, 0, 0)
 	gotFCC, gotSC = snapshot()
 	assert.Equal(t, [2]uint32{fcc, sc}, [2]uint32{gotFCC, gotSC}, "read from page 1, not the lagging cache")
 	gotFCC, gotSC = snapshot()

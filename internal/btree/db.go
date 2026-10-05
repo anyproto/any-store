@@ -344,6 +344,12 @@ type DB struct {
 	// snapCounters holds the page-1 counters of the last snapshot whose
 	// counters were read or written here (see snapCountersMemo).
 	snapCounters snapCountersMemo
+	// commitHook is the committing transaction's OnCommitted callback while
+	// its commit is inside the pager, and published the header that commit
+	// made visible, if it is a synthesized one. Writer-owned.
+	commitHook   func(fileChangeCounter, schemaCookie uint32)
+	published    WalIndexHdr
+	hasPublished bool
 
 	readTxPool  sync.Pool
 	writeTxPool sync.Pool
@@ -655,6 +661,20 @@ func Open(path string, opts Options) (*DB, error) {
 		readerCaches:    make(chan *pcache, maxReaders),
 		readerSem:       make(chan struct{}, maxReaders),
 		closeCh:         make(chan struct{}),
+	}
+
+	// A reader that pins a commit while it is still on its way out of
+	// pager.commit finds its counters remembered: the pager has them in its
+	// header before the frames are written. The dataVersion is the one such
+	// a reader loads.
+	p.wal.onPublish = func(hdr *WalIndexHdr) {
+		db.snapCounters.put(db.dataVersion.Load(), hdr, p.header.FileChangeCount, p.header.SchemaCookie)
+		if hdr.synthesized() {
+			db.published, db.hasPublished = *hdr, true
+		}
+		if f := db.commitHook; f != nil {
+			f(p.header.FileChangeCount, p.header.SchemaCookie)
+		}
 	}
 
 	// Initialize local counters from the on-disk state (reading through WAL).
@@ -1082,6 +1102,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.localSchemaCookie = db.localSchemaCookie.Load()
 	tx.dataChanged = false   // pool reuse safety
 	tx.schemaChanged = false // pool reuse safety
+	tx.onCommitted = nil
 	return tx, nil
 }
 
@@ -2141,6 +2162,19 @@ type WriteTx struct {
 	ReadTx
 	dataChanged   bool // set by MarkDataChanged; causes FileChangeCount++ on commit
 	schemaChanged bool // set by MarkSchemaChanged; causes SchemaCookie++ on commit
+	// onCommitted runs as the commit becomes visible to readers (see
+	// OnCommitted).
+	onCommitted func(fileChangeCounter, schemaCookie uint32)
+}
+
+// OnCommitted registers f to run inside Commit at the point the commit
+// becomes visible to readers, with the page-1 counters it carries. The write
+// lock is held: what f publishes is in place before the next writer begins,
+// and within instructions of the first reader that can pin the commit. f
+// must not block, take locks or begin a transaction. It does not run for a
+// commit that writes nothing, a failed commit or a rollback.
+func (tx *WriteTx) OnCommitted(f func(fileChangeCounter, schemaCookie uint32)) {
+	tx.onCommitted = f
 }
 
 // GetNamespace returns a Namespace handle for the given name.
@@ -2261,7 +2295,9 @@ func (tx *WriteTx) Commit() error {
 		testWriterFinishHook()
 	}
 	var nFrame, newFCC, newSC uint32
+	db.commitHook, db.hasPublished = tx.onCommitted, false
 	nFrame, newFCC, newSC, err = pager.commit(tx.dataChanged, tx.schemaChanged)
+	db.commitHook = nil
 	completed = true
 	if err == nil {
 		db.localFileChangeCounter.Store(newFCC)
@@ -2269,12 +2305,14 @@ func (tx *WriteTx) Commit() error {
 		// Increment dataVersion so persistent reader caches detect staleness.
 		// Unlike walMaxFrame, this counter never wraps after checkpoint restart.
 		dv := db.dataVersion.Add(1)
-		// The write lock is still held: the header a reader pins from here
-		// until the next commit is this one's, and these are its counters.
-		if hdr, ok := pager.wal.snapshotHdr(); ok {
-			db.snapCounters.put(dv, &hdr, newFCC, newSC)
+		// A synthesized header identifies the snapshot only together with
+		// the dataVersion, which just moved: the entry made as the commit
+		// became visible (wal.onPublish) is stored again under the new one.
+		if db.hasPublished {
+			db.snapCounters.put(dv, &db.published, newFCC, newSC)
 		}
 	}
+	tx.onCommitted = nil
 	threshold := db.opts.AutoCheckpointAfter
 	needCheckpoint = threshold > 0 && int(nFrame) >= threshold
 	// Not on the panic path: a tx that panicked mid-commit is dropped, never
@@ -2292,6 +2330,7 @@ func (tx *WriteTx) Rollback() error {
 	}
 	tx.closed = true
 	tx.aux = nil
+	tx.onCommitted = nil
 	db, pager, slot := tx.db, tx.pager, tx.walSlot
 	var completed bool
 	defer func() {

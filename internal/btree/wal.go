@@ -1374,6 +1374,11 @@ func (wi *walIndex) shmWriteReadMark(i int, val uint32) {
 
 // wal manages the Write-Ahead Log.
 type wal struct {
+	// onPublish, when set, runs as a commit becomes visible to readers, with
+	// the header they pin from then on (as DB.beginRead normalizes it). The
+	// write lock is held.
+	onPublish func(hdr *WalIndexHdr)
+
 	mu       sync.RWMutex // protects memFrames slice; readers use RLock, writer uses Lock
 	file     fileHandle
 	header   walHeader
@@ -2358,6 +2363,9 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		// after fdatasync.
 		mxCommit := w.index.maxFrame.Load()
 		w.index.mxCommitFrame.Store(mxCommit)
+		if w.inProcess && w.onPublish != nil {
+			w.onPublish(&WalIndexHdr{isInit: 1, mxFrame: mxCommit})
+		}
 		if !w.inProcess {
 			// Use dbSize directly instead of maxPage.Load() because a
 			// concurrent reader's tryBeginRead may have overwritten maxPage
@@ -2376,6 +2384,10 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 			// external state changes without false positives from our own
 			// commits (53f68eb fix).
 			w.writerHdr = w.index.hdr
+			if w.onPublish != nil {
+				hdr := w.index.hdr
+				w.onPublish(&hdr)
+			}
 		}
 	}
 
@@ -2487,9 +2499,13 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 
 	if commit {
 		// Advance mxCommitFrame so readers can see the committed frames.
-		w.index.mxCommitFrame.Store(w.index.maxFrame.Load())
+		mxCommit := w.index.maxFrame.Load()
+		w.index.mxCommitFrame.Store(mxCommit)
 		if dbSize > 0 {
 			w.index.maxPage.Store(dbSize)
+		}
+		if w.onPublish != nil {
+			w.onPublish(&WalIndexHdr{isInit: 1, mxFrame: mxCommit})
 		}
 	}
 
@@ -2749,20 +2765,6 @@ func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot i
 		time.Sleep(nDelay)
 	}
 	return WalIndexHdr{}, 0, 0, 0, ErrProtocol
-}
-
-// snapshotHdr returns the header a read transaction beginning now pins, as
-// DB.beginRead normalizes it; ok is false when the shared header cannot be
-// read consistently. Between two commits every reader pins the same one.
-func (w *wal) snapshotHdr() (WalIndexHdr, bool) {
-	if w.inProcess || w.inMemory {
-		return WalIndexHdr{isInit: 1, mxFrame: w.index.mxCommitFrame.LoadLocal()}, true
-	}
-	hdr, valid := w.index.readHeader()
-	if valid && hdr.isInit == 0 {
-		hdr = WalIndexHdr{isInit: 1, mxFrame: hdr.mxFrame}
-	}
-	return hdr, valid
 }
 
 // tryBeginReadHdr attempts to acquire a reader slot and returns the current
