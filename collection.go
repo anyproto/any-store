@@ -114,8 +114,10 @@ type Collection interface {
 	// Returns a WriteTx or an error if there is an issue starting the transaction.
 	WriteTx(ctx context.Context) (WriteTx, error)
 
-	// Close closes the collection.
-	// Returns an error if the operation fails.
+	// Close releases the handle: later operations through it fail with
+	// ErrCollectionClosed. A handle that changed the schema in a write
+	// transaction is released once that change is committed or rolled back,
+	// and stays open if the collection is opened again before that.
 	Close() error
 }
 
@@ -214,13 +216,33 @@ type collection struct {
 	sketchDirty bool
 	ftsDirty    bool
 
+	// ddlTxs counts the uncommitted schema changes the open write tx made
+	// through this handle: its creation, index DDL, a vector compaction, a
+	// rename, a drop. While it is non-zero the handle stays the collection's
+	// one registered handle. A second one — built from the writer's view or
+	// from the committed one — would not follow the transaction's outcome:
+	// no undo covers it, and a commit or rollback of this process moves no
+	// cookie for a staleness pass to act on.
+	//
+	// SQLite keeps one in-memory schema per connection, resets it when a
+	// transaction that changed it rolls back (sqlite3RollbackAll,
+	// OP_Savepoint), and under shared cache prepares no statement on
+	// another connection while the changes are uncommitted (prepare.c,
+	// sqlite3BtreeSchemaLocked). What goes stale all the same it detects:
+	// every statement checks the schema cookie and the schema generation it
+	// was prepared with (OP_Transaction). A handle carries no such check,
+	// so a second one must not come to exist; other users get this handle
+	// instead of an error, as they would without the Close().
+	//
+	// Guarded by db.mu.
+	ddlTxs int
+	// closePending records a Close() that waits for ddlTxs to reach zero
+	// (db.ddlEnd). An open of the collection in between hands this handle
+	// out again and clears it. Guarded by db.mu.
+	closePending bool
+
 	closed atomic.Bool
-	// userClosed records that Close() was explicitly requested. Drop flips
-	// closed itself (CAS), which makes a Close() racing in AFTER the flip a
-	// silent no-op — this latch lets Drop's rollback undo honor that Close
-	// instead of resurrecting a handle its owner released.
-	userClosed atomic.Bool
-	mu         sync.Mutex
+	mu     sync.Mutex
 }
 
 // loadIndexes returns the current index-set snapshot. Safe to call without
@@ -970,7 +992,7 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		return nil
 	}
 	return c.db.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (modified bool, txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		if txErr = c.beginDDL(wtx); txErr != nil {
 			return false, txErr
 		}
 		var newIndexes []*index
@@ -1291,7 +1313,7 @@ func (c *collection) buildFtsIndex(tx *btree.WriteTx, fx *ftsIndex) error {
 
 func (c *collection) DropIndex(ctx context.Context, indexName string) (err error) {
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		if txErr = c.beginDDL(wtx); txErr != nil {
 			return txErr
 		}
 		tx.MarkSchemaChanged()
@@ -1426,7 +1448,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if err = c.alive(); err != nil {
+		if err = c.beginDDL(wtx); err != nil {
 			return err
 		}
 
@@ -1535,7 +1557,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 // Drop closes the handle at execution time (same-tx semantics: later ops
 // through any alias fail ErrCollectionClosed) but defers the eviction from
 // db.openedCollections to COMMIT (see commonTx.pubs). Evicting at execution —
-// what close() would do — opens a corruption window: a concurrent
+// what Close() does — opens a corruption window: a concurrent
 // OpenCollection(name) misses the map, passes the catalog check on the
 // still-committed snapshot, and registers a fresh live handle the in-process
 // staleness pass never invalidates (own commits update localSchemaCookie);
@@ -1550,7 +1572,7 @@ func (c *collection) Drop(ctx context.Context) error {
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if err = c.alive(); err != nil {
+		if err = c.beginDDL(wtx); err != nil {
 			return err
 		}
 		// Discard buffered fts writes: Drop deletes the fts namespaces in this
@@ -1559,18 +1581,11 @@ func (c *collection) Drop(ctx context.Context) error {
 		for _, fx := range c.loadFtsIndexes() {
 			fx.pending.reset()
 		}
-		// CAS, not Store: a user Close() racing between alive() and here wins
-		// the flip and evicts the handle itself — then the rollback undo must
-		// NOT resurrect a handle its owner explicitly closed.
+		// CAS, not Store: the undo reverts only the flip this Drop made.
 		if c.closed.CompareAndSwap(false, true) {
 			wtx.onRollbackUndo(func() {
-				// A Close() that landed AFTER the flip was swallowed by its
-				// CAS (no eviction, nil return): honor it now instead of
-				// un-closing a handle its owner released.
-				if c.userClosed.Load() {
-					c.db.onCollectionClose(c)
-					return
-				}
+				// A Close() requested meanwhile stays pending: ddlEnd applies
+				// it once the handle's last schema change resolves.
 				// Un-close only while still registered: a same-tx recreate of
 				// the name replaced this map entry, and its own undo evicted
 				// the replacement — reviving an unregistered handle would let
@@ -1578,25 +1593,23 @@ func (c *collection) Drop(ctx context.Context) error {
 				// walks the registry). Callers re-obtain via db.Collection,
 				// as before.
 				c.db.mu.Lock()
-				registered := false
 				for _, cur := range c.db.openedCollections {
 					if cur == Collection(c) {
-						registered = true
+						c.closed.Store(false)
 						break
 					}
 				}
 				c.db.mu.Unlock()
-				if registered {
-					c.closed.Store(false)
-				}
 			})
 		}
-		// The eviction is onCollectionClose verbatim (identity scan — a
-		// Rename earlier in this tx re-keys the entry in its own, earlier
-		// publication and declines to resurrect a closed handle; a same-tx
-		// recreate replaced it, making this a no-op).
+		// The eviction is an identity scan: a Rename earlier in this tx
+		// re-keys the entry in its own, earlier publication and declines to
+		// resurrect a closed handle; a same-tx recreate replaced it, making
+		// this a no-op.
 		wtx.onCommitPublish(func() {
-			c.db.onCollectionClose(c)
+			c.db.mu.Lock()
+			c.db.evictLocked(c)
+			c.db.mu.Unlock()
 		})
 		// Delete all index namespaces. Enumerate indexes from the SAME on-disk
 		// source (idx:<coll>: metadata keys) that removeCollection deletes,
@@ -1652,23 +1665,47 @@ func (c *collection) ReadTx(ctx context.Context) (ReadTx, error) {
 	return c.db.ReadTx(ctx)
 }
 
+// Close evicts the handle from the registry and fails its later operations.
+// While the handle carries an uncommitted schema change (see ddlTxs) the
+// close waits until the last of them is committed or rolled back; the handle
+// stays usable until then.
 func (c *collection) Close() error {
-	if err := c.close(); err != nil {
-		return err
+	c.db.mu.Lock()
+	defer c.db.mu.Unlock()
+	if c.ddlTxs > 0 {
+		c.closePending = true
+		return nil
+	}
+	if c.closed.CompareAndSwap(false, true) {
+		c.db.evictLocked(c)
 	}
 	return nil
 }
 
-func (c *collection) close() error {
-	// Latch the intent BEFORE the CAS: if a Drop in an open tx already
-	// flipped closed, this Close is otherwise a silent no-op, and Drop's
-	// rollback undo must not un-close a handle its owner released.
-	c.userClosed.Store(true)
-	if !c.closed.CompareAndSwap(false, true) {
-		return nil
+// beginDDL rejects a handle that is no longer live and marks a live one as
+// carrying an uncommitted schema change of wtx (see ddlTxs) until that scope
+// commits or rolls back. Check and mark share db.mu with close, so a Close()
+// cannot evict the handle between them. A verb that then changes nothing
+// keeps the mark all the same; it only delays a Close().
+func (c *collection) beginDDL(wtx WriteTx) error {
+	c.db.mu.Lock()
+	if err := c.alive(); err != nil {
+		c.db.mu.Unlock()
+		return err
 	}
-	c.db.onCollectionClose(c)
+	c.ddlTxs++
+	c.db.mu.Unlock()
+	c.registerDDLEnd(wtx)
 	return nil
+}
+
+// registerDDLEnd releases one ddlTxs mark when the scope of wtx resolves:
+// exactly one of the two callbacks runs per outcome. Registered before the
+// verb's own callbacks, so on a rollback it runs after the verb's undo has
+// restored the handle.
+func (c *collection) registerDDLEnd(wtx WriteTx) {
+	wtx.onRollbackUndo(func() { c.db.ddlEnd(c) })
+	wtx.onCommitPublish(func() { c.db.ddlEnd(c) })
 }
 
 // alive rejects operations on a handle that is no longer live: explicitly

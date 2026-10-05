@@ -1,7 +1,10 @@
 package test
 
 import (
+	"context"
+	"fmt"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -640,6 +643,7 @@ func TestClosedHandleOpsFail(t *testing.T) {
 	assertClosed(coll.DropIndex(ctx, "a"))
 	assertClosed(coll.Rename(ctx, "d"))
 	assertClosed(coll.Drop(ctx))
+	assertClosed(coll.CompactVectorIndex(ctx, "emb"))
 	_, err = coll.Stats(ctx)
 	assertClosed(err)
 
@@ -1053,9 +1057,8 @@ func TestDropThenRecreateRollback(t *testing.T) {
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
 
-// A user Close() racing in AFTER Drop's closed-flip is swallowed by the CAS;
-// the rollback undo must honor it — evict, stay closed — not resurrect the
-// handle its owner released.
+// A Close() of a dropped handle while the Drop's tx is open waits for the tx
+// to end; after the rollback the handle is closed, not resurrected.
 func TestDropRollback_UserCloseDuringWindowSticks(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "x")
@@ -1073,7 +1076,667 @@ func TestDropRollback_UserCloseDuringWindowSticks(t *testing.T) {
 	assert.ErrorIs(t, err, anystore.ErrCollectionClosed)
 	reopened, err := fx.OpenCollection(ctx, "x")
 	require.NoError(t, err)
-	assert.NotSame(t, coll, reopened)
+	assert.False(t, reopened == coll, "the closed handle must have left the registry")
 	_, err = reopened.FindId(ctx, "1")
 	require.NoError(t, err)
+}
+
+// An open of the collection after that Close() gets the dropped handle back
+// and cancels the close: the rollback leaves the handle whole.
+func TestDropRollback_OpenAfterCloseKeepsHandle(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "x")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"1"}`)))
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.Drop(tx.Context()))
+	require.NoError(t, coll.Close())
+	h, err := fx.OpenCollection(ctx, "x")
+	require.NoError(t, err)
+	assert.True(t, h == coll, "an open around the dropping tx must return the dropped handle")
+	_, err = h.FindId(ctx, "1")
+	assert.ErrorIs(t, err, anystore.ErrCollectionClosed)
+	require.NoError(t, tx.Rollback())
+
+	_, err = h.FindId(ctx, "1")
+	require.NoError(t, err)
+}
+
+var (
+	ddlFtIdx = anystore.IndexInfo{Name: "ft", Kind: anystore.IndexKindFulltext, Fields: []string{"body"}}
+	ddlKIdx  = anystore.IndexInfo{Name: "k", Fields: []string{"k"}}
+)
+
+func ddlDoc(id int) *anyenc.Value {
+	return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"k":%d,"body":"alpha"}`, id, id))
+}
+
+func indexNames(c anystore.Collection) []string {
+	names := []string{}
+	for _, idx := range c.GetIndexes() {
+		names = append(names, idx.Info().Name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// assertIndexesHold closes h and checks, through a handle built from the
+// committed state, that collection name holds docs documents, has exactly the
+// indexes named, and that each of them covers every document.
+func assertIndexesHold(t *testing.T, fx *fixture, h anystore.Collection, name string, docs int, indexes ...string) {
+	t.Helper()
+	require.NoError(t, h.Close())
+	fresh, err := fx.OpenCollection(ctx, name)
+	require.NoError(t, err)
+	assert.Equal(t, append([]string{}, indexes...), indexNames(fresh))
+	assertCollCount(t, fresh, docs)
+	for _, idx := range fresh.GetIndexes() {
+		if idx.Info().Kind == anystore.IndexKindFulltext {
+			assertQueryCount(t, fresh.Find(`{"$text":{"$search":"alpha"}}`), docs)
+			continue
+		}
+		assertIndexLen(t, idx, docs)
+	}
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// A write tx changes a collection's schema, the handle that made the change
+// is closed and the collection is opened again inside the tx. The handle that
+// open returns follows the outcome of the tx.
+func TestReopenAfterDDLInTx(t *testing.T) {
+	t.Run("rolled-back DropIndex", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(ctx, ddlFtIdx))
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.DropIndex(tx.Context(), "ft"))
+		require.NoError(t, a.Close())
+		h, err := fx.OpenCollection(tx.Context(), "a")
+		require.NoError(t, err)
+		require.NoError(t, tx.Rollback())
+
+		assert.Equal(t, []string{"ft"}, indexNames(h))
+		require.NoError(t, h.Insert(ctx, ddlDoc(1)))
+		assertIndexesHold(t, fx, h, "a", 1, "ft")
+	})
+
+	t.Run("rolled-back CreateCollection", func(t *testing.T) {
+		fx := newFixture(t)
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		r, err := fx.CreateCollection(tx.Context(), "r")
+		require.NoError(t, err)
+		require.NoError(t, r.Close())
+		h, err := fx.OpenCollection(tx.Context(), "r")
+		require.NoError(t, err)
+		require.NoError(t, tx.Rollback())
+
+		// The collection is gone and so is its handle: nothing it writes can
+		// land in the pages the next collection takes.
+		other, err := fx.CreateCollection(ctx, "other")
+		require.NoError(t, err)
+		assert.ErrorIs(t, h.Insert(ctx, ddlDoc(1)), anystore.ErrCollectionClosed)
+		_, err = fx.OpenCollection(ctx, "r")
+		assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+		assertCollCount(t, other, 0)
+		require.NoError(t, fx.IntegrityCheck(ctx))
+	})
+
+	t.Run("rolled-back EnsureIndex", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+		for i := range 5 {
+			require.NoError(t, a.Insert(ctx, ddlDoc(i)))
+		}
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(tx.Context(), ddlKIdx))
+		require.NoError(t, a.Close())
+		h, err := fx.OpenCollection(tx.Context(), "a")
+		require.NoError(t, err)
+		require.NoError(t, tx.Rollback())
+
+		// The index is gone from the handle too: its pages are free for the
+		// next collection, and a write through the handle must not reach them.
+		assert.Empty(t, indexNames(h))
+		other, err := fx.CreateCollection(ctx, "other")
+		require.NoError(t, err)
+		for i := range 5 {
+			require.NoError(t, other.Insert(ctx, ddlDoc(100+i)))
+		}
+		require.NoError(t, h.Insert(ctx, ddlDoc(50)))
+		assertCollCount(t, other, 5)
+		assertCollCountInTx(ctx, t, other, 5)
+		assertIndexesHold(t, fx, h, "a", 6)
+	})
+
+	t.Run("rolled-back savepoint", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(ctx, ddlFtIdx))
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, a.DropIndex(sp.Context(), "ft"))
+		require.NoError(t, a.Close())
+		h, err := fx.OpenCollection(sp.Context(), "a")
+		require.NoError(t, err)
+		require.NoError(t, sp.Rollback())
+		require.NoError(t, h.Insert(tx.Context(), ddlDoc(1)))
+		require.NoError(t, tx.Commit())
+
+		assertIndexesHold(t, fx, h, "a", 1, "ft")
+	})
+
+	t.Run("rolled-back Rename", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(ctx, ddlKIdx))
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.Rename(tx.Context(), "b"))
+		require.NoError(t, a.Close())
+		h, err := fx.OpenCollection(tx.Context(), "b")
+		require.NoError(t, err)
+		require.NoError(t, tx.Rollback())
+
+		assert.Equal(t, "a", h.Name())
+		_, err = fx.OpenCollection(ctx, "b")
+		assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+		_, err = fx.CreateCollection(ctx, "b")
+		require.NoError(t, err)
+		require.NoError(t, h.Insert(ctx, ddlDoc(1)))
+		assertIndexesHold(t, fx, h, "a", 1, "k")
+	})
+
+	t.Run("rolled-back Drop of the reopened handle", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+		for i := range 5 {
+			require.NoError(t, a.Insert(ctx, ddlDoc(i)))
+		}
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(tx.Context(), ddlKIdx))
+		require.NoError(t, a.Close())
+		h, err := fx.OpenCollection(tx.Context(), "a")
+		require.NoError(t, err)
+		require.NoError(t, h.Drop(tx.Context()))
+		require.NoError(t, tx.Rollback())
+
+		assert.Empty(t, indexNames(h))
+		require.NoError(t, h.Insert(ctx, ddlDoc(50)))
+		assertIndexesHold(t, fx, h, "a", 6)
+	})
+
+	t.Run("rolled-back CompactVectorIndex", func(t *testing.T) {
+		const n, dim = 60, 8
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+		require.NoError(t, a.CreateIndex(ctx, anystore.IndexInfo{
+			Name: "emb", Kind: anystore.IndexKindVector,
+			Vector: &anystore.VectorParams{Field: "v", Dim: dim, Metric: anystore.VectorL2, EfSearch: 64},
+		}))
+		vecs := vrand(n, dim, 3)
+		for i, v := range vecs {
+			require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, v))))
+		}
+		for i := range n / 2 {
+			require.NoError(t, a.DeleteId(ctx, i))
+		}
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.CompactVectorIndex(tx.Context(), "emb"))
+		require.NoError(t, a.Close())
+		h, err := fx.OpenCollection(tx.Context(), "a")
+		require.NoError(t, err)
+		require.NoError(t, tx.Rollback())
+
+		// The handle writes into the graph the rollback restored, not into
+		// the compacted one, whose pages are free for the next collection.
+		other, err := fx.CreateCollection(ctx, "other")
+		require.NoError(t, err)
+		for i := range 5 {
+			require.NoError(t, other.Insert(ctx, ddlDoc(i)))
+		}
+		added := vrand(10, dim, 9)
+		for i, v := range added {
+			require.NoError(t, h.Insert(ctx, anyenc.MustParseJson(vecDocJSON(n+i, v))))
+		}
+		for i, v := range added {
+			hits, err := vsearch(h, "v", v, 1, 64)
+			require.NoError(t, err)
+			require.Len(t, hits, 1)
+			require.Equal(t, idBytesOf(n+i), hits[0].DocId)
+		}
+		for i := n / 2; i < n; i++ {
+			hits, err := vsearch(h, "v", vecs[i], 1, 64)
+			require.NoError(t, err)
+			require.Len(t, hits, 1)
+			require.Equal(t, idBytesOf(i), hits[0].DocId)
+		}
+		assertCollCount(t, other, 5)
+		assertCollCountInTx(ctx, t, other, 5)
+		require.NoError(t, fx.IntegrityCheck(ctx))
+	})
+
+	t.Run("commit", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(tx.Context(), ddlKIdx, ddlFtIdx))
+		require.NoError(t, a.Close())
+		h, err := fx.OpenCollection(tx.Context(), "a")
+		require.NoError(t, err)
+		require.NoError(t, h.Insert(tx.Context(), ddlDoc(1)))
+		require.NoError(t, tx.Commit())
+
+		assert.Equal(t, []string{"ft", "k"}, indexNames(h))
+		require.NoError(t, h.Insert(ctx, ddlDoc(2)))
+		assertIndexesHold(t, fx, h, "a", 2, "ft", "k")
+	})
+
+	// Only the reopen sits in the savepoint that rolls back: the schema
+	// change outside it stands, and the handle keeps it.
+	t.Run("savepoint rolled back after the reopen", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(tx.Context(), ddlKIdx))
+		require.NoError(t, a.Close())
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		h, err := fx.OpenCollection(sp.Context(), "a")
+		require.NoError(t, err)
+		require.NoError(t, sp.Rollback())
+		require.NoError(t, h.Insert(tx.Context(), ddlDoc(1)))
+		require.NoError(t, tx.Commit())
+
+		assertIndexesHold(t, fx, h, "a", 1, "k")
+	})
+
+	// The tx changed another collection only: the handle opened in it is
+	// right as it is and survives the rollback.
+	t.Run("collection the tx did not change", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(ctx, ddlKIdx))
+		require.NoError(t, a.Close())
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		_, err = fx.CreateCollection(tx.Context(), "z")
+		require.NoError(t, err)
+		h, err := fx.OpenCollection(tx.Context(), "a")
+		require.NoError(t, err)
+		require.NoError(t, tx.Rollback())
+
+		require.NoError(t, h.Insert(ctx, ddlDoc(1)))
+		assertIndexesHold(t, fx, h, "a", 1, "k")
+	})
+}
+
+// A write tx holds an uncommitted schema change of a collection, the handle
+// that made it is closed, and the collection is opened with a context that
+// does not carry the tx. The open returns a handle that follows the outcome
+// of the tx, not one frozen at the state committed before it.
+func TestOpenDuringUncommittedDDL(t *testing.T) {
+	t.Run("committed EnsureIndex", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(tx.Context(), ddlKIdx, ddlFtIdx))
+		require.NoError(t, a.Close())
+		h, err := fx.OpenCollection(ctx, "a")
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+
+		assert.Equal(t, []string{"ft", "k"}, indexNames(h))
+		require.NoError(t, h.Insert(ctx, ddlDoc(1)))
+		assertIndexesHold(t, fx, h, "a", 1, "ft", "k")
+	})
+
+	t.Run("committed DropIndex", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(ctx, ddlKIdx))
+		for i := range 5 {
+			require.NoError(t, a.Insert(ctx, ddlDoc(i)))
+		}
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.DropIndex(tx.Context(), "k"))
+		require.NoError(t, a.Close())
+		h, err := fx.OpenCollection(ctx, "a")
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+
+		assert.Empty(t, indexNames(h))
+		other, err := fx.CreateCollection(ctx, "other")
+		require.NoError(t, err)
+		for i := range 5 {
+			require.NoError(t, other.Insert(ctx, ddlDoc(100+i)))
+		}
+		require.NoError(t, h.Insert(ctx, ddlDoc(50)))
+		assertCollCount(t, other, 5)
+		assertCollCountInTx(ctx, t, other, 5)
+		assertIndexesHold(t, fx, h, "a", 6)
+	})
+
+	t.Run("rolled-back DropIndex", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(ctx, ddlFtIdx))
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.DropIndex(tx.Context(), "ft"))
+		require.NoError(t, a.Close())
+		h, err := fx.OpenCollection(ctx, "a")
+		require.NoError(t, err)
+		require.NoError(t, tx.Rollback())
+
+		assert.Equal(t, []string{"ft"}, indexNames(h))
+		require.NoError(t, h.Insert(ctx, ddlDoc(1)))
+		assertIndexesHold(t, fx, h, "a", 1, "ft")
+	})
+}
+
+// A Close() of a handle that changed the schema in an open write tx takes
+// effect when the tx ends: until then the handle stays the collection's
+// handle, and nothing opens the collection a second time.
+func TestCloseDuringDDLTx(t *testing.T) {
+	for _, commit := range []bool{true, false} {
+		name := "rollback"
+		if commit {
+			name = "commit"
+		}
+		t.Run(name, func(t *testing.T) {
+			fx := newFixture(t)
+			a, err := fx.CreateCollection(ctx, "a")
+			require.NoError(t, err)
+
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			require.NoError(t, a.EnsureIndex(tx.Context(), ddlKIdx))
+			require.NoError(t, a.Close())
+			require.NoError(t, a.Insert(tx.Context(), ddlDoc(1)))
+			if commit {
+				require.NoError(t, tx.Commit())
+			} else {
+				require.NoError(t, tx.Rollback())
+			}
+
+			assert.ErrorIs(t, a.Insert(ctx, ddlDoc(2)), anystore.ErrCollectionClosed)
+			fresh, err := fx.OpenCollection(ctx, "a")
+			require.NoError(t, err)
+			assert.False(t, fresh == a, "the closed handle must have left the registry")
+			if commit {
+				assertIndexesHold(t, fx, fresh, "a", 1, "k")
+			} else {
+				assertIndexesHold(t, fx, fresh, "a", 0)
+			}
+		})
+	}
+
+	// The savepoint's change is rolled back, the one made outside it is still
+	// uncommitted: the close keeps waiting.
+	t.Run("savepoint rollback with a change outside it", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(tx.Context(), ddlKIdx))
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(sp.Context(), ddlFtIdx))
+		require.NoError(t, a.Close())
+		require.NoError(t, sp.Rollback())
+		require.NoError(t, a.Insert(tx.Context(), ddlDoc(1)))
+		require.NoError(t, tx.Commit())
+
+		assert.ErrorIs(t, a.Insert(ctx, ddlDoc(2)), anystore.ErrCollectionClosed)
+		fresh, err := fx.OpenCollection(ctx, "a")
+		require.NoError(t, err)
+		assertIndexesHold(t, fx, fresh, "a", 1, "k")
+	})
+
+	// The savepoint's change was the handle's only one: its rollback leaves
+	// nothing uncommitted and the close takes effect inside the tx.
+	t.Run("savepoint rollback of the only change", func(t *testing.T) {
+		fx := newFixture(t)
+		a, err := fx.CreateCollection(ctx, "a")
+		require.NoError(t, err)
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, a.EnsureIndex(sp.Context(), ddlKIdx))
+		require.NoError(t, a.Close())
+		require.NoError(t, sp.Rollback())
+		assert.ErrorIs(t, a.Insert(tx.Context(), ddlDoc(1)), anystore.ErrCollectionClosed)
+		h, err := fx.OpenCollection(tx.Context(), "a")
+		require.NoError(t, err)
+		assert.False(t, h == a, "the closed handle must have left the registry")
+		require.NoError(t, h.Insert(tx.Context(), ddlDoc(1)))
+		require.NoError(t, tx.Commit())
+
+		assertIndexesHold(t, fx, h, "a", 1)
+	})
+}
+
+// One goroutine holds a write tx with an uncommitted EnsureIndex; another
+// closes the collection's handle, opens it again and inserts — an insert that
+// waits for the tx to commit. The handle it opened maintains the new indexes.
+func TestCloseAndReopenFromAnotherGoroutineDuringDDL(t *testing.T) {
+	fx := newFixture(t)
+	a, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, a.EnsureIndex(tx.Context(), ddlKIdx, ddlFtIdx))
+
+	opened := make(chan struct{})
+	inserted := make(chan error, 1)
+	go func() {
+		err := a.Close()
+		var h anystore.Collection
+		if err == nil {
+			h, err = fx.OpenCollection(ctx, "a")
+		}
+		close(opened)
+		if err == nil {
+			err = h.Insert(ctx, ddlDoc(1))
+		}
+		inserted <- err
+	}()
+	<-opened
+	require.NoError(t, tx.Commit())
+	require.NoError(t, <-inserted)
+
+	h, err := fx.OpenCollection(ctx, "a")
+	require.NoError(t, err)
+	assertIndexesHold(t, fx, h, "a", 1, "ft", "k")
+}
+
+// Once the transaction of a schema change has ended — whatever the change and
+// its outcome — the handle carries nothing uncommitted and Close() closes it
+// at once.
+func TestCloseAfterDDL(t *testing.T) {
+	vecIdx := anystore.IndexInfo{
+		Name:   "emb",
+		Kind:   anystore.IndexKindVector,
+		Vector: &anystore.VectorParams{Field: "v", Dim: 4, Metric: anystore.VectorL2},
+	}
+	inTx := func(t *testing.T, fx *fixture, commit bool, do func(txCtx context.Context)) {
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		do(tx.Context())
+		if commit {
+			require.NoError(t, tx.Commit())
+		} else {
+			require.NoError(t, tx.Rollback())
+		}
+	}
+	// Each case leaves the collection under the name it returns.
+	cases := []struct {
+		name string
+		ddl  func(t *testing.T, fx *fixture, c anystore.Collection) string
+	}{
+		{"create", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			return "a"
+		}},
+		{"ensure index", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			require.NoError(t, c.EnsureIndex(ctx, ddlKIdx, ddlFtIdx))
+			return "a"
+		}},
+		{"ensure an existing index", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			require.NoError(t, c.EnsureIndex(ctx, ddlKIdx))
+			require.NoError(t, c.EnsureIndex(ctx, ddlKIdx))
+			return "a"
+		}},
+		{"create an existing index", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			require.NoError(t, c.CreateIndex(ctx, ddlKIdx))
+			require.ErrorIs(t, c.CreateIndex(ctx, ddlKIdx), anystore.ErrIndexExists)
+			return "a"
+		}},
+		{"drop index", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			require.NoError(t, c.EnsureIndex(ctx, ddlKIdx))
+			require.NoError(t, c.DropIndex(ctx, "k"))
+			return "a"
+		}},
+		{"drop a missing index", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			require.ErrorIs(t, c.DropIndex(ctx, "k"), anystore.ErrIndexNotFound)
+			return "a"
+		}},
+		{"rename", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			require.NoError(t, c.Rename(ctx, "b"))
+			return "b"
+		}},
+		{"rename to the same name", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			require.NoError(t, c.Rename(ctx, "a"))
+			return "a"
+		}},
+		{"rename to a taken name", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			_, err := fx.CreateCollection(ctx, "b")
+			require.NoError(t, err)
+			require.ErrorIs(t, c.Rename(ctx, "b"), anystore.ErrCollectionExists)
+			return "a"
+		}},
+		{"compact vector index", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			require.NoError(t, c.CreateIndex(ctx, vecIdx))
+			for i, v := range vrand(8, 4, 1) {
+				require.NoError(t, c.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, v))))
+			}
+			require.NoError(t, c.DeleteId(ctx, 0))
+			require.NoError(t, c.CompactVectorIndex(ctx, "emb"))
+			return "a"
+		}},
+		{"compact a missing vector index", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			require.ErrorIs(t, c.CompactVectorIndex(ctx, "emb"), anystore.ErrIndexNotFound)
+			return "a"
+		}},
+		{"committed tx", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			inTx(t, fx, true, func(txCtx context.Context) {
+				require.NoError(t, c.EnsureIndex(txCtx, ddlKIdx, ddlFtIdx))
+				require.NoError(t, c.DropIndex(txCtx, "k"))
+				require.NoError(t, c.Rename(txCtx, "b"))
+			})
+			return "b"
+		}},
+		{"rolled-back tx", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			inTx(t, fx, false, func(txCtx context.Context) {
+				require.NoError(t, c.EnsureIndex(txCtx, ddlKIdx, ddlFtIdx))
+				require.NoError(t, c.DropIndex(txCtx, "k"))
+				require.NoError(t, c.Rename(txCtx, "b"))
+			})
+			return "a"
+		}},
+		{"rolled-back Drop", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			inTx(t, fx, false, func(txCtx context.Context) {
+				require.NoError(t, c.Drop(txCtx))
+			})
+			return "a"
+		}},
+		{"rolled-back savepoint", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			inTx(t, fx, true, func(txCtx context.Context) {
+				sp, err := fx.WriteTx(txCtx)
+				require.NoError(t, err)
+				require.NoError(t, c.EnsureIndex(sp.Context(), ddlKIdx))
+				require.NoError(t, sp.Rollback())
+			})
+			return "a"
+		}},
+		{"released savepoint", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			inTx(t, fx, true, func(txCtx context.Context) {
+				sp, err := fx.WriteTx(txCtx)
+				require.NoError(t, err)
+				require.NoError(t, c.EnsureIndex(sp.Context(), ddlKIdx))
+				require.NoError(t, sp.Commit())
+			})
+			return "a"
+		}},
+		{"created in a committed tx", func(t *testing.T, fx *fixture, c anystore.Collection) string {
+			var created anystore.Collection
+			inTx(t, fx, true, func(txCtx context.Context) {
+				var err error
+				created, err = fx.CreateCollection(txCtx, "n")
+				require.NoError(t, err)
+			})
+			require.NoError(t, created.Close())
+			_, err := created.Count(ctx)
+			assert.ErrorIs(t, err, anystore.ErrCollectionClosed)
+			return "a"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			c, err := fx.CreateCollection(ctx, "a")
+			require.NoError(t, err)
+			name := tc.ddl(t, fx, c)
+
+			require.NoError(t, c.Close())
+			_, err = c.Count(ctx)
+			assert.ErrorIs(t, err, anystore.ErrCollectionClosed)
+			fresh, err := fx.OpenCollection(ctx, name)
+			require.NoError(t, err)
+			assert.False(t, fresh == c, "the closed handle must have left the registry")
+			_, err = fresh.Count(ctx)
+			require.NoError(t, err)
+		})
+	}
 }
