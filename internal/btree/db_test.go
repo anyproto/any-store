@@ -928,6 +928,82 @@ func TestBeginReadFast(t *testing.T) {
 	require.NoError(t, rtx.Rollback())
 }
 
+// A fast begin reports the counters of its own snapshot: not the local
+// cache, which lags a peer's commit, and for a reader that began before a
+// commit not that commit's.
+func TestBeginReadFast_SnapshotCountersAreTheSnapshots(t *testing.T) {
+	for _, inProcess := range []bool{false, true} {
+		t.Run(fmt.Sprintf("inProcess=%v", inProcess), func(t *testing.T) {
+			opts := DefaultOptions()
+			opts.InProcess = inProcess
+			db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), opts)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = db.Close() })
+			testFastBeginSnapshotCounters(t, db)
+		})
+	}
+}
+
+func testFastBeginSnapshotCounters(t *testing.T, db *DB) {
+	commit := func(schema bool) (fcc, sc uint32) {
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := tx.GetNamespace("fast")
+		if err != nil {
+			ns, err = tx.CreateNamespace("fast")
+			require.NoError(t, err)
+		}
+		require.NoError(t, tx.Put(ns, []byte("k"), []byte("v")))
+		tx.MarkDataChanged()
+		if schema {
+			tx.MarkSchemaChanged()
+		}
+		require.NoError(t, tx.Commit())
+		return db.LocalCounters()
+	}
+	snapshot := func() (fcc, sc uint32) {
+		rtx, err := db.BeginReadFast()
+		require.NoError(t, err)
+		fcc, sc, err = rtx.SnapshotHeaderCounters()
+		require.NoError(t, err)
+		require.NoError(t, rtx.Rollback())
+		return
+	}
+
+	fcc, sc := commit(true)
+	gotFCC, gotSC := snapshot()
+	assert.Equal(t, [2]uint32{fcc, sc}, [2]uint32{gotFCC, gotSC}, "after an own commit")
+
+	// A peer's commit: the local cache lags, and nothing here remembers the
+	// snapshot's counters.
+	db.UpdateLocalCounters(fcc-1, sc-1)
+	db.snapCounters.put(0, &WalIndexHdr{}, 0, 0)
+	gotFCC, gotSC = snapshot()
+	assert.Equal(t, [2]uint32{fcc, sc}, [2]uint32{gotFCC, gotSC}, "read from page 1, not the lagging cache")
+	gotFCC, gotSC = snapshot()
+	assert.Equal(t, [2]uint32{fcc, sc}, [2]uint32{gotFCC, gotSC}, "remembered")
+	db.UpdateLocalCounters(fcc, sc)
+
+	// A reader that pinned its snapshot before a commit keeps that
+	// snapshot's counters; one that begins after gets the new ones.
+	older, err := db.BeginReadFast()
+	require.NoError(t, err)
+	fcc2, sc2 := commit(true)
+	require.NotEqual(t, sc, sc2)
+	_, olderSC, err := older.SnapshotHeaderCounters()
+	require.NoError(t, err)
+	assert.Equal(t, sc, olderSC)
+	require.NoError(t, older.Rollback())
+	gotFCC, gotSC = snapshot()
+	assert.Equal(t, [2]uint32{fcc2, sc2}, [2]uint32{gotFCC, gotSC})
+
+	// A commit without a schema change moves only the change counter.
+	fcc3, sc3 := commit(false)
+	assert.Equal(t, sc2, sc3)
+	gotFCC, gotSC = snapshot()
+	assert.Equal(t, [2]uint32{fcc3, sc3}, [2]uint32{gotFCC, gotSC})
+}
+
 // === DeleteNamespace with rootPage=0 edge case ===
 // freeTreePages is called only when rootPage != 0 (line 385-387)
 

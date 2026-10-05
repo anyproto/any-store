@@ -2751,6 +2751,20 @@ func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot i
 	return WalIndexHdr{}, 0, 0, 0, ErrProtocol
 }
 
+// snapshotHdr returns the header a read transaction beginning now pins, as
+// DB.beginRead normalizes it; ok is false when the shared header cannot be
+// read consistently. Between two commits every reader pins the same one.
+func (w *wal) snapshotHdr() (WalIndexHdr, bool) {
+	if w.inProcess || w.inMemory {
+		return WalIndexHdr{isInit: 1, mxFrame: w.index.mxCommitFrame.LoadLocal()}, true
+	}
+	hdr, valid := w.index.readHeader()
+	if valid && hdr.isInit == 0 {
+		hdr = WalIndexHdr{isInit: 1, mxFrame: hdr.mxFrame}
+	}
+	return hdr, valid
+}
+
 // tryBeginReadHdr attempts to acquire a reader slot and returns the current
 // max frame number plus the exact WAL header snapshot used to choose/validate
 // the reader slot. Returns errWALRetry if the WAL state changed between

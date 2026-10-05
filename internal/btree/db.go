@@ -341,6 +341,10 @@ type DB struct {
 	// checkpoint restart. Matches SQLite's pPager->iDataVersion (pager.c:1776).
 	dataVersion atomic.Uint64
 
+	// snapCounters holds the page-1 counters of the last snapshot whose
+	// counters were read or written here (see snapCountersMemo).
+	snapCounters snapCountersMemo
+
 	readTxPool  sync.Pool
 	writeTxPool sync.Pool
 
@@ -815,11 +819,44 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 		return nil, err
 	}
 
+	// The snapshot's identity: the FULL WAL-index header (not just mxFrame —
+	// aSalt is re-randomized on every WAL restart, so a peer process's
+	// checkpoint-restart cycle that happens to land on the same mxFrame is a
+	// different snapshot) plus dataVersion (monotonic, never wraps), which
+	// additionally covers in-process commits, whose synthesized header
+	// carries no salts. Keys the reader cache and the counters memo below.
+	// Matches SQLite's pChanged signal from walIndexReadHdr (raw header
+	// memcmp, wal.c:2611) driving pager_reset in pagerBeginReadTransaction
+	// (pager.c:3246-3267).
+	curDV := db.dataVersion.Load()
+	// Normalize the snapshot header once; the same value becomes the cache
+	// validity key, the memo key and tx.walHdr below.
+	snapHdr := hdr
+	if hdr.isInit == 0 {
+		snapHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
+	}
+
 	localFCC := db.localFileChangeCounter.Load()
 	localSC := db.localSchemaCookie.Load()
 	fcc := localFCC
 	sc := localSC
 	snapFCC, snapSC := localFCC, localSC
+	if !readCounters {
+		// The disk pair stays the seeded local one (no staleness detection on
+		// this path); the snapshot pair is exact all the same — from the
+		// memo, or read at the snapshot's own bounds.
+		var ok bool
+		if snapFCC, snapSC, ok = db.snapCounters.get(curDV, &snapHdr); !ok {
+			snapFCC, snapSC, err = db.pager.readHeaderCountersAt(maxFrame, minFrame)
+			if err != nil {
+				db.pager.endRead(slot)
+				db.mu.RUnlock()
+				<-db.readerSem
+				return nil, err
+			}
+			db.snapCounters.put(curDV, &snapHdr, snapFCC, snapSC)
+		}
+	}
 	if readCounters {
 		// Read on-disk counters for staleness detection (raised to the
 		// newest committed frame so peer commits are noticed).
@@ -844,25 +881,12 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 				return nil, err
 			}
 		}
+		db.snapCounters.put(curDV, &snapHdr, snapFCC, snapSC)
 	}
 
 	// Allocate reader cache from pool for per-connection page caching.
 	// Persistent cache: keep cached pages only if the DB snapshot hasn't
-	// changed. The snapshot key is the FULL WAL-index header (not just
-	// mxFrame): aSalt is re-randomized on every WAL restart, so a peer
-	// process's checkpoint-restart cycle that happens to land on the same
-	// mxFrame still invalidates the cache. dataVersion (monotonic, never
-	// wraps) additionally covers in-process commits, whose synthesized
-	// header carries no salts. Matches SQLite's pChanged signal from
-	// walIndexReadHdr (raw header memcmp, wal.c:2611) driving pager_reset
-	// in pagerBeginReadTransaction (pager.c:3246-3267).
-	curDV := db.dataVersion.Load()
-	// Normalize the snapshot header once; the same value becomes both the
-	// cache validity key and tx.walHdr below.
-	snapHdr := hdr
-	if hdr.isInit == 0 {
-		snapHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
-	}
+	// changed (curDV and snapHdr, above).
 	// Snapshot DB page count for this reader (hdr.nPage, fallback p.dbSize).
 	// Carried on the cache so reader bound checks accept pages a peer
 	// allocated after open. Set in lockstep with walHdr.
@@ -903,6 +927,7 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	tx.cache = cache
 	tx.closed = false
 	tx.writable = false
+	tx.aux = nil
 	// Dual-write during per-connection-hdr migration. Step 5 will remove
 	// walMaxFrame; until then, tests still read it directly.
 	tx.walMaxFrame = maxFrame
@@ -923,9 +948,11 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 	return db.beginRead(true)
 }
 
-// BeginReadFast starts a read-only transaction without reading page-1 counters.
-// It preserves snapshot isolation for data access, but skips staleness metadata.
-// DRIFT: BeginReadFast skips page-1 counter read; staleness APIs return stale/false See docs/btree/NOTES.md#drift-45-beginreadfast-skips-page-1-staleness-counter-reads
+// BeginReadFast starts a read-only transaction without the raised page-1
+// counter read. It preserves snapshot isolation for data access and reports
+// the snapshot's own counters exactly (SnapshotHeaderCounters), but skips
+// staleness detection: the disk counters are the seeded local ones.
+// DRIFT: BeginReadFast skips the raised page-1 counter read; staleness APIs return stale/false See docs/btree/NOTES.md#drift-45-beginreadfast-skips-page-1-staleness-counter-reads
 func (db *DB) BeginReadFast() (*ReadTx, error) {
 	return db.beginRead(false)
 }
@@ -1033,6 +1060,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.pager = db.pager
 	tx.ReadTx.cache = nil // writer uses shared pcache, not a reader cache
 	tx.ReadTx.closed = false
+	tx.ReadTx.aux = nil
 	tx.ReadTx.walMaxFrame = maxFrame
 	// Reuse the readSnap hdr captured above for BUSY_SNAPSHOT. In-process
 	// mode has readSnap=zero; synthesize minimal hdr so read paths consuming
@@ -1583,6 +1611,8 @@ type ReadTx struct {
 	// local values (see BeginReadFast's contract).
 	snapFileChangeCounter uint32
 	snapSchemaCookie      uint32
+	// aux is the caller's per-transaction state (see Aux).
+	aux                    any
 	closed                 bool
 	writable               bool // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
 }
@@ -2042,7 +2072,7 @@ func (tx *ReadTx) DiskSchemaCookie() uint32 {
 // the newest committed frame so staleness detection notices peer commits —
 // these values never exceed what the tx's tree reads can actually see: a
 // begin that raced a commit, or a reader slot pinned to an older snapshot,
-// reports the older counters here. Judgments about snapshot contents (e.g.
+// reports the older counters here. They are exact on a fast begin too. Judgments about snapshot contents (e.g.
 // whether a catalog key committed at cookie C must be visible) require this
 // bound, not the raised one. Field reads: no I/O, safe on hot paths.
 func (tx *ReadTx) SnapshotHeaderCounters() (fileChangeCount, schemaCookie uint32, err error) {
@@ -2050,6 +2080,19 @@ func (tx *ReadTx) SnapshotHeaderCounters() (fileChangeCount, schemaCookie uint32
 		return 0, 0, ErrTxClosed
 	}
 	return tx.snapFileChangeCounter, tx.snapSchemaCookie, nil
+}
+
+// Aux returns the caller's per-transaction state: whatever SetAux stored
+// since the transaction began, nil otherwise. The transaction neither reads
+// nor interprets it.
+func (tx *ReadTx) Aux() any {
+	return tx.aux
+}
+
+// SetAux stores the caller's per-transaction state; it is dropped when the
+// transaction ends.
+func (tx *ReadTx) SetAux(v any) {
+	tx.aux = v
 }
 
 // SnapshotSchemaCookie is the schema-cookie half of SnapshotHeaderCounters
@@ -2069,6 +2112,7 @@ func (tx *ReadTx) Rollback() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
+	tx.aux = nil
 	// Return the reader cache to the channel pool for reuse. Pages are kept
 	// intact (persistent cache): the next BeginRead() will check dataVersion
 	// and clear the cache only if a write committed since this transaction.
@@ -2177,6 +2221,7 @@ func (tx *WriteTx) Commit() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
+	tx.aux = nil
 	// Captured for the defer: on the normal path tx is returned to the pool
 	// before the defer runs (safe — the pool is only drained under writeMu,
 	// still held here — but the defer must not reach through a pooled tx).
@@ -2223,7 +2268,12 @@ func (tx *WriteTx) Commit() error {
 		db.localSchemaCookie.Store(newSC)
 		// Increment dataVersion so persistent reader caches detect staleness.
 		// Unlike walMaxFrame, this counter never wraps after checkpoint restart.
-		db.dataVersion.Add(1)
+		dv := db.dataVersion.Add(1)
+		// The write lock is still held: the header a reader pins from here
+		// until the next commit is this one's, and these are its counters.
+		if hdr, ok := pager.wal.snapshotHdr(); ok {
+			db.snapCounters.put(dv, &hdr, newFCC, newSC)
+		}
 	}
 	threshold := db.opts.AutoCheckpointAfter
 	needCheckpoint = threshold > 0 && int(nFrame) >= threshold
@@ -2241,6 +2291,7 @@ func (tx *WriteTx) Rollback() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
+	tx.aux = nil
 	db, pager, slot := tx.db, tx.pager, tx.walSlot
 	var completed bool
 	defer func() {
