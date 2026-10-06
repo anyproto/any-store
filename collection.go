@@ -180,13 +180,15 @@ type collection struct {
 	// is called while no version is installed.
 	openName string
 
-	// since is the epoch's known cookie at the moment the handle entered the
-	// registry. A schema change of this process to the collection went
-	// through an earlier handle if its cookie is at or below since, and
-	// through this one otherwise — so a version loaded by a transaction older
-	// than since may miss a change nothing here will ever tell it of, and is
-	// never installed (resolveSlow). Set under db.mu before the handle is
-	// reachable.
+	// since is the cookie the handle is proven from: the epoch's known at
+	// the moment it entered the registry, or the cookie of the commit this
+	// process was publishing then (db.sinceNow), or the one a created
+	// collection commits with. A schema change of this process to the
+	// collection went through an earlier handle if its cookie is at or
+	// below since, and through this one otherwise — so a version loaded by
+	// a transaction older than since may miss a change nothing here will
+	// ever tell it of, and is never installed (resolveSlow). Set under db.mu
+	// before the handle is reachable.
 	since uint32
 
 	// primaryKey is the document field whose value is the btree key. Resolved

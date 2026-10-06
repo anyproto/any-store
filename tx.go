@@ -116,23 +116,30 @@ func (tx *commonTx) schemaCommitted(fileChangeCounter, schemaCookie uint32) {
 	if testHookBeforeInstall != nil {
 		testHookBeforeInstall()
 	}
-	tx.schema.install(tx.db.epoch.Load().gen)
+	// settling from before the first handle changes — the install closes
+	// the dropped ones, and a slot held by a closed handle is one a
+	// registration may take — until the epoch has moved (sinceNow).
 	tx.db.settling.Store(schemaCookie)
+	defer tx.db.settling.Store(0)
+	tx.schema.install(tx.db.epoch.Load().gen)
+	if testHookAfterInstall != nil {
+		testHookAfterInstall()
+	}
 	tx.db.settleLog(&tx.schema)
 	if testHookAfterSettle != nil {
 		testHookAfterSettle()
 	}
 	tx.db.schemaCommitted(fileChangeCounter, schemaCookie)
-	tx.db.settling.Store(0)
 }
 
 // testHookBeforeInstall, when set, runs inside a schema-changing commit as
-// it becomes visible, before the heads are installed; testHookAfterSettle
-// once the registry is settled, before the epoch moves;
-// testHookAfterBtreeCommit right after the btree commit returned, the write
-// lock released. Tests only.
+// it becomes visible, before the heads are installed; testHookAfterInstall
+// once they are, before the registry is settled; testHookAfterSettle once
+// it is, before the epoch moves; testHookAfterBtreeCommit right after the
+// btree commit returned, the write lock released. Tests only.
 var (
 	testHookBeforeInstall    func()
+	testHookAfterInstall     func()
 	testHookAfterSettle      func()
 	testHookAfterBtreeCommit func()
 )

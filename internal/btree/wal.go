@@ -770,8 +770,12 @@ func (wi *walIndex) liveMinFrame() uint32 {
 
 // testInProcessReadSnapshotHook, when non-nil, runs in the in-process read
 // begin between its lock-free reads of the frame numbers and of the restart
-// count. Test-only.
-var testInProcessReadSnapshotHook func()
+// count; testInProcessFreshSlotHook once a fresh slot is held shared,
+// before its re-validation. Test-only.
+var (
+	testInProcessReadSnapshotHook func()
+	testInProcessFreshSlotHook    func()
+)
 
 // synthHdr is the header of a snapshot in the in-process and in-memory
 // modes, which keep no WAL-index header: the frame ceiling and the restart
@@ -2893,19 +2897,34 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 
 	for i := 1; i <= 4; i++ {
 		lockSlot := lockRead0 + i
-		if err := w.index.lock(lockSlot, lockShared); err == nil {
-			// Post-lock re-validation, as for the reused slot above: a
-			// checkpoint, a restart and a commit can all land between the
-			// lock-free snapshot and this lock, and the window would then
-			// span the new generation's frames under the old key.
-			if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill ||
-				w.index.restarts.Load() != restarts {
-				_ = w.index.unlock(lockSlot, lockShared)
-				return WalIndexHdr{}, 0, 0, 0, errWALRetry
-			}
-			w.index.aReadMark[i].Store(mxFrame)
-			return hdr, mxFrame, nBackfill + 1, i, nil
+		// The mark is claimed under the exclusive lock, before the slot is
+		// shared, as the multi-process path and SQLite do (walTryBeginRead,
+		// wal.c:3170-3185): a checkpoint skips a slot whose mark is unused,
+		// and a mark stored once the slot is shared would let one backfill
+		// past this snapshot in between — and two readers sharing the slot
+		// would overwrite each other's.
+		if err := w.index.lock(lockSlot, lockExclusive); err != nil {
+			continue
 		}
+		w.index.aReadMark[i].Store(mxFrame)
+		_ = w.index.unlock(lockSlot, lockExclusive)
+		if err := w.index.lock(lockSlot, lockShared); err != nil {
+			return WalIndexHdr{}, 0, 0, 0, errWALRetry
+		}
+		if testInProcessFreshSlotHook != nil {
+			testInProcessFreshSlotHook()
+		}
+		// Post-lock re-validation, as for the reused slot above: a
+		// checkpoint, a restart and a commit can all land between the
+		// lock-free snapshot and this lock, and the window would then span
+		// the new generation's frames under the old key; a checkpoint
+		// could also have cleared the mark while the slot was free.
+		if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill ||
+			w.index.restarts.Load() != restarts || w.index.aReadMark[i].Load() != mxFrame {
+			_ = w.index.unlock(lockSlot, lockShared)
+			return WalIndexHdr{}, 0, 0, 0, errWALRetry
+		}
+		return hdr, mxFrame, nBackfill + 1, i, nil
 	}
 
 	if err := w.index.lock(lockRead0, lockShared); err != nil {

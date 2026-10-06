@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -181,6 +182,122 @@ func TestBeginRead_InProcessFastPathRetriesAcrossRestart(t *testing.T) {
 			}
 			if _, c, _ := fast.SnapshotHeaderCounters(); c != cookieBefore+1 {
 				t.Fatalf("a reader after the commit reports cookie %d, want %d", c, cookieBefore+1)
+			}
+		})
+	}
+}
+
+// A fresh reader slot's mark is claimed before the slot is shared: a
+// checkpoint skips a slot whose mark is unused, so with the mark stored
+// later a checkpoint between the lock and the store backfills past the
+// snapshot, and the reader then takes newer content from the file for the
+// pages its WAL window does not cover — a torn snapshot.
+func TestBeginRead_InProcessFreshSlotMarkBeforeShare(t *testing.T) {
+	for _, mode := range []string{"inprocess", "inmemory"} {
+		t.Run(mode, func(t *testing.T) {
+			opts := DefaultOptions()
+			path := filepath.Join(t.TempDir(), "db")
+			if mode == "inmemory" {
+				opts.InMemory = true
+				path = ""
+			} else {
+				opts.InProcess = true
+			}
+			db, err := Open(path, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var ns *Namespace
+			// Values of a page each: the two keys on different pages, so one
+			// can come from the WAL and the other from the file.
+			big := func(v string) []byte { return append([]byte(v), make([]byte, 3000)...) }
+			put := func(key, val string) {
+				w, err := db.BeginWrite()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ns == nil {
+					if ns, err = w.CreateNamespace("n"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err = w.Put(ns, []byte(key), big(val)); err != nil {
+					t.Fatal(err)
+				}
+				if err = w.Commit(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A tree of several leaves, "a" and "b" on different ones. A
+			// restart leaves every mark unused; the next reader claims a
+			// fresh slot.
+			for i := range 40 {
+				put(fmt.Sprintf("k%02d", i), "k1")
+			}
+			put("a", "a1")
+			put("z", "b1")
+			if err = db.Checkpoint(CheckpointRestart); err != nil {
+				t.Fatal(err)
+			}
+			put("a", "a2")
+
+			var hookErr error
+			var commitFrame uint32
+			testInProcessFreshSlotHook = func() {
+				testInProcessFreshSlotHook = nil
+				// Backfill, a commit, backfill: a slot without a mark holds
+				// nothing back.
+				if hookErr = db.Checkpoint(CheckpointPassive); hookErr != nil {
+					return
+				}
+				w, err := db.BeginWrite()
+				if err != nil {
+					hookErr = err
+					return
+				}
+				if err = w.Put(ns, []byte("z"), big("b2")); err != nil {
+					hookErr = err
+					return
+				}
+				if hookErr = w.Commit(); hookErr != nil {
+					return
+				}
+				commitFrame = db.pager.wal.index.mxCommitFrame.LoadLocal()
+				hookErr = db.Checkpoint(CheckpointPassive)
+			}
+			defer func() { testInProcessFreshSlotHook = nil }()
+			rtx, err := db.BeginRead()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rtx.Rollback()
+			if hookErr != nil {
+				t.Fatal(hookErr)
+			}
+			a, err := rtx.Get(ns, []byte("a"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			a = a[:2]
+			b, err := rtx.Get(ns, []byte("z"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			b = b[:2]
+			// One snapshot: a2 with b1 (before the commit) or a2 with b2
+			// (after it, had the begin retried onto it) — never a2 with b1
+			// from the WAL and b2 from the file.
+			if string(a) != "a2" {
+				t.Fatalf("a = %q, want a2", a)
+			}
+			if string(b) != "b1" && string(b) != "b2" {
+				t.Fatalf("b = %q", b)
+			}
+			if string(b) == "b2" && rtx.walMaxFrame != commitFrame {
+				// The commit's content under a window that does not reach
+				// it: read from the file, past the snapshot.
+				t.Fatalf("b2 read at a snapshot whose window ends at frame %d; the commit is frame %d", rtx.walMaxFrame, commitFrame)
 			}
 		})
 	}

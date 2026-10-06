@@ -191,14 +191,15 @@ const (
 
 // sinceNow is the cookie a handle registered now is proven from
 // (collection.since): the epoch's known — or the cookie of the commit this
-// process is publishing right now, if its registry is settled and the
-// epoch not yet past it (db.settling). A handle the commit dropped is gone
-// from the registry by then, and a transaction at the snapshot before the
-// commit that registers a handle for the collection must not speak for it,
-// or it would install the dropped collection's version for the
+// process is publishing right now, from its first change to a handle until
+// the epoch is past it (db.settling). A handle the commit dropped is closed
+// at the install and gone from the registry at the settle, and a
+// transaction at the snapshot before the commit that registers a handle
+// for the collection, or for an older one under its name, must not speak
+// for it, or it would install a dropped collection's version for the
 // transactions after the commit. settling before known: the commit sets
-// settling before it settles and clears it after known moved, so a
-// registration that finds it clear and came after the settle finds known
+// settling before it touches a handle and clears it after known moved, so
+// a registration that finds it clear and came after a change finds known
 // moved too. The caller holds db.mu, which orders it against the settle.
 func (db *db) sinceNow() uint32 {
 	if settling := db.settling.Load(); settling != 0 {

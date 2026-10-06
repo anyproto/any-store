@@ -787,3 +787,86 @@ func TestName_OfAGoneHandle(t *testing.T) {
 	require.NoError(t, a.Close())
 	assert.Equal(t, "b", a.Name())
 }
+
+// Between a drop's install — the handle closed, its slot still held — and
+// the settle, a transaction whose snapshot has an older collection under
+// the name takes the slot for that one; the handle it registers, and any
+// the present registers after it, are proven from the commit's cookie: a
+// transaction at the snapshot before the drop does not install the
+// dropped collection's version for the transactions after the commit.
+func TestCommit_OlderCollectionUnderTheNameInThePublication(t *testing.T) {
+	fx := newFixture(t)
+	x0, err := fx.CreateCollection(ctx, "x")
+	require.NoError(t, err)
+	require.NoError(t, x0.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	r0, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { _ = r0.Commit() }()
+	require.NoError(t, x0.Drop(ctx))
+	x1, err := fx.CreateCollection(ctx, "x")
+	require.NoError(t, err)
+	require.NoError(t, x1.Insert(ctx, anyenc.MustParseJson(`{"id":2}`)))
+	other, err := fx.CreateCollection(ctx, "other")
+	require.NoError(t, err)
+	r1, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { _ = r1.Commit() }()
+
+	installed, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	testHookAfterInstall = func() {
+		once.Do(func() {
+			close(installed)
+			<-release
+		})
+	}
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		testHookAfterInstall = nil
+	})
+	committed := make(chan error, 1)
+	go func() { committed <- x1.Drop(ctx) }()
+	<-installed
+
+	// The oldest snapshot's collection takes the slot the closed handle
+	// held; the one before the drop finds its own collection gone from
+	// the registry.
+	old, err := fx.OpenCollection(r0.Context(), "x")
+	require.NoError(t, err)
+	n, err := old.Count(r0.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	before, err := fx.OpenCollection(r1.Context(), "x")
+	if err == nil {
+		n, err = before.Count(r1.Context())
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+	} else {
+		assert.ErrorIs(t, err, ErrCollectionNotFound)
+	}
+	close(release)
+	require.NoError(t, <-committed)
+
+	// The present: no handle answers for "x", and the dropped collection's
+	// pages are another's to take.
+	_, err = fx.OpenCollection(ctx, "x")
+	assert.ErrorIs(t, err, ErrCollectionNotFound)
+	for i := range 50 {
+		require.NoError(t, other.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%0200d"}`, i, i))))
+	}
+	for _, h := range []Collection{old, before} {
+		if h == nil {
+			continue
+		}
+		_, err = h.Count(ctx)
+		assert.ErrorIs(t, err, ErrCollectionNotFound, "a handle of a dropped collection answers in the present")
+	}
+	require.NoError(t, fx.IntegrityCheck(ctx))
+	x2, err := fx.CreateCollection(ctx, "x")
+	require.NoError(t, err)
+	assertCollCount(t, x2, 0)
+}
