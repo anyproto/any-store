@@ -140,9 +140,10 @@ func TestResolve_PeerSchemaChangeVerifiesOnFirstUse(t *testing.T) {
 // catching up with it — instructions apart, inside the btree commit — waits
 // for the epoch: the heads and the registry of that moment are the
 // pre-commit ones. It then works with the committed head, replaces nothing
-// and takes the commit for no other process's. Should the wait run out —
-// the announcement left standing by a commit that will not come back — the
-// cookie is another process's: a generation, and the reader's own view.
+// and takes the commit for no other process's. When the announcement is
+// withdrawn instead — the commit of this process published nothing, the
+// cookie is another process's — the reader starts a generation and works
+// through its own view.
 func TestResolve_ReaderBetweenCommitAndEpoch(t *testing.T) {
 	setup := func(t *testing.T) (*fixture, *db, Collection, *schemaEpoch, *schemaEpoch) {
 		fx := newFixture(t)
@@ -177,7 +178,7 @@ func TestResolve_ReaderBetweenCommitAndEpoch(t *testing.T) {
 	}
 
 	t.Run("epoch catches up", func(t *testing.T) {
-		fx, dbi, coll, before, after := setup(t)
+		_, dbi, coll, before, after := setup(t)
 		c := coll.(*collection)
 		head := c.cur()
 		loads := countSchemaLoads(t)
@@ -195,27 +196,26 @@ func TestResolve_ReaderBetweenCommitAndEpoch(t *testing.T) {
 		assert.True(t, head == c.cur())
 		assert.Equal(t, before.gen, dbi.epoch.Load().gen, "an own commit was taken for another process's")
 		assert.Equal(t, after.known, dbi.epoch.Load().known)
-		_ = fx
 	})
 
-	t.Run("wait runs out", func(t *testing.T) {
-		fx, dbi, coll, before, after := setup(t)
+	t.Run("announcement withdrawn", func(t *testing.T) {
+		_, dbi, coll, before, after := setup(t)
 		c := coll.(*collection)
 		head := c.cur()
-		spins := announcedCookieSpins
-		announcedCookieSpins = 64
-		defer func() { announcedCookieSpins = spins }()
 		loads := countSchemaLoads(t)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			time.Sleep(2 * time.Millisecond)
+			dbi.endAnnouncement(after.known)
+		}()
 		noDroppedIndex(t, coll)
+		<-done
 		assert.NotZero(t, *loads, "the reader trusted a head of a generation it is not in")
 		assert.Equal(t, before.gen+1, dbi.epoch.Load().gen, "the cookie is another process's")
 		assert.Equal(t, after.known, dbi.epoch.Load().known)
-		// The hook, late: the epoch is past it already.
-		dbi.schemaCommitted(0, after.known)
-		assert.Equal(t, before.gen+1, dbi.epoch.Load().gen)
 		assert.True(t, head == c.cur(), "the first reader of the generation confirmed the committed head")
 		assert.Equal(t, before.gen+1, c.cur().gen.Load())
-		_ = fx
 	})
 }
 
@@ -408,9 +408,6 @@ func TestCommit_ReaderInThePublicationWaits(t *testing.T) {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
 	}
 	gen := dbi.epoch.Load().gen
-	spins := announcedCookieSpins
-	announcedCookieSpins = 1 << 40
-	defer func() { announcedCookieSpins = spins }()
 	loads := countSchemaLoads(t)
 
 	visible, release := holdCommitBeforeInstall(t)
@@ -571,4 +568,71 @@ func TestCommit_EmptySchemaCommitAnnouncesNothingToTheNextWriter(t *testing.T) {
 			assert.Equal(t, 2, l, "the writer did not maintain the other process's index")
 		}
 	}
+}
+
+// A commit whose log holds pins only — a verb began on the handle and
+// changed nothing — discards the log after the btree released the write
+// lock, under the schema gate: a writer beginning then would find the
+// handle's mark cleared under its own entry, and resolve the head instead
+// of the index it is creating.
+func TestCommit_PinOnlyCommitIsGated(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"k":1}`)))
+
+	next := make(chan error, 1)
+	began := make(chan struct{})
+	var fired bool
+	testHookAfterBtreeCommit = func() {
+		if fired {
+			return
+		}
+		fired = true
+		// The next writer: its begin waits at the gate until this commit
+		// has discarded its log.
+		go func() {
+			wtx, err := fx.WriteTx(ctx)
+			if err != nil {
+				next <- err
+				return
+			}
+			close(began)
+			if err = coll.CreateIndex(wtx.Context(), IndexInfo{Name: "k", Fields: []string{"k"}}); err != nil {
+				_ = wtx.Rollback()
+				next <- err
+				return
+			}
+			if err = coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":2,"k":2}`)); err != nil {
+				_ = wtx.Rollback()
+				next <- err
+				return
+			}
+			next <- wtx.Commit()
+		}()
+		time.Sleep(3 * time.Millisecond)
+		select {
+		case <-began:
+			t.Error("a writer began while a pin-only commit was still to discard its log")
+		default:
+		}
+	}
+	defer func() { testHookAfterBtreeCommit = nil }()
+
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.Rename(wtx.Context(), "c"))
+	require.NoError(t, wtx.Commit())
+	require.NoError(t, <-next)
+
+	for _, idx := range coll.GetIndexes() {
+		if idx.Info().Name == "k" {
+			l, err := idx.Len(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 2, l, "the next writer's index misses the document it inserted")
+		}
+	}
+	n, err := coll.Find(`{"k":2}`).IndexHint(IndexHint{IndexName: "k", Boost: 1_000_000}).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
 }

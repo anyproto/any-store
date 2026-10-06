@@ -5,6 +5,7 @@ import (
 	"errors"
 	"runtime"
 	"sync/atomic"
+	"time"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 )
@@ -148,15 +149,17 @@ type schemaEpoch struct {
 // another process's schema change.
 //
 // The cookie this process announced is its commit becoming visible: the
-// heads it changed are installed and known follows within instructions of
-// the publication (commonTx.schemaCommitted), and the transaction waits for
-// that rather than work beside it — the heads of that moment are the
-// pre-commit ones, and so are the names the handles answer to. A commit
-// that publishes nothing withdraws its announcement once it returns
-// (writeTx.Commit); should the wait outlast that, the cookie is another
-// process's after all. Bounded in case the announcement is never withdrawn
-// (a commit that panicked): a generation taken for nothing costs one
-// verification per handle, never correctness.
+// heads it changed are installed, the registry settled and known moved
+// within instructions of the publication (commonTx.schemaCommitted), and
+// the transaction waits for that rather than work beside it — the heads of
+// that moment are the pre-commit ones, and so are the names the handles
+// answer to; a transaction that took them for the committed state would
+// retire the handle being renamed, or register a second one for the
+// collection being created. A commit that publishes nothing withdraws its
+// announcement once it returns (writeTx.Commit, on every exit), and the
+// wait ends with the withdrawal: the cookie is another process's after
+// all. The wait yields after a few spins, for a committer that was
+// descheduled.
 func (db *db) observeCookie(tx *btree.ReadTx) {
 	cookie := tx.SnapshotSchemaCookie()
 	for spins := 0; ; {
@@ -164,9 +167,13 @@ func (db *db) observeCookie(tx *btree.ReadTx) {
 		if cookieLE(cookie, e.known) {
 			return
 		}
-		if own := db.ownCookie.Load(); own>>32 != 0 && uint32(own) == cookie && spins < announcedCookieSpins {
-			spins++
-			runtime.Gosched()
+		if own := db.ownCookie.Load(); own>>32 != 0 && uint32(own) == cookie {
+			if spins < announcedCookieSpins {
+				spins++
+				runtime.Gosched()
+			} else {
+				time.Sleep(announcedCookieNap)
+			}
 			continue
 		}
 		if db.epoch.CompareAndSwap(e, &schemaEpoch{gen: e.gen + 1, start: cookie, known: cookie}) {
@@ -175,9 +182,12 @@ func (db *db) observeCookie(tx *btree.ReadTx) {
 	}
 }
 
-// announcedCookieSpins bounds the wait for an announced cookie's epoch.
-// A variable for the tests that hold a commit in its publication.
-var announcedCookieSpins = 1 << 16
+// announcedCookieSpins is how often the wait for an announced cookie's
+// epoch yields before it sleeps announcedCookieNap between checks.
+const (
+	announcedCookieSpins = 64
+	announcedCookieNap   = 20 * time.Microsecond
+)
 
 // announceCookie tells observeCookie which cookie the commit about to run
 // produces, so a reader that begins once it is visible does not take it for
@@ -435,6 +445,7 @@ func (t *txSchema) install(gen uint64) {
 // btree.WriteTx.OnCommitted).
 func (db *db) settleLog(t *txSchema) {
 	db.mu.Lock()
+	defer db.mu.Unlock()
 	for i := range t.log {
 		e := &t.log[i]
 		if e.kind == logPin || e.c.closed.Load() && e.kind != logDrop {
@@ -460,7 +471,6 @@ func (db *db) settleLog(t *txSchema) {
 		}
 	}
 	db.unpinLocked(t.log)
-	db.mu.Unlock()
 	for i := range t.log {
 		t.log[i].c.logLast = 0
 	}

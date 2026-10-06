@@ -221,14 +221,16 @@ func (w writeTx) Commit() error {
 		// returns. A schema-changing commit announces the cookie it
 		// produces (observeCookie), and the announcement of one that
 		// publishes nothing — empty, or failed — is withdrawn only once it
-		// returned: hold the schema gate (paired with newWriteTx) until
-		// then, so no writer of this process begins while another
-		// process's commit could pass for this one's. Taken before the
-		// release is deferred: what the release has left to discard, it
-		// discards under the gate.
+		// returned; a log the commit did not publish — a pin-only one, or
+		// one of a commit that failed — is discarded then too, and touches
+		// the handles' marks. Hold the schema gate (paired with newWriteTx)
+		// until then, so no writer of this process begins while another
+		// process's commit could pass for this one's, or while the marks
+		// move. Taken before the release is deferred: what the release has
+		// left to discard, it discards under the gate.
 		t := &w.commonTx.schema
 		schemaChange := w.writeTx.SchemaChanged()
-		if schemaChange {
+		if schemaChange || len(t.log) > 0 {
 			w.db.schemaGate.Lock()
 			defer w.db.schemaGate.Unlock()
 		}

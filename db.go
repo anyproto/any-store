@@ -268,12 +268,14 @@ type db struct {
 
 	// schemaGate serializes the end of a schema-changing commit against the
 	// next write tx. btree WriteTx.Commit releases the global write lock
-	// before it returns, and the registry follows the commit's schema log
-	// only then (settleLog) — or, after a failed commit, the log is
-	// discarded then: a writer beginning in that gap would find the registry
-	// behind the catalog it reads. A tx with a non-empty log holds the gate
-	// across btree Commit + settle; newWriteTx passes through it once after
-	// acquiring the write lock. Plain data txs skip it.
+	// before it returns, and only then does the commit withdraw the cookie
+	// it announced (observeCookie) when it published nothing, or discard
+	// the schema log it did not publish: a writer beginning in that gap
+	// would take another process's commit at the announced cookie for this
+	// one's, or race the discard on the handles' marks. A tx that announced
+	// or logged holds the gate across btree Commit + that; newWriteTx
+	// passes through it once after acquiring the write lock. Plain data txs
+	// skip it.
 	// The rollback and savepoint paths need no gate: they discard the log
 	// while the btree write lock is still held.
 	schemaGate sync.Mutex
