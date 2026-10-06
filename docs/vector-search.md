@@ -52,12 +52,24 @@ Only `Field` and `Dim` are required. Other `VectorParams`:
 
 | Field | Default | Purpose |
 |---|---|---|
-| `Metric` | `VectorCosine` | distance measure: `VectorCosine`, `VectorL2`, `VectorDot`. `VectorDot` is not supported by the IVF modes (index creation and open fail with `ErrVectorMetricUnsupported`) |
+| `Metric` | `VectorCosine` | distance measure: `VectorCosine`, `VectorL2`, `VectorDot`. `VectorDot` is not supported by the IVF mode (index creation and open fail with `ErrVectorMetricUnsupported`) |
 | `M`, `EfConstruction`, `EfSearch` | sensible defaults (0) | HNSW graph/search tuning |
 | `Quantization` | `VectorQuantNone` | `VectorQuantInt8` ≈ 4× smaller, RAM-resident vectors |
-| `Mode` | `VectorModeBTree` | `VectorModeHybrid` (RAM layer-0 cache), `VectorModeBruteForce` (exact O(N) scan, no graph), `VectorModeIVFPQ`/`VectorModeIVFSQ` (inverted-file cells; Cosine/L2 only) |
+| `Mode` | `VectorModeBTree` | `VectorModeHybrid` (RAM layer-0 cache), `VectorModeBruteForce` (exact O(N) scan, no graph), `VectorModeIVFSQ` (inverted-file cells of int8 vectors; Cosine/L2 only, always int8) |
 | `HybridCacheVectors` | `false` | hybrid only: also cache vectors in RAM for faster search |
-| `CompactRatio` | `0` (off) | auto-compact the graph when tombstones reach this ratio of live nodes |
+| `CompactRatio` | `0` (off) | HNSW: auto-compact the graph when tombstones reach this ratio of live nodes; `IVFSQ`: auto-rebuild (re-train the centroids) when the drift score reaches it |
+| `NList`, `NProbe`, `Closure` | `~4·√N`, `16`, `1` | `IVFSQ` only: coarse cells; cells scanned per query (the recall dial); cells each vector is placed in |
+
+An index built by an earlier release in the removed `ivfpq` mode still opens with
+its collection but is quarantined: `$knn` on its field and `CompactVectorIndex`
+return `ErrVectorIndexUnsupported`, writes leave it untouched, and
+`VectorIndexStats.Unsupported` reports it (with the sizes a drop reclaims).
+`EnsureIndex` of the same name in another mode fails with `ErrIndexMismatch`
+wrapping `ErrVectorIndexUnsupported`: `DropIndex` first, then create it again —
+or build the replacement under another name first; unqualified `$knn` prefers
+the supported index. Drop the quarantined index before an earlier release opens
+the file again: that release would serve it, and this one's writes no longer
+maintain it.
 
 ## 2. Document shape
 
@@ -216,7 +228,8 @@ Mistakes are reported rather than silently returning wrong results:
 | The pre-`$knn` spelling: a bare `Dim`-sized array equality on a vector-indexed field — `{"embedding":[...768 floats...]}` | `ErrLegacyVectorClause` |
 | Malformed `$knn`: wrong-dimension / empty / non-finite `$query`, out-of-range `$k` or `$ef` | `ErrInvalidVectorQuery` |
 | `$knn` on a field with no vector index (or `$index` names none) | `ErrNoVectorIndex` |
-| `$knn` on a field with several vector indexes and no `$index` | `ErrAmbiguousVectorIndex` |
+| `$knn` on a field with several supported vector indexes and no `$index` | `ErrAmbiguousVectorIndex` |
+| `$knn` on (or `$index` naming) an index in a removed mode (`ivfpq`) | `ErrVectorIndexUnsupported` |
 | `$knn` under `$or`/`$nor`/`$not`, nested, bare, or unstrippable | `ErrKnnBadPlacement` |
 | `$knn` and `$text` in one query | `ErrKnnWithText` |
 | Two `$knn` clauses in one query | `ErrMultipleVectorClauses` |
@@ -250,6 +263,7 @@ treat them as ratios, not absolutes (they scale with N, dim, and hardware).
 | **Lowest latency, RAM to spare** | `Hybrid` + `HybridCacheVectors` + `Int8` (or f32) | vectors served from RAM → sub-0.3 ms p50, ~3–9× the btree QPS; costs ≈ the stored vector size in RAM |
 | **Lowest RAM / many indexes / multi-process writers** | `BTree` + `Int8` | no RAM-resident layer beyond the btree page cache |
 | **Small set (≲ tens of k) or exact 100% recall** | `BruteForce` | exact O(N) scan, zero index storage, fastest writes; ~7 µs/doc at dim 768 on desktop CPUs |
+| **Large, write-heavy collection** | `IVFSQ` (create after bulk load; `NProbe` is the recall dial) | inserts/updates ~8× HNSW's at 38k, ~15× at 1M; smallest index; queries 3–16× slower than RAM HNSW at matched recall — see `docs/vector-engine.md` |
 | **Delete/update-heavy** | any mode + `CompactRatio 0.5` | caps tombstone growth — see below |
 | **Recall-tolerant / first-stage retrieval** | lower `Dim` (MRL 768→128) + `Int8` | ~2× faster, ~4× smaller; re-rank survivors at full dim |
 
@@ -279,8 +293,10 @@ treat them as ratios, not absolutes (they scale with N, dim, and hardware).
   laptop/server-class cores. The per-query cost is linear in N — past a few
   tens of thousands of documents prefer an ANN mode.
 
-Insert/update/delete throughput is **the same across all modes** — the hybrid
-mirror is built lazily on the read path, so it adds no measurable write cost.
+Insert/update/delete throughput is **the same across the HNSW modes** — the
+hybrid mirror is built lazily on the read path, so it adds no measurable write
+cost. `IVFSQ` writes ~8–15× faster (an insert assigns a cell and writes one int8
+record; an HNSW insert rewires the graph), and `BruteForce` maintains nothing.
 
 ### Quantization
 

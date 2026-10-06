@@ -1,7 +1,7 @@
 # IVF-SQ: Production Assessment & TODOs
 
-IVF-SQ (`VectorModeIVFSQ`) is the leading candidate mode for Anytype-style
-local-first workloads. Assessment from the any-store-tests cross-machine runs
+IVF-SQ (`VectorModeIVFSQ`) is the IVF mode (IVF-PQ was removed) and what
+Anytype-style local-first workloads run. Assessment from the any-store-tests cross-machine runs
 on f414ff6 (r9950x, r3900x Win+Linux dual-boot, p14, hp; real embeddinggemma
 corpus, 20k × 768 unless noted). Result files:
 any-store-tests `results/dist-runs/`, findings in PERF-1..3.

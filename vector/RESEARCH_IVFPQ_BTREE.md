@@ -1,6 +1,12 @@
 # Research: IVF-PQ / IVF-OPQ / residual-PQ as a btree-native vector index
 
-Status: **research / design** (branch `feat/vector-ivfpq-btree`).
+> Status: IVF-PQ as designed here shipped and was then removed; IVF-SQ (the "second
+> flavour" in Phase 3) is the IVF mode. At equal recall it built, wrote and searched
+> faster, was smaller and used less RAM; the measurements are kept below and in
+> docs/vector-engine.md. The btree layout, closure and drift/rebuild design carry
+> over unchanged.
+
+Original status: **research / design** (branch `feat/vector-ivfpq-btree`).
 Question posed: *instead of HNSW, evaluate the IVF-PQ family (IVFPQ, IVF-OPQ, residual/additive-PQ
 hybrids) — the hypothesis being that these algorithms fit any-store's btree far better than a graph.*
 
