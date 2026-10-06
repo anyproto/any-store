@@ -134,11 +134,11 @@ func TestBeginRead_InProcessFastPathRetriesAcrossRestart(t *testing.T) {
 			_ = rtx.Rollback()
 
 			var hookErr error
-			testInProcessReadSnapshotHook = func() {
-				testInProcessReadSnapshotHook = nil
-				// The old generation fully backfilled, its restart count
+			testInProcessFramesReadHook = func() {
+				testInProcessFramesReadHook = nil
+				// The old generation fully backfilled, its frame numbers
 				// read: a restart, then a commit that ends on the same
-				// frame number.
+				// frame number, before the fast path takes its lock.
 				if hookErr = db.Checkpoint(CheckpointRestart); hookErr != nil {
 					return
 				}
@@ -154,7 +154,7 @@ func TestBeginRead_InProcessFastPathRetriesAcrossRestart(t *testing.T) {
 				w.MarkSchemaChanged()
 				hookErr = w.Commit()
 			}
-			defer func() { testInProcessReadSnapshotHook = nil }()
+			defer func() { testInProcessFramesReadHook = nil }()
 			rtx, err = db.BeginRead()
 			if err != nil {
 				t.Fatal(err)
@@ -300,134 +300,6 @@ func TestBeginRead_InProcessFreshSlotMarkBeforeShare(t *testing.T) {
 				// The commit's content under a window that does not reach
 				// it: read from the file, past the snapshot.
 				t.Fatalf("b2 read at a snapshot whose window ends at frame %d; the commit is frame %d", rtx.walMaxFrame, commitFrame)
-			}
-		})
-	}
-}
-
-// The reuse of a reader slot re-validates the slot's mark after the shared
-// lock: a checkpoint between the scan and the lock resets a free slot to
-// unused (its backfill held off by a slot-0 reader, so nBackfill does not
-// move), and a reader holding a slot without a mark is one the next
-// checkpoint backfills past.
-func TestBeginRead_InProcessReusedSlotMarkRechecked(t *testing.T) {
-	for _, mode := range []string{"inprocess", "inmemory"} {
-		t.Run(mode, func(t *testing.T) {
-			opts := DefaultOptions()
-			path := filepath.Join(t.TempDir(), "db")
-			if mode == "inmemory" {
-				opts.InMemory = true
-				path = ""
-			} else {
-				opts.InProcess = true
-			}
-			db, err := Open(path, opts)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer db.Close()
-			var ns *Namespace
-			big := func(v string) []byte { return append([]byte(v), make([]byte, 3000)...) }
-			put := func(key, val string) {
-				w, err := db.BeginWrite()
-				if err != nil {
-					t.Fatal(err)
-				}
-				if ns == nil {
-					if ns, err = w.CreateNamespace("n"); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if err = w.Put(ns, []byte(key), big(val)); err != nil {
-					t.Fatal(err)
-				}
-				if err = w.Commit(); err != nil {
-					t.Fatal(err)
-				}
-			}
-			for i := range 40 {
-				put(fmt.Sprintf("k%02d", i), "k1")
-			}
-			put("a", "a1")
-			put("z", "b1")
-			if err = db.Checkpoint(CheckpointRestart); err != nil {
-				t.Fatal(err)
-			}
-			idx := db.pager.wal.index
-			put("a", "a2")
-			if err = db.Checkpoint(CheckpointPassive); err != nil {
-				t.Fatal(err)
-			}
-			// A slot-0 reader: the checkpoints below cannot backfill.
-			l, err := db.BeginRead()
-			if err != nil {
-				t.Fatal(err)
-			}
-			lDone := false
-			defer func() {
-				if !lDone {
-					_ = l.Rollback()
-				}
-			}()
-			if l.walSlot != 0 {
-				t.Fatalf("the slot-0 reader is on slot %d", l.walSlot)
-			}
-			put("k05", "k2")
-			ra, err := db.BeginRead() // a fresh claim: slot 1
-			if err != nil {
-				t.Fatal(err)
-			}
-			_ = ra.Rollback()
-			put("k06", "k2")
-			// A reader whose reuse of slot 1 meets the slot held exclusive
-			// for an instant (a checkpointer's per-slot lock) claims slot 2.
-			testInProcessReuseSlotHook = func() {
-				testInProcessReuseSlotHook = nil
-				if err := idx.lock(lockRead0+1, lockExclusive); err != nil {
-					t.Error(err)
-				}
-			}
-			rb, err := db.BeginRead()
-			testInProcessReuseSlotHook = nil
-			_ = idx.unlock(lockRead0+1, lockExclusive)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_ = rb.Rollback()
-			put("k07", "k2")
-
-			// The reader under test picks slot 2; a checkpoint between its
-			// scan and its lock resets the free slot.
-			testInProcessReuseSlotHook = func() {
-				testInProcessReuseSlotHook = nil
-				if err := db.Checkpoint(CheckpointPassive); err != nil {
-					t.Error(err)
-				}
-			}
-			defer func() { testInProcessReuseSlotHook = nil }()
-			r2, err := db.BeginRead()
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer r2.Rollback()
-			// A mark below the snapshot is fine (it holds the checkpoint
-			// below the snapshot); an unused one is not.
-			if mark := idx.aReadMark[r2.walSlot].Load(); r2.walSlot != 0 && mark == readMarkNotUsed {
-				t.Fatalf("the reader holds slot %d without a mark for a window up to %d", r2.walSlot, r2.walMaxFrame)
-			}
-			_ = l.Rollback()
-			lDone = true
-
-			put("z", "b2")
-			if err = db.Checkpoint(CheckpointPassive); err != nil {
-				t.Fatal(err)
-			}
-			b, err := r2.Get(ns, []byte("z"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(b[:2]) != "b1" {
-				t.Fatalf("the reader reads z=%q, want b1: a commit past its snapshot", b[:2])
 			}
 		})
 	}
@@ -637,6 +509,188 @@ func TestBeginRead_InProcessClaimsASlotForANewerSnapshot(t *testing.T) {
 			// lags by at most what that reader cannot see.
 			if lag := mx - nb; lag > mx-snapshot+5 {
 				t.Fatalf("after 20 rounds of overlapping readers nBackfill=%d, mxCommit=%d, the live reader's snapshot %d", nb, mx, snapshot)
+			}
+		})
+	}
+}
+
+func openInProcessN(t *testing.T, mode string, maxReaders int) *inProcessFixture {
+	opts := DefaultOptions()
+	opts.MaxReaders = maxReaders
+	path := filepath.Join(t.TempDir(), "db")
+	if mode == "inmemory" {
+		opts.InMemory = true
+		path = ""
+	} else {
+		opts.InProcess = true
+	}
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return &inProcessFixture{t: t, db: db}
+}
+
+// The reuse of a reader slot re-validates the slot's mark after the shared
+// lock. With every slot held, a reader reuses the one with the best mark;
+// a checkpoint between its scan and its lock resets the slot, freed
+// meanwhile, to unused — its backfill held off by a slot-0 reader, so the
+// frame counters do not move — and a reader holding a slot without a mark
+// is one the next checkpoint backfills past.
+func TestBeginRead_InProcessReusedSlotMarkRechecked(t *testing.T) {
+	for _, mode := range []string{"inprocess", "inmemory"} {
+		t.Run(mode, func(t *testing.T) {
+			f := openInProcessN(t, mode, 8)
+			db := f.db
+			for i := range 40 {
+				f.put(fmt.Sprintf("k%02d", i), "k1")
+			}
+			f.put("a", "a1", "z", "b1")
+			if err := db.Checkpoint(CheckpointRestart); err != nil {
+				t.Fatal(err)
+			}
+			f.put("a", "a2")
+			if err := db.Checkpoint(CheckpointPassive); err != nil {
+				t.Fatal(err)
+			}
+			l, err := db.BeginRead()
+			if err != nil {
+				t.Fatal(err)
+			}
+			lDone := false
+			defer func() {
+				if !lDone {
+					_ = l.Rollback()
+				}
+			}()
+			if l.walSlot != 0 {
+				t.Fatalf("the slot-0 reader is on slot %d", l.walSlot)
+			}
+			var held []*ReadTx
+			for i := range 4 {
+				f.put(fmt.Sprintf("k%02d", i), "k2")
+				r, err := db.BeginRead()
+				if err != nil {
+					t.Fatal(err)
+				}
+				held = append(held, r)
+			}
+			defer func() {
+				for _, r := range held {
+					_ = r.Rollback()
+				}
+			}()
+			f.put("k05", "k2")
+			testInProcessReuseSlotHook = func() {
+				testInProcessReuseSlotHook = nil
+				for _, r := range held {
+					_ = r.Rollback()
+				}
+				held = nil
+				if err := db.Checkpoint(CheckpointPassive); err != nil {
+					t.Error(err)
+				}
+			}
+			defer func() { testInProcessReuseSlotHook = nil }()
+			r, err := db.BeginRead()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Rollback()
+			_ = l.Rollback()
+			lDone = true
+			f.put("z", "b2")
+			if err := db.Checkpoint(CheckpointPassive); err != nil {
+				t.Fatal(err)
+			}
+			if got := f.get(r, "z"); got != "b1" {
+				t.Fatalf("the reader reads z=%s past its snapshot", got)
+			}
+			if got := f.get(r, "a"); got != "a2" {
+				t.Fatalf("a=%s", got)
+			}
+		})
+	}
+}
+
+// A read begin re-validates the restart count once it holds its slot: with
+// a restart and a commit that ends on the same frame number between its
+// read of the count and its reads of the frame numbers, the old count
+// would key the new commit as an older snapshot, whose pooled cache and
+// counters it would then take.
+func TestBeginRead_InProcessRestartCountRechecked(t *testing.T) {
+	for _, mode := range []string{"inprocess", "inmemory"} {
+		t.Run(mode, func(t *testing.T) {
+			f := openInProcess(t, mode)
+			db := f.db
+			commitNS := func(ns string, onc func(uint32, uint32)) error {
+				w, err := db.BeginWrite()
+				if err != nil {
+					return err
+				}
+				if _, err = w.CreateNamespace(ns); err != nil {
+					return err
+				}
+				w.MarkSchemaChanged()
+				if onc != nil {
+					w.OnCommitted(onc)
+				}
+				return w.Commit()
+			}
+			if err := commitNS("x", nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Checkpoint(CheckpointRestart); err != nil {
+				t.Fatal(err)
+			}
+			if err := commitNS("a", nil); err != nil {
+				t.Fatal(err)
+			}
+			// A reader of the generation's first commit: its cache goes to
+			// the pool under that key.
+			y, err := db.BeginRead()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := y.GetNamespace("a"); err != nil {
+				t.Fatal(err)
+			}
+			_, cookieA, _ := y.SnapshotHeaderCounters()
+			_ = y.Rollback()
+
+			// A begin that read the count: a restart, then a commit at the
+			// same frame number, still being published when the begin goes
+			// on.
+			done := make(chan error, 1)
+			testInProcessReadSnapshotHook = func() {
+				testInProcessReadSnapshotHook = nil
+				if err := db.Checkpoint(CheckpointRestart); err != nil {
+					t.Error(err)
+					return
+				}
+				published := make(chan struct{})
+				go func() {
+					done <- commitNS("b", func(uint32, uint32) {
+						close(published)
+						time.Sleep(200 * time.Millisecond)
+					})
+				}()
+				<-published
+			}
+			defer func() { testInProcessReadSnapshotHook = nil }()
+			x, err := db.BeginRead()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			defer x.Rollback()
+			_, cookieX, _ := x.SnapshotHeaderCounters()
+			_, errB := x.GetNamespace("b")
+			if (errB == nil) != (cookieX == cookieA+1) {
+				t.Fatalf("the snapshot's content and counters disagree: has b=%v, cookie %d (a's is %d)", errB == nil, cookieX, cookieA)
 			}
 		})
 	}

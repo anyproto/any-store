@@ -771,12 +771,14 @@ func (wi *walIndex) liveMinFrame() uint32 {
 
 // testInProcessReadSnapshotHook, when non-nil, runs in the in-process read
 // begin between its lock-free reads of the restart count and of the frame
-// numbers; testInProcessReuseSlotHook between the scan of the marks and the
+// numbers; testInProcessFramesReadHook after the frame numbers, before any
+// lock; testInProcessReuseSlotHook between the scan of the marks and the
 // shared lock on the slot it chose; testInProcessFreshSlotHook once a fresh
 // slot is held shared, before its re-validation; testResetMidHook inside a
 // WAL restart, the frame numbers zeroed and the count still odd. Test-only.
 var (
 	testInProcessReadSnapshotHook func()
+	testInProcessFramesReadHook   func()
 	testInProcessReuseSlotHook    func()
 	testInProcessFreshSlotHook    func()
 	testResetMidHook              func()
@@ -2849,6 +2851,9 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 	}
 	mxFrame := w.index.mxCommitFrame.LoadLocal()
 	nBackfill := w.index.nBackfill.Load()
+	if testInProcessFramesReadHook != nil {
+		testInProcessFramesReadHook()
+	}
 	hdr = WalIndexHdr{isInit: 1, mxFrame: mxFrame, iChange: restarts}
 	revalidate := func() bool {
 		return w.index.mxCommitFrame.LoadLocal() == mxFrame && w.index.nBackfill.Load() == nBackfill &&
@@ -3011,10 +3016,11 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 		_ = w.index.unlock(lockRead0, lockShared)
 		return WalIndexHdr{}, 0, 0, 0, errWALRetry
 	}
-	// Once validated, nBackfill < mxFrame still holds (this fallback is only
-	// reached when they differ), so backfill has work left and must take
-	// read-0 exclusive (blocked by our shared hold): nBackfill cannot advance
-	// — and therefore no restart can recycle frames — while we hold it.
+	// Once validated: with nBackfill < mxFrame, backfill has work left and
+	// must take read-0 exclusive (blocked by our shared hold), so nBackfill
+	// cannot advance — and no restart can recycle frames — while we hold
+	// it; with nBackfill == mxFrame (the fast path found read-0 busy) the
+	// window is empty and the file alone is read.
 	return hdr, mxFrame, nBackfill + 1, 0, nil
 }
 
