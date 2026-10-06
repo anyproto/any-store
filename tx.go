@@ -31,18 +31,9 @@ type WriteTx interface {
 	// used internally for sentinel mechanism
 	SetModified()
 
-	// onRollbackUndo registers a reversal of an in-memory schema publication;
-	// see commonTx.undo. Unexported: DDL-internal.
-	onRollbackUndo(f func())
-	undoLen() int
-	runUndo(from int)
-
-	// onCommitPublish registers an in-memory publication that must become
-	// visible only when the tx durably commits; see commonTx.pubs.
-	// Unexported: DDL-internal.
-	onCommitPublish(f func())
-	pubLen() int
-	dropPubs(from int)
+	// schemaLog is the transaction's uncommitted schema changes; see
+	// txSchema. Unexported: DDL-internal.
+	schemaLog() *txSchema
 
 	// The stack of open savepoints; see commonTx.savepoints.
 	// Unexported: savepoint-internal.
@@ -77,40 +68,24 @@ type commonTx struct {
 	version  atomic.Uint32
 	modified bool
 
-	// undo holds reversals of in-memory schema publications (collection
-	// registered in db.openedCollections, index set swaps, renames) made by DDL
-	// inside this tx. DDL must publish at execution time — not at top-level
-	// commit — because writes later in the SAME tx must see and maintain an
-	// index/collection created earlier in it. But a rollback then reverts the
-	// on-disk catalog without those maps, leaving handles whose cached root
-	// pages are freed — a later write through such a handle lands on whatever
-	// namespace reuses the page (silent cross-namespace corruption).
-	// Undos run in REVERSE order on rollback —
-	// full, failed-commit, or to a savepoint (savepointTx records a mark) —
-	// and are discarded on successful commit. Single-writer state: mutated
-	// only under the btree write lock, like the tx itself; runUndo must also
-	// execute while that lock is still held (see writeTx.Rollback).
-	undo []func()
-
-	// pubs are commit-time publications — the dual of undo: in-memory state
-	// changes that must become visible only once the tx durably commits.
-	// Rename's openedCollections re-key lives here: re-keying at execution
-	// time would let a concurrent OpenCollection(oldName) miss the map, pass
-	// the committed-snapshot catalog check, and register a duplicate live
-	// handle under the vacated name. Pubs run in
-	// registration order after a successful btree commit and are dropped
-	// unrun on any rollback or failed commit; savepoint scoping mirrors
-	// undo (savepointTx records a mark, rollback-to-savepoint drops its
-	// scope's entries). Single-writer state, like undo.
-	pubs []func()
+	// schema is the transaction's own schema state (txSchema), in the
+	// btree transaction's Aux slot for the resolve of every operation. For a
+	// write transaction its log holds the uncommitted DDL: the writes later
+	// in the same tx see and maintain an index or collection created earlier
+	// in it through the log, nothing else does until the commit installs
+	// it, and a rollback — full, failed-commit, or to a savepoint
+	// (savepointTx records a mark) — discards the scope's entries. Writer
+	// state: mutated under the btree write lock, or under db.schemaGate
+	// after a commit released it.
+	schema txSchema
 
 	// savepoints is the stack of open savepoints, outermost first, each by
 	// its version. A savepoint that ends takes the savepoints opened inside
 	// it with it — SQLite destroys every savepoint nested inside the one a
 	// RELEASE or ROLLBACK TO names (vdbe.c, OP_Savepoint). One that is no
 	// longer on the stack is gone: its btree savepoint id may name another
-	// savepoint by now, and its undo and publication marks cut the lists at
-	// positions that pair nothing. Single-writer state, like undo.
+	// savepoint by now, and its log mark cuts the log at a position that
+	// pairs nothing. Single-writer state, like the log.
 	savepoints []uint32
 }
 
@@ -129,56 +104,22 @@ func (tx *commonTx) savepointEnded(version uint32) {
 	}
 }
 
-func (tx *commonTx) onRollbackUndo(f func()) {
-	tx.undo = append(tx.undo, f)
+func (tx *commonTx) schemaLog() *txSchema {
+	return &tx.schema
 }
 
-func (tx *commonTx) onCommitPublish(f func()) {
-	tx.pubs = append(tx.pubs, f)
+// schemaCommitted runs inside the btree commit as it becomes visible
+// (btree.WriteTx.OnCommitted): the logged versions become the heads, then
+// the epoch's known passes the commit's cookie.
+func (tx *commonTx) schemaCommitted(fileChangeCounter, schemaCookie uint32) {
+	tx.schema.install(tx.db.epoch.Load().gen)
+	tx.db.schemaCommitted(fileChangeCounter, schemaCookie)
 }
 
-func (tx *commonTx) pubLen() int {
-	return len(tx.pubs)
-}
-
-// runPubs executes and discards all commit publications in registration
-// order. Called only after a successful btree commit.
-func (tx *commonTx) runPubs() {
-	for _, f := range tx.pubs {
-		f()
-	}
-	clear(tx.pubs)
-	tx.pubs = tx.pubs[:0]
-}
-
-// dropPubs discards publications [from:] without running them: their tx scope
-// rolled back, so the state they would publish never became durable.
-func (tx *commonTx) dropPubs(from int) {
-	clear(tx.pubs[from:])
-	tx.pubs = tx.pubs[:from]
-}
-
-func (tx *commonTx) undoLen() int {
-	return len(tx.undo)
-}
-
-// runUndo executes and discards undo entries [from:] in reverse registration
-// order, so nested publications (e.g. an index created on a collection created
-// in the same tx) unwind consistently. Executed slots are cleared so the
-// pooled commonTx does not pin the captured handles and index-set snapshots.
-func (tx *commonTx) runUndo(from int) {
-	for i := len(tx.undo) - 1; i >= from; i-- {
-		tx.undo[i]()
-	}
-	clear(tx.undo[from:])
-	tx.undo = tx.undo[:from]
-}
-
-// discardUndo drops all registered undos without running them: the commit
-// succeeded, so the publications they would revert are now durable.
-func (tx *commonTx) discardUndo() {
-	clear(tx.undo)
-	tx.undo = tx.undo[:0]
+// release returns the pooled state, with nothing pinned.
+func (tx *commonTx) release() {
+	tx.schema.release()
+	txPool.Put(tx)
 }
 
 func (tx *commonTx) btreeReadTx() *btree.ReadTx {
@@ -218,7 +159,7 @@ func (r readTx) Context() context.Context {
 
 func (r readTx) Commit() error {
 	if r.commonTx.version.CompareAndSwap(r.version, 0) {
-		defer txPool.Put(r.commonTx)
+		defer r.commonTx.release()
 		return r.readTx.Rollback()
 	}
 	return nil
@@ -237,25 +178,19 @@ func (w writeTx) Context() context.Context {
 	return w.ctx
 }
 
-// unwind discards this tx's buffered full-text postings, reverts its
-// in-memory schema publications, then rolls the btree tx back. The postings
-// go at rollback, as FTS5 discards its pending data in xRollback, and before
-// the undos, as on a savepoint rollback. The order of the rest matters: the
-// btree releases the global write lock inside Rollback, and a writer
-// acquiring it in the gap would still see the phantom state — or commit its
-// own index-set swaps that a late undo would then clobber. Running the undos
-// first is safe: this tx's writes were never reader-visible, so the restored
-// snapshots match the committed on-disk state throughout.
+// unwind discards this tx's buffered full-text postings and its schema log,
+// then rolls the btree tx back. The postings go at rollback, as FTS5
+// discards its pending data in xRollback. Both go before the btree releases
+// the global write lock inside Rollback: the log is writer state.
 func (w writeTx) unwind() error {
-	w.db.resetAllFtsPending()
-	w.commonTx.runUndo(0)
-	w.commonTx.dropPubs(0)
+	w.db.resetAllFtsPending(w.readTx)
+	w.db.discardLog(&w.commonTx.schema, 0)
 	return w.writeTx.Rollback()
 }
 
 func (w writeTx) Rollback() error {
 	if w.commonTx.version.CompareAndSwap(w.version, 0) {
-		defer txPool.Put(w.commonTx)
+		defer w.commonTx.release()
 		return w.unwind()
 	}
 	return nil
@@ -263,10 +198,10 @@ func (w writeTx) Rollback() error {
 
 func (w writeTx) Commit() error {
 	if w.commonTx.version.CompareAndSwap(w.version, 0) {
-		defer txPool.Put(w.commonTx)
-		// Every non-committed exit below must unwind the in-memory schema
-		// publications, BEFORE its btree rollback releases the global write
-		// lock (see unwind).
+		defer w.commonTx.release()
+		// Every non-committed exit below must discard the schema log
+		// BEFORE its btree rollback releases the global write lock (see
+		// unwind).
 		if w.modified {
 			w.writeTx.MarkDataChanged()
 			// Flush the full-text write-back buffer into this same tx BEFORE the
@@ -288,45 +223,42 @@ func (w writeTx) Commit() error {
 				return err
 			}
 		}
-		// The btree commit releases the global write lock before returning an
-		// error, so a failed-commit unwind would run outside the critical
-		// section — hold the DDL-unwind gate (paired with newWriteTx) across
-		// commit + unwind so no new writer can observe the phantoms in the
-		// gap. Only needed when this tx actually registered undos.
-		if len(w.commonTx.undo) > 0 || len(w.commonTx.pubs) > 0 {
-			w.db.ddlUnwindGate.Lock()
-			defer w.db.ddlUnwindGate.Unlock()
+		// The btree commit releases the global write lock before it returns,
+		// and the registry follows the schema log only after (settleLog) —
+		// hold the schema gate (paired with newWriteTx) across commit +
+		// settle so no new writer finds the registry behind the catalog.
+		// Only needed when this tx logged schema changes.
+		t := &w.commonTx.schema
+		if len(t.log) > 0 {
+			w.db.schemaGate.Lock()
+			defer w.db.schemaGate.Unlock()
 		}
 		schemaChange := w.writeTx.SchemaChanged()
+		var next uint32
 		if schemaChange {
-			// The heads this tx changed are in place since the verbs ran
-			// (collection.publish): the epoch follows the cookie as the
-			// commit becomes visible, so that next to no reader finds the
-			// new cookie ahead of it — and before the publications below
-			// let a changed handle out of the registry (see
-			// collection.since).
-			w.db.announceCookie(w.writeTx.DiskSchemaCookie() + 1)
-			w.writeTx.OnCommitted(w.db.schemaCommitted)
+			// The logged versions become the heads as the commit becomes
+			// visible, and the epoch follows the cookie right after, so that
+			// next to no reader finds the new cookie ahead of it
+			// (commonTx.schemaCommitted).
+			next = w.writeTx.DiskSchemaCookie() + 1
+			w.db.announceCookie(next)
+			w.writeTx.OnCommitted(w.commonTx.schemaCommitted)
 		}
 		err := w.writeTx.Commit()
 		if schemaChange {
 			// For a commit that failed or wrote nothing.
-			w.db.endAnnouncement(w.readTx.DiskSchemaCookie() + 1)
+			w.db.endAnnouncement(next)
 		}
-		if err == nil {
-			if w.modified {
-				w.db.recoveryController.OnWriteEvent()
-			}
-			w.commonTx.discardUndo()
-			// Commit publications run under the gate (when held): no new
-			// writer observes the pre-publication in-memory state after the
-			// on-disk state it describes became visible.
-			w.commonTx.runPubs()
+		if err == nil && w.modified {
+			w.db.recoveryController.OnWriteEvent()
+		}
+		// What the commit published, the registry follows, whatever Commit
+		// returned; a log that was not published is discarded, as after a
+		// rollback.
+		if t.installed {
+			w.db.settleLog(t)
 		} else {
-			// A failed btree commit leaves the catalog without this tx's DDL —
-			// unwind (under the gate), and its publications never happen.
-			w.commonTx.runUndo(0)
-			w.commonTx.dropPubs(0)
+			w.db.discardLog(t, 0)
 		}
 		return err
 	}
@@ -377,22 +309,18 @@ type savepointWrapper struct {
 type savepointTx struct {
 	WriteTx
 	savepointId int
-	// undoMark is the parent tx's undo length at savepoint creation: a
-	// rollback to this savepoint unwinds exactly the schema publications made
-	// inside its scope (entries [undoMark:]); a release keeps them registered
-	// on the parent so an outer rollback still unwinds them.
-	undoMark int
-	// pubMark scopes commit publications the same way: a rollback to this
-	// savepoint drops (unrun) the publications registered inside its scope.
-	pubMark int
+	// logMark is the parent tx's schema log length at savepoint creation: a
+	// rollback to this savepoint discards exactly the schema changes made
+	// inside its scope (entries [logMark:]); a release keeps them on the
+	// parent so an outer rollback still discards them.
+	logMark int
 	version atomic.Uint32
 }
 
 func (tx *savepointTx) reset(wtx WriteTx, spId int) {
 	tx.WriteTx = wtx
 	tx.savepointId = spId
-	tx.undoMark = wtx.undoLen()
-	tx.pubMark = wtx.pubLen()
+	tx.logMark = len(wtx.schemaLog().log)
 	tx.version.Store(newTxVersion())
 }
 
@@ -435,16 +363,15 @@ func (w savepointWrapper) Rollback() error {
 		err := btWtx.RollbackToSavepoint(w.savepointId)
 		// The fts pending buffers hold only ops made inside this savepoint's
 		// scope (they were flushed empty at its creation), and the btree state
-		// those ops were derived from has just been reverted — discard them.
-		// Both this and the undo unwind run even when RollbackToSavepoint
+		// those ops were derived from has just been reverted — discard them,
+		// with the scope's schema log. Both run even when RollbackToSavepoint
 		// fails: its error returns happen before any mutation, the outer tx is
 		// doomed either way, and matching the in-memory schema state to the
 		// last committed disk state is the conservative choice.
-		// RollbackToSavepoint keeps the write lock in all cases, so the unwind
-		// runs inside the critical section.
-		db.resetAllFtsPending()
-		w.WriteTx.runUndo(w.undoMark)
-		w.WriteTx.dropPubs(w.pubMark)
+		// RollbackToSavepoint keeps the write lock in all cases, so the
+		// discard runs inside the critical section.
+		db.resetAllFtsPending(&btWtx.ReadTx)
+		db.discardLog(w.WriteTx.schemaLog(), w.logMark)
 		if err != nil {
 			return err
 		}

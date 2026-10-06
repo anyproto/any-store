@@ -822,17 +822,17 @@ func TestRename_ThenDrop_NoOrphans(t *testing.T) {
 func TestRename_OpenNewNameInSameTx(t *testing.T) {
 	ft := IndexInfo{Name: "ft", Kind: IndexKindFulltext, Fields: []string{"body"}}
 	k := IndexInfo{Name: "k", Fields: []string{"k"}}
-	setup := func(t *testing.T) (*fixture, *db, Collection) {
+	setup := func(t *testing.T) (*fixture, Collection) {
 		fx := newFixture(t)
 		a, err := fx.CreateCollection(ctx, "a")
 		require.NoError(t, err)
 		require.NoError(t, a.EnsureIndex(ctx, ft, k))
 		require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(`{"id":1,"k":1,"body":"alpha"}`)))
-		return fx, fx.DB.(*db), a
+		return fx, a
 	}
 
 	t.Run("commit", func(t *testing.T) {
-		fx, dbi, a := setup(t)
+		fx, a := setup(t)
 		tx, err := fx.WriteTx(ctx)
 		require.NoError(t, err)
 		require.NoError(t, a.Rename(tx.Context(), "b"))
@@ -840,7 +840,7 @@ func TestRename_OpenNewNameInSameTx(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, h == a, "the renamed handle itself")
 		require.NoError(t, tx.Commit())
-		assert.Equal(t, 0, len(dbi.renaming))
+		assert.Equal(t, 0, a.(*collection).pinned, "the log released the handle")
 
 		// The fts namespaces are freed and reused by another collection; a
 		// write through h must not reach them.
@@ -862,7 +862,7 @@ func TestRename_OpenNewNameInSameTx(t *testing.T) {
 	})
 
 	t.Run("rollback", func(t *testing.T) {
-		fx, dbi, a := setup(t)
+		fx, a := setup(t)
 		tx, err := fx.WriteTx(ctx)
 		require.NoError(t, err)
 		require.NoError(t, a.Rename(tx.Context(), "b"))
@@ -870,7 +870,7 @@ func TestRename_OpenNewNameInSameTx(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, h == a, "the renamed handle itself")
 		require.NoError(t, tx.Rollback())
-		assert.Equal(t, 0, len(dbi.renaming))
+		assert.Equal(t, 0, a.(*collection).pinned, "the log released the handle")
 
 		assert.Equal(t, "a", a.Name())
 		_, err = fx.OpenCollection(ctx, "b")
@@ -881,14 +881,14 @@ func TestRename_OpenNewNameInSameTx(t *testing.T) {
 	})
 
 	t.Run("savepoint rollback", func(t *testing.T) {
-		fx, dbi, a := setup(t)
+		fx, a := setup(t)
 		tx, err := fx.WriteTx(ctx)
 		require.NoError(t, err)
 		sp, err := fx.WriteTx(tx.Context())
 		require.NoError(t, err)
 		require.NoError(t, a.Rename(tx.Context(), "b"))
 		require.NoError(t, sp.Rollback())
-		assert.Equal(t, 0, len(dbi.renaming))
+		assert.Equal(t, 0, a.(*collection).pinned, "the log released the handle")
 		_, err = fx.OpenCollection(tx.Context(), "b")
 		assert.ErrorIs(t, err, ErrCollectionNotFound)
 		require.NoError(t, tx.Commit())
@@ -896,7 +896,7 @@ func TestRename_OpenNewNameInSameTx(t *testing.T) {
 	})
 
 	t.Run("renamed twice, then dropped", func(t *testing.T) {
-		fx, dbi, a := setup(t)
+		fx, a := setup(t)
 		tx, err := fx.WriteTx(ctx)
 		require.NoError(t, err)
 		require.NoError(t, a.Rename(tx.Context(), "b"))
@@ -910,7 +910,7 @@ func TestRename_OpenNewNameInSameTx(t *testing.T) {
 		_, err = fx.OpenCollection(tx.Context(), "c")
 		assert.ErrorIs(t, err, ErrCollectionNotFound)
 		require.NoError(t, tx.Commit())
-		assert.Equal(t, 0, len(dbi.renaming))
+		assert.Equal(t, 0, a.(*collection).pinned, "the log released the handle")
 	})
 }
 

@@ -1283,13 +1283,12 @@ func TestRenameThenDropRollback_HandleHeals(t *testing.T) {
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
 
-// The dual of the undo tests above: Drop's handle eviction is a COMMIT
-// publication (commonTx.pubs). Evicting at execution time opened the same
-// corruption through the concurrency side door: a concurrent
-// OpenCollection during the uncommitted-drop window re-registered a fresh
-// live handle against the still-committed catalog, the drop's commit freed
-// its root pages, and a later insert through it landed inside whichever
-// collection reused them.
+// An uncommitted Drop is the dropping transaction's own: a concurrent
+// OpenCollection during its window gets the registered handle, which keeps
+// serving the committed collection, and the commit closes it. A second
+// handle registered in the window would be the old corruption: the drop's
+// commit frees the root pages, and a later insert through it lands inside
+// whichever collection reuses them.
 func TestDropConcurrentOpen_NoDanglingHandle(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "x")
@@ -1301,15 +1300,20 @@ func TestDropConcurrentOpen_NoDanglingHandle(t *testing.T) {
 	require.NoError(t, coll.Drop(tx.Context()))
 
 	// Window: the drop is uncommitted. A concurrent open must return the
-	// registered (closed) handle — fail-safe — not register a fresh live one.
-	// Probe it through the read path: a write would block on the write lock
-	// the open drop tx holds.
+	// registered handle, which still reads the committed collection — not
+	// register a fresh one. Probe it through the read path: a write would
+	// block on the write lock the open drop tx holds.
 	during, err := fx.OpenCollection(ctx, "x")
 	require.NoError(t, err)
+	assert.True(t, during == coll, "the registered handle")
 	_, err = during.FindId(ctx, "1")
-	assert.ErrorIs(t, err, anystore.ErrCollectionClosed)
+	require.NoError(t, err)
+	_, err = coll.FindId(tx.Context(), "1")
+	assert.ErrorIs(t, err, anystore.ErrCollectionClosed, "dropped for the dropping transaction")
 
 	require.NoError(t, tx.Commit())
+	_, err = during.FindId(ctx, "1")
+	assert.ErrorIs(t, err, anystore.ErrCollectionClosed)
 
 	// Committed: the handle is evicted and the catalog entry is gone.
 	_, err = fx.OpenCollection(ctx, "x")
@@ -1507,7 +1511,8 @@ func TestDropRollback_UserCloseDuringWindowSticks(t *testing.T) {
 }
 
 // An open of the collection after that Close() gets the dropped handle back
-// and cancels the close: the rollback leaves the handle whole.
+// and cancels the close: the handle reads the committed collection
+// throughout, and the rollback leaves it whole.
 func TestDropRollback_OpenAfterCloseKeepsHandle(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "x")
@@ -1522,11 +1527,14 @@ func TestDropRollback_OpenAfterCloseKeepsHandle(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, h == coll, "an open around the dropping tx must return the dropped handle")
 	_, err = h.FindId(ctx, "1")
-	assert.ErrorIs(t, err, anystore.ErrCollectionClosed)
+	require.NoError(t, err)
 	require.NoError(t, tx.Rollback())
 
 	_, err = h.FindId(ctx, "1")
 	require.NoError(t, err)
+	again, err := fx.OpenCollection(ctx, "x")
+	require.NoError(t, err)
+	assert.True(t, again == coll, "the cancelled Close() left the handle registered")
 }
 
 var (
@@ -2313,9 +2321,9 @@ func TestRenameCommit_ConcurrentOpenOfNewName(t *testing.T) {
 	}
 }
 
-// Inside the tx that renamed a collection its old name is gone, whether or
-// not the handle was closed since; other callers keep the committed name
-// until the commit.
+// Inside the tx that renamed a collection its old name is gone — free for a
+// collection created in the same tx — whether or not the handle was closed
+// since; other callers keep the committed name until the commit.
 func TestRename_OldNameInSameTx(t *testing.T) {
 	for _, closed := range []bool{false, true} {
 		name := "handle open"
@@ -2337,9 +2345,11 @@ func TestRename_OldNameInSameTx(t *testing.T) {
 			_, err = fx.OpenCollection(tx.Context(), "a")
 			assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
 			// Open-or-create must not hand out the renamed collection for
-			// the old name. The name stays taken until the commit.
-			_, err = fx.Collection(tx.Context(), "a")
-			require.Error(t, err)
+			// the old name: the name is free, and a new collection takes it.
+			a2, err := fx.Collection(tx.Context(), "a")
+			require.NoError(t, err)
+			require.False(t, a2 == a)
+			require.NoError(t, a2.Insert(tx.Context(), ddlDoc(2)))
 
 			around, err := fx.OpenCollection(ctx, "a")
 			require.NoError(t, err)
@@ -2350,9 +2360,161 @@ func TestRename_OldNameInSameTx(t *testing.T) {
 			require.NoError(t, b.Insert(tx.Context(), ddlDoc(1)))
 			require.NoError(t, tx.Commit())
 
-			_, err = fx.OpenCollection(ctx, "a")
-			assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+			reg, err := fx.OpenCollection(ctx, "a")
+			require.NoError(t, err)
+			assert.True(t, reg == a2, "the created collection holds the old name")
+			assertCollCount(t, a2, 1)
 			assertIndexesHold(t, fx, b, "b", 1)
 		})
 	}
+}
+
+// Uncommitted DDL is the write transaction's own. Inside it a created
+// collection, a new index, a new name and a drop are in effect; every other
+// caller — through a handle, by name, or in the catalog listing — has the
+// committed schema until the commit, and has it still after a rollback.
+func TestUncommittedDDL_IsTheWritersAlone(t *testing.T) {
+	for _, outcome := range []string{"commit", "rollback"} {
+		t.Run(outcome, func(t *testing.T) {
+			fx := newFixture(t)
+			a, err := fx.CreateCollection(ctx, "a")
+			require.NoError(t, err)
+			require.NoError(t, a.Insert(ctx, ddlDoc(1)))
+			b, err := fx.CreateCollection(ctx, "b")
+			require.NoError(t, err)
+			require.NoError(t, b.Insert(ctx, ddlDoc(1)))
+			d, err := fx.CreateCollection(ctx, "d")
+			require.NoError(t, err)
+			require.NoError(t, d.Insert(ctx, ddlDoc(1)))
+
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			n, err := fx.CreateCollection(tx.Context(), "n")
+			require.NoError(t, err)
+			require.NoError(t, n.EnsureIndex(tx.Context(), ddlKIdx))
+			require.NoError(t, n.Insert(tx.Context(), ddlDoc(1)))
+			require.NoError(t, a.EnsureIndex(tx.Context(), ddlKIdx))
+			require.NoError(t, a.Insert(tx.Context(), ddlDoc(2)))
+			require.NoError(t, b.Rename(tx.Context(), "b2"))
+			require.NoError(t, b.Insert(tx.Context(), ddlDoc(2)))
+			require.NoError(t, d.Drop(tx.Context()))
+
+			// The transaction's view.
+			inTx, err := fx.OpenCollection(tx.Context(), "n")
+			require.NoError(t, err)
+			assert.True(t, inTx == n)
+			assertCollCountInTx(tx.Context(), t, n, 1)
+			assertCollCountInTx(tx.Context(), t, a, 2)
+			cnt, err := a.Find(`{"k":2}`).Count(tx.Context())
+			require.NoError(t, err)
+			assert.Equal(t, 1, cnt)
+			inTx, err = fx.OpenCollection(tx.Context(), "b2")
+			require.NoError(t, err)
+			assert.True(t, inTx == b)
+			_, err = fx.OpenCollection(tx.Context(), "b")
+			assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+			_, err = fx.OpenCollection(tx.Context(), "d")
+			assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+			_, err = d.Count(tx.Context())
+			assert.ErrorIs(t, err, anystore.ErrCollectionClosed)
+			names, err := fx.GetCollectionNames(tx.Context())
+			require.NoError(t, err)
+			assert.ElementsMatch(t, []string{"a", "b2", "n"}, names)
+
+			// Everyone else's.
+			_, err = fx.OpenCollection(ctx, "n")
+			assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+			_, err = n.Count(ctx)
+			assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+			assertCollCount(t, a, 1)
+			assert.Empty(t, a.GetIndexes())
+			assert.Equal(t, "b", b.Name())
+			assertCollCount(t, b, 1)
+			around, err := fx.OpenCollection(ctx, "b")
+			require.NoError(t, err)
+			assert.True(t, around == b)
+			_, err = fx.OpenCollection(ctx, "b2")
+			assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+			assertCollCount(t, d, 1)
+			around, err = fx.OpenCollection(ctx, "d")
+			require.NoError(t, err)
+			assert.True(t, around == d)
+			names, err = fx.GetCollectionNames(ctx)
+			require.NoError(t, err)
+			assert.ElementsMatch(t, []string{"a", "b", "d"}, names)
+
+			if outcome == "rollback" {
+				require.NoError(t, tx.Rollback())
+				_, err = n.Count(ctx)
+				assert.ErrorIs(t, err, anystore.ErrCollectionClosed, "the handle of a collection never created")
+				_, err = fx.OpenCollection(ctx, "n")
+				assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+				assertIndexesHold(t, fx, a, "a", 1)
+				assert.Equal(t, "b", b.Name())
+				assertIndexesHold(t, fx, b, "b", 1)
+				assertIndexesHold(t, fx, d, "d", 1)
+				return
+			}
+			require.NoError(t, tx.Commit())
+			reg, err := fx.OpenCollection(ctx, "n")
+			require.NoError(t, err)
+			assert.True(t, reg == n, "the created handle is the registered one")
+			assertIndexesHold(t, fx, n, "n", 1, "k")
+			assertIndexesHold(t, fx, a, "a", 2, "k")
+			assert.Equal(t, "b2", b.Name())
+			reg, err = fx.OpenCollection(ctx, "b2")
+			require.NoError(t, err)
+			assert.True(t, reg == b)
+			_, err = fx.OpenCollection(ctx, "b")
+			assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+			assertIndexesHold(t, fx, b, "b2", 2)
+			_, err = d.Count(ctx)
+			assert.ErrorIs(t, err, anystore.ErrCollectionClosed)
+			_, err = fx.OpenCollection(ctx, "d")
+			assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+			names, err = fx.GetCollectionNames(ctx)
+			require.NoError(t, err)
+			assert.ElementsMatch(t, []string{"a", "b2", "n"}, names)
+		})
+	}
+}
+
+// A savepoint's rollback discards the DDL made inside it and nothing else:
+// the collection created there is gone and its handle dead, the index
+// created there is gone while the one created before stays, and the
+// transaction commits the rest.
+func TestSavepointRollback_DiscardsItsDDLOnly(t *testing.T) {
+	fx := newFixture(t)
+	a, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	require.NoError(t, a.Insert(ctx, ddlDoc(1)))
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, a.EnsureIndex(tx.Context(), ddlKIdx))
+	sp, err := fx.WriteTx(tx.Context())
+	require.NoError(t, err)
+	inner, err := fx.CreateCollection(sp.Context(), "inner")
+	require.NoError(t, err)
+	require.NoError(t, inner.Insert(sp.Context(), ddlDoc(1)))
+	require.NoError(t, a.EnsureIndex(sp.Context(), ddlFtIdx))
+	require.NoError(t, a.Insert(sp.Context(), ddlDoc(2)))
+	require.NoError(t, sp.Rollback())
+
+	_, err = inner.Count(tx.Context())
+	assert.ErrorIs(t, err, anystore.ErrCollectionClosed)
+	_, err = fx.OpenCollection(tx.Context(), "inner")
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	assertCollCountInTx(tx.Context(), t, a, 1)
+	_, err = a.Find(`{"$text":{"$search":"alpha"}}`).Count(tx.Context())
+	assert.ErrorIs(t, err, anystore.ErrNoFulltextIndex)
+	cnt, err := a.Find(`{"k":1}`).Count(tx.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+	require.NoError(t, a.Insert(tx.Context(), ddlDoc(3)))
+	require.NoError(t, tx.Commit())
+
+	_, err = fx.OpenCollection(ctx, "inner")
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	assertIndexesHold(t, fx, a, "a", 2, "k")
 }

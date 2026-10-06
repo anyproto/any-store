@@ -312,7 +312,7 @@ func TestResolve_ReadersDuringUncommittedDDLUseCommittedVersion(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, coll.EnsureIndex(wtx.Context(), IndexInfo{Name: "b", Fields: []string{"b"}}))
 	require.NoError(t, coll.DropIndex(wtx.Context(), "a"))
-	require.False(t, committed == c.cur())
+	require.True(t, committed == c.cur(), "the uncommitted changes are the transaction's own")
 	*loads = 0
 	for range 3 {
 		n, err := coll.Find(`{"a":{"$gte":5}}`).IndexHint(IndexHint{IndexName: "a", Boost: 1_000_000}).Count(ctx)
@@ -327,7 +327,7 @@ func TestResolve_ReadersDuringUncommittedDDLUseCommittedVersion(t *testing.T) {
 	require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":10,"a":10,"b":10}`)))
 
 	require.NoError(t, wtx.Rollback())
-	require.True(t, committed == c.cur(), "the rollback restores the committed head")
+	require.True(t, committed == c.cur(), "the rollback leaves the committed head")
 	assert.Equal(t, []string{"a"}, candidates(ctx))
 
 	wtx, err = fx.WriteTx(ctx)
@@ -337,5 +337,5 @@ func TestResolve_ReadersDuringUncommittedDDLUseCommittedVersion(t *testing.T) {
 	*loads = 0
 	assert.ElementsMatch(t, []string{"a", "b"}, candidates(ctx))
 	assert.Zero(t, *loads, "a reader past the commit works with the head")
-	assert.Nil(t, c.cur().base.Load(), "the committed head still holds the version it replaced")
+	assert.False(t, committed == c.cur(), "the commit installed the version")
 }

@@ -411,7 +411,7 @@ func (c *collection) loadVectorIndexAs(tx *btree.ReadTx, collName string, info I
 
 // createVectorIndex creates a new vector index (namespaces + meta) and builds it
 // from the collection's existing documents, all within tx.
-func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vectorIndex, error) {
+func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info IndexInfo) (*vectorIndex, error) {
 	if err := validateVectorParams(info.Vector); err != nil {
 		return nil, err
 	}
@@ -422,7 +422,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	if err := validateIndexName(info.Name); err != nil {
 		return nil, err
 	}
-	if err := c.db.registerIndex(tx, c.cur().name, info); err != nil {
+	if err := c.db.registerIndex(tx, s.name, info); err != nil {
 		return nil, err
 	}
 	if info.Vector.Mode.isBruteForce() {
@@ -430,7 +430,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 		// The persisted metadata above is the entire index.
 		return newVectorIndexFromVindex(c, info, nil), nil
 	}
-	prefix := vectorIndexNsPrefix(c.cur().name, info.Name)
+	prefix := vectorIndexNsPrefix(s.name, info.Name)
 
 	// Collect (id, vector) from existing documents, then build the index in RAM
 	// and flush it in one bulk pass (vindex.BulkBuild) — far faster than inserting
@@ -442,7 +442,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	tmpVI := newVectorIndexFromVindex(c, info, nil) // extractVector needs fieldPath/dim
 	var ids [][]byte
 	var vecs [][]float32
-	cursor := tx.NewCursor(c.cur().ns)
+	cursor := tx.NewCursor(s.ns)
 	defer cursor.Close()
 	if err := cursor.First(); err != nil {
 		return nil, err
@@ -494,7 +494,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	// Parallel in-RAM build (graph constructed concurrently in RAM, then flushed
 	// single-threaded) — ~17x faster than per-insert at scale. threads=0 → GOMAXPROCS.
 	// The parallel phase touches only RAM; tx is used single-threaded in the flush.
-	ix, err := vindex.BulkBuildParallel(tx, prefix, p, vectorIndexSeed(c.cur().name, info.Name), ids, vecs, 0)
+	ix, err := vindex.BulkBuildParallel(tx, prefix, p, vectorIndexSeed(s.name, info.Name), ids, vecs, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1201,13 +1201,11 @@ const vectorEfCap = 4096
 // with that name exists.
 func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) error {
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) error {
-		if err := c.beginDDL(wtx); err != nil {
+		s, err := c.beginDDL(wtx)
+		if err != nil {
 			return err
 		}
-		// The head is the writer's from beginDDL on: the set is read and the
-		// index rebuilt without c.mu, which a reader that has to load its own
-		// version would wait on for the whole compaction.
-		cur := c.loadVectorIndexes()
+		cur := s.vindexes
 		idx := -1
 		for i, vi := range cur {
 			if vi.info.Name == indexName {
@@ -1226,24 +1224,21 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 		// peers notice and reopen the index with fresh handles. (For IVF this
 		// re-trains the codebooks from the live set — see vectorIndex.compact.)
 		tx.MarkSchemaChanged()
-		nvi, err := vi.compact(tx, c.cur().name)
+		nvi, err := vi.compact(tx, s.name)
 		if err != nil {
 			return err
 		}
-		// This is an index-set publication inside an uncommitted tx, exactly
-		// like createIndexes': a rollback (ambient tx, or an error later in
-		// this one) reverts the namespace recreation and frees the compacted
-		// roots, so the pre-compaction snapshot must be restored — a handle
-		// left pointing at freed pages fails every subsequent vector op with
-		// "btree: key not found" until reopen.
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		c.registerHeadRestore(wtx)
-		nvi.bindIdentity(c.cur().name)
-		next := make([]*vectorIndex, len(cur))
-		copy(next, cur)
-		next[idx] = nvi
-		c.publish(wtx, func(s *collSchema) { s.vindexes = next })
+		// An index-set change inside an uncommitted tx, exactly like
+		// createIndexes': the version with the compacted index is the
+		// transaction's own until the commit, and a rollback (ambient tx,
+		// or an error later in this one) discards it with the namespace
+		// recreation — nothing is left pointing at freed pages.
+		nvi.bindIdentity(s.name)
+		next := s.clone()
+		next.vindexes = make([]*vectorIndex, len(cur))
+		copy(next.vindexes, cur)
+		next.vindexes[idx] = nvi
+		c.logVersion(wtx, s, next)
 		return nil
 	})
 }

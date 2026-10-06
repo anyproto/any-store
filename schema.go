@@ -10,11 +10,12 @@ import (
 )
 
 // collSchema is one version of a collection's schema: its name, its data
-// namespace and its index sets, all read from one catalog view. A published
-// version is immutable but for gen; a change publishes another version, so an
-// operation that resolved one works with a complete generation — mirroring
-// SQLite's whole-schema reload on a schema-cookie bump (a reader sees either
-// the old or the new schema, never half-applied DDL).
+// namespace and its index sets, all read from one catalog view. A version is
+// immutable once resolved by anyone, but for gen; a change makes another
+// version, so an operation that resolved one works with a complete
+// generation — mirroring SQLite's whole-schema reload on a schema-cookie
+// bump (a reader sees either the old or the new schema, never half-applied
+// DDL).
 //
 // A version says for which transactions it holds (see collection.resolve):
 // SQLite checks the schema of a connection against the cookie of the
@@ -42,10 +43,6 @@ type collSchema struct {
 	// gen is the peer generation (schemaEpoch.gen) the version is proven
 	// for: installed or verified by a transaction of that generation.
 	gen atomic.Uint64
-	// base is the committed version under this one, while the write
-	// transaction that published this one is open: what every reader of
-	// that time works with. Set by publish, dropped at the commit.
-	base atomic.Pointer[collSchema]
 	// names lists the names the collection went by, oldest first, each with
 	// the cookie it took effect at; nil for a collection never renamed
 	// through this handle. A transaction older than a rename finds the
@@ -71,7 +68,7 @@ func (s *collSchema) nameAt(cookie uint32) string {
 	return s.name
 }
 
-// clone returns a copy to edit and publish; gen and base start unset.
+// clone returns a copy to edit and log; gen starts unset.
 func (s *collSchema) clone() *collSchema {
 	return &collSchema{
 		name:       s.name,
@@ -181,37 +178,335 @@ func (db *db) endAnnouncement(cookie uint32) {
 	db.ownCookie.CompareAndSwap(1<<32|uint64(cookie), 0)
 }
 
-// schemaMemo holds the versions a transaction loaded for itself; it lives in
-// the transaction's Aux slot.
-type schemaMemo struct {
-	entries []schemaMemoEntry
+// txSchema is a transaction's own schema state, in the btree transaction's
+// Aux slot: the versions it loaded for itself (memo), and for the write
+// transaction the schema changes it made and has not committed (log).
+//
+// The log is where uncommitted DDL lives. A verb appends the version its
+// handle has from the change on — or the handle's end — and the writer's
+// resolve answers from the log before the head; everyone else keeps the
+// committed head, so an uncommitted create, drop, rename or index change is
+// the writer's alone, as a DDL statement's effect is its connection's in
+// SQLite until the commit. The commit installs the logged versions as the
+// heads (install); a rollback, or one to a savepoint, discards the entries
+// of its scope (discardLog) and has nothing to revert.
+type txSchema struct {
+	memo []memoEntry
+	log  []logEntry
+	// installed reports that the commit published the log (install ran):
+	// the registry has to follow it (settleLog), whatever Commit returned.
+	installed bool
 }
 
-type schemaMemoEntry struct {
+type memoEntry struct {
 	c *collection
 	s *collSchema
 }
 
+// logEntry is one schema change of the open write transaction, or the mark
+// a verb leaves on the handle it works on (logPin). s is the version the
+// handle has from the entry on — for a drop, the version dropped, for its
+// name — and prev the version the change was made to, nil for a collection
+// the transaction created.
+type logEntry struct {
+	c    *collection
+	s    *collSchema
+	prev *collSchema
+	kind logKind
+}
+
+type logKind uint8
+
+const (
+	// logPin references the handle without changing it: a verb began on it.
+	logPin logKind = iota
+	// logVersion replaces prev with s at the commit.
+	logVersion
+	// logCreate is the first version of a collection the transaction
+	// created; its handle enters the registry at the commit.
+	logCreate
+	// logDrop ends the handle at the commit.
+	logDrop
+)
+
+func txSchemaOf(tx *btree.ReadTx) *txSchema {
+	t, _ := tx.Aux().(*txSchema)
+	return t
+}
+
 func memoGet(tx *btree.ReadTx, c *collection) *collSchema {
-	m, _ := tx.Aux().(*schemaMemo)
-	if m == nil {
+	t := txSchemaOf(tx)
+	if t == nil {
 		return nil
 	}
-	for i := range m.entries {
-		if m.entries[i].c == c {
-			return m.entries[i].s
+	for i := range t.memo {
+		if t.memo[i].c == c {
+			return t.memo[i].s
 		}
 	}
 	return nil
 }
 
 func memoPut(tx *btree.ReadTx, c *collection, s *collSchema) {
-	m, _ := tx.Aux().(*schemaMemo)
-	if m == nil {
-		m = &schemaMemo{}
-		tx.SetAux(m)
+	t := txSchemaOf(tx)
+	if t == nil {
+		t = &txSchema{}
+		tx.SetAux(t)
 	}
-	m.entries = append(m.entries, schemaMemoEntry{c: c, s: s})
+	t.memo = append(t.memo, memoEntry{c: c, s: s})
+}
+
+// release empties the state for the next transaction that reuses it.
+func (t *txSchema) release() {
+	clear(t.memo)
+	t.memo = t.memo[:0]
+	clear(t.log)
+	t.log = t.log[:0]
+	t.installed = false
+}
+
+// logged returns the last schema change the open write transaction tx made
+// through c, nil when it made none: what the writer has in place of the
+// head.
+func (c *collection) logged(tx *btree.ReadTx) *logEntry {
+	t := txSchemaOf(tx)
+	if t == nil {
+		return nil
+	}
+	for i := len(t.log) - 1; i >= 0; i-- {
+		if e := &t.log[i]; e.c == c && e.kind != logPin {
+			return e
+		}
+	}
+	return nil
+}
+
+// inTx returns the version of c the open write transaction tx works with:
+// the last it logged for the handle, else the head. dropped reports that
+// the transaction dropped the collection. For the commit-time passes over
+// the handles written through, closed or not.
+func (c *collection) inTx(tx *btree.ReadTx) (s *collSchema, dropped bool) {
+	if e := c.logged(tx); e != nil {
+		return e.s, e.kind == logDrop
+	}
+	return c.head.Load(), false
+}
+
+// byName returns the entry under which the open write transaction has a
+// collection by name: the one it created or renamed to it, or the drop that
+// took the name. Only a handle's last change counts — the earlier ones are
+// superseded.
+func (t *txSchema) byName(name string) *logEntry {
+	for i := len(t.log) - 1; i >= 0; i-- {
+		e := &t.log[i]
+		if e.kind == logPin || e.s.name != name {
+			continue
+		}
+		if t.superseded(i) {
+			continue
+		}
+		return e
+	}
+	return nil
+}
+
+// superseded reports that a later entry changes the handle of entry i.
+func (t *txSchema) superseded(i int) bool {
+	for j := i + 1; j < len(t.log); j++ {
+		if t.log[j].c == t.log[i].c && t.log[j].kind != logPin {
+			return true
+		}
+	}
+	return false
+}
+
+// add appends an entry and pins its handle (collection.pinned).
+func (t *txSchema) add(db *db, e logEntry) {
+	db.mu.Lock()
+	e.c.pinned++
+	db.mu.Unlock()
+	t.log = append(t.log, e)
+}
+
+// logVersion records next as the version c has from the commit of wtx on,
+// made from prev. The version is valid from the cookie the commit produces:
+// every schema-changing verb MarkSchemaChanged, and SchemaCookie moves
+// exactly once per such commit, atomically with the DDL (the OP_Transaction
+// analog, vdbe.c:4091-4192 in SQLite).
+func (c *collection) logVersion(wtx WriteTx, prev, next *collSchema) {
+	next.validFrom = wtx.btreeWriteTx().DiskSchemaCookie() + 1
+	wtx.schemaLog().add(c.db, logEntry{c: c, s: next, prev: prev, kind: logVersion})
+}
+
+// logCreate records s as the first version of the collection c that wtx
+// created. The handle stays out of the registry until the commit: the
+// writer finds it by name through the log (db.openCollectionOnce).
+func (c *collection) logCreate(wtx WriteTx, s *collSchema) {
+	s.validFrom = wtx.btreeWriteTx().DiskSchemaCookie() + 1
+	// No transaction older than the creation speaks for the handle
+	// (resolveSlow): their snapshots do not have the collection, and that
+	// must not retire it.
+	c.since = s.validFrom
+	wtx.schemaLog().add(c.db, logEntry{c: c, s: s, kind: logCreate})
+}
+
+// logDrop records the end of c, at version s, at the commit of wtx.
+func (c *collection) logDrop(wtx WriteTx, s *collSchema) {
+	wtx.schemaLog().add(c.db, logEntry{c: c, s: s, prev: s, kind: logDrop})
+}
+
+// logPin marks c as worked on by a verb of wtx, so that a Close() waits for
+// the transaction to end (collection.pinned). Under db.mu with the check
+// that the handle is live: a Close() cannot evict it in between. A handle
+// the log references already is pinned already; the log does not grow with
+// the verbs called on it.
+func (c *collection) logPin(wtx WriteTx) error {
+	t := wtx.schemaLog()
+	for i := range t.log {
+		if t.log[i].c == c {
+			return c.alive()
+		}
+	}
+	c.db.mu.Lock()
+	if err := c.alive(); err != nil {
+		c.db.mu.Unlock()
+		return err
+	}
+	c.pinned++
+	c.db.mu.Unlock()
+	t.log = append(t.log, logEntry{c: c, kind: logPin})
+	return nil
+}
+
+// install publishes the log as the commit becomes visible, before the epoch
+// passes its cookie (schemaCommitted): the last version logged for a handle
+// is its head from here on, a dropped handle is closed. Runs inside the
+// btree commit (btree.WriteTx.OnCommitted) — atomic stores, no locks. A
+// reader that loaded a version for the handle meanwhile installs nothing
+// over these (the compare-and-swap in resolveSlow and adopt).
+func (t *txSchema) install(gen uint64) {
+	for i := range t.log {
+		e := &t.log[i]
+		switch e.kind {
+		case logVersion, logCreate:
+			e.s.gen.Store(gen)
+			e.c.head.Store(e.s)
+		case logDrop:
+			e.c.closed.Store(true)
+		}
+	}
+	t.installed = true
+}
+
+// settleLog brings the registry up to the committed log, after the commit
+// returned: a created collection's handle enters, a renamed one is re-keyed,
+// a dropped one leaves. In log order, so a name a handle went through on the
+// way is free for the entry that takes it next. A handle another caller
+// registered meanwhile for one of these collections or names — between the
+// commit's publication and here — is displaced (registerLocked). The entries
+// then release their handles.
+func (db *db) settleLog(t *txSchema) {
+	db.mu.Lock()
+	for i := range t.log {
+		e := &t.log[i]
+		if e.kind == logPin || e.c.closed.Load() && e.kind != logDrop {
+			continue
+		}
+		switch e.kind {
+		case logCreate:
+			db.registerLocked(e.c, e.s.name)
+		case logVersion:
+			if e.s.name != e.prev.name {
+				if cur, ok := db.openedCollections[e.prev.name]; ok && cur == Collection(e.c) {
+					delete(db.openedCollections, e.prev.name)
+				}
+				db.registerLocked(e.c, e.s.name)
+			}
+		case logDrop:
+			if cur, ok := db.openedCollections[e.s.name]; ok && cur == Collection(e.c) {
+				delete(db.openedCollections, e.s.name)
+				db.forgetLocked(e.c)
+			} else {
+				db.evictLocked(e.c)
+			}
+		}
+	}
+	db.unpinLocked(t.log)
+	db.mu.Unlock()
+	clear(t.log)
+	t.log = t.log[:0]
+}
+
+// discardLog drops the entries [from:] of the log: their scope rolled back.
+// Nothing of theirs was shared, so there is nothing to revert, except what
+// the transaction's writes did to the sketches a discarded version shares
+// with the head (index.cloneWithNs): those are flagged on the head's index
+// objects, so the next write transaction rebases them
+// (resetUncommittedSketches). The handle of a collection created in the
+// scope ends here.
+func (db *db) discardLog(t *txSchema, from int) {
+	for i := len(t.log) - 1; i >= from; i-- {
+		e := &t.log[i]
+		switch e.kind {
+		case logCreate:
+			e.c.closed.Store(true)
+		case logVersion:
+			head := e.c.head.Load()
+			if head == nil {
+				continue
+			}
+			for _, idx := range e.s.indexes {
+				if !idx.sketchModified {
+					continue
+				}
+				for _, h := range head.indexes {
+					if h.sketch == idx.sketch {
+						h.markSketchModified()
+					}
+				}
+			}
+		}
+	}
+	db.mu.Lock()
+	db.unpinLocked(t.log[from:])
+	db.mu.Unlock()
+	clear(t.log[from:])
+	t.log = t.log[:from]
+}
+
+// registerLocked puts c in the registry under name. A handle that holds the
+// name or stands for the same collection is displaced: left out of the
+// registry it would stay live and miss the schema changes made through c.
+// The caller holds db.mu.
+func (db *db) registerLocked(c *collection, name string) {
+	if other, ok := db.openedCollections[name]; ok && other != Collection(c) {
+		o := other.(*collection)
+		o.closed.Store(true)
+		db.forgetLocked(o)
+	}
+	if other := db.byIdentity[c.identity]; other != nil && other != c {
+		other.closed.Store(true)
+		db.evictLocked(other)
+	}
+	db.openedCollections[name] = c
+	db.byIdentity[c.identity] = c
+}
+
+// unpinLocked releases the handles of the entries (collection.pinned); a
+// Close() deferred meanwhile takes effect with the last reference. The
+// caller holds db.mu.
+func (db *db) unpinLocked(entries []logEntry) {
+	for i := range entries {
+		c := entries[i].c
+		c.pinned--
+		if c.pinned > 0 || !c.closePending.Load() {
+			continue
+		}
+		c.closePending.Store(false)
+		if c.closed.CompareAndSwap(false, true) {
+			db.evictLocked(c)
+		}
+	}
 }
 
 // current reports that the version holds for a transaction at cookie in the
@@ -228,11 +523,11 @@ func (s *collSchema) current(e *schemaEpoch, cookie uint32, writer bool) bool {
 // in the transaction's snapshot. Everything the operation reads of the schema
 // comes from the one version returned.
 //
+// The write transaction has its own uncommitted changes first (txSchema.log).
 // The head serves the transactions it is proven for: those of its generation
-// at a cookie from validFrom through the epoch's known. A head published by
-// the open write tx carries the committed version for everyone else (base).
-// Any other transaction — older than the head, in the gap between a commit
-// and known, or the first of a generation — goes through resolveSlow.
+// at a cookie from validFrom through the epoch's known. Any other transaction
+// — older than the head, in the gap between a commit and known, or the first
+// of a generation — goes through resolveSlow.
 func (c *collection) resolve(tx *btree.ReadTx) (*collSchema, error) {
 	return c.resolveAs(tx, "")
 }
@@ -248,6 +543,17 @@ func (c *collection) resolveAs(tx *btree.ReadTx, name string) (*collSchema, erro
 		return nil, err
 	}
 	writer := tx.IsWriteTx()
+	if writer {
+		if e := c.logged(tx); e != nil {
+			if e.kind == logDrop {
+				// Dropped by this transaction: gone for it, as a table is
+				// after DROP TABLE in the same SQLite transaction.
+				return nil, ErrCollectionClosed
+			}
+			c.refreshSketches(tx, e.s)
+			return e.s, nil
+		}
+	}
 	if s := c.head.Load(); s != nil {
 		e, cookie := c.db.epoch.Load(), tx.SnapshotSchemaCookie()
 		if s.current(e, cookie, writer) {
@@ -255,11 +561,6 @@ func (c *collection) resolveAs(tx *btree.ReadTx, name string) (*collSchema, erro
 				c.refreshSketches(tx, s)
 			}
 			return s, nil
-		}
-		// A head the open write tx published is that tx's until it commits:
-		// everyone else is served the committed version it stands on.
-		if b := s.base.Load(); b != nil && !writer && b.current(e, cookie, false) {
-			return b, nil
 		}
 	}
 	s, err := c.resolveSlow(tx, name)
@@ -277,8 +578,10 @@ func (c *collection) resolveAs(tx *btree.ReadTx, name string) (*collSchema, erro
 // is gone, so the handle retires. Any other transaction keeps its version to
 // itself for its lifetime.
 //
-// Loads of one handle are serialized under c.mu, with the schema changes
-// published through it.
+// Loads of one handle are serialized under c.mu. The commit of this process
+// installs the heads it changed without it (txSchema.install), so the head
+// is replaced by compare-and-swap: a load that began before such a commit
+// does not overwrite what it installed.
 func (c *collection) resolveSlow(tx *btree.ReadTx, asName string) (*collSchema, error) {
 	if s := memoGet(tx, c); s != nil {
 		return s, nil
@@ -318,8 +621,10 @@ func (c *collection) resolveSlow(tx *btree.ReadTx, asName string) (*collSchema, 
 		return s, nil
 	}
 	s.gen.Store(e.gen)
-	if s != head {
-		c.head.Store(s)
+	if s != head && !c.head.CompareAndSwap(head, s) {
+		// A commit of this process installed a newer version meanwhile:
+		// this transaction's own stays its own.
+		memoPut(tx, c, s)
 	}
 	return s, nil
 }
@@ -331,10 +636,11 @@ func (c *collection) adopt(tx *btree.ReadTx, s *collSchema) {
 	defer c.mu.Unlock()
 	e := c.db.epoch.Load()
 	cookie := tx.SnapshotSchemaCookie()
-	if c.head.Load() == nil && cookieLE(e.start, cookie) && cookieLE(cookie, e.known) && cookieLE(c.since, cookie) {
+	if cookieLE(e.start, cookie) && cookieLE(cookie, e.known) && cookieLE(c.since, cookie) {
 		s.gen.Store(e.gen)
-		c.head.Store(s)
-		return
+		if c.head.CompareAndSwap(nil, s) {
+			return
+		}
 	}
 	memoPut(tx, c, s)
 }

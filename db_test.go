@@ -1660,10 +1660,10 @@ func TestCheckStale_SketchesReloadOnUse(t *testing.T) {
 }
 
 // Another process's schema change noticed while a local tx has uncommitted
-// DDL on a collection — index DDL, or a rename — does not count as checked
-// for that collection: the head of that moment holds what the writer made,
-// and no reader of an older snapshot may vouch for it. The first transaction
-// to use the handle once the writer is done verifies it against the catalog.
+// DDL on a collection — index DDL, or a rename — is verified against the
+// committed head, which is what the readers of that moment work with; the
+// writer's version is in its log until the commit installs it, proven for
+// the generation the writer is in.
 func TestPeerSchemaChange_VerifiedAfterLocalDDL(t *testing.T) {
 	skipIfInMemory(t, "staleness counters model cross-process commits; not applicable in-memory")
 	fx := newFixture(t)
@@ -1681,10 +1681,13 @@ func TestPeerSchemaChange_VerifiedAfterLocalDDL(t *testing.T) {
 		"index":  func(wtx WriteTx) error { return coll.EnsureIndex(wtx.Context(), IndexInfo{Fields: []string{"a"}}) },
 		"rename": func(wtx WriteTx) error { return coll.Rename(wtx.Context(), "d") },
 	} {
+		committed := c.cur()
 		wtx, err := fx.WriteTx(ctx)
 		require.NoError(t, err)
 		require.NoError(t, ddl(wtx), name)
-		inFlight := c.cur()
+		inFlight, err := c.resolve(wtx.btreeReadTx())
+		require.NoError(t, err, name)
+		require.True(t, committed == c.cur(), "%s: the writer's version is its own until the commit", name)
 
 		peerSchemaChangeNow(t, dbi)
 		_, err = other.Count(ctx)
@@ -1692,15 +1695,15 @@ func TestPeerSchemaChange_VerifiedAfterLocalDDL(t *testing.T) {
 		n, err := coll.Count(ctx)
 		require.NoError(t, err, name)
 		assert.Equal(t, 1, n, name)
-		assert.True(t, inFlight == c.cur(), "%s: a reader replaced the writer's head", name)
-		assert.False(t, verified(), "%s: a reader vouched for a head holding uncommitted DDL", name)
+		assert.True(t, committed == c.cur(), "%s: a reader replaced the committed head", name)
+		assert.True(t, verified(), "%s: the reader verified the committed head", name)
 
 		require.NoError(t, wtx.Commit(), name)
-		assert.False(t, verified(), "%s: nothing checked the handle since the peer's change", name)
+		assert.True(t, inFlight == c.cur(), "%s: the commit installed the writer's version", name)
+		assert.True(t, verified(), "%s: installed for the writer's generation", name)
 		n, err = coll.Find(`{"a":1}`).Count(ctx)
 		require.NoError(t, err, name)
 		assert.Equal(t, 1, n, name)
-		assert.True(t, verified(), "%s: the first use after the commit verifies the handle", name)
 	}
 }
 
@@ -2309,10 +2312,10 @@ func setHead(c *collection, edit func(s *collSchema)) {
 	c.head.Store(next)
 }
 
-// CreateCollection's rollback puts back the registry entry it replaced only
-// if that handle carries this tx's Drop. A closed handle found there
-// otherwise is one a staleness pass is retiring — closed already, evicted
-// next — and put back it would answer for the name for good.
+// A collection created in a transaction has no registry entry until the
+// commit: a closed handle left in the slot — one being retired, closed
+// already, evicted next — is neither replaced by the create nor put back by
+// its rollback.
 func TestCreateCollectionRollback_RestoresOnlyADroppedHandle(t *testing.T) {
 	fx := newFixture(t)
 	d := fx.DB.(*db)
@@ -2333,8 +2336,19 @@ func TestCreateCollectionRollback_RestoresOnlyADroppedHandle(t *testing.T) {
 
 	tx, err := fx.WriteTx(ctx)
 	require.NoError(t, err)
-	_, err = fx.CreateCollection(tx.Context(), "x")
+	created, err := fx.CreateCollection(tx.Context(), "x")
 	require.NoError(t, err)
+	d.mu.Lock()
+	assert.True(t, d.openedCollections["x"] == retiring, "the create registers nothing before the commit")
+	d.mu.Unlock()
 	require.NoError(t, tx.Rollback())
+	d.mu.Lock()
+	assert.True(t, d.openedCollections["x"] == retiring)
+	d.mu.Unlock()
+	_, err = created.Count(ctx)
+	assert.ErrorIs(t, err, ErrCollectionClosed, "the rolled-back collection's handle is closed")
+	d.mu.Lock()
+	delete(d.openedCollections, "x")
+	d.mu.Unlock()
 	assert.False(t, registered("x"))
 }

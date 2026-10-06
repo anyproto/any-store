@@ -387,24 +387,23 @@ func (db *db) rebuildOutdatedIndex(tx *btree.WriteTx, collName, indexName string
 		return err
 	}
 	c := &collection{db: db, primaryKey: cfg.PrimaryKey}
-	c.head.Store(&collSchema{name: collName, ns: ns})
 	if c.primaryKey == "" {
 		c.primaryKey = "id"
 	}
-	return c.rebuildIndex(tx, *info)
+	return c.rebuildIndex(tx, &collSchema{name: collName, ns: ns}, *info)
 }
 
 // rebuildIndex drops the index namespace and builds it again from the
 // collection's documents under the current format, restamping the catalog
 // record.
-func (c *collection) rebuildIndex(tx *btree.WriteTx, info IndexInfo) (err error) {
+func (c *collection) rebuildIndex(tx *btree.WriteTx, s *collSchema, info IndexInfo) (err error) {
 	tx.MarkSchemaChanged()
-	if err = tx.DeleteNamespace(indexNsName(c.cur().name, info.Name)); err != nil && !errors.Is(err, btree.ErrNamespaceNotFound) {
+	if err = tx.DeleteNamespace(indexNsName(s.name, info.Name)); err != nil && !errors.Is(err, btree.ErrNamespaceNotFound) {
 		return err
 	}
-	if err = c.db.stampIndexFormat(tx, c.cur().name, info.Name); err != nil {
+	if err = c.db.stampIndexFormat(tx, s.name, info.Name); err != nil {
 		return err
 	}
-	_, err = c.buildRangeIndex(tx, info)
+	_, err = c.buildRangeIndex(tx, s, info)
 	return err
 }

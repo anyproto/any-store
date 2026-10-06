@@ -718,16 +718,18 @@ func forceSecondFtsIndex(t *testing.T, coll Collection) error {
 	t.Helper()
 	c := coll.(*collection)
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) error {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		fx, err := c.createFtsIndex(ctx, tx, IndexInfo{
+		s, err := c.beginDDL(wtx)
+		if err != nil {
+			return err
+		}
+		fx, err := c.createFtsIndex(tx, s, IndexInfo{
 			Name: "atitle", Fields: []string{"title"}, Kind: IndexKindFulltext})
 		if err != nil {
 			return err
 		}
-		c.publish(wtx, func(s *collSchema) {
-			s.ftsIndexes = append(s.ftsIndexes[:len(s.ftsIndexes):len(s.ftsIndexes)], fx)
-		})
+		next := s.clone()
+		next.ftsIndexes = append(s.ftsIndexes[:len(s.ftsIndexes):len(s.ftsIndexes)], fx)
+		c.logVersion(wtx, s, next)
 		return nil
 	})
 }
@@ -815,10 +817,10 @@ func collectIter(t *testing.T, q Query) ([]string, []float64) {
 	return ids, scores
 }
 
-// A reader that verifies the handle against its own, older snapshot while a
-// local write tx has uncommitted index DDL published in the head must leave
-// the head alone: installing its version would take the writer's index out
-// of the set the same tx keeps writing through.
+// A reader that verifies the handle against its own snapshot while a local
+// write tx has uncommitted index DDL finds the committed head and leaves
+// the writer's version alone: the index is in the transaction's log, which
+// the same tx keeps writing through, and the commit installs it.
 func TestOlderReaderLeavesUncommittedIndexDDLAlone(t *testing.T) {
 	skipIfInMemory(t, "staleness counters model cross-process commits; not applicable in-memory")
 	fx := newFixture(t)
@@ -833,11 +835,14 @@ func TestOlderReaderLeavesUncommittedIndexDDLAlone(t *testing.T) {
 	fcc, sc := rtx.DiskFileChangeCounter(), rtx.DiskSchemaCookie()
 	require.NoError(t, rtx.Rollback())
 
+	committed := coll.cur()
 	wtx, err := fx.WriteTx(ctx)
 	require.NoError(t, err)
 	require.NoError(t, coll.EnsureIndex(wtx.Context(), IndexInfo{Name: "ft", Fields: []string{"text"}, Kind: IndexKindFulltext}))
-	withIndex := coll.cur()
+	withIndex, err := coll.resolve(wtx.btreeReadTx())
+	require.NoError(t, err)
 	require.Len(t, withIndex.ftsIndexes, 1)
+	require.True(t, committed == coll.cur(), "the index is the transaction's own until the commit")
 
 	// Another process's schema change, noticed by a reader while the DDL is
 	// in flight: the reader resolves the handle for its snapshot.
@@ -847,11 +852,12 @@ func TestOlderReaderLeavesUncommittedIndexDDLAlone(t *testing.T) {
 	assert.Equal(t, 1, n)
 	_, err = coll.Find(`{"$text":{"$search":"alpha"}}`).Count(ctx)
 	assert.ErrorIs(t, err, ErrNoFulltextIndex, "the reader's snapshot has no full-text index yet")
-	assert.True(t, withIndex == coll.cur(), "an older reader replaced a head holding uncommitted index DDL")
+	assert.True(t, committed == coll.cur(), "the reader replaced the committed head")
 
 	// The writer keeps maintaining its index, and the commit makes it everyone's.
 	require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":2,"text":"alpha beta"}`)))
 	require.NoError(t, wtx.Commit())
+	assert.True(t, withIndex == coll.cur(), "the commit installed the writer's version")
 	n, err = coll.Find(`{"$text":{"$search":"alpha"}}`).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 2, n)
