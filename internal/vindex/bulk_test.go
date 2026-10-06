@@ -149,7 +149,13 @@ func TestBulkBuildByteIdentical(t *testing.T) {
 				m2 := dumpNS(t, db2, p.b)
 				require.Equalf(t, len(m1), len(m2), "metric=%v quant=%v ns=%s record count", metric, quant, p.name)
 				for k, v1 := range m1 {
-					require.Equalf(t, v1, m2[k], "metric=%v quant=%v ns=%s key=%x", metric, quant, p.name, k)
+					v2 := m2[k]
+					if p.name == "meta" {
+						// The build identity (meta.build, the record's tail)
+						// is random by design.
+						v1, v2 = v1[:len(v1)-8], v2[:len(v2)-8]
+					}
+					require.Equalf(t, v1, v2, "metric=%v quant=%v ns=%s key=%x", metric, quant, p.name, k)
 				}
 			}
 			_ = db1.Close()

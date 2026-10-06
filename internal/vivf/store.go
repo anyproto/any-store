@@ -54,6 +54,9 @@ func (p *StoreParams) withDefaults() {
 // is MVCC-consistent and multiprocess-safe, like internal/vindex.
 type StoreIndex struct {
 	vmeta, vcb, vcell, vvec, vlbl, vdoc *btree.Namespace
+	// build is the identity of the build this object was opened for or
+	// made by (meta.build).
+	build uint64
 
 	dim, nlist, m, dsub, nprobe, assign int
 	precompMiB                          int // precomputed-table RAM budget (see StoreParams)
@@ -329,10 +332,11 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	if n > 0 {
 		reconBase = reconSum / float64(n)
 	}
-	mt := &meta{dim: p.Dim, nlist: p.NList, m: p.M, assign: p.Assign, nprobe: p.NProbe, precompMiB: p.PrecompMiB, normalize: p.Normalize, int8vec: p.Int8 || p.SQ, sq: p.SQ, count: int64(n), nextLabel: uint32(n), reconBase: reconBase, buildCount: int64(n)}
+	mt := &meta{dim: p.Dim, nlist: p.NList, m: p.M, assign: p.Assign, nprobe: p.NProbe, precompMiB: p.PrecompMiB, normalize: p.Normalize, int8vec: p.Int8 || p.SQ, sq: p.SQ, count: int64(n), nextLabel: uint32(n), reconBase: reconBase, buildCount: int64(n), build: newBuild()}
 	if err := wtx.Put(ix.vmeta, metaKey, encodeMeta(mt)); err != nil {
 		return nil, err
 	}
+	ix.build = mt.build
 	if !ix.sq {
 		ix.buildPrecomp()
 	}
@@ -436,6 +440,7 @@ func OpenTx(rtx *btree.ReadTx, prefix string) (*StoreIndex, error) {
 	if err != nil {
 		return nil, err
 	}
+	ix.build = mt.build
 	ix.dim, ix.nlist, ix.m, ix.dsub = mt.dim, mt.nlist, mt.m, mt.dim/mt.m
 	ix.nprobe, ix.assign, ix.normalize = mt.nprobe, mt.assign, mt.normalize
 	ix.precompMiB = mt.precompMiB
@@ -464,6 +469,9 @@ func OpenTx(rtx *btree.ReadTx, prefix string) (*StoreIndex, error) {
 
 // MetaRoot is the :meta namespace root page (staleness check after compaction).
 func (ix *StoreIndex) MetaRoot() uint32 { return ix.metaRoot }
+
+// Build returns the identity of the build this object serves (meta.build).
+func (ix *StoreIndex) Build() uint64 { return ix.build }
 
 // Roots returns the root page of every namespace of the index, by the
 // namespace's suffix: what a view must have for this object to serve it.
@@ -645,6 +653,7 @@ func Rebuild(wtx *btree.WriteTx, prefix string) (*StoreIndex, error) {
 		mt.count, mt.nextLabel = 0, 0
 		mt.churn, mt.driftSum, mt.driftN = 0, 0, 0
 		mt.buildCount = 1 // churn-ratio denominator; a build never has n=0 otherwise
+		mt.build = newBuild()
 		if err := wtx.Put(old.vmeta, metaKey, encodeMeta(mt)); err != nil {
 			return nil, err
 		}

@@ -61,6 +61,9 @@ type Hit struct {
 // level generation. Every operation reads/writes through the passed transaction.
 type Index struct {
 	vmeta, vvec, vadj, vdoc, vlbl *btree.Namespace
+	// build is the identity of the build this object was opened for or
+	// made by (meta.build).
+	build uint64
 
 	dim   int
 	m     int
@@ -172,10 +175,12 @@ func Create(wtx *btree.WriteTx, prefix string, p Params, seed int64) (*Index, er
 	mt := &meta{
 		dim: p.Dim, metric: p.Metric, m: p.M, m0: 2 * p.M,
 		efC: p.EfConstruction, efS: p.EfSearch, ml: p.Ml, quant: p.Quantization,
+		build: newBuild(),
 	}
 	if err := ix.writeMeta(wtx, mt); err != nil {
 		return nil, err
 	}
+	ix.build = mt.build
 	return ix, nil
 }
 
@@ -203,7 +208,9 @@ func Open(db *btree.DB, prefix string, seed int64) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newIndex(ns, mt.dim, mt.m, mt.m0, mt.efC, mt.efS, mt.ml, mt.metric, mt.quant, seed), nil
+	ix := newIndex(ns, mt.dim, mt.m, mt.m0, mt.efC, mt.efS, mt.ml, mt.metric, mt.quant, seed)
+	ix.build = mt.build
+	return ix, nil
 }
 
 // OpenTx resolves an existing index using a caller-provided read transaction
@@ -226,7 +233,9 @@ func OpenTx(rtx *btree.ReadTx, prefix string, seed int64) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newIndex(ns, mt.dim, mt.m, mt.m0, mt.efC, mt.efS, mt.ml, mt.metric, mt.quant, seed), nil
+	ix := newIndex(ns, mt.dim, mt.m, mt.m0, mt.efC, mt.efS, mt.ml, mt.metric, mt.quant, seed)
+	ix.build = mt.build
+	return ix, nil
 }
 
 func newIndex(ns [5]*btree.Namespace, dim, m, m0, efC, efS int, ml float64, metric Metric, quant Quantization, seed int64) *Index {

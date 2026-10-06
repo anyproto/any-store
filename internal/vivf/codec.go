@@ -4,7 +4,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"math/rand/v2"
 
+	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/vecf"
 )
 
@@ -60,6 +62,14 @@ type meta struct {
 	driftN     int64
 	buildCount int64
 	churn      int64
+	// build identifies the build of the index: a random value taken when the
+	// index is built or rebuilt, never by a write. An open object serves a
+	// view only for the build the view's meta names (BuildOf): a rebuild can
+	// land every namespace back on its old root pages, and the object's RAM
+	// state — codebooks, the precomputed table — belongs to its own build.
+	// Persisted at the meta tail (back-compat: absent in older records => 0,
+	// equal to any other 0).
+	build uint64
 }
 
 func encodeMeta(mt *meta) []byte {
@@ -97,6 +107,7 @@ func encodeMeta(mt *meta) []byte {
 	} else {
 		buf = append(buf, 0)
 	}
+	put64(mt.build)
 	return buf
 }
 
@@ -138,7 +149,34 @@ func decodeMeta(data []byte) (*meta, error) {
 		mt.sq = data[off] != 0
 		off++
 	}
+	if off+8 <= len(data) { // build (absent in older records → 0)
+		mt.build = binary.LittleEndian.Uint64(data[off:])
+		off += 8
+	}
 	return mt, nil
+}
+
+// newBuild returns the identity of a build (meta.build).
+func newBuild() uint64 {
+	for {
+		if b := rand.Uint64(); b != 0 {
+			return b
+		}
+	}
+}
+
+// BuildOf returns the build the index's meta record in rtx's view names
+// (meta.build); 0 for a record written before builds were identified.
+func BuildOf(rtx *btree.ReadTx, vmeta *btree.Namespace) (uint64, error) {
+	b, err := rtx.Get(vmeta, metaKey)
+	if err != nil {
+		return 0, err
+	}
+	mt, err := decodeMeta(b)
+	if err != nil {
+		return 0, err
+	}
+	return mt.build, nil
 }
 
 // encodeCentroids flattens [k][dim] float32 to a raw little-endian blob.

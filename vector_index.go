@@ -306,19 +306,38 @@ func (vi *vectorIndex) boundIn(tx *btree.ReadTx, collName string) bool {
 		return true
 	}
 	prefix := vectorIndexNsPrefix(collName, vi.info.Name)
-	var roots map[string]uint32
+	var (
+		roots map[string]uint32
+		build uint64
+	)
 	if vi.isIVF() {
-		roots = vi.ivf.Roots()
+		roots, build = vi.ivf.Roots(), vi.ivf.Build()
 	} else {
-		roots = vi.ix.Roots()
+		roots, build = vi.ix.Roots(), vi.ix.Build()
 	}
+	var meta *btree.Namespace
 	for suffix, root := range roots {
 		ns, err := tx.GetNamespace(prefix + suffix)
 		if err != nil || ns.RootPage() != root {
 			return false
 		}
+		if suffix == ":meta" {
+			meta = ns
+		}
 	}
-	return true
+	// The build the view's meta names: a rebuild can put every namespace
+	// back on its pages, and the object's RAM state — the hybrid tier, the
+	// codebooks — belongs to the build it was opened for.
+	var (
+		viewBuild uint64
+		err       error
+	)
+	if vi.isIVF() {
+		viewBuild, err = vivf.BuildOf(tx, meta)
+	} else {
+		viewBuild, err = vindex.BuildOf(tx, meta)
+	}
+	return err == nil && viewBuild == build
 }
 
 // compact rebuilds the HNSW graph from its live vectors, reclaiming tombstones

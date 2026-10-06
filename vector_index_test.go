@@ -866,3 +866,67 @@ func vsearchIn(tctx context.Context, coll Collection, field string, q []float32,
 	}
 	return out, iter.Err()
 }
+
+// A rebuild can put every namespace of a vector index back on the root
+// pages it had — two compactions of a small index do, the freed pages
+// coming back in order — so the roots alone do not tell a reader's
+// snapshot's index from the rebuilt one. The build identity does: a reader
+// older than the rebuilds is served an object of its own snapshot's build,
+// not the head's, whose RAM state belongs to the rebuilt graph.
+func TestVectorIndex_OlderReaderAfterTwoCompactions(t *testing.T) {
+	const dim = 8
+	for _, mode := range []VectorMode{VectorModeBTree, VectorModeHybrid, VectorModeIVFSQ} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "docs")
+			require.NoError(t, err)
+			vecs := vrand(20, dim, 11)
+			for i, vc := range vecs {
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+			}
+			require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+				Name: "emb", Kind: IndexKindVector,
+				Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, Mode: mode},
+			}))
+			c := coll.(*collection)
+			roots := func(vi *vectorIndex) map[string]uint32 {
+				if vi.isIVF() {
+					return vi.ivf.Roots()
+				}
+				return vi.ix.Roots()
+			}
+			first := c.cur().vindexes[0]
+
+			rtx, err := fx.ReadTx(ctx)
+			require.NoError(t, err)
+			defer func() { _ = rtx.Commit() }()
+			hits, err := vsearchIn(rtx.Context(), coll, "v", vecs[7], 3, 64)
+			require.NoError(t, err)
+			require.Equal(t, string(idBytesOf(7)), string(hits[0].DocId))
+
+			for round := range 2 {
+				for i := range 3 {
+					require.NoError(t, coll.DeleteId(ctx, 10+round*3+i))
+				}
+				require.NoError(t, coll.CompactVectorIndex(ctx, "emb"))
+			}
+			head := c.cur().vindexes[0]
+			require.False(t, first == head)
+			require.Equal(t, roots(first), roots(head), "the recipe no longer puts every root back; the test covers nothing")
+
+			s, err := c.resolve(rtx.btreeReadTx())
+			require.NoError(t, err)
+			require.Len(t, s.vindexes, 1)
+			assert.False(t, s.vindexes[0] == head, "the older reader was served the rebuilt index's object")
+			// A document the reader's snapshot has and the rebuilt index does
+			// not, through the reader's own index.
+			hits, err = vsearchIn(rtx.Context(), coll, "v", vecs[12], 1, 64)
+			require.NoError(t, err)
+			require.NotEmpty(t, hits)
+			assert.Equal(t, string(idBytesOf(12)), string(hits[0].DocId))
+			hits, err = vsearch(coll, "v", vecs[7], 3, 64)
+			require.NoError(t, err)
+			assert.Equal(t, string(idBytesOf(7)), string(hits[0].DocId))
+		})
+	}
+}
