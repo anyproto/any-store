@@ -1,7 +1,6 @@
 package anystore
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"sync/atomic"
@@ -47,7 +46,7 @@ type collSchema struct {
 	// the cookie it took effect at; nil for a collection never renamed
 	// through this handle. A transaction older than a rename finds the
 	// collection in its snapshot under the name of that time.
-	names []nameSince
+	names *[]nameSince
 }
 
 type nameSince struct {
@@ -57,15 +56,29 @@ type nameSince struct {
 
 // nameAt returns the name the collection has in a snapshot at cookie.
 func (s *collSchema) nameAt(cookie uint32) string {
-	for i := len(s.names) - 1; i >= 0; i-- {
-		if cookieLE(s.names[i].from, cookie) {
-			return s.names[i].name
+	if s.names == nil {
+		return s.name
+	}
+	names := *s.names
+	for i := len(names) - 1; i >= 0; i-- {
+		if cookieLE(names[i].from, cookie) {
+			return names[i].name
 		}
 	}
-	if len(s.names) > 0 {
-		return s.names[0].name
+	return names[0].name
+}
+
+// renamed returns the names history with the name the collection takes at
+// cookie appended.
+func (s *collSchema) renamed(name string, cookie uint32) *[]nameSince {
+	var names []nameSince
+	if s.names != nil {
+		names = *s.names
+	} else {
+		names = []nameSince{{name: s.name}}
 	}
-	return s.name
+	names = append(names[:len(names):len(names)], nameSince{name: name, from: cookie})
+	return &names
 }
 
 // clone returns a copy to edit and log; gen starts unset.
@@ -687,11 +700,11 @@ func (c *collection) loadSchema(tx *btree.ReadTx, name string, prev *collSchema)
 		}
 		return nil, err
 	}
-	if c.catalogID == nil {
+	if c.identity == "" {
 		if err = c.identify(tx, name, token, ns); err != nil {
 			return nil, err
 		}
-	} else if !bytes.Equal(token, c.catalogID) || ns.RootPage() != c.dataRoot {
+	} else if ns.RootPage() != c.dataRoot || !c.sameToken(token) {
 		return nil, ErrCollectionNotFound
 	}
 	infos, err := db.getIndexInfos(tx, name)
@@ -751,11 +764,16 @@ func (c *collection) identify(tx *btree.ReadTx, name string, token []byte, ns *b
 		c.primaryKey = "id"
 	}
 	c.dataRoot = ns.RootPage()
-	c.catalogID = token
 	// The root tells apart the collections of old files that share one
 	// token; no two live collections share a root.
 	c.identity = string(binary.BigEndian.AppendUint32(append([]byte(nil), token...), c.dataRoot))
 	return nil
+}
+
+// sameToken reports that token is the catalog token of the handle's
+// identity.
+func (c *collection) sameToken(token []byte) bool {
+	return len(c.identity) == len(token)+4 && c.identity[:len(token)] == string(token)
 }
 
 func (c *collection) loadRangeIndex(tx *btree.ReadTx, name string, info IndexInfo, prev *collSchema) (*index, error) {

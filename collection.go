@@ -159,17 +159,16 @@ type collection struct {
 
 	compression Compression // 0 = use db default
 
-	// catalogID and dataRoot identify the collection this handle stands for:
-	// the coll: record value and the data namespace's root page, fixed at the
-	// first load (identify). A view that has another collection under the
-	// name — dropped and recreated, or renamed away and created anew — does
-	// not have this one (loadSchema). The token moves with a rename; the root
-	// is the second check for the entries of old files that share one token.
-	catalogID []byte
-	dataRoot  uint32
-	// identity is the two as one key: what the registry knows a collection
-	// by, besides its name (db.byIdentity).
+	// identity identifies the collection this handle stands for: the coll:
+	// record value (the catalog token) followed by the data namespace's root
+	// page, fixed at the first load (identify); empty until then. A view
+	// that has another collection under the name — dropped and recreated,
+	// or renamed away and created anew — does not have this one
+	// (loadSchema). The token moves with a rename; the root is the second
+	// check for the entries of old files that share one token. The registry
+	// knows a collection by it, besides its name (db.byIdentity).
 	identity string
+	dataRoot uint32
 
 	// openName is the name the handle was opened under: what the collection
 	// is called while no version is installed.
@@ -1302,11 +1301,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 			return err
 		}
 		next.name = newName
-		names := s.names
-		if names == nil {
-			names = []nameSince{{name: oldName}}
-		}
-		next.names = append(names[:len(names):len(names)], nameSince{name: newName, from: tx.DiskSchemaCookie() + 1})
+		next.names = s.renamed(newName, tx.DiskSchemaCookie()+1)
 		// The registry is re-keyed at the commit (settleLog). Until then
 		// OpenCollection(oldName) keeps returning this handle, which is right
 		// for the committed state; inside this transaction the old name is
