@@ -465,6 +465,15 @@ func OpenTx(rtx *btree.ReadTx, prefix string) (*StoreIndex, error) {
 // MetaRoot is the :meta namespace root page (staleness check after compaction).
 func (ix *StoreIndex) MetaRoot() uint32 { return ix.metaRoot }
 
+// Roots returns the root page of every namespace of the index, by the
+// namespace's suffix: what a view must have for this object to serve it.
+func (ix *StoreIndex) Roots() map[string]uint32 {
+	return map[string]uint32{
+		":meta": ix.vmeta.RootPage(), ":cb": ix.vcb.RootPage(), ":cell": ix.vcell.RootPage(),
+		":vec": ix.vvec.RootPage(), ":lbl": ix.vlbl.RootPage(), ":doc": ix.vdoc.RootPage(),
+	}
+}
+
 // StoreStats reports per-namespace sizes and counts for the index.
 type StoreStats struct {
 	Dim, NList, M, NProbe, Assign int

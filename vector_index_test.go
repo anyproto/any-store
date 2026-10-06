@@ -2,6 +2,7 @@ package anystore
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"math"
 	"math/rand"
@@ -772,3 +773,96 @@ func vknnJSON(vec []float32, k, ef int) string {
 }
 
 const kd = `{"$knn":{"$query":[3,1,2],"$k":4}}`
+
+// A vector index object is reused by a version only when every namespace
+// of the index is at the root page the object was opened against. After a
+// drop and a recreate with the same definition the freed pages come back:
+// the :meta root may, while the others moved. A reader whose snapshot has
+// the old index must not be served the new object, whose trees its
+// snapshot does not have.
+func TestVectorIndex_OlderReaderAfterRecreateOnSameRoots(t *testing.T) {
+	const dim = 8
+	info := IndexInfo{Name: "emb", Kind: IndexKindVector, Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2}}
+	metaCameBack := false
+	// How many pages are taken between the drop and the recreate decides
+	// which of the freed roots the recreate gets back.
+	for fillers := range 7 {
+		t.Run(fmt.Sprintf("fillers=%d", fillers), func(t *testing.T) {
+			metaCameBack = metaCameBack || vectorRecreateOnSameRoots(t, info, fillers)
+		})
+	}
+	require.True(t, metaCameBack, "no run put :meta back on its old page; the sweep no longer covers the case")
+}
+
+// vectorRecreateOnSameRoots runs one case of
+// TestVectorIndex_OlderReaderAfterRecreateOnSameRoots and reports whether
+// the recreated index's :meta root is the dropped one's.
+func vectorRecreateOnSameRoots(t *testing.T, info IndexInfo, fillers int) (metaCameBack bool) {
+	const dim = 8
+	{
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "docs")
+		require.NoError(t, err)
+		require.NoError(t, coll.CreateIndex(ctx, info))
+		vecs := vrand(50, dim, 7)
+		for i, vc := range vecs {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+		}
+		c := coll.(*collection)
+		before := c.cur().vindexes[0]
+
+		rtx, err := fx.ReadTx(ctx)
+		require.NoError(t, err)
+		defer func() { _ = rtx.Commit() }()
+		hits, err := vsearchIn(rtx.Context(), coll, "v", vecs[7], 3, 64)
+		require.NoError(t, err)
+		require.NotEmpty(t, hits)
+
+		wtx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, coll.DropIndex(wtx.Context(), "emb"))
+		for i := range fillers {
+			_, err = fx.CreateCollection(wtx.Context(), fmt.Sprintf("filler%d", i))
+			require.NoError(t, err)
+		}
+		require.NoError(t, coll.CreateIndex(wtx.Context(), info))
+		require.NoError(t, wtx.Commit())
+		after := c.cur().vindexes[0]
+		require.False(t, before == after)
+		if before.ix.MetaRoot() == after.ix.MetaRoot() {
+			metaCameBack = true
+			t.Logf(":meta back on page %d, roots before %v, after %v", after.ix.MetaRoot(), before.ix.Roots(), after.ix.Roots())
+		}
+
+		// The older reader: its own snapshot's index, whatever root pages
+		// the new one took.
+		hits, err = vsearchIn(rtx.Context(), coll, "v", vecs[7], 3, 64)
+		require.NoError(t, err)
+		require.NotEmpty(t, hits)
+		assert.Equal(t, string(idBytesOf(7)), string(hits[0].DocId))
+		require.NoError(t, rtx.Commit())
+		// And the newest state through the new object.
+		hits, err = vsearch(coll, "v", vecs[7], 3, 64)
+		require.NoError(t, err)
+		assert.Equal(t, string(idBytesOf(7)), string(hits[0].DocId))
+	}
+	return metaCameBack
+}
+
+// vsearchIn is vsearch in the transaction of ctx.
+func vsearchIn(tctx context.Context, coll Collection, field string, q []float32, k, ef int) ([]vhit, error) {
+	iter, err := coll.Find(fmt.Sprintf(`{%q:%s}`, field, vknnJSON(q, k, ef))).Iter(tctx)
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var out []vhit
+	for iter.Next() {
+		d, derr := iter.Doc()
+		if derr != nil {
+			return nil, derr
+		}
+		out = append(out, vhit{DocId: idBytesOf(d.Value().GetInt("id"))})
+	}
+	return out, iter.Err()
+}

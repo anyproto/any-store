@@ -296,20 +296,29 @@ func (vi *vectorIndex) update(tx *btree.WriteTx, prevIt, it item) error {
 func (vi *vectorIndex) Info() IndexInfo { return vi.info }
 
 // boundIn reports that the view of tx has the index of the collection
-// collName at the :meta root this object was opened against. Brute-force
-// indexes have no namespaces and are bound in any view that lists them.
+// collName at every root page this object was opened against — all of its
+// namespaces, as the full-text loader checks (sameRoots): a drop and a
+// recreate hand the freed pages out again, the :meta root alone can come
+// back while the others moved. Brute-force indexes have no namespaces and
+// are bound in any view that lists them.
 func (vi *vectorIndex) boundIn(tx *btree.ReadTx, collName string) bool {
 	if vi.ix == nil && vi.ivf == nil {
 		return true
 	}
-	ns, err := tx.GetNamespace(vectorIndexNsPrefix(collName, vi.info.Name) + ":meta")
-	if err != nil {
-		return false
-	}
+	prefix := vectorIndexNsPrefix(collName, vi.info.Name)
+	var roots map[string]uint32
 	if vi.isIVF() {
-		return ns.RootPage() == vi.ivf.MetaRoot()
+		roots = vi.ivf.Roots()
+	} else {
+		roots = vi.ix.Roots()
 	}
-	return ns.RootPage() == vi.ix.MetaRoot()
+	for suffix, root := range roots {
+		ns, err := tx.GetNamespace(prefix + suffix)
+		if err != nil || ns.RootPage() != root {
+			return false
+		}
+	}
+	return true
 }
 
 // compact rebuilds the HNSW graph from its live vectors, reclaiming tombstones
