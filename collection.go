@@ -300,7 +300,7 @@ func (c *collection) loadVectorIndexes() []*vectorIndex {
 }
 
 func (c *collection) Name() string {
-	if s := c.cur(); s != nil {
+	if s := c.committed(); s != nil {
 		return s.name
 	}
 	return c.openName
@@ -1225,30 +1225,44 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 // speak for it, see resolveSlow), or not verified since another process
 // changed the schema. nil if the collection is gone. For the accessors that
 // take no context: the schema as committed, as far as this process has
-// looked.
+// looked. The verification takes a read transaction; when none can begin at
+// once — every reader slot is held, maybe by the caller itself — the head
+// stands as it is.
 func (c *collection) committed() *collSchema {
-	if s := c.cur(); s != nil && s.gen.Load() == c.db.epoch.Load().gen {
+	s := c.cur()
+	if s != nil && s.gen.Load() == c.db.epoch.Load().gen {
 		return s
 	}
-	var s *collSchema
-	_ = c.db.doReadTx(context.Background(), func(tx *btree.ReadTx) (err error) {
-		s, err = c.resolve(tx)
-		return err
-	})
+	tx, err := c.db.btreeDB.TryBeginRead()
+	if err != nil {
+		return s
+	}
+	defer func() { _ = tx.Rollback() }()
+	c.db.checkStale(tx)
+	s, _ = c.resolve(tx)
 	return s
 }
 
 // schemaFor returns the schema a verb about to run in ctx works with: the
 // version of the transaction ctx carries, else the committed one its own
-// transaction is about to see.
+// transaction is about to see — verified through a short read when it is
+// not known to be, with the error that ends the verb if that fails.
 func (c *collection) schemaFor(ctx context.Context) (*collSchema, error) {
 	if tx, ok := ctx.Value(ctxKeyTx).(ReadTx); ok && !tx.Done() && tx.instanceId() == c.db.instanceId {
 		return c.resolve(tx.btreeReadTx())
 	}
-	if s := c.committed(); s != nil {
+	if s := c.cur(); s != nil && s.gen.Load() == c.db.epoch.Load().gen {
 		return s, nil
 	}
-	return nil, ErrCollectionNotFound
+	var s *collSchema
+	err := c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
+		s, err = c.resolve(tx)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 func (c *collection) GetIndexes() (indexes []Index) {
