@@ -230,6 +230,11 @@ type collection struct {
 	//
 	// Guarded by db.mu.
 	pinned int
+	// logLast is one past the index of this handle's last entry in the open
+	// write transaction's schema log (txSchema.log), 0 while it has none:
+	// how the writer finds its version of the handle without a scan.
+	// Writer-owned, like the log.
+	logLast int
 	// closePending records a Close() that waits for pinned to reach zero
 	// (db.unpinLocked). An open that hands this handle to a caller in between
 	// clears it (db.handOut). Written under db.mu.

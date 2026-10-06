@@ -295,16 +295,16 @@ func (t *txSchema) release() {
 
 // logged returns the last schema change the open write transaction tx made
 // through c, nil when it made none: what the writer has in place of the
-// head.
+// head. By the handle's own mark (collection.logLast), not a scan: a
+// transaction that changes many collections resolves each in constant
+// time.
 func (c *collection) logged(tx *btree.ReadTx) *logEntry {
 	t := txSchemaOf(tx)
-	if t == nil {
+	if t == nil || c.logLast == 0 || c.logLast > len(t.log) {
 		return nil
 	}
-	for i := len(t.log) - 1; i >= 0; i-- {
-		if e := &t.log[i]; e.c == c && e.kind != logPin {
-			return e
-		}
+	if e := &t.log[c.logLast-1]; e.c == c && e.kind != logPin {
+		return e
 	}
 	return nil
 }
@@ -327,10 +327,7 @@ func (c *collection) inTx(tx *btree.ReadTx) (s *collSchema, dropped bool) {
 func (t *txSchema) byName(name string) *logEntry {
 	for i := len(t.log) - 1; i >= 0; i-- {
 		e := &t.log[i]
-		if e.kind == logPin || e.s.name != name {
-			continue
-		}
-		if t.superseded(i) {
+		if e.kind == logPin || e.s.name != name || e.c.logLast != i+1 {
 			continue
 		}
 		return e
@@ -338,22 +335,22 @@ func (t *txSchema) byName(name string) *logEntry {
 	return nil
 }
 
-// superseded reports that a later entry changes the handle of entry i.
-func (t *txSchema) superseded(i int) bool {
-	for j := i + 1; j < len(t.log); j++ {
-		if t.log[j].c == t.log[i].c && t.log[j].kind != logPin {
-			return true
-		}
-	}
-	return false
-}
-
-// add appends an entry and pins its handle (collection.pinned).
+// add appends an entry, pins its handle (collection.pinned) and marks the
+// entry as the handle's last (collection.logLast).
 func (t *txSchema) add(db *db, e logEntry) {
 	db.mu.Lock()
 	e.c.pinned++
 	db.mu.Unlock()
 	t.log = append(t.log, e)
+	e.c.logLast = len(t.log)
+}
+
+// remark sets every handle's last-entry mark from the log: after entries
+// were discarded, for the handles with entries left.
+func (t *txSchema) remark() {
+	for i := range t.log {
+		t.log[i].c.logLast = i + 1
+	}
 }
 
 // logVersion records next as the version c has from the commit of wtx on,
@@ -389,12 +386,10 @@ func (c *collection) logDrop(wtx WriteTx, s *collSchema) {
 // the log references already is pinned already; the log does not grow with
 // the verbs called on it.
 func (c *collection) logPin(wtx WriteTx) error {
-	t := wtx.schemaLog()
-	for i := range t.log {
-		if t.log[i].c == c {
-			return c.alive()
-		}
+	if c.logLast != 0 {
+		return c.alive()
 	}
+	t := wtx.schemaLog()
 	c.db.mu.Lock()
 	if err := c.alive(); err != nil {
 		c.db.mu.Unlock()
@@ -403,6 +398,7 @@ func (c *collection) logPin(wtx WriteTx) error {
 	c.pinned++
 	c.db.mu.Unlock()
 	t.log = append(t.log, logEntry{c: c, kind: logPin})
+	c.logLast = len(t.log)
 	return nil
 }
 
@@ -465,6 +461,9 @@ func (db *db) settleLog(t *txSchema) {
 	}
 	db.unpinLocked(t.log)
 	db.mu.Unlock()
+	for i := range t.log {
+		t.log[i].c.logLast = 0
+	}
 	clear(t.log)
 	t.log = t.log[:0]
 }
@@ -483,17 +482,23 @@ func (db *db) discardLog(t *txSchema, from int) {
 		case logCreate:
 			e.c.closed.Store(true)
 		case logVersion:
-			head := e.c.head.Load()
-			if head == nil {
-				continue
-			}
+			// The flag goes to the objects the writer falls back to — the
+			// version this one was made from — and to the head's, which
+			// the next write transaction rebases after a full rollback.
 			for _, idx := range e.s.indexes {
 				if !idx.sketchModified {
 					continue
 				}
-				for _, h := range head.indexes {
+				for _, h := range e.prev.indexes {
 					if h.sketch == idx.sketch {
 						h.markSketchModified()
+					}
+				}
+				if head := e.c.head.Load(); head != nil {
+					for _, h := range head.indexes {
+						if h.sketch == idx.sketch {
+							h.markSketchModified()
+						}
 					}
 				}
 			}
@@ -502,8 +507,12 @@ func (db *db) discardLog(t *txSchema, from int) {
 	db.mu.Lock()
 	db.unpinLocked(t.log[from:])
 	db.mu.Unlock()
+	for i := from; i < len(t.log); i++ {
+		t.log[i].c.logLast = 0
+	}
 	clear(t.log[from:])
 	t.log = t.log[:from]
+	t.remark()
 }
 
 // registerLocked puts c in the registry under name. A handle that holds the
