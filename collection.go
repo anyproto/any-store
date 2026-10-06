@@ -24,7 +24,10 @@ import (
 // of the transaction it runs in: the indexes that transaction has, under the
 // name it has. A transaction that does not have the collection — it began
 // before the collection was created, or the collection was dropped or
-// replaced since — gets ErrCollectionNotFound.
+// replaced since — gets ErrCollectionNotFound. A schema change made in a
+// write transaction — a collection or index created or dropped, a rename —
+// is that transaction's own until it commits: every other caller, and the
+// accessors that take no context, have the committed schema.
 type Collection interface {
 	// Name returns the committed name of the collection: a rename made in an
 	// open write transaction shows once it commits.
@@ -108,12 +111,15 @@ type Collection interface {
 	// It scans the whole collection and is intended for diagnostics.
 	Stats(ctx context.Context) (CollectionStats, error)
 
-	// Rename renames the collection.
-	// Returns an error if the operation fails.
+	// Rename renames the collection. In the renaming transaction the old
+	// name is free from here on; the handle keeps working under the new
+	// name, for everyone once the rename commits.
 	Rename(ctx context.Context, newName string) (err error)
 
-	// Drop drops the collection.
-	// Returns an error if the operation fails.
+	// Drop drops the collection. Later operations through the handle fail
+	// with ErrCollectionClosed: in the dropping transaction at once, for
+	// everyone once the drop commits. A rollback leaves the handle as it
+	// was.
 	Drop(ctx context.Context) (err error)
 
 	// ReadTx starts a new read-only transaction. It's just a proxy to db object.
