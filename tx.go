@@ -119,7 +119,7 @@ func (tx *commonTx) schemaCommitted(fileChangeCounter, schemaCookie uint32) {
 	// settling from before the first handle changes — the install closes
 	// the dropped ones, and a slot held by a closed handle is one a
 	// registration may take — until the epoch has moved (sinceNow).
-	tx.db.settling.Store(schemaCookie)
+	tx.db.settling.Store(1<<32 | uint64(schemaCookie))
 	defer tx.db.settling.Store(0)
 	tx.schema.install(tx.db.epoch.Load().gen)
 	if testHookAfterInstall != nil {

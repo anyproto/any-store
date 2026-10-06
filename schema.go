@@ -202,8 +202,8 @@ const (
 // a registration that finds it clear and came after a change finds known
 // moved too. The caller holds db.mu, which orders it against the settle.
 func (db *db) sinceNow() uint32 {
-	if settling := db.settling.Load(); settling != 0 {
-		return settling
+	if settling := db.settling.Load(); settling>>32 != 0 {
+		return uint32(settling)
 	}
 	return db.epoch.Load().known
 }

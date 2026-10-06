@@ -302,3 +302,129 @@ func TestBeginRead_InProcessFreshSlotMarkBeforeShare(t *testing.T) {
 		})
 	}
 }
+
+// The reuse of a reader slot re-validates the slot's mark after the shared
+// lock: a checkpoint between the scan and the lock resets a free slot to
+// unused (its backfill held off by a slot-0 reader, so nBackfill does not
+// move), and a reader holding a slot without a mark is one the next
+// checkpoint backfills past.
+func TestBeginRead_InProcessReusedSlotMarkRechecked(t *testing.T) {
+	for _, mode := range []string{"inprocess", "inmemory"} {
+		t.Run(mode, func(t *testing.T) {
+			opts := DefaultOptions()
+			path := filepath.Join(t.TempDir(), "db")
+			if mode == "inmemory" {
+				opts.InMemory = true
+				path = ""
+			} else {
+				opts.InProcess = true
+			}
+			db, err := Open(path, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var ns *Namespace
+			big := func(v string) []byte { return append([]byte(v), make([]byte, 3000)...) }
+			put := func(key, val string) {
+				w, err := db.BeginWrite()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ns == nil {
+					if ns, err = w.CreateNamespace("n"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err = w.Put(ns, []byte(key), big(val)); err != nil {
+					t.Fatal(err)
+				}
+				if err = w.Commit(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for i := range 40 {
+				put(fmt.Sprintf("k%02d", i), "k1")
+			}
+			put("a", "a1")
+			put("z", "b1")
+			if err = db.Checkpoint(CheckpointRestart); err != nil {
+				t.Fatal(err)
+			}
+			idx := db.pager.wal.index
+			put("a", "a2")
+			if err = db.Checkpoint(CheckpointPassive); err != nil {
+				t.Fatal(err)
+			}
+			// A slot-0 reader: the checkpoints below cannot backfill.
+			l, err := db.BeginRead()
+			if err != nil {
+				t.Fatal(err)
+			}
+			lDone := false
+			defer func() {
+				if !lDone {
+					_ = l.Rollback()
+				}
+			}()
+			if l.walSlot != 0 {
+				t.Fatalf("the slot-0 reader is on slot %d", l.walSlot)
+			}
+			put("k05", "k2")
+			ra, err := db.BeginRead() // a fresh claim: slot 1
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = ra.Rollback()
+			put("k06", "k2")
+			// A reader whose reuse of slot 1 meets the slot held exclusive
+			// for an instant (a checkpointer's per-slot lock) claims slot 2.
+			testInProcessReuseSlotHook = func() {
+				testInProcessReuseSlotHook = nil
+				if err := idx.lock(lockRead0+1, lockExclusive); err != nil {
+					t.Error(err)
+				}
+			}
+			rb, err := db.BeginRead()
+			testInProcessReuseSlotHook = nil
+			_ = idx.unlock(lockRead0+1, lockExclusive)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = rb.Rollback()
+			put("k07", "k2")
+
+			// The reader under test picks slot 2; a checkpoint between its
+			// scan and its lock resets the free slot.
+			testInProcessReuseSlotHook = func() {
+				testInProcessReuseSlotHook = nil
+				if err := db.Checkpoint(CheckpointPassive); err != nil {
+					t.Error(err)
+				}
+			}
+			defer func() { testInProcessReuseSlotHook = nil }()
+			r2, err := db.BeginRead()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r2.Rollback()
+			if mark := idx.aReadMark[r2.walSlot].Load(); r2.walSlot != 0 && (mark == readMarkNotUsed || mark < r2.walMaxFrame) {
+				t.Fatalf("the reader holds slot %d with mark %d for a window up to %d", r2.walSlot, mark, r2.walMaxFrame)
+			}
+			_ = l.Rollback()
+			lDone = true
+
+			put("z", "b2")
+			if err = db.Checkpoint(CheckpointPassive); err != nil {
+				t.Fatal(err)
+			}
+			b, err := r2.Get(ns, []byte("z"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b[:2]) != "b1" {
+				t.Fatalf("the reader reads z=%q, want b1: a commit past its snapshot", b[:2])
+			}
+		})
+	}
+}

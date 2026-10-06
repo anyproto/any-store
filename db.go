@@ -291,11 +291,12 @@ type db struct {
 	// epoch is what this process knows of the schema cookie's history, and
 	// ownCookie the cookie a commit of this process is producing right now
 	// (flag in the high half); see schemaEpoch and observeCookie. settling
-	// is that cookie while the commit's registry work is done and the epoch
-	// not yet past it (commonTx.schemaCommitted); see sinceNow.
+	// is that cookie (flag likewise) from the commit's first change to a
+	// handle until the epoch is past it (commonTx.schemaCommitted); see
+	// sinceNow.
 	epoch     atomic.Pointer[schemaEpoch]
 	ownCookie atomic.Uint64
-	settling  atomic.Uint32
+	settling  atomic.Uint64
 	// sketchEpoch counts the commits of other processes this one noticed:
 	// each may have moved the sketches of any collection (see
 	// collection.refreshSketches).
