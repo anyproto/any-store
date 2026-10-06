@@ -636,3 +636,66 @@ func TestCommit_PinOnlyCommitIsGated(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
 }
+
+// A transaction at the snapshot before a drop that opens the dropped
+// collection while the commit is settling its registry — the handle gone
+// from it, the epoch not yet past the commit — gets a handle of its own for
+// its snapshot and nothing more: the handle is proven from the commit's
+// cookie on (since), so the transaction does not install the dropped
+// collection's version for the transactions after the commit.
+func TestCommit_OpenOfDroppedInThePublication(t *testing.T) {
+	fx := newFixture(t)
+	a, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	b, err := fx.CreateCollection(ctx, "b")
+	require.NoError(t, err)
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { _ = rtx.Commit() }()
+
+	settled, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	testHookAfterSettle = func() {
+		once.Do(func() {
+			close(settled)
+			<-release
+		})
+	}
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		testHookAfterSettle = nil
+	})
+	committed := make(chan error, 1)
+	go func() { committed <- a.Drop(ctx) }()
+	<-settled
+
+	// The older transaction: its snapshot has the collection.
+	old, err := fx.OpenCollection(rtx.Context(), "a")
+	require.NoError(t, err)
+	require.False(t, old == a)
+	n, err := old.Count(rtx.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	close(release)
+	require.NoError(t, <-committed)
+
+	// The present: the collection is gone, the handle with it, and the
+	// pages it had are another collection's to take.
+	_, err = fx.OpenCollection(ctx, "a")
+	assert.ErrorIs(t, err, ErrCollectionNotFound)
+	err = old.Insert(ctx, anyenc.MustParseJson(`{"id":2}`))
+	assert.ErrorIs(t, err, ErrCollectionNotFound, "a write through the dropped collection's handle")
+	for i := range 50 {
+		require.NoError(t, b.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%0200d"}`, i, i))))
+	}
+	require.NoError(t, fx.IntegrityCheck(ctx))
+	a2, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	assertCollCount(t, a2, 0)
+}

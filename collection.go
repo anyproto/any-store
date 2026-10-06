@@ -308,6 +308,10 @@ func (c *collection) Name() string {
 	if s := c.committed(); s != nil {
 		return s.name
 	}
+	// Gone: the name it had.
+	if s := c.cur(); s != nil {
+		return s.name
+	}
 	return c.openName
 }
 
@@ -1244,8 +1248,16 @@ func (c *collection) committed() *collSchema {
 	}
 	defer func() { _ = tx.Rollback() }()
 	c.db.checkStale(tx)
-	s, _ = c.resolve(tx)
-	return s
+	v, err := c.resolve(tx)
+	if err != nil {
+		if errors.Is(err, ErrCollectionNotFound) {
+			return nil
+		}
+		// The verification failed for a reason other than the collection
+		// being gone: as last seen.
+		return s
+	}
+	return v
 }
 
 // schemaFor returns the schema a verb about to run in ctx works with: the

@@ -838,10 +838,14 @@ func (wi *walIndex) reset(readMarksLocked bool) {
 	wi.mu.Lock()
 	clear(wi.pageMap)
 	wi.mu.Unlock()
-	wi.restarts.Add(1)
 	wi.maxFrame.Store(0)
 	wi.mxCommitFrame.Store(0)
 	wi.nBackfill.Store(0)
+	// After the frame numbers, as a read begin reads them before the
+	// count (tryBeginReadInProcessHdr): a begin that saw the old numbers
+	// and the new count, or the new numbers and the old count, fails its
+	// post-lock check either way.
+	wi.restarts.Add(1)
 	wi.nBackfillAttempted.Store(0)
 	for i := range wi.aReadMark {
 		wi.aReadMark[i].Store(readMarkNotUsed)
@@ -2810,12 +2814,13 @@ func (w *wal) tryBeginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slo
 // post-lock re-check of aReadMark[mxI], wal.c:3239-3249). On retry the
 // nBackfill==mxFrame slot-0 fast path stays safe.
 func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
-	// The restart count before the frame numbers, and checked again with
-	// them after the lock: a restart in between would pair the old frame
-	// numbers with the new generation's key.
-	restarts := w.index.restarts.Load()
+	// The restart count after the frame numbers (reset bumps it after
+	// zeroing them), and checked again with them after the lock: a restart
+	// in between would pair the old frame numbers with the new generation's
+	// key, or the other way round.
 	mxFrame := w.index.mxCommitFrame.LoadLocal()
 	nBackfill := w.index.nBackfill.Load()
+	restarts := w.index.restarts.Load()
 	hdr = WalIndexHdr{isInit: 1, mxFrame: mxFrame, iChange: restarts}
 
 	if mxFrame == 0 || nBackfill == mxFrame {
@@ -2879,6 +2884,15 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 	for i := 1; i <= 4; i++ {
 		lockSlot := lockRead0 + i
 		if err := w.index.lock(lockSlot, lockShared); err == nil {
+			// Post-lock re-validation, as for the reused slot above: a
+			// checkpoint, a restart and a commit can all land between the
+			// lock-free snapshot and this lock, and the window would then
+			// span the new generation's frames under the old key.
+			if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill ||
+				w.index.restarts.Load() != restarts {
+				_ = w.index.unlock(lockSlot, lockShared)
+				return WalIndexHdr{}, 0, 0, 0, errWALRetry
+			}
 			w.index.aReadMark[i].Store(mxFrame)
 			return hdr, mxFrame, nBackfill + 1, i, nil
 		}

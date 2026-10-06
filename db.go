@@ -844,7 +844,7 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 			}
 			db.forgetLocked(existing.(*collection))
 		}
-		c.since = db.epoch.Load().known
+		c.since = db.sinceNow()
 		db.openedCollections[collectionName] = c
 		db.byIdentity[c.identity] = c
 		db.mu.Unlock()
@@ -1348,13 +1348,18 @@ func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
 	gen := db.epoch.Load().gen
 	for _, c := range db.sketchDirty {
 		s, dropped := c.inTx(&tx.ReadTx)
-		if dropped || s == nil || c.closed.Load() || s.gen.Load() != gen {
+		if dropped || s == nil || c.closed.Load() {
 			// Dropped in this tx: the stat_data rows were deleted with the
 			// collection — persisting the still-dirty sketches would durably
 			// resurrect orphaned rows a later same-named index would adopt.
+			continue
+		}
+		if s == c.cur() && s.gen.Load() != gen {
 			// A head another process's change left unverified: its name
 			// and indexes may be gone; the flags wait for the handle to be
-			// verified.
+			// verified. A version this transaction logged is its own, made
+			// from its verified view; its generation is stamped at the
+			// install.
 			continue
 		}
 		if err := c.persistSketches(tx, s); err != nil {

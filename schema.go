@@ -189,6 +189,22 @@ const (
 	announcedCookieNap   = 20 * time.Microsecond
 )
 
+// sinceNow is the cookie a handle registered now is proven from
+// (collection.since): the epoch's known — or the cookie a commit of this
+// process is producing right now, if that is further. Inside such a commit
+// the registry is settled before known moves (commonTx.schemaCommitted): a
+// handle the commit dropped is gone from it already, and a transaction at
+// the snapshot before the commit that registers a handle for the
+// collection then must not speak for it, or it would install the dropped
+// collection's version for the transactions after the commit.
+func (db *db) sinceNow() uint32 {
+	known := db.epoch.Load().known
+	if own := db.ownCookie.Load(); own>>32 != 0 && !cookieLE(uint32(own), known) {
+		return uint32(own)
+	}
+	return known
+}
+
 // announceCookie tells observeCookie which cookie the commit about to run
 // produces, so a reader that begins once it is visible does not take it for
 // another process's. The write lock is held: no other commit can produce it.

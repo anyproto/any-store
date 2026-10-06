@@ -118,15 +118,20 @@ func (tx *commonTx) schemaCommitted(fileChangeCounter, schemaCookie uint32) {
 	}
 	tx.schema.install(tx.db.epoch.Load().gen)
 	tx.db.settleLog(&tx.schema)
+	if testHookAfterSettle != nil {
+		testHookAfterSettle()
+	}
 	tx.db.schemaCommitted(fileChangeCounter, schemaCookie)
 }
 
 // testHookBeforeInstall, when set, runs inside a schema-changing commit as
-// it becomes visible, before the heads are installed; testHookAfterBtreeCommit
-// right after the btree commit returned, the write lock released. Tests
-// only.
+// it becomes visible, before the heads are installed; testHookAfterSettle
+// once the registry is settled, before the epoch moves;
+// testHookAfterBtreeCommit right after the btree commit returned, the write
+// lock released. Tests only.
 var (
 	testHookBeforeInstall    func()
+	testHookAfterSettle      func()
 	testHookAfterBtreeCommit func()
 )
 
