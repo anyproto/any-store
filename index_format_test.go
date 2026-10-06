@@ -110,7 +110,7 @@ func legacyIndexBy(t *testing.T, c *collection, name string, commit ddlTx) {
 	}
 	require.NotNil(t, idx)
 	commit(t, c.db, func(tx *btree.WriteTx) error {
-		key := indexKey(c.name, name)
+		key := indexKey(c.cur().name, name)
 		raw, err := tx.AppendValue(c.db.systemNS, key, nil)
 		if err != nil {
 			return err
@@ -153,7 +153,7 @@ func readIndexFormat(t *testing.T, c *collection, name string) int {
 	t.Helper()
 	var format int
 	require.NoError(t, c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
-		format, err = c.db.readIndexFormat(tx, c.name, name)
+		format, err = c.db.readIndexFormat(tx, c.cur().name, name)
 		return err
 	}))
 	return format
@@ -163,7 +163,7 @@ func readMultikey(t *testing.T, c *collection, name string) []byte {
 	t.Helper()
 	var mk []byte
 	require.NoError(t, c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
-		mk, err = tx.AppendValue(c.db.systemNS, multikeyKey(indexNsName(c.name, name)), nil)
+		mk, err = tx.AppendValue(c.db.systemNS, multikeyKey(indexNsName(c.cur().name, name)), nil)
 		return err
 	}))
 	return mk
@@ -244,7 +244,7 @@ func schemaCookie(t *testing.T, fx *fixture) uint32 {
 func setIndexRecord(t *testing.T, c *collection, name, field string, val func(a *anyenc.Arena) *anyenc.Value) {
 	t.Helper()
 	otherBuildTx(t, c.db, func(tx *btree.WriteTx) error {
-		key := indexKey(c.name, name)
+		key := indexKey(c.cur().name, name)
 		raw, err := tx.AppendValue(c.db.systemNS, key, nil)
 		if err != nil {
 			return err
@@ -560,10 +560,9 @@ func TestIndexFormat_NewerStampRebuilt(t *testing.T) {
 }
 
 // An outdated index a running handle adopts after Open (a peer's
-// pre-versioning DDL, reconciled at the next tx) is never planned; the query
-// falls back to a scan, writes keep maintaining it, and the next Open
-// rebuilds it. The peer is simulated on the handle's own db, followed by a
-// forced reconcile pass.
+// pre-versioning DDL, noticed by the next tx that uses the handle) is never
+// planned; the query falls back to a scan, writes keep maintaining it, and
+// the next Open rebuilds it. The peer is simulated on the handle's own db.
 func TestIndexFormat_OutdatedIndexNotPlanned(t *testing.T) {
 	skipIfInMemory(t, "the index format stamp is written and the database reopened")
 	dir := legacyFixture(t)
@@ -577,10 +576,9 @@ func TestIndexFormat_OutdatedIndexNotPlanned(t *testing.T) {
 	assert.Contains(t, exp.Plan, "sparse")
 
 	legacyIndex(t, c, "sparse")
-	require.NoError(t, c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		c.reconcileIndexes(tx)
-		return nil
-	}))
+	peerSchemaChangeNow(t, c.db)
+	_, err = coll.Count(ctx)
+	require.NoError(t, err)
 	assert.True(t, formatIndex(t, coll, "sparse").outdated)
 
 	exp, err = coll.Find(`{"a":{"$exists":true}}`).Explain(ctx)
@@ -710,7 +708,7 @@ func TestIndexFormat_RebuildBadDocumentQuarantines(t *testing.T) {
 	legacyIndex(t, other.(*collection), "sparse")
 	c := other.(*collection)
 	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-		return tx.Put(c.ns, []byte("zzz"), anyenc.MustParseJson(`{"a":1}`).MarshalTo(nil))
+		return tx.Put(c.cur().ns, []byte("zzz"), anyenc.MustParseJson(`{"a":1}`).MarshalTo(nil))
 	}))
 	require.NoError(t, fx.Close())
 

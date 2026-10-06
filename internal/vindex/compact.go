@@ -125,3 +125,15 @@ func Compact(wtx *btree.WriteTx, prefix string, seed int64) (*Index, error) {
 // collection compares it against the on-disk namespace to detect that a peer
 // compaction recreated the index (root moved) and the Index must be reopened.
 func (ix *Index) MetaRoot() uint32 { return ix.vmeta.RootPage() }
+
+// Build returns the identity of the build this object serves (meta.build).
+func (ix *Index) Build() uint64 { return ix.build }
+
+// Roots returns the root page of every namespace of the index, by the
+// namespace's suffix: what a view must have for this object to serve it.
+func (ix *Index) Roots() map[string]uint32 {
+	return map[string]uint32{
+		":meta": ix.vmeta.RootPage(), ":vec": ix.vvec.RootPage(), ":adj": ix.vadj.RootPage(),
+		":doc": ix.vdoc.RootPage(), ":lbl": ix.vlbl.RootPage(),
+	}
+}

@@ -339,11 +339,6 @@ func (it *VectorScoreIter) less(a, b scoredVecCand) bool {
 
 func (it *VectorScoreIter) init() error {
 	it.inited = true
-	if it.Spec.CheckTx != nil {
-		if err := it.Spec.CheckTx(it.Data.Tx); err != nil {
-			return err
-		}
-	}
 	k := it.Spec.K
 	var dedup DocDedup
 	for {

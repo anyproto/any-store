@@ -8,7 +8,6 @@ import (
 	"math"
 	"slices"
 	"strings"
-	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
@@ -37,30 +36,12 @@ type vectorIndex struct {
 	// ivf is the btree-resident IVF-PQ index for VectorModeIVFPQ; nil otherwise.
 	ivf *vivf.StoreIndex
 
-	// validFromCookie: earliest schema cookie at which this handle is KNOWN
-	// visible. Same contract as index.validFromCookie — see there, forTx and
-	// visibleIndexes.
-	validFromCookie uint32
 	// collName and catalogKey are the identity of the generation this handle
 	// was built from, captured at construction (bindIdentity) and immutable:
-	// forTx's slow path reads them lock-free, so it must never consult
-	// c.name, which a concurrent Rename mutates under c.mu. After a rename
-	// they intentionally keep the OLD name — the only readers that consult
-	// them hold snapshots that predate this handle, i.e. snapshots in which
-	// that old name is the correct one.
+	// the loader carries a handle over to another version only under the
+	// same collection name (loadVectorIndexFor).
 	collName   string
 	catalogKey []byte
-	// prev is the handle this one replaced (compaction), still valid in every
-	// committed snapshot: while the compacting tx is uncommitted, a concurrent
-	// tx searches through prev instead (forTx resolves it by root against the
-	// reader's snapshot). Set before the CoW publish; cleared by the commit
-	// publication so successive compactions do not chain and pin every
-	// predecessor's codebooks/caches for the life of the process — a reader
-	// whose snapshot predates the compaction commit is served by a transient
-	// rebuild from its own snapshot instead (see forTx). nil for a freshly
-	// created index (nothing committed to serve; the reader errors as it did
-	// before the DDL began).
-	prev atomic.Pointer[vectorIndex]
 }
 
 // isIVF reports whether this index uses the IVF backend (PQ or SQ).
@@ -314,24 +295,49 @@ func (vi *vectorIndex) update(tx *btree.WriteTx, prevIt, it item) error {
 
 func (vi *vectorIndex) Info() IndexInfo { return vi.info }
 
-// rootUnchanged reports whether the index's on-disk :meta namespace still has the
-// btree root page this object was opened against. It returns false after a
-// compaction recreated the namespaces (root moved), which means the object's
-// handles are stale and it must be reopened. Brute-force indexes (no namespaces)
-// are always "unchanged". A transient resolution failure returns true so a
-// working index is not dropped over a momentary view.
-func (vi *vectorIndex) rootUnchanged(tx *btree.ReadTx, collName string) bool {
+// boundIn reports that the view of tx has the index of the collection
+// collName at every root page this object was opened against — all of its
+// namespaces, as the full-text loader checks (sameRoots): a drop and a
+// recreate hand the freed pages out again, the :meta root alone can come
+// back while the others moved. Brute-force indexes have no namespaces and
+// are bound in any view that lists them.
+func (vi *vectorIndex) boundIn(tx *btree.ReadTx, collName string) bool {
 	if vi.ix == nil && vi.ivf == nil {
 		return true
 	}
-	ns, err := tx.GetNamespace(vectorIndexNsPrefix(collName, vi.info.Name) + ":meta")
-	if err != nil {
-		return true
-	}
+	prefix := vectorIndexNsPrefix(collName, vi.info.Name)
+	var (
+		roots map[string]uint32
+		build uint64
+	)
 	if vi.isIVF() {
-		return ns.RootPage() == vi.ivf.MetaRoot()
+		roots, build = vi.ivf.Roots(), vi.ivf.Build()
+	} else {
+		roots, build = vi.ix.Roots(), vi.ix.Build()
 	}
-	return ns.RootPage() == vi.ix.MetaRoot()
+	var meta *btree.Namespace
+	for suffix, root := range roots {
+		ns, err := tx.GetNamespace(prefix + suffix)
+		if err != nil || ns.RootPage() != root {
+			return false
+		}
+		if suffix == ":meta" {
+			meta = ns
+		}
+	}
+	// The build the view's meta names: a rebuild can put every namespace
+	// back on its pages, and the object's RAM state — the hybrid tier, the
+	// codebooks — belongs to the build it was opened for.
+	var (
+		viewBuild uint64
+		err       error
+	)
+	if vi.isIVF() {
+		viewBuild, err = vivf.BuildOf(tx, meta)
+	} else {
+		viewBuild, err = vindex.BuildOf(tx, meta)
+	}
+	return err == nil && viewBuild == build
 }
 
 // compact rebuilds the HNSW graph from its live vectors, reclaiming tombstones
@@ -387,24 +393,17 @@ func (vi *vectorIndex) overThreshold(tx *btree.ReadTx) (bool, error) {
 	return deleted > 0 && float64(deleted) >= vi.compactRatio*float64(live), nil
 }
 
-// loadVectorIndex resolves an existing vector index from persisted info using
-// the provided read transaction (no nested read tx).
 // bindIdentity stamps the immutable generation identity (see the field
 // comments): every constructor funnel calls it before the handle is returned
-// or published, so forTx's lock-free slow path never reads c.name.
+// or published.
 func (vi *vectorIndex) bindIdentity(collName string) {
 	vi.collName = collName
 	vi.catalogKey = indexKey(collName, vi.info.Name)
 }
 
-func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorIndex, error) {
-	return c.loadVectorIndexAs(tx, c.name, info)
-}
-
 // loadVectorIndexAs opens the index from the given snapshot under collName —
-// the collection's name AS THAT SNAPSHOT knows it. forTx's transient rebuild
-// passes the handle's captured name, which may legitimately differ from
-// c.name (a later rename); init and reconcile go through loadVectorIndex.
+// the collection's name AS THAT SNAPSHOT knows it, which may legitimately
+// differ from the collection's present name (a later rename).
 func (c *collection) loadVectorIndexAs(tx *btree.ReadTx, collName string, info IndexInfo) (*vectorIndex, error) {
 	if err := validateVectorParams(info.Vector); err != nil {
 		return nil, err
@@ -435,18 +434,12 @@ func (c *collection) loadVectorIndexAs(tx *btree.ReadTx, collName string, info I
 		return nil, err
 	}
 	vi.bindIdentity(collName)
-	// The opened state is visible from this SNAPSHOT's cookie on (reconcile
-	// calls at tx begin, before any of this tx's writes; forTx's transient
-	// rebuild never republishes; the raised begin-time cookie can exceed the
-	// snapshot). A caller whose view may already hold uncommitted DDL must
-	// re-stamp begin+1 — init and createIndexes' publish block do.
-	vi.validFromCookie = tx.SnapshotSchemaCookie()
 	return vi, nil
 }
 
 // createVectorIndex creates a new vector index (namespaces + meta) and builds it
 // from the collection's existing documents, all within tx.
-func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vectorIndex, error) {
+func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info IndexInfo) (*vectorIndex, error) {
 	if err := validateVectorParams(info.Vector); err != nil {
 		return nil, err
 	}
@@ -457,7 +450,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	if err := validateIndexName(info.Name); err != nil {
 		return nil, err
 	}
-	if err := c.db.registerIndex(tx, c.name, info); err != nil {
+	if err := c.db.registerIndex(tx, s.name, info); err != nil {
 		return nil, err
 	}
 	if info.Vector.Mode.isBruteForce() {
@@ -465,7 +458,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 		// The persisted metadata above is the entire index.
 		return newVectorIndexFromVindex(c, info, nil), nil
 	}
-	prefix := vectorIndexNsPrefix(c.name, info.Name)
+	prefix := vectorIndexNsPrefix(s.name, info.Name)
 
 	// Collect (id, vector) from existing documents, then build the index in RAM
 	// and flush it in one bulk pass (vindex.BulkBuild) — far faster than inserting
@@ -477,7 +470,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	tmpVI := newVectorIndexFromVindex(c, info, nil) // extractVector needs fieldPath/dim
 	var ids [][]byte
 	var vecs [][]float32
-	cursor := tx.NewCursor(c.ns)
+	cursor := tx.NewCursor(s.ns)
 	defer cursor.Close()
 	if err := cursor.First(); err != nil {
 		return nil, err
@@ -529,7 +522,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	// Parallel in-RAM build (graph constructed concurrently in RAM, then flushed
 	// single-threaded) — ~17x faster than per-insert at scale. threads=0 → GOMAXPROCS.
 	// The parallel phase touches only RAM; tx is used single-threaded in the flush.
-	ix, err := vindex.BulkBuildParallel(tx, prefix, p, vectorIndexSeed(c.name, info.Name), ids, vecs, 0)
+	ix, err := vindex.BulkBuildParallel(tx, prefix, p, vectorIndexSeed(s.name, info.Name), ids, vecs, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -537,56 +530,6 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	ix.SetHybrid(hybrid)
 	ix.SetVectorCache(hybrid && info.Vector.HybridCacheVectors)
 	return newVectorIndexFromVindex(c, info, ix), nil
-}
-
-// reconcileVectorIndexesLocked rebuilds the vector-index set from on-disk infos
-// after a peer committed vector-index DDL. Caller holds c.mu. Tolerant of
-// transient resolution failures (keeps the existing object) so a working index
-// is never dropped over a stale view.
-func (c *collection) reconcileVectorIndexesLocked(tx *btree.ReadTx, infos []IndexInfo) {
-	cur := c.loadVectorIndexes()
-	byName := make(map[string]*vectorIndex, len(cur))
-	for _, vi := range cur {
-		byName[vi.info.Name] = vi
-	}
-
-	var want int
-	for _, info := range infos {
-		if info.Kind == IndexKindVector {
-			want++
-		}
-	}
-	rebuilt := make([]*vectorIndex, 0, want)
-	changed := want != len(cur)
-	for _, info := range infos {
-		if info.Kind != IndexKindVector {
-			continue
-		}
-		if existing, ok := byName[info.Name]; ok && existing.rootUnchanged(tx, c.name) {
-			rebuilt = append(rebuilt, existing)
-			continue
-		}
-		// New index, or a compaction recreated the namespaces under the same name
-		// (root page moved) so the existing object's handles are stale — reopen
-		// with fresh handles. This mirrors the range-index reconcile's
-		// root-moved-via-drop+recreate path.
-		vi, err := c.loadVectorIndex(tx, info)
-		if err != nil {
-			// not resolvable in this snapshot — keep any existing object rather than
-			// dropping a working index over a transient view; retry next round.
-			if existing, ok := byName[info.Name]; ok {
-				rebuilt = append(rebuilt, existing)
-			} else {
-				changed = true
-			}
-			continue
-		}
-		rebuilt = append(rebuilt, vi)
-		changed = true
-	}
-	if changed {
-		c.storeVectorIndexes(rebuilt)
-	}
 }
 
 // ErrMultipleVectorClauses is returned when a query carries more than one $knn
@@ -641,13 +584,13 @@ var ErrDistanceWithoutVector = errors.New("any-store: _distance is only availabl
 // on an already-built Filter and the production consumers build their ANN
 // filter programmatically — this walk is the only validation they ever see.
 // NOTE: the result is deliberately NOT memoized across calls. The spec's
-// Search closure captures the resolved *vectorIndex HANDLE, and stale handles
-// are reconciled at read-tx begin — a spec detected before the verb's tx
+// Search closure captures the resolved *vectorIndex HANDLE, and which handle
+// that is depends on the transaction — a spec detected before the verb's tx
 // opens (validateSources runs pre-tx, ahead of the unsatisfiable()
 // short-circuit) would search a peer-rebuilt index through its dead gen-0
 // namespaces (caught by the multiprocess IVF consistency test). compilePlan
-// re-detects after the tx begins, on the handle set the plan executes on.
-func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, error) {
+// re-detects after the tx begins, on the version resolved for it.
+func (q *collQuery) detectKnnQuery(s *collSchema) (*qplanner.VectorQuerySpec, query.Filter, error) {
 	if q.cond == nil || !query.ContainsKnn(q.cond) {
 		return nil, q.cond, nil
 	}
@@ -664,7 +607,7 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 		return nil, nil, fmt.Errorf("%w: %s", ErrInvalidVectorQuery, verr)
 	}
 	field := strings.Join(node.Path, ".")
-	vi, err := resolveKnnIndex(q.c.loadVectorIndexes(), field, knn.Index)
+	vi, err := resolveKnnIndex(s.vindexes, field, knn.Index)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -693,10 +636,6 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 		// distance kernel as the brute-force backend, so exact-mode distances
 		// are bit-identical to brute-driver distances.
 		DistFromDoc: knnDistFromDoc(vi, knn.Query),
-		CheckTx: func(tx *btree.ReadTx) error {
-			_, cerr := captured.forTx(tx)
-			return cerr
-		},
 	}
 	switch {
 	case vi.isIVF():
@@ -708,11 +647,7 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 		// IVFSQ benchmark (cell scans + exact rerank, amortized).
 		spec.SearchCostPerCand = 2.5
 		spec.Search = func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
-			svi, err := captured.forTx(tx)
-			if err != nil {
-				return nil, err
-			}
-			cands, err := svi.ivf.SearchCandidates(tx, qv, ef)
+			cands, err := captured.ivf.SearchCandidates(tx, qv, ef)
 			if err != nil {
 				return nil, err
 			}
@@ -733,11 +668,7 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 			topK = knn.K
 		}
 		spec.Search = func(tx *btree.ReadTx, qv []float32, _ int) ([]qplanner.VectorCandidate, error) {
-			svi, err := captured.forTx(tx)
-			if err != nil {
-				return nil, err
-			}
-			return q.c.bruteVectorCandidates(tx, svi, qv, topK)
+			return q.c.bruteVectorCandidates(tx, s.ns, captured, qv, topK)
 		}
 	default:
 		// HNSW: ef is the beam width. Graph traversal touches ~M neighbours
@@ -745,11 +676,7 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 		spec.SearchCostPerCand = 4.0
 		spec.Ef = knnEf(knn.Ef, vi.ix.EfSearch(), knn.K, hasResidual)
 		spec.Search = func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
-			svi, err := captured.forTx(tx)
-			if err != nil {
-				return nil, err
-			}
-			cands, err := svi.ix.SearchCandidates(tx, qv, ef)
+			cands, err := captured.ix.SearchCandidates(tx, qv, ef)
 			if err != nil {
 				return nil, err
 			}
@@ -761,43 +688,6 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 		}
 	}
 	return spec, residual, nil
-}
-
-// forTx resolves the handle the given SCAN tx may search through — the
-// visibility gate of visibleIndexes, vector-shaped (see index.visibleTo).
-// The write-tx view (single-writer: the creator's own) uses the handle as
-// resolved. A reader is served by generation INTERVAL, never by root-page
-// identity (page numbers are freelist-recycled, so a recreated root can
-// collide with the one a stale snapshot still holds): each handle in the
-// prev chain was the published handle for cookies [h.validFromCookie, next
-// generation), so the first h with cookie >= h.validFromCookie is exactly
-// the generation the reader's snapshot contains — the mid-compaction reader
-// lands on prev this way. A reader older than every held generation (prev
-// is cleared at the compaction's commit; init/reconcile restamp) is served
-// by a transient handle opened from its OWN snapshot, but only when the
-// snapshot's catalog row still carries this handle's exact definition —
-// which also guarantees the backend class, so the spec branch chosen at
-// detect time stays valid for the result. A definition the snapshot does
-// not carry errors exactly as before the index existed (the SQLITE_SCHEMA
-// posture: never serve old data under a new definition).
-func (vi *vectorIndex) forTx(tx *btree.ReadTx) (*vectorIndex, error) {
-	if tx.IsWriteTx() {
-		return vi, nil
-	}
-	// Snapshot cookie, not the raised begin-time one — see visibleIndexes.
-	cookie := tx.SnapshotSchemaCookie()
-	for h := vi; h != nil; h = h.prev.Load() {
-		if cookie >= h.validFromCookie {
-			return h, nil
-		}
-	}
-	raw, err := tx.AppendValue(vi.c.db.systemNS, vi.catalogKey, nil)
-	if err == nil && indexDefMatches(raw, vi.info) {
-		if svi, lerr := vi.c.loadVectorIndexAs(tx, vi.collName, vi.info); lerr == nil {
-			return svi, nil
-		}
-	}
-	return nil, fmt.Errorf("%w: vector index %q", ErrIndexNotFound, vi.info.Name)
 }
 
 // knnOf extracts the Knn from a leaf, accepting the pointer form too: every
@@ -1195,9 +1085,9 @@ func knnDistFromDoc(vi *vectorIndex, qv []float32) func(doc *anyenc.Value) (floa
 	}
 }
 
-func (c *collection) bruteVectorCandidates(tx *btree.ReadTx, vi *vectorIndex, qv []float32, topK int) ([]qplanner.VectorCandidate, error) {
+func (c *collection) bruteVectorCandidates(tx *btree.ReadTx, dataNs *btree.Namespace, vi *vectorIndex, qv []float32, topK int) ([]qplanner.VectorCandidate, error) {
 	dist := vindex.DistanceFor(vi.info.Vector.Metric.toVindex())
-	cursor := tx.NewCursor(c.ns)
+	cursor := tx.NewCursor(dataNs)
 	defer cursor.Close()
 	if err := cursor.First(); err != nil {
 		return nil, err
@@ -1339,12 +1229,11 @@ const vectorEfCap = 4096
 // with that name exists.
 func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) error {
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) error {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if err := c.beginDDL(wtx); err != nil {
+		s, err := c.beginDDL(wtx)
+		if err != nil {
 			return err
 		}
-		cur := c.loadVectorIndexes()
+		cur := s.vindexes
 		idx := -1
 		for i, vi := range cur {
 			if vi.info.Name == indexName {
@@ -1360,54 +1249,24 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 			return nil // brute-force: no index to compact
 		}
 		// Recreating the namespaces moves their root pages; MarkSchemaChanged so
-		// peers reconcile and reopen the index with fresh handles. (For IVF this
+		// peers notice and reopen the index with fresh handles. (For IVF this
 		// re-trains the codebooks from the live set — see vectorIndex.compact.)
 		tx.MarkSchemaChanged()
-		nvi, err := vi.compact(tx, c.name)
+		nvi, err := vi.compact(tx, s.name)
 		if err != nil {
 			return err
 		}
-		// This is an index-set publication inside an uncommitted tx, exactly
-		// like createIndexes': a rollback (ambient tx, or an error later in
-		// this one) reverts the namespace recreation and frees the compacted
-		// roots, so the pre-compaction snapshot must be restored — a handle
-		// left pointing at freed pages fails every subsequent vector op with
-		// "btree: key not found" until reopen. The restore undo also raises
-		// indexSetDDLTxs, so a concurrent read tx's reconcile (reacting to
-		// the cookie bump above) cannot rebuild the set from its older
-		// snapshot mid-tx.
-		c.registerIndexSetRestore(wtx)
-		// Visibility (see forTx): until commit, the compacted roots exist
-		// only in this tx's view. The stamp is the cookie this commit will
-		// publish (MarkSchemaChanged above guarantees the bump) — a
-		// concurrent reader fails the generation-interval walk on this
-		// handle and is served through prev instead.
-		nvi.bindIdentity(c.name)
-		nvi.validFromCookie = tx.DiskSchemaCookie() + 1
-		// prev must be a COMMITTED fallback: with chained same-tx DDL (create
-		// then compact, or compact twice) the replaced handle is itself
-		// pending this tx's commit (stamped past the begin cookie —
-		// single-writer, so only this tx can have published it) and would
-		// route concurrent readers onto namespaces that exist only in this
-		// tx's view — inherit the chain's committed tail instead (nil when
-		// the index was created in this tx: nothing committed to serve, the
-		// reader errors as before the DDL began).
-		prevTarget := vi
-		if vi.validFromCookie > tx.DiskSchemaCookie() {
-			prevTarget = vi.prev.Load()
-		}
-		nvi.prev.Store(prevTarget)
-		wtx.onCommitPublish(func() {
-			// Committed: readers at the new cookie resolve nvi on the fast
-			// path; drop the chain so predecessors are not pinned. A later
-			// reader on a pre-compaction snapshot is served by forTx's
-			// transient rebuild.
-			nvi.prev.Store(nil)
-		})
-		next := make([]*vectorIndex, len(cur))
-		copy(next, cur)
-		next[idx] = nvi
-		c.storeVectorIndexes(next)
+		// An index-set change inside an uncommitted tx, exactly like
+		// createIndexes': the version with the compacted index is the
+		// transaction's own until the commit, and a rollback (ambient tx,
+		// or an error later in this one) discards it with the namespace
+		// recreation — nothing is left pointing at freed pages.
+		nvi.bindIdentity(s.name)
+		next := s.clone()
+		next.vindexes = make([]*vectorIndex, len(cur))
+		copy(next.vindexes, cur)
+		next.vindexes[idx] = nvi
+		c.logVersion(wtx, s, next)
 		return nil
 	})
 }
@@ -1433,14 +1292,17 @@ func (c *collection) maybeAutoCompactVectors(ctx context.Context) {
 		return
 	}
 	// The threshold check only reads each index's meta record (live/deleted
-	// counts), so a fast read tx — no checkStale/reconcile/sketch-reload — is
-	// enough. A momentarily stale count at worst defers a compaction by one write,
+	// counts), so a fast read tx — no sketch reload — is enough. A
+	// momentarily stale count at worst defers a compaction by one write,
 	// which is harmless for this heuristic.
 	var due []string
 	if rtx, rerr := c.db.btreeDB.BeginReadFast(); rerr == nil {
-		for _, vi := range vidxs {
-			if over, err := vi.overThreshold(rtx); err == nil && over {
-				due = append(due, vi.info.Name)
+		c.db.observeCookie(rtx)
+		if s, err := c.resolve(rtx); err == nil {
+			for _, vi := range s.vindexes {
+				if over, err := vi.overThreshold(rtx); err == nil && over {
+					due = append(due, vi.info.Name)
+				}
 			}
 		}
 		_ = rtx.Rollback()

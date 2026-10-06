@@ -138,16 +138,17 @@ func (q *aggQuery) materialize(ctx context.Context, cq *collQuery, rest aggregat
 			return terr
 		}
 		tc := target.(*collection)
-		if terr = tc.alive(); terr != nil {
+		ts, terr := tc.resolve(&tx.ReadTx)
+		if terr != nil {
 			return terr
 		}
 		if isMerge {
 			if tc.primaryKey != "id" {
 				return fmt.Errorf("%w: collection %q's primary key is %q", errAggMergePrimaryKey, targetName, tc.primaryKey)
 			}
-			written, terr = applyMerge(tx, tc, slab, offs, merge)
+			written, terr = applyMerge(tx, tc, ts, slab, offs, merge)
 		} else {
-			written, terr = applyOut(tx, tc, slab, offs)
+			written, terr = applyOut(tx, tc, ts, slab, offs)
 		}
 		if terr != nil {
 			return terr
@@ -170,7 +171,7 @@ func (q *aggQuery) materialize(ctx context.Context, cq *collQuery, rest aggregat
 // path runs. A duplicate id among the results fails with ErrDocExists; a
 // result without tc's primary key fails with ErrDocWithoutId (same contract
 // as Insert).
-func applyOut(tx *btree.WriteTx, tc *collection, slab []byte, offs []int) (written int, err error) {
+func applyOut(tx *btree.WriteTx, tc *collection, ts *collSchema, slab []byte, offs []int) (written int, err error) {
 	buf := tc.db.syncPool.GetDocBuf()
 	defer tc.db.syncPool.ReleaseDocBuf(buf)
 
@@ -180,7 +181,7 @@ func applyOut(tx *btree.WriteTx, tc *collection, slab []byte, offs []int) (writt
 		keySlab []byte
 		keyOffs []int
 	)
-	cursor := tx.NewCursor(tc.ns)
+	cursor := tx.NewCursor(ts.ns)
 	if err = cursor.First(); err != nil {
 		cursor.Close()
 		return 0, err
@@ -202,7 +203,7 @@ func applyOut(tx *btree.WriteTx, tc *collection, slab []byte, offs []int) (writt
 
 	start := 0
 	for _, end := range keyOffs {
-		if err = tc.deleteItem(tx, buf, keySlab[start:end]); err != nil {
+		if err = tc.deleteItem(tx, ts, buf, keySlab[start:end]); err != nil {
 			return 0, err
 		}
 		start = end
@@ -219,7 +220,7 @@ func applyOut(tx *btree.WriteTx, tc *collection, slab []byte, offs []int) (writt
 		if ierr != nil {
 			return written, ierr
 		}
-		if err = tc.insertItem(tx, buf, it); err != nil {
+		if err = tc.insertItem(tx, ts, buf, it); err != nil {
 			return written, err
 		}
 		written++
@@ -231,7 +232,7 @@ func applyOut(tx *btree.WriteTx, tc *collection, slab []byte, offs []int) (writt
 // applyMerge upserts the buffered documents into tc by primary key, inside
 // the caller's tx. Matched/not-matched routing follows spec; a "fail" mode
 // returns an error naming the offending id, aborting the whole tx.
-func applyMerge(tx *btree.WriteTx, tc *collection, slab []byte, offs []int, spec aggregate.MergeSpec) (written int, err error) {
+func applyMerge(tx *btree.WriteTx, tc *collection, ts *collSchema, slab []byte, offs []int, spec aggregate.MergeSpec) (written int, err error) {
 	buf := tc.db.syncPool.GetDocBuf() // result-doc parse + insert scratch
 	defer tc.db.syncPool.ReleaseDocBuf(buf)
 	bufPrev := tc.db.syncPool.GetDocBuf() // existing-doc load
@@ -251,7 +252,7 @@ func applyMerge(tx *btree.WriteTx, tc *collection, slab []byte, offs []int, spec
 			return written, ierr
 		}
 		buf.SmallBuf = tc.appendId(buf.SmallBuf[:0], doc)
-		_, gerr := tx.Get(tc.ns, buf.SmallBuf)
+		_, gerr := tx.Get(ts.ns, buf.SmallBuf)
 		if gerr != nil && !errors.Is(gerr, btree.ErrKeyNotFound) {
 			return written, gerr
 		}
@@ -261,7 +262,7 @@ func applyMerge(tx *btree.WriteTx, tc *collection, slab []byte, offs []int, spec
 			case aggregate.MergeMatchedFail:
 				return written, fmt.Errorf("%w: id %s", ErrMergeMatched, doc.Get(tc.primaryKey))
 			case aggregate.MergeMatchedReplace:
-				modified, uerr := tc.update(tx, it, item{})
+				modified, uerr := tc.update(tx, ts, it, item{})
 				if uerr != nil {
 					return written, uerr
 				}
@@ -269,7 +270,7 @@ func applyMerge(tx *btree.WriteTx, tc *collection, slab []byte, offs []int, spec
 					written++
 				}
 			case aggregate.MergeMatchedMerge:
-				prevIt, lerr := tc.loadById(tx, bufPrev, buf.SmallBuf)
+				prevIt, lerr := tc.loadById(tx, ts, bufPrev, buf.SmallBuf)
 				if lerr != nil {
 					return written, lerr
 				}
@@ -286,7 +287,7 @@ func applyMerge(tx *btree.WriteTx, tc *collection, slab []byte, offs []int, spec
 				resObj.Visit(func(key []byte, val *anyenc.Value) {
 					mergedIt.val.Set(string(key), val)
 				})
-				if _, err = tc.update(tx, mergedIt, prevIt); err != nil {
+				if _, err = tc.update(tx, ts, mergedIt, prevIt); err != nil {
 					return written, err
 				}
 				written++
@@ -297,7 +298,7 @@ func applyMerge(tx *btree.WriteTx, tc *collection, slab []byte, offs []int, spec
 			case aggregate.MergeNotMatchedFail:
 				return written, fmt.Errorf("%w: id %s", ErrMergeNotMatched, doc.Get(tc.primaryKey))
 			case aggregate.MergeNotMatchedInsert:
-				if err = tc.insertItem(tx, buf, it); err != nil {
+				if err = tc.insertItem(tx, ts, buf, it); err != nil {
 					return written, err
 				}
 				written++

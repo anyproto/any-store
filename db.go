@@ -1,7 +1,6 @@
 package anystore
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -32,6 +31,8 @@ type DB interface {
 	CreateCollection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error)
 
 	// OpenCollection opens an existing collection with the specified name.
+	// With a transaction in ctx the collection is looked up in that
+	// transaction's view.
 	// Returns the opened Collection or an error if the collection does not exist.
 	// Possible errors:
 	// - ErrCollectionNotFound: if the collection does not exist.
@@ -127,6 +128,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		config:            config,
 		syncPool:          sPool,
 		openedCollections: make(map[string]Collection),
+		byIdentity:        make(map[string]*collection),
 	}
 
 	var quickCheckNeeded bool
@@ -201,6 +203,8 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 			c.SetVerify(false)
 		}
 	}
+	_, cookie := ds.btreeDB.LocalCounters()
+	ds.epoch.Store(&schemaEpoch{gen: 1, start: cookie, known: cookie})
 
 	if err = ds.init(ctx); err != nil {
 		_ = ds.recoveryController.Stop()
@@ -262,20 +266,41 @@ type db struct {
 
 	syncPool *syncpool.SyncPool
 
-	// ddlUnwindGate serializes the failed-COMMIT undo unwind against new write
-	// txs. btree WriteTx.Commit releases the global write lock before
-	// returning its error (and a failed pager commit self-recovers to
-	// pagerOpen), so without this gate a writer beginning in that gap could
-	// still observe the phantom schema publications the unwind is about to
-	// revert — the stale-handle-over-freed-catalog corruption class. A tx that
-	// registered DDL undos holds the gate across btree Commit + unwind;
-	// newWriteTx passes through it once after acquiring the write lock. Plain
-	// data txs (no undos) skip it.
-	// The rollback and savepoint paths need no gate: their unwind runs while
-	// the btree write lock is still held.
-	ddlUnwindGate sync.Mutex
+	// schemaGate serializes the end of a schema-changing commit against the
+	// next write tx. btree WriteTx.Commit releases the global write lock
+	// before it returns, and only then does the commit withdraw the cookie
+	// it announced (observeCookie) when it published nothing, or discard
+	// the schema log it did not publish: a writer beginning in that gap
+	// would take another process's commit at the announced cookie for this
+	// one's, or race the discard on the handles' marks. A tx that announced
+	// or logged holds the gate across btree Commit + that; newWriteTx
+	// passes through it once after acquiring the write lock. Plain data txs
+	// skip it.
+	// The rollback and savepoint paths need no gate: they discard the log
+	// while the btree write lock is still held.
+	schemaGate sync.Mutex
 
 	openedCollections map[string]Collection
+	// byIdentity holds the registered handles by the collection they stand
+	// for (collection.identity): one collection has one handle, whatever
+	// names transactions at different snapshots know it by — the one of an
+	// older snapshot, or the one the open write tx just gave it. Under mu,
+	// like openedCollections.
+	byIdentity map[string]*collection
+
+	// epoch is what this process knows of the schema cookie's history, and
+	// ownCookie the cookie a commit of this process is producing right now
+	// (flag in the high half); see schemaEpoch and observeCookie. settling
+	// is that cookie (flag likewise) from the commit's first change to a
+	// handle until the epoch is past it (commonTx.schemaCommitted); see
+	// sinceNow.
+	epoch     atomic.Pointer[schemaEpoch]
+	ownCookie atomic.Uint64
+	settling  atomic.Uint64
+	// sketchEpoch counts the commits of other processes this one noticed:
+	// each may have moved the sketches of any collection (see
+	// collection.refreshSketches).
+	sketchEpoch atomic.Uint64
 
 	// sketchDirty and ftsDirty list the collections whose writer state the
 	// end of a transaction has to visit: an index whose live sketch may hold
@@ -296,23 +321,13 @@ type db struct {
 	// btree rollback has released the write lock.
 	//
 	// Writer-owned, no mutex: every access holds the btree write lock, or
-	// ddlUnwindGate while a failed commit unwinds (newWriteTx passes the gate
-	// before reading them). Nothing touches them after a btree commit
-	// succeeded. A closed collection stays listed: postings buffered before
-	// a Close() in mid-tx still flush at commit (guarded by
+	// schemaGate while a failed commit discards its log (newWriteTx passes
+	// the gate before reading them). Nothing touches them after a btree
+	// commit succeeded. A closed collection stays listed: postings buffered
+	// before a Close() in mid-tx still flush at commit (guarded by
 	// TestFtsPendingSurvivesCollectionCloseMidTx).
 	sketchDirty []*collection
 	ftsDirty    []*collection
-
-	// renaming lists the collections renamed by the open write tx. They stay
-	// registered under the old name until commit, so inside that tx
-	// OpenCollection resolves the new name through this list to the same
-	// handle — one handle per collection, as SQLite's schema reload inside
-	// ALTER TABLE RENAME (alter.c renameReloadSchema) leaves one Table under
-	// the new name. A second handle would be displaced from the registry at
-	// commit and escape every later staleness pass. Writer-owned, like the
-	// lists above.
-	renaming []*collection
 
 	closed atomic.Bool
 
@@ -460,15 +475,11 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 		return nil, err
 	}
 
-	// Pass the DDL-unwind gate (see its field comment): a prior tx whose btree
-	// commit failed may still be unwinding its schema publications after the
-	// write lock was released; block until its in-memory state is consistent.
-	db.ddlUnwindGate.Lock()
-	db.ddlUnwindGate.Unlock() //lint:ignore SA2001 gate pass-through, not a critical section
-
-	db.checkStale(&btWtx.ReadTx)
-	db.resetUncommittedSketches(&btWtx.ReadTx)
-	db.resetAllFtsPending()
+	// Pass the schema gate (see its field comment): a prior schema-changing
+	// tx may still be settling its log after the write lock was released;
+	// block until the registry is consistent with the catalog.
+	db.schemaGate.Lock()
+	db.schemaGate.Unlock() //lint:ignore SA2001 gate pass-through, not a critical section
 
 	version := newTxVersion()
 	tx := txPool.Get().(*commonTx)
@@ -476,9 +487,13 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	tx.readTx = &btWtx.ReadTx
 	tx.writeTx = btWtx
 	tx.modified = false
-	tx.undo = tx.undo[:0]
-	tx.pubs = tx.pubs[:0]
 	tx.savepoints = tx.savepoints[:0]
+	btWtx.SetAux(&tx.schema)
+
+	db.checkStale(&btWtx.ReadTx)
+	db.resetUncommittedSketches(&btWtx.ReadTx)
+	db.resetAllFtsPending(&btWtx.ReadTx)
+
 	tx.version.Store(version)
 	wTx := writeTx{commonTx: tx, version: version}
 	tx.ctx = context.WithValue(ctx, ctxKeyTx, wTx)
@@ -499,214 +514,60 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 	tx.readTx = btRtx
 	tx.writeTx = nil
 	tx.version.Store(version)
+	btRtx.SetAux(&tx.schema)
 	rTx := readTx{commonTx: tx, version: version}
 	tx.ctx = context.WithValue(ctx, ctxKeyTx, rTx)
 	return rTx, nil
 }
 
-// checkStale checks if the on-disk data or schema has changed (by another
-// process) and reloads in-memory caches if necessary. It runs at the start of
-// every top-level read and write transaction (the analog of SQLite verifying
-// the schema cookie in OP_Transaction before a statement runs).
+// checkStale brings what this process keeps in memory up to the snapshot a
+// transaction begins at. It runs at the start of every top-level read and
+// write transaction (the analog of SQLite verifying the schema cookie in
+// OP_Transaction before a statement runs).
 //
-// The reaction is two-tiered, mirroring SQLite's sqlite3InitOne (structure)
-// running before sqlite3AnalysisLoad (statistics):
+// Two tiers, mirroring SQLite's sqlite3InitOne (structure) running before
+// sqlite3AnalysisLoad (statistics):
 //
-//	Tier 1 — STRUCTURAL (correctness): when the SCHEMA cookie advanced, a peer
-//	  committed DDL (index create/drop/recreate). reconcileIndexSet rebuilds
-//	  each open collection's index set from on-disk metadata: it adds
-//	  peer-created indexes, drops peer-removed ones, and re-resolves the btree
-//	  namespace handle (root) of any index whose definition or root changed —
-//	  so a long-lived handle can never keep reading/writing a dropped or
-//	  recreated index's stale namespace. A stale schema is never tolerated.
+//	STRUCTURAL (correctness): a schema cookie this process did not produce is
+//	  another process's schema change. observeCookie starts a new generation
+//	  for it, and that is all: which collection changed the cookie does not
+//	  say, so each handle is verified against the catalog by the first
+//	  transaction of the generation that uses it (collection.resolve). A
+//	  stale schema is never used; nothing is read for the handles nobody
+//	  touches.
 //
-//	Tier 2 — STATISTICAL (advisory): reloadSketches refreshes the selectivity
-//	  sketches over the (now reconciled) index set. A stale sketch only affects
-//	  which index the planner CHOOSES, never query RESULTS (the any-store analog
-//	  of sqlite_stat1), so it runs strictly after the structural reconcile.
+//	STATISTICAL (advisory): a commit of another process may have moved the
+//	  selectivity sketches of any collection. sketchEpoch records that one
+//	  was noticed, and each handle reloads its sketches when a transaction
+//	  next plans with them or writes through it (collection.refreshSketches).
+//	  A stale sketch only affects which index the planner CHOOSES, never
+//	  query RESULTS (the any-store analog of sqlite_stat1).
 //
-// The begin-time disk counters driving the verdict are RAISED to the newest
-// committed frame (see btree.ReadTx.SnapshotHeaderCounters), so a read tx can
-// detect staleness its own snapshot does not yet contain — a begin racing a
-// commit, or a reader slot pinned behind. The pass therefore reconciles and
-// consumes only up to the SNAPSHOT counters: reconciling judges what this
-// snapshot can see, and recording anything newer as consumed would mark DDL
-// as reconciled that never was — later txs (including writers) would trust an
-// index set missing a peer's index and stop maintaining it. Left short, the
-// verdict stays stale and the next begin (with a newer snapshot) converges.
+// Neither tier reads anything here: what a begin costs does not depend on how
+// many collections are open.
 //
-// A pass that could not reconcile a collection — a local DDL commit still
-// publishing, a rename between its name flip and its commit, a catalog read
-// that failed — consumes nothing either: the verdict stays stale and the next
-// begin converges, like after a short snapshot. So the local counters only
-// ever record a state the in-memory sets fully reflect.
+// The begin-time disk counters driving the sketch verdict are RAISED to the
+// newest committed frame (see btree.ReadTx.SnapshotHeaderCounters), so a read
+// tx can detect staleness its own snapshot does not yet contain. The pass
+// consumes only up to the SNAPSHOT counters; left short, the verdict stays
+// stale and the next begin converges.
 //
 // A verdict a commit of THIS process produced — it landed between the begin's
-// read of the local counters and its read of the disk ones — has nothing to
-// reload: the writer published its index sets and sketches in-process and
-// recorded the committed counters. The pass returns once the local counters
-// have reached the counters this tx saw on disk (LocalCaughtUp), and the
-// consumption below never moves them back (AdvanceLocalCounters), so under a
-// steady write load a read begin stays a counter comparison instead of a
-// reload of every open collection's sketches.
+// read of the local counters and its read of the disk ones — is none: the
+// writer published its sketches in-process and recorded the committed
+// counters. The pass returns once the local counters have reached the
+// counters this tx saw on disk (LocalCaughtUp), and the consumption below
+// never moves them back (AdvanceLocalCounters).
 func (db *db) checkStale(tx *btree.ReadTx) {
+	db.observeCookie(tx)
 	if !tx.IsSchemaStale() && !tx.IsDataStale() {
 		return
 	}
 	if tx.LocalCaughtUp() {
 		return
 	}
-	snapFCC, snapSC := tx.SnapshotFileChangeCounter(), tx.SnapshotSchemaCookie()
-	complete := true
-	if tx.IsSchemaStale() {
-		complete = db.reconcileIndexSet(tx, snapSC)
-	}
-	db.reloadSketches(tx)
-	if complete {
-		db.btreeDB.AdvanceLocalCounters(snapFCC, snapSC)
-	}
-}
-
-// reconcileIndexSet rebuilds the in-memory index set of every open collection
-// from on-disk metadata, called from checkStale when the schema cookie advanced.
-// See checkStale for the contract. A handle whose collection no longer exists
-// in the snapshot (renamed away or dropped by another process) is invalidated
-// instead of reconciled — reconciling it against an empty index set would
-// publish exactly the unindexed-write corruption a half-applied rename caused.
-// Each surviving
-// collection is reconciled under its own c.mu and the result published
-// atomically (copy-on-write), so lock-free query readers always observe a
-// complete index generation. complete reports that every collection was
-// judged against this snapshot; a skipped one leaves the pass unconsumed
-// (see checkStale).
-func (db *db) reconcileIndexSet(tx *btree.ReadTx, snapCookie uint32) (complete bool) {
-	complete = true
-	type namedColl struct {
-		name string
-		c    *collection
-	}
-	db.mu.Lock()
-	colls := make([]namedColl, 0, len(db.openedCollections))
-	for name, coll := range db.openedCollections {
-		colls = append(colls, namedColl{name: name, c: coll.(*collection)})
-	}
-	db.mu.Unlock()
-
-	for _, nc := range colls {
-		nc.c.mu.Lock()
-		renameInFlight := nc.c.name != nc.name
-		nc.c.mu.Unlock()
-		if renameInFlight {
-			// A local Rename is between its name flip and its commit (the
-			// registry re-keys only at commit). Skip, consuming nothing:
-			// while the renaming writer holds the cross-process write lock
-			// the cookie bump predates its begin and was reconciled there,
-			// and a peer's bump between its btree commit and its re-key
-			// waits for the next begin. Checking c.name against this tx's
-			// older snapshot would spuriously invalidate the handle, and
-			// reconciling its index set under the flipped name would publish
-			// an empty one.
-			complete = false
-			continue
-		}
-		if !tx.IsWriteTx() && snapCookie < nc.c.validFromCookie.Load() {
-			// The snapshot predates the handle's visibility bound: a create
-			// or rename committed after — or is still committing while —
-			// this reader began, so its catalog key is legitimately absent
-			// here. Judging existence needs a snapshot at or past the bound
-			// (same tolerance rule as index.forTx); skip. snapCookie is the
-			// SNAPSHOT cookie, not the raised begin-time one — the raised
-			// value can exceed what this tx's reads see and would let the
-			// vanished check judge a handle whose catalog key sits in frames
-			// past the snapshot. A write tx always sees latest state and
-			// needs no skip.
-			continue
-		}
-		if db.collectionVanished(tx, nc.name, nc.c) {
-			db.invalidateCollection(nc.c)
-			continue
-		}
-		if !nc.c.reconcileIndexes(tx) {
-			complete = false
-		}
-	}
-	return complete
-}
-
-// collectionVanished reports whether the collection this handle points at no
-// longer exists in the tx snapshot: its catalog key is gone (renamed away or
-// dropped by a peer process), or a DIFFERENT collection now answers for the
-// name (drop+recreate, or rename-away followed by a fresh create). The name is
-// the handle's REGISTERED key in openedCollections, which tracks committed
-// state (a local rename re-keys it only at commit) and therefore matches the
-// snapshot this tx reads — c.name may already be flipped by an in-flight
-// rename. Identity is the catalog token (see newCatalogID) plus the
-// data-namespace root page as a belt for legacy "1"-valued entries — the root
-// alone is unreliable because an immediate drop+recreate usually gets the same
-// root back from the freelist. Errors other than definite absence keep the
-// handle: invalidation must never fire on a read hiccup.
-func (db *db) collectionVanished(tx *btree.ReadTx, name string, c *collection) bool {
-	val, err := tx.AppendValue(db.systemNS, collKey(name), nil)
-	if err != nil {
-		return errors.Is(err, btree.ErrKeyNotFound)
-	}
-	if !bytes.Equal(val, c.catalogID) {
-		return true
-	}
-	ns, err := tx.GetNamespace(name)
-	if err != nil {
-		return errors.Is(err, btree.ErrNamespaceNotFound)
-	}
-	return ns.RootPage() != c.ns.RootPage()
-}
-
-// invalidateCollection retires a handle whose collection a peer process
-// renamed or dropped (SQLite re-prepare style: subsequent operations fail with
-// ErrCollectionClosed and the caller re-opens). Modeled on the CreateCollection
-// rollback undo, NOT on Close(): a closed handle's fts pending buffers still
-// flush at commit, and a dead handle's buffered writes must never flush into
-// the renamed/dropped collection's namespaces — reset them instead. The CAS
-// makes concurrent invalidations (multiple tx begins observing the same
-// cookie bump) idempotent.
-func (db *db) invalidateCollection(c *collection) {
-	if !c.closed.CompareAndSwap(false, true) {
-		return
-	}
-	for _, fx := range c.loadFtsIndexes() {
-		fx.pending.reset()
-	}
-	db.mu.Lock()
-	for name, cur := range db.openedCollections {
-		if cur == Collection(c) {
-			delete(db.openedCollections, name)
-			break
-		}
-	}
-	db.mu.Unlock()
-}
-
-// reloadSketches reloads all sketch data from the _system namespace for opened
-// collections (the advisory Tier-2 of checkStale). The per-index leaf branches
-// on whether this tx is the writer: a write tx (sole mutator under writeMu)
-// reloads in place into the live sketch; a read tx reloads the reader-owned
-// published copy so it can never clobber a concurrent writer's in-flight
-// increments.
-func (db *db) reloadSketches(tx *btree.ReadTx) {
-	writable := tx.IsWriteTx()
-	db.mu.Lock()
-	colls := make([]*collection, 0, len(db.openedCollections))
-	for _, coll := range db.openedCollections {
-		colls = append(colls, coll.(*collection))
-	}
-	db.mu.Unlock()
-
-	for _, c := range colls {
-		c.mu.Lock()
-		for _, idx := range c.loadIndexes() {
-			c.reloadSketch(tx, idx, writable)
-		}
-		c.mu.Unlock()
-	}
+	db.sketchEpoch.Add(1)
+	db.btreeDB.AdvanceLocalCounters(tx.SnapshotFileChangeCounter(), tx.SnapshotSchemaCookie())
 }
 
 // resetUncommittedSketches discards leftover, never-committed sketch deltas at
@@ -729,20 +590,28 @@ func (db *db) reloadSketches(tx *btree.ReadTx) {
 // next commit to persist.
 func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
 	kept := db.sketchDirty[:0]
+	gen := db.epoch.Load().gen
 	for _, c := range db.sketchDirty {
 		flagged := false
-		if !c.closed.Load() {
+		// Only a head verified for the present is rebased: another
+		// process may have redefined the index whose bytes the stale name
+		// finds, and the live object is shared with the readers' versions.
+		if s := c.cur(); !c.closed.Load() && s != nil && s.gen.Load() == gen {
 			c.mu.Lock()
-			for _, idx := range c.loadIndexes() {
+			for _, idx := range s.indexes {
 				if idx.sketchModified {
 					// reloadSketch (writable) rebases live to the committed bytes and
 					// clears sketchModified; if there are no committed bytes yet
 					// (brand-new pre-commit index) it preserves the built sketch.
-					c.reloadSketch(tx, idx, true)
+					c.reloadSketch(tx, s.name, idx, true)
 					flagged = flagged || idx.sketchModified
 				}
 			}
 			c.mu.Unlock()
+		} else if s != nil && !c.closed.Load() {
+			for _, idx := range s.indexes {
+				flagged = flagged || idx.sketchModified
+			}
 		}
 		if flagged {
 			kept = append(kept, c)
@@ -771,17 +640,23 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 	if err := validateCollectionName(collectionName); err != nil {
 		return nil, err
 	}
-	db.mu.Lock()
-	if existing, ok := db.openedCollections[collectionName]; ok && !existing.(*collection).closed.Load() {
+	if _, ok := db.ambientWriteTx(ctx); !ok {
+		// A live handle whose head is verified for the present — the
+		// current generation, under this name — answers for the name at
+		// once. One without a head (opened through an old snapshot, see
+		// resolveSlow), one another process's change left unverified, or
+		// one a commit renamed and not yet re-keyed (settleLog) proves
+		// nothing: the catalog check inside the tx decides. Inside a write
+		// tx the catalog alone decides: the registry holds the committed
+		// names, and the tx may have dropped or renamed the collection
+		// under this one.
+		db.mu.Lock()
+		if existing, ok := db.openedCollections[collectionName]; ok && existing.(*collection).answersFor(collectionName) {
+			db.mu.Unlock()
+			return nil, ErrCollectionExists
+		}
 		db.mu.Unlock()
-		return nil, ErrCollectionExists
 	}
-	// A CLOSED registered handle is a Drop in an open tx (eviction is
-	// deferred to its commit publication): whether the name is creatable is
-	// decided by the catalog check inside the tx below — the dropping tx
-	// sees its own delete and recreates; a concurrent creator blocks on the
-	// write lock and then sees whatever committed.
-	db.mu.Unlock()
 	merged := mergeCollOpts(opts)
 	pk := merged.PrimaryKey
 	if pk == "" {
@@ -833,52 +708,16 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 			}
 		}
 
-		if coll, err = newCollection(ctx, db, collectionName, tx); err != nil {
+		c, schema, err := newCollection(db, collectionName, &tx.ReadTx)
+		if err != nil {
 			return err
 		}
-
-		c := coll.(*collection)
-		db.mu.Lock()
-		// A same-tx Drop's closed handle may still occupy the slot: its
-		// eviction waits for the commit and then finds nothing to evict. A
-		// rollback puts it back. Only a handle that carries this tx's Drop
-		// qualifies (ddlTxs): one a staleness pass is retiring is on its
-		// way out of the registry.
-		dropped, hadDropped := db.openedCollections[collectionName]
-		hadDropped = hadDropped && dropped.(*collection).ddlTxs > 0
-		db.openedCollections[collectionName] = coll
-		// The creation is this handle's first uncommitted schema change.
-		c.ddlTxs++
-		db.mu.Unlock()
-		c.registerDDLEnd(wtx)
-
-		// A rollback of this scope reverts the namespace + catalog entries
-		// created above, but not the registration — a later write through the
-		// cached handle would land on the freed root page. Evict on rollback,
-		// restoring the dropped handle this one replaced: the Drop's undo
-		// un-closes a handle only if it finds it registered. Left out of
-		// the registry, a collection this tx created earlier and dropped in
-		// the rolled-back scope would be opened a second time.
-		// Deliberately NOT Close(): a closed handle's fts pending buffers
-		// still flush at commit — but this collection's fts writes belong to
-		// the rolled-back tx and must never flush. Reset them and mark
-		// closed so the handle's own Close is a no-op.
-		wtx.onRollbackUndo(func() {
-			db.mu.Lock()
-			if cur, ok := db.openedCollections[collectionName]; ok && cur == coll {
-				if hadDropped {
-					db.openedCollections[collectionName] = dropped
-				} else {
-					delete(db.openedCollections, collectionName)
-				}
-			}
-			db.mu.Unlock()
-			for _, fx := range c.loadFtsIndexes() {
-				fx.pending.reset()
-			}
-			c.closed.Store(true)
-		})
-
+		// The collection exists from the cookie this tx commits with, and
+		// so does its handle: in the transaction's log until then, where
+		// the writer finds it by name, out of the registry (settleLog puts
+		// it there; a rollback closes it).
+		c.logCreate(wtx, schema)
+		coll = c
 		return nil
 	})
 	if err != nil {
@@ -909,107 +748,158 @@ func (db *db) handOut(coll Collection) Collection {
 	return coll
 }
 
-// registered returns the live handle the registry holds under name, as the
-// caller of ctx sees it. The registry is keyed by committed names: a
-// collection renamed by the open write tx stays under its old name until the
-// commit, which is right for every caller but that tx. For the renaming tx
-// the old name is gone, as a table's old name is after ALTER TABLE RENAME in
-// the same SQLite transaction, and the catalog check that follows a miss,
-// read through the writer's view, answers for it.
-func (db *db) registered(ctx context.Context, name string) (Collection, bool) {
-	if db.renamedAway(ctx, name) {
-		return nil, false
-	}
+// registered returns the live handle the registry holds under name. The
+// registry is keyed by committed names: a collection renamed by the open
+// write tx stays under its old name until the commit, which is right for
+// every caller but that tx — for it the old name is gone, as a table's old
+// name is after ALTER TABLE RENAME in the same SQLite transaction, which the
+// name check of resolveIn answers (the version the writer resolves has the
+// new name).
+func (db *db) registered(name string) (Collection, bool) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return db.liveLocked(name)
 }
 
-// renamedAway reports that ctx carries the open write tx and that tx renamed
-// the collection registered under name to another name.
-func (db *db) renamedAway(ctx context.Context, name string) bool {
-	if _, ok := db.ambientWriteTx(ctx); !ok {
-		return false
-	}
-	for _, c := range db.renaming {
-		c.mu.Lock()
-		current := c.name
-		c.mu.Unlock()
-		if current == name {
-			continue
+// openCollection returns the handle of the collection as the caller of ctx
+// has it: with a transaction in ctx, the collection must be in that
+// transaction's view under that name. The handle is the one the open write
+// tx has under the name in its log, the registered one, or a new one loaded
+// through the caller's view — its own transaction or a short read of the
+// newest state.
+func (db *db) openCollection(ctx context.Context, collectionName string) (Collection, error) {
+	for attempt := 0; ; attempt++ {
+		coll, err := db.openCollectionOnce(ctx, collectionName)
+		if err != errHandleGone {
+			return coll, err
 		}
-		db.mu.Lock()
-		reg := db.openedCollections[name] == Collection(c)
-		db.mu.Unlock()
-		if reg {
-			return true
+		// The registered handle was closed or retired while it was resolved
+		// for this caller: the name is free for the collection that has it
+		// now, if any.
+		if attempt == 2 {
+			return nil, ErrCollectionNotFound
 		}
 	}
-	return false
 }
 
-func (db *db) openCollection(ctx context.Context, collectionName string) (Collection, error) {
-	if coll, ok := db.registered(ctx, collectionName); ok {
-		return coll, nil
-	}
-	// A CLOSED registered handle is a Drop in an open tx: the catalog check
-	// below is ctx-aware — the dropping tx sees its own delete
-	// (ErrCollectionNotFound, the correct same-tx answer), while a concurrent
-	// caller sees the committed row and gets the closed handle back
-	// (fail-safe: ops error until the drop resolves).
+// testHookBeforeRegister, when set, runs between the load of a new handle and
+// its registration. Tests only.
+var testHookBeforeRegister func(name string)
 
-	if _, ok := db.ambientWriteTx(ctx); ok {
-		if c := db.renamedTo(collectionName); c != nil {
-			return c, nil
+// errHandleGone tells openCollection that the handle it found registered is
+// not live any more.
+var errHandleGone = errors.New("any-store: registered handle is gone")
+
+func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Collection, error) {
+	if wtx, ok := db.ambientWriteTx(ctx); ok {
+		// The write tx's own uncommitted DDL first: a collection it created
+		// or renamed to the name has its handle in the log and nowhere
+		// else; one it dropped under the name is gone for it.
+		if e := wtx.schemaLog().byName(collectionName); e != nil {
+			if e.kind == logDrop {
+				return nil, ErrCollectionNotFound
+			}
+			if err := e.c.alive(); err != nil {
+				return nil, err
+			}
+			return e.c, nil
 		}
 	}
+	if coll, ok := db.registered(collectionName); ok {
+		return coll, db.resolveOpened(ctx, coll.(*collection), collectionName)
+	}
 
+	var opened Collection
 	err := db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		key := collKey(collectionName)
-		_, err := tx.Get(db.systemNS, key)
+		// Through an ambient write tx this is the WRITER'S view: the tx's own
+		// uncommitted DDL is visible only there.
+		c, schema, err := newCollection(db, collectionName, tx)
 		if err != nil {
-			if errors.Is(err, btree.ErrKeyNotFound) {
-				return ErrCollectionNotFound
-			}
 			return err
 		}
+		if testHookBeforeRegister != nil {
+			testHookBeforeRegister(collectionName)
+		}
+		db.mu.Lock()
+		if live, ok := db.liveLocked(collectionName); ok {
+			db.mu.Unlock()
+			opened = live
+			return db.resolveIn(tx, live.(*collection), collectionName)
+		}
+		// The collection tx has under this name has a handle already, under
+		// another name: the one the newest state gives it, or the open write
+		// tx. That is its handle; a second one would not follow the schema
+		// changes made through the first.
+		if other := db.byIdentity[c.identity]; other != nil && !other.closed.Load() {
+			db.mu.Unlock()
+			opened = other
+			return db.resolveIn(tx, other, collectionName)
+		}
+		if existing, ok := db.openedCollections[collectionName]; ok {
+			// A closed handle still in the slot: a drop that is published
+			// but not settled (settleLog). A caller whose snapshot still
+			// has that collection gets the closed handle (fail-safe: its
+			// operations fail), not a second one; a caller that has
+			// another collection under the name takes the slot.
+			if existing.(*collection).identity == c.identity {
+				db.mu.Unlock()
+				opened = existing
+				return nil
+			}
+			db.forgetLocked(existing.(*collection))
+		}
+		c.since = db.sinceNow()
+		db.openedCollections[collectionName] = c
+		db.byIdentity[c.identity] = c
+		db.mu.Unlock()
+		opened = c
+		c.adopt(tx, schema)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	return opened, nil
+}
 
-	// A reopen through an ambient write tx must bind and stamp through the
-	// WRITER'S view: the tx's own uncommitted DDL is visible only there (the
-	// embedded read view resolves committed namespaces only, so a mid-tx
-	// reopen after a same-tx CreateIndex would fail), and init stamps the
-	// loaded handles begin+1 when the tx already changed schema — an
-	// uncommitted index reloaded here must stay invisible to concurrent
-	// readers at the begin cookie.
-	var wtx *btree.WriteTx
-	if ctxTx := ctx.Value(ctxKeyTx); ctxTx != nil {
-		if w, ok := ctxTx.(WriteTx); ok && !w.Done() && w.instanceId() == db.instanceId {
-			wtx = w.btreeWriteTx()
+// resolveOpened answers an open that found c registered. With a transaction
+// in ctx the collection must be in its view under name. Without one a handle
+// whose head is verified for the present under the name is the answer as it
+// is; any other — none installed yet, unverified since another process's
+// change, renamed by a commit not yet settled — is resolved through a short
+// read first, so a handle left behind never answers for a collection that
+// is gone or called otherwise.
+func (db *db) resolveOpened(ctx context.Context, c *collection, name string) error {
+	if ctx.Value(ctxKeyTx) == nil && c.answersFor(name) {
+		return nil
+	}
+	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		return db.resolveIn(tx, c, name)
+	})
+}
+
+// resolveIn reports whether tx has the collection of c under name. The name
+// is also where a transaction older than the handle looks the collection up
+// when the handle itself does not know what it was called then.
+func (db *db) resolveIn(tx *btree.ReadTx, c *collection, name string) error {
+	if tx.IsWriteTx() {
+		// Dropped by the write tx itself: not under this name, or any.
+		if e := c.logged(tx); e != nil && e.kind == logDrop {
+			return ErrCollectionNotFound
 		}
 	}
-	coll, err := newCollection(ctx, db, collectionName, wtx)
+	s, err := c.resolveAs(tx, name)
 	if err != nil {
-		return nil, err
+		if c.closed.Load() && !db.closed.Load() {
+			return errHandleGone
+		}
+		return err
 	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if live, ok := db.liveLocked(collectionName); ok {
-		return live, nil
+	if s.name != name {
+		// The collection had another name at this snapshot.
+		return ErrCollectionNotFound
 	}
-	if existing, ok := db.openedCollections[collectionName]; ok {
-		// A CLOSED drop-in-flight handle: registering the fresh one over it
-		// would revive the dangling-handle corruption Drop's deferred
-		// eviction closes — return the closed handle instead (fail-safe).
-		return existing, nil
-	}
-	db.openedCollections[collectionName] = coll
-	return coll, nil
+	return nil
 }
 
 // liveLocked returns the live handle registered under name. The caller holds
@@ -1260,10 +1150,9 @@ func (db *db) doWriteTx(ctx context.Context, do func(tx *btree.WriteTx) error) e
 	})
 }
 
-// doWriteTxW is doWriteTx for DDL callbacks that publish in-memory schema
-// state and must register its reversal on the wrapper tx (onRollbackUndo, see
-// commonTx.undo) so a rollback of this scope — or of any enclosing tx — leaves
-// the in-memory maps consistent with the reverted on-disk catalog.
+// doWriteTxW is doWriteTx for DDL callbacks, which log their schema changes
+// on the wrapper tx (txSchema.log) so a rollback of this scope — or of any
+// enclosing tx — discards them with the reverted on-disk catalog.
 func (db *db) doWriteTxW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) error) error {
 	return db.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (bool, error) {
 		return true, do(wtx, tx)
@@ -1293,9 +1182,9 @@ func (db *db) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *b
 	// the release moved into a defer inside btree.WriteTx.Commit (the abandoned-tx
 	// case is guarded by btree's TestWriteTxAbandonedDoesNotDeadlockClose).
 	//
-	// The rollback runs the undo log, whose closures take c.mu / db.mu: a
-	// callback must not panic while holding either with an explicit (non-defer)
-	// unlock, or the unwind deadlocks here.
+	// The rollback discards the schema log under db.mu: a callback must not
+	// panic while holding it with an explicit (non-defer) unlock, or the
+	// unwind deadlocks here.
 	committing := false
 	defer func() {
 		if r := recover(); r != nil {
@@ -1433,35 +1322,10 @@ func (db *db) Flush(ctx context.Context, waitIdleTime time.Duration, mode FlushM
 	return db.recoveryController.Flush(ctx, waitIdleTime, mode.toRecoveryFlushMode())
 }
 
-// renamedTo returns the live collection the open write tx renamed to name
-// (see db.renaming). Writer only.
-func (db *db) renamedTo(name string) *collection {
-	for _, c := range db.renaming {
-		c.mu.Lock()
-		match := c.name == name
-		c.mu.Unlock()
-		if match && !c.closed.Load() {
-			return c
-		}
-	}
-	return nil
-}
-
-// renameResolved drops one entry of c from db.renaming: its rename committed
-// or rolled back. Writer only.
-func (db *db) renameResolved(c *collection) {
-	for i := len(db.renaming) - 1; i >= 0; i-- {
-		if db.renaming[i] == c {
-			db.renaming = append(db.renaming[:i], db.renaming[i+1:]...)
-			return
-		}
-	}
-}
-
 // evictLocked removes c from the registry. Identity scan, not a delete by
-// c.name: a Rename flips the name before the registry is re-keyed, so a
-// name-keyed delete could evict a same-named successor handle or miss the
-// entry. The caller holds db.mu.
+// name: the slot may be under an older name than the head's (a handle
+// opened through an old snapshot, a rename being settled). The caller holds
+// db.mu.
 func (db *db) evictLocked(c *collection) {
 	for name, cur := range db.openedCollections {
 		if cur == Collection(c) {
@@ -1469,39 +1333,46 @@ func (db *db) evictLocked(c *collection) {
 			break
 		}
 	}
+	db.forgetLocked(c)
 }
 
-// ddlEnd releases one uncommitted schema change of c (see collection.ddlTxs):
-// its scope committed or rolled back. With the last one a Close() deferred
-// meanwhile takes effect.
-func (db *db) ddlEnd(c *collection) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	c.ddlTxs--
-	if c.ddlTxs > 0 || !c.closePending.Load() {
-		return
-	}
-	c.closePending.Store(false)
-	if c.closed.CompareAndSwap(false, true) {
-		db.evictLocked(c)
+// forgetLocked takes c out of byIdentity. The caller holds db.mu.
+func (db *db) forgetLocked(c *collection) {
+	if db.byIdentity[c.identity] == c {
+		delete(db.byIdentity, c.identity)
 	}
 }
 
 // persistAllDirtySketches writes the modified sketches of the collections in
-// db.sketchDirty. Called once per write transaction commit to batch sketch
-// persistence. It removes nothing from the list: the next write-tx begin
-// does (resetUncommittedSketches), which also reaches a collection a failed
-// commit's undo un-closed.
+// db.sketchDirty, each under the version the transaction has for it. Called
+// once per write transaction commit to batch sketch persistence. It removes
+// nothing from the list: the next write-tx begin does
+// (resetUncommittedSketches).
 func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
+	gen := db.epoch.Load().gen
 	for _, c := range db.sketchDirty {
 		if c.closed.Load() {
-			// Closed in this tx. For a Drop, the stat_data rows were deleted
-			// with the collection — persisting the still-dirty sketches would
-			// durably resurrect orphaned rows a later same-named index would
-			// adopt.
 			continue
 		}
-		if err := c.persistSketches(tx); err != nil {
+		var s *collSchema
+		if e := c.logged(&tx.ReadTx); e != nil {
+			// A version this transaction logged is its own, made from its
+			// verified view; its generation is stamped at the install.
+			// Dropped in this tx: the stat_data rows were deleted with the
+			// collection — persisting the still-dirty sketches would
+			// durably resurrect orphaned rows a later same-named index
+			// would adopt.
+			if e.kind == logDrop {
+				continue
+			}
+			s = e.s
+		} else if s = c.cur(); s == nil || s.gen.Load() != gen {
+			// A head another process's change left unverified: its name
+			// and indexes may be gone; the flags wait for the handle to be
+			// verified.
+			continue
+		}
+		if err := c.persistSketches(tx, s); err != nil {
 			return err
 		}
 	}
@@ -1553,7 +1424,13 @@ func (db *db) flushAllFtsPending(tx *btree.WriteTx) error {
 		return nil
 	}
 	for _, c := range db.ftsDirty {
-		for _, fx := range c.loadFtsIndexes() {
+		// The version the tx has for the collection: an index it created
+		// holds postings too, one it dropped holds none (Drop resets them).
+		s, dropped := c.inTx(&tx.ReadTx)
+		if dropped || s == nil {
+			continue
+		}
+		for _, fx := range s.ftsIndexes {
 			if err := fx.flushPending(tx); err != nil {
 				return err
 			}
@@ -1566,13 +1443,18 @@ func (db *db) flushAllFtsPending(tx *btree.WriteTx) error {
 // resetAllFtsPending discards the buffered full-text writes of the
 // collections in db.ftsDirty: when the tx or one of its savepoints rolls
 // back, and at the start of every write tx, which finds the list empty unless
-// a tx ended without either.
-func (db *db) resetAllFtsPending() {
+// a tx ended without either. tx is the write transaction, for the versions
+// it has (flushAllFtsPending).
+func (db *db) resetAllFtsPending(tx *btree.ReadTx) {
 	if len(db.ftsDirty) == 0 {
 		return
 	}
 	for _, c := range db.ftsDirty {
-		for _, fx := range c.loadFtsIndexes() {
+		s, _ := c.inTx(tx)
+		if s == nil {
+			continue
+		}
+		for _, fx := range s.ftsIndexes {
 			fx.pending.reset()
 		}
 	}

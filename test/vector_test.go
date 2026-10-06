@@ -1557,10 +1557,10 @@ func TestVectorIndex_CreateThenCompactSameTx(t *testing.T) {
 	}))
 	require.NoError(t, coll.CompactVectorIndex(tx.Context(), "emb"))
 
-	// The chain's committed tail is nil (created in this tx): a concurrent
-	// reader errors exactly as before the DDL began.
+	// Nothing of the index is committed: a concurrent reader errors exactly
+	// as before the DDL began.
 	_, rerr := vsearch(coll, "v", vecs[0], 3, 64)
-	assert.ErrorIs(t, rerr, anystore.ErrIndexNotFound)
+	assert.ErrorIs(t, rerr, anystore.ErrNoVectorIndex)
 
 	require.NoError(t, tx.Commit())
 

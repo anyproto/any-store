@@ -145,9 +145,9 @@ func (q *aggQuery) checkReadOnly() error {
 
 // prefixQuery compiles the pushable pipeline prefix into a regular collection
 // query and returns the remaining in-pipeline stages.
-func (q *aggQuery) prefixQuery() (*collQuery, aggregate.Pipeline, error) {
+func (q *aggQuery) prefixQuery(ctx context.Context) (*collQuery, aggregate.Pipeline, error) {
 	prefix, rest := aggregate.SplitPrefix(q.pipeline)
-	if err := q.validateInPipelineStages(rest); err != nil {
+	if err := q.validateInPipelineStages(ctx, rest); err != nil {
 		return nil, nil, err
 	}
 	return &collQuery{
@@ -174,17 +174,29 @@ func (q *aggQuery) prefixQuery() (*collQuery, aggregate.Pipeline, error) {
 //     here (0 rows on packed storage); it is a hard error on every path, and
 //     an in-pipeline $match — which compilePlan's guard never sees, because
 //     only the pushdown prefix reaches the compiler — must reject it itself.
-func (q *aggQuery) validateInPipelineStages(rest aggregate.Pipeline) error {
-	v := &aggStageValidator{q: q}
+func (q *aggQuery) validateInPipelineStages(ctx context.Context, rest aggregate.Pipeline) error {
+	v := &aggStageValidator{q: q, ctx: ctx}
 	return v.validate(rest)
 }
 
-// aggStageValidator carries the lazily loaded vector-index list across the
-// recursive walk into $facet sub-pipelines.
+// aggStageValidator carries the lazily resolved schema — the one the verb
+// in ctx works with (collection.schemaFor) — across the recursive walk into
+// $facet sub-pipelines.
 type aggStageValidator struct {
-	q      *aggQuery
-	vidxs  []*vectorIndex
-	loaded bool
+	q   *aggQuery
+	ctx context.Context
+	s   *collSchema
+}
+
+func (val *aggStageValidator) schema() (*collSchema, error) {
+	if val.s == nil {
+		s, err := val.q.c.schemaFor(val.ctx)
+		if err != nil {
+			return nil, err
+		}
+		val.s = s
+	}
+	return val.s, nil
 }
 
 func (val *aggStageValidator) validate(p aggregate.Pipeline) error {
@@ -195,11 +207,15 @@ func (val *aggStageValidator) validate(p aggregate.Pipeline) error {
 			// $lookup is scoped to a self-join on the primary key: "from" may
 			// only name the aggregated collection (the parser can't know its
 			// name), and the "id" foreign field must actually be the pk.
-			if sp.From != "" && sp.From != q.c.name {
-				return fmt.Errorf("%w: from %q, aggregating %q", errAggLookupFrom, sp.From, q.c.name)
+			s, err := val.schema()
+			if err != nil {
+				return err
+			}
+			if sp.From != "" && sp.From != s.name {
+				return fmt.Errorf("%w: from %q, aggregating %q", errAggLookupFrom, sp.From, s.name)
 			}
 			if q.c.primaryKey != "id" {
-				return fmt.Errorf("%w: collection %q's primary key is %q", errAggLookupPrimaryKey, q.c.name, q.c.primaryKey)
+				return fmt.Errorf("%w: collection %q's primary key is %q", errAggLookupPrimaryKey, s.name, q.c.primaryKey)
 			}
 		case aggregate.MatchSpec:
 			if query.ContainsText(sp.Filter) {
@@ -208,10 +224,11 @@ func (val *aggStageValidator) validate(p aggregate.Pipeline) error {
 			if query.ContainsKnn(sp.Filter) {
 				return errAggVectorNotInPrefix
 			}
-			if !val.loaded {
-				val.vidxs, val.loaded = q.c.loadVectorIndexes(), true
+			s, err := val.schema()
+			if err != nil {
+				return err
 			}
-			if err := rejectLegacyVectorClause(sp.Filter, val.vidxs); err != nil {
+			if err := rejectLegacyVectorClause(sp.Filter, s.vindexes); err != nil {
 				return err
 			}
 		case aggregate.FacetSpec:
@@ -246,7 +263,7 @@ func (q *aggQuery) Iter(ctx context.Context) (Iterator, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	cq, rest, err := q.prefixQuery()
+	cq, rest, err := q.prefixQuery(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -273,12 +290,15 @@ func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.P
 		lookupTx ReadTx
 	)
 	if aggregate.HasLookup(rest) {
-		var btx *btree.ReadTx
-		if btx, lookupTx, err = q.lookupBtreeTx(ctx, inner); err != nil {
+		var (
+			btx *btree.ReadTx
+			s   *collSchema
+		)
+		if btx, s, lookupTx, err = q.lookupBtreeTx(ctx, inner); err != nil {
 			_ = inner.Close()
 			return nil, err
 		}
-		env.Lookup = q.c.lookupFunc(btx)
+		env.Lookup = q.c.lookupFunc(btx, s)
 	}
 
 	limits := q.limits.WithDefaults()
@@ -309,35 +329,37 @@ func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.P
 	}, nil
 }
 
-// lookupBtreeTx returns the btree read tx $lookup point reads run against:
-// the streaming iterator's own tx (same snapshot; the iterator holds it open
-// until Close, which happens after every stage — blocking ones included —
-// has finished). When the pushdown prefix is provably empty the iterator has
-// no tx at all, yet a $count downstream can still synthesize rows whose
-// fields feed $lookup — then a dedicated read tx is opened, returned as held
-// for aggIterator to release on Close.
-func (q *aggQuery) lookupBtreeTx(ctx context.Context, inner Iterator) (btx *btree.ReadTx, held ReadTx, err error) {
+// lookupBtreeTx returns the btree read tx $lookup point reads run against,
+// with the schema version resolved for it: the streaming iterator's own tx
+// (same snapshot; the iterator holds it open until Close, which happens after
+// every stage — blocking ones included — has finished). When the pushdown
+// prefix is provably empty the iterator has no tx at all, yet a $count
+// downstream can still synthesize rows whose fields feed $lookup — then a
+// dedicated read tx is opened, returned as held for aggIterator to release on
+// Close.
+func (q *aggQuery) lookupBtreeTx(ctx context.Context, inner Iterator) (btx *btree.ReadTx, s *collSchema, held ReadTx, err error) {
 	if pi, ok := inner.(*planIterator); ok {
-		return pi.tx.btreeReadTx(), nil, nil
+		return pi.tx.btreeReadTx(), pi.s, nil, nil
 	}
 	tx, err := q.c.db.getReadTx(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	if err = q.c.alive(); err != nil {
+	if s, err = q.c.resolve(tx.btreeReadTx()); err != nil {
 		_ = tx.Commit()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return tx.btreeReadTx(), tx, nil
+	return tx.btreeReadTx(), s, tx, nil
 }
 
-// lookupFunc serves $lookup point reads against btx. A missing key is a
-// non-match, not an error. The document is parsed owned into buf (stage-owned
-// scratch): valid until the stage reuses the same buf.
-func (c *collection) lookupFunc(btx *btree.ReadTx) aggregate.LookupFunc {
+// lookupFunc serves $lookup point reads against btx, s being the version
+// resolved for it. A missing key is a non-match, not an error. The document
+// is parsed owned into buf (stage-owned scratch): valid until the stage
+// reuses the same buf.
+func (c *collection) lookupFunc(btx *btree.ReadTx, s *collSchema) aggregate.LookupFunc {
 	return func(key []byte, buf *syncpool.DocBuffer) (*anyenc.Value, error) {
 		var err error
-		buf.DocBuf, err = btx.AppendValue(c.ns, key, buf.DocBuf[:0])
+		buf.DocBuf, err = btx.AppendValue(s.ns, key, buf.DocBuf[:0])
 		if err != nil {
 			if errors.Is(err, btree.ErrKeyNotFound) {
 				return nil, nil
@@ -358,7 +380,7 @@ func (q *aggQuery) Count(ctx context.Context) (count int, err error) {
 	if err = ctx.Err(); err != nil {
 		return 0, err
 	}
-	cq, rest, err := q.prefixQuery()
+	cq, rest, err := q.prefixQuery(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -385,7 +407,7 @@ func (q *aggQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	if q.err != nil {
 		return Explain{}, q.err
 	}
-	cq, rest, err := q.prefixQuery()
+	cq, rest, err := q.prefixQuery(ctx)
 	if err != nil {
 		return Explain{}, err
 	}

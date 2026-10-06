@@ -2397,6 +2397,15 @@ fast read `IsDataStale`/`IsSchemaStale` always return false and
 (`db.go:1801-1821`); this is an undocumented new API whose semantics a caller must understand
 to avoid mistaking a fast read's "not stale" for a verified cross-process check.
 
+The snapshot-bounded pair (`SnapshotHeaderCounters`) is exact on the fast path all the same:
+`snapCountersMemo` (`snapcounters.go`) remembers the counters of one snapshot, keyed by its
+WAL-index header (with `dataVersion` for the header synthesized in-process). A commit of this
+process stores its own as it becomes visible (`wal.onPublish`), a begin that had to read page 1
+stores what it read, and a fast begin that pins another snapshot reads page 1 at its own bounds
+once. SQLite reads the schema cookie of the statement's own transaction from the cached page 1
+in `OP_Transaction` (`vdbe.c:4128`, `btree.c:3784-3787`); the memo is how the fast path gets
+that value without the page read.
+
 <a id="drift-46-public-multi-process-staleness-api-diverges-from-sqlite-auto"></a>
 ### Drift: Public Multi Process Staleness API Diverges From SQLite Auto Tracking
 - **Category:** new-feature  -  **Severity:** medium

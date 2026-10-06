@@ -2093,15 +2093,19 @@ func (p *pager) committedCounters() (fileChangeCount, schemaCookie uint32) {
 // cross-process readers), but in single-process mode the Go map with its
 // RWMutex provides safe concurrent access.
 func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaCookie uint32, err error) {
-	fileChangeCount, schemaCookie, _, err = p.readHeaderCountersRaised(walMaxFrame)
+	fileChangeCount, schemaCookie, _, _, err = p.readHeaderCountersRaised(walMaxFrame)
 	return
 }
 
-// readHeaderCountersRaised is readHeaderCounters plus the effective frame
-// bound it actually used. beginRead consults it: when the bound was NOT
-// raised past the caller's walMaxFrame, the returned counters are also the
-// snapshot counters — no second read needed for the snapshot-bounded pair.
-func (p *pager) readHeaderCountersRaised(walMaxFrame uint32) (fileChangeCount, schemaCookie, effectiveMaxFrame uint32, err error) {
+// readHeaderCountersRaised is readHeaderCounters plus the frame bounds it
+// actually used: the effective ceiling and the live floor. beginRead
+// consults them: when both equal the snapshot's own bounds, the returned
+// counters are also the snapshot counters — no second read needed for the
+// snapshot-bounded pair. Either can differ: the ceiling when the WAL grew
+// since the snapshot was taken, the floor when a checkpoint moved it — or a
+// restart put it back below the snapshot's, under which the frames of the
+// new WAL generation sit at numbers the snapshot's window spans.
+func (p *pager) readHeaderCountersRaised(walMaxFrame uint32) (fileChangeCount, schemaCookie, effectiveMaxFrame, floor uint32, err error) {
 	// Determine the effective max frame by checking the SHM header,
 	// which reflects writes from ALL processes sharing this database.
 	// For inProcess mode, the SHM header is not updated by writers
@@ -2116,7 +2120,8 @@ func (p *pager) readHeaderCountersRaised(walMaxFrame uint32) (fileChangeCount, s
 	} else if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
 		effectiveMaxFrame = hdr.mxFrame
 	}
-	fileChangeCount, schemaCookie, err = p.readHeaderCountersAt(effectiveMaxFrame, p.wal.index.liveMinFrame())
+	floor = p.wal.index.liveMinFrame()
+	fileChangeCount, schemaCookie, err = p.readHeaderCountersAt(effectiveMaxFrame, floor)
 	return
 }
 

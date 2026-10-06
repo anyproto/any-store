@@ -18,8 +18,19 @@ import (
 )
 
 // Collection represents a collection of documents.
+//
+// A handle is shared by every caller that opens the collection and serves
+// transactions at different snapshots. Each operation works with the schema
+// of the transaction it runs in: the indexes that transaction has, under the
+// name it has. A transaction that does not have the collection — it began
+// before the collection was created, or the collection was dropped or
+// replaced since — gets ErrCollectionNotFound. A schema change made in a
+// write transaction — a collection or index created or dropped, a rename —
+// is that transaction's own until it commits: every other caller, and the
+// accessors that take no context, have the committed schema.
 type Collection interface {
-	// Name returns the name of the collection.
+	// Name returns the committed name of the collection: a rename made in an
+	// open write transaction shows once it commits.
 	Name() string
 
 	// PrimaryKey returns the document field used as this collection's primary key.
@@ -83,7 +94,9 @@ type Collection interface {
 
 	// GetIndexes returns a list of indexes on the collection: range indexes
 	// followed by full-text indexes (a full-text Len is the number of indexed
-	// documents). Vector indexes are not listed yet.
+	// documents). Vector indexes are not listed yet. The list is the
+	// committed one: an index created or dropped in an open write
+	// transaction shows once it commits.
 	GetIndexes() (indexes []Index)
 
 	// CompactVectorIndex rebuilds the named vector index from its live vectors,
@@ -98,12 +111,15 @@ type Collection interface {
 	// It scans the whole collection and is intended for diagnostics.
 	Stats(ctx context.Context) (CollectionStats, error)
 
-	// Rename renames the collection.
-	// Returns an error if the operation fails.
+	// Rename renames the collection. In the renaming transaction the old
+	// name is free from here on; the handle keeps working under the new
+	// name, for everyone once the rename commits.
 	Rename(ctx context.Context, newName string) (err error)
 
-	// Drop drops the collection.
-	// Returns an error if the operation fails.
+	// Drop drops the collection. Later operations through the handle fail
+	// with ErrCollectionClosed: in the dropping transaction at once, for
+	// everyone once the drop commits. A rollback leaves the handle as it
+	// was.
 	Drop(ctx context.Context) (err error)
 
 	// ReadTx starts a new read-only transaction. It's just a proxy to db object.
@@ -121,68 +137,63 @@ type Collection interface {
 	Close() error
 }
 
-// newCollection creates and initializes a collection. When called from within
-// a write transaction (e.g. CreateCollection), pass the WriteTx so that
-// namespace resolution can see uncommitted pages. Pass nil otherwise.
-func newCollection(ctx context.Context, db *db, name string, wtx ...*btree.WriteTx) (Collection, error) {
-	coll := &collection{
-		name: name,
-		db:   db,
+// newCollection makes the handle of the collection name and loads its schema
+// through tx, the view the caller opens it in: a read snapshot, or the open
+// write transaction's own view (a collection created earlier in it). The
+// caller registers the handle and installs the version, or keeps it for its
+// transaction alone (see resolveSlow).
+func newCollection(db *db, name string, tx *btree.ReadTx) (*collection, *collSchema, error) {
+	c := &collection{db: db, openName: name}
+	// The sketches are about to be read: as of the epoch before that.
+	c.sketchSeen.Store(db.sketchEpoch.Load())
+	s, err := c.loadSchema(tx, name, nil)
+	if err != nil {
+		return nil, nil, err
 	}
-	var tx *btree.WriteTx
-	if len(wtx) > 0 {
-		tx = wtx[0]
-	}
-	if err := coll.init(ctx, tx); err != nil {
-		return nil, err
-	}
-	return coll, nil
+	return c, s, nil
 }
 
 type collection struct {
-	name string
-	// indexes is an atomic copy-on-write snapshot of the collection's index
-	// set. The query path (query.go) reads it lock-free via loadIndexes();
-	// structural mutations (createIndex / DropIndex / reconcileIndexSet) build a
-	// fresh slice under c.mu and publish it via storeIndexes(). Readers always
-	// observe a complete generation, never a torn slice — mirroring SQLite's
-	// whole-schema reload on a schema-cookie bump (a reader sees either the old
-	// or the new schema, never half-applied DDL).
-	indexes atomic.Pointer[[]*index]
-	// ftsIndexes is the parallel copy-on-write snapshot of full-text indexes,
-	// maintained alongside indexes (range) on the same hot paths.
-	ftsIndexes atomic.Pointer[[]*ftsIndex]
-	// vindexes is the parallel CoW snapshot of vector (HNSW) indexes. The write
-	// hooks update them alongside the range indexes; the Find() pipeline reads
-	// them when a query has a `{vectorField: [..]}` clause.
-	vindexes atomic.Pointer[[]*vectorIndex]
-	db       *db
-	ns       *btree.Namespace
+	// head is the current committed schema version, nil while none is
+	// installed: the newest state this process knows. The open write
+	// transaction's own changes are in its log until its commit installs
+	// them (txSchema). Which transactions it serves is resolve's business.
+	// Read lock-free; replaced by compare-and-swap under c.mu, and by the
+	// commit (txSchema.install).
+	head atomic.Pointer[collSchema]
+	db   *db
 
 	compression Compression // 0 = use db default
 
-	// catalogID is the coll: record value captured at init — the collection's
-	// identity token, compared by the staleness pass to detect that a peer
-	// dropped/renamed this collection and a different one now answers for the
-	// name. Set once in init (under c.mu), never mutated after (a rename moves
-	// the token with the collection).
-	catalogID []byte
+	// identity identifies the collection this handle stands for: the coll:
+	// record value (the catalog token) followed by the data namespace's root
+	// page, fixed at the first load (identify); empty until then. A view
+	// that has another collection under the name — dropped and recreated,
+	// or renamed away and created anew — does not have this one
+	// (loadSchema). The token moves with a rename; the root is the second
+	// check for the entries of old files that share one token. The registry
+	// knows a collection by it, besides its name (db.byIdentity).
+	identity string
+	dataRoot uint32
 
-	// validFromCookie is the earliest schema cookie at which this handle's
-	// registered name is KNOWN to resolve to this collection on disk: the
-	// snapshot cookie at open, the commit cookie (begin+1) at create, and
-	// re-stamped to the commit cookie by Rename's publication. Same contract
-	// as index.validFromCookie. The staleness pass consults it: a read tx
-	// whose snapshot predates this bound cannot judge existence — the catalog
-	// key is legitimately absent there — and must skip the handle instead of
-	// invalidating it (see reconcileIndexSet). Atomic because Rename's commit
-	// publication stores it while lock-free staleness passes read it; taking
-	// c.mu there would invert the c.mu→db.mu order Rename establishes.
-	validFromCookie atomic.Uint32
+	// openName is the name the handle was opened under: what the collection
+	// is called while no version is installed.
+	openName string
+
+	// since is the cookie the handle is proven from: the epoch's known at
+	// the moment it entered the registry, or the cookie of the commit this
+	// process was publishing then (db.sinceNow), or the one a created
+	// collection commits with. A schema change of this process to the
+	// collection went through an earlier handle if its cookie is at or
+	// below since, and through this one otherwise — so a version loaded by
+	// a transaction older than since may miss a change nothing here will
+	// ever tell it of, and is never installed (resolveSlow). Set under db.mu
+	// before the handle is reachable.
+	since uint32
 
 	// primaryKey is the document field whose value is the btree key. Resolved
-	// once in init (default "id") and never mutated after, so the data and query
-	// paths read it lock-free.
+	// once at the first load (default "id") and never mutated after, so the
+	// data and query paths read it lock-free.
 	primaryKey string
 
 	// sketchReadBuf is reused scratch for decoding persisted sketch bytes during
@@ -191,38 +202,23 @@ type collection struct {
 	// allocating a fresh read buffer per index.
 	sketchReadBuf []byte
 
-	// indexSetDDLTxs counts local write transactions with UNCOMMITTED index-set
-	// publications on this collection (guarded by c.mu; incremented in
-	// registerIndexSetRestore, decremented exactly once at the tx's commit
-	// publish or rollback undo). reconcileIndexes consults it: a concurrent
-	// read tx's staleness pass must not rebuild the sets from ITS (older)
-	// snapshot while the writer's mid-tx publications are in them — it would
-	// evict the writer's uncommitted indexes. See the guard in reconcileIndexes.
-	indexSetDDLTxs int
-
-	// indexSetCookie is the schema cookie the published index/fts/vector sets
-	// were last built from (a reconcile's snapshot cookie) or published at (a
-	// local DDL's commit cookie). Guarded by c.mu. One-way ratchet for the
-	// staleness pass: a pass whose snapshot is older must not republish —
-	// rebuilt from its older catalog it would resurrect a dropped index or
-	// evict a fresher one db-wide, and readers at current snapshots would
-	// plan against freed namespaces, silently returning wrong results. The
-	// skipped pass consumes only its snapshot counters (see checkStale), so
-	// the verdict stays stale and a fresher begin converges.
-	indexSetCookie uint32
+	// sketchSeen is the db.sketchEpoch the sketches of this handle were last
+	// brought up to (refreshSketches).
+	sketchSeen atomic.Uint64
 
 	// sketchDirty and ftsDirty record membership in db.sketchDirty and
 	// db.ftsDirty; writer-owned like the lists.
 	sketchDirty bool
 	ftsDirty    bool
 
-	// ddlTxs counts the uncommitted schema changes the open write tx made
-	// through this handle: its creation, index DDL, a vector compaction, a
-	// rename, a drop. While it is non-zero the handle stays the collection's
-	// one registered handle. A second one — built from the writer's view or
-	// from the committed one — would not follow the transaction's outcome:
-	// no undo covers it, and a commit or rollback of this process moves no
-	// cookie for a staleness pass to act on.
+	// pinned counts the entries of the open write transaction's schema log
+	// that reference this handle (txSchema.log): its creation, each schema
+	// change made through it, and the mark a verb leaves when it begins.
+	// While it is non-zero the handle stays the collection's one registered
+	// handle. A second one — built from the writer's view or from the
+	// committed one — would not follow the transaction's outcome: its
+	// changes are installed on this handle at the commit, and a commit of
+	// this process verifies no handle (see schemaEpoch).
 	//
 	// SQLite keeps one in-memory schema per connection, resets it when a
 	// transaction that changed it rolls back (sqlite3RollbackAll,
@@ -235,9 +231,14 @@ type collection struct {
 	// instead of an error, as they would without the Close().
 	//
 	// Guarded by db.mu.
-	ddlTxs int
-	// closePending records a Close() that waits for ddlTxs to reach zero
-	// (db.ddlEnd). An open that hands this handle to a caller in between
+	pinned int
+	// logLast is one past the index of this handle's last entry in the open
+	// write transaction's schema log (txSchema.log), 0 while it has none:
+	// how the writer finds its version of the handle without a scan.
+	// Writer-owned, like the log.
+	logLast int
+	// closePending records a Close() that waits for pinned to reach zero
+	// (db.unpinLocked). An open that hands this handle to a caller in between
 	// clears it (db.handOut). Written under db.mu.
 	closePending atomic.Bool
 
@@ -245,34 +246,40 @@ type collection struct {
 	mu     sync.Mutex
 }
 
-// loadIndexes returns the current index-set snapshot. Safe to call without
-// holding c.mu — the slice it returns is immutable (publishers always build a
-// fresh slice rather than mutating in place), so callers may range over it
-// freely while a concurrent reconcile swaps in a new generation.
+// cur returns the head: the committed schema as this process last saw it;
+// nil while no version is installed. The write path and the schema changes
+// resolve the handle in their transaction instead.
+func (c *collection) cur() *collSchema {
+	return c.head.Load()
+}
+
+// answersFor reports that the handle stands for a live collection called
+// name as far as this process has verified: a head of the current
+// generation under that name. For the callers that have no transaction to
+// resolve in; anything else is resolved through a short read.
+func (c *collection) answersFor(name string) bool {
+	if c.closed.Load() {
+		return false
+	}
+	s := c.head.Load()
+	return s != nil && s.gen.Load() == c.db.epoch.Load().gen && s.name == name
+}
+
+// loadIndexes returns the head's range-index set. Lock-free; the slice is
+// immutable.
 func (c *collection) loadIndexes() []*index {
-	if p := c.indexes.Load(); p != nil {
-		return *p
+	if s := c.cur(); s != nil {
+		return s.indexes
 	}
 	return nil
 }
 
-// storeIndexes publishes a new index-set snapshot. Callers must hold c.mu (to
-// serialise concurrent publishers); readers need no lock.
-func (c *collection) storeIndexes(idxs []*index) {
-	c.indexes.Store(&idxs)
-}
-
-// loadFtsIndexes returns the current full-text index snapshot (lock-free).
+// loadFtsIndexes returns the head's full-text index set (lock-free).
 func (c *collection) loadFtsIndexes() []*ftsIndex {
-	if p := c.ftsIndexes.Load(); p != nil {
-		return *p
+	if s := c.cur(); s != nil {
+		return s.ftsIndexes
 	}
 	return nil
-}
-
-// storeFtsIndexes publishes a new full-text index snapshot. Callers hold c.mu.
-func (c *collection) storeFtsIndexes(idxs []*ftsIndex) {
-	c.ftsIndexes.Store(&idxs)
 }
 
 // markSketchDirty lists the collection in db.sketchDirty. Writer only.
@@ -291,169 +298,26 @@ func (c *collection) markFtsDirty() {
 	}
 }
 
-// loadVectorIndexes returns the current vector-index snapshot (lock-free).
+// loadVectorIndexes returns the head's vector-index set (lock-free).
 func (c *collection) loadVectorIndexes() []*vectorIndex {
-	if p := c.vindexes.Load(); p != nil {
-		return *p
+	if s := c.cur(); s != nil {
+		return s.vindexes
 	}
 	return nil
 }
 
-// storeVectorIndexes publishes a new vector-index snapshot. Callers hold c.mu.
-func (c *collection) storeVectorIndexes(vidxs []*vectorIndex) {
-	c.vindexes.Store(&vidxs)
-}
-
-// init initializes the collection, loading namespace handles and index metadata.
-// When wtx is non-nil (called from within a write transaction), namespace resolution
-// uses the writer path to see uncommitted pages.
-func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// getNamespace resolves a namespace, using the writer path when available.
-	getNamespace := func(name string) (*btree.Namespace, error) {
-		if wtx != nil {
-			return wtx.GetNamespace(name)
-		}
-		return c.db.btreeDB.GetNamespace(name)
-	}
-
-	// Get the namespace for this collection
-	ns, err := getNamespace(c.name)
-	if err != nil {
-		return err
-	}
-	c.ns = ns
-
-	// load reads per-collection config + index metadata. When invoked within a
-	// write tx (CreateCollection) it MUST read through the writer's own view so
-	// it observes config written earlier in this same uncommitted tx — a fresh
-	// read tx would see only committed state and miss it (read-your-writes,
-	// matching SQLite where a write tx's reads go through the shared page cache).
-	load := func(tx *btree.ReadTx) (err error) {
-		// Cache the catalog identity token (the coll: record value) — the
-		// staleness pass compares it to detect that a peer replaced this
-		// collection with a same-named one (see collectionVanished). The key
-		// can be legitimately absent here: openCollection's existence check
-		// ran in an earlier snapshot, and a peer may have dropped/renamed the
-		// collection in between — surface the public error, not the raw
-		// btree one, so open-or-create callers take their create path.
-		if c.catalogID, err = tx.AppendValue(c.db.systemNS, collKey(c.name), nil); err != nil {
-			if errors.Is(err, btree.ErrKeyNotFound) {
-				return ErrCollectionNotFound
-			}
-			return err
-		}
-		// Load per-collection config
-		cfg, err := c.db.loadCollConfig(tx, c.name)
-		if err != nil {
-			return err
-		}
-		c.compression = cfg.Compression
-		c.primaryKey = cfg.PrimaryKey
-		if c.primaryKey == "" {
-			c.primaryKey = "id"
-		}
-
-		idxInfos, err := c.db.getIndexInfos(tx, c.name)
-		if err != nil {
-			return err
-		}
-		var idxs []*index
-		var ftsIdxs []*ftsIndex
-		var vidxs []*vectorIndex
-		// resolve binds index namespaces through the SAME view the stamp below
-		// describes: the writer's own view under an ambient write tx, else
-		// this tx's snapshot — never the db-level latest-committed lookup,
-		// which could hand back roots from a peer commit newer than the
-		// snapshot cookie stamped on the handle.
-		resolve := func(name string) (*btree.Namespace, error) {
-			if wtx != nil {
-				return wtx.GetNamespace(name)
-			}
-			return tx.GetNamespace(name)
-		}
-		// The loaded handles' visibility bound: the snapshot cookie — except
-		// under an ambient write tx that already changed schema, whose view
-		// may include its own uncommitted DDL (a mid-tx reopen after a
-		// same-tx CreateIndex): those handles are known visible only from the
-		// cookie the commit will publish. Over-stamping a committed handle by
-		// one is safe (the slow path admits its readers exactly);
-		// under-stamping an uncommitted one would leak it to every reader at
-		// the begin cookie.
-		validFrom := tx.SnapshotSchemaCookie()
-		if wtx != nil && wtx.SchemaChanged() {
-			validFrom++
-		}
-		// The collection handle carries the same bound: for a create-in-flight
-		// (CreateCollection marks schema changed before init) this is the
-		// commit cookie, keeping the handle out of reach of staleness passes
-		// whose snapshot predates the create.
-		c.validFromCookie.Store(validFrom)
-		// The loaded sets are as-of the same bound: seed the publication
-		// ratchet (init runs before the handle is published; no c.mu needed).
-		c.indexSetCookie = validFrom
-		for _, info := range idxInfos {
-			if isFulltext(info) {
-				fx, fErr := newFtsIndex(c, info)
-				if fErr != nil {
-					return fErr
-				}
-				if fErr = fx.bindNamespaces(resolve); fErr != nil {
-					return fErr
-				}
-				fx.validFromCookie = validFrom
-				ftsIdxs = append(ftsIdxs, fx)
-				continue
-			}
-			if info.Kind == IndexKindVector {
-				vi, viErr := c.loadVectorIndex(tx, info)
-				if viErr != nil {
-					return viErr
-				}
-				vi.validFromCookie = validFrom
-				vidxs = append(vidxs, vi)
-				continue
-			}
-			nsName := indexNsName(c.name, info.Name)
-			ns, nsErr := resolve(nsName)
-			if nsErr != nil {
-				return nsErr
-			}
-			idx, idxErr := newIndex(c, info, ns)
-			if idxErr != nil {
-				return idxErr
-			}
-			idx.validFromCookie = validFrom
-			if idx.format, err = c.db.readIndexFormat(tx, c.name, info.Name); err != nil {
-				return err
-			}
-			idx.outdated = indexFormatOutdated(idx.format, info)
-			c.loadSketchAtOpen(tx, idx)
-			idxs = append(idxs, idx)
-		}
-		c.storeIndexes(idxs)
-		c.storeFtsIndexes(ftsIdxs)
-		c.storeVectorIndexes(vidxs)
-		return nil
-	}
-
-	if wtx != nil {
-		return load(&wtx.ReadTx)
-	}
-	return c.db.doReadTx(ctx, load)
-}
-
 func (c *collection) Name() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.name
+	if s := c.committed(); s != nil {
+		return s.name
+	}
+	// Gone: the name it had.
+	if s := c.cur(); s != nil {
+		return s.name
+	}
+	return c.openName
 }
 
 func (c *collection) PrimaryKey() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	return c.primaryKey
 }
 
@@ -534,34 +398,15 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 
 	buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], docId)
 	if ctx.Value(ctxKeyTx) == nil {
-		tx, txErr := c.db.btreeDB.BeginReadFast()
-		if txErr != nil {
-			return nil, txErr
-		}
-		defer func() {
-			if rbErr := tx.Rollback(); rbErr != nil && err == nil {
-				err = rbErr
-			}
-		}()
-		buf.DocBuf, err = tx.AppendValue(c.ns, buf.SmallBuf, buf.DocBuf[:0])
-		if err != nil {
-			if errors.Is(err, btree.ErrKeyNotFound) {
-				return nil, ErrDocNotFound
-			}
-			return nil, err
-		}
-		data, pErr := p.Parse(buf.DocBuf)
-		if pErr != nil {
-			return nil, pErr
-		}
-		return item{val: data}, nil
+		return c.findIdOwnTx(p, buf)
 	}
 
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
-		if err = c.alive(); err != nil {
+		s, err := c.resolve(tx)
+		if err != nil {
 			return err
 		}
-		buf.DocBuf, err = tx.AppendValue(c.ns, buf.SmallBuf, buf.DocBuf[:0])
+		buf.DocBuf, err = tx.AppendValue(s.ns, buf.SmallBuf, buf.DocBuf[:0])
 		if err != nil {
 			if errors.Is(err, btree.ErrKeyNotFound) {
 				return ErrDocNotFound
@@ -573,6 +418,39 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 		return
 	})
 	return doc, err
+}
+
+// findIdOwnTx is the point lookup of a caller without a transaction: one
+// fast read tx around the fetch of the key in buf.SmallBuf. A function of
+// its own to keep its return count low: past returns x defers = 15 the
+// compiler stops open-coding defers, which costs this path about 3%.
+func (c *collection) findIdOwnTx(p *anyenc.Parser, buf *syncpool.DocBuffer) (doc Doc, err error) {
+	tx, err := c.db.btreeDB.BeginReadFast()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && err == nil {
+			err = rbErr
+		}
+	}()
+	// The fast begin skips checkStale; the schema check it needs is this.
+	c.db.observeCookie(tx)
+	s, err := c.resolve(tx)
+	if err != nil {
+		return nil, err
+	}
+	if buf.DocBuf, err = tx.AppendValue(s.ns, buf.SmallBuf, buf.DocBuf[:0]); err != nil {
+		if errors.Is(err, btree.ErrKeyNotFound) {
+			err = ErrDocNotFound
+		}
+		return nil, err
+	}
+	data, err := p.Parse(buf.DocBuf)
+	if err != nil {
+		return nil, err
+	}
+	return item{val: data}, nil
 }
 
 func (c *collection) Find(filter any) Query {
@@ -601,7 +479,8 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	err = c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		s, txErr := c.resolve(&tx.ReadTx)
+		if txErr != nil {
 			return txErr
 		}
 		var it item
@@ -610,7 +489,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 			if it, txErr = c.newItem(doc); txErr != nil {
 				return txErr
 			}
-			if txErr = c.insertItem(tx, buf, it); txErr != nil {
+			if txErr = c.insertItem(tx, s, buf, it); txErr != nil {
 				return txErr
 			}
 		}
@@ -620,7 +499,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 	return
 }
 
-func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it item) (err error) {
+func (c *collection) insertItem(tx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, it item) (err error) {
 	buf.SmallBuf = c.appendId(buf.SmallBuf[:0], it.Value())
 	if c.compressionDisabled() {
 		buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
@@ -629,26 +508,26 @@ func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it i
 	}
 
 	// Check if key already exists
-	if _, err := tx.Get(c.ns, buf.SmallBuf); err == nil {
+	if _, err := tx.Get(s.ns, buf.SmallBuf); err == nil {
 		return ErrDocExists
 	}
 
-	if err = tx.Put(c.ns, buf.SmallBuf, buf.DocBuf); err != nil {
+	if err = tx.Put(s.ns, buf.SmallBuf, buf.DocBuf); err != nil {
 		return err
 	}
 
 	// Insert index entries
-	for _, idx := range c.loadIndexes() {
+	for _, idx := range s.indexes {
 		if err = idx.insertKeys(tx, it); err != nil {
 			return err
 		}
 	}
-	for _, fx := range c.loadFtsIndexes() {
+	for _, fx := range s.ftsIndexes {
 		if err = fx.insertDoc(tx, it); err != nil {
 			return err
 		}
 	}
-	for _, vi := range c.loadVectorIndexes() {
+	for _, vi := range s.vindexes {
 		if err = vi.insert(tx, it, nil); err != nil {
 			return err
 		}
@@ -673,10 +552,11 @@ func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err erro
 	}
 
 	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		s, txErr := c.resolve(&tx.ReadTx)
+		if txErr != nil {
 			return false, txErr
 		}
-		return c.update(tx, it, item{})
+		return c.update(tx, s, it, item{})
 	})
 	returned = true
 	return
@@ -699,11 +579,12 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
 	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		s, txErr := c.resolve(&tx.ReadTx)
+		if txErr != nil {
 			return false, txErr
 		}
 		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
-		it, txErr := c.loadById(tx, buf, buf.SmallBuf)
+		it, txErr := c.loadById(tx, s, buf, buf.SmallBuf)
 		if txErr != nil {
 			return
 		}
@@ -722,7 +603,7 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 		if vErr != nil {
 			return false, vErr
 		}
-		return c.update(tx, newIt, it)
+		return c.update(tx, s, newIt, it)
 	})
 	returned = true
 	if err != nil {
@@ -746,7 +627,8 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
 	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		s, txErr := c.resolve(&tx.ReadTx)
+		if txErr != nil {
 			return false, txErr
 		}
 		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
@@ -755,7 +637,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 			modValue *anyenc.Value
 			prevItem item
 		)
-		it, loadErr := c.loadById(tx, buf, buf.SmallBuf)
+		it, loadErr := c.loadById(tx, s, buf, buf.SmallBuf)
 		if loadErr != nil {
 			if errors.Is(loadErr, ErrDocNotFound) {
 				var idVal *anyenc.Value
@@ -792,11 +674,11 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 			return false, vErr
 		}
 		if isInsert {
-			txErr = c.insertItem(tx, buf2, newIt)
+			txErr = c.insertItem(tx, s, buf2, newIt)
 			return true, txErr
 		} else {
 			res.Matched = 1
-			return c.update(tx, newIt, prevItem)
+			return c.update(tx, s, newIt, prevItem)
 		}
 	})
 	returned = true
@@ -806,13 +688,13 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 	return
 }
 
-func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, err error) {
+func (c *collection) update(tx *btree.WriteTx, s *collSchema, it, prevIt item) (modified bool, err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	buf.SmallBuf = c.appendId(buf.SmallBuf[:0], it.Value())
 	if prevIt.val == nil {
-		prevIt, err = c.loadById(tx, buf, buf.SmallBuf)
+		prevIt, err = c.loadById(tx, s, buf, buf.SmallBuf)
 		if err != nil {
 			return
 		}
@@ -830,7 +712,7 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 	}
 
 	// Update index entries: delete old, insert new
-	for _, idx := range c.loadIndexes() {
+	for _, idx := range s.indexes {
 		if err = idx.deleteKeys(tx, prevIt); err != nil {
 			return
 		}
@@ -838,13 +720,13 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 			return
 		}
 	}
-	for _, fx := range c.loadFtsIndexes() {
+	for _, fx := range s.ftsIndexes {
 		if err = fx.updateDoc(tx, prevIt, it); err != nil {
 			return
 		}
 	}
 	// Vector indexes: only touch the graph when the embedding actually changed.
-	for _, vi := range c.loadVectorIndexes() {
+	for _, vi := range s.vindexes {
 		if err = vi.update(tx, prevIt, it); err != nil {
 			return
 		}
@@ -855,15 +737,15 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 	} else {
 		buf.DocBuf, buf.ScratchBuf = it.Value().MarshalCompressed(buf.DocBuf[:0], buf.ScratchBuf)
 	}
-	if err = tx.Put(c.ns, buf.SmallBuf, buf.DocBuf); err != nil {
+	if err = tx.Put(s.ns, buf.SmallBuf, buf.DocBuf); err != nil {
 		return
 	}
 
 	return true, nil
 }
 
-func (c *collection) loadById(tx *btree.WriteTx, buf *syncpool.DocBuffer, id anyenc.Tuple) (it item, err error) {
-	buf.DocBuf, err = tx.AppendValue(c.ns, id, buf.DocBuf[:0])
+func (c *collection) loadById(tx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, id anyenc.Tuple) (it item, err error) {
+	buf.DocBuf, err = tx.AppendValue(s.ns, id, buf.DocBuf[:0])
 	if err != nil {
 		if errors.Is(err, btree.ErrKeyNotFound) {
 			return item{}, ErrDocNotFound
@@ -894,12 +776,13 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 	}
 
 	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		s, txErr := c.resolve(&tx.ReadTx)
+		if txErr != nil {
 			return false, txErr
 		}
-		insErr := c.insertItem(tx, buf, it)
+		insErr := c.insertItem(tx, s, buf, it)
 		if errors.Is(insErr, ErrDocExists) {
-			return c.update(tx, it, item{})
+			return c.update(tx, s, it, item{})
 		}
 		if insErr != nil {
 			return false, insErr
@@ -922,29 +805,28 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
-		if txErr = c.alive(); txErr != nil {
+		s, txErr := c.resolve(&tx.ReadTx)
+		if txErr != nil {
 			return false, txErr
 		}
 		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
 		// Verify document exists
-		_, txErr = c.loadById(tx, buf, buf.SmallBuf)
+		_, txErr = c.loadById(tx, s, buf, buf.SmallBuf)
 		if txErr != nil {
 			return
 		}
-		return true, c.deleteItem(tx, buf, buf.SmallBuf)
+		return true, c.deleteItem(tx, s, buf, buf.SmallBuf)
 	})
 	returned = true
 	return err
 }
 
-func (c *collection) deleteItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, id []byte) (err error) {
+func (c *collection) deleteItem(tx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, id []byte) (err error) {
 	// Delete index entries. The document is loaded once and reused for the range,
 	// full-text and vector index removals (all need the field values).
-	idxs := c.loadIndexes()
-	ftsIdxs := c.loadFtsIndexes()
-	vidxs := c.loadVectorIndexes()
+	idxs, ftsIdxs, vidxs := s.indexes, s.ftsIndexes, s.vindexes
 	if len(idxs) > 0 || len(ftsIdxs) > 0 || len(vidxs) > 0 {
-		it, loadErr := c.loadById(tx, buf, id)
+		it, loadErr := c.loadById(tx, s, buf, id)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -964,16 +846,16 @@ func (c *collection) deleteItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, id [
 			}
 		}
 	}
-	return tx.Delete(c.ns, id)
+	return tx.Delete(s.ns, id)
 }
 
 func (c *collection) Count(ctx context.Context) (count int, err error) {
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		if aErr := c.alive(); aErr != nil {
-			return aErr
+		s, txErr := c.resolve(tx)
+		if txErr != nil {
+			return txErr
 		}
-		var txErr error
-		count, txErr = tx.Count(c.ns)
+		count, txErr = tx.Count(s.ns)
 		return txErr
 	})
 	return
@@ -992,7 +874,8 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		return nil
 	}
 	return c.db.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (modified bool, txErr error) {
-		if txErr = c.beginDDL(wtx); txErr != nil {
+		s, txErr := c.beginDDL(wtx)
+		if txErr != nil {
 			return false, txErr
 		}
 		var newIndexes []*index
@@ -1000,10 +883,10 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		var newVIndexes []*vectorIndex
 		for _, idxInfo := range info {
 			if isFulltext(idxInfo) {
-				if txErr = c.checkSingleFulltextIndex(idxInfo, newFtsIndexes); txErr != nil {
+				if txErr = c.checkSingleFulltextIndex(s, idxInfo, newFtsIndexes); txErr != nil {
 					return false, txErr
 				}
-				fx, fErr := c.createFtsIndex(ctx, tx, idxInfo)
+				fx, fErr := c.createFtsIndex(tx, s, idxInfo)
 				if fErr != nil {
 					if ensure && errors.Is(fErr, ErrIndexExists) {
 						continue
@@ -1014,7 +897,7 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 				continue
 			}
 			if idxInfo.Kind == IndexKindVector {
-				vi, viErr := c.createVectorIndex(tx, idxInfo)
+				vi, viErr := c.createVectorIndex(tx, s, idxInfo)
 				if viErr != nil {
 					if ensure && errors.Is(viErr, ErrIndexExists) {
 						continue
@@ -1024,7 +907,7 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 				newVIndexes = append(newVIndexes, vi)
 				continue
 			}
-			idx, txErr := c.createIndex(ctx, tx, idxInfo)
+			idx, txErr := c.createIndex(tx, s, idxInfo)
 			if txErr != nil {
 				// ensure=true is idempotent only for an EXISTING index whose
 				// definition matches. A same-name index with a DIFFERENT
@@ -1044,97 +927,23 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 			return false, nil
 		}
 
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		c.registerIndexSetRestore(wtx)
-		// The new handles' namespaces exist only in this tx's uncommitted
-		// view: stamp them valid from the cookie this commit will publish —
-		// every create path MarkSchemaChanged, and SchemaCookie bumps exactly
-		// once per schema-changing commit, atomically with the DDL (the
-		// OP_Transaction analog, vdbe.c:4091-4192 in SQLite), so there is no
-		// commit→publication gap for readers to fall into. Concurrent readers
-		// on older snapshots fail the fast path and cannot resolve the new
-		// namespaces in their own snapshots (see visibleIndexes). A rollback
-		// discards the handles themselves via the registerIndexSetRestore
-		// undo.
-		validFrom := tx.DiskSchemaCookie() + 1
-		for _, idx := range newIndexes {
-			idx.validFromCookie = validFrom
-		}
-		for _, fx := range newFtsIndexes {
-			fx.validFromCookie = validFrom
-		}
+		// The new index objects' namespaces exist only in this tx's
+		// uncommitted view: the version carrying them is the transaction's
+		// own until its commit installs it (txSchema.log); a rollback
+		// discards the objects with it.
 		for _, vi := range newVIndexes {
-			vi.bindIdentity(c.name)
-			vi.validFromCookie = validFrom
+			vi.bindIdentity(s.name)
 		}
-		// Copy-on-write publish: build fresh slices (current snapshot + new
-		// indexes) and swap them in atomically so lock-free query readers always
-		// see a complete generation.
-		if len(newIndexes) > 0 {
-			cur := c.loadIndexes()
-			merged := make([]*index, 0, len(cur)+len(newIndexes))
-			merged = append(merged, cur...)
-			merged = append(merged, newIndexes...)
-			c.storeIndexes(merged)
-		}
-		if len(newFtsIndexes) > 0 {
-			cur := c.loadFtsIndexes()
-			merged := make([]*ftsIndex, 0, len(cur)+len(newFtsIndexes))
-			merged = append(merged, cur...)
-			merged = append(merged, newFtsIndexes...)
-			c.storeFtsIndexes(merged)
-		}
-		if len(newVIndexes) > 0 {
-			cur := c.loadVectorIndexes()
-			merged := make([]*vectorIndex, 0, len(cur)+len(newVIndexes))
-			merged = append(merged, cur...)
-			merged = append(merged, newVIndexes...)
-			c.storeVectorIndexes(merged)
-		}
+		next := s.clone()
+		next.indexes = append(s.indexes[:len(s.indexes):len(s.indexes)], newIndexes...)
+		next.ftsIndexes = append(s.ftsIndexes[:len(s.ftsIndexes):len(s.ftsIndexes)], newFtsIndexes...)
+		next.vindexes = append(s.vindexes[:len(s.vindexes):len(s.vindexes)], newVIndexes...)
+		c.logVersion(wtx, s, next)
 		return true, nil
 	})
 }
 
-// registerIndexSetRestore snapshots the collection's three index sets and
-// registers their restoration on rollback of the given tx scope (see
-// commonTx.undo). A reverted DDL must not leave the in-memory sets pointing at
-// state the on-disk catalog no longer has (a created index over freed
-// namespace pages) or missing state it still has (a rolled-back drop whose
-// index would silently stop being maintained). Call with c.mu held, BEFORE
-// swapping; restoring an unchanged set is a harmless pointer store.
-func (c *collection) registerIndexSetRestore(wtx WriteTx) {
-	prevIndexes, prevFts, prevVec := c.loadIndexes(), c.loadFtsIndexes(), c.loadVectorIndexes()
-	// Mark the DDL in flight so a concurrent read tx's reconcile leaves the
-	// sets alone until this tx resolves. Exactly one of the two callbacks runs
-	// per outcome (commit → pubs, rollback/failed commit → undo), so the
-	// counter balances.
-	c.indexSetDDLTxs++
-	// The sets this tx publishes become committed state at its commit cookie
-	// (every caller marks schema changed; the cookie bumps once per commit):
-	// ratchet indexSetCookie there so an older-snapshot staleness pass cannot
-	// republish over them. The ratchet never moves mid-tx, so rollback has
-	// nothing to restore.
-	commitCookie := wtx.btreeWriteTx().DiskSchemaCookie() + 1
-	wtx.onRollbackUndo(func() {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		c.storeIndexes(prevIndexes)
-		c.storeFtsIndexes(prevFts)
-		c.storeVectorIndexes(prevVec)
-		c.indexSetDDLTxs--
-	})
-	wtx.onCommitPublish(func() {
-		c.mu.Lock()
-		c.indexSetDDLTxs--
-		if commitCookie > c.indexSetCookie {
-			c.indexSetCookie = commitCookie
-		}
-		c.mu.Unlock()
-	})
-}
-
-func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info IndexInfo) (idx *index, err error) {
+func (c *collection) createIndex(tx *btree.WriteTx, s *collSchema, info IndexInfo) (idx *index, err error) {
 	tx.MarkSchemaChanged()
 	if info.Name == "" {
 		info.Name = info.createName()
@@ -1149,23 +958,24 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 	}
 
 	// Register in system namespace
-	if err = c.db.registerIndex(tx, c.name, info); err != nil {
+	if err = c.db.registerIndex(tx, s.name, info); err != nil {
 		return nil, err
 	}
-	return c.buildRangeIndex(tx, info)
+	return c.buildRangeIndex(tx, s, info)
 }
 
 // buildRangeIndex creates the index namespace and fills it from the
-// collection's documents; the catalog record is already registered and
-// stamped with the current format. Shared by createIndex and rebuildIndex.
-func (c *collection) buildRangeIndex(tx *btree.WriteTx, info IndexInfo) (idx *index, err error) {
-	nsName := indexNsName(c.name, info.Name)
+// collection's documents (s: the writer's version); the catalog record is
+// already registered and stamped with the current format. Shared by
+// createIndex and rebuildIndex.
+func (c *collection) buildRangeIndex(tx *btree.WriteTx, s *collSchema, info IndexInfo) (idx *index, err error) {
+	nsName := indexNsName(s.name, info.Name)
 	ns, err := tx.CreateNamespace(nsName)
 	if err != nil {
 		return nil, err
 	}
 
-	idx, err = newIndex(c, info, ns)
+	idx, err = newIndex(c, s.name, info, ns)
 	if err != nil {
 		return nil, err
 	}
@@ -1183,17 +993,17 @@ func (c *collection) buildRangeIndex(tx *btree.WriteTx, info IndexInfo) (idx *in
 	idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
 
 	// Build index from existing documents (also populates sketch via insertKeys)
-	if err = c.buildIndex(tx, idx); err != nil {
+	if err = c.buildIndex(tx, s, idx); err != nil {
 		return nil, err
 	}
 
 	// Persist the sketch
-	skKey := sketchKey(c.name, info.Name)
+	skKey := sketchKey(s.name, info.Name)
 	if err = tx.Put(c.db.systemNS, skKey, idx.sketch.MarshalBinary(nil)); err != nil {
 		return nil, err
 	}
 	// Publish the live sketch as the reader snapshot before the index becomes
-	// reader-visible (appended to c.indexes by the caller), so no reader ever
+	// reader-visible (added to the index set by the caller), so no reader ever
 	// observes a nil sketchPub.
 	idx.storePubSketch(idx.sketch)
 	idx.sketchModified = false
@@ -1208,14 +1018,14 @@ func (c *collection) buildRangeIndex(tx *btree.WriteTx, info IndexInfo) (idx *in
 // decides whether that is idempotent (ErrIndexExists, swallowed under ensure)
 // or a genuine conflict (ErrIndexMismatch) — so only a DIFFERENT name is
 // rejected here. pending covers indexes created earlier in this same batch,
-// which are not published to c.loadFtsIndexes() until the tx commits.
-func (c *collection) checkSingleFulltextIndex(info IndexInfo, pending []*ftsIndex) error {
+// not in s yet.
+func (c *collection) checkSingleFulltextIndex(s *collSchema, info IndexInfo, pending []*ftsIndex) error {
 	name := info.Name
 	if name == "" {
 		name = info.createName()
 	}
 	existing := ""
-	for _, fx := range c.loadFtsIndexes() {
+	for _, fx := range s.ftsIndexes {
 		if fx.info.Name != name {
 			existing = fx.info.Name
 			break
@@ -1235,7 +1045,7 @@ func (c *collection) checkSingleFulltextIndex(info IndexInfo, pending []*ftsInde
 	return nil
 }
 
-func (c *collection) createFtsIndex(ctx context.Context, tx *btree.WriteTx, info IndexInfo) (*ftsIndex, error) {
+func (c *collection) createFtsIndex(tx *btree.WriteTx, s *collSchema, info IndexInfo) (*ftsIndex, error) {
 	tx.MarkSchemaChanged()
 	if info.Name == "" {
 		info.Name = info.createName()
@@ -1250,38 +1060,38 @@ func (c *collection) createFtsIndex(ctx context.Context, tx *btree.WriteTx, info
 	}
 
 	// Register in system namespace (carries Kind so reopen rebuilds an fts index).
-	if err := c.db.registerIndex(tx, c.name, info); err != nil {
+	if err := c.db.registerIndex(tx, s.name, info); err != nil {
 		return nil, err
 	}
 
-	fx, err := newFtsIndex(c, info)
+	fx, err := newFtsIndex(c, s.name, info)
 	if err != nil {
 		return nil, err
 	}
 
 	// Create the five namespaces.
-	for _, nsName := range ftsIndexNames(c.name, info.Name) {
+	for _, nsName := range ftsIndexNames(s.name, info.Name) {
 		if _, err = tx.CreateNamespace(nsName); err != nil {
 			return nil, err
 		}
 	}
-	if err = fx.bindNamespaces(tx.GetNamespace); err != nil {
+	if err = fx.bindNamespaces(s.name, tx.GetNamespace); err != nil {
 		return nil, err
 	}
 
 	// Backfill existing documents.
-	if err = c.buildFtsIndex(tx, fx); err != nil {
+	if err = c.buildFtsIndex(tx, s, fx); err != nil {
 		return nil, err
 	}
 	return fx, nil
 }
 
 // buildFtsIndex indexes every existing document into a new full-text index.
-func (c *collection) buildFtsIndex(tx *btree.WriteTx, fx *ftsIndex) error {
+func (c *collection) buildFtsIndex(tx *btree.WriteTx, s *collSchema, fx *ftsIndex) error {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	cursor := tx.NewCursor(c.ns)
+	cursor := tx.NewCursor(s.ns)
 	defer cursor.Close()
 	if err := cursor.First(); err != nil {
 		return err
@@ -1313,50 +1123,48 @@ func (c *collection) buildFtsIndex(tx *btree.WriteTx, fx *ftsIndex) error {
 
 func (c *collection) DropIndex(ctx context.Context, indexName string) (err error) {
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (txErr error) {
-		if txErr = c.beginDDL(wtx); txErr != nil {
+		// The version resolved for this write transaction reflects on-disk
+		// truth: an index a peer created is present (drop must succeed),
+		// and one a peer dropped is absent (return ErrIndexNotFound, not a
+		// false success).
+		s, txErr := c.beginDDL(wtx)
+		if txErr != nil {
 			return txErr
 		}
 		tx.MarkSchemaChanged()
-		// The write transaction began via checkStale, which reconciled the index
-		// set against on-disk metadata. So the snapshot here reflects on-disk
-		// truth: an index a peer created is present (drop must succeed), and one
-		// a peer dropped is absent (return ErrIndexNotFound, not a false success).
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		c.registerIndexSetRestore(wtx)
+		next := s.clone()
 
-		// Vector index drop: unregister, delete its namespaces, republish.
-		for _, vi := range c.loadVectorIndexes() {
+		// Vector index drop: unregister, delete its namespaces.
+		for _, vi := range s.vindexes {
 			if vi.info.Name != indexName {
 				continue
 			}
-			if txErr = c.db.removeIndex(tx, c.name, indexName); txErr != nil {
+			if txErr = c.db.removeIndex(tx, s.name, indexName); txErr != nil {
 				return
 			}
-			if txErr = dropVectorIndexNamespaces(tx, c.name, indexName); txErr != nil {
+			if txErr = dropVectorIndexNamespaces(tx, s.name, indexName); txErr != nil {
 				return
 			}
-			cur := c.loadVectorIndexes()
-			next := make([]*vectorIndex, 0, len(cur))
-			for _, v := range cur {
+			next.vindexes = make([]*vectorIndex, 0, len(s.vindexes))
+			for _, v := range s.vindexes {
 				if v.info.Name != indexName {
-					next = append(next, v)
+					next.vindexes = append(next.vindexes, v)
 				}
 			}
-			c.storeVectorIndexes(next)
+			c.logVersion(wtx, s, next)
 			return nil
 		}
 
 		found := false
 		isFts := false
-		for _, idx := range c.loadIndexes() {
+		for _, idx := range s.indexes {
 			if idx.info.Name == indexName {
 				found = true
 				break
 			}
 		}
 		if !found {
-			for _, fx := range c.loadFtsIndexes() {
+			for _, fx := range s.ftsIndexes {
 				if fx.info.Name == indexName {
 					found, isFts = true, true
 					break
@@ -1371,13 +1179,13 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 		// may have dropped the same index between our checkStale snapshot and
 		// here, and a raw btree.ErrKeyNotFound must never escape DropIndex (whose
 		// contract is nil or ErrIndexNotFound).
-		if txErr = c.db.removeIndex(tx, c.name, indexName); txErr != nil {
+		if txErr = c.db.removeIndex(tx, s.name, indexName); txErr != nil {
 			return
 		}
 
 		if isFts {
 			// Delete the five full-text namespaces.
-			for _, nsName := range ftsIndexNames(c.name, indexName) {
+			for _, nsName := range ftsIndexNames(s.name, indexName) {
 				if txErr = tx.DeleteNamespace(nsName); txErr != nil {
 					if !errors.Is(txErr, btree.ErrNamespaceNotFound) {
 						return
@@ -1385,19 +1193,18 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 					txErr = nil
 				}
 			}
-			cur := c.loadFtsIndexes()
-			next := make([]*ftsIndex, 0, len(cur))
-			for _, fx := range cur {
+			next.ftsIndexes = make([]*ftsIndex, 0, len(s.ftsIndexes))
+			for _, fx := range s.ftsIndexes {
 				if fx.info.Name != indexName {
-					next = append(next, fx)
+					next.ftsIndexes = append(next.ftsIndexes, fx)
 				}
 			}
-			c.storeFtsIndexes(next)
+			c.logVersion(wtx, s, next)
 			return nil
 		}
 
 		// Delete the index namespace
-		nsName := indexNsName(c.name, indexName)
+		nsName := indexNsName(s.name, indexName)
 		if txErr = tx.DeleteNamespace(nsName); txErr != nil {
 			if !errors.Is(txErr, btree.ErrNamespaceNotFound) {
 				return
@@ -1405,35 +1212,85 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 			txErr = nil
 		}
 		// Delete sketch data
-		skKey := sketchKey(c.name, indexName)
+		skKey := sketchKey(s.name, indexName)
 		_ = tx.Delete(c.db.systemNS, skKey) // ignore if not found
 		// Delete the multikey flag (keyed by the immutable namespace name —
 		// resolve it from the live index object, since nsName computed from
 		// the CURRENT collection name is wrong after a rename): drop+recreate
 		// is the flag's only reset path.
-		for _, idx := range c.loadIndexes() {
+		next.indexes = make([]*index, 0, len(s.indexes))
+		for _, idx := range s.indexes {
 			if idx.info.Name == indexName {
 				_ = tx.Delete(c.db.systemNS, multikeyKey(idx.ns.Name()))
-				break
+				continue
 			}
+			next.indexes = append(next.indexes, idx)
 		}
-		// Copy-on-write publish: build a fresh slice without the dropped index
-		// and swap it in atomically for lock-free query readers.
-		cur := c.loadIndexes()
-		next := make([]*index, 0, len(cur))
-		for _, idx := range cur {
-			if idx.info.Name != indexName {
-				next = append(next, idx)
-			}
-		}
-		c.storeIndexes(next)
+		c.logVersion(wtx, s, next)
 		return nil
 	})
 }
 
+// committed returns the head, brought up to date first if it is not known to
+// be: none installed yet (a handle opened through a transaction too old to
+// speak for it, see resolveSlow), or not verified since another process
+// changed the schema. nil if the collection is gone. For the accessors that
+// take no context: the schema as committed, as far as this process has
+// looked. The verification takes a read transaction; when none can begin at
+// once — every reader slot is held, maybe by the caller itself — the head
+// stands as it is.
+func (c *collection) committed() *collSchema {
+	s := c.cur()
+	if s != nil && s.gen.Load() == c.db.epoch.Load().gen {
+		return s
+	}
+	tx, err := c.db.btreeDB.TryBeginRead()
+	if err != nil {
+		return s
+	}
+	defer func() { _ = tx.Rollback() }()
+	c.db.checkStale(tx)
+	v, err := c.resolve(tx)
+	if err != nil {
+		if errors.Is(err, ErrCollectionNotFound) {
+			return nil
+		}
+		// The verification failed for a reason other than the collection
+		// being gone: as last seen.
+		return s
+	}
+	return v
+}
+
+// schemaFor returns the schema a verb about to run in ctx works with: the
+// version of the transaction ctx carries, else the committed one its own
+// transaction is about to see — verified through a short read when it is
+// not known to be, with the error that ends the verb if that fails.
+func (c *collection) schemaFor(ctx context.Context) (*collSchema, error) {
+	if tx, ok := ctx.Value(ctxKeyTx).(ReadTx); ok && !tx.Done() && tx.instanceId() == c.db.instanceId {
+		return c.resolve(tx.btreeReadTx())
+	}
+	if s := c.cur(); s != nil && s.gen.Load() == c.db.epoch.Load().gen {
+		return s, nil
+	}
+	var s *collSchema
+	err := c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
+		s, err = c.resolve(tx)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
 func (c *collection) GetIndexes() (indexes []Index) {
-	idxs := c.loadIndexes()
-	ftsIdxs := c.loadFtsIndexes()
+	s := c.committed()
+	if s == nil {
+		return nil
+	}
+	idxs := s.indexes
+	ftsIdxs := s.ftsIndexes
 	indexes = make([]Index, 0, len(idxs)+len(ftsIdxs))
 	for _, idx := range idxs {
 		indexes = append(indexes, idx)
@@ -1446,27 +1303,18 @@ func (c *collection) GetIndexes() (indexes []Index) {
 
 func (c *collection) Rename(ctx context.Context, newName string) error {
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if err = c.beginDDL(wtx); err != nil {
+		s, err := c.beginDDL(wtx)
+		if err != nil {
 			return err
 		}
-
-		oldName := c.name
+		oldName := s.name
 		if newName == oldName {
 			return nil
 		}
-		// A foreign live handle under the new name implies the name is taken
-		// even if some stale state made the catalog check below miss it.
-		c.db.mu.Lock()
-		if cur, ok := c.db.openedCollections[newName]; ok && cur != Collection(c) {
-			c.db.mu.Unlock()
-			return ErrCollectionExists
-		}
-		c.db.mu.Unlock()
 
 		// Re-keys the catalog metadata AND every derived btree namespace
-		// (data, per-index) in this tx.
+		// (data, per-index) in this tx; a collection under the new name in
+		// this transaction's view is ErrCollectionExists.
 		if err = c.db.renameCollection(tx, oldName, newName); err != nil {
 			return err
 		}
@@ -1476,153 +1324,61 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 		// feed multikeyKey: a post-rename fan-out write would then flag the
 		// WRONG record, and a later rename back would clobber the real one —
 		// re-enabling tight seeks over an index holding arrays (dropped
-		// docs). Published copy-on-write: readers access idx.ns lock-free.
-		prevIdxs := c.loadIndexes()
-		next := make([]*index, len(prevIdxs))
-		for i, idx := range prevIdxs {
+		// docs). Clones: readers access idx.ns lock-free through the
+		// committed version.
+		next := s.clone()
+		next.indexes = make([]*index, len(s.indexes))
+		for i, idx := range s.indexes {
 			nsName := indexNsName(newName, idx.info.Name)
 			ns, nsErr := tx.GetNamespace(nsName)
 			if nsErr != nil {
 				if errors.Is(nsErr, btree.ErrNamespaceNotFound) {
 					// Legacy-broken index (pre-fix rename victim): the sweep
 					// tolerated it; keep the old handle.
-					next[i] = idx
+					next.indexes[i] = idx
 					continue
 				}
 				return nsErr
 			}
-			next[i] = idx.cloneWithNs(ns, nsName, indexKey(newName, idx.info.Name))
+			next.indexes[i] = idx.cloneWithNs(ns, nsName, indexKey(newName, idx.info.Name))
 		}
-		c.storeIndexes(next)
-
-		c.name = newName
-		c.db.renaming = append(c.db.renaming, c)
-
-		// The handle registry is re-keyed only at COMMIT (see commonTx.pubs):
-		// re-keying here would open a window where a concurrent
-		// OpenCollection(oldName) misses the map, passes the catalog check on
-		// the still-committed old snapshot, and registers a duplicate live
-		// handle the in-process staleness pass never invalidates (own commits
-		// update localSchemaCookie). Until commit, OpenCollection(oldName)
-		// keeps returning this handle — correct for the committed state — and
-		// the staleness pass skips this collection while its registered name
-		// and c.name disagree (see reconcileIndexSet).
-		// Deliberately untouched: c.ns and the fts/vector-internal namespace
-		// handles — root pages are unchanged and nothing derives keys from
-		// their stale internal names; fts pending buffers flush at commit
-		// through those handles into the renamed namespaces.
-		renameValidFrom := tx.DiskSchemaCookie() + 1
-		wtx.onCommitPublish(func() {
-			// The registry key flips to the new name, which resolves only in
-			// snapshots at or past this commit: raise the handle's visibility
-			// bound so an older-snapshot staleness pass skips it instead of
-			// invalidating a just-renamed live handle (keyNotFound on the new
-			// name). See reconcileIndexSet.
-			c.validFromCookie.Store(renameValidFrom)
-			c.db.renameResolved(c)
-			// The key flips to the name the handle commits with, not to
-			// newName: after a further rename in this tx newName is an
-			// intermediate name, free for a collection created since, and
-			// that collection's handle holds the entry.
-			c.mu.Lock()
-			committed := c.name
-			c.mu.Unlock()
-			c.db.mu.Lock()
-			if cur, ok := c.db.openedCollections[oldName]; ok && cur == Collection(c) {
-				delete(c.db.openedCollections, oldName)
-				// A Rename→Drop in the same tx closed and evicted the handle
-				// already; don't resurrect it under the new name.
-				if !c.closed.Load() {
-					// An open of the new name between the btree commit and
-					// this publication missed the registry and registered a
-					// handle of its own. Displaced it would stay live outside
-					// the registry: retire it.
-					if other, ok := c.db.openedCollections[committed]; ok && other != Collection(c) {
-						other.(*collection).closed.Store(true)
-					}
-					c.db.openedCollections[committed] = c
-				}
-			}
-			c.db.mu.Unlock()
-		})
-
-		// A rollback restores the old catalog and namespaces; the in-memory
-		// name and index generation must follow (the map was never touched —
-		// the commit publication above is dropped unrun). Post-rename writes
-		// in this tx mutated the sketches SHARED with the restored snapshot
-		// through the clones: propagate their modified flags so the next tx
-		// begin rebases the restored sketches to committed bytes.
-		wtx.onRollbackUndo(func() {
-			c.db.renameResolved(c)
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			c.name = oldName
-			for i, idx := range prevIdxs {
-				if next[i] != idx && next[i].sketchModified {
-					idx.markSketchModified()
-				}
-			}
-			c.storeIndexes(prevIdxs)
-		})
+		// The data namespace handle is rebound with the rest: a version is
+		// what one view has under one name. Deliberately untouched: the
+		// fts/vector-internal namespace handles — root pages are unchanged
+		// and nothing derives keys from their stale internal names; fts
+		// pending buffers flush at commit through those handles into the
+		// renamed namespaces.
+		if next.ns, err = tx.GetNamespace(newName); err != nil {
+			return err
+		}
+		next.name = newName
+		next.names = s.renamed(newName, tx.DiskSchemaCookie()+1)
+		// The registry is re-keyed at the commit (settleLog). Until then
+		// OpenCollection(oldName) keeps returning this handle, which is right
+		// for the committed state; inside this transaction the old name is
+		// gone and the new one finds the handle through the log.
+		c.logVersion(wtx, s, next)
 		return nil
 	})
 }
 
-// Drop closes the handle at execution time (same-tx semantics: later ops
-// through any alias fail ErrCollectionClosed) but defers the eviction from
-// db.openedCollections to COMMIT (see commonTx.pubs). Evicting at execution —
-// what Close() does — opens a corruption window: a concurrent
-// OpenCollection(name) misses the map, passes the catalog check on the
-// still-committed snapshot, and registers a fresh live handle the in-process
-// staleness pass never invalidates (own commits update localSchemaCookie);
-// once the drop commits and a new collection reuses the freed root pages,
-// writes through that handle land inside the wrong collection. Deferring the
-// eviction keeps the closed handle registered through the window, so a
-// concurrent open returns it and fails fail-safe instead. A rollback un-closes
-// the handle: the btree restored the on-disk catalog, the map entry is the
-// handle again (a same-tx recreate that replaced it put it back in its own
-// undo), and Drop mutates no in-memory index set — so the handle is whole
-// again.
+// Drop deletes the collection in the write transaction. The handle keeps
+// serving the committed state to every other transaction until the commit
+// closes it (txSchema.install) and takes it out of the registry
+// (settleLog); the dropping transaction's own later operations through it
+// fail with ErrCollectionClosed. A rollback leaves the handle as it was.
 func (c *collection) Drop(ctx context.Context) error {
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if err = c.beginDDL(wtx); err != nil {
+		s, err := c.beginDDL(wtx)
+		if err != nil {
 			return err
 		}
 		// Discard buffered fts writes: Drop deletes the fts namespaces in this
 		// same tx — flushing a surviving buffer at commit would write into
 		// dropped namespaces and fail the whole transaction.
-		for _, fx := range c.loadFtsIndexes() {
+		for _, fx := range s.ftsIndexes {
 			fx.pending.reset()
 		}
-		// CAS, not Store: the undo reverts only the flip this Drop made.
-		if c.closed.CompareAndSwap(false, true) {
-			wtx.onRollbackUndo(func() {
-				// A Close() requested meanwhile stays pending: ddlEnd applies
-				// it once the handle's last schema change resolves.
-				// Un-close only while registered: a handle outside the
-				// registry would dangle past future peer DDL (the staleness
-				// pass only walks the registry).
-				c.db.mu.Lock()
-				for _, cur := range c.db.openedCollections {
-					if cur == Collection(c) {
-						c.closed.Store(false)
-						break
-					}
-				}
-				c.db.mu.Unlock()
-			})
-		}
-		// The eviction is an identity scan: a Rename earlier in this tx
-		// re-keys the entry in its own, earlier publication and declines to
-		// resurrect a closed handle; a same-tx recreate replaced it, making
-		// this a no-op.
-		wtx.onCommitPublish(func() {
-			c.db.mu.Lock()
-			c.db.evictLocked(c)
-			c.db.mu.Unlock()
-		})
 		// Delete all index namespaces. Enumerate indexes from the SAME on-disk
 		// source (idx:<coll>: metadata keys) that removeCollection deletes,
 		// rather than the in-memory index set which can lag the on-disk metadata
@@ -1631,22 +1387,22 @@ func (c *collection) Drop(ctx context.Context) error {
 		// namespace-delete set and the metadata-delete set identical within the
 		// single atomic Drop tx, so Drop can never leave an orphaned index
 		// namespace. Enumerate BEFORE removeCollection deletes the idx: keys.
-		idxInfos, err := c.db.getIndexInfos(&tx.ReadTx, c.name)
+		idxInfos, err := c.db.getIndexInfos(&tx.ReadTx, s.name)
 		if err != nil {
 			return err
 		}
 		for _, info := range idxInfos {
 			if info.Kind == IndexKindVector {
-				if err = dropVectorIndexNamespaces(tx, c.name, info.Name); err != nil {
+				if err = dropVectorIndexNamespaces(tx, s.name, info.Name); err != nil {
 					return
 				}
 				continue
 			}
 			var nsNames []string
 			if isFulltext(info) {
-				nsNames = ftsIndexNames(c.name, info.Name)
+				nsNames = ftsIndexNames(s.name, info.Name)
 			} else {
-				nsNames = []string{indexNsName(c.name, info.Name)}
+				nsNames = []string{indexNsName(s.name, info.Name)}
 			}
 			for _, nsName := range nsNames {
 				if err = tx.DeleteNamespace(nsName); err != nil {
@@ -1656,15 +1412,16 @@ func (c *collection) Drop(ctx context.Context) error {
 				}
 			}
 		}
-		if err = c.db.removeCollection(tx, c.name); err != nil {
+		if err = c.db.removeCollection(tx, s.name); err != nil {
 			return
 		}
 		// Delete the collection namespace
-		if err = tx.DeleteNamespace(c.name); err != nil {
+		if err = tx.DeleteNamespace(s.name); err != nil {
 			if !errors.Is(err, btree.ErrNamespaceNotFound) {
 				return
 			}
 		}
+		c.logDrop(wtx, s)
 		return nil
 	})
 }
@@ -1682,14 +1439,14 @@ func (c *collection) Close() error {
 }
 
 // close evicts the handle from the registry and fails its later operations.
-// While the handle carries an uncommitted schema change (see ddlTxs) the
-// close waits until the last of them is committed or rolled back, and the
-// handle stays usable until then — unless force: the database is closing and
-// no transaction will end.
+// While the open write transaction's schema log references the handle (see
+// pinned) the close waits until that transaction commits or rolls back, and
+// the handle stays usable until then — unless force: the database is
+// closing and no transaction will end.
 func (c *collection) close(force bool) error {
 	c.db.mu.Lock()
 	defer c.db.mu.Unlock()
-	if c.ddlTxs > 0 && !force {
+	if c.pinned > 0 && !force {
 		c.closePending.Store(true)
 		return nil
 	}
@@ -1699,54 +1456,45 @@ func (c *collection) close(force bool) error {
 	return nil
 }
 
-// beginDDL rejects a handle that is no longer live and marks a live one as
-// carrying an uncommitted schema change of wtx (see ddlTxs) until that scope
-// commits or rolls back. Check and mark share db.mu with close, so a Close()
-// cannot evict the handle between them. A verb that then changes nothing
-// keeps the mark all the same; it only delays a Close().
-func (c *collection) beginDDL(wtx WriteTx) error {
-	c.db.mu.Lock()
-	if err := c.alive(); err != nil {
-		c.db.mu.Unlock()
-		return err
+// beginDDL returns the version a schema change of wtx starts from — the
+// write transaction's own (resolve: its earlier changes through the handle,
+// else the head brought to its view) — and pins the handle in the log until
+// the transaction ends (logPin), so a Close() cannot take it out of the
+// registry under the change. A verb that then changes nothing leaves the
+// pin all the same; it only delays a Close().
+func (c *collection) beginDDL(wtx WriteTx) (*collSchema, error) {
+	s, err := c.resolve(wtx.btreeReadTx())
+	if err != nil {
+		return nil, err
 	}
-	c.ddlTxs++
-	c.db.mu.Unlock()
-	c.registerDDLEnd(wtx)
-	return nil
-}
-
-// registerDDLEnd releases one ddlTxs mark when the scope of wtx resolves:
-// exactly one of the two callbacks runs per outcome. Registered before the
-// verb's own callbacks, so on a rollback it runs after the verb's undo has
-// restored the handle.
-func (c *collection) registerDDLEnd(wtx WriteTx) {
-	wtx.onRollbackUndo(func() { c.db.ddlEnd(c) })
-	wtx.onCommitPublish(func() { c.db.ddlEnd(c) })
+	if err = c.logPin(wtx); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // alive rejects operations on a handle that is no longer live: explicitly
-// closed, dropped, or invalidated because another process renamed or dropped
-// the collection. Checked INSIDE the operation's transaction scope (not at
-// entry) so it runs after the tx-begin staleness pass that performs the
-// invalidation — an op that raced the invalidation still fails before
-// touching the tree.
+// closed, dropped, or retired because another process renamed or dropped the
+// collection (see retire). Operations check it INSIDE their transaction
+// scope, through resolve, which is also what retires a handle.
 func (c *collection) alive() error {
+	if c.db.closed.Load() {
+		// Every handle, the ones a closing write transaction created and
+		// never registered included.
+		return ErrDBIsClosed
+	}
 	if c.closed.Load() {
-		if c.db.closed.Load() {
-			return ErrDBIsClosed
-		}
 		return ErrCollectionClosed
 	}
 	return nil
 }
 
 // buildIndex populates index entries from all existing documents in the collection.
-func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
+func (c *collection) buildIndex(tx *btree.WriteTx, s *collSchema, idx *index) error {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	cursor := tx.NewCursor(c.ns)
+	cursor := tx.NewCursor(s.ns)
 	defer cursor.Close()
 	if err := cursor.First(); err != nil {
 		return err
@@ -1777,14 +1525,14 @@ func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
 
 // loadSketchAtOpen populates a brand-new (not-yet-reader-visible) index's live
 // sketch from the _system namespace and publishes it as the reader snapshot.
-// Called from init, createIndex, and reconcile's rebuild arm — in every case the
-// index is not yet in c.indexes, so filling live in place and publishing it is
-// unobservable to readers (no copy-on-write ceremony needed).
-func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, idx *index) {
+// Called from the loader and createIndex — in both the index is not yet in a
+// published set, so filling live in place and publishing it is unobservable
+// to readers (no copy-on-write ceremony needed).
+func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, collName string, idx *index) {
 	if idx.sketch == nil {
 		idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
 	}
-	key := sketchKey(c.name, idx.info.Name)
+	key := sketchKey(collName, idx.info.Name)
 	if data, err := tx.AppendValue(c.db.systemNS, key, nil); err == nil {
 		idx.sketch.UnmarshalBinary(data)
 	}
@@ -1793,8 +1541,34 @@ func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, idx *index) {
 	idx.storePubSketch(idx.sketch)
 }
 
+// refreshSketches reloads the sketches of the version s, resolved for tx, if
+// another process committed since they were last loaded (db.sketchEpoch).
+// Called where sketches are used: a reader's plan, and a writer's first
+// operation on the collection, before its own deltas go on top. A reader at
+// a snapshot older than the newest this process has consumed loads nothing:
+// what it would publish is older than what is published.
+func (c *collection) refreshSketches(tx *btree.ReadTx, s *collSchema) {
+	epoch := c.db.sketchEpoch.Load()
+	if c.sketchSeen.Load() == epoch {
+		return
+	}
+	writable := tx.IsWriteTx()
+	if fcc, _ := c.db.btreeDB.LocalCounters(); !writable && !cookieLE(fcc, tx.SnapshotFileChangeCounter()) {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sketchSeen.Load() == epoch {
+		return
+	}
+	for _, idx := range s.indexes {
+		c.reloadSketch(tx, s.name, idx, writable)
+	}
+	c.sketchSeen.Store(epoch)
+}
+
 // reloadSketch refreshes one already-published index's sketch from the _system
-// namespace during the advisory staleness tier (checkStale -> reloadSketches).
+// namespace (refreshSketches, and the rebase of resetUncommittedSketches).
 // It is the sqlite_stat1 reload analog and is advisory/fail-soft: a missing key
 // or decode error leaves current state intact and never aborts the transaction.
 //
@@ -1814,8 +1588,8 @@ func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, idx *index) {
 //	  live object (initially, and again after each commit republishes it).
 //	  The writer's live object is untouched; its in-flight increments can
 //	  never be lost.
-func (c *collection) reloadSketch(tx *btree.ReadTx, idx *index, writable bool) {
-	key := sketchKey(c.name, idx.info.Name)
+func (c *collection) reloadSketch(tx *btree.ReadTx, collName string, idx *index, writable bool) {
+	key := sketchKey(collName, idx.info.Name)
 	data, err := tx.AppendValue(c.db.systemNS, key, c.sketchReadBuf[:0])
 	if err != nil {
 		return // no persisted bytes: preserve current state (advisory)
@@ -1847,152 +1621,6 @@ func (c *collection) reloadSketch(tx *btree.ReadTx, idx *index, writable bool) {
 	idx.storePubSketch(pub)
 }
 
-// reconcileIndexes rebuilds the collection's index set from on-disk metadata
-// after a peer committed DDL (detected via the schema cookie in checkStale). It
-// is the any-store analog of SQLite's sqlite3InitOne: the authoritative source
-// is the persisted metadata, and the in-memory set is brought into agreement
-// with it — never the other way round.
-//
-// An existing in-memory *index is REUSED (preserving its loaded sketch) only
-// when its persisted definition is byte-for-byte unchanged AND its namespace
-// root page still matches disk. The root-page check is essential: a peer
-// drop+recreate of an index reuses the same name-keyed metadata slot but
-// allocates a FRESH btree root, so the cached *index (whose idx.ns/cboInfo.Ns
-// still address the freed old root) must be discarded and rebuilt — otherwise a
-// long-lived handle would read or write the wrong/old namespace and return
-// wrong results or corrupt the recreated index.
-//
-// Indexes present in memory but absent on disk are dropped. Indexes present on
-// disk but not yet in memory are built fresh. The new set is published
-// copy-on-write so lock-free query readers see a complete generation.
-//
-// Errors resolving an individual index's namespace (e.g. a transient view where
-// the metadata is visible but the namespace page is not) cause that index to be
-// skipped for this reconcile rather than aborting the transaction; the next
-// schema-stale tx will retry. The whole operation is best-effort and never
-// surfaces an error to the caller — a failed reconcile must not break an
-// otherwise valid read/write transaction.
-func (c *collection) reconcileIndexes(tx *btree.ReadTx) (complete bool) {
-	infos, err := c.db.getIndexInfos(tx, c.name)
-	if err != nil {
-		return false
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.indexSetDDLTxs > 0 {
-		// A local write tx has uncommitted index DDL published in these sets.
-		// While that writer holds the cross-process write lock the cookie
-		// bump this pass reacts to predates its begin, and its own begin-time
-		// checkStale reconciled it; rebuilding here from this tx's OLDER
-		// snapshot would evict the writer's uncommitted indexes (its same-tx
-		// inserts would silently stop being indexed, and buffered fts
-		// postings would never flush). Skip, consuming nothing: a peer's
-		// bump between the writer's btree commit and its commit publication
-		// waits for the next begin — the same argument as the
-		// renameInFlight guard in reconcileIndexSet.
-		return false
-	}
-
-	snapSC := tx.SnapshotSchemaCookie()
-	if !tx.IsWriteTx() && snapSC < c.indexSetCookie {
-		// Publication ratchet (see the field): the published sets are newer
-		// than this pass's snapshot — republishing from the older catalog
-		// would resurrect dropped indexes or evict fresher ones. Skip; a
-		// fresher begin reconciles, and the sets already cover this snapshot.
-		return true
-	}
-	c.indexSetCookie = snapSC
-
-	cur := c.loadIndexes()
-	byName := make(map[string]*index, len(cur))
-	for _, idx := range cur {
-		byName[idx.info.Name] = idx
-	}
-
-	// Reconcile vector and full-text indexes separately (different
-	// namespaces / types). Full-text infos must not fall through to the
-	// range loop below: they have no ix: namespace, so they would silently
-	// fail resolution there and the ftsIndexes snapshot would never track a
-	// peer's full-text DDL — leaving a stale handle that flushes postings
-	// into freed-and-reused ftx: pages, or never adopting a peer's index.
-	c.reconcileVectorIndexesLocked(tx, infos)
-	c.reconcileFtsIndexesLocked(tx, infos)
-
-	rangeInfos := infos[:0:0]
-	for _, info := range infos {
-		if info.Kind != IndexKindVector && !isFulltext(info) {
-			rangeInfos = append(rangeInfos, info)
-		}
-	}
-	infos = rangeInfos
-
-	rebuilt := make([]*index, 0, len(infos))
-	changed := len(infos) != len(cur)
-	for _, info := range infos {
-		nsName := indexNsName(c.name, info.Name)
-		ns, nsErr := tx.GetNamespace(nsName)
-		if nsErr != nil {
-			// Namespace not resolvable in this snapshot: keep the existing
-			// in-memory index if we have one (so we don't lose a working index
-			// over a transient view), otherwise skip it this round.
-			if existing, ok := byName[info.Name]; ok {
-				rebuilt = append(rebuilt, existing)
-			} else {
-				changed = true
-			}
-			continue
-		}
-		format, fErr := c.db.readIndexFormat(tx, c.name, info.Name)
-		if fErr != nil {
-			if existing, ok := byName[info.Name]; ok {
-				rebuilt = append(rebuilt, existing)
-			} else {
-				changed = true
-			}
-			continue
-		}
-		if existing, ok := byName[info.Name]; ok &&
-			indexInfoEqual(existing.info, info) && existing.format == format &&
-			existing.ns != nil && existing.ns.RootPage() == ns.RootPage() {
-			// Unchanged: reuse the live object (and its loaded sketch).
-			rebuilt = append(rebuilt, existing)
-			continue
-		}
-		// Added or changed (definition differs, root moved via
-		// drop+recreate, or a peer rebuilt it for a newer format): build a
-		// fresh index bound to the current namespace.
-		idx, idxErr := newIndex(c, info, ns)
-		if idxErr != nil {
-			// Malformed definition on disk: keep any existing object rather than
-			// dropping a working index over a parse error.
-			if existing, ok := byName[info.Name]; ok {
-				rebuilt = append(rebuilt, existing)
-			}
-			continue
-		}
-		// Reconcile runs at tx begin (checkStale), before any of this tx's
-		// writes: the adopted state is committed as of this snapshot, so the
-		// SNAPSHOT cookie is the exact visibility bound (the raised one can
-		// exceed it) — an older concurrent reader resolves per-snapshot in
-		// visibleTo and correctly skips a peer index its snapshot predates.
-		idx.validFromCookie = tx.SnapshotSchemaCookie()
-		idx.format = format
-		idx.outdated = indexFormatOutdated(format, info)
-		c.loadSketchAtOpen(tx, idx)
-		rebuilt = append(rebuilt, idx)
-		changed = true
-	}
-
-	if !changed {
-		// Fast path: same set, same definitions, same roots — nothing to publish.
-		return true
-	}
-	c.storeIndexes(rebuilt)
-	return true
-}
-
 // indexInfoEqual reports whether two IndexInfo values describe the same index
 // definition: same name, same fields (order significant), same unique and
 // sparse flags.
@@ -2017,11 +1645,12 @@ func indexInfoEqual(a, b IndexInfo) bool {
 // Store of the writer's own live object — no clone: the writer will not mutate
 // live again until its next write tx, and a reader that loads it sees an
 // advisory, atomically-fielded snapshot. Runs inside Commit before pager.commit,
-// so the bytes are atomic with the file-change counter / schema cookie.
-func (c *collection) persistSketches(tx *btree.WriteTx) error {
-	for _, idx := range c.loadIndexes() {
+// so the bytes are atomic with the file-change counter / schema cookie. s is
+// the writer's version (collection.inTx).
+func (c *collection) persistSketches(tx *btree.WriteTx, s *collSchema) error {
+	for _, idx := range s.indexes {
 		if idx.sketchModified {
-			key := sketchKey(c.name, idx.info.Name)
+			key := sketchKey(s.name, idx.info.Name)
 			idx.sketchBuf = idx.sketch.MarshalBinary(idx.sketchBuf)
 			if err := tx.Put(c.db.systemNS, key, idx.sketchBuf); err != nil {
 				return err

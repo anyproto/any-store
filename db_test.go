@@ -1368,7 +1368,7 @@ func TestReconcile_ReadTxSparesCreateInFlightHandle(t *testing.T) {
 	// Emulate an unconsumed cookie bump: the state a reader captures when its
 	// beginRead races a commit (snapshot fields baked before the writer's
 	// counter store lands) or when a peer process committed DDL.
-	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	modelPeerSchemaChange(dbi, fcc, sc)
 
 	// Any read op now begins a read tx that sees IsSchemaStale and runs
 	// reconcileIndexSet against a snapshot that predates the create.
@@ -1400,7 +1400,7 @@ func TestReconcile_ReadTxSparesFreshlyCommittedHandle(t *testing.T) {
 	require.NoError(t, rtx.Rollback())
 
 	// Stale verdict baked at begin; snapshot predates the create below.
-	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	modelPeerSchemaChange(dbi, fcc, sc)
 	reader, err := dbi.btreeDB.BeginRead()
 	require.NoError(t, err)
 	require.True(t, reader.IsSchemaStale())
@@ -1409,7 +1409,7 @@ func TestReconcile_ReadTxSparesFreshlyCommittedHandle(t *testing.T) {
 	require.NoError(t, err)
 	// The create stands in for a peer's commit, which leaves the local
 	// counters behind (TestCheckStale_ConsumesOnlySnapshotCounters).
-	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	modelPeerSchemaChange(dbi, fcc, sc)
 
 	// The reader resumes exactly where db.ReadTx would: checkStale on its own
 	// pre-create snapshot.
@@ -1438,14 +1438,14 @@ func TestReconcile_ReadTxSparesFreshlyRenamedHandle(t *testing.T) {
 	require.NoError(t, rtx.Rollback())
 
 	// Stale verdict baked at begin; snapshot predates the rename below.
-	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	modelPeerSchemaChange(dbi, fcc, sc)
 	reader, err := dbi.btreeDB.BeginRead()
 	require.NoError(t, err)
 	require.True(t, reader.IsSchemaStale())
 
 	require.NoError(t, coll.Rename(ctx, "after"))
 	// The rename stands in for a peer's commit (see above).
-	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	modelPeerSchemaChange(dbi, fcc, sc)
 
 	dbi.checkStale(reader)
 	require.NoError(t, reader.Rollback())
@@ -1475,7 +1475,7 @@ func TestCheckStale_ConsumesOnlySnapshotCounters(t *testing.T) {
 	// Stale verdict baked at begin; snapshot predates the DDL below.
 	// Assertions run after each tx is released so a failure cannot leave a
 	// reader open (Close would block in the fixture cleanup).
-	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	modelPeerSchemaChange(dbi, fcc, sc)
 	reader, err := dbi.btreeDB.BeginRead()
 	require.NoError(t, err)
 	readerStale := reader.IsSchemaStale()
@@ -1485,7 +1485,7 @@ func TestCheckStale_ConsumesOnlySnapshotCounters(t *testing.T) {
 	// The create stands in for a peer's commit, which leaves the local
 	// counters behind (an own commit records them, and the pass then has
 	// nothing to do: TestCheckStale_OwnCommitDuringBeginSkipsReload).
-	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	modelPeerSchemaChange(dbi, fcc, sc)
 
 	// The pass runs with a snapshot that lacks the create: it must neither
 	// invalidate the new handle nor consume the create's cookie bump.
@@ -1539,11 +1539,14 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 	rewindLocalCounters := func() {
 		dbi.btreeDB.UpdateLocalCounters(fcc-1, sc)
 	}
+	// stalePass is a reader that notices the peer's commit at its begin and
+	// then plans with the collection.
 	stalePass := func() {
 		reader, err := dbi.btreeDB.BeginRead()
 		require.NoError(t, err)
 		stale := reader.IsDataStale()
 		dbi.checkStale(reader)
+		c.refreshSketches(reader, c.cur())
 		require.NoError(t, reader.Rollback())
 		require.True(t, stale)
 	}
@@ -1554,6 +1557,7 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 	stale := reader.IsDataStale()
 	insertErr := coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":2}`))
 	dbi.checkStale(reader)
+	c.refreshSketches(reader, c.cur())
 	require.NoError(t, reader.Rollback())
 	require.NoError(t, insertErr)
 	require.True(t, stale)
@@ -1609,58 +1613,98 @@ func rawPut(t *testing.T, dbi *db, key, val []byte) {
 	require.NoError(t, wtx.Commit())
 }
 
-// A pass that cannot reconcile a collection — a local DDL tx has
-// uncommitted publications in its sets, or a local rename is between its
-// name flip and its commit — leaves the local counters where they were, so
-// the next begin is stale again and reconciles once the writer is done.
-func TestCheckStale_SkippedCollectionConsumesNothing(t *testing.T) {
+// A commit of another process is noticed at a begin without a read per open
+// collection: a collection's sketches are reloaded when it is next planned
+// with, or written to.
+func TestCheckStale_SketchesReloadOnUse(t *testing.T) {
 	skipIfInMemory(t, "staleness counters model cross-process commits; not applicable in-memory")
 	fx := newFixture(t)
 	dbi := fx.DB.(*db)
+	open := func(name string) (Collection, *index) {
+		coll, err := fx.CreateCollection(ctx, name)
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
+		return coll, coll.(*collection).loadIndexes()[0]
+	}
+	used, usedIdx := open("used")
+	written, writtenIdx := open("written")
+	_, idleIdx := open("idle")
+
+	// The other process: new sketch bytes for all three, and a commit this
+	// process has not counted.
+	peer := qplanner.NewIndexSketch(qplanner.DefaultSketchSize, 1)
+	for range 42 {
+		peer.IncrementDocCount()
+	}
+	for _, name := range []string{"used", "written", "idle"} {
+		rawPut(t, dbi, sketchKey(name, usedIdx.info.Name), peer.MarshalBinary(nil))
+	}
+	rtx, err := dbi.btreeDB.BeginRead()
+	require.NoError(t, err)
+	fcc, sc := rtx.DiskFileChangeCounter(), rtx.DiskSchemaCookie()
+	require.NoError(t, rtx.Rollback())
+	dbi.btreeDB.UpdateLocalCounters(fcc-1, sc)
+
+	n, err := used.Find(`{"a":1}`).Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	assert.Equal(t, uint64(42), usedIdx.loadPubSketch().GetDocCount(), "planned with: reloaded")
+	assert.Equal(t, uint64(1), writtenIdx.loadPubSketch().GetDocCount(), "not used yet")
+	assert.Equal(t, uint64(1), idleIdx.loadPubSketch().GetDocCount(), "not used yet")
+
+	// A write catches up before it adds its own.
+	require.NoError(t, written.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":2}`)))
+	assert.Equal(t, uint64(43), writtenIdx.loadPubSketch().GetDocCount())
+	assert.Equal(t, uint64(1), idleIdx.loadPubSketch().GetDocCount())
+}
+
+// Another process's schema change noticed while a local tx has uncommitted
+// DDL on a collection — index DDL, or a rename — is verified against the
+// committed head, which is what the readers of that moment work with; the
+// writer's version is in its log until the commit installs it, proven for
+// the generation the writer is in.
+func TestPeerSchemaChange_VerifiedAfterLocalDDL(t *testing.T) {
+	skipIfInMemory(t, "staleness counters model cross-process commits; not applicable in-memory")
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	other, err := fx.CreateCollection(ctx, "other")
+	require.NoError(t, err)
 	coll, err := fx.CreateCollection(ctx, "c")
 	require.NoError(t, err)
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
+	c := coll.(*collection)
+	verified := func() bool { return c.cur().gen.Load() == dbi.epoch.Load().gen }
+	require.True(t, verified())
 
-	counters := func() (uint32, uint32) {
-		rtx, err := dbi.btreeDB.BeginRead()
+	for name, ddl := range map[string]func(wtx WriteTx) error{
+		"index":  func(wtx WriteTx) error { return coll.EnsureIndex(wtx.Context(), IndexInfo{Fields: []string{"a"}}) },
+		"rename": func(wtx WriteTx) error { return coll.Rename(wtx.Context(), "d") },
+	} {
+		committed := c.cur()
+		wtx, err := fx.WriteTx(ctx)
 		require.NoError(t, err)
-		fcc, sc := rtx.DiskFileChangeCounter(), rtx.DiskSchemaCookie()
-		require.NoError(t, rtx.Rollback())
-		return fcc, sc
+		require.NoError(t, ddl(wtx), name)
+		inFlight, err := c.resolve(wtx.btreeReadTx())
+		require.NoError(t, err, name)
+		require.True(t, committed == c.cur(), "%s: the writer's version is its own until the commit", name)
+
+		peerSchemaChangeNow(t, dbi)
+		_, err = other.Count(ctx)
+		require.NoError(t, err, name)
+		n, err := coll.Count(ctx)
+		require.NoError(t, err, name)
+		assert.Equal(t, 1, n, name)
+		assert.True(t, committed == c.cur(), "%s: a reader replaced the committed head", name)
+		assert.True(t, verified(), "%s: the reader verified the committed head", name)
+
+		require.NoError(t, wtx.Commit(), name)
+		assert.True(t, inFlight == c.cur(), "%s: the commit installed the writer's version", name)
+		assert.True(t, verified(), "%s: installed for the writer's generation", name)
+		n, err = coll.Find(`{"a":1}`).Count(ctx)
+		require.NoError(t, err, name)
+		assert.Equal(t, 1, n, name)
 	}
-	// stalePass models a peer's DDL by winding the local cookie back, runs
-	// a reader's pass and returns the local cookie it left.
-	stalePass := func() uint32 {
-		fcc, sc := counters()
-		dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
-		reader, err := dbi.btreeDB.BeginRead()
-		require.NoError(t, err)
-		stale := reader.IsSchemaStale()
-		dbi.checkStale(reader)
-		require.NoError(t, reader.Rollback())
-		require.True(t, stale)
-		_, localSC := dbi.btreeDB.LocalCounters()
-		return localSC
-	}
-
-	_, sc := counters()
-	assert.Equal(t, sc, stalePass(), "a complete pass consumes its snapshot")
-
-	wtx, err := fx.WriteTx(ctx)
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(wtx.Context(), IndexInfo{Fields: []string{"a"}}))
-	assert.Equal(t, sc-1, stalePass(), "a pass skipping a collection under local DDL consumed")
-	require.NoError(t, wtx.Commit())
-	_, sc = counters()
-	assert.Equal(t, sc, stalePass())
-
-	wtx, err = fx.WriteTx(ctx)
-	require.NoError(t, err)
-	require.NoError(t, coll.Rename(wtx.Context(), "d"))
-	assert.Equal(t, sc-1, stalePass(), "a pass skipping a renaming collection consumed")
-	require.NoError(t, wtx.Commit())
-	_, sc = counters()
-	assert.Equal(t, sc, stalePass())
 }
 
 // Reloads decode into the published sketch while planners read it: run
@@ -1752,13 +1796,13 @@ func TestReconcileRatchet_NoResurrectionAfterDrop(t *testing.T) {
 	require.NoError(t, err)
 	fcc, sc := rtx.DiskFileChangeCounter(), rtx.DiskSchemaCookie()
 	require.NoError(t, rtx.Rollback())
-	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	modelPeerSchemaChange(dbi, fcc, sc)
 	reader, err := dbi.btreeDB.BeginRead()
 	require.NoError(t, err)
 
 	require.NoError(t, coll.DropIndex(ctx, "a"))
 	// The drop stands in for a peer's commit (TestCheckStale_ConsumesOnlySnapshotCounters).
-	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	modelPeerSchemaChange(dbi, fcc, sc)
 
 	dbi.checkStale(reader)
 	require.NoError(t, reader.Rollback())
@@ -1780,13 +1824,13 @@ func TestReconcileRatchet_NoEvictionAfterCreate(t *testing.T) {
 	require.NoError(t, err)
 	fcc, sc := rtx.DiskFileChangeCounter(), rtx.DiskSchemaCookie()
 	require.NoError(t, rtx.Rollback())
-	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	modelPeerSchemaChange(dbi, fcc, sc)
 	reader, err := dbi.btreeDB.BeginRead()
 	require.NoError(t, err)
 
 	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
 	// The create stands in for a peer's commit (see above).
-	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	modelPeerSchemaChange(dbi, fcc, sc)
 
 	dbi.checkStale(reader)
 	require.NoError(t, reader.Rollback())
@@ -1797,13 +1841,13 @@ func TestReconcileRatchet_NoEvictionAfterCreate(t *testing.T) {
 	require.NoError(t, coll.DropIndex(ctx, "a"))
 }
 
-// A rolled-back DDL tx must leave the ratchet where it was: the bump happens
-// only in the commit publication, which a rollback drops. A moved ratchet
-// would make later same-cookie staleness passes skip reconciles for state
+// A rolled-back DDL tx must leave the head exactly as it was: the same
+// version, proven for the same range. One stamped for a cookie that never
+// came would be trusted once another commit reaches that cookie, for state
 // that never committed.
 func TestReconcileRatchet_RollbackLeavesRatchetUntouched(t *testing.T) {
 	fx, dbi, coll := ratchetFixture(t)
-	before := coll.(*collection).indexSetCookie
+	before := coll.(*collection).cur()
 
 	wtx, err := fx.WriteTx(ctx)
 	require.NoError(t, err)
@@ -1812,7 +1856,7 @@ func TestReconcileRatchet_RollbackLeavesRatchetUntouched(t *testing.T) {
 
 	cc := coll.(*collection)
 	require.Empty(t, cc.loadIndexes(), "rollback must restore the published set")
-	require.Equal(t, before, cc.indexSetCookie, "rollback must not move the ratchet")
+	require.True(t, before == cc.cur(), "rollback must restore the head it replaced")
 
 	// The unmoved ratchet must not block a genuine staleness reconcile at the
 	// unchanged cookie (peer-bump emulation), and real DDL still works.
@@ -1820,7 +1864,7 @@ func TestReconcileRatchet_RollbackLeavesRatchetUntouched(t *testing.T) {
 	require.NoError(t, err)
 	fcc, sc := rtx.DiskFileChangeCounter(), rtx.DiskSchemaCookie()
 	require.NoError(t, rtx.Rollback())
-	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	modelPeerSchemaChange(dbi, fcc, sc)
 	n, err := coll.Find(`{"a":{"$gte":0}}`).Count(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 10, n)
@@ -1846,7 +1890,7 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 	names := func(cs []*collection) []string {
 		ns := make([]string, len(cs))
 		for i, c := range cs {
-			ns[i] = c.name
+			ns[i] = c.cur().name
 		}
 		return ns
 	}
@@ -1998,7 +2042,7 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		require.NoError(t, err)
 		for i, c := range colls {
 			require.NoError(t, c.Insert(tx.Context(), doc(i)))
-			assert.Equal(t, []string{c.name}, names(dbi.ftsDirty))
+			assert.Equal(t, []string{c.cur().name}, names(dbi.ftsDirty))
 		}
 		assert.Equal(t, names(colls), names(dbi.sketchDirty))
 		require.NoError(t, tx.Commit())
@@ -2141,10 +2185,137 @@ func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 	}
 }
 
-// CreateCollection's rollback puts back the registry entry it replaced only
-// if that handle carries this tx's Drop. A closed handle found there
-// otherwise is one a staleness pass is retiring — closed already, evicted
-// next — and put back it would answer for the name for good.
+// BenchmarkRead_DuringSchemaCommits reads one collection while another
+// goroutine keeps creating and dropping others: a schema commit that does not
+// touch a collection must not slow the reads of it.
+func BenchmarkRead_DuringSchemaCommits(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "hot")
+	require.NoError(b, err)
+	require.NoError(b, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(b, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":0}`)))
+
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				done <- nil
+				return
+			default:
+			}
+			c, cErr := fx.CreateCollection(ctx, fmt.Sprintf("n%07d", i))
+			if cErr == nil {
+				cErr = c.Drop(ctx)
+			}
+			if cErr != nil {
+				done <- cErr
+				return
+			}
+		}
+	}()
+
+	b.Run("FindId", func(b *testing.B) {
+		p := &anyenc.Parser{}
+		b.ReportAllocs()
+		for range b.N {
+			_, err := coll.FindIdWithParser(ctx, p, 1)
+			require.NoError(b, err)
+		}
+	})
+	b.Run("Count", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			_, err := coll.Count(ctx)
+			require.NoError(b, err)
+		}
+	})
+	b.Run("FindByIndex", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			_, err := coll.Find(`{"a":0}`).Count(ctx)
+			require.NoError(b, err)
+		}
+	})
+	close(stop)
+	require.NoError(b, <-done)
+}
+
+// BenchmarkPeerSchemaChange_OpenCollections reads one collection right after
+// another process changed the schema, with n collections open: the cost of
+// noticing the change must not depend on n.
+func BenchmarkPeerSchemaChange_OpenCollections(b *testing.B) {
+	skipIfInMemory(b, "staleness counters model cross-process commits; not applicable in-memory")
+	for _, n := range []int{1, 1000, 20000} {
+		b.Run(fmt.Sprintf("open=%d", n), func(b *testing.B) {
+			fx := newFixture(b)
+			dbi := fx.DB.(*db)
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(b, err)
+			colls := make([]Collection, n)
+			for i := range colls {
+				colls[i], err = fx.CreateCollection(tx.Context(), fmt.Sprintf("c%05d", i))
+				require.NoError(b, err)
+				require.NoError(b, colls[i].EnsureIndex(tx.Context(), IndexInfo{Fields: []string{"a"}}))
+			}
+			coll := colls[0]
+			require.NoError(b, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1,"a":0}`)))
+			require.NoError(b, tx.Commit())
+
+			rtx, err := dbi.btreeDB.BeginRead()
+			require.NoError(b, err)
+			fcc, sc := rtx.DiskFileChangeCounter(), rtx.DiskSchemaCookie()
+			require.NoError(b, rtx.Rollback())
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				modelPeerSchemaChange(dbi, fcc, sc)
+				_, err := coll.Count(ctx)
+				require.NoError(b, err)
+			}
+		})
+	}
+}
+
+// modelPeerSchemaChange leaves the process as it is after another process
+// committed the schema change that produced the cookie sc, unnoticed so far:
+// the counter cache and the epoch are one schema commit behind.
+func modelPeerSchemaChange(d *db, fcc, sc uint32) {
+	d.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	e := d.epoch.Load()
+	d.epoch.Store(&schemaEpoch{gen: e.gen, start: min(e.start, sc-1), known: sc - 1})
+}
+
+// peerSchemaChangeNow models that the newest committed state came from
+// another process (see modelPeerSchemaChange).
+func peerSchemaChangeNow(t testing.TB, d *db) {
+	t.Helper()
+	rtx, err := d.btreeDB.BeginRead()
+	require.NoError(t, err)
+	fcc, sc := rtx.DiskFileChangeCounter(), rtx.DiskSchemaCookie()
+	require.NoError(t, rtx.Rollback())
+	modelPeerSchemaChange(d, fcc, sc)
+}
+
+// setHead replaces the head of c with a copy changed by edit, as proven as
+// the one it replaces: for tests that put a handle in a state no code path
+// leaves it in.
+func setHead(c *collection, edit func(s *collSchema)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prev := c.cur()
+	next := prev.clone()
+	edit(next)
+	next.gen.Store(prev.gen.Load())
+	c.head.Store(next)
+}
+
+// A collection created in a transaction has no registry entry until the
+// commit: a closed handle left in the slot — one being retired, closed
+// already, evicted next — is neither replaced by the create nor put back by
+// its rollback.
 func TestCreateCollectionRollback_RestoresOnlyADroppedHandle(t *testing.T) {
 	fx := newFixture(t)
 	d := fx.DB.(*db)
@@ -2165,8 +2336,80 @@ func TestCreateCollectionRollback_RestoresOnlyADroppedHandle(t *testing.T) {
 
 	tx, err := fx.WriteTx(ctx)
 	require.NoError(t, err)
-	_, err = fx.CreateCollection(tx.Context(), "x")
+	created, err := fx.CreateCollection(tx.Context(), "x")
 	require.NoError(t, err)
+	d.mu.Lock()
+	assert.True(t, d.openedCollections["x"] == retiring, "the create registers nothing before the commit")
+	d.mu.Unlock()
 	require.NoError(t, tx.Rollback())
+	d.mu.Lock()
+	assert.True(t, d.openedCollections["x"] == retiring)
+	d.mu.Unlock()
+	_, err = created.Count(ctx)
+	assert.ErrorIs(t, err, ErrCollectionClosed, "the rolled-back collection's handle is closed")
+	d.mu.Lock()
+	delete(d.openedCollections, "x")
+	d.mu.Unlock()
 	assert.False(t, registered("x"))
+}
+
+// peerRenameCollection renames the collection with a raw btree transaction
+// and rewinds the local counters: what another process's Rename leaves for
+// this one to find.
+func peerRenameCollection(t *testing.T, d *db, from, to string) {
+	t.Helper()
+	fcc, sc := d.btreeDB.LocalCounters()
+	tx, err := d.btreeDB.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, d.renameCollection(tx, from, to))
+	tx.MarkDataChanged()
+	require.NoError(t, tx.Commit())
+	d.btreeDB.UpdateLocalCounters(fcc, sc)
+}
+
+// The sketch passes of a write transaction — the rebase at its begin, the
+// persist at its commit — act only on heads verified for the present: a
+// handle whose collection another process renamed since the deltas were
+// made keeps its flags until a transaction verifies it, and no sketch row
+// is written under a name the catalog no longer has.
+func TestSketchPasses_SkipUnverifiedHead(t *testing.T) {
+	skipIfInMemory(t, "models another process's commit; not applicable in-memory")
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	a, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	require.NoError(t, a.EnsureIndex(ctx, IndexInfo{Name: "k", Fields: []string{"k"}}))
+	x, err := fx.CreateCollection(ctx, "x")
+	require.NoError(t, err)
+	require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(`{"id":1,"k":1}`)))
+
+	// Deltas left by a rollback: the head's index stays flagged and a stays
+	// listed for the next begin.
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, a.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":2,"k":2}`)))
+	require.NoError(t, wtx.Rollback())
+	idx := a.(*collection).cur().indexes[0]
+	require.True(t, idx.sketchModified)
+
+	peerRenameCollection(t, dbi, "a", "b")
+	require.NoError(t, x.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+
+	rtx, err := dbi.btreeDB.BeginRead()
+	require.NoError(t, err)
+	_, err = rtx.Get(dbi.systemNS, sketchKey("a", "k"))
+	assert.ErrorIs(t, err, btree.ErrKeyNotFound, "a sketch row written under the name the other process took away")
+	_, err = rtx.Get(dbi.systemNS, sketchKey("b", "k"))
+	assert.NoError(t, err)
+	require.NoError(t, rtx.Rollback())
+	assert.True(t, idx.sketchModified, "the deltas were dropped without a rebase")
+
+	// The handle retires on use; the collection goes on under its new name.
+	_, err = a.Count(ctx)
+	assert.ErrorIs(t, err, ErrCollectionClosed)
+	b, err := fx.OpenCollection(ctx, "b")
+	require.NoError(t, err)
+	n, err := b.Find(`{"k":1}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
 }

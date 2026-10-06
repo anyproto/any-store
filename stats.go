@@ -183,42 +183,21 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 	if err = c.alive(); err != nil {
 		return
 	}
-	c.mu.Lock()
-	name := c.name
-	indexes := append([]*index(nil), c.loadIndexes()...)
-	vindexes := append([]*vectorIndex(nil), c.loadVectorIndexes()...)
-	ftsindexes := append([]*ftsIndex(nil), c.loadFtsIndexes()...)
-	c.mu.Unlock()
-
-	stats.Name = name
 	stats.CompressionEnabled = !c.compressionDisabled()
 	pageSize := int(c.db.btreeDB.PageSize())
 
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		// Visibility gate, like the query path: a handle whose creating DDL
-		// tx has not committed resolves to nothing in this tx's snapshot —
-		// NamespaceSize on it would fail the whole Stats call. Vector handles
-		// go through forTx so a compaction window reports the committed
-		// (pre-compaction) index instead of dropping it from the report.
-		indexes = visibleIndexes(tx, indexes)
-		keptV := vindexes[:0]
-		for _, vi := range vindexes {
-			if svi, ferr := vi.forTx(tx); ferr == nil {
-				keptV = append(keptV, svi)
-			}
+		s, rErr := c.resolve(tx)
+		if rErr != nil {
+			return rErr
 		}
-		vindexes = keptV
-		keptF := ftsindexes[:0]
-		for _, fx := range ftsindexes {
-			if fx.visibleTo(tx) {
-				keptF = append(keptF, fx)
-			}
-		}
-		ftsindexes = keptF
+		stats.Name = s.name
+		c.refreshSketches(tx, s)
+		indexes, vindexes, ftsindexes := s.indexes, s.vindexes, s.ftsIndexes
 
 		// Documents: scan the collection B-tree summing stored and
 		// uncompressed value sizes.
-		cursor := tx.NewCursor(c.ns)
+		cursor := tx.NewCursor(s.ns)
 		defer cursor.Close()
 		if cErr := cursor.First(); cErr != nil {
 			return cErr
@@ -241,7 +220,7 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 		}
 
 		// Physical size of the document B-tree.
-		docSize, dErr := tx.NamespaceSize(c.ns)
+		docSize, dErr := tx.NamespaceSize(s.ns)
 		if dErr != nil {
 			return dErr
 		}

@@ -99,6 +99,7 @@ func BulkBuildParallel(wtx *btree.WriteTx, prefix string, p Params, seed int64, 
 		count: int64(n), nextLabel: uint32(n), deletedCount: 0,
 		hasEntry: n > 0, entryLabel: pb.entry, topLayer: pb.top,
 		l0Gen: uint64(n),
+		build: newBuild(),
 	}
 	var kbuf, vbuf []byte
 	var lb [4]byte
@@ -137,6 +138,7 @@ func BulkBuildParallel(wtx *btree.WriteTx, prefix string, p Params, seed int64, 
 	if err := ix.writeMeta(wtx, mt); err != nil {
 		return nil, err
 	}
+	ix.build = mt.build
 	return ix, nil
 }
 
