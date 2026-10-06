@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // A reader's snapshot counters are the ones its snapshot contains, after a
@@ -135,8 +136,9 @@ func TestBeginRead_InProcessFastPathRetriesAcrossRestart(t *testing.T) {
 			var hookErr error
 			testInProcessReadSnapshotHook = func() {
 				testInProcessReadSnapshotHook = nil
-				// The old generation fully backfilled: a restart, then a
-				// commit that ends on the same frame number.
+				// The old generation fully backfilled, its restart count
+				// read: a restart, then a commit that ends on the same
+				// frame number.
 				if hookErr = db.Checkpoint(CheckpointRestart); hookErr != nil {
 					return
 				}
@@ -408,8 +410,10 @@ func TestBeginRead_InProcessReusedSlotMarkRechecked(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer r2.Rollback()
-			if mark := idx.aReadMark[r2.walSlot].Load(); r2.walSlot != 0 && (mark == readMarkNotUsed || mark < r2.walMaxFrame) {
-				t.Fatalf("the reader holds slot %d with mark %d for a window up to %d", r2.walSlot, mark, r2.walMaxFrame)
+			// A mark below the snapshot is fine (it holds the checkpoint
+			// below the snapshot); an unused one is not.
+			if mark := idx.aReadMark[r2.walSlot].Load(); r2.walSlot != 0 && mark == readMarkNotUsed {
+				t.Fatalf("the reader holds slot %d without a mark for a window up to %d", r2.walSlot, r2.walMaxFrame)
 			}
 			_ = l.Rollback()
 			lDone = true
@@ -424,6 +428,215 @@ func TestBeginRead_InProcessReusedSlotMarkRechecked(t *testing.T) {
 			}
 			if string(b[:2]) != "b1" {
 				t.Fatalf("the reader reads z=%q, want b1: a commit past its snapshot", b[:2])
+			}
+		})
+	}
+}
+
+// inProcessFixture opens an in-process or in-memory database for the
+// read-begin tests, with a namespace of page-sized values.
+type inProcessFixture struct {
+	t  *testing.T
+	db *DB
+	ns *Namespace
+}
+
+func openInProcess(t *testing.T, mode string) *inProcessFixture {
+	opts := DefaultOptions()
+	path := filepath.Join(t.TempDir(), "db")
+	if mode == "inmemory" {
+		opts.InMemory = true
+		path = ""
+	} else {
+		opts.InProcess = true
+	}
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return &inProcessFixture{t: t, db: db}
+}
+
+func (f *inProcessFixture) put(kv ...string) {
+	w, err := f.db.BeginWrite()
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if f.ns == nil {
+		if f.ns, err = w.CreateNamespace("n"); err != nil {
+			f.t.Fatal(err)
+		}
+	}
+	for i := 0; i < len(kv); i += 2 {
+		if err = w.Put(f.ns, []byte(kv[i]), append([]byte(kv[i+1]), make([]byte, 3000)...)); err != nil {
+			f.t.Fatal(err)
+		}
+	}
+	if err = w.Commit(); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *inProcessFixture) get(r *ReadTx, k string) string {
+	v, err := r.Get(f.ns, []byte(k))
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return string(v[:2])
+}
+
+// A read begin that lands inside a WAL restart — the frame numbers zeroed,
+// the restart count not yet moved on — retries: with the old count it
+// would take the key of the generation's start snapshot for the file at
+// the generation's end, and a reader cache or counters remembered under
+// that key by a reader of the start snapshot would serve it.
+func TestBeginRead_InProcessRetriesInsideRestart(t *testing.T) {
+	for _, mode := range []string{"inprocess", "inmemory"} {
+		t.Run(mode, func(t *testing.T) {
+			f := openInProcess(t, mode)
+			db := f.db
+			for i := range 40 {
+				f.put(fmt.Sprintf("k%02d", i), "k1")
+			}
+			f.put("a", "a1", "z", "b1")
+			if err := db.Checkpoint(CheckpointRestart); err != nil {
+				t.Fatal(err)
+			}
+			// The generation's start snapshot, with a commit between its
+			// slot claim and its data-version load: its cache and counters
+			// go to the pool under its key.
+			testReadSlotClaimedHook = func() {
+				testReadSlotClaimedHook = nil
+				f.put("a", "a2", "z", "b2")
+			}
+			r1, err := db.BeginRead()
+			testReadSlotClaimedHook = nil
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := f.get(r1, "z"); got != "b1" {
+				t.Fatalf("the start snapshot reads z=%q, want b1", got)
+			}
+			_ = r1.Rollback()
+
+			// A reader beginning inside the next restart: it claims no slot
+			// until the restart is over.
+			var r2 *ReadTx
+			var r2err error
+			done := make(chan struct{})
+			testResetMidHook = func() {
+				testResetMidHook = nil
+				claimed := make(chan struct{})
+				testReadSlotClaimedHook = func() {
+					testReadSlotClaimedHook = nil
+					close(claimed)
+				}
+				go func() {
+					defer close(done)
+					r2, r2err = db.BeginRead()
+				}()
+				select {
+				case <-claimed:
+					t.Error("the reader claimed a slot inside the restart")
+				case <-time.After(50 * time.Millisecond):
+				}
+			}
+			defer func() { testResetMidHook = nil; testReadSlotClaimedHook = nil }()
+			if err := db.Checkpoint(CheckpointRestart); err != nil {
+				t.Fatal(err)
+			}
+			<-done
+			if r2err != nil {
+				t.Fatal(r2err)
+			}
+			defer r2.Rollback()
+			if a, z := f.get(r2, "a"), f.get(r2, "z"); a != "a2" || z != "b2" {
+				t.Fatalf("the reader reads a=%s z=%s: one commit wrote a2 and b2 together", a, z)
+			}
+		})
+	}
+}
+
+// A read begin whose slot-0 fast path finds read-0 held — a checkpoint
+// backfilling — goes on to the reader slots, as SQLite does, instead of
+// failing the begin with ErrBusy.
+func TestBeginRead_InProcessFastPathBusyGoesToTheSlots(t *testing.T) {
+	for _, mode := range []string{"inprocess", "inmemory"} {
+		t.Run(mode, func(t *testing.T) {
+			f := openInProcess(t, mode)
+			db := f.db
+			idx := db.pager.wal.index
+			f.put("a", "a1")
+			if err := db.Checkpoint(CheckpointPassive); err != nil {
+				t.Fatal(err)
+			}
+			testInProcessReadSnapshotHook = func() {
+				testInProcessReadSnapshotHook = nil
+				if err := idx.lock(lockRead0, lockExclusive); err != nil {
+					t.Error(err)
+				}
+			}
+			defer func() { testInProcessReadSnapshotHook = nil }()
+			r, err := db.BeginRead()
+			_ = idx.unlock(lockRead0, lockExclusive)
+			if err != nil {
+				t.Fatalf("BeginRead: %v", err)
+			}
+			defer r.Rollback()
+			if r.walSlot == 0 {
+				t.Fatal("the reader holds read-0, which was held exclusive")
+			}
+			if got := f.get(r, "a"); got != "a1" {
+				t.Fatalf("a=%q", got)
+			}
+		})
+	}
+}
+
+// A reader whose snapshot is past every slot's mark claims a free slot for
+// it instead of reusing a slot with a lower mark: readers that overlap on a
+// reused slot would hold the checkpoint at that mark for as long as they
+// keep coming, and the WAL would never restart.
+func TestBeginRead_InProcessClaimsASlotForANewerSnapshot(t *testing.T) {
+	for _, mode := range []string{"inprocess", "inmemory"} {
+		t.Run(mode, func(t *testing.T) {
+			f := openInProcess(t, mode)
+			db := f.db
+			idx := db.pager.wal.index
+			for i := range 10 {
+				f.put(fmt.Sprintf("k%02d", i), "k1")
+			}
+			if err := db.Checkpoint(CheckpointPassive); err != nil {
+				t.Fatal(err)
+			}
+			f.put("a", "a1")
+			prev, err := db.BeginRead()
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A chain of overlapping readers, a commit and a checkpoint
+			// per round.
+			for round := range 20 {
+				f.put("a", fmt.Sprintf("a%d", round))
+				next, err := db.BeginRead()
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = prev.Rollback()
+				prev = next
+				if err := db.Checkpoint(CheckpointPassive); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mx := idx.mxCommitFrame.LoadLocal()
+			nb := idx.nBackfill.Load()
+			snapshot := prev.walMaxFrame
+			_ = prev.Rollback()
+			// The live reader pins its own snapshot only: the checkpoint
+			// lags by at most what that reader cannot see.
+			if lag := mx - nb; lag > mx-snapshot+5 {
+				t.Fatalf("after 20 rounds of overlapping readers nBackfill=%d, mxCommit=%d, the live reader's snapshot %d", nb, mx, snapshot)
 			}
 		})
 	}

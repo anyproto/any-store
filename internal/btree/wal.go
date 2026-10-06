@@ -530,11 +530,12 @@ type walIndex struct {
 	maxPage       atomic.Uint32 // database size at last commit
 	nBackfill     atomic.Uint32 // frames already checkpointed
 
-	// restarts counts the WAL restarts of this process's index (reset): the
-	// synthesized header of the in-process and in-memory modes carries it
-	// (synthHdr), so a snapshot taken before a restart and a commit after
-	// it that ends on the same frame number are not the same key to what
-	// is remembered per snapshot (snapCountersMemo, the reader cache).
+	// restarts counts the WAL restarts of this process's index (reset),
+	// twice each: odd while one is zeroing the frame numbers (a seqlock).
+	// The synthesized header of the in-process and in-memory modes carries
+	// it (synthHdr), so a snapshot taken before a restart and a commit
+	// after it that ends on the same frame number are not the same key to
+	// what is remembered per snapshot (snapCountersMemo, the reader cache).
 	restarts atomic.Uint32
 
 	// nBackfillAttempted is the highest frame that a checkpoint has attempted
@@ -769,14 +770,16 @@ func (wi *walIndex) liveMinFrame() uint32 {
 }
 
 // testInProcessReadSnapshotHook, when non-nil, runs in the in-process read
-// begin between its lock-free reads of the frame numbers and of the restart
-// count; testInProcessReuseSlotHook between the scan of the marks and the
+// begin between its lock-free reads of the restart count and of the frame
+// numbers; testInProcessReuseSlotHook between the scan of the marks and the
 // shared lock on the slot it chose; testInProcessFreshSlotHook once a fresh
-// slot is held shared, before its re-validation. Test-only.
+// slot is held shared, before its re-validation; testResetMidHook inside a
+// WAL restart, the frame numbers zeroed and the count still odd. Test-only.
 var (
 	testInProcessReadSnapshotHook func()
 	testInProcessReuseSlotHook    func()
 	testInProcessFreshSlotHook    func()
+	testResetMidHook              func()
 )
 
 // synthHdr is the header of a snapshot in the in-process and in-memory
@@ -849,13 +852,20 @@ func (wi *walIndex) reset(readMarksLocked bool) {
 	wi.mu.Lock()
 	clear(wi.pageMap)
 	wi.mu.Unlock()
+	// The restart count is a seqlock around the frame numbers: odd while
+	// they are being zeroed, even once they are. A read begin reads it
+	// before the frame numbers and retries while it is odd or once it has
+	// moved by the time it holds its slot (tryBeginReadInProcessHdr), so no
+	// begin pairs one generation's frame numbers with another's count —
+	// nor keys the file at this generation's end as the generation's start
+	// snapshot, which a begin inside the zeroing would do.
+	wi.restarts.Add(1)
 	wi.maxFrame.Store(0)
 	wi.mxCommitFrame.Store(0)
 	wi.nBackfill.Store(0)
-	// After the frame numbers, as a read begin reads them before the
-	// count (tryBeginReadInProcessHdr): a begin that saw the old numbers
-	// and the new count, or the new numbers and the old count, fails its
-	// post-lock check either way.
+	if testResetMidHook != nil {
+		testResetMidHook()
+	}
 	wi.restarts.Add(1)
 	wi.nBackfillAttempted.Store(0)
 	for i := range wi.aReadMark {
@@ -2827,42 +2837,52 @@ func (w *wal) tryBeginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slo
 // post-lock re-check of aReadMark[mxI], wal.c:3239-3249). On retry the
 // nBackfill==mxFrame slot-0 fast path stays safe.
 func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
-	// The restart count after the frame numbers (reset bumps it after
-	// zeroing them), and checked again with them after the lock: a restart
-	// in between would pair the old frame numbers with the new generation's
-	// key, or the other way round.
-	mxFrame := w.index.mxCommitFrame.LoadLocal()
-	nBackfill := w.index.nBackfill.Load()
+	// The restart count before the frame numbers (reset zeroes them with the
+	// count odd), and checked again with them after the lock: a restart in
+	// between would pair one generation's frame numbers with another's key.
+	restarts := w.index.restarts.Load()
+	if restarts&1 != 0 {
+		return WalIndexHdr{}, 0, 0, 0, errWALRetry
+	}
 	if testInProcessReadSnapshotHook != nil {
 		testInProcessReadSnapshotHook()
 	}
-	restarts := w.index.restarts.Load()
+	mxFrame := w.index.mxCommitFrame.LoadLocal()
+	nBackfill := w.index.nBackfill.Load()
 	hdr = WalIndexHdr{isInit: 1, mxFrame: mxFrame, iChange: restarts}
+	revalidate := func() bool {
+		return w.index.mxCommitFrame.LoadLocal() == mxFrame && w.index.nBackfill.Load() == nBackfill &&
+			w.index.restarts.Load() == restarts
+	}
 
 	if mxFrame == 0 || nBackfill == mxFrame {
-		if err := w.index.lock(lockRead0, lockShared); err != nil {
+		err := w.index.lock(lockRead0, lockShared)
+		if err == nil {
+			if !revalidate() {
+				// A restart in between: the content (the file alone) would
+				// be right, the key — the old frame numbers with the new
+				// count, or the other way round — would match the new
+				// generation's commits.
+				_ = w.index.unlock(lockRead0, lockShared)
+				return WalIndexHdr{}, 0, 0, 0, errWALRetry
+			}
+			// Slot 0's read mark is a fixed sentinel that must stay 0 (set at
+			// wal.go:1900): it pins frame 0, i.e. "read nothing from the WAL".
+			// SQLite's walTryBeginRead slot-0 fast path (wal.c:3136-3157) takes
+			// WAL_READ_LOCK(0) and returns WITHOUT writing aReadMark[0], relying on
+			// the invariant aReadMark[0]==0 (wal.c:2159,361). The returned maxFrame
+			// comes from the local mxFrame snapshot, and no reader/checkpointer scan
+			// consults slot 0 (all loops start at i=1), so no write is needed here.
+			// minFrame = mxFrame+1: a slot-0 reader reads nothing from the WAL
+			// (C's readLock==0 short-circuit, wal.c:3567), which keeps it immune
+			// to a concurrent WAL restart recycling frame numbers.
+			return hdr, mxFrame, mxFrame + 1, 0, nil
+		}
+		if !errors.Is(err, ErrBusy) {
 			return WalIndexHdr{}, 0, 0, 0, err
 		}
-		if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill ||
-			w.index.restarts.Load() != restarts {
-			// A restart in between: the content (the file alone) would be
-			// right, the key — the old frame numbers with the new count,
-			// or the other way round — would match the new generation's
-			// commits.
-			_ = w.index.unlock(lockRead0, lockShared)
-			return WalIndexHdr{}, 0, 0, 0, errWALRetry
-		}
-		// Slot 0's read mark is a fixed sentinel that must stay 0 (set at
-		// wal.go:1900): it pins frame 0, i.e. "read nothing from the WAL".
-		// SQLite's walTryBeginRead slot-0 fast path (wal.c:3136-3157) takes
-		// WAL_READ_LOCK(0) and returns WITHOUT writing aReadMark[0], relying on
-		// the invariant aReadMark[0]==0 (wal.c:2159,361). The returned maxFrame
-		// comes from the local mxFrame snapshot, and no reader/checkpointer scan
-		// consults slot 0 (all loops start at i=1), so no write is needed here.
-		// minFrame = mxFrame+1: a slot-0 reader reads nothing from the WAL
-		// (C's readLock==0 short-circuit, wal.c:3567), which keeps it immune
-		// to a concurrent WAL restart recycling frame numbers.
-		return hdr, mxFrame, mxFrame + 1, 0, nil
+		// Read-0 held exclusive: a checkpoint backfilling. On to the slots,
+		// as SQLite does (wal.c:3158-3160); a mark there caps the backfill.
 	}
 
 	bestSlot := -1
@@ -2875,12 +2895,68 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 		}
 	}
 
+	// claim takes a free slot for this snapshot's mark; ok reports that it
+	// returned a result (a begin, or a retry), false when every slot was
+	// held. The mark is claimed under the exclusive lock, before the slot is
+	// shared, as SQLite does (wal.c:3170-3185) and the multi-process path
+	// below: a checkpoint skips a slot whose mark is unused, and a mark
+	// stored once the slot is shared would let one backfill past this
+	// snapshot in between — and two readers sharing the slot would
+	// overwrite each other's.
+	claimed := false
+	claim := func() (WalIndexHdr, uint32, uint32, int, error, bool) {
+		claimed = true
+		for i := 1; i <= 4; i++ {
+			lockSlot := lockRead0 + i
+			if err := w.index.lock(lockSlot, lockExclusive); err != nil {
+				continue
+			}
+			w.index.aReadMark[i].Store(mxFrame)
+			_ = w.index.unlock(lockSlot, lockExclusive)
+			if err := w.index.lock(lockSlot, lockShared); err != nil {
+				return WalIndexHdr{}, 0, 0, 0, errWALRetry, true
+			}
+			if testInProcessFreshSlotHook != nil {
+				testInProcessFreshSlotHook()
+			}
+			// Post-lock re-validation: a checkpoint, a restart and a commit
+			// can all land between the lock-free snapshot and this lock, and
+			// the window would then span the new generation's frames under
+			// the old key; a checkpoint could also have cleared the mark
+			// while the slot was free.
+			if !revalidate() || w.index.aReadMark[i].Load() != mxFrame {
+				_ = w.index.unlock(lockSlot, lockShared)
+				return WalIndexHdr{}, 0, 0, 0, errWALRetry, true
+			}
+			return hdr, mxFrame, nBackfill + 1, i, nil, true
+		}
+		return WalIndexHdr{}, 0, 0, 0, nil, false
+	}
+
+	if bestSlot == -1 || bestMark < mxFrame {
+		// No slot holds this snapshot's mark: a free one for it first.
+		// Reusing a slot whose mark is lower would hold the checkpoint at
+		// that mark for as long as readers overlap on the slot, and the
+		// WAL would never restart.
+		if hdr, maxFrame, minFrame, slot, err, ok := claim(); ok {
+			return hdr, maxFrame, minFrame, slot, err
+		}
+	}
+
 	if bestSlot != -1 {
 		lockSlot := lockRead0 + bestSlot
 		if testInProcessReuseSlotHook != nil {
 			testInProcessReuseSlotHook()
 		}
-		if err := w.index.lock(lockSlot, lockShared); err == nil {
+		err := w.index.lock(lockSlot, lockShared)
+		if err != nil && !claimed {
+			// The slot held exclusive for an instant (a checkpointer's
+			// per-slot lock, a claim): a free one instead.
+			if hdr, maxFrame, minFrame, slot, err, ok := claim(); ok {
+				return hdr, maxFrame, minFrame, slot, err
+			}
+		}
+		if err == nil {
 			// Post-lock re-validation. An internal concurrent checkpoint
 			// (auto-checkpoint from Commit / DB.Checkpoint) runs WITHOUT
 			// pager.mu and may, between our lock-free scan above and the
@@ -2890,53 +2966,18 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 			// (endRead never resets a slot's mark), so a checkpointer that
 			// read that under-reported mark could backfill frames past the
 			// snapshot this slot still pins. Mirror SQLite walTryBeginRead's
-			// post-lock re-check of aReadMark[mxI] (wal.c:3239-3249): if
-			// either value changed, drop the lock and retry. On retry the
-			// nBackfill==mxFrame slot-0 fast path stays safe.
-			// The mark too, as the multi-process path and SQLite do
-			// (wal.c:3239-3249): a checkpoint may have reset a free slot to
-			// unused, or a reader of another generation's frame numbers
-			// stored its own, between the scan and this lock — and a
-			// checkpoint respects a slot by its mark, not by its holder.
-			if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill ||
-				w.index.restarts.Load() != restarts || w.index.aReadMark[bestSlot].Load() != bestMark {
+			// post-lock re-check (wal.c:3239-3249): the counters, and the
+			// mark — a checkpoint may have reset a free slot to unused, or a
+			// reader of another generation's frame numbers stored its own,
+			// and a checkpoint respects a slot by its mark, not by its
+			// holder. A mark below mxFrame is fine: it only holds the
+			// checkpoint below the snapshot.
+			if !revalidate() || w.index.aReadMark[bestSlot].Load() != bestMark {
 				_ = w.index.unlock(lockSlot, lockShared)
 				return WalIndexHdr{}, 0, 0, 0, errWALRetry
 			}
 			return hdr, mxFrame, nBackfill + 1, bestSlot, nil
 		}
-	}
-
-	for i := 1; i <= 4; i++ {
-		lockSlot := lockRead0 + i
-		// The mark is claimed under the exclusive lock, before the slot is
-		// shared, as the multi-process path and SQLite do (walTryBeginRead,
-		// wal.c:3170-3185): a checkpoint skips a slot whose mark is unused,
-		// and a mark stored once the slot is shared would let one backfill
-		// past this snapshot in between — and two readers sharing the slot
-		// would overwrite each other's.
-		if err := w.index.lock(lockSlot, lockExclusive); err != nil {
-			continue
-		}
-		w.index.aReadMark[i].Store(mxFrame)
-		_ = w.index.unlock(lockSlot, lockExclusive)
-		if err := w.index.lock(lockSlot, lockShared); err != nil {
-			return WalIndexHdr{}, 0, 0, 0, errWALRetry
-		}
-		if testInProcessFreshSlotHook != nil {
-			testInProcessFreshSlotHook()
-		}
-		// Post-lock re-validation, as for the reused slot above: a
-		// checkpoint, a restart and a commit can all land between the
-		// lock-free snapshot and this lock, and the window would then span
-		// the new generation's frames under the old key; a checkpoint
-		// could also have cleared the mark while the slot was free.
-		if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill ||
-			w.index.restarts.Load() != restarts || w.index.aReadMark[i].Load() != mxFrame {
-			_ = w.index.unlock(lockSlot, lockShared)
-			return WalIndexHdr{}, 0, 0, 0, errWALRetry
-		}
-		return hdr, mxFrame, nBackfill + 1, i, nil
 	}
 
 	if err := w.index.lock(lockRead0, lockShared); err != nil {
@@ -2966,8 +3007,7 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 	// would then match new-generation frames in walIndex.get. A change in
 	// either counter means the snapshot may span such a reset → drop the lock
 	// and retry with fresh values.
-	if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill ||
-		w.index.restarts.Load() != restarts {
+	if !revalidate() {
 		_ = w.index.unlock(lockRead0, lockShared)
 		return WalIndexHdr{}, 0, 0, 0, errWALRetry
 	}
