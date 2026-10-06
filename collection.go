@@ -1221,6 +1221,19 @@ func (c *collection) committed() *collSchema {
 	return s
 }
 
+// schemaFor returns the schema a verb about to run in ctx works with: the
+// version of the transaction ctx carries, else the committed one its own
+// transaction is about to see.
+func (c *collection) schemaFor(ctx context.Context) (*collSchema, error) {
+	if tx, ok := ctx.Value(ctxKeyTx).(ReadTx); ok && !tx.Done() && tx.instanceId() == c.db.instanceId {
+		return c.resolve(tx.btreeReadTx())
+	}
+	if s := c.committed(); s != nil {
+		return s, nil
+	}
+	return nil, ErrCollectionNotFound
+}
+
 func (c *collection) GetIndexes() (indexes []Index) {
 	s := c.committed()
 	if s == nil {

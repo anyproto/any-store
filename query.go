@@ -198,20 +198,14 @@ func (q *collQuery) validateSources(s *collSchema) error {
 }
 
 // validateSourcesIn is validateSources for a verb about to run in ctx, with
-// the schema that verb will work with: the version of the transaction ctx
-// carries, else the committed one its own transaction is about to see.
+// the schema that verb will work with (collection.schemaFor).
 func (q *collQuery) validateSourcesIn(ctx context.Context) error {
 	if q.srcValidated {
 		return nil
 	}
-	var s *collSchema
-	if tx, ok := ctx.Value(ctxKeyTx).(ReadTx); ok && !tx.Done() && tx.instanceId() == q.c.db.instanceId {
-		var err error
-		if s, err = q.c.resolve(tx.btreeReadTx()); err != nil {
-			return err
-		}
-	} else if s = q.c.committed(); s == nil {
-		return ErrCollectionNotFound
+	s, err := q.c.schemaFor(ctx)
+	if err != nil {
+		return err
 	}
 	return q.validateSources(s)
 }
