@@ -1063,10 +1063,9 @@ func TestClosedHandleOpsFail(t *testing.T) {
 	assert.ErrorIs(t, coll2.Insert(ctx, anyenc.MustParseJson(`{"id":"1"}`)), anystore.ErrDBIsClosed)
 }
 
-// These tests guard the per-tx DDL undo log (commonTx.undo): DDL publishes
-// in-memory schema state (openedCollections, index sets, names) at execution
-// time, and a rollback of the enclosing scope must unwind those publications
-// so no handle survives over a reverted (freed) catalog entry.
+// These tests guard the rollback of DDL: a rollback of the enclosing scope
+// discards the transaction's schema changes, and no handle survives over a
+// reverted (freed) catalog entry.
 
 // The corruption sequence: create a collection inside an ambient tx, roll
 // the outer tx back, let a later collection reuse the freed root page, then
@@ -1251,10 +1250,8 @@ func TestRenameRollback_NewNameReusable(t *testing.T) {
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
 
-// Rename then Drop in one rolled-back tx: the undo log runs in reverse (Drop's
-// eviction first, then the rename undo), and the original handle must come
-// back alive under the old name — the "zombie heals itself" property of the
-// identity-guarded undo.
+// Rename then Drop in one rolled-back tx: the handle is alive under the old
+// name, as it was throughout for everyone outside the transaction.
 func TestRenameThenDropRollback_HandleHeals(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "a")
@@ -1364,8 +1361,8 @@ func TestDropRollback_HandleHeals(t *testing.T) {
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
 
-// Create→Drop in one tx, both outcomes: the reverse-order undos must net to
-// closed+evicted on rollback, and the drop publication to evicted on commit.
+// Create→Drop in one tx, both outcomes: the handle ends closed and out of
+// the registry either way.
 func TestCreateThenDropSameTx(t *testing.T) {
 	fx := newFixture(t)
 
