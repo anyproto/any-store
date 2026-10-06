@@ -3,7 +3,9 @@ package anystore
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -135,60 +137,86 @@ func TestResolve_PeerSchemaChangeVerifiesOnFirstUse(t *testing.T) {
 }
 
 // A reader that begins between a commit becoming visible and the epoch
-// catching up with it — instructions apart, inside the btree commit — reads
-// the committed schema through its own view: the index the commit dropped is
-// not in its plan. It neither replaces the head nor takes the commit for
-// another process's.
+// catching up with it — instructions apart, inside the btree commit — waits
+// for the epoch: the heads and the registry of that moment are the
+// pre-commit ones. It then works with the committed head, replaces nothing
+// and takes the commit for no other process's. Should the wait run out —
+// the announcement left standing by a commit that will not come back — the
+// cookie is another process's: a generation, and the reader's own view.
 func TestResolve_ReaderBetweenCommitAndEpoch(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "c")
-	require.NoError(t, err)
-	other, err := fx.CreateCollection(ctx, "other")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
-	for i := range 10 {
-		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+	setup := func(t *testing.T) (*fixture, *db, Collection, *schemaEpoch, *schemaEpoch) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+		for i := range 10 {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+		}
+		dbi := fx.DB.(*db)
+		// The commit, and the epoch put back where that reader finds it:
+		// the cookie announced, known one behind.
+		before := dbi.epoch.Load()
+		require.NoError(t, coll.DropIndex(ctx, "a"))
+		after := dbi.epoch.Load()
+		require.Equal(t, before.known+1, after.known)
+		dbi.epoch.Store(before)
+		dbi.announceCookie(after.known)
+		return fx, dbi, coll, before, after
 	}
-	require.NoError(t, other.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
-	c := coll.(*collection)
-	dbi := fx.DB.(*db)
-
-	// The commit, and the epoch put back where that reader finds it: the
-	// cookie announced, known one behind.
-	before := dbi.epoch.Load()
-	require.NoError(t, coll.DropIndex(ctx, "a"))
-	after := dbi.epoch.Load()
-	require.Equal(t, before.known+1, after.known)
-	dbi.epoch.Store(before)
-	dbi.announceCookie(after.known)
-
-	head := c.cur()
-	loads := countSchemaLoads(t)
-	n, err := coll.Find(`{"a":{"$gte":5}}`).IndexHint(IndexHint{IndexName: "a", Boost: 1_000_000}).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 5, n)
-	exp, err := coll.Find(`{"a":{"$gte":5}}`).Explain(ctx)
-	require.NoError(t, err)
-	for _, ie := range exp.Indexes {
-		assert.NotEqual(t, "a", ie.Name, "the dropped index is a candidate for a reader past the commit")
+	noDroppedIndex := func(t *testing.T, coll Collection) {
+		n, err := coll.Find(`{"a":{"$gte":5}}`).IndexHint(IndexHint{IndexName: "a", Boost: 1_000_000}).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 5, n)
+		exp, err := coll.Find(`{"a":{"$gte":5}}`).Explain(ctx)
+		require.NoError(t, err)
+		for _, ie := range exp.Indexes {
+			assert.NotEqual(t, "a", ie.Name, "the dropped index is a candidate for a reader past the commit")
+		}
+		_, err = coll.FindId(ctx, 1)
+		require.NoError(t, err)
 	}
-	_, err = coll.FindId(ctx, 1)
-	require.NoError(t, err)
-	n, err = other.Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-	assert.NotZero(t, *loads, "the reader trusted a head the epoch does not cover yet")
-	assert.True(t, head == c.cur(), "a reader in the gap replaced the head")
-	assert.Equal(t, before.gen, dbi.epoch.Load().gen, "an own commit was taken for another process's")
 
-	// The commit hook, as the btree commit runs it.
-	dbi.schemaCommitted(0, after.known)
-	*loads = 0
-	n, err = coll.Find(`{"a":{"$gte":5}}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 5, n)
-	assert.Zero(t, *loads)
-	assert.Equal(t, after.known, dbi.epoch.Load().known)
+	t.Run("epoch catches up", func(t *testing.T) {
+		fx, dbi, coll, before, after := setup(t)
+		c := coll.(*collection)
+		head := c.cur()
+		loads := countSchemaLoads(t)
+		// The commit hook, as the btree commit runs it, while the reader
+		// waits for it.
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			time.Sleep(2 * time.Millisecond)
+			dbi.schemaCommitted(0, after.known)
+		}()
+		noDroppedIndex(t, coll)
+		<-done
+		assert.Zero(t, *loads, "the reader did not wait for the epoch")
+		assert.True(t, head == c.cur())
+		assert.Equal(t, before.gen, dbi.epoch.Load().gen, "an own commit was taken for another process's")
+		assert.Equal(t, after.known, dbi.epoch.Load().known)
+		_ = fx
+	})
+
+	t.Run("wait runs out", func(t *testing.T) {
+		fx, dbi, coll, before, after := setup(t)
+		c := coll.(*collection)
+		head := c.cur()
+		spins := announcedCookieSpins
+		announcedCookieSpins = 64
+		defer func() { announcedCookieSpins = spins }()
+		loads := countSchemaLoads(t)
+		noDroppedIndex(t, coll)
+		assert.NotZero(t, *loads, "the reader trusted a head of a generation it is not in")
+		assert.Equal(t, before.gen+1, dbi.epoch.Load().gen, "the cookie is another process's")
+		assert.Equal(t, after.known, dbi.epoch.Load().known)
+		// The hook, late: the epoch is past it already.
+		dbi.schemaCommitted(0, after.known)
+		assert.Equal(t, before.gen+1, dbi.epoch.Load().gen)
+		assert.True(t, head == c.cur(), "the first reader of the generation confirmed the committed head")
+		assert.Equal(t, before.gen+1, c.cur().gen.Load())
+		_ = fx
+	})
 }
 
 // A version is not trusted between two cookies at which it merely checks out
@@ -338,4 +366,209 @@ func TestResolve_ReadersDuringUncommittedDDLUseCommittedVersion(t *testing.T) {
 	assert.ElementsMatch(t, []string{"a", "b"}, candidates(ctx))
 	assert.Zero(t, *loads, "a reader past the commit works with the head")
 	assert.False(t, committed == c.cur(), "the commit installed the version")
+}
+
+// holdCommitBeforeInstall arranges for the next schema-changing commit to
+// pause as it becomes visible, before its heads are installed: visible is
+// closed then, and the commit goes on once release is closed.
+func holdCommitBeforeInstall(t *testing.T) (visible, release chan struct{}) {
+	t.Helper()
+	visible, release = make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	testHookBeforeInstall = func() {
+		once.Do(func() {
+			close(visible)
+			<-release
+		})
+	}
+	// A test that fails while the commit is held must still let it go, or
+	// the fixture cannot close the database.
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		testHookBeforeInstall = nil
+	})
+	return visible, release
+}
+
+// A reader that pins a schema-changing commit as it becomes visible, before
+// its heads are installed, waits for the installation (observeCookie): it
+// plans with the committed schema, not with the index the commit dropped,
+// and takes the commit for no other process's.
+func TestCommit_ReaderInThePublicationWaits(t *testing.T) {
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+	for i := range 10 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+	}
+	gen := dbi.epoch.Load().gen
+	spins := announcedCookieSpins
+	announcedCookieSpins = 1 << 40
+	defer func() { announcedCookieSpins = spins }()
+	loads := countSchemaLoads(t)
+
+	visible, release := holdCommitBeforeInstall(t)
+	committed := make(chan error, 1)
+	go func() { committed <- coll.DropIndex(ctx, "a") }()
+	<-visible
+
+	type result struct {
+		n   int
+		err error
+	}
+	read := make(chan result, 1)
+	go func() {
+		n, err := coll.Find(`{"a":{"$gte":5}}`).IndexHint(IndexHint{IndexName: "a", Boost: 1_000_000}).Count(ctx)
+		read <- result{n, err}
+	}()
+	time.Sleep(5 * time.Millisecond)
+	select {
+	case r := <-read:
+		t.Fatalf("the reader did not wait for the heads: %+v", r)
+	default:
+	}
+	close(release)
+	require.NoError(t, <-committed)
+	r := <-read
+	require.NoError(t, r.err)
+	assert.Equal(t, 5, r.n)
+	assert.Zero(t, *loads, "the reader read the catalog instead of the installed head")
+	assert.Equal(t, gen, dbi.epoch.Load().gen, "an own commit was taken for another process's")
+	assert.False(t, hasIndex(coll, "a"))
+}
+
+// The registry follows a commit as it becomes visible: an open of a
+// collection the commit created, or of the name it gave one, that begins in
+// the publication gets the committed handle itself, never a second one.
+func TestCommit_RegistrySettlesWithThePublication(t *testing.T) {
+	fx := newFixture(t)
+	a, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+
+	visible, release := holdCommitBeforeInstall(t)
+	var created Collection
+	committed := make(chan error, 1)
+	go func() {
+		tx, err := fx.WriteTx(ctx)
+		if err != nil {
+			committed <- err
+			return
+		}
+		if created, err = fx.CreateCollection(tx.Context(), "n"); err != nil {
+			committed <- err
+			return
+		}
+		if err = a.Rename(tx.Context(), "b"); err != nil {
+			committed <- err
+			return
+		}
+		committed <- tx.Commit()
+	}()
+	<-visible
+
+	type opened struct {
+		c   Collection
+		err error
+	}
+	byOpen, byCollection, byNewName, byOldName := make(chan opened, 1), make(chan opened, 1), make(chan opened, 1), make(chan opened, 1)
+	go func() { c, err := fx.OpenCollection(ctx, "n"); byOpen <- opened{c, err} }()
+	go func() { c, err := fx.Collection(ctx, "n"); byCollection <- opened{c, err} }()
+	go func() { c, err := fx.OpenCollection(ctx, "b"); byNewName <- opened{c, err} }()
+	go func() { c, err := fx.OpenCollection(ctx, "a"); byOldName <- opened{c, err} }()
+	time.Sleep(2 * time.Millisecond)
+	close(release)
+	require.NoError(t, <-committed)
+
+	for name, ch := range map[string]chan opened{"OpenCollection": byOpen, "Collection": byCollection} {
+		o := <-ch
+		require.NoError(t, o.err, name)
+		assert.True(t, o.c == created, "%s: the created handle", name)
+		_, err = o.c.Count(ctx)
+		require.NoError(t, err, name)
+	}
+	o := <-byNewName
+	require.NoError(t, o.err)
+	assert.True(t, o.c == a, "the renamed handle under its new name")
+	o = <-byOldName
+	if o.err == nil {
+		// Opened before the commit became visible: the committed name of
+		// that moment.
+		assert.True(t, o.c == a)
+	} else {
+		assert.ErrorIs(t, o.err, ErrCollectionNotFound)
+	}
+	_, err = fx.OpenCollection(ctx, "a")
+	assert.ErrorIs(t, err, ErrCollectionNotFound)
+}
+
+// A commit flagged as schema-changing that publishes nothing — its one DDL
+// verb failed — withdraws its announcement before any writer of this process
+// can begin: a commit of another process at the announced cookie, made as
+// the write lock was released, is seen for what it is, and the writer
+// maintains the index it created.
+func TestCommit_EmptySchemaCommitAnnouncesNothingToTheNextWriter(t *testing.T) {
+	skipIfInMemory(t, "models another process's commit; not applicable in-memory")
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"k":1}`)))
+	_, err = coll.Count(ctx)
+	require.NoError(t, err)
+	gen := dbi.epoch.Load().gen
+
+	inserted := make(chan error, 1)
+	var fired bool
+	testHookAfterBtreeCommit = func() {
+		if fired {
+			return
+		}
+		fired = true
+		// The other process: index k on c, at the cookie this commit
+		// announced and did not produce.
+		fcc, sc := dbi.btreeDB.LocalCounters()
+		ptx, err := dbi.btreeDB.BeginWrite()
+		require.NoError(t, err)
+		info := IndexInfo{Name: "k", Fields: []string{"k"}}
+		require.NoError(t, dbi.registerIndex(ptx, "c", info))
+		ns, err := ptx.GetNamespace("c")
+		require.NoError(t, err)
+		pc := &collection{db: dbi, primaryKey: "id"}
+		_, err = pc.buildRangeIndex(ptx, &collSchema{name: "c", ns: ns}, info)
+		require.NoError(t, err)
+		ptx.MarkSchemaChanged()
+		ptx.MarkDataChanged()
+		require.NoError(t, ptx.Commit())
+		dbi.btreeDB.UpdateLocalCounters(fcc, sc)
+		// A writer of this process, beginning now: held at the gate until
+		// the announcement is withdrawn.
+		go func() { inserted <- coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"k":2}`)) }()
+		time.Sleep(2 * time.Millisecond)
+	}
+	defer func() { testHookAfterBtreeCommit = nil }()
+
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.ErrorIs(t, coll.DropIndex(wtx.Context(), "nope"), ErrIndexNotFound)
+	require.NoError(t, wtx.Commit())
+	require.NoError(t, <-inserted)
+
+	assert.Equal(t, gen+1, dbi.epoch.Load().gen, "the other process's commit started no generation")
+	n, err := coll.Find(`{"k":2}`).IndexHint(IndexHint{IndexName: "k", Boost: 1_000_000}).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	for _, idx := range coll.GetIndexes() {
+		if idx.Info().Name == "k" {
+			l, err := idx.Len(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 2, l, "the writer did not maintain the other process's index")
+		}
+	}
 }

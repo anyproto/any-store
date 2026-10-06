@@ -3,6 +3,7 @@ package anystore
 import (
 	"encoding/binary"
 	"errors"
+	"runtime"
 	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -145,24 +146,38 @@ type schemaEpoch struct {
 // observeCookie brings the epoch up to the snapshot a transaction begins at:
 // a cookie past known that this process is not committing right now is
 // another process's schema change.
+//
+// The cookie this process announced is its commit becoming visible: the
+// heads it changed are installed and known follows within instructions of
+// the publication (commonTx.schemaCommitted), and the transaction waits for
+// that rather than work beside it — the heads of that moment are the
+// pre-commit ones, and so are the names the handles answer to. A commit
+// that publishes nothing withdraws its announcement once it returns
+// (writeTx.Commit); should the wait outlast that, the cookie is another
+// process's after all. Bounded in case the announcement is never withdrawn
+// (a commit that panicked): a generation taken for nothing costs one
+// verification per handle, never correctness.
 func (db *db) observeCookie(tx *btree.ReadTx) {
 	cookie := tx.SnapshotSchemaCookie()
-	for {
+	for spins := 0; ; {
 		e := db.epoch.Load()
 		if cookieLE(cookie, e.known) {
 			return
 		}
-		if own := db.ownCookie.Load(); own>>32 != 0 && uint32(own) == cookie {
-			// The commit of this process becoming visible: known follows
-			// within instructions (schemaCommitted), and until then this
-			// transaction loads what it uses through its own view.
-			return
+		if own := db.ownCookie.Load(); own>>32 != 0 && uint32(own) == cookie && spins < announcedCookieSpins {
+			spins++
+			runtime.Gosched()
+			continue
 		}
 		if db.epoch.CompareAndSwap(e, &schemaEpoch{gen: e.gen + 1, start: cookie, known: cookie}) {
 			return
 		}
 	}
 }
+
+// announcedCookieSpins bounds the wait for an announced cookie's epoch.
+// A variable for the tests that hold a commit in its publication.
+var announcedCookieSpins = 1 << 16
 
 // announceCookie tells observeCookie which cookie the commit about to run
 // produces, so a reader that begins once it is visible does not take it for
@@ -394,9 +409,9 @@ func (c *collection) logPin(wtx WriteTx) error {
 // install publishes the log as the commit becomes visible, before the epoch
 // passes its cookie (schemaCommitted): the last version logged for a handle
 // is its head from here on, a dropped handle is closed. Runs inside the
-// btree commit (btree.WriteTx.OnCommitted) — atomic stores, no locks. A
-// reader that loaded a version for the handle meanwhile installs nothing
-// over these (the compare-and-swap in resolveSlow and adopt).
+// btree commit (btree.WriteTx.OnCommitted) — atomic stores. A reader that
+// loaded a version for the handle meanwhile installs nothing over these
+// (the compare-and-swap in resolveSlow and adopt).
 func (t *txSchema) install(gen uint64) {
 	for i := range t.log {
 		e := &t.log[i]
@@ -411,13 +426,17 @@ func (t *txSchema) install(gen uint64) {
 	t.installed = true
 }
 
-// settleLog brings the registry up to the committed log, after the commit
-// returned: a created collection's handle enters, a renamed one is re-keyed,
-// a dropped one leaves. In log order, so a name a handle went through on the
-// way is free for the entry that takes it next. A handle another caller
-// registered meanwhile for one of these collections or names — between the
-// commit's publication and here — is displaced (registerLocked). The entries
-// then release their handles.
+// settleLog brings the registry up to the committed log, inside the btree
+// commit after install and before the epoch passes the cookie
+// (commonTx.schemaCommitted): a created collection's handle enters, a
+// renamed one is re-keyed, a dropped one leaves. In log order, so a name a
+// handle went through on the way is free for the entry that takes it next.
+// A handle another caller registered meanwhile for one of these
+// collections or names — an older snapshot's, left in the slot — is
+// displaced (registerLocked). The entries then release their handles.
+//
+// db.mu inside the commit: no holder of db.mu waits on the database (see
+// btree.WriteTx.OnCommitted).
 func (db *db) settleLog(t *txSchema) {
 	db.mu.Lock()
 	for i := range t.log {
@@ -567,9 +586,14 @@ func (c *collection) resolveAs(tx *btree.ReadTx, name string) (*collSchema, erro
 			return e.s, nil
 		}
 	}
+	// The epoch before the head: a commit of this process installs the
+	// heads it changed before known passes its cookie (schemaCommitted), so
+	// an epoch that admits the transaction's cookie was read after the
+	// installs, and the head read after it is the committed one. The other
+	// order could pair the pre-commit head with the epoch of after.
+	e := c.db.epoch.Load()
 	if s := c.head.Load(); s != nil {
-		e, cookie := c.db.epoch.Load(), tx.SnapshotSchemaCookie()
-		if s.current(e, cookie, writer) {
+		if s.current(e, tx.SnapshotSchemaCookie(), writer) {
 			if writer {
 				c.refreshSketches(tx, s)
 			}
@@ -604,8 +628,8 @@ func (c *collection) resolveSlow(tx *btree.ReadTx, asName string) (*collSchema, 
 	if err := c.alive(); err != nil {
 		return nil, err
 	}
+	e := c.db.epoch.Load() // before the head, as in resolveAs
 	head := c.head.Load()
-	e := c.db.epoch.Load()
 	cookie, writer := tx.SnapshotSchemaCookie(), tx.IsWriteTx()
 	if head != nil && head.current(e, cookie, writer) {
 		return head, nil

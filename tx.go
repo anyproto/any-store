@@ -75,8 +75,7 @@ type commonTx struct {
 	// in it through the log, nothing else does until the commit installs
 	// it, and a rollback — full, failed-commit, or to a savepoint
 	// (savepointTx records a mark) — discards the scope's entries. Writer
-	// state: mutated under the btree write lock, or under db.schemaGate
-	// after a commit released it.
+	// state: mutated under the btree write lock.
 	schema txSchema
 
 	// savepoints is the stack of open savepoints, outermost first, each by
@@ -109,15 +108,35 @@ func (tx *commonTx) schemaLog() *txSchema {
 }
 
 // schemaCommitted runs inside the btree commit as it becomes visible
-// (btree.WriteTx.OnCommitted): the logged versions become the heads, then
-// the epoch's known passes the commit's cookie.
+// (btree.WriteTx.OnCommitted): the logged versions become the heads, the
+// registry follows them, then the epoch's known passes the commit's cookie
+// — so a transaction the epoch admits finds the handles and the registry
+// as the commit left them.
 func (tx *commonTx) schemaCommitted(fileChangeCounter, schemaCookie uint32) {
+	if testHookBeforeInstall != nil {
+		testHookBeforeInstall()
+	}
 	tx.schema.install(tx.db.epoch.Load().gen)
+	tx.db.settleLog(&tx.schema)
 	tx.db.schemaCommitted(fileChangeCounter, schemaCookie)
 }
 
-// release returns the pooled state, with nothing pinned.
+// testHookBeforeInstall, when set, runs inside a schema-changing commit as
+// it becomes visible, before the heads are installed; testHookAfterBtreeCommit
+// right after the btree commit returned, the write lock released. Tests
+// only.
+var (
+	testHookBeforeInstall    func()
+	testHookAfterBtreeCommit func()
+)
+
+// release returns the pooled state, with nothing pinned. A log still there
+// belongs to a commit that did not come back (a panic in the btree): its
+// handles are released as after a rollback.
 func (tx *commonTx) release() {
+	if len(tx.schema.log) > 0 {
+		tx.db.discardLog(&tx.schema, 0)
+	}
 	tx.schema.release()
 	txPool.Put(tx)
 }
@@ -198,6 +217,21 @@ func (w writeTx) Rollback() error {
 
 func (w writeTx) Commit() error {
 	if w.commonTx.version.CompareAndSwap(w.version, 0) {
+		// The btree commit releases the global write lock before it
+		// returns. A schema-changing commit announces the cookie it
+		// produces (observeCookie), and the announcement of one that
+		// publishes nothing — empty, or failed — is withdrawn only once it
+		// returned: hold the schema gate (paired with newWriteTx) until
+		// then, so no writer of this process begins while another
+		// process's commit could pass for this one's. Taken before the
+		// release is deferred: what the release has left to discard, it
+		// discards under the gate.
+		t := &w.commonTx.schema
+		schemaChange := w.writeTx.SchemaChanged()
+		if schemaChange {
+			w.db.schemaGate.Lock()
+			defer w.db.schemaGate.Unlock()
+		}
 		defer w.commonTx.release()
 		// Every non-committed exit below must discard the schema log
 		// BEFORE its btree rollback releases the global write lock (see
@@ -223,41 +257,27 @@ func (w writeTx) Commit() error {
 				return err
 			}
 		}
-		// The btree commit releases the global write lock before it returns,
-		// and the registry follows the schema log only after (settleLog) —
-		// hold the schema gate (paired with newWriteTx) across commit +
-		// settle so no new writer finds the registry behind the catalog.
-		// Only needed when this tx logged schema changes.
-		t := &w.commonTx.schema
-		if len(t.log) > 0 {
-			w.db.schemaGate.Lock()
-			defer w.db.schemaGate.Unlock()
-		}
-		schemaChange := w.writeTx.SchemaChanged()
-		var next uint32
 		if schemaChange {
-			// The logged versions become the heads as the commit becomes
-			// visible, and the epoch follows the cookie right after, so that
-			// next to no reader finds the new cookie ahead of it
-			// (commonTx.schemaCommitted).
-			next = w.writeTx.DiskSchemaCookie() + 1
+			// The logged versions become the heads and the registry follows
+			// them as the commit becomes visible, and the epoch follows the
+			// cookie right after (commonTx.schemaCommitted). Withdrawn on
+			// every exit, a panic in the commit included: an announcement
+			// left standing would make the next process's commit at that
+			// cookie pass for this one's.
+			next := w.writeTx.DiskSchemaCookie() + 1
 			w.db.announceCookie(next)
+			defer w.db.endAnnouncement(next)
 			w.writeTx.OnCommitted(w.commonTx.schemaCommitted)
 		}
 		err := w.writeTx.Commit()
-		if schemaChange {
-			// For a commit that failed or wrote nothing.
-			w.db.endAnnouncement(next)
+		if testHookAfterBtreeCommit != nil {
+			testHookAfterBtreeCommit()
 		}
 		if err == nil && w.modified {
 			w.db.recoveryController.OnWriteEvent()
 		}
-		// What the commit published, the registry follows, whatever Commit
-		// returned; a log that was not published is discarded, as after a
-		// rollback.
-		if t.installed {
-			w.db.settleLog(t)
-		} else {
+		// A log the commit did not publish is discarded, as after a rollback.
+		if !t.installed {
 			w.db.discardLog(t, 0)
 		}
 		return err
