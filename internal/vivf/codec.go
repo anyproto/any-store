@@ -10,15 +10,19 @@ import (
 	"github.com/anyproto/any-store/v2/internal/vecf"
 )
 
-// On-disk record formats for the IVF-PQ namespaces (little-endian). Mirrors the
+// On-disk record formats for the IVF-SQ namespaces (little-endian). Mirrors the
 // conventions of internal/vindex/codec.go. Namespaces (prefix + suffix):
 //
-//	:meta  fixed key "m"          -> index parameters + counters
-//	:cb    "coarse" / "pq"        -> codebooks (raw float32 blobs)
-//	:cell  listID(be32)‖label(be32) -> M-byte PQ code   (the inverted lists)
-//	:vec   label(be32)            -> full/quantized vector (re-rank store)
-//	:lbl   label(be32)            -> docID
-//	:doc   docID                  -> label(le32)
+//	:meta  fixed key "m"            -> index parameters + counters
+//	:cb    "coarse"                 -> coarse centroids (raw float32 blob)
+//	:cell  listID(be32)‖label(be32) -> int8 record of the vector (the inverted lists)
+//	:vec   (empty)                  -> kept so earlier releases, which require it, open the index
+//	:lbl   label(be32)              -> docID
+//	:doc   docID                    -> label(le32) + cells
+//
+// The layout is byte-for-byte the one every earlier release wrote for IVF-SQ
+// (the removed IVF-PQ layout used :vec as its re-rank store): a file this code
+// writes to stays readable by them (multiprocess, mixed versions).
 const (
 	nsMeta = ":meta"
 	nsCB   = ":cb"
@@ -31,27 +35,27 @@ const (
 var (
 	metaKey   = []byte("m")
 	coarseKey = []byte("coarse")
-	pqKey     = []byte("pq")
 )
 
 const metaVersion = 1
 
-// meta is the single :meta record.
+// meta is the single :meta record. The record keeps the slots of the removed
+// IVF-PQ layout (subquantizer count, precomputed-table budget, int8 flag) so
+// the build id stays at its offset and earlier releases keep reading it; the
+// layout flag that follows them is what tells the two layouts apart (see
+// decodeMeta).
 type meta struct {
-	dim        int
-	nlist      int
-	m          int
-	assign     int  // closure factor used at build (informational)
-	nprobe     int  // default cells to scan at search
-	precompMiB int  // precomputed-table RAM budget (StoreParams.PrecompMiB)
-	normalize  bool // cosine: vectors stored/queried unit-normalized
-	int8vec    bool // :vec re-rank store is int8-quantized
-	sq         bool // IVF-SQ: :cell holds int8 full vectors (no PQ)
-	count      int64
-	nextLabel  uint32
+	dim       int
+	nlist     int
+	pqM       int  // reserved subquantizer count: earlier releases divide by it at open, so never 0
+	assign    int  // closure factor used at build (informational)
+	nprobe    int  // default cells to scan at search
+	normalize bool // cosine: vectors stored/queried unit-normalized
+	count     int64
+	nextLabel uint32
 
 	// Drift tracking (cheap, maintained incrementally): centroid quality decays as
-	// the data distribution shifts away from the build-time codebooks. reconBase is
+	// the data distribution shifts away from the build-time centroids. reconBase is
 	// the mean squared residual norm (‖x−nearestCentroid‖²) over the build set;
 	// driftSum/driftN accumulate the same for inserts since the last build, so
 	// (driftSum/driftN)/reconBase is how much worse new data fits the centroids.
@@ -66,7 +70,7 @@ type meta struct {
 	// index is built or rebuilt, never by a write. An open object serves a
 	// view only for the build the view's meta names (BuildOf): a rebuild can
 	// land every namespace back on its old root pages, and the object's RAM
-	// state — codebooks, the precomputed table — belongs to its own build.
+	// state — the centroids — belongs to its own build.
 	// Persisted at the meta tail (back-compat: absent in older records => 0,
 	// equal to any other 0).
 	build uint64
@@ -80,7 +84,7 @@ func encodeMeta(mt *meta) []byte {
 	put32(metaVersion)
 	put32(uint32(mt.dim))
 	put32(uint32(mt.nlist))
-	put32(uint32(mt.m))
+	put32(uint32(mt.pqM)) // reserved subquantizer count (see meta.pqM)
 	put32(uint32(mt.assign))
 	put32(uint32(mt.nprobe))
 	if mt.normalize {
@@ -96,20 +100,18 @@ func encodeMeta(mt *meta) []byte {
 	put64(uint64(mt.driftN))
 	put64(uint64(mt.buildCount))
 	put64(uint64(mt.churn))
-	put32(uint32(int32(mt.precompMiB))) // signed; <0 disables the table
-	if mt.int8vec {
-		buf = append(buf, 1)
-	} else {
-		buf = append(buf, 0)
-	}
-	if mt.sq {
-		buf = append(buf, 1)
-	} else {
-		buf = append(buf, 0)
-	}
+	put32(0)             // reserved: precomputed-table budget
+	buf = append(buf, 1) // reserved: int8 flag (always set for IVF-SQ)
+	buf = append(buf, 1) // layout flag: IVF-SQ
 	put64(mt.build)
 	return buf
 }
+
+// ErrUnsupportedPQ is returned when a meta record names the removed IVF-PQ
+// layout (:cell held PQ codes, not int8 vectors): this code cannot read such
+// an index. The db layer quarantines it by its catalog mode before ever
+// opening it here; this guards the raw store against a stray record.
+var ErrUnsupportedPQ = errors.New("vivf: IVF-PQ index layout is no longer supported; drop the index and recreate it")
 
 func decodeMeta(data []byte) (*meta, error) {
 	if len(data) < 4 {
@@ -124,7 +126,7 @@ func decodeMeta(data []byte) (*meta, error) {
 	mt := &meta{}
 	mt.dim = int(get32())
 	mt.nlist = int(get32())
-	mt.m = int(get32())
+	mt.pqM = int(get32()) // reserved subquantizer count, carried through
 	mt.assign = int(get32())
 	mt.nprobe = int(get32())
 	mt.normalize = data[off] != 0
@@ -138,22 +140,37 @@ func decodeMeta(data []byte) (*meta, error) {
 		mt.buildCount = int64(get64())
 		mt.churn = int64(get64())
 	}
-	if off+4 <= len(data) { // precompMiB (absent in older records → 0 = default)
-		mt.precompMiB = int(int32(get32()))
+	if off+4 <= len(data) { // reserved: precomputed-table budget
+		off += 4
 	}
-	if off < len(data) { // int8vec (absent in older records → false)
-		mt.int8vec = data[off] != 0
+	if off < len(data) { // reserved: int8 flag
 		off++
 	}
-	if off < len(data) { // sq (absent in older records → false)
-		mt.sq = data[off] != 0
-		off++
+	// The layout flag: set on every IVF-SQ record (the mode and the flag
+	// arrived together); absent or clear means the removed IVF-PQ layout.
+	if off >= len(data) || data[off] == 0 {
+		return nil, ErrUnsupportedPQ
 	}
+	off++
 	if off+8 <= len(data) { // build (absent in older records → 0)
 		mt.build = binary.LittleEndian.Uint64(data[off:])
 		off += 8
 	}
 	return mt, nil
+}
+
+// legacySubquantizers is the value earlier releases stored in the reserved
+// subquantizer slot for an index of this dimension (their default when the
+// caller set none): the largest of a small candidate set that divides dim
+// with at least two components per subspace, else dim. Those releases divide
+// by it at open, so a record this code writes carries the same non-zero value.
+func legacySubquantizers(dim int) int {
+	for _, m := range []int{96, 64, 48, 32, 16, 8, 4, 2} {
+		if dim%m == 0 && dim/m >= 2 {
+			return m
+		}
+	}
+	return dim
 }
 
 // newBuild returns the identity of a build (meta.build).
@@ -188,21 +205,6 @@ func encodeCentroids(cents [][]float32) []byte {
 	out := make([]byte, 0, len(cents)*dim*4)
 	for _, c := range cents {
 		out = append(out, f32bytes(c)...)
-	}
-	return out
-}
-
-// encodePQ flattens [m][pqK][dsub] to a raw blob (m·pqK·dsub floats).
-func encodePQ(pqcb [][][]float32) []byte {
-	if len(pqcb) == 0 {
-		return nil
-	}
-	dsub := len(pqcb[0][0])
-	out := make([]byte, 0, len(pqcb)*pqK*dsub*4)
-	for _, cb := range pqcb {
-		for _, c := range cb {
-			out = append(out, f32bytes(c)...)
-		}
 	}
 	return out
 }

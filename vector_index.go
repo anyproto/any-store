@@ -30,11 +30,17 @@ type vectorIndex struct {
 	mode         VectorMode
 	compactRatio float64
 	// ix is the btree-resident HNSW graph for btree/hybrid modes; it is nil for
-	// brute-force mode (search scans the documents) and for IVF-PQ mode (which uses
+	// brute-force mode (search scans the documents) and for IVF mode (which uses
 	// ivf instead).
 	ix *vindex.Index
-	// ivf is the btree-resident IVF-PQ index for VectorModeIVFPQ; nil otherwise.
+	// ivf is the btree-resident IVF-SQ index for VectorModeIVFSQ; nil otherwise.
 	ivf *vivf.StoreIndex
+	// unsupported marks an index the catalog describes in a removed mode
+	// (VectorMode.isRemoved): an earlier version built it and nothing here can
+	// read it. Its collection opens; the index is neither searched ($knn on its
+	// field is ErrVectorIndexUnsupported) nor maintained by writes, Stats report
+	// it, and DropIndex is the only way out.
+	unsupported bool
 
 	// collName and catalogKey are the identity of the generation this handle
 	// was built from, captured at construction (bindIdentity) and immutable:
@@ -44,21 +50,22 @@ type vectorIndex struct {
 	catalogKey []byte
 }
 
-// isIVF reports whether this index uses the IVF backend (PQ or SQ).
+// isIVF reports whether this index uses the IVF backend.
 func (vi *vectorIndex) isIVF() bool { return vi.mode.isIVF() }
 
 func vectorIndexNsPrefix(collName, indexName string) string {
 	return "vix:" + collName + ":" + indexName
 }
 
-// vectorIndexNsSuffixes is the union of namespace suffixes across both vector
-// backends: HNSW uses :adj, IVF-PQ uses :cb and :cell. Shared by the drop and
-// rename sweeps so the two lists can't drift.
+// vectorIndexNsSuffixes is the union of namespace suffixes across the vector
+// backends: HNSW uses :adj and :vec, IVF uses :cb and :cell plus an empty :vec
+// (the removed IVF-PQ layout's re-rank store, kept so earlier releases open
+// the index). Shared by the drop and rename sweeps so the lists can't drift.
 var vectorIndexNsSuffixes = []string{":meta", ":vec", ":adj", ":doc", ":lbl", ":cb", ":cell"}
 
 // dropVectorIndexNamespaces deletes all btree namespaces backing a vector index.
-// It drops the union of HNSW and IVF-PQ suffixes so it works for either
-// backend; absent namespaces are ignored.
+// It drops the union of HNSW and IVF suffixes so it works for either backend,
+// the quarantined one included; absent namespaces are ignored.
 func dropVectorIndexNamespaces(tx *btree.WriteTx, collName, indexName string) error {
 	prefix := vectorIndexNsPrefix(collName, indexName)
 	for _, suf := range vectorIndexNsSuffixes {
@@ -81,19 +88,17 @@ func validateVectorParams(p *VectorParams) error {
 	}
 	switch p.Mode {
 	case VectorModeBTree, VectorModeHybrid, VectorModeBruteForce:
-	case VectorModeIVFPQ, VectorModeIVFSQ:
+	case VectorModeIVFSQ:
 		if p.Metric == VectorDot {
 			// vivf has no dot-product ranking path: its distance surface is
 			// L2, or cosine via unit-normalization (StoreParams.Normalize).
 			// Accepting Dot here would silently rank by L2 — no error,
 			// plausible neighbours, wrong order. Refuse until a real MIPS
-			// path exists (dot-aware coarse assignment + ADC tables).
+			// path exists (dot-aware coarse assignment and scoring).
 			return ErrVectorMetricUnsupported
 		}
-		m := ivfM(p)
-		if p.Dim%m != 0 {
-			return fmt.Errorf("vector index: IVF requires Dim (%d) divisible by M (%d)", p.Dim, m)
-		}
+	case vectorModeIVFPQ:
+		return fmt.Errorf("%w: mode %s; create the index in another mode", ErrVectorIndexUnsupported, p.Mode)
 	default:
 		return fmt.Errorf("vector index: unknown mode %d", p.Mode)
 	}
@@ -104,22 +109,19 @@ func validateVectorParams(p *VectorParams) error {
 // selected mode cannot rank by. Validation runs on both create and open, so a
 // persisted index with an unsupported combination fails loudly instead of
 // silently ranking by the wrong metric.
-var ErrVectorMetricUnsupported = errors.New("any-store: vector index: VectorDot is not supported by IVF modes; use VectorModeBTree, VectorModeHybrid or VectorModeBruteForce, or the Cosine/L2 metrics")
+var ErrVectorMetricUnsupported = errors.New("any-store: vector index: VectorDot is not supported by the IVF mode; use VectorModeBTree, VectorModeHybrid or VectorModeBruteForce, or the Cosine/L2 metrics")
 
-// ivfM resolves the PQ subquantizer count: explicit M, else a default that divides
-// Dim (prefer 96 → 8-dim subspaces for typical embedding dims, else the largest of
-// a small candidate set that divides Dim, else Dim itself).
-func ivfM(p *VectorParams) int {
-	if p.M > 0 {
-		return p.M
-	}
-	for _, m := range []int{96, 64, 48, 32, 16, 8, 4, 2} {
-		if p.Dim%m == 0 && p.Dim/m >= 2 {
-			return m
-		}
-	}
-	return p.Dim
-}
+// ErrVectorIndexUnsupported names a vector index mode this version no longer
+// supports. Creating an index in it is refused. For an index the catalog
+// already describes in it (an earlier version built it; no backend here can
+// read it) the collection still opens and the index is quarantined: $knn on
+// its field and CompactVectorIndex return this error, writes leave it
+// untouched, VectorIndexStats.Unsupported reports it, EnsureIndex of the name
+// in another mode wraps it into ErrIndexMismatch — until DropIndex removes
+// it, after which the name can be created again in a supported mode. Drop it
+// before an earlier release opens the file: that release would serve the
+// index, which this one's writes no longer maintain.
+var ErrVectorIndexUnsupported = errors.New("any-store: vector index: mode no longer supported")
 
 // ivfNList resolves the coarse cell count: explicit NList, else ~4·√N clamped to
 // [16, 65536] (FAISS sizing), with a points-per-centroid floor so tiny collections
@@ -146,16 +148,12 @@ func ivfStoreParams(p *VectorParams, n int) vivf.StoreParams {
 		nprobe = 16
 	}
 	return vivf.StoreParams{
-		Dim:        p.Dim,
-		NList:      ivfNList(p, n),
-		M:          ivfM(p),
-		Assign:     closure,
-		NProbe:     nprobe,
-		Normalize:  p.Metric == VectorCosine,
-		Int8:       p.Quantization == VectorQuantInt8,
-		SQ:         p.Mode == VectorModeIVFSQ,
-		KMeansPP:   true,
-		PrecompMiB: p.PrecomputeTableMiB,
+		Dim:       p.Dim,
+		NList:     ivfNList(p, n),
+		Assign:    closure,
+		NProbe:    nprobe,
+		Normalize: p.Metric == VectorCosine,
+		KMeansPP:  true,
 	}
 }
 
@@ -346,8 +344,8 @@ func (vi *vectorIndex) boundIn(tx *btree.ReadTx, collName string) bool {
 // has no graph, so it is returned unchanged.
 func (vi *vectorIndex) compact(tx *btree.WriteTx, collName string) (*vectorIndex, error) {
 	if vi.isIVF() {
-		// IVF-PQ has no tombstones to reclaim (deletes are physical); "compaction"
-		// here means re-training the codebooks from the live set to clear centroid
+		// IVF has no tombstones to reclaim (deletes are physical); "compaction"
+		// here means re-training the centroids from the live set to clear centroid
 		// drift (RESEARCH_IVFPQ_BTREE.md §6). Recreates the namespaces, so the caller
 		// MarkSchemaChanged (done by CompactVectorIndex) so peers reopen.
 		ivf, err := vivf.Rebuild(tx, vectorIndexNsPrefix(collName, vi.info.Name))
@@ -393,6 +391,47 @@ func (vi *vectorIndex) overThreshold(tx *btree.ReadTx) (bool, error) {
 	return deleted > 0 && float64(deleted) >= vi.compactRatio*float64(live), nil
 }
 
+// unsupportedSizes fills the size fields of a quarantined index's stats from
+// its namespaces by suffix (the removed IVF-PQ layout: :vec re-rank store,
+// :cell codes + :cb codebooks, :doc+:lbl, :meta), without decoding anything;
+// absent namespaces count as empty.
+func (vi *vectorIndex) unsupportedSizes(tx *btree.ReadTx, collName string, st *VectorIndexStats) error {
+	prefix := vectorIndexNsPrefix(collName, vi.info.Name)
+	pages := func(suffixes ...string) (int, error) {
+		total := 0
+		for _, suf := range suffixes {
+			ns, err := tx.GetNamespace(prefix + suf)
+			if err != nil {
+				if errors.Is(err, btree.ErrNamespaceNotFound) {
+					continue
+				}
+				return 0, err
+			}
+			sz, err := tx.NamespaceSize(ns)
+			if err != nil {
+				return 0, err
+			}
+			total += sz.TotalPages() * int(vi.c.db.btreeDB.PageSize())
+		}
+		return total, nil
+	}
+	var err error
+	if st.VectorBytes, err = pages(":vec"); err != nil {
+		return err
+	}
+	if st.GraphBytes, err = pages(":cell", ":cb", ":adj"); err != nil {
+		return err
+	}
+	if st.MappingBytes, err = pages(":doc", ":lbl"); err != nil {
+		return err
+	}
+	if st.MetaBytes, err = pages(":meta"); err != nil {
+		return err
+	}
+	st.SizeBytes = st.VectorBytes + st.GraphBytes + st.MappingBytes + st.MetaBytes
+	return nil
+}
+
 // bindIdentity stamps the immutable generation identity (see the field
 // comments): every constructor funnel calls it before the handle is returned
 // or published.
@@ -405,6 +444,14 @@ func (vi *vectorIndex) bindIdentity(collName string) {
 // the collection's name AS THAT SNAPSHOT knows it, which may legitimately
 // differ from the collection's present name (a later rename).
 func (c *collection) loadVectorIndexAs(tx *btree.ReadTx, collName string, info IndexInfo) (*vectorIndex, error) {
+	if info.Vector != nil && info.Vector.Mode.isRemoved() {
+		// Quarantine, not a failed open: the collection stays usable and the
+		// app can DropIndex (the only operation the index still takes).
+		vi := newVectorIndexFromVindex(c, info, nil)
+		vi.unsupported = true
+		vi.bindIdentity(collName)
+		return vi, nil
+	}
 	if err := validateVectorParams(info.Vector); err != nil {
 		return nil, err
 	}
@@ -495,14 +542,14 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info In
 		}
 	}
 
-	// IVF-PQ: train the coarse + PQ codebooks and write the inverted lists in one
-	// pass (RESEARCH_IVFPQ_BTREE.md §5.1). nlist/closure auto-size from the live
-	// count. IVF trains from the existing documents, so the index must be created on
-	// a populated collection (the documented bulk-load pattern); creating it empty
-	// has no data to learn the quantizers from.
+	// IVF: train the coarse centroids and write the inverted lists in one pass
+	// (RESEARCH_IVFPQ_BTREE.md §5.1). nlist/closure auto-size from the live count.
+	// IVF trains from the existing documents, so the index must be created on a
+	// populated collection (the documented bulk-load pattern); creating it empty
+	// has no data to learn the centroids from.
 	if info.Vector.Mode.isIVF() {
 		if len(vecs) == 0 {
-			return nil, fmt.Errorf("vector index: IVF-PQ requires existing documents to train — insert documents before creating the index")
+			return nil, fmt.Errorf("vector index: IVF requires existing documents to train — insert documents before creating the index")
 		}
 		ivf, err := vivf.BulkBuild(tx, prefix, ivfStoreParams(info.Vector, len(vecs)), ids, vecs)
 		if err != nil {
@@ -611,6 +658,11 @@ func (q *collQuery) detectKnnQuery(s *collSchema) (*qplanner.VectorQuerySpec, qu
 	if err != nil {
 		return nil, nil, err
 	}
+	if vi.unsupported {
+		// Never fall through to the brute-force branch below: a quarantined
+		// index must fail loudly, not silently scan the collection.
+		return nil, nil, fmt.Errorf("%w: index %q (mode %s) on %q; drop the index and recreate it in another mode", ErrVectorIndexUnsupported, vi.info.Name, vi.mode, field)
+	}
 	if len(knn.Query) != vi.dim {
 		return nil, nil, fmt.Errorf("%w: $knn on %q: got %d dims, index has %d", ErrInvalidVectorQuery, field, len(knn.Query), vi.dim)
 	}
@@ -640,11 +692,11 @@ func (q *collQuery) detectKnnQuery(s *collSchema) (*qplanner.VectorQuerySpec, qu
 	switch {
 	case vi.isIVF():
 		// IVF: probe a few cells (contiguous range scans), re-rank by exact
-		// distance. ef is the re-rank depth / candidate count; nprobe is fixed
+		// distance. ef is the candidate count kept from the scan; nprobe is fixed
 		// in the index.
 		spec.Ef = knnEf(knn.Ef, captured.ivf.NProbe()*8, knn.K, hasResidual)
 		// ~2.2 cost units per ef candidate measured on the vector_restrict
-		// IVFSQ benchmark (cell scans + exact rerank, amortized).
+		// benchmark (cell scans, amortized).
 		spec.SearchCostPerCand = 2.5
 		spec.Search = func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
 			cands, err := captured.ivf.SearchCandidates(tx, qv, ef)
@@ -827,7 +879,11 @@ func isAllQueryFilter(f query.Filter) bool {
 // field must carry exactly one vector index — with two, the searched index (and
 // therefore the selected documents, on Delete too) would depend on load order.
 func resolveKnnIndex(vidxs []*vectorIndex, field, indexName string) (*vectorIndex, error) {
-	var match *vectorIndex
+	// An unsupported (quarantined) index is chosen only by name, or when it
+	// is the field's only index — so its error surfaces — never over a
+	// supported one: the replacement can be built under another name before
+	// the old index is dropped, and unqualified $knn keeps working meanwhile.
+	var match, unsupported *vectorIndex
 	for _, v := range vidxs {
 		if v.info.Vector.Field != field {
 			continue
@@ -838,10 +894,17 @@ func resolveKnnIndex(vidxs []*vectorIndex, field, indexName string) (*vectorInde
 			}
 			continue
 		}
+		if v.unsupported {
+			unsupported = v
+			continue
+		}
 		if match != nil {
 			return nil, fmt.Errorf("%w: field %q", ErrAmbiguousVectorIndex, field)
 		}
 		match = v
+	}
+	if match == nil {
+		match = unsupported
 	}
 	if match == nil {
 		if indexName != "" {
@@ -1245,12 +1308,15 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 			return fmt.Errorf("%w: vector index %q", ErrIndexNotFound, indexName)
 		}
 		vi := cur[idx]
+		if vi.unsupported {
+			return fmt.Errorf("%w: index %q (mode %s); drop the index and recreate it in another mode", ErrVectorIndexUnsupported, indexName, vi.mode)
+		}
 		if vi.ix == nil && vi.ivf == nil {
 			return nil // brute-force: no index to compact
 		}
 		// Recreating the namespaces moves their root pages; MarkSchemaChanged so
 		// peers notice and reopen the index with fresh handles. (For IVF this
-		// re-trains the codebooks from the live set — see vectorIndex.compact.)
+		// re-trains the centroids from the live set — see vectorIndex.compact.)
 		tx.MarkSchemaChanged()
 		nvi, err := vi.compact(tx, s.name)
 		if err != nil {

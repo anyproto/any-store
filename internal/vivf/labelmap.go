@@ -7,7 +7,7 @@ package vivf
 // the Go map's hashing, and reset bumps a tag instead of clearing). Owned by a
 // pooled searcher and reused across queries; pointer-free (no GC scan cost).
 //
-// Dedups closure candidates, keeping each label's best ADC distance.
+// Dedups closure candidates, keeping each label's best distance.
 type u32fmap struct {
 	key  []uint32
 	val  []float32

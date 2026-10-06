@@ -6,7 +6,6 @@ import (
 	"math/rand"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/stretchr/testify/require"
@@ -63,9 +62,9 @@ func buildStore(t testing.TB, db *btree.DB, p StoreParams, vecs [][]float32) {
 	require.NoError(t, wtx.Commit())
 }
 
-// TestStoreIVFPQSmall exercises build -> search -> insert -> delete on a real
+// TestStoreSmall exercises build -> search -> insert -> delete on a real
 // in-memory btree with clustered synthetic data.
-func TestStoreIVFPQSmall(t *testing.T) {
+func TestStoreSmall(t *testing.T) {
 	const (
 		n   = 4000
 		dim = 64
@@ -73,7 +72,7 @@ func TestStoreIVFPQSmall(t *testing.T) {
 	)
 	vecs := clusteredVecs(n, dim, 40, 7)
 	db := openMem(t)
-	p := StoreParams{Dim: dim, NList: 64, M: 16, Assign: 2, NProbe: 16, Normalize: true, KMeansPP: true, Seed: 1}
+	p := StoreParams{Dim: dim, NList: 64, Assign: 2, NProbe: 16, Normalize: true, KMeansPP: true, Seed: 1}
 	buildStore(t, db, p, vecs)
 
 	rtx, err := db.BeginRead()
@@ -125,214 +124,9 @@ func TestStoreIVFPQSmall(t *testing.T) {
 	require.NoError(t, rtx.Rollback())
 }
 
-// TestStoreIVFPQLUTPathsAgree verifies the precomputed-table ADC path (used by
-// small/medium indexes) and the per-cell sqL2 fallback (large indexes) return the
-// same candidates and distances — the precomp decomposition must be exact.
-func TestStoreIVFPQLUTPathsAgree(t *testing.T) {
-	const dim = 48
-	vecs := clusteredVecs(3000, dim, 50, 3)
-	db := openMem(t)
-	p := StoreParams{Dim: dim, NList: 64, M: 12, Assign: 3, NProbe: 12, Normalize: true, KMeansPP: true, Seed: 2}
-	buildStore(t, db, p, vecs)
-
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-	defer rtx.Rollback()
-	ix, err := OpenTx(rtx, "ivf")
-	require.NoError(t, err)
-	require.NotNil(t, ix.precomp, "this config should use the precomputed table")
-
-	for _, qi := range []int{0, 100, 500, 1500, 2999} {
-		withPre, err := ix.SearchCandidates(rtx, vecs[qi], 50)
-		require.NoError(t, err)
-		saved := ix.precomp
-		ix.precomp = nil // force the sqL2 fallback
-		without, err := ix.SearchCandidates(rtx, vecs[qi], 50)
-		ix.precomp = saved
-		require.NoError(t, err)
-
-		require.Equal(t, len(withPre), len(without))
-		for i := range withPre {
-			require.Equal(t, withPre[i].DocID, without[i].DocID, "query %d rank %d docID", qi, i)
-			require.InDelta(t, withPre[i].Distance, without[i].Distance, 1e-4, "query %d rank %d dist", qi, i)
-		}
-	}
-}
-
-// TestStoreIVFPQPrecompBudget verifies the precomputed-table RAM budget knob:
-// default builds the table, a negative budget disables it, and the setting
-// survives a reopen (it's persisted in meta).
-func TestStoreIVFPQPrecompBudget(t *testing.T) {
-	const dim = 32
-	vecs := clusteredVecs(2000, dim, 30, 4)
-
-	build := func(miB int) *btree.DB {
-		db := openMem(t)
-		ids := make([][]byte, len(vecs))
-		for i := range vecs {
-			ids[i] = bid(i)
-		}
-		wtx, err := db.BeginWrite()
-		require.NoError(t, err)
-		p := StoreParams{Dim: dim, NList: 64, M: 8, Assign: 2, NProbe: 8, Normalize: true, KMeansPP: true, Seed: 1, PrecompMiB: miB}
-		_, err = BulkBuild(wtx, "ivf", p, ids, vecs)
-		require.NoError(t, err)
-		require.NoError(t, wtx.Commit())
-		return db
-	}
-	open := func(db *btree.DB) *StoreIndex {
-		rtx, err := db.BeginRead()
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = rtx.Rollback() })
-		ix, err := OpenTx(rtx, "ivf")
-		require.NoError(t, err)
-		return ix
-	}
-
-	require.NotNil(t, open(build(0)).precomp, "default budget builds the table")
-	require.NotNil(t, open(build(64)).precomp, "explicit budget builds the table")
-	require.Nil(t, open(build(-1)).precomp, "negative budget disables the table")
-}
-
-// TestStoreIVFPQInt8 compares the int8 re-rank store to f32 on the real export:
-// recall must stay within ~1% and the :vec namespace must shrink ~4×.
-func TestStoreIVFPQInt8(t *testing.T) {
-	if testing.Short() {
-		t.Skip("recall diagnostic")
-	}
-	dir := vbenchDir()
-	base, err := readF32(filepath.Join(dir, "base.f32"))
-	if err != nil {
-		t.Skipf("no ASV_VBENCH export at %s: %v", dir, err)
-	}
-	queries, err := readF32(filepath.Join(dir, "query.f32"))
-	require.NoError(t, err)
-	gt, err := readI32(filepath.Join(dir, "gt.i32"))
-	require.NoError(t, err)
-	qidx, err := readI32(filepath.Join(dir, "qidx.i32"))
-	require.NoError(t, err)
-	self := func(i int) int { return int(qidx[0][i]) }
-	const (
-		k  = 10
-		ef = 100
-	)
-	dim := len(base[0])
-
-	run := func(int8vec bool) (recall float64, vecBytes int) {
-		db := openMem(t)
-		ids := make([][]byte, len(base))
-		for i := range base {
-			ids[i] = bid(i)
-		}
-		wtx, err := db.BeginWrite()
-		require.NoError(t, err)
-		p := StoreParams{Dim: dim, NList: 256, M: 96, Assign: 4, NProbe: 16, Normalize: true, Int8: int8vec, KMeansPP: true, Seed: 42}
-		_, err = BulkBuild(wtx, "ivf", p, ids, base)
-		require.NoError(t, err)
-		require.NoError(t, wtx.Commit())
-
-		rtx, err := db.BeginRead()
-		require.NoError(t, err)
-		defer rtx.Rollback()
-		ix, err := OpenTx(rtx, "ivf")
-		require.NoError(t, err)
-		st, err := ix.Stats(rtx)
-		require.NoError(t, err)
-		var sum float64
-		for i, q := range queries {
-			cands, err := ix.SearchCandidates(rtx, q, ef)
-			require.NoError(t, err)
-			got := make([]int, 0, k)
-			for _, c := range cands {
-				got = append(got, int(binary.BigEndian.Uint64(c.DocID))-1)
-			}
-			got = exclude(got, self(i), k)
-			sum += recallVsGT(got, gt[i], k)
-		}
-		return sum / float64(len(queries)), st.Vec.TotalPages()
-	}
-
-	rF32, szF32 := run(false)
-	rInt8, szInt8 := run(true)
-	t.Logf("recall@%d f32=%.4f int8=%.4f | :vec pages f32=%d int8=%d (%.2f×)", k, rF32, rInt8, szF32, szInt8, float64(szF32)/float64(szInt8))
-	require.GreaterOrEqual(t, rInt8, rF32-0.015, "int8 recall must stay within ~1.5%% of f32")
-	require.Less(t, szInt8, szF32*45/100, "int8 :vec must be <45%% of f32 size")
-}
-
-// TestStoreIVFSQvsPQ compares IVF-SQ (int8 full vectors scanned directly, no PQ
-// LUT, no re-rank) against IVF-PQ+int8 on the real export: recall@10 and per-query
-// search time. IVF-SQ uses closure=1 + higher nprobe (replicating full vectors is
-// expensive); IVF-PQ uses closure=4 + nprobe=16.
-func TestStoreIVFSQvsPQ(t *testing.T) {
-	if testing.Short() {
-		t.Skip("recall diagnostic")
-	}
-	dir := vbenchDir()
-	base, err := readF32(filepath.Join(dir, "base.f32"))
-	if err != nil {
-		t.Skipf("no ASV_VBENCH export at %s: %v", dir, err)
-	}
-	queries, err := readF32(filepath.Join(dir, "query.f32"))
-	require.NoError(t, err)
-	gt, err := readI32(filepath.Join(dir, "gt.i32"))
-	require.NoError(t, err)
-	qidx, err := readI32(filepath.Join(dir, "qidx.i32"))
-	require.NoError(t, err)
-	self := func(i int) int { return int(qidx[0][i]) }
-	const (
-		k  = 10
-		ef = 100
-	)
-	dim := len(base[0])
-
-	run := func(name string, p StoreParams) {
-		db := openMem(t)
-		ids := make([][]byte, len(base))
-		for i := range base {
-			ids[i] = bid(i)
-		}
-		wtx, err := db.BeginWrite()
-		require.NoError(t, err)
-		t0 := time.Now()
-		_, err = BulkBuild(wtx, "ivf", p, ids, base)
-		require.NoError(t, err)
-		require.NoError(t, wtx.Commit())
-		buildMs := time.Since(t0).Milliseconds()
-
-		rtx, err := db.BeginRead()
-		require.NoError(t, err)
-		defer rtx.Rollback()
-		ix, err := OpenTx(rtx, "ivf")
-		require.NoError(t, err)
-		st, err := ix.Stats(rtx)
-		require.NoError(t, err)
-
-		var sum float64
-		ts := time.Now()
-		for i, q := range queries {
-			cands, err := ix.SearchCandidates(rtx, q, ef)
-			require.NoError(t, err)
-			got := make([]int, 0, k)
-			for _, c := range cands {
-				got = append(got, int(binary.BigEndian.Uint64(c.DocID))-1)
-			}
-			got = exclude(got, self(i), k)
-			sum += recallVsGT(got, gt[i], k)
-		}
-		usPerQuery := float64(time.Since(ts).Microseconds()) / float64(len(queries))
-		t.Logf("%-12s recall@%d=%.4f  %.0f µs/query  build=%dms  :cell=%d :vec=%d pages",
-			name, k, sum/float64(len(queries)), usPerQuery, buildMs, st.Cell.TotalPages(), st.Vec.TotalPages())
-	}
-
-	run("ivf-pq i8", StoreParams{Dim: dim, NList: 256, M: 96, Assign: 4, NProbe: 16, Normalize: true, Int8: true, KMeansPP: true, Seed: 42})
-	run("ivf-sq np32", StoreParams{Dim: dim, NList: 256, M: 96, Assign: 1, NProbe: 32, Normalize: true, SQ: true, KMeansPP: true, Seed: 42})
-	run("ivf-sq np64", StoreParams{Dim: dim, NList: 256, M: 96, Assign: 1, NProbe: 64, Normalize: true, SQ: true, KMeansPP: true, Seed: 42})
-}
-
-// TestStoreIVFPQRecallReal builds the btree-resident index on the real export and
-// confirms its recall@10 matches the in-RAM prototype / HNSW baseline (~0.97),
-// proving the storage layer preserves the algorithm's recall.
-func TestStoreIVFPQRecallReal(t *testing.T) {
+// TestStoreRecallReal builds the index on the real export and confirms its
+// recall@10 against the exact ground truth (HNSW reaches ~0.97 on it).
+func TestStoreRecallReal(t *testing.T) {
 	if testing.Short() {
 		t.Skip("recall diagnostic")
 	}
@@ -352,7 +146,7 @@ func TestStoreIVFPQRecallReal(t *testing.T) {
 	dim := len(base[0])
 
 	db := openMem(t)
-	p := StoreParams{Dim: dim, NList: 256, M: 96, Assign: 4, NProbe: 16, Normalize: true, KMeansPP: true, Seed: 42}
+	p := StoreParams{Dim: dim, NList: 256, Assign: 1, NProbe: 64, Normalize: true, KMeansPP: true, Seed: 42}
 	buildStore(t, db, p, base)
 
 	rtx, err := db.BeginRead()
@@ -361,7 +155,7 @@ func TestStoreIVFPQRecallReal(t *testing.T) {
 	ix, err := OpenTx(rtx, "ivf")
 	require.NoError(t, err)
 
-	const ef = 100 // re-rank depth (≈ prototype kFactor=10 at k=10)
+	const ef = 100
 	var sum float64
 	for i, q := range queries {
 		cands, err := ix.SearchCandidates(rtx, q, ef)
@@ -375,8 +169,8 @@ func TestStoreIVFPQRecallReal(t *testing.T) {
 		sum += recallVsGT(got, gt[i], k)
 	}
 	r := sum / float64(len(queries))
-	t.Logf("btree-resident IVF-PQ recall@%d = %.4f (nlist=256 M=96 assign=4 nprobe=16 ef=%d) — HNSW=0.970", k, r, ef)
-	require.GreaterOrEqual(t, r, 0.95, "btree IVF-PQ must preserve prototype recall")
+	t.Logf("btree-resident IVF-SQ recall@%d = %.4f (nlist=256 assign=1 nprobe=64 ef=%d) — HNSW=0.970", k, r, ef)
+	require.GreaterOrEqual(t, r, 0.93)
 }
 
 // TestStoreEfCutIsDeterministic pins the (dist, label) tie-break on the ef-cut
@@ -397,8 +191,8 @@ func TestStoreEfCutIsDeterministic(t *testing.T) {
 		ef  = 20
 	)
 	// 10 docs near the query at distinct distances + 290 byte-identical docs
-	// (identical vectors ⇒ identical PQ codes ⇒ exact ADC ties). ef=20 needs
-	// 10 of the 290 ties: the cut lands inside the tie group.
+	// (identical vectors ⇒ identical int8 records ⇒ exact distance ties). ef=20
+	// needs 10 of the 290 ties: the cut lands inside the tie group.
 	query := make([]float32, dim)
 	for d := range query {
 		query[d] = float32(d) / dim
@@ -419,7 +213,7 @@ func TestStoreEfCutIsDeterministic(t *testing.T) {
 		vecs[i] = tie
 	}
 	db := openMem(t)
-	p := StoreParams{Dim: dim, NList: 4, M: 8, Assign: 1, NProbe: 4, Seed: 1}
+	p := StoreParams{Dim: dim, NList: 4, Assign: 1, NProbe: 4, Seed: 1}
 	buildStore(t, db, p, vecs)
 
 	rtx, err := db.BeginRead()

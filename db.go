@@ -1544,7 +1544,6 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 					NList:              vv.GetInt("nlist"),
 					NProbe:             vv.GetInt("nprobe"),
 					Closure:            vv.GetInt("closure"),
-					PrecomputeTableMiB: vv.GetInt("ptmib"),
 				}
 			}
 		}
@@ -1554,6 +1553,17 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 		}
 	}
 	return result, nil
+}
+
+// persistedVectorModeRemoved reports that a catalog record describes a vector
+// index in a mode this version removed (VectorMode.isRemoved).
+func persistedVectorModeRemoved(persisted []byte) bool {
+	var p anyenc.Parser
+	v, err := p.Parse(persisted)
+	if err != nil || IndexKind(v.GetInt("kind")) != IndexKindVector {
+		return false
+	}
+	return VectorMode(v.GetInt("vector", "mode")).isRemoved()
 }
 
 // indexDefMatches reports whether a persisted index record (the system-namespace
@@ -1608,7 +1618,7 @@ func vectorDefMatches(vv *anyenc.Value, p *VectorParams) bool {
 		dim, metric, m, efc, efs, quant, mode int
 		hvc                                   bool
 		cr                                    float64
-		nlist, nprobe, closure, ptmib         int
+		nlist, nprobe, closure                int
 	)
 	if vv != nil {
 		field = vv.GetString("field")
@@ -1624,7 +1634,6 @@ func vectorDefMatches(vv *anyenc.Value, p *VectorParams) bool {
 		nlist = vv.GetInt("nlist")
 		nprobe = vv.GetInt("nprobe")
 		closure = vv.GetInt("closure")
-		ptmib = vv.GetInt("ptmib")
 	}
 	return field == p.Field &&
 		dim == p.Dim &&
@@ -1638,8 +1647,7 @@ func vectorDefMatches(vv *anyenc.Value, p *VectorParams) bool {
 		cr == p.CompactRatio &&
 		nlist == p.NList &&
 		nprobe == p.NProbe &&
-		closure == p.Closure &&
-		ptmib == p.PrecomputeTableMiB
+		closure == p.Closure
 }
 
 // fulltextDefMatches compares a persisted fulltext-param record against the
@@ -1689,6 +1697,11 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 		if indexDefMatches(existing, info) {
 			return ErrIndexExists
 		}
+		if persistedVectorModeRemoved(existing) {
+			// The likely upgrade path — EnsureIndex of the same name in a
+			// supported mode — names the remedy, not just the mismatch.
+			return fmt.Errorf("%w: %w", ErrIndexMismatch, ErrVectorIndexUnsupported)
+		}
 		return ErrIndexMismatch
 	}
 	var a anyenc.Arena
@@ -1735,9 +1748,6 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 		}
 		if info.Vector.Closure != 0 {
 			vobj.Set("closure", a.NewNumberInt(info.Vector.Closure))
-		}
-		if info.Vector.PrecomputeTableMiB != 0 {
-			vobj.Set("ptmib", a.NewNumberInt(info.Vector.PrecomputeTableMiB))
 		}
 		obj.Set("vector", vobj)
 	}

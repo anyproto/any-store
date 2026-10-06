@@ -84,21 +84,17 @@ const (
 	// that a field is a vector. Search scans the collection and computes exact
 	// distances: ~free writes, ~0 storage, exact (100%) recall, O(N) search.
 	VectorModeBruteForce
-	// VectorModeIVFPQ is a btree-resident IVF-PQ index (see
-	// vector/RESEARCH_IVFPQ_BTREE.md): vectors are partitioned into nlist coarse
-	// cells and each is stored as a compact product-quantization code of its
-	// residual. Search probes a few cells (contiguous btree range scans — no random
-	// graph traversal) and re-ranks the survivors by exact distance. Far smaller hot
-	// RAM set (only the coarse centroids) and a sequential read pattern, at the cost
-	// of approximate recall recovered by re-rank. See VectorParams NList/NProbe/Closure.
-	VectorModeIVFPQ
-	// VectorModeIVFSQ is the same IVF partition but stores each vector as an int8
-	// scalar-quantized full vector per cell (no product quantization), scanned
-	// directly with exact int8 distance — no ADC table, no precomputed table, no
-	// re-rank. Versus IVFPQ: much faster builds (no PQ training), higher recall (int8
-	// is more faithful than PQ), smaller (no separate re-rank store), and no
-	// precompute-table RAM — at higher search cost (it reads full vectors, not codes).
-	// Favours Closure=1 with a higher NProbe (replicating full vectors is costly).
+	// vectorModeIVFPQ is the removed IVF-PQ mode. The value stays reserved so an
+	// index an earlier version built in it is recognised: such an index is
+	// quarantined at open (see loadVectorIndexAs) and can only be dropped.
+	vectorModeIVFPQ
+	// VectorModeIVFSQ is a btree-resident IVF index: vectors are partitioned into
+	// nlist coarse cells (k-means) and each is stored under its cell(s) as an
+	// int8 scalar-quantized full vector. Search probes a few cells — contiguous
+	// btree range scans, no random graph traversal — scoring every record by exact
+	// int8 distance; no re-rank. Only the coarse centroids are hot in RAM. Fast
+	// writes (an insert assigns a cell and writes one record), approximate recall
+	// set by NProbe. See VectorParams NList/NProbe/Closure.
 	VectorModeIVFSQ
 )
 
@@ -108,7 +104,7 @@ func (m VectorMode) String() string {
 		return "hybrid"
 	case VectorModeBruteForce:
 		return "brute"
-	case VectorModeIVFPQ:
+	case vectorModeIVFPQ:
 		return "ivfpq"
 	case VectorModeIVFSQ:
 		return "ivfsq"
@@ -117,9 +113,12 @@ func (m VectorMode) String() string {
 	}
 }
 
-// isIVF reports whether this mode is an IVF index (PQ or SQ) — both share the
-// internal/vivf backend.
-func (m VectorMode) isIVF() bool { return m == VectorModeIVFPQ || m == VectorModeIVFSQ }
+// isIVF reports whether this mode is an IVF index (the internal/vivf backend).
+func (m VectorMode) isIVF() bool { return m == VectorModeIVFSQ }
+
+// isRemoved reports whether this mode once existed and was removed: the catalog
+// may still describe an index in it, which no backend can serve.
+func (m VectorMode) isRemoved() bool { return m == vectorModeIVFPQ }
 
 // isBruteForce reports whether this mode keeps no on-disk index structure.
 func (m VectorMode) isBruteForce() bool { return m == VectorModeBruteForce }
@@ -136,11 +135,9 @@ type VectorParams struct {
 	M              int `json:"m,omitempty"`
 	EfConstruction int `json:"efConstruction,omitempty"`
 	EfSearch       int `json:"efSearch,omitempty"`
-	// Quantization selects the stored vector format (default full float32). For
-	// VectorModeIVFPQ it sets the format of the re-rank vector store (the bulk of the
-	// index): VectorQuantInt8 makes it ~4× smaller on disk and in the page cache —
-	// cutting RAM and speeding the random per-candidate re-rank reads — at ~0.5%
-	// recall, and is recommended there.
+	// Quantization selects the stored vector format of the HNSW modes (default
+	// full float32). VectorModeIVFSQ always stores int8: the value has no effect
+	// on its storage but stays part of the definition EnsureIndex compares.
 	Quantization VectorQuantization `json:"quantization,omitempty"`
 	// Mode selects the index strategy (default btree). See VectorMode.
 	Mode VectorMode `json:"mode,omitempty"`
@@ -177,16 +174,17 @@ type VectorParams struct {
 	// a maintenance window.
 	// Ignored for VectorModeBruteForce.
 	//
-	// For VectorModeIVFPQ, CompactRatio instead bounds *centroid drift*: IVF deletes
-	// are physical (no tombstones), but the codebooks are frozen at build, so as the
+	// For VectorModeIVFSQ, CompactRatio instead bounds *centroid drift*: IVF deletes
+	// are physical (no tombstones), but the centroids are frozen at build, so as the
 	// data distribution shifts the partition degrades. CompactRatio triggers an
 	// automatic rebuild (re-train from the live set) when the drift score —
 	// max(reconstruction-error ratio − 1, churn ratio) — reaches it. ~0.5 rebuilds
-	// after the live set roughly doubles or new data fits the centroids ~50% worse;
-	// 0 disables auto-rebuild (use Collection.CompactVectorIndex manually).
+	// once the writes since the build reach half its size, or new data fits the
+	// centroids ~50% worse; 0 disables auto-rebuild (use
+	// Collection.CompactVectorIndex manually).
 	CompactRatio float64 `json:"compactRatio,omitempty"`
 
-	// IVF-PQ parameters (Mode == VectorModeIVFPQ only). Zero values pick defaults.
+	// IVF parameters (Mode == VectorModeIVFSQ only). Zero values pick defaults.
 	//
 	// NList is the number of coarse cells (k-means centroids); 0 ⇒ ~4·√N at build.
 	// More cells = finer partition = fewer vectors scanned per probe, but more
@@ -196,18 +194,10 @@ type VectorParams struct {
 	// Higher = more recall, more cells scanned.
 	NProbe int `json:"nProbe,omitempty"`
 	// Closure is the multi-assignment factor: each vector is placed in its Closure
-	// nearest cells (with a per-cell residual code) so boundary vectors are found at
-	// lower NProbe (SPANN closure). 0/1 = single assignment; ~4 reaches parity at
-	// ~4× lower NProbe, costing ~Closure× the on-disk code bytes. M (above) sets the
-	// number of PQ subquantizers / code bytes; Dim must be divisible by M.
+	// nearest cells so boundary vectors are found at lower NProbe (SPANN closure).
+	// 0/1 = single assignment. Every extra cell stores a full int8 record, so the
+	// index grows ~Closure×; a higher NProbe is usually the cheaper dial.
 	Closure int `json:"closure,omitempty"`
-	// PrecomputeTableMiB budgets the RAM for the IVF-PQ precomputed ADC table, which
-	// removes the per-cell distance-table rebuild from search (measured ~3× faster
-	// search at dim 768) at the cost of an always-resident table of nlist·M·1 KiB.
-	// 0 = the default budget (128 MiB: on for typical indexes, off for very large
-	// ones whose table would exceed it); a negative value disables the table
-	// (smallest RAM, slower search); a positive value sets the budget in MiB.
-	PrecomputeTableMiB int `json:"precomputeTableMiB,omitempty"`
 }
 
 // IndexInfo provides information about an index.

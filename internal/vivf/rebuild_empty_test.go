@@ -7,13 +7,13 @@ import (
 )
 
 // Rebuild of an index whose documents were all deleted must not panic (kmeans
-// on an empty set): it keeps the trained codebooks, clears the data, and the
+// on an empty set): it keeps the trained centroids, clears the data, and the
 // store stays usable for searches and inserts.
 func TestRebuildEmptiedIndex(t *testing.T) {
 	const dim = 8
 	vecs := clusteredVecs(50, dim, 4, 1)
 	db := openMem(t)
-	p := StoreParams{Dim: dim, NList: 4, M: 4, Assign: 1, NProbe: 4, Seed: 1}
+	p := StoreParams{Dim: dim, NList: 4, Assign: 1, NProbe: 4, Seed: 1}
 	buildStore(t, db, p, vecs)
 
 	wtx, err := db.BeginWrite()
@@ -61,6 +61,6 @@ func TestBulkBuildEmptyErrors(t *testing.T) {
 	wtx, err := db.BeginWrite()
 	require.NoError(t, err)
 	defer wtx.Rollback()
-	_, err = BulkBuild(wtx, "ivf", StoreParams{Dim: 8, NList: 4, M: 4}, nil, nil)
+	_, err = BulkBuild(wtx, "ivf", StoreParams{Dim: 8, NList: 4}, nil, nil)
 	require.Error(t, err)
 }

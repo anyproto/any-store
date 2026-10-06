@@ -66,10 +66,16 @@ type VectorIndexStats struct {
 	// Dim is the embedding dimension; Metric is the distance metric.
 	Dim    int
 	Metric string
-	// Mode is the index strategy ("btree" | "hybrid" | "brute").
+	// Mode is the index strategy ("btree" | "hybrid" | "brute" | "ivfsq"; "ivfpq"
+	// only for an Unsupported index).
 	Mode string
 	// Quantization is the stored vector format ("none" | "int8").
 	Quantization string
+	// Unsupported reports an index built by an earlier version in a mode this
+	// one no longer supports (see ErrVectorIndexUnsupported): it is neither
+	// searched nor maintained, only its namespace sizes are reported (no
+	// counts), and it should be dropped and recreated in a supported mode.
+	Unsupported bool
 
 	// M / EfSearch are the HNSW graph parameters.
 	M        int
@@ -84,6 +90,9 @@ type VectorIndexStats struct {
 
 	// VectorBytes / GraphBytes / MappingBytes / MetaBytes are the on-disk sizes
 	// of the vector, adjacency, docId<->label, and meta namespaces respectively.
+	// For IVF-SQ the int8 cell records are the vectors (VectorBytes) and the
+	// centroid table is the graph (GraphBytes); for an Unsupported IVF-PQ index
+	// its re-rank store is the vectors and its codes + codebooks the graph.
 	VectorBytes  int
 	GraphBytes   int
 	MappingBytes int
@@ -255,7 +264,7 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 
 		// Per-vector-index statistics.
 		for _, vi := range vindexes {
-			// IVF-PQ backend: sum its btree namespaces (codes + vectors + maps).
+			// IVF backend: sum its btree namespaces (int8 vectors + centroids + maps).
 			if vi.ivf != nil {
 				vs, vErr := vi.ivf.Stats(tx)
 				if vErr != nil {
@@ -268,12 +277,11 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 					Dim:          vs.Dim,
 					Metric:       vi.info.Vector.Metric.toVindex().String(),
 					Mode:         vi.mode.String(),
-					Quantization: vi.info.Vector.Quantization.toVindex().String(),
-					M:            vs.M,
+					Quantization: "int8", // IVF-SQ cells are always int8
 					NodeCount:    int(vs.Count),
 					LiveCount:    int(vs.Count),
-					VectorBytes:  pages(vs.Vec),
-					GraphBytes:   pages(vs.Cell) + pages(vs.CB), // codes + codebooks
+					VectorBytes:  pages(vs.Cell) + pages(vs.Vec), // the int8 records, replicated per closure cell
+					GraphBytes:   pages(vs.CB),                   // coarse centroids
 					MappingBytes: pages(vs.Doc) + pages(vs.Lbl),
 					MetaBytes:    pages(vs.Meta),
 				}
@@ -282,16 +290,26 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 				stats.VectorIndexes = append(stats.VectorIndexes, vstat)
 				continue
 			}
-			// Brute-force mode keeps no index data: report metadata only, zero bytes.
+			// Brute-force mode keeps no index data: report metadata only, zero
+			// bytes. An unsupported index's data is never decoded, but its
+			// namespaces still hold it — their sizes are what a drop reclaims.
 			if vi.ix == nil {
-				stats.VectorIndexes = append(stats.VectorIndexes, VectorIndexStats{
+				vstat := VectorIndexStats{
 					Name:         vi.info.Name,
 					Field:        vi.info.Vector.Field,
 					Dim:          vi.dim,
 					Metric:       vi.info.Vector.Metric.toVindex().String(),
 					Mode:         vi.mode.String(),
 					Quantization: vi.info.Vector.Quantization.toVindex().String(),
-				})
+					Unsupported:  vi.unsupported,
+				}
+				if vi.unsupported {
+					if err := vi.unsupportedSizes(tx, s.name, &vstat); err != nil {
+						return err
+					}
+					stats.VectorIndexesSizeBytes += vstat.SizeBytes
+				}
+				stats.VectorIndexes = append(stats.VectorIndexes, vstat)
 				continue
 			}
 			vs, vErr := vi.ix.Stats(tx)
