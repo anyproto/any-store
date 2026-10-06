@@ -768,6 +768,11 @@ func (wi *walIndex) liveMinFrame() uint32 {
 	return wi.shmNBackfill() + 1
 }
 
+// testInProcessReadSnapshotHook, when non-nil, runs in the in-process read
+// begin between its lock-free reads of the frame numbers and of the restart
+// count. Test-only.
+var testInProcessReadSnapshotHook func()
+
 // synthHdr is the header of a snapshot in the in-process and in-memory
 // modes, which keep no WAL-index header: the frame ceiling and the restart
 // count (iChange, unused otherwise), no salts (WalIndexHdr.synthesized).
@@ -2820,6 +2825,9 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 	// key, or the other way round.
 	mxFrame := w.index.mxCommitFrame.LoadLocal()
 	nBackfill := w.index.nBackfill.Load()
+	if testInProcessReadSnapshotHook != nil {
+		testInProcessReadSnapshotHook()
+	}
 	restarts := w.index.restarts.Load()
 	hdr = WalIndexHdr{isInit: 1, mxFrame: mxFrame, iChange: restarts}
 
@@ -2827,10 +2835,12 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 		if err := w.index.lock(lockRead0, lockShared); err != nil {
 			return WalIndexHdr{}, 0, 0, 0, err
 		}
-		if w.index.restarts.Load() != restarts {
-			// The key of the snapshot the frame numbers describe moved
-			// under it; the content (the file alone) would be right, the
-			// key would match the new generation's commits.
+		if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill ||
+			w.index.restarts.Load() != restarts {
+			// A restart in between: the content (the file alone) would be
+			// right, the key — the old frame numbers with the new count,
+			// or the other way round — would match the new generation's
+			// commits.
 			_ = w.index.unlock(lockRead0, lockShared)
 			return WalIndexHdr{}, 0, 0, 0, errWALRetry
 		}

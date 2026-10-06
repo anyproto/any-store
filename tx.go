@@ -117,11 +117,13 @@ func (tx *commonTx) schemaCommitted(fileChangeCounter, schemaCookie uint32) {
 		testHookBeforeInstall()
 	}
 	tx.schema.install(tx.db.epoch.Load().gen)
+	tx.db.settling.Store(schemaCookie)
 	tx.db.settleLog(&tx.schema)
 	if testHookAfterSettle != nil {
 		testHookAfterSettle()
 	}
 	tx.db.schemaCommitted(fileChangeCounter, schemaCookie)
+	tx.db.settling.Store(0)
 }
 
 // testHookBeforeInstall, when set, runs inside a schema-changing commit as

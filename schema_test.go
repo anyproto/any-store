@@ -699,3 +699,91 @@ func TestCommit_OpenOfDroppedInThePublication(t *testing.T) {
 	require.NoError(t, err)
 	assertCollCount(t, a2, 0)
 }
+
+// A handle registered while a schema-flagged commit that publishes nothing
+// still has its announcement up — EnsureIndex of an existing index, the
+// startup idiom — is proven from the epoch's known like any other: the
+// announced cookie is produced by nothing, and a handle proven from it
+// would have no head until the next schema change, every transaction
+// loading its own version.
+func TestCommit_RegistrationDuringEmptySchemaCommit(t *testing.T) {
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "k", Fields: []string{"k"}}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"k":1}`)))
+	require.NoError(t, coll.Close())
+	d, err := fx.CreateCollection(ctx, "d")
+	require.NoError(t, err)
+	require.NoError(t, d.EnsureIndex(ctx, IndexInfo{Name: "k", Fields: []string{"k"}}))
+	known := dbi.epoch.Load().known
+
+	var opened Collection
+	var fired bool
+	testHookAfterBtreeCommit = func() {
+		if fired {
+			return
+		}
+		fired = true
+		// The announcement is up, the write lock released, nothing
+		// published: a registration now.
+		var err error
+		opened, err = fx.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+	}
+	defer func() { testHookAfterBtreeCommit = nil }()
+	require.NoError(t, d.EnsureIndex(ctx, IndexInfo{Name: "k", Fields: []string{"k"}}))
+	require.NotNil(t, opened)
+
+	c := opened.(*collection)
+	assert.Equal(t, known, c.since)
+	loads := countSchemaLoads(t)
+	for range 3 {
+		n, err := opened.Find(`{"k":1}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+	}
+	assert.NotNil(t, c.cur(), "no head installed: the handle is proven from a cookie nothing produces")
+	assert.LessOrEqual(t, *loads, 1, "every transaction loaded its own version")
+}
+
+// The sketch deltas of a transaction's writes to a collection whose schema
+// the same transaction changed are persisted with the commit: the version
+// the transaction logged is its own, whatever its generation stamp says
+// before the install.
+func TestCommit_PersistsSketchesOfLoggedVersions(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	other, err := fx.CreateCollection(ctx, "other")
+	require.NoError(t, err)
+
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(wtx.Context(), IndexInfo{Name: "k", Fields: []string{"k"}}))
+	for i := range 50 {
+		require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"k":%d}`, i, i%5))))
+	}
+	require.NoError(t, wtx.Commit())
+	idx := coll.(*collection).cur().indexes[0]
+	assert.False(t, idx.sketchModified, "the commit did not persist the sketch")
+	// The next write's begin rebases whatever was not persisted.
+	require.NoError(t, other.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	assert.Equal(t, uint64(50), idx.loadPubSketch().GetDocCount(), "the deltas were rebased away")
+}
+
+// Name() of a handle whose collection is gone — closed, dropped, renamed
+// by another process — reports the name it had, not the one it was opened
+// under.
+func TestName_OfAGoneHandle(t *testing.T) {
+	skipIfInMemory(t, "staleness counters model cross-process commits; not applicable in-memory")
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	a, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	require.NoError(t, a.Rename(ctx, "b"))
+	peerSchemaChangeNow(t, dbi)
+	require.NoError(t, a.Close())
+	assert.Equal(t, "b", a.Name())
+}

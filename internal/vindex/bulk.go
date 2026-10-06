@@ -87,8 +87,9 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p Params, seed int64, ids [][]
 		efC: ix.efC, efS: ix.efS, ml: ix.ml, quant: ix.quant,
 		count: int64(n), nextLabel: uint32(n), deletedCount: 0,
 		hasEntry: b.hasEntry, entryLabel: b.entry, topLayer: b.top,
+		// per-insert ends at l0Gen==n; match so a hybrid mirror keys correctly
 		l0Gen: uint64(n),
-		build: newBuild(), // per-insert ends at l0Gen==n; match so a hybrid mirror keys correctly
+		build: newBuild(),
 	}
 	var kbuf, vbuf []byte
 	var lb [4]byte

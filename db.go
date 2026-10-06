@@ -290,9 +290,12 @@ type db struct {
 
 	// epoch is what this process knows of the schema cookie's history, and
 	// ownCookie the cookie a commit of this process is producing right now
-	// (flag in the high half); see schemaEpoch and observeCookie.
+	// (flag in the high half); see schemaEpoch and observeCookie. settling
+	// is that cookie while the commit's registry work is done and the epoch
+	// not yet past it (commonTx.schemaCommitted); see sinceNow.
 	epoch     atomic.Pointer[schemaEpoch]
 	ownCookie atomic.Uint64
+	settling  atomic.Uint32
 	// sketchEpoch counts the commits of other processes this one noticed:
 	// each may have moved the sketches of any collection (see
 	// collection.refreshSketches).
@@ -1347,19 +1350,25 @@ func (db *db) forgetLocked(c *collection) {
 func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
 	gen := db.epoch.Load().gen
 	for _, c := range db.sketchDirty {
-		s, dropped := c.inTx(&tx.ReadTx)
-		if dropped || s == nil || c.closed.Load() {
-			// Dropped in this tx: the stat_data rows were deleted with the
-			// collection — persisting the still-dirty sketches would durably
-			// resurrect orphaned rows a later same-named index would adopt.
+		if c.closed.Load() {
 			continue
 		}
-		if s == c.cur() && s.gen.Load() != gen {
+		var s *collSchema
+		if e := c.logged(&tx.ReadTx); e != nil {
+			// A version this transaction logged is its own, made from its
+			// verified view; its generation is stamped at the install.
+			// Dropped in this tx: the stat_data rows were deleted with the
+			// collection — persisting the still-dirty sketches would
+			// durably resurrect orphaned rows a later same-named index
+			// would adopt.
+			if e.kind == logDrop {
+				continue
+			}
+			s = e.s
+		} else if s = c.cur(); s == nil || s.gen.Load() != gen {
 			// A head another process's change left unverified: its name
 			// and indexes may be gone; the flags wait for the handle to be
-			// verified. A version this transaction logged is its own, made
-			// from its verified view; its generation is stamped at the
-			// install.
+			// verified.
 			continue
 		}
 		if err := c.persistSketches(tx, s); err != nil {
