@@ -2518,3 +2518,38 @@ func TestSavepointRollback_DiscardsItsDDLOnly(t *testing.T) {
 	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
 	assertIndexesHold(t, fx, a, "a", 2, "k")
 }
+
+// A Close() of a handle the write transaction created waits, like any
+// close of a handle the transaction's DDL references: the handle works until
+// the transaction ends, an open in between keeps it, and otherwise it is
+// closed once the commit has registered it — so the next open builds a
+// fresh handle for the committed collection.
+func TestCreatedHandle_CloseDuringTx(t *testing.T) {
+	for _, reopened := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reopened=%v", reopened), func(t *testing.T) {
+			fx := newFixture(t)
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			n, err := fx.CreateCollection(tx.Context(), "n")
+			require.NoError(t, err)
+			require.NoError(t, n.Insert(tx.Context(), ddlDoc(1)))
+			require.NoError(t, n.Close())
+			assertCollCountInTx(tx.Context(), t, n, 1)
+			if reopened {
+				again, err := fx.OpenCollection(tx.Context(), "n")
+				require.NoError(t, err)
+				assert.True(t, again == n)
+			}
+			require.NoError(t, tx.Commit())
+
+			fresh, err := fx.OpenCollection(ctx, "n")
+			require.NoError(t, err)
+			assert.Equal(t, reopened, fresh == n)
+			assertCollCount(t, fresh, 1)
+			if !reopened {
+				_, err = n.Count(ctx)
+				assert.ErrorIs(t, err, anystore.ErrCollectionClosed)
+			}
+		})
+	}
+}
