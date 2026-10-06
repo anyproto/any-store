@@ -584,20 +584,28 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 // next commit to persist.
 func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
 	kept := db.sketchDirty[:0]
+	gen := db.epoch.Load().gen
 	for _, c := range db.sketchDirty {
 		flagged := false
-		if !c.closed.Load() {
+		// Only a head verified for the present is rebased: another
+		// process may have redefined the index whose bytes the stale name
+		// finds, and the live object is shared with the readers' versions.
+		if s := c.cur(); !c.closed.Load() && s != nil && s.gen.Load() == gen {
 			c.mu.Lock()
-			for _, idx := range c.loadIndexes() {
+			for _, idx := range s.indexes {
 				if idx.sketchModified {
 					// reloadSketch (writable) rebases live to the committed bytes and
 					// clears sketchModified; if there are no committed bytes yet
 					// (brand-new pre-commit index) it preserves the built sketch.
-					c.reloadSketch(tx, c.cur().name, idx, true)
+					c.reloadSketch(tx, s.name, idx, true)
 					flagged = flagged || idx.sketchModified
 				}
 			}
 			c.mu.Unlock()
+		} else if s != nil && !c.closed.Load() {
+			for _, idx := range s.indexes {
+				flagged = flagged || idx.sketchModified
+			}
 		}
 		if flagged {
 			kept = append(kept, c)
@@ -627,15 +635,17 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 		return nil, err
 	}
 	if _, ok := db.ambientWriteTx(ctx); !ok {
-		// A live handle with a version installed answers for the name at
-		// once. One without (opened through an old snapshot, see
-		// resolveSlow) proves nothing about the present: the catalog check
-		// inside the tx decides. Inside a write tx the catalog alone
-		// decides: the registry holds the committed names, and the tx may
-		// have dropped or renamed the collection under this one.
+		// A live handle whose head is verified for the present — the
+		// current generation, under this name — answers for the name at
+		// once. One without a head (opened through an old snapshot, see
+		// resolveSlow), one another process's change left unverified, or
+		// one a commit renamed and not yet re-keyed (settleLog) proves
+		// nothing: the catalog check inside the tx decides. Inside a write
+		// tx the catalog alone decides: the registry holds the committed
+		// names, and the tx may have dropped or renamed the collection
+		// under this one.
 		db.mu.Lock()
-		if existing, ok := db.openedCollections[collectionName]; ok &&
-			!existing.(*collection).closed.Load() && existing.(*collection).cur() != nil {
+		if existing, ok := db.openedCollections[collectionName]; ok && existing.(*collection).answersFor(collectionName) {
 			db.mu.Unlock()
 			return nil, ErrCollectionExists
 		}
@@ -783,6 +793,9 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 			if e.kind == logDrop {
 				return nil, ErrCollectionNotFound
 			}
+			if err := e.c.alive(); err != nil {
+				return nil, err
+			}
 			return e.c, nil
 		}
 	}
@@ -818,12 +831,16 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 		}
 		if existing, ok := db.openedCollections[collectionName]; ok {
 			// A closed handle still in the slot: a drop that is published
-			// but not settled (settleLog), and the caller an older snapshot
-			// that still has the collection. The closed handle is its
-			// answer (fail-safe: its operations fail), not a second one.
-			db.mu.Unlock()
-			opened = existing
-			return nil
+			// but not settled (settleLog). A caller whose snapshot still
+			// has that collection gets the closed handle (fail-safe: its
+			// operations fail), not a second one; a caller that has
+			// another collection under the name takes the slot.
+			if existing.(*collection).identity == c.identity {
+				db.mu.Unlock()
+				opened = existing
+				return nil
+			}
+			db.forgetLocked(existing.(*collection))
 		}
 		c.since = db.epoch.Load().known
 		db.openedCollections[collectionName] = c
@@ -841,11 +858,13 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 
 // resolveOpened answers an open that found c registered. With a transaction
 // in ctx the collection must be in its view under name. Without one a handle
-// that has a version is the answer as it is; one that has none yet is
-// resolved through a short read first, so a handle left behind by an old
-// snapshot never answers for a collection that is gone.
+// whose head is verified for the present under the name is the answer as it
+// is; any other — none installed yet, unverified since another process's
+// change, renamed by a commit not yet settled — is resolved through a short
+// read first, so a handle left behind never answers for a collection that
+// is gone or called otherwise.
 func (db *db) resolveOpened(ctx context.Context, c *collection, name string) error {
-	if ctx.Value(ctxKeyTx) == nil && c.cur() != nil {
+	if ctx.Value(ctxKeyTx) == nil && c.answersFor(name) {
 		return nil
 	}
 	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
@@ -1324,12 +1343,16 @@ func (db *db) forgetLocked(c *collection) {
 // nothing from the list: the next write-tx begin does
 // (resetUncommittedSketches).
 func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
+	gen := db.epoch.Load().gen
 	for _, c := range db.sketchDirty {
 		s, dropped := c.inTx(&tx.ReadTx)
-		if dropped || s == nil || c.closed.Load() {
+		if dropped || s == nil || c.closed.Load() || s.gen.Load() != gen {
 			// Dropped in this tx: the stat_data rows were deleted with the
 			// collection — persisting the still-dirty sketches would durably
 			// resurrect orphaned rows a later same-named index would adopt.
+			// A head another process's change left unverified: its name
+			// and indexes may be gone; the flags wait for the handle to be
+			// verified.
 			continue
 		}
 		if err := c.persistSketches(tx, s); err != nil {

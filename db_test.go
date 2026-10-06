@@ -2352,3 +2352,64 @@ func TestCreateCollectionRollback_RestoresOnlyADroppedHandle(t *testing.T) {
 	d.mu.Unlock()
 	assert.False(t, registered("x"))
 }
+
+// peerRenameCollection renames the collection with a raw btree transaction
+// and rewinds the local counters: what another process's Rename leaves for
+// this one to find.
+func peerRenameCollection(t *testing.T, d *db, from, to string) {
+	t.Helper()
+	fcc, sc := d.btreeDB.LocalCounters()
+	tx, err := d.btreeDB.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, d.renameCollection(tx, from, to))
+	tx.MarkDataChanged()
+	require.NoError(t, tx.Commit())
+	d.btreeDB.UpdateLocalCounters(fcc, sc)
+}
+
+// The sketch passes of a write transaction — the rebase at its begin, the
+// persist at its commit — act only on heads verified for the present: a
+// handle whose collection another process renamed since the deltas were
+// made keeps its flags until a transaction verifies it, and no sketch row
+// is written under a name the catalog no longer has.
+func TestSketchPasses_SkipUnverifiedHead(t *testing.T) {
+	skipIfInMemory(t, "models another process's commit; not applicable in-memory")
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	a, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	require.NoError(t, a.EnsureIndex(ctx, IndexInfo{Name: "k", Fields: []string{"k"}}))
+	x, err := fx.CreateCollection(ctx, "x")
+	require.NoError(t, err)
+	require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(`{"id":1,"k":1}`)))
+
+	// Deltas left by a rollback: the head's index stays flagged and a stays
+	// listed for the next begin.
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, a.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":2,"k":2}`)))
+	require.NoError(t, wtx.Rollback())
+	idx := a.(*collection).cur().indexes[0]
+	require.True(t, idx.sketchModified)
+
+	peerRenameCollection(t, dbi, "a", "b")
+	require.NoError(t, x.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+
+	rtx, err := dbi.btreeDB.BeginRead()
+	require.NoError(t, err)
+	_, err = rtx.Get(dbi.systemNS, sketchKey("a", "k"))
+	assert.ErrorIs(t, err, btree.ErrKeyNotFound, "a sketch row written under the name the other process took away")
+	_, err = rtx.Get(dbi.systemNS, sketchKey("b", "k"))
+	assert.NoError(t, err)
+	require.NoError(t, rtx.Rollback())
+	assert.True(t, idx.sketchModified, "the deltas were dropped without a rebase")
+
+	// The handle retires on use; the collection goes on under its new name.
+	_, err = a.Count(ctx)
+	assert.ErrorIs(t, err, ErrCollectionClosed)
+	b, err := fx.OpenCollection(ctx, "b")
+	require.NoError(t, err)
+	n, err := b.Find(`{"k":1}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+}

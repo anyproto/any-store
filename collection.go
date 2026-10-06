@@ -246,6 +246,18 @@ func (c *collection) cur() *collSchema {
 	return c.head.Load()
 }
 
+// answersFor reports that the handle stands for a live collection called
+// name as far as this process has verified: a head of the current
+// generation under that name. For the callers that have no transaction to
+// resolve in; anything else is resolved through a short read.
+func (c *collection) answersFor(name string) bool {
+	if c.closed.Load() {
+		return false
+	}
+	s := c.head.Load()
+	return s != nil && s.gen.Load() == c.db.epoch.Load().gen && s.name == name
+}
+
 // loadIndexes returns the head's range-index set. Lock-free; the slice is
 // immutable.
 func (c *collection) loadIndexes() []*index {
@@ -1433,10 +1445,12 @@ func (c *collection) beginDDL(wtx WriteTx) (*collSchema, error) {
 // collection (see retire). Operations check it INSIDE their transaction
 // scope, through resolve, which is also what retires a handle.
 func (c *collection) alive() error {
+	if c.db.closed.Load() {
+		// Every handle, the ones a closing write transaction created and
+		// never registered included.
+		return ErrDBIsClosed
+	}
 	if c.closed.Load() {
-		if c.db.closed.Load() {
-			return ErrDBIsClosed
-		}
 		return ErrCollectionClosed
 	}
 	return nil

@@ -2075,6 +2075,29 @@ func TestDBCloseDuringDDLTx(t *testing.T) {
 	assert.ErrorIs(t, a.Insert(tx.Context(), ddlDoc(101)), anystore.ErrDBIsClosed)
 }
 
+// The handle of a collection the open transaction created is closed with
+// the database like every other, though it entered no registry yet.
+func TestDBCloseDuringCreateTx(t *testing.T) {
+	fx := newFixture(t)
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	n, err := fx.CreateCollection(tx.Context(), "n")
+	require.NoError(t, err)
+	require.NoError(t, n.EnsureIndex(tx.Context(), ddlKIdx))
+	require.NoError(t, n.Insert(tx.Context(), ddlDoc(1)))
+	require.NoError(t, fx.Close())
+
+	_, err = n.FindId(tx.Context(), 1)
+	assert.ErrorIs(t, err, anystore.ErrDBIsClosed)
+	_, err = n.Count(tx.Context())
+	assert.ErrorIs(t, err, anystore.ErrDBIsClosed)
+	_, err = n.Find(`{"k":{"$gte":0}}`).Count(tx.Context())
+	assert.ErrorIs(t, err, anystore.ErrDBIsClosed)
+	assert.ErrorIs(t, n.Insert(tx.Context(), ddlDoc(2)), anystore.ErrDBIsClosed)
+	_, err = fx.OpenCollection(tx.Context(), "n")
+	assert.ErrorIs(t, err, anystore.ErrDBIsClosed)
+}
+
 // Once the transaction of a schema change has ended — whatever the change and
 // its outcome — the handle carries nothing uncommitted and Close() closes it
 // at once.
