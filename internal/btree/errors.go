@@ -39,6 +39,9 @@ var (
 	// ErrClosed indicates the database has been closed.
 	ErrClosed = errors.New("btree: database is closed")
 
+	// ErrReadersBusy: every reader slot is held (TryBeginRead).
+	ErrReadersBusy = errors.New("btree: all reader slots are busy")
+
 	// ErrFull indicates the database or page is full.
 	ErrFull = errors.New("btree: database is full")
 

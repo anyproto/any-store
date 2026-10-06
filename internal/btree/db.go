@@ -812,17 +812,28 @@ func (db *DB) Options() Options {
 // beginRead starts a read-only transaction.
 // When readCounters is false, disk counters are initialized from local counters
 // without reading page-1 metadata, which is useful for hot point-lookups.
-func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
+// When wait is false, a held-up reader slot is ErrReadersBusy, not a wait.
+func (db *DB) beginRead(readCounters, wait bool) (*ReadTx, error) {
 	if db.closing.Load() {
 		return nil, ErrClosed
 	}
 
 	// Acquire reader semaphore — limits concurrent read transactions.
 	// Uses closeCh to unblock if the DB is closing while we wait.
-	select {
-	case db.readerSem <- struct{}{}:
-	case <-db.closeCh:
-		return nil, ErrClosed
+	if wait {
+		select {
+		case db.readerSem <- struct{}{}:
+		case <-db.closeCh:
+			return nil, ErrClosed
+		}
+	} else {
+		select {
+		case db.readerSem <- struct{}{}:
+		case <-db.closeCh:
+			return nil, ErrClosed
+		default:
+			return nil, ErrReadersBusy
+		}
 	}
 
 	db.mu.RLock()
@@ -837,6 +848,9 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 		db.mu.RUnlock()
 		<-db.readerSem
 		return nil, err
+	}
+	if testReadSlotClaimedHook != nil {
+		testReadSlotClaimedHook()
 	}
 
 	// The snapshot's identity: the FULL WAL-index header (not just mxFrame —
@@ -853,7 +867,7 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	// validity key, the memo key and tx.walHdr below.
 	snapHdr := hdr
 	if hdr.isInit == 0 {
-		snapHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
+		snapHdr = db.pager.wal.index.synthHdr(maxFrame)
 	}
 
 	localFCC := db.localFileChangeCounter.Load()
@@ -880,19 +894,22 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	if readCounters {
 		// Read on-disk counters for staleness detection (raised to the
 		// newest committed frame so peer commits are noticed).
-		var effMax uint32
-		fcc, sc, effMax, err = db.pager.readHeaderCountersRaised(maxFrame)
+		var effMax, floor uint32
+		fcc, sc, effMax, floor, err = db.pager.readHeaderCountersRaised(maxFrame)
 		if err != nil {
 			db.pager.endRead(slot)
 			db.mu.RUnlock()
 			<-db.readerSem
 			return nil, err
 		}
-		// Snapshot-bounded pair: identical to the raised read unless the
-		// bound was actually raised (rare: begin racing a commit, or a
-		// pinned reader slot) — only then pay a second bounded read.
+		// Snapshot-bounded pair: identical to the raised read unless its
+		// bounds differ from the snapshot's (rare: begin racing a commit, a
+		// pinned reader slot, a checkpoint or restart in between) — only
+		// then pay a second bounded read. The floor matters as much as the
+		// ceiling: after a restart the new generation's frames sit below
+		// the snapshot's maxFrame, and only its own floor excludes them.
 		snapFCC, snapSC = fcc, sc
-		if effMax != maxFrame {
+		if effMax != maxFrame || floor != minFrame {
 			snapFCC, snapSC, err = db.pager.readHeaderCountersAt(maxFrame, minFrame)
 			if err != nil {
 				db.pager.endRead(slot)
@@ -965,7 +982,14 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 // BeginRead starts a read-only transaction.
 // DRIFT: BeginReadFast skips page-1 counter read; staleness APIs return stale/false See docs/btree/NOTES.md#drift-45-beginreadfast-skips-page-1-staleness-counter-reads
 func (db *DB) BeginRead() (*ReadTx, error) {
-	return db.beginRead(true)
+	return db.beginRead(true, true)
+}
+
+// TryBeginRead is BeginRead that does not wait for a reader slot:
+// ErrReadersBusy when every one is held. For a caller that may hold one
+// itself.
+func (db *DB) TryBeginRead() (*ReadTx, error) {
+	return db.beginRead(true, false)
 }
 
 // BeginReadFast starts a read-only transaction without the raised page-1
@@ -974,7 +998,7 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 // staleness detection: the disk counters are the seeded local ones.
 // DRIFT: BeginReadFast skips the raised page-1 counter read; staleness APIs return stale/false See docs/btree/NOTES.md#drift-45-beginreadfast-skips-page-1-staleness-counter-reads
 func (db *DB) BeginReadFast() (*ReadTx, error) {
-	return db.beginRead(false)
+	return db.beginRead(false, true)
 }
 
 // BeginWrite starts a read-write transaction. Only one write transaction
@@ -1088,7 +1112,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	if readSnap.isInit != 0 {
 		tx.ReadTx.walHdr = readSnap
 	} else {
-		tx.ReadTx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
+		tx.ReadTx.walHdr = db.pager.wal.index.synthHdr(maxFrame)
 	}
 	tx.ReadTx.walSlot = slot
 	tx.ReadTx.writable = true
@@ -2171,8 +2195,10 @@ type WriteTx struct {
 // becomes visible to readers, with the page-1 counters it carries. The write
 // lock is held: what f publishes is in place before the next writer begins,
 // and within instructions of the first reader that can pin the commit. f
-// must not block, take locks or begin a transaction. It does not run for a
-// commit that writes nothing, a failed commit or a rollback.
+// must not begin a transaction, nor wait on anything a transaction or a
+// commit holds: a mutex no holder of which waits on the database is the
+// most it may take. It does not run for a commit that writes nothing, a
+// failed commit or a rollback.
 func (tx *WriteTx) OnCommitted(f func(fileChangeCounter, schemaCookie uint32)) {
 	tx.onCommitted = f
 }
@@ -2233,6 +2259,11 @@ func (tx *WriteTx) Delete(ns *Namespace, key []byte) error {
 // AutoCheckpointThreshold is the default number of WAL frames after which
 // an automatic passive checkpoint is triggered.
 var AutoCheckpointThreshold = 10000
+
+// testReadSlotClaimedHook, when non-nil, runs inside beginRead once the
+// reader slot and the snapshot bounds are taken, before the page-1 counters
+// are read. Test-only.
+var testReadSlotClaimedHook func()
 
 // testWriterFinishHook, when non-nil, runs inside Commit/Rollback after the
 // closed flag is set and before the pager operation — the exact spot where a

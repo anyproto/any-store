@@ -530,6 +530,13 @@ type walIndex struct {
 	maxPage       atomic.Uint32 // database size at last commit
 	nBackfill     atomic.Uint32 // frames already checkpointed
 
+	// restarts counts the WAL restarts of this process's index (reset): the
+	// synthesized header of the in-process and in-memory modes carries it
+	// (synthHdr), so a snapshot taken before a restart and a commit after
+	// it that ends on the same frame number are not the same key to what
+	// is remembered per snapshot (snapCountersMemo, the reader cache).
+	restarts atomic.Uint32
+
 	// nBackfillAttempted is the highest frame that a checkpoint has attempted
 	// to copy back to the database. It is set BEFORE backfilling begins, so
 	// that after a crash during checkpoint, recovery knows which frames may
@@ -761,6 +768,13 @@ func (wi *walIndex) liveMinFrame() uint32 {
 	return wi.shmNBackfill() + 1
 }
 
+// synthHdr is the header of a snapshot in the in-process and in-memory
+// modes, which keep no WAL-index header: the frame ceiling and the restart
+// count (iChange, unused otherwise), no salts (WalIndexHdr.synthesized).
+func (wi *walIndex) synthHdr(mxFrame uint32) WalIndexHdr {
+	return WalIndexHdr{isInit: 1, mxFrame: mxFrame, iChange: wi.restarts.Load()}
+}
+
 // get returns the frame containing the latest version of pgno within
 // [minFrame, maxFrame], or 0 if not in WAL. maxFrame is the snapshot's
 // visibility ceiling; minFrame is the snapshot's checkpoint-frontier floor
@@ -824,6 +838,7 @@ func (wi *walIndex) reset(readMarksLocked bool) {
 	wi.mu.Lock()
 	clear(wi.pageMap)
 	wi.mu.Unlock()
+	wi.restarts.Add(1)
 	wi.maxFrame.Store(0)
 	wi.mxCommitFrame.Store(0)
 	wi.nBackfill.Store(0)
@@ -2364,7 +2379,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		mxCommit := w.index.maxFrame.Load()
 		w.index.mxCommitFrame.Store(mxCommit)
 		if w.inProcess && w.onPublish != nil {
-			w.onPublish(WalIndexHdr{isInit: 1, mxFrame: mxCommit})
+			w.onPublish(w.index.synthHdr(mxCommit))
 		}
 		if !w.inProcess {
 			// Use dbSize directly instead of maxPage.Load() because a
@@ -2504,7 +2519,7 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 			w.index.maxPage.Store(dbSize)
 		}
 		if w.onPublish != nil {
-			w.onPublish(WalIndexHdr{isInit: 1, mxFrame: mxCommit})
+			w.onPublish(w.index.synthHdr(mxCommit))
 		}
 	}
 
@@ -2795,13 +2810,24 @@ func (w *wal) tryBeginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slo
 // post-lock re-check of aReadMark[mxI], wal.c:3239-3249). On retry the
 // nBackfill==mxFrame slot-0 fast path stays safe.
 func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
+	// The restart count before the frame numbers, and checked again with
+	// them after the lock: a restart in between would pair the old frame
+	// numbers with the new generation's key.
+	restarts := w.index.restarts.Load()
 	mxFrame := w.index.mxCommitFrame.LoadLocal()
 	nBackfill := w.index.nBackfill.Load()
-	hdr = WalIndexHdr{isInit: 1, mxFrame: mxFrame}
+	hdr = WalIndexHdr{isInit: 1, mxFrame: mxFrame, iChange: restarts}
 
 	if mxFrame == 0 || nBackfill == mxFrame {
 		if err := w.index.lock(lockRead0, lockShared); err != nil {
 			return WalIndexHdr{}, 0, 0, 0, err
+		}
+		if w.index.restarts.Load() != restarts {
+			// The key of the snapshot the frame numbers describe moved
+			// under it; the content (the file alone) would be right, the
+			// key would match the new generation's commits.
+			_ = w.index.unlock(lockRead0, lockShared)
+			return WalIndexHdr{}, 0, 0, 0, errWALRetry
 		}
 		// Slot 0's read mark is a fixed sentinel that must stay 0 (set at
 		// wal.go:1900): it pins frame 0, i.e. "read nothing from the WAL".
@@ -2841,7 +2867,8 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 			// post-lock re-check of aReadMark[mxI] (wal.c:3239-3249): if
 			// either value changed, drop the lock and retry. On retry the
 			// nBackfill==mxFrame slot-0 fast path stays safe.
-			if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill {
+			if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill ||
+				w.index.restarts.Load() != restarts {
 				_ = w.index.unlock(lockSlot, lockShared)
 				return WalIndexHdr{}, 0, 0, 0, errWALRetry
 			}
@@ -2884,7 +2911,8 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 	// would then match new-generation frames in walIndex.get. A change in
 	// either counter means the snapshot may span such a reset → drop the lock
 	// and retry with fresh values.
-	if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill {
+	if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill ||
+		w.index.restarts.Load() != restarts {
 		_ = w.index.unlock(lockRead0, lockShared)
 		return WalIndexHdr{}, 0, 0, 0, errWALRetry
 	}
