@@ -930,3 +930,230 @@ func TestVectorIndex_OlderReaderAfterTwoCompactions(t *testing.T) {
 		})
 	}
 }
+
+// An index an earlier version built in the removed ivfpq mode: the catalog
+// still describes it. Its collection opens with the index quarantined — $knn
+// on its field and a compaction are ErrVectorIndexUnsupported, writes pass it
+// by and leave its namespaces untouched, Stats report it with its sizes,
+// EnsureIndex of the name in another mode says why it mismatches — and
+// DropIndex removes it, namespaces included, so a supported mode can take its
+// place. A replacement under another name serves unqualified $knn meanwhile.
+// Creating one anew is refused.
+func TestVectorIndex_RemovedModeQuarantined(t *testing.T) {
+	const dim = 8
+	tmpDir := t.TempDir()
+	fx := newFixturePath(t, tmpDir)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	vecs := vrand(64, dim, 11)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+	info := IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, Mode: VectorModeIVFSQ},
+	}
+	require.NoError(t, coll.CreateIndex(ctx, info))
+
+	removed := *info.Vector
+	removed.Mode = vectorModeIVFPQ
+	err = coll.CreateIndex(ctx, IndexInfo{Name: "emb2", Kind: IndexKindVector, Vector: &removed})
+	require.ErrorIs(t, err, ErrVectorIndexUnsupported)
+
+	d := fx.DB.(*db)
+	thisBuildTx(t, d, func(tx *btree.WriteTx) error { return forgeVectorMode(tx, d, "docs", "emb", vectorModeIVFPQ) })
+	require.NoError(t, fx.Close())
+
+	db2, err := Open(ctx, filepath.Join(tmpDir, "any-store-test.db"), nil)
+	require.NoError(t, err)
+	defer db2.Close()
+	d2 := db2.(*db)
+	coll2, err := db2.Collection(ctx, "docs")
+	require.NoError(t, err)
+
+	st, err := coll2.Stats(ctx)
+	require.NoError(t, err)
+	require.Len(t, st.VectorIndexes, 1)
+	assert.Equal(t, "ivfpq", st.VectorIndexes[0].Mode)
+	assert.True(t, st.VectorIndexes[0].Unsupported)
+	assert.Positive(t, st.VectorIndexes[0].SizeBytes, "the namespaces still hold the index")
+	assert.Equal(t, st.VectorIndexes[0].SizeBytes, st.VectorIndexesSizeBytes)
+
+	_, err = vsearch(coll2, "v", vecs[0], 3, 0)
+	require.ErrorIs(t, err, ErrVectorIndexUnsupported)
+	require.ErrorIs(t, coll2.CompactVectorIndex(ctx, "emb"), ErrVectorIndexUnsupported)
+	err = coll2.EnsureIndex(ctx, info)
+	require.ErrorIs(t, err, ErrIndexMismatch)
+	require.ErrorIs(t, err, ErrVectorIndexUnsupported)
+
+	// Writes to the collection succeed and leave the index as it was: its
+	// :meta record (every maintained write re-encodes it) is byte-identical.
+	before := vectorMetaBytes(t, d2, "docs", "emb")
+	require.NotEmpty(t, before)
+	require.NoError(t, coll2.Insert(ctx, anyenc.MustParseJson(vecDocJSON(100, vecs[1]))))
+	assert.Equal(t, before, vectorMetaBytes(t, d2, "docs", "emb"))
+	require.NoError(t, coll2.UpdateOne(ctx, anyenc.MustParseJson(vecDocJSON(100, vecs[2]))))
+	require.NoError(t, coll2.DeleteId(ctx, 100))
+	assert.Equal(t, before, vectorMetaBytes(t, d2, "docs", "emb"))
+
+	// A replacement under another name: unqualified $knn resolves to it, the
+	// quarantined one is still reachable by name.
+	info2 := info
+	info2.Name = "emb2"
+	require.NoError(t, coll2.CreateIndex(ctx, info2))
+	hits, err := vsearch(coll2, "v", vecs[0], 1, 0)
+	require.NoError(t, err)
+	require.Len(t, hits, 1)
+	assert.Equal(t, string(idBytesOf(0)), string(hits[0].DocId))
+	_, err = coll2.Find(fmt.Sprintf(`{"v":{"$knn":{"$query":%s,"$k":1,"$index":"emb"}}}`, vqJSON(vecs[0]))).Count(ctx)
+	require.ErrorIs(t, err, ErrVectorIndexUnsupported)
+	require.NoError(t, coll2.DropIndex(ctx, "emb2"))
+
+	require.NoError(t, coll2.DropIndex(ctx, "emb"))
+	names, err := d2.btreeDB.ListNamespaces()
+	require.NoError(t, err)
+	for _, n := range names {
+		assert.False(t, strings.HasPrefix(n, vectorIndexNsPrefix("docs", "emb")), n)
+	}
+
+	require.NoError(t, coll2.CreateIndex(ctx, info))
+	hits, err = vsearch(coll2, "v", vecs[0], 1, 0)
+	require.NoError(t, err)
+	require.Len(t, hits, 1)
+	assert.Equal(t, string(idBytesOf(0)), string(hits[0].DocId))
+}
+
+// The switch at run time, as a peer process's DDL (otherBuildTx: the cookie
+// moves, the head is not told): a supported index becomes quarantined — a
+// reader pinned before keeps searching its own build — and back. The way
+// back is the trap: the quarantined verdict was cached in this process's
+// head, and a verb must not end on it once the committed schema says the
+// index is fine again (a process healing on the error would drop a peer's
+// fresh index).
+func TestVectorIndex_RemovedModeSwitchAtRunTime(t *testing.T) {
+	const dim = 8
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	vecs := vrand(64, dim, 11)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, Mode: VectorModeIVFSQ},
+	}))
+	d := fx.DB.(*db)
+	c := coll.(*collection)
+	supported := c.cur().vindexes[0]
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { _ = rtx.Commit() }()
+
+	otherBuildTx(t, d, func(tx *btree.WriteTx) error { return forgeVectorMode(tx, d, "docs", "emb", vectorModeIVFPQ) })
+	_, err = vsearch(coll, "v", vecs[0], 1, 0)
+	require.ErrorIs(t, err, ErrVectorIndexUnsupported)
+	head := c.cur().vindexes[0]
+	assert.True(t, head.unsupported)
+	assert.False(t, head == supported, "the supported handle was reused for the quarantined index")
+	hits, err := vsearchIn(rtx.Context(), coll, "v", vecs[0], 1, 0)
+	require.NoError(t, err, "the older reader searches its own build")
+	require.Len(t, hits, 1)
+
+	otherBuildTx(t, d, func(tx *btree.WriteTx) error { return forgeVectorMode(tx, d, "docs", "emb", VectorModeIVFSQ) })
+	// Every verb validates its sources before its transaction; each must get
+	// past the cached verdict on its own (the first to run refreshes the head
+	// for the rest, so the order here is not what proves it — the stash
+	// check in the commit is).
+	knn := fmt.Sprintf(`{"v":%s,"id":-1}`, vknnJSON(vecs[0], 1, 0))
+	_, err = coll.Find(knn).Count(ctx)
+	require.NoError(t, err, "Count ended on the cached quarantined verdict")
+	_, err = coll.Find(knn).Explain(ctx)
+	require.NoError(t, err, "Explain ended on the cached quarantined verdict")
+	_, err = coll.Find(knn).Delete(ctx)
+	require.NoError(t, err, "Delete ended on the cached quarantined verdict")
+	hits, err = vsearch(coll, "v", vecs[0], 1, 0)
+	require.NoError(t, err, "the verb ended on the cached quarantined verdict")
+	require.Len(t, hits, 1)
+	assert.Equal(t, string(idBytesOf(0)), string(hits[0].DocId))
+	assert.False(t, c.cur().vindexes[0].unsupported)
+}
+
+// The CompactRatio drift trigger fires an auto-rebuild through the public
+// write path: the build identity changes after a batch the frozen centroids
+// do not cover, and does not with the trigger off (the black-box recall
+// checks in test/ cannot tell, IVF-SQ recall being int8-bound either way).
+func TestVectorIndex_IVFAutoRebuildFires(t *testing.T) {
+	const dim = 16
+	for _, ratio := range []float64{0, 0.5} {
+		t.Run(fmt.Sprintf("ratio=%g", ratio), func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "docs")
+			require.NoError(t, err)
+			a := vrand(500, dim, 1)
+			for i, vc := range a {
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+			}
+			require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+				Name: "emb", Kind: IndexKindVector,
+				Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, Mode: VectorModeIVFSQ, CompactRatio: ratio},
+			}))
+			c := coll.(*collection)
+			built := c.cur().vindexes[0].ivf.Build()
+			b := vrand(500, dim, 2)
+			docs := make([]*anyenc.Value, len(b))
+			for i, vc := range b {
+				for d := range vc {
+					vc[d] += 6 // far from every build-time centroid
+				}
+				docs[i] = anyenc.MustParseJson(vecDocJSON(1000+i, vc))
+			}
+			require.NoError(t, coll.Insert(ctx, docs...))
+			after := c.cur().vindexes[0].ivf.Build()
+			if ratio > 0 {
+				assert.NotEqual(t, built, after, "the drifted batch must trigger a rebuild")
+			} else {
+				assert.Equal(t, built, after, "no auto-rebuild with the trigger off")
+			}
+			hits, err := vsearch(coll, "v", b[3], 1, 0)
+			require.NoError(t, err)
+			require.Len(t, hits, 1)
+			assert.Equal(t, string(idBytesOf(1003)), string(hits[0].DocId))
+		})
+	}
+}
+
+// forgeVectorMode rewrites the catalog record of a vector index with the
+// given mode — the record an index built in that mode by another version
+// would have.
+func forgeVectorMode(tx *btree.WriteTx, d *db, collName, indexName string, mode VectorMode) error {
+	key := indexKey(collName, indexName)
+	raw, err := tx.Get(d.systemNS, key)
+	if err != nil {
+		return err
+	}
+	var p anyenc.Parser
+	v, err := p.Parse(raw)
+	if err != nil {
+		return err
+	}
+	var a anyenc.Arena
+	v.Get("vector").Set("mode", a.NewNumberInt(int(mode)))
+	return tx.Put(d.systemNS, key, v.MarshalTo(nil))
+}
+
+// vectorMetaBytes returns a vector index's :meta record.
+func vectorMetaBytes(t *testing.T, d *db, collName, indexName string) []byte {
+	t.Helper()
+	var raw []byte
+	require.NoError(t, d.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		ns, err := tx.GetNamespace(vectorIndexNsPrefix(collName, indexName) + ":meta")
+		if err != nil {
+			return err
+		}
+		raw, err = tx.Get(ns, []byte("m"))
+		return err
+	}))
+	return raw
+}

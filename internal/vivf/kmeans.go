@@ -1,9 +1,3 @@
-// Package vivf is a Phase-0, in-RAM prototype of a btree-native IVF-PQ vector
-// index (see vector/RESEARCH_IVFPQ_BTREE.md). It owns NO btree state — its sole
-// purpose is to validate recall parity with the current HNSW index on real
-// embeddings before any storage work. The algorithm here (coarse IVF quantizer +
-// product quantization of residuals + asymmetric distance + exact re-rank) is the
-// same one the eventual btree-resident index would use; only the container differs.
 package vivf
 
 import (
@@ -15,12 +9,12 @@ import (
 	"github.com/anyproto/any-store/v2/internal/simd"
 )
 
-// kmeans runs Lloyd's algorithm on data, returning k centroids and the per-point
-// assignment. Assignment (the O(n·k·dim) cost) is parallelised across cores;
-// centroid recomputation is a cheap single-threaded reduction. Empty clusters are
-// reseeded to a random point so k centroids are always populated. When kpp is set,
-// centroids are seeded with k-means++ (D² sampling) instead of random points.
-func kmeans(data [][]float32, k, iters int, seed int64, kpp bool) (cents [][]float32, assign []int32) {
+// kmeans runs Lloyd's algorithm on data, returning k centroids. Assignment (the
+// O(n·k·dim) cost) is parallelised across cores; centroid recomputation is a
+// cheap single-threaded reduction. Empty clusters are reseeded to a random point
+// so k centroids are always populated. When kpp is set, centroids are seeded
+// with k-means++ (D² sampling) instead of random points.
+func kmeans(data [][]float32, k, iters int, seed int64, kpp bool) (cents [][]float32) {
 	n := len(data)
 	dim := len(data[0])
 	rng := rand.New(rand.NewSource(seed))
@@ -37,7 +31,7 @@ func kmeans(data [][]float32, k, iters int, seed int64, kpp bool) (cents [][]flo
 		}
 	}
 
-	assign = make([]int32, n)
+	assign := make([]int32, n)
 	for it := 0; it < iters; it++ {
 		assignNearest(data, cents, assign)
 
@@ -69,7 +63,7 @@ func kmeans(data [][]float32, k, iters int, seed int64, kpp bool) (cents [][]flo
 		}
 	}
 	assignNearest(data, cents, assign)
-	return cents, assign
+	return cents
 }
 
 // kmeansppInit seeds k centroids with k-means++: each new centroid is sampled

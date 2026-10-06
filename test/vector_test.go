@@ -3,6 +3,7 @@ package test
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"path/filepath"
 	"slices"
@@ -355,105 +356,9 @@ func clusteredVecsAS(n, dim, centers int, seed int64) [][]float32 {
 	return out
 }
 
-// makeIVFPQIndex inserts vecs, then creates an IVF-PQ index (which trains from the
-// existing documents — the bulk-load pattern).
-func makeIVFPQIndex(t *testing.T, coll anystore.Collection, vecs [][]float32, dim int) {
-	t.Helper()
-	for i, vc := range vecs {
-		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
-	}
-	require.NoError(t, coll.CreateIndex(ctx, anystore.IndexInfo{
-		Name: "emb",
-		Kind: anystore.IndexKindVector,
-		Vector: &anystore.VectorParams{
-			Field: "v", Dim: dim, Metric: anystore.VectorL2, Mode: anystore.VectorModeIVFPQ,
-			Closure: 4, NProbe: 16,
-		},
-	}))
-}
-
-// TestVectorMode_IVFPQ_EndToEnd drives the btree-resident IVF-PQ index through the
-// public Find() pipeline: self-retrieval, recall vs a brute oracle, _distance
-// decoration, residual filtering, and update/delete.
-func TestVectorMode_IVFPQ_EndToEnd(t *testing.T) {
-	const (
-		n   = 3000
-		dim = 32
-		k   = 10
-	)
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "docs")
-	require.NoError(t, err)
-	vecs := clusteredVecsAS(n, dim, 60, 7)
-	makeIVFPQIndex(t, coll, vecs, dim)
-
-	// Stats reports the new mode.
-	st, err := coll.Stats(ctx)
-	require.NoError(t, err)
-	require.Len(t, st.VectorIndexes, 1)
-	assert.Equal(t, "ivfpq", st.VectorIndexes[0].Mode)
-	assert.Greater(t, st.VectorIndexes[0].SizeBytes, 0)
-
-	// Self-query: a stored vector's nearest neighbour is itself (re-rank makes the
-	// exact distance ~0), returned first.
-	hits, err := vsearch(coll, "v", vecs[42], 1, 0)
-	require.NoError(t, err)
-	require.Len(t, hits, 1)
-	assert.Equal(t, idBytesOf(42), hits[0].DocId)
-	assert.InDelta(t, 0, hits[0].Distance, 1e-3)
-
-	// Recall@k vs a brute-force L2 oracle. Queries are perturbed copies of random
-	// base vectors (the realistic "find documents similar to this one" case), so the
-	// true neighbours are well-defined near the source.
-	rng := rand.New(rand.NewSource(123))
-	queries := make([][]float32, 50)
-	for i := range queries {
-		src := vecs[rng.Intn(len(vecs))]
-		q := make([]float32, dim)
-		for d := range q {
-			q[d] = src[d] + float32(rng.NormFloat64())*0.02
-		}
-		queries[i] = q
-	}
-	var recall float64
-	for _, q := range queries {
-		truth := bruteIDs(vecs, q, k)
-		hh, err := vsearch(coll, "v", q, k, 0)
-		require.NoError(t, err)
-		hit := 0
-		for _, h := range hh {
-			if truth[string(h.DocId)] {
-				hit++
-			}
-		}
-		recall += float64(hit) / float64(k)
-	}
-	recall /= float64(len(queries))
-	t.Logf("IVF-PQ recall@%d = %.3f", k, recall)
-	assert.GreaterOrEqual(t, recall, 0.85, "IVF-PQ + re-rank should reach high recall on clustered data")
-
-	// _distance decoration + ascending order through the pipeline.
-	iter, err := coll.Find(vectorKnnFilter(vecs[7], 5)).Iter(ctx)
-	require.NoError(t, err)
-	var last float32 = -1
-	got7 := false
-	for iter.Next() {
-		doc, derr := iter.Doc()
-		require.NoError(t, derr)
-		if doc.Value().GetInt("id") == 7 {
-			got7 = true
-		}
-		d := float32(iter.Distance())
-		require.GreaterOrEqual(t, d, last, "results must be _distance-ascending")
-		last = d
-	}
-	require.NoError(t, iter.Close())
-	assert.True(t, got7, "self-query must return its own document")
-}
-
-// TestVectorMode_IVFPQ_FilterUpdateDelete covers a residual metadata filter plus
-// update/delete maintenance on the IVF-PQ index.
-func TestVectorMode_IVFPQ_FilterUpdateDelete(t *testing.T) {
+// TestVectorMode_IVFSQ_FilterUpdateDelete covers a residual metadata filter plus
+// update/delete maintenance on the IVF index.
+func TestVectorMode_IVFSQ_FilterUpdateDelete(t *testing.T) {
 	const (
 		n   = 2000
 		dim = 24
@@ -462,7 +367,7 @@ func TestVectorMode_IVFPQ_FilterUpdateDelete(t *testing.T) {
 	coll, err := fx.CreateCollection(ctx, "docs")
 	require.NoError(t, err)
 	vecs := clusteredVecsAS(n, dim, 40, 13)
-	makeIVFPQIndex(t, coll, vecs, dim)
+	makeIVFSQIndex(t, coll, vecs, dim)
 
 	// Residual filter: vector clause + id predicate. Every returned doc must satisfy
 	// the predicate.
@@ -501,10 +406,10 @@ func TestVectorMode_IVFPQ_FilterUpdateDelete(t *testing.T) {
 	}
 }
 
-// driftedRecall builds an IVF-PQ index (with the given CompactRatio) on cluster A,
+// driftedRecall builds an IVF index (with the given CompactRatio) on cluster A,
 // then batch-inserts a far-shifted cluster B and returns recall on B. With
 // auto-rebuild enabled (ratio>0) the post-insert maybeAutoCompactVectors re-trains
-// the codebooks to cover B; with it disabled (ratio 0) the frozen centroids miss B.
+// the centroids to cover B.
 func driftedRecall(t *testing.T, collName string, compactRatio float64) float64 {
 	return driftedRecallMode(t, collName, compactRatio, false)
 }
@@ -526,8 +431,8 @@ func driftedRecallMode(t *testing.T, collName string, compactRatio float64, manu
 	}
 	require.NoError(t, coll.CreateIndex(ctx, anystore.IndexInfo{
 		Name: "emb", Kind: anystore.IndexKindVector,
-		Vector: &anystore.VectorParams{Field: "v", Dim: dim, Metric: anystore.VectorL2, Mode: anystore.VectorModeIVFPQ,
-			Closure: 4, NProbe: 16, CompactRatio: compactRatio},
+		Vector: &anystore.VectorParams{Field: "v", Dim: dim, Metric: anystore.VectorL2, Mode: anystore.VectorModeIVFSQ,
+			NProbe: 16, CompactRatio: compactRatio},
 	}))
 
 	// Far-shifted cluster B, inserted as one batch (one self-contained write → at
@@ -566,51 +471,23 @@ func driftedRecallMode(t *testing.T, collName string, compactRatio float64, manu
 	return recall / 50
 }
 
-// TestVectorMode_IVFPQ_AutoRebuild proves the CompactRatio drift trigger: inserting
+// TestVectorMode_IVFSQ_AutoRebuild runs the CompactRatio drift trigger: inserting
 // a distribution the build-time centroids don't cover auto-rebuilds the index
-// (when CompactRatio>0), recovering recall that a frozen index loses.
-func TestVectorMode_IVFPQ_AutoRebuild(t *testing.T) {
+// (when CompactRatio>0) through the public write path, and the rebuilt index
+// answers correctly. Stale centroids cost IVF-SQ scan balance rather than recall
+// (every probed record is scored exactly), so the frozen index is the floor the
+// rebuilt one must hold, not a loss it must recover.
+func TestVectorMode_IVFSQ_AutoRebuild(t *testing.T) {
 	frozen := driftedRecall(t, "frozen", 0)     // no auto-rebuild
 	rebuilt := driftedRecall(t, "rebuilt", 0.5) // auto-rebuild on drift ≥ 0.5
 	t.Logf("recall on drifted cluster: frozen=%.3f, auto-rebuilt=%.3f", frozen, rebuilt)
-	assert.Greater(t, rebuilt, frozen, "auto-rebuild must recover recall lost to centroid drift")
-	assert.GreaterOrEqual(t, rebuilt, 0.9, "rebuilt index covers the new distribution")
-}
-
-// TestVectorMode_IVFPQ_Persist verifies the index round-trips through a reopen.
-func TestVectorMode_IVFPQ_Persist(t *testing.T) {
-	const (
-		n   = 1500
-		dim = 16
-	)
-	tmpDir := t.TempDir()
-	fx := newFixturePath(t, tmpDir)
-	coll, err := fx.CreateCollection(ctx, "docs")
-	require.NoError(t, err)
-	vecs := clusteredVecsAS(n, dim, 30, 5)
-	makeIVFPQIndex(t, coll, vecs, dim)
-	require.NoError(t, fx.Close())
-
-	db2, err := anystore.Open(ctx, filepath.Join(tmpDir, "any-store-test.db"), nil)
-	require.NoError(t, err)
-	defer db2.Close()
-	coll2, err := db2.Collection(ctx, "docs")
-	require.NoError(t, err)
-
-	st, err := coll2.Stats(ctx)
-	require.NoError(t, err)
-	require.Len(t, st.VectorIndexes, 1)
-	assert.Equal(t, "ivfpq", st.VectorIndexes[0].Mode)
-
-	// Search still works after reopen (codebooks reloaded from :cb).
-	hits, err := vsearch(coll2, "v", vecs[100], 1, 0)
-	require.NoError(t, err)
-	require.Len(t, hits, 1)
-	assert.Equal(t, idBytesOf(100), hits[0].DocId)
+	assert.GreaterOrEqual(t, rebuilt, frozen, "auto-rebuild must not cost recall")
+	assert.GreaterOrEqual(t, rebuilt, 0.85, "rebuilt index covers the new distribution")
 }
 
 // makeIVFSQIndex inserts vecs, then creates an IVF-SQ index (int8 full vectors per
-// cell, scanned directly — no PQ). IVF-SQ favours Closure=1 + higher NProbe.
+// cell, scanned directly). IVF trains from existing documents, so it is created
+// after the inserts.
 func makeIVFSQIndex(t *testing.T, coll anystore.Collection, vecs [][]float32, dim int) {
 	t.Helper()
 	for i, vc := range vecs {
@@ -707,6 +584,106 @@ func TestVectorMode_IVFSQ_EndToEnd(t *testing.T) {
 	require.NoError(t, err)
 	for _, h := range hits {
 		assert.NotEqual(t, string(idBytesOf(5)), string(h.DocId), "deleted doc must not be returned")
+	}
+}
+
+// TestVectorMode_IVFSQ_Metrics drives the IVF index on both metrics the int8
+// byte kernel serves (L2 keeps a per-record squared norm, cosine does not):
+// self-retrieval within the int8 slack, recall against an exact oracle, reopen.
+func TestVectorMode_IVFSQ_Metrics(t *testing.T) {
+	const (
+		n   = 3000
+		dim = 32
+		k   = 10
+	)
+	unit := func(v []float32) []float32 {
+		var ss float64
+		for _, x := range v {
+			ss += float64(x) * float64(x)
+		}
+		s := float32(1 / math.Sqrt(ss))
+		out := make([]float32, len(v))
+		for i, x := range v {
+			out[i] = x * s
+		}
+		return out
+	}
+	for _, metric := range []anystore.VectorMetric{anystore.VectorL2, anystore.VectorCosine} {
+		t.Run(fmt.Sprintf("metric=%d", metric), func(t *testing.T) {
+			tmpDir := t.TempDir()
+			fx := newFixturePath(t, tmpDir)
+			coll, err := fx.CreateCollection(ctx, "docs")
+			require.NoError(t, err)
+			vecs := clusteredVecsAS(n, dim, 60, 7)
+			for i, vc := range vecs {
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+			}
+			require.NoError(t, coll.CreateIndex(ctx, anystore.IndexInfo{
+				Name: "emb", Kind: anystore.IndexKindVector,
+				Vector: &anystore.VectorParams{Field: "v", Dim: dim, Metric: metric, Mode: anystore.VectorModeIVFSQ, NProbe: 32},
+			}))
+			st, err := coll.Stats(ctx)
+			require.NoError(t, err)
+			require.Len(t, st.VectorIndexes, 1)
+			assert.Equal(t, "ivfsq", st.VectorIndexes[0].Mode)
+			assert.Equal(t, "int8", st.VectorIndexes[0].Quantization)
+
+			// The oracle ranks by L2; on unit vectors that is the cosine order.
+			oracle := vecs
+			if metric == anystore.VectorCosine {
+				oracle = make([][]float32, n)
+				for i, v := range vecs {
+					oracle[i] = unit(v)
+				}
+			}
+			oracleQuery := func(q []float32) []float32 {
+				if metric == anystore.VectorCosine {
+					return unit(q)
+				}
+				return q
+			}
+
+			hits, err := vsearch(coll, "v", vecs[42], 1, 0)
+			require.NoError(t, err)
+			require.Len(t, hits, 1)
+			assert.Equal(t, idBytesOf(42), hits[0].DocId)
+			assert.InDelta(t, 0, hits[0].Distance, 0.05, "int8 self-distance is not exactly 0")
+
+			rng := rand.New(rand.NewSource(123))
+			var recall float64
+			const queries = 50
+			for range queries {
+				src := vecs[rng.Intn(n)]
+				q := make([]float32, dim)
+				for d := range q {
+					q[d] = src[d] + float32(rng.NormFloat64())*0.02
+				}
+				truth := bruteIDs(oracle, oracleQuery(q), k)
+				hh, err := vsearch(coll, "v", q, k, 0)
+				require.NoError(t, err)
+				hit := 0
+				for _, h := range hh {
+					if truth[string(h.DocId)] {
+						hit++
+					}
+				}
+				recall += float64(hit) / float64(k)
+			}
+			recall /= queries
+			t.Logf("IVF-SQ recall@%d = %.3f", k, recall)
+			assert.GreaterOrEqual(t, recall, 0.85)
+
+			require.NoError(t, fx.Close())
+			db2, err := anystore.Open(ctx, filepath.Join(tmpDir, "any-store-test.db"), nil)
+			require.NoError(t, err)
+			defer db2.Close()
+			coll2, err := db2.Collection(ctx, "docs")
+			require.NoError(t, err)
+			hits, err = vsearch(coll2, "v", vecs[100], 1, 0)
+			require.NoError(t, err)
+			require.Len(t, hits, 1)
+			assert.Equal(t, idBytesOf(100), hits[0].DocId)
+		})
 	}
 }
 
@@ -1072,11 +1049,11 @@ func TestVectorEntryRepoint_DeleteEntryChain(t *testing.T) {
 
 // TestVectorMetricModeMatrix pins the accepted metric x mode combinations.
 // vivf's distance surface is L2, or cosine via unit-normalization — it has no
-// dot-product ranking path — so VectorDot on the IVF modes must be refused at
+// dot-product ranking path — so VectorDot on the IVF mode must be refused at
 // validation instead of silently ranking by L2 (wrong order, no error).
 func TestVectorMetricModeMatrix(t *testing.T) {
 	const dim = 32
-	modes := []anystore.VectorMode{anystore.VectorModeBTree, anystore.VectorModeHybrid, anystore.VectorModeBruteForce, anystore.VectorModeIVFPQ, anystore.VectorModeIVFSQ}
+	modes := []anystore.VectorMode{anystore.VectorModeBTree, anystore.VectorModeHybrid, anystore.VectorModeBruteForce, anystore.VectorModeIVFSQ}
 	metrics := []anystore.VectorMetric{anystore.VectorCosine, anystore.VectorL2, anystore.VectorDot}
 	for _, mode := range modes {
 		for _, metric := range metrics {
@@ -1084,7 +1061,7 @@ func TestVectorMetricModeMatrix(t *testing.T) {
 				fx := newFixture(t)
 				coll, err := fx.CreateCollection(ctx, "docs")
 				require.NoError(t, err)
-				// IVF modes train from existing documents at create time.
+				// IVF trains from existing documents at create time.
 				rng := rand.New(rand.NewSource(11))
 				for i := 0; i < 128; i++ {
 					v := make([]float32, dim)
@@ -1098,7 +1075,7 @@ func TestVectorMetricModeMatrix(t *testing.T) {
 					Kind:   anystore.IndexKindVector,
 					Vector: &anystore.VectorParams{Field: "v", Dim: dim, Metric: metric, Mode: mode},
 				})
-				if metric == anystore.VectorDot && (mode == anystore.VectorModeIVFPQ || mode == anystore.VectorModeIVFSQ) {
+				if metric == anystore.VectorDot && mode == anystore.VectorModeIVFSQ {
 					assert.ErrorIs(t, err, anystore.ErrVectorMetricUnsupported)
 				} else {
 					assert.NoError(t, err)

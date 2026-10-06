@@ -7,9 +7,8 @@ import (
 	"github.com/anyproto/any-store/v2/internal/vecf"
 )
 
-// The re-rank store (:vec) and IVF-SQ cell store hold int8-quantized vectors
-// instead of raw f32 — ~4× smaller on disk and in the page cache, which is the
-// win on the random per-candidate re-rank reads and the SQ cell scan. The format
+// The cell store holds int8-quantized vectors instead of raw f32 — ~4× smaller
+// on disk and in the page cache, which is the win on the cell scan. The format
 // is per-vector symmetric scalar quantization with OFFSET-BINARY components, so
 // the unsigned SIMD float×byte kernel can score a candidate straight from the
 // bytes (no dequant) via the identity in StoreIndex.distBytes:

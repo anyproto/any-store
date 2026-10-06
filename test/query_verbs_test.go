@@ -769,7 +769,7 @@ func TestVerbCoherence_Knn(t *testing.T) {
 	)
 
 	// v = [i/10, fixed…] → L2 distance to query [q0, fixed…] is |i-q|/10:
-	// distinct per doc, exact under PQ re-rank, and the _distance threshold
+	// distinct per doc, int8-quantized under IVF, and the _distance threshold
 	// below has a predictable membership. "r" is a sort field uncorrelated
 	// with id; "a" is a ~50% selective residual field.
 	docJSON := func(i int) string {
@@ -785,7 +785,6 @@ func TestVerbCoherence_Knn(t *testing.T) {
 		{"btree", anystore.VectorModeBTree},
 		{"hybrid", anystore.VectorModeHybrid},
 		{"bruteforce", anystore.VectorModeBruteForce},
-		{"ivfpq", anystore.VectorModeIVFPQ},
 		{"ivfsq", anystore.VectorModeIVFSQ},
 	}
 	residuals := []struct {
@@ -820,7 +819,7 @@ func TestVerbCoherence_Knn(t *testing.T) {
 			fx := newFixture(t)
 			coll, err := fx.CreateCollection(ctx, "vc_"+m.name)
 			require.NoError(t, err)
-			// Docs first: IVF trains its codebooks from existing documents.
+			// Docs first: IVF trains its centroids from existing documents.
 			docs := make(map[int]string, n)
 			for i := 0; i < n; i++ {
 				docs[i] = docJSON(i)

@@ -67,16 +67,19 @@ func recallAt(t *testing.T, db *btree.DB, queries, all [][]float32, k int) float
 	return sum / float64(len(queries))
 }
 
-// TestStoreIVFPQDrift verifies the drift signal rises when the distribution shifts
-// away from the frozen codebooks, and that Rebuild clears it and restores recall.
-func TestStoreIVFPQDrift(t *testing.T) {
+// TestStoreDrift verifies the drift signal rises when the distribution shifts
+// away from the frozen centroids, and that Rebuild clears it without costing
+// recall. (Stale centroids cost IVF-SQ scan balance more than recall: every
+// probed record is scored exactly, so recall on the drifted data holds as
+// long as its cells are probed.)
+func TestStoreDrift(t *testing.T) {
 	const (
 		dim = 32
 		k   = 10
 	)
 	base := clusteredVecs(2000, dim, 40, 1)
 	db := openMem(t)
-	p := StoreParams{Dim: dim, NList: 64, M: 16, Assign: 2, NProbe: 16, Normalize: false, KMeansPP: true, Seed: 1}
+	p := StoreParams{Dim: dim, NList: 64, Assign: 2, NProbe: 16, Normalize: false, KMeansPP: true, Seed: 1}
 	buildStore(t, db, p, base)
 
 	require.InDelta(t, 0, driftScore(t, db), 0.01, "fresh build has ~0 drift")
@@ -97,7 +100,7 @@ func TestStoreIVFPQDrift(t *testing.T) {
 	t.Logf("drift score after 100%% drifted inserts = %.2f", score)
 	require.GreaterOrEqual(t, score, 0.5, "drift must be detected after a large distribution shift")
 
-	// Recall on the drifted cluster is poor while centroids are stale.
+	// Recall on the drifted cluster while the centroids are stale.
 	dq := drifted[:50]
 	allAfter := append(append([][]float32{}, base...), drifted...)
 	preRecall := recallAt(t, db, dq, allAfter, k)
@@ -113,6 +116,6 @@ func TestStoreIVFPQDrift(t *testing.T) {
 	require.InDelta(t, 0, driftScore(t, db), 0.01, "rebuild clears accumulated drift")
 	postRecall := recallAt(t, db, dq, allAfter, k)
 	t.Logf("post-rebuild recall on drifted cluster = %.3f", postRecall)
-	require.Greater(t, postRecall, preRecall, "rebuild must improve recall on the drifted data")
+	require.GreaterOrEqual(t, postRecall, preRecall, "rebuild must not cost recall on the drifted data")
 	require.GreaterOrEqual(t, postRecall, 0.85, "rebuilt index covers the new distribution")
 }

@@ -13,7 +13,7 @@ Schema-less documents, rich indexes, full-text and vector search, ACID transacti
 * **Indexes** — compound, unique, sparse, multikey (arrays), asc/desc per field; created and dropped at runtime.
 * **Cost-based planner** — index selection driven by btree page statistics and per-prefix selectivity sketches; `Explain()` shows the chosen plan and its candidates.
 * **Full-text search** — btree-resident inverted index with BM25 ranking via `$text`. See [docs/full-text-search.md](docs/full-text-search.md).
-* **Vector search** — btree-resident ANN indexes (IVF-PQ / IVF-SQ, HNSW, brute-force) via `$knn`. See [docs/vector-search.md](docs/vector-search.md) and [docs/vector-engine.md](docs/vector-engine.md).
+* **Vector search** — btree-resident ANN indexes (IVF-SQ, HNSW, brute-force) via `$knn`. See [docs/vector-search.md](docs/vector-search.md) and [docs/vector-engine.md](docs/vector-engine.md).
 * **Aggregation** — MongoDB-style pipelines: shaping (`$match`, `$group`, `$sort`, `$unwind`, `$facet`, ...), computed expressions (arithmetic, conditionals, comparisons, date math), field-to-field `$expr` predicates, primary-key `$lookup` joins, and materialization via `$merge`/`$out` — with planner pushdown. See [docs/aggregation.md](docs/aggregation.md).
 * **ACID transactions** — snapshot-isolated read transactions, single-writer write transactions.
 * **Multi-process** — SQLite-like contract: any number of OS processes may open, read and write the same database file at any time (WAL + shared-memory index, busy handling, cross-process DDL reconciliation).
@@ -137,15 +137,15 @@ _ = docs.EnsureIndex(ctx, anystore.IndexInfo{
     Vector: &anystore.VectorParams{
         Field:  "embedding",
         Dim:    768,
-        Metric: anystore.VectorCosine, // or VectorL2, VectorDot
-        Mode:   anystore.VectorModeIVFSQ, // or IVFPQ, BTree/Hybrid (HNSW), BruteForce
+        Metric: anystore.VectorCosine, // or VectorL2 (VectorDot: HNSW/brute-force modes only)
+        Mode:   anystore.VectorModeIVFSQ, // or BTree/Hybrid (HNSW), BruteForce
     },
 })
 
 res, _ := docs.Find(`{"embedding": {"$knn": {"$query": [0.1, 0.2, ...], "$k": 10}}}`).Iter(ctx)
 ```
 
-ANN results stream in distance order and compose with filters; `$ef` tunes recall per query, int8 quantization and IVF cell counts are per-index options. IVF modes are the production default for large collections.
+ANN results stream in distance order and compose with filters; `$ef` tunes recall per query, int8 quantization and IVF cell counts are per-index options. Large deployments run IVF-SQ; the API default is `VectorModeBTree`.
 
 ## Aggregation
 
