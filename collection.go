@@ -463,7 +463,7 @@ func (c *collection) Find(filter any) Query {
 }
 
 func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err error) {
-	// Inserts drive IVF-PQ centroid drift (they create no HNSW tombstones, so this
+	// Inserts drive IVF centroid drift (they create no HNSW tombstones, so this
 	// is a no-op for the graph modes beyond a cheap enabled-check), so an insert can
 	// cross a vector index's auto-maintenance threshold just like an update/delete.
 	// returned is set once the write tx returns; err == nil alone would also hold
@@ -1265,14 +1265,24 @@ func (c *collection) committed() *collSchema {
 // schemaFor returns the schema a verb about to run in ctx works with: the
 // version of the transaction ctx carries, else the committed one its own
 // transaction is about to see — verified through a short read when it is
-// not known to be, with the error that ends the verb if that fails.
-func (c *collection) schemaFor(ctx context.Context) (*collSchema, error) {
+// not known to be, with the error that ends the verb if that fails. The
+// second result reports that the schema is verified: resolved in a
+// transaction, as opposed to the cached head, which a peer process's DDL may
+// have left behind (its cookie is observed only through a transaction).
+func (c *collection) schemaFor(ctx context.Context) (*collSchema, bool, error) {
 	if tx, ok := ctx.Value(ctxKeyTx).(ReadTx); ok && !tx.Done() && tx.instanceId() == c.db.instanceId {
-		return c.resolve(tx.btreeReadTx())
+		s, err := c.resolve(tx.btreeReadTx())
+		return s, true, err
 	}
 	if s := c.cur(); s != nil && s.gen.Load() == c.db.epoch.Load().gen {
-		return s, nil
+		return s, false, nil
 	}
+	s, err := c.committedSchema(ctx)
+	return s, true, err
+}
+
+// committedSchema resolves the committed schema through a short read.
+func (c *collection) committedSchema(ctx context.Context) (*collSchema, error) {
 	var s *collSchema
 	err := c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
 		s, err = c.resolve(tx)

@@ -176,6 +176,21 @@ func (q *aggQuery) prefixQuery(ctx context.Context) (*collQuery, aggregate.Pipel
 //     only the pushdown prefix reaches the compiler — must reject it itself.
 func (q *aggQuery) validateInPipelineStages(ctx context.Context, rest aggregate.Pipeline) error {
 	v := &aggStageValidator{q: q, ctx: ctx}
+	err := v.validate(rest)
+	if err == nil || v.s == nil || v.verified || !schemaDependent(err) {
+		return err
+	}
+	// The same re-check as validateSourcesIn: a schema-dependent verdict from
+	// the unverified cached head is confirmed against the committed schema
+	// before it ends the verb.
+	fresh, ferr := q.c.committedSchema(ctx)
+	if ferr != nil {
+		return ferr
+	}
+	if fresh == v.s {
+		return err
+	}
+	v = &aggStageValidator{q: q, ctx: ctx, s: fresh, verified: true}
 	return v.validate(rest)
 }
 
@@ -183,18 +198,19 @@ func (q *aggQuery) validateInPipelineStages(ctx context.Context, rest aggregate.
 // in ctx works with (collection.schemaFor) — across the recursive walk into
 // $facet sub-pipelines.
 type aggStageValidator struct {
-	q   *aggQuery
-	ctx context.Context
-	s   *collSchema
+	q        *aggQuery
+	ctx      context.Context
+	s        *collSchema
+	verified bool // s was resolved in a transaction, not taken from the cached head
 }
 
 func (val *aggStageValidator) schema() (*collSchema, error) {
 	if val.s == nil {
-		s, err := val.q.c.schemaFor(val.ctx)
+		s, verified, err := val.q.c.schemaFor(val.ctx)
 		if err != nil {
 			return nil, err
 		}
-		val.s = s
+		val.s, val.verified = s, verified
 	}
 	return val.s, nil
 }

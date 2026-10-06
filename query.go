@@ -84,15 +84,20 @@ type collQuery struct {
 
 	indexHints []IndexHint
 
-	// srcValidated memoizes validateSources: the verbs validate before their
-	// unsatisfiable() short-circuit and compilePlan validates again — without
-	// the flag a $knn query would pay the guard walks (and a throwaway
-	// detection) twice more per verb. Only the VERDICT is cached, never the
-	// detected spec: the spec's Search closure captures the resolved index
-	// handle, and which one that is depends on the verb's transaction — see
-	// detectKnnQuery. A collQuery is a single-use
-	// builder (never shared across goroutines), so a plain field suffices.
-	srcValidated bool
+	// srcValidatedFor memoizes validateSources for the schema version it
+	// passed against: the verbs validate before their unsatisfiable()
+	// short-circuit and compilePlan validates again — without the memo a $knn
+	// query would pay the guard walks (and a throwaway detection) twice more
+	// per verb. It is bound to the version, not a bool: the pre-transaction
+	// pass may run against the cached head, and a verdict reached there must
+	// not stand for the version the transaction resolves when a peer's DDL
+	// sits between them (a vector index created there would let the legacy
+	// clause through as a literal comparison). Only the VERDICT is cached,
+	// never the detected spec: the spec's Search closure captures the resolved
+	// index handle, and which one that is depends on the verb's transaction —
+	// see detectKnnQuery. A collQuery is a single-use builder (never shared
+	// across goroutines), so a plain field suffices.
+	srcValidatedFor *collSchema
 
 	err error
 }
@@ -172,7 +177,7 @@ type planOpts struct {
 // identically on every verb, not return 0/nil wherever an unrelated $in:[]
 // happens to make the filter unsatisfiable.
 func (q *collQuery) validateSources(s *collSchema) error {
-	if q.srcValidated {
+	if q.srcValidatedFor == s {
 		return nil
 	}
 	if err := rejectLegacyVectorClause(q.cond, s.vindexes); err != nil {
@@ -193,21 +198,44 @@ func (q *collQuery) validateSources(s *collSchema) error {
 			return err
 		}
 	}
-	q.srcValidated = true
+	q.srcValidatedFor = s
 	return nil
 }
 
 // validateSourcesIn is validateSources for a verb about to run in ctx, with
-// the schema that verb will work with (collection.schemaFor).
+// the schema that verb will work with (collection.schemaFor). A source error
+// ends the verb, so one that depends on the schema and was found against the
+// unverified cached head is re-checked against the committed schema first: a
+// peer's DDL — the index dropped and recreated in another mode, say — would
+// otherwise keep the verb failing with the stale verdict (ErrNoVectorIndex,
+// ErrVectorIndexUnsupported) until some other operation of this process
+// happens to observe it. The success path stays transaction-free.
 func (q *collQuery) validateSourcesIn(ctx context.Context) error {
-	if q.srcValidated {
-		return nil
-	}
-	s, err := q.c.schemaFor(ctx)
+	s, verified, err := q.c.schemaFor(ctx)
 	if err != nil {
 		return err
 	}
-	return q.validateSources(s)
+	err = q.validateSources(s)
+	if err == nil || verified || !schemaDependent(err) {
+		return err
+	}
+	fresh, ferr := q.c.committedSchema(ctx)
+	if ferr != nil {
+		return ferr
+	}
+	if fresh == s {
+		return err
+	}
+	return q.validateSources(fresh)
+}
+
+// schemaDependent reports whether a source-validation error can change with
+// the schema version — index resolution and the legacy-clause guard — as
+// opposed to the shape of the query itself.
+func schemaDependent(err error) bool {
+	return errors.Is(err, ErrNoVectorIndex) || errors.Is(err, ErrAmbiguousVectorIndex) ||
+		errors.Is(err, ErrVectorIndexUnsupported) || errors.Is(err, ErrLegacyVectorClause) ||
+		errors.Is(err, ErrInvalidVectorQuery) // the dim check reads the index
 }
 
 // writeSorter applies the write-verb sorter rule: ordering decides WHICH

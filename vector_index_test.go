@@ -1023,6 +1023,63 @@ func TestVectorIndex_RemovedModeQuarantined(t *testing.T) {
 	assert.Equal(t, string(idBytesOf(0)), string(hits[0].DocId))
 }
 
+// The switch at run time, as a peer process's DDL (otherBuildTx: the cookie
+// moves, the head is not told): a supported index becomes quarantined — a
+// reader pinned before keeps searching its own build — and back. The way
+// back is the trap: the quarantined verdict was cached in this process's
+// head, and a verb must not end on it once the committed schema says the
+// index is fine again (a process healing on the error would drop a peer's
+// fresh index).
+func TestVectorIndex_RemovedModeSwitchAtRunTime(t *testing.T) {
+	const dim = 8
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	vecs := vrand(64, dim, 11)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, Mode: VectorModeIVFSQ},
+	}))
+	d := fx.DB.(*db)
+	c := coll.(*collection)
+	supported := c.cur().vindexes[0]
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { _ = rtx.Commit() }()
+
+	otherBuildTx(t, d, func(tx *btree.WriteTx) error { return forgeVectorMode(tx, d, "docs", "emb", vectorModeIVFPQ) })
+	_, err = vsearch(coll, "v", vecs[0], 1, 0)
+	require.ErrorIs(t, err, ErrVectorIndexUnsupported)
+	head := c.cur().vindexes[0]
+	assert.True(t, head.unsupported)
+	assert.False(t, head == supported, "the supported handle was reused for the quarantined index")
+	hits, err := vsearchIn(rtx.Context(), coll, "v", vecs[0], 1, 0)
+	require.NoError(t, err, "the older reader searches its own build")
+	require.Len(t, hits, 1)
+
+	otherBuildTx(t, d, func(tx *btree.WriteTx) error { return forgeVectorMode(tx, d, "docs", "emb", VectorModeIVFSQ) })
+	// Every verb validates its sources before its transaction; each must get
+	// past the cached verdict on its own (the first to run refreshes the head
+	// for the rest, so the order here is not what proves it — the stash
+	// check in the commit is).
+	knn := fmt.Sprintf(`{"v":%s,"id":-1}`, vknnJSON(vecs[0], 1, 0))
+	_, err = coll.Find(knn).Count(ctx)
+	require.NoError(t, err, "Count ended on the cached quarantined verdict")
+	_, err = coll.Find(knn).Explain(ctx)
+	require.NoError(t, err, "Explain ended on the cached quarantined verdict")
+	_, err = coll.Find(knn).Delete(ctx)
+	require.NoError(t, err, "Delete ended on the cached quarantined verdict")
+	hits, err = vsearch(coll, "v", vecs[0], 1, 0)
+	require.NoError(t, err, "the verb ended on the cached quarantined verdict")
+	require.Len(t, hits, 1)
+	assert.Equal(t, string(idBytesOf(0)), string(hits[0].DocId))
+	assert.False(t, c.cur().vindexes[0].unsupported)
+}
+
 // The CompactRatio drift trigger fires an auto-rebuild through the public
 // write path: the build identity changes after a batch the frozen centroids
 // do not cover, and does not with the trigger off (the black-box recall
