@@ -1277,12 +1277,14 @@ func TestMultikeyFlag_VerifyChainResidualPredicates(t *testing.T) {
 }
 
 // TestMultikeyFlag_ScanCostPricedFromSeekBounds: an unproven (multikey-
-// flagged) index seeks WIDE even though its tight bounds are narrow. The
-// scan-cost estimate must price the wide seek — charging the tight fraction
-// picks an index seek that still walks half the index. 1000 scalar docs plus
-// one array doc (inserted and deleted: the flag is sticky) — a narrow
-// two-sided mid-range query must stay on the full scan, because the real
-// index seek would visit ~90% of the entries.
+// flagged) index seeks WIDE — one side of a two-sided range — even though its
+// tight bounds are narrow. The scan-cost estimate must price the wide seek —
+// charging the tight fraction picks an index seek that still walks half the
+// index. 1000 scalar docs plus one array doc (inserted and deleted: the flag
+// is sticky) — a two-sided mid-range query whose either side alone covers
+// ~60% of the entries while their intersection covers 20% must stay on the
+// full scan, because the real index seek, on whichever side seeds it, would
+// visit ~60% of the entries.
 func TestMultikeyFlag_ScanCostPricedFromSeekBounds(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "seekprice")
@@ -1296,7 +1298,7 @@ func TestMultikeyFlag_ScanCostPricedFromSeekBounds(t *testing.T) {
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":9999,"a":[1,2]}`)))
 	require.NoError(t, coll.DeleteId(ctx, 9999))
 
-	explain, err := coll.Find(`{"a":{"$gt":100,"$lt":105}}`).Explain(ctx)
+	explain, err := coll.Find(`{"a":{"$gt":400,"$lt":600}}`).Explain(ctx)
 	require.NoError(t, err)
 	require.Contains(t, explain.Sql, "FullScan",
 		"an unproven index seeking wide must not be priced at the tight fraction: %s\n%s",

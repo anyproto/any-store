@@ -3,6 +3,7 @@ package qplanner
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"math/rand"
 	"path/filepath"
 	"strings"
@@ -445,11 +446,18 @@ func TestBuildPlan_IndexScan_SortWithoutLimit(t *testing.T) {
 func TestComputeFullScanCost_SortAddsMaterialize(t *testing.T) {
 	const totalDocs = 1000.0
 	const yield = 800.0
-	noSort := computeFullScanCost(totalDocs, yield, false, false)
-	withSort := computeFullScanCost(totalDocs, yield, true, false)
+	noSort := computeFullScanCost(totalDocs, yield, false, false, 0)
+	withSort := computeFullScanCost(totalDocs, yield, true, false, 0)
 
 	want := noSort + sortCost(yield) + yield*CostMaterialize
 	assert.InDelta(t, want, withSort, 1e-9)
+
+	// Under a LIMIT the sort is a heap of limit+offset rows: each row costs
+	// an insert into it, and only those rows are materialized.
+	topK := computeFullScanCost(totalDocs, yield, true, false, 5)
+	assert.InDelta(t, noSort+yield*math.Log2(6)*CostSortSwap+5*CostMaterialize, topK, 1e-9)
+	assert.InDelta(t, withSort, computeFullScanCost(totalDocs, yield, true, false, yield), 1e-9,
+		"a LIMIT at or past the yield is a full sort")
 	assert.Greater(t, withSort-noSort, sortCost(yield),
 		"materialize must add cost beyond the swap term alone")
 }
@@ -2910,27 +2918,27 @@ func TestComputeIndexBounds(t *testing.T) {
 // printed must be the cost the plan is chosen by.
 func TestFormatFullScanDetails(t *testing.T) {
 	total := func(docs, yield float64, needSort, idSeek bool) string {
-		return fmt.Sprintf("= %.1f", computeFullScanCost(docs, yield, needSort, idSeek))
+		return fmt.Sprintf("= %.1f", computeFullScanCost(docs, yield, needSort, idSeek, 0))
 	}
 	t.Run("small_no_sort", func(t *testing.T) {
-		s := formatFullScanDetails(100, 50, false, false)
+		s := formatFullScanDetails(100, 50, false, false, 0)
 		assert.Contains(t, s, fmt.Sprintf("100×fetch(%g)", CostDocFetch))
 		assert.NotContains(t, s, "× sort")
 		assert.True(t, strings.HasSuffix(s, total(100, 50, false, false)), "unexpected total in %q", s)
 	})
 	t.Run("large_scan_label", func(t *testing.T) {
-		s := formatFullScanDetails(1000, 1000, false, false)
+		s := formatFullScanDetails(1000, 1000, false, false, 0)
 		assert.Contains(t, s, fmt.Sprintf("1000×scan(%g)", CostScanDoc))
 		assert.True(t, strings.HasSuffix(s, total(1000, 1000, false, false)), "unexpected total in %q", s)
 	})
 	t.Run("large_with_idBoundsSeek_keeps_fetch", func(t *testing.T) {
-		s := formatFullScanDetails(1000, 1000, false, true)
+		s := formatFullScanDetails(1000, 1000, false, true, 0)
 		assert.Contains(t, s, fmt.Sprintf("1000×fetch(%g)", CostDocFetch),
 			"idBoundsSeek=true must override the large-table scan label")
 		assert.True(t, strings.HasSuffix(s, total(1000, 1000, false, true)), "unexpected total in %q", s)
 	})
 	t.Run("with_sort", func(t *testing.T) {
-		s := formatFullScanDetails(100, 50, true, false)
+		s := formatFullScanDetails(100, 50, true, false, 0)
 		assert.Contains(t, s, fmt.Sprintf("sort(%.0f)=%.1f", 50.0, sortCost(50)))
 		assert.Contains(t, s, fmt.Sprintf("50×materialize(%g)", CostMaterialize))
 		assert.True(t, strings.HasSuffix(s, total(100, 50, true, false)), "unexpected total in %q", s)
@@ -2949,8 +2957,10 @@ func TestExplainString_WithIndexName(t *testing.T) {
 			TotalDocs:   1000,
 			Selectivity: 0.05,
 			Candidates: []CandidatePlan{
-				{Name: "IndexSeek(a)", Cost: 123.4, EstRows: 50,
+				{Name: "IndexSeek(idx_a)", Cost: 123.4, EstRows: 50,
 					details: func() string { return "formula-goes-here" }},
+				{Name: "IndexSeek(idx_a)[ordered]", Cost: 123.4, EstRows: 50,
+					details: func() string { return "not-this-one" }},
 				{Name: "FullScan", Cost: 999.9, EstRows: 1000},
 			},
 		},
@@ -2962,8 +2972,14 @@ func TestExplainString_WithIndexName(t *testing.T) {
 	assert.Contains(t, out, "Selectivity: 0.05 (50 of 1000 docs)")
 	assert.Contains(t, out, "Iterator: NoPlan") // Root is nil in this fixture
 	assert.Contains(t, out, "Cost breakdown: formula-goes-here")
-	assert.Contains(t, out, "IndexSeek(a)")
-	assert.Contains(t, out, "[chosen]")
+	assert.NotContains(t, out, "not-this-one", "an exact cost tie marks only the plan's own candidate")
+	assert.Equal(t, 1, strings.Count(out, "[chosen]"))
+	assert.Less(t, strings.Index(out, "[chosen]"), strings.Index(out, "[ordered]"), "the primary line is marked")
+
+	plan.Ordered = true
+	out = plan.ExplainString()
+	assert.Contains(t, out, "Cost breakdown: not-this-one")
+	assert.Equal(t, 1, strings.Count(out, "[chosen]"))
 }
 
 // TestCalculateSelectivity covers the all/nil filter short-circuit, the sketch
@@ -4604,4 +4620,337 @@ func TestCBOIndexSize(t *testing.T) {
 		t.Skip("layout pinned for 64-bit")
 	}
 	assert.Equal(t, uintptr(144), unsafe.Sizeof(CBOIndex{}))
+}
+
+// ratedProbe rates bounds by their String() form; unknown bounds are unrated.
+func ratedProbe(est map[string]float64) BoundsProbe {
+	return func(_ string, bs query.Bounds) (float64, bool) {
+		e, ok := est[bs.String()]
+		return e, ok
+	}
+}
+
+func TestBoundsResult_BuildWithProbe_SeedsTheLowestRatedConjunct(t *testing.T) {
+	infos := []*IndexInfo{{Name: "tags", FieldNames: []string{"tags"}}}
+	filter := query.MustParseCondition(`{"tags":{"$all":["common","rare"]}}`)
+	common := mustParseBounds("tags", `{"tags":"common"}`)
+	rare := mustParseBounds("tags", `{"tags":"rare"}`)
+	lookup := func(br *BoundsResult) string {
+		bs, fixed, found := br.Lookup("tags")
+		require.True(t, found)
+		require.True(t, fixed)
+		return bs.String()
+	}
+
+	t.Run("lowest rated wins whichever is listed first", func(t *testing.T) {
+		var br BoundsResult
+		br.BuildWithProbe(infos, filter, ratedProbe(map[string]float64{common.String(): 5000, rare.String(): 50}), nil)
+		assert.Equal(t, rare.String(), lookup(&br))
+		assert.Equal(t, int8(-1), br.Fields[0].TightIdx, "$all's intersection is empty: no tight channel")
+		assert.Equal(t, int8(-1), br.Fields[0].OrderedIdx)
+
+		br.BuildWithProbe(infos, query.MustParseCondition(`{"tags":{"$all":["rare","common"]}}`),
+			ratedProbe(map[string]float64{common.String(): 5000, rare.String(): 50}), nil)
+		assert.Equal(t, rare.String(), lookup(&br))
+	})
+	t.Run("tie keeps the first conjunct", func(t *testing.T) {
+		var br BoundsResult
+		br.BuildWithProbe(infos, filter, ratedProbe(map[string]float64{common.String(): 7, rare.String(): 7}), nil)
+		assert.Equal(t, common.String(), lookup(&br))
+	})
+	t.Run("no probe keeps the first conjunct", func(t *testing.T) {
+		var br BoundsResult
+		br.Build(infos, filter)
+		assert.Equal(t, common.String(), lookup(&br))
+	})
+	t.Run("unrated field keeps the first conjunct", func(t *testing.T) {
+		var br BoundsResult
+		br.BuildWithProbe(infos, filter, ratedProbe(nil), nil)
+		assert.Equal(t, common.String(), lookup(&br))
+	})
+	t.Run("the walk stops at the first unrated conjunct", func(t *testing.T) {
+		var br BoundsResult
+		rated := 0
+		br.BuildWithProbe(infos, query.MustParseCondition(`{"tags":{"$all":["common","nope","rare"]}}`),
+			func(_ string, bs query.Bounds) (float64, bool) {
+				rated++
+				e, ok := map[string]float64{common.String(): 5000, rare.String(): 50}[bs.String()]
+				return e, ok
+			}, nil)
+		assert.Equal(t, common.String(), lookup(&br), "rare sits past the unrated conjunct")
+		assert.Equal(t, 2, rated)
+	})
+	t.Run("a single predicate is never probed", func(t *testing.T) {
+		var br BoundsResult
+		br.BuildWithProbe(infos, query.MustParseCondition(`{"tags":"common"}`),
+			func(string, query.Bounds) (float64, bool) { t.Fatal("probed"); return 0, false }, nil)
+		assert.Equal(t, common.String(), lookup(&br))
+	})
+	t.Run("two-sided range keeps the narrower side wide and the intersection tight", func(t *testing.T) {
+		infos := []*IndexInfo{{Name: "a", FieldNames: []string{"a"}}}
+		f := query.MustParseCondition(`{"a":{"$gt":10,"$lt":20}}`)
+		lo := mustParseBounds("a", `{"a":{"$gt":10}}`)
+		hi := mustParseBounds("a", `{"a":{"$lt":20}}`)
+		var br BoundsResult
+		br.BuildWithProbe(infos, f, ratedProbe(map[string]float64{lo.String(): 900, hi.String(): 100}), nil)
+		wide, fixed, _ := br.Lookup("a")
+		assert.False(t, fixed)
+		assert.Equal(t, hi.String(), wide.String())
+		tight, _, _ := br.LookupTight("a")
+		assert.Equal(t, lo.Intersect(hi).String(), tight.String())
+		assert.True(t, br.TightDiffers([]string{"a"}))
+	})
+}
+
+func TestBoundsResult_BuildWithProbe_OrderedChannel(t *testing.T) {
+	infos := []*IndexInfo{{Name: "a", FieldNames: []string{"a"}}}
+	f := query.MustParseCondition(`{"a":{"$gt":10,"$lt":20}}`)
+	lo := mustParseBounds("a", `{"a":{"$gt":10}}`)
+	hi := mustParseBounds("a", `{"a":{"$lt":20}}`)
+	probe := ratedProbe(map[string]float64{lo.String(): 900, hi.String(): 100})
+	orderedFor := func(reverse bool) func(string, query.Bounds) bool {
+		return func(field string, bs query.Bounds) bool { return field == "a" && OrderKeeping(bs, reverse) }
+	}
+
+	t.Run("descending keeps the order-providing side beside the seek pick", func(t *testing.T) {
+		var br BoundsResult
+		br.BuildWithProbe(infos, f, probe, orderedFor(true))
+		wide, _, _ := br.Lookup("a")
+		assert.Equal(t, hi.String(), wide.String(), "the seek pick is the narrower $lt side")
+		ordered, fixed, found := br.LookupOrdered("a")
+		require.True(t, found)
+		assert.False(t, fixed)
+		assert.Equal(t, lo.String(), ordered.String(), "the $gt side has no value cut above")
+		assert.True(t, br.OrderedDiffers([]string{"a"}))
+		assert.False(t, br.OrderedDiffers([]string{"b"}))
+	})
+	t.Run("ascending: the seek pick already keeps the order", func(t *testing.T) {
+		var br BoundsResult
+		br.BuildWithProbe(infos, f, probe, orderedFor(false))
+		assert.Equal(t, int8(-1), br.Fields[0].OrderedIdx)
+		assert.False(t, br.OrderedDiffers([]string{"a"}))
+		ordered, _, _ := br.LookupOrdered("a")
+		assert.Equal(t, hi.String(), ordered.String(), "falls back to the wide channel")
+	})
+	t.Run("no conjunct keeps the order", func(t *testing.T) {
+		var br BoundsResult
+		br.BuildWithProbe(infos, query.MustParseCondition(`{"a":{"$all":[1,2]}}`), ratedProbe(map[string]float64{
+			mustParseBounds("a", `{"a":1}`).String(): 5, mustParseBounds("a", `{"a":2}`).String(): 3,
+		}), orderedFor(true))
+		assert.Equal(t, int8(-1), br.Fields[0].OrderedIdx, "points cut on both sides")
+	})
+	t.Run("no sort: no ordered channel", func(t *testing.T) {
+		var br BoundsResult
+		br.BuildWithProbe(infos, f, probe, nil)
+		assert.Equal(t, int8(-1), br.Fields[0].OrderedIdx)
+	})
+}
+
+func TestOrderKeeping(t *testing.T) {
+	gt := mustParseBounds("a", `{"a":{"$gt":10}}`)
+	lt := mustParseBounds("a", `{"a":{"$lt":20}}`)
+	eq := mustParseBounds("a", `{"a":10}`)
+	in := mustParseBounds("a", `{"a":{"$in":[1,2]}}`)
+	assert.False(t, OrderKeeping(gt, false), "$gt cuts below: ascending loses the global min")
+	assert.True(t, OrderKeeping(gt, true), "$gt ends at a type edge: descending keeps the global max")
+	assert.True(t, OrderKeeping(lt, false))
+	assert.False(t, OrderKeeping(lt, true))
+	assert.False(t, OrderKeeping(eq, false))
+	assert.False(t, OrderKeeping(eq, true))
+	assert.False(t, OrderKeeping(in, false))
+	assert.True(t, OrderKeeping(nil, true), "no cut at all")
+}
+
+func TestEstimateFieldEntries(t *testing.T) {
+	info := &IndexInfo{Name: "a", FieldNames: []string{"a"}}
+	rare := mustParseBounds("a", `{"a":"rare"}`)
+	pair := mustParseBounds("a", `{"a":{"$in":["rare","common"]}}`)
+	lt := mustParseBounds("a", `{"a":{"$lt":"f"}}`)
+
+	t.Run("points sum the level-0 sketch", func(t *testing.T) {
+		sk := NewIndexSketch(DefaultSketchSize, 1)
+		for range 50 {
+			sk.Increment(0, rare[0].Start)
+		}
+		for range 5000 {
+			sk.Increment(0, mustParseBounds("a", `{"a":"common"}`)[0].Start)
+		}
+		est, ok := EstimateFieldEntries(nil, info, sk, 5000, rare)
+		require.True(t, ok)
+		assert.InDelta(t, 50, est, 0)
+		est, ok = EstimateFieldEntries(nil, info, sk, 5000, pair)
+		require.True(t, ok)
+		assert.InDelta(t, 5050, est, 0)
+	})
+	t.Run("points without a sketch are unrated", func(t *testing.T) {
+		_, ok := EstimateFieldEntries(nil, info, nil, 5000, rare)
+		assert.False(t, ok)
+	})
+	t.Run("a unique single-field index matches one entry per point", func(t *testing.T) {
+		uniq := &IndexInfo{Name: "a", FieldNames: []string{"a"}, Unique: true}
+		est, ok := EstimateFieldEntries(nil, uniq, nil, 5000, pair)
+		require.True(t, ok)
+		assert.InDelta(t, 2, est, 0)
+		sparse := &IndexInfo{Name: "a", FieldNames: []string{"a"}, Unique: true, Sparse: true}
+		_, ok = EstimateFieldEntries(nil, sparse, nil, 5000, pair)
+		assert.False(t, ok, "a sparse unique index drops docs missing the field: the rule does not apply")
+	})
+	t.Run("a reverse leading field is rated in stored space", func(t *testing.T) {
+		rev := &IndexInfo{Name: "a", FieldNames: []string{"a"}, Reverse: []bool{true}}
+		stored := anyenc.Tuple(nil).AppendInverted(anyenc.MustParseJson(`"rare"`))
+		sk := NewIndexSketch(DefaultSketchSize, 1)
+		for range 7 {
+			sk.Increment(0, stored)
+		}
+		est, ok := EstimateFieldEntries(nil, rev, sk, 100, rare)
+		require.True(t, ok)
+		assert.InDelta(t, 7, est, 0)
+	})
+	t.Run("ranges interpolate the live index", func(t *testing.T) {
+		ids := make([]string, 0, 26)
+		for c := 'a'; c <= 'z'; c++ {
+			ids = append(ids, string(c))
+		}
+		db, ns := coverageBtree(t, "a", ids)
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+		cur := rtx.NewCursor(ns)
+		defer cur.Close()
+		live := &IndexInfo{Name: "a", FieldNames: []string{"a"}, Ns: ns}
+		gt := mustParseBounds("a", `{"a":{"$gt":"f"}}`)
+		ltEst, ok := EstimateFieldEntries(cur, live, nil, 26, lt)
+		require.True(t, ok)
+		gtEst, ok := EstimateFieldEntries(cur, live, nil, 26, gt)
+		require.True(t, ok)
+		assert.Less(t, ltEst, gtEst, "a..e is the narrower side of f")
+		assert.Greater(t, ltEst, 0.0)
+	})
+	t.Run("ranges without a cursor take the default fraction of the sketch population", func(t *testing.T) {
+		sk := NewIndexSketch(DefaultSketchSize, 1)
+		for i := range 400 {
+			sk.Increment(0, []byte{byte(i), byte(i >> 8)})
+		}
+		est, ok := EstimateFieldEntries(nil, info, sk, 1000, lt)
+		require.True(t, ok)
+		assert.InDelta(t, DefaultRangeSelectivity*400, est, 1e-9)
+		_, ok = EstimateFieldEntries(nil, info, nil, 1000, lt)
+		assert.False(t, ok, "neither a sketch nor a cursor: unrated")
+	})
+	t.Run("empty bounds are unrated", func(t *testing.T) {
+		_, ok := EstimateFieldEntries(nil, info, NewIndexSketch(DefaultSketchSize, 1), 10, nil)
+		assert.False(t, ok)
+	})
+}
+
+func TestCBOIndex_CandidateName(t *testing.T) {
+	idx := CBOIndex{Info: &IndexInfo{Name: "tags"}}
+	assert.Equal(t, "IndexSeek(tags)", idx.candidateName("IndexSeek"))
+	idx.Ordered = true
+	assert.Equal(t, "IndexScan(tags)[ordered]", idx.candidateName("IndexScan"))
+}
+
+func TestLeadInBound(t *testing.T) {
+	numKey := func(v int) []byte { return []byte(mustParseBounds("a", fmt.Sprintf(`{"a":%d}`, v))[0].Start) }
+	open := query.Bounds{{}}
+	pick, empty := query.TightIndexBounds(query.MustParseCondition(`{"a":{"$gte":10,"$lte":100}}`), "a")
+	require.False(t, empty)
+	lo, hi := numKey(10), numKey(100)
+	unrated := func(query.Bound) (float64, bool) { return 0, false }
+
+	gap, ok := leadInBound(open, pick, true, 3, unrated)
+	require.True(t, ok)
+	assert.Equal(t, hi, []byte(gap.Start), "a reverse scan enters above the pick's End")
+	assert.Empty(t, gap.End)
+
+	gap, ok = leadInBound(open, pick, false, 3, unrated)
+	require.True(t, ok)
+	assert.Empty(t, gap.Start)
+	assert.Equal(t, lo, []byte(gap.End), "a forward scan enters below the pick's Start")
+
+	// A multi-point pick: the walk crosses the points in scan order and the
+	// gaps between them until their counts add up to need.
+	in := mustParseBounds("a", `{"a":{"$in":[5,50,20]}}`)
+	count := func(n map[int]float64) func(query.Bound) (float64, bool) {
+		return func(b query.Bound) (float64, bool) {
+			for v, c := range n {
+				if bytes.Equal(b.Start, numKey(v)) {
+					return c, true
+				}
+			}
+			return 0, false
+		}
+	}
+	gap, ok = leadInBound(open, in, true, 3, count(map[int]float64{50: 10}))
+	require.True(t, ok)
+	assert.Equal(t, numKey(50), []byte(gap.Start), "50 alone meets the need")
+	gap, ok = leadInBound(open, in, true, 3, count(map[int]float64{50: 1, 20: 1, 5: 1}))
+	require.True(t, ok)
+	assert.Equal(t, numKey(5), []byte(gap.Start), "the walk must reach 5 for three rows")
+	gap, ok = leadInBound(open, in, false, 3, count(map[int]float64{5: 2, 20: 2}))
+	require.True(t, ok)
+	assert.Equal(t, numKey(20), []byte(gap.End), "5 then 20 meet the need going up")
+	gap, ok = leadInBound(open, in, false, 3, unrated)
+	require.True(t, ok)
+	assert.Equal(t, numKey(5), []byte(gap.End), "an unrated point ends the walk at itself")
+
+	// A type-bracket edge is a cut too: the stretch past it holds other
+	// types, which the pick excludes.
+	gap, ok = leadInBound(open, mustParseBounds("a", `{"a":{"$gte":10}}`), true, 3, unrated)
+	require.True(t, ok)
+	assert.True(t, len(gap.Start) == 1, "the string-bracket edge")
+	// A pick open on the entry side has nothing to skip.
+	_, ok = leadInBound(open, query.Bounds{{Start: lo, StartInclude: true}}, true, 3, unrated)
+	assert.False(t, ok)
+	_, ok = leadInBound(open, query.Bounds{{End: hi, EndInclude: true}}, false, 3, unrated)
+	assert.False(t, ok)
+	_, ok = leadInBound(nil, pick, true, 3, unrated)
+	assert.False(t, ok)
+	_, ok = leadInBound(open, nil, true, 3, unrated)
+	assert.False(t, ok)
+}
+
+func TestOrderKeeping_ArrayBracketIsAValueCut(t *testing.T) {
+	for _, cond := range []string{
+		`{"a":{"$type":"array"}}`,
+		`{"a":{"$gte":[0]}}`,
+		`{"a":{"$lte":[5]}}`,
+		`{"a":{"$in":[[1],[2]]}}`,
+	} {
+		bs := mustParseBounds("a", cond)
+		require.NotEmpty(t, bs, cond)
+		assert.False(t, OrderKeeping(bs, false), cond)
+		assert.False(t, OrderKeeping(bs, true), cond)
+	}
+	// Brackets below and above the array one keep their edge semantics.
+	str := mustParseBounds("a", `{"a":{"$type":"string"}}`)
+	assert.True(t, OrderKeeping(str, false))
+	assert.True(t, OrderKeeping(str, true))
+	obj := mustParseBounds("a", `{"a":{"$type":"object"}}`)
+	assert.True(t, OrderKeeping(obj, false))
+	assert.True(t, OrderKeeping(obj, true))
+	assert.True(t, OrderKeeping(mustParseBounds("a", `{"a":{"$lt":20}}`), false))
+}
+
+func TestCountFilterFieldPreds_ElemMatchSubField(t *testing.T) {
+	f := query.MustParseCondition(`{"a":{"$elemMatch":{"b":1}},"a.b":2}`)
+	assert.Equal(t, 2, countFilterFieldPreds(f, "a.b"))
+	assert.Equal(t, 1, countFilterFieldPreds(f, "a"), "the $elemMatch itself is one predicate on a")
+	f = query.MustParseCondition(`{"a":{"$elemMatch":{"b":{"$gt":1,"$lt":5},"c":2}}}`)
+	assert.Equal(t, 2, countFilterFieldPreds(f, "a.b"))
+	assert.Equal(t, 1, countFilterFieldPreds(f, "a.c"))
+	// Dotted paths compare without joining.
+	f = query.MustParseCondition(`{"n.x":5,"n.y":3}`)
+	assert.Equal(t, 1, countFilterFieldPreds(f, "n.x"))
+	assert.Equal(t, 0, countFilterFieldPreds(f, "n.xy"))
+	assert.Equal(t, 0, countFilterFieldPreds(f, "n"))
+}
+
+func TestBoundsResult_BuildWithProbe_OnePredicatePerFieldIsNeverProbed(t *testing.T) {
+	infos := []*IndexInfo{{Name: "a", FieldNames: []string{"a"}}, {Name: "b", FieldNames: []string{"b"}}}
+	var br BoundsResult
+	br.BuildWithProbe(infos, query.MustParseCondition(`{"a":1,"b":{"$gt":2}}`),
+		func(string, query.Bounds) (float64, bool) { t.Fatal("probed"); return 0, false },
+		func(string, query.Bounds) bool { t.Fatal("ordered"); return false })
+	assert.Equal(t, 2, br.FieldCount())
 }

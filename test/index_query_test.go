@@ -1962,8 +1962,12 @@ func TestAudit10_RangeMultiKey_ReverseRange(t *testing.T) {
 
 	t.Run("explain confirms IndexScan + dedup wrap on the reverse scan", func(t *testing.T) {
 		// On a handful of documents the ordered scan over fan-out entries
-		// prices above the scan+sort; the hint forces the path under test.
-		explain, err := coll.Find(`{"tags":{"$gte":"a","$lte":"c"}}`).Sort("-tags").
+		// prices above the scan+sort; the hint forces the index. The
+		// two-sided range also offers the narrower $lte seek plus an
+		// in-memory sort, which the hint cannot tell apart from the ordered
+		// scan and which wins on three documents; the one-sided range keeps
+		// the ordered reverse scan this subtest pins.
+		explain, err := coll.Find(`{"tags":{"$gte":"a"}}`).Sort("-tags").
 			IndexHint(anystore.IndexHint{IndexName: "ix_tags", Boost: 1000000}).Explain(ctx)
 		require.NoError(t, err)
 		// The plan should use the index (IndexScan or IndexSeek), not a

@@ -379,7 +379,6 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 	sorter := q.writeSorter(opts)
 	visible := s.indexes
 	idxs := plannableIndexes(visible)
-	br := q.buildBoundsResult(idxs)
 	// The estimate reads the candidates' sketches; with every range index
 	// outdated it falls back to an outdated one's, advisory and better than
 	// none.
@@ -391,6 +390,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 	if opts.exactTotalDocs {
 		totalDocs = q.docCountExact(btx, s, countIdxs)
 	}
+	br := q.buildBoundsResult(idxs, btx, totalDocs, sorter != nil)
 	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly, totalDocs)
 	plan = qplanner.BuildPlan(&qplanner.PlanParams{
 		Tx:          btx,
@@ -885,8 +885,18 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 				explain.Indexes = append(explain.Indexes, ie)
 			}
 		}
-		for _, idx := range cboIndexes {
-			addIndex(idx.Info.Name, plan.Cost, idx.Info.Name == plan.IndexName)
+		// An index with a second (ordered) candidate is listed once.
+		for i, idx := range cboIndexes {
+			listed := false
+			for j := range i {
+				if cboIndexes[j].Info.Name == idx.Info.Name {
+					listed = true
+					break
+				}
+			}
+			if !listed {
+				addIndex(idx.Info.Name, plan.Cost, idx.Info.Name == plan.IndexName)
+			}
 		}
 		// An outdated index is never a candidate (plannableIndexes); listing
 		// it unused, like the vector and full-text handles below, keeps the
@@ -938,7 +948,7 @@ func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, s *collSchema, residual q
 	probePossible = idFixed
 	params.TotalDocs = q.docCountForPlan(btx, s, idxs)
 	if len(idxs) > 0 {
-		br := q.buildBoundsResult(idxs)
+		br := q.buildBoundsResult(idxs, btx, params.TotalDocs, needSort)
 		params.Indexes = q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly, params.TotalDocs)
 		params.FieldBounds = &br
 		for i := range params.Indexes {
@@ -1155,19 +1165,91 @@ func isIDOnlyFilterNode(f query.Filter, pk string) bool {
 	}
 }
 
-// buildBoundsResult computes IndexBounds once per unique field across all
+// buildBoundsResult computes the bounds once per unique field across all
 // indexes. idxs is the index-set snapshot for this planning pass; the caller
-// passes the SAME snapshot to buildCBOIndexesInto so bounds and CBOIndex entries
-// stay positionally consistent.
-func (q *collQuery) buildBoundsResult(idxs []*index) qplanner.BoundsResult {
+// passes the SAME snapshot to buildCBOIndexesInto, which builds its
+// candidates from these bounds. A field several conjuncts constrain gets the
+// conjunct its rating index's statistics rate most selective
+// (BoundsResult.BuildWithProbe); withOrder (the plan sorts) also keeps the
+// conjunct that lets a single-field index provide the order.
+func (q *collQuery) buildBoundsResult(idxs []*index, tx *btree.ReadTx, totalDocs int, withOrder bool) qplanner.BoundsResult {
 	var br qplanner.BoundsResult
 	var idxInfoBuf [8]*qplanner.IndexInfo
 	idxInfos := idxInfoBuf[:0]
 	for i := range idxs {
 		idxInfos = append(idxInfos, idxs[i].cboInfo)
 	}
-	br.Build(idxInfos, q.cond)
+	// The compound case needs the scalar proof regardless, and a proven
+	// index seeks the tight channel anyway (buildCBOIndexesInto). The sort
+	// fields are resolved on the first rated field: Sort.Fields allocates,
+	// and most sorted queries rate nothing.
+	var ordered func(string, query.Bounds) bool
+	if withOrder && q.sort != nil {
+		var sf []query.SortField
+		ordered = func(field string, bs query.Bounds) bool {
+			if sf == nil {
+				sf = q.sort.Fields()
+			}
+			return len(sf) > 0 && field == sf[0].Field && qplanner.OrderKeeping(bs, sf[0].Reverse)
+		}
+	}
+	// Range conjuncts are interpolated through a cursor over the rating
+	// index, opened on the first range, reopened when another index rates
+	// the next field, and closed with the build.
+	var cur *btree.Cursor
+	var curNs *btree.Namespace
+	defer func() {
+		if cur != nil {
+			cur.Close()
+		}
+	}()
+	br.BuildWithProbe(idxInfos, q.cond, func(field string, bs query.Bounds) (float64, bool) {
+		// The rating index is the best of those leading with the field, by
+		// a key that does not depend on the order idxs arrives in (creation
+		// order live, name order after a reopen): a non-sparse index before
+		// a sparse one (a sparse index holds no entry for a document missing
+		// the field, so it under-counts null and absence), a single-field
+		// index before a compound one (either level-0 sketch counts that
+		// field's values alone), then the lowest name. A field no index
+		// leads with cannot be rated; its first conjunct stays.
+		var lead *index
+		for _, idx := range idxs {
+			if len(idx.cboInfo.FieldNames) == 0 || idx.cboInfo.FieldNames[0] != field {
+				continue
+			}
+			if lead == nil || ratesBefore(idx, lead) {
+				lead = idx
+			}
+		}
+		if lead == nil {
+			return 0, false
+		}
+		var c *btree.Cursor
+		if tx != nil && lead.ns != nil && !qplanner.AllBoundsFixed(bs) {
+			if cur == nil || curNs != lead.ns {
+				if cur != nil {
+					cur.Close()
+				}
+				cur, curNs = tx.NewCursor(lead.ns), lead.ns
+			}
+			c = cur
+		}
+		return qplanner.EstimateFieldEntries(c, lead.cboInfo, lead.loadPubSketch(), totalDocs, bs)
+	}, ordered)
 	return br
+}
+
+// ratesBefore orders two indexes leading with the same field as rating
+// indexes (see buildBoundsResult): non-sparse before sparse, single-field
+// before compound, then by name.
+func ratesBefore(a, b *index) bool {
+	if a.cboInfo.Sparse != b.cboInfo.Sparse {
+		return !a.cboInfo.Sparse
+	}
+	if ac, bc := len(a.cboInfo.FieldNames) > 1, len(b.cboInfo.FieldNames) > 1; ac != bc {
+		return !ac
+	}
+	return a.cboInfo.Name < b.cboInfo.Name
 }
 
 // buildCBOIndexesInto builds CBOIndex entries into the provided buffer using
@@ -1218,90 +1300,124 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		if idx.cboInfo.SharedFrom < maxFields && !scalarProven() {
 			maxFields = idx.cboInfo.SharedFrom
 		}
-		cboIdx := q.buildCBOIndex(idx, br, sortFields, false, maxFields)
-		if br.TightDiffers(idx.cboInfo.FieldNames) {
-			if scalarProven() {
-				cboIdx = q.buildCBOIndex(idx, br, sortFields, true, maxFields)
-			} else if !qplanner.FanOut(cboIdx.Sketch, totalDocs) {
-				// Estimation-only tight bounds; seeks keep the wide Bounds.
-				cboIdx.EstBounds, _ = qplanner.ComputeIndexBoundsTightCapped(idx.cboInfo, br, maxFields)
+		cboIdx := q.buildCBOIndex(idx, br, sortFields, br.Lookup, maxFields)
+		wantsOrder := cboIdx.ExactSort
+		cboIdx = q.gateCandidate(cboIdx, idx, br, br.Lookup, sortFields, countOnly, totalDocs, maxFields, scalarProven)
+		cboIdx.ScalarProven = proven
+		result = append(result, cboIdx)
+		// The seek-best conjunct of a sort field may carry a value cut on
+		// the sort side, which the gate above demotes over possibly multikey
+		// data. When another conjunct keeps the order (the ordered channel),
+		// it is a second candidate of the same index: the ordered scan priced
+		// against the narrower seek plus an in-memory sort, as SQLite prices
+		// one loop per usable term. Only a non-sparse single-field index can
+		// keep its order without the proof (widenSortEdges), so only such an
+		// index builds one; it is built only when the primary lost the order
+		// — the sort gate ran on it, so a known proof is settled, and a
+		// proven index keeps the order on the primary — and kept only when
+		// the order is restored.
+		if wantsOrder && !cboIdx.ExactSort && !proven && len(idx.cboInfo.FieldNames) == 1 && !idx.cboInfo.Sparse &&
+			br.OrderedDiffers(idx.cboInfo.FieldNames) {
+			alt := q.buildCBOIndex(idx, br, sortFields, br.LookupOrdered, maxFields)
+			alt.Ordered = true
+			alt = q.gateCandidate(alt, idx, br, br.LookupOrdered, sortFields, countOnly, totalDocs, maxFields, scalarProven)
+			if alt.ExactSort {
+				alt.ScalarProven = proven
+				result = append(result, alt)
 			}
 		}
-		// A covering Count on a compound index needs the proof to keep
-		// CountEntries' page-batch: a compound prefix bound over unproven
-		// data must dedup per entry (fan-out entries != docs). Only the
-		// exact consuming shape pays the Get — a single point-bound chain
-		// that leaves trailing fields unbound. Full-key chains are already
-		// exact via FullKeyBound, multi-bound and non-point chains route to
-		// the seen-set walk regardless of the proof.
-		if countOnly && len(idx.cboInfo.FieldPaths) > 1 &&
-			cboIdx.PointLookup && len(cboIdx.Bounds) <= 1 &&
-			cboIdx.BoundFields < len(idx.cboInfo.FieldNames) {
-			scalarProven()
+	}
+	return result
+}
+
+// gateCandidate applies every bounds-derived gate to one candidate: the
+// tight-channel rebuild or estimation bounds, the scalar-proof reads the
+// counting shapes need, and the sort-order demotion or edge widening over
+// possibly multikey data. lookup is the channel the candidate was built
+// from — the sort gates read the candidate's own cuts through it; scalarProven
+// is the per-index memoized proof.
+func (q *collQuery) gateCandidate(cboIdx qplanner.CBOIndex, idx *index, br *qplanner.BoundsResult, lookup qplanner.BoundsLookup, sortFields []query.SortField, countOnly bool, totalDocs, maxFields int, scalarProven func() bool) qplanner.CBOIndex {
+	if br.TightDiffers(idx.cboInfo.FieldNames) {
+		if scalarProven() {
+			cboIdx = q.buildCBOIndex(idx, br, sortFields, br.LookupTight, maxFields)
+			lookup = br.LookupTight
+		} else if !qplanner.FanOut(cboIdx.Sketch, totalDocs) {
+			// Estimation-only tight bounds; seeks keep the wide Bounds.
+			cboIdx.EstBounds, _ = qplanner.ComputeIndexBoundsFrom(idx.cboInfo, br.LookupTight, maxFields)
 		}
-		// A presence count over a bound-less sparse index counts the whole
-		// index: the proof lets CountEntries page-batch it, entries == docs.
-		if countOnly && idx.cboInfo.Sparse && len(cboIdx.Bounds) == 0 {
-			scalarProven()
+	}
+	// A covering Count on a compound index needs the proof to keep
+	// CountEntries' page-batch: a compound prefix bound over unproven
+	// data must dedup per entry (fan-out entries != docs). Only the
+	// exact consuming shape pays the Get — a single point-bound chain
+	// that leaves trailing fields unbound. Full-key chains are already
+	// exact via FullKeyBound, multi-bound and non-point chains route to
+	// the seen-set walk regardless of the proof.
+	if countOnly && len(idx.cboInfo.FieldPaths) > 1 &&
+		cboIdx.PointLookup && len(cboIdx.Bounds) <= 1 &&
+		cboIdx.BoundFields < len(idx.cboInfo.FieldNames) {
+		scalarProven()
+	}
+	// A presence count over a bound-less sparse index counts the whole
+	// index: the proof lets CountEntries page-batch it, entries == docs.
+	if countOnly && idx.cboInfo.Sparse && len(cboIdx.Bounds) == 0 {
+		scalarProven()
+	}
+	// Multi-bound single-field counts (CountEntries' page-batch branch)
+	// and multi-bound unique lookups (CoverIter) need it too: a fan-out
+	// through an array of objects leaves no whole-array key to probe, so
+	// the proof alone spares them a per-entry dedup.
+	if len(cboIdx.Bounds) > 1 && cboIdx.PointLookup &&
+		((countOnly && len(idx.cboInfo.FieldPaths) == 1) ||
+			(idx.cboInfo.Unique && cboIdx.BoundFields == len(idx.cboInfo.FieldNames))) {
+		scalarProven()
+	}
+	// Order-providing gate (Mongo array-sort semantics): an index scan's
+	// intrinsic order equals the min/max-element sort key only when the
+	// traversal is guaranteed to meet each doc's key element first. Over
+	// possibly-multikey data, ExactSort must be demoted — SortIter then
+	// rebuilds the key from the document — when:
+	//   - the index is COMPOUND: its dedup keeps the first-encountered
+	//     entry, and the whole-array entry can precede the key element
+	//     in either direction (see sortRunNeedsScalarProof);
+	//   - a single-field sort field carries a direction-relevant cut:
+	//     the scan visits only in-bounds element entries, so a doc
+	//     surfaces at its in-bounds extremum, not the global min/max the
+	//     sort key uses (Mongo's rule: a multikey index provides a sort
+	//     only when the sort fields' bounds are [MinKey, MaxKey]).
+	// Bounds on a compound EQUALITY PREFIX would be fine on their own —
+	// the per-entry cartesian fan-out keeps every suffix combination
+	// inside the prefix run — but compound is gated wholesale above.
+	// Scalar-proven indexes keep ExactSort unchanged; the proof is read
+	// lazily, only for candidates the gate would demote. When the only cut
+	// on the sort side is a type-bracket edge, the candidate is widened
+	// (widenSortEdges) instead of demoted.
+	// A SPARSE index holds no entry for a missing leaf, so over fan-out
+	// data a document surfaces at its least existing leaf while the sort
+	// key is the least leaf of all (a missing leaf sorts as null and
+	// wins): demote, no edge widening can restore that. Over a path
+	// through objects the scalar proof does not rule this out — a
+	// document fanning out through an array of objects can keep a single
+	// key, {"x":[{"y":5},{"z":0}]} under x.y — so only an index on
+	// top-level fields, where every fan-out writes several keys, keeps
+	// its order on the proof.
+	if cboIdx.ExactSort && idx.cboInfo.Sparse && (idx.cboInfo.HasDottedPath() || !scalarProven()) {
+		cboIdx.ExactSort = false
+		cboIdx.PartialSort = false
+	}
+	if cboIdx.ExactSort && sortRunNeedsScalarProof(&cboIdx, sortFields, lookup) && !scalarProven() {
+		w, ok := qplanner.CBOIndex{}, false
+		if !countOnly {
+			w, ok = q.widenSortEdges(lookup, sortFields, &cboIdx)
 		}
-		// Multi-bound single-field counts (CountEntries' page-batch branch)
-		// and multi-bound unique lookups (CoverIter) need it too: a fan-out
-		// through an array of objects leaves no whole-array key to probe, so
-		// the proof alone spares them a per-entry dedup.
-		if len(cboIdx.Bounds) > 1 && cboIdx.PointLookup &&
-			((countOnly && len(idx.cboInfo.FieldPaths) == 1) ||
-				(idx.cboInfo.Unique && cboIdx.BoundFields == len(idx.cboInfo.FieldNames))) {
-			scalarProven()
-		}
-		// Order-providing gate (Mongo array-sort semantics): an index scan's
-		// intrinsic order equals the min/max-element sort key only when the
-		// traversal is guaranteed to meet each doc's key element first. Over
-		// possibly-multikey data, ExactSort must be demoted — SortIter then
-		// rebuilds the key from the document — when:
-		//   - the index is COMPOUND: its dedup keeps the first-encountered
-		//     entry, and the whole-array entry can precede the key element
-		//     in either direction (see sortRunNeedsScalarProof);
-		//   - a single-field sort field carries a direction-relevant cut:
-		//     the scan visits only in-bounds element entries, so a doc
-		//     surfaces at its in-bounds extremum, not the global min/max the
-		//     sort key uses (Mongo's rule: a multikey index provides a sort
-		//     only when the sort fields' bounds are [MinKey, MaxKey]).
-		// Bounds on a compound EQUALITY PREFIX would be fine on their own —
-		// the per-entry cartesian fan-out keeps every suffix combination
-		// inside the prefix run — but compound is gated wholesale above.
-		// Scalar-proven indexes keep ExactSort unchanged; the proof is read
-		// lazily, only for candidates the gate would demote. When the only cut
-		// on the sort side is a type-bracket edge, the candidate is widened
-		// (widenSortEdges) instead of demoted.
-		// A SPARSE index holds no entry for a missing leaf, so over fan-out
-		// data a document surfaces at its least existing leaf while the sort
-		// key is the least leaf of all (a missing leaf sorts as null and
-		// wins): demote, no edge widening can restore that. Over a path
-		// through objects the scalar proof does not rule this out — a
-		// document fanning out through an array of objects can keep a single
-		// key, {"x":[{"y":5},{"z":0}]} under x.y — so only an index on
-		// top-level fields, where every fan-out writes several keys, keeps
-		// its order on the proof.
-		if cboIdx.ExactSort && idx.cboInfo.Sparse && (idx.cboInfo.HasDottedPath() || !scalarProven()) {
+		if ok {
+			cboIdx = w
+		} else {
 			cboIdx.ExactSort = false
 			cboIdx.PartialSort = false
 		}
-		if cboIdx.ExactSort && sortRunNeedsScalarProof(&cboIdx, sortFields, br) && !scalarProven() {
-			w, ok := qplanner.CBOIndex{}, false
-			if !countOnly {
-				w, ok = q.widenSortEdges(br, sortFields, &cboIdx)
-			}
-			if ok {
-				cboIdx = w
-			} else {
-				cboIdx.ExactSort = false
-				cboIdx.PartialSort = false
-			}
-		}
-		cboIdx.ScalarProven = proven
-		result = append(result, cboIdx)
 	}
-	return result
+	return cboIdx
 }
 
 // sortRunNeedsScalarProof reports whether idx's ExactSort claim is only valid
@@ -1325,9 +1441,10 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 //   - descending selects the global MAX: symmetrically, only an upper cut
 //     (a bound with an End) can exclude it; a lower-only bound is safe.
 //
-// Bounds here are the field's logical (plain-space) bounds from the wide
-// Lookup — presence of a predicate is channel-independent.
-func sortRunNeedsScalarProof(idx *qplanner.CBOIndex, sortFields []query.SortField, br *qplanner.BoundsResult) bool {
+// Bounds here are the field's logical (plain-space) bounds from the channel
+// the candidate was built from: which side a cut sits on is what the ordered
+// channel changes.
+func sortRunNeedsScalarProof(idx *qplanner.CBOIndex, sortFields []query.SortField, lookup qplanner.BoundsLookup) bool {
 	if len(idx.Info.FieldNames) > 1 {
 		return true
 	}
@@ -1336,7 +1453,7 @@ func sortRunNeedsScalarProof(idx *qplanner.CBOIndex, sortFields []query.SortFiel
 		if fi >= len(idx.Info.FieldNames) {
 			break
 		}
-		bs, _, _ := br.Lookup(idx.Info.FieldNames[fi])
+		bs, _, _ := lookup(idx.Info.FieldNames[fi])
 		for _, b := range bs {
 			if !sf.Reverse && len(b.Start) > 0 {
 				return true
@@ -1363,22 +1480,19 @@ func sortRunNeedsScalarProof(idx *qplanner.CBOIndex, sortFields []query.SortFiel
 // is still rated on the real range. A VALUE cut ($gte 5 ascending, {a:false})
 // is never opened: demotion is the right price there, and opening could turn
 // a point seek into a scan.
-func (q *collQuery) widenSortEdges(br *qplanner.BoundsResult, sortFields []query.SortField, base *qplanner.CBOIndex) (qplanner.CBOIndex, bool) {
+func (q *collQuery) widenSortEdges(lookup qplanner.BoundsLookup, sortFields []query.SortField, base *qplanner.CBOIndex) (qplanner.CBOIndex, bool) {
 	info := base.Info
 	if len(info.FieldNames) != 1 || len(sortFields) == 0 || base.SortMatchStart != 0 {
 		return qplanner.CBOIndex{}, false
 	}
-	bs, _, found := br.Lookup(info.FieldNames[0])
+	bs, _, found := lookup(info.FieldNames[0])
 	if !found || len(bs) == 0 {
 		return qplanner.CBOIndex{}, false
 	}
 	reverse := sortFields[0].Reverse
 	// Decide before allocating: a value cut anywhere means demotion.
-	for _, b := range bs {
-		if !reverse && len(b.Start) > 0 && !b.StartIsTypeEdge() ||
-			reverse && len(b.End) > 0 && !b.EndIsTypeEdge() {
-			return qplanner.CBOIndex{}, false
-		}
+	if !qplanner.OrderKeeping(bs, reverse) {
+		return qplanner.CBOIndex{}, false
 	}
 	widened := make(query.Bounds, len(bs))
 	for i, b := range bs {
@@ -1410,21 +1524,14 @@ func (q *collQuery) widenSortEdges(br *qplanner.BoundsResult, sortFields []query
 }
 
 // buildCBOIndex builds one candidate's CBOIndex with bounds AND all
-// bounds-derived flags taken consistently from a single channel (wide or
-// tight) — see buildCBOIndexesInto for why mixing channels is forbidden.
-func (q *collQuery) buildCBOIndex(idx *index, br *qplanner.BoundsResult, sortFields []query.SortField, tight bool, maxFields int) qplanner.CBOIndex {
+// bounds-derived flags taken consistently from a single channel (wide,
+// tight or ordered) — see buildCBOIndexesInto for why mixing channels is
+// forbidden.
+func (q *collQuery) buildCBOIndex(idx *index, br *qplanner.BoundsResult, sortFields []query.SortField, lookup qplanner.BoundsLookup, maxFields int) qplanner.CBOIndex {
 	info := idx.cboInfo
 
-	// Compute bounds for this index
-	var bounds query.Bounds
-	var chainLen int
-	lookup := br.Lookup
-	if tight {
-		bounds, chainLen = qplanner.ComputeIndexBoundsTightCapped(info, br, maxFields)
-		lookup = br.LookupTight
-	} else {
-		bounds, chainLen = qplanner.ComputeIndexBoundsCapped(info, br, maxFields)
-	}
+	// Compute bounds for this index from the given channel
+	bounds, chainLen := qplanner.ComputeIndexBoundsFrom(info, lookup, maxFields)
 
 	pointLookup := qplanner.AllBoundsFixed(bounds)
 	// Note: AdjustBoundsForNonUnique is deferred to BuildPlan's
