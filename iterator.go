@@ -21,6 +21,10 @@ import (
 // collect the ids during iteration and mutate after Close — any-store's own
 // Query.Update/Delete do exactly that internally — or use those verbs
 // directly.
+//
+// An Iterator belongs to one goroutine at a time. Opened with the context
+// of a transaction, its methods take their turn on the transaction, and
+// once the transaction has ended Next and Doc fail with ErrTxIsUsed.
 type Iterator interface {
 	// Next advances the iterator to the next document.
 	Next() bool
@@ -47,6 +51,16 @@ type Iterator interface {
 // planIterator wraps a qplanner.Plan to implement the public Iterator interface.
 type planIterator struct {
 	tx ReadTx
+	// lk is tx when other callers can reach it — the transaction the
+	// context carries — for the turn each method takes on it (see
+	// commonTx); nil for the iterator's own read transaction. The
+	// transaction knows the iterator (iterOpened) until Close, and trips it
+	// as it ends.
+	lk ReadTx
+	// tripped: the transaction ended and took the cursors' pages with it
+	// (trip); the methods report ErrTxIsUsed and Close leaves the cursors
+	// alone.
+	tripped bool
 	// s is the schema version the plan was compiled against, resolved for tx.
 	s          *collSchema
 	err        error
@@ -64,6 +78,14 @@ type planIterator struct {
 func (pi *planIterator) Next() bool {
 	if pi.err != nil || pi.closed {
 		return false
+	}
+	if pi.lk != nil {
+		pi.lk.lock()
+		defer pi.lk.unlock()
+		if pi.tripped {
+			pi.err = ErrTxIsUsed
+			return false
+		}
 	}
 	for {
 		pi.plan.DocParsed = nil
@@ -119,11 +141,19 @@ func (pi *planIterator) Doc() (Doc, error) {
 	if perf {
 		pipePerf.docCalls.Add(1)
 	}
+	if pi.closed {
+		return nil, ErrIterClosed
+	}
 	if pi.err != nil && !errors.Is(pi.err, io.EOF) {
 		return nil, pi.err
 	}
 	var doc *anyenc.Value
 	if pi.plan.DocParsed != nil {
+		// The document is the iterator's own memory; ended, the
+		// transaction has nothing more to give.
+		if pi.lk != nil && pi.lk.Done() {
+			return nil, ErrTxIsUsed
+		}
 		if perf {
 			pipePerf.docParsedHits.Add(1)
 		}
@@ -131,6 +161,13 @@ func (pi *planIterator) Doc() (Doc, error) {
 	} else {
 		if perf {
 			pipePerf.docFallbacks.Add(1)
+		}
+		if pi.lk != nil {
+			pi.lk.lock()
+			defer pi.lk.unlock()
+			if pi.tripped {
+				return nil, ErrTxIsUsed
+			}
 		}
 		if pi.dataCursor == nil {
 			pi.dataCursor = pi.data.NewCursor()
@@ -189,12 +226,19 @@ func (pi *planIterator) Close() (err error) {
 		return ErrIterClosed
 	}
 	pi.closed = true
-	if pi.dataCursor != nil {
-		pi.dataCursor.Close()
+	if pi.lk != nil {
+		pi.lk.lock()
+		defer pi.lk.unlock()
+		// Ended without a trip (a panic in the trip): the pages are gone
+		// with the transaction all the same.
+		if pi.lk.Done() {
+			pi.tripped = true
+		}
+		if !pi.tripped {
+			pi.lk.iterClosed(pi)
+		}
 	}
-	if pi.plan != nil {
-		pi.plan.Close()
-	}
+	pi.releaseCursors()
 	if pi.tx != nil {
 		err = errors.Join(err, pi.tx.Commit())
 	}
@@ -209,6 +253,27 @@ func (pi *planIterator) Close() (err error) {
 
 func (pi *planIterator) String() string {
 	return pi.plan.String()
+}
+
+// trip is the transaction ending under its lock (commonTx.tripIters): the
+// cursors' pages go with it.
+func (pi *planIterator) trip() {
+	pi.releaseCursors()
+	pi.tripped = true
+}
+
+// releaseCursors closes the cursors once: Plan.Close is not idempotent.
+func (pi *planIterator) releaseCursors() {
+	if pi.tripped {
+		return
+	}
+	if pi.dataCursor != nil {
+		pi.dataCursor.Close()
+		pi.dataCursor = nil
+	}
+	if pi.plan != nil {
+		pi.plan.Close()
+	}
 }
 
 // emptyIter is the public Iterator returned by Find().Iter() when the

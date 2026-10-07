@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -728,4 +729,52 @@ func TestSketchNoDriftOnUniqueViolationRollback(t *testing.T) {
 	on, err := insp.InspectIndexSketch(ctx, "coll", "u")
 	require.NoError(t, err)
 	assert.Equal(t, uint64(2), on.DocCount, "on-disk sketch == true 2 (phantoms discarded, not persisted)")
+}
+
+// One transaction used from several goroutines: its calls run one at a time,
+// and the result is what the same calls give from one goroutine.
+func TestWriteTx_SharedAcrossGoroutines(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"g"}}))
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+
+	const goroutines, perGoroutine = 4, 100
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			errs <- func() error {
+				for j := 0; j < perGoroutine; j++ {
+					id := g*perGoroutine + j
+					if err := coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"g":%d}`, id, g))); err != nil {
+						return err
+					}
+					if _, err := coll.FindId(tx.Context(), id); err != nil {
+						return err
+					}
+					n, err := coll.Find(fmt.Sprintf(`{"g":%d}`, g)).Count(tx.Context())
+					if err != nil {
+						return err
+					}
+					if n != j+1 {
+						return fmt.Errorf("g %d: count %d after %d inserts", g, n, j+1)
+					}
+				}
+				return nil
+			}()
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	assertCollCountInTx(tx.Context(), t, coll, goroutines*perGoroutine)
+	require.NoError(t, tx.Commit())
+	assertCollCount(t, coll, goroutines*perGoroutine)
 }

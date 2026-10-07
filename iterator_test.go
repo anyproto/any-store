@@ -311,3 +311,29 @@ func TestIterator_Doc_FallbackPath(t *testing.T) {
 	assert.Equal(t, `{"id":1,"a":"hello"}`, doc2.Value().String(),
 		"fallback must re-read the same document via docId")
 }
+
+func TestIterator_DocAfterClose(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	iter, err := coll.Find(nil).Iter(ctx)
+	require.NoError(t, err)
+	require.True(t, iter.Next())
+	require.NoError(t, iter.Close())
+	_, err = iter.Doc()
+	assert.ErrorIs(t, err, ErrIterClosed)
+}
+
+func TestAggIterator_DocAfterClose(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"g":1}`)))
+	iter, err := coll.Aggregate(`[{"$group":{"_id":"$g","n":{"$sum":1}}}]`).Iter(ctx)
+	require.NoError(t, err)
+	require.True(t, iter.Next())
+	require.NoError(t, iter.Close())
+	_, err = iter.Doc()
+	assert.ErrorIs(t, err, ErrIterClosed)
+}

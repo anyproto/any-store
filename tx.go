@@ -9,9 +9,14 @@ import (
 	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
-var txVersion atomic.Uint32
+// txVersion numbers transactions and savepoints: a handle tells its own
+// from the one its pooled state serves next by it. 64 bits: at 2^32 the
+// numbers would come round within a day of writes, and a handle of an
+// ended transaction would pass for one of the transaction reusing its
+// state.
+var txVersion atomic.Uint64
 
-func newTxVersion() uint32 {
+func newTxVersion() uint64 {
 	if ver := txVersion.Add(1); ver != 0 {
 		return ver
 	} else {
@@ -30,6 +35,8 @@ type WriteTx interface {
 	// SetModified marks the transaction as having made modifications
 	// used internally for sentinel mechanism
 	SetModified()
+	// markModified is SetModified for a caller that holds the turn.
+	markModified()
 
 	// schemaLog is the transaction's uncommitted schema changes; see
 	// txSchema. Unexported: DDL-internal.
@@ -37,9 +44,8 @@ type WriteTx interface {
 
 	// The stack of open savepoints; see commonTx.savepoints.
 	// Unexported: savepoint-internal.
-	savepointOpened(version uint32)
-	savepointOpen(version uint32) bool
-	savepointEnded(version uint32)
+	savepointOpened(sp *savepointTx)
+	savepointEnded(sp *savepointTx)
 }
 
 // ReadTx represents a read-only transaction.
@@ -58,15 +64,48 @@ type ReadTx interface {
 	btreeWriteTx() *btree.WriteTx
 	instanceId() string
 	dbRef() *db
+
+	// The transaction's lock, one call at a time; see txHandle.
+	lock()
+	unlock()
+
+	// The open iterators that hold cursors on the transaction; see
+	// commonTx.iters. Unexported: iterator-internal.
+	iterOpened(pi *planIterator)
+	iterClosed(pi *planIterator)
 }
 
+// commonTx is a transaction's pooled state (db.txPool): what the handles of
+// one transaction share, and what a later transaction of the db takes over
+// once this one ended. A handle tells the two apart by version, and it
+// reads nothing else of a transaction that may have ended — its lock and
+// its context are the handle's own (txHandle).
+//
+// One call at a time: every call made on a transaction — an operation run
+// with its context, a savepoint's, its commit or rollback, a method of an
+// iterator — takes the transaction's turn (txHandle.mu) and gives it back
+// before control returns to the caller. What the transaction holds — the
+// page cache of its btree tx, the full-text buffers, the schema log, the
+// savepoint stack — is built for one caller at a time, so a transaction
+// several goroutines share runs their calls one after another, as SQLite's
+// serialized threading mode runs the calls made on one connection
+// (sqlite3_mutex_enter on db->mutex at every entry point). SQLite's mutex is
+// recursive and Go's is not: a call made from inside another call — a
+// callback's — runs under the enclosing call's turn only through the
+// context an internal savepoint hands out (heldTx); user code the library
+// calls holding the turn must not call back into the transaction. The
+// turn is taken at the entry points (lockCtxTx, enterWriteTx, the methods
+// of the transaction, of a savepoint, of an iterator); an iterator or a
+// savepoint the caller keeps relocks per call. A call that waited
+// re-checks Done under the lock: the call it waited for may have ended
+// the transaction.
 type commonTx struct {
-	db       *db
-	ctx      context.Context
-	readTx   *btree.ReadTx
-	writeTx  *btree.WriteTx
-	version  atomic.Uint32
-	modified bool
+	db      *db
+	readTx  *btree.ReadTx
+	writeTx *btree.WriteTx
+	version atomic.Uint64
+	// modified: SetModified is public, so a caller may set it outside the lock.
+	modified atomic.Bool
 
 	// schema is the transaction's own schema state (txSchema), in the
 	// btree transaction's Aux slot for the resolve of every operation. For a
@@ -78,29 +117,59 @@ type commonTx struct {
 	// state: mutated under the btree write lock.
 	schema txSchema
 
-	// savepoints is the stack of open savepoints, outermost first, each by
-	// its version. A savepoint that ends takes the savepoints opened inside
-	// it with it — SQLite destroys every savepoint nested inside the one a
-	// RELEASE or ROLLBACK TO names (vdbe.c, OP_Savepoint). One that is no
-	// longer on the stack is gone: its btree savepoint id may name another
-	// savepoint by now, and its log mark cuts the log at a position that
-	// pairs nothing. Single-writer state, like the log.
-	savepoints []uint32
+	// savepoints is the stack of open savepoints, outermost first. A
+	// savepoint that ends takes the savepoints opened inside it with it —
+	// SQLite destroys every savepoint nested inside the one a RELEASE or
+	// ROLLBACK TO names (vdbe.c, OP_Savepoint). One that is no longer on
+	// the stack is gone (savepointTx.ended): its btree savepoint id may
+	// name another savepoint by now, and its log mark cuts the log at a
+	// position that pairs nothing. Single-writer state, like the log.
+	savepoints []*savepointTx
+
+	// iters is the open iterators that hold cursors on the transaction —
+	// pinned pages of its btree tx. The transaction's end trips them
+	// (tripIters) before the btree tx ends: the pages are released with the
+	// transaction, and an iterator closed later touches none of them. SQLite
+	// trips the cursors of a transaction it rolls back
+	// (sqlite3BtreeTripAllCursors); a commit with cursors open it refuses,
+	// or turns into a read transaction the cursors go on in.
+	iters []*planIterator
 }
 
-func (tx *commonTx) savepointOpened(version uint32) {
-	tx.savepoints = append(tx.savepoints, version)
+func (tx *commonTx) savepointOpened(sp *savepointTx) {
+	tx.savepoints = append(tx.savepoints, sp)
 }
 
-func (tx *commonTx) savepointOpen(version uint32) bool {
-	return slices.Contains(tx.savepoints, version)
-}
-
-// savepointEnded pops the savepoint and every savepoint opened inside it.
-func (tx *commonTx) savepointEnded(version uint32) {
-	if i := slices.Index(tx.savepoints, version); i >= 0 {
+// savepointEnded pops the savepoint and every savepoint opened inside it,
+// marking each as ended.
+func (tx *commonTx) savepointEnded(sp *savepointTx) {
+	if i := slices.Index(tx.savepoints, sp); i >= 0 {
+		for _, inner := range tx.savepoints[i:] {
+			inner.ended.Store(true)
+		}
+		clear(tx.savepoints[i:])
 		tx.savepoints = tx.savepoints[:i]
 	}
+}
+
+func (tx *commonTx) iterOpened(pi *planIterator) {
+	tx.iters = append(tx.iters, pi)
+}
+
+func (tx *commonTx) iterClosed(pi *planIterator) {
+	if i := slices.Index(tx.iters, pi); i >= 0 {
+		tx.iters = slices.Delete(tx.iters, i, i+1)
+	}
+}
+
+// tripIters releases the pages the open iterators hold, as the transaction
+// ends: under its lock, before its btree tx ends.
+func (tx *commonTx) tripIters() {
+	for _, pi := range tx.iters {
+		pi.trip()
+	}
+	clear(tx.iters)
+	tx.iters = tx.iters[:0]
 }
 
 func (tx *commonTx) schemaLog() *txSchema {
@@ -152,7 +221,7 @@ func (tx *commonTx) release() {
 		tx.db.discardLog(&tx.schema, 0)
 	}
 	tx.schema.release()
-	txPool.Put(tx)
+	tx.db.txPool.Put(tx)
 }
 
 func (tx *commonTx) btreeReadTx() *btree.ReadTx {
@@ -163,9 +232,17 @@ func (tx *commonTx) btreeWriteTx() *btree.WriteTx {
 	return tx.writeTx
 }
 
-func (tx *commonTx) SetModified() {
-	tx.modified = true
+func (tx *commonTx) markModified() {
+	tx.modified.Store(true)
 }
+
+// heldTx is the transaction as a context marks it held: the enclosing call
+// holds its lock, so a call made through that context runs under its turn
+// instead of locking again — the context of an internal savepoint
+// (savepointWrapper.Context) hands it to a callback, and a call that holds
+// the turn and runs helpers that take their own passes it on (heldCtx).
+// Unwrapped by lockCtxTx and ctxWriteTx.
+type heldTx struct{ ReadTx }
 
 func (tx *commonTx) instanceId() string {
 	return tx.db.instanceId
@@ -175,40 +252,61 @@ func (tx *commonTx) dbRef() *db {
 	return tx.db
 }
 
-var txPool = &sync.Pool{
-	New: func() any {
-		return &commonTx{}
-	},
+// txHandle is a transaction's handle, one per transaction, which its
+// wrappers, its context and its savepoints all point at: beyond the pooled
+// state, the version that is this transaction's, the lock that is its own
+// — made with it, never pooled, so a handle of an ended transaction locks
+// nothing another transaction uses — and the context.
+type txHandle struct {
+	*commonTx
+	version uint64
+	mu      sync.Mutex
+	ctx     context.Context
+}
+
+func (h *txHandle) Context() context.Context {
+	return h.ctx
+}
+
+func (h *txHandle) Done() bool {
+	return h.commonTx.version.Load() != h.version
+}
+
+func (h *txHandle) lock() {
+	h.mu.Lock()
+}
+
+func (h *txHandle) unlock() {
+	h.mu.Unlock()
+}
+
+// SetModified is a call on the transaction: it takes the turn, and marks
+// nothing once the transaction has ended.
+func (h *txHandle) SetModified() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.Done() {
+		h.markModified()
+	}
 }
 
 type readTx struct {
-	*commonTx
-	version uint32
-}
-
-func (r readTx) Context() context.Context {
-	return r.ctx
+	*txHandle
 }
 
 func (r readTx) Commit() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.commonTx.version.CompareAndSwap(r.version, 0) {
 		defer r.commonTx.release()
+		r.commonTx.tripIters()
 		return r.readTx.Rollback()
 	}
 	return nil
 }
 
-func (r readTx) Done() bool {
-	return r.commonTx.version.Load() != r.version
-}
-
 type writeTx struct {
-	*commonTx
-	version uint32
-}
-
-func (w writeTx) Context() context.Context {
-	return w.ctx
+	*txHandle
 }
 
 // unwind discards this tx's buffered full-text postings and its schema log,
@@ -216,12 +314,15 @@ func (w writeTx) Context() context.Context {
 // discards its pending data in xRollback. Both go before the btree releases
 // the global write lock inside Rollback: the log is writer state.
 func (w writeTx) unwind() error {
+	w.commonTx.tripIters()
 	w.db.resetAllFtsPending(w.readTx)
 	w.db.discardLog(&w.commonTx.schema, 0)
 	return w.writeTx.Rollback()
 }
 
 func (w writeTx) Rollback() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.commonTx.version.CompareAndSwap(w.version, 0) {
 		defer w.commonTx.release()
 		return w.unwind()
@@ -229,8 +330,17 @@ func (w writeTx) Rollback() error {
 	return nil
 }
 
+// Commit takes the transaction's turn; commit is the work, kept apart so
+// that its defers stay open-coded.
 func (w writeTx) Commit() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.commit()
+}
+
+func (w writeTx) commit() error {
 	if w.commonTx.version.CompareAndSwap(w.version, 0) {
+		w.commonTx.tripIters()
 		// The btree commit releases the global write lock before it
 		// returns. A schema-changing commit announces the cookie it
 		// produces (observeCookie), and the announcement of one that
@@ -252,7 +362,7 @@ func (w writeTx) Commit() error {
 		// Every non-committed exit below must discard the schema log
 		// BEFORE its btree rollback releases the global write lock (see
 		// unwind).
-		if w.modified {
+		if w.modified.Load() {
 			w.writeTx.MarkDataChanged()
 			// Flush the full-text write-back buffer into this same tx BEFORE the
 			// btree commit, so postings commit atomically with the documents.
@@ -289,7 +399,7 @@ func (w writeTx) Commit() error {
 		if testHookAfterBtreeCommit != nil {
 			testHookAfterBtreeCommit()
 		}
-		if err == nil && w.modified {
+		if err == nil && w.modified.Load() {
 			w.db.recoveryController.OnWriteEvent()
 		}
 		// A log the commit did not publish is discarded, as after a rollback.
@@ -301,18 +411,18 @@ func (w writeTx) Commit() error {
 	return nil
 }
 
-func (w writeTx) Done() bool {
-	return w.commonTx.version.Load() != w.version
-}
-
 var savepointPool = &sync.Pool{
 	New: func() any {
 		return &savepointTx{}
 	},
 }
 
-func newSavepointTx(ctx context.Context, wrTx WriteTx) (WriteTx, error) {
-	btWtx := wrTx.btreeWriteTx()
+// newSavepointTx opens a savepoint on parent, whose lock the caller holds,
+// for a call made with ctx. held marks a savepoint of an enclosing call's
+// scope (enterWriteTx): its own calls lock nothing, and the context it
+// hands out marks the turn as held for the calls made through it.
+func newSavepointTx(ctx context.Context, parent WriteTx, held bool) (WriteTx, error) {
+	btWtx := parent.btreeWriteTx()
 	// Flush buffered full-text writes BEFORE creating the savepoint, so their
 	// btree writes land outside its scope. This keeps the fts pending buffer
 	// savepoint-consistent: at every savepoint creation the buffer is empty, so
@@ -323,41 +433,64 @@ func newSavepointTx(ctx context.Context, wrTx WriteTx) (WriteTx, error) {
 	// survive its rollback and flush at outer commit — while the seq/docmap
 	// writes they depend on were reverted, attributing ghost postings to
 	// whichever document later reuses the IntDocID.
-	if err := wrTx.dbRef().flushAllFtsPending(btWtx); err != nil {
+	if err := parent.dbRef().flushAllFtsPending(btWtx); err != nil {
 		return nil, err
 	}
 	spId, err := btWtx.Savepoint()
 	if err != nil {
 		return nil, err
 	}
-	tx := savepointPool.Get().(*savepointTx)
-	tx.reset(wrTx, spId)
-	version := tx.version.Load()
-	wrTx.savepointOpened(version)
-	return savepointWrapper{savepointTx: tx, version: version}, nil
+	sp := savepointPool.Get().(*savepointTx)
+	version := sp.reset(spId, len(parent.schemaLog().log))
+	parent.savepointOpened(sp)
+	return savepointWrapper{WriteTx: parent, sp: sp, version: version, held: held, ctx: ctx}, nil
 }
 
-type savepointWrapper struct {
-	*savepointTx
-	version uint32
-}
-
+// savepointTx is a savepoint's pooled state: what the parent's stack marks
+// (commonTx.savepoints) and the version that tells a handle its savepoint
+// from the one the state serves next.
 type savepointTx struct {
-	WriteTx
 	savepointId int
 	// logMark is the parent tx's schema log length at savepoint creation: a
 	// rollback to this savepoint discards exactly the schema changes made
 	// inside its scope (entries [logMark:]); a release keeps them on the
 	// parent so an outer rollback still discards them.
 	logMark int
-	version atomic.Uint32
+	version atomic.Uint64
+	// ended: the savepoint, or one enclosing it, has ended
+	// (commonTx.savepointEnded). Read without the parent's lock by Done.
+	ended atomic.Bool
 }
 
-func (tx *savepointTx) reset(wtx WriteTx, spId int) {
-	tx.WriteTx = wtx
-	tx.savepointId = spId
-	tx.logMark = len(wtx.schemaLog().log)
-	tx.version.Store(newTxVersion())
+func (sp *savepointTx) reset(spId, logMark int) uint64 {
+	sp.savepointId = spId
+	sp.logMark = logMark
+	sp.ended.Store(false)
+	version := newTxVersion()
+	sp.version.Store(version)
+	return version
+}
+
+// savepointWrapper is a savepoint's handle: the parent it was opened on —
+// the pooled state and the lock are reached through it — and what is this
+// handle's own, immutable: the savepoint's version, whether the handle is a
+// held one (newSavepointTx), and the context it was opened with.
+type savepointWrapper struct {
+	WriteTx
+	sp      *savepointTx
+	version uint64
+	held    bool
+	ctx     context.Context
+}
+
+// Context is the context the savepoint was opened with: for a held
+// savepoint, carrying the transaction as held (heldTx), so that the calls
+// a callback makes through it run under the enclosing call's turn.
+func (w savepointWrapper) Context() context.Context {
+	if w.held {
+		return context.WithValue(w.ctx, ctxKeyTx, heldTx{w.WriteTx})
+	}
+	return w.ctx
 }
 
 // orphaned reports that the savepoint no longer exists: the transaction it
@@ -368,58 +501,90 @@ func (tx *savepointTx) reset(wtx WriteTx, spId int) {
 // btree tx and the writer's buffers may already serve another transaction,
 // and the btree savepoint id another savepoint: touch nothing.
 func (w savepointWrapper) orphaned() bool {
-	return w.WriteTx.Done() || !w.WriteTx.savepointOpen(w.version)
+	return w.WriteTx.Done() || w.sp.ended.Load()
 }
 
-func (w savepointWrapper) Commit() error {
-	if w.savepointTx.version.CompareAndSwap(w.version, 0) {
-		if w.orphaned() {
-			savepointPool.Put(w.savepointTx)
-			return ErrTxIsUsed
+// SetModified marks the parent modified, in the savepoint's turn.
+func (w savepointWrapper) SetModified() {
+	if w.held {
+		if !w.orphaned() {
+			w.markModified()
 		}
-		w.WriteTx.savepointEnded(w.version)
-		btWtx := w.WriteTx.btreeWriteTx()
-		if err := btWtx.ReleaseSavepoint(w.savepointId); err != nil {
-			return err
-		}
-		savepointPool.Put(w.savepointTx)
+		return
 	}
+	w.lock()
+	defer w.unlock()
+	if !w.Done() {
+		w.markModified()
+	}
+}
+
+// Commit takes its turn on the parent before it claims the savepoint: a
+// caller that sees Done and then takes a turn finds the end complete.
+func (w savepointWrapper) Commit() error {
+	if !w.held {
+		w.lock()
+		defer w.unlock()
+	}
+	if !w.sp.version.CompareAndSwap(w.version, 0) {
+		return nil
+	}
+	if w.orphaned() {
+		savepointPool.Put(w.sp)
+		return ErrTxIsUsed
+	}
+	w.savepointEnded(w.sp)
+	if err := w.btreeWriteTx().ReleaseSavepoint(w.sp.savepointId); err != nil {
+		return err
+	}
+	savepointPool.Put(w.sp)
 	return nil
 }
 
 func (w savepointWrapper) Rollback() error {
-	if w.savepointTx.version.CompareAndSwap(w.version, 0) {
-		if w.orphaned() {
-			savepointPool.Put(w.savepointTx)
-			return ErrTxIsUsed
-		}
-		w.WriteTx.savepointEnded(w.version)
-		btWtx := w.WriteTx.btreeWriteTx()
-		db := w.WriteTx.dbRef()
-		err := btWtx.RollbackToSavepoint(w.savepointId)
-		// The fts pending buffers hold only ops made inside this savepoint's
-		// scope (they were flushed empty at its creation), and the btree state
-		// those ops were derived from has just been reverted — discard them,
-		// with the scope's schema log. Both run even when RollbackToSavepoint
-		// fails: its error returns happen before any mutation, the outer tx is
-		// doomed either way, and matching the in-memory schema state to the
-		// last committed disk state is the conservative choice.
-		// RollbackToSavepoint keeps the write lock in all cases, so the
-		// discard runs inside the critical section.
-		db.resetAllFtsPending(&btWtx.ReadTx)
-		db.discardLog(w.WriteTx.schemaLog(), w.logMark)
-		if err != nil {
-			return err
-		}
-		savepointPool.Put(w.savepointTx)
+	if !w.held {
+		w.lock()
+		defer w.unlock()
 	}
+	if !w.sp.version.CompareAndSwap(w.version, 0) {
+		return nil
+	}
+	if w.orphaned() {
+		savepointPool.Put(w.sp)
+		return ErrTxIsUsed
+	}
+	w.savepointEnded(w.sp)
+	btWtx := w.btreeWriteTx()
+	db := w.dbRef()
+	err := btWtx.RollbackToSavepoint(w.sp.savepointId)
+	// The fts pending buffers hold only ops made inside this savepoint's
+	// scope (they were flushed empty at its creation), and the btree state
+	// those ops were derived from has just been reverted — discard them,
+	// with the scope's schema log. Both run even when RollbackToSavepoint
+	// fails: its error returns happen before any mutation, the outer tx is
+	// doomed either way, and matching the in-memory schema state to the
+	// last committed disk state is the conservative choice.
+	// RollbackToSavepoint keeps the write lock in all cases, so the
+	// discard runs inside the critical section.
+	db.resetAllFtsPending(&btWtx.ReadTx)
+	db.discardLog(w.schemaLog(), w.sp.logMark)
+	if err != nil {
+		return err
+	}
+	savepointPool.Put(w.sp)
 	return nil
 }
 
+// Done takes no lock: a savepoint ends under its parent's lock, and marks
+// its pooled state (savepointTx.ended) as it does.
 func (w savepointWrapper) Done() bool {
-	return w.savepointTx.version.Load() != w.version || w.orphaned()
+	return w.sp.version.Load() != w.version || w.sp.ended.Load() || w.WriteTx.Done()
 }
 
+// noOpTx is the transaction a context carries as an operation gets it
+// (getReadTx) when an enclosing call holds the turn: Commit leaves the
+// transaction open and does nothing. turnTx is the same for an operation
+// that took its own turn: Commit ends the turn.
 type noOpTx struct {
 	ReadTx
 }
@@ -428,6 +593,11 @@ func (noOpTx) Commit() error {
 	return nil
 }
 
-func (noOpTx) Rollback() error {
+type turnTx struct {
+	ReadTx
+}
+
+func (tx turnTx) Commit() error {
+	tx.unlock()
 	return nil
 }

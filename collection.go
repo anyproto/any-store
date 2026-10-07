@@ -1269,7 +1269,14 @@ func (c *collection) committed() *collSchema {
 // transaction, as opposed to the cached head, which a peer process's DDL may
 // have left behind (its cookie is observed only through a transaction).
 func (c *collection) schemaFor(ctx context.Context) (*collSchema, bool, error) {
-	if tx, ok := ctx.Value(ctxKeyTx).(ReadTx); ok && !tx.Done() && tx.instanceId() == c.db.instanceId {
+	tx, locked, err := c.db.lockCtxTx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if tx != nil {
+		if locked != nil {
+			defer locked.unlock()
+		}
 		s, err := c.resolve(tx.btreeReadTx())
 		return s, true, err
 	}

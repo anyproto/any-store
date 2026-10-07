@@ -438,10 +438,23 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return &emptyIter{}, nil
 	}
 
-	tx, err := q.c.db.getReadTx(ctx)
+	// The iterator keeps tx beyond this call: the turn ends with the call,
+	// and the iterator's methods take theirs (lk).
+	tx, lk, err := q.c.db.lockCtxTx(ctx)
 	if err != nil {
 		qb.Close()
 		return
+	}
+	if tx == nil {
+		if tx, err = q.c.db.ReadTx(ctx); err != nil {
+			qb.Close()
+			return
+		}
+	} else {
+		if lk != nil {
+			defer lk.unlock()
+		}
+		tx = noOpTx{ReadTx: tx}
 	}
 
 	// Resolved inside the tx scope, for its snapshot (collection.resolve).
@@ -463,14 +476,19 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return nil, err
 	}
 
-	return &planIterator{
+	pi := &planIterator{
 		plan: plan,
 		tx:   tx,
+		lk:   lk,
 		s:    s,
 		buf:  buf,
 		qb:   qb,
 		data: &qplanner.CursorSource{Tx: btx, Ns: s.ns},
-	}, nil
+	}
+	if lk != nil {
+		lk.iterOpened(pi)
+	}
+	return pi, nil
 }
 
 func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResult, err error) {
@@ -579,9 +597,13 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(btWtx *btree.Writ
 		}
 	}()
 
-	tx, err := q.c.db.WriteTx(ctx)
+	tx, locked, err := q.c.db.enterWriteTx(ctx)
 	if err != nil {
 		return
+	}
+	// Registered first: released after the commit or rollback below.
+	if locked != nil {
+		defer locked.unlock()
 	}
 	defer func() {
 		// A panic (a user modifier's or filter's bug) leaves err == nil, so keying
@@ -753,22 +775,20 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 //     multi-key dedup internally via the per-entry value byte.
 //  3. Otherwise the shared generic distinct loop.
 func countPlanRoot(plan *qplanner.Plan) (int, error) {
+	// Deferred: a panic in a user filter must not leave the cursors' pages
+	// pinned on the transaction.
+	defer plan.Close()
 	if li, ok := plan.Root.(*qplanner.LimitIter); ok {
-		n, err := li.CountDistinct()
-		plan.Close()
-		return n, err
+		return li.CountDistinct()
 	}
 	if ci, ok := plan.Root.(qplanner.CountableIterator); ok {
-		n, err := ci.CountEntries()
-		plan.Close() // release cursor resources held by CountEntries
-		return n, err
+		return ci.CountEntries()
 	}
 	n := 0
 	err := qplanner.ForEachDistinct(plan.Root, func([]byte) error {
 		n++
 		return nil
 	})
-	plan.Close()
 	return n, err
 }
 
