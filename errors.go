@@ -95,6 +95,16 @@ var (
 
 	// ErrTxOtherInstance is returned when an operation is attempted using a transaction from a different database instance.
 	ErrTxOtherInstance = errors.New("any-store: transaction belongs to another database instance")
+	// ErrTxConcurrentCalls is the panic value of a call made on a transaction
+	// while a call from another goroutine is in progress on it; the check is
+	// best effort.
+	ErrTxConcurrentCalls = errors.New("any-store: concurrent calls on one transaction")
+	// ErrTxEndInModifier refuses a Commit or Rollback made from inside a
+	// modifier the transaction, or the savepoint, encloses (txHandle.enterEnd).
+	ErrTxEndInModifier = errors.New("any-store: transaction ended from inside a modifier")
+	// ErrWriteInModifier refuses a write to, or a schema change of, a
+	// collection from inside one of its own modifiers (collection.writable).
+	ErrWriteInModifier = errors.New("any-store: collection written from inside its modifier")
 
 	// ErrUniqueConstraint is returned when a unique constraint violation occurs.
 	ErrUniqueConstraint = errors.New("any-store: unique constraint violation")

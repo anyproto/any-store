@@ -304,35 +304,35 @@ func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.P
 	var (
 		env      aggregate.Env
 		lookupTx ReadTx
-		// lk is the shared transaction the pipeline reads through, nil
-		// for one of the iterator's own.
-		lk ReadTx
+		// shared is the transaction the pipeline reads through when other
+		// callers can reach it, nil for one of the iterator's own.
+		shared ReadTx
 	)
 	if pi, ok := inner.(*planIterator); ok {
-		lk = pi.lk
+		shared = pi.shared
 	} else {
 		// An empty prefix: the rows a stage synthesizes end with the
 		// transaction too.
-		tx, locked, err := q.c.db.lockCtxTx(ctx)
+		tx, entered, err := q.c.db.enterCtxTx(ctx)
 		if err != nil {
 			_ = inner.Close()
 			return nil, err
 		}
-		if locked != nil {
-			locked.unlock()
+		if entered != nil {
+			entered.exit()
 		}
-		lk = tx
+		shared = tx
 	}
 	if aggregate.HasLookup(rest) {
 		var (
 			btx *btree.ReadTx
 			s   *collSchema
 		)
-		if btx, s, lookupTx, lk, err = q.lookupBtreeTx(ctx, inner); err != nil {
+		if btx, s, lookupTx, shared, err = q.lookupBtreeTx(ctx, inner); err != nil {
 			_ = inner.Close()
 			return nil, err
 		}
-		env.Lookup = q.c.lookupFunc(btx, s, lk)
+		env.Lookup = q.c.lookupFunc(btx, s, shared)
 	}
 
 	limits := q.limits.WithDefaults()
@@ -352,7 +352,7 @@ func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.P
 		root:     root,
 		inner:    inner,
 		lookupTx: lookupTx,
-		lk:       lk,
+		shared:   shared,
 		c:        q.c,
 		buf:      buf,
 		actx: &aggregate.Ctx{
@@ -371,15 +371,15 @@ func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.P
 // prefix is provably empty the iterator has no tx at all, yet a $count
 // downstream can still synthesize rows whose fields feed $lookup — then a
 // dedicated read tx is opened, returned as own for aggIterator to release on
-// Close. lk is the transaction a lookup locks for its turn, nil when nobody
-// else can reach it (planIterator.lk).
-func (q *aggQuery) lookupBtreeTx(ctx context.Context, inner Iterator) (btx *btree.ReadTx, s *collSchema, own, lk ReadTx, err error) {
+// Close. shared is the transaction a lookup begins a call on, nil when nobody
+// else can reach it (planIterator.shared).
+func (q *aggQuery) lookupBtreeTx(ctx context.Context, inner Iterator) (btx *btree.ReadTx, s *collSchema, own, shared ReadTx, err error) {
 	if pi, ok := inner.(*planIterator); ok {
-		// The btree tx as Iter captured it under the turn: the iterator
-		// is outside its turn here.
-		return pi.data.Tx, pi.s, nil, pi.lk, nil
+		// The btree tx as Iter captured it inside its call: the iterator
+		// is outside a call here.
+		return pi.data.Tx, pi.s, nil, pi.shared, nil
 	}
-	tx, lk, err := q.c.db.lockCtxTx(ctx)
+	tx, shared, err := q.c.db.enterCtxTx(ctx)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -388,8 +388,8 @@ func (q *aggQuery) lookupBtreeTx(ctx context.Context, inner Iterator) (btx *btre
 			return nil, nil, nil, nil, err
 		}
 	} else {
-		if lk != nil {
-			defer lk.unlock()
+		if shared != nil {
+			defer shared.exit()
 		}
 		tx = noOpTx{ReadTx: tx}
 	}
@@ -398,20 +398,20 @@ func (q *aggQuery) lookupBtreeTx(ctx context.Context, inner Iterator) (btx *btre
 		_ = tx.Commit()
 		return nil, nil, nil, nil, err
 	}
-	return btx, s, tx, lk, nil
+	return btx, s, tx, shared, nil
 }
 
 // lookupFunc serves $lookup point reads against btx, s being the version
 // resolved for it. A missing key is a non-match, not an error. The document
 // is parsed owned into buf (stage-owned scratch): valid until the stage
-// reuses the same buf. A read takes its turn on lk when the transaction is
+// reuses the same buf. A read is a call on shared when the transaction is
 // shared (see lookupBtreeTx).
-func (c *collection) lookupFunc(btx *btree.ReadTx, s *collSchema, lk ReadTx) aggregate.LookupFunc {
+func (c *collection) lookupFunc(btx *btree.ReadTx, s *collSchema, shared ReadTx) aggregate.LookupFunc {
 	return func(key []byte, buf *syncpool.DocBuffer) (*anyenc.Value, error) {
-		if lk != nil {
-			lk.lock()
-			defer lk.unlock()
-			if lk.Done() {
+		if shared != nil {
+			shared.enter()
+			defer shared.exit()
+			if shared.Done() {
 				return nil, ErrTxIsUsed
 			}
 		}
@@ -539,10 +539,11 @@ type aggIterator struct {
 	// lookupTx is the dedicated $lookup read tx opened when the inner
 	// iterator has none of its own (empty-prefix fast path); nil otherwise.
 	lookupTx ReadTx
-	// lk is the shared transaction the rows come from, nil for one of the
+	// shared is the transaction the rows come from when other callers can
+	// reach it, nil for one of the
 	// iterator's own: a blocking stage has its rows in memory, and ends
 	// with the transaction all the same.
-	lk     ReadTx
+	shared ReadTx
 	actx   *aggregate.Ctx
 	c      *collection
 	buf    *syncpool.DocBuffer
@@ -555,7 +556,7 @@ func (it *aggIterator) Next() bool {
 	if it.err != nil || it.closed {
 		return false
 	}
-	if it.lk != nil && it.lk.Done() {
+	if it.shared != nil && it.shared.Done() {
 		it.err = ErrTxIsUsed
 		return false
 	}
@@ -578,7 +579,7 @@ func (it *aggIterator) Doc() (Doc, error) {
 	if it.err != nil {
 		return nil, it.err
 	}
-	if it.lk != nil && it.lk.Done() {
+	if it.shared != nil && it.shared.Done() {
 		return nil, ErrTxIsUsed
 	}
 	if it.cur == nil {

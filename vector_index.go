@@ -1291,7 +1291,7 @@ const vectorEfCap = 4096
 // for a brute-force index (no graph). Returns ErrIndexNotFound if no vector index
 // with that name exists.
 func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) error {
-	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) error {
+	return c.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) error {
 		s, err := c.beginDDL(wtx)
 		if err != nil {
 			return err

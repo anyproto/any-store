@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,8 +20,9 @@ import (
 	"github.com/anyproto/any-store/v2/syncpool"
 )
 
-// blockingFilter holds the turn of the call evaluating it: Ok blocks until
-// release is closed. entered is closed as Ok first runs.
+// blockingFilter keeps the call evaluating it in progress: Ok blocks until
+// release is closed. entered is closed as Ok first runs: the collection
+// must hold a document for Ok to be reached.
 type blockingFilter struct {
 	entered chan struct{}
 	release chan struct{}
@@ -202,33 +204,104 @@ func TestDb_WriteTx(t *testing.T) {
 	})
 }
 
-// The calls several goroutines make on one transaction run one at a time
-// (commonTx.opMu). Without the lock every subtest races in the btree page
-// cache the write tx owns — built for one caller — and ends in a nil
-// dereference or in allocation without bound. Run with -race.
-func TestWriteTx_SharedAcrossGoroutines(t *testing.T) {
-	const goroutines = 4
-
-	// Collects one error per goroutine and fails on the first.
-	run := func(t *testing.T, body func(g int) error) {
+// A call on a transaction while another call on it is in progress — from
+// a second goroutine — panics with ErrTxConcurrentCalls (txHandle.enter),
+// and the transaction stays usable by the call that was in progress.
+func TestTx_ConcurrentCalls(t *testing.T) {
+	// during runs body while a count with a blocking filter is in progress
+	// on tx from another goroutine, and lets that count finish after.
+	during := func(t *testing.T, coll Collection, tx ReadTx, body func()) {
 		t.Helper()
-		var wg sync.WaitGroup
-		errs := make(chan error, goroutines)
-		for g := 0; g < goroutines; g++ {
-			wg.Add(1)
-			go func(g int) {
-				defer wg.Done()
-				errs <- body(g)
-			}(g)
-		}
-		wg.Wait()
-		close(errs)
-		for err := range errs {
-			require.NoError(t, err)
-		}
+		f := newBlockingFilter()
+		held := make(chan error, 1)
+		go func() {
+			_, err := coll.Find(f).Count(tx.Context())
+			held <- err
+		}()
+		<-f.entered
+		body()
+		close(f.release)
+		require.NoError(t, <-held)
 	}
 
-	t.Run("reads", func(t *testing.T) {
+	t.Run("write tx", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		// Sorted in memory: Doc reads the document through the cursor (a
+		// call).
+		iter, err := coll.Find(nil).Sort("-a").Iter(tx.Context())
+		require.NoError(t, err)
+		require.True(t, iter.Next())
+		during(t, coll, tx, func() {
+			require.PanicsWithValue(t, ErrTxConcurrentCalls, func() { _, _ = coll.Count(tx.Context()) })
+			require.PanicsWithValue(t, ErrTxConcurrentCalls, func() { _ = coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":2}`)) })
+			require.PanicsWithValue(t, ErrTxConcurrentCalls, func() { _, _ = fx.WriteTx(tx.Context()) })
+			require.PanicsWithValue(t, ErrTxConcurrentCalls, func() { _, _ = fx.OpenCollection(tx.Context(), "test") })
+			require.PanicsWithValue(t, ErrTxConcurrentCalls, func() { _, _ = fx.Collection(tx.Context(), "test") })
+			require.PanicsWithValue(t, ErrTxConcurrentCalls, func() { _, _ = coll.Aggregate(`[{"$count":"n"}]`).Count(tx.Context()) })
+			require.PanicsWithValue(t, ErrTxConcurrentCalls, func() { _, _ = iter.Doc() })
+			require.PanicsWithValue(t, ErrTxConcurrentCalls, func() { iter.Next() })
+			require.PanicsWithValue(t, ErrTxConcurrentCalls, func() { _ = iter.Close() })
+			require.PanicsWithValue(t, ErrTxConcurrentCalls, func() { tx.SetModified() })
+		})
+		// The call that was in progress has ended: the transaction goes on,
+		// and the refused calls changed nothing — the iterator is open.
+		_, err = iter.Doc()
+		require.NoError(t, err)
+		require.False(t, iter.Next())
+		require.NoError(t, iter.Close())
+		require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":2}`)))
+		require.NoError(t, tx.Commit())
+		assertCollCount(t, coll, 2)
+	})
+
+	t.Run("read tx", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+		tx, err := fx.ReadTx(ctx)
+		require.NoError(t, err)
+		during(t, coll, tx, func() {
+			require.PanicsWithValue(t, ErrTxConcurrentCalls, func() { _, _ = coll.FindId(tx.Context(), 1) })
+		})
+		_, err = coll.FindId(tx.Context(), 1)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+	})
+
+	t.Run("savepoint", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":0}`)))
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		// A savepoint's methods, and the calls made through its context,
+		// are calls on the transaction.
+		during(t, coll, tx, func() {
+			require.PanicsWithValue(t, ErrTxConcurrentCalls, func() { _ = coll.Insert(sp.Context(), anyenc.MustParseJson(`{"id":1}`)) })
+			require.PanicsWithValue(t, ErrTxConcurrentCalls, func() { sp.SetModified() })
+		})
+		require.NoError(t, coll.Insert(sp.Context(), anyenc.MustParseJson(`{"id":1}`)))
+		require.NoError(t, sp.Commit())
+		require.NoError(t, tx.Commit())
+		assertCollCount(t, coll, 2)
+	})
+
+	// Several goroutines counting on one write transaction: a call the
+	// check refuses never reaches the btree page cache the transaction
+	// owns, built for one caller, so with -race this subtest reports
+	// nothing. Each goroutine retries a refused call, and the transaction
+	// commits. The refusals are not asserted: the overlap is near certain,
+	// not guaranteed.
+	t.Run("counts from several goroutines", func(t *testing.T) {
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
@@ -238,282 +311,333 @@ func TestWriteTx_SharedAcrossGoroutines(t *testing.T) {
 		}
 		tx, err := fx.WriteTx(ctx)
 		require.NoError(t, err)
-		run(t, func(int) error {
-			for j := 0; j < 20; j++ {
-				n, err := coll.Find(`{"a":{"$gt":5}}`).Count(tx.Context())
-				if err != nil {
-					return err
-				}
-				if n != 2000-6*20 {
-					return fmt.Errorf("count %d", n)
-				}
-			}
-			return nil
-		})
-		require.NoError(t, tx.Commit())
-	})
-
-	t.Run("reads and writes", func(t *testing.T) {
-		fx := newFixture(t)
-		w, err := fx.CreateCollection(ctx, "w")
-		require.NoError(t, err)
-		require.NoError(t, w.EnsureIndex(ctx, IndexInfo{Fields: []string{"g"}}))
-		// Read only: an iterator stays open across the others' writes, which
-		// the contract allows on a collection nobody writes.
-		r, err := fx.CreateCollection(ctx, "r")
-		require.NoError(t, err)
-		for i := 0; i < 100; i++ {
-			require.NoError(t, r.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i))))
-		}
-		tx, err := fx.WriteTx(ctx)
-		require.NoError(t, err)
-		const perGoroutine = 200
-		run(t, func(g int) error {
-			tctx := tx.Context()
-			for j := 0; j < perGoroutine; j++ {
-				id := g*perGoroutine + j
-				if err := w.Insert(tctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"g":%d,"j":%d}`, id, g, j))); err != nil {
-					return err
-				}
-				if _, err := w.UpdateId(tctx, id, query.MustParseModifier(`{"$inc":{"j":1}}`)); err != nil {
-					return err
-				}
-				if j%5 == 0 {
-					if err := w.DeleteId(tctx, id); err != nil {
-						return err
+		count := func() (n int, err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					if r != ErrTxConcurrentCalls {
+						panic(r)
 					}
-					if _, err := w.FindId(tctx, id); !errors.Is(err, ErrDocNotFound) {
-						return fmt.Errorf("deleted %d: %v", id, err)
-					}
-				} else if doc, err := w.FindId(tctx, id); err != nil || doc.Value().GetInt("j") != j+1 {
-					return fmt.Errorf("doc %d: %v", id, err)
+					err = ErrTxConcurrentCalls
 				}
-				if j%20 != 0 {
-					continue
-				}
-				// The goroutine's own documents through the index.
-				n, err := w.Find(fmt.Sprintf(`{"g":%d}`, g)).Count(tctx)
-				if err != nil {
-					return err
-				}
-				if want := j - j/5; n != want {
-					return fmt.Errorf("g %d: count %d, want %d", g, n, want)
-				}
-				iter, err := r.Find(`{"id":{"$gte":50}}`).Iter(tctx)
-				if err != nil {
-					return err
-				}
-				var seen int
-				for iter.Next() {
-					if _, err := iter.Doc(); err != nil {
-						_ = iter.Close()
-						return err
-					}
-					seen++
-				}
-				if err := errors.Join(iter.Err(), iter.Close()); err != nil {
-					return err
-				}
-				if seen != 50 {
-					return fmt.Errorf("r: %d docs", seen)
-				}
-			}
-			return nil
-		})
-		want := goroutines * (perGoroutine - perGoroutine/5)
-		assertCollCountInTx(tx.Context(), t, w, want)
-		require.NoError(t, tx.Commit())
-		assertCollCount(t, w, want)
-	})
-
-	t.Run("full-text reads flush the buffered postings", func(t *testing.T) {
-		fx := newFixture(t)
-		coll, err := fx.CreateCollection(ctx, "test")
-		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"text"}, Kind: IndexKindFulltext}))
-		tx, err := fx.WriteTx(ctx)
-		require.NoError(t, err)
-		for i := 0; i < 20; i++ {
-			require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"text":"alpha beta %d"}`, i, i))))
-		}
-		run(t, func(int) error {
-			for j := 0; j < 50; j++ {
-				n, err := coll.Find(`{"$text":{"$search":"alpha"}}`).Count(tx.Context())
-				if err != nil {
-					return err
-				}
-				if n != 20 {
-					return fmt.Errorf("count %d", n)
-				}
-			}
-			return nil
-		})
-		require.NoError(t, tx.Commit())
-		assertQueryCount(t, coll.Find(`{"$text":{"$search":"beta"}}`), 20)
-	})
-
-	t.Run("savepoints of their own", func(t *testing.T) {
-		// Each goroutine opens, writes in and ends savepoints of its own.
-		// They nest in the order they are opened, so one goroutine's end
-		// may orphan another's — ErrTxIsUsed, as the same interleaving
-		// from one goroutine — and what the transaction counts is what
-		// it commits.
-		fx := newFixture(t)
-		coll, err := fx.CreateCollection(ctx, "test")
-		require.NoError(t, err)
-		tx, err := fx.WriteTx(ctx)
-		require.NoError(t, err)
-		run(t, func(g int) error {
-			for j := 0; j < 30; j++ {
-				sp, err := fx.WriteTx(tx.Context())
-				if err != nil {
-					return err
-				}
-				if err = coll.Insert(sp.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, g*1000+j))); err != nil {
-					return err
-				}
-				if j%2 == 0 {
-					err = sp.Commit()
-				} else {
-					err = sp.Rollback()
-				}
-				if err != nil && !errors.Is(err, ErrTxIsUsed) {
-					return err
-				}
-				if !sp.Done() {
-					return errors.New("savepoint not done")
-				}
-			}
-			return nil
-		})
-		n, err := coll.Count(tx.Context())
-		require.NoError(t, err)
-		require.NoError(t, tx.Commit())
-		assertCollCount(t, coll, n)
-		require.NoError(t, fx.IntegrityCheck(ctx))
-	})
-
-	t.Run("savepoints beside reads", func(t *testing.T) {
-		fx := newFixture(t)
-		coll, err := fx.CreateCollection(ctx, "test")
-		require.NoError(t, err)
-		tx, err := fx.WriteTx(ctx)
-		require.NoError(t, err)
-		// Savepoints nest: two goroutines interleaving theirs would orphan
-		// one, as the same interleaving from one goroutine does. Each
-		// savepoint runs whole under a lock of the test's own, beside the
-		// other goroutines' reads.
-		var spMu sync.Mutex
-		var kept int
-		run(t, func(g int) error {
-			for j := 0; j < 20; j++ {
-				if g%2 == 1 {
-					if _, err := coll.Count(tx.Context()); err != nil {
-						return err
-					}
-					continue
-				}
-				spMu.Lock()
-				err := func() error {
-					sp, err := fx.WriteTx(tx.Context())
-					if err != nil {
-						return err
-					}
-					if sp.Done() {
-						return errors.New("savepoint done at once")
-					}
-					if err = coll.Insert(sp.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, g*100+j))); err != nil {
-						return err
-					}
-					if j%2 == 0 {
-						kept++
-						err = sp.Commit()
-					} else {
-						err = sp.Rollback()
-					}
-					if err != nil {
-						return err
-					}
-					if !sp.Done() {
-						return errors.New("savepoint not done")
-					}
-					return nil
-				}()
-				spMu.Unlock()
-				if err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-		assertCollCountInTx(tx.Context(), t, coll, kept)
-		require.NoError(t, tx.Commit())
-		assertCollCount(t, coll, kept)
-	})
-}
-
-func TestReadTx_SharedAcrossGoroutines(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-	for i := 0; i < 500; i++ {
-		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%10))))
-	}
-	tx, err := fx.ReadTx(ctx)
-	require.NoError(t, err)
-	var wg sync.WaitGroup
-	errs := make(chan error, 4)
-	for g := 0; g < 4; g++ {
-		wg.Add(1)
-		go func(g int) {
-			defer wg.Done()
-			errs <- func() error {
-				for j := 0; j < 30; j++ {
-					n, err := coll.Find(`{"a":{"$lt":5}}`).Count(tx.Context())
-					if err != nil {
-						return err
-					}
-					if n != 250 {
-						return fmt.Errorf("count %d", n)
-					}
-					if _, err = coll.FindId(tx.Context(), g*100+j); err != nil {
-						return err
-					}
-					iter, err := coll.Find(`{"a":1}`).Iter(tx.Context())
-					if err != nil {
-						return err
-					}
-					var seen int
-					for iter.Next() {
-						if _, err := iter.Doc(); err != nil {
-							_ = iter.Close()
-							return err
-						}
-						seen++
-					}
-					if err := errors.Join(iter.Err(), iter.Close()); err != nil {
-						return err
-					}
-					if seen != 50 {
-						return fmt.Errorf("iter: %d docs", seen)
-					}
-				}
-				return nil
 			}()
-		}(g)
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
+			return coll.Find(`{"a":{"$gt":5}}`).Count(tx.Context())
+		}
+		var refused atomic.Int32
+		var wg sync.WaitGroup
+		errs := make(chan error, 4)
+		for g := 0; g < 4; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 20; j++ {
+					n, err := count()
+					if errors.Is(err, ErrTxConcurrentCalls) {
+						refused.Add(1)
+						runtime.Gosched()
+						j--
+						continue
+					}
+					if err != nil {
+						errs <- err
+						return
+					}
+					if n != 2000-6*20 {
+						errs <- fmt.Errorf("count %d", n)
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			require.NoError(t, err)
+		}
+		t.Logf("refused calls: %d", refused.Load())
+		require.NoError(t, tx.Commit())
+	})
+
+	// Commit and Rollback wait a call in progress out: a deferred Rollback
+	// ends the transaction after a refused call, and the writer lock goes
+	// with it.
+	t.Run("an end waits for the call in progress", func(t *testing.T) {
+		for name, end := range map[string]func(WriteTx) error{"rollback": WriteTx.Rollback, "commit": WriteTx.Commit} {
+			t.Run(name, func(t *testing.T) {
+				fx := newFixture(t)
+				coll, err := fx.CreateCollection(ctx, "test")
+				require.NoError(t, err)
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+				tx, err := fx.WriteTx(ctx)
+				require.NoError(t, err)
+				require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":2}`)))
+				f := newBlockingFilter()
+				held := make(chan error, 1)
+				go func() {
+					_, err := coll.Find(f).Count(tx.Context())
+					held <- err
+				}()
+				<-f.entered
+				ended := make(chan error, 1)
+				go func() { ended <- end(tx) }()
+				select {
+				case err := <-ended:
+					t.Fatalf("the end did not wait: %v", err)
+				case <-time.After(50 * time.Millisecond):
+				}
+				close(f.release)
+				require.NoError(t, <-held)
+				require.NoError(t, <-ended)
+				require.True(t, tx.Done())
+				_, err = coll.Count(tx.Context())
+				assert.ErrorIs(t, err, ErrTxIsUsed)
+				// The writer lock is free.
+				next, err := fx.WriteTx(ctx)
+				require.NoError(t, err)
+				require.NoError(t, next.Rollback())
+				if name == "commit" {
+					assertCollCount(t, coll, 2)
+				} else {
+					assertCollCount(t, coll, 1)
+				}
+			})
+		}
+	})
+
+	t.Run("a read end waits for the call in progress", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
-	}
-	require.NoError(t, tx.Commit())
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+		tx, err := fx.ReadTx(ctx)
+		require.NoError(t, err)
+		f := newBlockingFilter()
+		held := make(chan error, 1)
+		go func() {
+			_, err := coll.Find(f).Count(tx.Context())
+			held <- err
+		}()
+		<-f.entered
+		ended := make(chan error, 1)
+		go func() { ended <- tx.Commit() }()
+		select {
+		case err := <-ended:
+			t.Fatalf("the end did not wait: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		close(f.release)
+		require.NoError(t, <-held)
+		require.NoError(t, <-ended)
+		require.True(t, tx.Done())
+	})
 }
 
-// A call on a transaction another goroutine has ended finds it ended —
-// under the lock, so after the call it may have waited for — and does not
-// touch the state the transaction gave back.
+// A call made from inside a user callback nests in the call that runs it:
+// a modifier reads through the transaction's context, the collection it
+// modifies and another, inside the operation that runs it.
+func TestTx_NestedCalls(t *testing.T) {
+	type refMod struct {
+		db         DB
+		coll, refs Collection
+		tx         WriteTx
+	}
+	// modifier derives refName from the refs collection and seen from a
+	// count of coll, both read through the transaction's context.
+	modifier := func(m refMod) query.Modifier {
+		return query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			ref, err := m.refs.FindId(m.tx.Context(), "r")
+			if err != nil {
+				return nil, false, err
+			}
+			n, err := m.coll.Count(m.tx.Context())
+			if err != nil {
+				return nil, false, err
+			}
+			if _, err = m.db.OpenCollection(m.tx.Context(), "refs"); err != nil {
+				return nil, false, err
+			}
+			v.Set("refName", a.NewString(string(ref.Value().GetStringBytes("name"))))
+			v.Set("seen", a.NewNumberInt(n))
+			return v, true, nil
+		})
+	}
+	setup := func(t *testing.T) refMod {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		refs, err := fx.CreateCollection(ctx, "refs")
+		require.NoError(t, err)
+		require.NoError(t, refs.Insert(ctx, anyenc.MustParseJson(`{"id":"r","name":"ref"}`)))
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		return refMod{db: fx, coll: coll, refs: refs, tx: tx}
+	}
+	t.Run("UpdateId and UpsertId", func(t *testing.T) {
+		m := setup(t)
+		_, err := m.coll.UpdateId(m.tx.Context(), 1, modifier(m))
+		require.NoError(t, err)
+		_, err = m.coll.UpsertId(m.tx.Context(), 2, modifier(m))
+		require.NoError(t, err)
+		require.NoError(t, m.tx.Commit())
+		for id, seen := range map[int]int{1: 1, 2: 1} {
+			doc, err := m.coll.FindId(ctx, id)
+			require.NoError(t, err)
+			assert.Equal(t, "ref", string(doc.Value().GetStringBytes("refName")))
+			assert.Equal(t, seen, doc.Value().GetInt("seen"))
+		}
+	})
+
+	t.Run("bulk update", func(t *testing.T) {
+		m := setup(t)
+		require.NoError(t, m.coll.Insert(m.tx.Context(), anyenc.MustParseJson(`{"id":2}`)))
+		res, err := m.coll.Find(nil).Update(m.tx.Context(), modifier(m))
+		require.NoError(t, err)
+		assert.Equal(t, 2, res.Modified)
+		require.NoError(t, m.tx.Commit())
+		for _, id := range []int{1, 2} {
+			doc, err := m.coll.FindId(ctx, id)
+			require.NoError(t, err)
+			assert.Equal(t, "ref", string(doc.Value().GetStringBytes("refName")))
+			assert.Equal(t, 2, doc.Value().GetInt("seen"))
+		}
+	})
+
+	t.Run("iterator and aggregation inside a modifier", func(t *testing.T) {
+		m := setup(t)
+		require.NoError(t, m.coll.Insert(m.tx.Context(), anyenc.MustParseJson(`{"id":2,"ref":"r"}`)))
+		_, err := m.coll.UpdateId(m.tx.Context(), 1, query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			iter, err := m.coll.Find(nil).Sort("-id").Iter(m.tx.Context())
+			if err != nil {
+				return nil, false, err
+			}
+			var seen int
+			for iter.Next() {
+				if _, err = iter.Doc(); err != nil {
+					_ = iter.Close()
+					return nil, false, err
+				}
+				seen++
+			}
+			if err = errors.Join(iter.Err(), iter.Close()); err != nil {
+				return nil, false, err
+			}
+			n, err := m.coll.Aggregate(`[{"$match":{"id":2}},{"$lookup":{"localField":"ref","foreignField":"id","as":"r"}},{"$count":"n"}]`).Count(m.tx.Context())
+			if err != nil {
+				return nil, false, err
+			}
+			v.Set("seen", a.NewNumberInt(seen))
+			v.Set("looked", a.NewNumberInt(n))
+			return v, true, nil
+		}))
+		require.NoError(t, err)
+		require.NoError(t, m.tx.Commit())
+		doc, err := m.coll.FindId(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, 2, doc.Value().GetInt("seen"))
+		assert.Equal(t, 1, doc.Value().GetInt("looked"))
+	})
+
+	// What the operation running the modifier holds, the modifier must not
+	// pull away: an end of the transaction, or of a savepoint enclosing
+	// the modifier, and a write to the collection are refused. A savepoint
+	// opened inside the modifier ends inside it, and other collections —
+	// one opened inside the modifier included — take writes and schema
+	// changes.
+	t.Run("ends refused inside a modifier", func(t *testing.T) {
+		m := setup(t)
+		sp, err := m.db.WriteTx(m.tx.Context())
+		require.NoError(t, err)
+		_, err = m.coll.UpdateId(sp.Context(), 1, query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			assert.ErrorIs(t, m.tx.Commit(), ErrTxEndInModifier)
+			assert.ErrorIs(t, m.tx.Rollback(), ErrTxEndInModifier)
+			assert.ErrorIs(t, sp.Commit(), ErrTxEndInModifier)
+			assert.ErrorIs(t, sp.Rollback(), ErrTxEndInModifier)
+			inner, err := m.db.WriteTx(m.tx.Context())
+			if err != nil {
+				return nil, false, err
+			}
+			if err = m.refs.Insert(inner.Context(), anyenc.MustParseJson(`{"id":"inner"}`)); err != nil {
+				return nil, false, err
+			}
+			if err = inner.Commit(); err != nil {
+				return nil, false, err
+			}
+			v.Set("v", a.NewNumberInt(1))
+			return v, true, nil
+		}))
+		require.NoError(t, err)
+		assert.False(t, sp.Done())
+		require.NoError(t, sp.Commit())
+		require.NoError(t, m.tx.Commit())
+		doc, err := m.coll.FindId(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, 1, doc.Value().GetInt("v"))
+		assertCollCount(t, m.refs, 2)
+	})
+
+	t.Run("writes to the collection refused inside its modifier", func(t *testing.T) {
+		m := setup(t)
+		require.NoError(t, m.coll.EnsureIndex(m.tx.Context(), IndexInfo{Fields: []string{"a"}}))
+		fresh, err := m.db.CreateCollection(m.tx.Context(), "fresh")
+		require.NoError(t, err)
+		require.NoError(t, fresh.Insert(m.tx.Context(), anyenc.MustParseJson(`{"id":1,"b":1}`)))
+		_, err = m.coll.UpdateId(m.tx.Context(), 1, query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			tctx := m.tx.Context()
+			assert.ErrorIs(t, m.coll.Insert(tctx, anyenc.MustParseJson(`{"id":9}`)), ErrWriteInModifier)
+			assert.ErrorIs(t, m.coll.UpsertOne(tctx, anyenc.MustParseJson(`{"id":9}`)), ErrWriteInModifier)
+			assert.ErrorIs(t, m.coll.DeleteId(tctx, 1), ErrWriteInModifier)
+			_, err := m.coll.UpsertId(tctx, 9, query.MustParseModifier(`{"$set":{"a":1}}`))
+			assert.ErrorIs(t, err, ErrWriteInModifier)
+			_, err = m.coll.Find(nil).Update(tctx, query.MustParseModifier(`{"$set":{"a":1}}`))
+			assert.ErrorIs(t, err, ErrWriteInModifier)
+			_, err = m.coll.Find(nil).Delete(tctx)
+			assert.ErrorIs(t, err, ErrWriteInModifier)
+			assert.ErrorIs(t, m.coll.EnsureIndex(tctx, IndexInfo{Fields: []string{"b"}}), ErrWriteInModifier)
+			assert.ErrorIs(t, m.coll.DropIndex(tctx, "a"), ErrWriteInModifier)
+			assert.ErrorIs(t, m.coll.Rename(tctx, "renamed"), ErrWriteInModifier)
+			assert.ErrorIs(t, m.coll.Drop(tctx), ErrWriteInModifier)
+			// Reads of the collection, and other collections, nest.
+			if _, err = m.coll.Count(tctx); err != nil {
+				return nil, false, err
+			}
+			if err = m.refs.Insert(tctx, anyenc.MustParseJson(`{"id":"other"}`)); err != nil {
+				return nil, false, err
+			}
+			opened, err := m.db.OpenCollection(tctx, "fresh")
+			if err != nil {
+				return nil, false, err
+			}
+			if err = opened.EnsureIndex(tctx, IndexInfo{Fields: []string{"b"}}); err != nil {
+				return nil, false, err
+			}
+			if err = opened.DropIndex(tctx, "b"); err != nil {
+				return nil, false, err
+			}
+			if err = opened.EnsureIndex(tctx, IndexInfo{Fields: []string{"b"}}); err != nil {
+				return nil, false, err
+			}
+			v.Set("a", a.NewNumberInt(7))
+			return v, true, nil
+		}))
+		require.NoError(t, err)
+		// A bulk modifier the same way.
+		_, err = m.coll.Find(nil).Update(m.tx.Context(), query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			assert.ErrorIs(t, m.coll.Insert(m.tx.Context(), anyenc.MustParseJson(`{"id":9}`)), ErrWriteInModifier)
+			return v, false, nil
+		}))
+		require.NoError(t, err)
+		require.NoError(t, m.tx.Commit())
+		assertCollCount(t, m.coll, 1)
+		assertQueryCount(t, m.coll.Find(`{"a":7}`), 1)
+		require.Len(t, m.coll.GetIndexes(), 1)
+		assertCollCount(t, m.refs, 2)
+		assertQueryCount(t, fresh.Find(`{"b":1}`), 1)
+		require.Len(t, fresh.GetIndexes(), 1)
+	})
+}
+
+// A call on a transaction another goroutine has ended finds it ended, and
+// does not touch the state the transaction gave back.
 func TestWriteTx_CallAfterAnotherGoroutineEnds(t *testing.T) {
 	t.Run("iterator", func(t *testing.T) {
 		fx := newFixture(t)
@@ -585,77 +709,11 @@ func TestWriteTx_CallAfterAnotherGoroutineEnds(t *testing.T) {
 		assert.ErrorIs(t, iter.Err(), ErrTxIsUsed)
 		assert.NoError(t, iter.Close())
 	})
-
-	t.Run("waiting at the commit", func(t *testing.T) {
-		fx := newFixture(t)
-		coll, err := fx.CreateCollection(ctx, "test")
-		require.NoError(t, err)
-		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
-		tx, err := fx.WriteTx(ctx)
-		require.NoError(t, err)
-		require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":2}`)))
-
-		// A call holds the turn inside a filter. The commit queues for it
-		// first and the count after: the count passes every check made
-		// before the lock while the transaction is live, and finds it
-		// ended under the lock (the mutex hands over in order once the
-		// waits pass a millisecond).
-		f := newBlockingFilter()
-		held := make(chan error, 1)
-		go func() {
-			_, err := coll.Find(f).Count(tx.Context())
-			held <- err
-		}()
-		<-f.entered
-		committed := make(chan error, 1)
-		go func() { committed <- tx.Commit() }()
-		time.Sleep(20 * time.Millisecond)
-		counted := make(chan error, 1)
-		go func() {
-			_, err := coll.Count(tx.Context())
-			counted <- err
-		}()
-		time.Sleep(20 * time.Millisecond)
-		close(f.release)
-		require.NoError(t, <-held)
-		require.NoError(t, <-committed)
-		assert.ErrorIs(t, <-counted, ErrTxIsUsed)
-		assertCollCount(t, coll, 2)
-	})
-
-	t.Run("write waiting at the commit", func(t *testing.T) {
-		// The write scope's re-check (enterWriteTx), the same way.
-		fx := newFixture(t)
-		coll, err := fx.CreateCollection(ctx, "test")
-		require.NoError(t, err)
-		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
-		tx, err := fx.WriteTx(ctx)
-		require.NoError(t, err)
-		require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":2}`)))
-		f := newBlockingFilter()
-		held := make(chan error, 1)
-		go func() {
-			_, err := coll.Find(f).Count(tx.Context())
-			held <- err
-		}()
-		<-f.entered
-		committed := make(chan error, 1)
-		go func() { committed <- tx.Commit() }()
-		time.Sleep(20 * time.Millisecond)
-		inserted := make(chan error, 1)
-		go func() { inserted <- coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":3}`)) }()
-		time.Sleep(20 * time.Millisecond)
-		close(f.release)
-		require.NoError(t, <-held)
-		require.NoError(t, <-committed)
-		assert.ErrorIs(t, <-inserted, ErrTxIsUsed)
-		assertCollCount(t, coll, 2)
-	})
 }
 
 // A handle of a transaction that ended fails with ErrTxIsUsed and touches
-// nothing of the transaction that reuses the pooled state: its lock and its
-// context are the handle's own.
+// nothing of the transaction that reuses the pooled state: its call counters
+// and its context are the handle's own.
 func TestWriteTx_HandleOfEndedTx(t *testing.T) {
 	t.Run("context", func(t *testing.T) {
 		fx := newFixture(t)
@@ -675,7 +733,7 @@ func TestWriteTx_HandleOfEndedTx(t *testing.T) {
 		assertCollCountInTx(tx2.Context(), t, coll, 0)
 	})
 
-	t.Run("call does not wait for the reusing transaction", func(t *testing.T) {
+	t.Run("call counts on its own handle", func(t *testing.T) {
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
@@ -692,18 +750,10 @@ func TestWriteTx_HandleOfEndedTx(t *testing.T) {
 			held <- err
 		}()
 		<-f.entered
-		// tx2's turn is held: a call on tx1 waits for nothing.
-		counted := make(chan error, 1)
-		go func() {
-			_, err := coll.Count(tx1.Context())
-			counted <- err
-		}()
-		select {
-		case err := <-counted:
-			assert.ErrorIs(t, err, ErrTxIsUsed)
-		case <-time.After(2 * time.Second):
-			t.Fatal("a call on the ended transaction waited for the transaction reusing its state")
-		}
+		// tx2 is inside a call: a call on tx1 counts on tx1's handle, and
+		// finds the transaction ended.
+		_, err = coll.Count(tx1.Context())
+		assert.ErrorIs(t, err, ErrTxIsUsed)
 		close(f.release)
 		require.NoError(t, <-held)
 		require.NoError(t, tx2.Commit())
@@ -721,36 +771,13 @@ func TestWriteTx_HandleOfEndedTx(t *testing.T) {
 		require.NoError(t, sp.Commit())
 		// Every write in the transaction opens a savepoint of its own, on
 		// the pooled state sp used. sp's context stays the transaction's:
-		// a call through it takes its turn like any other.
+		// a call through it is a call on the transaction like any other.
 		require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":2}`)))
-		var wg sync.WaitGroup
-		errs := make(chan error, 4)
-		for g := 0; g < 4; g++ {
-			wg.Add(1)
-			go func(g int) {
-				defer wg.Done()
-				for j := 0; j < 200; j++ {
-					var err error
-					if g%2 == 0 {
-						_, err = coll.FindId(sp.Context(), 1)
-					} else {
-						err = coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, 100+g*1000+j)))
-					}
-					if err != nil {
-						errs <- err
-						return
-					}
-				}
-				errs <- nil
-			}(g)
-		}
-		wg.Wait()
-		close(errs)
-		for err := range errs {
-			require.NoError(t, err)
-		}
+		_, err = coll.FindId(sp.Context(), 1)
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(sp.Context(), anyenc.MustParseJson(`{"id":3}`)))
 		require.NoError(t, tx.Commit())
-		assertCollCount(t, coll, 2+400)
+		assertCollCount(t, coll, 3)
 	})
 
 	t.Run("SetModified", func(t *testing.T) {
@@ -775,20 +802,11 @@ func TestWriteTx_HandleOfEndedTx(t *testing.T) {
 		sp, err := fx.WriteTx(tx.Context())
 		require.NoError(t, err)
 		var seen bool
-		updated := make(chan error, 1)
-		go func() {
-			_, err := coll.UpdateId(sp.Context(), 1, query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
-				seen = sp.Done()
-				return v, false, nil
-			}))
-			updated <- err
-		}()
-		select {
-		case err := <-updated:
-			require.NoError(t, err)
-		case <-time.After(2 * time.Second):
-			t.Fatal("sp.Done inside a modifier waited for the modifier's own call")
-		}
+		_, err = coll.UpdateId(sp.Context(), 1, query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			seen = sp.Done()
+			return v, false, nil
+		}))
+		require.NoError(t, err)
 		assert.False(t, seen)
 		require.NoError(t, sp.Commit())
 		assert.True(t, sp.Done())
@@ -837,57 +855,9 @@ func TestWriteTx_EndTripsOpenIterators(t *testing.T) {
 	require.NoError(t, iter.Close())
 }
 
-// Two goroutines that ensure the same collection in one transaction get
-// one handle: the open — the log, the registry, the catalog — and the
-// create run in one turn.
-func TestWriteTx_OpenAndCreateInOneTurn(t *testing.T) {
-	fx := newFixture(t)
-	tx, err := fx.WriteTx(ctx)
-	require.NoError(t, err)
-	// Between the first open's log lookup and its catalog read, a second
-	// goroutine ensures the same collection: it waits for the turn, and
-	// creates the collection — or finds it — once the first open is done.
-	// Were the open two turns, the create would land between them and the
-	// catalog read would register a second handle.
-	var fired atomic.Bool
-	created := make(chan error, 1)
-	bDone := make(chan struct{})
-	var hB Collection
-	testHookAfterLogLookup = func(name string) {
-		if !fired.CompareAndSwap(false, true) {
-			return
-		}
-		go func() {
-			defer close(bDone)
-			var err error
-			hB, err = fx.Collection(tx.Context(), name)
-			created <- err
-		}()
-		// Done at once were the open two turns; waiting for the turn the
-		// open holds otherwise.
-		select {
-		case <-bDone:
-		case <-time.After(300 * time.Millisecond):
-		}
-	}
-	defer func() { testHookAfterLogLookup = nil }()
-	hA, err := fx.Collection(tx.Context(), "c")
-	require.NoError(t, err)
-	require.NoError(t, <-created)
-	// One handle: the index made through one is maintained by the other.
-	require.NoError(t, hA.EnsureIndex(tx.Context(), IndexInfo{Fields: []string{"a"}}))
-	require.NoError(t, hB.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1,"a":1}`)))
-	require.NoError(t, tx.Commit())
-	c, err := fx.OpenCollection(ctx, "c")
-	require.NoError(t, err)
-	assertQueryCount(t, c.Find(`{"a":1}`), 1)
-	require.Len(t, c.GetIndexes(), 1)
-	assertIndexLen(t, c.GetIndexes()[0], 1)
-}
-
 // The calls an operation makes on the transaction its context carries,
-// against the same operations with no transaction: what the per-call turn
-// (commonTx.opMu) costs on the in-transaction paths.
+// against the same operations with no transaction: what a call on the
+// transaction (txHandle.enter) costs on the in-transaction paths.
 func BenchmarkWriteTx_Calls(b *testing.B) {
 	fx := newFixture(b)
 	coll, err := fx.CreateCollection(ctx, "test")

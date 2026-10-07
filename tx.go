@@ -2,6 +2,7 @@ package anystore
 
 import (
 	"context"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -35,7 +36,7 @@ type WriteTx interface {
 	// SetModified marks the transaction as having made modifications
 	// used internally for sentinel mechanism
 	SetModified()
-	// markModified is SetModified for a caller that holds the turn.
+	// markModified is SetModified for a caller inside a call on the transaction.
 	markModified()
 
 	// schemaLog is the transaction's uncommitted schema changes; see
@@ -66,9 +67,17 @@ type ReadTx interface {
 	instanceId() string
 	dbRef() *db
 
-	// The transaction's lock, one call at a time; see txHandle.
-	lock()
-	unlock()
+	// A call on the transaction begins and ends; see txHandle.enter. The
+	// call that ends the transaction, or a savepoint, begins with enterEnd.
+	enter()
+	enterEnd(cbDepth int32) error
+	exit()
+
+	// A user callback the current call runs begins and ends, and how many
+	// are running; see txHandle.enter.
+	callbackBegin()
+	callbackEnd()
+	callbackDepth() int32
 
 	// The open iterators that hold cursors on the transaction; see
 	// commonTx.iters. Unexported: iterator-internal.
@@ -79,33 +88,32 @@ type ReadTx interface {
 // commonTx is a transaction's pooled state (db.txPool): what the handles of
 // one transaction share, and what a later transaction of the db takes over
 // once this one ended. A handle tells the two apart by version, and it
-// reads nothing else of a transaction that may have ended — its lock and
-// its context are the handle's own (txHandle).
+// reads nothing else of a transaction that may have ended — its call
+// counters and its context are the handle's own (txHandle).
 //
-// One call at a time: every call made on a transaction — an operation run
-// with its context, a savepoint's, its commit or rollback, a method of an
-// iterator — takes the transaction's turn (txHandle.mu) and gives it back
-// before control returns to the caller. What the transaction holds — the
-// page cache of its btree tx, the full-text buffers, the schema log, the
-// savepoint stack — is built for one caller at a time, so a transaction
-// several goroutines share runs their calls one after another, as SQLite's
-// serialized threading mode runs the calls made on one connection
-// (sqlite3_mutex_enter on db->mutex at every entry point). SQLite's mutex is
-// recursive and Go's is not: a call made from inside another call — a
-// callback's — runs under the enclosing call's turn only through the
-// context an internal savepoint hands out (heldTx); user code the library
-// calls holding the turn must not call back into the transaction. The
-// turn is taken at the entry points (lockCtxTx, enterWriteTx, the methods
-// of the transaction, of a savepoint, of an iterator); an iterator or a
-// savepoint the caller keeps relocks per call. A call that waited
-// re-checks Done under the lock: the call it waited for may have ended
-// the transaction.
+// One goroutine at a time: what a transaction holds — the page cache of
+// its btree tx, the full-text buffers, the schema log, the savepoint stack
+// — is built for one caller, and every call
+// made on it — an operation run with its context, a savepoint's, its
+// commit or rollback, a method of an iterator — begins and ends as a call
+// on its handle (txHandle.enter). Calls nest: a user callback the library
+// runs — a query.Modifier — may call back into the transaction through its
+// context, and the helpers of a call reach it through the context that
+// marks the transaction held (heldTx). What the operation running the
+// modifier holds — the collection's schema and document it loaded, the
+// btree tx — the modifier must not pull away: a write to that collection
+// (collection.writable) and an end of the transaction or of a savepoint
+// enclosing the modifier (enterEnd) are refused. Two calls at once, from
+// two goroutines, are a misuse the handle detects the way the runtime
+// detects concurrent map writes: best effort, with a panic
+// (ErrTxConcurrentCalls); an end waits the other call out instead.
 type commonTx struct {
 	db      *db
 	readTx  *btree.ReadTx
 	writeTx *btree.WriteTx
 	version atomic.Uint64
-	// modified: SetModified is public, so a caller may set it outside the lock.
+	// modified: atomic, as SetModified is public and a handle of an ended
+	// transaction may still call it while the commit reads it.
 	modified atomic.Bool
 
 	// schema is the transaction's own schema state (txSchema), reached
@@ -187,7 +195,7 @@ func (tx *commonTx) iterClosed(pi *planIterator) {
 }
 
 // tripIters releases the pages the open iterators hold, as the transaction
-// ends: under its lock, before its btree tx ends.
+// ends: inside the call that ends it, before its btree tx ends.
 func (tx *commonTx) tripIters() {
 	for _, pi := range tx.iters {
 		pi.trip()
@@ -308,11 +316,11 @@ func (tx *commonTx) markModified() {
 }
 
 // heldTx is the transaction as a context marks it held: the enclosing call
-// holds its lock, so a call made through that context runs under its turn
-// instead of locking again — the context of an internal savepoint
-// (savepointWrapper.Context) hands it to a callback, and a call that holds
-// the turn and runs helpers that take their own passes it on (heldCtx).
-// Unwrapped by lockCtxTx and ctxWriteTx.
+// counts for it, so a call made through that context begins no call of its
+// own — the context of an internal savepoint (savepointWrapper.Context)
+// hands it to the callback of a write scope, and a call that runs helpers
+// which would begin their own passes it on (heldCtx). Unwrapped by
+// enterCtxTx and ctxWriteTx.
 type heldTx struct{ ReadTx }
 
 func (tx *commonTx) instanceId() string {
@@ -325,14 +333,17 @@ func (tx *commonTx) dbRef() *db {
 
 // txHandle is a transaction's handle, one per transaction, which its
 // wrappers, its context and its savepoints all point at: beyond the pooled
-// state, the version that is this transaction's, the lock that is its own
-// — made with it, never pooled, so a handle of an ended transaction locks
-// nothing another transaction uses — and the context.
+// state, the version that is this transaction's, the call counters that
+// are its own — made with it, never pooled, so a handle of an ended
+// transaction counts nothing another transaction uses — and the context.
 type txHandle struct {
 	*commonTx
 	version uint64
-	mu      sync.Mutex
-	ctx     context.Context
+	// calls is the calls in progress on the transaction, callbacks the
+	// user callbacks running inside them; see enter.
+	calls     atomic.Int32
+	callbacks atomic.Int32
+	ctx       context.Context
 }
 
 func (h *txHandle) Context() context.Context {
@@ -343,19 +354,67 @@ func (h *txHandle) Done() bool {
 	return h.commonTx.version.Load() != h.version
 }
 
-func (h *txHandle) lock() {
-	h.mu.Lock()
+// enter begins a call on the transaction. A call that begins while another
+// is in progress and no callback runs is a misuse — a second goroutine's
+// call, or one from a callback the library does not bracket (a Filter, a
+// Sort, OnIntegrityError) — and panics with ErrTxConcurrentCalls, the way
+// the runtime detects concurrent map writes: a best-effort check of the
+// overlap, not of the goroutine, so a second goroutine's call that lands
+// inside a callback passes for a nested one. The count is given back
+// before the panic: the call in progress goes on, and the transaction can
+// still be ended.
+func (h *txHandle) enter() {
+	if h.calls.Add(1) > 1 && h.callbacks.Load() == 0 {
+		h.calls.Add(-1)
+		panic(ErrTxConcurrentCalls)
+	}
 }
 
-func (h *txHandle) unlock() {
-	h.mu.Unlock()
+// enterEnd begins the call that ends the transaction, or a savepoint
+// opened while cbDepth callbacks were running. From inside a callback the
+// transaction or the savepoint encloses, the end is refused
+// (ErrTxEndInModifier): the operation running the callback holds the btree
+// tx. From inside a callback the savepoint was opened in, it nests. An
+// overlap it waits out instead of refusing: a deferred Rollback must end
+// the transaction after a refused call, or the writer lock is held for
+// good.
+func (h *txHandle) enterEnd(cbDepth int32) error {
+	switch cb := h.callbacks.Load(); {
+	case cb > cbDepth:
+		return ErrTxEndInModifier
+	case cb > 0:
+		h.enter()
+		return nil
+	}
+	for !h.calls.CompareAndSwap(0, 1) {
+		runtime.Gosched()
+	}
+	return nil
 }
 
-// SetModified is a call on the transaction: it takes the turn, and marks
-// nothing once the transaction has ended.
+func (h *txHandle) exit() {
+	h.calls.Add(-1)
+}
+
+// callbackBegin marks a user callback running inside the current call: the
+// calls it makes on the transaction nest in it (enter).
+func (h *txHandle) callbackBegin() {
+	h.callbacks.Add(1)
+}
+
+func (h *txHandle) callbackEnd() {
+	h.callbacks.Add(-1)
+}
+
+func (h *txHandle) callbackDepth() int32 {
+	return h.callbacks.Load()
+}
+
+// SetModified is a call on the transaction, and marks nothing once the
+// transaction has ended.
 func (h *txHandle) SetModified() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.enter()
+	defer h.exit()
 	if !h.Done() {
 		h.markModified()
 	}
@@ -366,8 +425,10 @@ type readTx struct {
 }
 
 func (r readTx) Commit() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	if err := r.enterEnd(0); err != nil {
+		return err
+	}
+	defer r.exit()
 	if r.commonTx.version.CompareAndSwap(r.version, 0) {
 		defer r.commonTx.release()
 		r.commonTx.tripIters()
@@ -392,8 +453,10 @@ func (w writeTx) unwind() error {
 }
 
 func (w writeTx) Rollback() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	if err := w.enterEnd(0); err != nil {
+		return err
+	}
+	defer w.exit()
 	if w.commonTx.version.CompareAndSwap(w.version, 0) {
 		defer w.commonTx.release()
 		return w.unwind()
@@ -401,11 +464,13 @@ func (w writeTx) Rollback() error {
 	return nil
 }
 
-// Commit takes the transaction's turn; commit is the work, kept apart so
-// that its defers stay open-coded.
+// Commit is the call that ends the transaction; commit is the work, kept
+// apart so that its defers stay open-coded.
 func (w writeTx) Commit() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	if err := w.enterEnd(0); err != nil {
+		return err
+	}
+	defer w.exit()
 	return w.commit()
 }
 
@@ -494,10 +559,10 @@ var savepointPool = &sync.Pool{
 	},
 }
 
-// newSavepointTx opens a savepoint on parent, whose lock the caller holds,
-// for a call made with ctx. held marks a savepoint of an enclosing call's
-// scope (enterWriteTx): its own calls lock nothing, and the context it
-// hands out marks the turn as held for the calls made through it.
+// newSavepointTx opens a savepoint on parent, inside a call on it, for a
+// call made with ctx. held marks a savepoint of an enclosing call's scope
+// (enterWriteTx): its own methods begin no call, and the context it hands
+// out marks the transaction as held for the calls made through it.
 func newSavepointTx(ctx context.Context, parent WriteTx, held bool) (WriteTx, error) {
 	btWtx := parent.btreeWriteTx()
 	// Flush buffered full-text writes BEFORE creating the savepoint, so their
@@ -520,7 +585,7 @@ func newSavepointTx(ctx context.Context, parent WriteTx, held bool) (WriteTx, er
 	sp := savepointPool.Get().(*savepointTx)
 	version := sp.reset(spId, len(parent.schemaLog().log))
 	parent.savepointOpened(sp)
-	return savepointWrapper{WriteTx: parent, sp: sp, version: version, held: held, ctx: ctx}, nil
+	return savepointWrapper{WriteTx: parent, sp: sp, version: version, held: held, cbDepth: parent.callbackDepth(), ctx: ctx}, nil
 }
 
 // savepointTx is a savepoint's pooled state: what the parent's stack marks
@@ -553,7 +618,7 @@ type savepointTx struct {
 	scope   uint64
 	version atomic.Uint64
 	// ended: the savepoint, or one enclosing it, has ended
-	// (commonTx.savepointEnded). Read without the parent's lock by Done.
+	// (commonTx.savepointEnded). Read by Done outside any call.
 	ended atomic.Bool
 }
 
@@ -644,20 +709,22 @@ func (sp *savepointTx) releaseImages(enclosing *savepointTx) {
 }
 
 // savepointWrapper is a savepoint's handle: the parent it was opened on —
-// the pooled state and the lock are reached through it — and what is this
-// handle's own, immutable: the savepoint's version, whether the handle is a
-// held one (newSavepointTx), and the context it was opened with.
+// the pooled state and the call counters are reached through it — and
+// what is this handle's own, immutable: the savepoint's version, whether
+// the handle is a held one (newSavepointTx), the callbacks running when it
+// was opened (enterEnd), and the context it was opened with.
 type savepointWrapper struct {
 	WriteTx
 	sp      *savepointTx
 	version uint64
 	held    bool
+	cbDepth int32
 	ctx     context.Context
 }
 
 // Context is the context the savepoint was opened with: for a held
 // savepoint, carrying the transaction as held (heldTx), so that the calls
-// a callback makes through it run under the enclosing call's turn.
+// a callback makes through it nest in the enclosing call.
 func (w savepointWrapper) Context() context.Context {
 	if w.held {
 		return context.WithValue(w.ctx, ctxKeyTx, heldTx{w.WriteTx})
@@ -676,7 +743,7 @@ func (w savepointWrapper) orphaned() bool {
 	return w.WriteTx.Done() || w.sp.ended.Load()
 }
 
-// SetModified marks the parent modified, in the savepoint's turn.
+// SetModified marks the parent modified: a call on it, unless held.
 func (w savepointWrapper) SetModified() {
 	if w.held {
 		if !w.orphaned() {
@@ -684,19 +751,21 @@ func (w savepointWrapper) SetModified() {
 		}
 		return
 	}
-	w.lock()
-	defer w.unlock()
+	w.enter()
+	defer w.exit()
 	if !w.Done() {
 		w.markModified()
 	}
 }
 
-// Commit takes its turn on the parent before it claims the savepoint: a
-// caller that sees Done and then takes a turn finds the end complete.
+// Commit is the call that ends the savepoint (enterEnd), begun before it
+// claims the savepoint.
 func (w savepointWrapper) Commit() error {
 	if !w.held {
-		w.lock()
-		defer w.unlock()
+		if err := w.enterEnd(w.cbDepth); err != nil {
+			return err
+		}
+		defer w.exit()
 	}
 	if !w.sp.version.CompareAndSwap(w.version, 0) {
 		return nil
@@ -715,8 +784,10 @@ func (w savepointWrapper) Commit() error {
 
 func (w savepointWrapper) Rollback() error {
 	if !w.held {
-		w.lock()
-		defer w.unlock()
+		if err := w.enterEnd(w.cbDepth); err != nil {
+			return err
+		}
+		defer w.exit()
 	}
 	if !w.sp.version.CompareAndSwap(w.version, 0) {
 		return nil
@@ -750,16 +821,16 @@ func (w savepointWrapper) Rollback() error {
 	return nil
 }
 
-// Done takes no lock: a savepoint ends under its parent's lock, and marks
-// its pooled state (savepointTx.ended) as it does.
+// Done begins no call: a savepoint ends inside a call on its parent, and
+// marks its pooled state (savepointTx.ended) as it does.
 func (w savepointWrapper) Done() bool {
 	return w.sp.version.Load() != w.version || w.sp.ended.Load() || w.WriteTx.Done()
 }
 
 // noOpTx is the transaction a context carries as an operation gets it
-// (getReadTx) when an enclosing call holds the turn: Commit leaves the
-// transaction open and does nothing. turnTx is the same for an operation
-// that took its own turn: Commit ends the turn.
+// (getReadTx) inside an enclosing call: Commit leaves the transaction open
+// and does nothing. callTx is the same for an operation that began a call
+// of its own: Commit ends the call.
 type noOpTx struct {
 	ReadTx
 }
@@ -768,11 +839,11 @@ func (noOpTx) Commit() error {
 	return nil
 }
 
-type turnTx struct {
+type callTx struct {
 	ReadTx
 }
 
-func (tx turnTx) Commit() error {
-	tx.unlock()
+func (tx callTx) Commit() error {
+	tx.exit()
 	return nil
 }
