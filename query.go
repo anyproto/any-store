@@ -775,22 +775,20 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 //     multi-key dedup internally via the per-entry value byte.
 //  3. Otherwise the shared generic distinct loop.
 func countPlanRoot(plan *qplanner.Plan) (int, error) {
+	// Deferred: a panic in a user filter must not leave the cursors' pages
+	// pinned on the transaction.
+	defer plan.Close()
 	if li, ok := plan.Root.(*qplanner.LimitIter); ok {
-		n, err := li.CountDistinct()
-		plan.Close()
-		return n, err
+		return li.CountDistinct()
 	}
 	if ci, ok := plan.Root.(qplanner.CountableIterator); ok {
-		n, err := ci.CountEntries()
-		plan.Close() // release cursor resources held by CountEntries
-		return n, err
+		return ci.CountEntries()
 	}
 	n := 0
 	err := qplanner.ForEachDistinct(plan.Root, func([]byte) error {
 		n++
 		return nil
 	})
-	plan.Close()
 	return n, err
 }
 
