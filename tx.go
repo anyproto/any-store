@@ -126,6 +126,11 @@ type commonTx struct {
 	// position that pairs nothing. Single-writer state, like the log.
 	savepoints []*savepointTx
 
+	// sketches is the indexes whose live sketch the commit persisted
+	// (persistSketches): settled as the commit becomes visible
+	// (settleSketches), left flagged by a commit that does not.
+	sketches []*index
+
 	// iters is the open iterators that hold cursors on the transaction —
 	// pinned pages of its btree tx. The transaction's end trips them
 	// (tripIters) before the btree tx ends: the pages are released with the
@@ -182,6 +187,7 @@ func (tx *commonTx) schemaLog() *txSchema {
 // — so a transaction the epoch admits finds the handles and the registry
 // as the commit left them.
 func (tx *commonTx) schemaCommitted(fileChangeCounter, schemaCookie uint32) {
+	tx.settleSketches()
 	if testHookBeforeInstall != nil {
 		testHookBeforeInstall()
 	}
@@ -201,16 +207,43 @@ func (tx *commonTx) schemaCommitted(fileChangeCounter, schemaCookie uint32) {
 	tx.db.schemaCommitted(fileChangeCounter, schemaCookie)
 }
 
+// sketchesCommitted is the commit's callback when only sketches were
+// persisted (schemaCommitted settles them too).
+func (tx *commonTx) sketchesCommitted(_, _ uint32) {
+	tx.settleSketches()
+}
+
+// settleSketches publishes the live sketches the commit persisted
+// (commonTx.sketches) as the reader snapshots and clears their flags: the
+// committed row and the live object agree from here on. Inside the btree
+// commit as it becomes visible (btree.WriteTx.OnCommitted), under the write
+// lock: a commit that fails settles nothing, its indexes stay flagged and
+// listed, and the next write transaction rebases them to the committed
+// bytes (resetUncommittedSketches). Settled at the persist instead, the
+// deltas of a failed commit would stay in the live sketch unflagged, for
+// the next commit to persist.
+func (tx *commonTx) settleSketches() {
+	for _, idx := range tx.sketches {
+		idx.storePubSketch(idx.sketch)
+		idx.sketchModified = false
+	}
+	clear(tx.sketches)
+	tx.sketches = tx.sketches[:0]
+}
+
 // testHookBeforeInstall, when set, runs inside a schema-changing commit as
 // it becomes visible, before the heads are installed; testHookAfterInstall
 // once they are, before the registry is settled; testHookAfterSettle once
-// it is, before the epoch moves; testHookAfterBtreeCommit right after the
-// btree commit returned, the write lock released. Tests only.
+// it is, before the epoch moves; testHookBeforeBtreeCommit right before the
+// btree commit, everything of the commit's persisted into the btree tx;
+// testHookAfterBtreeCommit right after the btree commit returned, the
+// write lock released. Tests only.
 var (
-	testHookBeforeInstall    func()
-	testHookAfterInstall     func()
-	testHookAfterSettle      func()
-	testHookAfterBtreeCommit func()
+	testHookBeforeInstall     func()
+	testHookAfterInstall      func()
+	testHookAfterSettle       func()
+	testHookBeforeBtreeCommit func(tx *btree.WriteTx)
+	testHookAfterBtreeCommit  func()
 )
 
 // release returns the pooled state, with nothing pinned. A log still there
@@ -221,6 +254,8 @@ func (tx *commonTx) release() {
 		tx.db.discardLog(&tx.schema, 0)
 	}
 	tx.schema.release()
+	clear(tx.sketches)
+	tx.sketches = tx.sketches[:0]
 	tx.db.txPool.Put(tx)
 }
 
@@ -370,7 +405,7 @@ func (w writeTx) commit() error {
 				_ = w.unwind()
 				return err
 			}
-			if err := w.db.persistAllDirtySketches(w.writeTx); err != nil {
+			if err := w.db.persistAllDirtySketches(w.writeTx, w.commonTx); err != nil {
 				_ = w.unwind()
 				return err
 			}
@@ -394,6 +429,11 @@ func (w writeTx) commit() error {
 			w.db.announceCookie(next)
 			defer w.db.endAnnouncement(next)
 			w.writeTx.OnCommitted(w.commonTx.schemaCommitted)
+		} else if len(w.commonTx.sketches) > 0 {
+			w.writeTx.OnCommitted(w.commonTx.sketchesCommitted)
+		}
+		if testHookBeforeBtreeCommit != nil {
+			testHookBeforeBtreeCommit(w.writeTx)
 		}
 		err := w.writeTx.Commit()
 		if testHookAfterBtreeCommit != nil {

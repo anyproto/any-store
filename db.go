@@ -328,7 +328,7 @@ type db struct {
 	// Writer-owned, no mutex: every access holds the btree write lock, or
 	// schemaGate while a failed commit discards its log (newWriteTx passes
 	// the gate before reading them). Nothing touches them after a btree
-	// commit succeeded. A closed collection stays listed: postings buffered
+	// commit returned. A closed collection stays listed: postings buffered
 	// before a Close() in mid-tx still flush at commit (guarded by
 	// TestFtsPendingSurvivesCollectionCloseMidTx).
 	sketchDirty []*collection
@@ -588,17 +588,19 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 
 // resetUncommittedSketches discards leftover, never-committed sketch deltas at
 // write-tx begin. putEntries/deleteEntries mutate the live sketch in place and set
-// sketchModified; a committed tx clears that flag via persistSketches, but a
-// ROLLED-BACK tx does not — so a still-set sketchModified at the start of a new
-// write tx means a prior tx incremented the sketch and then rolled back. Left
-// alone, those phantom deltas would accumulate across rolled-back txs (and be
-// persisted on the next commit), drifting the planner's cardinality estimate
-// (advisory only — never query results). Here we rebase any such index's live
-// sketch to the last committed on-disk state before the new tx applies its own
-// deltas — the in-methodology analog of resetting to the committed snapshot at
-// tx begin, with zero cost on the all-commit happy path (sketchModified is
-// false there, so the reload is skipped). Write-tx only: the caller holds the
-// btree write lock, so the live sketch has a single mutator.
+// sketchModified; a tx whose commit became visible clears that flag
+// (settleSketches), but a ROLLED-BACK or FAILED tx does not — so a still-set
+// sketchModified at the start of a new write tx means a prior tx incremented
+// the sketch and then did not commit. Left alone, those phantom deltas would
+// accumulate across rolled-back txs (and be persisted on the next commit),
+// drifting the planner's cardinality estimate (advisory only — never query
+// results). Here we rebase any such index's live sketch to the last committed
+// on-disk state before the new tx applies its own deltas — the in-methodology
+// analog of resetting to the committed snapshot at tx begin, with zero cost
+// on the all-commit happy path (sketchModified is false there, so the reload
+// is skipped). Write-tx only: the caller holds the btree write lock, so the
+// live sketch has a single mutator. A savepoint's rollback restores the
+// sketches it wrote itself (savepointTx.images).
 //
 // Only db.sketchDirty is visited, and this is where a collection leaves it:
 // once closed, or once none of its indexes is flagged. An index with no
@@ -1537,11 +1539,11 @@ func (db *db) forgetLocked(c *collection) {
 }
 
 // persistAllDirtySketches writes the modified sketches of the collections in
-// db.sketchDirty, each under the version the transaction has for it. Called
-// once per write transaction commit to batch sketch persistence. It removes
-// nothing from the list: the next write-tx begin does
-// (resetUncommittedSketches).
-func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
+// db.sketchDirty, each under the version the transaction has for it, and
+// lists them on t for the settle (commonTx.settleSketches). Called once per
+// write transaction commit to batch sketch persistence. It removes nothing
+// from the list: the next write-tx begin does (resetUncommittedSketches).
+func (db *db) persistAllDirtySketches(tx *btree.WriteTx, t *commonTx) error {
 	gen := db.epoch.Load().gen
 	for _, c := range db.sketchDirty {
 		if c.closed.Load() {
@@ -1565,7 +1567,7 @@ func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
 			// verified.
 			continue
 		}
-		if err := c.persistSketches(tx, s); err != nil {
+		if err := c.persistSketches(tx, s, t); err != nil {
 			return err
 		}
 	}

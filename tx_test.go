@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
@@ -945,4 +946,85 @@ func BenchmarkWriteTx_Calls(b *testing.B) {
 			}
 		})
 	}
+}
+
+// sketchCounts is a persisted sketch as a comparable, printable value: the
+// document count and the non-empty buckets.
+func sketchCounts(t *testing.T, dbi *db, coll, idx string) (counts map[int]uint64) {
+	info, err := dbi.InspectIndexSketch(ctx, coll, idx)
+	require.NoError(t, err)
+	counts = map[int]uint64{-1: info.DocCount}
+	for i, n := range info.Buckets {
+		if n != 0 {
+			counts[i] = n
+		}
+	}
+	return counts
+}
+
+// A commit the btree refuses leaves no sketch delta behind: the next write
+// transaction rebases the live sketches to the committed bytes, and no
+// later commit persists what the failed one made.
+func TestWriteTx_FailedCommitDiscardsSketchDeltas(t *testing.T) {
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":2,"a":2}`)))
+	// Rolling the btree tx back under the commit makes the commit fail
+	// after the sketches were persisted into it, as an I/O error would.
+	testHookBeforeBtreeCommit = func(btx *btree.WriteTx) { require.NoError(t, btx.Rollback()) }
+	err = tx.Commit()
+	testHookBeforeBtreeCommit = nil
+	require.ErrorIs(t, err, btree.ErrTxClosed)
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":3}`)))
+	n, err := coll.Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+	assert.EqualValues(t, 2, sketchCounts(t, dbi, "c", "a")[-1], "the document the failed commit inserted is not counted")
+	idx := coll.(*collection).loadIndexes()[0]
+	assert.EqualValues(t, 2, idx.sketch.GetDocCount())
+}
+
+// A schema-changing commit settles the sketches it persisted as it
+// installs the schema; a failed one leaves them flagged.
+func TestWriteTx_SchemaCommitSettlesSketches(t *testing.T) {
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
+	idx := coll.(*collection).loadIndexes()[0]
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":2,"a":2}`)))
+	_, err = fx.CreateCollection(tx.Context(), "d")
+	require.NoError(t, err)
+	assert.True(t, idx.sketchModified)
+	testHookBeforeBtreeCommit = func(btx *btree.WriteTx) { require.NoError(t, btx.Rollback()) }
+	err = tx.Commit()
+	testHookBeforeBtreeCommit = nil
+	require.ErrorIs(t, err, btree.ErrTxClosed)
+	assert.True(t, idx.sketchModified, "a failed commit settles nothing")
+	assert.EqualValues(t, 2, idx.sketch.GetDocCount())
+
+	tx, err = fx.WriteTx(ctx)
+	require.NoError(t, err)
+	assert.False(t, idx.sketchModified, "rebased at begin")
+	assert.EqualValues(t, 1, idx.sketch.GetDocCount())
+	require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":3,"a":3}`)))
+	_, err = fx.CreateCollection(tx.Context(), "d")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	assert.False(t, idx.sketchModified)
+	assert.Same(t, idx.sketch, idx.loadPubSketch())
+	assert.EqualValues(t, 2, sketchCounts(t, dbi, "c", "a")[-1])
 }
