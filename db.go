@@ -571,7 +571,7 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 }
 
 // resetUncommittedSketches discards leftover, never-committed sketch deltas at
-// write-tx begin. insertKeys/deleteKeys mutate the live sketch in place and set
+// write-tx begin. putEntries/deleteEntries mutate the live sketch in place and set
 // sketchModified; a committed tx clears that flag via persistSketches, but a
 // ROLLED-BACK tx does not — so a still-set sketchModified at the start of a new
 // write tx means a prior tx incremented the sketch and then rolled back. Left

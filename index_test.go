@@ -4198,22 +4198,19 @@ func TestAudit14_LegacyNilValue_QueryWithLegacyMix(t *testing.T) {
 // --- Subtest 3: update via public API rewrites legacy → bit-set ---
 
 // TestAudit14_LegacyNilValue_OverwriteOnUpdate verifies that an update
-// via the public API REPLACES a legacy nil-value entry with a new
-// bit-set value. The mechanism: collection.update calls deleteKeys
-// (removes by key — value-byte irrelevant) followed by insertKeys
-// (writes the new bit-set value).
+// via the public API which changes the index's key REPLACES a legacy
+// nil-value entry with a new bit-set value. The mechanism: updateKeys
+// sees a changed key sequence, deleteEntries removes the old entry by
+// key (value byte irrelevant) and putEntries writes the new bit-set
+// value.
 //
-// We must change the doc value (not just rewrite identical content) —
-// collection.update has an early-out via anyencutil.Equal that skips
-// the deleteKeys/insertKeys cycle when the old and new values are
-// identical. So we insert {a:10}, inject a legacy entry at the same
-// key, then update to {a:20}: deleteKeys removes the old key (10,d1)
-// regardless of its value byte, and insertKeys writes (20,d1) with the
-// new bit-set value.
+// The indexed value must change: an update that leaves the key as it
+// was writes nothing to the index and keeps the legacy entry
+// (TestIndex_UpdateKeys_UnchangedEntriesNotRewritten). So we insert
+// {a:10}, inject a legacy entry at the same key, then update to {a:20}.
 //
-// This proves there's a natural migration path: any doc that gets
-// touched (with a real value change) will have its index entries
-// normalized to the new format.
+// This is the migration path: a doc whose indexed value changes has
+// that index's entries normalized to the new format.
 func TestAudit14_LegacyNilValue_OverwriteOnUpdate(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit14_update")
@@ -4242,18 +4239,17 @@ func TestAudit14_LegacyNilValue_OverwriteOnUpdate(t *testing.T) {
 	assert.Empty(t, entries[0].Value,
 		"after injection the entry value must be empty (legacy)")
 
-	// Update the doc via the public API. We MUST change the value (10→20)
-	// so collection.update doesn't early-out on the equality check. The
-	// deleteKeys call removes the old (10,d1) entry by key (value byte
-	// irrelevant), and insertKeys writes (20,d1) with the new bit-set
-	// value.
+	// Update the doc via the public API, changing the indexed value
+	// (10→20): deleteEntries removes the old (10,d1) entry by key (value
+	// byte irrelevant), and putEntries writes (20,d1) with the new
+	// bit-set value.
 	require.NoError(t, coll.UpdateOne(ctx,
 		anyenc.MustParseJson(`{"id":"d1","a":20}`)))
 
 	entries = readRawIndexEntries(t, fx.DB, "audit14_update", "ix_a")
 	require.Len(t, entries, 1, "still exactly one entry after update")
 	assert.Equal(t, qplanner.IndexValueScalar, entries[0].Value,
-		"after public-API update the legacy nil entry must be replaced "+
+		"after a key-changing update the legacy nil entry must be replaced "+
 			"with IndexValueScalar (0x00) — this is the migration path")
 
 	// Query still works for the new value.
@@ -4689,4 +4685,239 @@ func TestIndex_EnsureIndex_SameNameChangedDefinitionErrors(t *testing.T) {
 	assert.True(t, coll.GetIndexes()[0].Info().Unique)
 	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":5}`))
 	require.ErrorIs(t, err, ErrUniqueConstraint)
+}
+
+// An update writes an index only when it changes the document's key
+// sequence there; an unchanged sequence leaves the entries and the sketch
+// as they were. Either way the entries end up as those of the new document.
+func TestIndex_UpdateKeys(t *testing.T) {
+	ix := func(sparse, unique bool, fields ...string) IndexInfo {
+		return IndexInfo{Name: "ix", Fields: fields, Sparse: sparse, Unique: unique}
+	}
+	cases := []struct {
+		name       string
+		info       IndexInfo
+		prev, next string
+		moves      bool
+		neighbour  string // another document, inserted first
+	}{
+		{"scalar, other field", ix(false, false, "a"),
+			`{"id":1,"a":1,"v":0}`, `{"id":1,"a":1,"v":1}`, false, ""},
+		{"scalar, indexed field", ix(false, false, "a"),
+			`{"id":1,"a":1,"v":0}`, `{"id":1,"a":2,"v":0}`, true, ""},
+		{"missing to explicit null", ix(false, false, "a"),
+			`{"id":1}`, `{"id":1,"a":null}`, false, ""},
+		{"sparse, missing to explicit null", ix(true, false, "a"),
+			`{"id":1}`, `{"id":1,"a":null}`, true, ""},
+		{"sparse, absent on both sides", ix(true, false, "a"),
+			`{"id":1,"v":0}`, `{"id":1,"v":1}`, false, ""},
+		{"compound, other field", ix(false, false, "a", "b"),
+			`{"id":1,"a":1,"b":2,"v":0}`, `{"id":1,"a":1,"b":2,"v":1}`, false, ""},
+		{"compound, second field", ix(false, false, "a", "b"),
+			`{"id":1,"a":1,"b":2}`, `{"id":1,"a":1,"b":3}`, true, ""},
+		{"unique with a neighbour, other field", ix(false, true, "a"),
+			`{"id":1,"a":1,"v":0}`, `{"id":1,"a":1,"v":1}`, false, `{"id":2,"a":2}`},
+		{"reverse, other field", ix(false, false, "-a"),
+			`{"id":1,"a":1,"v":0}`, `{"id":1,"a":1,"v":1}`, false, ""},
+		{"reverse, indexed field", ix(false, false, "-a"),
+			`{"id":1,"a":1,"v":0}`, `{"id":1,"a":2,"v":0}`, true, ""},
+		{"mixed direction, other field", ix(false, false, "a", "-b"),
+			`{"id":1,"a":1,"b":2,"v":0}`, `{"id":1,"a":1,"b":2,"v":1}`, false, ""},
+		{"array, other field", ix(false, false, "tags"),
+			`{"id":1,"tags":[1,2],"v":0}`, `{"id":1,"tags":[1,2],"v":1}`, false, ""},
+		{"array reordered", ix(false, false, "tags"),
+			`{"id":1,"tags":[1,2]}`, `{"id":1,"tags":[2,1]}`, true, ""},
+		{"dotted path, other field", ix(false, false, "x.y"),
+			`{"id":1,"x":[{"y":1},{"y":2}],"v":0}`, `{"id":1,"x":[{"y":1},{"y":2}],"v":1}`, false, ""},
+		{"dotted path reordered", ix(false, false, "x.y"),
+			`{"id":1,"x":[{"y":1},{"y":2}]}`, `{"id":1,"x":[{"y":2},{"y":1}]}`, true, ""},
+		{"dotted path, an element gains an unindexed field", ix(false, false, "x.y"),
+			`{"id":1,"x":[{"y":1},{"y":2}]}`, `{"id":1,"x":[{"y":1,"z":0},{"y":2}]}`, false, ""},
+		{"shared array, other field", ix(false, false, "arr.x", "arr.y"),
+			`{"id":1,"arr":[{"x":1,"y":1},{"x":2,"y":2}],"v":0}`, `{"id":1,"arr":[{"x":1,"y":1},{"x":2,"y":2}],"v":1}`, false, ""},
+		{"shared array, an element changes", ix(false, false, "arr.x", "arr.y"),
+			`{"id":1,"arr":[{"x":1,"y":1},{"x":2,"y":2}]}`, `{"id":1,"arr":[{"x":1,"y":1},{"x":2,"y":3}]}`, true, ""},
+		{"sparse dotted path keeps one key while fanning out", ix(true, false, "x.y"),
+			`{"id":1,"x":{"y":5}}`, `{"id":1,"x":[{"y":5},{"z":0}]}`, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			seed := func(name string, docs ...string) Collection {
+				coll, err := fx.CreateCollection(ctx, name)
+				require.NoError(t, err)
+				require.NoError(t, coll.EnsureIndex(ctx, tc.info))
+				for _, d := range docs {
+					require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+				}
+				return coll
+			}
+			var docs []string
+			if tc.neighbour != "" {
+				docs = append(docs, tc.neighbour)
+			}
+			coll := seed("test", append(docs, tc.prev)...)
+			before := readRawIndexEntries(t, fx.DB, "test", "ix")
+			_, idx := findIndex(t, coll, "ix")
+
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			require.NoError(t, coll.UpdateOne(tx.Context(), anyenc.MustParseJson(tc.next)))
+			assert.Equal(t, tc.moves, idx.sketchModified, "sketch touched")
+			require.NoError(t, tx.Commit())
+
+			after := readRawIndexEntries(t, fx.DB, "test", "ix")
+			seed("want", append(docs, tc.next)...)
+			assert.Equal(t, readRawIndexEntries(t, fx.DB, "want", "ix"), after, "entries of the new document")
+			if !tc.moves {
+				assert.Equal(t, before, after, "entries rewritten")
+			}
+		})
+	}
+}
+
+// A document that starts fanning out under the sparse rule while keeping
+// its one key still flips the index-level multikey marker, although no
+// entry is written.
+func TestIndex_UpdateKeys_SparseFanOutMarksMultiKey(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ix", Fields: []string{"x.y"}, Sparse: true}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"x":{"y":5}}`)))
+	c, idx := findIndex(t, coll, "ix")
+	require.Equal(t, mkValScalar, readMultikey(t, c, "ix"))
+	before := readRawIndexEntries(t, fx.DB, "test", "ix")
+	require.Len(t, before, 1)
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.UpdateOne(tx.Context(), anyenc.MustParseJson(`{"id":1,"x":[{"y":5},{"z":0}]}`)))
+	assert.False(t, idx.sketchModified, "the key (5) is unchanged")
+	require.NoError(t, tx.Commit())
+
+	assert.Equal(t, mkValMultiKey, readMultikey(t, c, "ix"), "the document fans out now")
+	assert.Equal(t, before, readRawIndexEntries(t, fx.DB, "test", "ix"))
+	require.NoError(t, c.db.doReadTx(ctx, func(rtx *btree.ReadTx) error {
+		assert.False(t, idx.isScalarProven(rtx))
+		return nil
+	}))
+
+	require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":1,"x":{"y":5}}`)))
+	assert.Equal(t, mkValMultiKey, readMultikey(t, c, "ix"), "the marker is one-way")
+}
+
+// An unchanged key is not re-put: an entry stripped of its value byte keeps
+// that shape through an update of another field, and gets the byte back
+// only when the key changes.
+func TestIndex_UpdateKeys_UnchangedEntriesNotRewritten(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ix", Fields: []string{"a"}}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":10,"v":0}`)))
+	c, idx := findIndex(t, coll, "ix")
+	injectRawIndexEntry(t, c, idx, buildIndexFullKey([]any{10}, 1), nil)
+
+	_, err = coll.UpdateId(ctx, 1, query.MustParseModifier(`{"$inc":{"v":1}}`))
+	require.NoError(t, err)
+	entries := readRawIndexEntries(t, fx.DB, "test", "ix")
+	require.Len(t, entries, 1)
+	assert.Empty(t, entries[0].Value, "the entry was re-put")
+
+	_, err = coll.UpdateId(ctx, 1, query.MustParseModifier(`{"$set":{"a":20}}`))
+	require.NoError(t, err)
+	entries = readRawIndexEntries(t, fx.DB, "test", "ix")
+	require.Len(t, entries, 1)
+	assert.Equal(t, buildIndexFullKey([]any{20}, 1), entries[0].Key)
+	assert.Equal(t, qplanner.IndexValueScalar, entries[0].Value)
+}
+
+// With several indexes, only the one whose key changes is written and
+// persisted at commit.
+func TestIndex_UpdateKeys_OnlyChangedIndexMoves(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}, IndexInfo{Fields: []string{"b"}}))
+	for i := range 20 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%3, i%5))))
+	}
+	insp := fx.DB.(IndexSketchInspector)
+	aBefore, err := insp.InspectIndexSketch(ctx, "test", "a")
+	require.NoError(t, err)
+	bBefore, err := insp.InspectIndexSketch(ctx, "test", "b")
+	require.NoError(t, err)
+	aEntries := readRawIndexEntries(t, fx.DB, "test", "a")
+	_, ia := findIndex(t, coll, "a")
+	_, ib := findIndex(t, coll, "b")
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	_, err = coll.UpdateId(tx.Context(), 7, query.MustParseModifier(`{"$set":{"b":9}}`))
+	require.NoError(t, err)
+	assert.False(t, ia.sketchModified)
+	assert.True(t, ib.sketchModified)
+	require.NoError(t, tx.Commit())
+
+	aAfter, err := insp.InspectIndexSketch(ctx, "test", "a")
+	require.NoError(t, err)
+	assert.Equal(t, aBefore, aAfter, "the sketch of a changed")
+	bAfter, err := insp.InspectIndexSketch(ctx, "test", "b")
+	require.NoError(t, err)
+	assert.NotEqual(t, bBefore.Buckets, bAfter.Buckets, "the sketch of b moved")
+	assert.Equal(t, aEntries, readRawIndexEntries(t, fx.DB, "test", "a"))
+}
+
+// The previous-keys slot is bounded like the live one: a document that fans
+// out into more entries than keysBufKeep hands its buffer back after the
+// update.
+func TestIndex_UpdateKeys_ReleasesLargePrevKeys(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ix", Fields: []string{"tags"}}))
+	const n = keysBufKeep + 1000
+	tags := make([]string, n)
+	for i := range tags {
+		tags[i] = strconv.Itoa(i)
+	}
+	doc := func(v int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":1,"tags":[%s],"v":%d}`, strings.Join(tags, ","), v))
+	}
+	require.NoError(t, coll.Insert(ctx, doc(0)))
+	_, idx := findIndex(t, coll, "ix")
+
+	require.NoError(t, coll.UpdateOne(ctx, doc(1)))
+	assert.LessOrEqual(t, cap(idx.prevKeysBuf), keysBufKeep)
+	assertIndexLen(t, idx, n+1) // every element, and the array itself
+
+	require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":1,"tags":[1,2],"v":1}`)))
+	assert.LessOrEqual(t, cap(idx.prevKeysBuf), keysBufKeep)
+	assertIndexLen(t, idx, 3)
+}
+
+// An update that leaves the key alone does not restore an entry that went
+// missing; a rebuild does.
+func TestIndex_Corruption_UnrelatedUpdateLeavesMissingEntry(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":10}`),
+		anyenc.MustParseJson(`{"id":2,"a":20}`),
+	))
+	c, idx := findIndex(t, coll, "a")
+	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		return tx.Delete(idx.ns, buildIndexFullKey([]any{10}, 1))
+	}))
+	assertIndexLen(t, idx, 1)
+
+	require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":1,"a":10,"b":1}`)))
+	assertIndexLen(t, idx, 1)
+
+	require.NoError(t, coll.DropIndex(ctx, "a"))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	assertIndexLen(t, coll.GetIndexes()[0], 2)
 }

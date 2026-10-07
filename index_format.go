@@ -257,7 +257,8 @@ func (db *db) outdatedIndexes(tx *btree.ReadTx, collName string) ([]IndexInfo, e
 // sparse index, elements fanned out under a dotted path), a document this
 // release rejects — rolls back and marks the record with the format it
 // failed at ("vq"): the index stays as it was, the planner never plans an
-// outdated index (plannableIndexes), writes keep maintaining it, Stats and
+// outdated index (plannableIndexes), writes that change a document's keys
+// keep maintaining it, Stats and
 // Explain report it, and no Open retries until the index is dropped and
 // recreated or the format changes again (a successful rebuild under any
 // format clears the mark).

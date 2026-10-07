@@ -711,12 +711,11 @@ func (c *collection) update(tx *btree.WriteTx, s *collSchema, it, prevIt item) (
 		return false, ErrPrimaryKeyModification
 	}
 
-	// Update index entries: delete old, insert new
+	// Range indexes: each moves this document's entries to its new keys; one
+	// whose keys the update leaves as they were is not written (updateKeys).
+	// buf.SmallBuf is the primary key both versions share (checked above).
 	for _, idx := range s.indexes {
-		if err = idx.deleteKeys(tx, prevIt); err != nil {
-			return
-		}
-		if err = idx.insertKeys(tx, it); err != nil {
+		if err = idx.updateKeys(tx, prevIt, it, buf.SmallBuf); err != nil {
 			return
 		}
 	}

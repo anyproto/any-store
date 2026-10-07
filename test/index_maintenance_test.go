@@ -1088,8 +1088,9 @@ func TestIndex_UpsertMutation_UpdateOneIndexConsistency(t *testing.T) {
 
 func TestIndex_UpsertMutation_FindUpdateUniqueConstraintViaInsert(t *testing.T) {
 	// The unique constraint is enforced on EVERY write path, including
-	// Find().Update(): collection.update does deleteKeys+insertKeys, and
-	// insertKeys runs the AppendSeekKey prefix check on each insert, so an
+	// Find().Update(): collection.update moves a changed key through
+	// updateKeys, and putEntries runs the AppendSeekKey prefix check on each
+	// key it writes, so an
 	// update onto another doc's unique value returns ErrUniqueConstraint and
 	// the whole tx rolls back (see TestIndex_Maintenance_FindUpdateUniqueConstraintEnforced
 	// and TestIndex_UniqueSparse_FindUpdateMultiDocCollisionRollsBack).

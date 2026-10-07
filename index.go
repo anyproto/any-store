@@ -330,7 +330,7 @@ type index struct {
 	reverse    []bool
 
 	// sketch is the WRITER-OWNED live selectivity sketch. It is mutated in place
-	// ONLY by the single writer (insertKeys/deleteKeys, serialized by the btree
+	// ONLY by the single writer (putEntries/deleteEntries, serialized by the btree
 	// writeMu and the cross-process WAL write lock) and marshaled by
 	// persistSketches. No reader ever swaps or mutates it, so a concurrent
 	// read-tx reload can never lose the writer's accumulated increments. Inside a
@@ -377,6 +377,10 @@ type index struct {
 	// in keysBuf[k] just past field L's encoding, so keysBuf[k][:keyBoundsBuf[k][L]]
 	// is the level-L prefix fed to the multi-level sketch.
 	keyBoundsBuf [][]int
+	// prevKeysBuf and prevKeyBoundsBuf hold the previous version's keys while
+	// updateKeys compares them with keysBuf; read nowhere else.
+	prevKeysBuf      []anyenc.Tuple
+	prevKeyBoundsBuf [][]int
 	// fields is writeValues' per-field scratch, indexed by field position and
 	// reset once per document (resetFields).
 	fields      []fieldScratch
@@ -516,8 +520,15 @@ func (idx *index) Len(ctx context.Context) (count int, err error) {
 }
 
 // insertKeys inserts index entries for the given item into the index namespace.
-// Both unique and non-unique indexes use key=Tuple(fields..., docId).
-// For unique indexes, a single-shot SeekKey + prefix check enforces the constraint.
+func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
+	idx.fillKeysBuf(it)
+	return idx.putEntries(tx, idx.c.appendId(nil, it.Value()))
+}
+
+// putEntries writes the entries of the document whose keys fill keysBuf; id
+// is its primary key. Both unique and non-unique indexes use
+// key=Tuple(fields..., docId). For unique indexes, a single-shot SeekKey +
+// prefix check enforces the constraint.
 //
 // Per-entry value (1 byte bitmask, see qplanner.IndexEntryFlagMultiKey):
 //   - len(idx.keysBuf) > 1 → IndexValueMultiKey (this doc has >1 entries here)
@@ -527,22 +538,16 @@ func (idx *index) Len(ctx context.Context) (count int, err error) {
 // without a hash set; only multi-key entries pay the dedup cost. Reversible
 // per-doc: an array shrinking from 3 elements to 1 next time round will see
 // its single new entry written with IndexValueScalar.
-func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
-	idx.fillKeysBuf(it)
-	idKey := idx.c.appendId(nil, it.Value())
-
+func (idx *index) putEntries(tx *btree.WriteTx, id []byte) error {
 	entryValue := qplanner.IndexValueScalar
 	if len(idx.keysBuf) > 1 {
 		entryValue = qplanner.IndexValueMultiKey
 	}
 	// Persist the sticky INDEX-LEVEL multikey flag in this same tx, so any
-	// snapshot that can see these entries sees the flag. Several keys mean
-	// this doc fans out (non-empty array at an indexed field); a sparse index
-	// can also keep a SINGLE key of a doc that fans out — the other elements'
-	// keys are dropped — and the index is not scalar then either. entryValue
-	// above is per entry and stays Scalar there: a lone key is still this
-	// doc's only one.
-	if len(idx.keysBuf) > 1 || (idx.skipped && len(idx.keysBuf) == 1) {
+	// snapshot that can see these entries sees the flag. entryValue above is
+	// per entry and stays Scalar for the lone key a sparse index kept of a
+	// fanning-out doc: it is still this doc's only one.
+	if idx.fansOut() {
 		if err := idx.markMultiKey(tx); err != nil {
 			return err
 		}
@@ -551,7 +556,7 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 	prevKi := -1
 	for ki, key := range idx.keysBuf {
 		idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
-		idx.fullKeyBuf = append(idx.fullKeyBuf, idKey...)
+		idx.fullKeyBuf = append(idx.fullKeyBuf, id...)
 
 		if idx.info.Unique {
 			// Escape-aware duplicate probe: a bare HasPrefix would match an
@@ -581,7 +586,7 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 			return err
 		}
 		if idx.sketch != nil {
-			idx.applySketch(ki, prevKi, true)
+			idx.applySketch(idx.keysBuf, idx.keyBoundsBuf, ki, prevKi, true)
 			idx.markSketchModified()
 		}
 		prevKi = ki
@@ -593,8 +598,14 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 	return nil
 }
 
-// deleteKeys deletes index entries for the given item from the index namespace.
-// Both unique and non-unique indexes use key=Tuple(fields..., docId), value=nil.
+// fansOut reports whether the document whose keys fill keysBuf has several
+// values at an indexed field: several keys (a non-empty array there), or the
+// single key a sparse index kept while it dropped the other elements' keys.
+// Either way the index is not scalar any more (markMultiKey).
+func (idx *index) fansOut() bool {
+	return len(idx.keysBuf) > 1 || (idx.skipped && len(idx.keysBuf) == 1)
+}
+
 // markMultiKey persists the sticky one-way index-level multikey flag in the
 // SAME write tx that commits this doc's fan-out entries: any snapshot that can
 // see the entries sees the flag, which is what lets plan-time tight-bounds
@@ -629,13 +640,20 @@ func (idx *index) isScalarProven(tx *btree.ReadTx) bool {
 	return err == nil && len(v) == 1 && v[0] == mkValScalar[0]
 }
 
+// deleteKeys deletes index entries for the given item from the index namespace.
+// Both unique and non-unique indexes use key=Tuple(fields..., docId).
 func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 	idx.fillKeysBuf(it)
-	idKey := idx.c.appendId(nil, it.Value())
+	return idx.deleteEntries(tx, idx.keysBuf, idx.keyBoundsBuf, idx.c.appendId(nil, it.Value()))
+}
+
+// deleteEntries deletes the entries of the document with primary key id whose
+// keys and sketch bounds are given: a filled key set, live or previous.
+func (idx *index) deleteEntries(tx *btree.WriteTx, keys []anyenc.Tuple, bounds [][]int, id []byte) error {
 	prevKi := -1
-	for ki, key := range idx.keysBuf {
+	for ki, key := range keys {
 		idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
-		idx.fullKeyBuf = append(idx.fullKeyBuf, idKey...)
+		idx.fullKeyBuf = append(idx.fullKeyBuf, id...)
 		if err := tx.Delete(idx.ns, idx.fullKeyBuf); err != nil {
 			if !errors.Is(err, btree.ErrKeyNotFound) {
 				return err
@@ -646,7 +664,7 @@ func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 			continue
 		}
 		if idx.sketch != nil {
-			idx.applySketch(ki, prevKi, false)
+			idx.applySketch(keys, bounds, ki, prevKi, false)
 			idx.markSketchModified()
 		}
 		prevKi = ki
@@ -658,28 +676,90 @@ func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 	return nil
 }
 
-// applySketch increments (inc) or decrements the multi-level sketch for entry ki,
-// deduping each prefix level it shares with the previously processed entry prevKi
-// (-1 = none). writeValues' DFS emits keys with equal shallow prefixes
-// contiguously, so a deeper multikey (array) field that fans one document into
-// several entries does not inflate the shallow levels — the level it diverges at
-// and below are bumped, the unchanged shallow prefixes are skipped. A missed
-// duplicate could only over-count, never under-count, matching the sketch's
-// existing collision bias.
-func (idx *index) applySketch(ki, prevKi int, inc bool) {
-	key := idx.keysBuf[ki]
-	bounds := idx.keyBoundsBuf[ki]
-	for L := 0; L < len(bounds); L++ {
+// updateKeys moves a document's entries from the keys of its previous
+// version, prevIt, to those of it; id is the primary key both share (update
+// rejects a change of it first). An index whose key sequence the update
+// leaves unchanged is not written: no entry is deleted or put, the sketch
+// keeps its counts and the collection does not join db.sketchDirty.
+//
+// SQLite's UPDATE skips such an index the same way: sqlite3Update (update.c)
+// leaves aRegIdx[i] zero for an index none of whose columns the statement
+// assigns (indexColumnIsBeingUpdated), unless the key changes or a foreign
+// key or a partial-index clause depends on the assignment, and
+// sqlite3GenerateRowIndexDelete (delete.c), sqlite3GenerateConstraintChecks
+// and sqlite3CompleteInsertion (insert.c) pass it by. The test differs on
+// purpose: update receives whole documents and a query.Modifier is
+// arbitrary code, so there are no assigned columns to inspect; the keys are
+// compared instead, as vectorIndex.update compares the embedding and
+// ftsIndex.updateDoc the token streams. It is exact where SQLite's is
+// conservative: a field set to the value it held writes nothing.
+//
+// The sequences are compared in order, so a reordered array takes the
+// delete-and-put path. Bounds are not compared: they are the field
+// boundaries of the key bytes. Nor is skipped: it changes no entry, only
+// whether the document fans out, so the multikey marker is checked here as
+// putEntries checks it. Nothing is repaired on this path: a missing entry or
+// a legacy entry without its value byte stays until an update changes the
+// keys or the index is rebuilt.
+func (idx *index) updateKeys(tx *btree.WriteTx, prevIt, it item, id []byte) (err error) {
+	idx.fillKeysBuf(prevIt)
+	// Swap the headers only: writeKey copies each key into the entry's own
+	// slice, so the two sets never share entries.
+	idx.keysBuf, idx.prevKeysBuf = idx.prevKeysBuf, idx.keysBuf
+	idx.keyBoundsBuf, idx.prevKeyBoundsBuf = idx.prevKeyBoundsBuf, idx.keyBoundsBuf
+	idx.fillKeysBuf(it)
+	if idx.keysUnchanged() {
+		if idx.fansOut() {
+			err = idx.markMultiKey(tx)
+		}
+	} else if err = idx.deleteEntries(tx, idx.prevKeysBuf, idx.prevKeyBoundsBuf, id); err == nil {
+		// Delete first: a key both versions hold is deleted and put back;
+		// the other order would delete the entry just put.
+		err = idx.putEntries(tx, id)
+	}
+	// fillKeysBuf polices only the live slot.
+	if cap(idx.prevKeysBuf) > keysBufKeep {
+		idx.prevKeysBuf, idx.prevKeyBoundsBuf = nil, nil
+	}
+	return err
+}
+
+// keysUnchanged reports whether the previous and the live key sets are the
+// same sequence.
+func (idx *index) keysUnchanged() bool {
+	if len(idx.prevKeysBuf) != len(idx.keysBuf) {
+		return false
+	}
+	for i, key := range idx.keysBuf {
+		if !bytes.Equal(key, idx.prevKeysBuf[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// applySketch increments (inc) or decrements the multi-level sketch for entry
+// ki of the key set keys/bounds, deduping each prefix level it shares with the
+// previously processed entry prevKi (-1 = none). writeValues' DFS emits keys
+// with equal shallow prefixes contiguously, so a deeper multikey (array) field
+// that fans one document into several entries does not inflate the shallow
+// levels — the level it diverges at and below are bumped, the unchanged
+// shallow prefixes are skipped. A missed duplicate could only over-count,
+// never under-count, matching the sketch's existing collision bias.
+func (idx *index) applySketch(keys []anyenc.Tuple, bounds [][]int, ki, prevKi int, inc bool) {
+	key := keys[ki]
+	kb := bounds[ki]
+	for L := 0; L < len(kb); L++ {
 		if prevKi >= 0 {
-			pe := idx.keyBoundsBuf[prevKi][L]
-			if pe == bounds[L] && bytes.Equal(key[:bounds[L]], idx.keysBuf[prevKi][:pe]) {
+			pe := bounds[prevKi][L]
+			if pe == kb[L] && bytes.Equal(key[:kb[L]], keys[prevKi][:pe]) {
 				continue // same level-L prefix as previous entry: already applied
 			}
 		}
 		if inc {
-			idx.sketch.Increment(L, key[:bounds[L]])
+			idx.sketch.Increment(L, key[:kb[L]])
 		} else {
-			idx.sketch.Decrement(L, key[:bounds[L]])
+			idx.sketch.Decrement(L, key[:kb[L]])
 		}
 	}
 }
@@ -889,7 +969,7 @@ func (idx *index) emitLeaf(i int, l anyenc.Leaf) bool {
 	// Reverse-flagged fields are stored bitwise-inverted so a single forward
 	// index scan yields the field's declared (descending) order; readers skip
 	// such fields via the inverted-tag length path in anyenc.parseValue. The
-	// docId suffix appended later (insertKeys/deleteKeys) and the per-entry
+	// docId suffix appended later (putEntries/deleteEntries) and the per-entry
 	// value flag are NEVER inverted. Inversion is a bijection, so the unique
 	// dedup (isUnique) and unique-constraint seek still compare correctly.
 	reverse := i < len(idx.reverse) && idx.reverse[i]
