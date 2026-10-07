@@ -14,6 +14,7 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/qplanner"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
@@ -1217,8 +1218,157 @@ func TestWriteTx_SchemaCommitSettlesSketches(t *testing.T) {
 	require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":3,"a":3}`)))
 	_, err = fx.CreateCollection(tx.Context(), "d")
 	require.NoError(t, err)
+	idx.storePubSketch(qplanner.NewIndexSketch(qplanner.DefaultSketchSize, 1)) // as a peer's reload leaves one
 	require.NoError(t, tx.Commit())
 	assert.False(t, idx.sketchModified)
-	assert.Same(t, idx.sketch, idx.loadPubSketch())
+	assert.Same(t, idx.sketch, idx.loadPubSketch(), "republished by the schema commit")
 	assert.EqualValues(t, 2, sketchCounts(t, dbi, "c", "a")[-1])
+}
+
+// A savepoint left open when its transaction ends keeps nothing: its
+// pooled state serves the next savepoint — of any database — with no image
+// of a sketch the earlier one wrote.
+func TestWriteTx_SavepointLeftOpenAtTxEnd(t *testing.T) {
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, id, id))
+	}
+	setup := func(t *testing.T) (*db, Collection, *index) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		require.NoError(t, coll.Insert(ctx, doc(1)))
+		return fx.DB.(*db), coll, coll.(*collection).loadIndexes()[0]
+	}
+	// leaveOpen writes doc 2 inside a savepoint and commits the transaction
+	// over it; the savepoint's late end finds it orphaned.
+	leaveOpen := func(t *testing.T, dbi *db, coll Collection) {
+		tx, err := dbi.WriteTx(ctx)
+		require.NoError(t, err)
+		sp, err := dbi.WriteTx(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(sp.Context(), doc(2)))
+		require.NoError(t, tx.Commit())
+		state := sp.(savepointWrapper).sp
+		require.ErrorIs(t, sp.Rollback(), ErrTxIsUsed)
+		assert.Empty(t, state.images, "the state goes to the pool clean")
+	}
+
+	t.Run("same database", func(t *testing.T) {
+		dbi, coll, idx := setup(t)
+		leaveOpen(t, dbi, coll)
+		tx, err := dbi.WriteTx(ctx)
+		require.NoError(t, err)
+		sp, err := dbi.WriteTx(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(sp.Context(), doc(3)))
+		require.NoError(t, sp.Rollback())
+		assert.EqualValues(t, 2, idx.sketch.GetDocCount(), "the rollback restores its own image only")
+		require.NoError(t, coll.Insert(tx.Context(), doc(4)))
+		require.NoError(t, tx.Commit())
+		assert.Equal(t, sketchRebuilt(t, dbi, coll, "a"), sketchCounts(t, dbi, "c", "a"))
+	})
+
+	t.Run("another database", func(t *testing.T) {
+		db1, coll1, idx1 := setup(t)
+		db2, coll2, _ := setup(t)
+		leaveOpen(t, db1, coll1)
+		require.NoError(t, coll1.Insert(ctx, doc(3)))
+		require.EqualValues(t, 3, idx1.sketch.GetDocCount())
+
+		tx, err := db2.WriteTx(ctx)
+		require.NoError(t, err)
+		sp, err := db2.WriteTx(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll2.Insert(sp.Context(), doc(2)))
+		require.NoError(t, sp.Rollback())
+		require.NoError(t, tx.Commit())
+		assert.EqualValues(t, 3, idx1.sketch.GetDocCount(), "untouched by the other database's rollback")
+	})
+}
+
+// A savepoint holds one image per index its scope wrote, however many
+// verbs wrote it: the verbs' own savepoints hand their images up once and
+// drop them from then on. A rename's clone is another index object of the
+// same sketch: its newer image restores first, the older wins.
+func TestWriteTx_SavepointImagesOncePerIndex(t *testing.T) {
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, id, id, id))
+	}
+	t.Run("one per index", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}, IndexInfo{Fields: []string{"b"}}))
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		for i := 0; i < 50; i++ {
+			require.NoError(t, coll.Insert(sp.Context(), doc(i)))
+		}
+		assert.Len(t, sp.(savepointWrapper).sp.images, 2)
+		require.NoError(t, sp.Rollback())
+		require.NoError(t, tx.Commit())
+		n, err := coll.Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 0, n)
+	})
+
+	t.Run("a clone's newer image", func(t *testing.T) {
+		fx := newFixture(t)
+		dbi := fx.DB.(*db)
+		coll, err := fx.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		require.NoError(t, coll.Insert(ctx, doc(1)))
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		outer, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		inner, err := fx.WriteTx(outer.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(inner.Context(), doc(2)))
+		require.NoError(t, coll.Rename(inner.Context(), "d"))
+		require.NoError(t, inner.Commit())
+		require.NoError(t, coll.Insert(outer.Context(), doc(3)))
+		require.Len(t, outer.(savepointWrapper).sp.images, 2, "the original's and the clone's")
+		require.NoError(t, outer.Rollback())
+		require.NoError(t, tx.Commit())
+		require.NoError(t, coll.Insert(ctx, doc(4)))
+		assert.EqualValues(t, 2, sketchCounts(t, dbi, "c", "a")[-1])
+		assert.Equal(t, sketchRebuilt(t, dbi, coll, "a"), sketchCounts(t, dbi, "c", "a"))
+	})
+}
+
+// A rollback restores every counter, the level totals included, and a
+// commit of sketches alone republishes the live sketch and clears the flag.
+func TestWriteTx_SketchRestoreAndSettle(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, id, id, id))
+	}
+	require.NoError(t, coll.Insert(ctx, doc(1)))
+	idx := coll.(*collection).loadIndexes()[0]
+	before := idx.sketch.MarshalBinary(nil)
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	sp, err := fx.WriteTx(tx.Context())
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(sp.Context(), doc(2), doc(3)))
+	require.NoError(t, sp.Rollback())
+	assert.Equal(t, before, idx.sketch.MarshalBinary(nil))
+	require.NoError(t, tx.Commit())
+
+	// A reader-owned snapshot, as a peer's reload leaves one.
+	idx.storePubSketch(qplanner.NewIndexSketch(qplanner.DefaultSketchSize, 2))
+	require.NoError(t, coll.Insert(ctx, doc(4)))
+	assert.False(t, idx.sketchModified)
+	assert.Same(t, idx.sketch, idx.loadPubSketch(), "republished")
 }

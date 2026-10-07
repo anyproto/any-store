@@ -328,7 +328,7 @@ type db struct {
 	// Writer-owned, no mutex: every access holds the btree write lock, or
 	// schemaGate while a failed commit discards its log (newWriteTx passes
 	// the gate before reading them). Nothing touches them after a btree
-	// commit returned. A closed collection stays listed: postings buffered
+	// commit succeeded. A closed collection stays listed: postings buffered
 	// before a Close() in mid-tx still flush at commit (guarded by
 	// TestFtsPendingSurvivesCollectionCloseMidTx).
 	sketchDirty []*collection
@@ -508,7 +508,9 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 func (db *db) pooledTx() *commonTx {
 	tx, _ := db.txPool.Get().(*commonTx)
 	if tx == nil {
-		return &commonTx{db: db}
+		tx = &commonTx{db: db}
+		tx.committed = tx.onCommitted
+		return tx
 	}
 	clear(tx.savepoints)
 	tx.savepoints = tx.savepoints[:0]

@@ -870,3 +870,20 @@ func TestCommit_OlderCollectionUnderTheNameInThePublication(t *testing.T) {
 	require.NoError(t, err)
 	assertCollCount(t, x2, 0)
 }
+
+// A raw btree transaction (no commonTx in its Aux slot) keeps the memo
+// memoPut gives it.
+func TestTxSchemaOf_RawTxMemo(t *testing.T) {
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	c := coll.(*collection)
+
+	tx, err := dbi.btreeDB.BeginReadFast()
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	assert.Nil(t, memoGet(tx, c))
+	memoPut(tx, c, c.cur())
+	assert.Same(t, c.cur(), memoGet(tx, c))
+}

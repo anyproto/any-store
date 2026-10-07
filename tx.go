@@ -109,9 +109,9 @@ type commonTx struct {
 	modified atomic.Bool
 
 	// schema is the transaction's own schema state (txSchema), reached
-	// through the btree transaction's Aux slot — which holds the commonTx —
-	// for the resolve of every operation. For a
-	// write transaction its log holds the uncommitted DDL: the writes later
+	// through the btree transaction's Aux slot, which holds the commonTx,
+	// for the resolve of every operation. For a write transaction its log
+	// holds the uncommitted DDL: the writes later
 	// in the same tx see and maintain an index or collection created earlier
 	// in it through the log, nothing else does until the commit installs
 	// it, and a rollback — full, failed-commit, or to a savepoint
@@ -132,6 +132,12 @@ type commonTx struct {
 	// (persistSketches): settled as the commit becomes visible
 	// (settleSketches), left flagged by a commit that does not.
 	sketches []*index
+	// committed is onCommitted bound once (db.pooledTx): a method value
+	// escapes, and a commit that persisted sketches would allocate it every
+	// time. schemaChange is what the commit told the callback beyond the
+	// sketches: the btree tx changed the schema (schemaCommitted).
+	committed    func(fileChangeCounter, schemaCookie uint32)
+	schemaChange bool
 
 	// iters is the open iterators that hold cursors on the transaction —
 	// pinned pages of its btree tx. The transaction's end trips them
@@ -194,13 +200,20 @@ func (tx *commonTx) schemaLog() *txSchema {
 	return &tx.schema
 }
 
+// journalSketch takes the pre-image of idx's live sketch onto the innermost
+// open savepoint, if any (savepointTx.journalSketch).
+func (tx *commonTx) journalSketch(idx *index) {
+	if n := len(tx.savepoints); n > 0 {
+		tx.savepoints[n-1].journalSketch(idx)
+	}
+}
+
 // schemaCommitted runs inside the btree commit as it becomes visible
 // (btree.WriteTx.OnCommitted): the logged versions become the heads, the
 // registry follows them, then the epoch's known passes the commit's cookie
 // — so a transaction the epoch admits finds the handles and the registry
 // as the commit left them.
 func (tx *commonTx) schemaCommitted(fileChangeCounter, schemaCookie uint32) {
-	tx.settleSketches()
 	if testHookBeforeInstall != nil {
 		testHookBeforeInstall()
 	}
@@ -220,21 +233,23 @@ func (tx *commonTx) schemaCommitted(fileChangeCounter, schemaCookie uint32) {
 	tx.db.schemaCommitted(fileChangeCounter, schemaCookie)
 }
 
-// sketchesCommitted is the commit's callback when only sketches were
-// persisted (schemaCommitted settles them too).
-func (tx *commonTx) sketchesCommitted(_, _ uint32) {
+// onCommitted is the commit's callback (btree.WriteTx.OnCommitted, bound
+// as commonTx.committed): the sketches the commit persisted settle, then
+// the schema it changed installs.
+func (tx *commonTx) onCommitted(fileChangeCounter, schemaCookie uint32) {
 	tx.settleSketches()
+	if tx.schemaChange {
+		tx.schemaCommitted(fileChangeCounter, schemaCookie)
+	}
 }
 
 // settleSketches publishes the live sketches the commit persisted
 // (commonTx.sketches) as the reader snapshots and clears their flags: the
 // committed row and the live object agree from here on. Inside the btree
-// commit as it becomes visible (btree.WriteTx.OnCommitted), under the write
-// lock: a commit that fails settles nothing, its indexes stay flagged and
-// listed, and the next write transaction rebases them to the committed
-// bytes (resetUncommittedSketches). Settled at the persist instead, the
-// deltas of a failed commit would stay in the live sketch unflagged, for
-// the next commit to persist.
+// commit as it becomes visible, under the write lock: a commit that fails
+// settles nothing, its indexes stay flagged and listed, and the next write
+// transaction rebases them to the committed bytes
+// (resetUncommittedSketches).
 func (tx *commonTx) settleSketches() {
 	for _, idx := range tx.sketches {
 		idx.storePubSketch(idx.sketch)
@@ -267,6 +282,14 @@ func (tx *commonTx) release() {
 		tx.db.discardLog(&tx.schema, 0)
 	}
 	tx.schema.release()
+	// A savepoint still open ends with the transaction, as SQLite frees
+	// every savepoint at the end of a transaction (pager.c
+	// releaseAllSavepoints): its images go — a commit kept the writes, a
+	// rollback is rebased at the next begin — before its handle can pool
+	// the state for a savepoint of any database.
+	for _, sp := range tx.savepoints {
+		sp.releaseImages(nil)
+	}
 	clear(tx.sketches)
 	tx.sketches = tx.sketches[:0]
 	tx.db.txPool.Put(tx)
@@ -441,9 +464,10 @@ func (w writeTx) commit() error {
 			next := w.writeTx.DiskSchemaCookie() + 1
 			w.db.announceCookie(next)
 			defer w.db.endAnnouncement(next)
-			w.writeTx.OnCommitted(w.commonTx.schemaCommitted)
-		} else if len(w.commonTx.sketches) > 0 {
-			w.writeTx.OnCommitted(w.commonTx.sketchesCommitted)
+		}
+		w.commonTx.schemaChange = schemaChange
+		if schemaChange || len(w.commonTx.sketches) > 0 {
+			w.writeTx.OnCommitted(w.commonTx.committed)
 		}
 		if testHookBeforeBtreeCommit != nil {
 			testHookBeforeBtreeCommit(w.writeTx)
@@ -512,13 +536,16 @@ type savepointTx struct {
 	// images are the pre-images of the live sketches first written inside
 	// this savepoint's scope (journalSketch), in creation order: a rollback
 	// restores them (restoreImages), a release hands them to the enclosing
-	// savepoint (releaseImages). The statement journal of SQLite's pager
-	// keeps a page's pre-image the same way — once per savepoint
-	// (pager.c subjRequiresPage), kept by RELEASE for the savepoint
-	// enclosing it, played back by ROLLBACK TO (pagerPlaybackSavepoint).
-	// Nothing is journaled outside a savepoint: a full rollback is rebased
-	// at the next write-tx begin (db.resetUncommittedSketches). Buffers stay
-	// with the pooled state.
+	// savepoint, or drops the ones it holds an older image of
+	// (releaseImages). The statement journal of SQLite's pager keeps a
+	// page's pre-image the same way — once per savepoint (pager.c
+	// subjRequiresPage), kept by RELEASE for the savepoint enclosing it
+	// unless that one has it (bTruncateOnRelease), played back by ROLLBACK
+	// TO (pagerPlaybackSavepoint). Nothing is journaled outside a
+	// savepoint: a full rollback is rebased at the next write-tx begin
+	// (db.resetUncommittedSketches), and a savepoint open as its
+	// transaction ends drops them (commonTx.release). Buffers stay with the
+	// pooled state.
 	images []sketchImage
 	// scope is the version the savepoint was opened with, kept once a
 	// handle claimed its end (version is zeroed then): what the images of
@@ -582,19 +609,25 @@ func (sp *savepointTx) journalSketch(idx *index) {
 func (sp *savepointTx) restoreImages() {
 	for i := len(sp.images) - 1; i >= 0; i-- {
 		img := &sp.images[i]
-		img.idx.sketch.Restore(img.buf)
+		if img.idx.sketch.Restore(img.buf) {
+			img.idx.sketchModified = img.modified
+		} else {
+			// Bytes of another shape, not restored: the deltas stay and
+			// the flag keeps them for the next begin's rebase.
+			img.idx.sketchModified = true
+		}
 		img.idx.sketchImaged = img.prev
-		img.idx.sketchModified = img.modified
 		img.idx = nil
 	}
 	sp.images = sp.images[:0]
 }
 
 // releaseImages hands the images to the savepoint enclosing this one, which
-// keeps the older image it holds of the same sketch (prev names it) and
-// adopts the rest: nothing wrote that sketch between the two savepoints'
+// keeps the older image it holds of the same index (prev names it) and
+// adopts the rest: nothing wrote that index between the two savepoints'
 // creation, or the enclosing one would hold an image. With no enclosing
-// savepoint the images are dropped.
+// savepoint the images are dropped. The marker follows the image that
+// stays.
 func (sp *savepointTx) releaseImages(enclosing *savepointTx) {
 	for i := range sp.images {
 		img := &sp.images[i]
@@ -602,6 +635,8 @@ func (sp *savepointTx) releaseImages(enclosing *savepointTx) {
 			img.idx.sketchImaged = enclosing.scope
 			enclosing.images = append(enclosing.images, *img)
 			img.buf = nil
+		} else {
+			img.idx.sketchImaged = img.prev
 		}
 		img.idx = nil
 	}

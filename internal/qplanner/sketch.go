@@ -27,7 +27,8 @@ import (
 //     distinct element. So levelTotals[L] != docCount in general, and differs
 //     between levels. Exposed via EntryCount(L).
 //
-// All methods are safe for concurrent use via atomic operations.
+// All methods are safe for concurrent use via atomic operations, except
+// Snapshot: the writer's.
 //
 // # Plan-time only
 //
@@ -407,10 +408,10 @@ func percentile(sorted []uint64, p float64) uint64 {
 	return sorted[idx]
 }
 
-// Snapshot appends the counters of s — buckets, level totals, document
-// count — to dst: the pre-image a savepoint's rollback puts back with
-// Restore. Writer only: s has a single mutator, so plain loads see its
-// counts.
+// Snapshot copies the counters of s — buckets, level totals, document
+// count — into dst, reusing its capacity: the pre-image a savepoint's
+// rollback puts back with Restore. Writer only: s has a single mutator, so
+// plain loads see its counts.
 func (s *IndexSketch) Snapshot(dst []uint64) []uint64 {
 	dst = append(dst[:0], s.Buckets...)
 	dst = append(dst, s.levelTotals...)
@@ -418,12 +419,13 @@ func (s *IndexSketch) Snapshot(dst []uint64) []uint64 {
 }
 
 // Restore sets the counters from a Snapshot of s, with atomic stores for
-// the readers loading them concurrently. A snapshot of another shape is
-// ignored: a live sketch keeps its index's shape.
-func (s *IndexSketch) Restore(src []uint64) {
+// the readers loading them concurrently, and reports whether it did: a
+// snapshot of another shape is ignored, as a live sketch keeps its index's
+// shape.
+func (s *IndexSketch) Restore(src []uint64) bool {
 	nb := len(s.Buckets)
 	if len(src) != nb+len(s.levelTotals)+1 {
-		return
+		return false
 	}
 	for i := range s.Buckets {
 		atomic.StoreUint64(&s.Buckets[i], src[i])
@@ -432,6 +434,7 @@ func (s *IndexSketch) Restore(src []uint64) {
 		atomic.StoreUint64(&s.levelTotals[l], src[nb+l])
 	}
 	s.docCount.Store(src[nb+len(s.levelTotals)])
+	return true
 }
 
 // Reset zeroes all buckets, level totals, and the document count.

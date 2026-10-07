@@ -330,7 +330,8 @@ type index struct {
 	reverse    []bool
 
 	// sketch is the WRITER-OWNED live selectivity sketch. It is mutated in place
-	// ONLY by the single writer (putEntries/deleteEntries, serialized by the btree
+	// ONLY by the single writer (putEntries/deleteEntries, a savepoint's
+	// restoreImages, the writer's reloadSketch, serialized by the btree
 	// writeMu and the cross-process WAL write lock) and marshaled by
 	// persistSketches. No reader ever swaps or mutates it, so a concurrent
 	// read-tx reload can never lose the writer's accumulated increments. Inside a
@@ -407,7 +408,8 @@ type index struct {
 func (idx *index) loadPubSketch() *qplanner.IndexSketch { return idx.sketchPub.Load() }
 
 // storePubSketch publishes a reader snapshot. Callers hold c.mu (publisher
-// serialisation, like storeIndexes); readers need no lock.
+// serialisation, like storeIndexes) or the btree write lock
+// (commonTx.settleSketches); readers need no lock.
 func (idx *index) storePubSketch(s *qplanner.IndexSketch) { idx.sketchPub.Store(s) }
 
 // markSketchModified flags the live sketch as holding unpersisted deltas and
@@ -418,14 +420,13 @@ func (idx *index) markSketchModified() {
 }
 
 // sketchWrite precedes the sketch mutations of one entry write (putEntries,
-// deleteEntries): inside a savepoint it journals the live sketch on the
-// innermost one, so the savepoint's rollback restores it, then flags it
-// modified. A write transaction opened by the db carries itself in the
-// btree transaction's Aux slot; one that does not (a rebuild on a copy)
-// journals nothing.
+// deleteEntries): inside a savepoint it journals the live sketch, so the
+// savepoint's rollback restores it, then flags it modified. A write
+// transaction of the db carries itself in the btree transaction's Aux
+// slot; a bare btree transaction journals nothing.
 func (idx *index) sketchWrite(tx *btree.WriteTx) {
-	if t, _ := tx.Aux().(*commonTx); t != nil && len(t.savepoints) > 0 {
-		t.savepoints[len(t.savepoints)-1].journalSketch(idx)
+	if t, _ := tx.Aux().(*commonTx); t != nil {
+		t.journalSketch(idx)
 	}
 	idx.markSketchModified()
 }
