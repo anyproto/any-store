@@ -1994,6 +1994,39 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		require.NoError(t, tx.Rollback())
 	})
 
+	t.Run("sketches: an update leaving every key as it was joins nothing", func(t *testing.T) {
+		fx := newFixture(t)
+		dbi := fx.DB.(*db)
+		a := create(t, fx, "a", rangeIdx, IndexInfo{Fields: []string{"n"}})
+		b := create(t, fx, "b", rangeIdx)
+		require.NoError(t, a.Insert(ctx, doc(1)))
+		require.NoError(t, b.Insert(ctx, doc(1)))
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		set := func(c *collection, mod string) {
+			_, err := c.UpdateId(tx.Context(), 1, query.MustParseModifier(mod))
+			require.NoError(t, err)
+		}
+		assert.Empty(t, names(dbi.sketchDirty))
+		set(a, `{"$set":{"body":"other words"}}`)
+		assert.Empty(t, names(dbi.sketchDirty), "no key of a changed")
+		set(b, `{"$set":{"a":2}}`)
+		assert.Equal(t, []string{"b"}, names(dbi.sketchDirty))
+		set(a, `{"$set":{"n":1}}`)
+		assert.Equal(t, []string{"b", "a"}, names(dbi.sketchDirty))
+		var modified []string
+		for _, idx := range a.loadIndexes() {
+			if idx.sketchModified {
+				modified = append(modified, idx.info.Name)
+			}
+		}
+		assert.Equal(t, []string{"n"}, modified, "only the index whose key changed")
+		set(a, `{"$set":{"body":"more words"}}`)
+		assert.Equal(t, []string{"b", "a"}, names(dbi.sketchDirty))
+		require.NoError(t, tx.Commit())
+	})
+
 	t.Run("fulltext: listed while postings are buffered", func(t *testing.T) {
 		fx := newFixture(t)
 		dbi := fx.DB.(*db)

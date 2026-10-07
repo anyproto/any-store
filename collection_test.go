@@ -1087,3 +1087,89 @@ func TestDropOrphanStaleIndexesRepro(t *testing.T) {
 		t.Fatalf("C.EnsureIndex(other) after drop+reopen failed (orphan namespace?): %v", err)
 	}
 }
+
+// Every verb that modifies a document goes through update: none of them
+// writes an index whose keys the change leaves alone.
+func TestCollection_UpdateLeavesUnchangedIndexes(t *testing.T) {
+	inc := query.MustParseModifier(`{"$inc":{"v":1}}`)
+	verbs := []struct {
+		name   string
+		srcDoc string // for $merge: the document of the source collection
+		run    func(t *testing.T, fx *fixture, ctx context.Context, coll Collection)
+	}{
+		{"UpdateOne", "", func(t *testing.T, fx *fixture, ctx context.Context, coll Collection) {
+			require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":1,"a":1,"u":1,"v":1}`)))
+		}},
+		{"UpdateId", "", func(t *testing.T, fx *fixture, ctx context.Context, coll Collection) {
+			res, err := coll.UpdateId(ctx, 1, inc)
+			require.NoError(t, err)
+			assert.Equal(t, 1, res.Modified)
+		}},
+		{"UpsertOne", "", func(t *testing.T, fx *fixture, ctx context.Context, coll Collection) {
+			require.NoError(t, coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":1,"a":1,"u":1,"v":1}`)))
+		}},
+		{"UpsertId", "", func(t *testing.T, fx *fixture, ctx context.Context, coll Collection) {
+			res, err := coll.UpsertId(ctx, 1, inc)
+			require.NoError(t, err)
+			assert.Equal(t, 1, res.Modified)
+		}},
+		{"Find().Update", "", func(t *testing.T, fx *fixture, ctx context.Context, coll Collection) {
+			res, err := coll.Find(`{"id":1}`).Update(ctx, inc)
+			require.NoError(t, err)
+			assert.Equal(t, 1, res.Modified)
+		}},
+		{"$merge replace", `{"id":1,"a":1,"u":1,"v":1}`, func(t *testing.T, fx *fixture, ctx context.Context, coll Collection) {
+			src, err := fx.Collection(ctx, "src")
+			require.NoError(t, err)
+			n, err := src.Aggregate(`[{"$merge":{"into":"test","whenMatched":"replace","whenNotMatched":"fail"}}]`).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 1, n)
+		}},
+		{"$merge merge", `{"id":1,"v":1}`, func(t *testing.T, fx *fixture, ctx context.Context, coll Collection) {
+			src, err := fx.Collection(ctx, "src")
+			require.NoError(t, err)
+			n, err := src.Aggregate(`[{"$merge":{"into":"test","whenMatched":"merge","whenNotMatched":"fail"}}]`).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 1, n)
+		}},
+	}
+	for _, v := range verbs {
+		t.Run(v.name, func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "test")
+			require.NoError(t, err)
+			require.NoError(t, coll.EnsureIndex(ctx,
+				IndexInfo{Fields: []string{"a"}},
+				IndexInfo{Fields: []string{"u"}, Unique: true},
+			))
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1,"u":1,"v":0}`)))
+			if v.srcDoc != "" {
+				src, err := fx.CreateCollection(ctx, "src")
+				require.NoError(t, err)
+				require.NoError(t, src.Insert(ctx, anyenc.MustParseJson(v.srcDoc)))
+			}
+			// Witnesses: both entries stripped of their value byte, which a
+			// re-put would restore.
+			c, ia := findIndex(t, coll, "a")
+			_, iu := findIndex(t, coll, "u")
+			injectRawIndexEntry(t, c, ia, buildIndexFullKey([]any{1}, 1), nil)
+			injectRawIndexEntry(t, c, iu, buildIndexFullKey([]any{1}, 1), nil)
+
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			require.False(t, c.sketchDirty)
+			v.run(t, fx, tx.Context(), coll)
+			assert.False(t, c.sketchDirty, "an index of the collection was written")
+			require.NoError(t, tx.Commit())
+
+			for _, name := range []string{"a", "u"} {
+				entries := readRawIndexEntries(t, fx.DB, "test", name)
+				require.Len(t, entries, 1)
+				assert.Empty(t, entries[0].Value, "index %s was re-put", name)
+			}
+			doc, err := coll.FindId(ctx, 1)
+			require.NoError(t, err)
+			assert.Equal(t, float64(1), doc.Value().GetFloat64("v"))
+		})
+	}
+}
