@@ -106,3 +106,56 @@ func MayTighten(f Filter) bool {
 		return false
 	}
 }
+
+// ConjunctBounds enumerates, for fieldName, the bounds each same-field
+// conjunct contributes ON ITS OWN — the bound sets And.IndexBounds keeps the
+// first of. Every yielded set is a sound seek range by the wide channel's own
+// argument: a matching document satisfies that conjunct, so it has an index
+// entry inside its bounds, and the residual filter re-checks the rest. The
+// planner rates each against the index statistics and seeds the seek with
+// the most selective one; it never intersects them (see TightIndexBounds for
+// why that drops documents on a multi-key path).
+//
+// Node handling mirrors TightIndexBounds: Key routes the field (its own path,
+// or an object-form $elemMatch re-keyed under its sub-fields); And/*And
+// flatten their children (nested $and, inline {$in,$eq}, $all → And(Eq…));
+// every other node is a leaf whose IndexBounds is yielded when non-empty, so
+// Or keeps its all-or-nothing union. The first set yielded is the one
+// And.IndexBounds returns, so a caller that keeps it pays no more than the
+// wide channel does; every set is a fresh slice the caller may retain. yield
+// returning false stops the walk. Bound bytes alias filter-owned clipped
+// memory and are never mutated, per docs/query-filter-contract.md.
+func ConjunctBounds(f Filter, fieldName string, yield func(Bounds) bool) {
+	conjunctBounds(f, fieldName, yield)
+}
+
+func conjunctBounds(f Filter, fieldName string, yield func(Bounds) bool) bool {
+	switch t := f.(type) {
+	case Key:
+		if t.PathIs(fieldName) {
+			return conjunctBounds(t.Filter, fieldName, yield)
+		}
+		if cond, sub, ok := t.elemMatchSubField(fieldName); ok {
+			return conjunctBounds(cond, sub, yield)
+		}
+		return true
+	case And:
+		return conjunctAndBounds(t, fieldName, yield)
+	case *And:
+		return conjunctAndBounds(*t, fieldName, yield)
+	default:
+		if bs := f.IndexBounds(fieldName, nil); len(bs) > 0 {
+			return yield(bs)
+		}
+		return true
+	}
+}
+
+func conjunctAndBounds(conj And, fieldName string, yield func(Bounds) bool) bool {
+	for _, child := range conj {
+		if !conjunctBounds(child, fieldName, yield) {
+			return false
+		}
+	}
+	return true
+}

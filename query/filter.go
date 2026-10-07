@@ -508,6 +508,25 @@ func okLeafSet(f Filter, leaves []anyenc.Leaf, buf *syncpool.DocBuffer) bool {
 	return okLeaves(f, leaves, buf)
 }
 
+// PathIs reports whether the key's path names fieldName (segments joined by
+// dots), without building the joined string.
+func (e Key) PathIs(fieldName string) bool {
+	off := 0
+	for i, seg := range e.Path {
+		if i > 0 {
+			if off >= len(fieldName) || fieldName[off] != '.' {
+				return false
+			}
+			off++
+		}
+		if len(fieldName)-off < len(seg) || fieldName[off:off+len(seg)] != seg {
+			return false
+		}
+		off += len(seg)
+	}
+	return off == len(fieldName)
+}
+
 // IndexBounds delegates to the inner filter on this path's own field. An
 // object-form $elemMatch additionally constrains the fields BELOW the path:
 // {"a":{"$elemMatch":{"b":{"$gt":1}}}} bounds "a.b" exactly as
@@ -540,7 +559,9 @@ func (e And) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 // IndexBounds returns a SOUND OVER-APPROXIMATION of the index bounds for this
 // conjunction: the bounds of the first conjunct that constrains fieldName. The
 // result must be a SUPERSET of the matching set so the index seek (and Iter)
-// never miss a doc.
+// never miss a doc. Which conjunct seeds a seek is the planner's choice:
+// ConjunctBounds enumerates every conjunct's own bounds for it to rate
+// against the index statistics; this pick is the default it starts from.
 //
 // Intersecting conjunct bounds is UNSOUND for
 // ARRAY/multi-key fields: array filter semantics match each conjunct against
