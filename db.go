@@ -491,7 +491,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	tx.readTx = &btWtx.ReadTx
 	tx.writeTx = btWtx
 	tx.modified.Store(false)
-	btWtx.SetAux(&tx.schema)
+	btWtx.SetAux(tx)
 
 	db.checkStale(&btWtx.ReadTx)
 	db.resetUncommittedSketches(&btWtx.ReadTx)
@@ -530,7 +530,7 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 	tx.readTx = btRtx
 	tx.writeTx = nil
 	tx.version.Store(version)
-	btRtx.SetAux(&tx.schema)
+	btRtx.SetAux(tx)
 	rTx := readTx{&txHandle{commonTx: tx, version: version}}
 	rTx.ctx = context.WithValue(ctx, ctxKeyTx, rTx)
 	return rTx, nil

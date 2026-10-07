@@ -287,8 +287,10 @@ const (
 )
 
 func txSchemaOf(tx *btree.ReadTx) *txSchema {
-	t, _ := tx.Aux().(*txSchema)
-	return t
+	if t, _ := tx.Aux().(*commonTx); t != nil {
+		return &t.schema
+	}
+	return nil
 }
 
 func memoGet(tx *btree.ReadTx, c *collection) *collSchema {

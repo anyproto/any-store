@@ -42,10 +42,11 @@ type WriteTx interface {
 	// txSchema. Unexported: DDL-internal.
 	schemaLog() *txSchema
 
-	// The stack of open savepoints; see commonTx.savepoints.
+	// The stack of open savepoints; see commonTx.savepoints. savepointEnded
+	// returns the savepoint enclosing sp, nil for the outermost.
 	// Unexported: savepoint-internal.
 	savepointOpened(sp *savepointTx)
-	savepointEnded(sp *savepointTx)
+	savepointEnded(sp *savepointTx) *savepointTx
 }
 
 // ReadTx represents a read-only transaction.
@@ -107,8 +108,9 @@ type commonTx struct {
 	// modified: SetModified is public, so a caller may set it outside the lock.
 	modified atomic.Bool
 
-	// schema is the transaction's own schema state (txSchema), in the
-	// btree transaction's Aux slot for the resolve of every operation. For a
+	// schema is the transaction's own schema state (txSchema), reached
+	// through the btree transaction's Aux slot — which holds the commonTx —
+	// for the resolve of every operation. For a
 	// write transaction its log holds the uncommitted DDL: the writes later
 	// in the same tx see and maintain an index or collection created earlier
 	// in it through the log, nothing else does until the commit installs
@@ -146,15 +148,26 @@ func (tx *commonTx) savepointOpened(sp *savepointTx) {
 }
 
 // savepointEnded pops the savepoint and every savepoint opened inside it,
-// marking each as ended.
-func (tx *commonTx) savepointEnded(sp *savepointTx) {
-	if i := slices.Index(tx.savepoints, sp); i >= 0 {
-		for _, inner := range tx.savepoints[i:] {
-			inner.ended.Store(true)
-		}
-		clear(tx.savepoints[i:])
-		tx.savepoints = tx.savepoints[:i]
+// marking each as ended. The nested ones hand their sketch images down,
+// innermost first, so sp holds what its own end restores or hands on. Returns
+// the savepoint enclosing sp, nil for the outermost.
+func (tx *commonTx) savepointEnded(sp *savepointTx) (enclosing *savepointTx) {
+	i := slices.Index(tx.savepoints, sp)
+	if i < 0 {
+		return nil
 	}
+	for k := len(tx.savepoints) - 1; k > i; k-- {
+		inner := tx.savepoints[k]
+		inner.ended.Store(true)
+		inner.releaseImages(tx.savepoints[k-1])
+	}
+	sp.ended.Store(true)
+	clear(tx.savepoints[i:])
+	tx.savepoints = tx.savepoints[:i]
+	if i > 0 {
+		return tx.savepoints[i-1]
+	}
+	return nil
 }
 
 func (tx *commonTx) iterOpened(pi *planIterator) {
@@ -496,6 +509,21 @@ type savepointTx struct {
 	// inside its scope (entries [logMark:]); a release keeps them on the
 	// parent so an outer rollback still discards them.
 	logMark int
+	// images are the pre-images of the live sketches first written inside
+	// this savepoint's scope (journalSketch), in creation order: a rollback
+	// restores them (restoreImages), a release hands them to the enclosing
+	// savepoint (releaseImages). The statement journal of SQLite's pager
+	// keeps a page's pre-image the same way — once per savepoint
+	// (pager.c subjRequiresPage), kept by RELEASE for the savepoint
+	// enclosing it, played back by ROLLBACK TO (pagerPlaybackSavepoint).
+	// Nothing is journaled outside a savepoint: a full rollback is rebased
+	// at the next write-tx begin (db.resetUncommittedSketches). Buffers stay
+	// with the pooled state.
+	images []sketchImage
+	// scope is the version the savepoint was opened with, kept once a
+	// handle claimed its end (version is zeroed then): what the images of
+	// its scope are marked with (index.sketchImaged).
+	scope   uint64
 	version atomic.Uint64
 	// ended: the savepoint, or one enclosing it, has ended
 	// (commonTx.savepointEnded). Read without the parent's lock by Done.
@@ -507,8 +535,77 @@ func (sp *savepointTx) reset(spId, logMark int) uint64 {
 	sp.logMark = logMark
 	sp.ended.Store(false)
 	version := newTxVersion()
+	sp.scope = version
 	sp.version.Store(version)
 	return version
+}
+
+// sketchImage is the pre-image of an index's live sketch, taken as a
+// savepoint's scope first wrote it: the counters, and the flag and the
+// marker the index had, all put back by the scope's rollback.
+type sketchImage struct {
+	idx *index
+	// prev is idx.sketchImaged at the image: the version of the savepoint
+	// holding the next older image, 0 for none.
+	prev uint64
+	// modified is idx.sketchModified at the image.
+	modified bool
+	buf      []uint64
+}
+
+// journalSketch takes the pre-image of idx's live sketch into this
+// savepoint, unless its scope holds one already (idx.sketchImaged).
+func (sp *savepointTx) journalSketch(idx *index) {
+	if idx.sketchImaged == sp.scope {
+		return
+	}
+	n := len(sp.images)
+	if n < cap(sp.images) {
+		sp.images = sp.images[:n+1]
+	} else {
+		sp.images = append(sp.images, sketchImage{})
+	}
+	img := &sp.images[n]
+	img.idx = idx
+	img.prev = idx.sketchImaged
+	img.modified = idx.sketchModified
+	img.buf = idx.sketch.Snapshot(img.buf)
+	idx.sketchImaged = sp.scope
+}
+
+// restoreImages puts the live sketches back as the scope found them, newest
+// image first: of two images of one sketch — a handle clone sharing the
+// sketch (index.cloneWithNs) can leave an older one behind a newer — the
+// older wins. The images stay in creation order: a savepoint takes one only
+// while no savepoint is open inside it, and the nested ones hand theirs
+// down as they end.
+func (sp *savepointTx) restoreImages() {
+	for i := len(sp.images) - 1; i >= 0; i-- {
+		img := &sp.images[i]
+		img.idx.sketch.Restore(img.buf)
+		img.idx.sketchImaged = img.prev
+		img.idx.sketchModified = img.modified
+		img.idx = nil
+	}
+	sp.images = sp.images[:0]
+}
+
+// releaseImages hands the images to the savepoint enclosing this one, which
+// keeps the older image it holds of the same sketch (prev names it) and
+// adopts the rest: nothing wrote that sketch between the two savepoints'
+// creation, or the enclosing one would hold an image. With no enclosing
+// savepoint the images are dropped.
+func (sp *savepointTx) releaseImages(enclosing *savepointTx) {
+	for i := range sp.images {
+		img := &sp.images[i]
+		if enclosing != nil && img.prev != enclosing.scope {
+			img.idx.sketchImaged = enclosing.scope
+			enclosing.images = append(enclosing.images, *img)
+			img.buf = nil
+		}
+		img.idx = nil
+	}
+	sp.images = sp.images[:0]
 }
 
 // savepointWrapper is a savepoint's handle: the parent it was opened on —
@@ -573,7 +670,7 @@ func (w savepointWrapper) Commit() error {
 		savepointPool.Put(w.sp)
 		return ErrTxIsUsed
 	}
-	w.savepointEnded(w.sp)
+	w.sp.releaseImages(w.savepointEnded(w.sp))
 	if err := w.btreeWriteTx().ReleaseSavepoint(w.sp.savepointId); err != nil {
 		return err
 	}
@@ -600,13 +697,16 @@ func (w savepointWrapper) Rollback() error {
 	// The fts pending buffers hold only ops made inside this savepoint's
 	// scope (they were flushed empty at its creation), and the btree state
 	// those ops were derived from has just been reverted — discard them,
-	// with the scope's schema log. Both run even when RollbackToSavepoint
+	// with the scope's schema log, and put the sketches the scope wrote
+	// back (before the log goes: the flags the discard propagates are the
+	// restored ones). All three run even when RollbackToSavepoint
 	// fails: its error returns happen before any mutation, the outer tx is
 	// doomed either way, and matching the in-memory schema state to the
 	// last committed disk state is the conservative choice.
 	// RollbackToSavepoint keeps the write lock in all cases, so the
 	// discard runs inside the critical section.
 	db.resetAllFtsPending(&btWtx.ReadTx)
+	w.sp.restoreImages()
 	db.discardLog(w.schemaLog(), w.sp.logMark)
 	if err != nil {
 		return err

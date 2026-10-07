@@ -349,6 +349,11 @@ type index struct {
 
 	sketchBuf      []byte
 	sketchModified bool
+	// sketchImaged is the version of the savepoint whose scope holds the
+	// newest pre-image of the live sketch (savepointTx.journalSketch), 0 for
+	// none. Versions are never reused, so the marker of an ended savepoint
+	// matches no open one and needs no reset.
+	sketchImaged uint64
 
 	cboInfo *qplanner.IndexInfo // cached CBO index info, built once during init
 
@@ -412,6 +417,19 @@ func (idx *index) markSketchModified() {
 	idx.c.markSketchDirty()
 }
 
+// sketchWrite precedes the sketch mutations of one entry write (putEntries,
+// deleteEntries): inside a savepoint it journals the live sketch on the
+// innermost one, so the savepoint's rollback restores it, then flags it
+// modified. A write transaction opened by the db carries itself in the
+// btree transaction's Aux slot; one that does not (a rebuild on a copy)
+// journals nothing.
+func (idx *index) sketchWrite(tx *btree.WriteTx) {
+	if t, _ := tx.Aux().(*commonTx); t != nil && len(t.savepoints) > 0 {
+		t.savepoints[len(t.savepoints)-1].journalSketch(idx)
+	}
+	idx.markSketchModified()
+}
+
 // cloneWithNs returns a copy of the index bound to a different namespace
 // handle; Rename publishes clones copy-on-write (via storeIndexes) because
 // concurrent readers access idx.ns lock-free, so the field can't be mutated
@@ -433,6 +451,7 @@ func (idx *index) cloneWithNs(ns *btree.Namespace, nsName string, catalogKey []b
 		reverse:        idx.reverse,
 		sketch:         idx.sketch,
 		sketchModified: idx.sketchModified,
+		sketchImaged:   idx.sketchImaged,
 	}
 	n.initScratch()
 	// cboInfo embeds the namespace handle — rebuild it around the new one.
@@ -539,6 +558,9 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 // per-doc: an array shrinking from 3 elements to 1 next time round will see
 // its single new entry written with IndexValueScalar.
 func (idx *index) putEntries(tx *btree.WriteTx, id []byte) error {
+	if idx.sketch != nil {
+		idx.sketchWrite(tx)
+	}
 	entryValue := qplanner.IndexValueScalar
 	if len(idx.keysBuf) > 1 {
 		entryValue = qplanner.IndexValueMultiKey
@@ -587,13 +609,11 @@ func (idx *index) putEntries(tx *btree.WriteTx, id []byte) error {
 		}
 		if idx.sketch != nil {
 			idx.applySketch(idx.keysBuf, idx.keyBoundsBuf, ki, prevKi, true)
-			idx.markSketchModified()
 		}
 		prevKi = ki
 	}
 	if idx.sketch != nil {
 		idx.sketch.IncrementDocCount()
-		idx.markSketchModified()
 	}
 	return nil
 }
@@ -650,6 +670,9 @@ func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 // deleteEntries deletes the entries of the document with primary key id whose
 // keys and sketch bounds are given: a filled key set, live or previous.
 func (idx *index) deleteEntries(tx *btree.WriteTx, keys []anyenc.Tuple, bounds [][]int, id []byte) error {
+	if idx.sketch != nil {
+		idx.sketchWrite(tx)
+	}
 	prevKi := -1
 	for ki, key := range keys {
 		idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
@@ -665,13 +688,11 @@ func (idx *index) deleteEntries(tx *btree.WriteTx, keys []anyenc.Tuple, bounds [
 		}
 		if idx.sketch != nil {
 			idx.applySketch(keys, bounds, ki, prevKi, false)
-			idx.markSketchModified()
 		}
 		prevKi = ki
 	}
 	if idx.sketch != nil {
 		idx.sketch.DecrementDocCount()
-		idx.markSketchModified()
 	}
 	return nil
 }

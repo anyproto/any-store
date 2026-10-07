@@ -962,6 +962,62 @@ func sketchCounts(t *testing.T, dbi *db, coll, idx string) (counts map[int]uint6
 	return counts
 }
 
+// The sketch deltas of the verbs a savepoint reverts go with it: the commit
+// persists the counts the savepoint found.
+func TestWriteTx_SavepointRollbackRevertsSketch(t *testing.T) {
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
+	before := sketchCounts(t, dbi, "c", "a")
+	require.EqualValues(t, 1, before[-1])
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	sp, err := fx.WriteTx(tx.Context())
+	require.NoError(t, err)
+	require.NoError(t, coll.DeleteId(sp.Context(), 1))
+	require.NoError(t, sp.Rollback())
+	require.NoError(t, tx.Commit())
+
+	n, err := coll.Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	assert.Equal(t, before, sketchCounts(t, dbi, "c", "a"), "the persisted sketch counts the document the rollback kept")
+	idx := coll.(*collection).loadIndexes()[0]
+	assert.EqualValues(t, 1, idx.sketch.GetDocCount(), "the live sketch too")
+}
+
+// A verb that fails inside a transaction runs under a savepoint of its
+// own: the sketch deltas it made before failing go with it.
+func TestWriteTx_FailedVerbRevertsSketch(t *testing.T) {
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx,
+		IndexInfo{Fields: []string{"a"}},
+		IndexInfo{Fields: []string{"u"}, Unique: true},
+	))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":1,"u":1}`),
+		anyenc.MustParseJson(`{"id":2,"a":2,"u":2}`),
+	))
+	before := sketchCounts(t, dbi, "c", "a")
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	_, err = coll.UpdateId(tx.Context(), 2, query.MustParseModifier(`{"$set":{"v":1}}`))
+	require.NoError(t, err)
+	_, err = coll.UpdateId(tx.Context(), 1, query.MustParseModifier(`{"$set":{"a":5,"u":2}}`))
+	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.NoError(t, tx.Commit())
+
+	assert.Equal(t, before, sketchCounts(t, dbi, "c", "a"), "no entry of a moved")
+}
+
 // A commit the btree refuses leaves no sketch delta behind: the next write
 // transaction rebases the live sketches to the committed bytes, and no
 // later commit persists what the failed one made.
@@ -990,6 +1046,144 @@ func TestWriteTx_FailedCommitDiscardsSketchDeltas(t *testing.T) {
 	assert.EqualValues(t, 2, sketchCounts(t, dbi, "c", "a")[-1], "the document the failed commit inserted is not counted")
 	idx := coll.(*collection).loadIndexes()[0]
 	assert.EqualValues(t, 2, idx.sketch.GetDocCount())
+}
+
+// sketchRebuilt is the sketch a fresh build of the index persists: the
+// ground truth for an index whose maintenance was exact.
+func sketchRebuilt(t *testing.T, dbi *db, coll Collection, idx string) map[int]uint64 {
+	var info IndexInfo
+	for _, i := range coll.GetIndexes() {
+		if i.Info().Name == idx {
+			info = i.Info()
+		}
+	}
+	require.NoError(t, coll.DropIndex(ctx, idx))
+	require.NoError(t, coll.EnsureIndex(ctx, info))
+	return sketchCounts(t, dbi, coll.Name(), idx)
+}
+
+// Nested savepoints: an image taken inside an inner savepoint serves the
+// outer one once the inner is released; an older image of the outer wins
+// over the inner's; an inner rollback leaves the outer's writes in place.
+func TestWriteTx_NestedSavepointsRevertSketch(t *testing.T) {
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"u":%d}`, id, id, id))
+	}
+	setup := func(t *testing.T) (*db, Collection) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx,
+			IndexInfo{Fields: []string{"a"}},
+			IndexInfo{Fields: []string{"u"}, Unique: true},
+		))
+		require.NoError(t, coll.Insert(ctx, doc(1)))
+		return fx.DB.(*db), coll
+	}
+	check := func(t *testing.T, dbi *db, coll Collection, docs int) {
+		n, err := coll.Count(ctx)
+		require.NoError(t, err)
+		require.Equal(t, docs, n)
+		for _, idx := range []string{"a", "u"} {
+			persisted := sketchCounts(t, dbi, "c", idx)
+			assert.EqualValues(t, docs, persisted[-1], idx)
+			assert.Equal(t, sketchRebuilt(t, dbi, coll, idx), persisted, idx)
+		}
+	}
+
+	t.Run("released into the outer, the outer rolled back", func(t *testing.T) {
+		dbi, coll := setup(t)
+		tx, err := dbi.WriteTx(ctx)
+		require.NoError(t, err)
+		outer, err := dbi.WriteTx(tx.Context())
+		require.NoError(t, err)
+		inner, err := dbi.WriteTx(outer.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(inner.Context(), doc(2)))
+		require.NoError(t, inner.Commit())
+		require.NoError(t, coll.Insert(outer.Context(), doc(3)))
+		require.NoError(t, outer.Rollback())
+		require.NoError(t, tx.Commit())
+		check(t, dbi, coll, 1)
+	})
+
+	t.Run("the outer's older image wins", func(t *testing.T) {
+		dbi, coll := setup(t)
+		tx, err := dbi.WriteTx(ctx)
+		require.NoError(t, err)
+		outer, err := dbi.WriteTx(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(outer.Context(), doc(2)))
+		inner, err := dbi.WriteTx(outer.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(inner.Context(), doc(3)))
+		require.NoError(t, inner.Commit())
+		require.NoError(t, coll.Insert(outer.Context(), doc(4)))
+		require.NoError(t, outer.Rollback())
+		require.NoError(t, tx.Commit())
+		check(t, dbi, coll, 1)
+	})
+
+	t.Run("the inner rolled back, the outer released", func(t *testing.T) {
+		dbi, coll := setup(t)
+		tx, err := dbi.WriteTx(ctx)
+		require.NoError(t, err)
+		outer, err := dbi.WriteTx(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.DeleteId(outer.Context(), 1))
+		inner, err := dbi.WriteTx(outer.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(inner.Context(), doc(2), doc(3)))
+		require.NoError(t, inner.Rollback())
+		require.NoError(t, coll.Insert(outer.Context(), doc(4)))
+		require.NoError(t, outer.Commit())
+		require.NoError(t, tx.Commit())
+		check(t, dbi, coll, 1)
+	})
+
+	t.Run("the outer ends the inner it encloses", func(t *testing.T) {
+		dbi, coll := setup(t)
+		tx, err := dbi.WriteTx(ctx)
+		require.NoError(t, err)
+		outer, err := dbi.WriteTx(tx.Context())
+		require.NoError(t, err)
+		inner, err := dbi.WriteTx(outer.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(inner.Context(), doc(2)))
+		require.NoError(t, outer.Rollback())
+		require.ErrorIs(t, inner.Rollback(), ErrTxIsUsed)
+		require.NoError(t, coll.Insert(tx.Context(), doc(3)))
+		require.NoError(t, tx.Commit())
+		check(t, dbi, coll, 2)
+	})
+
+	t.Run("a verb failing inside a savepoint", func(t *testing.T) {
+		dbi, coll := setup(t)
+		tx, err := dbi.WriteTx(ctx)
+		require.NoError(t, err)
+		sp, err := dbi.WriteTx(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(sp.Context(), doc(2)))
+		_, err = coll.UpdateId(sp.Context(), 1, query.MustParseModifier(`{"$set":{"a":7,"u":2}}`))
+		require.ErrorIs(t, err, ErrUniqueConstraint)
+		require.NoError(t, sp.Commit())
+		require.NoError(t, tx.Commit())
+		check(t, dbi, coll, 2)
+	})
+
+	t.Run("a full rollback after savepoints", func(t *testing.T) {
+		dbi, coll := setup(t)
+		tx, err := dbi.WriteTx(ctx)
+		require.NoError(t, err)
+		sp, err := dbi.WriteTx(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(sp.Context(), doc(2)))
+		require.NoError(t, sp.Commit())
+		require.NoError(t, coll.Insert(tx.Context(), doc(3)))
+		require.NoError(t, tx.Rollback())
+		require.NoError(t, coll.Insert(ctx, doc(4)))
+		check(t, dbi, coll, 2)
+	})
 }
 
 // A schema-changing commit settles the sketches it persisted as it
