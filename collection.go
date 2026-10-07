@@ -1625,7 +1625,7 @@ func (c *collection) reloadSketch(tx *btree.ReadTx, collName string, idx *index,
 	}
 	// idx.sketch is only replaced under c.mu (held here) or before the index
 	// is published, so the identity check is race-free; a commit that
-	// republishes live concurrently (persistSketches takes no c.mu) is
+	// republishes live concurrently (settleSketches takes no c.mu) is
 	// overtaken by this snapshot's bytes, as a fresh object would be. Bytes
 	// of another shape (a snapshot older than this handle's definition) go
 	// into a fresh object: a published one is never reshaped.
@@ -1655,15 +1655,15 @@ func indexInfoEqual(a, b IndexInfo) bool {
 	return true
 }
 
-// persistSketches writes all modified live sketches to the _system namespace and
-// republishes each as the reader snapshot. Last-writer-wins (no cross-process
-// merge — the sketch is advisory, like sqlite_stat1). Republishing is a pointer
-// Store of the writer's own live object — no clone: the writer will not mutate
-// live again until its next write tx, and a reader that loads it sees an
-// advisory, atomically-fielded snapshot. Runs inside Commit before pager.commit,
-// so the bytes are atomic with the file-change counter / schema cookie. s is
-// the writer's version (collection.inTx).
-func (c *collection) persistSketches(tx *btree.WriteTx, s *collSchema) error {
+// persistSketches writes all modified live sketches to the _system namespace
+// and lists them on the transaction for the settle that follows the commit
+// (commonTx.settleSketches: the republish as the reader snapshot and the
+// flag clear, once the commit is visible). Last-writer-wins (no
+// cross-process merge — the sketch is advisory, like sqlite_stat1). Runs
+// inside Commit before pager.commit, so the bytes are atomic with the
+// file-change counter / schema cookie. s is the writer's version
+// (collection.inTx).
+func (c *collection) persistSketches(tx *btree.WriteTx, s *collSchema, t *commonTx) error {
 	for _, idx := range s.indexes {
 		if idx.sketchModified {
 			key := sketchKey(s.name, idx.info.Name)
@@ -1671,8 +1671,7 @@ func (c *collection) persistSketches(tx *btree.WriteTx, s *collSchema) error {
 			if err := tx.Put(c.db.systemNS, key, idx.sketchBuf); err != nil {
 				return err
 			}
-			idx.storePubSketch(idx.sketch) // republish live as the reader snapshot
-			idx.sketchModified = false
+			t.sketches = append(t.sketches, idx)
 		}
 	}
 	return nil

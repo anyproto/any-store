@@ -286,9 +286,17 @@ const (
 	logDrop
 )
 
+// txSchemaOf is the schema state tx carries in its Aux slot: a
+// transaction of the db carries itself (commonTx), a raw btree transaction
+// the memo memoPut gave it.
 func txSchemaOf(tx *btree.ReadTx) *txSchema {
-	t, _ := tx.Aux().(*txSchema)
-	return t
+	switch t := tx.Aux().(type) {
+	case *commonTx:
+		return &t.schema
+	case *txSchema:
+		return t
+	}
+	return nil
 }
 
 func memoGet(tx *btree.ReadTx, c *collection) *collSchema {

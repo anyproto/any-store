@@ -528,8 +528,8 @@ func TestIteratorDeleteDuringIterationStaysConsistent(t *testing.T) {
 
 // TestSketchNoAccumulatingDriftAcrossRolledBackTxs is the regression test for the
 // rolled-back-sketch-delta fix. insertKeys/deleteKeys mutate the live index sketch
-// in place and set sketchModified; a committed tx clears that flag via
-// persistSketches, but a ROLLED-BACK tx does not. Before the fix, those phantom
+// in place and set sketchModified; a committed tx clears that flag as the
+// commit becomes visible, but a ROLLED-BACK tx does not. Before the fix, those phantom
 // deltas accumulated unbounded across rolled-back txs (a non-stale write tx never
 // reloaded the sketch) and were persisted to disk on the next clean commit —
 // drifting the planner's cardinality estimate (advisory only; never query results).

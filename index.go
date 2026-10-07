@@ -330,7 +330,8 @@ type index struct {
 	reverse    []bool
 
 	// sketch is the WRITER-OWNED live selectivity sketch. It is mutated in place
-	// ONLY by the single writer (putEntries/deleteEntries, serialized by the btree
+	// ONLY by the single writer (putEntries/deleteEntries, a savepoint's
+	// restoreImages, the writer's reloadSketch, serialized by the btree
 	// writeMu and the cross-process WAL write lock) and marshaled by
 	// persistSketches. No reader ever swaps or mutates it, so a concurrent
 	// read-tx reload can never lose the writer's accumulated increments. Inside a
@@ -349,6 +350,11 @@ type index struct {
 
 	sketchBuf      []byte
 	sketchModified bool
+	// sketchImaged is the version of the savepoint whose scope holds the
+	// newest pre-image of the live sketch (savepointTx.journalSketch), 0 for
+	// none. Versions are never reused, so the marker of an ended savepoint
+	// matches no open one and needs no reset.
+	sketchImaged uint64
 
 	cboInfo *qplanner.IndexInfo // cached CBO index info, built once during init
 
@@ -402,7 +408,8 @@ type index struct {
 func (idx *index) loadPubSketch() *qplanner.IndexSketch { return idx.sketchPub.Load() }
 
 // storePubSketch publishes a reader snapshot. Callers hold c.mu (publisher
-// serialisation, like storeIndexes); readers need no lock.
+// serialisation, like storeIndexes) or the btree write lock
+// (commonTx.settleSketches); readers need no lock.
 func (idx *index) storePubSketch(s *qplanner.IndexSketch) { idx.sketchPub.Store(s) }
 
 // markSketchModified flags the live sketch as holding unpersisted deltas and
@@ -410,6 +417,18 @@ func (idx *index) storePubSketch(s *qplanner.IndexSketch) { idx.sketchPub.Store(
 func (idx *index) markSketchModified() {
 	idx.sketchModified = true
 	idx.c.markSketchDirty()
+}
+
+// sketchWrite precedes the sketch mutations of one entry write (putEntries,
+// deleteEntries): inside a savepoint it journals the live sketch, so the
+// savepoint's rollback restores it, then flags it modified. A write
+// transaction of the db carries itself in the btree transaction's Aux
+// slot; a bare btree transaction journals nothing.
+func (idx *index) sketchWrite(tx *btree.WriteTx) {
+	if t, _ := tx.Aux().(*commonTx); t != nil {
+		t.journalSketch(idx)
+	}
+	idx.markSketchModified()
 }
 
 // cloneWithNs returns a copy of the index bound to a different namespace
@@ -433,6 +452,7 @@ func (idx *index) cloneWithNs(ns *btree.Namespace, nsName string, catalogKey []b
 		reverse:        idx.reverse,
 		sketch:         idx.sketch,
 		sketchModified: idx.sketchModified,
+		sketchImaged:   idx.sketchImaged,
 	}
 	n.initScratch()
 	// cboInfo embeds the namespace handle — rebuild it around the new one.
@@ -539,6 +559,9 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 // per-doc: an array shrinking from 3 elements to 1 next time round will see
 // its single new entry written with IndexValueScalar.
 func (idx *index) putEntries(tx *btree.WriteTx, id []byte) error {
+	if idx.sketch != nil {
+		idx.sketchWrite(tx)
+	}
 	entryValue := qplanner.IndexValueScalar
 	if len(idx.keysBuf) > 1 {
 		entryValue = qplanner.IndexValueMultiKey
@@ -587,13 +610,11 @@ func (idx *index) putEntries(tx *btree.WriteTx, id []byte) error {
 		}
 		if idx.sketch != nil {
 			idx.applySketch(idx.keysBuf, idx.keyBoundsBuf, ki, prevKi, true)
-			idx.markSketchModified()
 		}
 		prevKi = ki
 	}
 	if idx.sketch != nil {
 		idx.sketch.IncrementDocCount()
-		idx.markSketchModified()
 	}
 	return nil
 }
@@ -650,6 +671,9 @@ func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 // deleteEntries deletes the entries of the document with primary key id whose
 // keys and sketch bounds are given: a filled key set, live or previous.
 func (idx *index) deleteEntries(tx *btree.WriteTx, keys []anyenc.Tuple, bounds [][]int, id []byte) error {
+	if idx.sketch != nil {
+		idx.sketchWrite(tx)
+	}
 	prevKi := -1
 	for ki, key := range keys {
 		idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
@@ -665,13 +689,11 @@ func (idx *index) deleteEntries(tx *btree.WriteTx, keys []anyenc.Tuple, bounds [
 		}
 		if idx.sketch != nil {
 			idx.applySketch(keys, bounds, ki, prevKi, false)
-			idx.markSketchModified()
 		}
 		prevKi = ki
 	}
 	if idx.sketch != nil {
 		idx.sketch.DecrementDocCount()
-		idx.markSketchModified()
 	}
 	return nil
 }
