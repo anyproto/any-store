@@ -330,7 +330,7 @@ type index struct {
 	reverse    []bool
 
 	// sketch is the WRITER-OWNED live selectivity sketch. It is mutated in place
-	// ONLY by the single writer (insertKeys/deleteKeys, serialized by the btree
+	// ONLY by the single writer (putEntries/deleteEntries, serialized by the btree
 	// writeMu and the cross-process WAL write lock) and marshaled by
 	// persistSketches. No reader ever swaps or mutates it, so a concurrent
 	// read-tx reload can never lose the writer's accumulated increments. Inside a
@@ -641,7 +641,7 @@ func (idx *index) isScalarProven(tx *btree.ReadTx) bool {
 }
 
 // deleteKeys deletes index entries for the given item from the index namespace.
-// Both unique and non-unique indexes use key=Tuple(fields..., docId), value=nil.
+// Both unique and non-unique indexes use key=Tuple(fields..., docId).
 func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 	idx.fillKeysBuf(it)
 	return idx.deleteEntries(tx, idx.keysBuf, idx.keyBoundsBuf, idx.c.appendId(nil, it.Value()))
@@ -684,14 +684,15 @@ func (idx *index) deleteEntries(tx *btree.WriteTx, keys []anyenc.Tuple, bounds [
 //
 // SQLite's UPDATE skips such an index the same way: sqlite3Update (update.c)
 // leaves aRegIdx[i] zero for an index none of whose columns the statement
-// assigns (indexColumnIsBeingUpdated), and sqlite3GenerateRowIndexDelete
-// (delete.c), sqlite3GenerateConstraintChecks and sqlite3CompleteInsertion
-// (insert.c) pass it by. The test differs on purpose: update receives whole
-// documents and a query.Modifier is arbitrary code, so there are no assigned
-// columns to inspect; the keys are compared instead, as vectorIndex.update
-// compares the embedding and ftsIndex.updateDoc the token streams. It is
-// exact where SQLite's is conservative: a field set to the value it held
-// writes nothing.
+// assigns (indexColumnIsBeingUpdated), unless the key changes or a foreign
+// key or a partial-index clause depends on the assignment, and
+// sqlite3GenerateRowIndexDelete (delete.c), sqlite3GenerateConstraintChecks
+// and sqlite3CompleteInsertion (insert.c) pass it by. The test differs on
+// purpose: update receives whole documents and a query.Modifier is
+// arbitrary code, so there are no assigned columns to inspect; the keys are
+// compared instead, as vectorIndex.update compares the embedding and
+// ftsIndex.updateDoc the token streams. It is exact where SQLite's is
+// conservative: a field set to the value it held writes nothing.
 //
 // The sequences are compared in order, so a reordered array takes the
 // delete-and-put path. Bounds are not compared: they are the field
@@ -968,7 +969,7 @@ func (idx *index) emitLeaf(i int, l anyenc.Leaf) bool {
 	// Reverse-flagged fields are stored bitwise-inverted so a single forward
 	// index scan yields the field's declared (descending) order; readers skip
 	// such fields via the inverted-tag length path in anyenc.parseValue. The
-	// docId suffix appended later (insertKeys/deleteKeys) and the per-entry
+	// docId suffix appended later (putEntries/deleteEntries) and the per-entry
 	// value flag are NEVER inverted. Inversion is a bijection, so the unique
 	// dedup (isUnique) and unique-constraint seek still compare correctly.
 	reverse := i < len(idx.reverse) && idx.reverse[i]

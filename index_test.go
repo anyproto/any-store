@@ -4198,22 +4198,19 @@ func TestAudit14_LegacyNilValue_QueryWithLegacyMix(t *testing.T) {
 // --- Subtest 3: update via public API rewrites legacy → bit-set ---
 
 // TestAudit14_LegacyNilValue_OverwriteOnUpdate verifies that an update
-// via the public API REPLACES a legacy nil-value entry with a new
-// bit-set value. The mechanism: collection.update calls deleteKeys
-// (removes by key — value-byte irrelevant) followed by insertKeys
-// (writes the new bit-set value).
+// via the public API which changes the index's key REPLACES a legacy
+// nil-value entry with a new bit-set value. The mechanism: updateKeys
+// sees a changed key sequence, deleteEntries removes the old entry by
+// key (value byte irrelevant) and putEntries writes the new bit-set
+// value.
 //
-// We must change the doc value (not just rewrite identical content) —
-// collection.update has an early-out via anyencutil.Equal that skips
-// the deleteKeys/insertKeys cycle when the old and new values are
-// identical. So we insert {a:10}, inject a legacy entry at the same
-// key, then update to {a:20}: deleteKeys removes the old key (10,d1)
-// regardless of its value byte, and insertKeys writes (20,d1) with the
-// new bit-set value.
+// The indexed value must change: an update that leaves the key as it
+// was writes nothing to the index and keeps the legacy entry
+// (TestIndex_UpdateKeys_UnchangedEntriesNotRewritten). So we insert
+// {a:10}, inject a legacy entry at the same key, then update to {a:20}.
 //
-// This proves there's a natural migration path: any doc that gets
-// touched (with a real value change) will have its index entries
-// normalized to the new format.
+// This is the migration path: a doc whose indexed value changes has
+// that index's entries normalized to the new format.
 func TestAudit14_LegacyNilValue_OverwriteOnUpdate(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit14_update")
@@ -4242,18 +4239,17 @@ func TestAudit14_LegacyNilValue_OverwriteOnUpdate(t *testing.T) {
 	assert.Empty(t, entries[0].Value,
 		"after injection the entry value must be empty (legacy)")
 
-	// Update the doc via the public API. We MUST change the value (10→20)
-	// so collection.update doesn't early-out on the equality check. The
-	// deleteKeys call removes the old (10,d1) entry by key (value byte
-	// irrelevant), and insertKeys writes (20,d1) with the new bit-set
-	// value.
+	// Update the doc via the public API, changing the indexed value
+	// (10→20): deleteEntries removes the old (10,d1) entry by key (value
+	// byte irrelevant), and putEntries writes (20,d1) with the new
+	// bit-set value.
 	require.NoError(t, coll.UpdateOne(ctx,
 		anyenc.MustParseJson(`{"id":"d1","a":20}`)))
 
 	entries = readRawIndexEntries(t, fx.DB, "audit14_update", "ix_a")
 	require.Len(t, entries, 1, "still exactly one entry after update")
 	assert.Equal(t, qplanner.IndexValueScalar, entries[0].Value,
-		"after public-API update the legacy nil entry must be replaced "+
+		"after a key-changing update the legacy nil entry must be replaced "+
 			"with IndexValueScalar (0x00) — this is the migration path")
 
 	// Query still works for the new value.
@@ -4866,7 +4862,7 @@ func TestIndex_UpdateKeys_OnlyChangedIndexMoves(t *testing.T) {
 
 	aAfter, err := insp.InspectIndexSketch(ctx, "test", "a")
 	require.NoError(t, err)
-	assert.Equal(t, aBefore, aAfter, "the sketch of a was rewritten")
+	assert.Equal(t, aBefore, aAfter, "the sketch of a changed")
 	bAfter, err := insp.InspectIndexSketch(ctx, "test", "b")
 	require.NoError(t, err)
 	assert.NotEqual(t, bBefore.Buckets, bAfter.Buckets, "the sketch of b moved")
