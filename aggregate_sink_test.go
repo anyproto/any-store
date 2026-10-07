@@ -502,3 +502,39 @@ func BenchmarkAggregateMergeReplace10k(b *testing.B) {
 	}
 	b.ReportMetric(float64(10000*b.N)/b.Elapsed().Seconds(), "docs/s")
 }
+
+// $out into a collection that does not exist yet, inside a write tx: the
+// sink creates the target through the context of its own write scope — a
+// call made under the enclosing call's turn on the transaction (heldTx) —
+// and the transaction sees the result before its commit.
+func TestCollection_AggregateOut_InsideWriteTx(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "src")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"cat":"a","v":10}`),
+		anyenc.MustParseJson(`{"id":2,"cat":"b","v":20}`),
+	))
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":3,"cat":"a","v":30}`)))
+	n, err := coll.Aggregate(`[
+		{"$group": {"_id": "$cat", "total": {"$sum": "$v"}}},
+		{"$sort": {"id": 1}},
+		{"$out": "dst"}
+	]`).Count(tx.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+	target, err := fx.OpenCollection(tx.Context(), "dst")
+	require.NoError(t, err)
+	assertCollCountInTx(tx.Context(), t, target, 2)
+	_, err = fx.OpenCollection(ctx, "dst")
+	assert.ErrorIs(t, err, ErrCollectionNotFound)
+	require.NoError(t, tx.Commit())
+	target, err = fx.OpenCollection(ctx, "dst")
+	require.NoError(t, err)
+	assert.Equal(t, expectJson(t,
+		`{"id":"a","total":40}`,
+		`{"id":"b","total":20}`,
+	), collRows(t, target))
+}
