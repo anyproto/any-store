@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1341,4 +1342,106 @@ func TestWriteTx_SketchRestoreAndSettle(t *testing.T) {
 	require.NoError(t, coll.Insert(ctx, doc(4)))
 	assert.False(t, idx.sketchModified)
 	assert.Same(t, idx.sketch, idx.loadPubSketch(), "republished")
+}
+
+// A savepoint rollback ends the savepoint: the btree level it rolled back
+// to goes with it, as SQLite's statement journal rolls back to and then
+// releases its savepoint (vdbeCloseStatement). A level left on the pager's
+// stack takes a copy of every page the transaction writes from then on and
+// holds it until the transaction ends.
+func TestWriteTx_RollbackReleasesBtreeSavepoint(t *testing.T) {
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"u":%d}`, id, id))
+	}
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"u"}, Unique: true}))
+	require.NoError(t, coll.Insert(ctx, doc(1), doc(2)))
+
+	// depth is the number of btree savepoints open on tx: the id the next
+	// one gets, released again at once.
+	depth := func(t *testing.T, tx WriteTx) int {
+		btx := tx.btreeWriteTx()
+		id, err := btx.Savepoint()
+		require.NoError(t, err)
+		require.NoError(t, btx.ReleaseSavepoint(id))
+		return id
+	}
+
+	t.Run("failed verb", func(t *testing.T) {
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		defer func() { _ = tx.Rollback() }()
+		_, err = coll.UpdateId(tx.Context(), 1, query.MustParseModifier(`{"$set":{"u":2}}`))
+		require.ErrorIs(t, err, ErrUniqueConstraint)
+		assert.Equal(t, 0, depth(t, tx))
+	})
+
+	t.Run("savepoint rollback", func(t *testing.T) {
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		defer func() { _ = tx.Rollback() }()
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(sp.Context(), doc(3)))
+		require.NoError(t, sp.Rollback())
+		assert.Equal(t, 0, depth(t, tx))
+	})
+
+	t.Run("nested savepoint rollback", func(t *testing.T) {
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		defer func() { _ = tx.Rollback() }()
+		outer, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		inner, err := fx.WriteTx(outer.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(inner.Context(), doc(3)))
+		require.NoError(t, inner.Rollback())
+		assert.Equal(t, 1, depth(t, tx), "the outer savepoint stays")
+		require.NoError(t, outer.Rollback())
+		assert.Equal(t, 0, depth(t, tx))
+	})
+}
+
+// An inner savepoint's rollback hands the pre-images of the pages its
+// scope wrote to the enclosing savepoint, which plays them back with its
+// own when it is rolled back in turn.
+func TestWriteTx_OuterRollbackAfterInnerRollback(t *testing.T) {
+	pad := strings.Repeat("x", 200)
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"u":%d,"p":"%s"}`, id, id, pad))
+	}
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"u"}, Unique: true}))
+	require.NoError(t, coll.Insert(ctx, doc(1), doc(2)))
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	outer, err := fx.WriteTx(tx.Context())
+	require.NoError(t, err)
+	inner, err := fx.WriteTx(outer.Context())
+	require.NoError(t, err)
+	for i := 3; i < 203; i++ {
+		require.NoError(t, coll.Insert(inner.Context(), doc(i)))
+	}
+	require.NoError(t, inner.Rollback())
+	for i := 203; i < 403; i++ {
+		require.NoError(t, coll.Insert(outer.Context(), doc(i)))
+	}
+	_, err = coll.UpdateId(outer.Context(), 1, query.MustParseModifier(`{"$set":{"u":2}}`))
+	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.NoError(t, outer.Rollback())
+	require.NoError(t, coll.Insert(tx.Context(), doc(3)), "the unique index forgot the inner scope's entry")
+	require.NoError(t, tx.Commit())
+
+	n, err := coll.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 3, n)
+	_, err = coll.FindId(ctx, 203)
+	assert.ErrorIs(t, err, ErrDocNotFound)
+	require.NoError(t, fx.IntegrityCheck(ctx))
 }
