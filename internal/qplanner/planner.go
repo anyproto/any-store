@@ -500,7 +500,11 @@ func BuildPlan(params *PlanParams) *Plan {
 				// entries.
 				est = float64(len(idx.Bounds))
 			} else if idx.Sketch != nil {
-				est = float64(idx.Sketch.Estimate(0, idx.Bounds[0].Start))
+				// Bounds are in stored key space already; a multi-point set
+				// matches the sum of its points.
+				for _, b := range idx.Bounds {
+					est += float64(idx.Sketch.Estimate(0, b.Start))
+				}
 			}
 			if est > 0 && nFieldSel < len(fieldSelBuf) {
 				fieldSelBuf[nFieldSel] = fieldSelEntry{
@@ -1071,9 +1075,15 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 				} else if isEquality && idx.Sketch != nil && fi == 0 && sketchLevelTrusted(idx.Sketch, 0) {
 					// Equality on the index's leading field: the level-0 sketch holds
 					// the count for that field's value alone (the prefix), so this is
-					// accurate for both single-field and compound indexes.
-					est := idx.Sketch.Estimate(0, bounds[0].Start)
-					p := float64(est) / totalDocs
+					// accurate for both single-field and compound indexes. The sketch
+					// is keyed by STORED bytes — inverted on a reverse field — and a
+					// multi-point set ($in) matches the sum of its points, as the
+					// seek estimate counts them (estimateIndexDocsWithFieldSel).
+					var est float64
+					for _, b := range ComputeSingleFieldBounds(idx.Info, bounds) {
+						est += float64(idx.Sketch.Estimate(0, b.Start))
+					}
+					p := est / totalDocs
 					if p > 1.0 {
 						p = 1.0
 					}

@@ -3674,3 +3674,53 @@ func TestPlannerRegression_ArrayBracketNeverProvidesOrder(t *testing.T) {
 		assert.Equal(t, collectSortedIDs(t, oq), collectSortedIDs(t, q), "%s %s: %s", c.query, c.sort, explain.Sql)
 	}
 }
+
+// TestPlannerRegression_EqualitySelectivityStoredSpace: the selectivity of an
+// equality is read from the sketch in the index's stored key space — a
+// reverse-declared index stores its keys inverted — and a multi-point $in
+// matches the sum of its points, so the FullScan yield and the LIMIT pricing
+// see the same count the seek estimate does.
+func TestPlannerRegression_EqualitySelectivityStoredSpace(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "sel")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a_fwd", Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "b_rev", Fields: []string{"-b"}}))
+	var docs []*anyenc.Value
+	for i := range 5000 {
+		v := "cold" + fmt.Sprint(i)
+		if i%10 == 0 {
+			v = "hot"
+		}
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%q,"b":%q,"t":%d}`, i, v, v, i%50)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+
+	selectivity := func(q string) string {
+		explain, err := coll.Find(q).Explain(ctx)
+		require.NoError(t, err)
+		for _, line := range strings.Split(explain.Plan, "\n") {
+			if strings.Contains(line, "Selectivity:") {
+				return strings.TrimSpace(line)
+			}
+		}
+		t.Fatalf("no selectivity line: %s", explain.Plan)
+		return ""
+	}
+	// Sketch buckets collide differently in the two key spaces, so the counts
+	// agree to within the hash noise, not exactly.
+	assert.Contains(t, selectivity(`{"a":"hot"}`), "Selectivity: 0.10 (")
+	assert.Contains(t, selectivity(`{"b":"hot"}`), "Selectivity: 0.10 (", "a reverse index rates the value in its stored space")
+	assert.Contains(t, selectivity(`{"a":{"$in":["hot","cold1","cold2"]}}`), "Selectivity: 0.10 (", "hot plus two single docs, not the first point alone")
+	assert.Contains(t, selectivity(`{"b":{"$in":["hot","cold1","cold2"]}}`), "Selectivity: 0.10 (")
+	assert.Contains(t, selectivity(`{"a":{"$in":["cold1","cold2","hot"]}}`), "Selectivity: 0.10 (", "whichever point sorts first")
+
+	// With the count right, a LIMIT'd unsorted seek is priced for the rows
+	// the LimitIter lets it fetch, as the full scan is for the rows it reads.
+	for _, q := range []string{`{"b":"hot"}`, `{"a":{"$in":["cold1","hot"]}}`, `{"b":{"$in":["cold1","hot"]}}`} {
+		explain, err := coll.Find(q).Limit(5).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, explain.Sql, "IndexScan(", "%s: %s", q, explain.Sql)
+		assert.Contains(t, explain.Sql, "-> Limit(5)", "%s: %s", q, explain.Sql)
+	}
+}
