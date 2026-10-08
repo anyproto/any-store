@@ -388,7 +388,9 @@ func TestPageSlab_PutKeepsOnlySlabBuffers(t *testing.T) {
 
 // A slab buffer returned when the free list is already full is a double Put.
 // It is dropped, not pooled: a pooled copy would hand the page to a second
-// owner through an overflow Get or a non-slab DB.
+// owner through an overflow Get or a non-slab DB. The pool probe sees a
+// pooled duplicate reliably only without -race; the race detector makes
+// sync.Pool drop items at random.
 func TestPageSlab_DoublePutAtFullListIsDropped(t *testing.T) {
 	var s pageSlab
 	defer s.Reset()

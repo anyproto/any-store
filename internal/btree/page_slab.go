@@ -10,8 +10,8 @@ package btree
 //    one buffer of nPages pages and hands out page-sized slices of it. Modeled
 //    after SQLite's pcache1.c slab allocator (pcache1_g struct, pcache1Alloc,
 //    pcache1Free, pcache1UnderMemoryPressure). When the slab is exhausted,
-//    falls back to make() (overflow). UnderPressure triggers admission control
-//    and immediate eviction.
+//    overflow buffers come from the sync.Pool, then make(). UnderPressure
+//    triggers admission control and immediate eviction.
 //
 // All page buffer allocation should go through allocPageBuffer/freePageBuffer,
 // which dispatch to the appropriate mode.
@@ -251,8 +251,9 @@ func (s *pageSlab) Reset() {
 // By default (without calling this and setting UsePageSlab), page buffers are
 // allocated via sync.Pool (like SQLite's default malloc mode). Calling this
 // enables slab mode: a soft cap on total page cache memory across all open
-// databases. When the slab is exhausted, overflow allocations use make() but
-// the UnderPressure flag triggers admission control and immediate eviction.
+// databases. When the slab is exhausted, overflow buffers come from the
+// sync.Pool, then make(), and the UnderPressure flag triggers admission
+// control and immediate eviction.
 //
 // Example: ConfigPageCache(4096, 5000) pre-allocates ~20MB of page buffers.
 // DRIFT: pageSlab.Init/ConfigPageCache idempotent & no-disable vs C re-configurable setup See docs/btree/NOTES.md#drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl

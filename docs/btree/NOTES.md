@@ -546,9 +546,11 @@ sub-journaling for savepoints.
 - Per-connection caches: writer has `writerCache`, each reader gets a private
   cache from `sync.Pool` (`readerCachePool`)
 - **Global slab allocator** (`page_slab.go`): process-global `pageSlab` singleton
-  pre-allocates `[]byte` page buffers. `Get()` pops from free list, falls back to
-  `make()` overflow. `Put()` returns buffers. `UnderPressure()` atomic flag when
-  free list drops below `nReserve` (10% + 1 of slab size)
+  allocates one buffer and carves it into page slices. `Get()` pops from the free
+  list, falls back to the `sync.Pool`, then `make()` (overflow). `Put()` returns
+  slab buffers to the free list and overflow buffers to the `sync.Pool`.
+  `UnderPressure()` atomic flag when the free list drops below `nReserve`
+  (10% + 1 of slab size)
 - **Per-cache bulk allocation** (`pcache.initBulk`): first `create()` call
   pre-allocates up to 20 page structs with data buffers from the heap
 - **LRU**: insert at HEAD (`lruPrepend`), evict from TAIL (`evictOne`). Correct
@@ -602,8 +604,8 @@ drawn from the global slab that enforces a process-wide soft cap.
 | Page struct | Two structs: `PgHdr` (generic) + `PgHdr1` (pcache1-specific) | Single `page` struct (drift #5) |
 | Spill victim search | `pSynced` + `pDirtyTail` two-pass (prefers non-`NEED_SYNC`) | `dirtyTail` single-pass; no `pSynced` in WAL-only (drift #19) |
 | Dirty-list order | `sqlite3PcacheDirtyList` returns pgno-sorted (`pcache.c:783-818`) | `dirtyPages` walks MRU→LRU, unsorted; WAL frames written in that order (no correctness impact — frames are pgno-addressed; page-1-first holds incidentally since page 1 is dirtied last) |
-| Slab allocator | Contiguous `void*` buffer, pointer arithmetic (`pcache1.c:283-288`) | One contiguous `[]byte` carved into page-capped three-index slices; the free list is a `[][]byte` stack rather than a list threaded through the slots (a `make()` per page cost ~10 ms per process start at 32k pages) |
-| Slab buffer return | Range check `SQLITE_WITHIN` (`pcache1.c:381`) | Range check against the slab's backing array (`pageSlab.within`); overflow buffers recycle via `sync.Pool` where SQLite frees them; a slab buffer arriving at a full list is dropped where C asserts (the earlier count cap let a returned overflow buffer displace a slab page and clear the pressure flag) |
+| Slab allocator | Contiguous `void*` buffer, pointer arithmetic (`pcache1.c:283-288`) | One contiguous `[]byte` carved into page-capped three-index slices; the free list is a `[][]byte` stack rather than a list threaded through the slots |
+| Slab buffer return | Range check `SQLITE_WITHIN` (`pcache1.c:381`) | Range check against the slab's backing array (`pageSlab.within`); overflow buffers recycle via `sync.Pool` where SQLite frees them; a slab buffer arriving at a full list is dropped where C asserts |
 | Slab init | Library init `pcache1Init` (`pcache1.c:695-741`) | Explicit `ConfigPageCache()` before `Open`; `Open` with `UsePageSlab` fails with `ErrPageSlabNotInitialized` otherwise (drift #9) |
 | Bulk alloc | Contiguous `pBulk` carved into slots (`pcache1.c:312-327`) | Individual page structs with slab buffers (drift #10) |
 | Page flags | Bitmask on each page | None (`hasContent` mirrors `BtShared.pHasContent`, not a page flag) |
@@ -3584,9 +3586,9 @@ The consequence is that a database whose read-version byte is greater than 2 (a 
 <a id="drift-2026-06-25-22-slab-get-has-no-per-request-size-guard-and-its-initialized-pagesize-va"></a>
 ### Drift: Slab Get Has No Per-Request Size Guard And Its Initialized PageSize Validator Is Dead Code
 - **Category:** missing-feature  -  **Severity:** low
-- **Affected functions:** `page_slab.go:pageSlab.Get` (`internal/btree/page_slab.go:142-166`), `page_slab.go:pageSlab.Initialized` (`internal/btree/page_slab.go:210-217`), `db.go:Open` (`internal/btree/db.go:418-420`).
+- **Affected functions:** `page_slab.go:pageSlab.Get` (`internal/btree/page_slab.go:151-175`), `db.go:Open` (`internal/btree/db.go:418-420`).
 
-Go's `pageSlab.Get()` (`internal/btree/page_slab.go:142-166`) takes no size argument: it pops the last buffer off `freeList`, or on exhaustion returns `make([]byte, s.pageSize)` — always the slab's own configured `pageSize` (`internal/btree/page_slab.go:160,165`). `allocPageBuffer(pageSize, useSlab)` (`internal/btree/page_slab.go:78-86`) honors the caller's requested `pageSize` only on the non-slab `sync.Pool`/`make` branch and discards it entirely when `useSlab` is true, calling `globalPageSlab.Get()` with no size check. The one validator that could catch a mismatch, `pageSlab.Initialized(pageSize)` (`internal/btree/page_slab.go:210-217`), does compare the requested size against `s.pageSize`, but its doc comment names callers in `pcache.initBulk()` and `create()` that do not exist — it has no non-test callers and is dead code. The only size-related enforcement at open is the all-or-nothing `UsePageSlab && !globalPageSlab.initialized.Load()` guard in `Open` (`internal/btree/db.go:418-420`), which checks that the slab is initialized but never that its page size matches the DB being opened.
+Go's `pageSlab.Get()` (`internal/btree/page_slab.go:151-175`) takes no size argument: it pops the last buffer off `freeList`, or on exhaustion takes a buffer from `pageBufferPool` or returns `make([]byte, s.pageSize)` — always the slab's own configured `pageSize` (`internal/btree/page_slab.go:169,174`). `allocPageBuffer(pageSize, useSlab)` (`internal/btree/page_slab.go:80-88`) honors the caller's requested `pageSize` only on the non-slab `sync.Pool`/`make` branch and discards it entirely when `useSlab` is true, calling `globalPageSlab.Get()` with no size check. The one validator that could have caught a mismatch, `pageSlab.Initialized(pageSize)`, compared the requested size against `s.pageSize` but had no non-test callers and has been removed. The only size-related enforcement at open is the all-or-nothing `UsePageSlab && !globalPageSlab.initialized.Load()` guard in `Open` (`internal/btree/db.go:418-420`), which checks that the slab is initialized but never that its page size matches the DB being opened.
 
 SQLite's `pcache1Alloc(nByte)` (`pcache1.c:341-374`) instead guards every request with `if( nByte<=pcache1.szSlot )` (`pcache1.c:344`): only requests that fit the slot size are served from the slab, and anything larger falls through to `sqlite3Malloc(nByte)` (`pcache1.c:361`) at the correct size. The consequence is that if a process configures the slab for one page size and then opens a DB with a different page size (an existing file whose header page size differs, or a second DB), the pager receives buffers sized for the slab's page rather than its own — a too-small buffer triggers index-out-of-range panics on page read/write while a too-large one wastes memory — with no per-request size guard and no graceful heap fallback at the correct size as SQLite provides.
 
