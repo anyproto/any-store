@@ -1298,6 +1298,24 @@ func (bt *btree) Put(key, value []byte) error {
 		return ErrKeyTooLarge
 	}
 
+	// The cursors open on this tree are saved before a page of it changes
+	// (sqlite3BtreeInsert → saveAllCursors, btree.c:9424): the writer cache
+	// rewrites the pages they pin in place. A page a save let go can be
+	// evicted by this very descent, and key and value may be slices of it
+	// — the entry a cursor stands on, handed back by Key or Value — so they
+	// are copied first. SQLite's writing cursor keeps its pages (pExcept)
+	// and its payload is the VDBE's own; here every cursor on the tree is
+	// a reader's.
+	if bt.pager.cursors != nil {
+		saved, err := bt.pager.saveAllCursors(bt.rootPage)
+		if err != nil {
+			return err
+		}
+		if saved {
+			key, value = bytes.Clone(key), bytes.Clone(value)
+		}
+	}
+
 	// Descend through interior pages with read-only access to find the leaf.
 	// Only the leaf page (and parents on split) are dirtied, avoiding
 	// unnecessary page copies for the common non-split case.
@@ -2663,6 +2681,20 @@ func (bt *btree) insertIntoInterior(pg *page, key, value []byte) error {
 // When fragmentation exceeds the threshold (60 bytes, matching SQLite's limit),
 // a full rebuild is triggered to defragment the page.
 func (bt *btree) Delete(key []byte) error {
+	// The cursors open on this tree are saved first (sqlite3BtreeDelete →
+	// saveAllCursors, btree.c:9917): the delete rewrites the leaf they pin in
+	// place and the rebalance frees pages their frames name. The key is
+	// copied when a page was let go: it may be a slice of it (see Put).
+	if bt.pager.cursors != nil {
+		saved, err := bt.pager.saveAllCursors(bt.rootPage)
+		if err != nil {
+			return err
+		}
+		if saved {
+			key = bytes.Clone(key)
+		}
+	}
+
 	// Phase 1: Read-only descent to find the leaf
 	pg, err := bt.getPage(bt.rootPage)
 	if err != nil {
@@ -3559,13 +3591,54 @@ const btCursorMaxDepth = 20
 // read directly from the page buffer without re-acquiring it. Interior
 // frames release their pages after extracting child pointers. Close()
 // must be called when the cursor is no longer needed.
+//
+// A write transaction's cursor survives the writes of its transaction
+// (BtCursor.eState, btreeInt.h): before a tree is modified, the writer saves
+// every cursor open on it — the key it stands on is copied and its pages
+// are released (saveAllCursors, saveCursorPosition, btree.c:806,756) — and
+// the next move or read seeks the key again (restoreCursorPosition,
+// btree.c:896). A cursor whose entry the write removed lands on a
+// neighbour: the move onward in the direction it landed yields the
+// neighbour without stepping over it (CURSOR_SKIPNEXT), a read reports
+// ErrKeyNotFound (the VDBE's nullRow, vdbeaux.c:3830). A move that fails
+// ends the cursor (cursorFault). A cursor is closed inside the transaction
+// that opened it.
 type Cursor struct {
 	bt       *btree
 	btData   btree // embedded btree data to avoid separate heap allocation
 	stack    []cursorFrame
 	stackBuf [8]cursorFrame // pre-allocated stack to avoid growth allocs for typical tree depths
-	valid    bool
+	state    cursorState
+	// skipNext is where a restored cursor stands relative to the key it was
+	// saved on (BtCursor.skipNext): >0 after it, <0 before it. In
+	// cursorSkipNext the move onward in that direction — Next after, Previous
+	// before — does not step.
+	skipNext int8
+	// faultErr is what every use of a cursorFault reports; faultSeq is the
+	// schema event that tripped it (pager.schemaSeq), 0 for a failed move
+	// or a failed write transaction.
+	faultErr error
+	faultSeq uint64
+	// savedKey is the key the cursor stood on as it was saved
+	// (BtCursor.pKey); its buffer is kept across saves. A tripped cursor
+	// keeps it: the rollback of the drop that tripped it restores the key.
+	savedKey []byte
+	// nextCursor links the writer's open cursors (BtCursor.pNext,
+	// pager.cursors); linked says the cursor is on the list.
+	nextCursor *Cursor
+	linked     bool
 }
+
+// cursorState is the cursor's position state (btreeInt.h CURSOR_*).
+type cursorState uint8
+
+const (
+	cursorInvalid     cursorState = iota // no position
+	cursorValid                          // on an entry, its leaf pinned
+	cursorSkipNext                       // restored onto a neighbour of the saved key
+	cursorRequireSeek                    // saved: savedKey, no pages
+	cursorFault                          // tripped: every use reports faultErr
+)
 
 type cursorFrame struct {
 	pg      *page // pinned page (non-nil only for the leaf frame)
@@ -3576,7 +3649,11 @@ type cursorFrame struct {
 // Close releases all pinned pages and invalidates the cursor.
 func (c *Cursor) Close() {
 	c.releasePages()
-	c.valid = false
+	c.clearSaved()
+	c.state = cursorInvalid
+	if c.linked {
+		c.bt.pager.unlinkCursor(c)
+	}
 }
 
 // releasePages releases all pinned pages in the cursor stack.
@@ -3590,18 +3667,154 @@ func (c *Cursor) releasePages() {
 	// Logically empty the stack so the cursor no longer claims a tree position.
 	// Mirrors SQLite's pCur->iPage = -1 in btreeReleaseAllCursorPages (btree.c:707):
 	// after releasing pinned pages the cursor must report no position, otherwise
-	// post-close Next/Previous (whose guard is !c.valid && len(c.stack) == 0) would
-	// re-pin released, possibly-repurposed pages. Capacity-preserving truncate keeps
-	// the pre-allocated stackBuf backing array, so no allocation churn is introduced.
+	// post-close Next/Previous (whose guard is an invalid cursor with an empty
+	// stack) would re-pin released, possibly-repurposed pages. Capacity-preserving
+	// truncate keeps the pre-allocated stackBuf backing array, so no allocation
+	// churn is introduced.
 	c.stack = c.stack[:0]
 }
 
+// clearSaved drops a saved position (sqlite3BtreeClearCursor, btree.c:848):
+// the positioning calls start afresh.
+func (c *Cursor) clearSaved() {
+	c.savedKey = c.savedKey[:0]
+	c.skipNext = 0
+}
+
+// savePosition saves the cursor before the tree it is open on is modified
+// (saveCursorPosition, btree.c:756): the key it stands on is copied, its
+// pages released, and the next move or read restores it. A cursor without
+// a position has nothing to save, and one already saved keeps its key
+// (saveCursorsOnList, btree.c:823). Reports whether a pinned page was let
+// go: the writer's own key and value may be slices of it.
+func (c *Cursor) savePosition() (saved bool, err error) {
+	switch c.state {
+	case cursorValid:
+		c.skipNext = 0
+	case cursorSkipNext:
+		// Lands again on the side of the key it stood on: skipNext is kept.
+		c.state = cursorValid
+	default:
+		c.releasePages()
+		return false, nil
+	}
+	k, err := c.Key()
+	if err != nil {
+		return false, err
+	}
+	c.savedKey = append(c.savedKey[:0], k...)
+	c.releasePages()
+	c.state = cursorRequireSeek
+	return true, nil
+}
+
+// trip ends the cursor (sqlite3BtreeTripAllCursors, btree.c:4467): its
+// pages are released and every use reports err. The position is saved
+// first, so that the rollback of the drop that tripped it can revive it;
+// a position that cannot be saved is lost.
+func (c *Cursor) trip(err error, seq uint64) {
+	if _, serr := c.savePosition(); serr != nil {
+		c.releasePages()
+		c.clearSaved()
+	}
+	c.faultErr = err
+	c.faultSeq = seq
+	c.state = cursorFault
+}
+
+// fail is the error exit of a move that left the cursor without a
+// position it can be saved from: the cursor is ended with err, and
+// reports it from then on.
+func (c *Cursor) fail(err error) error {
+	c.trip(err, 0)
+	return err
+}
+
+// revive brings back a cursor the drop of its tree tripped, as the drop
+// is rolled back: it stands on its saved key again, or is exhausted as it
+// was.
+func (c *Cursor) revive() {
+	c.faultErr = nil
+	c.faultSeq = 0
+	if len(c.savedKey) > 0 {
+		c.state = cursorRequireSeek
+	} else {
+		c.state = cursorInvalid
+	}
+}
+
+// restorePosition seeks a saved cursor back to its key
+// (btreeRestoreCursorPosition, btree.c:896). The key found again: the
+// cursor stands on it. Gone: the cursor stands on the entry after it, or
+// on the last entry when none follows, and cursorSkipNext records the
+// side, so that the move onward in that direction yields that entry
+// without stepping. A skipNext kept from an earlier restore stays unless
+// the seek sets one. A seek that fails ends the cursor.
+func (c *Cursor) restorePosition() error {
+	switch c.state {
+	case cursorRequireSeek:
+	case cursorFault:
+		return c.faultErr
+	default:
+		return nil
+	}
+	skip := c.skipNext
+	key := c.savedKey
+	if err := c.seek(key); err != nil {
+		return c.fail(err)
+	}
+	if c.state == cursorValid {
+		k, err := c.Key()
+		if err != nil {
+			return c.fail(err)
+		}
+		if !bytes.Equal(k, key) {
+			skip = 1
+		}
+	} else {
+		if err := c.last(); err != nil {
+			return c.fail(err)
+		}
+		if c.state == cursorValid {
+			skip = -1
+		}
+	}
+	if skip != 0 && c.state == cursorValid {
+		c.skipNext = skip
+		c.state = cursorSkipNext
+	}
+	c.savedKey = c.savedKey[:0]
+	return nil
+}
+
+// restored is the check every move and read begins with
+// (restoreCursorPosition, btree.c:922): nil once the cursor stands on its
+// saved key or its neighbour.
+func (c *Cursor) restored() error {
+	if c.state < cursorRequireSeek {
+		return nil
+	}
+	return c.restorePosition()
+}
+
 // First positions the cursor at the first (smallest) key.
-// DRIFT: descent omits moveToChild's per-child nCell>=1 corruption guard See docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-
 func (c *Cursor) First() error {
+	if c.state == cursorFault {
+		return c.faultErr
+	}
+	c.clearSaved()
+	if err := c.first(); err != nil {
+		c.releasePages()
+		return err
+	}
+	return nil
+}
+
+// DRIFT: descent omits moveToChild's per-child nCell>=1 corruption guard See docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-
+func (c *Cursor) first() error {
 	c.releasePages()
 	c.stack = c.stack[:0]
-	c.valid = false
+	c.state = cursorInvalid
 
 	pg, err := c.bt.getPage(c.bt.rootPage)
 	if err != nil {
@@ -3654,7 +3867,7 @@ func (c *Cursor) First() error {
 
 	if pg.header.cellCount > 0 {
 		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: 0, pg: pg})
-		c.valid = true
+		c.state = cursorValid
 	} else {
 		c.bt.pager.releasePage(pg)
 	}
@@ -3662,11 +3875,23 @@ func (c *Cursor) First() error {
 }
 
 // Last positions the cursor at the last (largest) key.
-// DRIFT: descent omits moveToChild's per-child nCell>=1 corruption guard See docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-
 func (c *Cursor) Last() error {
+	if c.state == cursorFault {
+		return c.faultErr
+	}
+	c.clearSaved()
+	if err := c.last(); err != nil {
+		c.releasePages()
+		return err
+	}
+	return nil
+}
+
+// DRIFT: descent omits moveToChild's per-child nCell>=1 corruption guard See docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-
+func (c *Cursor) last() error {
 	c.releasePages()
 	c.stack = c.stack[:0]
-	c.valid = false
+	c.state = cursorInvalid
 
 	pg, err := c.bt.getPage(c.bt.rootPage)
 	if err != nil {
@@ -3699,7 +3924,7 @@ func (c *Cursor) Last() error {
 	n := int(pg.header.cellCount)
 	if n > 0 {
 		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: n - 1, pg: pg})
-		c.valid = true
+		c.state = cursorValid
 	} else {
 		c.bt.pager.releasePage(pg)
 	}
@@ -3707,12 +3932,26 @@ func (c *Cursor) Last() error {
 }
 
 // Seek positions the cursor at the first key >= the given key.
+func (c *Cursor) Seek(key []byte) error {
+	if c.state == cursorFault {
+		return c.faultErr
+	}
+	c.clearSaved()
+	if err := c.seek(key); err != nil {
+		c.releasePages()
+		return err
+	}
+	return nil
+}
+
+// seek is Seek without the saved position cleared: restorePosition seeks
+// the saved key itself.
 // DRIFT: descent omits moveToChild's per-child nCell>=1 corruption guard See docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-
 // DRIFT: seek descent omits SQLite's per-page intKey/page-type consistency check See docs/btree/NOTES.md#drift-12-b-tree-kind-consistency-check-omitted-on-descent
-func (c *Cursor) Seek(key []byte) error {
+func (c *Cursor) seek(key []byte) error {
 	c.releasePages()
 	c.stack = c.stack[:0]
-	c.valid = false
+	c.state = cursorInvalid
 
 	pg, err := c.bt.getPage(c.bt.rootPage)
 	if err != nil {
@@ -3745,7 +3984,7 @@ func (c *Cursor) Seek(key []byte) error {
 	}
 	if idx < int(pg.header.cellCount) {
 		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: idx, pg: pg})
-		c.valid = true
+		c.state = cursorValid
 	} else {
 		// Need to go to next leaf via parent
 		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: idx})
@@ -3825,8 +4064,9 @@ func leafKeyAt(pg *page, idx int) ([]byte, error) {
 // It optimises for the case where the target key falls within the currently
 // pinned leaf page, avoiding a full root-to-leaf traversal.
 func (c *Cursor) SeekNear(key []byte) error {
-	// Fast path: check if key falls within the pinned leaf page.
-	if c.valid && len(c.stack) > 0 {
+	// Fast path: check if key falls within the pinned leaf page. A saved or
+	// tripped cursor pins none and takes the full seek.
+	if c.state == cursorValid && len(c.stack) > 0 {
 		leaf := &c.stack[len(c.stack)-1]
 		if leaf.pg != nil {
 			n := int(leaf.pg.header.cellCount)
@@ -3848,7 +4088,7 @@ func (c *Cursor) SeekNear(key []byte) error {
 					}
 					leaf.cellIdx = idx
 					if idx < n {
-						c.valid = true
+						c.state = cursorValid
 					} else {
 						return c.Next()
 					}
@@ -3867,7 +4107,7 @@ func (c *Cursor) SeekExact(key []byte) error {
 	if err := c.SeekNear(key); err != nil {
 		return err
 	}
-	if !c.valid {
+	if c.state != cursorValid {
 		return ErrKeyNotFound
 	}
 	eq, err := c.currentKeyEqual(key)
@@ -3887,7 +4127,7 @@ func (c *Cursor) AppendValueByKey(key []byte, buf []byte) ([]byte, error) {
 	if err := c.SeekNear(key); err != nil {
 		return buf, err
 	}
-	if !c.valid {
+	if c.state != cursorValid {
 		return buf, ErrKeyNotFound
 	}
 	eq, err := c.currentKeyEqual(key)
@@ -3941,13 +4181,16 @@ func (c *Cursor) currentKeyEqual(key []byte) (bool, error) {
 
 // Key returns the current key.
 // For non-overflow cells, the returned slice points directly into the pinned
-// page buffer and is valid until the next cursor movement or Close().
+// page buffer and is valid until the next cursor movement, a write of the
+// transaction to the tree (which saves the cursor), or Close().
 // For overflow cells where the key spills, a new slice is allocated.
 func (c *Cursor) Key() ([]byte, error) {
-	if !c.valid {
+	if err := c.restored(); err != nil {
+		return nil, err
+	}
+	if c.state != cursorValid {
 		return nil, ErrKeyNotFound
 	}
-
 	frame := &c.stack[len(c.stack)-1]
 	if frame.pg == nil {
 		return nil, ErrCorrupt
@@ -3971,10 +4214,14 @@ func (c *Cursor) Key() ([]byte, error) {
 
 // Value returns the current value.
 // For non-overflow values, the returned slice points directly into the pinned
-// page buffer and is valid until the next cursor movement or Close().
+// page buffer and is valid until the next cursor movement, a write of the
+// transaction to the tree (which saves the cursor), or Close().
 // For overflow values, a new slice is allocated and returned.
 func (c *Cursor) Value() ([]byte, error) {
-	if !c.valid {
+	if err := c.restored(); err != nil {
+		return nil, err
+	}
+	if c.state != cursorValid {
 		return nil, ErrKeyNotFound
 	}
 
@@ -4043,7 +4290,10 @@ func (c *Cursor) Value() ([]byte, error) {
 // For overflow values, reads directly into buf with no intermediate allocation,
 // matching SQLite's accessPayload() offset approach.
 func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
-	if !c.valid {
+	if err := c.restored(); err != nil {
+		return buf, err
+	}
+	if c.state != cursorValid {
 		return buf, ErrKeyNotFound
 	}
 
@@ -4108,11 +4358,27 @@ func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
 	return append(buf, cell.value...), nil
 }
 
-// Next advances the cursor to the next key in order.
+// Next advances the cursor to the next key in order. A saved cursor is
+// restored first; one that landed after its saved key stands on the next
+// key already and does not step (btreeNext, btree.c:6315).
+// An invalid cursor with no frames is exhausted; one with frames (a seek
+// past a leaf's last entry) continues from them.
 // DRIFT: B+tree (leaf-only keys) drops interior-cell positions that SQLite B-tree visits See docs/btree/NOTES.md#drift-14-b-plus-tree-traversal-drops-interior-cell-keys-versus-sqlite
 func (c *Cursor) Next() error {
-	if !c.valid && len(c.stack) == 0 {
-		return nil
+	if c.state != cursorValid {
+		if err := c.restored(); err != nil {
+			return err
+		}
+		if c.state == cursorSkipNext {
+			c.state = cursorValid
+			if c.skipNext > 0 {
+				c.skipNext = 0
+				return nil
+			}
+			c.skipNext = 0
+		} else if len(c.stack) == 0 {
+			return nil
+		}
 	}
 
 	for len(c.stack) > 0 {
@@ -4122,7 +4388,7 @@ func (c *Cursor) Next() error {
 		if frame.pg != nil {
 			frame.cellIdx++
 			if frame.cellIdx < int(frame.pg.header.cellCount) {
-				c.valid = true
+				c.state = cursorValid
 				return nil
 			}
 			// Past end of this leaf — release pinned page, pop frame, go up.
@@ -4135,7 +4401,7 @@ func (c *Cursor) Next() error {
 		// Interior frame: re-acquire page to read child pointers.
 		pg, err := c.bt.getPage(frame.pgno)
 		if err != nil {
-			return err
+			return c.fail(err)
 		}
 
 		frame.cellIdx++
@@ -4144,7 +4410,7 @@ func (c *Cursor) Next() error {
 			off := int(pg.getCellOffset(frame.cellIdx))
 			if off+4 > len(pg.data) {
 				c.bt.pager.releasePage(pg)
-				return ErrCorrupt
+				return c.fail(ErrCorrupt)
 			}
 			childPgno = binary.BigEndian.Uint32(pg.data[off : off+4])
 		} else if frame.cellIdx == int(pg.header.cellCount) {
@@ -4160,7 +4426,7 @@ func (c *Cursor) Next() error {
 		// Descend to leftmost leaf of child (mirrors SQLite's moveToLeftmost).
 		childPg, err := c.bt.getPage(childPgno)
 		if err != nil {
-			return err
+			return c.fail(err)
 		}
 		for childPg.header.isInterior() {
 			if childPg.header.cellCount == 0 {
@@ -4168,42 +4434,56 @@ func (c *Cursor) Next() error {
 			}
 			if len(c.stack) >= btCursorMaxDepth-1 {
 				c.bt.pager.releasePage(childPg)
-				return ErrCorrupt
+				return c.fail(ErrCorrupt)
 			}
 			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: 0})
 			off := int(childPg.getCellOffset(0))
 			if off+4 > len(childPg.data) {
 				c.bt.pager.releasePage(childPg)
-				return ErrCorrupt
+				return c.fail(ErrCorrupt)
 			}
 			nextPgno := binary.BigEndian.Uint32(childPg.data[off : off+4])
 			c.bt.pager.releasePage(childPg)
 			childPg, err = c.bt.getPage(nextPgno)
 			if err != nil {
-				return err
+				return c.fail(err)
 			}
 		}
 
 		if childPg.header.cellCount > 0 {
 			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: 0, pg: childPg})
-			c.valid = true
+			c.state = cursorValid
 			return nil
 		}
 		c.bt.pager.releasePage(childPg)
 	}
 
-	c.valid = false
+	c.state = cursorInvalid
 	return nil
 }
 
-// Previous moves the cursor to the previous key in order.
+// Previous moves the cursor to the previous key in order. A saved cursor
+// is restored first; one that landed before its saved key stands on the
+// previous key already and does not step (btreePrevious, btree.c:6409).
 // Modeled after sqlite3BtreePrevious / btreePrevious in btree.c.
 // The logic mirrors Next() but in reverse: on a leaf we decrement the cell
 // index; on an interior page we descend into the previous child's rightmost
 // leaf.
 func (c *Cursor) Previous() error {
-	if !c.valid && len(c.stack) == 0 {
-		return nil
+	if c.state != cursorValid {
+		if err := c.restored(); err != nil {
+			return err
+		}
+		if c.state == cursorSkipNext {
+			c.state = cursorValid
+			if c.skipNext < 0 {
+				c.skipNext = 0
+				return nil
+			}
+			c.skipNext = 0
+		} else if len(c.stack) == 0 {
+			return nil
+		}
 	}
 
 	for len(c.stack) > 0 {
@@ -4213,7 +4493,7 @@ func (c *Cursor) Previous() error {
 		if frame.pg != nil {
 			frame.cellIdx--
 			if frame.cellIdx >= 0 {
-				c.valid = true
+				c.state = cursorValid
 				return nil
 			}
 			// Past the beginning of this leaf — release pinned page, pop, go up.
@@ -4226,7 +4506,7 @@ func (c *Cursor) Previous() error {
 		// Interior frame: re-acquire page to read child pointers.
 		pg, err := c.bt.getPage(frame.pgno)
 		if err != nil {
-			return err
+			return c.fail(err)
 		}
 
 		// Descend to the previous child's rightmost leaf.
@@ -4244,7 +4524,7 @@ func (c *Cursor) Previous() error {
 			off := int(pg.getCellOffset(frame.cellIdx))
 			if off+4 > len(pg.data) {
 				c.bt.pager.releasePage(pg)
-				return ErrCorrupt
+				return c.fail(ErrCorrupt)
 			}
 			childPgno = binary.BigEndian.Uint32(pg.data[off : off+4])
 		} else if frame.cellIdx == int(pg.header.cellCount) {
@@ -4260,7 +4540,7 @@ func (c *Cursor) Previous() error {
 		// Descend to the rightmost leaf of this child subtree (mirrors SQLite's moveToRightmost).
 		childPg, err := c.bt.getPage(childPgno)
 		if err != nil {
-			return err
+			return c.fail(err)
 		}
 		for childPg.header.isInterior() {
 			n := int(childPg.header.cellCount)
@@ -4269,7 +4549,7 @@ func (c *Cursor) Previous() error {
 			}
 			if len(c.stack) >= btCursorMaxDepth-1 {
 				c.bt.pager.releasePage(childPg)
-				return ErrCorrupt
+				return c.fail(ErrCorrupt)
 			}
 			// Push frame pointing to the rightChild position (cellIdx = n)
 			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: n})
@@ -4277,7 +4557,7 @@ func (c *Cursor) Previous() error {
 			c.bt.pager.releasePage(childPg)
 			childPg, err = c.bt.getPage(nextPgno)
 			if err != nil {
-				return err
+				return c.fail(err)
 			}
 		}
 
@@ -4285,13 +4565,13 @@ func (c *Cursor) Previous() error {
 		if n > 0 {
 			// Position at the last cell of this leaf
 			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: n - 1, pg: childPg})
-			c.valid = true
+			c.state = cursorValid
 			return nil
 		}
 		c.bt.pager.releasePage(childPg)
 	}
 
-	c.valid = false
+	c.state = cursorInvalid
 	return nil
 }
 
@@ -4299,8 +4579,25 @@ func (c *Cursor) Previous() error {
 // Within a leaf page, this is an O(1) cellIdx bump. Page transitions
 // only happen at leaf boundaries, so skipping N entries costs
 // O(N / entries_per_page) page transitions instead of O(N) Next() calls.
+// A restored cursor that landed after its saved key has taken the first
+// step already.
 func (c *Cursor) Skip(n int) error {
-	for n > 0 && c.valid {
+	if n <= 0 {
+		return nil
+	}
+	if c.state != cursorValid {
+		if err := c.restored(); err != nil {
+			return err
+		}
+		if c.state == cursorSkipNext {
+			c.state = cursorValid
+			if c.skipNext > 0 {
+				n--
+			}
+			c.skipNext = 0
+		}
+	}
+	for n > 0 && c.state == cursorValid {
 		frame := &c.stack[len(c.stack)-1]
 		if frame.pg == nil {
 			return ErrCorrupt
@@ -4327,7 +4624,22 @@ func (c *Cursor) Skip(n int) error {
 // SkipBackward moves the cursor backward by n positions.
 // Mirror of Skip for reverse traversal.
 func (c *Cursor) SkipBackward(n int) error {
-	for n > 0 && c.valid {
+	if n <= 0 {
+		return nil
+	}
+	if c.state != cursorValid {
+		if err := c.restored(); err != nil {
+			return err
+		}
+		if c.state == cursorSkipNext {
+			c.state = cursorValid
+			if c.skipNext < 0 {
+				n--
+			}
+			c.skipNext = 0
+		}
+	}
+	for n > 0 && c.state == cursorValid {
 		frame := &c.stack[len(c.stack)-1]
 		if frame.pg == nil {
 			return ErrCorrupt
@@ -4350,9 +4662,10 @@ func (c *Cursor) SkipBackward(n int) error {
 	return nil
 }
 
-// Valid returns true if the cursor is positioned at a valid entry.
+// Valid returns true if the cursor is positioned at a valid entry. A saved
+// cursor is not, until its next move or read restores it.
 func (c *Cursor) Valid() bool {
-	return c.valid
+	return c.state == cursorValid
 }
 
 // CountUntil counts entries from the current position until the end key,
@@ -4363,7 +4676,24 @@ func (c *Cursor) CountUntil(endKey []byte, endInclusive bool) (int, error) {
 	count := 0
 	usableSize := c.bt.usablePageSize()
 
-	for c.valid {
+	if c.state != cursorValid {
+		// A restored cursor counts from its saved key: landed after it, the
+		// entry it stands on is the first; before it, the first is the next.
+		if err := c.restored(); err != nil {
+			return 0, err
+		}
+		if c.state == cursorSkipNext {
+			c.state = cursorValid
+			skip := c.skipNext
+			c.skipNext = 0
+			if skip < 0 {
+				if err := c.Next(); err != nil {
+					return 0, err
+				}
+			}
+		}
+	}
+	for c.state == cursorValid {
 		frame := &c.stack[len(c.stack)-1]
 		if frame.pg == nil {
 			return count, ErrCorrupt
@@ -4417,7 +4747,7 @@ func (c *Cursor) CountUntil(endKey []byte, endInclusive bool) (int, error) {
 		if len(endKey) > 0 {
 			cmp := bytes.Compare(k, endKey)
 			if cmp > 0 || (cmp == 0 && !endInclusive) {
-				c.valid = false
+				c.state = cursorInvalid
 				return count, nil
 			}
 		}
@@ -4441,6 +4771,9 @@ func (c *Cursor) CountUntil(endKey []byte, endInclusive bool) (int, error) {
 // beat a full scan" decision. It reads one page per level (tree depth ≈ 3–5),
 // exactly the pages a Seek touches, and holds no page across the call.
 func (c *Cursor) keyRank(key []byte) (float64, error) {
+	if c.state == cursorFault {
+		return 0, c.faultErr
+	}
 	pg, err := c.bt.getPage(c.bt.rootPage)
 	if err != nil {
 		return 0, err
@@ -4520,9 +4853,16 @@ func (c *Cursor) RangeFraction(low, high []byte) (float64, error) {
 
 // NewCursor creates a new cursor for the B-tree.
 // The btree data is copied into the Cursor to avoid a separate heap allocation.
+// A writer's cursor joins the pager's cursor list (btreeCursor, btree.c:4741):
+// the writes of its transaction save it. A reader's cursor reads a
+// snapshot no write touches and runs on the reader's goroutine; it is
+// never linked.
 func (bt *btree) NewCursor() *Cursor {
 	c := &Cursor{btData: *bt}
 	c.bt = &c.btData
 	c.stack = c.stackBuf[:0]
+	if bt.writable {
+		bt.pager.linkCursor(c)
+	}
 	return c
 }

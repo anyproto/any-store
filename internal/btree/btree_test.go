@@ -2019,33 +2019,21 @@ func TestSearchLeafOverflow_ProbeNilInProduction(t *testing.T) {
 	require.Equal(t, 0, idx)
 }
 
-// === Cursor read-only / two-state invariants (moved from cursor_readonly_invariant_test.go) ===
+// === Cursor read-only / single-leaf-pin invariants ===
 
-// These tests pin the structural invariants behind the by-design drift
-// documented at docs/btree/NOTES.md#old-drift-readonly-two-state-cursor:
-// the Go Cursor is a READ-ONLY, 2-STATE (valid bool), dynamic-stack cursor that
-// pins ONLY its leaf frame and has NO save/restore.
+// These tests pin the structural contract of the Go Cursor (docs/btree/NOTES.md
+// §15): a READ-ONLY, dynamic-stack cursor that pins ONLY its leaf frame, whose
+// position is saved before a write of its transaction touches the tree and
+// restored by its next move or read (saveAllCursors, btree.c:806;
+// btreeRestoreCursorPosition, btree.c:896) — see cursor_save_test.go for the
+// save/restore behaviour itself.
 //
-// In SQLite a BtCursor has 5 states and, before every tree mutation, calls
-// saveAllCursors(pBt, pCur->pgnoRoot, pCur) (btree.c:9442 in sqlite3BtreeInsert,
-// btree.c:9935 in sqlite3BtreeDelete), which serializes the cursor key, releases
-// all pinned cursor pages (btreeReleaseAllCursorPages, btree.c:769-789), and sets
-// eState=CURSOR_REQUIRESEEK so the cursor re-seeks on next use. The Go port drops
-// this entirely: the cursor keeps frame.pg pinned and frame.cellIdx frozen across
-// any mutation.
-//
-// That omission is SAFE only because the design relies on an unstated invariant:
-// the Go cursor is a read-only iterator whose pinned leaf and frozen position are
-// never mutated underneath it within the same logical operation. Writes go through
-// WriteTx.Put / WriteTx.Delete, which build their OWN writable btree and traverse
-// from the root (db.go:1834-1849, btree.go:Put/Delete) rather than driving a
-// cursor. These tests assert the load-bearing facts of that contract so that a
+// Writes go through WriteTx.Put / WriteTx.Delete, which build their OWN writable
+// btree and traverse from the root (btree.go Put/Delete) rather than driving a
+// cursor: the cursor is an observer the writes save, never the mutation
+// vehicle. These tests assert the load-bearing facts of that contract so that a
 // future refactor which (e.g.) adds a write method to Cursor, pins more than the
-// leaf, drives mutations through a cursor, or introduces a hidden re-seek state
-// fails loudly here.
-//
-// NONE of these tests change or exercise unsupported production behavior — they
-// only observe and pin the existing read-only/2-state/single-leaf-pin contract.
+// leaf, or drives mutations through a cursor fails loudly here.
 
 // buildMultiLevelTree inserts n small entries with a 512-byte page size so the
 // resulting tree has at least one interior level above the leaves. The cursor
@@ -2078,11 +2066,11 @@ func buildMultiLevelTree(t *testing.T, n int) (*DB, *Namespace) {
 // saveAllCursors/btreeReleaseAllCursorPages to drop them before a mutation; the
 // Go design pins only the leaf precisely because it never has to release-and-
 // re-seek mid-operation. If a refactor starts pinning interior frames (or stops
-// pinning the leaf), the no-save/restore design's assumptions change and this
+// pinning the leaf), the single-leaf-pin contract changes and this
 // fails loudly.
 func assertSingleLeafPin(t *testing.T, c *Cursor) {
 	t.Helper()
-	require.True(t, c.valid, "cursor must be positioned for the pin invariant to apply")
+	require.True(t, c.state == cursorValid, "cursor must be positioned for the pin invariant to apply")
 	require.NotEmpty(t, c.stack, "a valid cursor must have a non-empty stack")
 
 	last := len(c.stack) - 1
@@ -2106,7 +2094,7 @@ func assertSingleLeafPin(t *testing.T, c *Cursor) {
 // TestCursorReadOnlyInvariant_OnlyLeafPinned walks the cursor across a
 // multi-level tree (First + repeated Next, then Last + repeated Previous) and
 // asserts the single-leaf-pin invariant at every position. This is the core
-// structural property the no-save/restore drift relies on.
+// structural property the save/restore design relies on: a save releases one pin.
 func TestCursorReadOnlyInvariant_OnlyLeafPinned(t *testing.T) {
 	db, _ := buildMultiLevelTree(t, 2000)
 
@@ -2143,13 +2131,12 @@ func TestCursorReadOnlyInvariant_OnlyLeafPinned(t *testing.T) {
 	}
 }
 
-// TestCursorReadOnlyInvariant_NoReSeekStateFrozenPin pins the 2-STATE +
-// frozen-pin half of the contract: a positioned cursor stays on the SAME pinned
-// *page with a STABLE cellIdx across repeated value reads, and Valid() is exactly
-// the 2-state model (no hidden CURSOR_REQUIRESEEK that would silently re-seek and
-// swap the pinned page). SQLite's re-seek machinery (saveCursorKey + REQUIRESEEK,
-// btree.c:724-789) deliberately invalidates the pinned page; the Go cursor must
-// NOT — its readers (Key/Value) point directly into the still-pinned buffer.
+// TestCursorReadOnlyInvariant_NoReSeekStateFrozenPin pins the frozen-pin half
+// of the contract: a positioned cursor stays on the SAME pinned *page with a
+// STABLE cellIdx across repeated value reads — its readers (Key/Value) point
+// directly into the still-pinned buffer. Only a write of its transaction to the
+// tree saves the cursor (saveCursorKey + REQUIRESEEK, btree.c:714-789); a read
+// never does.
 func TestCursorReadOnlyInvariant_NoReSeekStateFrozenPin(t *testing.T) {
 	db, _ := buildMultiLevelTree(t, 2000)
 
@@ -2172,10 +2159,11 @@ func TestCursorReadOnlyInvariant_NoReSeekStateFrozenPin(t *testing.T) {
 	k0, err := cur.Key()
 	require.NoError(t, err)
 
-	// Repeated reads must NOT re-seek (which in SQLite would drop and re-pin the
-	// page) — same *page pointer, same cellIdx, identical key/value each time.
+	// Repeated reads must NOT re-seek (only a write saves the cursor, and a
+	// read of a saved cursor re-pins) — same *page pointer, same cellIdx,
+	// identical key/value each time.
 	for i := 0; i < 5; i++ {
-		require.True(t, cur.Valid(), "read must not flip the 2-state validity")
+		require.True(t, cur.Valid(), "read must not flip the validity")
 		require.Same(t, pinnedPage, cur.stack[len(cur.stack)-1].pg,
 			"repeated reads must keep the SAME pinned leaf page (no hidden re-seek)")
 		require.Equal(t, frozenIdx, cur.stack[len(cur.stack)-1].cellIdx,
@@ -2204,7 +2192,7 @@ func TestCursorReadOnlyInvariant_NoReSeekStateFrozenPin(t *testing.T) {
 //
 // This is the exact "write to the same namespace a live cursor is positioned on,
 // within one write transaction" scenario from the invariant statement. We assert
-// the design fact that makes the absent saveAllCursors harmless here: the writer
+// the design fact behind it: the writer
 // does its own traversal, so the cursor's pinned page is not the mutation vehicle.
 func TestCursorReadOnlyInvariant_WritesBypassCursor(t *testing.T) {
 	db := tempDBWithPageSize(t, 512)
@@ -2234,16 +2222,23 @@ func TestCursorReadOnlyInvariant_WritesBypassCursor(t *testing.T) {
 
 	// Mutate the SAME namespace via the WriteTx API. This must succeed and must
 	// not route through the cursor: Put/Delete build their own bt{writable:true}
-	// and traverse from ns.rootPage. We are NOT asserting the cursor stays valid
-	// afterwards (the design explicitly does not guarantee that); we are pinning
-	// that the write path exists and is independent of the cursor object.
+	// and traverse from ns.rootPage. The write saves the cursor — pages
+	// released, key kept — and its next move seeks the key again.
 	require.NoError(t, wtx.Put(ns, []byte("k-100"), []byte("inserted")))
+	require.Equal(t, cursorRequireSeek, cur.state)
+	require.Empty(t, cur.stack)
 	require.NoError(t, wtx.Delete(ns, []byte("k-001")))
+	require.NoError(t, cur.Next())
+	k, err := cur.Key()
+	require.NoError(t, err)
+	require.Equal(t, "k-005", string(k))
+	cur.Close()
 
 	// The Cursor object carries no path into the writer's mutation routines: it
 	// has no Put/Delete/Insert/Set/Update/Remove method. A future refactor that
-	// adds one (i.e. makes the cursor a write cursor) must consciously revisit
-	// the saveAllCursors gap and will trip this guard.
+	// adds one (i.e. makes the cursor a write cursor) takes on SQLite's
+	// BTCF_WriteFlag semantics (a write cursor is tripped, not saved, by a
+	// rollback) and will trip this guard.
 	assertCursorExposesNoWriteMethods(t)
 
 	// After the commit the data reflects the writer's own traversal, confirming
@@ -2263,10 +2258,10 @@ func TestCursorReadOnlyInvariant_WritesBypassCursor(t *testing.T) {
 }
 
 // assertCursorExposesNoWriteMethods uses reflection to pin the read-only API
-// surface of *Cursor. The Go cursor (NOTES.md:918) has no BTCF_WriteFlag
+// surface of *Cursor. The Go cursor (NOTES.md §15) has no BTCF_WriteFlag
 // equivalent: it must expose only read/seek/navigation methods. The presence of
 // any mutation method would mean the cursor became a write cursor, at which point
-// the missing saveAllCursors/restore machinery is no longer a benign drift.
+// a rollback must trip it as SQLite trips a write cursor, not save it.
 func assertCursorExposesNoWriteMethods(t *testing.T) {
 	t.Helper()
 	forbidden := map[string]struct{}{
@@ -2279,7 +2274,7 @@ func assertCursorExposesNoWriteMethods(t *testing.T) {
 		_, bad := forbidden[name]
 		require.Falsef(t, bad,
 			"Cursor must remain read-only (no write methods); found mutating method %q — "+
-				"if the cursor is now a write cursor, the missing saveAllCursors/restore "+
-				"(NOTES #old-drift-readonly-two-state-cursor) must be revisited", name)
+				"if the cursor is now a write cursor, its trip on rollback "+
+				"(sqlite3BtreeTripAllCursors writeOnly, NOTES.md §15) must be added", name)
 	}
 }

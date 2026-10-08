@@ -1236,6 +1236,7 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	if err != nil {
 		return err
 	}
+	db.pager.rootCreated(rootPg.pgno)
 
 	// Initialize as empty leaf page
 	hdrOff := 0
@@ -1276,8 +1277,13 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 		return err
 	}
 
-	// Free all pages in the namespace's B-tree
+	// Free all pages in the namespace's B-tree. A cursor still open on it
+	// is ended first: its pages go to the freelist, and its key has no tree
+	// to be sought in; the rollback of a savepoint that undoes the drop
+	// revives it. SQLite refuses the drop instead, while any other
+	// statement is running (vdbe.c OP_Destroy, SQLITE_LOCKED).
 	if rootPage != 0 {
+		db.pager.rootDropped(rootPage)
 		return db.freeTreePages(rootPage)
 	}
 	return nil
@@ -2007,11 +2013,17 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 	}
 }
 
-// NewCursor creates a cursor for iterating over the namespace.
+// NewCursor creates a cursor for iterating over the namespace. A write
+// transaction's cursor is saved by the transaction's writes to the
+// namespace and restored by its next move or read (see Cursor); it is
+// closed before the transaction ends.
 func (tx *ReadTx) NewCursor(ns *Namespace) *Cursor {
 	c := &Cursor{}
 	c.btData = btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
 	c.bt = &c.btData
+	if tx.writable && !tx.closed {
+		tx.pager.linkCursor(c)
+	}
 	return c
 }
 
@@ -2396,9 +2408,18 @@ func (tx *WriteTx) Savepoint() (int, error) {
 }
 
 // RollbackToSavepoint rolls back all changes made since the given savepoint.
+// The open cursors are saved first (sqlite3BtreeSavepoint, btree.c:4614):
+// none pins a page while the pager plays the savepoint back, and each
+// seeks its key again in the restored tree. A cursor on a tree the
+// rollback drops is ended, one on a tree it brings back goes on
+// (pager.schemaRolledBack); the layer above ends the cursors positioned
+// inside the savepoint before this (tx.go tripItersFrom).
 func (tx *WriteTx) RollbackToSavepoint(id int) error {
 	if tx.closed {
 		return ErrTxClosed
+	}
+	if _, err := tx.pager.saveAllCursors(0); err != nil {
+		return err
 	}
 	return tx.pager.rollbackToSavepoint(id)
 }

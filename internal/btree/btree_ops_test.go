@@ -4311,7 +4311,7 @@ func TestCov_CursorKeyFramePgNil(t *testing.T) {
 
 	cur := bt.NewCursor()
 	// Manually set valid and push a frame with nil pg
-	cur.valid = true
+	cur.state = cursorValid
 	cur.stack = append(cur.stack, cursorFrame{pgno: pg.pgno, cellIdx: 0, pg: nil})
 
 	_, kerr := cur.Key()
@@ -4328,7 +4328,7 @@ func TestCov_CursorValueFramePgNil(t *testing.T) {
 	p.releasePage(pg)
 
 	cur := bt.NewCursor()
-	cur.valid = true
+	cur.state = cursorValid
 	cur.stack = append(cur.stack, cursorFrame{pgno: pg.pgno, cellIdx: 0, pg: nil})
 
 	_, verr := cur.Value()
@@ -4348,7 +4348,7 @@ func TestCov_SeekNearFirstKeyError(t *testing.T) {
 	bt.rebuildLeafPage(pg, []cellData{{key: []byte("abc"), value: []byte("v")}})
 
 	cur := bt.NewCursor()
-	cur.valid = true
+	cur.state = cursorValid
 	cur.stack = append(cur.stack, cursorFrame{pgno: pg.pgno, cellIdx: 0, pg: pg})
 
 	// Corrupt the first cell to trigger leafKeyAt error
@@ -4377,7 +4377,7 @@ func TestCov_SeekNearLastKeyError(t *testing.T) {
 	})
 
 	cur := bt.NewCursor()
-	cur.valid = true
+	cur.state = cursorValid
 	cur.stack = append(cur.stack, cursorFrame{pgno: pg.pgno, cellIdx: 0, pg: pg})
 
 	// Corrupt second cell pointer to trigger leafKeyAt error for lastKey
@@ -4404,7 +4404,7 @@ func TestCov_SeekNearSearchLeafError(t *testing.T) {
 	})
 
 	cur := bt.NewCursor()
-	cur.valid = true
+	cur.state = cursorValid
 	cur.stack = append(cur.stack, cursorFrame{pgno: pg.pgno, cellIdx: 0, pg: pg})
 
 	// Corrupt middle cell to trigger searchLeaf error when searching within range
@@ -4496,7 +4496,7 @@ func TestCov_CursorKeyCellOffsetError(t *testing.T) {
 	// cellIdx must be large enough so that cellPointerOffset + cellIdx*2 + 2 > len(pg.data)
 	// For a 4096-byte page with 8-byte leaf header: need 8 + cellIdx*2 + 2 > 4096 => cellIdx > 2043
 	cur := bt.NewCursor()
-	cur.valid = true
+	cur.state = cursorValid
 	cur.stack = append(cur.stack, cursorFrame{pgno: pg.pgno, cellIdx: 9999, pg: pg})
 
 	_, kerr := cur.Key()
@@ -4516,7 +4516,7 @@ func TestCov_CursorValueCellOffsetError(t *testing.T) {
 	bt.rebuildLeafPage(pg, []cellData{{key: []byte("k"), value: []byte("v")}})
 
 	cur := bt.NewCursor()
-	cur.valid = true
+	cur.state = cursorValid
 	cur.stack = append(cur.stack, cursorFrame{pgno: pg.pgno, cellIdx: 9999, pg: pg})
 
 	_, verr := cur.Value()
@@ -5219,7 +5219,7 @@ func TestCov_CursorPreviousGetPageError(t *testing.T) {
 	cur := bt.NewCursor()
 	// Push a single interior frame with pgno=0 (triggers ErrInvalidPage on getPage)
 	cur.stack = append(cur.stack, cursorFrame{pgno: 0, cellIdx: 1})
-	cur.valid = true
+	cur.state = cursorValid
 
 	err := cur.Previous()
 	assert.Error(t, err)
@@ -5237,7 +5237,7 @@ func TestCov_CursorNextGetPageError(t *testing.T) {
 	cur := bt.NewCursor()
 	// Push a single interior frame with pgno=0 (triggers ErrInvalidPage on getPage)
 	cur.stack = append(cur.stack, cursorFrame{pgno: 0, cellIdx: 0})
-	cur.valid = true
+	cur.state = cursorValid
 
 	err := cur.Next()
 	assert.Error(t, err)
@@ -5261,7 +5261,7 @@ func TestCov_CursorPreviousDescentGetPageError(t *testing.T) {
 	cur := bt.NewCursor()
 	// Push interior frame at cellIdx=1 (rightChild position)
 	cur.stack = append(cur.stack, cursorFrame{pgno: intPg.pgno, cellIdx: 1})
-	cur.valid = true
+	cur.state = cursorValid
 
 	// Previous decrements cellIdx to 0, reads leftChild=0, getPage(0) fails
 	err = cur.Previous()
@@ -5286,7 +5286,7 @@ func TestCov_CursorNextDescentGetPageError(t *testing.T) {
 	cur := bt.NewCursor()
 	// Push interior frame at cellIdx=0
 	cur.stack = append(cur.stack, cursorFrame{pgno: intPg.pgno, cellIdx: 0})
-	cur.valid = true
+	cur.state = cursorValid
 
 	// Next increments cellIdx to 1, which == cellCount(1), reads rightChild=0, getPage(0) fails
 	err = cur.Next()
@@ -5462,7 +5462,7 @@ func TestCov_PreviousInteriorDescentRightChildPos(t *testing.T) {
 	cur.stack = append(cur.stack, cursorFrame{pgno: intPg.pgno, cellIdx: int(intPg.header.cellCount)})
 	cur.stack = append(cur.stack, cursorFrame{pgno: leafPg2.pgno, cellIdx: 0, pg: leafPg2})
 	leafPg2.pinCount++
-	cur.valid = true
+	cur.state = cursorValid
 
 	// Previous: leaf cellIdx goes to -1, pops leaf, interior frame cellIdx is decremented from cellCount
 	// to cellCount-1 which is < cellCount, reads leftChild pointer
@@ -5487,7 +5487,7 @@ func TestCov_PreviousInteriorCellOffCorrupt(t *testing.T) {
 	cur := bt.NewCursor()
 	// Interior frame at cellIdx=1 (one past the cell, so Previous will decrement to 0)
 	cur.stack = append(cur.stack, cursorFrame{pgno: intPg.pgno, cellIdx: 1})
-	cur.valid = true
+	cur.state = cursorValid
 
 	err = cur.Previous()
 	assert.ErrorIs(t, err, ErrCorrupt)
@@ -5506,7 +5506,7 @@ func TestCov_PreviousElseBranchCellIdxBeyond(t *testing.T) {
 	// Interior frame with cellIdx far beyond cellCount
 	// After decrement, cellIdx will still be > cellCount, triggering else branch
 	cur.stack = append(cur.stack, cursorFrame{pgno: intPg.pgno, cellIdx: 100})
-	cur.valid = true
+	cur.state = cursorValid
 
 	err = cur.Previous()
 	// Should pop this frame and continue, eventually hitting empty stack
@@ -5544,7 +5544,7 @@ func TestCov_PreviousInteriorDescentToInterior(t *testing.T) {
 	cur.stack = append(cur.stack, cursorFrame{pgno: midPg.pgno, cellIdx: 1})
 	cur.stack = append(cur.stack, cursorFrame{pgno: leafPg2.pgno, cellIdx: 0, pg: leafPg2})
 	leafPg2.pinCount++
-	cur.valid = true
+	cur.state = cursorValid
 
 	// Previous: leaf pops, mid interior frame cellIdx goes from 1 to 0,
 	// reads leftChild=leafPg1, descends to rightmost leaf
@@ -5567,7 +5567,7 @@ func TestCov_PreviousDescentMaxDepth(t *testing.T) {
 	cur := bt.NewCursor()
 	// Interior frame at cellIdx=1 (rightChild)
 	cur.stack = append(cur.stack, cursorFrame{pgno: intPg.pgno, cellIdx: 1})
-	cur.valid = true
+	cur.state = cursorValid
 
 	// Previous decrements to cellIdx=0, gets leftChild=intPg (which is interior),
 	// tries to descend but hits maxDepth
@@ -5589,7 +5589,7 @@ func TestCov_PreviousDescentGetPageErrorInLoop(t *testing.T) {
 	cur := bt.NewCursor()
 	// Interior frame at cellIdx=1
 	cur.stack = append(cur.stack, cursorFrame{pgno: intPg.pgno, cellIdx: 1})
-	cur.valid = true
+	cur.state = cursorValid
 
 	// Previous: decrements to cellIdx=0, reads leftChild=intPg, descends.
 	// intPg is interior with rightChild=0, so it pushes a frame and calls getPage(0) which fails
@@ -5613,7 +5613,7 @@ func TestCov_PreviousDescentEmptyLeaf(t *testing.T) {
 
 	cur := bt.NewCursor()
 	cur.stack = append(cur.stack, cursorFrame{pgno: intPg.pgno, cellIdx: 1})
-	cur.valid = true
+	cur.state = cursorValid
 
 	// Previous: cellIdx goes to 0, reads leftChild=emptyLeaf, finds cellCount=0
 	// releases page and continues loop
@@ -5685,7 +5685,7 @@ func TestCov_NextInteriorDescentToInterior(t *testing.T) {
 	cur.stack = append(cur.stack, cursorFrame{pgno: midPg.pgno, cellIdx: 0})
 	cur.stack = append(cur.stack, cursorFrame{pgno: leafPg1.pgno, cellIdx: 0, pg: leafPg1})
 	leafPg1.pinCount++
-	cur.valid = true
+	cur.state = cursorValid
 
 	// Next: leaf has 1 cell, cellIdx goes to 1 >= cellCount, pops.
 	// mid interior: cellIdx goes from 0 to 1 == cellCount(1), reads rightChild=leafPg2
@@ -5719,7 +5719,7 @@ func TestCov_NextInteriorDescentCellOffCorrupt(t *testing.T) {
 
 	cur := bt.NewCursor()
 	cur.stack = append(cur.stack, cursorFrame{pgno: intPg.pgno, cellIdx: 0})
-	cur.valid = true
+	cur.state = cursorValid
 
 	// Next: cellIdx goes to 1 == cellCount(1), reads rightChild=childInt
 	// childInt is interior, tries to read cell 0 offset which is corrupted
@@ -5745,7 +5745,7 @@ func TestCov_NextInteriorDescentGetPageErrorInLoop(t *testing.T) {
 
 	cur := bt.NewCursor()
 	cur.stack = append(cur.stack, cursorFrame{pgno: intPg.pgno, cellIdx: 0})
-	cur.valid = true
+	cur.state = cursorValid
 
 	// Next: cellIdx goes to 1 == cellCount, reads rightChild=childInt
 	// childInt is interior with cellCount>0, reads leftChild=0, getPage(0) fails
