@@ -800,15 +800,25 @@ func (w savepointWrapper) Rollback() error {
 	btWtx := w.btreeWriteTx()
 	db := w.dbRef()
 	err := btWtx.RollbackToSavepoint(w.sp.savepointId)
+	if err == nil {
+		// The savepoint is gone with its rollback (savepointEnded above):
+		// the btree level it rolled back to is released with it. Left on
+		// the pager's stack, the level would hold a copy of every page
+		// written until the transaction or an enclosing savepoint ended.
+		// SQLite's statement journal closes the same way: rollback to,
+		// then release (vdbeCloseStatement).
+		err = btWtx.ReleaseSavepoint(w.sp.savepointId)
+	}
 	// The fts pending buffers hold only ops made inside this savepoint's
 	// scope (they were flushed empty at its creation), and the btree state
 	// those ops were derived from has just been reverted — discard them,
 	// with the scope's schema log, and put the sketches the scope wrote
 	// back (before the log goes: the flags the discard propagates are the
-	// restored ones). All three run even when RollbackToSavepoint
-	// fails: its error returns happen before any mutation, the outer tx is
-	// doomed either way, and matching the in-memory schema state to the
-	// last committed disk state is the conservative choice.
+	// restored ones). All three run even when the rollback or the
+	// release fails: RollbackToSavepoint's error returns happen before any
+	// mutation, the outer tx is doomed either way, and matching the
+	// in-memory schema state to the last committed disk state is the
+	// conservative choice.
 	// RollbackToSavepoint keeps the write lock in all cases, so the
 	// discard runs inside the critical section.
 	db.resetAllFtsPending(&btWtx.ReadTx)
