@@ -8538,8 +8538,8 @@ func TestAllocateFromFreelist_SpilledFreedLeafReallocated(t *testing.T) {
 	require.NoError(t, tx.Delete(ns, []byte("x")))
 	require.True(t, db.pager.getHasContent(grown))
 	// Churn the 6-page cache so the leaves are spilled and evicted. The
-	// small values fit in the root leaf, so nothing is taken from the
-	// freelist yet.
+	// same-size overwrites rewrite cells in place, so nothing is taken from
+	// the freelist yet.
 	val[0] = 1
 	for i := 0; i < 300; i++ {
 		require.NoError(t, tx.Put(nsb, []byte(fmt.Sprintf("b%04d", i)), val))

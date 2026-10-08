@@ -1233,7 +1233,7 @@
       {
         "file": "pager.c",
         "func": "sqlite3PagerDontWrite",
-        "reason": "PGHDR_DONT_WRITE is honoured only by the rollback-journal writer (pager_write_pagelist); in WAL mode the frame is written at spill and commit, and the flag's re-journal side effect is the per-savepoint copy in getWritablePage."
+        "reason": "PGHDR_DONT_WRITE has no effect in WAL mode: only the rollback-journal writer (pager_write_pagelist) reads it, and clearing WRITEABLE just routes the next sqlite3PagerWrite through sqlite3PcacheMakeDirty, which drops it; frames are written at spill and commit."
       },
       {
         "file": "pager.c",

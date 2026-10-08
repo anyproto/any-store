@@ -1564,12 +1564,13 @@ func (p *pager) freePage(pgno uint32) error {
 			p.releasePage(trunkPg)
 			p.header.TotalFreelistPgs++
 			// No PGHDR_DONT_WRITE equivalent (freePage2, btree.c:6920): in WAL
-			// mode the flag has no I/O effect (the frame is written at spill
-			// and commit), and its only side effect, re-journaling the page for
-			// a savepoint opened later, is what getWritablePage's per-savepoint
-			// copy does. The bytes stay reachable: allocateFromFreelist reads
-			// them back on reuse in this transaction, and a backup reads every
-			// page below dbSize.
+			// mode the flag has no effect. Only the rollback-journal writer
+			// reads it (pager_write_pagelist, pager.c:4471); clearing WRITEABLE
+			// just routes the next sqlite3PagerWrite through
+			// sqlite3PcacheMakeDirty, which drops it. The frame is written at
+			// spill and commit, and the bytes stay reachable: allocateFromFreelist
+			// reads them back on reuse in this transaction, and a backup reads
+			// every page up to dbSize.
 			// Track that this page had content before being freed, so that if
 			// it is re-allocated from the freelist within the same transaction,
 			// its content will be properly journaled for savepoint rollback.
@@ -1624,6 +1625,7 @@ func (p *pager) freePage(pgno uint32) error {
 // instead of the last leaf — matches SQLite btree.c:6678-6699 in
 // BTALLOC_ANY mode. Callers that don't care about locality pass 0.
 // DRIFT: only BTALLOC_ANY; EXACT/LE absent (any-store has no auto-vacuum, their sole consumer) See docs/btree/NOTES.md#old-drift-no-btalloc-exact-le-modes
+// DRIFT: a NOCONTENT freelist realloc under a savepoint is journaled; C skips the sub-journal via the savepoint bitvecs See docs/btree/NOTES.md#drift-nocontent-realloc-savepoint-copy
 func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 	trunkPgno := p.header.FirstFreelistPg
 	if trunkPgno == 0 {
@@ -1722,22 +1724,22 @@ func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 			return pg, nil
 		}
 
-		// When savepoints are active, MUST use getWritablePage so the page's
-		// pre-allocation state is saved for potential rollback. This matches
-		// SQLite which always calls sqlite3PagerWrite() after btreeGetUnusedPage(),
-		// ensuring the page is journaled for savepoint rollback regardless of
-		// the NOCONTENT flag. Without this, rolling back a savepoint would leave
-		// the page with its new data while the freelist header is restored to
-		// reference it — causing corruption.
+		// With a savepoint open, C fetches the leaf NOCONTENT too; the fetch
+		// marks the page in every open savepoint's bitvec (getPageNormal,
+		// pager.c:5599-5611), so the sqlite3PagerWrite that follows
+		// (btree.c:6728) does not sub-journal it and ROLLBACK TO leaves the
+		// post-allocation bytes on the freelist leaf. Go copies the zeroed page
+		// into the innermost savepoint instead (see the DRIFT on this func): the
+		// rollback restores it as a dirty page, so the leaf keeps readable bytes
+		// without C's short-read zero-fill.
 		if len(p.savepoints) > 0 {
 			if debugTrace {
 				trace("allocateFromFreelist: leaf pg=%d hasContent=false but savepoints=%d → getPageNoContent + savepoint copy", leafPgno, len(p.savepoints))
 			}
 			// hasContent==false: the leaf's bytes are irrelevant, so fetch it
 			// NOCONTENT (no read), matching SQLite's
-			// `noContent = !btreeGetHasContent(...)` (btree.c:6725), then journal
-			// the no-content state into the innermost savepoint so a rollback
-			// restores the page consistently with the freelist header.
+			// `noContent = !btreeGetHasContent(...)` (btree.c:6725), then copy
+			// the zeroed page into the innermost savepoint.
 			pg, err := p.getPageNoContent(leafPgno)
 			if err != nil {
 				return nil, err
