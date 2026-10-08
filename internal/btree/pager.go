@@ -225,7 +225,7 @@ type pager struct {
 	openIno     uint64
 	openIdentOK bool
 
-	// useSlab is set once by btree.Open from Options.SlabPages.
+	// useSlab is set once by btree.Open from Options.UsePageSlab.
 	// Local bool — no atomic/global reads on hot path.
 	useSlab bool
 
@@ -294,7 +294,7 @@ func newPager(path string, pageSize uint32, cacheSize int, purgeable bool) *page
 	p := &pager{
 		path:     path,
 		pageSize: pageSize,
-		// useSlab defaults to false; set by btree.Open from Options.SlabPages.
+		// useSlab defaults to false; set by btree.Open from Options.UsePageSlab.
 		writerCache: newPcache(int(pageSize), cacheSize, purgeable),
 		// cellData and [][]byte scratch entries hold pointers into recycled
 		// buffers; clear them on put so stale headers do not pin backing

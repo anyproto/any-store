@@ -147,7 +147,7 @@ func newPcache(pageSize, maxPages int, purgeable bool) *pcache {
 		pageSize:  pageSize,
 		purgeable: purgeable,
 		// useSlab defaults to false (sync.Pool mode). Callers that want slab
-		// mode (btree.Open with SlabPages > 0) override this after creation.
+		// mode (btree.Open with UsePageSlab) override this after creation.
 	}
 }
 

@@ -602,9 +602,9 @@ drawn from the global slab that enforces a process-wide soft cap.
 | Page struct | Two structs: `PgHdr` (generic) + `PgHdr1` (pcache1-specific) | Single `page` struct (drift #5) |
 | Spill victim search | `pSynced` + `pDirtyTail` two-pass (prefers non-`NEED_SYNC`) | `dirtyTail` single-pass; no `pSynced` in WAL-only (drift #19) |
 | Dirty-list order | `sqlite3PcacheDirtyList` returns pgno-sorted (`pcache.c:783-818`) | `dirtyPages` walks MRU→LRU, unsorted; WAL frames written in that order (no correctness impact — frames are pgno-addressed; page-1-first holds incidentally since page 1 is dirtied last) |
-| Slab allocator | Contiguous `void*` buffer, pointer arithmetic (`pcache1.c:283-288`) | `[][]byte` slice, Go-idiomatic (drift #7) |
-| Slab buffer return | Range check `SQLITE_WITHIN` (`pcache1.c:381`) | Caps free list at `nSlab`; overflow buffers recycle via `sync.Pool` (drift #8, since commit `01af9d6`) |
-| Slab init | Library init `pcache1Init` (`pcache1.c:695-741`) | Lazy init on first `Open()` or explicit `ConfigPageCache()` (drift #9) |
+| Slab allocator | Contiguous `void*` buffer, pointer arithmetic (`pcache1.c:283-288`) | One contiguous `[]byte` carved into page-capped three-index slices; the free list is a `[][]byte` stack rather than a list threaded through the slots (a `make()` per page cost ~10 ms per process start at 32k pages) |
+| Slab buffer return | Range check `SQLITE_WITHIN` (`pcache1.c:381`) | Range check against the slab's backing array (`pageSlab.within`); overflow buffers recycle via `sync.Pool` where SQLite frees them; a slab buffer arriving at a full list is dropped where C asserts (the earlier count cap let a returned overflow buffer displace a slab page and clear the pressure flag) |
+| Slab init | Library init `pcache1Init` (`pcache1.c:695-741`) | Explicit `ConfigPageCache()` before `Open`; `Open` with `UsePageSlab` fails with `ErrPageSlabNotInitialized` otherwise (drift #9) |
 | Bulk alloc | Contiguous `pBulk` carved into slots (`pcache1.c:312-327`) | Individual page structs with slab buffers (drift #10) |
 | Page flags | Bitmask on each page | None (`hasContent` mirrors `BtShared.pHasContent`, not a page flag) |
 | Cache ownership | Per-connection (private) | Per-connection (private) — matches SQLite |
@@ -1493,15 +1493,16 @@ the error to the commit caller would change the application contract).
 
 **Global Slab Allocator** -- Severity: N/A (implemented)
 
-Process-global `pageSlab` singleton pre-allocates `[]byte` page buffers at init.
-Configured via `ConfigPageCache(pageSize, nPages)` before opening any databases,
-or lazily initialized with defaults (2000 buffers) on first `Open()` call.
+Process-global `pageSlab` singleton allocates one buffer at init and carves it
+into page slices. Configured via `ConfigPageCache(pageSize, nPages)` before
+opening any database; `Open` with `UsePageSlab` fails with
+`ErrPageSlabNotInitialized` otherwise.
 Matches SQLite's `sqlite3_config(SQLITE_CONFIG_PAGECACHE)` /
 `sqlite3PCacheBufferSetup` (`pcache1.c:271-291`).
 
 Key components:
-- `pageSlab.Get()`: pops from free list; falls back to `make()` overflow
-- `pageSlab.Put()`: returns buffer to free list
+- `pageSlab.Get()`: pops from free list; falls back to the `sync.Pool`, then `make()` (overflow)
+- `pageSlab.Put()`: returns slab buffers to the free list; overflow buffers go to the `sync.Pool`
 - `pageSlab.UnderPressure()`: atomic bool, true when `len(freeList) < nReserve`
   (`nReserve`: if nPages > 90 then 10 else nPages/10 + 1, matching `pcache1.c:279`)
 - All page buffer allocations (pcache create, bulk alloc, temp pages) go through
@@ -2623,11 +2624,11 @@ would never produce.
 <a id="drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl"></a>
 ### Drift: pageSlab And ConfigPageCache Idempotent Versus Reconfigurable Setup
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `page_slab.go:*pageSlab.Init` (`internal/btree/page_slab.go:112-136`),
+- **Affected functions:** `page_slab.go:*pageSlab.Init` (`internal/btree/page_slab.go:115-146`),
   `page_slab.go:ConfigPageCache`
-  (`internal/btree/page_slab.go:112-136 (guard at 113,118); wrapper page_slab.go:246-248`),
+  (`internal/btree/page_slab.go:115-146 (guard at 116,121); wrapper page_slab.go:259-261`),
   `page_slab.go:ConfigPageCache`
-  (`internal/btree/page_slab.go:121-130 (nReserve/freeList for nPages==0); Put logic page_slab.go:185-193`).
+  (`internal/btree/page_slab.go:124-143 (nReserve/slab/freeList for nPages==0); Put logic page_slab.go:192-202`).
 
 C's `sqlite3PCacheBufferSetup` (`pcache1.c:271-291`) is fully reconfigurable: on every call while
 initialized it unconditionally overwrites the entire global slab config (`szSlot`,
@@ -2636,7 +2637,7 @@ list, and it has two explicit disable branches up front -- `if(pBuf==0) sz=n=0;`
 sz=0;` (`pcache1.c:274-275`) -- so passing `n==0` drives `szSlot` to 0 and effectively turns the
 static page cache OFF, routing all allocations to `sqlite3Malloc`. Go's `pageSlab.Init` (the
 worker behind `ConfigPageCache`) is permanently first-call-wins idempotent: a double-checked
-`s.initialized.Load()` guard (`page_slab.go:113,118`) makes every subsequent `Init` a silent no-op
+`s.initialized.Load()` guard (`page_slab.go:116,121`) makes every subsequent `Init` a silent no-op
 ("If already initialized, this is a no-op."), so re-configuration with different parameters is
 ignored, and there is no disable path -- `nPages==0` still sets `initialized=true` and is treated
 as an initialized but empty slab rather than a disabled cache. The consequences are that the page
@@ -2646,12 +2647,12 @@ way SQLite allows; both diverge from SQLite's reconfigurable, disable-capable se
 <a id="drift-69-underpressure-drops-heap-nearly-full-fallback"></a>
 ### Drift: UnderPressure Drops Heap Nearly Full Fallback
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `page_slab.go:*pageSlab.UnderPressure` (`page_slab.go:199-201`).
+- **Affected functions:** `page_slab.go:*pageSlab.UnderPressure` (`page_slab.go:226-228`).
 
 C's `pcache1UnderMemoryPressure` (`pcache1.c:517-523`) has two branches: when a slab is configured
 and the page fits a slot it returns the atomic `bUnderPressure` flag, but ELSE (no slab configured,
 or a page too big for a slot) it falls back to `sqlite3HeapNearlyFull()`, still reporting memory
-pressure from the global soft-heap-limit. Go's `UnderPressure()` (`page_slab.go:199-201`)
+pressure from the global soft-heap-limit. Go's `UnderPressure()` (`page_slab.go:226-228`)
 implements only the first branch and drops the `sqlite3HeapNearlyFull()` fallback entirely. The
 consequence is that in the default no-slab configuration Go always reports no memory pressure,
 whereas SQLite would still surface heap-based pressure, so the cache never receives the
@@ -3236,20 +3237,20 @@ map-backed "disk", and any reasoning about durability or post-checkpoint page st
 <a id="drift-123-process-global-page-buffer-pool-single-page-size-constraint"></a>
 ### Drift: Process Global Page Buffer Pool Single Page Size Constraint
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `page_slab.go` (`internal/btree/page_slab.go:53-66` initPageBufferPool,
-  `:45-47` pageBufferPoolSize, `errors.go:87-90` ErrPageBufferPoolSizeMismatch, `db.go:422` enforcement at Open,
+- **Affected functions:** `page_slab.go` (`internal/btree/page_slab.go:55-68` initPageBufferPool,
+  `:47-49` pageBufferPoolSize, `errors.go:87-90` ErrPageBufferPoolSizeMismatch, `db.go:422` enforcement at Open,
   `pager.go:612` second enforcement on header read),
-  `page_slab.go` (`internal/btree/page_slab.go:41-47` pageBufferPool/pageBufferPoolSize,
-  `:78-107` allocPageBuffer/freePageBuffer dispatch, `:160-166` + `:186-190` slab overflow recycles via default pool).
+  `page_slab.go` (`internal/btree/page_slab.go:43-49` pageBufferPool/pageBufferPoolSize,
+  `:78-109` allocPageBuffer/freePageBuffer dispatch, `:167-174` + `:193-194` slab overflow recycles via default pool).
 
 In the default (non-slab) mode, page-buffer allocation routes through a single process-global `sync.Pool`
-(`pageBufferPool`, `page_slab.go:41-47`) shared across every DB in the process, keyed to one global page size held in
-the atomic `pageBufferPoolSize`. `initPageBufferPool` (`page_slab.go:53-66`) CAS-sets that size on first init and
+(`pageBufferPool`, `page_slab.go:43-49`) shared across every DB in the process, keyed to one global page size held in
+the atomic `pageBufferPoolSize`. `initPageBufferPool` (`page_slab.go:55-68`) CAS-sets that size on first init and
 thereafter returns `ErrPageBufferPoolSizeMismatch` (`errors.go:87-90`) for any DB opened with a different `PageSize`;
 `db.Open` enforces this unconditionally on every open (`db.go:422`), and the pager re-enforces it against the on-disk
 page size after reading the header (`pager.go:612`). Because `useSlab` defaults false
 (`pcache.go:36,133`, `pager.go:229-231`), all page buffers for all DBs come from and return to this one shared
-pool, and even slab-mode OVERFLOW buffers recycle through the same default pool (`page_slab.go:160-166,186-190`). The
+pool, and even slab-mode OVERFLOW buffers recycle through the same default pool (`page_slab.go:167-174,193-194`). The
 consequence is an undocumented process-wide constraint with no SQLite counterpart — SQLite's `pcache1Alloc`
 (`pcache1.c:341-361`) sizes each allocation per request and falls back to `sqlite3Malloc`, so it imposes no
 process-wide single-page-size constraint. Two DBs in the same process cannot use different page sizes in default
