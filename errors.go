@@ -112,6 +112,12 @@ var (
 	// ErrIterClosed is returned when operations are attempted on a closed iterator.
 	ErrIterClosed = errors.New("any-store: iterator is closed")
 
+	// ErrIterRolledBack is the error of an iterator that was opened or moved
+	// inside a savepoint's scope once that savepoint is rolled back: Next
+	// returns false, Err and Doc report it. The pages it stood on went with
+	// the rollback; the transaction goes on.
+	ErrIterRolledBack = errors.New("any-store: iterator ended by a savepoint rollback")
+
 	// ErrQuickCheckFailed is returned when we did a quick check (e.g. when opening db in a dirty state with sentinel config on) and it failed, indicating possible database corruption.
 	ErrQuickCheckFailed = errors.New("any-store: quick check failed on db open")
 
