@@ -179,12 +179,6 @@ type pager struct {
 	keyScratch  scratchPool[[]byte]
 	pgnoScratch scratchPool[uint32]
 
-	// dontWritePages tracks pages that were dirtied but whose content doesn't
-	// need to be persisted (e.g., freed leaf pages added to a freelist trunk).
-	// Matches SQLite's PGHDR_DONT_WRITE flag (pager.c:6283). We use a map
-	// because we cannot modify the page struct in page.go.
-	dontWritePages map[uint32]bool
-
 	// backups is the list of in-flight online backups reading from this
 	// pager. ~ Pager.pBackup (singly-linked list head in SQLite). Go slice
 	// is simpler since we never insert from callback context.
@@ -198,10 +192,10 @@ type pager struct {
 	// Matches SQLite's BtShared.pHasContent bitvec (btree.c:617-685).
 	//
 	// Without this, a page freed and re-allocated within the same transaction
-	// after a savepoint would lose its original content: freePage marks it as
-	// dontWrite (skipping the WAL write), and allocateFromFreelist would use
-	// getPageNoContent (skipping savepoint journaling). On savepoint rollback
-	// the page content is not restored, leading to corrupt overflow chains.
+	// after a savepoint would lose its original content: allocateFromFreelist
+	// would use getPageNoContent (skipping savepoint journaling). On savepoint
+	// rollback the page content is not restored, leading to corrupt overflow
+	// chains.
 	// This is the exact bug from SQLite ticket 7f7f8026eda387d544b.
 	hasContent map[uint32]bool
 
@@ -1398,10 +1392,6 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 	// Check writer cache first. Spilled pages (clean but still cached)
 	// are re-dirtied here. Evicted pages fall through to getPage().
 	if pg := p.writerCache.fetch(pgno); pg != nil {
-		// Clear dontWrite flag: the page is being re-acquired for writing,
-		// so its content is meaningful again (fix 5.4). Matches SQLite's
-		// pcache.c:596-597 where PGHDR_DONT_WRITE is cleared by makeDirty.
-		delete(p.dontWritePages, pgno)
 		// Re-dirty pages that were made clean by pagerStress (spill).
 		if !pg.dirty {
 			p.writerCache.makeDirty(pg)
@@ -1573,14 +1563,13 @@ func (p *pager) freePage(pgno uint32) error {
 			binary.BigEndian.PutUint32(trunkPg.data[4:8], uint32(leafCount+1))
 			p.releasePage(trunkPg)
 			p.header.TotalFreelistPgs++
-			// Mark the freed page as dontWrite if it's dirty (fix 5.4).
-			// The page content is now irrelevant since it's a freelist leaf.
-			// Only done when adding as leaf to trunk, NOT when becoming a trunk
-			// (trunk page content is meaningful -- it holds freelist structure).
-			// Matches SQLite's freePage2() (btree.c:6920).
-			if p.writerCache.hashFind(pgno) != nil {
-				p.dontWrite(pgno)
-			}
+			// No PGHDR_DONT_WRITE equivalent (freePage2, btree.c:6920): in WAL
+			// mode the flag has no I/O effect (the frame is written at spill
+			// and commit), and its only side effect, re-journaling the page for
+			// a savepoint opened later, is what getWritablePage's per-savepoint
+			// copy does. The bytes stay reachable: allocateFromFreelist reads
+			// them back on reuse in this transaction, and a backup reads every
+			// page below dbSize.
 			// Track that this page had content before being freed, so that if
 			// it is re-allocated from the freelist within the same transaction,
 			// its content will be properly journaled for savepoint rollback.
@@ -1730,7 +1719,6 @@ func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 			}
 			clear(pg.data)
 			pg.header = pageHeader{}
-			delete(p.dontWritePages, leafPgno)
 			return pg, nil
 		}
 
@@ -1769,7 +1757,6 @@ func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 			clear(pg.data)
 			pg.header = pageHeader{}
 			p.writerCache.makeDirty(pg)
-			delete(p.dontWritePages, leafPgno)
 			return pg, nil
 		}
 
@@ -1785,12 +1772,6 @@ func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 		clear(pg.data)
 		pg.header = pageHeader{}
 		p.writerCache.makeDirty(pg)
-		// Clear dontWrite flag: when a page is freed and then re-allocated
-		// within the same transaction, the freePage() call may have marked it
-		// dontWrite. Now that it's being reused, its content is meaningful
-		// and must be written to WAL on commit. Matches SQLite's pcache.c
-		// makeDirty() which clears PGHDR_DONT_WRITE.
-		delete(p.dontWritePages, leafPgno)
 		return pg, nil
 	}
 
@@ -1872,29 +1853,6 @@ func (p *pager) releasePage(pg *page) {
 		return
 	}
 	p.writerCache.release(pg)
-}
-
-// dontWrite marks a page so that it will be skipped during WAL writes on commit
-// (fix 5.4). This is used for freed pages added as leaves to a freelist trunk:
-// their content is irrelevant and need not be persisted.
-//
-// Matches SQLite's sqlite3PagerDontWrite() (pager.c:6283). The flag is only set
-// when no savepoints are active, matching SQLite's condition (pPager->nSavepoint==0).
-// With savepoints, the page data may need to be preserved for rollback.
-func (p *pager) dontWrite(pgno uint32) {
-	if len(p.savepoints) > 0 {
-		if debugTrace {
-			trace("dontWrite: SKIPPED pg=%d (savepoints=%d active)", pgno, len(p.savepoints))
-		}
-		return
-	}
-	if debugTrace {
-		trace("dontWrite: marking pg=%d (no savepoints)", pgno)
-	}
-	if p.dontWritePages == nil {
-		p.dontWritePages = make(map[uint32]bool)
-	}
-	p.dontWritePages[pgno] = true
 }
 
 // setHasContent marks a page as having had meaningful content before being
@@ -2307,44 +2265,17 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	}
 
 	if debugTrace {
-		trace("commit: dbSize=%d savepoints=%d dirtyPages=%d dontWritePages=%d hasContent=%d",
-			p.dbSize.Load(), len(p.savepoints), p.writerCache.nDirty, len(p.dontWritePages), len(p.hasContent))
+		trace("commit: dbSize=%d savepoints=%d dirtyPages=%d hasContent=%d",
+			p.dbSize.Load(), len(p.savepoints), p.writerCache.nDirty, len(p.hasContent))
 	}
 
 	// Update the in-memory header with current database size.
 	p.header.DatabaseSize = p.dbSize.Load()
 
-	// Filter out dontWrite pages before WAL write (fix 5.4). These are freed
-	// leaf pages whose content is irrelevant. We clean them directly from the
-	// cache by iterating the dontWritePages map (no dirty-list collect): a
-	// dontWrite page is either dirty (makeClean removes it from the dirty
-	// list and decrements nDirty), already clean from a prior spill
-	// (makeClean is a no-op), or evicted (absent from the cache — nothing to
-	// do). This is equivalent to the previous dirty-list walk but avoids a
-	// redundant dirty-page collection. The authoritative dirty set is
-	// collected exactly once below, after page 1 is dirtied — mirroring
-	// SQLite's single sqlite3PcacheDirtyList in sqlite3PagerCommitPhaseOne
-	// (pager.c:6502).
-	if len(p.dontWritePages) > 0 {
-		if debugTrace {
-			trace("commit: filtering %d dontWrite pages (nDirty=%d) savepoints=%d",
-				len(p.dontWritePages), p.writerCache.nDirty, len(p.savepoints))
-		}
-		for pgno := range p.dontWritePages {
-			if pg := p.writerCache.hashFind(pgno); pg != nil {
-				if debugTrace && pg.dirty {
-					trace("commit: dontWrite filtering pg=%d (skipping WAL write)", pgno)
-				}
-				p.writerCache.makeClean(pg)
-			}
-		}
-		clear(p.dontWritePages)
-	}
-
 	// Determine if there are real changes: dirty data pages, header
 	// modifications (freelist, dbSize changes), or spilled pages. Counter
 	// increments are deferred until we confirm there's something to commit.
-	// nDirty (post dontWrite-filter) counts the pages that would be collected.
+	// nDirty counts the pages that would be collected.
 	// The nFrame check catches transactions where all dirty pages were spilled
 	// (making nDirty zero) but a commit frame is still needed.
 	hasRealChanges := p.hasChanges()
@@ -2387,8 +2318,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	p.releasePage(pg1)
 
 	// Collect the authoritative dirty set once, now that page 1 has been
-	// dirtied. dontWrite pages were already cleaned above so they are not on
-	// the dirty list. Single collection mirrors SQLite (pager.c:6502).
+	// dirtied. Single collection mirrors SQLite (pager.c:6502).
 	p.dirtyBuf = p.writerCache.appendDirtyPages(p.dirtyBuf[:0])
 
 	if debugTrace {
@@ -2436,7 +2366,6 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 
 	p.freeSavepointPageBuffers(0, len(p.savepoints))
 	p.savepoints = p.savepoints[:0]
-	clear(p.dontWritePages)
 	clear(p.hasContent)
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
@@ -2490,7 +2419,6 @@ func (p *pager) unwindWriter() {
 		p.writerCache.clear()
 		p.freeSavepointPageBuffers(0, len(p.savepoints))
 		p.savepoints = p.savepoints[:0]
-		clear(p.dontWritePages)
 		clear(p.hasContent)
 		p.state.Store(int32(pagerOpen))
 		p.wal.endWrite()
@@ -2550,7 +2478,6 @@ func (p *pager) rollbackLocked() error {
 	p.doNotSpill &^= spillFlagRollback
 	p.freeSavepointPageBuffers(0, len(p.savepoints))
 	p.savepoints = p.savepoints[:0]
-	clear(p.dontWritePages)
 	clear(p.hasContent)
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
@@ -2559,7 +2486,7 @@ func (p *pager) rollbackLocked() error {
 
 // rollbackForClose is a variant of rollbackLocked for use by DB.Close().
 // It only performs WAL-level rollback and lock release — all writer-owned
-// state (dontWritePages, hasContent, header, savepoints, WAL checksums)
+// state (hasContent, header, savepoints, WAL checksums)
 // is deliberately left untouched because the writer goroutine may still be
 // in a B-tree operation accessing those structures, and pcache has no mutex.
 // Since the database is closing, that state will be GC'd.
@@ -2587,7 +2514,7 @@ func (p *pager) rollbackForClose() {
 		p.wal.mu.Unlock()
 	}
 
-	// Skip dontWritePages, hasContent, header, savepoints, and WAL
+	// Skip hasContent, header, savepoints, and WAL
 	// checksum restoration — all are writer-owned, non-atomic state that
 	// the writer goroutine may be reading concurrently. Touching them
 	// here would be a data race. None of it matters after Close().
@@ -2645,7 +2572,6 @@ func (p *pager) pagerError() {
 	p.freeSavepointPageBuffers(0, len(p.savepoints))
 	p.savepoints = p.savepoints[:0]
 
-	clear(p.dontWritePages)
 	clear(p.hasContent)
 
 	// Release the WAL write lock so other writers are not blocked (fix 2.2).
@@ -2679,8 +2605,8 @@ func (p *pager) savepoint() (int, error) {
 	dbSz := p.dbSize.Load()
 	walFr := p.wal.nFrame.Load()
 	if debugTrace {
-		trace("savepoint: creating id=%d dbSize=%d walFrame=%d dirtyPages=%d dontWritePages=%d hasContent=%d",
-			id, dbSz, walFr, p.writerCache.nDirty, len(p.dontWritePages), len(p.hasContent))
+		trace("savepoint: creating id=%d dbSize=%d walFrame=%d dirtyPages=%d hasContent=%d",
+			id, dbSz, walFr, p.writerCache.nDirty, len(p.hasContent))
 	}
 	p.savepoints = append(p.savepoints, savepointState{
 		id:     id,
