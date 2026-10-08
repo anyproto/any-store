@@ -438,9 +438,9 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return &emptyIter{}, nil
 	}
 
-	// The iterator keeps tx beyond this call: the turn ends with the call,
-	// and the iterator's methods take theirs (lk).
-	tx, lk, err := q.c.db.lockCtxTx(ctx)
+	// The iterator keeps tx beyond this call: the call ends with Iter, and
+	// the iterator's methods begin their own (shared).
+	tx, shared, err := q.c.db.enterCtxTx(ctx)
 	if err != nil {
 		qb.Close()
 		return
@@ -451,8 +451,8 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 			return
 		}
 	} else {
-		if lk != nil {
-			defer lk.unlock()
+		if shared != nil {
+			defer shared.exit()
 		}
 		tx = noOpTx{ReadTx: tx}
 	}
@@ -477,16 +477,16 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	}
 
 	pi := &planIterator{
-		plan: plan,
-		tx:   tx,
-		lk:   lk,
-		s:    s,
-		buf:  buf,
-		qb:   qb,
-		data: &qplanner.CursorSource{Tx: btx, Ns: s.ns},
+		plan:   plan,
+		tx:     tx,
+		shared: shared,
+		s:      s,
+		buf:    buf,
+		qb:     qb,
+		data:   &qplanner.CursorSource{Tx: btx, Ns: s.ns},
 	}
-	if lk != nil {
-		lk.iterOpened(pi)
+	if shared != nil {
+		shared.iterOpened(pi)
 	}
 	return pi, nil
 }
@@ -501,7 +501,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	}
 	// The modifier is parsed above so a malformed one is surfaced even when
 	// the filter is unsatisfiable.
-	return q.bulkWrite(ctx, func(btWtx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error {
+	return q.bulkWrite(ctx, func(wtx WriteTx, btWtx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error {
 		modBuf := q.c.db.syncPool.GetDocBuf()
 		defer q.c.db.syncPool.ReleaseDocBuf(modBuf)
 
@@ -522,7 +522,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 			}
 
 			modBuf.Arena.Reset()
-			modifiedVal, isModified, modErr := mod.Modify(modBuf.Arena, copyItem(modBuf, oldItem).val)
+			modifiedVal, isModified, modErr := q.c.runModifier(wtx, mod, modBuf.Arena, copyItem(modBuf, oldItem).val)
 			if modErr != nil {
 				return modErr
 			}
@@ -546,7 +546,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 }
 
 func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error) {
-	return q.bulkWrite(ctx, func(btWtx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error {
+	return q.bulkWrite(ctx, func(_ WriteTx, btWtx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error {
 		for _, id := range ids {
 			if err := q.c.deleteItem(btWtx, s, buf, id); err != nil {
 				return err
@@ -562,7 +562,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 // it compiles the query plan inside a write tx, materializes the distinct
 // target ids, releases the plan's cursors and hands the ids to mutate, which
 // applies the per-id mutation and accumulates result.
-func (q *collQuery) bulkWrite(ctx context.Context, mutate func(btWtx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error) (result ModifyResult, err error) {
+func (q *collQuery) bulkWrite(ctx context.Context, mutate func(wtx WriteTx, btWtx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error) (result ModifyResult, err error) {
 	if err = q.c.alive(); err != nil {
 		return
 	}
@@ -597,13 +597,16 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(btWtx *btree.Writ
 		}
 	}()
 
-	tx, locked, err := q.c.db.enterWriteTx(ctx)
+	if err = q.c.writable(); err != nil {
+		return
+	}
+	tx, entered, err := q.c.db.enterWriteTx(ctx)
 	if err != nil {
 		return
 	}
-	// Registered first: released after the commit or rollback below.
-	if locked != nil {
-		defer locked.unlock()
+	// Registered first: the call ends after the commit or rollback below.
+	if entered != nil {
+		defer entered.exit()
 	}
 	defer func() {
 		// A panic (a user modifier's or filter's bug) leaves err == nil, so keying
@@ -669,7 +672,7 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(btWtx *btree.Writ
 	}
 	closePlan()
 
-	if err = mutate(btWtx, s, buf, ids, &result); err != nil {
+	if err = mutate(tx, btWtx, s, buf, ids, &result); err != nil {
 		return
 	}
 	if result.Modified > 0 {

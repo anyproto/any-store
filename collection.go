@@ -154,6 +154,11 @@ func newCollection(db *db, name string, tx *btree.ReadTx) (*collection, *collSch
 }
 
 type collection struct {
+	// modifiers is the modifiers of this collection running right now
+	// (runModifier): a write to the collection waits for none and is
+	// refused while one runs (writable).
+	modifiers atomic.Int32
+
 	// head is the current committed schema version, nil while none is
 	// installed: the newest state this process knows. The open write
 	// transaction's own changes are in its log until its commit installs
@@ -478,7 +483,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	err = c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (txErr error) {
+	err = c.doWriteTx(ctx, func(tx *btree.WriteTx) (txErr error) {
 		s, txErr := c.resolve(&tx.ReadTx)
 		if txErr != nil {
 			return txErr
@@ -551,7 +556,7 @@ func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err erro
 		return
 	}
 
-	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+	err = c.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		s, txErr := c.resolve(&tx.ReadTx)
 		if txErr != nil {
 			return false, txErr
@@ -560,6 +565,59 @@ func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err erro
 	})
 	returned = true
 	return
+}
+
+// runModifier runs a user modifier inside the write scope wtx as a callback
+// of the call (callbackBegin): the calls it makes on the transaction nest
+// in this one, and a write to this collection is refused (writable).
+func (c *collection) runModifier(wtx WriteTx, mod query.Modifier, a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+	wtx.callbackBegin()
+	defer wtx.callbackEnd()
+	c.modifiers.Add(1)
+	defer c.modifiers.Add(-1)
+	return mod.Modify(a, v)
+}
+
+// writable is the error that refuses a write to, or a schema change of,
+// the collection while one of its modifiers runs (ErrWriteInModifier): the
+// operation running the modifier loaded the document and resolved the
+// schema it writes with.
+func (c *collection) writable() error {
+	if c.modifiers.Load() > 0 {
+		return ErrWriteInModifier
+	}
+	return nil
+}
+
+// doWriteTx, doWriteTxW, doWriteTxModified and doWriteTxModifiedW are the
+// db's, for a write to this collection: refused while a modifier of the
+// collection runs (writable).
+func (c *collection) doWriteTx(ctx context.Context, do func(tx *btree.WriteTx) error) error {
+	if err := c.writable(); err != nil {
+		return err
+	}
+	return c.db.doWriteTx(ctx, do)
+}
+
+func (c *collection) doWriteTxW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) error) error {
+	if err := c.writable(); err != nil {
+		return err
+	}
+	return c.db.doWriteTxW(ctx, do)
+}
+
+func (c *collection) doWriteTxModified(ctx context.Context, do func(tx *btree.WriteTx) (bool, error)) error {
+	if err := c.writable(); err != nil {
+		return err
+	}
+	return c.db.doWriteTxModified(ctx, do)
+}
+
+func (c *collection) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) (bool, error)) error {
+	if err := c.writable(); err != nil {
+		return err
+	}
+	return c.db.doWriteTxModifiedW(ctx, do)
 }
 
 func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error) {
@@ -578,7 +636,7 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 	buf2 := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
-	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+	err = c.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (modified bool, txErr error) {
 		s, txErr := c.resolve(&tx.ReadTx)
 		if txErr != nil {
 			return false, txErr
@@ -590,7 +648,7 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 		}
 
 		buf2.Arena.Reset()
-		newVal, modified, txErr := mod.Modify(buf2.Arena, copyItem(buf2, it).val)
+		newVal, modified, txErr := c.runModifier(wtx, mod, buf2.Arena, copyItem(buf2, it).val)
 		if txErr != nil {
 			return
 		}
@@ -626,7 +684,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 	buf2 := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
-	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+	err = c.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (modified bool, txErr error) {
 		s, txErr := c.resolve(&tx.ReadTx)
 		if txErr != nil {
 			return false, txErr
@@ -658,7 +716,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 		}
 
 		buf2.Arena.Reset()
-		newVal, modified, txErr := mod.Modify(buf2.Arena, modValue)
+		newVal, modified, txErr := c.runModifier(wtx, mod, buf2.Arena, modValue)
 		if txErr != nil {
 			return
 		}
@@ -774,7 +832,7 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 		return
 	}
 
-	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+	err = c.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		s, txErr := c.resolve(&tx.ReadTx)
 		if txErr != nil {
 			return false, txErr
@@ -803,7 +861,7 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+	err = c.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		s, txErr := c.resolve(&tx.ReadTx)
 		if txErr != nil {
 			return false, txErr
@@ -872,7 +930,7 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 	if len(info) == 0 {
 		return nil
 	}
-	return c.db.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (modified bool, txErr error) {
+	return c.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (modified bool, txErr error) {
 		s, txErr := c.beginDDL(wtx)
 		if txErr != nil {
 			return false, txErr
@@ -1121,7 +1179,7 @@ func (c *collection) buildFtsIndex(tx *btree.WriteTx, s *collSchema, fx *ftsInde
 }
 
 func (c *collection) DropIndex(ctx context.Context, indexName string) (err error) {
-	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (txErr error) {
+	return c.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (txErr error) {
 		// The version resolved for this write transaction reflects on-disk
 		// truth: an index a peer created is present (drop must succeed),
 		// and one a peer dropped is absent (return ErrIndexNotFound, not a
@@ -1269,13 +1327,13 @@ func (c *collection) committed() *collSchema {
 // transaction, as opposed to the cached head, which a peer process's DDL may
 // have left behind (its cookie is observed only through a transaction).
 func (c *collection) schemaFor(ctx context.Context) (*collSchema, bool, error) {
-	tx, locked, err := c.db.lockCtxTx(ctx)
+	tx, entered, err := c.db.enterCtxTx(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	if tx != nil {
-		if locked != nil {
-			defer locked.unlock()
+		if entered != nil {
+			defer entered.exit()
 		}
 		s, err := c.resolve(tx.btreeReadTx())
 		return s, true, err
@@ -1318,7 +1376,7 @@ func (c *collection) GetIndexes() (indexes []Index) {
 }
 
 func (c *collection) Rename(ctx context.Context, newName string) error {
-	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
+	return c.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
 		s, err := c.beginDDL(wtx)
 		if err != nil {
 			return err
@@ -1384,7 +1442,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 // (settleLog); the dropping transaction's own later operations through it
 // fail with ErrCollectionClosed. A rollback leaves the handle as it was.
 func (c *collection) Drop(ctx context.Context) error {
-	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
+	return c.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
 		s, err := c.beginDDL(wtx)
 		if err != nil {
 			return err

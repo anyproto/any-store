@@ -282,7 +282,7 @@ type db struct {
 
 	// txPool holds the pooled state of this db's transactions (commonTx):
 	// per db, so that a state's db never changes and a handle reads it
-	// without the lock (usable).
+	// unsynchronized (usable).
 	txPool sync.Pool
 
 	openedCollections map[string]Collection
@@ -803,28 +803,22 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 }
 
 // testHookBeforeRegister, when set, runs between the load of a new handle and
-// its registration; testHookAfterLogLookup between an open's lookup in the
-// transaction's schema log and its catalog read. Tests only.
-var (
-	testHookBeforeRegister func(name string)
-	testHookAfterLogLookup func(name string)
-)
+// its registration. Tests only.
+var testHookBeforeRegister func(name string)
 
 // errHandleGone tells openCollection that the handle it found registered is
 // not live any more.
 var errHandleGone = errors.New("any-store: registered handle is gone")
 
 func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Collection, error) {
-	// One turn for the whole open: the log, the registry and the catalog
-	// answer together, as they do from one goroutine — a collection another
-	// goroutine creates in the transaction between them would get a second
-	// handle.
-	tx, locked, err := db.lockCtxTx(ctx)
+	// One call for the whole open: the log, the registry and the catalog
+	// are read inside it (heldCtx).
+	tx, entered, err := db.enterCtxTx(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if locked != nil {
-		defer locked.unlock()
+	if entered != nil {
+		defer entered.exit()
 		ctx = heldCtx(ctx, tx)
 	}
 	// The write tx's own uncommitted DDL first: a collection it created
@@ -832,9 +826,6 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 	// one it dropped under the name is gone for it.
 	if coll, err := db.loggedCollection(ctx, collectionName); coll != nil || err != nil {
 		return coll, err
-	}
-	if testHookAfterLogLookup != nil {
-		testHookAfterLogLookup(collectionName)
 	}
 	if coll, ok := db.registered(collectionName); ok {
 		return coll, db.resolveOpened(ctx, coll.(*collection), collectionName)
@@ -897,14 +888,14 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 // write transaction ctx carries: the handle of a collection it created or
 // renamed to the name, ErrCollectionNotFound for one it dropped under it,
 // and (nil, nil) when it logged nothing under the name or ctx carries no
-// write transaction. The log is the writer's state, read under its lock.
+// write transaction. The log is the writer's state, read inside a call on it.
 func (db *db) loggedCollection(ctx context.Context, name string) (Collection, error) {
-	tx, locked, err := db.lockCtxTx(ctx)
+	tx, entered, err := db.enterCtxTx(ctx)
 	if err != nil || tx == nil {
 		return nil, err
 	}
-	if locked != nil {
-		defer locked.unlock()
+	if entered != nil {
+		defer entered.exit()
 	}
 	wtx, ok := tx.(WriteTx)
 	if !ok {
@@ -984,14 +975,13 @@ func (db *db) Collection(ctx context.Context, collectionName string, opts ...Col
 // collection opens or creates the collection without handing it out (see
 // handOut): for a caller inside the library that keeps no handle.
 func (db *db) collection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error) {
-	// One turn for the open and the create: two goroutines that ensure the
-	// same collection in one transaction get one handle.
-	tx, locked, err := db.lockCtxTx(ctx)
+	// One call for the open and the create (heldCtx).
+	tx, entered, err := db.enterCtxTx(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if locked != nil {
-		defer locked.unlock()
+	if entered != nil {
+		defer entered.exit()
 		ctx = heldCtx(ctx, tx)
 	}
 	coll, err := db.openCollection(ctx, collectionName)
@@ -1207,11 +1197,11 @@ func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {
 	if err = db.usable(wtx); err != nil {
 		return nil, err
 	}
-	// The savepoint is handed out: this call's turn ends with the call,
-	// and the savepoint's own calls take theirs.
+	// The savepoint is handed out: this call ends with the method, and
+	// the savepoint's methods are calls of their own.
 	if !held {
-		wtx.lock()
-		defer wtx.unlock()
+		wtx.enter()
+		defer wtx.exit()
 	}
 	if err = db.usable(wtx); err != nil {
 		return nil, err
@@ -1222,7 +1212,7 @@ func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {
 // ctxWriteTx returns the write transaction ctx carries — nil when it
 // carries none, ErrTxIsReadOnly when it carries a read transaction —
 // unwrapped from heldTx, with held reporting that wrapper: the call runs
-// inside another call's turn on the transaction.
+// inside another call on the transaction.
 func (db *db) ctxWriteTx(ctx context.Context) (wtx WriteTx, held bool, err error) {
 	ctxTx := ctx.Value(ctxKeyTx)
 	if ctxTx == nil {
@@ -1239,9 +1229,7 @@ func (db *db) ctxWriteTx(ctx context.Context) (wtx WriteTx, held bool, err error
 }
 
 // usable is the error that rejects a transaction ctx carries: another
-// instance's — read without the lock, a state's db never changes (txPool)
-// — or ended, which only the lock settles: the call waited for may have
-// ended it.
+// instance's (a state's db never changes, txPool) or ended.
 func (db *db) usable(tx ReadTx) error {
 	if tx.instanceId() != db.instanceId {
 		return ErrTxOtherInstance
@@ -1252,11 +1240,11 @@ func (db *db) usable(tx ReadTx) error {
 	return nil
 }
 
-// lockCtxTx takes this call's turn on the transaction ctx carries: tx is
-// that transaction, nil when ctx carries none; locked is the transaction
-// to unlock when the call ends, nil when an enclosing call holds it. The
-// transaction is checked usable under the lock.
-func (db *db) lockCtxTx(ctx context.Context) (tx, locked ReadTx, err error) {
+// enterCtxTx begins this call on the transaction ctx carries: tx is that
+// transaction, nil when ctx carries none; entered is the transaction to
+// exit when this call ends, nil when an enclosing call holds it. The
+// transaction is checked usable inside the call.
+func (db *db) enterCtxTx(ctx context.Context) (tx, entered ReadTx, err error) {
 	ctxTx := ctx.Value(ctxKeyTx)
 	if ctxTx == nil {
 		return nil, nil, nil
@@ -1273,32 +1261,33 @@ func (db *db) lockCtxTx(ctx context.Context) (tx, locked ReadTx, err error) {
 		return nil, nil, ErrTxOtherInstance
 	}
 	if !held {
-		tx.lock()
-		locked = tx
+		tx.enter()
+		entered = tx
 	}
 	if err = db.usable(tx); err != nil {
-		if locked != nil {
-			locked.unlock()
+		if entered != nil {
+			entered.exit()
 		}
 		return nil, nil, err
 	}
-	return tx, locked, nil
+	return tx, entered, nil
 }
 
 // heldCtx is ctx with the transaction it carries marked as held (heldTx):
-// for a call that took the turn and runs helpers that take their own.
+// for a call that runs helpers which would begin calls of their own — and
+// refuse themselves as a second call (txHandle.enter).
 func heldCtx(ctx context.Context, tx ReadTx) context.Context {
 	return context.WithValue(ctx, ctxKeyTx, heldTx{tx})
 }
 
 // enterWriteTx begins a write scope for ctx: a fresh write transaction
-// when ctx carries none, else a savepoint on the transaction it carries
-// with this call's turn on it taken — locked is the transaction to unlock
-// once the scope has ended with the savepoint's commit or rollback, nil
-// when the transaction is fresh or an enclosing call holds it. The
-// savepoint is a held one (newSavepointTx): its calls, and the calls made
-// through its Context, run under this turn.
-func (db *db) enterWriteTx(ctx context.Context) (tx WriteTx, locked ReadTx, err error) {
+// when ctx carries none, else a savepoint on the transaction it carries,
+// as a call on it — entered is the transaction to exit once the scope has
+// ended with the savepoint's commit or rollback, nil when the transaction
+// is fresh or an enclosing call holds it. The savepoint is a held one
+// (newSavepointTx): its methods, and the calls made through its Context,
+// nest in this call.
+func (db *db) enterWriteTx(ctx context.Context) (tx WriteTx, entered ReadTx, err error) {
 	wtx, held, err := db.ctxWriteTx(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -1310,20 +1299,20 @@ func (db *db) enterWriteTx(ctx context.Context) (tx WriteTx, locked ReadTx, err 
 	if err = db.usable(wtx); err != nil {
 		return nil, nil, err
 	}
-	// turn is the lock this call took (a local: the named result is zeroed
-	// by an error return before the defer runs). It is this call's until
-	// the caller defers the unlock: an error or a panic before then (the
-	// full-text flush, the btree savepoint) gives it back on the way out,
-	// so the caller's rollback can take it.
-	var turn ReadTx
+	// call is the call this function began (a local: the named result is
+	// zeroed by an error return before the defer runs). It is open until
+	// the caller defers the exit: an error or a panic before then (the
+	// full-text flush, the btree savepoint) ends it on the way out, so the
+	// caller's rollback can begin a call of its own.
+	var call ReadTx
 	if !held {
-		wtx.lock()
-		turn = wtx
+		wtx.enter()
+		call = wtx
 	}
 	defer func() {
 		r := recover()
-		if (err != nil || r != nil) && turn != nil {
-			turn.unlock()
+		if (err != nil || r != nil) && call != nil {
+			call.exit()
 		}
 		if r != nil {
 			panic(r)
@@ -1335,7 +1324,7 @@ func (db *db) enterWriteTx(ctx context.Context) (tx WriteTx, locked ReadTx, err 
 	if tx, err = newSavepointTx(ctx, wtx, true); err != nil {
 		return nil, nil, err
 	}
-	return tx, turn, nil
+	return tx, call, nil
 }
 
 func (db *db) doWriteTx(ctx context.Context, do func(tx *btree.WriteTx) error) error {
@@ -1356,13 +1345,13 @@ func (db *db) doWriteTxW(ctx context.Context, do func(wtx WriteTx, tx *btree.Wri
 // doWriteTxModifiedW is doWriteTxW whose callback also reports whether it
 // modified data (SetModified is skipped otherwise).
 func (db *db) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) (bool, error)) error {
-	tx, locked, err := db.enterWriteTx(ctx)
+	tx, entered, err := db.enterWriteTx(ctx)
 	if err != nil {
 		return err
 	}
-	// Registered first: released after the commit or rollback below.
-	if locked != nil {
-		defer locked.unlock()
+	// Registered first: the call ends after the commit or rollback below.
+	if entered != nil {
+		defer entered.exit()
 	}
 	// User code runs inside this tx (a query.Modifier — UpdateId/UpsertId call
 	// mod.Modify inside the callback — or a DDL callback). A panic must not
@@ -1410,19 +1399,19 @@ func (db *db) doWriteTxModified(ctx context.Context, do func(tx *btree.WriteTx) 
 }
 
 // getReadTx is the transaction an operation run with ctx reads through: the
-// one ctx carries, with the operation's turn on it taken — its Commit ends
-// the turn and leaves the transaction open (noOpTx) — else a fresh read
-// transaction, which Commit ends.
+// one ctx carries, as a call on it — its Commit ends the call and leaves
+// the transaction open (callTx), or does nothing inside an enclosing call
+// (noOpTx) — else a fresh read transaction, which Commit ends.
 func (db *db) getReadTx(ctx context.Context) (tx ReadTx, err error) {
-	tx, locked, err := db.lockCtxTx(ctx)
+	tx, entered, err := db.enterCtxTx(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if tx == nil {
 		return db.ReadTx(ctx)
 	}
-	if locked != nil {
-		return turnTx{ReadTx: tx}, nil
+	if entered != nil {
+		return callTx{ReadTx: tx}, nil
 	}
 	return noOpTx{ReadTx: tx}, nil
 }
@@ -1595,8 +1584,8 @@ func (db *db) flushAmbientFtsPending(ctx context.Context) error {
 }
 
 // ambientWriteTx extracts a usable write tx carried by ctx: present, not
-// done, and belonging to this db instance. For a caller that holds the
-// transaction's turn.
+// done, and belonging to this db instance. For a caller inside a call on
+// the transaction.
 func (db *db) ambientWriteTx(ctx context.Context) (WriteTx, bool) {
 	wtx, _, err := db.ctxWriteTx(ctx)
 	if err != nil || wtx == nil || db.usable(wtx) != nil {

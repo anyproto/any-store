@@ -731,50 +731,60 @@ func TestSketchNoDriftOnUniqueViolationRollback(t *testing.T) {
 	assert.Equal(t, uint64(2), on.DocCount, "on-disk sketch == true 2 (phantoms discarded, not persisted)")
 }
 
-// One transaction used from several goroutines: its calls run one at a time,
-// and the result is what the same calls give from one goroutine.
-func TestWriteTx_SharedAcrossGoroutines(t *testing.T) {
+// blockingFilter keeps the call evaluating it in progress: Ok blocks until
+// release is closed. entered is closed as Ok first runs: the collection
+// must hold a document for Ok to be reached.
+type blockingFilter struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingFilter) Ok(*anyenc.Value, *syncpool.DocBuffer) bool {
+	f.once.Do(func() { close(f.entered) })
+	<-f.release
+	return true
+}
+
+func (f *blockingFilter) IndexBounds(_ string, bs query.Bounds) query.Bounds { return bs }
+
+func (f *blockingFilter) String() string { return "blocking" }
+
+// A transaction belongs to one goroutine at a time: a call made on it while
+// another call is in progress panics with ErrTxConcurrentCalls, and the
+// transaction stays usable by the call that was in progress. A modifier's
+// calls through the transaction's context nest in the call that runs it.
+func TestWriteTx_ConcurrentCalls(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"g"}}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
 	tx, err := fx.WriteTx(ctx)
 	require.NoError(t, err)
 
-	const goroutines, perGoroutine = 4, 100
-	var wg sync.WaitGroup
-	errs := make(chan error, goroutines)
-	for g := 0; g < goroutines; g++ {
-		wg.Add(1)
-		go func(g int) {
-			defer wg.Done()
-			errs <- func() error {
-				for j := 0; j < perGoroutine; j++ {
-					id := g*perGoroutine + j
-					if err := coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"g":%d}`, id, g))); err != nil {
-						return err
-					}
-					if _, err := coll.FindId(tx.Context(), id); err != nil {
-						return err
-					}
-					n, err := coll.Find(fmt.Sprintf(`{"g":%d}`, g)).Count(tx.Context())
-					if err != nil {
-						return err
-					}
-					if n != j+1 {
-						return fmt.Errorf("g %d: count %d after %d inserts", g, n, j+1)
-					}
-				}
-				return nil
-			}()
-		}(g)
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		require.NoError(t, err)
-	}
-	assertCollCountInTx(tx.Context(), t, coll, goroutines*perGoroutine)
+	f := &blockingFilter{entered: make(chan struct{}), release: make(chan struct{})}
+	held := make(chan error, 1)
+	go func() {
+		_, err := coll.Find(f).Count(tx.Context())
+		held <- err
+	}()
+	<-f.entered
+	require.PanicsWithValue(t, anystore.ErrTxConcurrentCalls, func() { _, _ = coll.Count(tx.Context()) })
+	require.PanicsWithValue(t, anystore.ErrTxConcurrentCalls, func() { _ = coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":3}`)) })
+	close(f.release)
+	require.NoError(t, <-held)
+
+	_, err = coll.UpsertId(tx.Context(), 2, query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+		n, err := coll.Count(tx.Context())
+		if err != nil {
+			return nil, false, err
+		}
+		v.Set("seen", a.NewNumberInt(n))
+		return v, true, nil
+	}))
+	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
-	assertCollCount(t, coll, goroutines*perGoroutine)
+	doc, err := coll.FindId(ctx, 2)
+	require.NoError(t, err)
+	assert.Equal(t, 1, doc.Value().GetInt("seen"))
 }

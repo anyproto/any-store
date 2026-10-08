@@ -505,7 +505,7 @@ func BenchmarkAggregateMergeReplace10k(b *testing.B) {
 
 // $out into a collection that does not exist yet, inside a write tx: the
 // sink creates the target through the context of its own write scope — a
-// call made under the enclosing call's turn on the transaction (heldTx) —
+// call made inside the enclosing call on the transaction (heldTx) —
 // and the transaction sees the result before its commit.
 func TestCollection_AggregateOut_InsideWriteTx(t *testing.T) {
 	fx := newFixture(t)

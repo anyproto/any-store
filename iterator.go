@@ -23,8 +23,9 @@ import (
 // directly.
 //
 // An Iterator belongs to one goroutine at a time. Opened with the context
-// of a transaction, its methods take their turn on the transaction, and
-// once the transaction has ended Next and Doc fail with ErrTxIsUsed.
+// of a transaction, its methods are calls on the transaction (see
+// commonTx), and once the transaction has ended Next and Doc fail with
+// ErrTxIsUsed.
 type Iterator interface {
 	// Next advances the iterator to the next document.
 	Next() bool
@@ -51,12 +52,12 @@ type Iterator interface {
 // planIterator wraps a qplanner.Plan to implement the public Iterator interface.
 type planIterator struct {
 	tx ReadTx
-	// lk is tx when other callers can reach it — the transaction the
-	// context carries — for the turn each method takes on it (see
+	// shared is tx when other callers can reach it — the transaction the
+	// context carries — for the call each method begins on it (see
 	// commonTx); nil for the iterator's own read transaction. The
 	// transaction knows the iterator (iterOpened) until Close, and trips it
 	// as it ends.
-	lk ReadTx
+	shared ReadTx
 	// tripped: the transaction ended and took the cursors' pages with it
 	// (trip); the methods report ErrTxIsUsed and Close leaves the cursors
 	// alone.
@@ -79,9 +80,9 @@ func (pi *planIterator) Next() bool {
 	if pi.err != nil || pi.closed {
 		return false
 	}
-	if pi.lk != nil {
-		pi.lk.lock()
-		defer pi.lk.unlock()
+	if pi.shared != nil {
+		pi.shared.enter()
+		defer pi.shared.exit()
 		if pi.tripped {
 			pi.err = ErrTxIsUsed
 			return false
@@ -151,7 +152,7 @@ func (pi *planIterator) Doc() (Doc, error) {
 	if pi.plan.DocParsed != nil {
 		// The document is the iterator's own memory; ended, the
 		// transaction has nothing more to give.
-		if pi.lk != nil && pi.lk.Done() {
+		if pi.shared != nil && pi.shared.Done() {
 			return nil, ErrTxIsUsed
 		}
 		if perf {
@@ -162,9 +163,9 @@ func (pi *planIterator) Doc() (Doc, error) {
 		if perf {
 			pipePerf.docFallbacks.Add(1)
 		}
-		if pi.lk != nil {
-			pi.lk.lock()
-			defer pi.lk.unlock()
+		if pi.shared != nil {
+			pi.shared.enter()
+			defer pi.shared.exit()
 			if pi.tripped {
 				return nil, ErrTxIsUsed
 			}
@@ -225,19 +226,20 @@ func (pi *planIterator) Close() (err error) {
 	if pi.closed {
 		return ErrIterClosed
 	}
-	pi.closed = true
-	if pi.lk != nil {
-		pi.lk.lock()
-		defer pi.lk.unlock()
+	if pi.shared != nil {
+		// Before closed is set: a refused call closes nothing.
+		pi.shared.enter()
+		defer pi.shared.exit()
 		// Ended without a trip (a panic in the trip): the pages are gone
 		// with the transaction all the same.
-		if pi.lk.Done() {
+		if pi.shared.Done() {
 			pi.tripped = true
 		}
 		if !pi.tripped {
-			pi.lk.iterClosed(pi)
+			pi.shared.iterClosed(pi)
 		}
 	}
+	pi.closed = true
 	pi.releaseCursors()
 	if pi.tx != nil {
 		err = errors.Join(err, pi.tx.Commit())
@@ -255,8 +257,8 @@ func (pi *planIterator) String() string {
 	return pi.plan.String()
 }
 
-// trip is the transaction ending under its lock (commonTx.tripIters): the
-// cursors' pages go with it.
+// trip is the transaction ending, inside a call on it (commonTx.tripIters):
+// the cursors' pages go with it.
 func (pi *planIterator) trip() {
 	pi.releaseCursors()
 	pi.tripped = true
