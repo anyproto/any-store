@@ -2228,7 +2228,6 @@ func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
 // Only the writer's cache has xStress set; reader caches have no stress callback.
 // Modeled after SQLite's pagerStress() (pager.c:4609-4681).
 // DRIFT: pagerStress guards pgno==1; C relies on page-1 staying pinned (never a victim) See docs/btree/NOTES.md#old-drift-pagerstress-page1-exclusion
-// DRIFT: pagerStress skips WAL write for dontWrite pages, just makeClean; C writes the frame anyway See docs/btree/NOTES.md#old-drift-pagerstress-dontwrite-skip-walwrite
 func (p *pager) pagerStress(pg *page) error {
 	// Defense-in-depth: do not spill in error state (SQLite pager.c:4632).
 	// SQLite marks this path NEVER() — it should be unreachable because
@@ -2247,16 +2246,6 @@ func (p *pager) pagerStress(pg *page) error {
 	// it explicitly because page 1 may become unpinned between b-tree
 	// operations (see the page1-exclusion DRIFT on this func's doc comment).
 	if pg.pgno == 1 {
-		return nil
-	}
-
-	// Skip the WAL write for dontWrite pages and just mark them clean (see
-	// the dontWrite-skip DRIFT on this func's doc comment). Safe because
-	// dontWrite page data is never read back. We must still make them clean
-	// so they become evictable — without this, the cache grows unbounded
-	// when freed pages are the only dirty victims.
-	if p.dontWritePages[pg.pgno] {
-		p.writerCache.makeClean(pg)
 		return nil
 	}
 

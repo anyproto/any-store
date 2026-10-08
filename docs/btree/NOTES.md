@@ -1266,7 +1266,14 @@ comments in source):
    frame is unregistered.
 
 <a id="old-drift-pagerstress-dontwrite-skip-walwrite"></a>
-5. **dontWrite pages made clean without WAL write** (`pager.go:pagerStress`) — **Severity:** low.
+5. **Resolved (2026-10-08)** — `pagerStress` writes the WAL frame for every victim, as C's WAL
+   branch does (`pagerWalFrames`, `pager.c:4647-4649`; the `PGHDR_DONT_WRITE` check lives only in
+   the rollback-journal writer, `pager_write_pagelist` `pager.c:4471`). The skip rested on
+   "dontWrite page data is never read back", which is false: a same-transaction reallocation
+   through `allocateFromFreelist`'s hasContent branch reads the page, and a page grown in that
+   transaction exists in neither the WAL nor the file, so the read failed with EOF after the leaf
+   was unlinked and the commit leaked the page. **dontWrite pages made clean without WAL write**
+   (`pager.go:pagerStress`) — **Severity:** low.
    SQLite's `pagerStress` in WAL mode writes `PGHDR_DONT_WRITE` pages to WAL
    anyway (the data is irrelevant but the frame is still written). We skip the WAL
    write and just mark them clean, avoiding unnecessary I/O. Safe because dontWrite
