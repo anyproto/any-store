@@ -1733,17 +1733,11 @@ func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 			if debugTrace {
 				trace("allocateFromFreelist: leaf pg=%d hasContent=false but savepoints=%d → getPageNoContent + savepoint copy", leafPgno, len(p.savepoints))
 			}
-			// hasContent==false: the page has no meaningful on-disk content, and
-			// for a page near dbSize whose content was never materialised to the
-			// DB file (grown+freed within uncommitted/un-checkpointed churn) a real
-			// read would hit EOF. Use a NOCONTENT fetch (no disk read) — matching
-			// SQLite's `noContent = !btreeGetHasContent(...)` path (btree.c:6725) —
-			// then journal the no-content state into the innermost savepoint so a
-			// rollback restores the page consistently with the freelist header.
-			// A plain getWritablePage here would READ the page and fail with EOF,
-			// leaking the already-popped leaf: the caller (allocatePageNear)
-			// swallows the error and grows instead, leaving the page neither on
-			// the freelist nor referenced ("page N: never used").
+			// hasContent==false: the leaf's bytes are irrelevant, so fetch it
+			// NOCONTENT (no read), matching SQLite's
+			// `noContent = !btreeGetHasContent(...)` (btree.c:6725), then journal
+			// the no-content state into the innermost savepoint so a rollback
+			// restores the page consistently with the freelist header.
 			pg, err := p.getPageNoContent(leafPgno)
 			if err != nil {
 				return nil, err

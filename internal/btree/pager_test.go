@@ -2860,12 +2860,18 @@ func TestFreePage_WithSavepoints(t *testing.T) {
 	require.NoError(t, err)
 	p.releasePage(pg2)
 
-	// Create savepoint
-	_, err = p.savepoint()
+	id, err := p.savepoint()
 	require.NoError(t, err)
+	total, first := p.header.TotalFreelistPgs, p.header.FirstFreelistPg
 
-	// Free pg2 with a savepoint open.
+	// Free pg2 with the savepoint open, then roll back to it: the freelist
+	// header is restored.
 	require.NoError(t, p.freePage(pg2.pgno))
+	require.Equal(t, total+1, p.header.TotalFreelistPgs)
+	require.Equal(t, pg2.pgno, p.header.FirstFreelistPg)
+	require.NoError(t, p.rollbackToSavepoint(id))
+	require.Equal(t, total, p.header.TotalFreelistPgs)
+	require.Equal(t, first, p.header.FirstFreelistPg)
 
 	require.NoError(t, p.rollback())
 	p.endRead(slot)
