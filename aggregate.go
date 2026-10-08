@@ -552,12 +552,33 @@ type aggIterator struct {
 	closed bool
 }
 
+// endedErr is why the rows' transaction can give no more: the inner
+// iterator was tripped — the transaction ended, or a savepoint it moved
+// inside was rolled back — or the transaction ended without a trip. Nil
+// while the rows keep coming. A blocking stage holds its rows in memory
+// and ends all the same: what its lookups and its stored rows came from is
+// gone.
+func (it *aggIterator) endedErr() error {
+	if it.shared == nil {
+		return nil
+	}
+	if pi, ok := it.inner.(*planIterator); ok {
+		if err := pi.trippedErr(); err != nil {
+			return err
+		}
+	}
+	if it.shared.Done() {
+		return ErrTxIsUsed
+	}
+	return nil
+}
+
 func (it *aggIterator) Next() bool {
 	if it.err != nil || it.closed {
 		return false
 	}
-	if it.shared != nil && it.shared.Done() {
-		it.err = ErrTxIsUsed
+	if err := it.endedErr(); err != nil {
+		it.err = err
 		return false
 	}
 	v, err := it.root.Next(it.actx)
@@ -579,8 +600,8 @@ func (it *aggIterator) Doc() (Doc, error) {
 	if it.err != nil {
 		return nil, it.err
 	}
-	if it.shared != nil && it.shared.Done() {
-		return nil, ErrTxIsUsed
+	if err := it.endedErr(); err != nil {
+		return nil, err
 	}
 	if it.cur == nil {
 		return nil, ErrDocNotFound

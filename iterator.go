@@ -3,6 +3,7 @@ package anystore
 import (
 	"errors"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -25,7 +26,11 @@ import (
 // An Iterator belongs to one goroutine at a time. Opened with the context
 // of a transaction, its methods are calls on the transaction (see
 // commonTx), and once the transaction has ended Next and Doc fail with
-// ErrTxIsUsed.
+// ErrTxIsUsed. Once a savepoint that was open as the iterator was opened or
+// last moved is rolled back, they fail with ErrIterRolledBack; an iterator
+// that last moved before the savepoint opened goes on. A write that fails
+// rolls back a savepoint of its own: an iterator a query.Modifier moved
+// while the write ran ends with it.
 type Iterator interface {
 	// Next advances the iterator to the next document.
 	Next() bool
@@ -58,10 +63,18 @@ type planIterator struct {
 	// transaction knows the iterator (iterOpened) until Close, and trips it
 	// as it ends.
 	shared ReadTx
-	// tripped: the transaction ended and took the cursors' pages with it
-	// (trip); the methods report ErrTxIsUsed and Close leaves the cursors
-	// alone.
-	tripped bool
+	// tripped: the cursors' pages went with the transaction's end, or with
+	// the rollback of a savepoint the iterator moved inside (trip); the
+	// methods report tripErr, and Close leaves the cursors alone. Atomic:
+	// Doc reads it outside a call when the document is the iterator's own
+	// memory.
+	tripped atomic.Bool
+	tripErr error
+	// mark is the transaction's savepoint mark as the iterator was opened
+	// or last moved (iterOpened, savepointMark): the savepoints whose
+	// rollback trips it are the ones opened by then and still open
+	// (commonTx.spSeq).
+	mark uint64
 	// s is the schema version the plan was compiled against, resolved for tx.
 	s          *collSchema
 	err        error
@@ -83,10 +96,11 @@ func (pi *planIterator) Next() bool {
 	if pi.shared != nil {
 		pi.shared.enter()
 		defer pi.shared.exit()
-		if pi.tripped {
-			pi.err = ErrTxIsUsed
+		if err := pi.trippedErr(); err != nil {
+			pi.err = err
 			return false
 		}
+		pi.mark = pi.shared.savepointMark()
 	}
 	for {
 		pi.plan.DocParsed = nil
@@ -152,8 +166,13 @@ func (pi *planIterator) Doc() (Doc, error) {
 	if pi.plan.DocParsed != nil {
 		// The document is the iterator's own memory; ended, the
 		// transaction has nothing more to give.
-		if pi.shared != nil && pi.shared.Done() {
-			return nil, ErrTxIsUsed
+		if pi.shared != nil {
+			if err := pi.trippedErr(); err != nil {
+				return nil, err
+			}
+			if pi.shared.Done() {
+				return nil, ErrTxIsUsed
+			}
 		}
 		if perf {
 			pipePerf.docParsedHits.Add(1)
@@ -166,9 +185,10 @@ func (pi *planIterator) Doc() (Doc, error) {
 		if pi.shared != nil {
 			pi.shared.enter()
 			defer pi.shared.exit()
-			if pi.tripped {
-				return nil, ErrTxIsUsed
+			if err := pi.trippedErr(); err != nil {
+				return nil, err
 			}
+			pi.mark = pi.shared.savepointMark()
 		}
 		if pi.dataCursor == nil {
 			pi.dataCursor = pi.data.NewCursor()
@@ -233,9 +253,9 @@ func (pi *planIterator) Close() (err error) {
 		// Ended without a trip (a panic in the trip): the pages are gone
 		// with the transaction all the same.
 		if pi.shared.Done() {
-			pi.tripped = true
+			pi.tripped.Store(true)
 		}
-		if !pi.tripped {
+		if !pi.tripped.Load() {
 			pi.shared.iterClosed(pi)
 		}
 	}
@@ -257,16 +277,27 @@ func (pi *planIterator) String() string {
 	return pi.plan.String()
 }
 
-// trip is the transaction ending, inside a call on it (commonTx.tripIters):
-// the cursors' pages go with it.
-func (pi *planIterator) trip() {
+// trip is the transaction ending, or a savepoint the iterator moved inside
+// being rolled back, inside a call on the transaction (commonTx.tripIters,
+// tripItersFrom): the cursors' pages go with it, and the methods report err.
+func (pi *planIterator) trip(err error) {
 	pi.releaseCursors()
-	pi.tripped = true
+	pi.tripErr = err
+	pi.tripped.Store(true)
+}
+
+// trippedErr is the error a tripped iterator reports, nil while it is not
+// tripped. Reads the flag atomically: for a caller outside a call.
+func (pi *planIterator) trippedErr() error {
+	if pi.tripped.Load() {
+		return pi.tripErr
+	}
+	return nil
 }
 
 // releaseCursors closes the cursors once: Plan.Close is not idempotent.
 func (pi *planIterator) releaseCursors() {
-	if pi.tripped {
+	if pi.tripped.Load() {
 		return
 	}
 	if pi.dataCursor != nil {

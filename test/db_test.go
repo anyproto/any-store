@@ -271,6 +271,66 @@ func TestTxPanic_NestedTxRollsBackOnlySavepoint(t *testing.T) {
 	requireNotWedged(t, db, coll)
 }
 
+// The rollback of a savepoint ends the iterators opened or moved while it
+// was open: Next and Doc fail with ErrIterRolledBack, Close returns nil, and the
+// transaction goes on. An iterator that last moved before the savepoint
+// opened continues with the rest of its scan.
+func TestSavepointRollback_EndsIteratorsMovedInside(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	pad := strings.Repeat("x", 400)
+	for i := 0; i < 200; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%s"}`, i, pad))))
+	}
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	before, err := coll.Find(nil).Iter(tx.Context())
+	require.NoError(t, err)
+	for i := 0; i < 50; i++ {
+		require.True(t, before.Next())
+	}
+
+	sp, err := fx.WriteTx(tx.Context())
+	require.NoError(t, err)
+	for i := 1000; i < 1500; i++ {
+		require.NoError(t, coll.Insert(sp.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%s"}`, i, pad))))
+	}
+	inside, err := coll.Find(nil).Iter(sp.Context())
+	require.NoError(t, err)
+	for i := 0; i < 400; i++ {
+		require.True(t, inside.Next())
+	}
+	doc, err := inside.Doc()
+	require.NoError(t, err)
+	require.Equal(t, 1199, doc.Value().GetInt("id"))
+	require.NoError(t, sp.Rollback())
+
+	assert.False(t, inside.Next())
+	assert.ErrorIs(t, inside.Err(), anystore.ErrIterRolledBack)
+	_, err = inside.Doc()
+	assert.ErrorIs(t, err, anystore.ErrIterRolledBack)
+	require.NoError(t, inside.Close())
+
+	n := 50
+	for before.Next() {
+		doc, err := before.Doc()
+		require.NoError(t, err)
+		require.Equal(t, n, doc.Value().GetInt("id"))
+		n++
+	}
+	require.NoError(t, before.Err())
+	assert.Equal(t, 200, n)
+	require.NoError(t, before.Close())
+
+	require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":7777}`)))
+	require.NoError(t, tx.Commit())
+	count, err := coll.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 201, count)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
 // Collection and index names are capped so the derived namespace names
 // (widest: "ftx:"+coll+":"+index+":vocab") can never overflow a master-table
 // cell at the default page size.

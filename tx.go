@@ -83,6 +83,12 @@ type ReadTx interface {
 	// commonTx.iters. Unexported: iterator-internal.
 	iterOpened(pi *planIterator)
 	iterClosed(pi *planIterator)
+
+	// The transaction's savepoint mark, and the trip of the iterators that
+	// moved since the savepoint with mark opened; see commonTx.spSeq.
+	// Unexported: iterator- and savepoint-internal.
+	savepointMark() uint64
+	tripItersFrom(mark uint64)
 }
 
 // commonTx is a transaction's pooled state (db.txPool): what the handles of
@@ -153,11 +159,28 @@ type commonTx struct {
 	// transaction, and an iterator closed later touches none of them. SQLite
 	// trips the cursors of a transaction it rolls back
 	// (sqlite3BtreeTripAllCursors); a commit with cursors open it refuses,
-	// or turns into a read transaction the cursors go on in.
+	// or turns into a read transaction the cursors go on in. A savepoint's
+	// rollback trips the ones that moved inside its scope (tripItersFrom).
 	iters []*planIterator
+
+	// spSeq counts the savepoints opened on the transaction: the mark a
+	// savepoint takes as it opens (savepointTx.mark), and an iterator as it
+	// is opened or moves (planIterator.mark). An iterator was opened or
+	// moved inside a savepoint's scope — while it, or a savepoint nested in
+	// it, was the one opened last — iff its mark is at least the
+	// savepoint's: the savepoint's rollback trips exactly those
+	// (tripItersFrom). They stand on pages the rollback discards, or
+	// restores to a state they never saw; the ones that last moved before
+	// the savepoint opened stand on pages it restores to what they saw, or
+	// leaves alone, and go on. SQLite trips the write cursors of a ROLLBACK
+	// TO and saves the read ones to re-seek (sqlite3BtreeTripAllCursors,
+	// saveAllCursors); a cursor here has no position to save.
+	spSeq uint64
 }
 
 func (tx *commonTx) savepointOpened(sp *savepointTx) {
+	tx.spSeq++
+	sp.mark = tx.spSeq
 	tx.savepoints = append(tx.savepoints, sp)
 }
 
@@ -185,6 +208,7 @@ func (tx *commonTx) savepointEnded(sp *savepointTx) (enclosing *savepointTx) {
 }
 
 func (tx *commonTx) iterOpened(pi *planIterator) {
+	pi.mark = tx.spSeq
 	tx.iters = append(tx.iters, pi)
 }
 
@@ -198,10 +222,27 @@ func (tx *commonTx) iterClosed(pi *planIterator) {
 // ends: inside the call that ends it, before its btree tx ends.
 func (tx *commonTx) tripIters() {
 	for _, pi := range tx.iters {
-		pi.trip()
+		pi.trip(ErrTxIsUsed)
 	}
 	clear(tx.iters)
 	tx.iters = tx.iters[:0]
+}
+
+func (tx *commonTx) savepointMark() uint64 {
+	return tx.spSeq
+}
+
+// tripItersFrom releases the pages held by the iterators opened or moved
+// since the savepoint with mark opened, as it is rolled back: inside the
+// call that rolls it back, before the btree savepoint is.
+func (tx *commonTx) tripItersFrom(mark uint64) {
+	tx.iters = slices.DeleteFunc(tx.iters, func(pi *planIterator) bool {
+		if pi.mark < mark {
+			return false
+		}
+		pi.trip(ErrIterRolledBack)
+		return true
+	})
 }
 
 func (tx *commonTx) schemaLog() *txSchema {
@@ -593,6 +634,10 @@ func newSavepointTx(ctx context.Context, parent WriteTx, held bool) (WriteTx, er
 // from the one the state serves next.
 type savepointTx struct {
 	savepointId int
+	// mark is the parent's savepoint mark as this savepoint opened
+	// (commonTx.spSeq): the iterators its rollback trips are the ones
+	// opened or moved since.
+	mark uint64
 	// logMark is the parent tx's schema log length at savepoint creation: a
 	// rollback to this savepoint discards exactly the schema changes made
 	// inside its scope (entries [logMark:]); a release keeps them on the
@@ -799,6 +844,12 @@ func (w savepointWrapper) Rollback() error {
 	w.savepointEnded(w.sp)
 	btWtx := w.btreeWriteTx()
 	db := w.dbRef()
+	// The iterators opened or moved inside the scope stand on pages the
+	// rollback discards or restores: tripped first, as SQLite trips the
+	// write cursors of a ROLLBACK TO and saves the read ones before the
+	// pager plays the savepoint back (vdbe.c OP_Savepoint,
+	// sqlite3BtreeSavepoint).
+	w.tripItersFrom(w.sp.mark)
 	err := btWtx.RollbackToSavepoint(w.sp.savepointId)
 	if err == nil {
 		// The savepoint is gone with its rollback (savepointEnded above):

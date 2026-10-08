@@ -837,7 +837,7 @@ func TestWriteTx_EndTripsOpenIterators(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, tx.Commit())
 		pi := iter.(*planIterator)
-		require.True(t, pi.tripped, "the commit did not trip the iterator")
+		require.True(t, pi.tripped.Load(), "the commit did not trip the iterator")
 		require.Nil(t, pi.dataCursor, "the fallback cursor outlived the transaction")
 		assert.False(t, iter.Next())
 		assert.ErrorIs(t, iter.Err(), ErrTxIsUsed)
@@ -850,7 +850,7 @@ func TestWriteTx_EndTripsOpenIterators(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, iter.Next())
 	require.NoError(t, rtx.Commit())
-	require.True(t, iter.(*planIterator).tripped)
+	require.True(t, iter.(*planIterator).tripped.Load())
 	assert.False(t, iter.Next())
 	assert.ErrorIs(t, iter.Err(), ErrTxIsUsed)
 	require.NoError(t, iter.Close())
@@ -1444,4 +1444,463 @@ func TestWriteTx_OuterRollbackAfterInnerRollback(t *testing.T) {
 	_, err = coll.FindId(ctx, 203)
 	assert.ErrorIs(t, err, ErrDocNotFound)
 	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// A savepoint's rollback trips the iterators opened or moved inside its
+// scope: the pages they stand on are the rollback's to discard. Next and Doc then
+// fail with ErrIterRolledBack, Close returns nil, and the transaction goes
+// on. SQLite trips the cursors of a ROLLBACK TO before the pager plays the
+// savepoint back (sqlite3BtreeTripAllCursors, saveAllCursors).
+func TestSavepoint_RollbackTripsIteratorsPositionedInside(t *testing.T) {
+	pad := strings.Repeat("x", 400)
+	for _, mode := range []string{"next", "close", "nextAfterWrites"} {
+		t.Run(mode, func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			for i := 1; i <= 10; i++ {
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":"base"}`, i))))
+			}
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			sp, err := fx.WriteTx(tx.Context())
+			require.NoError(t, err)
+			for i := 1000; i < 2000; i++ {
+				require.NoError(t, coll.Insert(sp.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":"sp","pad":"%s"}`, i, pad))))
+			}
+			// Parked on a page the savepoint allocated.
+			iter, err := coll.Find(nil).Iter(sp.Context())
+			require.NoError(t, err)
+			for read := 0; read < 600; read++ {
+				require.True(t, iter.Next())
+			}
+			_, err = iter.Doc()
+			require.NoError(t, err)
+			require.NoError(t, sp.Rollback())
+
+			require.True(t, iter.(*planIterator).tripped.Load(), "the rollback did not trip the iterator")
+			if mode == "nextAfterWrites" {
+				// The page structs the rollback freed are reused.
+				for i := 5000; i < 5600; i++ {
+					require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":"after","pad":"%s"}`, i, pad))))
+				}
+			}
+			if mode != "close" {
+				_, err = iter.Doc()
+				assert.ErrorIs(t, err, ErrIterRolledBack)
+				assert.False(t, iter.Next())
+				assert.ErrorIs(t, iter.Err(), ErrIterRolledBack)
+				_, err = iter.Doc()
+				assert.ErrorIs(t, err, ErrIterRolledBack)
+			}
+			require.NoError(t, iter.Close())
+
+			require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":7777,"v":"tail"}`)))
+			require.NoError(t, tx.Commit())
+			n, err := coll.Count(ctx)
+			require.NoError(t, err)
+			want := 11
+			if mode == "nextAfterWrites" {
+				want += 600
+			}
+			assert.Equal(t, want, n)
+			require.NoError(t, fx.IntegrityCheck(ctx))
+		})
+	}
+}
+
+// An iterator that last moved before the savepoint opened is not tripped by
+// its rollback: the pages it stands on are restored to what it saw, and it
+// yields exactly the rest of its scan — SQLite saves such cursors and lets
+// them continue. The savepoint splits the leaf under the cursor, or writes
+// another collection.
+func TestSavepoint_RollbackKeepsIteratorsPositionedBefore(t *testing.T) {
+	pad := strings.Repeat("x", 400)
+	for _, other := range []bool{false, true} {
+		t.Run(fmt.Sprintf("otherCollection=%v", other), func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			target := coll
+			if other {
+				target, err = fx.CreateCollection(ctx, "d")
+				require.NoError(t, err)
+			}
+			for i := 0; i < 300; i++ {
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, 2*i))))
+			}
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			iter, err := coll.Find(nil).Iter(tx.Context())
+			require.NoError(t, err)
+			for read := 0; read < 100; read++ {
+				require.True(t, iter.Next())
+			}
+			doc, err := iter.Doc()
+			require.NoError(t, err)
+			require.Equal(t, 198, doc.Value().GetInt("id"))
+
+			sp, err := fx.WriteTx(tx.Context())
+			require.NoError(t, err)
+			for i := 0; i < 300; i++ {
+				require.NoError(t, target.Insert(sp.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%s"}`, 2*i+1, pad))))
+			}
+			require.NoError(t, sp.Rollback())
+
+			require.False(t, iter.(*planIterator).tripped.Load(), "an iterator positioned before the savepoint was tripped")
+			var got []int
+			for iter.Next() {
+				doc, err := iter.Doc()
+				require.NoError(t, err)
+				got = append(got, doc.Value().GetInt("id"))
+			}
+			require.NoError(t, iter.Err())
+			var want []int
+			for i := 100; i < 300; i++ {
+				want = append(want, 2*i)
+			}
+			assert.Equal(t, want, got)
+			require.NoError(t, iter.Close())
+			require.NoError(t, tx.Commit())
+			require.NoError(t, fx.IntegrityCheck(ctx))
+		})
+	}
+}
+
+// A failed verb rolls its own savepoint back; an iterator open in the
+// enclosing scope stood on nothing of it and continues.
+func TestSavepoint_FailedVerbKeepsOuterIterator(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"u"}, Unique: true}))
+	for i := 0; i < 100; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"u":%d}`, i, i))))
+	}
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	iter, err := coll.Find(nil).Iter(tx.Context())
+	require.NoError(t, err)
+	for read := 0; read < 50; read++ {
+		require.True(t, iter.Next())
+	}
+	err = coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1000,"u":7}`))
+	require.ErrorIs(t, err, ErrUniqueConstraint)
+	_, err = coll.UpdateId(tx.Context(), 3, query.MustParseModifier(`{"$set":{"u":8}}`))
+	require.ErrorIs(t, err, ErrUniqueConstraint)
+
+	require.False(t, iter.(*planIterator).tripped.Load())
+	n := 50
+	for iter.Next() {
+		doc, err := iter.Doc()
+		require.NoError(t, err)
+		require.Equal(t, n, doc.Value().GetInt("id"))
+		n++
+	}
+	require.NoError(t, iter.Err())
+	assert.Equal(t, 100, n)
+	require.NoError(t, iter.Close())
+	require.NoError(t, tx.Commit())
+}
+
+// Nested savepoints: an iterator that moved inside an inner savepoint is
+// tripped when the enclosing one is rolled back after the inner's release,
+// not when a later sibling is; one positioned before an inner savepoint
+// survives the inner's rollback.
+func TestSavepoint_RollbackTripsNestedPositions(t *testing.T) {
+	pad := strings.Repeat("x", 400)
+	fill := func(t *testing.T, coll Collection, sp WriteTx, from, to int) {
+		for i := from; i < to; i++ {
+			require.NoError(t, coll.Insert(sp.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%s"}`, i, pad))))
+		}
+	}
+	parked := func(t *testing.T, coll Collection, tx WriteTx, n int) Iterator {
+		iter, err := coll.Find(nil).Iter(tx.Context())
+		require.NoError(t, err)
+		for read := 0; read < n; read++ {
+			require.True(t, iter.Next())
+		}
+		_, err = iter.Doc()
+		require.NoError(t, err)
+		return iter
+	}
+
+	t.Run("innerReleasedOuterRolledBack", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		outer, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		inner, err := fx.WriteTx(outer.Context())
+		require.NoError(t, err)
+		fill(t, coll, inner, 0, 1000)
+		iter := parked(t, coll, inner, 600)
+		require.NoError(t, inner.Commit())
+		require.NoError(t, outer.Rollback())
+		require.True(t, iter.(*planIterator).tripped.Load())
+		assert.False(t, iter.Next())
+		assert.ErrorIs(t, iter.Err(), ErrIterRolledBack)
+		require.NoError(t, iter.Close())
+		require.NoError(t, tx.Commit())
+		n, err := coll.Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 0, n)
+		require.NoError(t, fx.IntegrityCheck(ctx))
+	})
+
+	t.Run("siblingRolledBack", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		first, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		fill(t, coll, first, 0, 1000)
+		iter := parked(t, coll, first, 600)
+		require.NoError(t, first.Commit())
+		second, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		fill(t, coll, second, 1000, 1300)
+		require.NoError(t, second.Rollback())
+		require.False(t, iter.(*planIterator).tripped.Load())
+		n := 600
+		for iter.Next() {
+			doc, err := iter.Doc()
+			require.NoError(t, err)
+			require.Equal(t, n, doc.Value().GetInt("id"))
+			n++
+		}
+		require.NoError(t, iter.Err())
+		assert.Equal(t, 1000, n)
+		require.NoError(t, iter.Close())
+		require.NoError(t, tx.Commit())
+		n, err = coll.Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1000, n)
+		require.NoError(t, fx.IntegrityCheck(ctx))
+	})
+
+	t.Run("positionedBeforeInner", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		outer, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		fill(t, coll, outer, 0, 1000)
+		iter := parked(t, coll, outer, 600)
+		inner, err := fx.WriteTx(outer.Context())
+		require.NoError(t, err)
+		fill(t, coll, inner, 1000, 1300)
+		require.NoError(t, inner.Rollback())
+		require.False(t, iter.(*planIterator).tripped.Load())
+		n := 600
+		for iter.Next() {
+			doc, err := iter.Doc()
+			require.NoError(t, err)
+			require.Equal(t, n, doc.Value().GetInt("id"))
+			n++
+		}
+		require.NoError(t, iter.Err())
+		assert.Equal(t, 1000, n)
+		require.NoError(t, iter.Close())
+		require.NoError(t, outer.Rollback())
+		require.NoError(t, tx.Commit())
+		n, err = coll.Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 0, n)
+		require.NoError(t, fx.IntegrityCheck(ctx))
+	})
+}
+
+// A failed write rolls back its own savepoint; an iterator its modifier
+// moved while it ran stands on pages of that scope and is tripped with it.
+// Without the trip, the write's growth of the documents — incompressible
+// padding, so that it takes pages — moves the iterator onto pages the
+// rollback discards, and it yields rolled-back documents.
+func TestSavepoint_FailedVerbTripsIteratorMovedByModifier(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"u"}, Unique: true}))
+	for i := 0; i < 300; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"u":%d}`, i, i))))
+	}
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	outer, err := coll.Find(nil).Iter(tx.Context())
+	require.NoError(t, err)
+	require.True(t, outer.Next())
+
+	rng := rand.New(rand.NewSource(1))
+	pad := make([]byte, 200)
+	moved := 0
+	grow := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+		if outer.Next() {
+			moved++
+		}
+		rng.Read(pad)
+		v.Set("pad", a.NewString(fmt.Sprintf("%x", pad)))
+		if v.GetInt("id") == 150 {
+			v.Set("u", a.NewNumberInt(299))
+		}
+		return v, true, nil
+	})
+	_, err = coll.Find(`{"id":{"$lt":200}}`).Update(tx.Context(), grow)
+	require.ErrorIs(t, err, ErrUniqueConstraint)
+	require.Greater(t, moved, 100, "the modifier did not move the outer iterator")
+
+	require.True(t, outer.(*planIterator).tripped.Load(), "the failed write did not trip the iterator its modifier moved")
+	assert.False(t, outer.Next())
+	assert.ErrorIs(t, outer.Err(), ErrIterRolledBack)
+	_, err = outer.Doc()
+	assert.ErrorIs(t, err, ErrIterRolledBack)
+	require.NoError(t, outer.Close())
+
+	require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1000,"u":1000}`)))
+	require.NoError(t, tx.Commit())
+	n, err := coll.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 301, n)
+	n, err = coll.Find(`{"pad":{"$exists":true}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n, "the failed write's changes survived")
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// An aggregation with a blocking stage drains its inner iterator at the
+// first Next and serves rows from memory: tripped with the inner iterator
+// all the same, as what its rows and lookups came from is gone. The sort is
+// on a computed field, which the planner cannot take over: the stage is the
+// pipeline's own.
+func TestSavepoint_RollbackTripsAggregationIterator(t *testing.T) {
+	pad := strings.Repeat("x", 400)
+	for _, openInside := range []bool{false, true} {
+		t.Run(fmt.Sprintf("openedInside=%v", openInside), func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			for i := 0; i < 10; i++ {
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":"base"}`, i))))
+			}
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			var iter Iterator
+			if !openInside {
+				iter, err = coll.Aggregate(`[{"$addFields":{"k":"$id"}},{"$sort":{"k":-1}}]`).Iter(tx.Context())
+				require.NoError(t, err)
+			}
+			sp, err := fx.WriteTx(tx.Context())
+			require.NoError(t, err)
+			for i := 1000; i < 1600; i++ {
+				require.NoError(t, coll.Insert(sp.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":"sp","pad":"%s"}`, i, pad))))
+			}
+			if openInside {
+				iter, err = coll.Aggregate(`[{"$addFields":{"k":"$id"}},{"$sort":{"k":-1}}]`).Iter(sp.Context())
+				require.NoError(t, err)
+			}
+			// The first Next drains the inner iterator, inside the savepoint.
+			require.True(t, iter.Next())
+			doc, err := iter.Doc()
+			require.NoError(t, err)
+			require.Equal(t, 1599, doc.Value().GetInt("id"))
+			require.NoError(t, sp.Rollback())
+
+			assert.False(t, iter.Next())
+			assert.ErrorIs(t, iter.Err(), ErrIterRolledBack)
+			_, err = iter.Doc()
+			assert.ErrorIs(t, err, ErrIterRolledBack)
+			require.NoError(t, iter.Close())
+			require.NoError(t, tx.Commit())
+			n, err := coll.Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 10, n)
+		})
+	}
+}
+
+// What counts as a move inside the savepoint: a Next of an iterator opened
+// before it, the opening itself with nothing done since, and a Doc that
+// reads the store — the fallback cursor of a sorted query seeks inside the
+// savepoint — each on its own. After the trip, Doc on the fallback path
+// reports the rollback and the fallback cursor is gone.
+func TestSavepoint_RollbackTripsEachKindOfMove(t *testing.T) {
+	pad := strings.Repeat("x", 400)
+	setup := func(t *testing.T) (*fixture, Collection, WriteTx) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		for i := 0; i < 300; i++ {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"pad":"%s"}`, i, i, pad))))
+		}
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		return fx, coll, tx
+	}
+	tripped := func(t *testing.T, iter Iterator) {
+		require.True(t, iter.(*planIterator).tripped.Load(), "the rollback did not trip the iterator")
+		// Doc first: the trip is reported before Next records it.
+		_, err := iter.Doc()
+		assert.ErrorIs(t, err, ErrIterRolledBack)
+		assert.False(t, iter.Next())
+		assert.ErrorIs(t, iter.Err(), ErrIterRolledBack)
+		_, err = iter.Doc()
+		assert.ErrorIs(t, err, ErrIterRolledBack)
+		require.NoError(t, iter.Close())
+	}
+
+	t.Run("nextInside", func(t *testing.T) {
+		fx, coll, tx := setup(t)
+		iter, err := coll.Find(nil).Iter(tx.Context())
+		require.NoError(t, err)
+		require.True(t, iter.Next())
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		for i := 1000; i < 1300; i++ {
+			require.NoError(t, coll.Insert(sp.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%s"}`, i, pad))))
+		}
+		require.True(t, iter.Next())
+		require.NoError(t, sp.Rollback())
+		tripped(t, iter)
+		require.NoError(t, tx.Commit())
+	})
+
+	t.Run("openedInsideNothingWritten", func(t *testing.T) {
+		fx, coll, tx := setup(t)
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		// Opened, never moved: the opening is the move.
+		iter, err := coll.Find(nil).Iter(sp.Context())
+		require.NoError(t, err)
+		require.NoError(t, sp.Rollback())
+		tripped(t, iter)
+		require.NoError(t, tx.Commit())
+	})
+
+	t.Run("docInside", func(t *testing.T) {
+		fx, coll, tx := setup(t)
+		// Sorted on a field without an index: the sort buffers the ids
+		// and Doc re-fetches the document through the fallback cursor.
+		iter, err := coll.Find(nil).Sort("-a").Iter(tx.Context())
+		require.NoError(t, err)
+		require.True(t, iter.Next())
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		for i := 1000; i < 1300; i++ {
+			require.NoError(t, coll.Insert(sp.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%s"}`, i, pad))))
+		}
+		doc, err := iter.Doc()
+		require.NoError(t, err)
+		require.Equal(t, 299, doc.Value().GetInt("id"))
+		pi := iter.(*planIterator)
+		require.NotNil(t, pi.dataCursor, "the sorted query did not use the fallback cursor")
+		require.NoError(t, sp.Rollback())
+		require.Nil(t, pi.dataCursor, "the fallback cursor outlived the savepoint")
+		tripped(t, iter)
+		require.NoError(t, tx.Commit())
+	})
 }
