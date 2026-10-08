@@ -1904,3 +1904,338 @@ func TestSavepoint_RollbackTripsEachKindOfMove(t *testing.T) {
 		require.NoError(t, tx.Commit())
 	})
 }
+
+// A write to the scanned collection through the same transaction saves the
+// scan's cursors and their next move restores them (btree.Cursor): the scan
+// goes on with every document, the ones inserted ahead of it included. The
+// data tree here is one root leaf that the inserts split in place.
+func TestIterator_WriteWhileIterating_RootLeafSplit(t *testing.T) {
+	pad := strings.Repeat("x", 316)
+	for _, extra := range []int{30, 108} {
+		t.Run(fmt.Sprintf("extra=%d", extra), func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			doc := func(id int) *anyenc.Value {
+				return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%s"}`, id, pad))
+			}
+			for i := 0; i < 46; i++ {
+				require.NoError(t, coll.Insert(ctx, doc(i)))
+			}
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			next := 1000
+			ins := func(n int) {
+				for i := 0; i < n; i++ {
+					require.NoError(t, coll.Insert(tx.Context(), doc(next)))
+					next++
+				}
+			}
+			ins(3)
+			iter, err := coll.Find(nil).Iter(tx.Context())
+			require.NoError(t, err)
+			ins(18)
+			require.True(t, iter.Next())
+			d, err := iter.Doc()
+			require.NoError(t, err)
+			require.Equal(t, 0, d.Value().GetInt("id"))
+			ins(extra)
+			got := []int{0}
+			for iter.Next() {
+				d, err := iter.Doc()
+				require.NoError(t, err)
+				got = append(got, d.Value().GetInt("id"))
+			}
+			require.NoError(t, iter.Err())
+			require.NoError(t, iter.Close())
+			var want []int
+			for i := 0; i < 46; i++ {
+				want = append(want, i)
+			}
+			for i := 1000; i < next; i++ {
+				want = append(want, i)
+			}
+			assert.Equal(t, want, got)
+			require.NoError(t, tx.Commit())
+			require.NoError(t, fx.IntegrityCheck(ctx))
+		})
+	}
+}
+
+// Deletes under a scan of the same transaction — a full scan, an index
+// range, a reverse pk scan, under a small page cache and incompressible
+// documents of varied size: the scan ends without an error, yields no
+// deleted document and no document twice, and the store stays sound.
+func TestIterator_WriteWhileIterating_DeletesUnderScan(t *testing.T) {
+	seeds := 60
+	if testing.Short() {
+		seeds = 10
+	}
+	for seed := 0; seed < seeds; seed++ {
+		t.Run(fmt.Sprint(seed), func(t *testing.T) {
+			rng := rand.New(rand.NewSource(int64(seed)))
+			fx := newFixture(t, &Config{DisableCompression: true, CacheSize: 8 + 6*rng.Intn(3)})
+			coll, err := fx.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"k"}}))
+			n := 100 + rng.Intn(300)
+			padLen := 10 + rng.Intn(9000)
+			pad := make([]byte, padLen)
+			kOf := make([]int, n)
+			for i := 0; i < n; i++ {
+				rng.Read(pad)
+				kOf[i] = rng.Intn(50)
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"k":%d,"pad":"%x"}`, i, kOf[i], pad))))
+			}
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			var q Query
+			kind := rng.Intn(3)
+			switch kind {
+			case 0:
+				q = coll.Find(nil)
+			case 1:
+				q = coll.Find(`{"k":{"$gte":10}}`).Sort("k")
+			default:
+				q = coll.Find(nil).Sort("-id")
+			}
+			iter, err := q.Iter(tx.Context())
+			require.NoError(t, err)
+			seen := map[int]int{}
+			last := -1
+			for i := 0; i < n/4 && iter.Next(); i++ {
+				d, err := iter.Doc()
+				require.NoError(t, err)
+				last = d.Value().GetInt("id")
+				seen[last]++
+			}
+			require.NoError(t, iter.Err())
+			deleted := map[int]bool{}
+			for id := 0; id < n; id++ {
+				if rng.Intn(3) != 0 {
+					require.NoError(t, coll.DeleteId(tx.Context(), id))
+					deleted[id] = true
+				}
+			}
+			// The rest of the scan: every surviving document after the position
+			// in the scan's order, each once.
+			after := func(id int) bool {
+				switch kind {
+				case 0:
+					return id > last
+				case 1:
+					if kOf[id] < 10 {
+						return false
+					}
+					return kOf[id] > kOf[last] || (kOf[id] == kOf[last] && id > last)
+				default:
+					return id < last
+				}
+			}
+			want := map[int]int{}
+			for id := 0; id < n; id++ {
+				if !deleted[id] && after(id) {
+					want[id] = 1
+				}
+			}
+			got := map[int]int{}
+			for iter.Next() {
+				d, err := iter.Doc()
+				require.NoError(t, err)
+				id := d.Value().GetInt("id")
+				require.False(t, deleted[id], "deleted document %d yielded", id)
+				seen[id]++
+				got[id]++
+			}
+			require.NoError(t, iter.Err())
+			require.NoError(t, iter.Close())
+			require.Equal(t, want, got)
+			for id, c := range seen {
+				require.Equalf(t, 1, c, "document %d yielded %d times", id, c)
+			}
+			require.NoError(t, tx.Commit())
+			require.NoError(t, fx.IntegrityCheck(ctx))
+			cnt, err := coll.Count(ctx)
+			require.NoError(t, err)
+			require.Equal(t, n-len(deleted), cnt)
+		})
+	}
+}
+
+// Doc of a sorted scan on an unindexed field reads the document through
+// the iterator's own data cursor; inserts that split the data tree under
+// that cursor leave every later Doc correct.
+func TestIterator_WriteWhileIterating_DocFallbackCursor(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	for i := 0; i < 300; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"u":%d}`, i, (i*7)%300))))
+	}
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	iter, err := coll.Find(nil).Sort("u").Iter(tx.Context())
+	require.NoError(t, err)
+	var got []int
+	read := func() {
+		d, err := iter.Doc()
+		require.NoError(t, err)
+		require.Equal(t, len(got), d.Value().GetInt("u"))
+		got = append(got, d.Value().GetInt("id"))
+	}
+	for i := 0; i < 100; i++ {
+		require.True(t, iter.Next())
+		read()
+	}
+	pad := strings.Repeat("y", 500)
+	for i := 1000; i < 1600; i++ {
+		require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"u":%d,"pad":"%s"}`, i, i, pad))))
+	}
+	// The current document again, through the saved data cursor.
+	d, err := iter.Doc()
+	require.NoError(t, err)
+	require.Equal(t, got[99], d.Value().GetInt("id"))
+	for iter.Next() {
+		read()
+	}
+	require.NoError(t, iter.Err())
+	require.NoError(t, iter.Close())
+	require.Len(t, got, 300)
+	require.NoError(t, tx.Commit())
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// The document under the scan deleted — at the first position, mid-scan,
+// and as the last one — under a full scan, a reverse scan and an index
+// scan in both directions: the scan goes on with the neighbour, every
+// document is yielded once, and nothing is yielded after the last.
+func TestIterator_WriteWhileIterating_DeleteCurrent(t *testing.T) {
+	const n = 300
+	kinds := map[string]func(coll Collection) Query{
+		"full":         func(coll Collection) Query { return coll.Find(nil) },
+		"reverse":      func(coll Collection) Query { return coll.Find(nil).Sort("-id") },
+		"index":        func(coll Collection) Query { return coll.Find(nil).Sort("k") },
+		"indexReverse": func(coll Collection) Query { return coll.Find(nil).Sort("-k") },
+	}
+	for name, q := range kinds {
+		for _, at := range []int{1, 100, n} {
+			t.Run(fmt.Sprintf("%s/at=%d", name, at), func(t *testing.T) {
+				fx := newFixture(t)
+				coll, err := fx.CreateCollection(ctx, "c")
+				require.NoError(t, err)
+				require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"k"}}))
+				for i := 0; i < n; i++ {
+					require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"k":%d}`, i, i))))
+				}
+				tx, err := fx.WriteTx(ctx)
+				require.NoError(t, err)
+				iter, err := q(coll).Iter(tx.Context())
+				require.NoError(t, err)
+				var got []int
+				for i := 0; i < at; i++ {
+					require.True(t, iter.Next())
+					d, err := iter.Doc()
+					require.NoError(t, err)
+					got = append(got, d.Value().GetInt("id"))
+				}
+				require.NoError(t, coll.DeleteId(tx.Context(), got[len(got)-1]))
+				for iter.Next() {
+					d, err := iter.Doc()
+					require.NoError(t, err)
+					got = append(got, d.Value().GetInt("id"))
+				}
+				require.NoError(t, iter.Err())
+				require.NoError(t, iter.Close())
+				want := make([]int, n)
+				for i := range want {
+					want[i] = i
+					if strings.Contains(name, "everse") {
+						want[i] = n - 1 - i
+					}
+				}
+				require.Equal(t, want, got)
+				require.NoError(t, tx.Commit())
+				require.NoError(t, fx.IntegrityCheck(ctx))
+			})
+		}
+	}
+}
+
+// A plan that collects its result before yielding it — a sort the planner
+// runs in memory — yields what it collected: a document deleted since
+// makes its Doc fail with ErrDocNotFound and the scan goes on, one
+// inserted since is not visited.
+func TestIterator_WriteWhileIterating_CollectedPlan(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	for i := 0; i < 100; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"u":%d}`, i, (i*7)%100))))
+	}
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	iter, err := coll.Find(nil).Sort("u").Iter(tx.Context())
+	require.NoError(t, err)
+	require.True(t, iter.Next())
+	d, err := iter.Doc()
+	require.NoError(t, err)
+	require.Equal(t, 0, d.Value().GetInt("u"))
+	require.NoError(t, coll.DeleteId(tx.Context(), 43)) // u = 1
+	require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1000,"u":2}`)))
+	require.True(t, iter.Next())
+	_, err = iter.Doc()
+	require.ErrorIs(t, err, ErrDocNotFound)
+	var us []int
+	for iter.Next() {
+		d, err := iter.Doc()
+		require.NoError(t, err)
+		require.NotEqual(t, 1000, d.Value().GetInt("id"))
+		us = append(us, d.Value().GetInt("u"))
+	}
+	require.NoError(t, iter.Err())
+	require.Len(t, us, 98)
+	require.Equal(t, 2, us[0])
+	require.NoError(t, iter.Close())
+	require.NoError(t, tx.Commit())
+}
+
+// A savepoint drops the iterated collection and is rolled back: the
+// iterator positioned before the savepoint opened continues with the
+// rest of its scan.
+func TestSavepoint_RollbackOfDropKeepsIteratorPositionedBefore(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	for i := 0; i < 200; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i))))
+	}
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	iter, err := coll.Find(nil).Iter(tx.Context())
+	require.NoError(t, err)
+	for i := 0; i < 50; i++ {
+		require.True(t, iter.Next())
+	}
+	sp, err := fx.WriteTx(tx.Context())
+	require.NoError(t, err)
+	require.NoError(t, coll.Drop(sp.Context()))
+	require.NoError(t, sp.Rollback())
+	var got []int
+	for iter.Next() {
+		d, err := iter.Doc()
+		require.NoError(t, err)
+		got = append(got, d.Value().GetInt("id"))
+	}
+	require.NoError(t, iter.Err())
+	require.NoError(t, iter.Close())
+	var want []int
+	for i := 50; i < 200; i++ {
+		want = append(want, i)
+	}
+	require.Equal(t, want, got)
+	require.NoError(t, tx.Commit())
+	cnt, err := coll.Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 200, cnt)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}

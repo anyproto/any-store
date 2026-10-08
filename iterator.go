@@ -14,14 +14,22 @@ import (
 
 // Iterator represents an iterator over query results.
 //
-// Mutating the iterated collection through the same write transaction while
-// the iterator is open (deleting or updating documents mid-loop) is
-// UNDEFINED, matching SQLite's same-connection isolation contract: live rows
-// may be skipped or returned more than once, silently. It never corrupts the
-// store and never surfaces an error. To mutate every matched document,
-// collect the ids during iteration and mutate after Close — any-store's own
-// Query.Update/Delete do exactly that internally — or use those verbs
-// directly.
+// Writing the iterated collection through the same write transaction while
+// the iterator is open (inserting, updating or deleting documents mid-loop)
+// never corrupts the store. A scan the plan drives with a cursor — a full
+// scan, an index scan, in the plan's order — goes on from the key it stood
+// on, as a cursor of the same SQLite connection does: the current document
+// deleted, the scan continues with its successor; a document inserted ahead
+// of the position is visited, one inserted behind it is not; a write that
+// moves a document within the scan's order — an update of an indexed field
+// under an index scan — can make the scan visit the document again at its
+// new place, or miss it. A plan that collects its result before yielding
+// it — a sort the planner runs in memory, a $knn search — yields what it
+// collected: a document inserted since is not visited, one deleted since
+// makes its Doc fail with ErrDocNotFound. Doc returns the document as Next
+// read it. To mutate every matched document once, collect the ids during
+// iteration and mutate after Close — any-store's own Query.Update/Delete do
+// exactly that internally — or use those verbs directly.
 //
 // An Iterator belongs to one goroutine at a time. Opened with the context
 // of a transaction, its methods are calls on the transaction (see
@@ -198,6 +206,10 @@ func (pi *planIterator) Doc() (Doc, error) {
 			seekStart = time.Now()
 		}
 		if err := pi.dataCursor.SeekExact(pi.docId); err != nil {
+			if errors.Is(err, btree.ErrKeyNotFound) {
+				// Deleted since the plan collected it.
+				return nil, ErrDocNotFound
+			}
 			return nil, err
 		}
 		if perf {
