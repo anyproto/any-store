@@ -44,6 +44,25 @@ func (f *blockingFilter) IndexBounds(_ string, bs query.Bounds) query.Bounds { r
 
 func (f *blockingFilter) String() string { return "blocking" }
 
+// blockingModifier parks the modifier it runs until released, like
+// blockingFilter.
+type blockingModifier struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingModifier() *blockingModifier {
+	return &blockingModifier{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (m *blockingModifier) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+	m.once.Do(func() { close(m.entered) })
+	<-m.release
+	v.Set("m", a.NewNumberInt(1))
+	return v, true, nil
+}
+
 func TestDb_WriteTx(t *testing.T) {
 	t.Run("err other instance", func(t *testing.T) {
 		fx := newFixture(t)
@@ -635,6 +654,75 @@ func TestTx_NestedCalls(t *testing.T) {
 		assertQueryCount(t, fresh.Find(`{"b":1}`), 1)
 		require.Len(t, fresh.GetIndexes(), 1)
 	})
+}
+
+// A modifier refuses the writes to its collection made from inside it,
+// in its own transaction: a write from another transaction waits for the
+// writer lock, as it does behind any transaction, and lands once the
+// modifier's transaction has ended.
+func TestWriteTx_ModifierRefusesOnlyItsOwnTransaction(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
+
+	m := newBlockingModifier()
+	held := make(chan error, 1)
+	go func() {
+		_, err := coll.UpdateId(ctx, 1, m)
+		held <- err
+	}()
+	<-m.entered
+
+	writes := map[string]func() error{
+		"insert": func() error {
+			return coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":2}`))
+		},
+		"bulk update": func() error {
+			_, err := coll.Find(`{"id":1}`).Update(ctx, `{"$set":{"b":1}}`)
+			return err
+		},
+		"ensure index": func() error {
+			return coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}})
+		},
+		"explicit tx": func() error {
+			tx, err := fx.WriteTx(ctx)
+			if err != nil {
+				return err
+			}
+			if err = coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":3,"a":3}`)); err != nil {
+				return errors.Join(err, tx.Rollback())
+			}
+			return tx.Commit()
+		},
+	}
+	type result struct {
+		name string
+		err  error
+	}
+	results := make(chan result, len(writes))
+	for name, write := range writes {
+		go func() { results <- result{name, write()} }()
+	}
+	// Each write began while the modifier runs: none ends before it.
+	select {
+	case r := <-results:
+		t.Fatalf("%s returned while the modifier runs: %v", r.name, r.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(m.release)
+	require.NoError(t, <-held)
+	for range writes {
+		r := <-results
+		assert.NoError(t, r.err, r.name)
+	}
+
+	doc, err := coll.FindId(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, doc.Value().GetInt("m"))
+	assert.Equal(t, 1, doc.Value().GetInt("b"))
+	assertCollCount(t, coll, 3)
+	require.Len(t, coll.GetIndexes(), 1)
 }
 
 // A call on a transaction another goroutine has ended finds it ended, and
