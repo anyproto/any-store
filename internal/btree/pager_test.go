@@ -889,7 +889,12 @@ func TestCommit_EmptyTransaction(t *testing.T) {
 	p.endRead(slot)
 }
 
-func TestCommit_WithDontWritePages(t *testing.T) {
+// TestCommit_FreedLeafWritesFrame: a dirty page freed as a freelist leaf is
+// written at commit like any dirty page, as in SQLite's WAL mode (commit
+// hands the whole dirty list to pagerWalFrames). A page grown in the same
+// transaction has no other copy: without the frame it exists in neither
+// the WAL nor the file, and a backup before the next checkpoint hits EOF.
+func TestCommit_FreedLeafWritesFrame(t *testing.T) {
 	dir := t.TempDir()
 	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
 	p.inProcess = true
@@ -901,21 +906,30 @@ func TestCommit_WithDontWritePages(t *testing.T) {
 	p.walMaxFrame.Store(mf)
 	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
-	// Allocate pages, free one (which marks it dontWrite)
+	// Allocate two dirty pages; free pg3 (becomes the trunk), then pg2 (a leaf).
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
 	pg3, err := p.allocatePage()
 	require.NoError(t, err)
 	p.releasePage(pg2)
 	p.releasePage(pg3)
-
-	// Free pg3 (becomes trunk), then free pg2 (added as leaf, dontWrite)
 	require.NoError(t, p.freePage(pg3.pgno))
 	require.NoError(t, p.freePage(pg2.pgno))
 
 	_, _, _, err = p.commit(true, false)
 	require.NoError(t, err)
+	frames := map[uint32]uint32{}
+	for _, pgno := range []uint32{pg2.pgno, pg3.pgno} {
+		frame, err := p.wal.index.get(pgno, p.wal.nFrame.Load(), p.wal.index.liveMinFrame())
+		require.NoError(t, err)
+		frames[pgno] = frame
+	}
+	// Release the read slot before asserting: a failed assertion runs the
+	// deferred close, which waits for the slot.
 	p.endRead(slot)
+	for pgno, frame := range frames {
+		require.NotZero(t, frame, "page %d has a WAL frame after commit", pgno)
+	}
 }
 
 func TestPagerCommit_SchemaChanged(t *testing.T) {
@@ -1352,42 +1366,6 @@ func TestGetWritablePage_NotWriter(t *testing.T) {
 
 	_, err := p.getWritablePage(1)
 	assert.ErrorIs(t, err, ErrReadOnly)
-}
-
-func TestGetWritablePage_ReAcquireClears_dontWrite(t *testing.T) {
-	dir := t.TempDir()
-	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
-	p.inProcess = true
-	require.NoError(t, p.open())
-	defer p.close()
-
-	mf, slot, err := p.beginRead()
-	require.NoError(t, err)
-	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite(WalIndexHdr{}))
-
-	// Allocate pages
-	pg2, err := p.allocatePage()
-	require.NoError(t, err)
-	pg3, err := p.allocatePage()
-	require.NoError(t, err)
-	p.releasePage(pg2)
-	p.releasePage(pg3)
-
-	// Free to create trunk + leaf (marks pg2 as dontWrite)
-	require.NoError(t, p.freePage(pg3.pgno))
-	require.NoError(t, p.freePage(pg2.pgno))
-
-	if p.dontWritePages[pg2.pgno] {
-		// Re-acquire pg2 for writing — should clear dontWrite
-		pg, err := p.getWritablePage(pg2.pgno)
-		require.NoError(t, err)
-		assert.False(t, p.dontWritePages[pg2.pgno])
-		p.releasePage(pg)
-	}
-
-	require.NoError(t, p.rollback())
-	p.endRead(slot)
 }
 
 // ============================================================
@@ -2888,15 +2866,18 @@ func TestFreePage_WithSavepoints(t *testing.T) {
 	require.NoError(t, err)
 	p.releasePage(pg2)
 
-	// Create savepoint
-	_, err = p.savepoint()
+	id, err := p.savepoint()
 	require.NoError(t, err)
+	total, first := p.header.TotalFreelistPgs, p.header.FirstFreelistPg
 
-	// Free pg2 — with savepoints active, dontWrite is skipped
+	// Free pg2 with the savepoint open, then roll back to it: the freelist
+	// header is restored.
 	require.NoError(t, p.freePage(pg2.pgno))
-
-	// dontWrite should NOT be set (savepoints active)
-	assert.False(t, p.dontWritePages[pg2.pgno])
+	require.Equal(t, total+1, p.header.TotalFreelistPgs)
+	require.Equal(t, pg2.pgno, p.header.FirstFreelistPg)
+	require.NoError(t, p.rollbackToSavepoint(id))
+	require.Equal(t, total, p.header.TotalFreelistPgs)
+	require.Equal(t, first, p.header.FirstFreelistPg)
 
 	require.NoError(t, p.rollback())
 	p.endRead(slot)
@@ -8464,41 +8445,15 @@ func TestBeginWriteHeaderRefreshError_DoubleIOFailure(t *testing.T) {
 // Merged from pager_stress_dontwrite_test.go
 // ============================================================
 
-// TestPagerStress_DontWriteSkipsWALWrite_RegressionPin pins a by-design drift
-// between the Go port and upstream SQLite.
-//
-// DRIFT (docs/btree/NOTES.md#old-drift-pagerstress-dontwrite-skip-walwrite):
-// Go's pagerStress short-circuits a PGHDR_DONT_WRITE page (pager.go:2062-2065):
-// it calls makeClean(pg) and returns WITHOUT writing a WAL frame. SQLite's
-// pagerStress (sqlitec/src/pager.c:4645-4650) instead calls
-// pagerWalFrames(pPager,pPg,0,0) in WAL mode, and pagerWalFrames
-// (pager.c:3179-3236) writes the frame UNCONDITIONALLY — it never checks
-// PGHDR_DONT_WRITE. The DONT_WRITE skip in C lives only in the rollback-journal
-// path pager_write_pagelist (pager.c:4471), gated by assert(!pagerUseWal)
-// (pager.c:4432). So in WAL mode C writes a (garbage) frame for a spilled
-// dontWrite page; Go does not. This is an intentional I/O-avoidance optimization.
-//
-// THE INVARIANT a future refactor must not break (the relied-upon behavior that
-// makes skipping the write safe): a freed freelist-leaf page is marked dontWrite,
-// and pagerStress must still be able to make it CLEAN (evictable) WITHOUT
-// emitting a WAL frame — so freed pages whose content is irrelevant never bloat
-// the WAL, yet the cache can still drain them under memory pressure. The
-// stale/garbage cached content is never read back: getWritablePage clears
-// dontWrite and re-dirties on same-tx re-allocation (pager.go:1268), and
-// allocateFromFreelist uses getPageNoContent in later txs (hasContent is cleared
-// at commit), so no consumer ever interprets the spilled-but-not-rewritten bytes.
-//
-// This test builds the EXACT scenario the drift relies on: a real page that was
-// allocated, then freed via freePage as a freelist LEAF (which calls
-// dontWrite(pgno) at pager.go:1446 because the page is cached). The page is left
-// dirty + cached, made the genuine spill victim via the real findSpillVictim,
-// then handed to the real pagerStress. We assert the two halves of the
-// invariant: NO WAL frame is appended, and the page IS made clean. If a refactor
-// deletes the dontWrite branch (so it falls through to wal.writeFrames), the
-// "no WAL frame" assertion fails loudly.
-//
-// Production logic is unchanged; the test only drives existing internal methods.
-func TestPagerStress_DontWriteSkipsWALWrite_RegressionPin(t *testing.T) {
+// TestPagerStress_FreedLeafSpillWritesWALFrame: a page freed as a freelist
+// leaf is spilled like any other dirty page — pagerStress appends its WAL
+// frame and makes it clean. Matches SQLite's pagerStress WAL branch, which
+// calls pagerWalFrames for every victim (pager.c:4647-4649); PGHDR_DONT_WRITE
+// is honoured only by the rollback-journal writer (pager_write_pagelist,
+// pager.c:4471). The frame is load-bearing: a same-transaction reallocation
+// through allocateFromFreelist's hasContent branch reads the page back after
+// eviction, and a page grown in this transaction exists nowhere else.
+func TestPagerStress_FreedLeafSpillWritesWALFrame(t *testing.T) {
 	db := tempDB(t)
 	p := db.pager
 
@@ -8506,141 +8461,96 @@ func TestPagerStress_DontWriteSkipsWALWrite_RegressionPin(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback() }()
 
-	// Allocate two fresh data pages (pgno>1, within dbSize, dirty + cached).
-	// Both are released to pinCount==0 but stay dirty in the writer cache.
+	// Two fresh dirty pages: the first freed becomes the trunk, the second
+	// a leaf.
 	pgA, err := p.allocatePage()
 	require.NoError(t, err)
 	pgnoA := pgA.pgno
 	p.releasePage(pgA)
-
 	pgB, err := p.allocatePage()
 	require.NoError(t, err)
 	pgnoB := pgB.pgno
 	p.releasePage(pgB)
-
-	require.Greater(t, pgnoA, uint32(1))
-	require.Greater(t, pgnoB, uint32(1))
-
-	// Free pgA first: with no freelist yet, it becomes the new trunk page (its
-	// content is meaningful, so it is NOT marked dontWrite).
 	require.NoError(t, p.freePage(pgnoA))
-
-	// Free pgB: the trunk (pgA) now has room, so pgB is appended as a freelist
-	// LEAF. Because pgB is still cached, freePage marks it dontWrite
-	// (pager.go:1445-1447) — exactly the spill-then-free state the drift targets.
 	require.NoError(t, p.freePage(pgnoB))
 
-	require.True(t, p.dontWritePages[pgnoB],
-		"freeing a cached page as a freelist leaf must mark it dontWrite")
-
-	// pgB must still be a dirty, cached, unpinned page — the precondition for a
-	// pagerStress spill victim.
 	pgBcached := p.writerCache.hashFind(pgnoB)
-	require.NotNil(t, pgBcached, "freed dontWrite leaf must still be cached")
-	require.True(t, pgBcached.dirty, "freed dontWrite leaf must still be dirty")
-	require.Equal(t, 0, pgBcached.pinCount, "freed dontWrite leaf must be unpinned")
+	require.NotNil(t, pgBcached)
+	require.True(t, pgBcached.dirty)
+	require.Equal(t, 0, pgBcached.pinCount)
 
-	// Park every OTHER dirty page ahead of pgB so pgB is the oldest unpinned
-	// dirty page — the page findSpillVictim walks back to first. We must NOT
-	// touch pgB via getWritablePage: that would clear its dontWrite flag
-	// (pager.go:1268) and defeat the scenario.
+	// Park every other dirty page ahead of pgB so the real victim search
+	// picks it; pgB itself stays the oldest dirty page.
 	for _, d := range p.writerCache.appendDirtyPages(nil) {
-		if d.pgno == pgnoB {
+		if d.pgno == pgnoB || !d.dirty {
 			continue
 		}
-		if d.dirty {
-			wp, gerr := p.getWritablePage(d.pgno)
-			require.NoError(t, gerr)
-			p.releasePage(wp)
-		}
+		wp, gerr := p.getWritablePage(d.pgno)
+		require.NoError(t, gerr)
+		p.releasePage(wp)
 	}
-
-	// Load-bearing precondition: the REAL victim search selects the dontWrite
-	// page. This proves the dontWrite branch in pagerStress is genuinely
-	// reachable for this page under memory pressure.
 	victim := p.writerCache.findSpillVictim()
-	require.NotNil(t, victim, "there must be an unpinned dirty victim")
-	require.Equal(t, pgnoB, victim.pgno,
-		"the dontWrite leaf must be the oldest unpinned dirty page (spill victim)")
-	require.True(t, p.dontWritePages[pgnoB],
-		"sanity: dontWrite flag must survive the parking step")
+	require.NotNil(t, victim)
+	require.Equal(t, pgnoB, victim.pgno)
 
 	walFramesBefore := p.wal.index.maxFrame.Load()
 	dirtyBefore := p.writerCache.nDirty
+	require.NoError(t, p.pagerStress(pgBcached))
 
-	// Drive the REAL pagerStress on the dontWrite victim.
-	require.NoError(t, p.pagerStress(pgBcached),
-		"pagerStress on a dontWrite page must return nil")
-
-	// INVARIANT 1 (the drift): NO WAL frame was appended. SQLite would append a
-	// (garbage) frame here; Go must not. A wal.writeFrames call would advance
-	// walIndex.maxFrame.
-	assert.Equal(t, walFramesBefore, p.wal.index.maxFrame.Load(),
-		"pagerStress on a dontWrite page must NOT append a WAL frame")
-
-	// INVARIANT 2: the page WAS made clean (evictable) and the dirty count
-	// dropped by exactly one. This is what lets the cache drain freed pages
-	// under memory pressure even though no WAL write happened.
-	assert.False(t, pgBcached.dirty,
-		"pagerStress on a dontWrite page must make it clean (evictable)")
-	assert.Equal(t, dirtyBefore-1, p.writerCache.nDirty,
-		"pagerStress on a dontWrite page must drop the dirty count by exactly one")
+	assert.Equal(t, walFramesBefore+1, p.wal.index.maxFrame.Load(),
+		"spilling a freed leaf appends its WAL frame")
+	assert.False(t, pgBcached.dirty, "the spilled leaf is clean (evictable)")
+	assert.Equal(t, dirtyBefore-1, p.writerCache.nDirty)
 }
 
-// TestPagerStress_NonDontWriteWritesWALFrame_Control is the control proving the
-// regression pin above is not vacuous. An otherwise identical dirty/unpinned
-// spill victim that is NOT marked dontWrite IS written to the WAL by the real
-// pagerStress (maxFrame advances) and then made clean. This guards against
-// pagerStress silently becoming a no-op for all pages, which would make the
-// "no WAL frame" assertion above pass for the wrong reason.
-func TestPagerStress_NonDontWriteWritesWALFrame_Control(t *testing.T) {
-	db := tempDB(t)
-	p := db.pager
+// TestAllocateFromFreelist_SpilledFreedLeafReallocated reallocates, in the
+// same transaction and with no savepoint open, a freelist leaf that was
+// grown, freed, then spilled and evicted under cache pressure. The
+// hasContent branch reads the page back, so its spill frame must exist:
+// without one the read hits EOF (the page lies past the file's end) after
+// the leaf was already unlinked, and the commit leaks it ("page N: never
+// used").
+func TestAllocateFromFreelist_SpilledFreedLeafReallocated(t *testing.T) {
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "e.db"), Options{PageSize: 512, CacheSize: 6})
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
 
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
-	defer func() { _ = tx.Rollback() }()
-
-	// A plain dirty data page that is NOT freed / NOT marked dontWrite.
-	pg, err := p.allocatePage()
+	ns, err := tx.CreateNamespace("a")
 	require.NoError(t, err)
-	pgno := pg.pgno
-	require.Greater(t, pgno, uint32(1))
-	p.releasePage(pg)
-
-	require.False(t, p.dontWritePages[pgno],
-		"control page must NOT be marked dontWrite")
-
-	pgCached := p.writerCache.hashFind(pgno)
-	require.NotNil(t, pgCached)
-	require.True(t, pgCached.dirty)
-	require.Equal(t, 0, pgCached.pinCount)
-
-	// Park other dirty pages ahead so this page is the spill victim.
-	for _, d := range p.writerCache.appendDirtyPages(nil) {
-		if d.pgno == pgno {
-			continue
-		}
-		if d.dirty {
-			wp, gerr := p.getWritablePage(d.pgno)
-			require.NoError(t, gerr)
-			p.releasePage(wp)
-		}
+	nsb, err := tx.CreateNamespace("b")
+	require.NoError(t, err)
+	val := make([]byte, 100)
+	for i := 0; i < 300; i++ {
+		require.NoError(t, tx.Put(nsb, []byte(fmt.Sprintf("b%04d", i)), val))
 	}
+	require.NoError(t, tx.Commit())
 
-	victim := p.writerCache.findSpillVictim()
-	require.NotNil(t, victim)
-	require.Equal(t, pgno, victim.pgno)
-
-	walFramesBefore := p.wal.index.maxFrame.Load()
-
-	require.NoError(t, p.pagerStress(pgCached))
-
-	// A non-dontWrite victim IS spilled: a WAL frame is appended and it is cleaned.
-	assert.Greater(t, p.wal.index.maxFrame.Load(), walFramesBefore,
-		"a non-dontWrite spill victim must append a WAL frame (proves pagerStress is not a global no-op)")
-	assert.False(t, pgCached.dirty,
-		"a non-dontWrite spill victim must be made clean (evictable)")
+	tx, err = db.BeginWrite()
+	require.NoError(t, err)
+	require.Empty(t, db.pager.savepoints)
+	// Grow: the value's overflow pages are new pages past the file's end.
+	big := make([]byte, 2000)
+	require.NoError(t, tx.Put(ns, []byte("x"), big))
+	grown := db.pager.dbSize.Load()
+	// Free them: the first becomes the trunk, the rest leaves.
+	require.NoError(t, tx.Delete(ns, []byte("x")))
+	require.True(t, db.pager.getHasContent(grown))
+	// Churn the 6-page cache so the leaves are spilled and evicted. The
+	// same-size overwrites rewrite cells in place, so nothing is taken from
+	// the freelist yet.
+	val[0] = 1
+	for i := 0; i < 300; i++ {
+		require.NoError(t, tx.Put(nsb, []byte(fmt.Sprintf("b%04d", i)), val))
+	}
+	require.Nil(t, db.pager.writerCache.hashFind(grown), "the freed leaf was evicted")
+	total := db.pager.header.TotalFreelistPgs
+	// Reallocate from the freelist: the hasContent branch reads the leaf.
+	require.NoError(t, tx.Put(ns, []byte("y"), big))
+	require.Less(t, db.pager.header.TotalFreelistPgs, total)
+	require.NoError(t, tx.Commit())
+	require.NoError(t, db.IntegrityCheck())
 }
 
 // ============================================================

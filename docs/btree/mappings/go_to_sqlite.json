@@ -1580,12 +1580,6 @@
     ],
     "note": "fans out the per-page update hook to all attached Backups after each committed write so already-copied pages stay current"
   },
-  "pager.go:*pager.dontWrite": {
-    "sqlite": [
-      "pager.c:sqlite3PagerDontWrite"
-    ],
-    "note": ""
-  },
   "pager.go:*pager.encryptPage": {
     "sqlite": [],
     "note": ""

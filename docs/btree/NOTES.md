@@ -506,7 +506,7 @@ const (
 | Hot journal rollback | Automatic recovery | Not applicable (no rollback journal) |
 | Sub-journal (savepoint journal) | Written to disk | In-memory page copies |
 | NOCONTENT optimization | `PAGER_GET_NOCONTENT` flag | `getPageNoContent()` |
-| DONT_WRITE flag | `PGHDR_DONT_WRITE` in page flags | `dontWritePages` map |
+| DONT_WRITE flag | `PGHDR_DONT_WRITE` in page flags (no effect in WAL mode: only `pager_write_pagelist` reads it) | None — frames are written at spill and commit |
 | Page size changes | `sqlite3BtreeSetPageSize()` | Fixed at open time |
 | Deferred durability | `PRAGMA synchronous=NORMAL` | `NoCommitSync` option |
 | In-memory databases | `:memory:` or `PRAGMA journal_mode=MEMORY` | `InMemory` option with `memFrames` WAL |
@@ -606,7 +606,7 @@ drawn from the global slab that enforces a process-wide soft cap.
 | Slab buffer return | Range check `SQLITE_WITHIN` (`pcache1.c:381`) | Caps free list at `nSlab`; overflow buffers recycle via `sync.Pool` (drift #8, since commit `01af9d6`) |
 | Slab init | Library init `pcache1Init` (`pcache1.c:695-741`) | Lazy init on first `Open()` or explicit `ConfigPageCache()` (drift #9) |
 | Bulk alloc | Contiguous `pBulk` carved into slots (`pcache1.c:312-327`) | Individual page structs with slab buffers (drift #10) |
-| Page flags | Bitmask on each page | Separate maps (`dontWritePages`, `hasContent`) |
+| Page flags | Bitmask on each page | None (`hasContent` mirrors `BtShared.pHasContent`, not a page flag) |
 | Cache ownership | Per-connection (private) | Per-connection (private) — matches SQLite |
 | Thread safety | Per-connection (no mutex needed) | Per-connection (no mutex needed) — matches SQLite |
 | PGroup cross-cache stealing | Enabled in single-thread mode (`pcache1.c:718-719`) | No PGroup; each cache isolated (drift #1) |
@@ -642,7 +642,7 @@ The Go implementation uses the same trunk/leaf format (pager.go):
 - Same layout: `[4B next_trunk] [4B leaf_count] [4B leaf_pgno * N]`
 - Fills trunks to `(usableSize - 8) / 4` == `usableSize/4 - 2` (SQLite's corruption ceiling), **not** SQLite's conservative `usableSize/4 - 8` — see Drift
 - `hasContent` map (replacing SQLite's bitvec) for savepoint-safe freelist reuse
-- `dontWritePages` map (replacing SQLite's `PGHDR_DONT_WRITE` flag)
+- No `PGHDR_DONT_WRITE` equivalent: in WAL mode the flag has no effect (only the rollback-journal writer reads it; frames are written at spill and commit)
 - Bounds validation on trunk/leaf page numbers
 
 <a id="old-drift-freelist-trunk-fill-corruption-ceiling"></a>
@@ -653,7 +653,7 @@ The Go implementation uses the same trunk/leaf format (pager.go):
 |--------|--------|-----|
 | Freelist format | Trunk/leaf linked list | Identical trunk/leaf linked list |
 | hasContent tracking | Bitvec (`pHasContent`) | Go map (`hasContent`) |
-| dontWrite flag | Page header flag (`PGHDR_DONT_WRITE`) | Separate map (`dontWritePages`) |
+| dontWrite flag | Page header flag (`PGHDR_DONT_WRITE`), no I/O effect in WAL mode | None |
 | Auto-vacuum integration | Pointer-map page updates during free/alloc | Not applicable |
 | Leaf-first allocation | Prefers leaf pages from most-recent trunk | Same behavior |
 | Trunk fill bound | Fills to `usableSize/4 - 8` (6 slots reserved for pre-3.6.0 compat) | Fills to `usableSize/4 - 2` (the corruption ceiling) — 6 more leaves/trunk; format drift vs SQLite <3.6.0 only (3.6.0+ accepts it) |
@@ -1266,7 +1266,20 @@ comments in source):
    frame is unregistered.
 
 <a id="old-drift-pagerstress-dontwrite-skip-walwrite"></a>
-5. **dontWrite pages made clean without WAL write** (`pager.go:pagerStress`) — **Severity:** low.
+5. **Resolved (2026-10-08)** — `pagerStress` writes the WAL frame for every victim, as C's WAL
+   branch does (`pagerWalFrames`, `pager.c:4647-4649`; the `PGHDR_DONT_WRITE` check lives only in
+   the rollback-journal writer, `pager_write_pagelist` `pager.c:4471`). The skip rested on
+   "dontWrite page data is never read back", which is false: a same-transaction reallocation
+   through `allocateFromFreelist`'s hasContent branch reads the page, and a page grown in that
+   transaction exists in neither the WAL nor the file, so the read failed with EOF after the leaf
+   was unlinked and the commit leaked the page. The commit-time filter that dropped the frames of the
+   same pages is gone with it, as is the `dontWritePages` map: a page grown and freed in one
+   transaction then had no bytes in the WAL or the file, and a backup before the next checkpoint
+   failed with EOF; a hole above about 64 KiB also tripped the checkpoint's over-grow guard
+   (`wal.go`, C `wal.c:2281`) with `database is corrupt` until enough new frames accumulated.
+   Files written before the fix keep their holes until the next full checkpoint extends the file
+   (see the short-read drift). **dontWrite pages made clean without WAL write**
+   (`pager.go:pagerStress`) — **Severity:** low.
    SQLite's `pagerStress` in WAL mode writes `PGHDR_DONT_WRITE` pages to WAL
    anyway (the data is irrelevant but the frame is still written). We skip the WAL
    write and just mark them clean, avoiding unnecessary I/O. Safe because dontWrite
@@ -2041,6 +2054,7 @@ which can return outdated page content as if it were current.
 C `sqlite3WalReadFrame` (`sqlitec/src/wal.c:3649-3664`, 3.52.0) is a bare `sqlite3OsRead` with no bounds check — a read past the physical WAL tail surfaces as the raw OS error (typically `SQLITE_IOERR_SHORT_READ` from `unixRead`), and `readDbPage` forgives short reads only on the DB-file branch, never the WAL branch (`pager.c:3042-3045`). Go's `readFrame`/`readFrameRaw` instead remap a `ReadAt` failure at `frame > nFrame` (a stale process-local tail view in multi-process mode) to `ErrWALCorrupt` rather than leaking the raw I/O error. Both C and Go treat the condition as an error; the divergence is only the error identity. Since the drift-6 resolution these errors propagate to page-get callers, so the remap is now user-visible: callers see `ErrWALCorrupt` where C would surface an I/O error code. Kept deliberately — a lookup-resolved frame that cannot be read within the reader's validated snapshot implies index/tail inconsistency, which `ErrWALCorrupt` describes more accurately than a short-read errno.
 
 
+<a id="drift-7-short-db-file-read-treated-as-hard-error"></a>
 ### Drift: Short DB File Read Treated As Hard Error
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `pager.go:*pager.readTempPage` (`internal/btree/pager.go:1085-1178`; hard-error path `1126-1132`; underlying `readDBPage` `internal/btree/pager.go:339-368`).
@@ -2052,7 +2066,23 @@ zero-padded rather than as an error (`os_unix.c:3575-3577` zero-fills the unread
 Go's `readTempPage` instead treats a short read of an in-bounds page (`pgno <= dbSizeBound`)
 in a physically-short DB file as a hard error. The consequence is divergent error
 behavior for a physically-truncated-but-logically-valid file: Go fails where SQLite
-returns a partially-read, zero-padded page as success.
+returns a partially-read, zero-padded page as success. Load-bearing only for files written
+before the dontWrite removal (resolved entry 5 under Known Implementation Gaps): their
+freed-leaf holes read as EOF here (`Backup`, `VerifyIntegrity`) until the next full
+checkpoint, where C would zero-fill.
+
+<a id="drift-nocontent-realloc-savepoint-copy"></a>
+### Drift: NOCONTENT Freelist Reallocation Under A Savepoint Is Journaled
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.allocateFromFreelist` (the `hasContent==false`, savepoint-open branch).
+
+C fetches the leaf NOCONTENT and the fetch marks the page in every open savepoint's bitvec
+(`getPageNormal`, `pager.c:5599-5611`), so the `sqlite3PagerWrite` that follows
+(`btree.c:6728`) does not sub-journal it and ROLLBACK TO leaves the post-allocation bytes on
+the freelist leaf. Go copies the zeroed page into the innermost savepoint, so the rollback
+restores it as a dirty page that is written at spill or commit. Kept deliberately: the leaf's
+bytes stay reachable without C's short-read zero-fill (the drift above), including for files
+written before the dontWrite removal.
 
 <a id="drift-8-max-page-count-sqlite-full-enforcement-absent"></a>
 ### Drift: Max Page Count SQLITE_FULL Enforcement Absent
@@ -2651,7 +2681,7 @@ referenced by a cursor, where SQLite would have stopped with a corruption error.
 <a id="drift-73-freepage2-trunk-decision-and-page-invalidation-drifts"></a>
 ### Drift: freePage2 Trunk Decision And Page Invalidation Drifts
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `pager.go:*pager.freePage` (`internal/btree/pager.go:1536-1628`),
+- **Affected functions:** `pager.go:*pager.freePage` (`internal/btree/pager.go:1527-1617`),
   decision at `internal/btree/pager.go:1548-1550`, leaf path at `internal/btree/pager.go:1569-1589`.
 
 C's `freePage2` decides whether to append a freed page as a leaf of the existing first trunk or to
@@ -2666,23 +2696,21 @@ new-trunk cases (`btree.c:6947-6949`), invalidating any cached parse of that pag
 path does clear the freed page's header (`clear(newTrunkPg.data)`/`newTrunkPg.header = pageHeader{}`,
 `pager.go:1619-1622`), so the missing-invalidation gap applies only to Go's leaf
 path (`pager.go:1569-1589`), which never fetches or touches the freed page object -- it only updates the
-trunk's leaf array and records `dontWrite`/`setHasContent` by page number. The consequence is that
+trunk's leaf array and records `setHasContent` by page number. The consequence is that
 on an inconsistent header Go can pick the wrong free-list shape, and a stale cached header parse for
 a freed leaf page can survive where SQLite would have discarded it.
 
 <a id="drift-74-secure-delete-page-zeroing-on-free-unsupported"></a>
 ### Drift: secure_delete Page Zeroing On Free Unsupported
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `pager.go:*pager.freePage` (`internal/btree/pager.go:1536-1628`).
+- **Affected functions:** `pager.go:*pager.freePage` (`internal/btree/pager.go:1527-1617`).
 
 C's `freePage2` honors `BTS_SECURE_DELETE`: when the pragma is enabled it fetches the freed page and
 `memset(pPage->aData, 0, pPage->pBt->pageSize)` to scrub the deleted data (`btree.c:6849-6859`), and
 it also suppresses the `PagerDontWrite` optimization in that mode so the zeroed page is actually
 persisted (`btree.c:6919-6920`). Go's `freePage` has no secure-delete concept at all
-(`pager.go:1536-1628`): freed leaf-page contents are never zeroed and `dontWrite` is applied
-unconditionally (`pager.go:1580-1581`). The consequence is that deleted row/cell data physically remains in freed pages
-on disk in Go where SQLite's secure_delete mode would have scrubbed it, and this gap is currently
-undocumented.
+(`pager.go:1527-1617`): freed leaf-page contents are never zeroed. The consequence is that deleted row/cell data physically remains in freed pages
+on disk in Go where SQLite's secure_delete mode would have scrubbed it.
 
 <a id="drift-76-beginwrite-re-reads-page-1-header-on-state-change"></a>
 ### Drift: beginWrite Re Reads Page 1 Header On State Change

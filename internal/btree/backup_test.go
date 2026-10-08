@@ -795,3 +795,47 @@ func TestBackup_RestartsOnExternalProcessWrite(t *testing.T) {
 // page_slab.go:47). The check in BackupInit is trivial
 // (`dst.PageSize() != src.PageSize()`) and is exercised indirectly by
 // any future refactor that drops it — tests will break immediately.
+
+// TestBackup_FreedLeafGrownInTransactionReadable: a page grown and freed as a
+// freelist leaf in one transaction gets its frame at commit, so a backup taken
+// before the next checkpoint can read it. Without the frame the page exists
+// in neither the WAL nor the file and Step fails with EOF.
+func TestBackup_FreedLeafGrownInTransactionReadable(t *testing.T) {
+	dir := t.TempDir()
+	src, err := testOpen(t, filepath.Join(dir, "src.db"), Options{PageSize: 512})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = src.Close() })
+	tx, err := src.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("a")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	tx, err = src.BeginWrite()
+	require.NoError(t, err)
+	before := src.pager.dbSize.Load()
+	big := make([]byte, 2000) // its overflow pages lie past the file's end
+	require.NoError(t, tx.Put(ns, []byte("x"), big))
+	grown := src.pager.dbSize.Load()
+	require.Greater(t, grown, before)
+	require.NoError(t, tx.Delete(ns, []byte("x")))
+	require.NoError(t, tx.Commit())
+	for pg := before + 1; pg <= grown; pg++ {
+		frame, err := src.pager.wal.index.get(pg, src.pager.wal.nFrame.Load(), src.pager.wal.index.liveMinFrame())
+		require.NoError(t, err)
+		require.NotZero(t, frame, "page %d has a WAL frame", pg)
+	}
+
+	dst, err := Open(filepath.Join(dir, "dst.db"), Options{PageSize: 512})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dst.Close() })
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	stepErr := b.Step(-1)
+	// Finish before asserting: an unfinished backup keeps its source read
+	// transaction open, and closing the source in cleanup would wait on it.
+	finishErr := b.Finish()
+	require.ErrorIs(t, stepErr, ErrBackupDone)
+	require.NoError(t, finishErr)
+	require.NoError(t, dst.IntegrityCheck())
+}

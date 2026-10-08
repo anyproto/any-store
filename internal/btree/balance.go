@@ -688,8 +688,8 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 
 	// ---- Free surplus old pages (btree.c:9000-9004) -------------------------
 	// Pages apOld[nNew..nOld) were not reused. Release our pin first (freePage
-	// re-acquires the trunk via getWritablePage and marks the freed page
-	// dontWrite), matching the merge path (btree.go:2552-2556).
+	// re-acquires the trunk via getWritablePage), matching the merge path in
+	// btree.go.
 	var surplusArr [nbSiblings]uint32
 	surplus := surplusArr[:0]
 	for g := nNew; g < nOld; g++ {
@@ -775,8 +775,8 @@ func (bt *btree) parentDividerFullKey(parentPg *page, slot int, usableSize int) 
 // freePageDeferred frees a page that is no longer reachable, used for the
 // surplus old siblings after a balance (btree.c:9000-9004). The page's pin must
 // already have been released by the caller (freePage re-acquires the freelist
-// trunk via getWritablePage and marks the freed page dontWrite), matching the
-// merge path's freePage usage (btree.go:2554).
+// trunk via getWritablePage), matching the merge path's freePage usage in
+// btree.go.
 func (bt *btree) freePageDeferred(pgno uint32) error {
 	return bt.pager.freePage(pgno)
 }

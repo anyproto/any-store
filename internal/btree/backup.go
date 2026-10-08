@@ -125,9 +125,9 @@ func (b *Backup) onePage(iSrcPg uint32, srcData []byte, bUpdate bool, snapPageCo
 	}
 
 	// ~ backup.c:255–256: sqlite3PagerGet + sqlite3PagerWrite in one call.
-	// getWritablePage (pager.go:698) combines both: it admits the page
-	// into writerCache, handles savepoint copy-on-write, clears
-	// dontWrite, and marks the page dirty via makeDirty (pcache.go:335).
+	// getWritablePage combines both: it admits the page
+	// into writerCache, handles savepoint copy-on-write, and marks the
+	// page dirty via makeDirty.
 	// This is the exact SQLite pattern: get-then-write.
 	dstPg, err := b.dst.pager.getWritablePage(iSrcPg)
 	if err != nil {

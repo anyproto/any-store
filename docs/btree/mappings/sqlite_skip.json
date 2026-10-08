@@ -1232,6 +1232,11 @@
       },
       {
         "file": "pager.c",
+        "func": "sqlite3PagerDontWrite",
+        "reason": "PGHDR_DONT_WRITE has no effect in WAL mode: only the rollback-journal writer (pager_write_pagelist) reads it, and clearing WRITEABLE just routes the next sqlite3PagerWrite through sqlite3PcacheMakeDirty, which drops it; frames are written at spill and commit."
+      },
+      {
+        "file": "pager.c",
         "func": "pageInJournal"
       },
       {
