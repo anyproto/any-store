@@ -918,12 +918,18 @@ func TestCommit_FreedLeafWritesFrame(t *testing.T) {
 
 	_, _, _, err = p.commit(true, false)
 	require.NoError(t, err)
+	frames := map[uint32]uint32{}
 	for _, pgno := range []uint32{pg2.pgno, pg3.pgno} {
 		frame, err := p.wal.index.get(pgno, p.wal.nFrame.Load(), p.wal.index.liveMinFrame())
 		require.NoError(t, err)
+		frames[pgno] = frame
+	}
+	// Release the read slot before asserting: a failed assertion runs the
+	// deferred close, which waits for the slot.
+	p.endRead(slot)
+	for pgno, frame := range frames {
 		require.NotZero(t, frame, "page %d has a WAL frame after commit", pgno)
 	}
-	p.endRead(slot)
 }
 
 func TestPagerCommit_SchemaChanged(t *testing.T) {
