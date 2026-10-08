@@ -897,5 +897,54 @@ func TestWriteWhileIterating_ScanContinues(t *testing.T) {
 	}
 	require.Equal(t, want, got)
 	require.NoError(t, tx.Commit())
+}
+
+// A modifier cannot open a savepoint on its transaction: the operation
+// running it would write inside that savepoint, and a rollback from a
+// later call of a bulk verb's modifier would undo the verb's own writes
+// while the verb reports them modified.
+func TestWriteTx_SavepointRefusedInModifier(t *testing.T) {
+	fx := newFixture(t)
+	c, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	d, err := fx.CreateCollection(ctx, "d")
+	require.NoError(t, err)
+	for i := range 3 {
+		require.NoError(t, c.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":0}`, i))))
+	}
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+
+	var sp anystore.WriteTx
+	var opens []error
+	n := 0
+	res, err := c.Find(nil).Update(tx.Context(), query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+		n++
+		switch {
+		case n == 1:
+			var err error
+			sp, err = fx.WriteTx(tx.Context())
+			opens = append(opens, err)
+		case n == 3 && sp != nil:
+			_ = sp.Rollback()
+		}
+		if err := d.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, n))); err != nil {
+			return nil, false, err
+		}
+		v.Set("v", a.NewNumberInt(1))
+		return v, true, nil
+	}))
+	require.NoError(t, err)
+	assert.Equal(t, anystore.ModifyResult{Matched: 3, Modified: 3}, res)
+	require.Len(t, opens, 1)
+	assert.ErrorIs(t, opens[0], anystore.ErrSavepointInModifier)
+	assert.Nil(t, sp)
+	require.NoError(t, tx.Commit())
+	cnt, err := c.Find(`{"v":1}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 3, cnt)
+	cnt, err = d.Find(nil).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 3, cnt)
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
