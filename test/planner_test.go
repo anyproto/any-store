@@ -2041,7 +2041,8 @@ func TestIndex_Planner_UniqueCompound_PrefixUsesRangeScan(t *testing.T) {
 }
 
 // act-24: FullScan with no-sort + small limit uses the early-termination scan
-// estimate and beats the index seek path.
+// estimate; the index seek gets the same credit, and on a 50% range its five
+// fetches price below the scan's ten reads.
 func TestIndex_Planner_FullScanLimit_EarlyTerminationCost(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
@@ -2057,8 +2058,9 @@ func TestIndex_Planner_FullScanLimit_EarlyTerminationCost(t *testing.T) {
 	t.Log("Plan:", explain.Sql)
 	t.Log("Rich:\n", explain.Plan)
 
-	assert.Equal(t, "FullScan(filtered) -> Limit(5)", explain.Sql)
-	assert.NotContains(t, explain.Sql, "IndexScan(a)")
+	assert.Equal(t, "IndexScan(a)[bounds=Bounds{['50','<string>')}] -> Fetch -> Filter -> Dedup(canonical) -> Limit(5)", explain.Sql)
+	assert.Contains(t, explain.Plan, "FullScan                  cost=35.1       est_rows=10", "ten reads find five matches at 50%%")
+	assert.Contains(t, explain.Plan, "IndexSeek(a)              cost=18.0       est_rows=5", "five fetches, not the thousand in range")
 
 	// Correctness: exactly 5 docs in the window.
 	docs := collectDocs(t, coll.Find(`{"a":{"$gte":50}}`).Limit(5))
@@ -3194,4 +3196,531 @@ func TestUniqueInCountMultikeyDedup(t *testing.T) {
 	cnt, iterN := countAndIterLen(t, coll, `{"aliases":{"$in":["a","b","d"]}}`)
 	assert.Equal(t, 2, cnt, "same-doc multi-element hits must dedup")
 	assert.Equal(t, cnt, iterN)
+}
+
+// TestPlannerRegression_SameFieldConjunctsSeekMostSelective: a field several
+// conjuncts constrain ($all, the $and spelling, {$in,$eq}, a two-sided range)
+// seeds its seek with the most selective conjunct, whichever is listed first;
+// the rest stays residual, so every spelling returns the same rows.
+func TestPlannerRegression_SameFieldConjunctsSeekMostSelective(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "indexed")
+	require.NoError(t, err)
+	oracle, err := fx.CreateCollection(ctx, "oracle")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"nums"}}))
+
+	// tags: common 5000, a 2500, c 1000, rare 50; nums: two consecutive
+	// values per doc, plus one doc whose elements straddle every range below.
+	var docs []*anyenc.Value
+	for i := range 5000 {
+		tags := `"common"`
+		if i%2 == 0 {
+			tags += `,"a"`
+		}
+		if i%5 == 0 {
+			tags += `,"c"`
+		}
+		if i%100 == 0 {
+			tags += `,"rare"`
+		}
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(
+			`{"id":%d,"tags":[%s],"nums":[%d,%d]}`, i, tags, i, i+1)))
+	}
+	docs = append(docs, anyenc.MustParseJson(`{"id":"straddle","tags":["common"],"nums":[50000,-5]}`))
+	require.NoError(t, coll.Insert(ctx, docs...))
+	require.NoError(t, oracle.Insert(ctx, docs...))
+
+	cases := []struct {
+		query  string
+		index  string
+		bound  string
+		expect string
+	}{
+		{`{"tags":{"$all":["rare","common"]}}`, "tags", `'"rare"'`, "rare listed first"},
+		{`{"tags":{"$all":["common","rare"]}}`, "tags", `'"rare"'`, "rare listed second"},
+		{`{"$and":[{"tags":"common"},{"tags":"rare"}]}`, "tags", `'"rare"'`, "$and spelling"},
+		{`{"tags":{"$in":["common","a"],"$eq":"rare"}}`, "tags", `'"rare"'`, "$in then $eq"},
+		{`{"tags":{"$all":["nosuch","a"]}}`, "tags", `'"nosuch"'`, "absent value first"},
+		{`{"tags":{"$all":["a","nosuch"]}}`, "tags", `'"nosuch"'`, "absent value second"},
+		{`{"tags":{"$all":["c","a"]}}`, "tags", `'"c"'`, "rarer value first"},
+		{`{"tags":{"$all":["a","c"]}}`, "tags", `'"c"'`, "rarer value second"},
+		{`{"nums":{"$gt":-1,"$lt":10}}`, "nums", `'10')`, "upper side narrower"},
+		{`{"nums":{"$gt":4990,"$lt":100000}}`, "nums", `('4990'`, "lower side narrower"},
+	}
+	for _, c := range cases {
+		explain, err := coll.Find(c.query).Explain(ctx)
+		require.NoError(t, err, c.expect)
+		assert.Contains(t, explain.Sql, "IndexScan("+c.index+")", "%s: %s", c.expect, explain.Sql)
+		assert.Contains(t, explain.Sql, c.bound, "%s: %s", c.expect, explain.Sql)
+
+		want, err := oracle.Find(c.query).Count(ctx)
+		require.NoError(t, err)
+		got, err := coll.Find(c.query).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, want, got, "%s: rows must not depend on the seeding conjunct", c.expect)
+	}
+
+	// The straddling document matches each range through a different
+	// element; whichever side seeds the seek must still find it.
+	for _, q := range []string{`{"nums":{"$gt":-1,"$lt":10}}`, `{"nums":{"$lt":10,"$gt":-1}}`} {
+		doc, err := coll.Find(q).Iter(ctx)
+		require.NoError(t, err)
+		ids := map[string]bool{}
+		for doc.Next() {
+			d, err := doc.Doc()
+			require.NoError(t, err)
+			ids[d.Value().GetString("id")] = true
+		}
+		require.NoError(t, doc.Close())
+		assert.True(t, ids["straddle"], "%s: %v", q, ids)
+	}
+
+	// The selectivity estimate follows the chosen conjunct too: a LIMIT does
+	// not talk the planner into a FullScan priced as if every doc matched.
+	explain, err := coll.Find(`{"tags":{"$all":["common","rare"]}}`).Limit(5).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "IndexScan(tags)", explain.Sql)
+
+	// A sort on the field: the seek-best side may cut on the sort side,
+	// which loses the index order for a scan over possibly multikey data,
+	// so the other side is a second candidate of the same index. The ordered
+	// scan is priced for the stretch it walks before the pick's cut, so it
+	// wins only when that stretch is short: with a LIMIT, when the pick's
+	// cut sits near the scan's entry side. Over these two-element arrays a
+	// descending scan enters through every whole-array entry, which sort
+	// above the numbers, so it never wins there. Both candidates return the
+	// oracle's rows in order, and Explain lists the index once.
+	sorted := func(q anystore.Query) []string {
+		it, err := q.Iter(ctx)
+		require.NoError(t, err)
+		var ids []string
+		for it.Next() {
+			d, err := it.Doc()
+			require.NoError(t, err)
+			ids = append(ids, d.Value().GetString("id"))
+		}
+		require.NoError(t, it.Close())
+		return ids
+	}
+	orderedCases := []struct {
+		query, sort string
+		expect      string // plan string fragments
+		ordered     bool
+	}{
+		// Descending: the $lt pick cuts above; the $gt side enters at +inf,
+		// through the whole-array entries.
+		{`{"nums":{"$gt":-1,"$lt":4990}}`, "-nums", "", false},
+		{`{"nums":{"$lt":300,"$gt":-1}}`, "-nums", "", false},
+		// Ascending: the $gt pick cuts below; the $lt side enters at -inf.
+		{`{"nums":{"$gt":10,"$lt":100000}}`, "nums", "'100000')", true},
+		{`{"nums":{"$gt":4990,"$lt":100000}}`, "nums", "('4990'", false},
+	}
+	for _, c := range orderedCases {
+		explain, err := coll.Find(c.query).Sort(c.sort).Limit(3).Explain(ctx)
+		require.NoError(t, err, c.query)
+		assert.Contains(t, explain.Sql, c.expect, "%s: %s", c.query, explain.Sql)
+		if c.ordered {
+			assert.Contains(t, explain.Sql, "IndexScan(nums)", "%s: %s", c.query, explain.Sql)
+			assert.NotContains(t, explain.Sql, "Sort", "%s: %s", c.query, explain.Sql)
+			assert.NotContains(t, explain.Sql, "TopK", "%s: %s", c.query, explain.Sql)
+			assert.Contains(t, explain.Plan, "[ordered]", "%s: %s", c.query, explain.Plan)
+		} else {
+			assert.Contains(t, explain.Sql, "TopK(3)", "%s: %s", c.query, explain.Sql)
+		}
+		assert.Equal(t, sorted(oracle.Find(c.query).Sort(c.sort).Limit(3)), sorted(coll.Find(c.query).Sort(c.sort).Limit(3)), c.query)
+		names := map[string]int{}
+		for _, ie := range explain.Indexes {
+			names[ie.Name]++
+		}
+		assert.Equal(t, 1, names["nums"], "%s: %v", c.query, explain.Indexes)
+	}
+
+	// Without a LIMIT the ordered scan walks everything: the narrower seek
+	// plus an in-memory sort wins.
+	desc := `{"nums":{"$gt":-1,"$lt":1500}}`
+	explain, err = coll.Find(desc).Sort("-nums").Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "'1500')", explain.Sql)
+	assert.Contains(t, explain.Sql, "-> Sort", explain.Sql)
+	assert.Equal(t, sorted(oracle.Find(desc).Sort("-nums")), sorted(coll.Find(desc).Sort("-nums")))
+
+	// Over scalar entries (the multikey flag set by an array document since
+	// deleted) a descending scan enters right at the top: with the pick's
+	// cut near it, the ordered scan wins.
+	scalar, err := fx.CreateCollection(ctx, "scalar")
+	require.NoError(t, err)
+	scalarOracle, err := fx.CreateCollection(ctx, "scalar_oracle")
+	require.NoError(t, err)
+	require.NoError(t, scalar.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"nums"}}))
+	docs = docs[:0]
+	for i := range 5000 {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"nums":%d}`, i, i)))
+	}
+	require.NoError(t, scalar.Insert(ctx, docs...))
+	require.NoError(t, scalarOracle.Insert(ctx, docs...))
+	require.NoError(t, scalar.Insert(ctx, anyenc.MustParseJson(`{"id":"arr","nums":[1,2]}`)))
+	require.NoError(t, scalar.DeleteId(ctx, "arr"))
+	explain, err = scalar.Find(`{"nums":{"$gt":-1,"$lt":4990}}`).Sort("-nums").Limit(3).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "IndexScan(nums)(reverse)", explain.Sql)
+	assert.Contains(t, explain.Sql, "('-1'", explain.Sql)
+	assert.NotContains(t, explain.Sql, "TopK", explain.Sql)
+	assert.Contains(t, explain.Plan, "[ordered]", explain.Plan)
+	assert.Equal(t, sorted(scalarOracle.Find(`{"nums":{"$gt":-1,"$lt":4990}}`).Sort("-nums").Limit(3)),
+		sorted(scalar.Find(`{"nums":{"$gt":-1,"$lt":4990}}`).Sort("-nums").Limit(3)))
+	explain, err = scalar.Find(`{"nums":{"$gt":-1,"$lt":300}}`).Sort("-nums").Limit(3).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "TopK(3)", "the cut sits far from the top: %s", explain.Sql)
+}
+
+// TestPlannerRegression_OrderedLeadInMultiPointPick: the ordered candidate's
+// walk is charged up to the point of a multi-point pick at which the points'
+// counts add up to the LIMIT — the gaps between points are crossed too.
+func TestPlannerRegression_OrderedLeadInMultiPointPick(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "indexed")
+	require.NoError(t, err)
+	oracle, err := fx.CreateCollection(ctx, "oracle")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"v"}}))
+	var docs []*anyenc.Value
+	for i := range 20000 {
+		v := i
+		if i >= 15000 {
+			v = 19000
+		}
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":%d}`, i, v)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+	require.NoError(t, oracle.Insert(ctx, docs...))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"arr","v":[1,2]}`)))
+	require.NoError(t, coll.DeleteId(ctx, "arr"))
+	const q = `{"v":{"$in":[5,19000],"$lt":1000000000}}`
+	for _, limit := range []uint{3, 10, 100} {
+		explain, err := coll.Find(q).Sort("v").Limit(limit).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, explain.Sql, "TopK(", "limit %d: the walk from 5 to 19000 crosses 15000 entries: %s", limit, explain.Sql)
+		assert.Equal(t, collectSortedIDs(t, oracle.Find(q).Sort("v").Limit(limit)), collectSortedIDs(t, coll.Find(q).Sort("v").Limit(limit)))
+	}
+}
+
+// TestPlannerRegression_SparseIndexNeverRatesOverAPlainOne: a sparse index
+// holds no entry for a document missing the field, so it under-counts null
+// and absence; a plain index leading with the field rates the conjuncts
+// before it, whatever its arity.
+func TestPlannerRegression_SparseIndexNeverRatesOverAPlainOne(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "indexed")
+	require.NoError(t, err)
+	oracle, err := fx.CreateCollection(ctx, "oracle")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a_sparse", Fields: []string{"a"}, Sparse: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a_b", Fields: []string{"a", "b"}}))
+	var docs []*anyenc.Value
+	for i := range 20000 {
+		if i < 2000 {
+			docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i, i%7)))
+		} else {
+			docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"b":%d}`, i, i%7)))
+		}
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+	require.NoError(t, oracle.Insert(ctx, docs...))
+	for _, q := range []string{
+		`{"a":{"$gte":1900,"$in":[null,50]}}`,
+		`{"a":{"$in":[null,50],"$gte":1900}}`,
+	} {
+		explain, err := coll.Find(q).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, explain.Sql, "IndexScan(a_b)", "%s: %s", q, explain.Sql)
+		assert.Contains(t, explain.Sql, "'1900'", "%s: the $gte side, rated by the plain index: %s", q, explain.Sql)
+		want, err := oracle.Find(q).Count(ctx)
+		require.NoError(t, err)
+		got, err := coll.Find(q).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, want, got, q)
+	}
+}
+
+// collectSortedIDs drains a query and returns its ids in iteration order.
+func collectSortedIDs(t *testing.T, q anystore.Query) []string {
+	t.Helper()
+	it, err := q.Iter(ctx)
+	require.NoError(t, err)
+	var ids []string
+	for it.Next() {
+		d, err := it.Doc()
+		require.NoError(t, err)
+		ids = append(ids, d.Value().GetString("id"))
+	}
+	require.NoError(t, it.Close())
+	return ids
+}
+
+// TestPlannerRegression_SameFieldConjunctsReverseIndex: the conjunct pick,
+// the ordered candidate and its lead-in pricing hold on a reverse-declared
+// index, whose keys are stored inverted and whose scan direction flips.
+func TestPlannerRegression_SameFieldConjunctsReverseIndex(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "indexed")
+	require.NoError(t, err)
+	oracle, err := fx.CreateCollection(ctx, "oracle")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "nums_desc", Fields: []string{"-nums"}}))
+	var docs []*anyenc.Value
+	for i := range 5000 {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"nums":[%d,%d]}`, i, i, i+1)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+	require.NoError(t, oracle.Insert(ctx, docs...))
+
+	// Stored keys are inverted, so the plan string shows no readable values;
+	// the plan shape and the rows are what is pinned. A descending sort is a
+	// forward scan here and still enters through the whole-array entries.
+	for _, c := range []struct {
+		query, sort string
+		ordered     bool
+	}{
+		{`{"nums":{"$gt":-1,"$lt":10}}`, "", false},
+		{`{"nums":{"$gt":4990,"$lt":100000}}`, "", false},
+		{`{"nums":{"$gt":-1,"$lt":4990}}`, "-nums", false},
+		{`{"nums":{"$lt":300,"$gt":-1}}`, "-nums", false},
+		{`{"nums":{"$gt":10,"$lt":100000}}`, "nums", true},
+		{`{"nums":{"$gt":4990,"$lt":100000}}`, "nums", false},
+	} {
+		q := coll.Find(c.query)
+		oq := oracle.Find(c.query)
+		if c.sort != "" {
+			q = q.Sort(c.sort).Limit(3)
+			oq = oq.Sort(c.sort).Limit(3)
+		}
+		explain, err := q.Explain(ctx)
+		require.NoError(t, err, c.query)
+		if c.sort == "" || c.ordered {
+			assert.Contains(t, explain.Sql, "IndexScan(nums_desc)", "%s: %s", c.query, explain.Sql)
+		}
+		if c.sort != "" {
+			if c.ordered {
+				assert.NotContains(t, explain.Sql, "Sort", "%s: %s", c.query, explain.Sql)
+				assert.NotContains(t, explain.Sql, "TopK", "%s: %s", c.query, explain.Sql)
+				assert.Contains(t, explain.Plan, "[ordered]", "%s: %s", c.query, explain.Plan)
+			} else {
+				assert.Contains(t, explain.Sql, "TopK(3)", "%s: %s", c.query, explain.Sql)
+			}
+		}
+		assert.Equal(t, collectSortedIDs(t, oq), collectSortedIDs(t, q), c.query)
+	}
+}
+
+// TestPlannerRegression_SameFieldConjunctsUnratedField: a field only a
+// compound index leads INTO is not rated; its first conjunct seeds the seek
+// in every spelling, and rows do not depend on it.
+func TestPlannerRegression_SameFieldConjunctsUnratedField(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "indexed")
+	require.NoError(t, err)
+	oracle, err := fx.CreateCollection(ctx, "oracle")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "x_tags", Fields: []string{"x", "tags"}}))
+	var docs []*anyenc.Value
+	for i := range 2000 {
+		tags := `"common"`
+		if i%50 == 0 {
+			tags += `,"rare"`
+		}
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"x":%d,"tags":[%s]}`, i, i%4, tags)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+	require.NoError(t, oracle.Insert(ctx, docs...))
+	for _, c := range []struct{ query, seeds string }{
+		{`{"x":0,"tags":{"$all":["rare","common"]}}`, `/"rare"'`},
+		{`{"x":0,"tags":{"$all":["common","rare"]}}`, `/"common"'`},
+	} {
+		explain, err := coll.Find(c.query).IndexHint(anystore.IndexHint{IndexName: "x_tags", Boost: 1_000_000}).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, explain.Sql, "IndexScan(x_tags)", explain.Sql)
+		assert.Contains(t, explain.Sql, c.seeds, "%s: %s", c.query, explain.Sql)
+		want, err := oracle.Find(c.query).Count(ctx)
+		require.NoError(t, err)
+		got, err := coll.Find(c.query).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, want, got, c.query)
+	}
+}
+
+// TestPlannerRegression_ConjunctRatingIndexIsOrderIndependent: two indexes
+// lead with the field; a live collection lists them in creation order, a
+// reopened one in name order. The rating index — and so the plan — must not
+// depend on that: a non-sparse index rates before a sparse one, which holds
+// no entry for documents missing the field.
+func TestPlannerRegression_ConjunctRatingIndexIsOrderIndependent(t *testing.T) {
+	skipIfInMemory(t, "the collection is reopened from disk")
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "reopen")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a_sparse", Fields: []string{"a"}, Sparse: true}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a_plain", Fields: []string{"a"}}))
+	var docs []*anyenc.Value
+	for i := range 2000 {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i)))
+	}
+	for i := range 200 {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":"a%d","a":%d}`, i, i)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"arr","a":[1,2]}`)))
+	require.NoError(t, coll.DeleteId(ctx, "arr"))
+
+	const q = `{"a":{"$in":[null,50],"$gte":40}}`
+	live, err := coll.Find(q).Explain(ctx)
+	require.NoError(t, err)
+	liveCount, err := coll.Find(q).Count(ctx)
+	require.NoError(t, err)
+	require.NoError(t, fx.Close())
+
+	fx2 := newFixturePath(t, fx.tmpDir)
+	coll2, err := fx2.OpenCollection(ctx, "reopen")
+	require.NoError(t, err)
+	reopened, err := coll2.Find(q).Explain(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, live.Sql, reopened.Sql)
+	assert.Contains(t, reopened.Sql, "IndexScan(a_plain)", reopened.Sql)
+	reopenedCount, err := coll2.Find(q).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, liveCount, reopenedCount)
+	assert.Equal(t, 1, reopenedCount, "$in admits null and 50, $gte 40 keeps only 50")
+}
+
+// TestPlannerRegression_CountVerifyChainMultiPredicateField: Count may verify
+// an uncovered field through its own index only when ONE predicate
+// constrains it. A field's bounds are one of its conjuncts — the planner's
+// pick — so verifying that point alone would drop the others from the count.
+func TestPlannerRegression_CountVerifyChainMultiPredicateField(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "indexed")
+	require.NoError(t, err)
+	oracle, err := fx.CreateCollection(ctx, "oracle")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "x", Fields: []string{"x"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+	cycle := []string{`["a","c"]`, `["b"]`, `["a","b"]`, `["c"]`}
+	var docs []*anyenc.Value
+	for i := range 2000 {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"x":%d,"tags":%s}`, i, i%100, cycle[i%4])))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+	require.NoError(t, oracle.Insert(ctx, docs...))
+	hint := anystore.IndexHint{IndexName: "x", Boost: 1_000_000}
+	for _, q := range []string{
+		`{"x":1,"tags":{"$in":["a","c"],"$eq":"b"}}`,
+		`{"x":1,"$and":[{"tags":{"$in":["a","c"]}},{"tags":"b"}]}`,
+		`{"x":3,"tags":{"$all":["a","b"]}}`,
+		`{"x":3,"tags":{"$all":["b","a"]}}`,
+		`{"x":2,"tags":{"$in":["a","b"],"$ne":"c"}}`,
+	} {
+		want, err := oracle.Find(q).Count(ctx)
+		require.NoError(t, err)
+		got, err := coll.Find(q).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, want, got, q)
+		got, err = coll.Find(q).IndexHint(hint).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, want, got, "%s (hinted)", q)
+	}
+}
+
+// TestPlannerRegression_ArrayBracketNeverProvidesOrder: a bound reaching
+// into the array type bracket selects whole-array entries, where a document
+// surfaces regardless of its extreme element; such a bound never lets the
+// index provide the sort, whichever conjunct it rides in on.
+func TestPlannerRegression_ArrayBracketNeverProvidesOrder(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "indexed")
+	require.NoError(t, err)
+	oracle, err := fx.CreateCollection(ctx, "oracle")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "ix", Fields: []string{"tags"}}))
+	docs := []*anyenc.Value{
+		anyenc.MustParseJson(`{"id":"a","tags":[1,9]}`),
+		anyenc.MustParseJson(`{"id":"b","tags":[2,"y"]}`),
+		anyenc.MustParseJson(`{"id":"c","tags":[3]}`),
+		anyenc.MustParseJson(`{"id":"o1","tags":[{"k":5},{"k":0}]}`),
+		anyenc.MustParseJson(`{"id":"o2","tags":[{"k":1}]}`),
+	}
+	for i := range 600 {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":"f%d","tags":[%d,%d]}`, i, 100+2*i, 101+2*i)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+	require.NoError(t, oracle.Insert(ctx, docs...))
+	for _, c := range []struct {
+		query, sort string
+		limit       int
+	}{
+		{`{"tags":{"$lte":30,"$type":"array"}}`, "-tags", 1},
+		{`{"tags":{"$type":"array","$lte":30}}`, "-tags", 1},
+		{`{"tags":{"$ne":"zz","$type":"array"}}`, "tags", 0},
+		{`{"tags":{"$type":"array"}}`, "-tags", 2},
+		{`{"tags":{"$type":"array"}}`, "tags", 3},
+	} {
+		q := coll.Find(c.query).Sort(c.sort)
+		oq := oracle.Find(c.query).Sort(c.sort)
+		if c.limit > 0 {
+			q, oq = q.Limit(uint(c.limit)), oq.Limit(uint(c.limit))
+		}
+		explain, err := q.Explain(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, collectSortedIDs(t, oq), collectSortedIDs(t, q), "%s %s: %s", c.query, c.sort, explain.Sql)
+	}
+}
+
+// TestPlannerRegression_EqualitySelectivityStoredSpace: the selectivity of an
+// equality is read from the sketch in the index's stored key space — a
+// reverse-declared index stores its keys inverted — and a multi-point $in
+// matches the sum of its points, so the FullScan yield and the LIMIT pricing
+// see the same count the seek estimate does.
+func TestPlannerRegression_EqualitySelectivityStoredSpace(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "sel")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a_fwd", Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "b_rev", Fields: []string{"-b"}}))
+	var docs []*anyenc.Value
+	for i := range 5000 {
+		v := "cold" + fmt.Sprint(i)
+		if i%10 == 0 {
+			v = "hot"
+		}
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%q,"b":%q,"t":%d}`, i, v, v, i%50)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+
+	selectivity := func(q string) string {
+		explain, err := coll.Find(q).Explain(ctx)
+		require.NoError(t, err)
+		for _, line := range strings.Split(explain.Plan, "\n") {
+			if strings.Contains(line, "Selectivity:") {
+				return strings.TrimSpace(line)
+			}
+		}
+		t.Fatalf("no selectivity line: %s", explain.Plan)
+		return ""
+	}
+	// Sketch buckets collide differently in the two key spaces, so the counts
+	// agree to within the hash noise, not exactly.
+	assert.Contains(t, selectivity(`{"a":"hot"}`), "Selectivity: 0.10 (")
+	assert.Contains(t, selectivity(`{"b":"hot"}`), "Selectivity: 0.10 (", "a reverse index rates the value in its stored space")
+	assert.Contains(t, selectivity(`{"a":{"$in":["hot","cold1","cold2"]}}`), "Selectivity: 0.10 (", "hot plus two single docs, not the first point alone")
+	assert.Contains(t, selectivity(`{"b":{"$in":["hot","cold1","cold2"]}}`), "Selectivity: 0.10 (")
+	assert.Contains(t, selectivity(`{"a":{"$in":["cold1","cold2","hot"]}}`), "Selectivity: 0.10 (", "whichever point sorts first")
+
+	// With the count right, a LIMIT'd unsorted seek is priced for the rows
+	// the LimitIter lets it fetch, as the full scan is for the rows it reads.
+	for _, q := range []string{`{"b":"hot"}`, `{"a":{"$in":["cold1","hot"]}}`, `{"b":{"$in":["cold1","hot"]}}`} {
+		explain, err := coll.Find(q).Limit(5).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, explain.Sql, "IndexScan(", "%s: %s", q, explain.Sql)
+		assert.Contains(t, explain.Sql, "-> Limit(5)", "%s: %s", q, explain.Sql)
+	}
 }

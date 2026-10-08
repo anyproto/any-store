@@ -167,3 +167,147 @@ func TestTightIndexBounds_CapClipped(t *testing.T) {
 		}
 	}
 }
+
+// cb collects every set ConjunctBounds yields for a parsed condition.
+func cb(t *testing.T, cond, field string) (sets []Bounds) {
+	t.Helper()
+	f, err := ParseCondition(cond)
+	require.NoError(t, err)
+	ConjunctBounds(f, field, func(bs Bounds) bool {
+		sets = append(sets, bs)
+		return true
+	})
+	return sets
+}
+
+func TestConjunctBounds_EnumeratesEachConjunct(t *testing.T) {
+	// $all desugars to And(Eq, Eq): one point set per value, in order.
+	sets := cb(t, `{"tags":{"$all":["common","rare"]}}`, "tags")
+	require.Len(t, sets, 2)
+	assert.Equal(t, []byte(newBoundKey("common")), []byte(sets[0][0].Start))
+	assert.Equal(t, []byte(newBoundKey("rare")), []byte(sets[1][0].Start))
+
+	// The $and-array spelling, a nested $and and an inline multi-op all
+	// flatten to the same enumeration.
+	for _, cond := range []string{
+		`{"$and":[{"tags":"common"},{"tags":"rare"}]}`,
+		`{"tags":"common","$and":[{"$and":[{"tags":"rare"}]}]}`,
+		`{"tags":{"$eq":"common","$in":["rare"]}}`,
+	} {
+		got := cb(t, cond, "tags")
+		require.Len(t, got, 2, cond)
+		assert.Equal(t, sets[0].String(), got[0].String(), cond)
+		assert.Equal(t, sets[1].String(), got[1].String(), cond)
+	}
+
+	// A two-sided range yields each side on its own.
+	sets = cb(t, `{"a":{"$gt":10,"$lt":20}}`, "a")
+	require.Len(t, sets, 2)
+	assert.Equal(t, []byte(newBoundKey(10)), []byte(sets[0][0].Start))
+	assert.True(t, sets[0][0].EndIsTypeEdge(), "the $gt side ends at its type bracket")
+	assert.Equal(t, []byte(newBoundKey(20)), []byte(sets[1][0].End))
+}
+
+func TestConjunctBounds_FirstSetIsTheWideChannel(t *testing.T) {
+	// Whatever is enumerated first is exactly And.IndexBounds' pick.
+	for _, cond := range []string{
+		`{"a":{"$all":["common","rare"]}}`,
+		`{"a":{"$in":[1,5,10],"$gte":5}}`,
+		`{"a":{"$gt":1,"$lt":9,"$ne":5}}`,
+		`{"a":{"$exists":true,"$gt":1,"$lt":9}}`,
+		`{"a":5}`,
+		`{"$or":[{"a":1},{"a":2}],"a":{"$gt":0}}`,
+	} {
+		sets := cb(t, cond, "a")
+		require.NotEmpty(t, sets, cond)
+		assert.Equal(t, MustParseCondition(cond).IndexBounds("a", nil).String(), sets[0].String(), cond)
+	}
+}
+
+func TestConjunctBounds_LeavesAndRouting(t *testing.T) {
+	// Non-contributing conjuncts ($exists, a prefix-less $regex) are skipped,
+	// not yielded as empty sets.
+	sets := cb(t, `{"a":{"$exists":true,"$regex":"x$","$gt":1}}`, "a")
+	require.Len(t, sets, 1)
+	assert.Equal(t, []byte(newBoundKey(1)), []byte(sets[0][0].Start))
+
+	// Or is a leaf: its union is yielded once, never its branches.
+	sets = cb(t, `{"$or":[{"a":1},{"a":2}],"a":{"$gt":0}}`, "a")
+	require.Len(t, sets, 2)
+	assert.Len(t, sets[0], 2, "the $or union")
+	assert.Len(t, sets[1], 1)
+
+	// A value-form $elemMatch intersects its own conjuncts (one element) and
+	// is a single leaf.
+	sets = cb(t, `{"a":{"$elemMatch":{"$gt":1,"$lt":5}}}`, "a")
+	require.Len(t, sets, 1)
+	assert.Equal(t, []byte(newBoundKey(1)), []byte(sets[0][0].Start))
+	assert.Equal(t, []byte(newBoundKey(5)), []byte(sets[0][0].End))
+
+	// An object-form $elemMatch is re-keyed under its sub-field, alongside a
+	// dotted-path conjunct on the same field.
+	sets = cb(t, `{"a":{"$elemMatch":{"b":1}},"a.b":2}`, "a.b")
+	require.Len(t, sets, 2)
+	assert.Equal(t, []byte(newBoundKey(1)), []byte(sets[0][0].Start))
+	assert.Equal(t, []byte(newBoundKey(2)), []byte(sets[1][0].Start))
+
+	// Another field's conjuncts yield nothing.
+	assert.Empty(t, cb(t, `{"b":{"$all":[1,2]}}`, "a"))
+
+	// yield returning false stops the walk.
+	f := MustParseCondition(`{"tags":{"$all":["x","y","z"]}}`)
+	n := 0
+	ConjunctBounds(f, "tags", func(Bounds) bool { n++; return false })
+	assert.Equal(t, 1, n)
+}
+
+func TestConjunctBounds_CapClipped(t *testing.T) {
+	// Every yielded bound aliases filter-owned memory clipped to cap == len,
+	// so a planner append can never write into the filter.
+	for _, cond := range []string{
+		`{"a":{"$all":["common","rare"]}}`,
+		`{"a":{"$gt":10,"$lt":20}}`,
+		`{"a":{"$in":[1,5,10],"$gte":5}}`,
+	} {
+		sets := cb(t, cond, "a")
+		require.NotEmpty(t, sets, cond)
+		for _, bs := range sets {
+			for _, b := range bs {
+				assert.Equal(t, len(b.Start), cap(b.Start), cond)
+				assert.Equal(t, len(b.End), cap(b.End), cond)
+			}
+		}
+	}
+}
+
+func TestKey_PathIs(t *testing.T) {
+	k := Key{Path: []string{"a", "b"}}
+	assert.True(t, k.PathIs("a.b"))
+	assert.False(t, k.PathIs("a"))
+	assert.False(t, k.PathIs("a.bc"))
+	assert.False(t, k.PathIs("a.b.c"))
+	assert.False(t, k.PathIs("ab"))
+	assert.False(t, k.PathIs(""))
+	assert.True(t, Key{Path: []string{"a"}}.PathIs("a"))
+	assert.False(t, Key{Path: []string{"a"}}.PathIs("a."))
+	assert.Zero(t, testing.AllocsPerRun(10, func() { k.PathIs("a.b") }))
+}
+
+func TestKey_ElemMatchSubField_NoJoin(t *testing.T) {
+	f := MustParseCondition(`{"a.x":{"$elemMatch":{"b":1}},"c.d":2}`)
+	k := f.(And)[0].(Key)
+	cond, sub, ok := k.ElemMatchSubField("a.x.b")
+	require.True(t, ok)
+	assert.Equal(t, "b", sub)
+	assert.Equal(t, `{"b": {"$eq": 1}}`, cond.String())
+	_, _, ok = k.ElemMatchSubField("a.xb")
+	assert.False(t, ok)
+	_, _, ok = k.ElemMatchSubField("a.x")
+	assert.False(t, ok)
+	_, _, ok = k.ElemMatchSubField("c.d.e")
+	assert.False(t, ok)
+	// Asking for an unrelated dotted field — what IndexBounds does for every
+	// index field — allocates nothing.
+	assert.Zero(t, testing.AllocsPerRun(10, func() { k.ElemMatchSubField("c.d.e") }))
+	assert.Zero(t, testing.AllocsPerRun(10, func() { k.ElemMatchSubField("a.x.b") }))
+}

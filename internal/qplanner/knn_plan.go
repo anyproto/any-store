@@ -136,7 +136,7 @@ func buildKnnPlan(params *PlanParams) *Plan {
 				nSeeks = 1
 			}
 			cands = append(cands, knnCandidate{
-				name: "KnnProbeSeek(" + idx.Info.Name + ")", idx: idx,
+				name: idx.candidateName("KnnProbeSeek"), idx: idx,
 				cost: nSeeks*CostIndexSeek + e*CostSeqRead + finish(e),
 				est:  min(e, float64(spec.K)), kind: knnPlanProbeSeek,
 			})

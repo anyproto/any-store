@@ -69,6 +69,7 @@ type Plan struct {
 	Name      string  // "FullScan", "IndexSeek", "IndexScan"
 	Cost      float64 // computed cost
 	IndexName string  // name of the index used (empty for full scan)
+	Ordered   bool    // the index's ordered-channel candidate was chosen (CBOIndex.Ordered)
 
 	Explain ExplainInfo // rich explain data
 }
@@ -109,9 +110,10 @@ func (p *Plan) ExplainString() string {
 	sb.WriteString(fmt.Sprintf("  Iterator: %s\n", p.String()))
 
 	// Chosen candidate's cost details
+	chosenName := p.chosenCandidateName()
 	for i := range info.Candidates {
 		c := &info.Candidates[i]
-		if c.Cost == p.Cost && strings.Contains(c.Name, p.Name) {
+		if c.Cost == p.Cost && p.isChosen(c.Name, chosenName) {
 			if d := c.Details(); d != "" {
 				sb.WriteString(fmt.Sprintf("  Cost breakdown: %s\n", d))
 			}
@@ -124,7 +126,7 @@ func (p *Plan) ExplainString() string {
 		sb.WriteString("Candidates:\n")
 		for i, c := range info.Candidates {
 			chosen := ""
-			if c.Cost == p.Cost && strings.Contains(c.Name, p.Name) {
+			if c.Cost == p.Cost && p.isChosen(c.Name, chosenName) {
 				chosen = "  [chosen]"
 			}
 			sb.WriteString(fmt.Sprintf("  %d. %-25s cost=%-10.1f est_rows=%.0f%s\n",
@@ -136,7 +138,7 @@ func (p *Plan) ExplainString() string {
 }
 
 // formatFullScanDetails returns a cost formula string for a full scan plan.
-func formatFullScanDetails(totalDocs, estimatedYield float64, needSort, idBoundsSeek bool) string {
+func formatFullScanDetails(totalDocs, estimatedYield float64, needSort, idBoundsSeek bool, topK float64) string {
 	perDocCost := CostDocFetch
 	label := "fetch"
 	if totalDocs > 500 && !idBoundsSeek {
@@ -146,9 +148,9 @@ func formatFullScanDetails(totalDocs, estimatedYield float64, needSort, idBounds
 	s := fmt.Sprintf("%.0f×%s(%g) + %.0f×filter(%g)", totalDocs, label, perDocCost, totalDocs, CostFilter)
 	if needSort {
 		s += fmt.Sprintf(" + sort(%.0f)=%.1f + %.0f×materialize(%g)",
-			estimatedYield, sortCost(estimatedYield), estimatedYield, CostMaterialize)
+			estimatedYield, boundedSortCost(estimatedYield, topK), sortKept(estimatedYield, topK), CostMaterialize)
 	}
-	s += fmt.Sprintf(" = %.1f", computeFullScanCost(totalDocs, estimatedYield, needSort, idBoundsSeek))
+	s += fmt.Sprintf(" = %.1f", computeFullScanCost(totalDocs, estimatedYield, needSort, idBoundsSeek, topK))
 	return s
 }
 
@@ -267,6 +269,12 @@ type CBOIndex struct {
 	ExactSort   bool
 	PartialSort bool
 
+	// Ordered marks the second candidate of an index built from the ordered
+	// channel (BoundsResult.LookupOrdered: the conjunct that keeps the index
+	// order-providing); Explain names it kind(index)[ordered]. In the bool
+	// run, so the struct does not grow.
+	Ordered bool
+
 	// sparseComplete memoizes sparseIndexComplete for this candidate, valid
 	// only for the filter of the plan the candidate was built for —
 	// candidates are built per plan and never reused across filters. Kept in
@@ -312,6 +320,41 @@ type CBOIndex struct {
 	// seeking wide undercharges the seek and picks index scans that still
 	// walk half the index. Planner-internal.
 	rangeSelTight float64
+}
+
+// candidateName is the Explain name of this candidate: kind(index) for the
+// primary, kind(index)[ordered] for the index's ordered-channel candidate.
+func (idx *CBOIndex) candidateName(kind string) string {
+	return candidateName(kind, idx.Info.Name, idx.Ordered)
+}
+
+func candidateName(kind, index string, ordered bool) string {
+	if ordered {
+		return kind + "(" + index + ")[ordered]"
+	}
+	return kind + "(" + index + ")"
+}
+
+// chosenCandidateName is the Explain name of the candidate this plan runs:
+// exact for the three CBO kinds (an index's two candidates share a prefix),
+// empty for the driver plans that name their candidates on their own.
+func (p *Plan) chosenCandidateName() string {
+	switch p.Name {
+	case "FullScan":
+		return p.Name
+	case "IndexSeek", "IndexScan":
+		return candidateName(p.Name, p.IndexName, p.Ordered)
+	}
+	return ""
+}
+
+// isChosen reports whether a candidate name is the plan's: by exact name
+// when chosenCandidateName knows it, by prefix otherwise.
+func (p *Plan) isChosen(name, chosenName string) bool {
+	if chosenName != "" {
+		return name == chosenName
+	}
+	return strings.Contains(name, p.Name)
 }
 
 // fullKeyPointBound reports whether the bound chain pins EVERY index field
@@ -413,7 +456,9 @@ func BuildPlan(params *PlanParams) *Plan {
 			fullScanEffective = needed
 		}
 	}
-	fullScanCost := computeFullScanCost(fullScanEffective, estimatedYield, fullScanNeedSort, idBoundsSeek)
+	// A LIMIT bounds every in-memory sort to a heap of limit+offset rows.
+	topK := float64(sortTopK(params))
+	fullScanCost := computeFullScanCost(fullScanEffective, estimatedYield, fullScanNeedSort, idBoundsSeek, topK)
 
 	if collectExplain {
 		fse := fullScanEffective
@@ -421,7 +466,7 @@ func BuildPlan(params *PlanParams) *Plan {
 			Name:    "FullScan",
 			Cost:    fullScanCost,
 			EstRows: fse,
-			details: func() string { return formatFullScanDetails(fse, estimatedYield, fullScanNeedSort, idBoundsSeek) },
+			details: func() string { return formatFullScanDetails(fse, estimatedYield, fullScanNeedSort, idBoundsSeek, topK) },
 		})
 	}
 
@@ -455,7 +500,11 @@ func BuildPlan(params *PlanParams) *Plan {
 				// entries.
 				est = float64(len(idx.Bounds))
 			} else if idx.Sketch != nil {
-				est = float64(idx.Sketch.Estimate(0, idx.Bounds[0].Start))
+				// Bounds are in stored key space already; a multi-point set
+				// matches the sum of its points.
+				for _, b := range idx.Bounds {
+					est += float64(idx.Sketch.Estimate(0, b.Start))
+				}
 			}
 			if est > 0 && nFieldSel < len(fieldSelBuf) {
 				fieldSelBuf[nFieldSel] = fieldSelEntry{
@@ -514,6 +563,7 @@ func BuildPlan(params *PlanParams) *Plan {
 			nSeeks = 1
 		}
 		seekCost := (nSeeks * CostIndexSeek) + (e * fetchCost) + (e * CostFilter)
+		rows := e // the rows the chain visits, for the explain report
 		walkRows, presenceCount := 0.0, false
 		if len(idx.Bounds) == 0 {
 			// A presence scan walks every entry of the index, where a seek
@@ -537,9 +587,13 @@ func BuildPlan(params *PlanParams) *Plan {
 			seekCost = (nSeeks * CostIndexSeek) + (e * CostSeqRead)
 		}
 
-		// When the index covers the sort and we have a LIMIT, we only need to
-		// scan limit/scanSel docs through the index (same logic as Plan C).
-		if needSort && idx.ExactSort && params.Limit > 0 && !isCovering && !presenceCount {
+		// With a LIMIT the chain stops early: an unsorted seek, or one whose
+		// index provides the order, fetches limit/scanSel rows for the
+		// LimitIter to see limit matches (the credit FullScan gets through
+		// fullScanEffective, the logic Plan C applies), after the stretch an
+		// ordered candidate walks before its first possible match
+		// (orderedLeadIn).
+		if params.Limit > 0 && (!needSort || idx.ExactSort) && !isCovering && !presenceCount {
 			scanSel := pTotal / idxSel
 			if scanSel > 1.0 {
 				scanSel = 1.0
@@ -547,7 +601,7 @@ func BuildPlan(params *PlanParams) *Plan {
 			if scanSel <= 0 {
 				scanSel = 0.0001
 			}
-			s := float64(params.Limit+params.Offset) / scanSel
+			s := orderedLeadIn(params, idx) + float64(params.Limit+params.Offset)/scanSel
 			if s > e {
 				s = e
 			}
@@ -555,11 +609,12 @@ func BuildPlan(params *PlanParams) *Plan {
 				s = 1
 			}
 			seekCost = (nSeeks * CostIndexSeek) + (s * fetchCost) + (s * CostFilter)
+			rows, walkRows = s, 0
 		}
 
 		seekSortCost := 0.0
 		if needSort && !idx.ExactSort && !presenceCount {
-			seekSortCost = sortCost(filteredYield)
+			seekSortCost = boundedSortCost(filteredYield, topK)
 			seekCost += seekSortCost
 		}
 		// No sort cost if the index also covers the sort
@@ -570,11 +625,11 @@ func BuildPlan(params *PlanParams) *Plan {
 		}
 
 		if collectExplain {
-			seekNS, seekE, seekFetchCost, seekSC, seekWalk := nSeeks, e, fetchCost, seekSortCost, walkRows
+			seekNS, seekE, seekFetchCost, seekSC, seekWalk := nSeeks, rows, fetchCost, seekSortCost, walkRows
 			candidates = append(candidates, CandidatePlan{
-				Name:    "IndexSeek(" + idx.Info.Name + ")",
+				Name:    idx.candidateName("IndexSeek"),
 				Cost:    seekCost,
-				EstRows: e,
+				EstRows: rows,
 				details: func() string { return formatSeekDetails(seekNS, seekE, seekFetchCost, seekSC, seekWalk) },
 			})
 		}
@@ -673,8 +728,9 @@ func BuildPlan(params *PlanParams) *Plan {
 			var scanRows float64
 			if params.Limit > 0 {
 				// With LIMIT: expected rows to scan = LIMIT / scanSel entries per
-				// matching document, capped at scanPopulation
-				s := float64(params.Limit+params.Offset) / scanSel * entriesPerDoc
+				// matching document, after an ordered candidate's lead-in,
+				// capped at scanPopulation
+				s := orderedLeadIn(params, idx) + float64(params.Limit+params.Offset)/scanSel*entriesPerDoc
 				if s > scanPopulation {
 					s = scanPopulation
 				}
@@ -708,7 +764,7 @@ func BuildPlan(params *PlanParams) *Plan {
 			if collectExplain {
 				scanSR, scanFC, scanHL := scanRows, fetchCost, params.Limit > 0
 				candidates = append(candidates, CandidatePlan{
-					Name:    "IndexScan(" + idx.Info.Name + ")",
+					Name:    idx.candidateName("IndexScan"),
 					Cost:    scanCost,
 					EstRows: scanRows,
 					details: func() string { return formatScanDetails(scanSR, scanFC, scanHL) },
@@ -769,6 +825,7 @@ func BuildPlan(params *PlanParams) *Plan {
 		Name:      bestPlanName,
 		Cost:      bestCost,
 		IndexName: indexName,
+		Ordered:   bestIndex != nil && indexName != "" && bestIndex.Ordered,
 		Explain: ExplainInfo{
 			TotalDocs:   params.TotalDocs,
 			Selectivity: pTotal,
@@ -870,7 +927,7 @@ func buildSearchPlan(params *PlanParams, dataCS *CursorSource, source Iterator, 
 // have similar cost, so we use CostDocFetch.
 // When idBoundsSeek is true, the scan does random point lookups (not sequential),
 // so CostDocFetch is used regardless of collection size.
-func computeFullScanCost(totalDocs, estimatedYield float64, needSort, idBoundsSeek bool) float64 {
+func computeFullScanCost(totalDocs, estimatedYield float64, needSort, idBoundsSeek bool, topK float64) float64 {
 	perDocCost := CostDocFetch
 	if totalDocs > 500 && !idBoundsSeek {
 		perDocCost = CostScanDoc
@@ -882,7 +939,7 @@ func computeFullScanCost(totalDocs, estimatedYield float64, needSort, idBoundsSe
 		// alone understates. Charging it here lets an order-providing index scan win
 		// for selective or LIMIT-capped queries, while the index scan's own
 		// per-row fetch cost still protects the poorly-selective case.
-		cost += sortCost(estimatedYield) + (estimatedYield * CostMaterialize)
+		cost += inMemorySortCost(estimatedYield, topK)
 	}
 	return cost
 }
@@ -900,6 +957,33 @@ func sortCost(n float64) float64 {
 		return 0
 	}
 	return n * math.Log2(n) * CostSortSwap
+}
+
+// boundedSortCost prices an in-memory sort of n rows: n·log2(n) swaps, or
+// n·log2(topK+1) when a LIMIT keeps only the top topK rows in a heap
+// (SortIter's bounded heap, sortTopK) — each row then costs one insert into
+// a heap that never grows past topK, a fraction of a fetch, where the full
+// sort charged about a fetch per row.
+func boundedSortCost(n, topK float64) float64 {
+	if topK > 0 && topK < n {
+		return n * math.Log2(topK+1) * CostSortSwap
+	}
+	return sortCost(n)
+}
+
+// sortKept is the number of rows an in-memory sort of n rows holds: all of
+// them, or the heap's topK under a LIMIT.
+func sortKept(n, topK float64) float64 {
+	if topK > 0 && topK < n {
+		return topK
+	}
+	return n
+}
+
+// inMemorySortCost is boundedSortCost plus the materialization of the rows
+// the sort keeps (CostMaterialize).
+func inMemorySortCost(n, topK float64) float64 {
+	return boundedSortCost(n, topK) + sortKept(n, topK)*CostMaterialize
 }
 
 // sortTopK returns the bounded heap size for an in-memory SortIter.
@@ -991,9 +1075,15 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 				} else if isEquality && idx.Sketch != nil && fi == 0 && sketchLevelTrusted(idx.Sketch, 0) {
 					// Equality on the index's leading field: the level-0 sketch holds
 					// the count for that field's value alone (the prefix), so this is
-					// accurate for both single-field and compound indexes.
-					est := idx.Sketch.Estimate(0, bounds[0].Start)
-					p := float64(est) / totalDocs
+					// accurate for both single-field and compound indexes. The sketch
+					// is keyed by STORED bytes — inverted on a reverse field — and a
+					// multi-point set ($in) matches the sum of its points, as the
+					// seek estimate counts them (estimateIndexDocsWithFieldSel).
+					var est float64
+					for _, b := range ComputeSingleFieldBounds(idx.Info, bounds) {
+						est += float64(idx.Sketch.Estimate(0, b.Start))
+					}
+					p := est / totalDocs
 					if p > 1.0 {
 						p = 1.0
 					}
@@ -1180,6 +1270,111 @@ func measureRanges(params *PlanParams) {
 		// differ only for unproven indexes carrying EstBounds.
 		idx.rangeSel, idx.rangeSelTight = interpolateRangeSels(params.Tx, idx)
 	}
+}
+
+// orderedLeadIn estimates the entries an ordered candidate's LIMIT walk
+// passes before the first row can match. The candidate seeks its
+// order-keeping conjunct, while the field's seek pick (the wide channel) cuts
+// the sort side, and every row satisfies both: on scalar entries no match
+// lies between the scan's entry side and the pick's cut, so the walk pays
+// that stretch — measured by interpolation like any range — before the
+// limit/scanSel rows the uniform-spread pricing charges. Zero for a primary
+// candidate, without a read tx, or when the pick is open on that side.
+func orderedLeadIn(params *PlanParams, idx *CBOIndex) float64 {
+	if !idx.Ordered || params.Tx == nil || idx.Ns == nil || params.FieldBounds == nil ||
+		len(idx.Info.FieldNames) == 0 {
+		return 0
+	}
+	pick, _, found := params.FieldBounds.Lookup(idx.Info.FieldNames[0])
+	if !found || len(pick) == 0 {
+		return 0
+	}
+	// A point of the pick matches the level-0 sketch's count for it less the
+	// bucket's shared floor (entries/Size: every bucket carries about that
+	// much of other values, and a LIMIT of a few rows must not be "met" by
+	// it); a range piece is not estimated here, and the walk is charged up
+	// to it.
+	est := func(b query.Bound) (float64, bool) {
+		sk := idx.Sketch
+		if sk == nil || !sketchLevelTrusted(sk, 0) || !allBoundsFixedNonEmpty(query.Bounds{b}) {
+			return 0, false
+		}
+		n := float64(sk.Estimate(0, b.Start)) - float64(sk.EntryCount(0))/float64(max(sk.Size, 1))
+		return max(n, 0), true
+	}
+	gap, ok := leadInBound(idx.Bounds, ComputeSingleFieldBounds(idx.Info, pick), shouldReverse(params.Sorter, idx),
+		float64(params.Limit+params.Offset), est)
+	if !ok {
+		return 0
+	}
+	cur := params.Tx.NewCursor(idx.Ns)
+	f, err := cur.RangeFraction(gap.Start, gap.End)
+	cur.Close()
+	if err != nil || f <= 0 {
+		return 0
+	}
+	return f * indexEntries(idx, float64(max(params.TotalDocs, 1)))
+}
+
+// leadInBound is the stretch of an ordered candidate's scan range the walk
+// crosses before it can have met need rows of the field's seek pick: from
+// the scan's entry side (above for a reverse scan, below for a forward one)
+// to the near edge of the pick bound at which the pick's accumulated
+// estimate reaches need — the bounds visited in scan order, the gaps between
+// them crossed too, and a bound est cannot rate ending the walk there. Both
+// bound sets are in stored key space. ok=false when the pick is open on the
+// entry side (nothing to skip).
+func leadInBound(scan, pick query.Bounds, reverse bool, need float64, est func(query.Bound) (float64, bool)) (query.Bound, bool) {
+	if len(scan) == 0 || len(pick) == 0 {
+		return query.Bound{}, false
+	}
+	edge := func(b query.Bound) []byte {
+		if reverse {
+			return b.End
+		}
+		return b.Start
+	}
+	nearer := func(a, b []byte) bool { // a sits closer to the entry side than b
+		if reverse {
+			return bytes.Compare(a, b) > 0
+		}
+		return bytes.Compare(a, b) < 0
+	}
+	for _, b := range pick {
+		if len(edge(b)) == 0 {
+			return query.Bound{}, false
+		}
+	}
+	var visitedBuf [16]bool
+	visited := visitedBuf[:0]
+	if len(pick) > len(visitedBuf) {
+		visited = make([]bool, len(pick))
+	} else {
+		visited = visitedBuf[:len(pick)]
+	}
+	var cut []byte
+	cum := 0.0
+	for range pick {
+		next := -1
+		for i, b := range pick {
+			if !visited[i] && (next < 0 || nearer(edge(b), edge(pick[next]))) {
+				next = i
+			}
+		}
+		visited[next] = true
+		cut = edge(pick[next])
+		n, ok := est(pick[next])
+		if !ok {
+			break
+		}
+		if cum += n; cum >= need {
+			break
+		}
+	}
+	if reverse {
+		return query.Bound{Start: cut, End: scan[len(scan)-1].End, StartInclude: true, EndInclude: true}, true
+	}
+	return query.Bound{Start: scan[0].Start, End: cut, StartInclude: true}, true
 }
 
 // interpolateRangeSel estimates the fraction of this index's entries that its
@@ -2054,7 +2249,12 @@ func boundedFieldsSinglePredicate(idx *CBOIndex, filter query.Filter) bool {
 func countFilterFieldPreds(f query.Filter, field string) int {
 	switch ft := f.(type) {
 	case query.Key:
-		if strings.Join(ft.Path, ".") != field {
+		if !ft.PathIs(field) {
+			// An object-form $elemMatch on a prefix of the field constrains
+			// it through its sub-field, as Key.IndexBounds reads it.
+			if cond, sub, ok := ft.ElemMatchSubField(field); ok {
+				return countFilterFieldPreds(cond, sub)
+			}
 			return 0
 		}
 		// One Key on this field; its inner filter is an And when the field
@@ -2213,6 +2413,12 @@ func buildVerifyChain(params *PlanParams, idx *CBOIndex, root Iterator) Iterator
 		if !found || !fixed || len(bounds) != 1 {
 			return nil
 		}
+		// The field's bounds are ONE of its conjuncts (And.IndexBounds, or
+		// the planner's pick among them): verifying that point alone would
+		// drop the other conjuncts from the count.
+		if countFilterFieldPreds(params.Filter, field) > 1 {
+			return nil
+		}
 
 		// Find a non-unique single-field index for this field. A sparse index
 		// holds no entry for a document missing the field, so it can verify
@@ -2276,9 +2482,17 @@ type BoundsResult struct {
 	// FieldBounds.TightIdx. Kept out of FieldBounds so the common no-tighten
 	// query pays zero struct growth (BoundsResult escapes per query and
 	// fieldsBuf is inline — every FieldBounds byte is multiplied by 8).
-	tightFields []tightFieldBounds
-	boundsBuf   [8]query.Bound
-	fieldsBuf   [8]FieldBounds
+	tightFields []boundsSpan
+	// orderedFields is the ORDERED channel: for a sort field several
+	// conjuncts constrain, the lowest-rated conjunct whose bounds keep the
+	// index order-providing (OrderKeeping) when that is not the wide pick.
+	// The query layer builds a second candidate of the index from it, so the
+	// cost model prices the ordered scan against the narrower seek plus an
+	// in-memory sort. Indexed by FieldBounds.OrderedIdx; the bounds are the
+	// conjunct's own fresh slice (query.ConjunctBounds), kept by header.
+	orderedFields []orderedBounds
+	boundsBuf     [8]query.Bound
+	fieldsBuf     [8]FieldBounds
 }
 
 // FieldBounds holds pre-computed bounds for a single filter field.
@@ -2296,20 +2510,59 @@ type FieldBounds struct {
 	// int8 packs into Fixed's padding, keeping the struct at its pre-tight
 	// size.
 	TightIdx int8
+	// OrderedIdx indexes BoundsResult.orderedFields, or -1 when no other
+	// conjunct keeps the index order (also whenever Build ran without a
+	// probe). Packs into the same padding as TightIdx.
+	OrderedIdx int8
 }
 
-// tightFieldBounds is a tight-channel span into BoundsResult.TightBounds.
-type tightFieldBounds struct {
+// boundsSpan is a tight-channel span into BoundsResult.TightBounds.
+type boundsSpan struct {
 	Start int
 	Count int
 	Fixed bool
 }
 
-// Build computes bounds for all unique fields across the given indexes.
+// orderedBounds is one field's ordered-channel conjunct.
+type orderedBounds struct {
+	bounds query.Bounds
+	fixed  bool
+}
+
+// BoundsProbe rates a field's candidate bounds: the index entries a seek over
+// them fetches, from the same statistics the cost model prices the chosen
+// candidate with (EstimateFieldEntries). ok=false means the statistics cannot
+// rate these bounds; BuildWithProbe stops rating the field there and keeps
+// the best conjunct so far.
+type BoundsProbe func(field string, bs query.Bounds) (entries float64, ok bool)
+
+// Build computes bounds for all unique fields across the given indexes,
+// keeping And.IndexBounds' first contributing conjunct per field.
 func (br *BoundsResult) Build(indexInfos []*IndexInfo, filter query.Filter) {
+	br.BuildWithProbe(indexInfos, filter, nil, nil)
+}
+
+// BuildWithProbe is Build with a probe choosing, for a field that several
+// same-field conjuncts constrain ({tags:{$all:[a,b]}}, {a:{$gt:1,$lt:9}}),
+// the conjunct whose bounds the probe rates lowest as the field's WIDE
+// bounds — the one the seek chains, the selectivity estimate and the sort
+// gates then all read through Lookup. Each conjunct on its own is a sound
+// seek range (query.ConjunctBounds), so the choice changes cost only, never
+// rows, and the conjuncts are still never intersected outside the tight
+// channel. SQLite builds one WhereLoop per usable WHERE term on a column and
+// keeps the cheapest (where.c whereLoopAddBtreeIndex); for a fixed index the
+// seek cost is monotone in the entries estimate, so rating the conjuncts
+// once per field picks the same loop without a candidate per conjunct —
+// except where the conjuncts differ in what the estimate cannot see, the
+// index order: ordered (nil when the query has no sort) reports whether a
+// field's bounds keep it, and the lowest-rated conjunct that does is kept
+// beside the pick as the ORDERED channel (LookupOrdered) for a second
+// candidate.
+func (br *BoundsResult) BuildWithProbe(indexInfos []*IndexInfo, filter query.Filter, probe BoundsProbe, ordered func(field string, bs query.Bounds) bool) {
 	br.Bounds = br.boundsBuf[:0]
 	br.TightBounds = nil
 	br.tightFields = nil
+	br.orderedFields = nil
 	br.Fields = br.fieldsBuf[:0]
 	// Single-predicate filters can't tighten; skip the per-field tight walk.
 	mayTighten := query.MayTighten(filter)
@@ -2327,28 +2580,43 @@ func (br *BoundsResult) Build(indexInfos []*IndexInfo, filter query.Filter) {
 				continue
 			}
 			start := len(br.Bounds)
-			bs := filter.IndexBounds(field, nil)
+			// countFilterFieldPreds is a zero-alloc pre-check: tight bounds
+			// can only differ from wide, and there can only be a conjunct
+			// to choose, when THIS field carries more than one predicate —
+			// MayTighten alone also fires for multi-FIELD conjunctions
+			// ({a:1,b:2}), which would pay an allocating walk per field for
+			// an always-equal result.
+			multi := mayTighten && countFilterFieldPreds(filter, field) > 1
+			var bs, orderedBs query.Bounds
+			if multi && probe != nil {
+				bs, orderedBs = selectConjuncts(filter, field, probe, ordered)
+			} else {
+				bs = filter.IndexBounds(field, nil)
+			}
 			br.Bounds = append(br.Bounds, bs...)
 			count := len(bs)
+			multi = multi && count > 0
 
 			fb := FieldBounds{
-				Field:    field,
-				Start:    start,
-				Count:    count,
-				Fixed:    allBoundsFixedNonEmpty(br.Bounds[start:]),
-				TightIdx: -1,
+				Field:      field,
+				Start:      start,
+				Count:      count,
+				Fixed:      allBoundsFixedNonEmpty(br.Bounds[start:]),
+				TightIdx:   -1,
+				OrderedIdx: -1,
 			}
-			// countFilterFieldPreds is a zero-alloc pre-check: tight bounds
-			// can only differ from wide when THIS field carries more than
-			// one predicate — MayTighten alone also fires for multi-FIELD
-			// conjunctions ({a:1,b:2}), which would pay an allocating walk
-			// per field for an always-equal result.
-			if mayTighten && count > 0 && len(br.tightFields) < 127 &&
-				countFilterFieldPreds(filter, field) > 1 {
+			if orderedBs != nil && len(br.orderedFields) < 127 {
+				fb.OrderedIdx = int8(len(br.orderedFields))
+				br.orderedFields = append(br.orderedFields, orderedBounds{
+					bounds: orderedBs,
+					fixed:  allBoundsFixedNonEmpty(orderedBs),
+				})
+			}
+			if multi && len(br.tightFields) < 127 {
 				tight, tEmpty := query.TightIndexBounds(filter, field)
 				if !tEmpty && !boundsEqual(tight, bs) {
 					fb.TightIdx = int8(len(br.tightFields))
-					br.tightFields = append(br.tightFields, tightFieldBounds{
+					br.tightFields = append(br.tightFields, boundsSpan{
 						Start: len(br.TightBounds),
 						Count: len(tight),
 						Fixed: allBoundsFixedNonEmpty(tight),
@@ -2359,6 +2627,132 @@ func (br *BoundsResult) Build(indexInfos []*IndexInfo, filter query.Filter) {
 			br.Fields = append(br.Fields, fb)
 		}
 	}
+}
+
+// selectConjuncts returns the bounds of the same-field conjunct probe rates
+// lowest and, when ordered is set and a different conjunct keeps the index
+// order, the lowest-rated of those (nil otherwise). The first conjunct is
+// And.IndexBounds' pick and stays the answer on a tie, when a conjunct
+// cannot be rated (the walk stops there, keeping the best so far) or when
+// nothing rates lower — the plan is unchanged wherever the statistics do not
+// tell the conjuncts apart. The walk computes each conjunct's bounds once,
+// the first of them being the set the wide channel pays for anyway.
+func selectConjuncts(filter query.Filter, field string, probe BoundsProbe, ordered func(string, query.Bounds) bool) (best, bestOrdered query.Bounds) {
+	bestEst, rated := 0.0, false
+	orderedEst, orderedRated := 0.0, false
+	query.ConjunctBounds(filter, field, func(bs query.Bounds) bool {
+		if best == nil {
+			best = bs
+		}
+		est, ok := probe(field, bs)
+		if !ok {
+			return false
+		}
+		if !rated || est < bestEst {
+			best, bestEst, rated = bs, est, true
+		}
+		if ordered != nil && (!orderedRated || est < orderedEst) && ordered(field, bs) {
+			bestOrdered, orderedEst, orderedRated = bs, est, true
+		}
+		return true
+	})
+	if orderedRated && boundsEqual(bestOrdered, best) {
+		bestOrdered = nil
+	}
+	return best, bestOrdered
+}
+
+// OrderKeeping reports whether bs lets a single-field index scan over
+// possibly multikey data provide the field's sort order in the given
+// direction: ascending needs no value cut below (a document surfaces at its
+// global MIN element only if no lower cut can hide it), descending none
+// above. A type-bracket edge is not a value cut — the query layer opens it
+// (widenSortEdges). See sortRunNeedsScalarProof (query.go) for the argument.
+//
+// A bound reaching into the array bracket ({$type:"array"}, an array
+// operand) never keeps the order: it selects whole-array entries, and a
+// document matched through its whole-array entry surfaces there even when
+// its extreme element lies outside the range — opening the sort-side edge
+// cannot bring that element in, so such a bound is a value cut either way.
+func OrderKeeping(bs query.Bounds, reverse bool) bool {
+	for _, b := range bs {
+		if coversArrayBracket(b) {
+			return false
+		}
+		if !reverse && len(b.Start) > 0 && !b.StartIsTypeEdge() ||
+			reverse && len(b.End) > 0 && !b.EndIsTypeEdge() {
+			return false
+		}
+	}
+	return true
+}
+
+// coversArrayBracket reports whether a bound in ascending value space selects
+// whole-array keys: its range reaches the TypeArray tag from below or starts
+// inside the bracket, and ends past the bracket's first key.
+func coversArrayBracket(b query.Bound) bool {
+	tag := byte(anyenc.TypeArray)
+	if len(b.Start) > 0 && b.Start[0] > tag {
+		return false
+	}
+	if len(b.End) == 0 {
+		return true
+	}
+	switch {
+	case b.End[0] > tag:
+		return true
+	case b.End[0] < tag:
+		return false
+	}
+	return len(b.End) > 1 || b.EndInclude
+}
+
+// EstimateFieldEntries rates bs as a single-field chain of info: the index
+// entries a seek over them fetches, priced as Plan B prices a chosen
+// candidate. A unique non-sparse single-field index matches one entry per
+// point (uniqueFullKeyDocs); point bounds sum the level-0 sketch counts;
+// range bounds interpolate their fraction of the live index through cur, a
+// cursor over the index namespace (rangeFraction, as measureRanges does),
+// and apply it to the index's entry count — totalDocs when the sketch cannot
+// say — or take DefaultRangeSelectivity of it without a cursor. bs is in
+// ascending value space; a reverse leading field is transformed to stored
+// space first, the space both the sketch keys and the B-tree live in.
+// ok=false when the statistics cannot rate the bounds: points without a
+// trusted sketch, ranges with neither a sketch nor a cursor.
+func EstimateFieldEntries(cur *btree.Cursor, info *IndexInfo, sk *IndexSketch, totalDocs int, bs query.Bounds) (float64, bool) {
+	if len(bs) == 0 {
+		return 0, false
+	}
+	bs = ComputeSingleFieldBounds(info, bs)
+	sketched := sk != nil && sketchLevelTrusted(sk, 0)
+	if allBoundsFixedNonEmpty(bs) {
+		if info.Unique && !info.Sparse && len(info.FieldNames) == 1 {
+			return float64(len(bs)), true
+		}
+		if !sketched {
+			return 0, false
+		}
+		var total float64
+		for _, b := range bs {
+			total += float64(sk.Estimate(0, b.Start))
+		}
+		return total, true
+	}
+	entries := float64(max(totalDocs, 1))
+	if sketched {
+		if n := float64(sk.EntryCount(0)); n > 0 {
+			entries = n
+		}
+	}
+	if cur != nil {
+		if f := rangeFraction(cur, bs); f > 0 {
+			return f * entries, true
+		}
+	}
+	if !sketched {
+		return 0, false
+	}
+	return DefaultRangeSelectivity * entries, true
 }
 
 // allBoundsFixedNonEmpty reports whether bs is non-empty and every bound is an
@@ -2431,6 +2825,43 @@ func (br *BoundsResult) TightDiffers(fields []string) bool {
 		for i := range br.Fields {
 			if br.Fields[i].Field == field {
 				if br.Fields[i].TightIdx >= 0 {
+					return true
+				}
+				break
+			}
+		}
+	}
+	return false
+}
+
+// LookupOrdered returns the ORDERED channel for a field — the lowest-rated
+// conjunct keeping the index order (see BuildWithProbe) — falling back to the
+// wide bounds when there is none.
+func (br *BoundsResult) LookupOrdered(field string) (bounds query.Bounds, fixed bool, found bool) {
+	for i := range br.Fields {
+		if br.Fields[i].Field == field {
+			oi := br.Fields[i].OrderedIdx
+			if oi < 0 {
+				s := br.Fields[i].Start
+				return br.Bounds[s : s+br.Fields[i].Count], br.Fields[i].Fixed, true
+			}
+			of := br.orderedFields[oi]
+			return of.bounds, of.fixed, true
+		}
+	}
+	return nil, false, false
+}
+
+// OrderedDiffers reports whether the ordered channel differs from the wide
+// one for any of the given fields.
+func (br *BoundsResult) OrderedDiffers(fields []string) bool {
+	if len(br.orderedFields) == 0 {
+		return false
+	}
+	for _, field := range fields {
+		for i := range br.Fields {
+			if br.Fields[i].Field == field {
+				if br.Fields[i].OrderedIdx >= 0 {
 					return true
 				}
 				break
@@ -2747,24 +3178,12 @@ func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
 	return computeIndexBounds(idx, br.Lookup, len(idx.FieldNames))
 }
 
-// ComputeIndexBoundsCapped is ComputeIndexBounds over the first maxFields
-// index fields only (see IndexInfo.SharedFrom).
-func ComputeIndexBoundsCapped(idx *IndexInfo, br *BoundsResult, maxFields int) (query.Bounds, int) {
-	return computeIndexBounds(idx, br.Lookup, maxFields)
-}
-
 // ComputeIndexBoundsTight is the tight-channel variant, built from
 // BoundsResult.LookupTight. Its result is for cost ESTIMATION only (CBOIndex
 // EstBounds): feeding it to a seek requires the fan-out-free proof documented
 // on query.TightIndexBounds.
 func ComputeIndexBoundsTight(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
 	return computeIndexBounds(idx, br.LookupTight, len(idx.FieldNames))
-}
-
-// ComputeIndexBoundsTightCapped is ComputeIndexBoundsTight over the first
-// maxFields index fields only.
-func ComputeIndexBoundsTightCapped(idx *IndexInfo, br *BoundsResult, maxFields int) (query.Bounds, int) {
-	return computeIndexBounds(idx, br.LookupTight, maxFields)
 }
 
 // ComputeSingleFieldBounds is the single-field chain for explicit logical
@@ -2778,7 +3197,18 @@ func ComputeSingleFieldBounds(idx *IndexInfo, bs query.Bounds) query.Bounds {
 	return bs
 }
 
-func computeIndexBounds(idx *IndexInfo, lookup func(string) (query.Bounds, bool, bool), maxFields int) (query.Bounds, int) {
+// BoundsLookup resolves a field's bounds in one BoundsResult channel
+// (Lookup, LookupTight, LookupOrdered).
+type BoundsLookup func(field string) (bounds query.Bounds, fixed bool, found bool)
+
+// ComputeIndexBoundsFrom builds the chain over the first maxFields index
+// fields from the given channel; the caller owns the channel's soundness
+// argument.
+func ComputeIndexBoundsFrom(idx *IndexInfo, lookup BoundsLookup, maxFields int) (query.Bounds, int) {
+	return computeIndexBounds(idx, lookup, maxFields)
+}
+
+func computeIndexBounds(idx *IndexInfo, lookup BoundsLookup, maxFields int) (query.Bounds, int) {
 	type fieldBound struct {
 		bounds query.Bounds
 		fixed  bool

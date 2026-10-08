@@ -74,19 +74,31 @@ func (e ElemMatch) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
+// ElemMatchSubField resolves fieldName, a path below this key's, to the
+// condition an object-form $elemMatch on the key puts on that sub-field:
+// {"a":{"$elemMatch":{"b":1}}} resolves "a.b" to {"b":1} with sub "b". ok is
+// false when the key is not such an $elemMatch or the path is not below it.
+func (e Key) ElemMatchSubField(fieldName string) (cond Filter, sub string, ok bool) {
+	return e.elemMatchSubField(fieldName)
+}
+
 // elemMatchSubField reports whether the Key holds an object-form $elemMatch
 // — or an $all conjunction of them — whose condition constrains fieldName
 // below the Key's path, and returns that condition with the sub-field name.
 // Sound because the index fans an element's values out under the sub-field,
 // so a matching element's value is an entry there. Not on a positional path:
-// its leaf is stored whole and has no element entries to seek.
+// its leaf is stored whole and has no element entries to seek. The prefix
+// test joins nothing: Key.IndexBounds asks it for every index field.
 func (e Key) elemMatchSubField(fieldName string) (cond Filter, sub string, ok bool) {
-	path := strings.Join(e.Path, ".")
-	if len(fieldName) <= len(path)+1 || fieldName[len(path)] != '.' ||
-		!strings.HasPrefix(fieldName, path) || lastSegmentNumeric(path) {
+	pathLen := len(e.Path) - 1
+	for _, seg := range e.Path {
+		pathLen += len(seg)
+	}
+	if len(e.Path) == 0 || len(fieldName) <= pathLen+1 || fieldName[pathLen] != '.' ||
+		!e.PathIs(fieldName[:pathLen]) || lastSegmentNumeric(e.Path[len(e.Path)-1]) {
 		return nil, "", false
 	}
-	sub = fieldName[len(path)+1:]
+	sub = fieldName[pathLen+1:]
 	// A numeric first segment indexes the ARRAY on the index side (the leaf
 	// is stored whole) but names an object key inside the element on the
 	// condition side: nothing to seek.

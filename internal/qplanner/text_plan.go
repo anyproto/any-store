@@ -135,8 +135,7 @@ func buildTextPlan(params *PlanParams) *Plan {
 		}
 		cost := accCost + consumed*(CostDocFetch+CostFilter)
 		if needSort {
-			yield := gated * pOther
-			cost += sortCost(yield) + yield*CostMaterialize
+			cost += inMemorySortCost(gated*pOther, float64(sortTopK(params)))
 		}
 		cands = append(cands, textCandidate{
 			name: "FtsSearch", cost: cost, estRows: gated, kind: textPlanDriver,
@@ -166,7 +165,7 @@ func buildTextPlan(params *PlanParams) *Plan {
 			}
 			cost := e*probeDocCost + fetchN*(CostDocFetch+CostFilter)
 			if needSort {
-				cost += sortCost(matches*pOther) + matches*pOther*CostMaterialize
+				cost += inMemorySortCost(matches*pOther, float64(sortTopK(params)))
 			}
 			return cost
 		}
@@ -205,7 +204,7 @@ func buildTextPlan(params *PlanParams) *Plan {
 			access := nSeeks*CostIndexSeek + e*CostSeqRead
 			orderedOut := rankMode || (needSort && idx.ExactSort)
 			cands = append(cands, textCandidate{
-				name: "FtsProbeSeek(" + idx.Info.Name + ")", idx: idx,
+				name: idx.candidateName("FtsProbeSeek"), idx: idx,
 				cost:    access + finishCost(e, orderedOut),
 				estRows: e * selText, kind: textPlanProbeSeek,
 			})
@@ -249,7 +248,7 @@ func buildTextPlan(params *PlanParams) *Plan {
 				}
 				cost := s*(CostIndexSeek+probeDocCost) + s*selText*(CostDocFetch+CostFilter)
 				cands = append(cands, textCandidate{
-					name: "FtsProbeScan(" + idx.Info.Name + ")", idx: idx,
+					name: idx.candidateName("FtsProbeScan"), idx: idx,
 					cost: cost, estRows: s * selText * scanSel, kind: textPlanProbeScan,
 				})
 			}

@@ -181,9 +181,12 @@ func TestQueryCount_ArrayTwoSidedRange(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, explain.Sql, "IndexScan", "reproducer must take the index path; got: %s", explain.Sql)
 	// The index has seen arrays (multikey flag set), so the executed bounds
-	// must stay the sound half-open over-approximation — tight seeks on this
-	// index would drop doc 1 entirely.
-	require.Contains(t, explain.Sql, "'<string>')",
+	// must stay a sound half-open over-approximation — one conjunct's own
+	// bounds, whichever side the planner seeds the seek with — never the
+	// intersection, which would drop doc 1 entirely.
+	require.NotContains(t, explain.Sql, "['2','3']",
+		"a multikey index must not seek the intersection; got: %s", explain.Sql)
+	require.True(t, strings.Contains(explain.Sql, "'<string>')") || strings.Contains(explain.Sql, "['<number>'"),
 		"a multikey index must serve wide (bracket-open) bounds; got: %s", explain.Sql)
 
 	assertQueryCount(t, coll.Find(filter).IndexHint(hint), 3)
