@@ -853,6 +853,7 @@ func TestBackup_ReleasesSourcePages(t *testing.T) {
 	opts := DefaultOptions()
 	opts.UsePageSlab = true
 	opts.CacheSize = 50 // soft creates are refused once 90% of it is pinned
+	opts.MaxReaders = 1 // one reader cache serves every Step and the check below
 	opts.InProcess = true
 	src, err := testOpen(t, filepath.Join(dir, "src.db"), opts)
 	require.NoError(t, err)
@@ -864,7 +865,7 @@ func TestBackup_ReleasesSourcePages(t *testing.T) {
 	ns, err := stx.CreateNamespace("data")
 	require.NoError(t, err)
 	val := make([]byte, 1024)
-	for i := 0; i < 1500; i++ { // several hundred pages, far past the cache
+	for i := 0; i < 1500; i++ { // ~1700 pages (each value spills to an overflow page), far past the cache
 		require.NoError(t, stx.Put(ns, fmt.Appendf(nil, "k-%05d", i), val))
 	}
 	require.NoError(t, stx.Commit())
@@ -880,6 +881,15 @@ func TestBackup_ReleasesSourcePages(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.NoError(t, b.Finish())
+
+	// Close frees pinned pages too, so check the pins first: the one reader
+	// cache served every Step and must hold no pinned page.
+	rtx, err := src.BeginRead()
+	require.NoError(t, err)
+	pinned := rtx.cache.nPage - rtx.cache.nRecyclable
+	require.NoError(t, rtx.Rollback())
+	require.Equal(t, 0, pinned, "source reader cache still has pinned pages after the backup")
+
 	require.NoError(t, dst.Close())
 	require.NoError(t, src.Close())
 

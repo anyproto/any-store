@@ -247,7 +247,7 @@ func (b *Backup) Step(nPage int) error {
 		// ~ backup.c:397 sqlite3PagerUnref(pSrcPg). A cached page is unpinned
 		// so the reader cache can evict it instead of filling up with pinned
 		// pages; an uncached fallback page (soft create refused) returns its
-		// buffer to the slab, which has no other way to get it back.
+		// buffer to the slab or pool; the slab has no other way to get it back.
 		b.src.pager.releasePage(srcPg)
 		if err != nil {
 			b.rc = err
