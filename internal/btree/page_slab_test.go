@@ -181,7 +181,7 @@ func TestPageSlab_InitIdempotent(t *testing.T) {
 	s.mu.Unlock()
 }
 
-func TestPageSlab_OverflowBuffersCapped(t *testing.T) {
+func TestPageSlab_OverflowBuffersGoToPool(t *testing.T) {
 	var s pageSlab
 	defer s.Reset()
 	s.Init(4096, 5) // nSlab=5, nReserve=5/10+1=1
@@ -212,12 +212,12 @@ func TestPageSlab_OverflowBuffersCapped(t *testing.T) {
 		s.Put(b)
 	}
 
-	// Free list should be capped at nSlab=5 (overflow buffers discarded)
+	// Only the 5 slab buffers are retained; the overflow buffers went to the pool
 	s.mu.Lock()
 	freeCount := len(s.freeList)
 	s.mu.Unlock()
 	if freeCount != 5 {
-		t.Fatalf("freeList should be capped at nSlab=5, got %d", freeCount)
+		t.Fatalf("freeList should hold the 5 slab buffers, got %d", freeCount)
 	}
 
 	// Pressure should be cleared (5 >= nReserve=1)
@@ -273,5 +273,142 @@ func TestPageSlab_PressureEdgeCases(t *testing.T) {
 	s.Put(buf)
 	if s.UnderPressure() {
 		t.Fatal("should not be under pressure after putting buffer back")
+	}
+}
+
+// Init makes one allocation for the page memory and one for the free list,
+// whatever nPages is: the slab is a single buffer carved into page slices.
+func TestPageSlab_InitAllocatesOnce(t *testing.T) {
+	const nPages = 1024
+	s := new(pageSlab) // allocated outside the measured closure
+	allocs := testing.AllocsPerRun(10, func() {
+		s.Reset()
+		s.Init(4096, nPages)
+	})
+	if allocs != 2 {
+		t.Fatalf("Init(4096, %d): %v allocations, want 2 (slab + free list)", nPages, allocs)
+	}
+}
+
+// Slab buffers are disjoint pages of one backing array, each capped at
+// pageSize, so writing or appending to one never touches its neighbour.
+func TestPageSlab_BuffersAreDisjointPages(t *testing.T) {
+	var s pageSlab
+	defer s.Reset()
+	const pageSize, nPages = 512, 8
+	s.Init(pageSize, nPages)
+
+	bufs := make([][]byte, nPages)
+	for i := range bufs {
+		bufs[i] = s.Get()
+		if len(bufs[i]) != pageSize || cap(bufs[i]) != pageSize {
+			t.Fatalf("buffer %d: len %d cap %d, want %d/%d", i, len(bufs[i]), cap(bufs[i]), pageSize, pageSize)
+		}
+		for j := range bufs[i] {
+			bufs[i][j] = byte(i + 1)
+		}
+	}
+	// Appending past the cap must reallocate, not spill into the next page.
+	// Page 0 (popped last) is the one a two-index slice would give the whole
+	// array as capacity; the last page has cap == pageSize either way.
+	first := bufs[len(bufs)-1]
+	grown := append(first, 0xFF)
+	if &grown[0] == &first[0] {
+		t.Fatal("append grew in place: buffer cap exceeds pageSize")
+	}
+	for i := range bufs {
+		for j, b := range bufs[i] {
+			if b != byte(i+1) {
+				t.Fatalf("buffer %d byte %d = %#x, want %#x: pages overlap", i, j, b, byte(i+1))
+			}
+		}
+	}
+	for _, buf := range bufs {
+		s.Put(buf)
+	}
+}
+
+func BenchmarkPageSlabInit(b *testing.B) {
+	const nPages = (128 << 20) / 4096
+	b.ReportAllocs()
+	for b.Loop() {
+		var s pageSlab
+		s.Init(4096, nPages)
+	}
+}
+
+// Overflow buffers never enter the free list, even when they are returned
+// before the slab's own buffers: an admitted overflow buffer would displace a
+// slab page that nothing can reclaim.
+func TestPageSlab_PutKeepsOnlySlabBuffers(t *testing.T) {
+	var s pageSlab
+	defer s.Reset()
+	const nPages = 4
+	s.Init(4096, nPages)
+
+	slabBufs := make([][]byte, nPages)
+	for i := range slabBufs {
+		slabBufs[i] = s.Get()
+	}
+	overflowBufs := make([][]byte, 2)
+	for i := range overflowBufs {
+		overflowBufs[i] = s.Get()
+		if s.within(overflowBufs[i]) {
+			t.Fatalf("overflow buffer %d lies inside the slab", i)
+		}
+	}
+
+	for _, b := range overflowBufs {
+		s.Put(b)
+	}
+	s.mu.Lock()
+	n := len(s.freeList)
+	s.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("free list holds %d overflow buffers, want 0", n)
+	}
+	if !s.UnderPressure() {
+		t.Fatal("returning overflow buffers must not clear pressure")
+	}
+
+	for _, b := range slabBufs {
+		s.Put(b)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.freeList) != nPages {
+		t.Fatalf("free list holds %d buffers, want %d", len(s.freeList), nPages)
+	}
+	for i, b := range s.freeList {
+		if !s.within(b) {
+			t.Fatalf("free list entry %d is not a slab buffer", i)
+		}
+	}
+}
+
+// A slab buffer returned when the free list is already full is a double Put.
+// It is dropped, not pooled: a pooled copy would hand the page to a second
+// owner through an overflow Get or a non-slab DB. The pool probe sees a
+// pooled duplicate reliably only without -race; the race detector makes
+// sync.Pool drop items at random.
+func TestPageSlab_DoublePutAtFullListIsDropped(t *testing.T) {
+	var s pageSlab
+	defer s.Reset()
+	resetPageBufferPool()
+	s.Init(4096, 2)
+
+	a, b := s.Get(), s.Get()
+	s.Put(a)
+	s.Put(b)
+	s.Put(a) // double Put at a full list
+
+	s.mu.Lock()
+	n := len(s.freeList)
+	s.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("free list holds %d buffers, want 2", n)
+	}
+	if got, _ := pageBufferPool.Get().([]byte); got != nil && s.within(got) {
+		t.Fatal("double Put placed a slab buffer in the pool")
 	}
 }

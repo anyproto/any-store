@@ -839,3 +839,62 @@ func TestBackup_FreedLeafGrownInTransactionReadable(t *testing.T) {
 	require.NoError(t, finishErr)
 	require.NoError(t, dst.IntegrityCheck())
 }
+
+// Step returns every source page it reads. With a reader cache too small to
+// pin the whole source, getPageReader falls back to uncached temp pages, and
+// an unreleased temp page is a slab page lost for the life of the process.
+func TestBackup_ReleasesSourcePages(t *testing.T) {
+	const slabPages = 1000
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, slabPages)
+	defer globalPageSlab.Reset()
+
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.UsePageSlab = true
+	opts.CacheSize = 50 // soft creates are refused once 90% of it is pinned
+	opts.MaxReaders = 1 // one reader cache serves every Step and the check below
+	opts.InProcess = true
+	src, err := testOpen(t, filepath.Join(dir, "src.db"), opts)
+	require.NoError(t, err)
+	dst, err := testOpen(t, filepath.Join(dir, "dst.db"), opts)
+	require.NoError(t, err)
+
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	ns, err := stx.CreateNamespace("data")
+	require.NoError(t, err)
+	val := make([]byte, 1024)
+	for i := 0; i < 1500; i++ { // ~1700 pages (each value spills to an overflow page), far past the cache
+		require.NoError(t, stx.Put(ns, fmt.Appendf(nil, "k-%05d", i), val))
+	}
+	require.NoError(t, stx.Commit())
+	require.NoError(t, src.Checkpoint(CheckpointFull))
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	for {
+		err := b.Step(64)
+		if err == ErrBackupDone {
+			break
+		}
+		require.NoError(t, err)
+	}
+	require.NoError(t, b.Finish())
+
+	// Close frees pinned pages too, so check the pins first: the one reader
+	// cache served every Step and must hold no pinned page.
+	rtx, err := src.BeginRead()
+	require.NoError(t, err)
+	pinned := rtx.cache.nPage - rtx.cache.nRecyclable
+	require.NoError(t, rtx.Rollback())
+	require.Equal(t, 0, pinned, "source reader cache still has pinned pages after the backup")
+
+	require.NoError(t, dst.Close())
+	require.NoError(t, src.Close())
+
+	globalPageSlab.mu.Lock()
+	free := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+	require.Equal(t, slabPages, free, "slab pages not returned after the backup")
+}

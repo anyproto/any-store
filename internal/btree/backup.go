@@ -243,9 +243,13 @@ func (b *Backup) Step(nPage int) error {
 			b.rc = err
 			return err
 		}
-		// No explicit releasePage on reader cache — tx.Rollback handles it.
-
-		if err := b.onePage(iSrcPg, srcPg.data[:srcPgsz], false, nSrcPage); err != nil {
+		err = b.onePage(iSrcPg, srcPg.data[:srcPgsz], false, nSrcPage)
+		// ~ backup.c:397 sqlite3PagerUnref(pSrcPg). A cached page is unpinned
+		// so the reader cache can evict it instead of filling up with pinned
+		// pages; an uncached fallback page (soft create refused) returns its
+		// buffer to the slab or pool; the slab has no other way to get it back.
+		b.src.pager.releasePage(srcPg)
+		if err != nil {
 			b.rc = err
 			return err
 		}

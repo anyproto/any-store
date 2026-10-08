@@ -6,12 +6,12 @@ package btree
 //    SQLite's default malloc-based page cache allocation. Buffers are GC'd when
 //    not in use. No memory pressure tracking.
 //
-// 2. Slab mode (opt-in via SlabPages option or ConfigPageCache): Pre-allocates
-//    a fixed number of page-sized buffers. Modeled after SQLite's pcache1.c slab
-//    allocator (pcache1_g struct, pcache1Alloc, pcache1Free,
-//    pcache1UnderMemoryPressure). When the slab is exhausted, falls back to
-//    make() (overflow). UnderPressure triggers admission control and immediate
-//    eviction.
+// 2. Slab mode (opt-in per DB via UsePageSlab, after ConfigPageCache): Pre-allocates
+//    one buffer of nPages pages and hands out page-sized slices of it. Modeled
+//    after SQLite's pcache1.c slab allocator (pcache1_g struct, pcache1Alloc,
+//    pcache1Free, pcache1UnderMemoryPressure). When the slab is exhausted,
+//    overflow buffers come from the sync.Pool, then make(). UnderPressure
+//    triggers admission control and immediate eviction.
 //
 // All page buffer allocation should go through allocPageBuffer/freePageBuffer,
 // which dispatch to the appropriate mode.
@@ -19,6 +19,7 @@ package btree
 import (
 	"sync"
 	"sync/atomic"
+	"unsafe"
 )
 
 // pageSlab manages a pool of reusable []byte page buffers.
@@ -32,10 +33,11 @@ type pageSlab struct {
 	underPressure atomic.Bool // true when free list is below reserve
 	pageSize      int         // immutable after Init; safe to read after initialized.Load() == true
 	initialized   atomic.Bool // set last in Init(); acts as release barrier for pageSize
+	slab          []byte      // backing array of the slab buffers; Put retains only slices of it
 }
 
 // globalPageSlab is the process-global singleton. Only initialized when slab
-// mode is explicitly enabled via SlabPages option or ConfigPageCache.
+// mode is explicitly enabled via ConfigPageCache and opted into per DB with UsePageSlab.
 var globalPageSlab pageSlab
 
 // pageBufferPool is a sync.Pool for page-sized []byte buffers. Used as the
@@ -106,8 +108,8 @@ func freePageBuffer(buf []byte, useSlab bool) {
 	pageBufferPool.Put(buf)
 }
 
-// Init pre-allocates nPages buffers of the given pageSize.
-// If already initialized, this is a no-op.
+// Init allocates one nPages*pageSize buffer and fills the free list with its
+// page slices. If already initialized, this is a no-op.
 // Matches sqlite3PCacheBufferSetup (pcache1.c:271-291).
 // DRIFT: pageSlab.Init/ConfigPageCache idempotent & no-disable vs C re-configurable setup See docs/btree/NOTES.md#drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl
 func (s *pageSlab) Init(pageSize, nPages int) {
@@ -128,16 +130,23 @@ func (s *pageSlab) Init(pageSize, nPages int) {
 	} else {
 		s.nReserve = nPages/10 + 1
 	}
+	// One allocation carved into page slices, as pcache1.c:283-288 carves
+	// pBuf by szSlot. A make() per page costs an allocator refill every two
+	// pages (4 KiB is a two-object size class) and leaves nPages heap objects
+	// for every GC cycle to mark; one object is allocated and marked once.
+	// The three-index slice caps each buffer at pageSize so an append can
+	// never reach its neighbour.
+	s.slab = make([]byte, nPages*pageSize)
 	s.freeList = make([][]byte, nPages)
 	for i := range nPages {
-		s.freeList[i] = make([]byte, pageSize)
+		s.freeList[i] = s.slab[i*pageSize : (i+1)*pageSize : (i+1)*pageSize]
 	}
 	s.underPressure.Store(false)
 	s.initialized.Store(true)
 }
 
-// Get returns a page buffer from the slab. If the free list is empty,
-// allocates a new buffer from the heap (overflow).
+// Get returns a page buffer from the slab. If the free list is empty, takes
+// one from the sync.Pool or the heap (overflow).
 // Matches pcache1Alloc (pcache1.c:341-374).
 func (s *pageSlab) Get() []byte {
 	s.mu.Lock()
@@ -169,30 +178,46 @@ func (s *pageSlab) Get() []byte {
 // Matches pcache1Free (pcache1.c:379-406).
 //
 // Like SQLite's SQLITE_WITHIN check (pcache1.c:381), only slab-origin buffers
-// are retained. Overflow buffers (heap-allocated when slab is exhausted) are
-// discarded so the GC can collect them. This prevents unbounded free list
-// growth and keeps underPressure semantics accurate: the flag only clears
-// when actual slab buffers are returned, not when overflow buffers inflate
-// the list.
+// are retained. Overflow buffers (heap-allocated when the slab is exhausted)
+// recycle through sync.Pool instead. An overflow buffer admitted to the free
+// list would displace a slab page: the slab is one backing array, so a slice
+// the GC drops from the pool stays resident but unusable for the life of the
+// process. The origin check also keeps underPressure accurate: the flag only
+// clears when actual slab buffers are returned, as pcache1Free does.
 func (s *pageSlab) Put(buf []byte) {
 	if buf == nil {
 		return
 	}
 	s.mu.Lock()
-	// Cap the free list at the original slab size. Buffers beyond nSlab are
-	// overflow allocations — route them to sync.Pool for reuse instead of
-	// dropping them for GC. This reduces allocation pressure when the slab
-	// is persistently exhausted (many DBs, heavy writes).
-	if len(s.freeList) < s.nSlab {
-		s.freeList = append(s.freeList, buf)
-	} else {
+	switch {
+	case !s.within(buf):
 		pageBufferPool.Put(buf)
+	case len(s.freeList) < s.nSlab:
+		s.freeList = append(s.freeList, buf)
+	default:
+		// A slab buffer arriving at a full list is a double Put (C asserts
+		// nFreeSlot <= nSlot). Dropping it keeps the page with its one owner;
+		// pooling it would hand a live page to a second one. A double Put at
+		// a non-full list is not detectable here.
 	}
 	// Update pressure: pcache1.c:389 — clear if freeList refills above reserve
 	if len(s.freeList) >= s.nReserve {
 		s.underPressure.Store(false)
 	}
 	s.mu.Unlock()
+}
+
+// within reports whether buf is a slice of the slab's backing array.
+// Matches SQLITE_WITHIN(p, pcache1.pStart, pcache1.pEnd) (pcache1.c:381).
+// Addresses are compared as integers; heap objects do not move, and s.slab
+// keeps the array alive, so the range stays valid while the slab is initialized.
+func (s *pageSlab) within(buf []byte) bool {
+	if len(buf) == 0 || len(s.slab) == 0 {
+		return false
+	}
+	p := uintptr(unsafe.Pointer(&buf[0]))
+	start := uintptr(unsafe.Pointer(&s.slab[0]))
+	return p >= start && p < start+uintptr(len(s.slab))
 }
 
 // UnderPressure returns true when the free list is below the reserve threshold.
@@ -210,6 +235,7 @@ func (s *pageSlab) Reset() {
 	// Initialized() from reading stale pageSize during reset.
 	s.initialized.Store(false)
 	s.freeList = nil
+	s.slab = nil
 	s.nTotal = 0
 	s.nSlab = 0
 	s.nOverflow = 0
@@ -222,11 +248,12 @@ func (s *pageSlab) Reset() {
 // and number of pages. This mirrors sqlite3_config(SQLITE_CONFIG_PAGECACHE).
 // Must be called before opening any databases.
 //
-// By default (without calling this or setting SlabPages), page buffers are
+// By default (without calling this and setting UsePageSlab), page buffers are
 // allocated via sync.Pool (like SQLite's default malloc mode). Calling this
 // enables slab mode: a soft cap on total page cache memory across all open
-// databases. When the slab is exhausted, overflow allocations use make() but
-// the UnderPressure flag triggers admission control and immediate eviction.
+// databases. When the slab is exhausted, overflow buffers come from the
+// sync.Pool, then make(), and the UnderPressure flag triggers admission
+// control and immediate eviction.
 //
 // Example: ConfigPageCache(4096, 5000) pre-allocates ~20MB of page buffers.
 // DRIFT: pageSlab.Init/ConfigPageCache idempotent & no-disable vs C re-configurable setup See docs/btree/NOTES.md#drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl
