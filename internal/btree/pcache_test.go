@@ -250,6 +250,76 @@ func TestPcacheTruncate(t *testing.T) {
 	}
 }
 
+// TestPcacheTruncateMaxKeyWindow covers truncate's maxKey paths: a limit at
+// or above the largest page is a no-op, a limit a few pages below it walks
+// only the slots those pages hash to (also across the slot wrap), a far
+// lower one the whole table — each leaving exactly the pages at or below
+// the limit.
+func TestPcacheTruncateMaxKeyWindow(t *testing.T) {
+	pc := newPcache(4096, 1000, true)
+	nHash := uint32(len(pc.apHash))
+	require.GreaterOrEqual(t, nHash, uint32(minHashSize))
+	add := func(pgnos ...uint32) {
+		for _, i := range pgnos {
+			pc.release(pc.create(i, 2))
+		}
+	}
+	has := func(pgnos ...uint32) {
+		t.Helper()
+		for _, i := range pgnos {
+			assert.NotNil(t, pc.hashFind(i), "page %d", i)
+		}
+	}
+	lacks := func(pgnos ...uint32) {
+		t.Helper()
+		for _, i := range pgnos {
+			assert.Nil(t, pc.hashFind(i), "page %d", i)
+		}
+	}
+	// Pages 1..100 plus a run straddling the slot wrap, nHash-4 .. nHash+6.
+	for i := uint32(1); i <= 100; i++ {
+		add(i)
+	}
+	for i := nHash - 4; i <= nHash+6; i++ {
+		add(i)
+	}
+	require.Equal(t, nHash+6, pc.maxKey)
+	n := pc.nPage
+
+	pc.truncate(nHash + 6) // no page above: a no-op
+	assert.Equal(t, n, pc.nPage)
+	assert.Equal(t, nHash+6, pc.maxKey)
+
+	pc.truncate(nHash - 1) // the window wraps the table end
+	assert.Equal(t, nHash-1, pc.maxKey)
+	has(nHash-4, nHash-3, nHash-2, nHash-1)
+	lacks(nHash, nHash+1, nHash+6)
+	assert.Equal(t, n-7, pc.nPage)
+
+	pc.truncate(60) // a window within the table
+	assert.Equal(t, uint32(60), pc.maxKey)
+	has(1, 60)
+	lacks(61, 100, nHash-4)
+	assert.Equal(t, 60, pc.nPage)
+
+	add(2 * nHash) // a far page: the general case walks the whole table
+	pc.truncate(1)
+	assert.Equal(t, uint32(1), pc.maxKey)
+	has(1)
+	lacks(2, 60, 2*nHash)
+	assert.Equal(t, 1, pc.nPage)
+
+	// nHash+1 pages above the limit: the first and last of them share a slot,
+	// so a window would cover only that slot; the whole table is walked.
+	pc = newPcache(4096, 1000, true)
+	const base = uint32(10)
+	add(base, base+1, base+2, base+nHash+1)
+	pc.truncate(base)
+	has(base)
+	lacks(base+1, base+2, base+nHash+1)
+	assert.Equal(t, 1, pc.nPage)
+}
+
 func TestPcacheTruncateDirty(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
