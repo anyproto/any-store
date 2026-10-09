@@ -3222,6 +3222,14 @@ func ComputeIndexBoundsFrom(idx *IndexInfo, lookup BoundsLookup, maxFields int) 
 	return computeIndexBounds(idx, lookup, maxFields)
 }
 
+// compoundScratch holds a compound chain's tuple keys and the bound sets of
+// its first two levels; the chain's result aliases it.
+type compoundScratch struct {
+	arena  [256]byte
+	result [4]query.Bound
+	ext    [4]query.Bound
+}
+
 func computeIndexBounds(idx *IndexInfo, lookup BoundsLookup, maxFields int) (query.Bounds, int) {
 	type fieldBound struct {
 		bounds query.Bounds
@@ -3270,13 +3278,14 @@ func computeIndexBounds(idx *IndexInfo, lookup BoundsLookup, maxFields int) (que
 		return chain[0].bounds, chainLen
 	}
 
-	// Compound index: build combined tuple bounds using arena to avoid per-tuple heap allocs.
-	// Each sub-slice reserves 1 extra cap byte so AdjustBoundsForNonUnique can append 0xff in-place.
-	var arenaBuf [256]byte
-	arena := arenaBuf[:0]
-
-	var resultBuf [4]query.Bound
-	result := query.Bounds(resultBuf[:0])
+	// Compound index: build combined tuple bounds using an arena to avoid
+	// per-tuple heap allocs. Each sub-slice reserves 1 extra cap byte so
+	// AdjustBoundsForNonUnique can append 0xff in-place. The result aliases
+	// the scratch, so it lives on the heap: one allocation for the whole
+	// two-field chain, a further one per field beyond.
+	scratch := new(compoundScratch)
+	arena := scratch.arena[:0]
+	result := query.Bounds(scratch.result[:0])
 	for _, b := range chain[0].bounds {
 		result = append(result, b)
 	}
@@ -3285,8 +3294,13 @@ func computeIndexBounds(idx *IndexInfo, lookup BoundsLookup, maxFields int) (que
 		if !chain[i-1].fixed {
 			break
 		}
-		var extBuf [4]query.Bound
-		extended := query.Bounds(extBuf[:0])
+		var extended query.Bounds
+		if i == 1 {
+			extended = scratch.ext[:0]
+		} else {
+			var extBuf [4]query.Bound
+			extended = extBuf[:0]
+		}
 		for _, prev := range result {
 			for _, cur := range chain[i].bounds {
 				eb := query.Bound{

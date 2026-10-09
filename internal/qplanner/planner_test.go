@@ -893,6 +893,18 @@ func buildBoundsResult(idx *IndexInfo, cond query.Filter) *BoundsResult {
 	return &br
 }
 
+// TestComputeIndexBounds_CompoundScratchOneAlloc pins that a two-field
+// compound chain allocates its scratch once (arena and both bound sets).
+func TestComputeIndexBounds_CompoundScratchOneAlloc(t *testing.T) {
+	idx := &IndexInfo{FieldNames: []string{"a", "b"}}
+	br := buildBoundsResult(idx, query.MustParseCondition(`{"a": 1, "b": {"$gt": 2}}`))
+	bounds, chainLen := ComputeIndexBounds(idx, br)
+	require.Equal(t, 2, chainLen)
+	require.Len(t, bounds, 1)
+	allocs := testing.AllocsPerRun(50, func() { ComputeIndexBounds(idx, br) })
+	assert.Equal(t, 1.0, allocs, "one scratch allocation per compound chain")
+}
+
 func TestComputeIndexBounds_SingleField(t *testing.T) {
 	idx := &IndexInfo{FieldNames: []string{"a"}}
 	cond := query.MustParseCondition(`{"a": 5}`)
