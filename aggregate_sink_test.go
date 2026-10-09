@@ -9,6 +9,7 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/aggregate"
+	"github.com/anyproto/any-store/v2/query"
 )
 
 // collRows returns every document of coll ordered by id, as JSON strings.
@@ -537,4 +538,73 @@ func TestCollection_AggregateOut_InsideWriteTx(t *testing.T) {
 		`{"id":"a","total":40}`,
 		`{"id":"b","total":20}`,
 	), collRows(t, target))
+}
+
+// A sink into the collection whose modifier is running is refused like every
+// other write to it: the operation running the modifier holds the document's
+// pre-image and diffs the index keys against it, so a sink that replaced the
+// document underneath left the index out of step with it. A sink into another
+// collection nests in the modifier, and the transaction goes on after the
+// refusal.
+func TestCollection_AggregateSink_RefusedInsideTargetModifier(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		into func(target string) string
+	}{
+		{"merge", func(target string) string {
+			return fmt.Sprintf(`[{"$merge": {"into": %q, "whenMatched": "replace"}}]`, target)
+		}},
+		{"out", func(target string) string {
+			return fmt.Sprintf(`[{"$out": %q}]`, target)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			x, err := fx.CreateCollection(ctx, "x")
+			require.NoError(t, err)
+			require.NoError(t, x.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+			require.NoError(t, x.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
+			y, err := fx.CreateCollection(ctx, "y")
+			require.NoError(t, err)
+			require.NoError(t, y.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":5}`)))
+
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			var sinkErr error
+			_, err = x.UpdateId(tx.Context(), 1, query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+				if _, sinkErr = y.Aggregate(tc.into("x")).Count(tx.Context()); sinkErr != nil {
+					return nil, false, sinkErr
+				}
+				v.Set("m", a.NewNumberInt(1))
+				return v, true, nil
+			}))
+			assert.ErrorIs(t, sinkErr, ErrWriteInModifier)
+			assert.ErrorIs(t, err, ErrWriteInModifier)
+
+			res, err := x.UpdateId(tx.Context(), 1, query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+				n, err := y.Aggregate(tc.into("z")).Count(tx.Context())
+				if err != nil {
+					return nil, false, err
+				}
+				assert.Equal(t, 1, n)
+				v.Set("m", a.NewNumberInt(2))
+				return v, true, nil
+			}))
+			require.NoError(t, err)
+			assert.Equal(t, ModifyResult{Matched: 1, Modified: 1}, res)
+			require.NoError(t, tx.Commit())
+
+			// The document and its index agree; the sink that was refused
+			// wrote nothing, the one that nested wrote its target. The
+			// counts are pinned to the index: a full scan would not see
+			// the stale entry.
+			assert.Equal(t, expectJson(t, `{"id":1,"a":1,"m":2}`), collRows(t, x))
+			byIndex := []IndexHint{{IndexName: "a", Boost: 1 << 30}}
+			assertQueryCount(t, x.Find(`{"a":1}`).IndexHint(byIndex...), 1)
+			assertQueryCount(t, x.Find(`{"a":5}`).IndexHint(byIndex...), 0)
+			z, err := fx.OpenCollection(ctx, "z")
+			require.NoError(t, err)
+			assert.Equal(t, expectJson(t, `{"id":1,"a":5}`), collRows(t, z))
+		})
+	}
 }

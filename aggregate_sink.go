@@ -138,6 +138,13 @@ func (q *aggQuery) materialize(ctx context.Context, cq *collQuery, rest aggregat
 			return terr
 		}
 		tc := target.(*collection)
+		// The target's write gate (collection.doWriteTxModifiedW): the
+		// operation running the target's modifier holds the document's
+		// pre-image and diffs the index keys against it, so a sink written
+		// under it would leave the index out of step with the document.
+		if terr = tc.writable(); terr != nil {
+			return terr
+		}
 		ts, terr := tc.resolve(&tx.ReadTx)
 		if terr != nil {
 			return terr

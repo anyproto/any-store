@@ -340,9 +340,12 @@ query the materialized field through it, instead of recomputing per client.
 Both must be the **last** pipeline stage (parse error otherwise, as in Mongo)
 and are rejected inside `$facet`. Neither may target the aggregated
 collection itself — `ErrAggregateIntoSource` (divergence: Mongo allows it
-with caveats; unsafe under our streaming-read-plus-write model). Only a plain
-collection name is accepted: Mongo's db-qualified form is a parse error. A
-missing target is created inside the same write transaction.
+with caveats; unsafe under our streaming-read-plus-write model). A sink run
+with the transaction's context into the collection whose `query.Modifier` is
+running fails with `ErrWriteInModifier`, as every such write does (README,
+Transactions). Only a plain collection name is accepted: Mongo's db-qualified
+form is a parse error. A missing target is created inside the same write
+transaction.
 
 **Execution model — buffer, then write.** The read pipeline runs to EOF in
 its own read snapshot, buffering results as raw marshaled bytes; the buffered

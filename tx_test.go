@@ -614,6 +614,10 @@ func TestTx_NestedCalls(t *testing.T) {
 			assert.ErrorIs(t, m.coll.DropIndex(tctx, "a"), ErrWriteInModifier)
 			assert.ErrorIs(t, m.coll.Rename(tctx, "renamed"), ErrWriteInModifier)
 			assert.ErrorIs(t, m.coll.Drop(tctx), ErrWriteInModifier)
+			_, err = m.refs.Aggregate(`[{"$out":"test"}]`).Count(tctx)
+			assert.ErrorIs(t, err, ErrWriteInModifier)
+			_, err = m.refs.Aggregate(`[{"$merge":{"into":"test"}}]`).Count(tctx)
+			assert.ErrorIs(t, err, ErrWriteInModifier)
 			// Reads of the collection, and other collections, nest.
 			if _, err = m.coll.Count(tctx); err != nil {
 				return nil, false, err
