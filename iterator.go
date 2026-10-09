@@ -95,7 +95,7 @@ type planIterator struct {
 	plan       *qplanner.Plan
 	buf        *syncpool.DocBuffer
 	qb         *queryBuilder
-	data       *qplanner.CursorSource
+	data       qplanner.CursorSource
 	dataCursor *btree.Cursor
 	docId      []byte
 	dedup      qplanner.DocDedup // lazy-allocated when upstream emits multiKey=true

@@ -1735,6 +1735,13 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 	return root
 }
 
+// coverBatch is a unique point lookup's CoverIter and its cursor source in
+// one allocation, as seekBatch is for the seek chain.
+type coverBatch struct {
+	cs    CursorSource
+	cover CoverIter
+}
+
 // seekBatch batches common iterator allocations for an index seek plan
 // into a single heap allocation instead of 5 separate ones.
 type seekBatch struct {
@@ -1765,15 +1772,14 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// a partial prefix (BoundFields < len(FieldNames)) can match multiple
 	// entries with different trailing fields, so a range scan is needed.
 	if idx.Info.Unique && idx.fullKeyPointBound() {
-		var root Iterator = &CoverIter{
-			Source: &CursorSource{
-				Tx: params.Tx,
-				Ns: idx.Info.Ns,
-			},
+		cb := &coverBatch{cs: CursorSource{Tx: params.Tx, Ns: idx.Info.Ns}}
+		cb.cover = CoverIter{
+			Source:       &cb.cs,
 			IdxInfo:      idx.Info,
 			Bounds:       idx.Bounds,
 			ScalarProven: idx.ScalarProven,
 		}
+		var root Iterator = &cb.cover
 
 		// A unique index can still be multikey (each array element unique
 		// across docs), so a multi-bound $in can hit the SAME doc through

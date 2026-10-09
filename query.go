@@ -512,7 +512,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		s:      s,
 		buf:    buf,
 		qb:     qb,
-		data:   &qplanner.CursorSource{Tx: btx, Ns: s.ns},
+		data:   qplanner.CursorSource{Tx: btx, Ns: s.ns},
 	}
 	if shared != nil {
 		shared.iterOpened(pi)
