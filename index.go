@@ -129,12 +129,12 @@ type VectorParams struct {
 	Field string `json:"field"`
 	// Dim is the embedding dimension.
 	Dim int `json:"dim"`
-	// Metric is the distance measure (default cosine).
-	Metric VectorMetric `json:"metric"`
 	// M / EfConstruction / EfSearch tune the HNSW graph; 0 = sensible defaults.
 	M              int `json:"m,omitempty"`
 	EfConstruction int `json:"efConstruction,omitempty"`
 	EfSearch       int `json:"efSearch,omitempty"`
+	// Metric is the distance measure (default cosine).
+	Metric VectorMetric `json:"metric"`
 	// Quantization selects the stored vector format of the HNSW modes (default
 	// full float32). VectorModeIVFSQ always stores int8: the value has no effect
 	// on its storage but stays part of the definition EnsureIndex compares.
@@ -348,8 +348,7 @@ type index struct {
 	// clone). Non-nil once the index is published to readers.
 	sketchPub atomic.Pointer[qplanner.IndexSketch]
 
-	sketchBuf      []byte
-	sketchModified bool
+	sketchBuf []byte
 	// sketchImaged is the version of the savepoint whose scope holds the
 	// newest pre-image of the live sketch (savepointTx.journalSketch), 0 for
 	// none. Versions are never reused, so the marker of an ended savepoint
@@ -376,7 +375,12 @@ type index struct {
 	// one seen afterwards (adopted from a peer, or left by a rebuild the
 	// data defeated) is maintained but never planned (plannableIndexes).
 	outdated bool
+	// sketchModified flags the live sketch as holding unpersisted deltas
+	// (markSketchModified).
+	sketchModified bool
 
+	rebound bool // some field was rebound for this document: keys dedup whole
+	skipped bool // the sparse rule dropped a key of this document
 	keyBuf  anyenc.Tuple
 	keysBuf []anyenc.Tuple
 	// keyBoundsBuf is parallel to keysBuf: keyBoundsBuf[k][L] is the byte offset
@@ -392,8 +396,6 @@ type index struct {
 	fields      []fieldScratch
 	rebinds     []rebind        // stack of rebound fields across nested fan-outs
 	shared      int             // later fields currently rebound: level dedup is off
-	rebound     bool            // some field was rebound for this document: keys dedup whole
-	skipped     bool            // the sparse rule dropped a key of this document
 	valBuf      []*anyenc.Value // stack of a leaf array's index values
 	fullKeyBuf  anyenc.Tuple    // reusable buffer for full keys (key+docId)
 	seekBuf     anyenc.Tuple    // reusable buffer for unique constraint seek results

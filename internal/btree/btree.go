@@ -3614,6 +3614,10 @@ type Cursor struct {
 	// cursorSkipNext the move onward in that direction — Next after, Previous
 	// before — does not step.
 	skipNext int8
+	// nextCursor links the writer's open cursors (BtCursor.pNext,
+	// pager.cursors); linked says the cursor is on the list.
+	linked     bool
+	nextCursor *Cursor
 	// faultErr is what every use of a cursorFault reports; faultSeq is the
 	// schema event that tripped it (pager.schemaSeq), 0 for a failed move
 	// or a failed write transaction.
@@ -3623,10 +3627,6 @@ type Cursor struct {
 	// (BtCursor.pKey); its buffer is kept across saves. A tripped cursor
 	// keeps it: the rollback of the drop that tripped it restores the key.
 	savedKey []byte
-	// nextCursor links the writer's open cursors (BtCursor.pNext,
-	// pager.cursors); linked says the cursor is on the list.
-	nextCursor *Cursor
-	linked     bool
 }
 
 // cursorState is the cursor's position state (btreeInt.h CURSOR_*).

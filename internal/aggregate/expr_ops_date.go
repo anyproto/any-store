@@ -600,13 +600,12 @@ func (e *DateDiffExpr) String() string {
 type DateTruncExpr struct {
 	Date      Expr
 	Unit      dateUnit
+	binSet    bool  // binSize was spelled explicitly: render it in String
 	Bin       int64 // effective binSize, >= 1
 	Loc       *time.Location
 	TZ        string
 	WeekStart time.Weekday
 	WeekName  string
-
-	binSet bool // binSize was spelled explicitly: render it in String
 }
 
 func parseDateTrunc(v *anyenc.Value) (Expr, error) {

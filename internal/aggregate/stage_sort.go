@@ -36,8 +36,8 @@ type SortStage struct {
 	order     []int // compaction scratch
 	seq       uint32
 
-	p     anyenc.Parser
 	built bool
+	p     anyenc.Parser
 	idx   int
 }
 

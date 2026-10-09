@@ -83,18 +83,11 @@ type pager struct {
 	writerOpMu  sync.Mutex
 	master      *masterStore // InMemory "disk" — holds checkpointed page data
 	header      dbHeader
-	path        string
 	pageSize    uint32
+	path        string
 	usableSize_ int           // pageSize - ReservedSpace; immutable after open, safe for concurrent reads
 	dbSize      atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
 	state       atomic.Int32  // pagerState
-
-	// closeInvalidated is set by rollbackForClose when DB.Close force-rolls
-	// back an in-flight write transaction. Writer-state guards consult it via
-	// writeStateErr so the abandoned writer goroutine observes ErrClosed
-	// rather than ErrReadOnly. Never cleared: once Close has invalidated the
-	// writer, the database is closing for good.
-	closeInvalidated atomic.Bool
 
 	// balanceQuickDispatchCount counts dispatches into splitLeafRightmostAppend.
 	// Test-only: production code never reads it (atomic load is ~ns). Used to
@@ -165,6 +158,15 @@ type pager struct {
 	// pagerStress callback. Modeled after SQLite's Pager.doNotSpill (pager.c:648).
 	doNotSpill uint8
 
+	// inProcess uses heap-backed shm (faster, single-process only)
+	inProcess bool
+
+	// noCommitSync skips fdatasync on WAL commit (deferred durability)
+	noCommitSync bool
+
+	// inMemory keeps the entire database in memory with no files on disk
+	inMemory bool
+
 	// Reusable slice for collecting dirty pages during commit
 	dirtyBuf []*page
 
@@ -217,14 +219,6 @@ type pager struct {
 	// (MVCC snapshot) pages, avoiding per-read-transaction heap allocations.
 	// Inspired by SQLite's pcache1 free-list recycling (pcache1.c:429-465).
 	pagePool sync.Pool
-	// inProcess uses heap-backed shm (faster, single-process only)
-	inProcess bool
-
-	// noCommitSync skips fdatasync on WAL commit (deferred durability)
-	noCommitSync bool
-
-	// inMemory keeps the entire database in memory with no files on disk
-	inMemory bool
 
 	// openDev / openIno capture the (device, inode) identity of the live DB
 	// file at open time. openIdentOK reports whether that identity could be
@@ -242,6 +236,13 @@ type pager struct {
 	// useSlab is set once by btree.Open from Options.UsePageSlab.
 	// Local bool — no atomic/global reads on hot path.
 	useSlab bool
+
+	// closeInvalidated is set by rollbackForClose when DB.Close force-rolls
+	// back an in-flight write transaction. Writer-state guards consult it via
+	// writeStateErr so the abandoned writer goroutine observes ErrClosed
+	// rather than ErrReadOnly. Never cleared: once Close has invalidated the
+	// writer, the database is closing for good.
+	closeInvalidated atomic.Bool
 
 	// mmapSize caps the DB-file mmap region. 0 disables. Populated
 	// from Options.MmapSize at open time; the dbMmap fetcher reads
@@ -285,9 +286,9 @@ type pager struct {
 // savepointState captures the state needed to rollback to a savepoint.
 type savepointState struct {
 	id        int
-	dbSize    uint32
 	schemaSeq uint64            // pager.schemaSeq as the savepoint opened
 	pages     map[uint32][]byte // pgno -> copy of page data before modification
+	dbSize    uint32
 	// walHdr captures the WAL frame count + cumulative checksums at savepoint
 	// time. Only three fields of the hdr are consulted on rollback:
 	//   - mxFrame: truncate-back target for spill frames

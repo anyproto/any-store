@@ -1425,8 +1425,8 @@ type wal struct {
 	file     fileHandle
 	header   walHeader
 	index    *walIndex
-	pageSize uint32
 	path     string
+	pageSize uint32
 	nFrame   atomic.Uint32 // total frames written (atomic: read by readFrame, written by writeFrames)
 
 	// Cumulative checksum state for appending frames

@@ -71,16 +71,43 @@ func registryKeyForOpenFile(f fileHandle, fallback string) string {
 
 // Options configures the database.
 type Options struct {
-	PageSize  uint32 // Page size in bytes (default: 4096)
-	CacheSize int    // Maximum number of cached pages (default: 2000)
-
-	// DisableAutoCheckpoint disables auto-checkpoint entirely (manual Checkpoint() only).
-	DisableAutoCheckpoint bool
+	CacheSize int // Maximum number of cached pages (default: 2000)
 
 	// AutoCheckpointAfter is the number of WAL frames after which an
 	// automatic passive checkpoint is triggered. 0 means use default (10000).
 	// Ignored when DisableAutoCheckpoint is true.
 	AutoCheckpointAfter int
+
+	// MaxReaders is the maximum number of concurrent read transactions per DB.
+	// Each reader holds a private pcache with up to CacheSize pages that
+	// persist across transactions (matching SQLite's per-connection cache).
+	// Total reader cache memory per DB is bounded by
+	// MaxReaders * CacheSize * PageSize.
+	// Default: 4.
+	MaxReaders int
+
+	// MmapSize enables mmap-backed reads of the database file up to the
+	// given byte limit. Zero disables mmap (reads use pread via ReadAt).
+	// Values > 0 allocate a shared mapping of min(DBsize, MmapSize)
+	// bytes; reads falling within the mapping memcpy from it instead of
+	// issuing pread. Writes still go through WriteAt and are coherent
+	// via the OS unified page cache. Matches SQLite's PRAGMA mmap_size
+	// (sqlitec/src/os_unix.c:4240 SQLITE_FCNTL_MMAP_SIZE).
+	//
+	// Linux/darwin + amd64/arm64 only; no-op on other platforms.
+	//
+	// SAFETY: enabling trades a small perf win for SIGBUS-crash tail
+	// risk on file-shrink / device-removal events (USB unplug, iCloud
+	// eviction, NFS timeout). Go cannot recover from SIGBUS; the whole
+	// process dies. Only enable on stable local storage. Do NOT enable
+	// on mobile / networked filesystems / cloud sync paths. See
+	// anystore.Config.MmapSize for the full rationale.
+	MmapSize int64
+
+	PageSize uint32 // Page size in bytes (default: 4096)
+
+	// DisableAutoCheckpoint disables auto-checkpoint entirely (manual Checkpoint() only).
+	DisableAutoCheckpoint bool
 
 	// InProcess uses heap-backed shared memory for the WAL index instead of
 	// mmap'd files with POSIX fcntl locks. Faster, but restricts access to a
@@ -110,14 +137,6 @@ type Options struct {
 	// The path argument to Open is ignored and can be any string.
 	InMemory bool
 
-	// MaxReaders is the maximum number of concurrent read transactions per DB.
-	// Each reader holds a private pcache with up to CacheSize pages that
-	// persist across transactions (matching SQLite's per-connection cache).
-	// Total reader cache memory per DB is bounded by
-	// MaxReaders * CacheSize * PageSize.
-	// Default: 4.
-	MaxReaders int
-
 	// UsePageSlab opts this DB into the global pre-allocated page buffer slab.
 	// The slab must be initialized beforehand via ConfigPageCache (btree) or
 	// InitPageBuffer (anystore). When false (default), page buffers use
@@ -125,6 +144,13 @@ type Options struct {
 	UsePageSlab bool
 
 	// BEGIN ENCRYPTION
+	// Checksum, when true, installs a no-encryption page-checksum codec
+	// (XXH3-128 trailer, 16 bytes per page). Mutually exclusive with
+	// Key and Codec — combining them returns an error from Open.
+	// Conceptually mirrors SQLite's cksumvfs extension. See
+	// docs/btree/specs/integrity.md.
+	Checksum bool
+
 	// Key enables page-level AES-256-GCM encryption when non-nil.
 	// Accepted forms:
 	//   - len 32: raw AES-256 key, used directly (no KDF).
@@ -151,36 +177,11 @@ type Options struct {
 	// concurrent use.
 	Codec Codec
 
-	// Checksum, when true, installs a no-encryption page-checksum codec
-	// (XXH3-128 trailer, 16 bytes per page). Mutually exclusive with
-	// Key and Codec — combining them returns an error from Open.
-	// Conceptually mirrors SQLite's cksumvfs extension. See
-	// docs/btree/specs/integrity.md.
-	Checksum bool
-
 	// OnIntegrityError, if non-nil, is fired by the installed codec
 	// (cksum or AEAD) on every per-page integrity failure. Same hook
 	// for both modes. Runs on the I/O goroutine; must not block.
 	OnIntegrityError func(pgno uint32, inner error)
 	// END ENCRYPTION
-
-	// MmapSize enables mmap-backed reads of the database file up to the
-	// given byte limit. Zero disables mmap (reads use pread via ReadAt).
-	// Values > 0 allocate a shared mapping of min(DBsize, MmapSize)
-	// bytes; reads falling within the mapping memcpy from it instead of
-	// issuing pread. Writes still go through WriteAt and are coherent
-	// via the OS unified page cache. Matches SQLite's PRAGMA mmap_size
-	// (sqlitec/src/os_unix.c:4240 SQLITE_FCNTL_MMAP_SIZE).
-	//
-	// Linux/darwin + amd64/arm64 only; no-op on other platforms.
-	//
-	// SAFETY: enabling trades a small perf win for SIGBUS-crash tail
-	// risk on file-shrink / device-removal events (USB unplug, iCloud
-	// eviction, NFS timeout). Go cannot recover from SIGBUS; the whole
-	// process dies. Only enable on stable local storage. Do NOT enable
-	// on mobile / networked filesystems / cloud sync paths. See
-	// anystore.Config.MmapSize for the full rationale.
-	MmapSize int64
 }
 
 // BEGIN ENCRYPTION
@@ -322,6 +323,7 @@ type DB struct {
 	closing         atomic.Bool // set to reject new transactions
 	closed          atomic.Bool // set when Close() is actually called
 	writerLocksDone atomic.Bool // CAS guard: writer lock cleanup (endRead+RUnlock+Unlock) runs exactly once
+	closeOnce       sync.Once   // guards closing closeCh
 
 	// Namespace root pages are stored in a master table on page 1.
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
@@ -367,8 +369,7 @@ type DB struct {
 	readerSem chan struct{}
 	// closeCh is closed when the DB is shutting down, unblocking any
 	// goroutines waiting on readerSem in BeginRead.
-	closeCh   chan struct{}
-	closeOnce sync.Once // guards closing closeCh
+	closeCh chan struct{}
 
 	// lastAutoCheckpointErr stores the most recent non-nil error from
 	// tx.pager.tryCheckpoint() during auto-checkpoint. Allows monitoring
@@ -1662,10 +1663,10 @@ type ReadTx struct {
 	// local values (see BeginReadFast's contract).
 	snapFileChangeCounter uint32
 	snapSchemaCookie      uint32
+	closed                bool
+	writable              bool // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
 	// aux is the caller's per-transaction state (see Aux).
-	aux                    any
-	closed                 bool
-	writable               bool // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
+	aux any
 }
 
 // WalMaxFrame returns the reader's snapshot mxFrame. Prefer this over

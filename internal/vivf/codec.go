@@ -51,8 +51,8 @@ type meta struct {
 	assign    int  // closure factor used at build (informational)
 	nprobe    int  // default cells to scan at search
 	normalize bool // cosine: vectors stored/queried unit-normalized
-	count     int64
 	nextLabel uint32
+	count     int64
 
 	// Drift tracking (cheap, maintained incrementally): centroid quality decays as
 	// the data distribution shifts away from the build-time centroids. reconBase is

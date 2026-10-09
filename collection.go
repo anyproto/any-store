@@ -159,12 +159,6 @@ func newCollection(db *db, name string, tx *btree.ReadTx) (*collection, *collSch
 }
 
 type collection struct {
-	// modifiers is the modifiers of this collection running right now
-	// (runModifier). Read inside a write scope (writable), where the one
-	// live write transaction of the db is the caller's: a count above zero
-	// there is the caller's own modifier.
-	modifiers atomic.Int32
-
 	// head is the current committed schema version, nil while none is
 	// installed: the newest state this process knows. The open write
 	// transaction's own changes are in its log until its commit installs
@@ -176,6 +170,10 @@ type collection struct {
 
 	compression Compression // 0 = use db default
 
+	// openName is the name the handle was opened under: what the collection
+	// is called while no version is installed.
+	openName string
+
 	// identity identifies the collection this handle stands for: the coll:
 	// record value (the catalog token) followed by the data namespace's root
 	// page, fixed at the first load (identify); empty until then. A view
@@ -186,10 +184,6 @@ type collection struct {
 	// knows a collection by it, besides its name (db.byIdentity).
 	identity string
 	dataRoot uint32
-
-	// openName is the name the handle was opened under: what the collection
-	// is called while no version is installed.
-	openName string
 
 	// since is the cookie the handle is proven from: the epoch's known at
 	// the moment it entered the registry, or the cookie of the commit this
@@ -216,11 +210,6 @@ type collection struct {
 	// sketchSeen is the db.sketchEpoch the sketches of this handle were last
 	// brought up to (refreshSketches).
 	sketchSeen atomic.Uint64
-
-	// sketchDirty and ftsDirty record membership in db.sketchDirty and
-	// db.ftsDirty; writer-owned like the lists.
-	sketchDirty bool
-	ftsDirty    bool
 
 	// pinned counts the entries of the open write transaction's schema log
 	// that reference this handle (txSchema.log): its creation, each schema
@@ -249,6 +238,18 @@ type collection struct {
 	// how the writer finds its version of the handle without a scan.
 	// Writer-owned, like the log.
 	logLast int
+
+	// sketchDirty and ftsDirty record membership in db.sketchDirty and
+	// db.ftsDirty; writer-owned like the lists.
+	sketchDirty bool
+	ftsDirty    bool
+
+	// modifiers is the modifiers of this collection running right now
+	// (runModifier). Read inside a write scope (writable), where the one
+	// live write transaction of the db is the caller's: a count above zero
+	// there is the caller's own modifier.
+	modifiers atomic.Int32
+
 	// closePending records a Close() that waits for pinned to reach zero
 	// (db.unpinLocked). An open that hands this handle to a caller in between
 	// clears it (db.handOut). Written under db.mu.

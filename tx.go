@@ -129,9 +129,6 @@ type commonTx struct {
 	readTx  *btree.ReadTx
 	writeTx *btree.WriteTx
 	version atomic.Uint64
-	// modified: atomic, as SetModified is public and a handle of an ended
-	// transaction may still call it while the commit reads it.
-	modified atomic.Bool
 
 	// schema is the transaction's own schema state (txSchema), reached
 	// through the btree transaction's Aux slot, which holds the commonTx,
@@ -163,6 +160,9 @@ type commonTx struct {
 	// sketches: the btree tx changed the schema (schemaCommitted).
 	committed    func(fileChangeCounter, schemaCookie uint32)
 	schemaChange bool
+	// modified: atomic, as SetModified is public and a handle of an ended
+	// transaction may still call it while the commit reads it.
+	modified atomic.Bool
 
 	// iters is the open iterators that hold cursors on the transaction —
 	// pinned pages of its btree tx. The transaction's end trips them

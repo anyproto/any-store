@@ -41,15 +41,6 @@ type Config struct {
 	// default value is 2MiB
 	SyncPoolElementMaxSize int
 
-	// CommitSync forces fsync on every WAL commit (like SQLite synchronous=FULL in WAL mode).
-	// When false (default), fsync is deferred to checkpoint time, which reduces write latency
-	// at the cost of losing the last committed transaction(s) on power loss.
-	CommitSync bool
-
-	// DisableAutoCheckpoint disables WAL auto-checkpoint entirely.
-	// When true, checkpoint must be triggered manually or via durability auto-flush.
-	DisableAutoCheckpoint bool
-
 	// AutoCheckpointAfter overrides the default WAL auto-checkpoint threshold (10000 frames).
 	// Only used when DisableAutoCheckpoint is false. 0 means use default.
 	AutoCheckpointAfter int
@@ -68,6 +59,15 @@ type Config struct {
 	// modest on small devices.
 	ReadConcurrency int
 
+	// CommitSync forces fsync on every WAL commit (like SQLite synchronous=FULL in WAL mode).
+	// When false (default), fsync is deferred to checkpoint time, which reduces write latency
+	// at the cost of losing the last committed transaction(s) on power loss.
+	CommitSync bool
+
+	// DisableAutoCheckpoint disables WAL auto-checkpoint entirely.
+	// When true, checkpoint must be triggered manually or via durability auto-flush.
+	DisableAutoCheckpoint bool
+
 	// InMemory keeps the entire database in memory with no files on disk.
 	// The database does not survive process crashes. When true, InProcess
 	// and CommitSync=false are forced on automatically.
@@ -83,6 +83,22 @@ type Config struct {
 	// When false (default), page buffers use sync.Pool (GC-managed, like
 	// SQLite's default malloc mode).
 	UseGlobalPageBuffer bool
+
+	// ContinueOnIntegrityError, when true, lets reads of corrupt pages
+	// return their (potentially garbage) bytes instead of erroring with
+	// ErrPageIntegrity. The OnIntegrityError callback still fires —
+	// only the error-return is suppressed. Mirror of cksumvfs's
+	// `PRAGMA checksum_verification = OFF`.
+	//
+	// Default (false) is the safe choice: corrupt pages cause reads to
+	// fail, callers see the error, app halts or recovers. Enable only
+	// for forensic dumps where you'd rather read garbage than not be
+	// able to read at all.
+	//
+	// Honored only in checksum mode. AEAD-encrypted databases ignore
+	// this flag (disabling AEAD verification would return attacker-
+	// controlled plaintext, defeating the cipher).
+	ContinueOnIntegrityError bool
 
 	// MmapSize enables mmap-backed reads of the database file up to the
 	// given byte limit. Zero (default) disables mmap — reads use pread
@@ -144,22 +160,6 @@ type Config struct {
 	// no post-Open setter — the codebase favors config-at-Open over
 	// runtime mutation.
 	OnIntegrityError func(IntegrityError)
-
-	// ContinueOnIntegrityError, when true, lets reads of corrupt pages
-	// return their (potentially garbage) bytes instead of erroring with
-	// ErrPageIntegrity. The OnIntegrityError callback still fires —
-	// only the error-return is suppressed. Mirror of cksumvfs's
-	// `PRAGMA checksum_verification = OFF`.
-	//
-	// Default (false) is the safe choice: corrupt pages cause reads to
-	// fail, callers see the error, app halts or recovers. Enable only
-	// for forensic dumps where you'd rather read garbage than not be
-	// able to read at all.
-	//
-	// Honored only in checksum mode. AEAD-encrypted databases ignore
-	// this flag (disabling AEAD verification would return attacker-
-	// controlled plaintext, defeating the cipher).
-	ContinueOnIntegrityError bool
 }
 
 // EncryptionConfig enables page-level encryption of the database file.
@@ -247,6 +247,10 @@ const (
 )
 
 type DurabilityConfig struct {
+	// Sentinel enables the sentinel file (.lock) that tracks database dirty state
+	// When true (default is false), the sentinel file is used to detect unclean shutdowns and perform QuickCheck on open
+	Sentinel bool
+
 	// Enable auto-flush according to IdleAfter and FlushMode
 	AutoFlush bool
 
@@ -257,10 +261,6 @@ type DurabilityConfig struct {
 	// FlushMode specifies how to autoflush data during idle periods
 	// Default: FlushModeCheckpointPassive
 	FlushMode FlushMode
-
-	// Sentinel enables the sentinel file (.lock) that tracks database dirty state
-	// When true (default is false), the sentinel file is used to detect unclean shutdowns and perform QuickCheck on open
-	Sentinel bool
 }
 
 func (c *Config) setDefaults() {

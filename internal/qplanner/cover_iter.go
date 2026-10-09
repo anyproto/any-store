@@ -15,12 +15,12 @@ type CoverIter struct {
 	// ScalarProven mirrors CBOIndex.ScalarProven (see IndexIter).
 	ScalarProven bool
 
+	multiKeyProbed bool // lazy: probe runs on the first Next when len(Bounds) > 1
+	hasMultiKey    bool
+
 	idx     int
 	keyBuf  []byte // reusable buffer for SeekKey results
 	seekBuf []byte // reusable buffer for the padded seek key (inverted tail)
-
-	multiKeyProbed bool // lazy: probe runs on the first Next when len(Bounds) > 1
-	hasMultiKey    bool
 }
 
 func (it *CoverIter) Next() (key []byte, docId []byte, multiKey bool, err error) {

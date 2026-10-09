@@ -33,12 +33,6 @@ type pcache struct {
 	nPage    int     // number of pages currently in apHash (was len(pc.pages))
 	maxPages int     // maximum number of cached pages
 	pageSize int     // size of each page in bytes
-	useSlab  bool    // resolved once at creation; true when slab allocator is active
-
-	// purgeable controls whether the cache can evict pages.
-	// When false (InMemory databases), pages are never evicted and the
-	// cache can grow beyond maxPages. Matches SQLite's pcache1.bPurgeable.
-	purgeable bool
 
 	// LRU list for clean pages (dirty pages are not evicted)
 	lruHead     *page
@@ -95,6 +89,13 @@ type pcache struct {
 	// fallback at pager.c:3300).
 	dbSize uint32
 
+	useSlab bool // resolved once at creation; true when slab allocator is active
+
+	// purgeable controls whether the cache can evict pages.
+	// When false (InMemory databases), pages are never evicted and the
+	// cache can grow beyond maxPages. Matches SQLite's pcache1.bPurgeable.
+	purgeable bool
+
 	// pFree is a per-cache list of reusable page structs with data buffers.
 	// In non-slab mode, initBulk() pre-allocates up to 20 pages from the heap
 	// (marked isBulkLocal=true). In slab mode, initBulk is a no-op (SQLite
@@ -102,8 +103,8 @@ type pcache struct {
 	// accumulate in pFree during clear() for reuse across transactions.
 	// Matches SQLite pcache1.c:201 (pFree), pcache1.c:297-330 (pcache1InitBulk),
 	// pcache1.c:434-438 (tries pFree first), pcache1.c:470-475 (isBulkLocal→pFree).
-	pFree    []*page
 	bulkInit bool // true after initBulk() has been called
+	pFree    []*page
 
 	// xStress is invoked when the cache is full and all clean pages are
 	// exhausted. It should write the dirty page to WAL and call makeClean.
