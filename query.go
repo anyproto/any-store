@@ -1286,7 +1286,9 @@ func ratesBefore(a, b *index) bool {
 // set, so the index is rated on the wide bounds it seeks with. tx == nil (unit
 // tests) means no proof — wide seeks.
 func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult, idxs []*index, tx *btree.ReadTx, countOnly bool, totalDocs int) []qplanner.CBOIndex {
-	result := buf
+	// One candidate per index, allocated once; the rare ordered second
+	// candidate grows it.
+	result := slices.Grow(buf, len(idxs))
 
 	var sortFields []query.SortField
 	if q.sort != nil {
