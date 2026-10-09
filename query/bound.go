@@ -59,6 +59,41 @@ func (b Bound) PadInclusiveEnd() Bound {
 	return b
 }
 
+// PadInclusiveEnds is PadInclusiveEnd over every bound with an inclusive End,
+// in place. The padded keys that need new storage share one buffer, so a
+// $in of n values pays one allocation instead of n; an End with spare
+// capacity (the planner's tuple arena reserves the byte) is padded where it
+// is, exactly as PadInclusiveEnd would.
+func (bs Bounds) PadInclusiveEnds() Bounds {
+	size := 0
+	for i := range bs {
+		b := &bs[i]
+		if len(b.End) > 0 && b.EndInclude && cap(b.End) == len(b.End) {
+			size += len(b.End) + 1
+		}
+	}
+	var buf []byte
+	if size > 0 {
+		buf = make([]byte, 0, size)
+	}
+	for i := range bs {
+		b := &bs[i]
+		if len(b.End) == 0 || !b.EndInclude {
+			continue
+		}
+		if cap(b.End) > len(b.End) {
+			b.End = append(b.End, 0xff)
+		} else {
+			off := len(buf)
+			buf = append(buf, b.End...)
+			buf = append(buf, 0xff)
+			b.End = buf[off:len(buf):len(buf)]
+		}
+		b.endPad = true
+	}
+	return bs
+}
+
 // OpenStart returns b with an open lower side.
 func (b Bound) OpenStart() Bound {
 	b.Start, b.StartInclude, b.startEdge = nil, false, false

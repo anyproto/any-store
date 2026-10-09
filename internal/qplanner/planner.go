@@ -3372,12 +3372,7 @@ func HasExactFieldPrefix(k, p []byte, lastFieldInverted bool) bool {
 // AdjustBoundsForNonUnique adjusts End bounds in-place for non-unique indexes
 // by appending 0xff to capture all docId suffixes.
 func AdjustBoundsForNonUnique(bounds query.Bounds) query.Bounds {
-	for i := range bounds {
-		if len(bounds[i].End) > 0 && bounds[i].EndInclude {
-			bounds[i] = bounds[i].PadInclusiveEnd()
-		}
-	}
-	return bounds
+	return bounds.PadInclusiveEnds()
 }
 
 // boundsOverlap reports whether b intersects a in key space, given that a
