@@ -116,11 +116,6 @@ type searcher struct {
 	rtx   *btree.ReadTx
 	query []float32
 
-	// checkDeleted gates the per-visited-node tombstone read. When the index has
-	// no tombstones (the common case, and always during a fresh build) every node
-	// is live, so we skip that extra adjacency read entirely.
-	checkDeleted bool
-
 	// l0 is the RAM layer-0 mirror for hybrid-mode READ searches; when set,
 	// layer-0 neighbour and deleted lookups are served from it instead of the
 	// btree. nil on the write path (Insert), which must see the in-progress graph.
@@ -140,12 +135,6 @@ type searcher struct {
 	qbuf2  []byte    // quantized-record read buffer for vf2 (int8 mode)
 	recBuf []byte    // raw int8 record buffer for the byte-kernel distance path
 
-	// byteDistOn enables the int8 byte-kernel query distance (set only on the
-	// read/Search path, never during Insert, so builds stay on the float path).
-	// qsum is Σ of the query components — the offset-binary correction term.
-	byteDistOn bool
-	qsum       float32
-
 	// normBuf holds the unit-normalized query for a Cosine index (the stored
 	// vectors are normalized too, so distance is a dot product). Reused per op.
 	normBuf []float32
@@ -164,20 +153,16 @@ type searcher struct {
 	// Reused across inserts via the pooled searcher; reset at the start of Insert.
 	dirtyL0 []uint32
 
-	// write-path scratch reused by addNeighbor (insert connect phase, which runs
-	// after searchLayer so these don't overlap with the read buffers above).
-	naKey [4]byte // neighbour key buffer (field of the pooled searcher so the
-	//                  big-endian label key handed to the btree doesn't heap-escape
-	//                  per addNeighbor call)
-	naAdj []byte     // a's adjacency record read buffer
-	naEnc []byte     // re-encoded adjacency write buffer
-	naDec [][]uint32 // decoded per-layer neighbour lists (reused)
+	// byteDistOn enables the int8 byte-kernel query distance (set only on the
+	// read/Search path, never during Insert, so builds stay on the float path).
+	// qsum is Σ of the query components — the offset-binary correction term.
+	qsum       float32
+	byteDistOn bool
 
-	// neighbour-selection-heuristic scratch.
-	sel      []candidate // selected diverse neighbours (reused)
-	naCand   []candidate // candidate set for an addNeighbor prune (reused)
-	aVecBuf  []float32   // stable copy of the centre vector during a prune
-	keptVecs []float32   // RAM cache of kept-neighbour vectors (m*dim, reused)
+	// checkDeleted gates the per-visited-node tombstone read. When the index has
+	// no tombstones (the common case, and always during a fresh build) every node
+	// is live, so we skip that extra adjacency read entirely.
+	checkDeleted bool
 
 	// Vector cache (lever 1), consulted by vecOf/vec2Of on the insert path. Spans
 	// a whole write BATCH: across the inserts in one WriteTx the same hub vectors
@@ -192,6 +177,21 @@ type searcher struct {
 	// vcacheNext is the label high-water mark ("all cached labels < vcacheNext")
 	// used by beginVecCache's rollback detection.
 	vcacheNext uint32
+
+	// write-path scratch reused by addNeighbor (insert connect phase, which runs
+	// after searchLayer so these don't overlap with the read buffers above).
+	naKey [4]byte // neighbour key buffer (field of the pooled searcher so the
+	//                  big-endian label key handed to the btree doesn't heap-escape
+	//                  per addNeighbor call)
+	naAdj []byte     // a's adjacency record read buffer
+	naEnc []byte     // re-encoded adjacency write buffer
+	naDec [][]uint32 // decoded per-layer neighbour lists (reused)
+
+	// neighbour-selection-heuristic scratch.
+	sel      []candidate // selected diverse neighbours (reused)
+	naCand   []candidate // candidate set for an addNeighbor prune (reused)
+	aVecBuf  []float32   // stable copy of the centre vector during a prune
+	keptVecs []float32   // RAM cache of kept-neighbour vectors (m*dim, reused)
 }
 
 // beginVecCache turns the vector cache on for an insert and resets it at a batch
