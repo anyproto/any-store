@@ -6,6 +6,7 @@ import (
 	"slices"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
@@ -462,6 +463,23 @@ func (it *VectorScoreIter) Next() (key []byte, docId []byte, multiKey bool, err 
 		// document shape the driver plan streams past its k-cut.
 		it.Buf.DocBuf, err = it.Data.AppendValue(id, it.Buf.DocBuf[:0])
 		if err != nil {
+			if err == btree.ErrKeyNotFound {
+				// Deleted since the probe kept it (a write of the same
+				// transaction): yielded as kept, without a document —
+				// the public iterator's Doc fails with ErrDocNotFound,
+				// its distance stands. DocParsed cleared so that no
+				// stage reads the previous row's document as this one's.
+				if it.Plan != nil {
+					it.Plan.DocParsed = nil
+					if it.Spec.NeedDistances {
+						if it.Plan.Distances == nil {
+							it.Plan.Distances = &FloatSidecar{}
+						}
+						it.Plan.Distances.Set(id, float64(c.dist))
+					}
+				}
+				return id, id, false, nil
+			}
 			return nil, nil, false, err
 		}
 		doc, perr := it.Buf.Parser.ParseOwned(it.Buf.DocBuf)

@@ -151,12 +151,13 @@ func (q *aggQuery) prefixQuery(ctx context.Context) (*collQuery, aggregate.Pipel
 		return nil, nil, err
 	}
 	return &collQuery{
-		c:          q.c,
-		cond:       prefix.Filter,
-		sort:       prefix.Sort,
-		limit:      uint(prefix.Limit),
-		offset:     uint(prefix.Skip),
-		indexHints: q.hints,
+		c:            q.c,
+		cond:         prefix.Filter,
+		sort:         prefix.Sort,
+		limit:        uint(prefix.Limit),
+		offset:       uint(prefix.Skip),
+		indexHints:   q.hints,
+		lookupSource: aggregate.HasLookup(rest),
 	}, rest, nil
 }
 

@@ -88,8 +88,9 @@ type Collection interface {
 	// Returns an error if the operation fails.
 	EnsureIndex(ctx context.Context, info ...IndexInfo) (err error)
 
-	// DropIndex drops an index by its name.
-	// Returns an error if the operation fails.
+	// DropIndex drops an index by its name: ErrIndexNotFound for none of
+	// that name, ErrIterOpen while an iterator of the transaction is open
+	// on the collection.
 	DropIndex(ctx context.Context, indexName string) (err error)
 
 	// GetIndexes returns a list of indexes on the collection: range indexes
@@ -103,7 +104,8 @@ type Collection interface {
 	// reclaiming nodes and storage left behind by deletes and replaces (which only
 	// tombstone). It is synchronous and holds the write lock for the rebuild;
 	// prefer a maintenance window for large indexes. No-op when nothing is
-	// reclaimable or for a brute-force index. Returns ErrIndexNotFound if absent.
+	// reclaimable or for a brute-force index. Returns ErrIndexNotFound if absent,
+	// ErrIterOpen while an iterator of the transaction is open on the collection.
 	CompactVectorIndex(ctx context.Context, indexName string) error
 
 	// Stats returns the storage footprint of the collection: document count,
@@ -119,7 +121,8 @@ type Collection interface {
 	// Drop drops the collection. Later operations through the handle fail
 	// with ErrCollectionClosed: in the dropping transaction at once, for
 	// everyone once the drop commits. A rollback leaves the handle as it
-	// was.
+	// was. Refused with ErrIterOpen while an iterator of the transaction
+	// is open on the collection.
 	Drop(ctx context.Context) (err error)
 
 	// ReadTx starts a new read-only transaction. It's just a proxy to db object.
@@ -593,6 +596,25 @@ func (c *collection) runModifier(wtx WriteTx, mod query.Modifier, a *anyenc.Aren
 func (c *collection) writable() error {
 	if c.modifiers.Load() > 0 {
 		return ErrWriteInModifier
+	}
+	return nil
+}
+
+// droppable is the error that refuses a schema change which frees the
+// collection's trees — Drop, DropIndex, CompactVectorIndex — while an
+// iterator of the transaction is open on the collection (ErrIterOpen):
+// its cursors stand on those trees, or are created on them at its next
+// move — the planner opens its cursors at the first Next, the Doc
+// fallback at the first fallback — and would read the freed pages, or
+// what another tree of the transaction put there. Checked inside the
+// write scope, with the version the change starts from, once the change
+// has something to free: an index that does not exist, or a compaction
+// with nothing to rebuild, reports that first. SQLite refuses the drop
+// while another statement of the connection runs (OP_Destroy,
+// SQLITE_LOCKED); see commonTx.iterOpenOn.
+func (c *collection) droppable(wtx WriteTx, s *collSchema) error {
+	if wtx.iterOpenOn(s.ns.RootPage()) {
+		return ErrIterOpen
 	}
 	return nil
 }
@@ -1203,6 +1225,9 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 			if vi.info.Name != indexName {
 				continue
 			}
+			if txErr = c.droppable(wtx, s); txErr != nil {
+				return txErr
+			}
 			if txErr = c.db.removeIndex(tx, s.name, indexName); txErr != nil {
 				return
 			}
@@ -1237,6 +1262,9 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 		}
 		if !found {
 			return ErrIndexNotFound
+		}
+		if txErr = c.droppable(wtx, s); txErr != nil {
+			return txErr
 		}
 
 		// removeIndex tolerates an already-absent metadata key: a concurrent peer
@@ -1448,10 +1476,15 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 // closes it (txSchema.install) and takes it out of the registry
 // (settleLog); the dropping transaction's own later operations through it
 // fail with ErrCollectionClosed. A rollback leaves the handle as it was.
+// Refused while an iterator of the transaction is open on the collection
+// (droppable).
 func (c *collection) Drop(ctx context.Context) error {
 	return c.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
 		s, err := c.beginDDL(wtx)
 		if err != nil {
+			return err
+		}
+		if err = c.droppable(wtx, s); err != nil {
 			return err
 		}
 		// Discard buffered fts writes: Drop deletes the fts namespaces in this

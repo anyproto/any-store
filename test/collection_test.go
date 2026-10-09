@@ -2573,3 +2573,45 @@ func TestCreatedHandle_CloseDuringTx(t *testing.T) {
 		})
 	}
 }
+
+// Drop and DropIndex are refused while an iterator of the transaction is open
+// on the collection; a collection with no iterator drops, and the iterator
+// goes on past the refusal.
+func TestDrop_RefusedUnderOpenIterator(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "a", Fields: []string{"a"}}))
+	other, err := fx.CreateCollection(ctx, "d")
+	require.NoError(t, err)
+	for i := 0; i < 100; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%5))))
+	}
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	iter, err := coll.Find(`{"a":3}`).Iter(tx.Context())
+	require.NoError(t, err)
+	require.True(t, iter.Next())
+	assert.ErrorIs(t, coll.Drop(tx.Context()), anystore.ErrIterOpen)
+	assert.ErrorIs(t, coll.DropIndex(tx.Context(), "a"), anystore.ErrIterOpen)
+	require.NoError(t, other.Drop(tx.Context()))
+	var ids []int
+	for iter.Next() {
+		d, err := iter.Doc()
+		require.NoError(t, err)
+		ids = append(ids, d.Value().GetInt("id"))
+	}
+	require.NoError(t, iter.Err())
+	assert.Len(t, ids, 19)
+	require.NoError(t, iter.Close())
+	require.NoError(t, coll.DropIndex(tx.Context(), "a"))
+	require.NoError(t, coll.Drop(tx.Context()))
+	require.NoError(t, tx.Commit())
+
+	_, err = fx.OpenCollection(ctx, "c")
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	_, err = fx.OpenCollection(ctx, "d")
+	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}

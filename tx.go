@@ -89,6 +89,10 @@ type ReadTx interface {
 	// Unexported: iterator- and savepoint-internal.
 	savepointMark() uint64
 	tripItersFrom(mark uint64)
+
+	// Whether an open iterator of the transaction reads the collection
+	// whose data tree is root; see commonTx.iterOpenOn.
+	iterOpenOn(root uint32) bool
 }
 
 // commonTx is a transaction's pooled state (db.txPool): what the handles of
@@ -250,6 +254,27 @@ func (tx *commonTx) tripItersFrom(mark uint64) {
 		pi.trip(ErrIterRolledBack)
 		return true
 	})
+}
+
+// iterOpenOn reports an open iterator of the transaction on the collection
+// whose data tree is root — opened and not yet closed, advanced or not: a
+// schema change that frees the collection's trees — Drop, DropIndex,
+// CompactVectorIndex — is refused while one is (collection.droppable).
+// The iterator's cursors stand on those trees, or are created on them at
+// its next move; an aggregation's $lookup reads them through its inner
+// iterator's transaction (collQuery.lookupSource). SQLite's OP_Destroy
+// refuses while any other statement of the connection is running
+// (SQLITE_LOCKED, vdbe.c; a statement counts from its first step to its
+// end): with autovacuum a drop can move the root of another table; the
+// pages freed here are the dropped trees' own, so an iterator on another
+// collection goes on.
+func (tx *commonTx) iterOpenOn(root uint32) bool {
+	for _, pi := range tx.iters {
+		if pi.s.ns.RootPage() == root {
+			return true
+		}
+	}
+	return false
 }
 
 func (tx *commonTx) schemaLog() *txSchema {

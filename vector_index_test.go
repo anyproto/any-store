@@ -3,6 +3,7 @@ package anystore
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -1156,4 +1157,96 @@ func vectorMetaBytes(t *testing.T, d *db, collName, indexName string) []byte {
 		return err
 	}))
 	return raw
+}
+
+// A document the transaction deletes after the probe kept it is yielded as
+// kept: its Doc fails with ErrDocNotFound, its Distance stands and the scan
+// goes on to the end. The ANN driver skips it and yields the first k of the
+// candidates it collected, fewer once they run out. A sort over either plan
+// collects every row at the first Next and yields the deleted one the
+// probe's way.
+func TestKnnProbe_DeletedSinceKept(t *testing.T) {
+	const dim, n, k = 12, 200, 5
+	plans := []struct {
+		name string // the plan, as Explain names it
+		cond func(vecs [][]float32) query.Filter
+		hint IndexHint
+	}{
+		{"KnnProbeIds", func(v [][]float32) query.Filter {
+			return knnCond(v[30], k, idInFilter(0, 10, 20, 30, 40, 50, 60, 70, 80, 90))
+		}, IndexHint{IndexName: "id", Boost: 1 << 30}},
+		{"KnnProbeSeek", func(v [][]float32) query.Filter {
+			return knnCond(v[30], k, query.MustParseCondition(`{"a":3}`))
+		}, IndexHint{IndexName: "a", Boost: 1 << 30}},
+		{"KnnSearch", func(v [][]float32) query.Filter {
+			return knnCond(v[30], k, nil)
+		}, IndexHint{IndexName: "emb", Boost: 1 << 30}},
+	}
+	for _, mode := range []VectorMode{VectorModeBruteForce, VectorModeBTree} {
+		coll, vecs := knnProbeColl(t, mode, n, dim)
+		// run opens q in a write transaction, deletes gone after the first
+		// Next and drains: the ids yielded with a document, and the rows
+		// whose Doc failed with ErrDocNotFound, each at distance dist.
+		run := func(t *testing.T, q Query, gone int, dist float32) (got []int, missing int) {
+			t.Helper()
+			tx, err := coll.WriteTx(ctx)
+			require.NoError(t, err)
+			// A failed assertion leaves no writer behind the next subtest.
+			t.Cleanup(func() { _ = tx.Rollback() })
+			iter, err := q.Iter(tx.Context())
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = iter.Close() })
+			require.True(t, iter.Next())
+			require.NoError(t, coll.DeleteId(tx.Context(), gone))
+			for {
+				d, err := iter.Doc()
+				if errors.Is(err, ErrDocNotFound) {
+					assert.Equal(t, dist, iter.Distance())
+					missing++
+				} else {
+					require.NoError(t, err)
+					got = append(got, d.Value().GetInt("id"))
+				}
+				if !iter.Next() {
+					break
+				}
+			}
+			require.NoError(t, iter.Err())
+			require.NoError(t, iter.Close())
+			require.NoError(t, tx.Rollback())
+			return got, missing
+		}
+		for _, p := range plans {
+			cond := p.cond(vecs)
+			q := func() Query { return coll.Find(cond).IndexHint(p.hint) }
+			ex, err := q().Explain(ctx)
+			require.NoError(t, err)
+			require.True(t, strings.HasPrefix(ex.Plan, "Plan: "+p.name), ex.Plan)
+			expect, dists := collectKnn(t, q())
+			require.Len(t, expect, k)
+			gone := expect[2]
+			t.Run(fmt.Sprintf("%v/%s", mode, p.name), func(t *testing.T) {
+				got, missing := run(t, q(), gone, dists[2])
+				assert.NotContains(t, got, gone)
+				if p.name == "KnnSearch" {
+					// The first k candidates that remain: the next fills
+					// k while the candidates last.
+					assert.Equal(t, 0, missing)
+					assert.GreaterOrEqual(t, len(got), k-1)
+					assert.LessOrEqual(t, len(got), k)
+					return
+				}
+				assert.Equal(t, 1, missing)
+				assert.Equal(t, append([]int{expect[0], expect[1]}, expect[3:]...), got)
+			})
+			// The contract of a sort, under either plan; passes without the
+			// fix too: the sort drains the probe before the delete.
+			t.Run(fmt.Sprintf("%v/%s sorted", mode, p.name), func(t *testing.T) {
+				got, missing := run(t, q().Sort("-_distance"), gone, dists[2])
+				assert.Equal(t, 1, missing)
+				assert.NotContains(t, got, gone)
+				assert.Len(t, got, k-1)
+			})
+		}
+	}
 }
