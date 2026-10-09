@@ -2,6 +2,7 @@ package test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -2290,4 +2291,52 @@ func TestFulltextIndex_RedefinitionDetected(t *testing.T) {
 		Fulltext: &anystore.FulltextParams{Weights: map[string]float64{"title": 2}},
 	})
 	require.ErrorIs(t, err, anystore.ErrIndexMismatch)
+}
+
+// A $knn probe yields what it kept: a document the transaction deleted since
+// fails its Doc with ErrDocNotFound, and the scan goes on to its end.
+func TestKnn_DeletedSinceKept(t *testing.T) {
+	const k = 5
+	coll, vecs := setupPipeline(t, 300, 16)
+	filter := fmt.Sprintf(`{"id":{"$in":[0,10,20,30,40,50,60,70,80,90]},"v":%s}`, vknnJSON(vecs[30], k, 0))
+	ex, err := coll.Find(filter).Explain(ctx)
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(ex.Plan, "Plan: KnnProbe"), ex.Plan)
+	var expect []int
+	iter, err := coll.Find(filter).Iter(ctx)
+	require.NoError(t, err)
+	for iter.Next() {
+		d, err := iter.Doc()
+		require.NoError(t, err)
+		expect = append(expect, d.Value().GetInt("id"))
+	}
+	require.NoError(t, iter.Err())
+	require.NoError(t, iter.Close())
+	require.Len(t, expect, k)
+
+	tx, err := coll.WriteTx(ctx)
+	require.NoError(t, err)
+	iter, err = coll.Find(filter).Iter(tx.Context())
+	require.NoError(t, err)
+	require.True(t, iter.Next())
+	require.NoError(t, coll.DeleteId(tx.Context(), expect[2]))
+	var got []int
+	missing := 0
+	for {
+		d, err := iter.Doc()
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			missing++
+		} else {
+			require.NoError(t, err)
+			got = append(got, d.Value().GetInt("id"))
+		}
+		if !iter.Next() {
+			break
+		}
+	}
+	require.NoError(t, iter.Err())
+	require.NoError(t, iter.Close())
+	require.NoError(t, tx.Commit())
+	assert.Equal(t, 1, missing)
+	assert.Equal(t, append([]int{expect[0], expect[1]}, expect[3:]...), got)
 }

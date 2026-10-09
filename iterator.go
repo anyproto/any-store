@@ -24,15 +24,17 @@ import (
 // moves a document within the scan's order — an update of an indexed field
 // under an index scan — can make the scan visit the document again at its
 // new place, or miss it. A plan that collects its result before yielding
-// it — a sort the planner runs in memory, a $knn search — yields what it
+// it — a sort the planner runs in memory, a $knn probe — yields what it
 // collected: a document inserted since is not visited, one deleted since
-// makes its Doc fail with ErrDocNotFound. Doc returns the document as Next
-// read it. To mutate every matched document once, collect the ids during
-// iteration and mutate after Close — any-store's own Query.Update/Delete do
-// exactly that internally — or use those verbs directly. Through the same
-// transaction, Drop, DropIndex and CompactVectorIndex of the collection
-// fail with ErrIterOpen until the iterator is closed, advanced or not: they
-// free the trees it reads.
+// makes its Doc fail with ErrDocNotFound. The $knn search over the vector
+// index collects its candidates the same way and skips one deleted since:
+// it yields the first k that remain, fewer once they run out. Doc returns
+// the document as Next read it. To mutate every matched document once,
+// collect the ids during iteration and mutate after Close — any-store's
+// own Query.Update/Delete do exactly that internally — or use those verbs
+// directly. Through the same transaction, Drop, DropIndex and
+// CompactVectorIndex of the collection fail with ErrIterOpen until the
+// iterator is closed, advanced or not: they free the trees it reads.
 //
 // An Iterator belongs to one goroutine at a time. Opened with the context
 // of a transaction, its methods are calls on the transaction (see
