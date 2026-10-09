@@ -848,3 +848,54 @@ func TestWriteTx_ConcurrentCalls(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, doc.Value().GetInt("seen"))
 }
+
+// A write to the collection an iterator of the same transaction is scanning
+// leaves the scan on the key it stood on: every committed document and
+// every document inserted ahead of the position is yielded, none twice,
+// with no error.
+func TestWriteWhileIterating_ScanContinues(t *testing.T) {
+	pad := strings.Repeat("x", 316)
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%s"}`, id, pad))
+	}
+	for i := 0; i < 46; i++ {
+		require.NoError(t, coll.Insert(ctx, doc(i)))
+	}
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	iter, err := coll.Find(nil).Iter(tx.Context())
+	require.NoError(t, err)
+	require.True(t, iter.Next())
+	d, err := iter.Doc()
+	require.NoError(t, err)
+	require.Equal(t, 0, d.Value().GetInt("id"))
+	for i := 1000; i < 1130; i++ {
+		require.NoError(t, coll.Insert(tx.Context(), doc(i)))
+	}
+	require.NoError(t, coll.DeleteId(tx.Context(), 0)) // the document under the scan
+	require.NoError(t, coll.DeleteId(tx.Context(), 1))
+	require.NoError(t, coll.DeleteId(tx.Context(), 45))
+	got := []int{0}
+	for iter.Next() {
+		d, err := iter.Doc()
+		require.NoError(t, err)
+		got = append(got, d.Value().GetInt("id"))
+	}
+	require.NoError(t, iter.Err())
+	require.NoError(t, iter.Close())
+	var want []int
+	for i := 0; i < 45; i++ {
+		if i != 1 {
+			want = append(want, i)
+		}
+	}
+	for i := 1000; i < 1130; i++ {
+		want = append(want, i)
+	}
+	require.Equal(t, want, got)
+	require.NoError(t, tx.Commit())
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}

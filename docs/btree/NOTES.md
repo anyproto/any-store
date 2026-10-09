@@ -901,9 +901,12 @@ Key features:
 
 ```go
 type Cursor struct {
-    bt    *btree
-    stack []cursorFrame
-    valid bool
+    bt         *btree
+    stack      []cursorFrame
+    state      cursorState // invalid, valid, skipNext, requireSeek, fault
+    skipNext   int8        // side of the saved key a restored cursor landed on
+    savedKey   []byte      // the key a saved cursor seeks again
+    nextCursor *Cursor     // the writer's cursor list (pager.cursors)
 }
 type cursorFrame struct {
     pgno    uint32
@@ -913,10 +916,31 @@ type cursorFrame struct {
 ```
 
 Key features:
-- **2 states**: valid or invalid (no REQUIRESEEK/SKIPNEXT/FAULT)
+- **5 states** (`cursorState`): invalid, valid, skipNext, requireSeek, fault
+- **Save/restore**: a write transaction's cursors are linked on `pager.cursors`
+  (`BtShared.pCursor`, btree.c:4741). `btree.Put` / `btree.Delete` call
+  `pager.saveAllCursors(root)` before a page of the tree changes
+  (`sqlite3BtreeInsert` btree.c:9424, `sqlite3BtreeDelete` btree.c:9917), and copy
+  the caller's key and value when a cursor let a page go — they may be slices of
+  it (SQLite's writing cursor keeps its pages, `pExcept`, and its payload is the
+  VDBE's own). `WriteTx.RollbackToSavepoint` saves every root before the pager
+  plays the savepoint back (`sqlite3BtreeSavepoint` btree.c:4614); `DeleteNamespace`
+  trips the dropped root's cursors (`sqlite3BtreeTripAllCursors` btree.c:4467),
+  and the rollback of a savepoint opened before the drop revives them, while it
+  ends the cursors on a tree created inside it (`pager.schemaRolledBack`; the VDBE
+  trips every cursor on the rollback of a savepoint that changed the schema,
+  vdbe.c OP_Savepoint). A saved cursor copies its key and releases its pages
+  (`saveCursorPosition` btree.c:756); its next move or read seeks the key again
+  (`btreeRestoreCursorPosition` btree.c:896). The key gone, the cursor stands on a
+  neighbour in `cursorSkipNext`, and the move onward in the direction it landed —
+  `Next` after the key, `Previous` before it — yields the neighbour without
+  stepping (`btreeNext` btree.c:6315); a read of it reports `ErrKeyNotFound` (the
+  VDBE's nullRow, vdbeaux.c:3830). A move that fails ends the cursor
+  (`cursorFault`), as does the end of a write transaction in the pager's error
+  state.
 - **Dynamic stack** (slice, not fixed-size array)
 - **Only leaf page pinned** (interior pages released during descent)
-- **Read-only** (no write cursor support)
+- **Read-only** (no write cursor support; writes descend on their own)
 - **SeekNear optimization**: checks if target key is within current leaf bounds
 - **No overflow page cache**
 - **No cell info caching**
@@ -925,22 +949,30 @@ Key features:
 
 | Aspect | SQLite | Go |
 |--------|--------|-----|
-| States | 5 (VALID, INVALID, SKIPNEXT, REQUIRESEEK, FAULT) | 2 (valid, invalid) |
+| States | 5 (VALID, INVALID, SKIPNEXT, REQUIRESEEK, FAULT) | 5 (the same) |
 | Page stack | Fixed-size arrays (20 depth) | Dynamic slice |
 | Pinned pages | All pages in stack pinned | Only leaf page pinned |
 | Overflow cache | `aOverflow[]` | None |
 | Cell info cache | `CellInfo info` | None |
 | Write support | Full (BTCF_WriteFlag) | Read-only |
-| Save/restore | Automatic via `pKey`/`nKey` | Not supported |
-| Delete during iterate | `SKIPNEXT` mechanism | Not supported |
+| Save/restore | Automatic via `pKey`/`nKey` | Same: `savedKey`, `saveAllCursors` at Put / Delete / savepoint rollback |
+| Delete during iterate | `SKIPNEXT` mechanism | Same (`cursorSkipNext`) |
+| Cursor list | `BtShared.pCursor`, every cursor | `pager.cursors`, the writer's cursors only: a reader's cursor reads a snapshot no write touches |
+| Trip on tx rollback | `sqlite3BtreeTripAllCursors` | The layer above closes a transaction's iterators before the btree tx ends (tx.go tripIters); the list is reset with the write; a write ending in the pager's error state trips them |
+| Writer's payload | The VDBE's own; `pExcept` keeps the writing cursor's pages | Put / Delete copy key and value when a cursor let a page go |
+| Failed move | `moveToChild` falls back to the parent, the cursor stays VALID | The cursor is ended (`cursorFault`): an interior frame holds no key to save |
+| Drop under an open cursor | OP_Destroy refuses (SQLITE_LOCKED) while another statement runs | The cursor is tripped (`ErrNamespaceNotFound`); the rollback of the drop revives it |
 
 <a id="old-drift-readonly-two-state-cursor"></a>
 **Severity:** low
 
-**Classification: Structural** -- The Go cursor is significantly simpler, designed
-for read-only iteration. Write operations go through `btree.Put()` / `btree.Delete()`
-which do their own tree traversal rather than using a cursor. The lack of
-save/restore means cursors become invalid if the tree is modified.
+**Classification: Structural** -- The Go cursor is read-only: `btree.Put()` /
+`btree.Delete()` do their own tree traversal rather than driving a cursor, so there
+is no `BTCF_WriteFlag` / `BTCF_Multiple` accounting and `saveAllCursors` saves every
+cursor on the written root (SQLite skips the writing cursor itself). `FAULT` is
+reached by a dropped tree, a failed move, or a write transaction ending in the
+pager's error state: an ordinary transaction end never meets a live cursor, the
+layer above closes them first.
 
 ---
 
@@ -1174,7 +1206,7 @@ counter.
 | 12. MVCC | Divergent | High | Explicit uncached reads for goroutine safety |
 | 13. Corruption protection | Divergent | Low | Fixed 1GB cap vs page-count-based validation |
 | 14. Integrity check | Divergent | Low | Same core checks; auto-discovers trees |
-| 15. Cursor | Structural | High | Read-only; no save/restore; only leaf pinned |
+| 15. Cursor | Structural | Low | Read-only; save/restore as SQLite; only leaf pinned |
 | 16. Savepoints | Divergent | Medium | In-memory vs on-disk sub-journal |
 | 17. Auto-vacuum | Missing | Medium | Not implemented |
 | 18. Table B-trees | Structural | High | Not implemented; index B-trees only |

@@ -127,6 +127,20 @@ type pager struct {
 	// Savepoint support: snapshots of dirty pages at savepoint boundaries
 	savepoints []savepointState
 
+	// cursors is the writer's open cursors (BtShared.pCursor, btreeInt.h):
+	// the list saveAllCursors walks before a tree changes under them.
+	// Writer-goroutine only, like the writer cache they pin; reset as the
+	// write transaction ends. A reader's cursors are never on it.
+	cursors *Cursor
+	// schemaSeq counts the trees created and dropped in the write
+	// transaction; createdRoots are the roots created, with the count as
+	// they were. A savepoint records the count as it opens: its rollback
+	// revives the cursors a later drop tripped and ends the cursors on a
+	// later-created root (SQLite trips every cursor on the rollback of a
+	// savepoint that changed the schema, vdbe.c OP_Savepoint).
+	schemaSeq    uint64
+	createdRoots []createdRoot
+
 	// savedHeader is a snapshot of the database header at the start of the
 	// write transaction, used to restore p.header on rollback (fix 5.2).
 	savedHeader dbHeader
@@ -270,9 +284,10 @@ type pager struct {
 
 // savepointState captures the state needed to rollback to a savepoint.
 type savepointState struct {
-	id     int
-	dbSize uint32
-	pages  map[uint32][]byte // pgno -> copy of page data before modification
+	id        int
+	dbSize    uint32
+	schemaSeq uint64            // pager.schemaSeq as the savepoint opened
+	pages     map[uint32][]byte // pgno -> copy of page data before modification
 	// walHdr captures the WAL frame count + cumulative checksums at savepoint
 	// time. Only three fields of the hdr are consulted on rollback:
 	//   - mxFrame: truncate-back target for spill frames
@@ -2281,6 +2296,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		p.state.Store(int32(pagerOpen))
 		p.freeSavepointPageBuffers(0, len(p.savepoints))
 		p.savepoints = p.savepoints[:0]
+		p.resetCursors()
 		clear(p.hasContent)
 		p.wal.endWrite()
 		return 0, p.header.FileChangeCount, p.header.SchemaCookie, nil
@@ -2362,6 +2378,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 
 	p.freeSavepointPageBuffers(0, len(p.savepoints))
 	p.savepoints = p.savepoints[:0]
+	p.resetCursors()
 	clear(p.hasContent)
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
@@ -2415,6 +2432,7 @@ func (p *pager) unwindWriter() {
 		p.writerCache.clear()
 		p.freeSavepointPageBuffers(0, len(p.savepoints))
 		p.savepoints = p.savepoints[:0]
+		p.resetCursors()
 		clear(p.hasContent)
 		p.state.Store(int32(pagerOpen))
 		p.wal.endWrite()
@@ -2474,6 +2492,7 @@ func (p *pager) rollbackLocked() error {
 	p.doNotSpill &^= spillFlagRollback
 	p.freeSavepointPageBuffers(0, len(p.savepoints))
 	p.savepoints = p.savepoints[:0]
+	p.resetCursors()
 	clear(p.hasContent)
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
@@ -2532,6 +2551,13 @@ func (p *pager) rollbackForClose() {
 // DRIFT: pagerError eager-cleans (purge/WAL-rollback/unlock); C pager_error only sets errCode, defers See docs/btree/NOTES.md#old-drift-pagererror-eager-cleanup
 func (p *pager) pagerError() {
 	p.state.Store(int32(pagerError))
+
+	// The transaction's cursors are ended before the cache is purged
+	// (sqlite3BtreeRollback with a tripCode, btree.c:4526): they pin pages
+	// of it, and would otherwise be saved through a purged page by the
+	// next transaction's writes.
+	p.tripCursors(0, p.writeStateErr(), 0)
+	p.resetCursors()
 
 	// Purge the cache — its contents cannot be trusted after an error.
 	dirtyPages := p.writerCache.dirtyPages()
@@ -2605,9 +2631,10 @@ func (p *pager) savepoint() (int, error) {
 			id, dbSz, walFr, p.writerCache.nDirty, len(p.hasContent))
 	}
 	p.savepoints = append(p.savepoints, savepointState{
-		id:     id,
-		dbSize: dbSz,
-		pages:  make(map[uint32][]byte),
+		schemaSeq: p.schemaSeq,
+		id:        id,
+		dbSize:    dbSz,
+		pages:     make(map[uint32][]byte),
 		walHdr: WalIndexHdr{
 			isInit:      1,
 			mxFrame:     walFr,
@@ -2732,6 +2759,7 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	// savepoint active so it can be released or rolled back again later.
 	p.savepoints = p.savepoints[:id+1]
 
+	p.schemaRolledBack(sp.schemaSeq)
 	return nil
 }
 
@@ -3365,4 +3393,127 @@ func (p *pager) close() error {
 		return err
 	}
 	return nil
+}
+
+// createdRoot is a tree created in the write transaction: its root and
+// the schema count as it was created.
+type createdRoot struct {
+	root uint32
+	seq  uint64
+}
+
+// linkCursor adds a writer's cursor to the list the writes save
+// (btreeCursor, btree.c:4741).
+func (p *pager) linkCursor(c *Cursor) {
+	c.nextCursor = p.cursors
+	c.linked = true
+	p.cursors = c
+}
+
+// unlinkCursor removes a closed cursor from the list
+// (sqlite3BtreeCloseCursor, btree.c:4826). A cursor not on the list —
+// closed after the write transaction forgot it — touches nothing.
+func (p *pager) unlinkCursor(c *Cursor) {
+	if !c.linked {
+		return
+	}
+	if p.cursors == c {
+		p.cursors = c.nextCursor
+	} else {
+		for prev := p.cursors; prev != nil; prev = prev.nextCursor {
+			if prev.nextCursor == c {
+				prev.nextCursor = c.nextCursor
+				break
+			}
+		}
+	}
+	c.nextCursor = nil
+	c.linked = false
+}
+
+// saveAllCursors saves the position of every writer cursor open on the
+// tree rooted at root, every tree for root 0, before the tree is modified
+// (saveAllCursors, btree.c:806): the next move or read of each seeks its
+// key again. Reports whether a cursor let a pinned page go. The common
+// case, no cursor open, is the caller's nil check.
+func (p *pager) saveAllCursors(root uint32) (saved bool, err error) {
+	for c := p.cursors; c != nil; c = c.nextCursor {
+		if root != 0 && c.bt.rootPage != root {
+			continue
+		}
+		s, err := c.savePosition()
+		if err != nil {
+			return saved, err
+		}
+		saved = saved || s
+	}
+	return saved, nil
+}
+
+// tripCursors ends every writer cursor open on the tree rooted at root,
+// every tree for root 0, with err (sqlite3BtreeTripAllCursors,
+// btree.c:4467): their pages are released, and every later use reports
+// err. seq is the schema event that drops the tree, 0 for the end of a
+// failed write.
+func (p *pager) tripCursors(root uint32, err error, seq uint64) {
+	for c := p.cursors; c != nil; c = c.nextCursor {
+		if root == 0 || c.bt.rootPage == root {
+			c.trip(err, seq)
+		}
+	}
+}
+
+// rootCreated records a tree created in the transaction, for the
+// rollback of a savepoint opened before it.
+func (p *pager) rootCreated(root uint32) {
+	p.schemaSeq++
+	p.createdRoots = append(p.createdRoots, createdRoot{root: root, seq: p.schemaSeq})
+}
+
+// rootDropped ends the cursors open on a tree the transaction drops,
+// before its pages are freed; the drop's rollback revives them.
+func (p *pager) rootDropped(root uint32) {
+	p.schemaSeq++
+	p.tripCursors(root, ErrNamespaceNotFound, p.schemaSeq)
+}
+
+// schemaRolledBack is the rollback of a savepoint opened at schema count
+// seq: the trees dropped since are back, and their cursors go on from
+// their saved keys; the trees created since are gone, and the cursors on
+// them are ended for good.
+func (p *pager) schemaRolledBack(seq uint64) {
+	if p.schemaSeq == seq {
+		return
+	}
+	for c := p.cursors; c != nil; c = c.nextCursor {
+		if c.state == cursorFault && c.faultSeq > seq {
+			c.revive()
+		}
+	}
+	kept := p.createdRoots[:0]
+	for _, cr := range p.createdRoots {
+		if cr.seq > seq {
+			p.tripCursors(cr.root, ErrNamespaceNotFound, 0)
+			continue
+		}
+		kept = append(kept, cr)
+	}
+	p.createdRoots = kept
+	p.schemaSeq = seq
+}
+
+// resetCursors forgets the list and the schema events as the write
+// transaction ends: the transaction's cursors are closed by then (the
+// layer above closes an iterator's cursors before its transaction ends);
+// one that is not is unlinked here, and its Close touches no list.
+func (p *pager) resetCursors() {
+	for c := p.cursors; c != nil; {
+		next := c.nextCursor
+		c.nextCursor = nil
+		c.linked = false
+		c = next
+	}
+	p.cursors = nil
+	p.createdRoots = p.createdRoots[:0]
+	p.schemaSeq = 0
 }

@@ -9,7 +9,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
 func TestIterator_Doc(t *testing.T) {
@@ -236,8 +235,9 @@ func TestIterator_Doc_ErrorPropagates(t *testing.T) {
 	assert.Equal(t, "boom", err.Error())
 }
 
-// TestIterator_Doc_Fallback_SeekErr pins iterator.go:87-88 — when the data
-// cursor SeekExact fails (invalid docId), Doc() returns the btree error.
+// TestIterator_Doc_Fallback_SeekErr pins the Doc fallback: a docId the data
+// namespace does not hold — a document deleted since the plan collected it —
+// makes Doc fail with ErrDocNotFound.
 func TestIterator_Doc_Fallback_SeekErr(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "iter_doc_seek_err")
@@ -255,8 +255,8 @@ func TestIterator_Doc_Fallback_SeekErr(t *testing.T) {
 	pi.plan.DocParsed = nil
 
 	_, err = it.Doc()
-	require.ErrorIs(t, err, btree.ErrKeyNotFound,
-		"fallback with missing docId must surface the specific btree.ErrKeyNotFound sentinel")
+	require.ErrorIs(t, err, ErrDocNotFound,
+		"fallback with a missing docId reports ErrDocNotFound")
 }
 
 // TestIterator_Doc_FallbackPath forces the Doc() fallback branch

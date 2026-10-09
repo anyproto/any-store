@@ -1881,7 +1881,7 @@ func TestDelCurCov_DirectCursorSeekExactKeyError(t *testing.T) {
 // re-pin (and re-read) released pages. This mirrors SQLite's
 // btreeReleaseAllCursorPages setting pCur->iPage = -1 (btree.c:707): releasing
 // the pinned pages must also logically empty the stack, otherwise the
-// !c.valid && len(c.stack) == 0 emptiness guard in Next/Previous fails open and
+// invalid-with-empty-stack guard in Next/Previous fails open and
 // the leaf frame (now pg==nil) is misclassified as interior, re-pinning a
 // possibly-repurposed page.
 func TestDelCurCov_CursorCloseClearsStackNoRepin(t *testing.T) {
