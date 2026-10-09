@@ -311,7 +311,7 @@ func buildTextPlan(params *PlanParams) *Plan {
 	}
 
 	plan.Cost = best.cost
-	if !params.CountOnly {
+	if !params.CountOnly && !params.NoExplain {
 		explainCands := make([]CandidatePlan, 0, len(cands))
 		for ci := range cands {
 			c := cands[ci]

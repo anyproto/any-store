@@ -252,6 +252,41 @@ func TestRangeEstimates_MeasuredBroadRange(t *testing.T) {
 	assert.InDelta(t, 0.8, calculateSelectivity(filter, []CBOIndex{idx}, totalDocs, br), 1e-9)
 }
 
+// TestBuildPlan_NoExplainKeepsChoice: NoExplain drops the candidate report
+// and its allocations, and nothing else — the chosen plan is the same.
+func TestBuildPlan_NoExplainKeepsChoice(t *testing.T) {
+	const totalDocs = 1000
+	filter := query.MustParseCondition(`{"a": {"$gt": 5}}`)
+	build := func(noExplain bool) *Plan {
+		idx := CBOIndex{
+			Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Bounds:      mustParseBounds("a", `{"a": {"$gt": 5}}`),
+			BoundFields: 1,
+			ExactSort:   true,
+		}
+		idx.rangeSel, idx.rangeSelTight = 0.1, 0.1
+		return BuildPlan(&PlanParams{
+			Filter:    filter,
+			Sorter:    mustParseSort("a"),
+			TotalDocs: totalDocs,
+			Limit:     10,
+			Indexes:   []CBOIndex{idx},
+			NoExplain: noExplain,
+		})
+	}
+	full, bare := build(false), build(true)
+	assert.NotEmpty(t, full.Explain.Candidates)
+	assert.Empty(t, bare.Explain.Candidates)
+	assert.Equal(t, full.Name, bare.Name)
+	assert.Equal(t, full.IndexName, bare.IndexName)
+	assert.Equal(t, full.Cost, bare.Cost)
+	assert.Equal(t, full.Explain.Selectivity, bare.Explain.Selectivity)
+
+	withReport := testing.AllocsPerRun(50, func() { build(false) })
+	without := testing.AllocsPerRun(50, func() { build(true) })
+	assert.Less(t, without, withReport, "the report's names and closures must not be built")
+}
+
 // TestBuildPlan_OrderedScanPricesEntries: an ordered index scan walks and
 // fetches ENTRIES, so on a fan-out index its population is the in-range entry
 // count, not the capped document count, and a LIMIT needs proportionally more

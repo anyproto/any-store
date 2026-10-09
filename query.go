@@ -327,6 +327,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 			Buf:        buf,
 			IndexHints: q.buildIndexHints(),
 			CountOnly:  opts.countOnly,
+			NoExplain:  !opts.wantCandidates,
 			Fts:        ftsSpec,
 		}
 		probePossible := q.fillProbeInputs(btx, s, ftsResidual, sorter != nil, opts, params)
@@ -370,6 +371,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 			Buf:        buf,
 			IndexHints: q.buildIndexHints(),
 			CountOnly:  opts.countOnly,
+			NoExplain:  !opts.wantCandidates,
 			Vector:     vspec,
 		}
 		q.fillProbeInputs(btx, s, residual, false, opts, params)
@@ -413,6 +415,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 		Indexes:     cboIndexes,
 		IndexHints:  q.buildIndexHints(),
 		CountOnly:   opts.countOnly,
+		NoExplain:   !opts.wantCandidates,
 		FieldBounds: &br,
 	})
 	if opts.wantCandidates {

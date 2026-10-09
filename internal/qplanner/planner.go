@@ -209,6 +209,11 @@ type PlanParams struct {
 	// FilterIter are skipped (covering index count optimization).
 	CountOnly bool
 
+	// NoExplain says the caller never reads Plan.Explain (Iter and the
+	// write verbs): the candidate report — names, cost formulas and their
+	// closures — is not built. The plan choice never reads it.
+	NoExplain bool
+
 	// FieldBounds is an optional pre-computed bounds result.
 	// When set, calculateSelectivity uses cached bounds instead of calling
 	// filter.IndexBounds repeatedly (avoids ~N redundant filter tree traversals).
@@ -399,8 +404,9 @@ func BuildPlan(params *PlanParams) *Plan {
 
 	estimatedYield := totalDocs * pTotal
 
-	// Collect all candidate plans for explain output (skip when CountOnly to reduce allocations)
-	collectExplain := !params.CountOnly
+	// Collect all candidate plans for explain output (skipped when the
+	// caller never reads it: CountOnly, NoExplain)
+	collectExplain := !params.CountOnly && !params.NoExplain
 	var candidates []CandidatePlan
 	if collectExplain {
 		candidates = make([]CandidatePlan, 0, len(params.Indexes)+1)
