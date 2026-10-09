@@ -261,6 +261,16 @@ func (q *collQuery) writeSorter(opts planOpts) query.Sort {
 	return q.sort
 }
 
+// sortFields is the sort's field list, resolved once per planning pass:
+// Sort.Fields allocates, and the candidates' sort flags, the ordered channel
+// and the planner all read it.
+func (q *collQuery) sortFields() []query.SortField {
+	if q.sort == nil {
+		return nil
+	}
+	return q.sort.Fields()
+}
+
 // compilePlan is the single query compiler shared by the verbs. It owns the
 // source guards (validateSources), $text detection (detectFtsQuery +
 // ftsSorter), $knn detection (detectKnnQuery), and CBO input assembly
@@ -399,13 +409,20 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 	if opts.exactTotalDocs {
 		totalDocs = q.docCountExact(btx, s, countIdxs)
 	}
-	br := q.buildBoundsResult(idxs, btx, totalDocs, sorter != nil)
-	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly, totalDocs)
+	sortFields := q.sortFields()
+	br := q.buildBoundsResult(idxs, btx, totalDocs, sorter != nil, sortFields)
+	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly, totalDocs, sortFields)
+	// sorter is q.sort or nil (writeSorter), so its fields are these.
+	var planSortFields []query.SortField
+	if sorter != nil {
+		planSortFields = sortFields
+	}
 	plan = qplanner.BuildPlan(&qplanner.PlanParams{
 		Tx:          btx,
 		DataNs:      s.ns,
 		Filter:      q.cond,
 		Sorter:      sorter,
+		SortFields:  planSortFields,
 		IDBounds:    idBounds,
 		PrimaryKey:  q.c.primaryKey,
 		Limit:       int(q.limit),
@@ -966,8 +983,9 @@ func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, s *collSchema, residual q
 	probePossible = idFixed
 	params.TotalDocs = q.docCountForPlan(btx, s, idxs)
 	if len(idxs) > 0 {
-		br := q.buildBoundsResult(idxs, btx, params.TotalDocs, needSort)
-		params.Indexes = q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly, params.TotalDocs)
+		sortFields := q.sortFields()
+		br := q.buildBoundsResult(idxs, btx, params.TotalDocs, needSort, sortFields)
+		params.Indexes = q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly, params.TotalDocs, sortFields)
 		params.FieldBounds = &br
 		for i := range params.Indexes {
 			if len(params.Indexes[i].Bounds) > 0 || (needSort && params.Indexes[i].ExactSort) ||
@@ -1190,7 +1208,7 @@ func isIDOnlyFilterNode(f query.Filter, pk string) bool {
 // conjunct its rating index's statistics rate most selective
 // (BoundsResult.BuildWithProbe); withOrder (the plan sorts) also keeps the
 // conjunct that lets a single-field index provide the order.
-func (q *collQuery) buildBoundsResult(idxs []*index, tx *btree.ReadTx, totalDocs int, withOrder bool) qplanner.BoundsResult {
+func (q *collQuery) buildBoundsResult(idxs []*index, tx *btree.ReadTx, totalDocs int, withOrder bool, sortFields []query.SortField) qplanner.BoundsResult {
 	var br qplanner.BoundsResult
 	var idxInfoBuf [8]*qplanner.IndexInfo
 	idxInfos := idxInfoBuf[:0]
@@ -1198,17 +1216,11 @@ func (q *collQuery) buildBoundsResult(idxs []*index, tx *btree.ReadTx, totalDocs
 		idxInfos = append(idxInfos, idxs[i].cboInfo)
 	}
 	// The compound case needs the scalar proof regardless, and a proven
-	// index seeks the tight channel anyway (buildCBOIndexesInto). The sort
-	// fields are resolved on the first rated field: Sort.Fields allocates,
-	// and most sorted queries rate nothing.
+	// index seeks the tight channel anyway (buildCBOIndexesInto).
 	var ordered func(string, query.Bounds) bool
 	if withOrder && q.sort != nil {
-		var sf []query.SortField
 		ordered = func(field string, bs query.Bounds) bool {
-			if sf == nil {
-				sf = q.sort.Fields()
-			}
-			return len(sf) > 0 && field == sf[0].Field && qplanner.OrderKeeping(bs, sf[0].Reverse)
+			return len(sortFields) > 0 && field == sortFields[0].Field && qplanner.OrderKeeping(bs, sortFields[0].Reverse)
 		}
 	}
 	// Range conjuncts are interpolated through a cursor over the rating
@@ -1288,15 +1300,10 @@ func ratesBefore(a, b *index) bool {
 // (qplanner.FanOut): over fan-out data the intersection describes no document
 // set, so the index is rated on the wide bounds it seeks with. tx == nil (unit
 // tests) means no proof — wide seeks.
-func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult, idxs []*index, tx *btree.ReadTx, countOnly bool, totalDocs int) []qplanner.CBOIndex {
+func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult, idxs []*index, tx *btree.ReadTx, countOnly bool, totalDocs int, sortFields []query.SortField) []qplanner.CBOIndex {
 	// One candidate per index, allocated once; the rare ordered second
 	// candidate grows it.
 	result := slices.Grow(buf, len(idxs))
-
-	var sortFields []query.SortField
-	if q.sort != nil {
-		sortFields = q.sort.Fields()
-	}
 
 	for _, idx := range idxs {
 		// Lazy scalar-proof: at most one systemNS point Get per index per

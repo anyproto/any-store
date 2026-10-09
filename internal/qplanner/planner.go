@@ -190,6 +190,10 @@ type PlanParams struct {
 	Sorter   query.Sort
 	IDBounds query.Bounds
 
+	// SortFields is Sorter.Fields(), when the caller resolved it already; the
+	// planner reads it through sortFields, which resolves it once otherwise.
+	SortFields []query.SortField
+
 	// PrimaryKey is the collection's primary-key field. Empty ⇒ "id". A single
 	// Sort on this field needs no SortIter because a full scan already yields
 	// primary-key order.
@@ -228,6 +232,14 @@ type PlanParams struct {
 	// source and ignores all other indexes. Filter (the residual, minus the
 	// $text clause) and Sorter still apply as downstream stages.
 	Fts *FtsQuerySpec
+}
+
+// sortFields returns Sorter's field list, resolved once per plan.
+func (p *PlanParams) sortFields() []query.SortField {
+	if p.SortFields == nil && p.Sorter != nil {
+		p.SortFields = p.Sorter.Fields()
+	}
+	return p.SortFields
 }
 
 // IndexHintParam mirrors the public IndexHint type.
@@ -440,7 +452,7 @@ func BuildPlan(params *PlanParams) *Plan {
 	// key is free.
 	fullScanNeedSort := needSort
 	if needSort {
-		fields := params.Sorter.Fields()
+		fields := params.sortFields()
 		pk := params.PrimaryKey
 		if pk == "" {
 			pk = "id"
@@ -1308,7 +1320,7 @@ func orderedLeadIn(params *PlanParams, idx *CBOIndex) float64 {
 		n := float64(sk.Estimate(0, b.Start)) - float64(sk.EntryCount(0))/float64(max(sk.Size, 1))
 		return max(n, 0), true
 	}
-	gap, ok := leadInBound(idx.Bounds, ComputeSingleFieldBounds(idx.Info, pick), shouldReverse(params.Sorter, idx),
+	gap, ok := leadInBound(idx.Bounds, ComputeSingleFieldBounds(idx.Info, pick), shouldReverse(params.sortFields(), idx),
 		float64(params.Limit+params.Offset), est)
 	if !ok {
 		return 0
@@ -1657,7 +1669,7 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 
 	idSorted := false
 	if needSort {
-		fields := params.Sorter.Fields()
+		fields := params.sortFields()
 		pk := params.PrimaryKey
 		if pk == "" {
 			pk = "id"
@@ -1746,7 +1758,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	}
 
 	// Determine reverse scan direction
-	reverse := shouldReverse(params.Sorter, idx)
+	reverse := shouldReverse(params.sortFields(), idx)
 
 	// Check for unique index point lookup (CoverIter shortcut).
 	// Only safe when ALL index fields are covered by equality bounds;
@@ -1962,7 +1974,7 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 	// Pre-pad bounds for CanonicalKeyDedupIter (bare field values); padded
 	// bounds for IndexIter (full keys) — see buildIndexSeekChain.
 	dedupBounds := finalizeIndexBounds(idx)
-	reverse := shouldReverse(params.Sorter, idx)
+	reverse := shouldReverse(params.sortFields(), idx)
 
 	var root Iterator = &IndexIter{
 		Source: &CursorSource{
@@ -2054,11 +2066,7 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 // the output is re-sorted by a SortIter, so the scan direction is immaterial and
 // a stale SortMatchStart (0) is harmless. Direction is only load-bearing when
 // ExactSort==true, and then SortMatchStart is set correctly.
-func shouldReverse(sorter query.Sort, idx *CBOIndex) bool {
-	if sorter == nil {
-		return false
-	}
-	fields := sorter.Fields()
+func shouldReverse(fields []query.SortField, idx *CBOIndex) bool {
 	if len(fields) == 0 {
 		return false
 	}
