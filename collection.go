@@ -134,9 +134,11 @@ type Collection interface {
 	WriteTx(ctx context.Context) (WriteTx, error)
 
 	// Close releases the handle: later operations through it fail with
-	// ErrCollectionClosed. A handle that changed the schema in a write
-	// transaction is released once that change is committed or rolled back,
-	// and stays open if the collection is opened again before that.
+	// ErrCollectionClosed. A handle a write transaction changed the schema
+	// through, or ran a query.Modifier of, is released once that change or
+	// operation commits or rolls back — with the transaction, or with a
+	// savepoint that encloses it — and stays open if the collection is
+	// opened again before that.
 	Close() error
 }
 
@@ -222,7 +224,8 @@ type collection struct {
 
 	// pinned counts the entries of the open write transaction's schema log
 	// that reference this handle (txSchema.log): its creation, each schema
-	// change made through it, and the mark a verb leaves when it begins.
+	// change made through it, and the mark a verb leaves when it changes
+	// the schema or runs a modifier (logPin).
 	// While it is non-zero the handle stays the collection's one registered
 	// handle. A second one — built from the writer's view or from the
 	// committed one — would not follow the transaction's outcome: its
@@ -573,8 +576,18 @@ func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err erro
 
 // runModifier runs a user modifier inside the write scope wtx as a callback
 // of the call (callbackBegin): the calls it makes on the transaction nest
-// in this one, and a write to this collection is refused (writable).
+// in this one, and a write to this collection is refused (writable). The
+// handle is pinned in the transaction's log first (logPin), as a schema
+// change pins it: a Close() while the modifier runs then waits for the
+// operation's scope to end — the transaction's commit or rollback, or the
+// rollback of a savepoint enclosing the operation. Evicted at once, the
+// handle would be replaced by an
+// open by name with a second one that counts no modifier, and a write
+// through that one — a verb, a $merge/$out sink — would pass the gate.
 func (c *collection) runModifier(wtx WriteTx, mod query.Modifier, a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+	if err := c.logPin(wtx); err != nil {
+		return nil, false, err
+	}
 	wtx.callbackBegin()
 	defer wtx.callbackEnd()
 	c.modifiers.Add(1)
