@@ -70,7 +70,7 @@ type ReadTx interface {
 	// A call on the transaction begins and ends; see txHandle.enter. The
 	// call that ends the transaction, or a savepoint, begins with enterEnd.
 	enter()
-	enterEnd(cbDepth int32) error
+	enterEnd() error
 	exit()
 
 	// A user callback the current call runs begins and ends, and how many
@@ -107,9 +107,16 @@ type ReadTx interface {
 // context, and the helpers of a call reach it through the context that
 // marks the transaction held (heldTx). What the operation running the
 // modifier holds — the collection's schema and document it loaded, the
-// btree tx — the modifier must not pull away: a write to that collection
-// (collection.writable) and an end of the transaction or of a savepoint
-// enclosing the modifier (enterEnd) are refused. Two calls at once, from
+// btree tx, the scope its writes land in — the modifier must not pull
+// away or layer over: a write to that collection (collection.writable),
+// an end of the transaction or of a savepoint (enterEnd), and a savepoint
+// of its own (db.WriteTx) are refused. SQLite refuses the same while a
+// write statement runs — SAVEPOINT, RELEASE and COMMIT fail with "SQL
+// statements in progress" (vdbe.c OP_Savepoint, OP_AutoCommit) — and lets
+// a ROLLBACK or ROLLBACK TO through, aborting the statements in progress
+// (sqlite3RollbackAll, sqlite3BtreeTripAllCursors), which this refuses
+// instead: the modifier returns an error to fail its operation. Two calls
+// at once, from
 // two goroutines, are a misuse the handle detects the way the runtime
 // detects concurrent map writes: best effort, with a panic
 // (ErrTxConcurrentCalls); an end waits the other call out instead.
@@ -411,21 +418,16 @@ func (h *txHandle) enter() {
 	}
 }
 
-// enterEnd begins the call that ends the transaction, or a savepoint
-// opened while cbDepth callbacks were running. From inside a callback the
-// transaction or the savepoint encloses, the end is refused
-// (ErrTxEndInModifier): the operation running the callback holds the btree
-// tx. From inside a callback the savepoint was opened in, it nests. An
+// enterEnd begins the call that ends the transaction, or a savepoint.
+// From inside a callback the end is refused (ErrTxEndInModifier): the
+// operation running the callback holds the btree tx, and every savepoint
+// open was opened outside the callback (db.WriteTx), so encloses it. An
 // overlap it waits out instead of refusing: a deferred Rollback must end
 // the transaction after a refused call, or the writer lock is held for
 // good.
-func (h *txHandle) enterEnd(cbDepth int32) error {
-	switch cb := h.callbacks.Load(); {
-	case cb > cbDepth:
+func (h *txHandle) enterEnd() error {
+	if h.callbacks.Load() > 0 {
 		return ErrTxEndInModifier
-	case cb > 0:
-		h.enter()
-		return nil
 	}
 	for !h.calls.CompareAndSwap(0, 1) {
 		runtime.Gosched()
@@ -466,7 +468,7 @@ type readTx struct {
 }
 
 func (r readTx) Commit() error {
-	if err := r.enterEnd(0); err != nil {
+	if err := r.enterEnd(); err != nil {
 		return err
 	}
 	defer r.exit()
@@ -494,7 +496,7 @@ func (w writeTx) unwind() error {
 }
 
 func (w writeTx) Rollback() error {
-	if err := w.enterEnd(0); err != nil {
+	if err := w.enterEnd(); err != nil {
 		return err
 	}
 	defer w.exit()
@@ -508,7 +510,7 @@ func (w writeTx) Rollback() error {
 // Commit is the call that ends the transaction; commit is the work, kept
 // apart so that its defers stay open-coded.
 func (w writeTx) Commit() error {
-	if err := w.enterEnd(0); err != nil {
+	if err := w.enterEnd(); err != nil {
 		return err
 	}
 	defer w.exit()
@@ -601,9 +603,11 @@ var savepointPool = &sync.Pool{
 }
 
 // newSavepointTx opens a savepoint on parent, inside a call on it, for a
-// call made with ctx. held marks a savepoint of an enclosing call's scope
-// (enterWriteTx): its own methods begin no call, and the context it hands
-// out marks the transaction as held for the calls made through it.
+// call made with ctx. A savepoint handed out (db.WriteTx) opens outside
+// any callback. held marks a savepoint of an enclosing call's scope
+// (enterWriteTx), opened inside a callback when the call is a modifier's
+// write: its own methods begin no call, and the context it hands out
+// marks the transaction as held for the calls made through it.
 func newSavepointTx(ctx context.Context, parent WriteTx, held bool) (WriteTx, error) {
 	btWtx := parent.btreeWriteTx()
 	// Flush buffered full-text writes BEFORE creating the savepoint, so their
@@ -626,7 +630,7 @@ func newSavepointTx(ctx context.Context, parent WriteTx, held bool) (WriteTx, er
 	sp := savepointPool.Get().(*savepointTx)
 	version := sp.reset(spId, len(parent.schemaLog().log))
 	parent.savepointOpened(sp)
-	return savepointWrapper{WriteTx: parent, sp: sp, version: version, held: held, cbDepth: parent.callbackDepth(), ctx: ctx}, nil
+	return savepointWrapper{WriteTx: parent, sp: sp, version: version, held: held, ctx: ctx}, nil
 }
 
 // savepointTx is a savepoint's pooled state: what the parent's stack marks
@@ -756,14 +760,13 @@ func (sp *savepointTx) releaseImages(enclosing *savepointTx) {
 // savepointWrapper is a savepoint's handle: the parent it was opened on —
 // the pooled state and the call counters are reached through it — and
 // what is this handle's own, immutable: the savepoint's version, whether
-// the handle is a held one (newSavepointTx), the callbacks running when it
-// was opened (enterEnd), and the context it was opened with.
+// the handle is a held one (newSavepointTx), and the context it was
+// opened with.
 type savepointWrapper struct {
 	WriteTx
 	sp      *savepointTx
 	version uint64
 	held    bool
-	cbDepth int32
 	ctx     context.Context
 }
 
@@ -807,7 +810,7 @@ func (w savepointWrapper) SetModified() {
 // claims the savepoint.
 func (w savepointWrapper) Commit() error {
 	if !w.held {
-		if err := w.enterEnd(w.cbDepth); err != nil {
+		if err := w.enterEnd(); err != nil {
 			return err
 		}
 		defer w.exit()
@@ -829,7 +832,7 @@ func (w savepointWrapper) Commit() error {
 
 func (w savepointWrapper) Rollback() error {
 	if !w.held {
-		if err := w.enterEnd(w.cbDepth); err != nil {
+		if err := w.enterEnd(); err != nil {
 			return err
 		}
 		defer w.exit()

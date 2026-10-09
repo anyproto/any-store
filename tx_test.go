@@ -44,6 +44,25 @@ func (f *blockingFilter) IndexBounds(_ string, bs query.Bounds) query.Bounds { r
 
 func (f *blockingFilter) String() string { return "blocking" }
 
+// blockingModifier parks the modifier it runs until released, like
+// blockingFilter.
+type blockingModifier struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingModifier() *blockingModifier {
+	return &blockingModifier{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (m *blockingModifier) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+	m.once.Do(func() { close(m.entered) })
+	<-m.release
+	v.Set("m", a.NewNumberInt(1))
+	return v, true, nil
+}
+
 func TestDb_WriteTx(t *testing.T) {
 	t.Run("err other instance", func(t *testing.T) {
 		fx := newFixture(t)
@@ -539,12 +558,11 @@ func TestTx_NestedCalls(t *testing.T) {
 	})
 
 	// What the operation running the modifier holds, the modifier must not
-	// pull away: an end of the transaction, or of a savepoint enclosing
-	// the modifier, and a write to the collection are refused. A savepoint
-	// opened inside the modifier ends inside it, and other collections —
-	// one opened inside the modifier included — take writes and schema
-	// changes.
-	t.Run("ends refused inside a modifier", func(t *testing.T) {
+	// pull away or layer over: an end of the transaction or of a savepoint,
+	// a savepoint of its own, and a write to the collection are refused.
+	// Other collections — one opened inside the modifier included — take
+	// writes and schema changes.
+	t.Run("ends and savepoints refused inside a modifier", func(t *testing.T) {
 		m := setup(t)
 		sp, err := m.db.WriteTx(m.tx.Context())
 		require.NoError(t, err)
@@ -554,13 +572,12 @@ func TestTx_NestedCalls(t *testing.T) {
 			assert.ErrorIs(t, sp.Commit(), ErrTxEndInModifier)
 			assert.ErrorIs(t, sp.Rollback(), ErrTxEndInModifier)
 			inner, err := m.db.WriteTx(m.tx.Context())
-			if err != nil {
-				return nil, false, err
-			}
-			if err = m.refs.Insert(inner.Context(), anyenc.MustParseJson(`{"id":"inner"}`)); err != nil {
-				return nil, false, err
-			}
-			if err = inner.Commit(); err != nil {
+			assert.ErrorIs(t, err, ErrSavepointInModifier)
+			assert.Nil(t, inner)
+			inner, err = m.coll.WriteTx(m.tx.Context())
+			assert.ErrorIs(t, err, ErrSavepointInModifier)
+			assert.Nil(t, inner)
+			if err := m.refs.Insert(m.tx.Context(), anyenc.MustParseJson(`{"id":"inner"}`)); err != nil {
 				return nil, false, err
 			}
 			v.Set("v", a.NewNumberInt(1))
@@ -635,6 +652,154 @@ func TestTx_NestedCalls(t *testing.T) {
 		assertQueryCount(t, fresh.Find(`{"b":1}`), 1)
 		require.Len(t, fresh.GetIndexes(), 1)
 	})
+}
+
+// A savepoint a modifier opens would sit above the scope of the operation
+// running it, and the operation's later writes would land inside it: a
+// rollback from a later call of a bulk verb's modifier undid the verb's
+// writes between the calls. The open is refused instead.
+func TestWriteTx_SavepointRefusedInBulkModifier(t *testing.T) {
+	setup := func(t *testing.T) (*fixture, Collection, Collection, WriteTx) {
+		fx := newFixture(t)
+		c, err := fx.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		d, err := fx.CreateCollection(ctx, "d")
+		require.NoError(t, err)
+		for i := range 3 {
+			require.NoError(t, c.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":0}`, i))))
+		}
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		return fx, c, d, tx
+	}
+
+	// The shape of the bug: opened on the first call, rolled back on the
+	// third. Unrefused, the rollback undid the first two documents' writes.
+	t.Run("refusal ignored: every document written", func(t *testing.T) {
+		fx, c, d, tx := setup(t)
+		var sp WriteTx
+		var opens, ends []error
+		n := 0
+		res, err := c.Find(nil).Update(tx.Context(), query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			n++
+			switch {
+			case n == 1:
+				var err error
+				sp, err = fx.WriteTx(tx.Context())
+				opens = append(opens, err)
+			case n == 3 && sp != nil:
+				ends = append(ends, sp.Rollback())
+			}
+			if err := d.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, n))); err != nil {
+				return nil, false, err
+			}
+			v.Set("v", a.NewNumberInt(1))
+			return v, true, nil
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, ModifyResult{Matched: 3, Modified: 3}, res)
+		require.Len(t, opens, 1)
+		assert.ErrorIs(t, opens[0], ErrSavepointInModifier)
+		assert.Nil(t, sp)
+		assert.Empty(t, ends)
+		n, err = c.Find(`{"v":1}`).Count(tx.Context())
+		require.NoError(t, err)
+		assert.Equal(t, 3, n)
+		require.NoError(t, tx.Commit())
+		assertQueryCount(t, c.Find(`{"v":1}`), 3)
+		assertCollCount(t, d, 3)
+		require.NoError(t, fx.IntegrityCheck(ctx))
+	})
+
+	t.Run("refusal returned: the verb fails, the transaction goes on", func(t *testing.T) {
+		fx, c, d, tx := setup(t)
+		_, err := c.Find(nil).Update(tx.Context(), query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			if err := d.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1}`)); err != nil {
+				return nil, false, err
+			}
+			_, err := fx.WriteTx(tx.Context())
+			return nil, false, err
+		}))
+		assert.ErrorIs(t, err, ErrSavepointInModifier)
+		// The verb's scope is rolled back, the modifier's insert with it.
+		n, err := d.Find(nil).Count(tx.Context())
+		require.NoError(t, err)
+		assert.Equal(t, 0, n)
+		require.NoError(t, c.Insert(tx.Context(), anyenc.MustParseJson(`{"id":3,"v":0}`)))
+		require.NoError(t, tx.Commit())
+		assertQueryCount(t, c.Find(`{"v":1}`), 0)
+		assertCollCount(t, c, 4)
+		assertCollCount(t, d, 0)
+	})
+}
+
+// A modifier refuses the writes to its collection made from inside it,
+// in its own transaction: a write from another transaction waits for the
+// writer lock, as it does behind any transaction, and lands once the
+// modifier's transaction has ended.
+func TestWriteTx_ModifierRefusesOnlyItsOwnTransaction(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
+
+	m := newBlockingModifier()
+	held := make(chan error, 1)
+	go func() {
+		_, err := coll.UpdateId(ctx, 1, m)
+		held <- err
+	}()
+	<-m.entered
+
+	writes := map[string]func() error{
+		"insert": func() error {
+			return coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":2}`))
+		},
+		"bulk update": func() error {
+			_, err := coll.Find(`{"id":1}`).Update(ctx, `{"$set":{"b":1}}`)
+			return err
+		},
+		"ensure index": func() error {
+			return coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}})
+		},
+		"explicit tx": func() error {
+			tx, err := fx.WriteTx(ctx)
+			if err != nil {
+				return err
+			}
+			if err = coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":3,"a":3}`)); err != nil {
+				return errors.Join(err, tx.Rollback())
+			}
+			return tx.Commit()
+		},
+	}
+	type result struct {
+		name string
+		err  error
+	}
+	results := make(chan result, len(writes))
+	for name, write := range writes {
+		go func() { results <- result{name, write()} }()
+	}
+	// Each write began while the modifier runs: none ends before it.
+	select {
+	case r := <-results:
+		t.Fatalf("%s returned while the modifier runs: %v", r.name, r.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(m.release)
+	require.NoError(t, <-held)
+	for range writes {
+		r := <-results
+		assert.NoError(t, r.err, r.name)
+	}
+
+	doc, err := coll.FindId(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, doc.Value().GetInt("m"))
+	assert.Equal(t, 1, doc.Value().GetInt("b"))
+	assertCollCount(t, coll, 3)
+	require.Len(t, coll.GetIndexes(), 1)
 }
 
 // A call on a transaction another goroutine has ended finds it ended, and

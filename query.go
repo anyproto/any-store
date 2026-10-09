@@ -597,9 +597,6 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(wtx WriteTx, btWt
 		}
 	}()
 
-	if err = q.c.writable(); err != nil {
-		return
-	}
 	tx, entered, err := q.c.db.enterWriteTx(ctx)
 	if err != nil {
 		return
@@ -624,6 +621,12 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(wtx WriteTx, btWt
 			committed = true
 		}
 	}()
+
+	// Inside the scope, as the single-document writes check it
+	// (collection.writable).
+	if err = q.c.writable(); err != nil {
+		return
+	}
 
 	// Resolved inside the tx scope, for its view (collection.resolve) — the
 	// entry check alone would let this bulk write proceed through a handle

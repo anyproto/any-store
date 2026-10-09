@@ -1197,6 +1197,14 @@ func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {
 	if err = db.usable(wtx); err != nil {
 		return nil, err
 	}
+	// From inside a modifier the savepoint is refused: it would sit above
+	// the scope of the operation running the modifier, and that operation's
+	// later writes would land inside it — a rollback of it from a later
+	// call of the modifier undid them. SQLite refuses the same: "cannot
+	// open savepoint - SQL statements in progress" (vdbe.c OP_Savepoint).
+	if wtx.callbackDepth() > 0 {
+		return nil, ErrSavepointInModifier
+	}
 	// The savepoint is handed out: this call ends with the method, and
 	// the savepoint's methods are calls of their own.
 	if !held {

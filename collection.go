@@ -155,8 +155,9 @@ func newCollection(db *db, name string, tx *btree.ReadTx) (*collection, *collSch
 
 type collection struct {
 	// modifiers is the modifiers of this collection running right now
-	// (runModifier): a write to the collection waits for none and is
-	// refused while one runs (writable).
+	// (runModifier). Read inside a write scope (writable), where the one
+	// live write transaction of the db is the caller's: a count above zero
+	// there is the caller's own modifier.
 	modifiers atomic.Int32
 
 	// head is the current committed schema version, nil while none is
@@ -579,9 +580,16 @@ func (c *collection) runModifier(wtx WriteTx, mod query.Modifier, a *anyenc.Aren
 }
 
 // writable is the error that refuses a write to, or a schema change of,
-// the collection while one of its modifiers runs (ErrWriteInModifier): the
-// operation running the modifier loaded the document and resolved the
-// schema it writes with.
+// the collection from inside one of its modifiers (ErrWriteInModifier):
+// the operation running the modifier loaded the document and resolved the
+// schema it writes with. Checked inside the write scope: a modifier runs
+// in a write transaction, and the btree admits one at a time
+// (btree.DB.BeginWrite, writeMu), so a modifier seen from inside a scope
+// runs in the scope's own transaction. A write from another transaction
+// waits for the writer lock instead; one made from inside the modifier
+// with a context that carries no transaction waits for the lock its own
+// transaction holds until the database closes, as such a write to any
+// other collection does.
 func (c *collection) writable() error {
 	if c.modifiers.Load() > 0 {
 		return ErrWriteInModifier
@@ -590,34 +598,33 @@ func (c *collection) writable() error {
 }
 
 // doWriteTx, doWriteTxW, doWriteTxModified and doWriteTxModifiedW are the
-// db's, for a write to this collection: refused while a modifier of the
-// collection runs (writable).
+// db's, for a write to this collection: refused, inside the scope, while
+// a modifier of the collection runs (writable).
 func (c *collection) doWriteTx(ctx context.Context, do func(tx *btree.WriteTx) error) error {
-	if err := c.writable(); err != nil {
-		return err
-	}
-	return c.db.doWriteTx(ctx, do)
+	return c.doWriteTxW(ctx, func(_ WriteTx, tx *btree.WriteTx) error {
+		return do(tx)
+	})
 }
 
 func (c *collection) doWriteTxW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) error) error {
-	if err := c.writable(); err != nil {
-		return err
-	}
-	return c.db.doWriteTxW(ctx, do)
+	return c.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (bool, error) {
+		return true, do(wtx, tx)
+	})
 }
 
 func (c *collection) doWriteTxModified(ctx context.Context, do func(tx *btree.WriteTx) (bool, error)) error {
-	if err := c.writable(); err != nil {
-		return err
-	}
-	return c.db.doWriteTxModified(ctx, do)
+	return c.doWriteTxModifiedW(ctx, func(_ WriteTx, tx *btree.WriteTx) (bool, error) {
+		return do(tx)
+	})
 }
 
 func (c *collection) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) (bool, error)) error {
-	if err := c.writable(); err != nil {
-		return err
-	}
-	return c.db.doWriteTxModifiedW(ctx, do)
+	return c.db.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (bool, error) {
+		if err := c.writable(); err != nil {
+			return false, err
+		}
+		return do(wtx, tx)
+	})
 }
 
 func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error) {

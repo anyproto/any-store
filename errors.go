@@ -99,9 +99,12 @@ var (
 	// while a call from another goroutine is in progress on it; the check is
 	// best effort.
 	ErrTxConcurrentCalls = errors.New("any-store: concurrent calls on one transaction")
-	// ErrTxEndInModifier refuses a Commit or Rollback made from inside a
-	// modifier the transaction, or the savepoint, encloses (txHandle.enterEnd).
+	// ErrTxEndInModifier refuses a Commit or Rollback of a transaction or
+	// a savepoint made from inside a modifier (txHandle.enterEnd).
 	ErrTxEndInModifier = errors.New("any-store: transaction ended from inside a modifier")
+	// ErrSavepointInModifier refuses a savepoint opened from inside a
+	// modifier (db.WriteTx with the transaction's context).
+	ErrSavepointInModifier = errors.New("any-store: savepoint opened from inside a modifier")
 	// ErrWriteInModifier refuses a write to, or a schema change of, a
 	// collection from inside one of its own modifiers (collection.writable).
 	ErrWriteInModifier = errors.New("any-store: collection written from inside its modifier")
