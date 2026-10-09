@@ -2,6 +2,7 @@ package anystore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -1172,4 +1173,241 @@ func TestCollection_UpdateLeavesUnchangedIndexes(t *testing.T) {
 			assert.Equal(t, float64(1), doc.Value().GetFloat64("v"))
 		})
 	}
+}
+
+// Drop, DropIndex and CompactVectorIndex are refused while an iterator of
+// the transaction is open on the collection: its cursors stand on the trees
+// they free, or are created on them at its next move. The refusal leaves
+// the iterator and the transaction as they were.
+func TestCollection_DropRefusedUnderIterator(t *testing.T) {
+	const dim, n = 8, 200
+	setup := func(t *testing.T) (*fixture, Collection, [][]float32) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+		makeVectorIndex(t, coll, VectorModeBTree, dim)
+		vecs := vrand(n, dim, 3)
+		for i, vc := range vecs {
+			doc := anyenc.MustParseJson(vecDocJSON(i, vc))
+			doc.Set("a", anyenc.MustParseJson(fmt.Sprintf("%d", i%7)))
+			require.NoError(t, coll.Insert(ctx, doc))
+		}
+		return fx, coll, vecs
+	}
+	drain := func(t *testing.T, iter Iterator) (rows int) {
+		t.Helper()
+		for iter.Next() {
+			_, err := iter.Doc()
+			require.NoError(t, err)
+			rows++
+		}
+		require.NoError(t, iter.Err())
+		return rows
+	}
+	refused := func(t *testing.T, coll Collection, ctx context.Context) {
+		t.Helper()
+		assert.ErrorIs(t, coll.Drop(ctx), ErrIterOpen)
+		assert.ErrorIs(t, coll.DropIndex(ctx, "a"), ErrIterOpen)
+		assert.ErrorIs(t, coll.CompactVectorIndex(ctx, "emb"), ErrIterOpen)
+	}
+	aIs3 := 0 // the documents with a == 3
+	for i := 0; i < n; i++ {
+		if i%7 == 3 {
+			aIs3++
+		}
+	}
+	kinds := []struct {
+		name string
+		open func(coll Collection, vecs [][]float32, ctx context.Context) (Iterator, error)
+		rows int
+	}{
+		{"full scan", func(c Collection, _ [][]float32, ctx context.Context) (Iterator, error) {
+			return c.Find(nil).Iter(ctx)
+		}, n},
+		{"index scan", func(c Collection, _ [][]float32, ctx context.Context) (Iterator, error) {
+			return c.Find(`{"a":3}`).IndexHint(IndexHint{IndexName: "a", Boost: 1 << 30}).Iter(ctx)
+		}, aIs3},
+		{"sort in memory", func(c Collection, _ [][]float32, ctx context.Context) (Iterator, error) {
+			return c.Find(nil).Sort("-v.0").Iter(ctx)
+		}, n},
+		{"knn", func(c Collection, vecs [][]float32, ctx context.Context) (Iterator, error) {
+			return c.Find(knnCond(vecs[1], 5, nil)).Iter(ctx)
+		}, 5},
+		{"aggregation", func(c Collection, _ [][]float32, ctx context.Context) (Iterator, error) {
+			return c.Aggregate(`[{"$group":{"_id":"$a","n":{"$sum":1}}}]`).Iter(ctx)
+		}, 7},
+		// A prefix that matches nothing, and a $lookup that reads the
+		// collection all the same.
+		{"aggregation, empty prefix with $lookup", func(c Collection, _ [][]float32, ctx context.Context) (Iterator, error) {
+			return c.Aggregate(`[{"$match":{"id":{"$in":[]}}},{"$count":"n"},{"$lookup":{"localField":"n","as":"d"}}]`).Iter(ctx)
+		}, 1},
+	}
+	for _, kind := range kinds {
+		t.Run(kind.name+"/not advanced", func(t *testing.T) {
+			fx, coll, vecs := setup(t)
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			iter, err := kind.open(coll, vecs, tx.Context())
+			require.NoError(t, err)
+			refused(t, coll, tx.Context())
+			// The planner creates its cursors at the first Next: on the
+			// trees as they are, the drop refused.
+			assert.Equal(t, kind.rows, drain(t, iter))
+			require.NoError(t, iter.Close())
+			require.NoError(t, coll.Drop(tx.Context()))
+			require.NoError(t, tx.Commit())
+			_, err = fx.OpenCollection(ctx, "c")
+			assert.ErrorIs(t, err, ErrCollectionNotFound)
+			require.NoError(t, fx.IntegrityCheck(ctx))
+		})
+		t.Run(kind.name+"/advanced", func(t *testing.T) {
+			fx, coll, vecs := setup(t)
+			tx, err := fx.WriteTx(ctx)
+			require.NoError(t, err)
+			iter, err := kind.open(coll, vecs, tx.Context())
+			require.NoError(t, err)
+			require.True(t, iter.Next())
+			_, err = iter.Doc()
+			require.NoError(t, err)
+			refused(t, coll, tx.Context())
+			assert.Equal(t, kind.rows-1, drain(t, iter))
+			// Exhausted, still open: still refused.
+			refused(t, coll, tx.Context())
+			require.NoError(t, iter.Close())
+			require.NoError(t, coll.DropIndex(tx.Context(), "a"))
+			require.NoError(t, coll.CompactVectorIndex(tx.Context(), "emb"))
+			require.NoError(t, coll.Drop(tx.Context()))
+			require.NoError(t, tx.Commit())
+			require.NoError(t, fx.IntegrityCheck(ctx))
+		})
+	}
+
+	t.Run("nothing to free reports first", func(t *testing.T) {
+		fx, coll, _ := setup(t)
+		brute, err := fx.CreateCollection(ctx, "b")
+		require.NoError(t, err)
+		makeVectorIndex(t, brute, VectorModeBruteForce, dim)
+		require.NoError(t, brute.Insert(ctx, anyenc.MustParseJson(vecDocJSON(1, vrand(1, dim, 1)[0]))))
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		iter, err := coll.Find(nil).Iter(tx.Context())
+		require.NoError(t, err)
+		biter, err := brute.Find(nil).Iter(tx.Context())
+		require.NoError(t, err)
+		assert.ErrorIs(t, coll.DropIndex(tx.Context(), "nope"), ErrIndexNotFound)
+		assert.ErrorIs(t, coll.CompactVectorIndex(tx.Context(), "nope"), ErrIndexNotFound)
+		assert.NoError(t, brute.CompactVectorIndex(tx.Context(), "emb"), "a brute-force index has nothing to rebuild")
+		assert.ErrorIs(t, brute.DropIndex(tx.Context(), "emb"), ErrIterOpen)
+		require.NoError(t, iter.Close())
+		require.NoError(t, biter.Close())
+		require.NoError(t, tx.Commit())
+	})
+
+	t.Run("another collection goes on", func(t *testing.T) {
+		fx, coll, _ := setup(t)
+		other, err := fx.CreateCollection(ctx, "d")
+		require.NoError(t, err)
+		for i := 0; i < 50; i++ {
+			require.NoError(t, other.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i))))
+		}
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		iter, err := other.Find(nil).Iter(tx.Context())
+		require.NoError(t, err)
+		require.True(t, iter.Next())
+		require.NoError(t, coll.Drop(tx.Context()))
+		// A collection created now may reuse the dropped one's pages.
+		again, err := fx.CreateCollection(tx.Context(), "c")
+		require.NoError(t, err)
+		for i := 0; i < 300; i++ {
+			require.NoError(t, again.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i))))
+		}
+		assert.Equal(t, 49, drain(t, iter))
+		require.NoError(t, iter.Close())
+		require.NoError(t, tx.Commit())
+		require.NoError(t, fx.IntegrityCheck(ctx))
+	})
+
+	t.Run("renamed under the iterator", func(t *testing.T) {
+		fx, coll, _ := setup(t)
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		iter, err := coll.Find(nil).Iter(tx.Context())
+		require.NoError(t, err)
+		require.True(t, iter.Next())
+		require.NoError(t, coll.Rename(tx.Context(), "c2"))
+		refused(t, coll, tx.Context())
+		assert.Equal(t, n-1, drain(t, iter))
+		require.NoError(t, iter.Close())
+		require.NoError(t, coll.Drop(tx.Context()))
+		require.NoError(t, tx.Commit())
+		require.NoError(t, fx.IntegrityCheck(ctx))
+	})
+
+	t.Run("inside a savepoint", func(t *testing.T) {
+		fx, coll, _ := setup(t)
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		iter, err := coll.Find(nil).Iter(tx.Context())
+		require.NoError(t, err)
+		require.True(t, iter.Next())
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		refused(t, coll, sp.Context())
+		require.NoError(t, sp.Rollback())
+		sp, err = fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		refused(t, coll, sp.Context())
+		require.NoError(t, sp.Commit())
+		assert.Equal(t, n-1, drain(t, iter))
+		require.NoError(t, iter.Close())
+		require.NoError(t, tx.Commit())
+		assertCollCount(t, coll, n)
+		require.NoError(t, fx.IntegrityCheck(ctx))
+	})
+
+	t.Run("opened from inside a modifier", func(t *testing.T) {
+		fx, coll, _ := setup(t)
+		other, err := fx.CreateCollection(ctx, "d")
+		require.NoError(t, err)
+		require.NoError(t, other.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		_, err = other.UpdateId(tx.Context(), 1, query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			iter, err := coll.Find(nil).Iter(tx.Context())
+			if err != nil {
+				return nil, false, err
+			}
+			if err = coll.Drop(tx.Context()); !errors.Is(err, ErrIterOpen) {
+				return nil, false, fmt.Errorf("drop under the modifier's iterator: %v", err)
+			}
+			if err = iter.Close(); err != nil {
+				return nil, false, err
+			}
+			if err = coll.Drop(tx.Context()); err != nil {
+				return nil, false, err
+			}
+			v.Set("m", a.NewNumberInt(1))
+			return v, true, nil
+		}))
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+		_, err = fx.OpenCollection(ctx, "c")
+		assert.ErrorIs(t, err, ErrCollectionNotFound)
+		require.NoError(t, fx.IntegrityCheck(ctx))
+	})
+
+	t.Run("own read transaction", func(t *testing.T) {
+		fx, coll, _ := setup(t)
+		// A snapshot of its own: the drop commits past it, and the
+		// iterator reads the snapshot to its end.
+		iter, err := coll.Find(nil).Iter(ctx)
+		require.NoError(t, err)
+		require.True(t, iter.Next())
+		require.NoError(t, coll.Drop(ctx))
+		assert.Equal(t, n-1, drain(t, iter))
+		require.NoError(t, iter.Close())
+		require.NoError(t, fx.IntegrityCheck(ctx))
+	})
 }

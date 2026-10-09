@@ -961,7 +961,7 @@ Key features:
 | Trip on tx rollback | `sqlite3BtreeTripAllCursors` | The layer above closes a transaction's iterators before the btree tx ends (tx.go tripIters); the list is reset with the write; a write ending in the pager's error state trips them |
 | Writer's payload | The VDBE's own; `pExcept` keeps the writing cursor's pages | Put / Delete copy key and value when a cursor let a page go |
 | Failed move | `moveToChild` falls back to the parent, the cursor stays VALID | The cursor is ended (`cursorFault`): an interior frame holds no key to save |
-| Drop under an open cursor | OP_Destroy refuses (SQLITE_LOCKED) while another statement runs | The cursor is tripped (`ErrNamespaceNotFound`); the rollback of the drop revives it |
+| Drop under an open cursor | OP_Destroy refuses (SQLITE_LOCKED) while any other statement of the connection is running — from its first step to its end, whatever it reads | The layer above refuses `Drop`, `DropIndex` and `CompactVectorIndex` while an iterator of the transaction is open on the collection, from its open to its `Close`, advanced or exhausted or not (`ErrIterOpen`, collection.go `droppable`: the planner creates its cursors at the first `Next`, so the btree cannot see every iterator); an iterator on another collection does not count — without autovacuum no other root moves; the btree trips the cursors of a dropped tree (`ErrNamespaceNotFound`), and the rollback of the drop revives them |
 
 <a id="old-drift-readonly-two-state-cursor"></a>
 **Severity:** low

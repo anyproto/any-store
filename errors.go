@@ -121,6 +121,12 @@ var (
 	// the rollback; the transaction goes on.
 	ErrIterRolledBack = errors.New("any-store: iterator ended by a savepoint rollback")
 
+	// ErrIterOpen refuses a Drop, DropIndex or CompactVectorIndex of a
+	// collection while an iterator of the transaction is open on it
+	// (collection.droppable): they free the trees the iterator reads.
+	// Close the iterator first.
+	ErrIterOpen = errors.New("any-store: an iterator of the transaction is open on the collection")
+
 	// ErrQuickCheckFailed is returned when we did a quick check (e.g. when opening db in a dirty state with sentinel config on) and it failed, indicating possible database corruption.
 	ErrQuickCheckFailed = errors.New("any-store: quick check failed on db open")
 

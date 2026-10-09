@@ -29,7 +29,10 @@ import (
 // makes its Doc fail with ErrDocNotFound. Doc returns the document as Next
 // read it. To mutate every matched document once, collect the ids during
 // iteration and mutate after Close — any-store's own Query.Update/Delete do
-// exactly that internally — or use those verbs directly.
+// exactly that internally — or use those verbs directly. Through the same
+// transaction, Drop, DropIndex and CompactVectorIndex of the collection
+// fail with ErrIterOpen until the iterator is closed, advanced or not: they
+// free the trees it reads.
 //
 // An Iterator belongs to one goroutine at a time. Opened with the context
 // of a transaction, its methods are calls on the transaction (see

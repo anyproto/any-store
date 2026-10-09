@@ -84,6 +84,13 @@ type collQuery struct {
 
 	indexHints []IndexHint
 
+	// lookupSource: the query feeds an aggregation whose $lookup reads the
+	// collection through the iterator's transaction (aggQuery.iterRest).
+	// Its plan is built even for a filter that provably matches nothing,
+	// so that the transaction knows the iterator (iterOpened) and refuses
+	// to drop the collection under it (collection.droppable).
+	lookupSource bool
+
 	// srcValidatedFor memoizes validateSources for the schema version it
 	// passed against: the verbs validate before their unsatisfiable()
 	// short-circuit and compilePlan validates again — without the memo a $knn
@@ -432,8 +439,10 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	}
 
 	// Fast path: filter provably matches no documents — return an empty
-	// iterator with no transaction, no plan construction, no I/O.
-	if q.unsatisfiable() {
+	// iterator with no transaction, no plan construction, no I/O. Not for
+	// a $lookup's source: its reads go through a transaction that must
+	// know the iterator (lookupSource).
+	if q.unsatisfiable() && !q.lookupSource {
 		qb.Close()
 		return &emptyIter{}, nil
 	}

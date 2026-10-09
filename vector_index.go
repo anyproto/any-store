@@ -1289,7 +1289,8 @@ const vectorEfCap = 4096
 // it holds the write lock for the whole O(live) rebuild, so prefer a maintenance
 // window for large indexes. It is a no-op when there is nothing to reclaim or
 // for a brute-force index (no graph). Returns ErrIndexNotFound if no vector index
-// with that name exists.
+// with that name exists, ErrIterOpen while an iterator of the transaction is
+// open on the collection (droppable).
 func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) error {
 	return c.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) error {
 		s, err := c.beginDDL(wtx)
@@ -1313,6 +1314,10 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 		}
 		if vi.ix == nil && vi.ivf == nil {
 			return nil // brute-force: no index to compact
+		}
+		// The rebuild recreates the index's namespaces (droppable).
+		if err = c.droppable(wtx, s); err != nil {
+			return err
 		}
 		// Recreating the namespaces moves their root pages; MarkSchemaChanged so
 		// peers notice and reopen the index with fresh handles. (For IVF this
