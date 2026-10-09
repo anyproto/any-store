@@ -274,8 +274,9 @@ type db struct {
 	// would take another process's commit at the announced cookie for this
 	// one's, or race the discard on the handles' marks. A tx that announced
 	// or logged holds the gate across btree Commit + that; newWriteTx
-	// passes through it once after acquiring the write lock. Plain data txs
-	// skip it.
+	// passes through it once after acquiring the write lock. A tx whose log
+	// is empty — no schema change, no modifier run (runModifier pins) —
+	// skips it.
 	// The rollback and savepoint paths need no gate: they discard the log
 	// while the btree write lock is still held.
 	schemaGate sync.Mutex

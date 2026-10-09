@@ -614,6 +614,10 @@ func TestTx_NestedCalls(t *testing.T) {
 			assert.ErrorIs(t, m.coll.DropIndex(tctx, "a"), ErrWriteInModifier)
 			assert.ErrorIs(t, m.coll.Rename(tctx, "renamed"), ErrWriteInModifier)
 			assert.ErrorIs(t, m.coll.Drop(tctx), ErrWriteInModifier)
+			_, err = m.refs.Aggregate(`[{"$out":"test"}]`).Count(tctx)
+			assert.ErrorIs(t, err, ErrWriteInModifier)
+			_, err = m.refs.Aggregate(`[{"$merge":{"into":"test"}}]`).Count(tctx)
+			assert.ErrorIs(t, err, ErrWriteInModifier)
 			// Reads of the collection, and other collections, nest.
 			if _, err = m.coll.Count(tctx); err != nil {
 				return nil, false, err
@@ -2362,4 +2366,126 @@ func TestIterator_WriteWhileIterating_CollectedPlan(t *testing.T) {
 	require.Equal(t, 2, us[0])
 	require.NoError(t, iter.Close())
 	require.NoError(t, tx.Commit())
+}
+
+// A Close() of the handle while its modifier runs waits for the transaction
+// to end, as one made while the handle changes the schema does. Evicted at
+// once, the handle would be replaced by an open by name with a second one
+// that counts no modifier, and a write through it — a verb, a sink — would
+// pass the gate and leave the index out of step with the document.
+func TestWriteTx_ModifierPinsItsHandle(t *testing.T) {
+	setup := func(t *testing.T) (*fixture, Collection, Collection, WriteTx) {
+		fx := newFixture(t)
+		x, err := fx.CreateCollection(ctx, "x")
+		require.NoError(t, err)
+		require.NoError(t, x.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		require.NoError(t, x.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`)))
+		y, err := fx.CreateCollection(ctx, "y")
+		require.NoError(t, err)
+		require.NoError(t, y.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":5}`)))
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		return fx, x, y, tx
+	}
+	// The document and its index agree after the commit.
+	agree := func(t *testing.T, x Collection) {
+		assert.Equal(t, expectJson(t, `{"id":1,"a":1,"m":1}`), collRows(t, x))
+		byIndex := []IndexHint{{IndexName: "a", Boost: 1 << 30}}
+		assertQueryCount(t, x.Find(`{"a":1}`).IndexHint(byIndex...), 1)
+		assertQueryCount(t, x.Find(`{"a":5}`).IndexHint(byIndex...), 0)
+	}
+
+	t.Run("closed inside the modifier", func(t *testing.T) {
+		fx, x, y, tx := setup(t)
+		_, err := x.UpdateId(tx.Context(), 1, query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			if err := x.Close(); err != nil {
+				return nil, false, err
+			}
+			_, err := y.Aggregate(`[{"$out":"x"}]`).Count(tx.Context())
+			assert.ErrorIs(t, err, ErrWriteInModifier)
+			_, err = y.Aggregate(`[{"$merge":{"into":"x","whenMatched":"replace"}}]`).Count(tx.Context())
+			assert.ErrorIs(t, err, ErrWriteInModifier)
+			v.Set("m", a.NewNumberInt(1))
+			return v, true, nil
+		}))
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+		// The close took effect with the commit.
+		_, err = x.FindId(ctx, 1)
+		assert.ErrorIs(t, err, ErrCollectionClosed)
+		x, err = fx.OpenCollection(ctx, "x")
+		require.NoError(t, err)
+		agree(t, x)
+	})
+
+	t.Run("closed and opened again inside the modifier", func(t *testing.T) {
+		fx, x, y, tx := setup(t)
+		_, err := x.UpdateId(tx.Context(), 1, query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			if err := x.Close(); err != nil {
+				return nil, false, err
+			}
+			// The registry still holds the handle: the open hands it out
+			// again, and the writes through it are refused.
+			again, err := fx.OpenCollection(tx.Context(), "x")
+			if err != nil {
+				return nil, false, err
+			}
+			assert.ErrorIs(t, again.UpsertOne(tx.Context(), anyenc.MustParseJson(`{"id":1,"a":5}`)), ErrWriteInModifier)
+			assert.ErrorIs(t, again.DeleteId(tx.Context(), 1), ErrWriteInModifier)
+			assert.ErrorIs(t, again.DropIndex(tx.Context(), "a"), ErrWriteInModifier)
+			assert.ErrorIs(t, again.Drop(tx.Context()), ErrWriteInModifier)
+			_, err = y.Aggregate(`[{"$out":"x"}]`).Count(tx.Context())
+			assert.ErrorIs(t, err, ErrWriteInModifier)
+			v.Set("m", a.NewNumberInt(1))
+			return v, true, nil
+		}))
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+		// Opened again before the transaction ended: the handle stays open.
+		agree(t, x)
+	})
+
+	// A bulk verb pins once; the pin outlives the rollback of a nested
+	// write's savepoint between two of its calls.
+	t.Run("bulk modifier", func(t *testing.T) {
+		fx, x, y, tx := setup(t)
+		require.NoError(t, x.Insert(tx.Context(),
+			anyenc.MustParseJson(`{"id":2,"a":2}`),
+			anyenc.MustParseJson(`{"id":3,"a":3}`),
+		))
+		call := 0
+		res, err := x.Find(nil).Sort("id").Update(tx.Context(), query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			call++
+			switch call {
+			case 1:
+				if err := x.Close(); err != nil {
+					return nil, false, err
+				}
+			case 2:
+				// A nested write that fails rolls back its own savepoint.
+				assert.ErrorIs(t, y.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1}`)), ErrDocExists)
+			case 3:
+				again, err := fx.OpenCollection(tx.Context(), "x")
+				if err != nil {
+					return nil, false, err
+				}
+				assert.ErrorIs(t, again.UpsertOne(tx.Context(), anyenc.MustParseJson(`{"id":3,"a":5}`)), ErrWriteInModifier)
+				_, err = y.Aggregate(`[{"$out":"x"}]`).Count(tx.Context())
+				assert.ErrorIs(t, err, ErrWriteInModifier)
+			}
+			v.Set("m", a.NewNumberInt(1))
+			return v, true, nil
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, ModifyResult{Matched: 3, Modified: 3}, res)
+		require.NoError(t, tx.Commit())
+		assert.Equal(t, expectJson(t,
+			`{"id":1,"a":1,"m":1}`,
+			`{"id":2,"a":2,"m":1}`,
+			`{"id":3,"a":3,"m":1}`,
+		), collRows(t, x))
+		byIndex := []IndexHint{{IndexName: "a", Boost: 1 << 30}}
+		assertQueryCount(t, x.Find(`{"a":3}`).IndexHint(byIndex...), 1)
+		assertQueryCount(t, x.Find(`{"a":5}`).IndexHint(byIndex...), 0)
+	})
 }
