@@ -76,6 +76,7 @@ type planIterator struct {
 	// transaction knows the iterator (iterOpened) until Close, and trips it
 	// as it ends.
 	shared ReadTx
+	closed bool
 	// tripped: the cursors' pages went with the transaction's end, or with
 	// the rollback of a savepoint the iterator moved inside (trip); the
 	// methods report tripErr, and Close leaves the cursors alone. Atomic:
@@ -97,7 +98,6 @@ type planIterator struct {
 	data       *qplanner.CursorSource
 	dataCursor *btree.Cursor
 	docId      []byte
-	closed     bool
 	dedup      qplanner.DocDedup // lazy-allocated when upstream emits multiKey=true
 	distArena  anyenc.Arena      // _distance re-injection on the post-sort re-fetch path
 }

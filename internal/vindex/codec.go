@@ -19,7 +19,6 @@ const metaVersion = 1
 // meta is the single vmeta record (key metaKey).
 type meta struct {
 	dim          int
-	metric       Metric
 	m            int
 	m0           int
 	efC          int
@@ -28,8 +27,9 @@ type meta struct {
 	entryLabel   uint32
 	topLayer     int32
 	count        int64
-	nextLabel    uint32
 	deletedCount int64
+	nextLabel    uint32
+	metric       Metric
 	hasEntry     bool
 	quant        Quantization
 	// l0Gen is a monotonic version bumped on every write that changes layer 0

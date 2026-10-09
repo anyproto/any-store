@@ -34,8 +34,8 @@ type integrityChecker struct {
 	pager       *pager
 	cache       *pcache // private reader cache (avoids racing with writerCache)
 	walMaxFrame uint32
-	pageRef     []byte   // bit-packed: 1 bit per page
 	nPages      uint32   // total database pages
+	pageRef     []byte   // bit-packed: 1 bit per page
 	usableSize  int      // pageSize - reservedSpace
 	maxErrors   int      // stop after this many errors
 	errors      []string // accumulated error messages

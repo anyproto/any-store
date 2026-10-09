@@ -41,13 +41,11 @@ var (
 type Backup struct {
 	dst        *DB    // ~ pDest            (backup.c:23)
 	iDstSchema uint32 // ~ iDestSchema      (backup.c:24) — captured on first lock
-	dstLocked  bool   // ~ bDestLocked      (backup.c:25)
+	iNext      uint32 // ~ iNext            (backup.c:27) — next source page to copy (1-based)
 
 	// dstWriteTx is held from first Step until Finish. SQLite tracks the
 	// equivalent via Btree.inTrans; we use the explicit Go tx handle.
 	dstWriteTx *WriteTx
-
-	iNext uint32 // ~ iNext (backup.c:27) — next source page to copy (1-based)
 
 	src *DB // ~ pSrc (backup.c:29)
 
@@ -59,16 +57,18 @@ type Backup struct {
 	nRemaining uint32 // pages left to copy
 	nPagecount uint32 // total pages in source (as of last Step)
 
-	// isAttached mirrors backup.c:39 — once true, this Backup is in the
-	// src pager's backups list and receives update/restart callbacks.
-	isAttached bool
-
 	// lastFCC is the FileChangeCounter observed at the previous Step's
 	// read-tx open. A jump between Steps signals an external-process
 	// commit: the in-process dispatchBackupUpdate hook can't observe
 	// cross-process writes, so we restart per backup.c:701-707.
 	// 0 = "no prior Step" (init state).
 	lastFCC uint32
+
+	dstLocked bool // ~ bDestLocked (backup.c:25)
+
+	// isAttached mirrors backup.c:39 — once true, this Backup is in the
+	// src pager's backups list and receives update/restart callbacks.
+	isAttached bool
 
 	// finished is set by Finish; enables explicit double-close detection.
 	// DRIFT: SQLite's finish is NULL-tolerant/idempotent; Go surfaces double-finish. See docs/btree/NOTES.md#drift-44-backup-finish-double-call-returns-error-not-no-op

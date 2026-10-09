@@ -27,20 +27,20 @@ type vectorIndex struct {
 	info         IndexInfo
 	fieldPath    []string
 	dim          int
-	mode         VectorMode
 	compactRatio float64
-	// ix is the btree-resident HNSW graph for btree/hybrid modes; it is nil for
-	// brute-force mode (search scans the documents) and for IVF mode (which uses
-	// ivf instead).
-	ix *vindex.Index
-	// ivf is the btree-resident IVF-SQ index for VectorModeIVFSQ; nil otherwise.
-	ivf *vivf.StoreIndex
+	mode         VectorMode
 	// unsupported marks an index the catalog describes in a removed mode
 	// (VectorMode.isRemoved): an earlier version built it and nothing here can
 	// read it. Its collection opens; the index is neither searched ($knn on its
 	// field is ErrVectorIndexUnsupported) nor maintained by writes, Stats report
 	// it, and DropIndex is the only way out.
 	unsupported bool
+	// ix is the btree-resident HNSW graph for btree/hybrid modes; it is nil for
+	// brute-force mode (search scans the documents) and for IVF mode (which uses
+	// ivf instead).
+	ix *vindex.Index
+	// ivf is the btree-resident IVF-SQ index for VectorModeIVFSQ; nil otherwise.
+	ivf *vivf.StoreIndex
 
 	// collName and catalogKey are the identity of the generation this handle
 	// was built from, captured at construction (bindIdentity) and immutable:

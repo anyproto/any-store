@@ -317,7 +317,6 @@ func (b *BtreeHNSW) SetEf(ef int) { b.flat.EfSearch = ef }
 
 type indexMeta struct {
 	dim            int
-	metric         Metric
 	M, M0          int
 	Ml             float64
 	EfSearch       int
@@ -325,6 +324,7 @@ type indexMeta struct {
 	entryID        uint32
 	topLayer       int32
 	count          uint32
+	metric         Metric
 }
 
 func encodeMeta(buf []byte, m indexMeta) []byte {

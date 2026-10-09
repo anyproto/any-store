@@ -54,15 +54,15 @@ type VectorQuerySpec struct {
 
 	// ---- probe (pre-filter exact) form, filled by the anystore layer ----
 
+	// SearchCostPerCand estimates the ANN search's own cost per ef candidate
+	// (graph/list traversal + rerank, amortized); BruteDriver marks the
+	// brute-force backend, whose driver cost is a full collection scan.
+	BruteDriver       bool
+	SearchCostPerCand float64
 	// DistFromDoc computes the query↔document distance from a parsed document
 	// (the same vector source and kernel as the brute-force backend). nil
 	// means the probe form is unavailable and only the ANN driver is legal.
 	DistFromDoc func(doc *anyenc.Value) (float32, bool)
-	// SearchCostPerCand estimates the ANN search's own cost per ef candidate
-	// (graph/list traversal + rerank, amortized); BruteDriver marks the
-	// brute-force backend, whose driver cost is a full collection scan.
-	SearchCostPerCand float64
-	BruteDriver       bool
 }
 
 // VectorIter is the source iterator for a vector query. On first Next it runs

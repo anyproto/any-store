@@ -27,11 +27,11 @@ const (
 // Params configure a freshly created index. Zero fields take defaults.
 type Params struct {
 	Dim            int
-	Metric         Metric
 	M              int     // max neighbours on layers >= 1 (default 16)
 	EfConstruction int     // candidate list at insert (default 200)
 	EfSearch       int     // candidate list at query (default 64)
 	Ml             float64 // level factor (default 0.25)
+	Metric         Metric
 	Quantization   Quantization
 }
 
@@ -65,13 +65,12 @@ type Index struct {
 	// made by (meta.build).
 	build uint64
 
-	dim   int
-	m     int
-	m0    int
-	efC   int
-	efS   int
-	ml    float64
-	quant Quantization
+	dim int
+	m   int
+	m0  int
+	efC int
+	efS int
+	ml  float64
 
 	dist DistanceFunc
 
@@ -82,6 +81,13 @@ type Index struct {
 	// back to decode+dist. scale/comps come from the record; qsum is the
 	// precomputed Σ of the query components (the offset-binary correction term).
 	distInt8 func(q []float32, scale float32, comps []byte, qsum float32) float32
+
+	// vecCache enables the RAM vector tier (hybrid only): layer-0 vector reads are
+	// served from RAM instead of the btree. vtier is created lazily.
+	vtier    *vecTier
+	vecCache bool
+
+	quant Quantization
 
 	// normalize is set for the Cosine metric: vectors are unit-normalized on write
 	// and queries on read, so dist is the dot-product cosine kernel
@@ -100,11 +106,6 @@ type Index struct {
 	l0base     atomic.Pointer[l0Base]
 	dirty      *dirtyRing
 	fullStreak atomic.Uint64
-
-	// vecCache enables the RAM vector tier (hybrid only): layer-0 vector reads are
-	// served from RAM instead of the btree. vtier is created lazily.
-	vecCache bool
-	vtier    *vecTier
 
 	// vcacheCap bounds the per-batch insert vector cache (lever 1), in vectors;
 	// 0 disables it. RAM ceiling ≈ vcacheCap*dim*4 bytes per active write searcher.

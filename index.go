@@ -129,12 +129,12 @@ type VectorParams struct {
 	Field string `json:"field"`
 	// Dim is the embedding dimension.
 	Dim int `json:"dim"`
-	// Metric is the distance measure (default cosine).
-	Metric VectorMetric `json:"metric"`
 	// M / EfConstruction / EfSearch tune the HNSW graph; 0 = sensible defaults.
 	M              int `json:"m,omitempty"`
 	EfConstruction int `json:"efConstruction,omitempty"`
 	EfSearch       int `json:"efSearch,omitempty"`
+	// Metric is the distance measure (default cosine).
+	Metric VectorMetric `json:"metric"`
 	// Quantization selects the stored vector format of the HNSW modes (default
 	// full float32). VectorModeIVFSQ always stores int8: the value has no effect
 	// on its storage but stays part of the definition EnsureIndex compares.

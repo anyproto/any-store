@@ -29,9 +29,9 @@ type pageSlab struct {
 	nTotal        int         // total buffers ever allocated (slab + overflow)
 	nSlab         int         // number of pre-allocated slab buffers
 	nOverflow     int         // number of overflow (heap) allocations
+	pageSize      int         // immutable after Init; safe to read after initialized.Load() == true
 	nReserve      int         // pressure threshold: len(freeList) < nReserve => under pressure
 	underPressure atomic.Bool // true when free list is below reserve
-	pageSize      int         // immutable after Init; safe to read after initialized.Load() == true
 	initialized   atomic.Bool // set last in Init(); acts as release barrier for pageSize
 	slab          []byte      // backing array of the slab buffers; Put retains only slices of it
 }

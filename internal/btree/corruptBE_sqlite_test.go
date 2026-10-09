@@ -953,9 +953,9 @@ func TestSqlite_CorruptE_3_KeyOrderingVectors(t *testing.T) {
 	type corruptVector struct {
 		name   string
 		pgno   uint32
+		value  byte // corrupt value
 		cellID int  // which cell on the page to corrupt
 		keyOff int  // which byte within the key to corrupt (0-based)
-		value  byte // corrupt value
 	}
 
 	// We need pages with at least 3 cells so we can corrupt a middle one

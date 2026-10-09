@@ -60,13 +60,14 @@ type StoreIndex struct {
 	// when a byte kernel is available for this CPU.
 	byteDist bool
 
+	metaRoot uint32
+
 	// coarse is the RAM-resident centroid table, held as ONE flat, contiguous
 	// float32 view of its :cb blob (an arena) rather than nested slices: opening
 	// an index aliases the blob with zero extra allocation, and the hot loops
 	// read it contiguously. Row c is coarseRow(c).
 	coarse []float32 // nlist·dim
 
-	metaRoot  uint32
 	searchers sync.Pool // *searcher — reusable per-query scratch (alloc-free search)
 }
 

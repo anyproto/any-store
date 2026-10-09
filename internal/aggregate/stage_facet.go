@@ -56,13 +56,6 @@ type facetPipe struct {
 	ctx Ctx
 	buf *syncpool.DocBuffer
 
-	// copyRow: the sub-pipeline mutates its input rows in place, so it is fed
-	// a private re-parse of the row instead of the shared document. This keeps
-	// mutations facet-local even when a mid-stream $limit finishes the chain
-	// before the mutating stage's undo runs.
-	copyRow   bool
-	rowParser anyenc.Parser
-
 	// res is the facet's result array assembled as raw anyenc bytes: the
 	// leading array tag, then every emitted document marshaled in order (the
 	// terminating EOS is appended at assembly). Parsed once at emit by the
@@ -71,6 +64,13 @@ type facetPipe struct {
 	res      []byte
 	parser   anyenc.Parser
 	finished bool // root hit end-of-stream early (a $limit was satisfied)
+
+	// copyRow: the sub-pipeline mutates its input rows in place, so it is fed
+	// a private re-parse of the row instead of the shared document. This keeps
+	// mutations facet-local even when a mid-stream $limit finishes the chain
+	// before the mutating stage's undo runs.
+	copyRow   bool
+	rowParser anyenc.Parser
 }
 
 // FacetStage implements $facet: it consumes its entire input stream, feeding

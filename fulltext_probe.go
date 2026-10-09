@@ -39,9 +39,9 @@ type probeTerm struct {
 // a prefix is already expanded to its vocabulary completions.
 type probeGroup struct {
 	phrase bool
+	dead   bool        // some phrase constituent has df == 0 → can't match
 	terms  []probeTerm // phrase: constituents (idf unused); prefix: expansions
 	idfSum float64     // phrase: summed constituent IDF
-	dead   bool        // some phrase constituent has df == 0 → can't match
 	reqBit uint64
 }
 
@@ -56,10 +56,6 @@ type ftsProber struct {
 	groups      []probeGroup
 	negs        []probeGroup
 	requiredAll uint64
-	// hasPositive is false when no positive clause can match anything (all
-	// df == 0 or the query analyzed to nothing): every probe is then a miss,
-	// matching the driver's empty candidate stream.
-	hasPositive bool
 
 	keyBuf    []byte
 	valBuf    []byte
@@ -68,13 +64,18 @@ type ftsProber struct {
 	posBufs   [][]uint32
 	posBufB   [][]uint32
 
+	// hasPositive is false when no positive clause can match anything (all
+	// df == 0 or the query analyzed to nothing): every probe is then a miss,
+	// matching the driver's empty candidate stream.
+	hasPositive bool
+
 	// per-Probe scoring state (fields, not closures: Probe runs once per
 	// candidate in the planner's inner loop and must not allocate).
+	curMatched  bool
+	curDlLoaded bool
 	curScore    float64
 	curMask     uint64
-	curMatched  bool
 	curDl       float64
-	curDlLoaded bool
 }
 
 // curDocLen returns the probed document's token length, loading it once.

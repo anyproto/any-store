@@ -74,14 +74,14 @@ type FtsProbeIter struct {
 	Source Iterator
 	Tx     *btree.ReadTx
 	Plan   *Plan
-	Rank   bool
 	// TopK, when > 0, bounds the rank-mode materialization to the best K
 	// matches under the driver order (K = Limit + Offset, like SortIter's
 	// bounded heap); 0 keeps every match (no limit, or offset-only).
 	TopK int
+	Rank bool
 
-	prober FtsProber
 	inited bool
+	prober FtsProber
 
 	// rank state: docId bytes live in arena, entries reference spans.
 	entries   []probeEntry
