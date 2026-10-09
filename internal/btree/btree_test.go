@@ -373,6 +373,43 @@ func TestReadTx_Has_NoValueAlloc(t *testing.T) {
 	assert.Zero(t, allocs, "tx.Has must not allocate on hot cache")
 }
 
+// TestReadTx_NewCursor_SeekAllocsCursorOnly pins that a reader's cursor
+// descent allocates nothing beyond the Cursor: the page stack is the
+// cursor's inline buffer, on a tree deep enough to need several frames.
+func TestReadTx_NewCursor_SeekAllocsCursorOnly(t *testing.T) {
+	db := tempDB(t)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("data")
+	require.NoError(t, err)
+	val := bytes.Repeat([]byte("v"), 200)
+	for i := range 5000 {
+		require.NoError(t, tx.Put(ns, fmt.Appendf(nil, "key-%05d", i), val))
+	}
+	require.NoError(t, tx.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	ns2, _ := db.getNamespaceLocked("data")
+
+	probe := []byte("key-02500")
+	seek := func() {
+		c := rtx.NewCursor(ns2)
+		_ = c.Seek(probe)
+		c.Close()
+	}
+	// Warm: load the path's pages into pcache, and check the tree has depth.
+	seek()
+	c := rtx.NewCursor(ns2)
+	require.NoError(t, c.Seek(probe))
+	require.Greater(t, len(c.stack), 1, "test needs a multi-level tree")
+	c.Close()
+
+	allocs := testing.AllocsPerRun(100, seek)
+	assert.Equal(t, 1.0, allocs, "a seek must allocate only the Cursor")
+}
+
 // TestReadTx_Has_NotFound pins (false, nil) for missing keys via ReadTx.
 func TestReadTx_Has_NotFound(t *testing.T) {
 	db, ns := tempDBWithNS(t, "data")
