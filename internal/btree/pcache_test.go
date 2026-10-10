@@ -1052,3 +1052,18 @@ func TestPcacheUnpin_OverfullDiscardsImmediately(t *testing.T) {
 		pc.release(pgs[i])
 	}
 }
+
+// BenchmarkPcacheCreateRecycle is the miss path of a scan wider than the
+// cache: every create evicts the LRU page and reuses its buffer, which the
+// caller then fills.
+func BenchmarkPcacheCreateRecycle(b *testing.B) {
+	pc := newPcache(4096, 64, true)
+	b.ReportAllocs()
+	for i := range b.N {
+		pg := pc.create(uint32(i+1), 1)
+		if pg == nil {
+			b.Fatal("create refused")
+		}
+		pc.release(pg)
+	}
+}

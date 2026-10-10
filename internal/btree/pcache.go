@@ -420,12 +420,13 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	return p
 }
 
-// resetPage initializes a page for use with the given pgno.
-// Clears data buffer and resets all fields. Called from create() after
-// obtaining a page struct from pFree, initBulk, or heap allocation.
-// DRIFT: resetPage zeroes page buffer on every creation; SQLite never zeroes at fetch/recycle See docs/btree/NOTES.md#drift-129-resetpage-zeroes-buffer-on-every-page-creation
+// resetPage initializes a page struct for pgno. Called from create() after
+// obtaining the struct from pFree, initBulk, a recycled victim, or the heap.
+// Only the bookkeeping is reset (pcacheFetchFinishWithInit, pcache.c:501-520):
+// the content buffer keeps whatever it held, as every create() caller either
+// reads the whole page into it or clears it (getPageNoContent, a page beyond
+// the snapshot's size, the new freelist trunk).
 func (pc *pcache) resetPage(p *page, pgno uint32) {
-	clear(p.data)
 	p.pgno = pgno
 	p.pinCount = 1
 	p.dirty = false

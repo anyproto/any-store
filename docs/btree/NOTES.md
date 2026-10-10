@@ -1617,7 +1617,7 @@ chained hash (`pcache.apHash []*page` + `page.hashNext`), a direct port of
 <a id="old-drift-pcache-buffer-reuse-on-eviction"></a>
 - Buffer reuse on eviction: **Severity:** none — matches SQLite step 4 (`pcache1.c:897-914`) — since
   commit `acf91a0`, `create()` keeps the evicted victim as `recycled` and reuses
-  its buffer in-place (`resetPage` → `clear(p.data)`) for **both** writer and reader
+  its buffer in place (`resetPage` keeps the content; the caller fills or clears it) for **both** writer and reader
   caches (gated on `pc.purgeable`, not `xStress`). Only *surplus* evicted buffers
   beyond the kept one go back to the slab in `clear()`/`discard()`/`truncate()`;
   `evictOne` does not free the kept victim's buffer.
@@ -3358,8 +3358,8 @@ occupancy and spill frequency under memory pressure.
 
 <a id="drift-129-resetpage-zeroes-buffer-on-every-page-creation"></a>
 ### Drift: resetPage Zeroes Buffer On Every Page Creation
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `pcache.go:*pcache.resetPage` (`pcache.go:420`).
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** RESOLVED 2026-10-10: `resetPage` resets only the page bookkeeping, as `pcacheFetchFinishWithInit` does; every `create()` caller reads the whole page into the buffer (`getPageWriter`, `getPageReader`, savepoint restore) or clears it explicitly (`getPageNoContent`, a page beyond the snapshot's size, the new freelist trunk in `freePage`), so the per-creation 4 KB wipe was pure overhead on every cache miss.
+- **Affected functions:** `pcache.go:*pcache.resetPage` (`pcache.go:429`).
 
 SQLite's pcache layer never zeroes the page data buffer at fetch/recycle time: `pcacheFetchFinishWithInit`
 (`pcache.c:501-520`) does `memset(&pPgHdr->pDirty, 0, sizeof(PgHdr)-offsetof(PgHdr,pDirty))`, clearing only the `PgHdr`
