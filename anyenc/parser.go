@@ -325,7 +325,6 @@ func parseArray(b []byte, c *cache, eos byte, depth int) (*Value, []byte, error)
 		a.t = TypeArray
 		a.a = a.a[:0]
 	}
-	var i int
 	var err error
 	var val *Value
 	for {
@@ -335,14 +334,23 @@ func parseArray(b []byte, c *cache, eos byte, depth int) (*Value, []byte, error)
 		if b[0] == eos {
 			return a, b[1:], nil
 		}
+		// A number element is decoded here, as parseValue's TypeNumber case
+		// does, without its dispatch: int arrays are the common bulk element.
+		// c != nil rules out the inverted form, whose tag is 0xFD not 0x02.
+		if c != nil && b[0] == byte(TypeNumber) && len(b) >= 9 {
+			val = c.getValue()
+			val.t = TypeNumber
+			val.n = BytesToFloat64(b[1:])
+			b = b[9:]
+			a.a = append(a.a, val)
+			continue
+		}
 		if val, b, err = parseValue(b, c, depth+1); err != nil {
 			return nil, nil, err
 		}
 		if c != nil {
-			a.a = slices.Grow(a.a, 1)[:i+1]
-			a.a[i] = val
+			a.a = append(a.a, val)
 		}
-		i++
 	}
 }
 

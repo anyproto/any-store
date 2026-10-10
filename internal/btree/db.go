@@ -2022,6 +2022,9 @@ func (tx *ReadTx) NewCursor(ns *Namespace) *Cursor {
 	c := &Cursor{}
 	c.btData = btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
 	c.bt = &c.btData
+	// The page stack lives in the cursor (BtCursor.apPage/aiIdx, btreeInt.h);
+	// without it every descent regrows the stack from nil.
+	c.stack = c.stackBuf[:0]
 	if tx.writable && !tx.closed {
 		tx.pager.linkCursor(c)
 	}

@@ -313,6 +313,7 @@ func newIndex(c *collection, collName string, info IndexInfo, ns *btree.Namespac
 		ns:         ns,
 		nsName:     indexNsName(collName, info.Name),
 		catalogKey: indexKey(collName, info.Name),
+		mkKey:      multikeyKey(ns.Name()),
 	}
 	if err = idx.init(); err != nil {
 		return nil, err
@@ -364,6 +365,8 @@ type index struct {
 	// (cloneWithNs); handles from before a rename keep the old one.
 	nsName     string
 	catalogKey []byte
+	// mkKey is the multikey-flag record's key, fixed with the namespace.
+	mkKey []byte
 	// format is the index format stamp of the catalog record this handle was
 	// built from (indexFormatVersion at build). Part of the identity the
 	// loader checks: a rebuild for a newer format keeps the name and
@@ -447,6 +450,7 @@ func (idx *index) cloneWithNs(ns *btree.Namespace, nsName string, catalogKey []b
 		ns:             ns,
 		nsName:         nsName,
 		catalogKey:     catalogKey,
+		mkKey:          multikeyKey(ns.Name()),
 		format:         idx.format,
 		outdated:       idx.outdated,
 		fieldNames:     idx.fieldNames,
@@ -642,7 +646,7 @@ func (idx *index) fansOut() bool {
 // which is exactly the consistent outcome. deleteKeys never clears the flag
 // (older snapshots may still hold fanned-out entries); drop+recreate resets.
 func (idx *index) markMultiKey(tx *btree.WriteTx) error {
-	key := multikeyKey(idx.ns.Name())
+	key := idx.mkKey
 	var err error
 	idx.mkBuf, err = tx.AppendValue(idx.c.db.systemNS, key, idx.mkBuf[:0])
 	if err == nil && len(idx.mkBuf) == 1 && idx.mkBuf[0] == mkValMultiKey[0] {
@@ -659,7 +663,9 @@ func (idx *index) markMultiKey(tx *btree.WriteTx) error {
 // the same tx as the entries (markMultiKey), so reading it through the query's
 // read tx is exact for that snapshot, including across processes.
 func (idx *index) isScalarProven(tx *btree.ReadTx) bool {
-	v, err := tx.Get(idx.c.db.systemNS, multikeyKey(idx.ns.Name()))
+	// The record is one byte; read it into a stack buffer, no copy.
+	var buf [1]byte
+	v, err := tx.AppendValue(idx.c.db.systemNS, idx.mkKey, buf[:0])
 	return err == nil && len(v) == 1 && v[0] == mkValScalar[0]
 }
 

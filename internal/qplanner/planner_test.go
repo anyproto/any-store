@@ -252,6 +252,41 @@ func TestRangeEstimates_MeasuredBroadRange(t *testing.T) {
 	assert.InDelta(t, 0.8, calculateSelectivity(filter, []CBOIndex{idx}, totalDocs, br), 1e-9)
 }
 
+// TestBuildPlan_NoExplainKeepsChoice: NoExplain drops the candidate report
+// and its allocations, and nothing else — the chosen plan is the same.
+func TestBuildPlan_NoExplainKeepsChoice(t *testing.T) {
+	const totalDocs = 1000
+	filter := query.MustParseCondition(`{"a": {"$gt": 5}}`)
+	build := func(noExplain bool) *Plan {
+		idx := CBOIndex{
+			Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Bounds:      mustParseBounds("a", `{"a": {"$gt": 5}}`),
+			BoundFields: 1,
+			ExactSort:   true,
+		}
+		idx.rangeSel, idx.rangeSelTight = 0.1, 0.1
+		return BuildPlan(&PlanParams{
+			Filter:    filter,
+			Sorter:    mustParseSort("a"),
+			TotalDocs: totalDocs,
+			Limit:     10,
+			Indexes:   []CBOIndex{idx},
+			NoExplain: noExplain,
+		})
+	}
+	full, bare := build(false), build(true)
+	assert.NotEmpty(t, full.Explain.Candidates)
+	assert.Empty(t, bare.Explain.Candidates)
+	assert.Equal(t, full.Name, bare.Name)
+	assert.Equal(t, full.IndexName, bare.IndexName)
+	assert.Equal(t, full.Cost, bare.Cost)
+	assert.Equal(t, full.Explain.Selectivity, bare.Explain.Selectivity)
+
+	withReport := testing.AllocsPerRun(50, func() { build(false) })
+	without := testing.AllocsPerRun(50, func() { build(true) })
+	assert.Less(t, without, withReport, "the report's names and closures must not be built")
+}
+
 // TestBuildPlan_OrderedScanPricesEntries: an ordered index scan walks and
 // fetches ENTRIES, so on a fan-out index its population is the in-range entry
 // count, not the capped document count, and a LIMIT needs proportionally more
@@ -856,6 +891,18 @@ func buildBoundsResult(idx *IndexInfo, cond query.Filter) *BoundsResult {
 	var br BoundsResult
 	br.Build([]*IndexInfo{idx}, cond)
 	return &br
+}
+
+// TestComputeIndexBounds_CompoundScratchOneAlloc pins that a two-field
+// compound chain allocates its scratch once (arena and both bound sets).
+func TestComputeIndexBounds_CompoundScratchOneAlloc(t *testing.T) {
+	idx := &IndexInfo{FieldNames: []string{"a", "b"}}
+	br := buildBoundsResult(idx, query.MustParseCondition(`{"a": 1, "b": {"$gt": 2}}`))
+	bounds, chainLen := ComputeIndexBounds(idx, br)
+	require.Equal(t, 2, chainLen)
+	require.Len(t, bounds, 1)
+	allocs := testing.AllocsPerRun(50, func() { ComputeIndexBounds(idx, br) })
+	assert.Equal(t, 1.0, allocs, "one scratch allocation per compound chain")
 }
 
 func TestComputeIndexBounds_SingleField(t *testing.T) {
@@ -2593,29 +2640,29 @@ func TestShouldReverse(t *testing.T) {
 	})
 	t.Run("empty_fields", func(t *testing.T) {
 		s := &sortFieldStub{fields: nil}
-		assert.False(t, shouldReverse(s, &CBOIndex{}))
+		assert.False(t, shouldReverse(s.Fields(), &CBOIndex{}))
 	})
 	// Forward-declared index (Reverse nil ⇒ idxRev=false): scan direction
 	// equals the requested sort direction.
 	t.Run("forward_index_forward_sort", func(t *testing.T) {
 		s := &sortFieldStub{fields: []query.SortField{{Field: "a", Reverse: false}}}
-		assert.False(t, shouldReverse(s, &CBOIndex{}))
+		assert.False(t, shouldReverse(s.Fields(), &CBOIndex{}))
 	})
 	t.Run("forward_index_reverse_sort", func(t *testing.T) {
 		s := &sortFieldStub{fields: []query.SortField{{Field: "a", Reverse: true}}}
-		assert.True(t, shouldReverse(s, &CBOIndex{Reverse: []bool{false}}))
+		assert.True(t, shouldReverse(s.Fields(), &CBOIndex{Reverse: []bool{false}}))
 	})
 	// Reverse-declared single-field index: a forward scan already yields
 	// descending, so Sort("-a") is served FORWARD and Sort("a") REVERSE.
 	t.Run("reverse_index_reverse_sort_is_forward", func(t *testing.T) {
 		s := &sortFieldStub{fields: []query.SortField{{Field: "a", Reverse: true}}}
 		idx := &CBOIndex{Reverse: []bool{true}, SortMatchStart: 0}
-		assert.False(t, shouldReverse(s, idx), "Sort(-a) on (-a) index must scan forward")
+		assert.False(t, shouldReverse(s.Fields(), idx), "Sort(-a) on (-a) index must scan forward")
 	})
 	t.Run("reverse_index_forward_sort_is_reverse", func(t *testing.T) {
 		s := &sortFieldStub{fields: []query.SortField{{Field: "a", Reverse: false}}}
 		idx := &CBOIndex{Reverse: []bool{true}, SortMatchStart: 0}
-		assert.True(t, shouldReverse(s, idx), "Sort(a) on (-a) index must scan reverse")
+		assert.True(t, shouldReverse(s.Fields(), idx), "Sort(a) on (-a) index must scan reverse")
 	})
 	// Equality-pinned prefix: matchStart shifts to the trailing field, so the
 	// declared direction read must be idx.Reverse[SortMatchStart].
@@ -2624,13 +2671,13 @@ func TestShouldReverse(t *testing.T) {
 		// f[0].Reverse(true) == idx.Reverse[1](true) → forward.
 		s := &sortFieldStub{fields: []query.SortField{{Field: "b", Reverse: true}}}
 		idx := &CBOIndex{Reverse: []bool{false, true}, SortMatchStart: 1}
-		assert.False(t, shouldReverse(s, idx))
+		assert.False(t, shouldReverse(s.Fields(), idx))
 	})
 	t.Run("equality_prefix_reverse_trailing_reverse_scan", func(t *testing.T) {
 		// Same index, Sort(b): f[0].Reverse(false) != idx.Reverse[1](true) → reverse.
 		s := &sortFieldStub{fields: []query.SortField{{Field: "b", Reverse: false}}}
 		idx := &CBOIndex{Reverse: []bool{false, true}, SortMatchStart: 1}
-		assert.True(t, shouldReverse(s, idx))
+		assert.True(t, shouldReverse(s.Fields(), idx))
 	})
 }
 

@@ -14,6 +14,64 @@ func newBoundKey(v any) (k anyenc.Tuple) {
 	return anyenc.AppendAnyValue(nil, v)
 }
 
+// TestBounds_PadInclusiveEnds pins that the bulk pad equals the per-bound
+// PadInclusiveEnd — keys, inclusivity, the pad mark Explain renders — and
+// allocates once for the whole set.
+func TestBounds_PadInclusiveEnds(t *testing.T) {
+	// Keys with cap == len, as the filter's bounds arrive.
+	exact := func(v any) anyenc.Tuple {
+		k := newBoundKey(v)
+		return k[:len(k):len(k)]
+	}
+	mk := func() Bounds {
+		var bs Bounds
+		for i := range 100 {
+			k := exact(i)
+			bs = append(bs, Bound{Start: k, End: k, StartInclude: true, EndInclude: true})
+		}
+		// An exclusive End and an open End stay as they are.
+		bs = append(bs, Bound{Start: exact(200), End: exact(201), StartInclude: true})
+		bs = append(bs, Bound{Start: exact(300), StartInclude: true})
+		// An End with spare capacity is padded where it is.
+		spare := append(make(anyenc.Tuple, 0, 16), newBoundKey(400)...)
+		bs = append(bs, Bound{Start: spare, End: spare, StartInclude: true, EndInclude: true})
+		return bs
+	}
+	want := mk()
+	for i := range want {
+		if len(want[i].End) > 0 && want[i].EndInclude {
+			want[i] = want[i].PadInclusiveEnd()
+		}
+	}
+	got := mk().PadInclusiveEnds()
+	require.Equal(t, len(want), len(got))
+	for i := range want {
+		assert.Equal(t, want[i].End, got[i].End, "bound %d", i)
+		assert.Equal(t, want[i].EndInclude, got[i].EndInclude, "bound %d", i)
+		assert.Equal(t, want[i].endPad, got[i].endPad, "bound %d", i)
+		assert.Equal(t, want[i].String(), got[i].String(), "bound %d", i)
+	}
+	last := got[len(got)-1]
+	assert.Same(t, &last.Start[0], &last.End[0], "spare capacity is used in place")
+
+	// Each End padded into the shared buffer is capped at its own length, so
+	// an append to one never writes into the next.
+	next := append(anyenc.Tuple(nil), got[1].End...)
+	_ = append(got[0].End, 0xaa, 0xbb)
+	assert.Equal(t, next, got[1].End)
+
+	sets := make([]Bounds, 11)
+	for i := range sets {
+		sets[i] = mk()
+	}
+	n := 0
+	allocs := testing.AllocsPerRun(10, func() {
+		sets[n].PadInclusiveEnds()
+		n++
+	})
+	assert.Equal(t, 1.0, allocs, "one buffer for every padded End")
+}
+
 type boundTestCase struct {
 	unmerged Bounds
 	expected string

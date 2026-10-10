@@ -32,7 +32,11 @@ import (
 // test cleanup.
 func stubDMSFcntl(t *testing.T, fake func(real func(uintptr, int, *syscall.Flock_t) syscall.Errno, fd uintptr, cmd int, flock *syscall.Flock_t) (syscall.Errno, bool)) {
 	t.Helper()
-	real := sysFcntl
+	prev := sysFcntl
+	real := prev
+	if real == nil {
+		real = sysFcntlFlock
+	}
 	sysFcntl = func(fd uintptr, cmd int, flock *syscall.Flock_t) syscall.Errno {
 		if flock != nil && flock.Start == shmDMSOffset {
 			if errno, handled := fake(real, fd, cmd, flock); handled {
@@ -41,7 +45,7 @@ func stubDMSFcntl(t *testing.T, fake func(real func(uintptr, int, *syscall.Flock
 		}
 		return real(fd, cmd, flock)
 	}
-	t.Cleanup(func() { sysFcntl = real })
+	t.Cleanup(func() { sysFcntl = prev })
 }
 
 // writeGarbageShm writes a shmRegionSize file of 0xFF bytes — a stand-in for
@@ -283,4 +287,28 @@ func TestShmStumpCrashBeforeRecoverySelfHeals(t *testing.T) {
 	defer func() { _ = db2.Close() }()
 	require.Equal(t, 30, countKeys(t, db2, "t1"),
 		"a crash between the stump reset and recovery must self-heal on the next open")
+}
+
+// TestShmLockUnlockNoAlloc pins that a read-mark lock/unlock pair — what
+// every transaction pays — allocates nothing: the flock struct stays on the
+// stack (unixShmSystemLock, os_unix.c:4710).
+func TestShmLockUnlockNoAlloc(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x-wal-shm")
+	sh, err := newPlatformShm(path)
+	require.NoError(t, err)
+	s := sh.(*mmapShm)
+	t.Cleanup(func() { _ = s.close(false) })
+
+	const slot = 3
+	cycle := func() {
+		if err := s.lock(slot, lockShared); err != nil {
+			t.Error(err)
+		}
+		if err := s.unlock(slot, lockShared); err != nil {
+			t.Error(err)
+		}
+	}
+	cycle()
+	allocs := testing.AllocsPerRun(100, cycle)
+	require.Zero(t, allocs, "shm lock/unlock must not allocate")
 }

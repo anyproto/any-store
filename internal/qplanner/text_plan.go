@@ -311,7 +311,7 @@ func buildTextPlan(params *PlanParams) *Plan {
 	}
 
 	plan.Cost = best.cost
-	if !params.CountOnly {
+	if !params.CountOnly && !params.NoExplain {
 		explainCands := make([]CandidatePlan, 0, len(cands))
 		for ci := range cands {
 			c := cands[ci]
@@ -388,7 +388,7 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 		if len(idx.Bounds) > 0 {
 			idx.Bounds = AdjustBoundsForNonUnique(idx.Bounds)
 		}
-		reverse := shouldReverse(params.Sorter, idx)
+		reverse := shouldReverse(params.sortFields(), idx)
 
 		if idx.Info.Unique && idx.fullKeyPointBound() {
 			// CoverIter must get the UN-finalized bounds: it seeks the raw

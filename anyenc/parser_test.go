@@ -74,6 +74,39 @@ func BenchmarkParser_Parse(b *testing.B) {
 
 }
 
+// BenchmarkParseOwned_Document is the full-scan parse of a document shaped
+// like a stored record: scalars, text fields, an int array and a string
+// array; uncompressed bytes, so the parse itself is what is measured.
+func BenchmarkParseOwned_Document(b *testing.B) {
+	a := &Arena{}
+	doc := a.NewObject()
+	doc.Set("id", a.NewNumberInt(42))
+	doc.Set("a", a.NewNumberInt(42%100))
+	doc.Set("email", a.NewString("user42@test.com"))
+	doc.Set("city", a.NewString("Berlin"))
+	doc.Set("score", a.NewNumberFloat64(4.2))
+	doc.Set("bio", a.NewStringBytes(bytes.Repeat([]byte("biography text "), 20)))
+	nums := a.NewArray()
+	for k := range 120 {
+		nums.SetArrayItem(k, a.NewNumberInt((42+k*7)%1000))
+	}
+	doc.Set("nums", nums)
+	tags := a.NewArray()
+	for k := range 10 {
+		tags.SetArrayItem(k, a.NewString("tag-12-"+string(rune('a'+k))))
+	}
+	doc.Set("tags", tags)
+	data := doc.MarshalTo(nil)
+	p := &Parser{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := p.ParseOwned(data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // TestMustParse_AndParseOwned pins the MustParse wrapper and Parser.ParseOwned,
 // both of which are exposed as public API and not yet covered.
 func TestMustParse_AndParseOwned(t *testing.T) {
@@ -193,6 +226,12 @@ func TestParse_MalformedInputs_Extra(t *testing.T) {
 		{"object_no_value_after_key", []byte{byte(TypeObject), 'k', EOS}, "expected value"},
 		// parseArray: length byte but nothing to parse → "parse array: unexpected end".
 		{"array_truncated", []byte{byte(TypeArray)}, "parse array: unexpected end"},
+		// parseArray: a number element one byte short → parseValue's "expected 8 bytes".
+		{"array_number_truncated", append([]byte{byte(TypeArray), byte(TypeNumber)},
+			1, 2, 3, 4, 5, 6, 7), "expected 8 bytes"},
+		// parseArray: a whole number element, then no end of array.
+		{"array_number_no_eos", append([]byte{byte(TypeArray), byte(TypeNumber)},
+			1, 2, 3, 4, 5, 6, 7, 8), "parse array: unexpected end"},
 		// parseBinary: length says 10 bytes but only 2 supplied → "expected 10 bytes to read binary".
 		{"binary_length_overflow", append(
 			[]byte{byte(TypeBinary), 0x00, 0x00, 0x00, 0x0a},

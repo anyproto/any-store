@@ -1617,7 +1617,7 @@ chained hash (`pcache.apHash []*page` + `page.hashNext`), a direct port of
 <a id="old-drift-pcache-buffer-reuse-on-eviction"></a>
 - Buffer reuse on eviction: **Severity:** none — matches SQLite step 4 (`pcache1.c:897-914`) — since
   commit `acf91a0`, `create()` keeps the evicted victim as `recycled` and reuses
-  its buffer in-place (`resetPage` → `clear(p.data)`) for **both** writer and reader
+  its buffer in place (`resetPage` keeps the content; the caller fills or clears it) for **both** writer and reader
   caches (gated on `pc.purgeable`, not `xStress`). Only *surplus* evicted buffers
   beyond the kept one go back to the slab in `clear()`/`discard()`/`truncate()`;
   `evictOne` does not free the kept victim's buffer.
@@ -3358,8 +3358,8 @@ occupancy and spill frequency under memory pressure.
 
 <a id="drift-129-resetpage-zeroes-buffer-on-every-page-creation"></a>
 ### Drift: resetPage Zeroes Buffer On Every Page Creation
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `pcache.go:*pcache.resetPage` (`pcache.go:420`).
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** RESOLVED 2026-10-10: `resetPage` resets only the page bookkeeping, as `pcacheFetchFinishWithInit` does; every `create()` caller reads the whole page into the buffer (`getPageWriter`, `getPageReader`, savepoint restore) or clears it explicitly (`getPageNoContent`, a page beyond the snapshot's size, the new freelist trunk in `freePage`), so the per-creation 4 KB wipe was pure overhead on every cache miss.
+- **Affected functions:** `pcache.go:*pcache.resetPage` (`pcache.go:429`).
 
 SQLite's pcache layer never zeroes the page data buffer at fetch/recycle time: `pcacheFetchFinishWithInit`
 (`pcache.c:501-520`) does `memset(&pPgHdr->pDirty, 0, sizeof(PgHdr)-offsetof(PgHdr,pDirty))`, clearing only the `PgHdr`
@@ -3626,8 +3626,8 @@ SQLite's `pcache1Alloc(nByte)` (`pcache1.c:341-374`) instead guards every reques
 
 <a id="drift-2026-06-25-24-truncate-always-full-scans-all-hash-buckets-sqlite-uses-imaxkey-to-sca"></a>
 ### Drift: Truncate Always Full-Scans All Hash Buckets; SQLite Uses iMaxKey To Scan Only Affected Slots
-- **Category:** performance  -  **Severity:** low
-- **Affected functions:** `pcache.go:*pcache.truncate` (`internal/btree/pcache.go:713-748`).
+- **Category:** performance  -  **Severity:** low  -  **Status:** RESOLVED 2026-10-10: `pcache` tracks `maxKey` (`PCache1.iMaxKey`), raised by `hashInsert` and lowered by `truncate`; a truncate at or above it returns at once (`pcache1Truncate`, `pcache1.c:1157`), and one whose span `maxKey - maxPage` is at most `nHash` walks only the slots from `(maxPage+1) & (nHash-1)` to `maxKey & (nHash-1)`, as `pcache1TruncateUnsafe` does (`pcache1.c:653-666`). The commit-time truncate at the database size is the no-op case whenever the transaction freed no tail page. Regression test: `TestPcacheTruncateMaxKeyWindow`.
+- **Affected functions:** `pcache.go:*pcache.truncate` (`internal/btree/pcache.go:727-780`).
 
 Go's `truncate` unconditionally iterates every bucket in the hash table — `for bi := range pc.apHash` — and walks each chain in place to drop pages with `pgno > maxPage` (`internal/btree/pcache.go:714-747`), so the cost is always O(nHash) regardless of how many pages are actually removed. SQLite's `pcache1TruncateUnsafe` first compares the highest cached key against the limit: when `pCache->iMaxKey - iLimit < pCache->nHash` it concludes it is "just shaving the last few pages off the end of the cache" and scans only the slots from `iLimit % nHash` to `iMaxKey % nHash`, falling back to a full-table scan only in the general case where many pages are removed (`pcache1.c:653-666`). Because Go tracks no `iMaxKey`-equivalent, it cannot take the shave-the-tail shortcut and always pays for the whole table. The consequence is that every truncate (DB shrink, savepoint rollback, or commit-time size reduction) costs O(nHash) — up to roughly 8K bucket walks for a 5000-page cache — even when only a couple of trailing pages are dropped, which is purely a throughput cost with no correctness impact.
 

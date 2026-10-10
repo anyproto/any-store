@@ -2642,7 +2642,17 @@ func setWalReadFrameFaultHook(fn func(frame uint32) error) {
 // alias buf. aeadScratchBuf (if non-nil) holds the nonce/AAD buffers to
 // keep them off-heap. Callers that pass nil for either get a per-call
 // alloc (rare paths).
+//
+// readFrame takes the page number from the frame header, for tests that read
+// a frame directly; the pager reads go through readFramePage.
 func (w *wal) readFrame(frame uint32, buf, scratchBuf []byte, aeadScratchBuf *aeadScratch) error {
+	return w.readFramePage(frame, 0, buf, scratchBuf, aeadScratchBuf)
+}
+
+// readFramePage is readFrame for the page the caller resolved frame for:
+// pgno binds the codec's AAD, so the content read is the only I/O
+// (sqlite3WalReadFrame, wal.c:3649). pgno 0 reads it from the frame header.
+func (w *wal) readFramePage(frame, pgno uint32, buf, scratchBuf []byte, aeadScratchBuf *aeadScratch) error {
 	if frame == 0 {
 		return ErrWALCorrupt
 	}
@@ -2696,13 +2706,15 @@ func (w *wal) readFrame(frame uint32, buf, scratchBuf []byte, aeadScratchBuf *ae
 		return err
 	}
 	// BEGIN ENCRYPTION
-	// Decrypt frame payload if a codec is installed. The caller needs the
-	// frame's page number to bind into AAD; we extract it from the frame
-	// header which lives at offset - walFrameSize.
+	// Decrypt frame payload if a codec is installed. The page number binds
+	// into AAD; without one from the caller it comes from the frame header,
+	// which lives at offset - walFrameSize.
 	if w.codec != nil {
-		pgno, perr := w.readFramePgno(frame)
-		if perr != nil {
-			return perr
+		if pgno == 0 {
+			var perr error
+			if pgno, perr = w.readFramePgno(frame); perr != nil {
+				return perr
+			}
 		}
 		scratch := scratchBuf
 		ownScratch := false

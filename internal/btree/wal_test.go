@@ -1120,6 +1120,45 @@ func BenchmarkWalOpen_CleanReopen(b *testing.B) {
 	}
 }
 
+// BenchmarkWALReadFramePage is a page read from the WAL under the default
+// checksum codec: with the page number known (the pager getters) the content
+// read is the only I/O; learned from the frame header it is a second one.
+func BenchmarkWALReadFramePage(b *testing.B) {
+	dir := b.TempDir()
+	w := newWal(filepath.Join(dir, "bench.wal"), 4096)
+	w.codec = newCksumCodec()
+	require.NoError(b, w.open())
+	defer func() { _ = w.close(false) }()
+	_, err := w.beginWrite()
+	require.NoError(b, err)
+	const n = 64
+	pages := make([]*page, n)
+	for i := range pages {
+		pages[i] = &page{pgno: uint32(i + 2), data: make([]byte, 4096)}
+		pages[i].data[0] = byte(i)
+	}
+	require.NoError(b, w.writeFrames(pages, true, n+1))
+	w.endWrite()
+
+	buf := make([]byte, 4096)
+	scratch := make([]byte, 4096)
+	var aead aeadScratch
+	b.Run("pgno", func(b *testing.B) {
+		for i := range b.N {
+			if err := w.readFramePage(uint32(i%n+1), uint32(i%n+2), buf, scratch, &aead); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("header", func(b *testing.B) {
+		for i := range b.N {
+			if err := w.readFrame(uint32(i%n+1), buf, scratch, &aead); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 func TestEnsureHeaderInitialized_FreshSHM(t *testing.T) {
 	dir := t.TempDir()
 	w := newWal(filepath.Join(dir, "t.db-wal"), 4096)

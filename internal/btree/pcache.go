@@ -33,6 +33,11 @@ type pcache struct {
 	nPage    int     // number of pages currently in apHash (was len(pc.pages))
 	maxPages int     // maximum number of cached pages
 	pageSize int     // size of each page in bytes
+	// maxKey bounds every pgno in apHash from above (PCache1.iMaxKey,
+	// pcache1.c:191): raised by hashInsert, lowered by truncate, so a
+	// truncate above it is a no-op and one shaving the last few pages off
+	// scans only the slots those pages can hash to.
+	maxKey uint32
 
 	// LRU list for clean pages (dirty pages are not evicted)
 	lruHead     *page
@@ -193,6 +198,9 @@ func (pc *pcache) hashInsert(p *page) {
 	pc.apHash[h] = p
 	p.inCache = true
 	pc.nPage++
+	if p.pgno > pc.maxKey {
+		pc.maxKey = p.pgno
+	}
 }
 
 // hashRemove unlinks p from its bucket chain, clears its in-cache state, and
@@ -412,12 +420,13 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	return p
 }
 
-// resetPage initializes a page for use with the given pgno.
-// Clears data buffer and resets all fields. Called from create() after
-// obtaining a page struct from pFree, initBulk, or heap allocation.
-// DRIFT: resetPage zeroes page buffer on every creation; SQLite never zeroes at fetch/recycle See docs/btree/NOTES.md#drift-129-resetpage-zeroes-buffer-on-every-page-creation
+// resetPage initializes a page struct for pgno. Called from create() after
+// obtaining the struct from pFree, initBulk, a recycled victim, or the heap.
+// Only the bookkeeping is reset (pcacheFetchFinishWithInit, pcache.c:501-520):
+// the content buffer keeps whatever it held, as every create() caller either
+// reads the whole page into it or clears it (getPageNoContent, a page beyond
+// the snapshot's size, the new freelist trunk).
 func (pc *pcache) resetPage(p *page, pgno uint32) {
-	clear(p.data)
 	p.pgno = pgno
 	p.pinCount = 1
 	p.dirty = false
@@ -630,6 +639,7 @@ func (pc *pcache) clear() {
 		pc.apHash[bi] = nil
 	}
 	pc.nPage = 0
+	pc.maxKey = 0
 	pc.lruHead = nil
 	pc.lruTail = nil
 	pc.dirtyHead = nil
@@ -707,11 +717,29 @@ func (pc *pcache) discard(pgno uint32) {
 // pFree; non-bulk pages return to the slab/pool. Pinned pages that match are
 // removed too (hashRemove clears inCache so a later release won't re-LRU them).
 // Walks each bucket chain in place via a pointer-to-link, mirroring SQLite
-// pcache1TruncateUnsafe (pcache1.c:644-687).
+// pcache1TruncateUnsafe (pcache1.c:644-687): nothing to do above maxKey
+// (pcache1Truncate, pcache1.c:1157), and when the pages to drop span fewer
+// slots than the table has, only the slots they can hash to are walked —
+// pgno & (nHash-1) maps the range (maxPage, maxKey] onto a circular run of
+// slots starting at maxPage+1's. The commit-time truncate at the database
+// size is the no-op case whenever the transaction freed no tail pages.
 // DRIFT: pcache clear/truncate omit C's pgno==0 page-1 zero-and-retain (nRefSum>0) special case See docs/btree/NOTES.md#drift-126-pcache-truncate-and-clear-omit-page-1-zero-and-preserve-spec
 func (pc *pcache) truncate(maxPage uint32) {
-	for bi := range pc.apHash {
-		pp := &pc.apHash[bi]
+	if maxPage >= pc.maxKey {
+		return
+	}
+	nHash := uint32(len(pc.apHash))
+	var h, stop uint32
+	if pc.maxKey-maxPage-1 < nHash {
+		h = (maxPage + 1) & (nHash - 1)
+		stop = pc.maxKey & (nHash - 1)
+	} else {
+		// nHash is at least minHashSize, so h-1 does not wrap.
+		h = nHash / 2
+		stop = h - 1
+	}
+	for {
+		pp := &pc.apHash[h]
 		for *pp != nil {
 			p := *pp
 			if p.pgno > maxPage {
@@ -743,7 +771,12 @@ func (pc *pcache) truncate(maxPage uint32) {
 				pp = &p.hashNext
 			}
 		}
+		if h == stop {
+			break
+		}
+		h = (h + 1) & (nHash - 1)
 	}
+	pc.maxKey = maxPage
 }
 
 // lruPrepend inserts a page at the HEAD of the LRU list (MRU position).

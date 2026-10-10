@@ -655,7 +655,7 @@ func (p *pager) open() (err error) {
 			// open holds recovery exclusively — there is no benign concurrent
 			// checkpoint race to fall through for.
 			walBuf := make([]byte, p.pageSize)
-			if err := p.wal.readFrame(frame, walBuf, nil, nil); err != nil {
+			if err := p.wal.readFramePage(frame, 1, walBuf, nil, nil); err != nil {
 				return err
 			}
 			if err := p.header.deserialize(walBuf[:dbHeaderSize]); err != nil {
@@ -1006,7 +1006,7 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 			// read error becomes the page-get error (pager.c:3035-3046).
 			// Reader paths (readTempPage, getPageReader) share this
 			// contract via the reader-slot lock — see readTempPage.
-			if err := p.wal.readFrame(frame, pg.data, p.codecScratch, &p.codecAEAD); err != nil {
+			if err := p.wal.readFramePage(frame, pgno, pg.data, p.codecScratch, &p.codecAEAD); err != nil {
 				p.writerCache.discard(pg.pgno)
 				return nil, fmt.Errorf("btree: failed to read page %d (WAL frame %d): %w", pgno, frame, err)
 			}
@@ -1112,7 +1112,7 @@ func (p *pager) readTempPage(pgno, walMaxFrame, walMinFrame, dbSizeBound uint32,
 			// frame for them (C readLock==0 short-circuit). The failure is
 			// therefore always genuine. See getPageWriter for the writer-
 			// path variant of this argument.
-			if err := p.wal.readFrame(frame, pg.data, codecBuf, codecAEAD); err != nil {
+			if err := p.wal.readFramePage(frame, pgno, pg.data, codecBuf, codecAEAD); err != nil {
 				p.recycleTempPage(pg)
 				return nil, fmt.Errorf("btree: failed to read page %d (WAL frame %d): %w", pgno, frame, err)
 			}
@@ -1249,7 +1249,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 			// Propagate readFrame failures — the reader-slot lock held by
 			// this read tx makes them always genuine; see readTempPage for
 			// the full argument (C readDbPage, pager.c:3035-3046).
-			if err := p.wal.readFrame(frame, pg.data, cache.codecScratch, &cache.codecAEAD); err != nil {
+			if err := p.wal.readFramePage(frame, pgno, pg.data, cache.codecScratch, &cache.codecAEAD); err != nil {
 				cache.discard(pg.pgno)
 				return nil, fmt.Errorf("btree: failed to read page %d (WAL frame %d): %w", pgno, frame, err)
 			}

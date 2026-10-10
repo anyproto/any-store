@@ -15,16 +15,33 @@ import (
 var (
 	sysMmap   = syscall.Mmap
 	sysMunmap = syscall.Munmap
-	// sysFcntl performs an fcntl record-lock call (F_SETLK / F_GETLK). The
-	// typed *Flock_t parameter lets tests stub lock conflicts and probe
-	// responses (impossible with real fcntl intra-process, since POSIX locks
-	// never conflict within one process); for F_GETLK the kernel — or a stub
-	// — rewrites flock.Type with the answer.
-	sysFcntl = func(fd uintptr, cmd int, flock *syscall.Flock_t) syscall.Errno {
-		_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, fd, uintptr(cmd), uintptr(unsafe.Pointer(flock)))
+	// sysFcntl, when set, stands in for the fcntl record-lock call (F_SETLK /
+	// F_GETLK). The typed *Flock_t parameter lets tests stub lock conflicts
+	// and probe responses (impossible with real fcntl intra-process, since
+	// POSIX locks never conflict within one process); for F_GETLK the kernel
+	// — or a stub — rewrites flock.Type with the answer. nil in production.
+	sysFcntl func(fd uintptr, cmd int, flock *syscall.Flock_t) syscall.Errno
+)
+
+// fcntlFlock performs an fcntl record-lock call on flock, through sysFcntl
+// when a test installed one. flock stays on the caller's stack, as
+// unixShmSystemLock's struct flock does (os_unix.c:4710): the indirect stub
+// call would make it escape, so that path works on a copy.
+func fcntlFlock(fd uintptr, cmd int, flock *syscall.Flock_t) syscall.Errno {
+	if sysFcntl != nil {
+		stubbed := *flock
+		errno := sysFcntl(fd, cmd, &stubbed)
+		*flock = stubbed
 		return errno
 	}
-)
+	return sysFcntlFlock(fd, cmd, flock)
+}
+
+// sysFcntlFlock is the real fcntl record-lock call.
+func sysFcntlFlock(fd uintptr, cmd int, flock *syscall.Flock_t) syscall.Errno {
+	_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, fd, uintptr(cmd), uintptr(unsafe.Pointer(flock)))
+	return errno
+}
 
 // hasMmapShm indicates this platform supports mmap-based shared memory
 // for multi-process WAL coordination. When false, only heap SHM is
@@ -228,7 +245,7 @@ func (s *mmapShm) fcntlGetLock(offset int64) (int16, error) {
 		Start:  offset,
 		Len:    1,
 	}
-	if errno := sysFcntl(s.file.Fd(), syscall.F_GETLK, &flock); errno != 0 {
+	if errno := fcntlFlock(s.file.Fd(), syscall.F_GETLK, &flock); errno != 0 {
 		return 0, fmt.Errorf("btree: fcntl getlk: %w", errno)
 	}
 	return flock.Type, nil
@@ -419,7 +436,7 @@ func (s *mmapShm) fcntlLock(lockType int, offset int64) error {
 		Len:    1,
 	}
 	// Use F_SETLK for non-blocking lock attempts.
-	errno := sysFcntl(s.file.Fd(), syscall.F_SETLK, &flock)
+	errno := fcntlFlock(s.file.Fd(), syscall.F_SETLK, &flock)
 	if errno != 0 {
 		// Mirror sqliteErrorFromPosixError (os_unix.c:1029-1038): the documented
 		// set of transient/NFS-retry errnos that SQLite collapses to SQLITE_BUSY

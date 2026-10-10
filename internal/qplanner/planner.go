@@ -190,6 +190,10 @@ type PlanParams struct {
 	Sorter   query.Sort
 	IDBounds query.Bounds
 
+	// SortFields is Sorter.Fields(), when the caller resolved it already; the
+	// planner reads it through sortFields, which resolves it once otherwise.
+	SortFields []query.SortField
+
 	// PrimaryKey is the collection's primary-key field. Empty ⇒ "id". A single
 	// Sort on this field needs no SortIter because a full scan already yields
 	// primary-key order.
@@ -209,6 +213,11 @@ type PlanParams struct {
 	// FilterIter are skipped (covering index count optimization).
 	CountOnly bool
 
+	// NoExplain says the caller never reads Plan.Explain (Iter and the
+	// write verbs): the candidate report — names, cost formulas and their
+	// closures — is not built. The plan choice never reads it.
+	NoExplain bool
+
 	// FieldBounds is an optional pre-computed bounds result.
 	// When set, calculateSelectivity uses cached bounds instead of calling
 	// filter.IndexBounds repeatedly (avoids ~N redundant filter tree traversals).
@@ -223,6 +232,14 @@ type PlanParams struct {
 	// source and ignores all other indexes. Filter (the residual, minus the
 	// $text clause) and Sorter still apply as downstream stages.
 	Fts *FtsQuerySpec
+}
+
+// sortFields returns Sorter's field list, resolved once per plan.
+func (p *PlanParams) sortFields() []query.SortField {
+	if p.SortFields == nil && p.Sorter != nil {
+		p.SortFields = p.Sorter.Fields()
+	}
+	return p.SortFields
 }
 
 // IndexHintParam mirrors the public IndexHint type.
@@ -399,8 +416,9 @@ func BuildPlan(params *PlanParams) *Plan {
 
 	estimatedYield := totalDocs * pTotal
 
-	// Collect all candidate plans for explain output (skip when CountOnly to reduce allocations)
-	collectExplain := !params.CountOnly
+	// Collect all candidate plans for explain output (skipped when the
+	// caller never reads it: CountOnly, NoExplain)
+	collectExplain := !params.CountOnly && !params.NoExplain
 	var candidates []CandidatePlan
 	if collectExplain {
 		candidates = make([]CandidatePlan, 0, len(params.Indexes)+1)
@@ -434,7 +452,7 @@ func BuildPlan(params *PlanParams) *Plan {
 	// key is free.
 	fullScanNeedSort := needSort
 	if needSort {
-		fields := params.Sorter.Fields()
+		fields := params.sortFields()
 		pk := params.PrimaryKey
 		if pk == "" {
 			pk = "id"
@@ -1302,7 +1320,7 @@ func orderedLeadIn(params *PlanParams, idx *CBOIndex) float64 {
 		n := float64(sk.Estimate(0, b.Start)) - float64(sk.EntryCount(0))/float64(max(sk.Size, 1))
 		return max(n, 0), true
 	}
-	gap, ok := leadInBound(idx.Bounds, ComputeSingleFieldBounds(idx.Info, pick), shouldReverse(params.Sorter, idx),
+	gap, ok := leadInBound(idx.Bounds, ComputeSingleFieldBounds(idx.Info, pick), shouldReverse(params.sortFields(), idx),
 		float64(params.Limit+params.Offset), est)
 	if !ok {
 		return 0
@@ -1651,7 +1669,7 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 
 	idSorted := false
 	if needSort {
-		fields := params.Sorter.Fields()
+		fields := params.sortFields()
 		pk := params.PrimaryKey
 		if pk == "" {
 			pk = "id"
@@ -1717,6 +1735,13 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 	return root
 }
 
+// coverBatch is a unique point lookup's CoverIter and its cursor source in
+// one allocation, as seekBatch is for the seek chain.
+type coverBatch struct {
+	cs    CursorSource
+	cover CoverIter
+}
+
 // seekBatch batches common iterator allocations for an index seek plan
 // into a single heap allocation instead of 5 separate ones.
 type seekBatch struct {
@@ -1740,22 +1765,21 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	}
 
 	// Determine reverse scan direction
-	reverse := shouldReverse(params.Sorter, idx)
+	reverse := shouldReverse(params.sortFields(), idx)
 
 	// Check for unique index point lookup (CoverIter shortcut).
 	// Only safe when ALL index fields are covered by equality bounds;
 	// a partial prefix (BoundFields < len(FieldNames)) can match multiple
 	// entries with different trailing fields, so a range scan is needed.
 	if idx.Info.Unique && idx.fullKeyPointBound() {
-		var root Iterator = &CoverIter{
-			Source: &CursorSource{
-				Tx: params.Tx,
-				Ns: idx.Info.Ns,
-			},
+		cb := &coverBatch{cs: CursorSource{Tx: params.Tx, Ns: idx.Info.Ns}}
+		cb.cover = CoverIter{
+			Source:       &cb.cs,
 			IdxInfo:      idx.Info,
 			Bounds:       idx.Bounds,
 			ScalarProven: idx.ScalarProven,
 		}
+		var root Iterator = &cb.cover
 
 		// A unique index can still be multikey (each array element unique
 		// across docs), so a multi-bound $in can hit the SAME doc through
@@ -1956,7 +1980,7 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 	// Pre-pad bounds for CanonicalKeyDedupIter (bare field values); padded
 	// bounds for IndexIter (full keys) — see buildIndexSeekChain.
 	dedupBounds := finalizeIndexBounds(idx)
-	reverse := shouldReverse(params.Sorter, idx)
+	reverse := shouldReverse(params.sortFields(), idx)
 
 	var root Iterator = &IndexIter{
 		Source: &CursorSource{
@@ -2048,11 +2072,7 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 // the output is re-sorted by a SortIter, so the scan direction is immaterial and
 // a stale SortMatchStart (0) is harmless. Direction is only load-bearing when
 // ExactSort==true, and then SortMatchStart is set correctly.
-func shouldReverse(sorter query.Sort, idx *CBOIndex) bool {
-	if sorter == nil {
-		return false
-	}
-	fields := sorter.Fields()
+func shouldReverse(fields []query.SortField, idx *CBOIndex) bool {
 	if len(fields) == 0 {
 		return false
 	}
@@ -3208,6 +3228,14 @@ func ComputeIndexBoundsFrom(idx *IndexInfo, lookup BoundsLookup, maxFields int) 
 	return computeIndexBounds(idx, lookup, maxFields)
 }
 
+// compoundScratch holds a compound chain's tuple keys and the bound sets of
+// its first two levels; the chain's result aliases it.
+type compoundScratch struct {
+	arena  [256]byte
+	result [4]query.Bound
+	ext    [4]query.Bound
+}
+
 func computeIndexBounds(idx *IndexInfo, lookup BoundsLookup, maxFields int) (query.Bounds, int) {
 	type fieldBound struct {
 		bounds query.Bounds
@@ -3256,13 +3284,14 @@ func computeIndexBounds(idx *IndexInfo, lookup BoundsLookup, maxFields int) (que
 		return chain[0].bounds, chainLen
 	}
 
-	// Compound index: build combined tuple bounds using arena to avoid per-tuple heap allocs.
-	// Each sub-slice reserves 1 extra cap byte so AdjustBoundsForNonUnique can append 0xff in-place.
-	var arenaBuf [256]byte
-	arena := arenaBuf[:0]
-
-	var resultBuf [4]query.Bound
-	result := query.Bounds(resultBuf[:0])
+	// Compound index: build combined tuple bounds using an arena to avoid
+	// per-tuple heap allocs. Each sub-slice reserves 1 extra cap byte so
+	// AdjustBoundsForNonUnique can append 0xff in-place. The result aliases
+	// the scratch, so it lives on the heap: one allocation for the whole
+	// two-field chain, a further one per field beyond.
+	scratch := new(compoundScratch)
+	arena := scratch.arena[:0]
+	result := query.Bounds(scratch.result[:0])
 	for _, b := range chain[0].bounds {
 		result = append(result, b)
 	}
@@ -3271,8 +3300,13 @@ func computeIndexBounds(idx *IndexInfo, lookup BoundsLookup, maxFields int) (que
 		if !chain[i-1].fixed {
 			break
 		}
-		var extBuf [4]query.Bound
-		extended := query.Bounds(extBuf[:0])
+		var extended query.Bounds
+		if i == 1 {
+			extended = scratch.ext[:0]
+		} else {
+			var extBuf [4]query.Bound
+			extended = extBuf[:0]
+		}
 		for _, prev := range result {
 			for _, cur := range chain[i].bounds {
 				eb := query.Bound{
@@ -3358,12 +3392,7 @@ func HasExactFieldPrefix(k, p []byte, lastFieldInverted bool) bool {
 // AdjustBoundsForNonUnique adjusts End bounds in-place for non-unique indexes
 // by appending 0xff to capture all docId suffixes.
 func AdjustBoundsForNonUnique(bounds query.Bounds) query.Bounds {
-	for i := range bounds {
-		if len(bounds[i].End) > 0 && bounds[i].EndInclude {
-			bounds[i] = bounds[i].PadInclusiveEnd()
-		}
-	}
-	return bounds
+	return bounds.PadInclusiveEnds()
 }
 
 // boundsOverlap reports whether b intersects a in key space, given that a
