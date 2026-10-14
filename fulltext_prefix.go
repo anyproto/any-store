@@ -45,16 +45,23 @@ func (e *ftsExec) scorePrefix(g ftsClauseGroup, reqBit uint64, tomb bool) error 
 func (e *ftsExec) scorePrefixUnion(stem string, reqBit uint64) error {
 	tab := ftsGetDocTable()
 	defer ftsPutDocTable(tab)
-	seen, err := e.docBits()
-	if err != nil {
-		return err
+	// Unscoped, every posting takes a slot and the table is the count.
+	var seen *ftsDocBits
+	if e.scoped {
+		var err error
+		if seen, err = e.docBits(); err != nil {
+			return err
+		}
+		defer ftsPutDocBits(seen)
 	}
-	defer ftsPutDocBits(seen)
 	nf := e.nFields
 	tfs := tab.aux[:0] // per slot: nf per-field TF sums
-	err = e.walkCompletions(stem, func(it fts.ChunkIterator, docID uint64) error {
-		seen.set(docID)
-		mask := it.FieldMask() & e.scope
+	err := e.walkCompletions(stem, func(it fts.ChunkIterator, docID uint64) error {
+		mask := it.FieldMask()
+		if e.scoped {
+			seen.set(docID)
+			mask &= e.scope
+		}
 		if mask == 0 {
 			return nil
 		}
@@ -79,7 +86,11 @@ func (e *ftsExec) scorePrefixUnion(stem string, reqBit uint64) error {
 	if n == 0 {
 		return nil
 	}
-	idf := e.idf(seen.count())
+	df := uint64(n)
+	if seen != nil {
+		df = seen.count()
+	}
+	idf := e.idf(df)
 	for slot := 0; slot < n; slot++ {
 		docID := tab.ids[slot]
 		tf := e.fieldsTF(tfs[slot*nf : (slot+1)*nf])
@@ -110,13 +121,6 @@ func (e *ftsExec) scorePhrasePrefix(g ftsClauseGroup, reqBit uint64, tomb bool) 
 	}
 	cand := ftsGetDocTable()
 	defer ftsPutDocTable(cand)
-	// union counts the documents holding any completion (the merged IDF), one
-	// bit per IntDocID.
-	union, err := e.docBits()
-	if err != nil {
-		return err
-	}
-	defer ftsPutDocBits(union)
 
 	// next[endOff[slot]:endOff[slot+1]] are the positions a completion must
 	// occupy for candidate slot (the fixed occurrence's end + 1), ascending;
@@ -164,6 +168,13 @@ func (e *ftsExec) scorePhrasePrefix(g ftsClauseGroup, reqBit uint64, tomb bool) 
 		endOff = append(endOff, uint32(len(next)))
 	}
 
+	// union counts the documents holding any completion (the merged IDF), one
+	// bit per IntDocID.
+	union, err := e.docBits()
+	if err != nil {
+		return err
+	}
+	defer ftsPutDocBits(union)
 	err = e.walkCompletions(g.stem, func(it fts.ChunkIterator, docID uint64) error {
 		union.set(docID)
 		if it.FieldMask()&e.scope == 0 {
@@ -222,21 +233,31 @@ func (e *ftsExec) scorePhrasePrefix(g ftsClauseGroup, reqBit uint64, tomb bool) 
 func (e *ftsExec) walkCompletions(stem string, visit func(it fts.ChunkIterator, docID uint64) error) error {
 	cur := e.tx.NewCursor(e.fx.nsPost)
 	defer cur.Close()
-	return e.forEachCompletion(stem, func(term []byte, _ uint64) error {
+	return e.forEachCompletion(stem, false, func(term []byte, _ uint64) error {
 		e.prefixBuf = postingsTermPrefixBytes(e.prefixBuf, term)
 		return e.walkPostings(cur, e.prefixBuf, visit)
 	})
 }
 
 // ftsDocBits is a bit set over IntDocID: the corpus-wide document count of a
-// prefix clause, 1 bit per id ever allocated (125 KB per million) instead of a
-// hash slot per document. Its size follows the id sequence, which deletes and
-// re-inserts grow for good (ids are never reused), like a Lucene maxDoc.
-// Pooled across queries like the tables.
+// prefix clause, 1 bit per id instead of a hash slot per document. It is
+// two-level so its cost follows the documents touched, not the id sequence
+// (which deletes and re-inserts grow for good, since ids are never reused):
+// a block of ftsBitsBlock ids is laid out in the arena the first time one of
+// its ids is set, and the block index is the only part sized from the
+// sequence (4 bytes per block, 1 KB per million ids). Pooled across queries
+// like the tables.
 type ftsDocBits struct {
-	words []uint64
+	index []uint32 // block → 1 + arena offset in words; 0 = untouched
+	arena []uint64 // touched blocks, ftsBitsWords words each
 	n     uint64
 }
+
+const (
+	ftsBitsBlock = 1 << 12                    // ids per block
+	ftsBitsWords = ftsBitsBlock / 64          // words per block
+	ftsBitsMax   = ftsMaxDocID / ftsBitsBlock // blocks the index can hold
+)
 
 var ftsDocBitsPool = sync.Pool{New: func() any { return &ftsDocBits{} }}
 
@@ -247,40 +268,51 @@ func ftsGetDocBits(maxID uint64) *ftsDocBits {
 	return b
 }
 
-// ftsPutDocBits returns a set to the pool, dropping it if it grew past
-// ftsAccMaxPooled words (4 M ids) so pooled RAM stays bounded.
+// ftsPutDocBits returns a set to the pool, dropping its arrays if they grew
+// past ftsAccMaxPooled entries so pooled RAM stays bounded.
 func ftsPutDocBits(b *ftsDocBits) {
-	if cap(b.words) > ftsAccMaxPooled {
-		b.words = nil
+	if cap(b.index) > ftsAccMaxPooled {
+		b.index = nil
+	}
+	if cap(b.arena) > ftsAccMaxPooled {
+		b.arena = nil
 	}
 	ftsDocBitsPool.Put(b)
 }
 
 // reset clears the set for ids up to maxID.
 func (b *ftsDocBits) reset(maxID uint64) {
-	size := int(maxID>>6) + 1
-	if cap(b.words) < size {
-		b.words = make([]uint64, size)
+	size := int(maxID/ftsBitsBlock) + 1
+	if cap(b.index) < size {
+		b.index = make([]uint32, size)
 	} else {
-		b.words = b.words[:size]
-		clear(b.words)
+		b.index = b.index[:size]
+		clear(b.index)
 	}
+	b.arena = b.arena[:0]
 	b.n = 0
 }
 
-// set marks id, growing past maxID if an id beyond it ever appears. An id
+// set marks id, growing the index if an id beyond maxID ever appears. An id
 // beyond ftsMaxDocID is corruption and is not counted.
 func (b *ftsDocBits) set(id uint64) {
 	if id > ftsMaxDocID {
 		return
 	}
-	w := int(id >> 6)
-	if w >= len(b.words) {
-		b.words = append(b.words, make([]uint64, w+1-len(b.words))...)
+	blk := int(id / ftsBitsBlock)
+	if blk >= len(b.index) {
+		b.index = append(b.index, make([]uint32, blk+1-len(b.index))...)
 	}
+	off := b.index[blk]
+	if off == 0 {
+		off = uint32(len(b.arena)) + 1
+		b.index[blk] = off
+		b.arena = append(b.arena, make([]uint64, ftsBitsWords)...)
+	}
+	w := &b.arena[int(off-1)+int(id%ftsBitsBlock)/64]
 	bit := uint64(1) << (id & 63)
-	if b.words[w]&bit == 0 {
-		b.words[w] |= bit
+	if *w&bit == 0 {
+		*w |= bit
 		b.n++
 	}
 }

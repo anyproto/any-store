@@ -630,10 +630,11 @@ func (e *ftsExec) walkPostings(cur *btree.Cursor, prefix []byte, visit func(it f
 }
 
 // forEachCompletion streams every vocabulary term with the given byte prefix,
-// in vocabulary (byte) order, through fn with its document frequency; term is
-// valid for the call only. There is no cap: a prefix clause covers every
-// completion, and costs what the completions' postings cost.
-func (e *ftsExec) forEachCompletion(stem string, fn func(term []byte, df uint64) error) error {
+// in vocabulary (byte) order, through fn — with its document frequency when
+// withDF is set (the plan stats need it, the walk does not); term is valid
+// for the call only. There is no cap: a prefix clause covers every completion,
+// and costs what the completions' postings cost.
+func (e *ftsExec) forEachCompletion(stem string, withDF bool, fn func(term []byte, df uint64) error) error {
 	if stem == "" {
 		return nil
 	}
@@ -651,11 +652,14 @@ func (e *ftsExec) forEachCompletion(stem string, fn func(term []byte, df uint64)
 		if !bytes.HasPrefix(key, p) {
 			break
 		}
-		val, err := cur.Value()
-		if err != nil {
-			return err
+		var df uint64
+		if withDF {
+			val, verr := cur.Value()
+			if verr != nil {
+				return verr
+			}
+			df, _ = binary.Uvarint(val)
 		}
-		df, _ := binary.Uvarint(val)
 		if err = fn(key, df); err != nil {
 			return err
 		}
@@ -668,7 +672,7 @@ func (e *ftsExec) forEachCompletion(stem string, fn func(term []byte, df uint64)
 
 // ftsMaxDocID bounds the IntDocID sequence a query trusts: ids are allocated
 // one per inserted document and never reused, so a larger value is corruption
-// (a bit set sized from it would be a multi-gigabyte allocation).
+// (a bit-set index sized from it would be an absurd allocation).
 const ftsMaxDocID = 1 << 36
 
 // errFtsCorruptMeta reports an fts:meta value no healthy index can hold.

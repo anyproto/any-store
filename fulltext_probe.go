@@ -455,7 +455,7 @@ func (fx *ftsIndex) planStats(tx *btree.ReadTx, text query.Text) (st qplanner.Ft
 		if g.prefix {
 			// The merged completions are walked in full.
 			var sum float64
-			if err := e.forEachCompletion(g.stem, func(_ []byte, cdf uint64) error {
+			if err := e.forEachCompletion(g.stem, true, func(_ []byte, cdf uint64) error {
 				sum += float64(cdf)
 				return nil
 			}); err != nil {
@@ -465,7 +465,9 @@ func (fx *ftsIndex) planStats(tx *btree.ReadTx, text query.Text) (st qplanner.Ft
 			if len(g.terms) == 0 {
 				est = sum
 			} else {
-				est = min(est, sum)
+				// A completion follows the fixed phrase about as often as
+				// completions occur per document (Explain-only heuristic).
+				est = min(est, sum) * min(sum/float64(n), 1)
 			}
 		}
 		if positive {

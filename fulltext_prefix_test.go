@@ -124,21 +124,26 @@ func splitComma(s string) (out []string) {
 // TestFtsPrefix_CorruptSeqIsAnError pins that an absurd fts:meta seq (which
 // would size the bit set in gigabytes) fails the query instead of allocating.
 func TestFtsPrefix_CorruptSeqIsAnError(t *testing.T) {
-	fx, c := ftsTestColl(t, "name")
+	fx, c := ftsTestColl(t, "name", "body")
 	defer fx.finish()
-	insertJSON(t, c, `{"id":"a","name":"zebra"}`)
+	insertJSON(t, c, `{"id":"a","name":"zebra","body":"x"}`)
 	fxi := c.loadFtsIndexes()[0]
 	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
 		return fxi.putMetaUint(tx, ftsMetaSeq, 1<<58)
 	}))
-	ids, _ := collectIter(t, c.Find(`{"$text":{"$search":"zebra"}}`))
-	assert.Equal(t, []string{"a"}, ids, "a plain term never reads the sequence")
-	_, err := c.Find(`{"$text":{"$search":"zeb*"}}`).Count(ctx)
-	assert.ErrorIs(t, err, errFtsCorruptMeta)
-	it, err := c.Find(`{"$text":{"$search":"zeb*"}}`).Iter(ctx)
-	if err == nil {
-		assert.False(t, it.Next())
-		assert.ErrorIs(t, errors.Join(it.Err(), it.Close()), errFtsCorruptMeta)
+	for _, q := range []string{`{"$text":{"$search":"zebra"}}`, `{"$text":{"$search":"zeb*"}}`} {
+		ids, _ := collectIter(t, c.Find(q))
+		assert.Equal(t, []string{"a"}, ids, "%s never reads the sequence", q)
+	}
+	// A scoped prefix and a phrase-prefix count documents in the bit set.
+	for _, q := range []string{`{"$text":{"$search":"zeb*","$fields":"name"}}`, `{"$text":{"$search":"^zeb*"}}`, `{"$text":{"$search":"\"x zeb\"*"}}`} {
+		_, err := c.Find(q).Count(ctx)
+		assert.ErrorIs(t, err, errFtsCorruptMeta, q)
+		it, err := c.Find(q).Iter(ctx)
+		if err == nil {
+			assert.False(t, it.Next())
+			assert.ErrorIs(t, errors.Join(it.Err(), it.Close()), errFtsCorruptMeta, q)
+		}
 	}
 }
 
@@ -148,11 +153,21 @@ func TestFtsDocBits(t *testing.T) {
 	b.set(3)
 	b.set(3)
 	b.set(100)
-	b.set(500) // beyond the sizing bound: grows
+	b.set(5000) // beyond the sizing bound: the index grows
 	b.set(ftsMaxDocID + 1)
 	assert.Equal(t, uint64(3), b.count())
+	assert.Len(t, b.arena, 2*ftsBitsWords, "two blocks touched")
 	b.reset(10)
 	assert.Equal(t, uint64(0), b.count())
+	assert.Empty(t, b.arena)
 	b.set(3)
 	assert.Equal(t, uint64(1), b.count())
+	// Cost follows the touched blocks, not the sequence: a narrow set over a
+	// huge id range lays out one block.
+	b.reset(1 << 30)
+	b.set(1 << 29)
+	b.set(1<<29 + 1)
+	assert.Equal(t, uint64(2), b.count())
+	assert.Len(t, b.arena, ftsBitsWords)
+	assert.Len(t, b.index, 1<<30/ftsBitsBlock+1)
 }
