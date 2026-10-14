@@ -3,6 +3,7 @@ package anystore
 import (
 	"fmt"
 	"math"
+	"math/rand"
 	"strings"
 	"testing"
 
@@ -11,7 +12,6 @@ import (
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
-	"math/rand"
 )
 
 func qplannerEnableCounters(t *testing.T) {
@@ -490,7 +490,7 @@ func TestFtsProbe_PrefixDriverOnly(t *testing.T) {
 // random non-prefix queries (plain, quoted single, phrases, anchors, joined
 // words, $require/$exclude, $defaultOperator, $fields, BM25F weights with a
 // zero weight) and requires the prober's verdict and score bits to equal the
-// driver scan's. Helpers and corpora: fulltext_search_oracle_test.go.
+// driver scan's. Helpers and corpora: fulltext_search_test.go.
 func TestFtsProbe_RandomParity(t *testing.T) {
 	fx := newFixture(t)
 	defer fx.finish()

@@ -135,12 +135,16 @@ func TestFtsSayt_Anchored(t *testing.T) {
 	assert.Equal(t, []string{"a", "d"}, sortedIDs(ids))
 	ids, _ = ftsSaytQuery(t, coll, map[string]any{"$search": "tokyo", "$exclude": "^tok*"})
 	assert.Equal(t, []string{"a", "d"}, sortedIDs(ids))
-	// An anchored term scores once (tf 1) however often it repeats.
-	insertJSON(t, coll, `{"id":"g","body":"east east east"}`)
-	_, scores := ftsSaytQuery(t, coll, map[string]any{"$search": "^east"})
-	ids, _ = ftsSaytQuery(t, coll, map[string]any{"$search": "^east"})
+	// An anchored term scores once (tf 1) however often it repeats: g has
+	// "east" twice and the same length as a, so both score the same.
+	insertJSON(t, coll, `{"id":"g","body":"east east bound train"}`)
+	ids, scores := ftsSaytQuery(t, coll, map[string]any{"$search": "^east"})
 	assert.Equal(t, []string{"a", "c", "g"}, sortedIDs(ids))
-	assert.Len(t, scores, 3)
+	byID := map[string]float64{}
+	for i, id := range ids {
+		byID[id] = scores[i]
+	}
+	assert.Equal(t, byID["a"], byID["g"])
 }
 
 func TestFtsSayt_CJKPrefixAndAnchor(t *testing.T) {
@@ -333,4 +337,17 @@ func TestFtsSayt_FieldScopeNestedAndVerbs(t *testing.T) {
 	}
 	require.NoError(t, it.Close())
 	assert.Equal(t, []string{"b"}, got)
+}
+
+// TestFtsSayt_ExplainShowsScope pins that an aggregation Explain names the
+// whole pushed-down predicate, scope included.
+func TestFtsSayt_ExplainShowsScope(t *testing.T) {
+	fx, coll := ftsFieldsColl(t, nil)
+	defer fx.finish()
+	ex, err := coll.Aggregate([]any{map[string]any{"$match": map[string]any{
+		"$text": map[string]any{"$search": "east", "$fields": "title", "$exclude": "^west"},
+	}}}).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, ex.Plan, `"$fields":["title"]`)
+	assert.Contains(t, ex.Plan, `"$exclude":["^west"]`)
 }

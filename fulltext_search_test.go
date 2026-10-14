@@ -2,6 +2,10 @@ package anystore
 
 import (
 	"fmt"
+	"math"
+	"math/rand"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,10 +15,6 @@ import (
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-store/v2/syncpool"
-	"math"
-	"math/rand"
-	"slices"
-	"strings"
 )
 
 // TestFtsResidual_NoTextSurvives mirrors TestKnnResidual_NoKnnSurvives: the

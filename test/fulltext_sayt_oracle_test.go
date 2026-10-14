@@ -16,9 +16,8 @@ import (
 // (term, phrase, phrase-prefix, prefix, anchored term / phrase / prefix /
 // phrase-prefix). The reference evaluates every clause per field element, so
 // it does not share positionsOf / postingTF with the engine the way the
-// driver/probe differential does. Every element holds at least one token: an
-// array whose first element is token-less shifts the document's first
-// position off 0, which this oracle does not model.
+// driver/probe differential does. Every element holds at least one token;
+// token-less elements are covered by the root package's scoring oracle.
 func TestFtsSayt_FieldScopeOracle(t *testing.T) {
 	rng := &oracleRand{s: 7}
 	vocab := []string{"a", "b", "c", "ab"}
