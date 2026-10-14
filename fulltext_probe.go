@@ -30,8 +30,9 @@ import (
 //
 // A prefix clause has no probe form: its merged-completion IDF is the number
 // of documents holding any completion, known only after the completions'
-// postings are walked in full. planStats marks such a predicate DriverOnly;
-// newFtsProber refuses it.
+// postings are walked in full. detectFtsQuery leaves such a predicate with no
+// Probe and no StatsFn, so the driver is the only plan; newFtsProber and
+// planStats refuse it as a guard.
 
 // probeTerm is one plain term with its precomputed IDF.
 type probeTerm struct {
@@ -50,8 +51,8 @@ type probeGroup struct {
 	reqBit   uint64
 }
 
-// errFtsPrefixProbe reports a prefix clause reaching the prober, which the
-// planner's DriverOnly gate must prevent.
+// errFtsPrefixProbe reports a prefix clause reaching the prober or the plan
+// stats, which detectFtsQuery's nil Probe / StatsFn must prevent.
 var errFtsPrefixProbe = errors.New("any-store: internal: prefix clause has no probe form")
 
 // ftsProber evaluates the compiled $text predicate against single documents.
@@ -390,10 +391,8 @@ func (p *ftsProber) Close() {}
 const ftsPhraseMatchFraction = 0.25
 
 // planStats compiles the predicate and reads the per-term document frequencies
-// (one vocab point-get per term; a prefix pays one vocab range scan — the same
-// reads the chosen plan repeats at execution). SumDF and ProbeTerms are exact;
-// only EstMatches is an estimate. A prefix clause makes the predicate
-// DriverOnly (see the file comment).
+// (one vocab point-get per term). SumDF and ProbeTerms are exact; only
+// EstMatches is an estimate. A prefix clause is refused (see the file comment).
 func (fx *ftsIndex) planStats(tx *btree.ReadTx, text query.Text) (st qplanner.FtsPlanStats, err error) {
 	clauses := text.ParsedClauses()
 	if len(clauses) == 0 {
@@ -437,7 +436,10 @@ func (fx *ftsIndex) planStats(tx *btree.ReadTx, text query.Text) (st qplanner.Ft
 		account(d, cq.plainBit[term] != 0)
 	}
 	groupStats := func(g ftsClauseGroup, positive bool) error {
-		// Phrase part: the zig-zag advances every stream at most min-df times.
+		if g.prefix {
+			return errFtsPrefixProbe
+		}
+		// Phrase: the zig-zag advances every stream at most min-df times.
 		minDF := math.MaxFloat64
 		for _, t := range g.terms {
 			d, derr := df(t)
@@ -451,27 +453,8 @@ func (fx *ftsIndex) planStats(tx *btree.ReadTx, text query.Text) (st qplanner.Ft
 			minDF = 0
 		}
 		st.SumDF += minDF * float64(len(g.terms))
-		est := minDF * ftsPhraseMatchFraction
-		if g.prefix {
-			// The merged completions are walked in full.
-			st.DriverOnly = true
-			comps, xerr := e.expandPrefix(g.stem)
-			if xerr != nil {
-				return xerr
-			}
-			var sum float64
-			for _, c := range comps {
-				sum += float64(c.df)
-			}
-			st.SumDF += sum
-			if len(g.terms) == 0 {
-				est = sum
-			} else {
-				est = min(est, sum)
-			}
-		}
 		if positive {
-			account(est, g.reqBit != 0)
+			account(minDF*ftsPhraseMatchFraction, g.reqBit != 0)
 		}
 		return nil
 	}

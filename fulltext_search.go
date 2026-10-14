@@ -552,7 +552,12 @@ func (e *ftsExec) walkTerm(term string, visit func(it fts.ChunkIterator, docID u
 	cur := e.tx.NewCursor(e.fx.nsPost)
 	defer cur.Close()
 	e.prefixBuf = postingsTermPrefix(e.prefixBuf, term)
-	prefix := e.prefixBuf
+	return e.walkPostings(cur, e.prefixBuf, visit)
+}
+
+// walkPostings streams the postings chunks under prefix (postingsTermPrefix of
+// one term) through visit, reusing cur across calls.
+func (e *ftsExec) walkPostings(cur *btree.Cursor, prefix []byte, visit func(it fts.ChunkIterator, docID uint64) error) error {
 	if err := cur.Seek(prefix); err != nil {
 		return err
 	}
@@ -587,47 +592,36 @@ func (e *ftsExec) walkTerm(term string, visit func(it fts.ChunkIterator, docID u
 	return nil
 }
 
-// ftsCompletion is one vocabulary term expanded from a prefix stem, with its
-// document frequency.
-type ftsCompletion struct {
-	term string
-	df   uint64
-}
-
-// expandPrefix returns every vocabulary term with the given byte prefix, in
-// vocabulary (byte) order. There is no cap: a prefix clause covers every
-// completion, and costs what the completions' postings cost (the planner
-// prices that from the summed document frequencies).
-func (e *ftsExec) expandPrefix(stem string) ([]ftsCompletion, error) {
+// forEachCompletion streams every vocabulary term with the given byte prefix,
+// in vocabulary (byte) order, through fn; term is valid for the call only.
+// There is no cap: a prefix clause covers every completion, and costs what the
+// completions' postings cost.
+func (e *ftsExec) forEachCompletion(stem string, fn func(term []byte) error) error {
 	if stem == "" {
-		return nil, nil
+		return nil
 	}
-	var out []ftsCompletion
 	cur := e.tx.NewCursor(e.fx.nsVocab)
 	defer cur.Close()
 	p := []byte(stem)
 	if err := cur.Seek(p); err != nil {
-		return nil, err
+		return err
 	}
 	for cur.Valid() {
 		key, err := cur.Key()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if !bytes.HasPrefix(key, p) {
 			break
 		}
-		val, err := cur.Value()
-		if err != nil {
-			return nil, err
+		if err = fn(key); err != nil {
+			return err
 		}
-		df, _ := binary.Uvarint(val)
-		out = append(out, ftsCompletion{term: string(key), df: df})
 		if err = cur.Next(); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return out, nil
+	return nil
 }
 
 // scorePhrase finds documents where the phrase terms occur at consecutive
@@ -1075,6 +1069,12 @@ func postingsTermPrefix(dst []byte, term string) []byte {
 	return append(dst, term...)
 }
 
+// postingsTermPrefixBytes is postingsTermPrefix for a borrowed term.
+func postingsTermPrefixBytes(dst []byte, term []byte) []byte {
+	dst = binary.AppendUvarint(dst[:0], uint64(len(term)))
+	return append(dst, term...)
+}
+
 func ftsGetUint(tx *btree.ReadTx, ns *btree.Namespace, key []byte) (uint64, error) {
 	n, _, err := ftsGetUintOk(tx, ns, key)
 	return n, err
@@ -1147,6 +1147,7 @@ func (q *collQuery) detectFtsQuery(s *collSchema) (*qplanner.FtsQuerySpec, query
 	if _, _, err = fx.resolveScope(text.Fields); err != nil {
 		return nil, nil, err
 	}
+	clauses := text.ParsedClauses()
 	spec := &qplanner.FtsQuerySpec{
 		IndexName:  fx.info.Name,
 		Ordered:    true, // searchCandidates returns score-descending
@@ -1162,6 +1163,14 @@ func (q *collQuery) detectFtsQuery(s *collSchema) (*qplanner.FtsQuerySpec, query
 			return fx.planStats(tx, text)
 		},
 	}
+	if ftsHasPrefix(clauses) {
+		// A prefix clause has no probe form: its merged-completion IDF is the
+		// number of documents holding any completion, known only after the
+		// completions' postings are walked in full. A nil Probe makes the
+		// driver the only legal plan, and the stats (whose only consumer is
+		// the probe costing) are not computed at all.
+		spec.Probe, spec.StatsFn = nil, nil
+	}
 	residual := ftsResidualFilter(q.cond)
 	// HARD post-condition, mirroring detectKnnQuery's ContainsKnn assert: a
 	// Text leaking into the residual FilterIter fails OPEN (Text.Ok returns
@@ -1172,6 +1181,16 @@ func (q *collQuery) detectFtsQuery(s *collSchema) (*qplanner.FtsQuerySpec, query
 		return nil, nil, fmt.Errorf("%w: internal: $text survived residual extraction", errFtsBadPlacement)
 	}
 	return spec, residual, nil
+}
+
+// ftsHasPrefix reports whether any clause is a prefix (foo*, "foo bar"*).
+func ftsHasPrefix(clauses []query.TextClause) bool {
+	for _, c := range clauses {
+		if c.Prefix {
+			return true
+		}
+	}
+	return false
 }
 
 // ftsSorter maps the query's sort to the planner's sorter for a $text query:

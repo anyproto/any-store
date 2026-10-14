@@ -14,50 +14,52 @@ import (
 // documents holding any completion, so a rare completion never outweighs a
 // common one and a document is scored once per clause, not once per matching
 // completion. The merge needs the completions' postings walked in full, which
-// is why a prefix clause has no probe form (planStats marks it DriverOnly).
+// is why a prefix clause has no probe form (detectFtsQuery drops the probe).
 
 // scorePrefix scores (or tombstones) a prefix group: a bare stem as the merged
 // term, a phrase-prefix or an anchored stem through the positional variant.
 func (e *ftsExec) scorePrefix(g ftsClauseGroup, reqBit uint64, tomb bool) error {
-	comps, err := e.expandPrefix(g.stem)
-	if err != nil || len(comps) == 0 {
-		return err
-	}
 	if len(g.terms) > 0 || g.anchored {
-		return e.scorePhrasePrefix(g, comps, reqBit, tomb)
+		return e.scorePhrasePrefix(g, reqBit, tomb)
 	}
 	if tomb {
 		// Exclusion needs no merge: every in-scope posting of every completion
 		// tombstones its document.
-		return e.walkCompletions(comps, func(it fts.ChunkIterator, docID uint64) error {
+		return e.walkCompletions(g.stem, func(it fts.ChunkIterator, docID uint64) error {
 			if _, ok := e.postingTF(it); ok {
 				e.acc.markTomb(docID)
 			}
 			return nil
 		})
 	}
-	return e.scorePrefixUnion(comps, reqBit)
+	return e.scorePrefixUnion(g.stem, reqBit)
 }
 
 // scorePrefixUnion scores a bare prefix clause: one pass over the completions'
 // postings sums the per-field term frequencies per document into a dense
-// table, then every document in the table is scored once with the merged IDF.
-func (e *ftsExec) scorePrefixUnion(comps []ftsCompletion, reqBit uint64) error {
+// table, then every document with an in-scope posting is scored once with the
+// merged IDF. The IDF counts every document holding a completion, in scope or
+// not — corpus-wide like a plain term's — so a scoped prefix ranks as the
+// unscoped one restricted to the matching fields.
+func (e *ftsExec) scorePrefixUnion(stem string, reqBit uint64) error {
 	tab := ftsGetDocTable()
 	defer ftsPutDocTable(tab)
 	nf := e.nFields
-	tfs := tab.aux[:0] // per slot: nf per-field TF sums
-	err := e.walkCompletions(comps, func(it fts.ChunkIterator, docID uint64) error {
-		mask := it.FieldMask() & e.scope
-		if mask == 0 {
-			return nil
-		}
+	tfs := tab.aux[:0]      // per slot: nf per-field TF sums
+	visible := tab.aux2[:0] // per slot: 1 when some posting lies in scope
+	err := e.walkCompletions(stem, func(it fts.ChunkIterator, docID uint64) error {
 		slot, inserted := tab.insert(docID)
 		if inserted {
 			for i := 0; i < nf; i++ {
 				tfs = append(tfs, 0)
 			}
+			visible = append(visible, 0)
 		}
+		mask := it.FieldMask() & e.scope
+		if mask == 0 {
+			return nil
+		}
+		visible[slot] = 1
 		row := tfs[slot*nf : (slot+1)*nf]
 		for m := mask; m != 0; m &= m - 1 {
 			f := bits.TrailingZeros64(m)
@@ -65,7 +67,7 @@ func (e *ftsExec) scorePrefixUnion(comps []ftsCompletion, reqBit uint64) error {
 		}
 		return nil
 	})
-	tab.aux = tfs
+	tab.aux, tab.aux2 = tfs, visible
 	if err != nil {
 		return err
 	}
@@ -75,6 +77,9 @@ func (e *ftsExec) scorePrefixUnion(comps []ftsCompletion, reqBit uint64) error {
 	}
 	idf := e.idf(uint64(n))
 	for slot := 0; slot < n; slot++ {
+		if visible[slot] == 0 {
+			continue
+		}
 		docID := tab.ids[slot]
 		tf := e.fieldsTF(tfs[slot*nf : (slot+1)*nf])
 		dl, derr := e.docLen(docID)
@@ -92,10 +97,11 @@ func (e *ftsExec) scorePrefixUnion(comps []ftsCompletion, reqBit uint64) error {
 // phrase's occurrence ends come from the positional merge; the completions'
 // postings are then walked once and each posting of a candidate document is
 // checked against those ends — the cost is the fixed merge plus the
-// completions' posting lists, never occurrences × completions. Scored as one
-// synthetic term: TF = confirmed occurrences, IDF = Σ idf(fixed terms) + the
-// merged completions' IDF.
-func (e *ftsExec) scorePhrasePrefix(g ftsClauseGroup, comps []ftsCompletion, reqBit uint64, tomb bool) error {
+// completions' posting lists, never occurrences × completions, and nothing is
+// walked when the fixed phrase occurs nowhere. Scored as one synthetic term:
+// TF = confirmed occurrences, IDF = Σ idf(fixed terms) + the merged
+// completions' IDF (corpus-wide, like the fixed terms').
+func (e *ftsExec) scorePhrasePrefix(g ftsClauseGroup, reqBit uint64, tomb bool) error {
 	k := len(g.terms)
 	idfSum, alive, err := e.phraseIDF(g.terms)
 	if err != nil || !alive {
@@ -113,6 +119,7 @@ func (e *ftsExec) scorePhrasePrefix(g ftsClauseGroup, comps []ftsCompletion, req
 	next := union.aux[:0]
 	endOff := cand.aux2[:0]
 	cnt := cand.aux[:0]
+	defer func() { union.aux, cand.aux, cand.aux2 = next, cnt, endOff }()
 	if k > 0 {
 		err = e.phraseMerge(g.terms, func(docID uint64, posLists [][]uint32) error {
 			start := len(next)
@@ -143,17 +150,19 @@ func (e *ftsExec) scorePhrasePrefix(g ftsClauseGroup, comps []ftsCompletion, req
 			return nil
 		})
 		if err != nil {
-			union.aux, cand.aux, cand.aux2 = next, cnt, endOff
 			return err
+		}
+		if cand.len() == 0 {
+			return nil // the fixed phrase occurs nowhere
 		}
 		endOff = append(endOff, uint32(len(next)))
 	}
 
-	err = e.walkCompletions(comps, func(it fts.ChunkIterator, docID uint64) error {
+	err = e.walkCompletions(g.stem, func(it fts.ChunkIterator, docID uint64) error {
+		union.insert(docID)
 		if it.FieldMask()&e.scope == 0 {
 			return nil
 		}
-		union.insert(docID)
 		if k == 0 {
 			// ^stem*: the completion is the document's first token.
 			e.posOut = e.positionsOf(it, e.posOut[:0])
@@ -174,7 +183,6 @@ func (e *ftsExec) scorePhrasePrefix(g ftsClauseGroup, comps []ftsCompletion, req
 		cnt[slot] += countCommon(next[endOff[slot]:endOff[slot+1]], e.posOut)
 		return nil
 	})
-	union.aux, cand.aux, cand.aux2 = next, cnt, endOff
 	if err != nil {
 		return err
 	}
@@ -201,15 +209,16 @@ func (e *ftsExec) scorePhrasePrefix(g ftsClauseGroup, comps []ftsCompletion, req
 	return nil
 }
 
-// walkCompletions streams every posting of every completion, in completion
-// (vocabulary) order, through visit.
-func (e *ftsExec) walkCompletions(comps []ftsCompletion, visit func(it fts.ChunkIterator, docID uint64) error) error {
-	for _, c := range comps {
-		if err := e.walkTerm(c.term, visit); err != nil {
-			return err
-		}
-	}
-	return nil
+// walkCompletions streams every posting of every completion of stem, in
+// completion (vocabulary) order, through visit: the vocabulary cursor drives,
+// one postings cursor is reused for every completion.
+func (e *ftsExec) walkCompletions(stem string, visit func(it fts.ChunkIterator, docID uint64) error) error {
+	cur := e.tx.NewCursor(e.fx.nsPost)
+	defer cur.Close()
+	return e.forEachCompletion(stem, func(term []byte) error {
+		e.prefixBuf = postingsTermPrefixBytes(e.prefixBuf, term)
+		return e.walkPostings(cur, e.prefixBuf, visit)
+	})
 }
 
 // countCommon counts the values present in both ascending lists.

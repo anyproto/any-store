@@ -65,7 +65,7 @@ func buildTextPlan(params *PlanParams) *Plan {
 	needSort := params.Sorter != nil
 	needFilter := params.Filter != nil && !isAllFilter(params.Filter)
 
-	canProbe := spec.Probe != nil && spec.Stats.Valid && !spec.Stats.DriverOnly
+	canProbe := spec.Probe != nil && spec.Stats.Valid
 	stats := spec.Stats
 
 	// selText: fraction of the collection matching the $text predicate.
