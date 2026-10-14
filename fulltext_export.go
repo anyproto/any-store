@@ -10,7 +10,8 @@ import "github.com/anyproto/any-store/v2/internal/fts"
 // UAX#29 word boundaries + CJK bigrams) over text and returns the resulting
 // terms in token order — the terms a $text clause over the same text would
 // match. An application builds search-as-you-type queries with it: split the
-// typed string, mark the last term a prefix, quote the rest as a phrase.
+// typed string, quote the terms as one phrase and put a * after the closing
+// quote (the last word is a prefix stem), with ^ in front for "starts with".
 func FtsAnalyzeTerms(text string) []string {
 	tokens := fts.Analyze(text)
 	terms := make([]string, len(tokens))

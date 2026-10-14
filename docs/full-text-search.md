@@ -133,10 +133,13 @@ quotes is ignored (the analyzer drops it). The operators are the ASCII `^`, `*`
 and `"` only — full-width `＾＊＂` and typographic quotes are ordinary text. A word
 that the analyzer splits into several terms (`well-known*`, a CJK run) is matched
 as a phrase, so `well-known*` is the phrase-prefix `"well known"*` and `東京*` is
-the bigram phrase `"東京"*`. `*` and `^` are the only inline operators; an
-application that forwards a raw search box into `$search` either accepts them
-or strips a leading `^` and trailing `*` itself (there is deliberately no inline
-`+`/`-`: `-9` must stay the term `9`).
+the bigram phrase `"東京"*`. `"`, `*` and `^` are the only inline operators
+(there is deliberately no inline `+`/`-`: `-9` must stay the term `9`); an
+application that forwards a raw search box into `$search` accepts that a typed
+quote opens a phrase, a `*` after a word makes it a prefix and a `^` before one
+anchors it — or it builds the query from `FtsAnalyzeTerms` as the
+search-as-you-type section does, where typed punctuation never reaches the
+parser.
 
 **A prefix is one term.** `tok*` is scored as a single term whose postings are
 the merged postings of every vocabulary term starting with `tok`: per document
@@ -152,18 +155,22 @@ milliseconds at 100k titles, a large share of a big body index), so an
 application decides the minimum stem length it searches.
 
 **Anchors** test the document's first token: position 0, which is the first
-token of the first indexed field that yields any tokens (an empty or
-punctuation-only title does not count; in an array field only the first element
-can anchor). `^"mario kart"` is "the title starts with mario kart" when the
-title is the index's first field; combined with the title's token count it is
-"the title is mario kart". This is narrower than FTS5's `^`, which anchors at
-the start of any column: with `$fields` naming a later field, `^` matches only
-documents whose earlier fields are empty. Anchored clauses count one occurrence
-(tf 1).
+token of the first indexed field that yields any tokens — an empty or
+punctuation-only title does not count, and in an array field the first element
+that yields tokens is the one that can anchor. `^"mario kart"` with
+`$fields: "title"` is "the title starts with mario kart" when the title is the
+index's first field; combined with the title's token count it is "the title is
+mario kart". This is narrower than FTS5's `^`, which anchors at the start of any
+column: with `$fields` naming a later field, `^` matches only documents whose
+earlier fields are empty. Anchored clauses count one occurrence (tf 1).
+Documents indexed by a build before this rule whose first field is an array
+with a token-less leading element keep their shifted positions until they are
+rewritten, and `^` misses them.
 
-**Phrases, phrase-prefixes and anchored clauses count occurrences** (tf = the
-number of confirmed occurrences) and ignore per-field `Weights`; a term or
-prefix clause scores Σ weight · tf over its fields. IDF is always corpus-wide.
+**Phrases and phrase-prefixes of two or more terms, and anchored clauses, count
+occurrences** (tf = the number of confirmed occurrences) and ignore per-field
+`Weights`; a term, a quoted single term and a prefix score Σ weight · tf over
+their fields. IDF is always corpus-wide.
 
 The other `$text` fields:
 
@@ -245,16 +252,19 @@ func titleTiers(typed string) []string {
     }
     phrase := strings.Join(terms, " ")
     star := "*" // the last word is unfinished …
-    if strings.HasSuffix(typed, " ") {
+    if r, _ := utf8.DecodeLastRuneInString(typed); unicode.IsSpace(r) {
         star = "" // … unless the user typed a space after it
     }
-    last := terms[len(terms)-1] + star
-    bag := strings.Join(append(terms[:len(terms)-1:len(terms)-1], last), " ")
-    return []string{
+    tiers := []string{
         `^"` + phrase + `"` + star, // tier 1: the title starts with the typed words   → Mario Kart, Mario Kart 64
         `"` + phrase + `"` + star,  // tier 2: the typed words appear in order inside → Super Mario Kart
-        bag,                        // tier 3: every word present, last as prefix    → Kart: Mario Edition
     }
+    if len(terms) > 1 { // one word: tier 2 already is "the word, anywhere"
+        last := terms[len(terms)-1] + star
+        bag := strings.Join(append(terms[:len(terms)-1:len(terms)-1], last), " ")
+        tiers = append(tiers, bag) // tier 3: every word present, last as prefix   → Kart: Mario Edition
+    }
+    return tiers
 }
 
 seen := map[string]bool{}
@@ -265,13 +275,17 @@ for _, search := range titleTiers(typed) {
         return err
     }
     for iter.Next() {
-        doc, _ := iter.Doc()
+        doc, err := iter.Doc()
+        if err != nil {
+            iter.Close()
+            return err
+        }
         if id := doc.Value().GetString("id"); !seen[id] {
             seen[id] = true
             // … show it …
         }
     }
-    if err := iter.Close(); err != nil {
+    if err := errors.Join(iter.Err(), iter.Close()); err != nil {
         return err
     }
 }
@@ -282,10 +296,11 @@ document, so with a title-only index the shortest titles come first, which is
 what a title list wants (with a title+body index a long body pushes a short
 title down). Tier 0, "the title *is* the typed text", is tier 1 with the title's
 token count equal to `len(terms)`, which the application knows from the
-document. Each tier walks the typed words' postings once — a few milliseconds at
-100k titles — so running them per keystroke is fine; the costly keystroke is a
-one-letter last word (`mario k`), which walks every `k…` posting, and an
-application may wait for the second letter.
+document. Each tier walks the typed words' postings once — about a millisecond
+at 100k titles for a two-letter stem, 9 ms for a one-letter one — so running
+them per keystroke is fine; the costly keystroke is a one-letter last word
+(`mario k`), which walks every `k…` posting, and an application may wait for the
+second letter.
 
 ### CJK and multilingual queries
 

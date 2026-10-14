@@ -234,7 +234,8 @@ coll.Find(`{"$text": {"$search": "east tokyo"}}`).
 
 FTS is a **first-class planner source**, integrated exactly like the vector
 index. A `$text` predicate must drive the query (it's the only selective
-source), so `BuildPlan` bypasses the CBO and builds:
+source), so `BuildPlan` builds (or, when a selective restriction makes the
+probe form cheaper, the FtsProbeIter plan of `text_plan.go` instead):
 
 ```
 FtsIter -> [FilterIter(residual)] -> [SortIter(real field)] -> [LimitIter]
@@ -281,7 +282,7 @@ affects matching and tf only). `"phrase"*` runs the phrase merge for the fixed
 terms, records each occurrence's end, then walks the completions' postings once
 and counts the completions that follow an end. `^` (FTS5's initial-token
 operator) anchors a clause at position 0 — the first token of the first field
-that yields tokens, so only the first element of an array field can anchor;
+that yields tokens, so in an array field the first element with tokens anchors;
 positions are a single global sequence per document and the per-field starts
 are not stored, so FTS5's per-column anchoring would need per-document field
 offsets in docinfo (reserved for docinfo v2 with per-field lengths). `$fields`
@@ -289,9 +290,15 @@ scopes a query by the postings' field mask; a position's field follows from the
 per-field TFs (the first TF_f positions belong to the lowest occupied field,
 and so on), so phrases are scoped exactly with no format change. A prefix
 clause has no probe form (its merged IDF needs the full walk): `detectFtsQuery`
-hands the planner no Probe and no StatsFn for it, so the driver is the only
-plan. The completions are streamed from the vocabulary straight into one reused
-postings cursor; nothing is materialized per completion.
+hands the planner no Probe for it, so the driver is the only plan and the plan
+stats are computed for Explain only. The completions are streamed from the
+vocabulary straight into one reused postings cursor (SeekNear: postings keys
+are length-major, so consecutive completions share leaves); nothing is
+materialized per completion. The corpus-wide document count of a prefix is a
+bit set over IntDocID; only in-scope documents take a slot in the TF table. A
+document whose first tokens follow a token-less array element is rewritten
+whole on update (`leadingTokenless`), since earlier builds laid its positions
+out differently.
 
 Boolean require/exclude (**implemented**, Phase 1) come from the typed
 `$require`/`$exclude` sub-fields of `$text` (not inline `+`/`-`): required clauses
@@ -362,8 +369,7 @@ prefix, anchored `^` clauses, `$fields` scope; boolean require/exclude
 (`$require` / `$exclude`) and `$defaultOperator`.
 
 Explicitly **deferred to v2+**: per-field length normalisation (docinfo v2;
-BM25F weights and `b`/`k1` are in); top-k materialization in
-`search` (it currently clones every matched id before `Limit` trims); replacing
+BM25F weights and `b`/`k1` are in); replacing
 the per-doc `docinfo` `Get` with an in-memory dense quantized doc-length array
 (safe now that `IntDocID` is stable and dense); fuzzy/Levenshtein search over
 `fts:vocab`; chunk-level (max-TF) WAND skipping; configurable analyzers /
