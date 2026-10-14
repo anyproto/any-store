@@ -37,29 +37,33 @@ func (e *ftsExec) scorePrefix(g ftsClauseGroup, reqBit uint64, tomb bool) error 
 
 // scorePrefixUnion scores a bare prefix clause: one pass over the completions'
 // postings sums the per-field term frequencies per document into a dense
-// table, then every document with an in-scope posting is scored once with the
-// merged IDF. The IDF counts every document holding a completion, in scope or
-// not — corpus-wide like a plain term's — so a scoped prefix ranks as the
-// unscoped one restricted to the matching fields.
+// table, then every document in it is scored once with the merged IDF. The IDF
+// counts every document holding a completion, in scope or not — corpus-wide
+// like a plain term's, so a scoped prefix ranks as the unscoped one restricted
+// to the matching fields — in a bit set over IntDocID; only in-scope documents
+// take a table slot.
 func (e *ftsExec) scorePrefixUnion(stem string, reqBit uint64) error {
 	tab := ftsGetDocTable()
 	defer ftsPutDocTable(tab)
+	seen, err := e.docBits()
+	if err != nil {
+		return err
+	}
+	defer ftsPutDocBits(seen)
 	nf := e.nFields
-	tfs := tab.aux[:0]      // per slot: nf per-field TF sums
-	visible := tab.aux2[:0] // per slot: 1 when some posting lies in scope
-	err := e.walkCompletions(stem, func(it fts.ChunkIterator, docID uint64) error {
+	tfs := tab.aux[:0] // per slot: nf per-field TF sums
+	err = e.walkCompletions(stem, func(it fts.ChunkIterator, docID uint64) error {
+		seen.set(docID)
+		mask := it.FieldMask() & e.scope
+		if mask == 0 {
+			return nil
+		}
 		slot, inserted := tab.insert(docID)
 		if inserted {
 			for i := 0; i < nf; i++ {
 				tfs = append(tfs, 0)
 			}
-			visible = append(visible, 0)
 		}
-		mask := it.FieldMask() & e.scope
-		if mask == 0 {
-			return nil
-		}
-		visible[slot] = 1
 		row := tfs[slot*nf : (slot+1)*nf]
 		for m := mask; m != 0; m &= m - 1 {
 			f := bits.TrailingZeros64(m)
@@ -67,7 +71,7 @@ func (e *ftsExec) scorePrefixUnion(stem string, reqBit uint64) error {
 		}
 		return nil
 	})
-	tab.aux, tab.aux2 = tfs, visible
+	tab.aux = tfs
 	if err != nil {
 		return err
 	}
@@ -75,11 +79,8 @@ func (e *ftsExec) scorePrefixUnion(stem string, reqBit uint64) error {
 	if n == 0 {
 		return nil
 	}
-	idf := e.idf(uint64(n))
+	idf := e.idf(seen.count())
 	for slot := 0; slot < n; slot++ {
-		if visible[slot] == 0 {
-			continue
-		}
 		docID := tab.ids[slot]
 		tf := e.fieldsTF(tfs[slot*nf : (slot+1)*nf])
 		dl, derr := e.docLen(docID)
@@ -109,17 +110,22 @@ func (e *ftsExec) scorePhrasePrefix(g ftsClauseGroup, reqBit uint64, tomb bool) 
 	}
 	cand := ftsGetDocTable()
 	defer ftsPutDocTable(cand)
-	union := ftsGetDocTable()
-	defer ftsPutDocTable(union)
+	// union counts the documents holding any completion (the merged IDF), one
+	// bit per IntDocID.
+	union, err := e.docBits()
+	if err != nil {
+		return err
+	}
+	defer ftsPutDocBits(union)
 
 	// next[endOff[slot]:endOff[slot+1]] are the positions a completion must
 	// occupy for candidate slot (the fixed occurrence's end + 1), ascending;
-	// cnt[slot] the confirmed occurrences. All three live in the pooled tables'
-	// scratch so a phrase-prefix query allocates nothing per call.
-	next := union.aux[:0]
+	// cnt[slot] the confirmed occurrences. All three live in the pooled
+	// table's scratch so a phrase-prefix query allocates nothing per call.
+	next := cand.aux3[:0]
 	endOff := cand.aux2[:0]
 	cnt := cand.aux[:0]
-	defer func() { union.aux, cand.aux, cand.aux2 = next, cnt, endOff }()
+	defer func() { cand.aux, cand.aux2, cand.aux3 = cnt, endOff, next }()
 	if k > 0 {
 		err = e.phraseMerge(g.terms, func(docID uint64, posLists [][]uint32) error {
 			start := len(next)
@@ -159,7 +165,7 @@ func (e *ftsExec) scorePhrasePrefix(g ftsClauseGroup, reqBit uint64, tomb bool) 
 	}
 
 	err = e.walkCompletions(g.stem, func(it fts.ChunkIterator, docID uint64) error {
-		union.insert(docID)
+		union.set(docID)
 		if it.FieldMask()&e.scope == 0 {
 			return nil
 		}
@@ -186,10 +192,11 @@ func (e *ftsExec) scorePhrasePrefix(g ftsClauseGroup, reqBit uint64, tomb bool) 
 	if err != nil {
 		return err
 	}
-	if union.len() == 0 {
+	n := union.count()
+	if n == 0 {
 		return nil
 	}
-	idf := idfSum + e.idf(uint64(union.len()))
+	idf := idfSum + e.idf(n)
 	for slot := 0; slot < cand.len(); slot++ {
 		c := cnt[slot]
 		if c == 0 {
@@ -215,11 +222,64 @@ func (e *ftsExec) scorePhrasePrefix(g ftsClauseGroup, reqBit uint64, tomb bool) 
 func (e *ftsExec) walkCompletions(stem string, visit func(it fts.ChunkIterator, docID uint64) error) error {
 	cur := e.tx.NewCursor(e.fx.nsPost)
 	defer cur.Close()
-	return e.forEachCompletion(stem, func(term []byte) error {
+	return e.forEachCompletion(stem, func(term []byte, _ uint64) error {
 		e.prefixBuf = postingsTermPrefixBytes(e.prefixBuf, term)
 		return e.walkPostings(cur, e.prefixBuf, visit)
 	})
 }
+
+// ftsDocBits is a bit set over IntDocID: the corpus-wide document count of a
+// prefix clause, 1 bit per id ever allocated (125 KB per million) instead of a
+// hash slot per document. Pooled across queries like the tables.
+type ftsDocBits struct {
+	words []uint64
+	n     uint64
+}
+
+var ftsDocBitsPool = sync.Pool{New: func() any { return &ftsDocBits{} }}
+
+// ftsGetDocBits returns a cleared set for ids up to maxID.
+func ftsGetDocBits(maxID uint64) *ftsDocBits {
+	b := ftsDocBitsPool.Get().(*ftsDocBits)
+	b.reset(maxID)
+	return b
+}
+
+// ftsPutDocBits returns a set to the pool, dropping it if it grew past
+// ftsAccMaxPooled words (4 M ids) so pooled RAM stays bounded.
+func ftsPutDocBits(b *ftsDocBits) {
+	if cap(b.words) > ftsAccMaxPooled {
+		b.words = nil
+	}
+	ftsDocBitsPool.Put(b)
+}
+
+// reset clears the set for ids up to maxID.
+func (b *ftsDocBits) reset(maxID uint64) {
+	size := int(maxID>>6) + 1
+	if cap(b.words) < size {
+		b.words = make([]uint64, size)
+	} else {
+		b.words = b.words[:size]
+		clear(b.words)
+	}
+	b.n = 0
+}
+
+// set marks id, growing past maxID if an id beyond it ever appears.
+func (b *ftsDocBits) set(id uint64) {
+	w := int(id >> 6)
+	for w >= len(b.words) {
+		b.words = append(b.words, 0)
+	}
+	bit := uint64(1) << (id & 63)
+	if b.words[w]&bit == 0 {
+		b.words[w] |= bit
+		b.n++
+	}
+}
+
+func (b *ftsDocBits) count() uint64 { return b.n }
 
 // countCommon counts the values present in both ascending lists.
 func countCommon(a, b []uint32) (n uint32) {
@@ -265,10 +325,11 @@ type ftsDocTable struct {
 	ids  []uint64 // docID by slot (insertion order)
 	gen  uint32
 	mask uint32
-	// aux and aux2 are per-slot scratch the scorers lay their side tables in
-	// (TF sums, occurrence ends, counts); pooled and bounded with the table.
+	// aux, aux2 and aux3 are scratch the scorers lay their side tables in
+	// (TF sums, counts, occurrence ends); pooled and bounded with the table.
 	aux  []uint32
 	aux2 []uint32
+	aux3 []uint32
 }
 
 var ftsDocTablePool = sync.Pool{New: func() any { return &ftsDocTable{} }}
@@ -291,6 +352,9 @@ func ftsPutDocTable(t *ftsDocTable) {
 	}
 	if cap(t.aux2) > ftsAccMaxPooled {
 		t.aux2 = nil
+	}
+	if cap(t.aux3) > ftsAccMaxPooled {
+		t.aux3 = nil
 	}
 	ftsDocTablePool.Put(t)
 }

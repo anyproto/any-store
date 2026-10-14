@@ -181,6 +181,7 @@ type ftsExec struct {
 	posBuf      []uint32          // scratch: a posting's full position list (scoped decode)
 	tfBuf       []uint32          // scratch: a posting's sparse per-field TFs (scoped decode)
 	posOut      []uint32          // scratch: a posting's in-scope positions (prefix walks)
+	maxDocID    uint64            // fts:meta seq, read on first use (docBits sizing)
 	requiredAll uint64            // OR of every allocated required-clause bit
 	nextBit     uint              // next required-clause bit index
 }
@@ -548,16 +549,12 @@ func (e *ftsExec) scanTerm(term string, reqBit uint64, tomb bool) error {
 
 // walkTerm streams every posting of term, chunk by chunk, through visit (the
 // query's shared chunk iterator is parked on the posting; docID is its id).
+// The loop is the hot path of every plain term and stays self-contained.
 func (e *ftsExec) walkTerm(term string, visit func(it fts.ChunkIterator, docID uint64) error) error {
 	cur := e.tx.NewCursor(e.fx.nsPost)
 	defer cur.Close()
 	e.prefixBuf = postingsTermPrefix(e.prefixBuf, term)
-	return e.walkPostings(cur, e.prefixBuf, visit)
-}
-
-// walkPostings streams the postings chunks under prefix (postingsTermPrefix of
-// one term) through visit, reusing cur across calls.
-func (e *ftsExec) walkPostings(cur *btree.Cursor, prefix []byte, visit func(it fts.ChunkIterator, docID uint64) error) error {
+	prefix := e.prefixBuf
 	if err := cur.Seek(prefix); err != nil {
 		return err
 	}
@@ -592,11 +589,50 @@ func (e *ftsExec) walkPostings(cur *btree.Cursor, prefix []byte, visit func(it f
 	return nil
 }
 
+// walkPostings streams the postings chunks under prefix (postingsTermPrefix of
+// one term) through visit, reusing cur across calls: completions arrive in
+// vocabulary order and postings keys are length-major, so the next term's
+// chunks usually sit on the leaf the cursor already holds (SeekNear).
+func (e *ftsExec) walkPostings(cur *btree.Cursor, prefix []byte, visit func(it fts.ChunkIterator, docID uint64) error) error {
+	if err := cur.SeekNear(prefix); err != nil {
+		return err
+	}
+	for cur.Valid() {
+		key, kerr := cur.Key()
+		if kerr != nil {
+			return kerr
+		}
+		if len(key) < len(prefix) || string(key[:len(prefix)]) != string(prefix) {
+			break
+		}
+		val, verr := cur.Value()
+		if verr != nil {
+			return verr
+		}
+		it, ierr := e.chunkReader(val)
+		if ierr != nil {
+			return ierr
+		}
+		for it.Next() {
+			if err := visit(it, it.DocID()); err != nil {
+				return err
+			}
+		}
+		if it.Err() != nil {
+			return it.Err()
+		}
+		if err := cur.Next(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // forEachCompletion streams every vocabulary term with the given byte prefix,
-// in vocabulary (byte) order, through fn; term is valid for the call only.
-// There is no cap: a prefix clause covers every completion, and costs what the
-// completions' postings cost.
-func (e *ftsExec) forEachCompletion(stem string, fn func(term []byte) error) error {
+// in vocabulary (byte) order, through fn with its document frequency; term is
+// valid for the call only. There is no cap: a prefix clause covers every
+// completion, and costs what the completions' postings cost.
+func (e *ftsExec) forEachCompletion(stem string, fn func(term []byte, df uint64) error) error {
 	if stem == "" {
 		return nil
 	}
@@ -614,7 +650,12 @@ func (e *ftsExec) forEachCompletion(stem string, fn func(term []byte) error) err
 		if !bytes.HasPrefix(key, p) {
 			break
 		}
-		if err = fn(key); err != nil {
+		val, err := cur.Value()
+		if err != nil {
+			return err
+		}
+		df, _ := binary.Uvarint(val)
+		if err = fn(key, df); err != nil {
 			return err
 		}
 		if err = cur.Next(); err != nil {
@@ -622,6 +663,20 @@ func (e *ftsExec) forEachCompletion(stem string, fn func(term []byte) error) err
 		}
 	}
 	return nil
+}
+
+// docBits returns a cleared pooled bit set over IntDocID, sized from fts:meta
+// seq (the largest id ever allocated, read once per query). The caller returns
+// it with ftsPutDocBits.
+func (e *ftsExec) docBits() (*ftsDocBits, error) {
+	if e.maxDocID == 0 {
+		seq, err := ftsGetUint(e.tx, e.fx.nsMeta, ftsMetaSeq)
+		if err != nil {
+			return nil, err
+		}
+		e.maxDocID = seq
+	}
+	return ftsGetDocBits(e.maxDocID), nil
 }
 
 // scorePhrase finds documents where the phrase terms occur at consecutive
@@ -1167,9 +1222,9 @@ func (q *collQuery) detectFtsQuery(s *collSchema) (*qplanner.FtsQuerySpec, query
 		// A prefix clause has no probe form: its merged-completion IDF is the
 		// number of documents holding any completion, known only after the
 		// completions' postings are walked in full. A nil Probe makes the
-		// driver the only legal plan, and the stats (whose only consumer is
-		// the probe costing) are not computed at all.
-		spec.Probe, spec.StatsFn = nil, nil
+		// driver the only legal plan; compilePlan then computes the stats
+		// (one vocabulary scan) for Explain only.
+		spec.Probe = nil
 	}
 	residual := ftsResidualFilter(q.cond)
 	// HARD post-condition, mirroring detectKnnQuery's ContainsKnn assert: a

@@ -341,7 +341,9 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 			Fts:        ftsSpec,
 		}
 		probePossible := q.fillProbeInputs(btx, s, ftsResidual, sorter != nil, opts, params)
-		if probePossible && ftsSpec.StatsFn != nil {
+		// With no probe form the stats price nothing: compute them for
+		// Explain only.
+		if probePossible && ftsSpec.StatsFn != nil && (ftsSpec.Probe != nil || opts.wantCandidates) {
 			// A stats failure only disables the probe form (Valid stays
 			// false); the driver plan needs none of it.
 			if st, serr := ftsSpec.StatsFn(btx); serr == nil {
