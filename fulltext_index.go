@@ -301,11 +301,11 @@ func (fx *ftsIndex) appendFieldTokens(dst []fts.Token, fv *anyenc.Value, base ui
 			// >= ftsPosGap tokens would otherwise overlap the next element's range,
 			// producing false cross-element phrase matches and non-ascending
 			// per-term position lists (breaking AppendChunk's ascending contract
-			// and countAdjacent's binary search).
+			// and countAdjacent's binary search). An element with no tokens
+			// leaves the base alone, so a token-less leading element keeps the
+			// document's first token at position 0 (the ^ anchor).
 			if len(dst) > 0 {
 				base = dst[len(dst)-1].Pos + 1 + ftsPosGap
-			} else {
-				base += ftsPosGap
 			}
 		}
 	}
