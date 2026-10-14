@@ -739,7 +739,9 @@ func parseText(v *anyenc.Value) (Filter, error) {
 //
 // A ^ or * that is not attached to a word or phrase (a lone "^", "*", "^*") is
 // dropped. A * inside the quotes is ignored (the analyzer drops it); only a *
-// right after the closing quote makes a phrase-prefix.
+// right after the closing quote makes a phrase-prefix. A doubled quote inside
+// a phrase ("" as in FTS5) is a literal quote, for the scripts whose words keep
+// one (Hebrew צה"ל).
 //
 // Deliberately there is NO inline +/- boolean syntax. Parsing boolean intent out
 // of a raw human search string is a footgun for an embedded library whose common
@@ -749,8 +751,7 @@ func parseText(v *anyenc.Value) (Filter, error) {
 // — so "-9" is just the term "9". Boolean require/exclude lives in the structured
 // $require / $exclude arrays, which are unambiguous and run through the same
 // analyzer. An app that wants single-box power-user syntax can parse it itself and
-// populate those fields. A trailing * is honoured on bare words and after a
-// closing quote (the phrase-prefix form); inside the quotes it is ignored.
+// populate those fields.
 func ParseTextSearch(s string) []TextClause {
 	var clauses []TextClause
 	rs := []rune(s)
@@ -772,14 +773,21 @@ func ParseTextSearch(s string) []TextClause {
 		}
 		if rs[i] == '"' {
 			i++ // opening quote
-			start := i
-			for i < n && rs[i] != '"' {
+			var sb strings.Builder
+			for i < n {
+				if rs[i] == '"' {
+					if i+1 < n && rs[i+1] == '"' {
+						sb.WriteByte('"') // "" → a literal quote
+						i += 2
+						continue
+					}
+					i++ // closing quote
+					break
+				}
+				sb.WriteRune(rs[i])
 				i++
 			}
-			raw := strings.TrimSpace(string(rs[start:i]))
-			if i < n {
-				i++ // closing quote
-			}
+			raw := strings.TrimSpace(sb.String())
 			prefix := false
 			for i < n && rs[i] == '*' {
 				prefix = true // "phrase"* — the last word is a stem

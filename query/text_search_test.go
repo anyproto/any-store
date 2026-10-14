@@ -83,6 +83,15 @@ func TestParseTextSearch(t *testing.T) {
 			[]TextClause{{Raw: "east", Op: TextShould}, {Raw: "tokyo", Op: TextShould}},
 		},
 		{
+			"doubled quote inside a phrase is a literal quote",
+			`"צה""ל ב"* "a ""b"" c" "x"""`,
+			[]TextClause{
+				{Raw: `צה"ל ב`, Phrase: true, Prefix: true, Op: TextShould},
+				{Raw: `a "b" c`, Phrase: true, Op: TextShould},
+				{Raw: `x"`, Phrase: true, Op: TextShould},
+			},
+		},
+		{
 			"multiple trailing stars collapse",
 			`"east tok"** pre**`,
 			[]TextClause{
@@ -176,6 +185,10 @@ func TestText_String(t *testing.T) {
 	})
 	assert.Equal(t, `{"$text":{"$search":"east ^\"tok yo\"*","$defaultOperator":"and","$require":["^critical","\"east side\"*"],"$exclude":["draft*"],"$fields":["title","body"]}}`, f.String())
 	assert.Equal(t, `{"$text":{"$search":"x"}}`, Text{Search: "x"}.String())
+	// A quote inside a phrase round-trips doubled.
+	c := TextClause{Raw: `צה"ל ב`, Phrase: true, Prefix: true, Anchored: true}
+	assert.Equal(t, `^"צה""ל ב"*`, c.String())
+	assert.Equal(t, []TextClause{{Raw: c.Raw, Phrase: true, Prefix: true, Anchored: true, Op: TextShould}}, ParseTextSearch(c.String()))
 	// Valid JSON, not Go escapes, so the string survives a JSON reader.
 	s := Text{Search: "a\x01b\u00ff"}.String()
 	assert.Equal(t, `{"$text":{"$search":"a\u0001bÿ"}}`, s)

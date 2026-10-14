@@ -984,7 +984,7 @@ func (t Text) String() string {
 }
 
 // String renders the clause in $search syntax: ^ for an anchor, quotes for a
-// phrase, a trailing * for a prefix.
+// phrase (a quote inside it doubled), a trailing * for a prefix.
 func (c TextClause) String() string {
 	var sb strings.Builder
 	if c.Anchored {
@@ -992,7 +992,7 @@ func (c TextClause) String() string {
 	}
 	if c.Phrase {
 		sb.WriteByte('"')
-		sb.WriteString(c.Raw)
+		sb.WriteString(strings.ReplaceAll(c.Raw, `"`, `""`))
 		sb.WriteByte('"')
 	} else {
 		sb.WriteString(c.Raw)
