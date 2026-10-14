@@ -907,3 +907,30 @@ func TestFtsUpdate_LegacyLeadingGapLayout(t *testing.T) {
 	assert.Equal(t, []string{"keep"}, find(`"mario kart"`))
 	assert.Empty(t, find("^mario"), "an untouched old-layout document still does not anchor")
 }
+
+// TestFtsLeadingTokenlessFlag pins the shape that forces a whole rewrite on
+// update: the document's first token from an array element preceded, in the
+// same array, by token-less elements. Shapes earlier builds laid out the same
+// way are not flagged, so their updates keep the cheap diff.
+func TestFtsLeadingTokenlessFlag(t *testing.T) {
+	fx, c := ftsTestColl(t, "title", "names", "body")
+	defer fx.finish()
+	fxi := c.loadFtsIndexes()[0]
+	cases := []struct {
+		doc  string
+		want bool
+	}{
+		{`{"names":["","mario"]}`, true},
+		{`{"title":"","names":["!!","","mario"]}`, true},
+		{`{"title":"x","names":["","mario"]}`, false}, // tokens before the array
+		{`{"names":[""],"body":"mario"}`, false},      // no later element yields tokens
+		{`{"names":["",""],"body":"mario"}`, false},
+		{`{"names":["mario",""]}`, false},
+		{`{"names":[7,"mario"]}`, false}, // a number is skipped before the gap logic
+		{`{"body":"mario"}`, false},
+	}
+	for _, tc := range cases {
+		fxi.analyzeInto(nil, item{val: anyenc.MustParseJson(tc.doc)})
+		assert.Equal(t, tc.want, fxi.leadingTokenless, tc.doc)
+	}
+}

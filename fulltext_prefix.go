@@ -230,7 +230,9 @@ func (e *ftsExec) walkCompletions(stem string, visit func(it fts.ChunkIterator, 
 
 // ftsDocBits is a bit set over IntDocID: the corpus-wide document count of a
 // prefix clause, 1 bit per id ever allocated (125 KB per million) instead of a
-// hash slot per document. Pooled across queries like the tables.
+// hash slot per document. Its size follows the id sequence, which deletes and
+// re-inserts grow for good (ids are never reused), like a Lucene maxDoc.
+// Pooled across queries like the tables.
 type ftsDocBits struct {
 	words []uint64
 	n     uint64
@@ -266,11 +268,15 @@ func (b *ftsDocBits) reset(maxID uint64) {
 	b.n = 0
 }
 
-// set marks id, growing past maxID if an id beyond it ever appears.
+// set marks id, growing past maxID if an id beyond it ever appears. An id
+// beyond ftsMaxDocID is corruption and is not counted.
 func (b *ftsDocBits) set(id uint64) {
+	if id > ftsMaxDocID {
+		return
+	}
 	w := int(id >> 6)
-	for w >= len(b.words) {
-		b.words = append(b.words, 0)
+	if w >= len(b.words) {
+		b.words = append(b.words, make([]uint64, w+1-len(b.words))...)
 	}
 	bit := uint64(1) << (id & 63)
 	if b.words[w]&bit == 0 {

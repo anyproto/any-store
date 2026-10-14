@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -118,4 +119,40 @@ func splitComma(s string) (out []string) {
 		}
 	}
 	return out
+}
+
+// TestFtsPrefix_CorruptSeqIsAnError pins that an absurd fts:meta seq (which
+// would size the bit set in gigabytes) fails the query instead of allocating.
+func TestFtsPrefix_CorruptSeqIsAnError(t *testing.T) {
+	fx, c := ftsTestColl(t, "name")
+	defer fx.finish()
+	insertJSON(t, c, `{"id":"a","name":"zebra"}`)
+	fxi := c.loadFtsIndexes()[0]
+	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		return fxi.putMetaUint(tx, ftsMetaSeq, 1<<58)
+	}))
+	ids, _ := collectIter(t, c.Find(`{"$text":{"$search":"zebra"}}`))
+	assert.Equal(t, []string{"a"}, ids, "a plain term never reads the sequence")
+	_, err := c.Find(`{"$text":{"$search":"zeb*"}}`).Count(ctx)
+	assert.ErrorIs(t, err, errFtsCorruptMeta)
+	it, err := c.Find(`{"$text":{"$search":"zeb*"}}`).Iter(ctx)
+	if err == nil {
+		assert.False(t, it.Next())
+		assert.ErrorIs(t, errors.Join(it.Err(), it.Close()), errFtsCorruptMeta)
+	}
+}
+
+func TestFtsDocBits(t *testing.T) {
+	b := ftsGetDocBits(100)
+	defer ftsPutDocBits(b)
+	b.set(3)
+	b.set(3)
+	b.set(100)
+	b.set(500) // beyond the sizing bound: grows
+	b.set(ftsMaxDocID + 1)
+	assert.Equal(t, uint64(3), b.count())
+	b.reset(10)
+	assert.Equal(t, uint64(0), b.count())
+	b.set(3)
+	assert.Equal(t, uint64(1), b.count())
 }

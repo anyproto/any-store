@@ -113,7 +113,7 @@ func (p *ftsProber) addContribution(intId uint64, idf, tf float64, reqBit uint64
 }
 
 // newFtsProber compiles the $text predicate for probing on the given snapshot.
-// Corpus stats (N, avgdl) and prefix expansions are resolved against tx, so a
+// Corpus stats (N, avgdl) and term frequencies are resolved against tx, so a
 // prober and a driver scan on the same snapshot see identical vocabularies.
 func (fx *ftsIndex) newFtsProber(tx *btree.ReadTx, text query.Text) (*ftsProber, error) {
 	clauses := text.ParsedClauses()
@@ -299,7 +299,7 @@ func (p *ftsProber) Probe(docId []byte) (score float64, intId uint64, ok bool, e
 	p.curScore, p.curMask, p.curMatched, p.curDlLoaded = 0, 0, false, false
 
 	// Positive contributions, in the driver's exact order: plain terms
-	// (first-seen order), then groups (each prefix expansion in order).
+	// (first-seen order), then groups in clause order.
 	for i := range p.plain {
 		pt := &p.plain[i]
 		if pt.df == 0 {

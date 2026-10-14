@@ -73,11 +73,12 @@ type ftsIndex struct {
 	// at commit. See fulltext_pending.go.
 	pending ftsPending
 
-	// leadingTokenless is set by analyzeInto when the document's first tokens
-	// come from an array element preceded by token-less elements: the one
-	// shape whose positions earlier builds laid out differently (shifted by a
-	// gap per such element). updateDoc rewrites such a document whole instead
-	// of diffing, so stored positions from either layout never mix with new
+	// leadingTokenless is set by appendFieldTokens (reset by analyzeInto)
+	// when the document's first token comes from an array element preceded,
+	// in the same array, by elements that yielded none: the one shape whose
+	// positions builds up to v2.3.0 laid out differently (shifted by a gap per
+	// such element). updateDoc rewrites a flagged document whole instead of
+	// diffing, so stored positions from either layout never mix with new
 	// ones. legacyLeadingGap reproduces the old layout for tests.
 	leadingTokenless bool
 	legacyLeadingGap bool
@@ -297,6 +298,7 @@ func (fx *ftsIndex) appendFieldTokens(dst []fts.Token, fv *anyenc.Value, base ui
 		if err != nil {
 			return dst
 		}
+		tokenlessFirst := false // a token-less element seen before the document's first token
 		for _, av := range arr {
 			if av.Type() != anyenc.TypeString {
 				continue
@@ -305,7 +307,11 @@ func (fx *ftsIndex) appendFieldTokens(dst []fts.Token, fv *anyenc.Value, base ui
 			if err != nil {
 				continue
 			}
+			before := len(dst)
 			dst = fx.appendText(dst, string(sb), base)
+			if before == 0 && len(dst) > 0 && tokenlessFirst {
+				fx.leadingTokenless = true // the shape builds up to v2.3.0 shifted
+			}
 			// Keep array elements on separate position runs too. Advance past the
 			// element's last emitted position (not by a fixed step): an element with
 			// >= ftsPosGap tokens would otherwise overlap the next element's range,
@@ -321,7 +327,7 @@ func (fx *ftsIndex) appendFieldTokens(dst []fts.Token, fv *anyenc.Value, base ui
 			case fx.legacyLeadingGap:
 				base += ftsPosGap
 			default:
-				fx.leadingTokenless = true
+				tokenlessFirst = true
 			}
 		}
 	}

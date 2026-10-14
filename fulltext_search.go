@@ -591,8 +591,9 @@ func (e *ftsExec) walkTerm(term string, visit func(it fts.ChunkIterator, docID u
 
 // walkPostings streams the postings chunks under prefix (postingsTermPrefix of
 // one term) through visit, reusing cur across calls: completions arrive in
-// vocabulary order and postings keys are length-major, so the next term's
-// chunks usually sit on the leaf the cursor already holds (SeekNear).
+// vocabulary order and postings keys are length-major, so a next term of the
+// same length often sits on the leaf the cursor already holds (SeekNear takes
+// the short path then, a full seek otherwise).
 func (e *ftsExec) walkPostings(cur *btree.Cursor, prefix []byte, visit func(it fts.ChunkIterator, docID uint64) error) error {
 	if err := cur.SeekNear(prefix); err != nil {
 		return err
@@ -665,6 +666,14 @@ func (e *ftsExec) forEachCompletion(stem string, fn func(term []byte, df uint64)
 	return nil
 }
 
+// ftsMaxDocID bounds the IntDocID sequence a query trusts: ids are allocated
+// one per inserted document and never reused, so a larger value is corruption
+// (a bit set sized from it would be a multi-gigabyte allocation).
+const ftsMaxDocID = 1 << 36
+
+// errFtsCorruptMeta reports an fts:meta value no healthy index can hold.
+var errFtsCorruptMeta = errors.New("any-store: full-text index meta is corrupt; drop and recreate the index")
+
 // docBits returns a cleared pooled bit set over IntDocID, sized from fts:meta
 // seq (the largest id ever allocated, read once per query). The caller returns
 // it with ftsPutDocBits.
@@ -673,6 +682,9 @@ func (e *ftsExec) docBits() (*ftsDocBits, error) {
 		seq, err := ftsGetUint(e.tx, e.fx.nsMeta, ftsMetaSeq)
 		if err != nil {
 			return nil, err
+		}
+		if seq > ftsMaxDocID {
+			return nil, errFtsCorruptMeta
 		}
 		e.maxDocID = seq
 	}
