@@ -73,6 +73,15 @@ type ftsIndex struct {
 	// at commit. See fulltext_pending.go.
 	pending ftsPending
 
+	// leadingTokenless is set by analyzeInto when the document's first tokens
+	// come from an array element preceded by token-less elements: the one
+	// shape whose positions earlier builds laid out differently (shifted by a
+	// gap per such element). updateDoc rewrites such a document whole instead
+	// of diffing, so stored positions from either layout never mix with new
+	// ones. legacyLeadingGap reproduces the old layout for tests.
+	leadingTokenless bool
+	legacyLeadingGap bool
+
 	// nFields is the number of indexed fields (== len(fieldPaths)); each token's
 	// field index keys into the FieldMask / per-field TF of the v2 postings.
 	nFields int
@@ -230,6 +239,7 @@ func (fx *ftsIndex) analyzeInto(dst []fts.Token, it item) []fts.Token {
 	dst = dst[:0]
 	val := it.Value()
 	fx.fieldStarts = append(fx.fieldStarts[:0], make([]uint32, fx.nFields+1)...)
+	fx.leadingTokenless = false
 	var base uint32
 	for fieldIdx, path := range fx.fieldPaths {
 		fx.fieldStarts[fieldIdx] = base
@@ -303,9 +313,15 @@ func (fx *ftsIndex) appendFieldTokens(dst []fts.Token, fv *anyenc.Value, base ui
 			// per-term position lists (breaking AppendChunk's ascending contract
 			// and countAdjacent's binary search). An element with no tokens
 			// leaves the base alone, so a token-less leading element keeps the
-			// document's first token at position 0 (the ^ anchor).
-			if len(dst) > 0 {
+			// document's first token at position 0 (the ^ anchor); builds before
+			// this rule advanced it (see leadingTokenless).
+			switch {
+			case len(dst) > 0:
 				base = dst[len(dst)-1].Pos + 1 + ftsPosGap
+			case fx.legacyLeadingGap:
+				base += ftsPosGap
+			default:
+				fx.leadingTokenless = true
 			}
 		}
 	}
@@ -536,13 +552,18 @@ func (fx *ftsIndex) updateDoc(tx *btree.WriteTx, oldIt, newIt item) error {
 	fx.termBufA, oldLen = fx.termPostingsInto(fx.termBufA, fx.tokBuf)
 	oldTerms := fx.termBufA
 	fx.fieldStartsOld = append(fx.fieldStartsOld[:0], fx.fieldStarts...)
+	// The old document's stored positions may follow an earlier build's layout
+	// (a token-less leading array element once shifted them); the diff below
+	// would keep some of those and mix them with new ones, so such a document
+	// is rewritten whole.
+	rewriteAll := fx.leadingTokenless
 	fx.tokBufB = fx.analyzeInto(fx.tokBufB, newIt)
 	fx.termBufB, newLen = fx.termPostingsInto(fx.termBufB, fx.tokBufB)
 	newTerms := fx.termBufB
 	// Field ranges moved (e.g. an earlier field emptied, so a later field inherits
 	// its base): identical positions may now map to different fields, so every
 	// surviving term must be re-attributed even when its positions are unchanged.
-	startsChanged := !slices.Equal(fx.fieldStartsOld, fx.fieldStarts)
+	startsChanged := rewriteAll || !slices.Equal(fx.fieldStartsOld, fx.fieldStarts)
 
 	if newLen == 0 {
 		// Doc lost all indexable text → drop it from the index entirely.

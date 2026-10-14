@@ -862,3 +862,48 @@ func TestOlderReaderLeavesUncommittedIndexDDLAlone(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, n)
 }
+
+// TestFtsUpdate_LegacyLeadingGapLayout pins the upgrade path for a document
+// whose first tokens come from an array element preceded by token-less
+// elements: earlier builds shifted its positions by a gap per such element.
+// An update of such a document rewrites it whole under the current layout —
+// stored positions of the two layouts never mix — so phrases neither cross
+// an element or field boundary nor go missing, and ^ anchors it afterwards.
+// Untouched documents keep the old layout and merely fail to anchor.
+func TestFtsUpdate_LegacyLeadingGapLayout(t *testing.T) {
+	fx, c := ftsTestColl(t, "names", "body")
+	defer fx.finish()
+	fxi := c.loadFtsIndexes()[0]
+	fxi.legacyLeadingGap = true
+	insertJSON(t, c,
+		`{"id":"u2","names":["","mario kart"],"body":"x"}`,
+		`{"id":"u5","names":["","k"],"body":"m"}`,
+		`{"id":"u6","names":["","a","b"],"body":"x"}`,
+		`{"id":"keep","names":["","mario kart"],"body":"x"}`,
+	)
+	fxi.legacyLeadingGap = false
+
+	find := func(search string) []string {
+		ids, _ := collectIter(t, c.Find(map[string]any{"$text": map[string]any{"$search": search}}))
+		return ids
+	}
+	// Old layout: the first token sits at position 100, so nothing anchors.
+	assert.Empty(t, find("^mario"))
+	assert.ElementsMatch(t, []string{"u2", "keep"}, find(`"mario kart"`))
+
+	for _, j := range []string{
+		`{"id":"u2","names":["","luigi kart"],"body":"x"}`,
+		`{"id":"u5","names":["","k"],"body":"n"}`,
+		`{"id":"u6","names":["","a","q"],"body":"x"}`,
+	} {
+		require.NoError(t, c.UpsertOne(ctx, anyenc.MustParseJson(j)))
+	}
+	assert.Equal(t, []string{"u2"}, find(`"luigi kart"`), "the phrase is whole after the rewrite")
+	assert.Equal(t, []string{"u2"}, find("^luigi"))
+	assert.Empty(t, find(`"k n"`), "no phrase across the field boundary")
+	assert.Equal(t, []string{"u5"}, find("^k"))
+	assert.Empty(t, find(`"a q"`), "no phrase across array elements")
+	assert.Equal(t, []string{"u6"}, find("^a"))
+	assert.Equal(t, []string{"keep"}, find(`"mario kart"`))
+	assert.Empty(t, find("^mario"), "an untouched old-layout document still does not anchor")
+}
