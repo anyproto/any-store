@@ -9,7 +9,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
+	"math/rand"
 )
 
 func qplannerEnableCounters(t *testing.T) {
@@ -481,5 +483,75 @@ func TestFtsProbe_PrefixDriverOnly(t *testing.T) {
 			}
 		}
 		assertSamePlanResults(t, coll, cond, 0, 0, nil)
+	}
+}
+
+// TestFtsProbe_RandomParity probes every document of random corpora with
+// random non-prefix queries (plain, quoted single, phrases, anchors, joined
+// words, $require/$exclude, $defaultOperator, $fields, BM25F weights with a
+// zero weight) and requires the prober's verdict and score bits to equal the
+// driver scan's. Helpers and corpora: fulltext_search_oracle_test.go.
+func TestFtsProbe_RandomParity(t *testing.T) {
+	fx := newFixture(t)
+	defer fx.finish()
+	r := rand.New(rand.NewSource(11))
+	failures := 0
+	for _, zc := range ftoCorpora(t, fx) {
+		fxi := zc.c.loadFtsIndexes()[0]
+		require.NoError(t, zc.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+			for i := 0; i < 1500 && failures < 10; i++ {
+				q := ftoQuery(r, false)
+				text := ftoParse(t, q)
+				require.False(t, ftoHasPrefix(text))
+				drv := ftoDriver(t, fxi, tx, text)
+				prb := ftoProber(t, zc.c, fxi, tx, text, zc.docs)
+				if d := ftoDiff(drv, prb); len(d) > 0 {
+					failures++
+					t.Errorf("%s %v: prober diverges from the driver:\n  %s", zc.c.Name(), q, strings.Join(d, "\n  "))
+				}
+			}
+			return nil
+		}))
+	}
+}
+
+// TestFtsProbe_DifferentialScopedSorted extends the driver/probe differential
+// to the search-as-you-type forms: $fields scopes, anchors and phrase-prefixes,
+// each under every residual restriction and every real-field sort, with and
+// without Limit/Offset. assertSamePlanResults compares rows, order, bit-exact
+// scores and Count across the forced plans.
+func TestFtsProbe_DifferentialScopedSorted(t *testing.T) {
+	fx, coll := ftsProbeColl(t)
+	defer fx.finish()
+	texts := []map[string]any{
+		{"$search": "alpha", "$fields": "title"},
+		{"$search": "alpha beta", "$fields": "body"},
+		{"$search": `"alpha beta"`, "$fields": "body"},
+		{"$search": "^alpha"},
+		{"$search": `^"alpha title"`, "$require": "omega"},
+		{"$search": "omega", "$fields": "body", "$exclude": "^alpha"},
+		{"$search": `"alpha prefixt"*`, "$fields": "body"},
+		{"$search": `^"alpha ti"*`},
+		{"$search": "^alpha*", "$fields": "title"},
+		{"$search": "omega", "$require": `"alpha be"*`, "$defaultOperator": "and"},
+	}
+	restrictions := []map[string]any{
+		nil,
+		{"a": 3},
+		{"id": map[string]any{"$in": manyIds(30)}},
+		{"a": 3, "s": map[string]any{"$lt": 30}},
+	}
+	for _, text := range texts {
+		for _, r := range restrictions {
+			cond := map[string]any{"$text": text}
+			for k, v := range r {
+				cond[k] = v
+			}
+			for _, sort := range []any{nil, "s", "-s", "a"} {
+				assertSamePlanResults(t, coll, cond, 0, 0, sort)
+				assertSamePlanResults(t, coll, cond, 4, 0, sort)
+				assertSamePlanResults(t, coll, cond, 4, 2, sort)
+			}
+		}
 	}
 }

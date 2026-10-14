@@ -254,3 +254,83 @@ func TestFtsSayt_Verbs(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, strings.Contains(ex.Plan, "FtsSearch"), "a prefix clause has no probe form: %s", ex.Plan)
 }
+
+// TestFtsSayt_AnchorTokenlessLeadingElement pins the anchor on an array field
+// whose first element yields no tokens: the document's first token is still
+// position 0, so ^ matches it like a plain string title.
+func TestFtsSayt_AnchorTokenlessLeadingElement(t *testing.T) {
+	fx := newFixture(t)
+	defer fx.finish()
+	coll, err := fx.CreateCollection(ctx, "names")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Kind: anystore.IndexKindFulltext, Fields: []string{"names", "body"}}))
+	insertJSON(t, coll,
+		`{"id":"plain","names":["mario kart"],"body":"x"}`,
+		`{"id":"emptyfirst","names":["","mario kart"],"body":"x"}`,
+		`{"id":"bangfirst","names":["!!","mario kart"],"body":"x"}`,
+		`{"id":"numfirst","names":[7,"mario kart"],"body":"x"}`,
+		`{"id":"emptyarr","names":[""],"body":"mario kart"}`,
+		`{"id":"second","names":["luigi","mario kart"],"body":"x"}`, // only the first element anchors
+	)
+	want := []string{"bangfirst", "emptyarr", "emptyfirst", "numfirst", "plain"}
+	for _, search := range []string{"^mario", `^"mario kart"`, "^mar*", `^"mario ka"*`} {
+		ids, _ := ftsSaytQuery(t, coll, map[string]any{"$search": search})
+		assert.Equal(t, want, sortedIDs(ids), search)
+	}
+	ids, _ := ftsSaytQuery(t, coll, map[string]any{"$search": "mario", "$exclude": "^mario"})
+	assert.Equal(t, []string{"second"}, sortedIDs(ids))
+}
+
+// TestFtsSayt_ScopedPrefixIDFIsCorpusWide pins that a prefix's merged IDF
+// counts documents regardless of the $fields scope, like a plain term's: a
+// prefix whose only completion is the term scores exactly like the term,
+// scoped or not.
+func TestFtsSayt_ScopedPrefixIDFIsCorpusWide(t *testing.T) {
+	fx, coll := ftsFieldsColl(t, nil)
+	defer fx.finish()
+	insertJSON(t, coll, `{"id":"e","title":"kart","body":"kart kart"}`, `{"id":"f","body":"kart"}`)
+	for _, scope := range []any{nil, "title", "body"} {
+		term := map[string]any{"$search": "kart"}
+		pre := map[string]any{"$search": "kart*"}
+		if scope != nil {
+			term["$fields"], pre["$fields"] = scope, scope
+		}
+		ids1, s1 := ftsSaytQuery(t, coll, term)
+		ids2, s2 := ftsSaytQuery(t, coll, pre)
+		assert.Equal(t, ids1, ids2, "scope %v", scope)
+		assert.Equal(t, s1, s2, "scope %v: the merged term must score like the plain term", scope)
+	}
+}
+
+// TestFtsSayt_FieldScopeNestedAndVerbs pins $fields on a nested index path and
+// the unknown-field error on Update and in an aggregation.
+func TestFtsSayt_FieldScopeNestedAndVerbs(t *testing.T) {
+	fx := newFixture(t)
+	defer fx.finish()
+	coll, err := fx.CreateCollection(ctx, "nested")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Kind: anystore.IndexKindFulltext, Fields: []string{"meta.note", "body"}}))
+	insertJSON(t, coll,
+		`{"id":"a","meta":{"note":"east tokyo"},"body":"west"}`,
+		`{"id":"b","meta":{"note":"west"},"body":"east tokyo"}`,
+	)
+	ids, _ := ftsSaytQuery(t, coll, map[string]any{"$search": "east", "$fields": "meta.note"})
+	assert.Equal(t, []string{"a"}, ids)
+	ids, _ = ftsSaytQuery(t, coll, map[string]any{"$search": `^"east tok"*`, "$fields": "meta.note"})
+	assert.Equal(t, []string{"a"}, ids)
+	bad := map[string]any{"$text": map[string]any{"$search": "east", "$fields": "meta"}}
+	_, err = coll.Find(bad).Update(ctx, `{"$set":{"x":1}}`)
+	assert.ErrorIs(t, err, anystore.ErrFulltextUnknownField)
+	_, err = coll.Aggregate([]any{map[string]any{"$match": bad}}).Count(ctx)
+	assert.ErrorIs(t, err, anystore.ErrFulltextUnknownField)
+	it, err := coll.Aggregate([]any{map[string]any{"$match": map[string]any{"$text": map[string]any{"$search": "east", "$fields": "body"}}}}).Iter(ctx)
+	require.NoError(t, err)
+	var got []string
+	for it.Next() {
+		d, derr := it.Doc()
+		require.NoError(t, derr)
+		got = append(got, d.Value().GetString("id"))
+	}
+	require.NoError(t, it.Close())
+	assert.Equal(t, []string{"b"}, got)
+}
