@@ -95,10 +95,10 @@ A query becomes a full-text search when it contains a `$text` clause:
 iter, err := coll.Find(`{"$text":{"$search":"zeppelin disaster"}}`).Limit(10).Iter(ctx)
 ```
 
-The search is **bag-of-words** (OR): a document matches if it contains any query
-term, and its score is the sum of the per-term BM25 contributions, so documents
-matching more (and rarer) terms rank higher. Everything else in the filter is
-applied as a normal predicate on the ranked candidates:
+The search is **bag-of-words** (OR) by default: a document matches if it contains
+any query term, and its score is the sum of the per-term BM25 contributions, so
+documents matching more (and rarer) terms rank higher. Everything else in the
+filter is applied as a normal predicate on the ranked candidates:
 
 ```go
 // $text + ordinary filters (implicit AND).
@@ -112,6 +112,63 @@ coll.Find(map[string]any{
 `$search` accepts a `$language`/`$caseSensitive`/`$diacriticSensitive` companion
 for MongoDB compatibility; they are currently accepted and ignored (the analyzer
 is language-neutral).
+
+### Query syntax
+
+The `$search` string is split into clauses (the syntax follows SQLite FTS5):
+
+| Clause | Matches |
+|---|---|
+| `word` | the term anywhere in the document |
+| `"east tokyo"` | the terms adjacent and in order (phrase) |
+| `tok*` | any term starting with `tok` (prefix) |
+| `"east tok"*` | the phrase `east` followed by a term starting with `tok` (phrase-prefix) |
+| `^east`, `^"east tokyo"` | the term / phrase at the document's first token (anchored) |
+| `^tok*`, `^"east tok"*` | anchored prefix and phrase-prefix |
+
+A `^` or `*` that is not attached to a word or phrase is dropped; a `*` inside the
+quotes is literal (the analyzer drops it). A word that the analyzer splits into
+several terms (`well-known*`, a CJK run) is matched as a phrase, so `well-known*`
+is the phrase-prefix `"well kno"*`.
+
+**A prefix is one term.** `tok*` is scored as a single term whose postings are
+the merged postings of every vocabulary term starting with `tok`: per document
+the completions' frequencies add up, and the IDF comes from the number of
+documents holding *any* completion. A rare completion therefore never outweighs
+a common one (`mario ka*` ranks "Mario Kart 64" with "Mario Kart", not behind a
+document with the rare word "kanzenban"), and a document is scored once per
+clause however many completions it holds. There is no cap on the expansion: a
+prefix covers every completion, and costs what the completions' posting lists
+cost — a one-letter prefix over a large body index walks a large share of the
+index, so an application decides the minimum stem length it offers.
+
+**Anchors** test the document's first token: position 0, which is the first
+token of the first non-empty indexed field. `^"mario kart"` is "the title starts
+with mario kart"; combined with the field's length it is "the title is mario
+kart". Anchored clauses count one occurrence (tf 1).
+
+The other `$text` fields:
+
+```go
+coll.Find(map[string]any{"$text": map[string]any{
+    "$search":          `mario ka*`,       // should clauses (OR), or AND with:
+    "$defaultOperator": "and",             // every $search clause required
+    "$require":         []string{"^mario"}, // each entry required, same syntax
+    "$exclude":         []string{"draft"},  // each entry excludes matching docs
+    "$fields":          []string{"title"},  // match in these index fields only
+}})
+```
+
+`$require`/`$exclude` take a string or an array of strings; each entry uses the
+clause syntax above. There is deliberately no inline `+`/`-` syntax: a search box
+forwarded verbatim into `$search` must not turn `-9` into an exclusion.
+
+**`$fields`** scopes every clause to the listed fields of the index (names as
+given in `IndexInfo.Fields`; an unknown name fails with
+`ErrFulltextUnknownField`). A posting outside the scope is invisible: it neither
+matches nor scores nor satisfies a required clause, phrase adjacency is checked
+on the in-scope positions only, and `^` requires the first token to lie in scope.
+BM25 length normalisation still uses the whole document's length.
 
 ### Score: the `_score` field
 
@@ -146,6 +203,38 @@ coll.Find(`{"$text":{"$search":"london"}}`).Sort("-year").Iter(ctx)  // newest f
 
 `Limit`/`Offset` apply *after* the residual filter and any sort, so
 `Find($text + filter).Limit(10)` returns ten *matching, filtered* rows.
+
+### Search-as-you-type
+
+A search box wants, per keystroke, the documents whose text *begins* with what
+was typed before the ones that merely contain it, and the last word treated as
+unfinished. Build the query from the analyzer's split of the typed string
+(`FtsAnalyzeTerms` is the index's own pipeline) and run the match tiers as
+separate queries, most specific first, dropping ids already shown:
+
+```go
+terms := anystore.FtsAnalyzeTerms(typed)          // "Mario Ka" → ["mario", "ka"]
+phrase := strings.Join(terms, " ")
+tiers := []string{
+    `^"` + phrase + `"*`,  // tier 1: the text starts with the typed words   → Mario Kart, Mario Kart 64
+    `"` + phrase + `"*`,   // tier 2: the typed words appear in order inside → Super Mario Kart
+    stemLast(terms),       // tier 3: every word present, last as prefix    → "Kart: Mario Edition"
+}
+for _, search := range tiers {
+    text := map[string]any{"$search": search, "$defaultOperator": "and", "$fields": "title"}
+    iter, _ := coll.Find(map[string]any{"$text": text}).Limit(10).Iter(ctx)
+    // … collect ids not yet shown …
+}
+```
+
+(`stemLast` joins the terms with the last one suffixed `*`.) Within a tier BM25
+orders the hits, and its length normalisation puts the shortest titles first,
+which is what a title list wants. Tier 0, "the title *is* the typed text", is
+tier 1 with the title's token count equal to `len(terms)`, which the application
+knows from the document. Each tier is one index walk of the typed words'
+postings — a few milliseconds at 100k titles — so running them per keystroke is
+fine; a one-letter query is the only expensive shape, and the application may
+require two characters before it searches.
 
 ### CJK and multilingual queries
 
