@@ -123,6 +123,18 @@ func ftsProbeQueries() []map[string]any {
 		text("$search", "alpha alpha beta"), // repeated term dedup
 		text("$search", "nosuchterm"),
 		text("$search", ""),
+		// Anchors ride the positional path; $fields scopes every clause.
+		text("$search", "^alpha"),
+		text("$search", `^"alpha title"`),
+		text("$search", `^"alpha beta"`, "$require", "gamma"),
+		text("$search", "omega", "$exclude", "^alpha"),
+		text("$search", "alpha", "$fields", "title"),
+		text("$search", "alpha beta", "$fields", []any{"body"}, "$defaultOperator", "and"),
+		text("$search", `"alpha beta"`, "$fields", "body"),
+		text("$search", `"alpha"`, "$fields", "title"), // quoted single token, scoped
+		text("$search", "^alpha", "$fields", "body"),
+		text("$search", "alpha", "$fields", "title", "$exclude", "beta"),
+		text("$search", "alpha", "$fields", "body", "$require", "^alpha"),
 	}
 	restrictions := []map[string]any{
 		nil,
@@ -443,4 +455,31 @@ func TestFtsProbe_DriverIdGate(t *testing.T) {
 		assert.Less(t, id, "d040")
 	}
 	require.NotEmpty(t, ids)
+}
+
+// A prefix clause has no probe form: whatever the restriction or hint, the
+// plan is the driver, and the results are the same under every hint.
+func TestFtsProbe_PrefixDriverOnly(t *testing.T) {
+	fx, coll := ftsProbeColl(t)
+	defer fx.finish()
+	for _, s := range []string{"prefix*", "alpha prefixon*", `"alpha prefixt"*`, "^prefixt*", "alpha"} {
+		cond := map[string]any{
+			"$text": map[string]any{"$search": s},
+			"id":    map[string]any{"$in": []any{"d000", "d004", "d008"}},
+		}
+		for _, p := range ftsProbePlans {
+			q := coll.Find(cond).Limit(10)
+			if len(p.hint) > 0 {
+				q = q.IndexHint(p.hint...)
+			}
+			ex, err := q.Explain(ctx)
+			require.NoError(t, err)
+			if strings.Contains(s, "*") {
+				assert.Contains(t, ex.Plan, "FtsSearch", "%s under %s: %s", s, p.name, ex.Plan)
+			} else if p.name == "cbo" {
+				assert.Contains(t, ex.Plan, "FtsProbe", "%s under %s: %s", s, p.name, ex.Plan)
+			}
+		}
+		assertSamePlanResults(t, coll, cond, 0, 0, nil)
+	}
 }

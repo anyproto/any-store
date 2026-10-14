@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"slices"
 	"sync"
 
@@ -38,6 +39,10 @@ var ErrNoFulltextIndex = errors.New("any-store: collection has no full-text inde
 // with per-field Weights.
 var ErrMultipleFulltextIndexes = errors.New("any-store: collection already has a fulltext index; index multiple fields from one")
 
+// ErrFulltextUnknownField is returned when a $text $fields scope names a field
+// the collection's full-text index does not cover.
+var ErrFulltextUnknownField = errors.New("any-store: $text $fields names a field the full-text index does not cover")
+
 // ErrFtsFormatOutdated is returned when a full-text index's postings were written
 // by an older build (a different on-disk format version). The fix is to drop and
 // recreate the index. any-store makes no on-disk back-compatibility promise for
@@ -69,22 +74,28 @@ func ftsMapFormatErr(err error) error {
 // returns the pooled state; a nil stream means no matches.
 //
 // Semantics: the $text predicate is parsed into clauses — should clauses from
-// $search ("quoted phrases", prefix* terms, plain terms; OR by default, AND when
-// $defaultOperator:"and"), required clauses from $require, and excluded clauses
-// from $exclude. (Boolean role comes from the typed sub-field, not inline +/- in
-// the string — see query.ParseTextSearch.) Each clause's text is analyzed with
-// the same pipeline as indexing. Positive clauses contribute BM25 to a
-// per-document accumulator; required clauses also set a bit in the doc's
-// requiredMask (a doc must satisfy every required clause to survive); excluded
-// clauses tombstone matching docs. A bare word that analyzes to several tokens
-// (notably any CJK run, e.g. "東京都" → "東京","京都") becomes an implicit phrase
-// matched by positional adjacency — this is what makes CJK substring search
-// correct. A pure bag-of-words OR query reduces exactly to the v1 behavior (same
-// term scan order, same float64 summation), so BM25 ranking is unchanged.
+// $search ("quoted phrases", prefix* terms, "phrase"* prefixes, ^anchored
+// clauses, plain terms; OR by default, AND when $defaultOperator:"and"),
+// required clauses from $require, and excluded clauses from $exclude. (Boolean
+// role comes from the typed sub-field, not inline +/- in the string — see
+// query.ParseTextSearch.) Each clause's text is analyzed with the same pipeline
+// as indexing. Positive clauses contribute BM25 to a per-document accumulator;
+// required clauses also set a bit in the doc's requiredMask (a doc must satisfy
+// every required clause to survive); excluded clauses tombstone matching docs.
+// A bare word that analyzes to several tokens (notably any CJK run, e.g.
+// "東京都" → "東京","京都") becomes an implicit phrase matched by positional
+// adjacency — this is what makes CJK substring search correct. $fields scopes
+// every clause to the listed index fields (postings outside the scope are
+// invisible). A pure bag-of-words OR query reduces exactly to the v1 behavior
+// (same term scan order, same float64 summation), so BM25 ranking is unchanged.
 func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, text query.Text) (qplanner.FtsCandidateStream, error) {
 	clauses := text.ParsedClauses()
 	if len(clauses) == 0 {
 		return nil, nil
+	}
+	scope, scoped, err := fx.resolveScope(text.Fields)
+	if err != nil {
+		return nil, err
 	}
 
 	n, err := ftsGetUint(tx, fx.nsMeta, ftsMetaCount)
@@ -116,6 +127,7 @@ func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, text query.Text) (qplanne
 	e := ftsExec{
 		tx: tx, fx: fx, acc: acc, n: float64(n), avgdl: avgdl, az: fts.NewAnalyzer(),
 		k1: k1, b: b, nFields: fx.nFields, weights: weights, weighted: weighted,
+		scope: scope, scoped: scoped,
 	}
 	if err = e.run(clauses, text.DefaultAnd); err != nil {
 		ftsPutAcc(acc)
@@ -148,12 +160,6 @@ func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, text query.Text) (qplanne
 	return &ftsCandidateStream{tx: tx, fx: fx, acc: acc}, nil
 }
 
-// ftsPrefixMaxExpansions caps how many vocabulary completions a single prefix
-// (foo*) clause expands to — the top-M by document frequency. It bounds the work
-// (and the accumulator growth) of a broad prefix like "a*"; truncation is logged
-// by run so a silent cap never reads as full coverage.
-const ftsPrefixMaxExpansions = 50
-
 // ftsExec carries the per-query scoring state shared across clauses.
 type ftsExec struct {
 	tx          *btree.ReadTx
@@ -166,12 +172,125 @@ type ftsExec struct {
 	nFields     int               // number of indexed fields
 	weights     []float64         // per-field BM25F boost (len nFields); nil when unweighted
 	weighted    bool              // any field weight != 1.0 — enables the per-field score path
+	scope       uint64            // FieldMask of the $fields scope (every field when unscoped)
+	scoped      bool              // scope leaves out at least one indexed field
 	dlBuf       []byte            // reusable docinfo value buffer (one per query)
 	tokBuf      []fts.Token       // reusable analyze() output
 	prefixBuf   []byte            // reusable postings key-prefix (one per query)
 	chunkIt     fts.ChunkIterator // reused across every chunk/term of the query (Reset)
+	posBuf      []uint32          // scratch: a posting's full position list (scoped decode)
+	tfBuf       []uint32          // scratch: a posting's sparse per-field TFs (scoped decode)
+	posOut      []uint32          // scratch: a posting's in-scope positions (prefix walks)
 	requiredAll uint64            // OR of every allocated required-clause bit
 	nextBit     uint              // next required-clause bit index
+}
+
+// resolveScope maps a $text $fields list to the FieldMask of the index's
+// fields. An empty list is every field (scoped == false).
+func (fx *ftsIndex) resolveScope(fields []string) (mask uint64, scoped bool, err error) {
+	all := ^uint64(0)
+	if fx.nFields < 64 {
+		all = uint64(1)<<uint(fx.nFields) - 1
+	}
+	if len(fields) == 0 {
+		return all, false, nil
+	}
+	for _, name := range fields {
+		i := slices.Index(fx.info.Fields, name)
+		if i < 0 {
+			return 0, false, fmt.Errorf("%w: %q", ErrFulltextUnknownField, name)
+		}
+		mask |= uint64(1) << uint(i)
+	}
+	return mask, mask != all, nil
+}
+
+// idf is the BM25 inverse document frequency of a term (or merged term) seen in
+// df documents. Every scorer and the prober go through it, so a term's weight
+// is the same float wherever it is computed.
+func (e *ftsExec) idf(df uint64) float64 {
+	return math.Log(1 + (e.n-float64(df)+0.5)/(float64(df)+0.5))
+}
+
+// postingTF returns the scored term frequency of the iterator's current posting
+// — under BM25F the pseudo-frequency Σ weight_f · tf_f over the in-scope fields,
+// otherwise the plain in-scope total — and whether the posting is visible at
+// all. A posting whose fields all lie outside the $fields scope is invisible:
+// it neither matches nor scores nor sets a required bit.
+func (e *ftsExec) postingTF(it fts.ChunkIterator) (tf float64, ok bool) {
+	mask := it.FieldMask()
+	if e.scoped {
+		mask &= e.scope
+		if mask == 0 {
+			return 0, false
+		}
+	}
+	if !e.weighted {
+		if !e.scoped {
+			return float64(it.TF()), true
+		}
+		var sum uint32
+		for m := mask; m != 0; m &= m - 1 {
+			sum += it.FieldTF(bits.TrailingZeros64(m))
+		}
+		return float64(sum), true
+	}
+	// Ascending field order, one product per occupied field: the same terms in
+	// the same order as the unscoped v2 loop, so unscoped scores are unchanged.
+	for m := mask; m != 0; m &= m - 1 {
+		f := bits.TrailingZeros64(m)
+		if w := e.weights[f]; w != 0 {
+			tf += w * float64(it.FieldTF(f))
+		}
+	}
+	return tf, true
+}
+
+// fieldsTF is postingTF over a dense per-field TF vector (a prefix union's
+// summed frequencies): the in-scope BM25F pseudo-frequency or plain total.
+func (e *ftsExec) fieldsTF(tfs []uint32) (tf float64) {
+	for f, n := range tfs {
+		if n == 0 || e.scope&(uint64(1)<<uint(f)) == 0 {
+			continue
+		}
+		if e.weighted {
+			if w := e.weights[f]; w != 0 {
+				tf += w * float64(n)
+			}
+		} else {
+			tf += float64(n)
+		}
+	}
+	return tf
+}
+
+// positionsOf appends the current posting's IN-SCOPE positions to dst. A
+// document's positions form one ascending sequence laid out field by field,
+// and the per-field TFs come in the same ascending field order, so the first
+// TF_f positions belong to the lowest occupied field, the next TF_g to the
+// next, and so on: every position's field follows from the counts alone, with
+// no field offsets stored. Unscoped, it is the plain position list.
+func (e *ftsExec) positionsOf(it fts.ChunkIterator, dst []uint32) []uint32 {
+	if !e.scoped {
+		return it.AppendPositions(dst)
+	}
+	mask := it.FieldMask()
+	e.tfBuf = it.AppendFieldTFs(e.tfBuf[:0])
+	e.posBuf = it.AppendPositions(e.posBuf[:0])
+	off, ord := 0, 0
+	for m := mask; m != 0; m &= m - 1 {
+		f := bits.TrailingZeros64(m)
+		n := int(e.tfBuf[ord])
+		ord++
+		if off+n > len(e.posBuf) {
+			break // truncated positions: the iterator carries the decode error
+		}
+		if e.scope&(uint64(1)<<uint(f)) != 0 {
+			dst = append(dst, e.posBuf[off:off+n]...)
+		}
+		off += n
+	}
+	return dst
 }
 
 // chunkReader returns a chunk iterator over val, reusing the query's single
@@ -264,13 +383,15 @@ func (e *ftsExec) analyze(raw string) []string {
 	return terms
 }
 
-// ftsClauseGroup is one compiled non-plain clause: a phrase (len(terms) > 1),
-// or a prefix clause (prefix == true, stem set).
+// ftsClauseGroup is one compiled non-plain clause: a phrase, an anchored term
+// or phrase, a prefix (stem set, terms empty), or a phrase-prefix (stem set,
+// terms = the phrase before the completion).
 type ftsClauseGroup struct {
-	terms  []string // >1 ⇒ phrase
-	stem   string   // prefix clause stem (Prefix only)
-	prefix bool
-	reqBit uint64
+	terms    []string // phrase terms; for a prefix group the terms BEFORE the stem
+	stem     string   // prefix stem (prefix only)
+	prefix   bool
+	anchored bool // the occurrence must start at the document's first token
+	reqBit   uint64
 }
 
 // ftsCompiledQuery is the compiled clause set of one $text predicate. It is
@@ -303,8 +424,11 @@ func (e *ftsExec) compileClauses(clauses []query.TextClause, defaultAnd bool) ft
 		negated := c.Op == query.TextMustNot
 
 		switch {
-		case c.Prefix && len(terms) == 1 && !c.Phrase:
-			g := ftsClauseGroup{stem: terms[0], prefix: true}
+		case c.Prefix:
+			// foo* or "foo bar"*: the last analyzed term is the stem, the rest a
+			// phrase that must precede its completion. A bare word analyzing to
+			// several tokens (CJK, "foo-bar*") is a phrase-prefix the same way.
+			g := ftsClauseGroup{terms: terms[:len(terms)-1], stem: terms[len(terms)-1], prefix: true, anchored: c.Anchored}
 			if negated {
 				cq.negGroups = append(cq.negGroups, g)
 			} else {
@@ -313,7 +437,7 @@ func (e *ftsExec) compileClauses(clauses []query.TextClause, defaultAnd bool) ft
 				}
 				cq.posGroups = append(cq.posGroups, g)
 			}
-		case len(terms) == 1 && !c.Phrase:
+		case len(terms) == 1 && !c.Phrase && !c.Anchored:
 			term := terms[0]
 			if negated {
 				cq.negGroups = append(cq.negGroups, ftsClauseGroup{terms: terms})
@@ -331,8 +455,9 @@ func (e *ftsExec) compileClauses(clauses []query.TextClause, defaultAnd bool) ft
 				cq.plainOrder = append(cq.plainOrder, term)
 			}
 		default:
-			// Multi-token: explicit phrase, or an implicit phrase (CJK / joined word).
-			g := ftsClauseGroup{terms: terms}
+			// Multi-token: explicit phrase, or an implicit phrase (CJK / joined
+			// word); or an anchored term, which needs positions like a phrase.
+			g := ftsClauseGroup{terms: terms, anchored: c.Anchored}
 			if negated {
 				cq.negGroups = append(cq.negGroups, g)
 			} else {
@@ -360,31 +485,34 @@ func (e *ftsExec) run(clauses []query.TextClause, defaultAnd bool) error {
 			return err
 		}
 	}
-	// 2) Positive phrases and prefixes.
+	// 2) Positive phrases, anchors and prefixes.
 	for _, g := range cq.posGroups {
-		if err := e.scoreGroup(g.terms, g.stem, g.prefix, g.reqBit, false); err != nil {
+		if err := e.scoreGroup(g, g.reqBit, false); err != nil {
 			return err
 		}
 	}
 	// 3) Negated clauses (tombstone only docs already present).
 	for _, g := range cq.negGroups {
-		if err := e.scoreGroup(g.terms, g.stem, g.prefix, 0, true); err != nil {
+		if err := e.scoreGroup(g, 0, true); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// scoreGroup dispatches a phrase or prefix group to its scorer (tomb selects the
-// tombstone variant for a negated clause).
-func (e *ftsExec) scoreGroup(terms []string, stem string, prefix bool, reqBit uint64, tomb bool) error {
-	if prefix {
-		return e.scorePrefix(stem, reqBit, tomb)
+// scoreGroup dispatches a group to its scorer (tomb selects the tombstone
+// variant for a negated clause): prefixes to the merged-completion scorers, a
+// single unanchored term to the plain scan, everything else to the positional
+// phrase merge.
+func (e *ftsExec) scoreGroup(g ftsClauseGroup, reqBit uint64, tomb bool) error {
+	switch {
+	case g.prefix:
+		return e.scorePrefix(g, reqBit, tomb)
+	case len(g.terms) == 1 && !g.anchored:
+		return e.scanTerm(g.terms[0], reqBit, tomb)
+	default:
+		return e.scorePhrase(g.terms, g.anchored, reqBit, tomb)
 	}
-	if len(terms) == 1 {
-		return e.scanTerm(terms[0], reqBit, tomb)
-	}
-	return e.scorePhrase(terms, reqBit, tomb)
 }
 
 // scanTerm scores (or, if tomb, tombstones) every posting of a single term.
@@ -396,13 +524,36 @@ func (e *ftsExec) scanTerm(term string, reqBit uint64, tomb bool) error {
 	if df == 0 {
 		return nil
 	}
-	idf := math.Log(1 + (e.n-float64(df)+0.5)/(float64(df)+0.5))
+	idf := e.idf(df)
+	return e.walkTerm(term, func(it fts.ChunkIterator, docID uint64) error {
+		// BM25F: combine per-field TFs by weight into a pseudo-frequency, then
+		// apply standard saturation + (global) length normalization. Unweighted
+		// indexes take the exact v1 path (total TF), so scores are unchanged.
+		tf, ok := e.postingTF(it)
+		if !ok {
+			return nil // out of the $fields scope
+		}
+		if tomb {
+			e.acc.markTomb(docID)
+			return nil
+		}
+		dl, derr := e.docLen(docID)
+		if derr != nil {
+			return derr
+		}
+		e.acc.addScore(docID, e.bm25(idf, tf, float64(dl)), reqBit)
+		return nil
+	})
+}
 
+// walkTerm streams every posting of term, chunk by chunk, through visit (the
+// query's shared chunk iterator is parked on the posting; docID is its id).
+func (e *ftsExec) walkTerm(term string, visit func(it fts.ChunkIterator, docID uint64) error) error {
 	cur := e.tx.NewCursor(e.fx.nsPost)
 	defer cur.Close()
 	e.prefixBuf = postingsTermPrefix(e.prefixBuf, term)
 	prefix := e.prefixBuf
-	if err = cur.Seek(prefix); err != nil {
+	if err := cur.Seek(prefix); err != nil {
 		return err
 	}
 	for cur.Valid() {
@@ -422,68 +573,36 @@ func (e *ftsExec) scanTerm(term string, reqBit uint64, tomb bool) error {
 			return ierr
 		}
 		for it.Next() {
-			docID := it.DocID()
-			if tomb {
-				e.acc.markTomb(docID)
-				continue
+			if err := visit(it, it.DocID()); err != nil {
+				return err
 			}
-			// BM25F: combine per-field TFs by weight into a pseudo-frequency, then
-			// apply standard saturation + (global) length normalization. Unweighted
-			// indexes take the exact v1 path (total TF), so scores are unchanged.
-			var tf float64
-			if e.weighted {
-				for f := 0; f < e.nFields; f++ {
-					if w := e.weights[f]; w != 0 {
-						if ftf := it.FieldTF(f); ftf != 0 {
-							tf += w * float64(ftf)
-						}
-					}
-				}
-			} else {
-				tf = float64(it.TF())
-			}
-			dl, derr := e.docLen(docID)
-			if derr != nil {
-				return derr
-			}
-			e.acc.addScore(docID, e.bm25(idf, tf, float64(dl)), reqBit)
 		}
 		if it.Err() != nil {
 			return it.Err()
 		}
-		if err = cur.Next(); err != nil {
+		if err := cur.Next(); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// scorePrefix expands stem against the vocabulary (top-M completions by df) and
-// scores/tombstones each completion as a plain term sharing the clause's bit.
-func (e *ftsExec) scorePrefix(stem string, reqBit uint64, tomb bool) error {
-	terms, err := e.expandPrefix(stem)
-	if err != nil {
-		return err
-	}
-	for _, t := range terms {
-		if err = e.scanTerm(t, reqBit, tomb); err != nil {
-			return err
-		}
-	}
-	return nil
+// ftsCompletion is one vocabulary term expanded from a prefix stem, with its
+// document frequency.
+type ftsCompletion struct {
+	term string
+	df   uint64
 }
 
-// expandPrefix returns up to ftsPrefixMaxExpansions vocabulary terms with the
-// given byte prefix, the most frequent (highest df) first.
-func (e *ftsExec) expandPrefix(stem string) ([]string, error) {
+// expandPrefix returns every vocabulary term with the given byte prefix, in
+// vocabulary (byte) order. There is no cap: a prefix clause covers every
+// completion, and costs what the completions' postings cost (the planner
+// prices that from the summed document frequencies).
+func (e *ftsExec) expandPrefix(stem string) ([]ftsCompletion, error) {
 	if stem == "" {
 		return nil, nil
 	}
-	type td struct {
-		term string
-		df   uint64
-	}
-	var matches []td
+	var out []ftsCompletion
 	cur := e.tx.NewCursor(e.fx.nsVocab)
 	defer cur.Close()
 	p := []byte(stem)
@@ -503,54 +622,62 @@ func (e *ftsExec) expandPrefix(stem string) ([]string, error) {
 			return nil, err
 		}
 		df, _ := binary.Uvarint(val)
-		matches = append(matches, td{string(key), df})
+		out = append(out, ftsCompletion{term: string(key), df: df})
 		if err = cur.Next(); err != nil {
 			return nil, err
 		}
-	}
-	slices.SortFunc(matches, func(a, b td) int {
-		if a.df != b.df {
-			if a.df > b.df {
-				return -1
-			}
-			return 1
-		}
-		if a.term < b.term {
-			return -1
-		}
-		if a.term > b.term {
-			return 1
-		}
-		return 0
-	})
-	if len(matches) > ftsPrefixMaxExpansions {
-		matches = matches[:ftsPrefixMaxExpansions]
-	}
-	out := make([]string, len(matches))
-	for i := range matches {
-		out[i] = matches[i].term
 	}
 	return out, nil
 }
 
 // scorePhrase finds documents where the phrase terms occur at consecutive
-// positions and contributes (or tombstones) a synthetic-term BM25 score: the
-// term frequency is the number of adjacency-confirmed occurrences and the IDF is
-// the sum of the constituent terms' IDFs (the standard phrase-IDF substitute).
-func (e *ftsExec) scorePhrase(terms []string, reqBit uint64, tomb bool) error {
-	// Per-term IDF; if any term is absent (df==0) the phrase cannot occur.
-	idfSum := 0.0
-	for _, t := range terms {
-		df, err := ftsGetUint(e.tx, e.fx.nsVocab, []byte(t))
-		if err != nil {
-			return err
-		}
-		if df == 0 {
+// positions (anchored: starting at the document's first token) and contributes
+// (or tombstones) a synthetic-term BM25 score: the term frequency is the number
+// of adjacency-confirmed occurrences and the IDF is the sum of the constituent
+// terms' IDFs (the standard phrase-IDF substitute).
+func (e *ftsExec) scorePhrase(terms []string, anchored bool, reqBit uint64, tomb bool) error {
+	idfSum, alive, err := e.phraseIDF(terms)
+	if err != nil || !alive {
+		return err
+	}
+	return e.phraseMerge(terms, func(docID uint64, posLists [][]uint32) error {
+		cnt := phraseCount(posLists, anchored)
+		if cnt == 0 {
 			return nil
 		}
-		idfSum += math.Log(1 + (e.n-float64(df)+0.5)/(float64(df)+0.5))
-	}
+		if tomb {
+			e.acc.markTomb(docID)
+			return nil
+		}
+		dl, derr := e.docLen(docID)
+		if derr != nil {
+			return derr
+		}
+		e.acc.addScore(docID, e.bm25(idfSum, float64(cnt), float64(dl)), reqBit)
+		return nil
+	})
+}
 
+// phraseIDF sums the constituent terms' IDFs. alive is false when some term is
+// absent from the index (df == 0): the phrase then occurs nowhere.
+func (e *ftsExec) phraseIDF(terms []string) (idfSum float64, alive bool, err error) {
+	for _, t := range terms {
+		df, derr := ftsGetUint(e.tx, e.fx.nsVocab, []byte(t))
+		if derr != nil {
+			return 0, false, derr
+		}
+		if df == 0 {
+			return 0, false, nil
+		}
+		idfSum += e.idf(df)
+	}
+	return idfSum, true, nil
+}
+
+// phraseMerge zig-zags the terms' posting streams by IntDocID and calls visit
+// for every document holding all of them, with each term's in-scope positions
+// (ascending) in term order. posLists is reused between calls.
+func (e *ftsExec) phraseMerge(terms []string, visit func(docID uint64, posLists [][]uint32) error) error {
 	streams := make([]*termStream, len(terms))
 	for i, t := range terms {
 		streams[i] = newTermStream(e.tx, e.fx.nsPost, t)
@@ -605,29 +732,45 @@ func (e *ftsExec) scorePhrase(terms []string, reqBit uint64, tomb bool) error {
 		if !allMatch {
 			continue // some stream advanced past target; recompute max
 		}
-		// Common document: decode positions and count adjacency.
+		// Common document: decode positions and hand them over.
 		for i, s := range streams {
-			posLists[i] = s.positions(posLists[i][:0])
+			posLists[i] = s.positions(e, posLists[i][:0])
 			if s.err != nil {
 				return s.err
 			}
 		}
-		if cnt := countAdjacent(posLists); cnt > 0 {
-			if tomb {
-				e.acc.markTomb(target)
-			} else {
-				dl, derr := e.docLen(target)
-				if derr != nil {
-					return derr
-				}
-				e.acc.addScore(target, e.bm25(idfSum, float64(cnt), float64(dl)), reqBit)
-			}
+		if err := visit(target, posLists); err != nil {
+			return err
 		}
 		for _, s := range streams {
 			s.next()
 		}
 	}
 	return nil
+}
+
+// phraseCount is the number of occurrences of the phrase whose terms' positions
+// are posLists: every adjacent run, or for an anchored phrase the single run
+// starting at position 0.
+func phraseCount(posLists [][]uint32, anchored bool) uint32 {
+	if anchored {
+		if anchoredAt(posLists) {
+			return 1
+		}
+		return 0
+	}
+	return countAdjacent(posLists)
+}
+
+// anchoredAt reports whether the phrase starts at the document's first token:
+// posLists[i] holds position i for every i.
+func anchoredAt(posLists [][]uint32) bool {
+	for i, l := range posLists {
+		if _, found := slices.BinarySearch(l, uint32(i)); !found {
+			return false
+		}
+	}
+	return true
 }
 
 // countAdjacent counts positions b at which the phrase occurs: posLists[0] holds
@@ -1001,6 +1144,9 @@ func (q *collQuery) detectFtsQuery(s *collSchema) (*qplanner.FtsQuerySpec, query
 			ErrMultipleFulltextIndexes, fxs[0].info.Name, fxs[1].info.Name)
 	}
 	fx := fxs[0]
+	if _, _, err = fx.resolveScope(text.Fields); err != nil {
+		return nil, nil, err
+	}
 	spec := &qplanner.FtsQuerySpec{
 		IndexName:  fx.info.Name,
 		Ordered:    true, // searchCandidates returns score-descending

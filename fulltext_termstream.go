@@ -152,10 +152,11 @@ func (ts *termStream) seek(target uint64) {
 	}
 }
 
-// positions decodes the current document's positions onto dst, returning the
-// extended slice. Valid only while parked on a document (valid()==true).
-func (ts *termStream) positions(dst []uint32) []uint32 {
-	dst = ts.it.AppendPositions(dst)
+// positions decodes the current document's in-scope positions (e's $fields
+// scope) onto dst, returning the extended slice. Valid only while parked on a
+// document (valid()==true).
+func (ts *termStream) positions(e *ftsExec, dst []uint32) []uint32 {
+	dst = e.positionsOf(ts.it, dst)
 	if err := ts.it.Err(); err != nil {
 		ts.err = err
 	}

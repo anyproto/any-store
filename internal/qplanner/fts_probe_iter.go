@@ -50,6 +50,10 @@ type FtsPlanStats struct {
 	// Valid gates cost-based probe selection; false (unit tests, stats read
 	// failure) keeps the driver-only behavior.
 	Valid bool
+	// DriverOnly reports a predicate with no probe form — one with a prefix
+	// clause, whose merged-completion IDF needs the completions' postings
+	// walked in full — so only the driver plan is legal.
+	DriverOnly bool
 }
 
 // FtsProbeIter filters an upstream candidate stream through the $text

@@ -19,15 +19,21 @@ import (
 //
 // PARITY CONTRACT: for any document, the prober must produce EXACTLY the same
 // match verdict and BIT-IDENTICAL score as the driver scan (searchCandidates).
-// Both sides share ftsExec.compileClauses (clause order, required bits) and
-// ftsExec.bm25 (formula and float evaluation order), and this file adds each
-// doc's per-clause contributions in the same order the driver's scans would
-// have: plain terms in first-seen order, then groups in clause order (each
-// prefix expansion in expansion order). A bounded write verb selects rows by
-// (score desc, IntDocID asc), so an epsilon here is wrong rows, not noise —
-// the differential test in fulltext_probe_test.go pins this.
+// Both sides share ftsExec.compileClauses (clause order, required bits),
+// ftsExec.postingTF / positionsOf (the $fields scope) and ftsExec.bm25
+// (formula and float evaluation order), and this file adds each doc's
+// per-clause contributions in the same order the driver's scans would have:
+// plain terms in first-seen order, then groups in clause order. A bounded
+// write verb selects rows by (score desc, IntDocID asc), so an epsilon here is
+// wrong rows, not noise — the differential test in fulltext_probe_test.go
+// pins this.
+//
+// A prefix clause has no probe form: its merged-completion IDF is the number
+// of documents holding any completion, known only after the completions'
+// postings are walked in full. planStats marks such a predicate DriverOnly;
+// newFtsProber refuses it.
 
-// probeTerm is one plain term (or prefix expansion) with its precomputed IDF.
+// probeTerm is one plain term with its precomputed IDF.
 type probeTerm struct {
 	term   string
 	idf    float64
@@ -35,15 +41,18 @@ type probeTerm struct {
 	reqBit uint64
 }
 
-// probeGroup is one compiled phrase or prefix clause, resolved for probing:
-// a prefix is already expanded to its vocabulary completions.
+// probeGroup is one compiled phrase or anchored clause, resolved for probing.
 type probeGroup struct {
-	phrase bool
-	dead   bool        // some phrase constituent has df == 0 → can't match
-	terms  []probeTerm // phrase: constituents (idf unused); prefix: expansions
-	idfSum float64     // phrase: summed constituent IDF
-	reqBit uint64
+	anchored bool
+	dead     bool        // some constituent has df == 0 → can't match
+	terms    []probeTerm // constituents (idf unused)
+	idfSum   float64     // summed constituent IDF
+	reqBit   uint64
 }
+
+// errFtsPrefixProbe reports a prefix clause reaching the prober, which the
+// planner's DriverOnly gate must prevent.
+var errFtsPrefixProbe = errors.New("any-store: internal: prefix clause has no probe form")
 
 // ftsProber evaluates the compiled $text predicate against single documents.
 // Not safe for concurrent use; one per query execution.
@@ -124,9 +133,14 @@ func (fx *ftsIndex) newFtsProber(tx *btree.ReadTx, text query.Text) (*ftsProber,
 	}
 	k1, b := ftsResolveBM25(fx.info.Fulltext)
 	weights, weighted := ftsResolveWeights(fx.info.Fulltext, fx.info.Fields)
+	scope, scoped, err := fx.resolveScope(text.Fields)
+	if err != nil {
+		return nil, err
+	}
 	p.e = ftsExec{
 		tx: tx, fx: fx, n: float64(n), avgdl: avgdl, az: fts.NewAnalyzer(),
 		k1: k1, b: b, nFields: fx.nFields, weights: weights, weighted: weighted,
+		scope: scope, scoped: scoped,
 	}
 	if n == 0 || len(clauses) == 0 {
 		return p, nil // hasPositive stays false: probes never match
@@ -142,7 +156,7 @@ func (fx *ftsIndex) newFtsProber(tx *btree.ReadTx, text query.Text) (*ftsProber,
 		}
 		pt := probeTerm{term: term, df: df, reqBit: reqBit}
 		if df > 0 {
-			pt.idf = math.Log(1 + (p.e.n-float64(df)+0.5)/(float64(df)+0.5))
+			pt.idf = p.e.idf(df)
 		}
 		return pt, nil
 	}
@@ -158,50 +172,28 @@ func (fx *ftsIndex) newFtsProber(tx *btree.ReadTx, text query.Text) (*ftsProber,
 		}
 	}
 	buildGroup := func(g ftsClauseGroup) (probeGroup, error) {
-		pg := probeGroup{reqBit: g.reqBit}
+		pg := probeGroup{reqBit: g.reqBit, anchored: g.anchored}
 		if g.prefix {
-			// Same expansion set and order as the driver's scorePrefix.
-			terms, xerr := p.e.expandPrefix(g.stem)
-			if xerr != nil {
-				return pg, xerr
-			}
-			for _, t := range terms {
-				pt, terr := termOf(t, g.reqBit)
-				if terr != nil {
-					return pg, terr
-				}
-				pg.terms = append(pg.terms, pt)
-			}
-			pg.dead = len(pg.terms) == 0
-			return pg, nil
+			return pg, errFtsPrefixProbe
 		}
-		// Mirror scoreGroup's dispatch exactly: only a MULTI-token group is a
-		// phrase; a quoted clause that analyzes to one token is scored by the
-		// driver as a plain scanTerm (weighted TF), so the prober must route
-		// it through the per-term path too.
-		pg.phrase = len(g.terms) > 1
+		// Mirror scoreGroup's dispatch exactly: a quoted clause that analyzes
+		// to one unanchored token is scored by the driver as a plain scanTerm
+		// (weighted TF), so the prober routes it through the per-term path
+		// too; anything else goes through the positional phrase path.
 		for _, t := range g.terms {
 			pt, terr := termOf(t, 0)
 			if terr != nil {
 				return pg, terr
 			}
-			if pt.df == 0 && pg.phrase {
-				pg.dead = true // driver's scorePhrase: any absent term → no matches
+			if pt.df == 0 {
+				pg.dead = true // driver's phraseIDF: any absent term → no matches
 			}
 			pg.idfSum += pt.idf
 			pg.terms = append(pg.terms, pt)
 		}
-		if !pg.phrase {
-			dead := true
-			for _, pt := range pg.terms {
-				if pt.df > 0 {
-					dead = false
-				}
-			}
-			pg.dead = dead
-		}
 		return pg, nil
 	}
+
 	for _, g := range cq.posGroups {
 		pg, gerr := buildGroup(g)
 		if gerr != nil {
@@ -222,13 +214,14 @@ func (fx *ftsIndex) newFtsProber(tx *btree.ReadTx, text query.Text) (*ftsProber,
 	return p, nil
 }
 
-// termTF returns the term's frequency in document intId (the weighted
-// pseudo-frequency under BM25F, matching scanTerm's weighted branch) and
-// whether a posting for the document EXISTS. found is the driver's semantic
-// trigger: scanTerm scores/tombstones/sets required bits for every posting it
-// visits regardless of the computed tf (a zero-weight field yields tf == 0
-// with found == true), so callers must gate on found, never on tf > 0.
-// Positions, when dst is non-nil, are decoded into *dst for phrase adjacency.
+// termTF returns the term's frequency in document intId (the in-scope
+// weighted pseudo-frequency under BM25F, matching scanTerm's postingTF) and
+// whether an IN-SCOPE posting for the document exists. found is the driver's
+// semantic trigger: scanTerm scores/tombstones/sets required bits for every
+// visible posting regardless of the computed tf (a zero-weight field yields
+// tf == 0 with found == true), so callers must gate on found, never on tf > 0.
+// Positions, when dst is non-nil, are decoded (in scope) into *dst for phrase
+// adjacency.
 func (p *ftsProber) termTF(term string, intId uint64, dst *[]uint32) (tf float64, found bool, err error) {
 	p.keyBuf = postingsKey(p.keyBuf, term, fts.ChunkID(intId))
 	p.valBuf, err = p.tx.AppendValue(p.fx.nsPost, p.keyBuf, p.valBuf[:0])
@@ -250,19 +243,12 @@ func (p *ftsProber) termTF(term string, intId uint64, dst *[]uint32) (tf float64
 		if docID != intId {
 			continue
 		}
-		if p.e.weighted {
-			for f := 0; f < p.e.nFields; f++ {
-				if w := p.e.weights[f]; w != 0 {
-					if ftf := it.FieldTF(f); ftf != 0 {
-						tf += w * float64(ftf)
-					}
-				}
-			}
-		} else {
-			tf = float64(it.TF())
+		tf, found = p.e.postingTF(it)
+		if !found {
+			return 0, false, it.Err() // out of the $fields scope
 		}
 		if dst != nil {
-			*dst = it.AppendPositions((*dst)[:0])
+			*dst = p.e.positionsOf(it, (*dst)[:0])
 		}
 		if it.Err() != nil {
 			return 0, false, it.Err()
@@ -272,8 +258,9 @@ func (p *ftsProber) termTF(term string, intId uint64, dst *[]uint32) (tf float64
 	return 0, false, it.Err()
 }
 
-// phrasePresent reports the phrase's adjacency-confirmed occurrence count in
-// intId (0 when any constituent is absent or no adjacent run exists).
+// phraseCount reports the phrase's occurrence count in intId as the driver's
+// phraseCount would: adjacency-confirmed runs, or for an anchored group the
+// run at position 0 (0 when any constituent is absent in scope).
 func (p *ftsProber) phraseCount(g *probeGroup, intId uint64) (uint32, error) {
 	for len(p.posBufs) < len(g.terms) {
 		p.posBufs = append(p.posBufs, nil)
@@ -293,7 +280,7 @@ func (p *ftsProber) phraseCount(g *probeGroup, intId uint64) (uint32, error) {
 		lists = append(lists, p.posBufs[i])
 	}
 	p.posBufB = lists
-	return countAdjacent(lists), nil
+	return phraseCount(lists, g.anchored), nil
 }
 
 // Probe evaluates the $text predicate for one document. ok reports a match;
@@ -335,23 +322,9 @@ func (p *ftsProber) Probe(docId []byte) (score float64, intId uint64, ok bool, e
 		if g.dead {
 			continue
 		}
-		if g.phrase {
-			cnt, cerr := p.phraseCount(g, intId)
-			if cerr != nil {
-				return 0, 0, false, cerr
-			}
-			if cnt > 0 {
-				if err = p.addContribution(intId, g.idfSum, float64(cnt), g.reqBit); err != nil {
-					return 0, 0, false, err
-				}
-			}
-			continue
-		}
-		for ti := range g.terms {
-			pt := &g.terms[ti]
-			if pt.df == 0 {
-				continue
-			}
+		if len(g.terms) == 1 && !g.anchored {
+			// The driver's scanTerm path (a quoted single token).
+			pt := &g.terms[0]
 			tf, hit, terr := p.termTF(pt.term, intId, nil)
 			if terr != nil {
 				return 0, 0, false, terr
@@ -360,6 +333,16 @@ func (p *ftsProber) Probe(docId []byte) (score float64, intId uint64, ok bool, e
 				if err = p.addContribution(intId, pt.idf, tf, g.reqBit); err != nil {
 					return 0, 0, false, err
 				}
+			}
+			continue
+		}
+		cnt, cerr := p.phraseCount(g, intId)
+		if cerr != nil {
+			return 0, 0, false, cerr
+		}
+		if cnt > 0 {
+			if err = p.addContribution(intId, g.idfSum, float64(cnt), g.reqBit); err != nil {
+				return 0, 0, false, err
 			}
 		}
 	}
@@ -373,28 +356,22 @@ func (p *ftsProber) Probe(docId []byte) (score float64, intId uint64, ok bool, e
 		if g.dead {
 			continue
 		}
-		if g.phrase {
-			cnt, cerr := p.phraseCount(g, intId)
-			if cerr != nil {
-				return 0, 0, false, cerr
-			}
-			if cnt > 0 {
-				return 0, 0, false, nil
-			}
-			continue
-		}
-		for ti := range g.terms {
-			pt := &g.terms[ti]
-			if pt.df == 0 {
-				continue
-			}
-			_, hit, terr := p.termTF(pt.term, intId, nil)
+		if len(g.terms) == 1 && !g.anchored {
+			_, hit, terr := p.termTF(g.terms[0].term, intId, nil)
 			if terr != nil {
 				return 0, 0, false, terr
 			}
 			if hit {
 				return 0, 0, false, nil
 			}
+			continue
+		}
+		cnt, cerr := p.phraseCount(g, intId)
+		if cerr != nil {
+			return 0, 0, false, cerr
+		}
+		if cnt > 0 {
+			return 0, 0, false, nil
 		}
 	}
 
@@ -413,9 +390,10 @@ func (p *ftsProber) Close() {}
 const ftsPhraseMatchFraction = 0.25
 
 // planStats compiles the predicate and reads the per-term document frequencies
-// (one vocab point-get per term; a prefix pays one bounded vocab scan — the
-// same reads the chosen plan repeats at execution). SumDF and ProbeTerms are
-// exact; only EstMatches is an estimate.
+// (one vocab point-get per term; a prefix pays one vocab range scan — the same
+// reads the chosen plan repeats at execution). SumDF and ProbeTerms are exact;
+// only EstMatches is an estimate. A prefix clause makes the predicate
+// DriverOnly (see the file comment).
 func (fx *ftsIndex) planStats(tx *btree.ReadTx, text query.Text) (st qplanner.FtsPlanStats, err error) {
 	clauses := text.ParsedClauses()
 	if len(clauses) == 0 {
@@ -459,27 +437,7 @@ func (fx *ftsIndex) planStats(tx *btree.ReadTx, text query.Text) (st qplanner.Ft
 		account(d, cq.plainBit[term] != 0)
 	}
 	groupStats := func(g ftsClauseGroup, positive bool) error {
-		if g.prefix {
-			terms, xerr := e.expandPrefix(g.stem)
-			if xerr != nil {
-				return xerr
-			}
-			var sum float64
-			for _, t := range terms {
-				d, derr := df(t)
-				if derr != nil {
-					return derr
-				}
-				sum += d
-				st.SumDF += d
-				st.ProbeTerms++
-			}
-			if positive {
-				account(sum, g.reqBit != 0)
-			}
-			return nil
-		}
-		// Phrase: the zig-zag advances every stream at most min-df times.
+		// Phrase part: the zig-zag advances every stream at most min-df times.
 		minDF := math.MaxFloat64
 		for _, t := range g.terms {
 			d, derr := df(t)
@@ -493,8 +451,27 @@ func (fx *ftsIndex) planStats(tx *btree.ReadTx, text query.Text) (st qplanner.Ft
 			minDF = 0
 		}
 		st.SumDF += minDF * float64(len(g.terms))
+		est := minDF * ftsPhraseMatchFraction
+		if g.prefix {
+			// The merged completions are walked in full.
+			st.DriverOnly = true
+			comps, xerr := e.expandPrefix(g.stem)
+			if xerr != nil {
+				return xerr
+			}
+			var sum float64
+			for _, c := range comps {
+				sum += float64(c.df)
+			}
+			st.SumDF += sum
+			if len(g.terms) == 0 {
+				est = sum
+			} else {
+				est = min(est, sum)
+			}
+		}
 		if positive {
-			account(minDF*ftsPhraseMatchFraction, g.reqBit != 0)
+			account(est, g.reqBit != 0)
 		}
 		return nil
 	}
