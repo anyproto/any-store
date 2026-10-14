@@ -20,7 +20,8 @@ func FtsAnalyzeTerms(text string) []string {
 	return terms
 }
 
-// FtsBM25Params returns the BM25 k1 and b parameters used by $text scoring.
+// FtsBM25Params returns the default BM25 k1 and b; an index's FulltextParams
+// K1 / B override them for its own queries.
 func FtsBM25Params() (k1, b float64) {
 	return bm25K1, bm25B
 }

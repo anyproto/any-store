@@ -276,18 +276,22 @@ every completion (no cap — coverage is complete) and score the clause as ONE
 term over the merged postings: per document the completions' per-field TFs add
 up (`fulltext_prefix.go`, a pooled dense doc table), the IDF comes from the
 number of documents holding any completion (FTS5 scores a prefix token the same
-way). `"phrase"*` runs the phrase merge for the fixed terms, records each
-occurrence's end, then walks the completions' postings once and counts the
-completions that follow an end. `^` (FTS5's initial-token operator) anchors a
-clause at position 0 — the first token of the first non-empty field; positions
-are a single global sequence per document and the per-field starts are not
-stored, so anchoring a later field would need per-document field offsets in
-docinfo (reserved for docinfo v2 with per-field lengths). `$fields` scopes a
-query by the postings' field mask; a position's field follows from the
+way; the IDF is corpus-wide like every other clause's, a `$fields` scope
+affects matching and tf only). `"phrase"*` runs the phrase merge for the fixed
+terms, records each occurrence's end, then walks the completions' postings once
+and counts the completions that follow an end. `^` (FTS5's initial-token
+operator) anchors a clause at position 0 — the first token of the first field
+that yields tokens, so only the first element of an array field can anchor;
+positions are a single global sequence per document and the per-field starts
+are not stored, so FTS5's per-column anchoring would need per-document field
+offsets in docinfo (reserved for docinfo v2 with per-field lengths). `$fields`
+scopes a query by the postings' field mask; a position's field follows from the
 per-field TFs (the first TF_f positions belong to the lowest occupied field,
 and so on), so phrases are scoped exactly with no format change. A prefix
-clause has no probe form (its merged IDF needs the full walk), so
-`FtsPlanStats.DriverOnly` keeps such queries on the driver plan.
+clause has no probe form (its merged IDF needs the full walk): `detectFtsQuery`
+hands the planner no Probe and no StatsFn for it, so the driver is the only
+plan. The completions are streamed from the vocabulary straight into one reused
+postings cursor; nothing is materialized per completion.
 
 Boolean require/exclude (**implemented**, Phase 1) come from the typed
 `$require`/`$exclude` sub-fields of `$text` (not inline `+`/`-`): required clauses
@@ -357,8 +361,8 @@ positional CJK matching; prefix search (merged-term scoring, uncapped), phrase-
 prefix, anchored `^` clauses, `$fields` scope; boolean require/exclude
 (`$require` / `$exclude`) and `$defaultOperator`.
 
-Explicitly **deferred to v2+**: per-field weights / BM25F (Phase 3 — postings v2
-+ docinfo v2); configurable BM25 `b`/`k1` (Phase 2); top-k materialization in
+Explicitly **deferred to v2+**: per-field length normalisation (docinfo v2;
+BM25F weights and `b`/`k1` are in); top-k materialization in
 `search` (it currently clones every matched id before `Limit` trims); replacing
 the per-doc `docinfo` `Get` with an in-memory dense quantized doc-length array
 (safe now that `IntDocID` is stable and dense); fuzzy/Levenshtein search over
