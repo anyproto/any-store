@@ -3,6 +3,7 @@ package query
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -882,8 +883,9 @@ type Text struct {
 	// become required (AND) rather than the default OR.
 	DefaultAnd bool
 	// Clauses are the parsed clauses of the whole $text predicate: the should
-	// clauses from $search (phrases, prefix*, plain terms) plus the required and
-	// excluded clauses from the $require / $exclude sub-fields. Populated by
+	// clauses from $search (plain terms, phrases, prefixes, phrase-prefixes,
+	// each optionally anchored) plus the required and excluded clauses from the
+	// $require / $exclude sub-fields. Populated by
 	// ParseCondition; a Text built directly with only Search set has nil Clauses
 	// and the executor re-parses Search on demand (yielding should clauses only).
 	Clauses []TextClause
@@ -902,9 +904,10 @@ const (
 	// TextShould is a default clause: OR'd with the other should-clauses, unless
 	// the query sets DefaultAnd, in which case it is required.
 	TextShould TextOp = iota
-	// TextMust is a +term: always required (AND), regardless of DefaultAnd.
+	// TextMust is a $require entry: always required (AND), regardless of
+	// DefaultAnd.
 	TextMust
-	// TextMustNot is a -term: documents containing it are excluded.
+	// TextMustNot is an $exclude entry: documents containing it are excluded.
 	TextMustNot
 )
 
@@ -948,13 +951,13 @@ func (t Text) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
-// String renders the predicate as its $text object: $search, then
+// String renders the predicate as its $text object (valid JSON): $search, then
 // $defaultOperator, $require, $exclude (re-synthesized from the parsed
 // clauses) and $fields when set.
 func (t Text) String() string {
 	var sb strings.Builder
 	sb.WriteString(`{"$text":{"$search":`)
-	sb.WriteString(fmt.Sprintf("%q", t.Search))
+	sb.WriteString(jsonQuote(t.Search))
 	if t.DefaultAnd {
 		sb.WriteString(`,"$defaultOperator":"and"`)
 	}
@@ -1008,10 +1011,19 @@ func quoteList(ss []string) string {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		sb.WriteString(fmt.Sprintf("%q", s))
+		sb.WriteString(jsonQuote(s))
 	}
 	sb.WriteByte(']')
 	return sb.String()
+}
+
+// jsonQuote renders s as a JSON string literal.
+func jsonQuote(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return fmt.Sprintf("%q", s)
+	}
+	return string(b)
 }
 
 // Knn is the {"<field>":{"$knn":{"$query":[…],"$k":N}}} approximate-nearest-neighbour

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -698,6 +699,7 @@ func parseText(v *anyenc.Value) (Filter, error) {
 					return
 				}
 			}
+			fields = dedupeStrings(fields)
 		case "$language", "$caseSensitive", "$diacriticSensitive":
 			// accepted for Mongo compatibility, ignored in v1
 		default:
@@ -803,6 +805,17 @@ func ParseTextSearch(s string) []TextClause {
 		}
 	}
 	return clauses
+}
+
+// dedupeStrings drops repeated entries, keeping first occurrences in order.
+func dedupeStrings(ss []string) []string {
+	out := ss[:0]
+	for i, s := range ss {
+		if !slices.Contains(ss[:i], s) {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // appendTextClauses parses raw with ParseTextSearch and appends its clauses to

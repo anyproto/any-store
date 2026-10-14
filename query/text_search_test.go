@@ -144,6 +144,10 @@ func TestParseText_Fields(t *testing.T) {
 		"$text": map[string]any{"$search": "east", "$fields": []any{"title", "body"}},
 	})
 	assert.Equal(t, []string{"title", "body"}, f.(Text).Fields)
+	f = MustParseCondition(map[string]any{
+		"$text": map[string]any{"$search": "east", "$fields": []any{"title", "body", "title"}},
+	})
+	assert.Equal(t, []string{"title", "body"}, f.(Text).Fields, "duplicates are dropped")
 
 	for _, bad := range []any{1, []any{"title", 2}, "", []any{""}, []any{}} {
 		_, err := ParseCondition(map[string]any{"$text": map[string]any{"$search": "east", "$fields": bad}})
@@ -172,4 +176,9 @@ func TestText_String(t *testing.T) {
 	})
 	assert.Equal(t, `{"$text":{"$search":"east ^\"tok yo\"*","$defaultOperator":"and","$require":["^critical","\"east side\"*"],"$exclude":["draft*"],"$fields":["title","body"]}}`, f.String())
 	assert.Equal(t, `{"$text":{"$search":"x"}}`, Text{Search: "x"}.String())
+	// Valid JSON, not Go escapes, so the string survives a JSON reader.
+	s := Text{Search: "a\x01b\u00ff"}.String()
+	assert.Equal(t, `{"$text":{"$search":"a\u0001bÿ"}}`, s)
+	_, err := ParseCondition(s)
+	require.NoError(t, err)
 }
