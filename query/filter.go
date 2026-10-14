@@ -948,11 +948,56 @@ func (t Text) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
+// String renders the predicate as its $text object: $search, then
+// $defaultOperator, $require, $exclude (re-synthesized from the parsed
+// clauses) and $fields when set.
 func (t Text) String() string {
-	if len(t.Fields) == 0 {
-		return fmt.Sprintf(`{"$text":{"$search":%q}}`, t.Search)
+	var sb strings.Builder
+	sb.WriteString(`{"$text":{"$search":`)
+	sb.WriteString(fmt.Sprintf("%q", t.Search))
+	if t.DefaultAnd {
+		sb.WriteString(`,"$defaultOperator":"and"`)
 	}
-	return fmt.Sprintf(`{"$text":{"$search":%q,"$fields":%s}}`, t.Search, quoteList(t.Fields))
+	var require, exclude []string
+	for _, c := range t.Clauses {
+		switch c.Op {
+		case TextMust:
+			require = append(require, c.String())
+		case TextMustNot:
+			exclude = append(exclude, c.String())
+		}
+	}
+	if len(require) > 0 {
+		sb.WriteString(`,"$require":` + quoteList(require))
+	}
+	if len(exclude) > 0 {
+		sb.WriteString(`,"$exclude":` + quoteList(exclude))
+	}
+	if len(t.Fields) > 0 {
+		sb.WriteString(`,"$fields":` + quoteList(t.Fields))
+	}
+	sb.WriteString("}}")
+	return sb.String()
+}
+
+// String renders the clause in $search syntax: ^ for an anchor, quotes for a
+// phrase, a trailing * for a prefix.
+func (c TextClause) String() string {
+	var sb strings.Builder
+	if c.Anchored {
+		sb.WriteByte('^')
+	}
+	if c.Phrase {
+		sb.WriteByte('"')
+		sb.WriteString(c.Raw)
+		sb.WriteByte('"')
+	} else {
+		sb.WriteString(c.Raw)
+	}
+	if c.Prefix {
+		sb.WriteByte('*')
+	}
+	return sb.String()
 }
 
 // quoteList renders ss as a JSON array of strings.

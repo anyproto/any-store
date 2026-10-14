@@ -688,6 +688,10 @@ func parseText(v *anyenc.Value) (Filter, error) {
 			excludeRaws = appendStrings("$exclude", val, excludeRaws)
 		case "$fields":
 			fields = appendStrings("$fields", val, fields)
+			if perr == nil && len(fields) == 0 {
+				fail("$fields", "$fields must name at least one field")
+				return
+			}
 			for _, f := range fields {
 				if f == "" {
 					fail("$fields", "$fields entries must be non-empty field names")
@@ -732,7 +736,7 @@ func parseText(v *anyenc.Value) (Filter, error) {
 //   - word             → a plain term clause.
 //
 // A ^ or * that is not attached to a word or phrase (a lone "^", "*", "^*") is
-// dropped. A * inside the quotes stays literal (the analyzer drops it); only a *
+// dropped. A * inside the quotes is ignored (the analyzer drops it); only a *
 // right after the closing quote makes a phrase-prefix.
 //
 // Deliberately there is NO inline +/- boolean syntax. Parsing boolean intent out
@@ -743,9 +747,8 @@ func parseText(v *anyenc.Value) (Filter, error) {
 // — so "-9" is just the term "9". Boolean require/exclude lives in the structured
 // $require / $exclude arrays, which are unambiguous and run through the same
 // analyzer. An app that wants single-box power-user syntax can parse it itself and
-// populate those fields. A trailing * is still honoured on bare words (prefix
-// expansion has negligible false-positive rate in natural text); it is left
-// literal inside a phrase, where positional expansion would be combinatorial.
+// populate those fields. A trailing * is honoured on bare words and after a
+// closing quote (the phrase-prefix form); inside the quotes it is ignored.
 func ParseTextSearch(s string) []TextClause {
 	var clauses []TextClause
 	rs := []rune(s)

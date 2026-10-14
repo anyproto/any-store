@@ -145,7 +145,7 @@ func TestParseText_Fields(t *testing.T) {
 	})
 	assert.Equal(t, []string{"title", "body"}, f.(Text).Fields)
 
-	for _, bad := range []any{1, []any{"title", 2}, "", []any{""}} {
+	for _, bad := range []any{1, []any{"title", 2}, "", []any{""}, []any{}} {
 		_, err := ParseCondition(map[string]any{"$text": map[string]any{"$search": "east", "$fields": bad}})
 		assert.Error(t, err, "%v", bad)
 	}
@@ -158,4 +158,18 @@ func TestParseText_Fields(t *testing.T) {
 		{Raw: "east", Anchored: true, Op: TextMust},
 		{Raw: "east tok", Phrase: true, Prefix: true, Op: TextMustNot},
 	}, f.(Text).Clauses)
+}
+
+func TestText_String(t *testing.T) {
+	f := MustParseCondition(map[string]any{
+		"$text": map[string]any{
+			"$search":          `east ^"tok yo"*`,
+			"$defaultOperator": "and",
+			"$require":         []any{"^critical", `"east side"*`},
+			"$exclude":         "draft*",
+			"$fields":          []any{"title", "body"},
+		},
+	})
+	assert.Equal(t, `{"$text":{"$search":"east ^\"tok yo\"*","$defaultOperator":"and","$require":["^critical","\"east side\"*"],"$exclude":["draft*"],"$fields":["title","body"]}}`, f.String())
+	assert.Equal(t, `{"$text":{"$search":"x"}}`, Text{Search: "x"}.String())
 }
