@@ -233,9 +233,9 @@ coll.Find(`{"$text": {"$search": "east tokyo"}}`).
 ## Query / planner integration (first-class, mirrors the vector index)
 
 FTS is a **first-class planner source**, integrated exactly like the vector
-index. A `$text` predicate must drive the query (it's the only selective
-source), so `BuildPlan` builds (or, when a selective restriction makes the
-probe form cheaper, the FtsProbeIter plan of `text_plan.go` instead):
+index. A `$text` predicate drives the query unless a selective restriction
+makes the probe form cheaper (the FtsProbeIter plan of `text_plan.go`);
+`BuildPlan` otherwise builds:
 
 ```
 FtsIter -> [FilterIter(residual)] -> [SortIter(real field)] -> [LimitIter]
@@ -293,8 +293,8 @@ clause has no probe form (its merged IDF needs the full walk): `detectFtsQuery`
 hands the planner no Probe for it, so the driver is the only plan and the plan
 stats are computed for Explain only. The completions are streamed from the
 vocabulary straight into one reused postings cursor (SeekNear: postings keys
-are length-major, so consecutive completions share leaves); nothing is
-materialized per completion. The corpus-wide document count of a prefix is a
+are length-major, so a next completion of the same length is often on the leaf
+already held); nothing is materialized per completion. The corpus-wide document count of a prefix is a
 bit set over IntDocID; only in-scope documents take a slot in the TF table. A
 document whose first tokens follow a token-less array element is rewritten
 whole on update (`leadingTokenless`), since earlier builds laid its positions

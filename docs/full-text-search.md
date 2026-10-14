@@ -129,17 +129,15 @@ The `$search` string is split into clauses (the syntax follows SQLite FTS5):
 | `^tok*`, `^"east tok"*` | anchored prefix and phrase-prefix |
 
 A `^` or `*` that is not attached to a word or phrase is dropped; a `*` inside the
-quotes is ignored (the analyzer drops it). The operators are the ASCII `^`, `*`
-and `"` only — full-width `＾＊＂` and typographic quotes are ordinary text. A word
-that the analyzer splits into several terms (`well-known*`, a CJK run) is matched
-as a phrase, so `well-known*` is the phrase-prefix `"well known"*` and `東京*` is
-the bigram phrase `"東京"*`. `"`, `*` and `^` are the only inline operators
-(there is deliberately no inline `+`/`-`: `-9` must stay the term `9`); an
-application that forwards a raw search box into `$search` accepts that a typed
-quote opens a phrase, a `*` after a word makes it a prefix and a `^` before one
-anchors it — or it builds the query from `FtsAnalyzeTerms` as the
-search-as-you-type section does, where typed punctuation never reaches the
-parser.
+quotes is ignored (the analyzer drops it); a doubled quote inside a phrase
+(`""`, as in FTS5) is a literal quote, for the words that keep one (Hebrew
+`צה"ל` is the phrase `"צה""ל"`). The operators are the ASCII `^`, `*` and `"`
+only — full-width `＾＊＂` and typographic quotes are ordinary text. A word that
+the analyzer splits into several terms (`well-known*`, a CJK run) is matched as
+a phrase, so `well-known*` is the phrase-prefix `"well known"*` and `東京都*` is
+the bigram phrase-prefix `"東京 京都"*`. `"`, `*` and `^` are the only inline
+operators; an application builds `$search` from `FtsAnalyzeTerms` as the
+search-as-you-type section does, so that typed punctuation never acts as one.
 
 **A prefix is one term.** `tok*` is scored as a single term whose postings are
 the merged postings of every vocabulary term starting with `tok`: per document
@@ -150,9 +148,9 @@ document with the rare word "kanzenban"), and a document is scored once per
 clause however many completions it holds. There is no cap on the expansion: a
 prefix covers every completion, and costs what the completions' posting lists
 cost. The expensive shape is a one-letter *stem*, whatever precedes it: `k*`,
-`mario k*` and `"mario k"*` all walk every posting of every `k…` term (a few
-milliseconds at 100k titles, a large share of a big body index), so an
-application decides the minimum stem length it searches.
+`mario k*` and `"mario k"*` all walk every posting of every `k…` term (9 ms for
+`m*` over 100k titles against 1.2 ms for `zel*`; a large share of a big body
+index), so an application decides the minimum stem length it searches.
 
 **Anchors** test the document's first token: position 0, which is the first
 token of the first indexed field that yields any tokens — an empty or
@@ -163,9 +161,10 @@ index's first field; combined with the title's token count it is "the title is
 mario kart". This is narrower than FTS5's `^`, which anchors at the start of any
 column: with `$fields` naming a later field, `^` matches only documents whose
 earlier fields are empty. Anchored clauses count one occurrence (tf 1).
-Documents indexed by a build before this rule whose first field is an array
-with a token-less leading element keep their shifted positions until they are
-rewritten, and `^` misses them.
+Documents indexed by any-store up to v2.3.0 whose first tokens come from an
+array element after a token-less one (`names: ["", "mario kart"]`) keep their
+shifted positions until the document is next updated, and `^` misses them
+meanwhile; the update re-indexes such a document whole.
 
 **Phrases and phrase-prefixes of two or more terms, and anchored clauses, count
 occurrences** (tf = the number of confirmed occurrences) and ignore per-field
@@ -185,8 +184,8 @@ coll.Find(map[string]any{"$text": map[string]any{
 ```
 
 `$require`/`$exclude` take a string or an array of strings; each entry uses the
-clause syntax above. There is deliberately no inline `+`/`-` syntax: a search box
-forwarded verbatim into `$search` must not turn `-9` into an exclusion.
+clause syntax above. There is deliberately no inline `+`/`-` syntax: `-9` stays
+the term `9`, and boolean intent lives in these typed fields.
 
 **`$fields`** scopes every clause to the listed fields of the index (names as
 given in `IndexInfo.Fields`, nested paths included; an unknown name fails with
@@ -250,7 +249,7 @@ func titleTiers(typed string) []string {
     if len(terms) == 0 {
         return nil
     }
-    phrase := strings.Join(terms, " ")
+    phrase := strings.ReplaceAll(strings.Join(terms, " "), `"`, `""`) // a quote inside a word is doubled
     star := "*" // the last word is unfinished …
     if r, _ := utf8.DecodeLastRuneInString(typed); unicode.IsSpace(r) {
         star = "" // … unless the user typed a space after it
@@ -296,11 +295,10 @@ document, so with a title-only index the shortest titles come first, which is
 what a title list wants (with a title+body index a long body pushes a short
 title down). Tier 0, "the title *is* the typed text", is tier 1 with the title's
 token count equal to `len(terms)`, which the application knows from the
-document. Each tier walks the typed words' postings once — about a millisecond
-at 100k titles for a two-letter stem, 9 ms for a one-letter one — so running
-them per keystroke is fine; the costly keystroke is a one-letter last word
-(`mario k`), which walks every `k…` posting, and an application may wait for the
-second letter.
+document. Each tier walks the typed words' postings once (`zel*` 1.2 ms, `m*`
+9 ms over 100k titles), so running them per keystroke is fine; the costly
+keystroke is a one-letter last word (`mario k`), which walks every `k…` posting,
+and an application may wait for the second letter.
 
 ### CJK and multilingual queries
 
@@ -313,7 +311,7 @@ coll.Find(`{"$text":{"$search":"東京"}}`).Iter(ctx)
 
 A CJK run is matched as a phrase of its bigrams, so `東京都` matches documents
 containing `東京` immediately followed by `京都`, and `東*` matches every
-document holding a bigram that starts with 東.
+document holding a bigram that starts with 東 (or the lone unigram 東).
 
 ## 4. Errors for malformed queries
 
@@ -375,6 +373,12 @@ every insert, update, and delete.
 
 ## 7. Performance notes
 
+- **A prefix clause always walks its completions' postings.** It has no probe
+  form, so a selective filter beside it (`id $in` a few ids) does not cut its
+  cost the way it does for plain terms; the walk is the same the unfiltered
+  query pays (milliseconds at 100k documents for a two-letter stem). The
+  defaults behind `_score` are `FtsBM25Params`; an index's `FulltextParams`
+  override them.
 - **Batch your writes.** A batch insert (one `Insert(docs...)` call or one
   `WriteTx`) collapses the per-term postings rewrites to once-per-touched-chunk
   at commit — substantially faster and lower-allocation than per-document
