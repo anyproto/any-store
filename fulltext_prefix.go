@@ -57,11 +57,10 @@ func (e *ftsExec) scorePrefixUnion(stem string, reqBit uint64) error {
 	nf := e.nFields
 	tfs := tab.aux[:0] // per slot: nf per-field TF sums
 	err := e.walkCompletions(stem, func(it fts.ChunkIterator, docID uint64) error {
-		mask := it.FieldMask()
 		if e.scoped {
 			seen.set(docID)
-			mask &= e.scope
 		}
+		mask := it.FieldMask() & e.scope // scope is every field when unscoped
 		if mask == 0 {
 			return nil
 		}
@@ -254,9 +253,8 @@ type ftsDocBits struct {
 }
 
 const (
-	ftsBitsBlock = 1 << 12                    // ids per block
-	ftsBitsWords = ftsBitsBlock / 64          // words per block
-	ftsBitsMax   = ftsMaxDocID / ftsBitsBlock // blocks the index can hold
+	ftsBitsBlock = 1 << 12           // ids per block
+	ftsBitsWords = ftsBitsBlock / 64 // words per block
 )
 
 var ftsDocBitsPool = sync.Pool{New: func() any { return &ftsDocBits{} }}

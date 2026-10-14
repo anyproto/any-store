@@ -2,6 +2,8 @@ package anystore
 
 import (
 	"errors"
+	"math/bits"
+	"math/rand"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -170,4 +172,31 @@ func TestFtsDocBits(t *testing.T) {
 	assert.Equal(t, uint64(2), b.count())
 	assert.Len(t, b.arena, ftsBitsWords)
 	assert.Len(t, b.index, 1<<30/ftsBitsBlock+1)
+	// Ids that coincide modulo the block are distinct bits.
+	b.reset(3 * ftsBitsBlock)
+	b.set(3)
+	b.set(ftsBitsBlock + 3)
+	b.set(2*ftsBitsBlock + 3)
+	assert.Equal(t, uint64(3), b.count())
+	assert.Len(t, b.arena, 3*ftsBitsWords)
+
+	// Randomized against a map across several blocks, reusing the pooled set
+	// between rounds (stale index offsets must not alias).
+	rng := rand.New(rand.NewSource(11))
+	for round := 0; round < 30; round++ {
+		bound := uint64(rng.Intn(1 << 16))
+		b.reset(bound)
+		ref := map[uint64]bool{}
+		for i := 0; i < 2000; i++ {
+			id := uint64(rng.Intn(1 << 17)) // may exceed the bound
+			b.set(id)
+			ref[id] = true
+			require.Equal(t, uint64(len(ref)), b.count(), "round %d", round)
+		}
+		var pop uint64
+		for _, w := range b.arena {
+			pop += uint64(bits.OnesCount64(w))
+		}
+		assert.Equal(t, uint64(len(ref)), pop, "round %d", round)
+	}
 }

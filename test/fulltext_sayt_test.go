@@ -293,6 +293,12 @@ func TestFtsSayt_ScopedPrefixIDFIsCorpusWide(t *testing.T) {
 	fx, coll := ftsFieldsColl(t, nil)
 	defer fx.finish()
 	insertJSON(t, coll, `{"id":"e","title":"kart","body":"kart kart"}`, `{"id":"f","body":"kart"}`)
+	// Enough documents for the ids to span several bit-set blocks.
+	var filler []string
+	for i := 0; i < 9000; i++ {
+		filler = append(filler, fmt.Sprintf(`{"id":"k%04d","body":"kart %d"}`, i, i))
+	}
+	insertJSON(t, coll, filler...)
 	for _, scope := range []any{nil, "title", "body"} {
 		term := map[string]any{"$search": "kart"}
 		pre := map[string]any{"$search": "kart*"}

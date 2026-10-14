@@ -294,8 +294,10 @@ hands the planner no Probe for it, so the driver is the only plan and the plan
 stats are computed for Explain only. The completions are streamed from the
 vocabulary straight into one reused postings cursor (SeekNear: postings keys
 are length-major, so a next completion of the same length is often on the leaf
-already held); nothing is materialized per completion. The corpus-wide document count of a prefix is a
-bit set over IntDocID; only in-scope documents take a slot in the TF table. A
+already held); nothing is materialized per completion. The corpus-wide document count of a scoped prefix
+or a phrase-prefix is a bit set over IntDocID laid out per touched block (an
+unscoped prefix counts its TF table); only in-scope documents take a slot in
+the TF table. A
 document whose first tokens follow a token-less array element is rewritten
 whole on update (`leadingTokenless`), since earlier builds laid its positions
 out differently.
