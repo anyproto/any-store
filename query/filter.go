@@ -887,6 +887,12 @@ type Text struct {
 	// ParseCondition; a Text built directly with only Search set has nil Clauses
 	// and the executor re-parses Search on demand (yielding should clauses only).
 	Clauses []TextClause
+	// Fields is the {"$fields":[...]} scope: the indexed fields the clauses
+	// match in. Empty means every field of the index. A posting outside the
+	// scope neither matches nor scores; phrase adjacency and the ^ anchor are
+	// evaluated on the in-scope positions only. Names must be index fields —
+	// the executor rejects unknown ones.
+	Fields []string
 }
 
 // TextOp classifies a $text clause's boolean role within the query.
@@ -903,9 +909,10 @@ const (
 )
 
 // TextClause is one parsed unit of a $text $search string: a single term, a
-// quoted phrase, or a prefix term, together with its boolean role. The raw text
-// is NOT analyzed here — the query package stays free of the fts analyzer; the
-// FTS executor analyzes each clause with the index's own pipeline.
+// quoted phrase, a prefix term or a phrase-prefix, optionally anchored, together
+// with its boolean role. The raw text is NOT analyzed here — the query package
+// stays free of the fts analyzer; the FTS executor analyzes each clause with the
+// index's own pipeline.
 type TextClause struct {
 	// Raw is the unanalyzed clause text: a single word, or the inner text of a
 	// "quoted phrase".
@@ -913,9 +920,13 @@ type TextClause struct {
 	// Phrase marks a "..." clause: Raw analyzes to an ordered term list matched
 	// by positional adjacency.
 	Phrase bool
-	// Prefix marks a trailing-* clause (foo*): Raw's single analyzed term is
-	// expanded against the vocabulary. Mutually exclusive with Phrase.
+	// Prefix marks a trailing-* clause: foo* or "foo bar"*. The LAST analyzed
+	// term of Raw is a prefix stem expanded against the vocabulary; any terms
+	// before it are matched as a phrase immediately preceding a completion.
 	Prefix bool
+	// Anchored marks a leading-^ clause (^foo, ^"foo bar", ^foo*): the clause
+	// matches only an occurrence starting at the document's first token.
+	Anchored bool
 	// Op is the clause's boolean role.
 	Op TextOp
 }
@@ -938,7 +949,24 @@ func (t Text) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 }
 
 func (t Text) String() string {
-	return fmt.Sprintf(`{"$text":{"$search":%q}}`, t.Search)
+	if len(t.Fields) == 0 {
+		return fmt.Sprintf(`{"$text":{"$search":%q}}`, t.Search)
+	}
+	return fmt.Sprintf(`{"$text":{"$search":%q,"$fields":%s}}`, t.Search, quoteList(t.Fields))
+}
+
+// quoteList renders ss as a JSON array of strings.
+func quoteList(ss []string) string {
+	var sb strings.Builder
+	sb.WriteByte('[')
+	for i, s := range ss {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(fmt.Sprintf("%q", s))
+	}
+	sb.WriteByte(']')
+	return sb.String()
 }
 
 // Knn is the {"<field>":{"$knn":{"$query":[…],"$k":N}}} approximate-nearest-neighbour
