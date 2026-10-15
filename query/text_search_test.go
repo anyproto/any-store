@@ -59,6 +59,46 @@ func TestParseTextSearch(t *testing.T) {
 			`"east tokyo`,
 			[]TextClause{{Raw: "east tokyo", Phrase: true, Op: TextShould}},
 		},
+		{
+			"phrase-prefix: star after the closing quote",
+			`"east tok"* crash`,
+			[]TextClause{
+				{Raw: "east tok", Phrase: true, Prefix: true, Op: TextShould},
+				{Raw: "crash", Op: TextShould},
+			},
+		},
+		{
+			"anchored word, phrase, prefix and phrase-prefix",
+			`^east ^"east tokyo" ^tok* ^"east tok"*`,
+			[]TextClause{
+				{Raw: "east", Anchored: true, Op: TextShould},
+				{Raw: "east tokyo", Phrase: true, Anchored: true, Op: TextShould},
+				{Raw: "tok", Prefix: true, Anchored: true, Op: TextShould},
+				{Raw: "east tok", Phrase: true, Prefix: true, Anchored: true, Op: TextShould},
+			},
+		},
+		{
+			"detached ^ and * are dropped",
+			`^ east * ^* "" ^"" tokyo`,
+			[]TextClause{{Raw: "east", Op: TextShould}, {Raw: "tokyo", Op: TextShould}},
+		},
+		{
+			"doubled quote inside a phrase is a literal quote",
+			`"צה""ל ב"* "a ""b"" c" "x"""`,
+			[]TextClause{
+				{Raw: `צה"ל ב`, Phrase: true, Prefix: true, Op: TextShould},
+				{Raw: `a "b" c`, Phrase: true, Op: TextShould},
+				{Raw: `x"`, Phrase: true, Op: TextShould},
+			},
+		},
+		{
+			"multiple trailing stars collapse",
+			`"east tok"** pre**`,
+			[]TextClause{
+				{Raw: "east tok", Phrase: true, Prefix: true, Op: TextShould},
+				{Raw: "pre", Prefix: true, Op: TextShould},
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -98,4 +138,60 @@ func TestParseText_ExcludeArray(t *testing.T) {
 		{Raw: "a", Op: TextMustNot},
 		{Raw: "b", Prefix: true, Op: TextMustNot},
 	}, txt.Clauses)
+}
+
+func TestParseText_Fields(t *testing.T) {
+	f := MustParseCondition(map[string]any{
+		"$text": map[string]any{"$search": "east", "$fields": "title"},
+	})
+	txt, ok := f.(Text)
+	require.True(t, ok)
+	assert.Equal(t, []string{"title"}, txt.Fields)
+	assert.Equal(t, `{"$text":{"$search":"east","$fields":["title"]}}`, txt.String())
+
+	f = MustParseCondition(map[string]any{
+		"$text": map[string]any{"$search": "east", "$fields": []any{"title", "body"}},
+	})
+	assert.Equal(t, []string{"title", "body"}, f.(Text).Fields)
+	f = MustParseCondition(map[string]any{
+		"$text": map[string]any{"$search": "east", "$fields": []any{"title", "body", "title"}},
+	})
+	assert.Equal(t, []string{"title", "body"}, f.(Text).Fields, "duplicates are dropped")
+
+	for _, bad := range []any{1, []any{"title", 2}, "", []any{""}, []any{}} {
+		_, err := ParseCondition(map[string]any{"$text": map[string]any{"$search": "east", "$fields": bad}})
+		assert.Error(t, err, "%v", bad)
+	}
+	// Anchors and phrase-prefixes keep their flags under $require / $exclude.
+	f = MustParseCondition(map[string]any{
+		"$text": map[string]any{"$search": "x", "$require": "^east", "$exclude": []any{`"east tok"*`}},
+	})
+	assert.Equal(t, []TextClause{
+		{Raw: "x", Op: TextShould},
+		{Raw: "east", Anchored: true, Op: TextMust},
+		{Raw: "east tok", Phrase: true, Prefix: true, Op: TextMustNot},
+	}, f.(Text).Clauses)
+}
+
+func TestText_String(t *testing.T) {
+	f := MustParseCondition(map[string]any{
+		"$text": map[string]any{
+			"$search":          `east ^"tok yo"*`,
+			"$defaultOperator": "and",
+			"$require":         []any{"^critical", `"east side"*`},
+			"$exclude":         "draft*",
+			"$fields":          []any{"title", "body"},
+		},
+	})
+	assert.Equal(t, `{"$text":{"$search":"east ^\"tok yo\"*","$defaultOperator":"and","$require":["^critical","\"east side\"*"],"$exclude":["draft*"],"$fields":["title","body"]}}`, f.String())
+	assert.Equal(t, `{"$text":{"$search":"x"}}`, Text{Search: "x"}.String())
+	// A quote inside a phrase round-trips doubled.
+	c := TextClause{Raw: `צה"ל ב`, Phrase: true, Prefix: true, Anchored: true}
+	assert.Equal(t, `^"צה""ל ב"*`, c.String())
+	assert.Equal(t, []TextClause{{Raw: c.Raw, Phrase: true, Prefix: true, Anchored: true, Op: TextShould}}, ParseTextSearch(c.String()))
+	// Valid JSON, not Go escapes, so the string survives a JSON reader.
+	s := Text{Search: "a\x01b\u00ff"}.String()
+	assert.Equal(t, `{"$text":{"$search":"a\u0001bÿ"}}`, s)
+	_, err := ParseCondition(s)
+	require.NoError(t, err)
 }

@@ -3,6 +3,7 @@ package query
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -882,11 +883,18 @@ type Text struct {
 	// become required (AND) rather than the default OR.
 	DefaultAnd bool
 	// Clauses are the parsed clauses of the whole $text predicate: the should
-	// clauses from $search (phrases, prefix*, plain terms) plus the required and
-	// excluded clauses from the $require / $exclude sub-fields. Populated by
+	// clauses from $search (plain terms, phrases, prefixes, phrase-prefixes,
+	// each optionally anchored) plus the required and excluded clauses from the
+	// $require / $exclude sub-fields. Populated by
 	// ParseCondition; a Text built directly with only Search set has nil Clauses
 	// and the executor re-parses Search on demand (yielding should clauses only).
 	Clauses []TextClause
+	// Fields is the {"$fields":[...]} scope: the indexed fields the clauses
+	// match in. Empty means every field of the index. A posting outside the
+	// scope neither matches nor scores; phrase adjacency and the ^ anchor are
+	// evaluated on the in-scope positions only. Names must be index fields —
+	// the executor rejects unknown ones.
+	Fields []string
 }
 
 // TextOp classifies a $text clause's boolean role within the query.
@@ -896,16 +904,18 @@ const (
 	// TextShould is a default clause: OR'd with the other should-clauses, unless
 	// the query sets DefaultAnd, in which case it is required.
 	TextShould TextOp = iota
-	// TextMust is a +term: always required (AND), regardless of DefaultAnd.
+	// TextMust is a $require entry: always required (AND), regardless of
+	// DefaultAnd.
 	TextMust
-	// TextMustNot is a -term: documents containing it are excluded.
+	// TextMustNot is an $exclude entry: documents containing it are excluded.
 	TextMustNot
 )
 
 // TextClause is one parsed unit of a $text $search string: a single term, a
-// quoted phrase, or a prefix term, together with its boolean role. The raw text
-// is NOT analyzed here — the query package stays free of the fts analyzer; the
-// FTS executor analyzes each clause with the index's own pipeline.
+// quoted phrase, a prefix term or a phrase-prefix, optionally anchored, together
+// with its boolean role. The raw text is NOT analyzed here — the query package
+// stays free of the fts analyzer; the FTS executor analyzes each clause with the
+// index's own pipeline.
 type TextClause struct {
 	// Raw is the unanalyzed clause text: a single word, or the inner text of a
 	// "quoted phrase".
@@ -913,9 +923,13 @@ type TextClause struct {
 	// Phrase marks a "..." clause: Raw analyzes to an ordered term list matched
 	// by positional adjacency.
 	Phrase bool
-	// Prefix marks a trailing-* clause (foo*): Raw's single analyzed term is
-	// expanded against the vocabulary. Mutually exclusive with Phrase.
+	// Prefix marks a trailing-* clause: foo* or "foo bar"*. The LAST analyzed
+	// term of Raw is a prefix stem expanded against the vocabulary; any terms
+	// before it are matched as a phrase immediately preceding a completion.
 	Prefix bool
+	// Anchored marks a leading-^ clause (^foo, ^"foo bar", ^foo*): the clause
+	// matches only an occurrence starting at the document's first token.
+	Anchored bool
 	// Op is the clause's boolean role.
 	Op TextOp
 }
@@ -937,8 +951,79 @@ func (t Text) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
+// String renders the predicate as its $text object (valid JSON): $search, then
+// $defaultOperator, $require, $exclude (re-synthesized from the parsed
+// clauses) and $fields when set.
 func (t Text) String() string {
-	return fmt.Sprintf(`{"$text":{"$search":%q}}`, t.Search)
+	var sb strings.Builder
+	sb.WriteString(`{"$text":{"$search":`)
+	sb.WriteString(jsonQuote(t.Search))
+	if t.DefaultAnd {
+		sb.WriteString(`,"$defaultOperator":"and"`)
+	}
+	var require, exclude []string
+	for _, c := range t.Clauses {
+		switch c.Op {
+		case TextMust:
+			require = append(require, c.String())
+		case TextMustNot:
+			exclude = append(exclude, c.String())
+		}
+	}
+	if len(require) > 0 {
+		sb.WriteString(`,"$require":` + quoteList(require))
+	}
+	if len(exclude) > 0 {
+		sb.WriteString(`,"$exclude":` + quoteList(exclude))
+	}
+	if len(t.Fields) > 0 {
+		sb.WriteString(`,"$fields":` + quoteList(t.Fields))
+	}
+	sb.WriteString("}}")
+	return sb.String()
+}
+
+// String renders the clause in $search syntax: ^ for an anchor, quotes for a
+// phrase (a quote inside it doubled), a trailing * for a prefix.
+func (c TextClause) String() string {
+	var sb strings.Builder
+	if c.Anchored {
+		sb.WriteByte('^')
+	}
+	if c.Phrase {
+		sb.WriteByte('"')
+		sb.WriteString(strings.ReplaceAll(c.Raw, `"`, `""`))
+		sb.WriteByte('"')
+	} else {
+		sb.WriteString(c.Raw)
+	}
+	if c.Prefix {
+		sb.WriteByte('*')
+	}
+	return sb.String()
+}
+
+// quoteList renders ss as a JSON array of strings.
+func quoteList(ss []string) string {
+	var sb strings.Builder
+	sb.WriteByte('[')
+	for i, s := range ss {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(jsonQuote(s))
+	}
+	sb.WriteByte(']')
+	return sb.String()
+}
+
+// jsonQuote renders s as a JSON string literal.
+func jsonQuote(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return fmt.Sprintf("%q", s)
+	}
+	return string(b)
 }
 
 // Knn is the {"<field>":{"$knn":{"$query":[…],"$k":N}}} approximate-nearest-neighbour

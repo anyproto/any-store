@@ -12,7 +12,7 @@ Schema-less documents, rich indexes, full-text and vector search, ACID transacti
 * **Mongo-style queries** — `$eq/$in/$gt/...`, logical operators, dot-path fields, modifiers (`$set`, `$inc`, ...). Formal semantics in [docs/query-filter-contract.md](docs/query-filter-contract.md).
 * **Indexes** — compound, unique, sparse, multikey (arrays), asc/desc per field; created and dropped at runtime.
 * **Cost-based planner** — index selection driven by btree page statistics and per-prefix selectivity sketches; `Explain()` shows the chosen plan and its candidates.
-* **Full-text search** — btree-resident inverted index with BM25 ranking via `$text`. See [docs/full-text-search.md](docs/full-text-search.md).
+* **Full-text search** — btree-resident inverted index with BM25 ranking via `$text`: phrases, prefixes, anchored and per-field matching for search-as-you-type. See [docs/full-text-search.md](docs/full-text-search.md).
 * **Vector search** — btree-resident ANN indexes (IVF-SQ, HNSW, brute-force) via `$knn`. See [docs/vector-search.md](docs/vector-search.md) and [docs/vector-engine.md](docs/vector-engine.md).
 * **Aggregation** — MongoDB-style pipelines: shaping (`$match`, `$group`, `$sort`, `$unwind`, `$facet`, ...), computed expressions (arithmetic, conditionals, comparisons, date math), field-to-field `$expr` predicates, primary-key `$lookup` joins, and materialization via `$merge`/`$out` — with planner pushdown. See [docs/aggregation.md](docs/aggregation.md).
 * **ACID transactions** — snapshot-isolated read transactions, single-writer write transactions.

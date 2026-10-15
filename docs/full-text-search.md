@@ -30,14 +30,16 @@ err := coll.EnsureIndex(ctx, anystore.IndexInfo{
 
 `CreateIndex` errors if the index already exists; `EnsureIndex` is idempotent.
 Creating the index on a non-empty collection backfills it from existing
-documents. `Fields` is the only requirement (`FulltextParams` is reserved for
-future options — per-field weights, analyzer selection, positionless mode — and
-may be left nil).
+documents. `Fields` is the only requirement; `FulltextParams` (per-field
+`Weights`, BM25 `K1`/`B`) may be left nil.
 
-A query's `$text` clause searches **all** of the index's fields together.
-Multiple fields are concatenated with a position gap so a phrase can't match
-across a field boundary. Nested paths work (`Fields: ["meta.note"]`), and a
-field holding an array of strings is indexed element by element.
+A query's `$text` clause searches **all** of the index's fields together unless
+it names some with `$fields` (see § Query syntax). Multiple fields are
+concatenated with a position gap so a phrase can't match across a field
+boundary. Nested paths work (`Fields: ["meta.note"]`), and a field holding an
+array of strings is indexed element by element, each on its own position run.
+Field order matters for one operator: `^` anchors at the document's first
+token, so the field a search box anchors on (the title) goes first.
 
 > **One text index per collection.** Like MongoDB, a collection is expected to
 > have a single full-text index; a `$text` query uses the first one. To change
@@ -95,10 +97,10 @@ A query becomes a full-text search when it contains a `$text` clause:
 iter, err := coll.Find(`{"$text":{"$search":"zeppelin disaster"}}`).Limit(10).Iter(ctx)
 ```
 
-The search is **bag-of-words** (OR): a document matches if it contains any query
-term, and its score is the sum of the per-term BM25 contributions, so documents
-matching more (and rarer) terms rank higher. Everything else in the filter is
-applied as a normal predicate on the ranked candidates:
+The search is **bag-of-words** (OR) by default: a document matches if it contains
+any query term, and its score is the sum of the per-term BM25 contributions, so
+documents matching more (and rarer) terms rank higher. Everything else in the
+filter is applied as a normal predicate on the ranked candidates:
 
 ```go
 // $text + ordinary filters (implicit AND).
@@ -112,6 +114,91 @@ coll.Find(map[string]any{
 `$search` accepts a `$language`/`$caseSensitive`/`$diacriticSensitive` companion
 for MongoDB compatibility; they are currently accepted and ignored (the analyzer
 is language-neutral).
+
+### Query syntax
+
+The `$search` string is split into clauses (the syntax follows SQLite FTS5):
+
+| Clause | Matches |
+|---|---|
+| `word` | the term anywhere in the document |
+| `"east tokyo"` | the terms adjacent and in order (phrase) |
+| `tok*` | any term starting with `tok` (prefix) |
+| `"east tok"*` | the phrase `east` followed by a term starting with `tok` (phrase-prefix) |
+| `^east`, `^"east tokyo"` | the term / phrase at the document's first token (anchored) |
+| `^tok*`, `^"east tok"*` | anchored prefix and phrase-prefix |
+
+A `^` or `*` that is not attached to a word or phrase is dropped; a `*` inside the
+quotes is ignored (the analyzer drops it); a doubled quote inside a phrase
+(`""`, as in FTS5) is a literal quote, for the words that keep one (Hebrew
+`צה"ל` is the phrase `"צה""ל"`). The operators are the ASCII `^`, `*` and `"`
+only — full-width `＾＊＂` and typographic quotes are ordinary text. A word that
+the analyzer splits into several terms (`well-known*`, a CJK run) is matched as
+a phrase, so `well-known*` is the phrase-prefix `"well known"*` and `東京都*` is
+the bigram phrase-prefix `"東京 京都"*`. `"`, `*` and `^` are the only inline
+operators; an application builds `$search` from `FtsAnalyzeTerms` as the
+search-as-you-type section does, so that typed punctuation never acts as one.
+
+**A prefix is one term.** `tok*` is scored as a single term whose postings are
+the merged postings of every vocabulary term starting with `tok`: per document
+the completions' frequencies add up, and the IDF comes from the number of
+documents holding *any* completion. A rare completion therefore never outweighs
+a common one (`mario ka*` ranks "Mario Kart 64" with "Mario Kart", not behind a
+document with the rare word "kanzenban"), and a document is scored once per
+clause however many completions it holds. There is no cap on the expansion: a
+prefix covers every completion, and costs what the completions' posting lists
+cost. The expensive shape is a one-letter *stem*, whatever precedes it: `k*`,
+`mario k*` and `"mario k"*` all walk every posting of every `k…` term (9 ms for
+`m*` over 100k titles against 1.2 ms for `zel*`; a large share of a big body
+index), so an application decides the minimum stem length it searches.
+
+**Anchors** test the document's first token: position 0, which is the first
+token of the first indexed field that yields any tokens — an empty or
+punctuation-only title does not count, and in an array field the first element
+that yields tokens is the one that can anchor. `^"mario kart"` with
+`$fields: "title"` is "the title starts with mario kart" when the title is the
+index's first field; combined with the title's token count it is "the title is
+mario kart". This is narrower than FTS5's `^`, which anchors at the start of any
+column: with `$fields` naming a later field, `^` matches only documents whose
+earlier fields are empty. Anchored clauses count one occurrence (tf 1).
+Documents indexed by any-store up to v2.3.0 whose first tokens come from an
+array element after a token-less one (`names: ["", "mario kart"]`) keep their
+shifted positions until the document is next updated, and `^` misses them
+meanwhile; the update re-indexes such a document whole.
+
+**Phrases and phrase-prefixes of two or more terms, and anchored clauses, count
+occurrences** (tf = the number of confirmed occurrences) and ignore per-field
+`Weights`; a term, a quoted single term and a prefix score Σ weight · tf over
+their fields. IDF is always corpus-wide.
+
+The other `$text` fields:
+
+```go
+coll.Find(map[string]any{"$text": map[string]any{
+    "$search":          `mario ka*`,       // should clauses (OR), or AND with:
+    "$defaultOperator": "and",             // every $search clause required
+    "$require":         []string{"^mario"}, // each entry required, same syntax
+    "$exclude":         []string{"draft"},  // each entry excludes matching docs
+    "$fields":          []string{"title"},  // match in these index fields only
+}})
+```
+
+`$require`/`$exclude` take a string or an array of strings; each entry uses the
+clause syntax above. There is deliberately no inline `+`/`-` syntax: `-9` stays
+the term `9`, and boolean intent lives in these typed fields.
+
+**`$fields`** scopes every clause to the listed fields of the index (names as
+given in `IndexInfo.Fields`, nested paths included; an unknown name fails with
+`ErrFulltextUnknownField`, an empty list is a parse error). A posting outside
+the scope is invisible: it neither matches nor scores nor satisfies a required
+clause, phrase adjacency is checked on the in-scope positions only, and `^`
+requires the document's first token to lie in scope. IDF stays corpus-wide and
+BM25 length normalisation still uses the whole document's length, so a scoped
+query ranks like the unscoped one restricted to the matching fields.
+
+These are extensions: MongoDB's `$text` has no prefix, anchor or field scope,
+treats a quoted phrase as required, and parses inline `-`; `$require`,
+`$exclude`, `$defaultOperator` and `$fields` are any-store's.
 
 ### Score: the `_score` field
 
@@ -147,6 +234,72 @@ coll.Find(`{"$text":{"$search":"london"}}`).Sort("-year").Iter(ctx)  // newest f
 `Limit`/`Offset` apply *after* the residual filter and any sort, so
 `Find($text + filter).Limit(10)` returns ten *matching, filtered* rows.
 
+### Search-as-you-type
+
+A search box wants, per keystroke, the documents whose title *begins* with what
+was typed before the ones that merely contain it, and the last word treated as
+unfinished. Index the title as the first field (or alone), build the query from
+the analyzer's split of the typed string (`FtsAnalyzeTerms` is the index's own
+pipeline) and run the match tiers as separate queries, most specific first,
+dropping ids already shown:
+
+```go
+func titleTiers(typed string) []string {
+    terms := anystore.FtsAnalyzeTerms(typed) // "Mario Ka" → ["mario", "ka"]
+    if len(terms) == 0 {
+        return nil
+    }
+    phrase := strings.ReplaceAll(strings.Join(terms, " "), `"`, `""`) // a quote inside a word is doubled
+    star := "*" // the last word is unfinished …
+    if r, _ := utf8.DecodeLastRuneInString(typed); unicode.IsSpace(r) {
+        star = "" // … unless the user typed a space after it
+    }
+    tiers := []string{
+        `^"` + phrase + `"` + star, // tier 1: the title starts with the typed words   → Mario Kart, Mario Kart 64
+        `"` + phrase + `"` + star,  // tier 2: the typed words appear in order inside → Super Mario Kart
+    }
+    if len(terms) > 1 { // one word: tier 2 already is "the word, anywhere"
+        last := terms[len(terms)-1] + star
+        bag := strings.Join(append(terms[:len(terms)-1:len(terms)-1], last), " ")
+        tiers = append(tiers, bag) // tier 3: every word present, last as prefix   → Kart: Mario Edition
+    }
+    return tiers
+}
+
+seen := map[string]bool{}
+for _, search := range titleTiers(typed) {
+    text := map[string]any{"$search": search, "$defaultOperator": "and", "$fields": "title"}
+    iter, err := coll.Find(map[string]any{"$text": text}).Limit(10).Iter(ctx)
+    if err != nil {
+        return err
+    }
+    for iter.Next() {
+        doc, err := iter.Doc()
+        if err != nil {
+            iter.Close()
+            return err
+        }
+        if id := doc.Value().GetString("id"); !seen[id] {
+            seen[id] = true
+            // … show it …
+        }
+    }
+    if err := errors.Join(iter.Err(), iter.Close()); err != nil {
+        return err
+    }
+}
+```
+
+Within a tier BM25 orders the hits; its length normalisation uses the whole
+document, so with a title-only index the shortest titles come first, which is
+what a title list wants (with a title+body index a long body pushes a short
+title down). Tier 0, "the title *is* the typed text", is tier 1 with the title's
+token count equal to `len(terms)`, which the application knows from the
+document. Each tier walks the typed words' postings once (`zel*` 1.2 ms, `m*`
+9 ms over 100k titles), so running them per keystroke is fine; the costly
+keystroke is a one-letter last word (`mario k`), which walks every `k…` posting,
+and an application may wait for the second letter.
+
 ### CJK and multilingual queries
 
 Searching works the same across scripts. A CJK query is split into the same
@@ -156,10 +309,9 @@ bigrams used at index time, so `"東京"` matches documents containing 東京:
 coll.Find(`{"$text":{"$search":"東京"}}`).Iter(ctx)
 ```
 
-Because CJK is matched as a bag of bigrams (positional phrase matching is a
-future addition), a query for `東京都` matches documents containing both `東京`
-and `京都`; at local-first scale the false-positive rate is negligible and
-recall is excellent.
+A CJK run is matched as a phrase of its bigrams, so `東京都` matches documents
+containing `東京` immediately followed by `京都`, and `東*` matches every
+document holding a bigram that starts with 東 (or the lone unigram 東).
 
 ## 4. Errors for malformed queries
 
@@ -169,6 +321,8 @@ recall is excellent.
 | `$text` nested under `$or` / `$nor` / `$not` | error — `$text` must be top-level or inside `$and` |
 | More than one `$text` clause in a query | error — only one `$text` per query |
 | `$text` with no `$search`, or `$search` not a string | error |
+| `$fields` not a string / array of non-empty strings, or an empty array | error |
+| `$fields` naming a field the index does not cover | `ErrFulltextUnknownField` |
 
 `$text` combined with other predicates via top-level fields or `$and` is the
 supported shape (it must be able to *drive* the query).
@@ -219,6 +373,12 @@ every insert, update, and delete.
 
 ## 7. Performance notes
 
+- **A prefix clause always walks its completions' postings.** It has no probe
+  form, so a selective filter beside it (`id $in` a few ids) does not cut its
+  cost the way it does for plain terms; the walk is the same the unfiltered
+  query pays (milliseconds at 100k documents for a two-letter stem). The
+  defaults behind `_score` are `FtsBM25Params`; an index's `FulltextParams`
+  override them.
 - **Batch your writes.** A batch insert (one `Insert(docs...)` call or one
   `WriteTx`) collapses the per-term postings rewrites to once-per-touched-chunk
   at commit — substantially faster and lower-allocation than per-document

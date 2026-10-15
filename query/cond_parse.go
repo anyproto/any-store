@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -602,18 +603,20 @@ func parseKnn(v *anyenc.Value) (Filter, error) {
 // parseText parses the $text predicate object into a Text filter:
 //
 //	{
-//	  "$search": "free text \"phrases\" prefix*",  // should/OR (or AND, see below)
+//	  "$search": "free text \"phrases\" prefix* ^anchored",  // should/OR (or AND, see below)
 //	  "$defaultOperator": "and" | "or",            // default joins $search terms
 //	  "$require": "critical" | ["a", "\"b c\""],   // each entry required (AND)
-//	  "$exclude": "spam" | ["draft", "x*"]          // each entry excluded
+//	  "$exclude": "spam" | ["draft", "x*"],         // each entry excluded
+//	  "$fields": "title" | ["title", "body"]        // match in these index fields only
 //	}
 //
 // $require/$exclude take a string or an array of strings; each entry reuses the
-// phrase/prefix syntax of $search (ParseTextSearch) with its boolean role fixed
-// by the field. This replaces inline +/- in the search string, which is unsafe
-// for raw user input (see ParseTextSearch). $language/$caseSensitive/
-// $diacriticSensitive are accepted and ignored (the analyzer is language-neutral).
-// Note the Text caveat: outside an FTS-driven query its Ok matches everything.
+// phrase/prefix/anchor syntax of $search (ParseTextSearch) with its boolean role
+// fixed by the field. This replaces inline +/- in the search string, which is
+// unsafe for raw user input (see ParseTextSearch). $fields scopes every clause
+// to the listed index fields. $language/$caseSensitive/$diacriticSensitive are
+// accepted and ignored (the analyzer is language-neutral). Note the Text caveat:
+// outside an FTS-driven query its Ok matches everything.
 func parseText(v *anyenc.Value) (Filter, error) {
 	if v.Type() != anyenc.TypeObject {
 		return nil, &ParseError{Op: "$text", Reason: `$text must be an object, e.g. {"$search":"..."}`}
@@ -625,6 +628,7 @@ func parseText(v *anyenc.Value) (Filter, error) {
 		defaultAnd  bool
 		requireRaws []string
 		excludeRaws []string
+		fields      []string
 		perr        error
 	)
 	// fail records a structured rejection located at the given $text sub-key.
@@ -683,6 +687,19 @@ func parseText(v *anyenc.Value) (Filter, error) {
 			requireRaws = appendStrings("$require", val, requireRaws)
 		case "$exclude":
 			excludeRaws = appendStrings("$exclude", val, excludeRaws)
+		case "$fields":
+			fields = appendStrings("$fields", val, fields)
+			if perr == nil && len(fields) == 0 {
+				fail("$fields", "$fields must name at least one field")
+				return
+			}
+			for _, f := range fields {
+				if f == "" {
+					fail("$fields", "$fields entries must be non-empty field names")
+					return
+				}
+			}
+			fields = dedupeStrings(fields)
 		case "$language", "$caseSensitive", "$diacriticSensitive":
 			// accepted for Mongo compatibility, ignored in v1
 		default:
@@ -703,7 +720,7 @@ func parseText(v *anyenc.Value) (Filter, error) {
 	for _, r := range excludeRaws {
 		clauses = appendTextClauses(clauses, r, TextMustNot)
 	}
-	return Text{Search: search, DefaultAnd: defaultAnd, Clauses: clauses}, nil
+	return Text{Search: search, DefaultAnd: defaultAnd, Clauses: clauses, Fields: fields}, nil
 }
 
 // ParseTextSearch splits a $text $search string into clauses. It is a purely
@@ -714,7 +731,17 @@ func parseText(v *anyenc.Value) (Filter, error) {
 //
 //   - "double quoted"  → a phrase clause (positional adjacency).
 //   - word*            → a prefix clause (vocabulary expansion).
+//   - "double quoted"* → a phrase-prefix clause: the phrase followed by a
+//     completion of its last word (search-as-you-type).
+//   - ^word, ^"..."    → an anchored clause: the match must start at the
+//     document's first token. Combines with * (^word*, ^"..."*).
 //   - word             → a plain term clause.
+//
+// A ^ or * that is not attached to a word or phrase (a lone "^", "*", "^*") is
+// dropped. A * inside the quotes is ignored (the analyzer drops it); only a *
+// right after the closing quote makes a phrase-prefix. A doubled quote inside
+// a phrase ("" as in FTS5) is a literal quote, for the scripts whose words keep
+// one (Hebrew צה"ל).
 //
 // Deliberately there is NO inline +/- boolean syntax. Parsing boolean intent out
 // of a raw human search string is a footgun for an embedded library whose common
@@ -724,9 +751,7 @@ func parseText(v *anyenc.Value) (Filter, error) {
 // — so "-9" is just the term "9". Boolean require/exclude lives in the structured
 // $require / $exclude arrays, which are unambiguous and run through the same
 // analyzer. An app that wants single-box power-user syntax can parse it itself and
-// populate those fields. A trailing * is still honoured on bare words (prefix
-// expansion has negligible false-positive rate in natural text); it is left
-// literal inside a phrase, where positional expansion would be combinatorial.
+// populate those fields.
 func ParseTextSearch(s string) []TextClause {
 	var clauses []TextClause
 	rs := []rune(s)
@@ -738,18 +763,38 @@ func ParseTextSearch(s string) []TextClause {
 		if i >= n {
 			break
 		}
+		anchored := false
+		if rs[i] == '^' {
+			anchored = true
+			i++
+			if i >= n || unicode.IsSpace(rs[i]) {
+				continue // a lone ^ anchors nothing
+			}
+		}
 		if rs[i] == '"' {
 			i++ // opening quote
-			start := i
-			for i < n && rs[i] != '"' {
+			var sb strings.Builder
+			for i < n {
+				if rs[i] == '"' {
+					if i+1 < n && rs[i+1] == '"' {
+						sb.WriteByte('"') // "" → a literal quote
+						i += 2
+						continue
+					}
+					i++ // closing quote
+					break
+				}
+				sb.WriteRune(rs[i])
 				i++
 			}
-			raw := strings.TrimSpace(string(rs[start:i]))
-			if i < n {
-				i++ // closing quote
+			raw := strings.TrimSpace(sb.String())
+			prefix := false
+			for i < n && rs[i] == '*' {
+				prefix = true // "phrase"* — the last word is a stem
+				i++
 			}
 			if raw != "" {
-				clauses = append(clauses, TextClause{Raw: raw, Phrase: true, Op: TextShould})
+				clauses = append(clauses, TextClause{Raw: raw, Phrase: true, Prefix: prefix, Anchored: anchored, Op: TextShould})
 			}
 			continue
 		}
@@ -764,15 +809,26 @@ func ParseTextSearch(s string) []TextClause {
 			word = strings.TrimRight(word, "*")
 		}
 		if word != "" {
-			clauses = append(clauses, TextClause{Raw: word, Prefix: prefix, Op: TextShould})
+			clauses = append(clauses, TextClause{Raw: word, Prefix: prefix, Anchored: anchored, Op: TextShould})
 		}
 	}
 	return clauses
 }
 
+// dedupeStrings drops repeated entries, keeping first occurrences in order.
+func dedupeStrings(ss []string) []string {
+	out := ss[:0]
+	for i, s := range ss {
+		if !slices.Contains(ss[:i], s) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // appendTextClauses parses raw with ParseTextSearch and appends its clauses to
 // dst with their boolean role forced to op (used for $require / $exclude entries,
-// which reuse the phrase/prefix syntax but fix the clause role by field).
+// which reuse the phrase/prefix/anchor syntax but fix the clause role by field).
 func appendTextClauses(dst []TextClause, raw string, op TextOp) []TextClause {
 	for _, c := range ParseTextSearch(raw) {
 		c.Op = op

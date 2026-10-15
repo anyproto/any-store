@@ -233,8 +233,9 @@ coll.Find(`{"$text": {"$search": "east tokyo"}}`).
 ## Query / planner integration (first-class, mirrors the vector index)
 
 FTS is a **first-class planner source**, integrated exactly like the vector
-index. A `$text` predicate must drive the query (it's the only selective
-source), so `BuildPlan` bypasses the CBO and builds:
+index. A `$text` predicate drives the query unless a selective restriction
+makes the probe form cheaper (the FtsProbeIter plan of `text_plan.go`);
+`BuildPlan` otherwise builds:
 
 ```
 FtsIter -> [FilterIter(residual)] -> [SortIter(real field)] -> [LimitIter]
@@ -271,9 +272,35 @@ then a positional adjacency check; it scores the phrase as a synthetic term
 (TF = adjacency count, IDF = Σ of constituent IDFs). A CJK run analyzes to
 adjacent bigrams and is matched as an implicit phrase.
 
-Prefix / search-as-you-type (**implemented**, Phase 1): prefix-scan `fts:vocab`,
-take the top-M completions by `df` (`ftsPrefixMaxExpansions`), then OR those
-terms' postings — bounds latency.
+Prefix / search-as-you-type (**implemented**): prefix-scan `fts:vocab` for
+every completion (no cap — coverage is complete) and score the clause as ONE
+term over the merged postings: per document the completions' per-field TFs add
+up (`fulltext_prefix.go`, a pooled dense doc table), the IDF comes from the
+number of documents holding any completion (FTS5 scores a prefix token the same
+way; the IDF is corpus-wide like every other clause's, a `$fields` scope
+affects matching and tf only). `"phrase"*` runs the phrase merge for the fixed
+terms, records each occurrence's end, then walks the completions' postings once
+and counts the completions that follow an end. `^` (FTS5's initial-token
+operator) anchors a clause at position 0 — the first token of the first field
+that yields tokens, so in an array field the first element with tokens anchors;
+positions are a single global sequence per document and the per-field starts
+are not stored, so FTS5's per-column anchoring would need per-document field
+offsets in docinfo (reserved for docinfo v2 with per-field lengths). `$fields`
+scopes a query by the postings' field mask; a position's field follows from the
+per-field TFs (the first TF_f positions belong to the lowest occupied field,
+and so on), so phrases are scoped exactly with no format change. A prefix
+clause has no probe form (its merged IDF needs the full walk): `detectFtsQuery`
+hands the planner no Probe for it, so the driver is the only plan and the plan
+stats are computed for Explain only. The completions are streamed from the
+vocabulary straight into one reused postings cursor (SeekNear: postings keys
+are length-major, so a next completion of the same length is often on the leaf
+already held); nothing is materialized per completion. The corpus-wide document count of a scoped prefix
+or a phrase-prefix is a bit set over IntDocID laid out per touched block (an
+unscoped prefix counts its TF table); only in-scope documents take a slot in
+the TF table. A
+document whose first tokens follow a token-less array element is rewritten
+whole on update (`leadingTokenless`), since earlier builds laid its positions
+out differently.
 
 Boolean require/exclude (**implemented**, Phase 1) come from the typed
 `$require`/`$exclude` sub-fields of `$text` (not inline `+`/`-`): required clauses
@@ -339,12 +366,12 @@ The real footprint lever is structural, not compression: a positionless
 At ~19MB index for 29MB text (with positions), the index is already well-coded.
 
 Implemented since the original v1 cut (Phase 1, `any-store-tests:docs/any-store/fts/FTS-V2-PLAN.md`): phrase /
-positional CJK matching; prefix search; boolean require/exclude (`$require` /
-`$exclude`) and `$defaultOperator`.
+positional CJK matching; prefix search (merged-term scoring, uncapped), phrase-
+prefix, anchored `^` clauses, `$fields` scope; boolean require/exclude
+(`$require` / `$exclude`) and `$defaultOperator`.
 
-Explicitly **deferred to v2+**: per-field weights / BM25F (Phase 3 — postings v2
-+ docinfo v2); configurable BM25 `b`/`k1` (Phase 2); top-k materialization in
-`search` (it currently clones every matched id before `Limit` trims); replacing
+Explicitly **deferred to v2+**: per-field length normalisation (docinfo v2;
+BM25F weights and `b`/`k1` are in); replacing
 the per-doc `docinfo` `Get` with an in-memory dense quantized doc-length array
 (safe now that `IntDocID` is stable and dense); fuzzy/Levenshtein search over
 `fts:vocab`; chunk-level (max-TF) WAND skipping; configurable analyzers /

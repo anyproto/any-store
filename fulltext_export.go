@@ -2,13 +2,16 @@ package anystore
 
 import "github.com/anyproto/any-store/v2/internal/fts"
 
-// fulltext_export.go exposes a minimal test-support surface so external test
-// harnesses (any-store-tests) can build an exact BM25 oracle with the same
-// analyzer and parameters as the engine. Not intended for application use.
+// fulltext_export.go exposes the full-text analyzer and scoring parameters so
+// an application can split text exactly as the index does (query building,
+// highlighting, an external BM25 oracle in tests).
 
 // FtsAnalyzeTerms runs the full-text analyzer pipeline (NFKC + case folding +
 // UAX#29 word boundaries + CJK bigrams) over text and returns the resulting
-// terms in token order.
+// terms in token order — the terms a $text clause over the same text would
+// match. An application builds search-as-you-type queries with it: split the
+// typed string, quote the terms as one phrase and put a * after the closing
+// quote (the last word is a prefix stem), with ^ in front for "starts with".
 func FtsAnalyzeTerms(text string) []string {
 	tokens := fts.Analyze(text)
 	terms := make([]string, len(tokens))
@@ -18,7 +21,8 @@ func FtsAnalyzeTerms(text string) []string {
 	return terms
 }
 
-// FtsBM25Params returns the BM25 k1 and b parameters used by $text scoring.
+// FtsBM25Params returns the default BM25 k1 and b; an index's FulltextParams
+// K1 / B override them for its own queries.
 func FtsBM25Params() (k1, b float64) {
 	return bm25K1, bm25B
 }
