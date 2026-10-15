@@ -4573,6 +4573,7 @@ func TestCheckpointWithMode_BackfillErrors(t *testing.T) {
 	p := newPager(path, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer forgetPager(p)
 
 	// Write data
 	mf, slot, err := p.beginRead()
@@ -5539,6 +5540,7 @@ func TestCheckpointWithMode_FileReadPageDataError(t *testing.T) {
 	p := newPager(path, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer forgetPager(p)
 
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
@@ -5881,6 +5883,7 @@ func TestWalWriteFrames_FdatasyncError(t *testing.T) {
 	p := newPager(dbPath, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer forgetPager(p)
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
@@ -8917,4 +8920,25 @@ func TestUnmoved_CloseCheckpointsWhenInPlace(t *testing.T) {
 	n, err := rtx.Count(ns)
 	require.NoError(t, err)
 	assert.Equal(t, 50, n, "all 50 rows must survive the in-place close-time checkpoint")
+}
+
+// A close removes only its own registry entry: after ResetOpenRegistry a
+// newer handle may hold the same key, and the older handle's close must
+// leave it registered.
+func TestPagerClose_RemovesOnlyOwnRegistryEntry(t *testing.T) {
+	const key = "inode:test:registry-owner"
+	older := newPager("older.db", DefaultPageSize, 10, true)
+	newer := newPager("newer.db", DefaultPageSize, 10, true)
+	openDBs.Store(key, newer)
+	t.Cleanup(func() { openDBs.Delete(key) })
+
+	older.registryKey = key
+	require.NoError(t, older.close())
+	_, held := openDBs.Load(key)
+	require.True(t, held, "the older handle's close removed the newer handle's entry")
+
+	newer.registryKey = key
+	require.NoError(t, newer.close())
+	_, held = openDBs.Load(key)
+	require.False(t, held)
 }

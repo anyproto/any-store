@@ -40,9 +40,11 @@ func rawClose(db *DB) {
 		_ = db.pager.file.Close()
 		db.pager.file = nil
 	}
-	// Remove from open registry so the path can be re-opened.
-	if !db.opts.InMemory {
-		openDBs.Delete(db.registryKey)
+	// Remove from open registry so the path can be re-opened, and leave the
+	// pager holding no key.
+	if db.pager.registryKey != "" {
+		openDBs.CompareAndDelete(db.pager.registryKey, db.pager)
+		db.pager.registryKey = ""
 	}
 }
 

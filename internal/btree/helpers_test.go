@@ -111,3 +111,33 @@ func stressRebalance(t *testing.T, db *DB, count, initSize, shrinkSize, expandSi
 	updateOne(t, db, "t1", target, expandSize)
 	require.NoError(t, db.IntegrityCheck())
 }
+
+// forgetPager removes a pager's registry entry for tests that close its
+// files by hand instead of through pager.close.
+func forgetPager(p *pager) {
+	if p.registryKey != "" {
+		openDBs.CompareAndDelete(p.registryKey, p)
+		p.registryKey = ""
+	}
+}
+
+// createNS creates namespace name in its own write transaction.
+func createNS(t *testing.T, db *DB, name string) {
+	t.Helper()
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace(name)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+}
+
+// putKey writes one row with a 4-byte big-endian key in its own write transaction.
+func putKey(t *testing.T, db *DB, nsName string, key uint32, val []byte) {
+	t.Helper()
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := db.getNamespaceLocked(nsName)
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, binary.BigEndian.AppendUint32(nil, key), val))
+	require.NoError(t, tx.Commit())
+}
