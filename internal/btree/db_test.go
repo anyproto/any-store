@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -3998,7 +3999,12 @@ func TestOpen_DoubleOpenByInodeIdentity(t *testing.T) {
 
 	// Create a symlink and a hardlink pointing at the same inode.
 	require.NoError(t, os.Symlink(realPath, symPath))
-	require.NoError(t, os.Link(realPath, hardPath))
+	if err := os.Link(realPath, hardPath); err != nil {
+		if errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.EPERM) {
+			t.Skipf("no hard links on this filesystem: %v", err)
+		}
+		require.NoError(t, err)
+	}
 
 	// Sanity: the OS agrees these spellings are the same physical file, but
 	// their lexical absolute paths differ (so a path-keyed guard would miss them).
