@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/anyproto/any-store/v2 v2.3.0
 	github.com/fatih/color v1.19.0
-	github.com/peterh/liner v1.2.2
+	github.com/peterh/liner v1.2.3
 	github.com/robertkrimen/otto v0.5.1
 	github.com/spf13/pflag v1.0.10
 	github.com/stretchr/testify v1.12.1
@@ -18,7 +18,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.23 // indirect
-	github.com/mattn/go-runewidth v0.0.24 // indirect
+	github.com/mattn/go-runewidth v0.0.31 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/valyala/fastjson v1.6.10 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
