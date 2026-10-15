@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -160,6 +161,14 @@ type pager struct {
 
 	// inProcess uses heap-backed shm (faster, single-process only)
 	inProcess bool
+
+	// registryKey is the key this handle holds in openDBs from open until
+	// close, "" when it holds none; registryPath is the absolute path the
+	// key falls back to; unstableLocked is set while this open holds
+	// unstableOpenMu.
+	registryKey    string
+	registryPath   string
+	unstableLocked bool
 
 	// noCommitSync skips fdatasync on WAL commit (deferred durability)
 	noCommitSync bool
@@ -455,8 +464,61 @@ func (p *pager) open() (err error) {
 				_ = p.file.Close()
 				p.file = nil
 			}
+			if p.registryKey != "" {
+				openDBs.CompareAndDelete(p.registryKey, p)
+				p.registryKey = ""
+			}
 		}
 	}()
+
+	// Register in openDBs now, with the fd open and nothing locked. SQLite
+	// registers the inode at the same point (findInodeInfo in fillInUnixFile
+	// on unixOpen's path, os_unix.c:6138) and hangs the shm node off that
+	// entry, so only the first connection per inode runs the DMS election
+	// (unixOpenSharedMemory, os_unix.c:4973). A second same-process open is
+	// refused here, before a DB-file lock, the WAL open and the shm attach:
+	// record locks are per process, so a second attacher would win the
+	// election against the live handle, truncate its wal-index and, on
+	// closing its shm fd, drop every record lock this process holds on it.
+	// The refusal leaves p.registryKey empty: the entry belongs to the live
+	// handle, and the deferred cleanup must not remove it. An open still in
+	// progress holds its entry too, so a concurrent same-process open is
+	// refused rather than raced. The value is this pager: a delete removes
+	// only the owner's entry (see rekeyRegistry and close).
+	//
+	// The key is the fd's identity (dev,ino) from this first stat, as in
+	// SQLite, except for an empty file on a volume that reports a wrong
+	// inode for it (macOS msdos and exfat, SQLite ticket #3260): that
+	// handle is keyed by its absolute path until the file has content and
+	// rekeyRegistry moves it to the inode — at the create/existing decision
+	// below or after initNewDB writes page 1, before any WAL open. Every
+	// open on such a volume takes unstableOpenMu for its key stat and store,
+	// and a path-keyed handle keeps it until its re-key, so the move from
+	// path to inode is atomic to the others: an opener that stats after the
+	// creator wrote page 1 waits for the re-key and is refused by inode.
+	// DRIFT: SQLite writes a byte before its fstat on such volumes ('S' opens its header, os_unix.c:1553-1576, and unixFileSize reads a size of 1 as 0, os_unix.c:4029); any-store's header does not start that way and a 1-byte file would not read as empty, so the empty file is keyed by path under a mutex instead. See docs/btree/NOTES.md#drift-2026-10-15-1-empty-file-registry-key-is-the-path
+	abs, err := filepath.Abs(p.path)
+	if err != nil {
+		return fmt.Errorf("btree: cannot resolve path: %w", err)
+	}
+	unstable := emptyFileInodeUnstable(f)
+	if unstable {
+		unstableOpenMu.Lock()
+		p.unstableLocked = true
+		defer p.releaseUnstable()
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	key := registryKey(fi, abs, unstable)
+	if _, loaded := openDBs.LoadOrStore(key, p); loaded {
+		return ErrDatabaseOpen
+	}
+	p.registryKey, p.registryPath = key, abs
+	if key != abs {
+		p.releaseUnstable()
+	}
 
 	// Initialize the optional mmap reader. No syscalls here — the
 	// underlying syscall.Mmap is deferred until the first fetch() to
@@ -473,8 +535,10 @@ func (p *pager) open() (err error) {
 	//
 	// In-process mode uses heap-backed, process-local SHM and is therefore
 	// single-process only, so it takes an EXCLUSIVE lock instead — a second
-	// opener (another process, or another handle in this process) is rejected
-	// with a clear error rather than silently corrupting via a separate heap SHM.
+	// opener in another process is rejected with a clear error rather than
+	// silently corrupting via a separate heap SHM. A second handle in this
+	// process is refused at registration above; on Windows, where keys are
+	// paths, another spelling of this file fails here instead.
 	// (In-memory already returned above, so here p.inProcess implies file-backed.)
 	if !p.inProcess {
 		for attempt := 0; attempt < 100; attempt++ {
@@ -497,21 +561,11 @@ func (p *pager) open() (err error) {
 	} else {
 		if lockErr := acquireExclusiveDBLock(f); lockErr != nil {
 			if errors.Is(lockErr, ErrBusy) {
-				// Derive the registry key BEFORE closing f (inode identity needs
-				// the open fd). A same-process second open is already tracked in
-				// openDBs (the first handle registered after its own open) -> use
-				// the established ErrDatabaseOpen; a lock held by a DIFFERENT
-				// process is reported as ErrInProcessLocked.
-				key := registryKeyForOpenFile(f, p.path)
-				_ = f.Close()
-				p.file = nil
-				if _, here := openDBs.Load(key); here {
-					return ErrDatabaseOpen
-				}
+				// A same-process second open was refused at registration
+				// above: a busy exclusive lock is held by another process
+				// (or, on Windows, by another spelling of this file).
 				return ErrInProcessLocked
 			}
-			_ = f.Close()
-			p.file = nil
 			return fmt.Errorf("btree: acquire DB-file exclusive lock: %w", lockErr)
 		}
 	}
@@ -519,6 +573,15 @@ func (p *pager) open() (err error) {
 	info, err := f.Stat()
 	if err != nil {
 		return err
+	}
+
+	// A path-keyed handle whose file has content by now (another process
+	// created it) joins it by inode here, before either branch opens the WAL.
+	if err := p.rekeyRegistry(); err != nil {
+		return err
+	}
+	if p.registryKey != p.registryPath {
+		p.releaseUnstable()
 	}
 
 	if info.Size() == 0 {
@@ -814,6 +877,10 @@ func (p *pager) initNewDB() error {
 		if err := fdatasync(p.file); err != nil {
 			return err
 		}
+		if err := p.rekeyRegistry(); err != nil {
+			return err
+		}
+		p.releaseUnstable()
 	}
 
 	p.dbSize.Store(1)
@@ -845,6 +912,39 @@ func (p *pager) initNewDB() error {
 
 	p.state.Store(int32(pagerOpen))
 	return nil
+}
+
+// rekeyRegistry moves a path-keyed handle's openDBs entry to the identity
+// its fd reports once the file has content (see open); a no-op for a handle
+// keyed by inode. It runs before the WAL opens, so a refusal here has
+// attached nothing. On a refusal the entry under the path stays for the
+// deferred cleanup to remove; the inode entry belongs to the other opener.
+func (p *pager) rekeyRegistry() error {
+	if p.registryKey == "" || p.registryKey != p.registryPath || p.file == nil {
+		return nil
+	}
+	fi, err := p.file.Stat()
+	if err != nil {
+		return err
+	}
+	key := registryKey(fi, p.registryPath, true)
+	if key == p.registryKey {
+		return nil
+	}
+	if _, loaded := openDBs.LoadOrStore(key, p); loaded {
+		return ErrDatabaseOpen
+	}
+	openDBs.CompareAndDelete(p.registryKey, p)
+	p.registryKey = key
+	return nil
+}
+
+// releaseUnstable lets go of unstableOpenMu if this open holds it.
+func (p *pager) releaseUnstable() {
+	if p.unstableLocked {
+		p.unstableLocked = false
+		unstableOpenMu.Unlock()
+	}
 }
 
 // beginRead starts a read transaction, taking a WAL snapshot.
@@ -3388,13 +3488,28 @@ func (p *pager) close() error {
 		p.dbMmap = nil
 	}
 
+	var err error
 	if p.file != nil {
-		err := p.file.Close()
+		err = p.file.Close()
 		p.file = nil
-		return err
 	}
-	return nil
+	// The openDBs entry goes once the fd is closed: a same-process reopen
+	// racing this close is refused until the handle is fully gone. Only this
+	// pager's own entry goes: after ResetOpenRegistry a newer handle may hold
+	// the same key.
+	if f := testBeforeRegistryDeleteHook; f != nil {
+		f(p)
+	}
+	if p.registryKey != "" {
+		openDBs.CompareAndDelete(p.registryKey, p)
+		p.registryKey = ""
+	}
+	return err
 }
+
+// testBeforeRegistryDeleteHook runs in close with every fd of the pager
+// closed and its openDBs entry still present.
+var testBeforeRegistryDeleteHook func(p *pager)
 
 // createdRoot is a tree created in the write transaction: its root and
 // the schema count as it was created.

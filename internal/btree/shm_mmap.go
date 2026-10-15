@@ -137,8 +137,14 @@ func shmRegionsPerMap() int {
 // Intra-process safety: POSIX fcntl record locks are per-(process, inode). A
 // second attachment in the SAME process would not conflict with our locks —
 // its F_WRLCK would silently convert our F_RDLCK and truncate a LIVE shm.
-// That cannot happen because openDBs (db.go) forbids same-process double-open
-// by file identity — the analog of SQLite's per-inode unixShmNode singleton.
+// pager.open prevents that for the live file: it registers the DB in openDBs
+// as soon as the DB fd is open and before the WAL open reaches here, so a
+// same-process second open of that file is refused without
+// opening this file — the analog of SQLite's per-inode unixShmNode singleton,
+// which runs the election only for the first connection per inode
+// (unixOpenSharedMemory, os_unix.c:4973). The sidecar paths are lexical, so a
+// different inode at the live path (the DB renamed or replaced under its
+// handle) still attaches here, as in SQLite (howtocorrupt.html §2.4).
 // For the same reason, no code may open+close this *-shm path in a process
 // that has it attached: closing ANY fd for the inode drops all of the
 // process's record locks on it (the shm slot locks and the DMS byte).

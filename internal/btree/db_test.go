@@ -1,7 +1,9 @@
 package btree
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -3996,7 +3999,12 @@ func TestOpen_DoubleOpenByInodeIdentity(t *testing.T) {
 
 	// Create a symlink and a hardlink pointing at the same inode.
 	require.NoError(t, os.Symlink(realPath, symPath))
-	require.NoError(t, os.Link(realPath, hardPath))
+	if err := os.Link(realPath, hardPath); err != nil {
+		if errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.EPERM) {
+			t.Skipf("no hard links on this filesystem: %v", err)
+		}
+		require.NoError(t, err)
+	}
 
 	// Sanity: the OS agrees these spellings are the same physical file, but
 	// their lexical absolute paths differ (so a path-keyed guard would miss them).
@@ -4069,4 +4077,147 @@ func TestOpen_DoubleOpenSamePathStillRejected(t *testing.T) {
 		_ = db3.Close()
 	}
 	require.ErrorIs(t, err, ErrDatabaseOpen)
+}
+
+// A second Open of a file this process holds is refused before it takes a
+// lock or opens the WAL and shm, so the live handle sees nothing of it: a
+// read transaction opened before the refusal keeps its snapshot through a
+// later checkpoint, the handle keeps working, and the path reopens once it
+// is closed.
+func TestOpen_SameProcessRefusalKeepsLiveSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "live.db")
+	db, err := testOpen(t, path, Options{DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	const ns = "ns"
+	createNS(t, db, ns)
+	putN(t, db, ns, 4000, 64)
+	require.NoError(t, db.Checkpoint(CheckpointTruncate))
+
+	valA := bytes.Repeat([]byte{0xAA}, 64)
+	valB := bytes.Repeat([]byte{0xBB}, 64)
+	putKey(t, db, ns, 1, valA)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rtx.Rollback() })
+	putKey(t, db, ns, 4000, valB)
+	require.NoError(t, db.Checkpoint(CheckpointPassive)) // stops at rtx's snapshot
+
+	for i := 0; i < 2; i++ {
+		db2, err := Open(path, Options{})
+		if db2 != nil {
+			_ = db2.Close()
+		}
+		require.ErrorIs(t, err, ErrDatabaseOpen)
+	}
+
+	require.NoError(t, db.Checkpoint(CheckpointPassive))
+	nsRef, err := db.getNamespaceLocked(ns)
+	require.NoError(t, err)
+	got, err := rtx.Get(nsRef, binary.BigEndian.AppendUint32(nil, 4000))
+	require.NoError(t, err)
+	require.Equal(t, make([]byte, 64), got, "snapshot read returned a value committed after the snapshot")
+	got, err = rtx.Get(nsRef, binary.BigEndian.AppendUint32(nil, 1))
+	require.NoError(t, err)
+	require.Equal(t, valA, got)
+	require.NoError(t, rtx.Rollback())
+
+	putKey(t, db, ns, 2, valA)
+	require.NoError(t, db.Close())
+	db2, err := testOpen(t, path, Options{})
+	require.NoError(t, err, "the path reopens once the live handle is closed")
+	require.NoError(t, db2.Close())
+}
+
+// Concurrent first opens of one new path: exactly one wins, the others get
+// ErrDatabaseOpen, and the winner works and closes normally. (That the
+// losers touch nothing is what the shm probes in double_open_test.go pin.)
+func TestOpen_ConcurrentSameProcessOpensOneWins(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "new.db")
+	resetPageBufferPool()
+	const n = 8
+	dbs := make([]*DB, n)
+	errs := make([]error, n)
+	t.Cleanup(func() {
+		for _, db := range dbs {
+			if db != nil {
+				_ = db.Close()
+			}
+		}
+	})
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			dbs[i], errs[i] = Open(path, Options{})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var winners []*DB
+	for i := 0; i < n; i++ {
+		if errs[i] == nil {
+			winners = append(winners, dbs[i])
+			continue
+		}
+		require.ErrorIs(t, errs[i], ErrDatabaseOpen)
+	}
+	if len(winners) != 1 {
+		for _, w := range winners {
+			_ = w.Close()
+		}
+		t.Fatalf("%d concurrent opens of a new path succeeded, want 1", len(winners))
+	}
+	winner := winners[0]
+	createNS(t, winner, "ns")
+	putN(t, winner, "ns", 100, 16)
+	require.NoError(t, winner.Close())
+
+	db, err := testOpen(t, path, Options{})
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+}
+
+// The registry entry outlives every fd of its handle: a same-process reopen
+// racing Close is refused until the handle is fully gone, so it can never
+// attach to a shm the closing handle still has open.
+func TestOpen_RefusedUntilCloseCompletes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "live.db")
+	db, err := testOpen(t, path, Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	createNS(t, db, "ns")
+	putN(t, db, "ns", 10, 16)
+
+	hooked := false
+	var inHook error
+	testBeforeRegistryDeleteHook = func(p *pager) {
+		if p != db.pager {
+			return
+		}
+		hooked = true
+		if p.file != nil {
+			inHook = errors.New("registry entry removed before the DB fd closed")
+			return
+		}
+		db2, err := Open(path, Options{})
+		if db2 != nil {
+			_ = db2.Close()
+		}
+		inHook = err
+	}
+	t.Cleanup(func() { testBeforeRegistryDeleteHook = nil })
+
+	require.NoError(t, db.Close())
+	require.True(t, hooked, "close did not reach the registry delete")
+	require.ErrorIs(t, inHook, ErrDatabaseOpen, "a reopen racing Close got through before the handle was gone")
+
+	db3, err := testOpen(t, path, Options{})
+	require.NoError(t, err)
+	require.NoError(t, db3.Close())
 }
