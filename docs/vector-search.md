@@ -42,11 +42,17 @@ in one pass — far faster than inserting into a live index one vector at a time
 > into an already-existing index still works and is fully supported — it's just the
 > slower path for a large initial load.
 
-Build (and compaction) parallelism is a process-wide worker budget, default
-`GOMAXPROCS`. Cap it with `anystore.SetVectorBuildConcurrency(n)` (e.g. `1`–`2`) so
-many indexes building at once can't oversubscribe the CPU; it never affects search
-or insert/update/delete. Like `InitPageBuffer`, it's a process-global call made once
-at startup — not a per-database `Config` field.
+Build (and compaction) parallelism is a process-wide budget, default
+`GOMAXPROCS`, on how many build tasks execute at once: HNSW graph construction
+and IVF k-means training and placement, for every index (create,
+`CompactVectorIndex`, auto-compaction, the automatic IVF rebuild). Cap it with
+`anystore.SetVectorBuildConcurrency(n)` (e.g. `1`–`2`) so many indexes building
+at once can't oversubscribe the CPU. The serial work between those tasks (btree
+writes, sorts, centroid updates) runs on each build's own goroutine outside the
+cap. The budget never affects search or a write itself, only the compaction or
+rebuild a self-contained write may trigger before it returns; an IVF index comes
+out the same whatever the budget. Like `InitPageBuffer`, it's a process-global
+call made once at startup — not a per-database `Config` field.
 
 Only `Field` and `Dim` are required. Other `VectorParams`:
 
@@ -58,7 +64,7 @@ Only `Field` and `Dim` are required. Other `VectorParams`:
 | `Mode` | `VectorModeBTree` | `VectorModeHybrid` (RAM layer-0 cache), `VectorModeBruteForce` (exact O(N) scan, no graph), `VectorModeIVFSQ` (inverted-file cells of int8 vectors; Cosine/L2 only, always int8) |
 | `HybridCacheVectors` | `false` | hybrid only: also cache vectors in RAM for faster search |
 | `CompactRatio` | `0` (off) | HNSW: auto-compact the graph when tombstones reach this ratio of live nodes; `IVFSQ`: auto-rebuild (re-train the centroids) when the drift score reaches it |
-| `NList`, `NProbe`, `Closure` | `~4·√N`, `16`, `1` | `IVFSQ` only: coarse cells; cells scanned per query (the recall dial); cells each vector is placed in |
+| `NList`, `NProbe`, `Closure` | `~4·√N`, `16`, `1` | `IVFSQ` only: coarse cells; cells scanned per query (the recall dial), plus up to 64 more whose centroid is exactly as near as the farthest of them; cells each vector is placed in |
 
 An index built by an earlier release in the removed `ivfpq` mode still opens with
 its collection but is quarantined: `$knn` on its field and `CompactVectorIndex`
@@ -348,7 +354,8 @@ O(live); for very large indexes prefer `0` and schedule
   **Throughput-neutral**; its value is a bounded, GC-quiet page-cache footprint.
   Size the slab ≥ `CacheSize` (it falls back to `sync.Pool` on overflow).
 - **`anystore.SetVectorBuildConcurrency(n)`** — caps the process-wide
-  build/compaction worker budget (default `GOMAXPROCS`); see §1.
+  build/compaction worker budget of HNSW and IVF indexes (default `GOMAXPROCS`);
+  see §1.
 - **Document encoding** — store the embedding as `anyenc.TypeVectorF32` (not a
   number array): ~2× smaller docs and a faster pipeline, recall unchanged.
 - **`:memory:`** keeps the whole DB resident — fastest, but many× the RAM of a
