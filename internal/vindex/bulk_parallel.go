@@ -3,34 +3,12 @@ package vindex
 import (
 	"encoding/binary"
 	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/buildpool"
 )
-
-// buildSem bounds the total number of concurrent index-build / compaction workers
-// across the whole process. Every parallel build draws workers from one shared
-// budget, so many simultaneous builds cannot oversubscribe the CPU regardless of
-// how many indexes build at once. Default budget is GOMAXPROCS.
-type buildSem struct{ ch chan struct{} }
-
-var curBuildSem atomic.Pointer[buildSem]
-
-func init() {
-	n := max(runtime.GOMAXPROCS(0), 1)
-	curBuildSem.Store(&buildSem{ch: make(chan struct{}, n)})
-}
-
-// SetBuildConcurrency sets the process-wide budget of concurrent build/compaction
-// workers. n < 1 is treated as 1. In-flight builds keep the budget they captured.
-func SetBuildConcurrency(n int) {
-	if n < 1 {
-		n = 1
-	}
-	curBuildSem.Store(&buildSem{ch: make(chan struct{}, n)})
-}
 
 // BulkBuildParallel is BulkBuild with a concurrent in-RAM graph construction
 // phase, then the same single-threaded bulk flush. This is the technique hnswlib
@@ -40,8 +18,12 @@ func SetBuildConcurrency(n int) {
 // the dominant build cost). The resulting graph is a valid HNSW of equivalent
 // recall, not byte-identical (it depends on insertion interleaving).
 //
-// threads <= 0 uses GOMAXPROCS. Levels are drawn sequentially from the index RNG
-// (deterministic), so only the connection order is nondeterministic.
+// threads <= 0 uses the size of the process-wide build budget (internal/buildpool,
+// GOMAXPROCS by default). Graph construction — the workers, and the sequential
+// seeding or a build that stays serial on the calling goroutine — holds one of
+// its tokens per goroutine; the vector preparation and the flush hold none. The
+// caller must not hold a token. Levels are drawn sequentially from the index
+// RNG (deterministic), so only the connection order is nondeterministic.
 func BulkBuildParallel(wtx *btree.WriteTx, prefix string, p Params, seed int64, ids [][]byte, vecs [][]float32, threads int) (*Index, error) {
 	if p.Dim <= 0 {
 		return nil, fmt.Errorf("vindex: dim must be > 0")
@@ -232,28 +214,37 @@ const (
 
 func (b *pBuilder) build(threads int) {
 	n := len(b.full)
-	sem := curBuildSem.Load()
+	budget := buildpool.Current()
 	if threads <= 0 {
-		threads = cap(sem.ch)
+		threads = budget.Size()
 	}
 	threads = max(threads, 1)
 	seedN := min(max(n/seedFraction+1, seedFloor), n)
-	sc := &pScratch{}
-	for i := 1; i < seedN; i++ { // node 0 is the initial entry, already placed
-		b.insert(uint32(i), sc)
-	}
-	if threads <= 1 || n-seedN < threads {
-		for i := seedN; i < n; i++ {
+	serial := threads <= 1 || n-seedN < threads
+	// The sequential seeding, and the whole build when it stays serial, run on
+	// this goroutine holding a token of the shared budget, as a worker would.
+	func() {
+		budget.Acquire()
+		defer budget.Release()
+		sc := &pScratch{}
+		for i := 1; i < seedN; i++ { // node 0 is the initial entry, already placed
 			b.insert(uint32(i), sc)
 		}
+		if serial {
+			for i := seedN; i < n; i++ {
+				b.insert(uint32(i), sc)
+			}
+		}
+	}()
+	if serial {
 		return
 	}
 	var next int64 = int64(seedN)
 	var wg sync.WaitGroup
 	for w := 0; w < threads; w++ {
 		wg.Go(func() {
-			sem.ch <- struct{}{} // bound active workers to the shared budget
-			defer func() { <-sem.ch }()
+			budget.Acquire() // bound active workers to the shared budget
+			defer budget.Release()
 			lsc := &pScratch{}
 			for {
 				i := atomic.AddInt64(&next, 1) - 1
@@ -301,11 +292,13 @@ func (b *pBuilder) repair(threads int) {
 			}
 		}
 	}
-	sem := curBuildSem.Load()
+	budget := buildpool.Current()
 	if threads <= 0 {
-		threads = cap(sem.ch)
+		threads = budget.Size()
 	}
 	if threads <= 1 || n < threads*2 {
+		budget.Acquire() // serial: this goroutine is the one worker
+		defer budget.Release()
 		sc := &pScratch{}
 		for i := 0; i < n; i++ {
 			do(uint32(i), sc)
@@ -316,8 +309,8 @@ func (b *pBuilder) repair(threads int) {
 	var wg sync.WaitGroup
 	for w := 0; w < threads; w++ {
 		wg.Go(func() {
-			sem.ch <- struct{}{}
-			defer func() { <-sem.ch }()
+			budget.Acquire()
+			defer budget.Release()
 			sc := &pScratch{}
 			for {
 				i := next.Add(1) - 1

@@ -71,8 +71,10 @@ shadow in-memory structure that can diverge from disk.
   distance via the float×byte kernel. No codebook beyond the centroids, no encode
   step, no re-rank store — so build/insert are fast and the index is the smallest of
   any mode.
-- Search = probe `NProbe` cells → score every member → keep the `ef` best → resolve
-  docIDs; results stream back distance-ordered (the planner then skips the sort).
+- Search = probe `NProbe` cells (plus up to 64 more whose centroid is exactly as
+  near as the farthest of them, e.g. duplicated centroids) → score every member →
+  keep the `ef` best → resolve docIDs; results stream back distance-ordered (the
+  planner then skips the sort).
 
 ---
 
@@ -91,7 +93,7 @@ shadow in-memory structure that can diverge from disk.
 | **`CompactRatio` auto-compaction** | rebuild when tombstones reach ratio×live | caps tombstone growth; ~0.5 default |
 | **IVF-SQ (`VectorModeIVFSQ`)** | coarse cells + int8 vectors scanned directly | **~6–9× insert/update vs HNSW**, smallest index, RAM ≈ HNSW int8 |
 | **IVF closure** | each vector in its `Closure` nearest cells | recall at lower `NProbe`, at ~Closure× the cell bytes; a higher `NProbe` is usually cheaper |
-| **Process-global knobs** | `SetVectorBuildConcurrency`, `InitPageBuffer`+`UseGlobalPageBuffer` | bound build CPU / pre-allocated page slab |
+| **Process-global knobs** | `SetVectorBuildConcurrency`, `InitPageBuffer`+`UseGlobalPageBuffer` | bound HNSW + IVF build CPU / pre-allocated page slab |
 | **`CacheSize` sizing** | btree page cache in pages | non-tiered f32 search ↑ up to ~48% when cache ≈ index |
 
 ### Configuration model (process-global vs per-DB)
@@ -101,7 +103,7 @@ mirroring SQLite's global config; only per-DB choices live on `Config`:
 | Concern | Process-global setup | Per-DB |
 |---|---|---|
 | Page buffers | `InitPageBuffer(pageSize, nPages)` | `Config.UseGlobalPageBuffer` |
-| Build/compaction parallelism | `SetVectorBuildConcurrency(n)` | — (always shared) |
+| Build/compaction parallelism (HNSW and IVF) | `SetVectorBuildConcurrency(n)` | — (always shared) |
 
 ---
 
@@ -147,11 +149,22 @@ removed flavour, kept for the record:
   precomputed table; that is why PQ was removed.
 - **Search still favours HNSW** (`hyb+vc f32` 3519 / btree int8 1582), but IVF-SQ
   np32 (1794) beats btree int8 at slightly lower recall; tune via `NProbe`.
-- IVF **build under-parallelizes** (training runs across cores; the encode-and-put
-  pass over every vector is serial: ~7k/s local but ~850/s on 48c) — an open
-  optimization vs HNSW's parallel build.
+- IVF **bulk build** time is now mostly training (k-means): the placement pass
+  reuses k-means' final assignment where a vector's nearest centroid is unique,
+  does its per-vector work on the build budget and writes each namespace in key
+  order. The btree writes, the sorts, the drift-baseline sum,
+  Lloyd's centroid update and k-means++ sampling stay serial. Directional numbers
+  from one fanless 8-core M2 (`vivf.BulkBuild`, before → after, `Rebuild`
+  included): placement 0.82–0.91 s → 65–72 ms at 20k×768 (nlist 256) and
+  31–34 s → 0.33–0.57 s at 200k×128 (nlist 1788); whole build 2.6–2.7 →
+  1.7–1.9 s and 55–62 → 27–33 s. Runs interleaved under heavy load from other
+  processes kept the placement gap (0.85–3.6 s → 74–297 ms; 41–120 s →
+  0.6–2.9 s). Training still lags HNSW's parallel build.
 
 ### At 1M vectors (ann-benchmarks protocol, SIFT-1M / GloVe-100, 9950X)
+
+Measured before GO-7591, while the IVF bulk build's placement pass was serial.
+1M and 48-core builds have not been re-measured since.
 
 | mode | build | index (MB) | queries/s @ ≥0.90 / ≥0.95 recall | max recall | insert/s |
 |---|--:|--:|--:|--:|--:|
@@ -167,7 +180,7 @@ Sizes as the run reported them (MB); insert/s from the SIFT incremental-write ru
 at `NProbe` 32. IVF-SQ's recall on clustered angular data (GloVe) caps at 0.88 with
 `NProbe` 128, below RAM HNSW's 0.956; on L2 data (SIFT) it reaches 0.98. Its writes
 run ~15× HNSW's; its queries 6–16× slower than RAM HNSW at matched recall. The
-k-means build is the widest gap (5–7 min against 1–1.5 for HNSW).
+IVF build was the widest gap in that run (5–7 min against 1–1.5 for HNSW).
 
 ### Cross-hardware (insert/s · search/s · index MiB · heap MiB)
 

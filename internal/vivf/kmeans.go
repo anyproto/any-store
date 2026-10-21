@@ -4,17 +4,21 @@ import (
 	"math"
 	"math/rand"
 	"runtime"
-	"sync"
 
+	"github.com/anyproto/any-store/v2/internal/buildpool"
 	"github.com/anyproto/any-store/v2/internal/simd"
 )
 
-// kmeans runs Lloyd's algorithm on data, returning k centroids. Assignment (the
-// O(n·k·dim) cost) is parallelised across cores; centroid recomputation is a
-// cheap single-threaded reduction. Empty clusters are reseeded to a random point
-// so k centroids are always populated. When kpp is set, centroids are seeded
-// with k-means++ (D² sampling) instead of random points.
-func kmeans(data [][]float32, k, iters int, seed int64, kpp bool) (cents [][]float32) {
+// kmeans runs Lloyd's algorithm on data, returning k centroids and the final
+// assignment: assign[i] is the centroid nearest data[i] among the returned
+// centroids, or -1 when that is not unique (see nearestUnique and place), so a
+// build that places each point in its one nearest cell reuses it instead of
+// scoring every centroid again. Assignment (the O(n·k·dim) cost) is
+// parallelised on the build budget; centroid recomputation is a cheap
+// single-threaded reduction. Empty clusters are reseeded to a random point so k
+// centroids are always populated. When kpp is set, centroids are seeded with
+// k-means++ (D² sampling) instead of random points.
+func kmeans(data [][]float32, k, iters int, seed int64, kpp bool) (cents [][]float32, assign []int32) {
 	n := len(data)
 	dim := len(data[0])
 	rng := rand.New(rand.NewSource(seed))
@@ -31,9 +35,9 @@ func kmeans(data [][]float32, k, iters int, seed int64, kpp bool) (cents [][]flo
 		}
 	}
 
-	assign := make([]int32, n)
+	assign = make([]int32, n)
 	for it := 0; it < iters; it++ {
-		assignNearest(data, cents, assign)
+		assignNearest(data, cents, assign, false)
 
 		// Recompute centroids as the mean of their members.
 		sums := make([][]float64, k)
@@ -62,13 +66,14 @@ func kmeans(data [][]float32, k, iters int, seed int64, kpp bool) (cents [][]flo
 			}
 		}
 	}
-	assignNearest(data, cents, assign)
-	return cents
+	assignNearest(data, cents, assign, true)
+	return cents, assign
 }
 
 // kmeansppInit seeds k centroids with k-means++: each new centroid is sampled
 // with probability proportional to its squared distance to the nearest centroid
-// already chosen. The per-point d² update is parallelised across cores.
+// already chosen. The per-point d² update is parallelised on the build budget;
+// it sums d² per parallelRange chunk, then the chunk sums in chunk order.
 func kmeansppInit(data [][]float32, k int, rng *rand.Rand) [][]float32 {
 	n := len(data)
 	dim := len(data[0])
@@ -82,33 +87,21 @@ func kmeansppInit(data [][]float32, k int, rng *rand.Rand) [][]float32 {
 	for i := range d2 {
 		d2[i] = math.Inf(1)
 	}
+	chunks, size := rangeChunks(n)
+	part := make([]float64, chunks)
 	updateD2 := func(c []float32) (sum float64) {
-		nThreads := runtime.GOMAXPROCS(0)
-		chunk := (n + nThreads - 1) / nThreads
-		part := make([]float64, nThreads)
-		var wg sync.WaitGroup
-		for t := 0; t < nThreads; t++ {
-			lo := t * chunk
-			if lo >= n {
-				break
-			}
-			hi := min(lo+chunk, n)
-			wg.Add(1)
-			go func(t, lo, hi int) {
-				defer wg.Done()
-				var s float64
-				for i := lo; i < hi; i++ {
-					dist := float64(simd.Distance(data[i], c))
-					dd := dist * dist
-					if dd < d2[i] {
-						d2[i] = dd
-					}
-					s += d2[i]
+		buildpool.Current().Run(chunks, func(t int) {
+			var s float64
+			for i := t * size; i < min((t+1)*size, n); i++ {
+				dist := float64(simd.Distance(data[i], c))
+				dd := dist * dist
+				if dd < d2[i] {
+					d2[i] = dd
 				}
-				part[t] = s
-			}(t, lo, hi)
-		}
-		wg.Wait()
+				s += d2[i]
+			}
+			part[t] = s
+		})
 		for _, s := range part {
 			sum += s
 		}
@@ -136,30 +129,44 @@ func kmeansppInit(data [][]float32, k int, rng *rand.Rand) [][]float32 {
 }
 
 // assignNearest fills assign[i] with the index of the centroid closest (L2) to
-// data[i], parallelised over the point range.
-func assignNearest(data [][]float32, cents [][]float32, assign []int32) {
-	nThreads := runtime.GOMAXPROCS(0)
-	n := len(data)
-	if nThreads > n {
-		nThreads = 1
-	}
-	chunk := (n + nThreads - 1) / nThreads
-	var wg sync.WaitGroup
-	for t := 0; t < nThreads; t++ {
-		lo := t * chunk
-		if lo >= n {
-			break
-		}
-		hi := min(lo+chunk, n)
-		wg.Add(1)
-		go func(lo, hi int) {
-			defer wg.Done()
+// data[i], parallelised over the point range. With markTies, a point whose
+// nearest centroid is not unique gets -1 instead (see nearestUnique).
+func assignNearest(data [][]float32, cents [][]float32, assign []int32, markTies bool) {
+	parallelRange(len(data), func(lo, hi int) {
+		if markTies {
 			for i := lo; i < hi; i++ {
-				assign[i] = int32(nearest(data[i], cents))
+				assign[i] = int32(nearestUnique(data[i], cents))
 			}
-		}(lo, hi)
+			return
+		}
+		for i := lo; i < hi; i++ {
+			assign[i] = int32(nearest(data[i], cents))
+		}
+	})
+}
+
+// parallelRange runs fn over [0, n) in rangeChunks chunks, on workers drawn
+// from the process-wide build budget (internal/buildpool), and returns once
+// all are done. Each index is handled by exactly one call, and the chunks
+// depend only on n and GOMAXPROCS, so a result written per index, or summed
+// per chunk and then in chunk order, does not depend on the budget or on
+// scheduling.
+func parallelRange(n int, fn func(lo, hi int)) {
+	chunks, size := rangeChunks(n)
+	buildpool.Current().Run(chunks, func(t int) {
+		fn(t*size, min((t+1)*size, n))
+	})
+}
+
+// rangeChunks splits n items into chunks of size items (the last one shorter):
+// one per GOMAXPROCS, at least one item each.
+func rangeChunks(n int) (chunks, size int) {
+	if n <= 0 {
+		return 0, 0
 	}
-	wg.Wait()
+	procs := runtime.GOMAXPROCS(0)
+	size = (n + procs - 1) / procs
+	return (n + size - 1) / size, size
 }
 
 // nearest returns the index of the centroid closest (L2) to x.
@@ -172,6 +179,30 @@ func nearest(x []float32, cents [][]float32) int {
 			bestD = d
 			best = c
 		}
+	}
+	return best
+}
+
+// nearestUnique is nearest for the final assignment: the same index, or -1 when
+// that nearest is not unique — another centroid exactly as close, or a NaN
+// distance, which orders against nothing.
+func nearestUnique(x []float32, cents [][]float32) int {
+	best := 0
+	bestD := simd.Distance(x, cents[0])
+	tie, nan := false, bestD != bestD
+	for c := 1; c < len(cents); c++ {
+		d := simd.Distance(x, cents[c])
+		switch {
+		case d < bestD:
+			bestD, best, tie = d, c, false
+		case d == bestD:
+			tie = true
+		case d != d:
+			nan = true
+		}
+	}
+	if tie || nan {
+		return -1
 	}
 	return best
 }
