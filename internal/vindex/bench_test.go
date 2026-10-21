@@ -12,6 +12,10 @@ const (
 	benchDim = 128
 )
 
+// benchSink receives the distance benchmarks' sums: a local sink discarded with
+// `_ = sink` lets the compiler drop the arithmetic around the timed call.
+var benchSink float32
+
 // buildBench builds an in-memory index of n vectors and returns the db + index.
 func buildBench(b testing.TB, n, dim int) (*btree.DB, *Index, [][]float32) {
 	b.Helper()
@@ -100,7 +104,7 @@ func BenchmarkVindexVecDist(b *testing.B) {
 			fv := bytesAsF32(f32rec, dim)
 			sink += df(q, fv)
 		}
-		_ = sink
+		benchSink = sink
 	})
 	b.Run("int8", func(b *testing.B) {
 		b.ReportAllocs()
@@ -109,7 +113,7 @@ func BenchmarkVindexVecDist(b *testing.B) {
 			fv, _ := decodeVecInto(i8rec, dim, QuantInt8, dst)
 			sink += df(q, fv)
 		}
-		_ = sink
+		benchSink = sink
 	})
 }
 
@@ -137,7 +141,7 @@ func BenchmarkVindexInt8Dist(b *testing.B) {
 			fv, _ := decodeVecInto(i8rec, dim, QuantInt8, dst)
 			sink += 1 - simd.Dot(q, fv)
 		}
-		_ = sink
+		benchSink = sink
 	})
 	b.Run("byte-kernel", func(b *testing.B) {
 		b.ReportAllocs()
@@ -145,7 +149,7 @@ func BenchmarkVindexInt8Dist(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			sink += 1 - scale*(simd.DotFloatByte(q, comps)-int8Bias*qsum)
 		}
-		_ = sink
+		benchSink = sink
 	})
 }
 

@@ -7,6 +7,10 @@
 // 386, or an x86 without AVX2 (e.g. pre-Haswell Ivy Bridge) — the pure-Go
 // fallbacks in fallback.go are used, which beat a naive scalar loop.
 //
+// One kernel is any-store's own rather than vendored: the arm64 float×byte dot
+// (dot_float_byte_arm64.s). The vendored NEON one chains every FMA through a
+// single register and ran ~3× slower than the f32 Dot (GO-7590).
+//
 // This package replaces the former github.com/viterin/vek/vek32 dependency,
 // which was amd64+AVX2-only and fell back to slow portable Go on arm64.
 package simd
