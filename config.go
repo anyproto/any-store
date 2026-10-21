@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/buildpool"
 	"github.com/anyproto/any-store/v2/internal/durability"
-	"github.com/anyproto/any-store/v2/internal/vindex"
 )
 
 // InitPageBuffer pre-allocates a global pool of nPages page-sized buffers.
@@ -18,21 +18,34 @@ func InitPageBuffer(pageSize, nPages int) {
 	btree.ConfigPageCache(pageSize, nPages)
 }
 
-// SetVectorBuildConcurrency bounds the worker goroutines used to BUILD and
-// COMPACT vector (HNSW) indexes — the only place any-store uses internal
-// parallelism. It is a single process-wide budget shared by every vector index
-// in the process, so many simultaneous builds/compactions cannot oversubscribe
-// the CPU. n <= 0 (the default) uses GOMAXPROCS; set it low (e.g. 1–2) on
-// constrained or many-database deployments. It does NOT affect search,
-// insert/update/delete, or any non-vector operation.
+// SetVectorBuildConcurrency caps how many vector index build tasks execute at
+// once across the process — the only place any-store uses internal
+// parallelism: the HNSW graph construction of a build or compaction, and the
+// IVF k-means training and bulk placement that creating, compacting or
+// automatically rebuilding an IVF index runs. It is a single process-wide
+// budget shared by every vector index, so many simultaneous builds and
+// compactions cannot run more build tasks at once than it allows. The serial
+// work between those tasks (btree writes, sorts, centroid updates, sampling)
+// runs on each build's own goroutine outside the cap. n <= 0 (the default)
+// uses GOMAXPROCS; set it low (e.g. 1–2) on constrained or many-database
+// deployments. An IVF index comes out the same whatever the budget; only its
+// build time changes.
+//
+// It does not affect search or any non-vector operation, nor a vector write
+// itself; but a self-contained write that takes an index past its
+// CompactRatio compacts (or, for IVF, rebuilds) that index before it returns,
+// and that work runs under the budget.
 //
 // Like InitPageBuffer this is a process-global setting, not per-database: call
-// it once at process startup, before opening databases.
+// it once at process startup, before opening databases. A build takes the
+// budget per phase — an IVF build for each k-means pass and placement step, an
+// HNSW build for its construction and again for its repair pass — so a call
+// while a build runs applies from that build's next phase on.
 func SetVectorBuildConcurrency(n int) {
 	if n <= 0 {
 		n = runtime.GOMAXPROCS(0)
 	}
-	vindex.SetBuildConcurrency(n)
+	buildpool.Set(n)
 }
 
 // Config provides the configuration options for the database.

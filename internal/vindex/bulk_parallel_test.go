@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/buildpool"
 	"github.com/stretchr/testify/require"
 )
 
@@ -231,6 +232,49 @@ func TestBulkBuildParallelRecall768(t *testing.T) {
 
 	t.Logf("dim768 recall per-insert=%.3f parallel=%.3f", ref, par)
 	require.InDelta(t, ref, par, 0.03, "parallel recall must match per-insert at dim 768")
+}
+
+// TestBulkBuildParallelSerialHoldsBudget: a build that stays on the calling
+// goroutine (a budget of one) still constructs the graph under the budget's
+// token, so it waits while another holder has it, as a worker would.
+func TestBulkBuildParallelSerialHoldsBudget(t *testing.T) {
+	defer buildpool.Set(buildpool.Current().Size())
+	buildpool.Set(1)
+	const (
+		n   = 300
+		dim = 8
+	)
+	vecs := randVecs(n, dim, 3)
+	ids := make([][]byte, n)
+	for i := range ids {
+		ids[i] = docID(i)
+	}
+	db, err := btree.Open(":memory:", btree.Options{InMemory: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	defer wtx.Rollback()
+
+	b := buildpool.Current()
+	b.Acquire()
+	done := make(chan error, 1)
+	go func() {
+		_, err := BulkBuildParallel(wtx, "vix", Params{Dim: dim, Metric: L2, EfSearch: 64}, 1, ids, vecs, 0)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("serial build ran while the only token was held (err %v)", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	b.Release()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("build did not complete")
+	}
 }
 
 // TestBulkBuildParallelEdge covers small / degenerate sizes (empty, single, fewer
