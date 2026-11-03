@@ -71,8 +71,8 @@ func requireSameIndex(t *testing.T, want, got *btree.DB) {
 	}
 }
 
-// mainNearestCells is the cell finder of the releases before GO-7591, copied
-// as they shipped it: every centroid scored in index order, then a
+// mainNearestCells is the cell finder of earlier releases, copied as they
+// shipped it: every centroid scored in index order, then a
 // distance-only sort. It is the routing — placement and probing — earlier
 // releases use, so the index this code writes and reads must agree with it,
 // exact distance ties included.
@@ -93,7 +93,7 @@ func mainNearestCells(ix *StoreIndex, q []float32, n int) []int {
 }
 
 // lowestFirstCells ranks exactly equidistant cells by index instead: a tie
-// order another sort could produce, as this branch briefly did.
+// order another sort could produce.
 func lowestFirstCells(ix *StoreIndex, q []float32, n int) []int {
 	cd := make([]cellDist, ix.nlist)
 	for c := 0; c < ix.nlist; c++ {
@@ -133,8 +133,8 @@ func putBuildMeta(t *testing.T, wtx *btree.WriteTx, ix *StoreIndex, p StoreParam
 	require.NoError(t, wtx.Put(ix.vmeta, metaKey, encodeMeta(mt)))
 }
 
-// serialWrite writes the index the way the releases before GO-7591 did, over
-// the given centroids: one vector at a time in label order, its cells from
+// serialWrite writes the index the way earlier releases' bulk build does,
+// over the given centroids: one vector at a time in label order, its cells from
 // cellsOf, its :doc record laid out by hand, every write landing wherever its
 // key falls. vecs are already normalized for a cosine index.
 func serialWrite(t *testing.T, db *btree.DB, p StoreParams, cents [][]float32, ids [][]byte, vecs [][]float32, cellsOf func(*StoreIndex, []float32, int) []int) {
@@ -171,8 +171,8 @@ func serialWrite(t *testing.T, db *btree.DB, p StoreParams, cents [][]float32, i
 	require.NoError(t, wtx.Commit())
 }
 
-// mainBuild is the bulk build of the releases before GO-7591: the same
-// k-means, then serialWrite with their cell finder.
+// mainBuild is the bulk build of earlier releases: the same k-means, then
+// serialWrite with their cell finder.
 func mainBuild(t *testing.T, db *btree.DB, p StoreParams, ids [][]byte, vecs [][]float32) {
 	t.Helper()
 	norm := make([][]float32, len(vecs))
@@ -252,7 +252,7 @@ func repeatedVecs() [][]float32 {
 
 // TestBulkBuildMatchesMainBuild pins that the parallel, key-ordered build —
 // cells from k-means' final assignment or nearestCellsInto, records encoded a
-// chunk at a time — writes exactly the index the releases before it wrote: the
+// chunk at a time — writes exactly the index earlier releases write: the
 // same :cb, :cell, :lbl, :doc and meta (drift baseline bit for bit), so either
 // release reads, inserts into and searches the other's index alike. Fixtures
 // with exact distance ties between centroids included.
@@ -372,8 +372,8 @@ func TestBulkBuildsShareBudgetOfOne(t *testing.T) {
 	}
 }
 
-// mainKmeansppInit is k-means++ seeding as the releases before the build
-// budget ran it: a goroutine per GOMAXPROCS chunk, the chunk d² sums added in
+// mainKmeansppInit is k-means++ seeding as earlier releases run it, without
+// the build budget: a goroutine per GOMAXPROCS chunk, the chunk d² sums added in
 // chunk order.
 func mainKmeansppInit(data [][]float32, k int, rng *rand.Rand) [][]float32 {
 	n := len(data)
@@ -419,8 +419,8 @@ func mainKmeansppInit(data [][]float32, k int, rng *rand.Rand) [][]float32 {
 }
 
 // TestKMeansPPIndependentOfBudget: k-means++ seeding on the build budget picks
-// the centroids it picked before, at any budget — its d² sum is reduced over
-// the same chunks in the same order.
+// the centroids earlier releases pick, at any budget — its d² sum is reduced
+// over the same chunks in the same order.
 func TestKMeansPPIndependentOfBudget(t *testing.T) {
 	data := clusteredVecs(3000, 24, 40, 17)
 	defer buildpool.Set(buildpool.Current().Size())
@@ -433,7 +433,7 @@ func TestKMeansPPIndependentOfBudget(t *testing.T) {
 
 // TestBulkBuildTiesPlaceAsInsert: on exact distance ties between centroids the
 // build places a vector in the cells an insert of it gets — nearestCells,
-// which ranks a tie as the releases before it did.
+// which ranks a tie as earlier releases do.
 func TestBulkBuildTiesPlaceAsInsert(t *testing.T) {
 	vecs := repeatedVecs()
 	for _, assign := range []int{1, 2, 3} {
@@ -472,8 +472,8 @@ func TestBulkBuildTiesPlaceAsInsert(t *testing.T) {
 	}
 }
 
-// probeLabels is how the releases before GO-7591 search: the labels in the
-// nprobe cells mainNearestCells ranks first.
+// probeLabels is how earlier releases search: the labels in the nprobe cells
+// mainNearestCells ranks first.
 func probeLabels(t *testing.T, db *btree.DB, q []float32, nprobe int) map[uint32]bool {
 	t.Helper()
 	rtx, err := db.BeginRead()

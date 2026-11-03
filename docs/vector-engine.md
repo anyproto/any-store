@@ -147,22 +147,22 @@ removed flavour, kept for the record:
   precomputed table; that is why PQ was removed.
 - **Search still favours HNSW** (`hyb+vc f32` 3519 / btree int8 1582), but IVF-SQ
   np32 (1794) beats btree int8 at slightly lower recall; tune via `NProbe`.
-- IVF **bulk build** time is now mostly training (k-means): the placement pass
+- IVF **bulk build** time is mostly training (k-means): the placement pass
   reuses k-means' final assignment where a vector's nearest centroid is unique,
   does its per-vector work on the build budget and writes each namespace in key
-  order. The btree writes, the sorts, the drift-baseline sum,
-  Lloyd's centroid update and k-means++ sampling stay serial. Directional numbers
-  from one fanless 8-core M2 (`vivf.BulkBuild`, before → after, `Rebuild`
-  included): placement 0.82–0.91 s → 65–72 ms at 20k×768 (nlist 256) and
-  31–34 s → 0.33–0.57 s at 200k×128 (nlist 1788); whole build 2.6–2.7 →
+  order. The btree writes, the sorts, the drift-baseline sum, Lloyd's centroid
+  update and k-means++ sampling are serial. Directional numbers from one fanless
+  8-core M2 (`vivf.BulkBuild`, serial placement in label order → this placement,
+  `Rebuild` included): placement 0.82–0.91 s → 65–72 ms at 20k×768 (nlist 256)
+  and 31–34 s → 0.33–0.57 s at 200k×128 (nlist 1788); whole build 2.6–2.7 →
   1.7–1.9 s and 55–62 → 27–33 s. Runs interleaved under heavy load from other
   processes kept the placement gap (0.85–3.6 s → 74–297 ms; 41–120 s →
-  0.6–2.9 s). Training still lags HNSW's parallel build.
+  0.6–2.9 s). Training lags HNSW's parallel build.
 
 ### At 1M vectors (ann-benchmarks protocol, SIFT-1M / GloVe-100, 9950X)
 
-Measured before GO-7591, while the IVF bulk build's placement pass was serial.
-1M and 48-core builds have not been re-measured since.
+Measured with a serial IVF bulk-build placement pass; 1M and 48-core builds
+have not been re-measured with the parallel one.
 
 | mode | build | index (MB) | queries/s @ ≥0.90 / ≥0.95 recall | max recall | insert/s |
 |---|--:|--:|--:|--:|--:|

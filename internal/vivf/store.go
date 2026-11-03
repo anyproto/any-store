@@ -300,8 +300,9 @@ func (ix *StoreIndex) place(wtx *btree.WriteTx, ids [][]byte, norm [][]float32, 
 			resid[i] = sqNorm(r)
 		}
 	})
-	// Summed in label order, as the serial build did: the baseline is the
-	// same float64 whatever the worker count.
+	// Summed in label order, one vector after another: the baseline is the
+	// same float64 whatever the worker count, and the one earlier releases
+	// compute.
 	var reconSum float64
 	for _, d := range resid {
 		reconSum += float64(d)
