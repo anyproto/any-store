@@ -9,7 +9,12 @@ any-store-tests `results/dist-runs/`, findings in PERF-1..3.
 ## Why it is the favourite (measured)
 
 - Fastest indexed build: ~9.7k docs/s bulk at 20k×768 (11.9k/s at dim 128);
-  incremental inserts don't pay HNSW graph maintenance.
+  incremental inserts don't pay HNSW graph maintenance. Those runs used a
+  serial placement pass and have not been repeated with the parallel,
+  key-ordered one. On one fanless 8-core M2 (single runs, directional),
+  `vivf.BulkBuild` at 20k×768 takes 3.2 s against 4.7 s with the serial pass
+  at nlist 512 (the size `CreateIndex` picks for 20k), and 1.8 s against
+  2.6 s at nlist 256; the rest is mostly training.
 - Smallest index: ~3.5x smaller than f32 HNSW (int8 vectors per cell,
   no graph).
 - Plain kNN 1.2–1.5 ms/q at 20k×768 on every machine, on par with HNSW-int8 —
