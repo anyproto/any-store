@@ -670,3 +670,20 @@ func TestTieOrderGolden(t *testing.T) {
 		})
 	})
 }
+
+// TestPlaceRejectsWrongLengthRecord: a vector that encodes to a record of the
+// wrong length fails the placement instead of writing a bad :cell record.
+// BulkBuild rejects such a vector up front; this reaches place directly.
+func TestPlaceRejectsWrongLengthRecord(t *testing.T) {
+	cents := [][]float32{{0, 0, 0, 0}, {5, 5, 5, 5}}
+	vecs := [][]float32{{1, 0, 0, 0}, {5, 4, 5, 5}, {1, 1, 1}, {0, 1, 0, 0}} // vector 2 has 3 components
+	wtx, err := openMem(t).BeginWrite()
+	require.NoError(t, err)
+	defer wtx.Rollback()
+	ix := openIndexNS(t, wtx, StoreParams{Dim: 4, Assign: 1, NProbe: 1}, cents)
+	_, err = ix.place(wtx, seqIDs(len(vecs)), vecs, []int32{0, 1, 0, 0})
+	require.ErrorContains(t, err, "vector 2 encodes to a 11-byte record, want 12")
+	sz, err := wtx.NamespaceSize(ix.vcell)
+	require.NoError(t, err)
+	require.Zero(t, sz.Entries, "no :cell record written")
+}

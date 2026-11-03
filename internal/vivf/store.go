@@ -9,6 +9,7 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/simd"
@@ -353,8 +354,9 @@ func (ix *StoreIndex) place(wtx *btree.WriteTx, ids [][]byte, norm [][]float32, 
 	}
 
 	// Encode a chunk of records in parallel, each into its fixed-size slot of
-	// the arena (BulkBuild checked every vector has dim components), then write
-	// the chunk in key order; Put copies the value.
+	// the arena, then write the chunk in key order; Put copies the value. A
+	// record of any other length (a vector without dim components) fails the
+	// build before its chunk is written.
 	l2 := !ix.normalize
 	recSize := int8RecordSize(ix.dim, l2)
 	chunk := min(max(placeChunkBytes/recSize, 1), len(byCell))
@@ -363,11 +365,21 @@ func (ix *StoreIndex) place(wtx *btree.WriteTx, ids [][]byte, norm [][]float32, 
 	cell := 0
 	for lo := 0; lo < len(byCell); lo += chunk {
 		hi := min(lo+chunk, len(byCell))
+		var bad atomic.Int64 // the chunk's first slot holding a wrong-length record
+		bad.Store(math.MaxInt64)
 		parallelRange(hi-lo, func(plo, phi int) {
 			for k := plo; k < phi; k++ {
-				encodeVecInt8(arena[k*recSize:k*recSize:(k+1)*recSize], norm[byCell[lo+k]], l2)
+				rec := encodeVecInt8(arena[k*recSize:k*recSize:(k+1)*recSize], norm[byCell[lo+k]], l2)
+				if len(rec) != recSize {
+					for b := bad.Load(); int64(k) < b && !bad.CompareAndSwap(b, int64(k)); b = bad.Load() {
+					}
+				}
 			}
 		})
+		if k := bad.Load(); k != math.MaxInt64 {
+			label := byCell[lo+int(k)]
+			return 0, fmt.Errorf("vivf: vector %d encodes to a %d-byte record, want %d", label, len(encodeVecInt8(nil, norm[label], l2)), recSize)
+		}
 		for j := lo; j < hi; j++ {
 			for start[cell+1] <= j {
 				cell++
