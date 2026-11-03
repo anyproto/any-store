@@ -15,6 +15,11 @@
 // as its own tasks are done and phases back to back each get the budget
 // afresh. A goroutine must not wait on the budget while it holds one of its
 // tokens: with every token so held, nothing completes.
+//
+// The wait for a token has no timeout. Builds run inside their database's
+// write transaction, HNSW and IVF alike, so a build waiting on tokens that
+// another database's builds hold keeps its own database's writers waiting
+// too.
 package buildpool
 
 import (

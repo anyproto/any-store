@@ -36,6 +36,12 @@ func InitPageBuffer(pageSize, nPages int) {
 // CompactRatio compacts (or, for IVF, rebuilds) that index before it returns,
 // and that work runs under the budget.
 //
+// A build or compaction runs inside its database's write transaction and
+// waits for budget tokens there, with no timeout. The budget is shared across
+// databases, so while builds in other databases hold every token, a build
+// here waits and this database's other writers wait behind its write
+// transaction.
+//
 // Like InitPageBuffer this is a process-global setting, not per-database: call
 // it once at process startup, before opening databases. A build takes the
 // budget per phase — an IVF build for each k-means pass and placement step, an
