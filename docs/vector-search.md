@@ -64,7 +64,7 @@ Only `Field` and `Dim` are required. Other `VectorParams`:
 | `Mode` | `VectorModeBTree` | `VectorModeHybrid` (RAM layer-0 cache), `VectorModeBruteForce` (exact O(N) scan, no graph), `VectorModeIVFSQ` (inverted-file cells of int8 vectors; Cosine/L2 only, always int8) |
 | `HybridCacheVectors` | `false` | hybrid only: also cache vectors in RAM for faster search |
 | `CompactRatio` | `0` (off) | HNSW: auto-compact the graph when tombstones reach this ratio of live nodes; `IVFSQ`: auto-rebuild (re-train the centroids) when the drift score reaches it |
-| `NList`, `NProbe`, `Closure` | `~4·√N`, `16`, `1` | `IVFSQ` only: coarse cells; cells scanned per query (the recall dial); cells each vector is placed in |
+| `NList`, `NProbe`, `Closure` | `~4·√N`, `16`, `1` | `IVFSQ` only: coarse cells; cells scanned per query (the recall dial), plus up to 64 more whose centroid is exactly as near as the farthest of them; cells each vector is placed in |
 
 An index built by an earlier release in the removed `ivfpq` mode still opens with
 its collection but is quarantined: `$knn` on its field and `CompactVectorIndex`
