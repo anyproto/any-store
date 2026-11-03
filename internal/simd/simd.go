@@ -14,7 +14,10 @@ package simd
 import "math"
 
 // dotImpl and l2Impl are the active kernels, selected once per process by the
-// arch-specific init(). l2Impl returns the SQUARED L2 distance.
+// arch-specific init(). l2Impl returns the SQUARED L2 distance. No kernel may
+// be called with an empty vector: the vendored AVX2 and AVX-512 kernels read
+// past its end, so every exported function checks for one before calling a
+// kernel.
 var (
 	dotImpl     = dotScalar
 	l2Impl      = l2Scalar
@@ -30,7 +33,12 @@ var (
 // u, where each byte is interpreted as an UNSIGNED value 0..255 (matching the
 // vendored weaviate kernels). Callers using offset-binary int8 storage recover
 // the signed dot via scale·(DotFloatByte(q,u) − 128·Σq); see internal/vindex.
-func DotFloatByte(q []float32, u []byte) float32 { return dotFBImpl(q, u) }
+func DotFloatByte(q []float32, u []byte) float32 {
+	if len(q) == 0 {
+		return 0
+	}
+	return dotFBImpl(q, u)
+}
 
 // AcceleratedFloatByte reports whether a SIMD float×byte kernel is active (false
 // on the pure-Go fallback path, and on arches where it is not wired).
@@ -41,19 +49,35 @@ func AcceleratedFloatByte() bool { return acceleratedFB }
 func Accelerated() bool { return accelerated }
 
 // Dot returns the inner product of two equal-length vectors.
-func Dot(a, b []float32) float32 { return dotImpl(a, b) }
+func Dot(a, b []float32) float32 {
+	if len(a) == 0 {
+		return 0
+	}
+	return dotImpl(a, b)
+}
 
 // L2Squared returns the squared Euclidean distance (no sqrt).
-func L2Squared(a, b []float32) float32 { return l2Impl(a, b) }
+func L2Squared(a, b []float32) float32 {
+	if len(a) == 0 {
+		return 0
+	}
+	return l2Impl(a, b)
+}
 
 // Distance returns the Euclidean distance. Kept as sqrt(L2Squared) so the
 // returned/stored distance values stay identical to the previous vek32.Distance.
 func Distance(a, b []float32) float32 {
+	if len(a) == 0 {
+		return 0
+	}
 	return float32(math.Sqrt(float64(l2Impl(a, b))))
 }
 
 // Norm returns the L2 norm (length) of v.
 func Norm(v []float32) float32 {
+	if len(v) == 0 {
+		return 0
+	}
 	return float32(math.Sqrt(float64(dotImpl(v, v))))
 }
 
@@ -61,11 +85,12 @@ func Norm(v []float32) float32 {
 // operand it returns 0 (so a cosine distance of 1-sim is maximal, matching the
 // previous behavior for degenerate vectors).
 func CosineSimilarity(a, b []float32) float32 {
-	na := dotImpl(a, a)
-	nb := dotImpl(b, b)
+	na := Dot(a, a)
+	nb := Dot(b, b)
 	if na == 0 || nb == 0 {
 		return 0
 	}
+	// Both norms are non-zero, so neither vector is empty.
 	return dotImpl(a, b) / float32(math.Sqrt(float64(na))*math.Sqrt(float64(nb)))
 }
 

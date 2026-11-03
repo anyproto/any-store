@@ -115,6 +115,59 @@ func TestDotFloatByteMatchesReference(t *testing.T) {
 	}
 }
 
+// kernelEntryPoints are the exported functions that reach a dispatched kernel,
+// each reduced to a float32 result.
+var kernelEntryPoints = []struct {
+	name string
+	f    func(v []float32, u []byte) float32
+}{
+	{"Dot", func(v []float32, _ []byte) float32 { return Dot(v, v) }},
+	{"L2Squared", func(v []float32, _ []byte) float32 { return L2Squared(v, v) }},
+	{"Distance", func(v []float32, _ []byte) float32 { return Distance(v, v) }},
+	{"Norm", func(v []float32, _ []byte) float32 { return Norm(v) }},
+	{"CosineSimilarity", func(v []float32, _ []byte) float32 { return CosineSimilarity(v, v) }},
+	{"NormalizeInto", func(v []float32, _ []byte) float32 { return float32(len(NormalizeInto(nil, v))) }},
+	{"DotFloatByte", func(v []float32, u []byte) float32 { return DotFloatByte(v, u) }},
+}
+
+// useKernels runs f with the given kernels dispatched, as if init had selected
+// them, and restores the previous ones afterwards.
+func useKernels(dot, l2 func(a, b []float32) float32, dotFB func([]float32, []byte) float32, f func()) {
+	d, l, fb := dotImpl, l2Impl, dotFBImpl
+	defer func() { dotImpl, l2Impl, dotFBImpl = d, l, fb }()
+	dotImpl, l2Impl, dotFBImpl = dot, l2, dotFB
+	f()
+}
+
+// checkEmptyVectors checks that every kernel entry point gives the pure-Go
+// fallback's result for nil and empty vectors with the currently dispatched
+// kernels.
+func checkEmptyVectors(t *testing.T) {
+	t.Helper()
+	for _, in := range []struct {
+		name string
+		v    []float32
+		u    []byte
+	}{
+		{"nil", nil, nil},
+		{"empty", []float32{}, []byte{}},
+	} {
+		for _, e := range kernelEntryPoints {
+			got := e.f(in.v, in.u)
+			var want float32
+			useKernels(dotScalar, l2Scalar, dotFloatByteScalar, func() { want = e.f(in.v, in.u) })
+			if got != want {
+				t.Errorf("%s on %s vectors: got %v, fallback gives %v", e.name, in.name, got, want)
+			}
+		}
+	}
+}
+
+func TestEmptyVectors(t *testing.T) {
+	t.Logf("Accelerated()=%v AcceleratedFloatByte()=%v", Accelerated(), AcceleratedFloatByte())
+	checkEmptyVectors(t)
+}
+
 // TestInt8OffsetBinaryDot proves the offset-binary identity used by vindex:
 // signed dot q·s == scale·(DotFloatByte(q,u) − 128·Σq) where u = s+128.
 func TestInt8OffsetBinaryDot(t *testing.T) {
