@@ -2,12 +2,14 @@ package vivf
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/simd"
@@ -108,7 +110,14 @@ func (ix *StoreIndex) coarseRow(c int) []float32 {
 }
 
 // nearestCellsInto fills out with the n coarse cells nearest (L2) to q, reusing
-// the scratch slice. The flat-coarse cell finder for both search and build/insert.
+// the scratch slice, and leaves every cell in *scratch sorted by distance. The
+// flat-coarse cell finder for both search and build/insert.
+//
+// Cells at an exact distance tie (duplicated centroids, say) come out in the
+// order this distance-only sort of this input leaves them. Every release has
+// placed vectors and probed cells in that order, so it must not change: a
+// vector placed in one cell of a tie by one release would be missed by another
+// release probing a different one (see probeCellsInto).
 func (ix *StoreIndex) nearestCellsInto(q []float32, n int, scratch *[]cellDist, out []int) []int {
 	cd := *scratch
 	if cap(cd) < ix.nlist {
@@ -128,6 +137,41 @@ func (ix *StoreIndex) nearestCellsInto(q []float32, n int, scratch *[]cellDist, 
 		out = append(out, cd[i].idx)
 	}
 	*scratch = cd
+	return out
+}
+
+// maxTieProbes bounds the cells probeCellsInto adds past nprobe, so a query
+// against many duplicated centroids stays a bounded number of cell seeks.
+const maxTieProbes = 64
+
+// probeCellsInto is the search's cell finder: the nprobe cells nearestCellsInto
+// ranks first, plus up to maxTieProbes more cells exactly as near as the
+// farthest of them. Which cell of such a tie a vector went in is down to the
+// sort that ranked the cells when it was written; a build whose sort ordered
+// equal elements differently (a release built with another Go version) put
+// tied vectors in other cells of the tie, and the extra cells give bounded
+// coverage of those. The extra cells come in the sort's order or, when more
+// than maxTieProbes tie, are the lowest-index ones, so a larger tie is covered
+// only in part. Without an exact tie at the boundary it is nearestCellsInto.
+func (ix *StoreIndex) probeCellsInto(q []float32, nprobe int, scratch *[]cellDist, out []int) []int {
+	out = ix.nearestCellsInto(q, nprobe, scratch, out)
+	cd := *scratch
+	n := len(out)
+	if n == 0 || n == len(cd) {
+		return out
+	}
+	end := n
+	for end < len(cd) && cd[end].dist == cd[n-1].dist {
+		end++
+	}
+	tied := cd[n:end]
+	if len(tied) > maxTieProbes {
+		slices.SortFunc(tied, func(a, b cellDist) int { return a.idx - b.idx })
+		tied = tied[:maxTieProbes]
+	}
+	for _, c := range tied {
+		out = append(out, c.idx)
+	}
 	return out
 }
 
@@ -161,9 +205,9 @@ func DropNamespaces(wtx *btree.WriteTx, prefix string) error {
 	return nil
 }
 
-// BulkBuild trains the coarse quantizer on (ids, vecs) and writes the whole index
-// in one pass: centroids to :cb, per-cell int8 vectors to :cell, and the
-// label↔docID maps. ids[i] is the document id for vecs[i].
+// BulkBuild trains the coarse quantizer on (ids, vecs) and writes the whole index:
+// centroids to :cb, per-cell int8 vectors to :cell, and the label↔docID maps
+// (see place). ids[i] is the document id for vecs[i], which gets label i.
 func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, vecs [][]float32) (*StoreIndex, error) {
 	if p.Dim <= 0 {
 		return nil, fmt.Errorf("vivf: dim %d must be positive", p.Dim)
@@ -173,6 +217,14 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 		// trained centroids. (Rebuild handles the emptied-index case itself by
 		// keeping the previous centroids.)
 		return nil, fmt.Errorf("vivf: cannot build from an empty vector set")
+	}
+	if len(ids) != len(vecs) {
+		return nil, fmt.Errorf("vivf: ids/vecs length mismatch: %d != %d", len(ids), len(vecs))
+	}
+	for i, v := range vecs {
+		if len(v) != p.Dim {
+			return nil, fmt.Errorf("vivf: vec %d dim mismatch: got %d want %d", i, len(v), p.Dim)
+		}
 	}
 	p.withDefaults()
 	ix := &StoreIndex{dim: p.Dim, nlist: p.NList, nprobe: p.NProbe, assign: p.Assign, normalize: p.Normalize}
@@ -195,9 +247,11 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	norm := make([][]float32, len(vecs))
 	if p.Normalize {
 		arena := make([]float32, len(vecs)*p.Dim)
-		for i, v := range vecs {
-			norm[i] = normalizeInto(arena[i*p.Dim:(i+1)*p.Dim:(i+1)*p.Dim], v)
-		}
+		parallelRange(len(vecs), func(lo, hi int) {
+			for i := lo; i < hi; i++ {
+				norm[i] = normalizeInto(arena[i*p.Dim:(i+1)*p.Dim:(i+1)*p.Dim], vecs[i])
+			}
+		})
 	} else {
 		copy(norm, vecs)
 	}
@@ -212,33 +266,15 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	}
 	ix.coarse = bytesAsF32(coarseBlob, ix.nlist*ix.dim)
 
-	// Place each vector: its int8 record under each of its cells. label == build
-	// order (dense 0..n-1). Accumulate the primary-cell reconstruction error to
-	// seed the drift baseline.
-	var keyBuf, recBuf []byte
-	var reconSum float64
-	r := make([]float32, ix.dim)
-	var cellScratch []cellDist // reused across vectors (was a fresh nlist-slice per call)
-	var cellsOut []int
-	for i, x := range norm {
-		label := uint32(i)
-		if err := ix.writeLabel(wtx, label, ids[i]); err != nil {
-			return nil, err
-		}
-		cellsOut = ix.nearestCellsInto(x, ix.assign, &cellScratch, cellsOut)
-		cells := cellsOut
-		if err := ix.putDocCells(wtx, ids[i], label, cells); err != nil {
-			return nil, err
-		}
-		simd.Sub_Into(r, x, ix.coarseRow(cells[0]))
-		reconSum += float64(sqNorm(r)) // nearest-cell residual = drift baseline
-		recBuf = encodeVecInt8(recBuf, x, !ix.normalize)
-		for _, c := range cells {
-			keyBuf = cellKey(keyBuf, uint32(c), label)
-			if err := wtx.Put(ix.vcell, keyBuf, recBuf); err != nil {
-				return nil, err
-			}
-		}
+	// Placing each vector in one cell, a vector whose nearest centroid is
+	// unique goes there with no full ranking of the cells (see place).
+	var assign []int32
+	if min(ix.assign, ix.nlist) == 1 {
+		assign = assignUnique(norm, coarseN)
+	}
+	reconSum, err := ix.place(wtx, ids, norm, assign)
+	if err != nil {
+		return nil, err
 	}
 
 	n := len(vecs)
@@ -255,6 +291,154 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	return ix, nil
 }
 
+// placeChunkBytes bounds the int8 records place holds encoded at once: it
+// encodes the :cell records a chunk at a time, in key order, not all n up
+// front. A var so tests can force many chunks.
+var placeChunkBytes = 32 << 20
+
+// place writes the vectors of a build under labels 0..n−1 (build order):
+// :lbl in label order, :doc in docID order and :cell in (cell, label) order,
+// so each namespace is written as one ascending run of keys and its leaves
+// fill left to right instead of splitting mid-tree. Each vector's cells, its
+// nearest-cell residual and its int8 record are computed on build-budget
+// workers (parallelRange); the btree writes run on the calling goroutine, as
+// the write tx is single-threaded, and so do the sorts and the residual sum.
+//
+// A vector goes in the cells nearestCellsInto ranks first, as an insert's
+// does: on an exact distance tie that is the cell every release picks and
+// probes. When each vector goes in one cell, assign is required: assign[i] is
+// vector i's nearest centroid (assignUnique), used as its cell, or -1 when that
+// is not unique (an exact tie, or a NaN distance). A -1 vector, and with
+// closure every vector, gets its cells from nearestCellsInto; with closure
+// assign is unused. Returns the sum of the squared nearest-cell residuals, the
+// drift baseline.
+//
+// Besides the input and the btree's own memory, it holds 8·Assign+8 bytes per
+// vector (cells, residual, sort orders), 16 bytes per cell (8 on 32-bit),
+// encoded records of at most max(placeChunkBytes, one record), and, per chunk
+// running at once, 4·Dim bytes of residual scratch plus, when the chunk has a
+// -1 vector or the index uses closure, 16·NList bytes of cell-distance scratch
+// (8·NList on 32-bit). A vector in several cells is encoded once per cell; the
+// encoding is deterministic, so its records are identical.
+func (ix *StoreIndex) place(wtx *btree.WriteTx, ids [][]byte, norm [][]float32, assign []int32) (float64, error) {
+	n := len(norm)
+	a := min(ix.assign, ix.nlist) // cells per vector, clamped as nearestCellsInto does
+
+	// cells[i*a:(i+1)*a] are vector i's cells, nearest first; resid[i] is its
+	// squared residual to the nearest one.
+	cells := make([]int32, n*a)
+	resid := make([]float32, n)
+	parallelRange(n, func(lo, hi int) {
+		var scratch []cellDist
+		var ranked []int
+		r := make([]float32, ix.dim)
+		for i := lo; i < hi; i++ {
+			own := cells[i*a : (i+1)*a]
+			if a == 1 && assign[i] >= 0 {
+				own[0] = assign[i]
+			} else {
+				ranked = ix.nearestCellsInto(norm[i], a, &scratch, ranked)
+				for j, c := range ranked {
+					own[j] = int32(c)
+				}
+			}
+			simd.Sub_Into(r, norm[i], ix.coarseRow(int(own[0])))
+			resid[i] = sqNorm(r)
+		}
+	})
+	// Summed in label order, one vector after another: the baseline is the
+	// same float64 whatever the worker count, and the one earlier releases
+	// compute.
+	var reconSum float64
+	for _, d := range resid {
+		reconSum += float64(d)
+	}
+
+	// :lbl — label order is key order.
+	for i := 0; i < n; i++ {
+		if err := ix.writeLabel(wtx, uint32(i), ids[i]); err != nil {
+			return 0, err
+		}
+	}
+
+	// :doc — sorted by docID: a rebuild collects its vectors in the old index's
+	// (cell, label) order, so its ids arrive shuffled. Equal ids keep label
+	// order, so the last label wins, as when written in label order.
+	byDoc := make([]uint32, n)
+	for i := range byDoc {
+		byDoc[i] = uint32(i)
+	}
+	slices.SortFunc(byDoc, func(x, y uint32) int {
+		if c := bytes.Compare(ids[x], ids[y]); c != 0 {
+			return c
+		}
+		return cmp.Compare(x, y)
+	})
+	var docBuf []byte
+	for _, label := range byDoc {
+		docBuf = appendDocCells(docBuf[:0], label, cells[int(label)*a:(int(label)+1)*a])
+		if err := wtx.Put(ix.vdoc, ids[label], docBuf); err != nil {
+			return 0, err
+		}
+	}
+
+	// :cell — a counting sort groups the placements by cell, labels ascending
+	// within a cell: byCell[start[c]:start[c+1]] are the labels in cell c.
+	start := make([]int, ix.nlist+1)
+	for _, c := range cells {
+		start[int(c)+1]++
+	}
+	for c := 0; c < ix.nlist; c++ {
+		start[c+1] += start[c]
+	}
+	byCell := make([]uint32, len(cells))
+	next := slices.Clone(start[:ix.nlist])
+	for i, c := range cells {
+		byCell[next[c]] = uint32(i / a)
+		next[c]++
+	}
+
+	// Encode a chunk of records in parallel, each into its fixed-size slot of
+	// the arena, then write the chunk in key order; Put copies the value. A
+	// record of any other length (a vector without dim components) fails the
+	// build before its chunk is written.
+	l2 := !ix.normalize
+	recSize := int8RecordSize(ix.dim, l2)
+	chunk := min(max(placeChunkBytes/recSize, 1), len(byCell))
+	arena := make([]byte, chunk*recSize)
+	var keyBuf []byte
+	cell := 0
+	for lo := 0; lo < len(byCell); lo += chunk {
+		hi := min(lo+chunk, len(byCell))
+		var bad atomic.Int64 // the chunk's first slot holding a wrong-length record
+		bad.Store(math.MaxInt64)
+		parallelRange(hi-lo, func(plo, phi int) {
+			for k := plo; k < phi; k++ {
+				rec := encodeVecInt8(arena[k*recSize:k*recSize:(k+1)*recSize], norm[byCell[lo+k]], l2)
+				if len(rec) != recSize {
+					for b := bad.Load(); int64(k) < b && !bad.CompareAndSwap(b, int64(k)); b = bad.Load() {
+					}
+				}
+			}
+		})
+		if k := bad.Load(); k != math.MaxInt64 {
+			label := byCell[lo+int(k)]
+			return 0, fmt.Errorf("vivf: vector %d encodes to a %d-byte record, want %d", label, len(encodeVecInt8(nil, norm[label], l2)), recSize)
+		}
+		for j := lo; j < hi; j++ {
+			for start[cell+1] <= j {
+				cell++
+			}
+			keyBuf = cellKey(keyBuf, uint32(cell), byCell[j])
+			k := j - lo
+			if err := wtx.Put(ix.vcell, keyBuf, arena[k*recSize:(k+1)*recSize]); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return reconSum, nil
+}
+
 // writeLabel records the label → docID map entry.
 func (ix *StoreIndex) writeLabel(wtx *btree.WriteTx, label uint32, docID []byte) error {
 	var lk [4]byte
@@ -265,16 +449,18 @@ func (ix *StoreIndex) writeLabel(wtx *btree.WriteTx, label uint32, docID []byte)
 // putDocCells records, under docID, the label and the cells it was placed in — so
 // delete/update can remove its :cell entries without scanning.
 func (ix *StoreIndex) putDocCells(wtx *btree.WriteTx, docID []byte, label uint32, cells []int) error {
-	buf := make([]byte, 0, 4+1+4*len(cells))
-	var b [4]byte
-	binary.LittleEndian.PutUint32(b[:], label)
-	buf = append(buf, b[:]...)
+	return wtx.Put(ix.vdoc, docID, appendDocCells(make([]byte, 0, 4+1+4*len(cells)), label, cells))
+}
+
+// appendDocCells appends the :doc record of a vector to buf: label(le32), the
+// cell count (one byte), then each cell(le32).
+func appendDocCells[C int | int32](buf []byte, label uint32, cells []C) []byte {
+	buf = binary.LittleEndian.AppendUint32(buf, label)
 	buf = append(buf, byte(len(cells)))
 	for _, c := range cells {
-		binary.LittleEndian.PutUint32(b[:], uint32(c))
-		buf = append(buf, b[:]...)
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(c))
 	}
-	return wtx.Put(ix.vdoc, docID, buf)
+	return buf
 }
 
 func decodeDocCells(data []byte) (label uint32, cells []uint32) {
@@ -529,10 +715,14 @@ func ivfRebuildNList(configured, n int) int {
 }
 
 // SearchCandidates returns up to ef nearest candidates, closest-first. It scans
-// nprobe cells (each a contiguous :cell range), scoring every member by exact
-// distance on its int8 record, keeps the ef best, and resolves their docIDs.
-// The cell scans are sequential — the btree-fit read pattern.
+// nprobe cells, plus up to maxTieProbes more exactly tied with the farthest of
+// them (see probeCellsInto) — each a contiguous :cell range — scoring every
+// member by exact distance on its int8 record, keeps the ef best, and resolves
+// their docIDs. The cell scans are sequential — the btree-fit read pattern.
 func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) ([]Candidate, error) {
+	if len(q) != ix.dim {
+		return nil, fmt.Errorf("vivf: dim mismatch: got %d want %d", len(q), ix.dim)
+	}
 	if ef < 1 {
 		ef = 1
 	}
@@ -557,7 +747,7 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 			s.qnorm2 = simd.Dot(qn, qn)
 		}
 	}
-	s.cells = ix.nearestCellsInto(qn, ix.nprobe, &s.cd, s.cells)
+	s.cells = ix.probeCellsInto(qn, ix.nprobe, &s.cd, s.cells)
 
 	// Scan probed cells into s.dedup (label -> best distance).
 	s.dedup.reset()

@@ -3,6 +3,7 @@ package simd
 import (
 	"math"
 	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -112,6 +113,35 @@ func TestDotFloatByteMatchesReference(t *testing.T) {
 				t.Errorf("dotFloatByteScalar n=%d: got %v want %v", n, gf, want)
 			}
 		}
+	}
+}
+
+// TestDotFloatByteShortUPanics pins the length contract on whichever kernel
+// this platform selected: a u shorter than q panics with DotFloatByte's own
+// message (not a kernel's bounds check, which the SIMD kernels lack), even
+// when u's capacity would let a kernel read on; extra bytes in u are ignored.
+func TestDotFloatByteShortUPanics(t *testing.T) {
+	r := rand.New(rand.NewSource(13))
+	q := randVec(r, 768)
+	u := make([]byte, 800)
+	for i := range u {
+		u[i] = byte(r.Intn(256))
+	}
+	if got, want := DotFloatByte(q, u), DotFloatByte(q, u[:768]); got != want {
+		t.Errorf("extra bytes changed the result: %v vs %v", got, want)
+	}
+	for _, c := range []struct{ nq, nu int }{{768, 100}, {768, 767}, {1, 0}} {
+		func() {
+			defer func() {
+				p := recover()
+				if p == nil {
+					t.Errorf("DotFloatByte(q[:%d], u[:%d]) did not panic", c.nq, c.nu)
+				} else if s, _ := p.(string); !strings.Contains(s, "len(u) < len(q)") {
+					t.Errorf("DotFloatByte(q[:%d], u[:%d]) panicked with %v, want the length check", c.nq, c.nu, p)
+				}
+			}()
+			DotFloatByte(q[:c.nq], u[:c.nu])
+		}()
 	}
 }
 

@@ -7,6 +7,10 @@
 // 386, or an x86 without AVX2 (e.g. pre-Haswell Ivy Bridge) — the pure-Go
 // fallbacks in fallback.go are used, which beat a naive scalar loop.
 //
+// One kernel is any-store's own rather than vendored: the arm64 float×byte dot
+// (dot_float_byte_arm64.s). The vendored NEON one chains every FMA through a
+// single register, so it runs at FMA latency rather than at issue width.
+//
 // This package replaces the former github.com/viterin/vek/vek32 dependency,
 // which was amd64+AVX2-only and fell back to slow portable Go on arm64.
 package simd
@@ -14,7 +18,12 @@ package simd
 import "math"
 
 // dotImpl and l2Impl are the active kernels, selected once per process by the
-// arch-specific init(). l2Impl returns the SQUARED L2 distance.
+// arch-specific init(). l2Impl returns the SQUARED L2 distance. A kernel takes
+// its length from its first vector, returns 0 when that is empty (the vendored
+// AVX2 and AVX-512 ones only through the adapters in dispatch_amd64.go), and
+// reads that many elements from the second without bounds checks. So the
+// exported functions panic on a second vector shorter than the first before
+// calling a kernel, where the pure-Go fallback hits its own bounds checks.
 var (
 	dotImpl     = dotScalar
 	l2Impl      = l2Scalar
@@ -27,10 +36,20 @@ var (
 )
 
 // DotFloatByte returns the inner product of a float32 vector q and a byte vector
-// u, where each byte is interpreted as an UNSIGNED value 0..255 (matching the
-// vendored weaviate kernels). Callers using offset-binary int8 storage recover
+// u, where each byte is interpreted as an UNSIGNED value 0..255 by every kernel
+// behind it: the vendored AVX2 one on amd64, any-store's own NEON one on arm64,
+// and the pure-Go fallback. Callers using offset-binary int8 storage recover
 // the signed dot via scale·(DotFloatByte(q,u) − 128·Σq); see internal/vindex.
-func DotFloatByte(q []float32, u []byte) float32 { return dotFBImpl(q, u) }
+//
+// The length is len(q): extra bytes in u are ignored, and a u shorter than q
+// panics. The check lives here so it covers every kernel: the SIMD ones read
+// len(q) bytes from u without bounds checks.
+func DotFloatByte(q []float32, u []byte) float32 {
+	if len(u) < len(q) {
+		panic("simd: DotFloatByte: len(u) < len(q)")
+	}
+	return dotFBImpl(q, u)
+}
 
 // AcceleratedFloatByte reports whether a SIMD float×byte kernel is active (false
 // on the pure-Go fallback path, and on arches where it is not wired).
@@ -40,15 +59,31 @@ func AcceleratedFloatByte() bool { return acceleratedFB }
 // fallback) was selected for this CPU. Mirrors the old vek32.Info().Acceleration.
 func Accelerated() bool { return accelerated }
 
-// Dot returns the inner product of two equal-length vectors.
-func Dot(a, b []float32) float32 { return dotImpl(a, b) }
+// Dot returns the inner product of two equal-length vectors. A b shorter than a
+// panics.
+func Dot(a, b []float32) float32 {
+	if len(b) < len(a) {
+		panic("simd: Dot: len(b) < len(a)")
+	}
+	return dotImpl(a, b)
+}
 
-// L2Squared returns the squared Euclidean distance (no sqrt).
-func L2Squared(a, b []float32) float32 { return l2Impl(a, b) }
+// L2Squared returns the squared Euclidean distance (no sqrt). A b shorter than
+// a panics.
+func L2Squared(a, b []float32) float32 {
+	if len(b) < len(a) {
+		panic("simd: L2Squared: len(b) < len(a)")
+	}
+	return l2Impl(a, b)
+}
 
 // Distance returns the Euclidean distance. Kept as sqrt(L2Squared) so the
 // returned/stored distance values stay identical to the previous vek32.Distance.
+// A b shorter than a panics.
 func Distance(a, b []float32) float32 {
+	if len(b) < len(a) {
+		panic("simd: Distance: len(b) < len(a)")
+	}
 	return float32(math.Sqrt(float64(l2Impl(a, b))))
 }
 
@@ -59,12 +94,16 @@ func Norm(v []float32) float32 {
 
 // CosineSimilarity returns the cosine similarity of a and b. For a zero-length
 // operand it returns 0 (so a cosine distance of 1-sim is maximal, matching the
-// previous behavior for degenerate vectors).
+// previous behavior for degenerate vectors). Otherwise a b shorter than a
+// panics.
 func CosineSimilarity(a, b []float32) float32 {
 	na := dotImpl(a, a)
 	nb := dotImpl(b, b)
 	if na == 0 || nb == 0 {
 		return 0
+	}
+	if len(b) < len(a) {
+		panic("simd: CosineSimilarity: len(b) < len(a)")
 	}
 	return dotImpl(a, b) / float32(math.Sqrt(float64(na))*math.Sqrt(float64(nb)))
 }

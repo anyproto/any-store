@@ -58,6 +58,34 @@ func TestDistanceSIMDMatchesScalar(t *testing.T) {
 		assert.InDelta(t, CosineDistanceScalar(a, b), CosineDistanceSIMD(a, b), 1e-3, "cos dim=%d", dim)
 		assert.InDelta(t, DotDistanceScalar(a, b), DotDistanceSIMD(a, b), 1e-3, "dot dim=%d", dim)
 	}
+	for _, in := range []struct {
+		name string
+		v    []float32
+	}{{"nil", nil}, {"empty", []float32{}}} {
+		assert.Equal(t, L2DistanceScalar(in.v, in.v), L2DistanceSIMD(in.v, in.v), "l2 %s", in.name)
+		assert.Equal(t, CosineDistanceScalar(in.v, in.v), CosineDistanceSIMD(in.v, in.v), "cos %s", in.name)
+		assert.Equal(t, DotDistanceScalar(in.v, in.v), DotDistanceSIMD(in.v, in.v), "dot %s", in.name)
+	}
+	// A second vector shorter than the first panics, as in the scalar versions,
+	// instead of the SIMD kernels reading past its end. Cosine with a zero-length
+	// second vector is 1, as simd.CosineSimilarity defines it.
+	a := make([]float32, 768)
+	for i := range a {
+		a[i] = rng.Float32()
+	}
+	for _, b := range []struct {
+		name string
+		v    []float32
+	}{{"nil", nil}, {"empty", []float32{}}, {"shorter", a[:767:767]}} {
+		assert.Panics(t, func() { L2DistanceScalar(a, b.v) }, "l2 scalar %s", b.name)
+		assert.Panics(t, func() { L2DistanceSIMD(a, b.v) }, "l2 %s", b.name)
+		assert.Panics(t, func() { DotDistanceScalar(a, b.v) }, "dot scalar %s", b.name)
+		assert.Panics(t, func() { DotDistanceSIMD(a, b.v) }, "dot %s", b.name)
+	}
+	assert.Panics(t, func() { CosineDistanceScalar(a, a[:767:767]) }, "cos scalar shorter")
+	assert.Panics(t, func() { CosineDistanceSIMD(a, a[:767:767]) }, "cos shorter")
+	assert.Equal(t, float32(1), CosineDistanceSIMD(a, nil), "cos nil")
+	assert.Equal(t, float32(1), CosineDistanceSIMD(a, []float32{}), "cos empty")
 }
 
 func TestBruteExact(t *testing.T) {
