@@ -130,22 +130,85 @@ func TestDotFloatByteNEONLengthContract(t *testing.T) {
 	}
 }
 
-// TestDotFloatByteNEONNonFinite checks Inf and NaN propagate like the fallback.
+// fpClass names the class of a float result: +Inf, -Inf, NaN or finite.
+func fpClass(f float32) string {
+	switch x := float64(f); {
+	case math.IsNaN(x):
+		return "NaN"
+	case math.IsInf(x, 1):
+		return "+Inf"
+	case math.IsInf(x, -1):
+		return "-Inf"
+	}
+	return "finite"
+}
+
+// TestDotFloatByteNEONNonFinite plants non-finite values in q, over random
+// finite q and random bytes u, and requires the kernel's result to have the
+// same class (+Inf, -Inf or NaN) as the pure-Go fallback's and as the IEEE
+// answer, which no summation order changes:
+//   - +Inf or -Inf times a nonzero byte gives +Inf or -Inf;
+//   - NaN gives NaN, with a zero byte too;
+//   - +Inf times a zero byte gives NaN (Inf·0);
+//   - +Inf and -Inf at two elements give NaN, and two +Inf give +Inf.
+//
+// Single plants go at the first, middle and last element. Pairs are an element
+// and the one four after it (the next accumulator inside a 32- or 16-element
+// block), and the first and last elements (different stages).
 func TestDotFloatByteNEONNonFinite(t *testing.T) {
-	for _, n := range []int{1, 5, 17, 40, 768} {
+	inf, nan := float32(math.Inf(1)), float32(math.NaN())
+	type plant struct {
+		at   int
+		q    float32
+		zero bool // u[at] = 0; otherwise a random nonzero byte
+	}
+	type tcase struct {
+		name, want string
+		plants     []plant
+	}
+	r := rand.New(rand.NewSource(7594))
+	for _, n := range []int{1, 5, 17, 33, 40, 768} {
+		var cases []tcase
 		for _, at := range []int{0, n / 2, n - 1} {
-			q := make([]float32, n)
+			cases = append(cases,
+				tcase{"+Inf", "+Inf", []plant{{at, inf, false}}},
+				tcase{"-Inf", "-Inf", []plant{{at, -inf, false}}},
+				tcase{"NaN", "NaN", []plant{{at, nan, false}}},
+				tcase{"NaN·0", "NaN", []plant{{at, nan, true}}},
+				tcase{"+Inf·0", "NaN", []plant{{at, inf, true}}},
+			)
+		}
+		var pairs [][2]int
+		for _, at := range []int{0, n / 2} {
+			if at+4 < n {
+				pairs = append(pairs, [2]int{at, at + 4})
+			}
+		}
+		if n > 1 {
+			pairs = append(pairs, [2]int{0, n - 1})
+		}
+		for _, p := range pairs {
+			cases = append(cases,
+				tcase{"+Inf,-Inf", "NaN", []plant{{p[0], inf, false}, {p[1], -inf, false}}},
+				tcase{"+Inf,+Inf", "+Inf", []plant{{p[0], inf, false}, {p[1], inf, false}}},
+			)
+		}
+		for _, c := range cases {
+			q := randVec(r, n)
 			u := make([]byte, n)
-			for i := range q {
-				q[i], u[i] = 0.5, 200
+			for i := range u {
+				u[i] = byte(r.Intn(256))
 			}
-			q[at] = float32(math.Inf(1))
-			if got := dotFloatByteNEON(q, u); !math.IsInf(float64(got), 1) {
-				t.Errorf("n=%d at=%d: +Inf gave %v", n, at, got)
+			for _, p := range c.plants {
+				q[p.at], u[p.at] = p.q, byte(1+r.Intn(255))
+				if p.zero {
+					u[p.at] = 0
+				}
 			}
-			q[at] = float32(math.NaN())
-			if got := dotFloatByteNEON(q, u); !math.IsNaN(float64(got)) {
-				t.Errorf("n=%d at=%d: NaN gave %v", n, at, got)
+			got, fb := dotFloatByteNEON(q, u), dotFloatByteScalar(q, u)
+			if fpClass(got) != fpClass(fb) || fpClass(got) != c.want {
+				t.Errorf("n=%d %s at %v: neon=%v fallback=%v, want %s",
+					n, c.name, c.plants, got, fb, c.want)
 			}
 		}
 	}
