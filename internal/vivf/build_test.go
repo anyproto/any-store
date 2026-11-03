@@ -289,27 +289,38 @@ func TestBulkBuildMatchesMainBuild(t *testing.T) {
 	}
 }
 
-// TestBulkBuildIndependentOfWorkers: the placement hands each vector to
-// exactly one worker and sums the drift baseline in label order, and every
-// parallel phase splits its work by GOMAXPROCS alone, so the index depends on
-// neither the build budget nor the worker count.
-func TestBulkBuildIndependentOfWorkers(t *testing.T) {
+// TestBulkBuildIndependentOfBudget: each item of a parallel phase is handled
+// by exactly one worker, results are written per item or reduced in a fixed
+// order, and no phase splits its work by the budget, so the index is the same
+// at any build budget. Across GOMAXPROCS it is the same with k-means++ off:
+// k-means++ sums d² per GOMAXPROCS chunk, as earlier releases do, so with it
+// on another GOMAXPROCS can round that sum differently and, rarely, seed other
+// centroids. The GOMAXPROCS case below therefore runs with k-means++ off.
+func TestBulkBuildIndependentOfBudget(t *testing.T) {
 	vecs := clusteredVecs(2000, 32, 20, 13)
 	ids := shuffledIDs(2000, 7)
-	p := StoreParams{Dim: 32, NList: 32, Assign: 2, NProbe: 8, Normalize: true, KMeansPP: true, Seed: 1}
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
 	defer buildpool.Set(buildpool.Current().Size())
-	var first *btree.DB
-	for _, w := range []struct{ procs, budget int }{{8, 8}, {8, 1}, {8, 3}, {1, 8}} {
-		runtime.GOMAXPROCS(w.procs)
-		buildpool.Set(w.budget)
-		db := openMem(t)
-		buildWithIDs(t, db, p, ids, vecs)
-		if first == nil {
-			first = db
-			continue
+	for _, tc := range []struct {
+		kpp    bool
+		setups []struct{ procs, budget int }
+	}{
+		{kpp: true, setups: []struct{ procs, budget int }{{8, 8}, {8, 1}, {8, 3}}},
+		{kpp: false, setups: []struct{ procs, budget int }{{8, 8}, {1, 1}, {1, 8}, {3, 2}}},
+	} {
+		p := StoreParams{Dim: 32, NList: 32, Assign: 2, NProbe: 8, Normalize: true, KMeansPP: tc.kpp, Seed: 1}
+		var first *btree.DB
+		for _, w := range tc.setups {
+			runtime.GOMAXPROCS(w.procs)
+			buildpool.Set(w.budget)
+			db := openMem(t)
+			buildWithIDs(t, db, p, ids, vecs)
+			if first == nil {
+				first = db
+				continue
+			}
+			requireSameIndex(t, first, db)
 		}
-		requireSameIndex(t, first, db)
 	}
 }
 
@@ -419,8 +430,8 @@ func mainKmeansppInit(data [][]float32, k int, rng *rand.Rand) [][]float32 {
 }
 
 // TestKMeansPPIndependentOfBudget: k-means++ seeding on the build budget picks
-// the centroids earlier releases pick, at any budget — its d² sum is reduced
-// over the same chunks in the same order.
+// the centroids earlier releases pick at the same GOMAXPROCS, at any budget —
+// its d² sum is reduced over the same GOMAXPROCS chunks in the same order.
 func TestKMeansPPIndependentOfBudget(t *testing.T) {
 	data := clusteredVecs(3000, 24, 40, 17)
 	defer buildpool.Set(buildpool.Current().Size())
