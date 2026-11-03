@@ -34,7 +34,16 @@ var (
 // u, where each byte is interpreted as an UNSIGNED value 0..255 (matching the
 // vendored weaviate kernels). Callers using offset-binary int8 storage recover
 // the signed dot via scale·(DotFloatByte(q,u) − 128·Σq); see internal/vindex.
-func DotFloatByte(q []float32, u []byte) float32 { return dotFBImpl(q, u) }
+//
+// The length is len(q): extra bytes in u are ignored, and a u shorter than q
+// panics. The check lives here so it covers every kernel: the SIMD ones read
+// len(q) bytes from u without bounds checks.
+func DotFloatByte(q []float32, u []byte) float32 {
+	if len(u) < len(q) {
+		panic("simd: DotFloatByte: len(u) < len(q)")
+	}
+	return dotFBImpl(q, u)
+}
 
 // AcceleratedFloatByte reports whether a SIMD float×byte kernel is active (false
 // on the pure-Go fallback path, and on arches where it is not wired).

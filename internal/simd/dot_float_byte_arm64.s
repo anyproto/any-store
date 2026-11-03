@@ -10,7 +10,7 @@
 // (V0–V7), so no fmla waits on the previous one and the loop is bounded by
 // issue width, not latency. Then at most one 16-element block (V0–V3), 4-wide
 // steps (V0), the horizontal reduction, and a 1-element scalar loop. Every
-// length, 0 included, is handled here; the Go wrapper only checks len(u).
+// length, 0 included, is handled here; DotFloatByte checks len(u) ≥ n first.
 //
 // Bytes are widened straight from 8 to 32 bits with TBL (an index ≥ 16
 // selects 0), one instruction per 4 lanes instead of two UXTL levels.

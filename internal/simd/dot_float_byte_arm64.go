@@ -5,13 +5,10 @@ package simd
 import "unsafe"
 
 // dotFloatByteNEON is the arm64 float×byte kernel (unsigned bytes), owned by
-// any-store rather than vendored: see dot_float_byte_arm64.s for why. Same
-// contract as the pure-Go fallback: the length is len(q), extra bytes in u are
-// ignored, and a u shorter than q panics (the kernel never reads past it).
+// any-store rather than vendored: see dot_float_byte_arm64.s for why. The
+// length is len(q) and extra bytes in u are ignored. It reads len(q) bytes from
+// u unchecked: DotFloatByte panics on a shorter u before calling it.
 func dotFloatByteNEON(q []float32, u []byte) float32 {
-	if len(u) < len(q) {
-		panic("simd: DotFloatByte: len(u) < len(q)")
-	}
 	return dotFloatByteNEONAsm(unsafe.SliceData(q), unsafe.SliceData(u), len(q))
 }
 

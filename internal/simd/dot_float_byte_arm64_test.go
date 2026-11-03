@@ -113,9 +113,9 @@ func TestDotFloatByteNEONExact(t *testing.T) {
 	}
 }
 
-// TestDotFloatByteNEONLengthContract pins the API contract shared with the
-// fallback: the length is len(q), extra bytes in u are ignored, and a u
-// shorter than q panics instead of reading past it.
+// TestDotFloatByteNEONLengthContract pins the kernel's half of the length
+// contract: the length is len(q) and extra bytes in u are ignored. The short-u
+// panic is DotFloatByte's (TestDotFloatByteShortUPanics).
 func TestDotFloatByteNEONLengthContract(t *testing.T) {
 	r := rand.New(rand.NewSource(7592))
 	for _, n := range []int{0, 3, 16, 33, 768} {
@@ -126,22 +126,6 @@ func TestDotFloatByteNEONLengthContract(t *testing.T) {
 		}
 		if got, want := dotFloatByteNEON(q, u), dotFloatByteNEON(q, u[:n]); got != want {
 			t.Errorf("n=%d: extra bytes changed the result: %v vs %v", n, got, want)
-		}
-		if n == 0 {
-			continue
-		}
-		for _, k := range []struct {
-			name string
-			fn   func([]float32, []byte) float32
-		}{{"neon", dotFloatByteNEON}, {"fallback", dotFloatByteScalar}} {
-			func() {
-				defer func() {
-					if recover() == nil {
-						t.Errorf("%s n=%d: short u did not panic", k.name, n)
-					}
-				}()
-				k.fn(q, u[:n-1])
-			}()
 		}
 	}
 }
