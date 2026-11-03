@@ -596,3 +596,77 @@ func TestTiedCentroidsAcrossReleases(t *testing.T) {
 		requireSameIndex(t, older, newer)
 	})
 }
+
+// TestTieOrderGolden pins, as hard-coded cell ids, the order in which
+// nearestCellsInto ranks cells at an exact distance tie, and so the cells the
+// build places tied vectors in. The other tie tests compare against a copy of
+// the same sort, which would move along with it. If this fails after a Go
+// upgrade, the toolchain changed how slices.SortFunc orders equal elements:
+// routing no longer matches indexes written by earlier releases, which put
+// tied vectors in the cells listed here, so their searches miss them and
+// theirs miss new ones. Do not update the expected ids; vendor the earlier
+// sort for nearestCellsInto instead. The alternating fixture also pins its
+// k-means centroids, which a change to training would move as well.
+func TestTieOrderGolden(t *testing.T) {
+	order := func(ix *StoreIndex, q float32) []int {
+		var scratch []cellDist
+		return ix.nearestCellsInto([]float32{q}, ix.nlist, &scratch, nil)
+	}
+	// requirePlaced checks the build's :doc and :cell entries put vector i in
+	// cell cellOf(i), and nowhere else.
+	requirePlaced := func(t *testing.T, db *btree.DB, n int, cellOf func(i int) uint32) {
+		t.Helper()
+		got, _ := dumpIndex(t, db, "ivf")
+		require.Len(t, got[nsDoc], n)
+		for _, e := range got[nsDoc] {
+			label, cells := decodeDocCells(e.v)
+			require.Equal(t, []uint32{cellOf(int(label))}, cells, "label %d", label)
+		}
+		var want [][]byte
+		for i := 0; i < n; i++ {
+			want = append(want, cellKey(nil, cellOf(i), uint32(i)))
+		}
+		slices.SortFunc(want, bytes.Compare)
+		require.Len(t, got[nsCell], n)
+		for i, e := range got[nsCell] {
+			require.Equal(t, want[i], e.k, ":cell key #%d", i)
+		}
+	}
+
+	t.Run("alternating", func(t *testing.T) {
+		db := openMem(t)
+		buildWithIDs(t, db, StoreParams{Dim: 1, NList: 13, Assign: 1, NProbe: 1, KMeansPP: true, Seed: 0}, seqIDs(26), alternatingVecs(26))
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer rtx.Rollback()
+		ix, err := OpenTx(rtx, "ivf")
+		require.NoError(t, err)
+		require.Equal(t, []float32{0, 2, 2, 2, 0, 0, 2, 0, 0, 0, 0, 0, 2}, ix.coarse, "k-means centroids")
+		require.Equal(t, []int{8, 11, 10, 0, 4, 5, 9, 7, 3, 6, 2, 1, 12}, order(ix, 0))
+		require.Equal(t, []int{6, 1, 2, 3, 12, 4, 5, 0, 7, 8, 9, 10, 11}, order(ix, 2))
+		requirePlaced(t, db, 26, func(i int) uint32 {
+			if i%2 == 0 {
+				return 8 // [0]
+			}
+			return 6 // [2]
+		})
+	})
+	t.Run("fixed centroids", func(t *testing.T) {
+		cents := [][]float32{{10}, {0}, {0}, {10}, {10}, {10}, {10}, {10}, {10}, {10}, {10}, {10}, {10}}
+		vecs := make([][]float32, 20)
+		for i := range vecs {
+			vecs[i] = []float32{float32(10 * (i % 2))}
+		}
+		db := openMem(t)
+		placeWrite(t, db, StoreParams{Dim: 1, Assign: 1, NProbe: 1}, cents, seqIDs(20), vecs)
+		ix := &StoreIndex{dim: 1, nlist: len(cents), coarse: bytesAsF32(encodeCentroids(cents), len(cents))}
+		require.Equal(t, []int{2, 1, 6, 3, 4, 5, 0, 7, 8, 9, 10, 11, 12}, order(ix, 0))
+		require.Equal(t, []int{6, 3, 4, 5, 0, 7, 8, 9, 10, 11, 12, 1, 2}, order(ix, 10))
+		requirePlaced(t, db, 20, func(i int) uint32 {
+			if i%2 == 0 {
+				return 2 // [0]
+			}
+			return 6 // [10]
+		})
+	})
+}
