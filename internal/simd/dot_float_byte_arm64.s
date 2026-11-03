@@ -16,36 +16,8 @@
 // selects 0), one instruction per 4 lanes instead of two UXTL levels.
 //
 // Go's assembler (≤ 1.26) has no vector UCVTF/FADD/FADDP, so those are WORD
-// encodings, each with its instruction in the comment. To re-verify them, run
-// this in bash in this directory. It needs clang and llvm-objdump (on macOS
-// OBJDUMP=objdump is LLVM's; a GNU objdump works only if built for AArch64).
-// It exits non-zero, printing MISMATCH, COUNT or the offending line, on a wrong
-// encoding, a WORD without a parsable instruction comment, or any WORD it
-// failed to extract:
-//
-//	(
-//	set -euo pipefail
-//	f=dot_float_byte_arm64.s
-//	d=$(mktemp -d); trap 'rm -rf "$d"' EXIT; : > "$d/want"; : > "$d/insn"
-//	awk -v d="$d" '/^[ \t]*WORD[ \t]/ {
-//		if (!match($0, /\$0[xX][0-9a-fA-F]+/)) { print "BAD OPERAND: " $0; exit 1 }
-//		h = tolower(substr($0, RSTART + 3, RLENGTH - 3)); while (length(h) < 8) h = "0" h
-//		c = index($0, "//"); s = c ? substr($0, c + 2) : ""; gsub(/^[ \t]+|[ \t]+$/, "", s)
-//		if (s == "") { print "NO INSTRUCTION COMMENT: " $0; exit 1 }
-//		print "0x" h > (d "/want"); print s > (d "/insn") }' "$f"
-//	n=$(grep -cE '^[[:space:]]*WORD([[:space:]]|$)' "$f" || true)
-//	clang -c -x assembler --target=aarch64-linux-gnu -o "$d/w.o" "$d/insn"
-//	"${OBJDUMP:-llvm-objdump}" -d "$d/w.o" | awk '/^ *[0-9a-f]+:/ {print "0x" $2}' > "$d/got"
-//	w=$(awk 'END {print NR}' "$d/want"); g=$(awk 'END {print NR}' "$d/got")
-//	[ "$n" -gt 0 ] && [ "$w" -eq "$n" ] && [ "$g" -eq "$n" ] || { echo "COUNT: $n WORD, $w parsed, $g assembled"; exit 1; }
-//	paste "$d/want" "$d/got" | awk '$1 != $2 {bad = 1; print "MISMATCH", $0} END {exit bad}'
-//	)
-//
-// and read the kernel back as Go assembled it (WORDs decode by name). This
-// needs an arm64 binary; GOARCH=arm64 cross-compiles it on any host:
-//
-//	(d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
-//	GOARCH=arm64 go test -c -o "$d/simd.test" . && go tool objdump -s dotFloatByteNEONAsm "$d/simd.test")
+// encodings, each with its instruction in the comment.
+// verify_words_arm64.sh checks them against clang and Go's disassembler.
 //
 // Leaf, no frame, no stack. Uses only R0–R4, V0–V25 and V28–V31 (the Go ABI
 // has no callee-saved FP registers); R18 and R26–R30 are untouched.
