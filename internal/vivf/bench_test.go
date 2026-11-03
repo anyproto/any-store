@@ -131,7 +131,8 @@ func BenchmarkBulkBuildPlace(b *testing.B) {
 		norm[i] = normalize(norm[i])
 		ids[i] = bid(i)
 	}
-	cents, assign := kmeans(norm, nlist, 15, 1, true)
+	cents := kmeans(norm, nlist, 15, 1, true)
+	assign := assignUnique(norm, cents) // BulkBuild's input to place for one cell per vector
 	coarse := bytesAsF32(encodeCentroids(cents), nlist*dim)
 	for _, closure := range []int{1, 2} {
 		b.Run(fmt.Sprintf("assign%d", closure), func(b *testing.B) {

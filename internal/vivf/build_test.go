@@ -182,20 +182,18 @@ func mainBuild(t *testing.T, db *btree.DB, p StoreParams, ids [][]byte, vecs [][
 			norm[i] = normalize(v)
 		}
 	}
-	cents, _ := kmeans(norm, p.NList, 15, p.Seed, p.KMeansPP)
+	cents := kmeans(norm, p.NList, 15, p.Seed, p.KMeansPP)
 	serialWrite(t, db, p, cents, ids, norm, mainNearestCells)
 }
 
 // placeWrite writes the index over the given centroids with this code's
-// placement: k-means' final assignment pass, then place.
+// placement: assignUnique, then place.
 func placeWrite(t *testing.T, db *btree.DB, p StoreParams, cents [][]float32, ids [][]byte, vecs [][]float32) {
 	t.Helper()
 	wtx, err := db.BeginWrite()
 	require.NoError(t, err)
 	ix := openIndexNS(t, wtx, p, cents)
-	assign := make([]int32, len(vecs))
-	assignNearest(vecs, cents, assign, true)
-	reconSum, err := ix.place(wtx, ids, vecs, assign)
+	reconSum, err := ix.place(wtx, ids, vecs, assignUnique(vecs, cents))
 	require.NoError(t, err)
 	putBuildMeta(t, wtx, ix, p, len(vecs), reconSum)
 	require.NoError(t, wtx.Commit())
@@ -251,7 +249,7 @@ func repeatedVecs() [][]float32 {
 }
 
 // TestBulkBuildMatchesMainBuild pins that the parallel, key-ordered build —
-// cells from k-means' final assignment or nearestCellsInto, records encoded a
+// cells from assignUnique or nearestCellsInto, records encoded a
 // chunk at a time — writes exactly the index earlier releases write: the
 // same :cb, :cell, :lbl, :doc and meta (drift baseline bit for bit), so either
 // release reads, inserts into and searches the other's index alike. Fixtures
@@ -563,7 +561,7 @@ func TestTiedCentroidsAcrossReleases(t *testing.T) {
 		// 26 docs alternating [0]/[2], NList 13: k-means duplicates the centroids.
 		vecs := alternatingVecs(26)
 		p := StoreParams{Dim: 1, NList: 13, Assign: 1, NProbe: 1, KMeansPP: true, Seed: 0}
-		cents, _ := kmeans(vecs, p.NList, 15, p.Seed, p.KMeansPP)
+		cents := kmeans(vecs, p.NList, 15, p.Seed, p.KMeansPP)
 		probe := &StoreIndex{dim: 1, nlist: len(cents), coarse: bytesAsF32(encodeCentroids(cents), len(cents))}
 		require.NotEqual(t, lowestFirstCells(probe, []float32{0}, 1), mainNearestCells(probe, []float32{0}, 1),
 			"the fixture must rank the [0] tie differently from lowest-first")

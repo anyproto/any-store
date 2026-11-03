@@ -224,13 +224,19 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	// Train the coarse quantizer. The centroids are persisted and then held as
 	// the flat view of that blob (same layout the reader gets), so there is one
 	// representation, not two.
-	coarseN, assign := kmeans(norm, p.NList, 15, p.Seed, p.KMeansPP)
+	coarseN := kmeans(norm, p.NList, 15, p.Seed, p.KMeansPP)
 	coarseBlob := encodeCentroids(coarseN)
 	if err := wtx.Put(ix.vcb, coarseKey, coarseBlob); err != nil {
 		return nil, err
 	}
 	ix.coarse = bytesAsF32(coarseBlob, ix.nlist*ix.dim)
 
+	// Placing each vector in one cell, a vector whose nearest centroid is
+	// unique goes there with no full ranking of the cells (see place).
+	var assign []int32
+	if min(ix.assign, ix.nlist) == 1 {
+		assign = assignUnique(norm, coarseN)
+	}
 	reconSum, err := ix.place(wtx, ids, norm, assign)
 	if err != nil {
 		return nil, err
@@ -265,39 +271,43 @@ var placeChunkBytes = 32 << 20
 //
 // A vector goes in the cells nearestCellsInto ranks first, as an insert's
 // does: on an exact distance tie that is the cell every release picks and
-// probes. assign[i] is vector i's nearest centroid from k-means' final pass,
-// or -1 when that is not unique (an exact tie, or a NaN distance); a build
-// placing each vector in one cell reuses it unless it is -1. Otherwise — a
-// tie, or closure — the cells come from nearestCellsInto. Returns the sum of
-// the squared nearest-cell residuals, the drift baseline.
+// probes. When each vector goes in one cell, assign is required: assign[i] is
+// vector i's nearest centroid (assignUnique), used as its cell, or -1 when that
+// is not unique (an exact tie, or a NaN distance). A -1 vector, and with
+// closure every vector, gets its cells from nearestCellsInto; with closure
+// assign is unused. Returns the sum of the squared nearest-cell residuals, the
+// drift baseline.
 //
-// Besides the input and the btree's own memory, it holds on a 64-bit platform
-// 12·Assign+8 bytes per vector (cells, residual, sort orders) and 16 bytes per
-// cell (8·Assign+8 and 8 on 32-bit); encoded records of at most
-// max(placeChunkBytes, one record); and, per chunk running at once, 4·Dim
-// bytes of residual scratch plus, when the chunk has a tied vector or the
-// index uses closure, 16·NList bytes of cell-distance scratch (8·NList on
-// 32-bit). A vector in several cells is encoded once per cell; the encoding is
-// deterministic, so its records are identical.
+// Besides the input and the btree's own memory, it holds 8·Assign+8 bytes per
+// vector (cells, residual, sort orders), 16 bytes per cell (8 on 32-bit),
+// encoded records of at most max(placeChunkBytes, one record), and, per chunk
+// running at once, 4·Dim bytes of residual scratch plus, when the chunk has a
+// -1 vector or the index uses closure, 16·NList bytes of cell-distance scratch
+// (8·NList on 32-bit). A vector in several cells is encoded once per cell; the
+// encoding is deterministic, so its records are identical.
 func (ix *StoreIndex) place(wtx *btree.WriteTx, ids [][]byte, norm [][]float32, assign []int32) (float64, error) {
 	n := len(norm)
 	a := min(ix.assign, ix.nlist) // cells per vector, clamped as nearestCellsInto does
 
 	// cells[i*a:(i+1)*a] are vector i's cells, nearest first; resid[i] is its
 	// squared residual to the nearest one.
-	cells := make([]int, n*a)
+	cells := make([]int32, n*a)
 	resid := make([]float32, n)
 	parallelRange(n, func(lo, hi int) {
 		var scratch []cellDist
+		var ranked []int
 		r := make([]float32, ix.dim)
 		for i := lo; i < hi; i++ {
-			own := cells[i*a : (i+1)*a : (i+1)*a]
-			if a == 1 && assign != nil && assign[i] >= 0 {
-				own[0] = int(assign[i])
+			own := cells[i*a : (i+1)*a]
+			if a == 1 && assign[i] >= 0 {
+				own[0] = assign[i]
 			} else {
-				ix.nearestCellsInto(norm[i], a, &scratch, own[:0])
+				ranked = ix.nearestCellsInto(norm[i], a, &scratch, ranked)
+				for j, c := range ranked {
+					own[j] = int32(c)
+				}
 			}
-			simd.Sub_Into(r, norm[i], ix.coarseRow(own[0]))
+			simd.Sub_Into(r, norm[i], ix.coarseRow(int(own[0])))
 			resid[i] = sqNorm(r)
 		}
 	})
@@ -341,7 +351,7 @@ func (ix *StoreIndex) place(wtx *btree.WriteTx, ids [][]byte, norm [][]float32, 
 	// within a cell: byCell[start[c]:start[c+1]] are the labels in cell c.
 	start := make([]int, ix.nlist+1)
 	for _, c := range cells {
-		start[c+1]++
+		start[int(c)+1]++
 	}
 	for c := 0; c < ix.nlist; c++ {
 		start[c+1] += start[c]
@@ -409,7 +419,7 @@ func (ix *StoreIndex) putDocCells(wtx *btree.WriteTx, docID []byte, label uint32
 
 // appendDocCells appends the :doc record of a vector to buf: label(le32), the
 // cell count (one byte), then each cell(le32).
-func appendDocCells(buf []byte, label uint32, cells []int) []byte {
+func appendDocCells[C int | int32](buf []byte, label uint32, cells []C) []byte {
 	buf = binary.LittleEndian.AppendUint32(buf, label)
 	buf = append(buf, byte(len(cells)))
 	for _, c := range cells {

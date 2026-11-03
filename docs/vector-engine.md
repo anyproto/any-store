@@ -148,9 +148,9 @@ removed flavour, kept for the record:
 - **Search still favours HNSW** (`hyb+vc f32` 3519 / btree int8 1582), but IVF-SQ
   np32 (1794) beats btree int8 at slightly lower recall; tune via `NProbe`.
 - IVF **bulk build** time is mostly training (k-means): the placement pass
-  reuses k-means' final assignment where a vector's nearest centroid is unique,
-  does its per-vector work on the build budget and writes each namespace in key
-  order. The btree writes, the sorts, the drift-baseline sum, Lloyd's centroid
+  puts a vector in its nearest centroid's cell directly where that centroid is
+  unique, does its per-vector work on the build budget and writes each
+  namespace in key order. The btree writes, the sorts, the drift-baseline sum, Lloyd's centroid
   update and k-means++ sampling are serial. Directional numbers from one fanless
   8-core M2 (`vivf.BulkBuild`, serial placement in label order → this placement,
   `Rebuild` included): placement 0.82–0.91 s → 65–72 ms at 20k×768 (nlist 256)
