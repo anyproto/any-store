@@ -7,6 +7,10 @@
 // 386, or an x86 without AVX2 (e.g. pre-Haswell Ivy Bridge) — the pure-Go
 // fallbacks in fallback.go are used, which beat a naive scalar loop.
 //
+// One kernel is any-store's own rather than vendored: the arm64 float×byte dot
+// (dot_float_byte_arm64.s). The vendored NEON one chains every FMA through a
+// single register, so it runs at FMA latency rather than at issue width.
+//
 // This package replaces the former github.com/viterin/vek/vek32 dependency,
 // which was amd64+AVX2-only and fell back to slow portable Go on arm64.
 package simd
@@ -27,10 +31,20 @@ var (
 )
 
 // DotFloatByte returns the inner product of a float32 vector q and a byte vector
-// u, where each byte is interpreted as an UNSIGNED value 0..255 (matching the
-// vendored weaviate kernels). Callers using offset-binary int8 storage recover
+// u, where each byte is interpreted as an UNSIGNED value 0..255 by every kernel
+// behind it: the vendored AVX2 one on amd64, any-store's own NEON one on arm64,
+// and the pure-Go fallback. Callers using offset-binary int8 storage recover
 // the signed dot via scale·(DotFloatByte(q,u) − 128·Σq); see internal/vindex.
-func DotFloatByte(q []float32, u []byte) float32 { return dotFBImpl(q, u) }
+//
+// The length is len(q): extra bytes in u are ignored, and a u shorter than q
+// panics. The check lives here so it covers every kernel: the SIMD ones read
+// len(q) bytes from u without bounds checks.
+func DotFloatByte(q []float32, u []byte) float32 {
+	if len(u) < len(q) {
+		panic("simd: DotFloatByte: len(u) < len(q)")
+	}
+	return dotFBImpl(q, u)
+}
 
 // AcceleratedFloatByte reports whether a SIMD float×byte kernel is active (false
 // on the pure-Go fallback path, and on arches where it is not wired).

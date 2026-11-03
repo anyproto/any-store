@@ -171,7 +171,9 @@ k-means build is the widest gap (5–7 min against 1–1.5 for HNSW).
 
 ### Cross-hardware (insert/s · search/s · index MiB · heap MiB)
 
-Four machines, with the int8 byte kernel (after migration):
+Four machines, with the int8 byte kernel (after migration). The M-series column
+was measured with the vendored NEON float×byte kernel, not the any-store one arm64
+uses (§ Distance backend), so its int8 and IVF-SQ search figures are understated:
 
 | mode | 32c AVX512 | 16c AVX2 | 48c (no-AVX2) | 8c M-series arm64 NEON |
 |---|---|---|---|---|
@@ -193,9 +195,11 @@ int8) because vek had no ARM SIMD at all — even f32 was scalar before.
 
 ### Distance backend & SIMD (`internal/simd`)
 
-Distance kernels run through **`internal/simd`** — vendored hand-written assembly
-(weaviate, BSD-3-Clause): **dot/L2 for amd64 (AVX2/AVX512) and arm64 (NEON/SVE)**,
-plus a **float×int8 kernel**, with a pure-Go fallback for wasm and non-AVX2 x86.
+Distance kernels run through **`internal/simd`**: vendored hand-written assembly
+(weaviate, BSD-3-Clause) for **dot/L2 on amd64 (AVX2/AVX512) and arm64 (NEON/SVE)**
+and for the amd64 **float×int8 kernel** (AVX2, used on AVX512 CPUs too); any-store's
+own NEON assembly for the arm64 float×int8 kernel (below); and a pure-Go fallback
+for wasm and non-AVX2 x86.
 This replaced the former `viterin/vek` (amd64-only, which left arm64 on a scalar
 fallback), so **`vector.SIMD()` is now true on Apple Silicon** — ARM gets real NEON,
 not scalar.
@@ -203,8 +207,8 @@ not scalar.
 **int8 byte distance.** Stored int8 vectors are scored straight from their bytes
 via the unsigned float×byte kernel (offset-binary format, `byte(q)^0x80`), skipping
 the per-element dequantization loop. Isolated int8 distance at dim768 drops
-**308 → 19.8 ns (15.6×) — f32 speed at 4× smaller storage**. End-to-end on the real
-dataset (recall unchanged):
+**308 → 19.8 ns (15.6×) on amd64 AVX2 — f32 speed at 4× smaller storage**. End-to-end
+on the real dataset (recall unchanged):
 
 | path | int8 search before → after |
 |---|---|
@@ -216,6 +220,53 @@ dataset (recall unchanged):
 IVF-SQ accelerates **both cosine and L2** (L2 via `‖q−x‖²=‖q‖²+‖x‖²−2·dot`, storing a
 per-vector `‖x‖²`); HNSW int8 covers cosine/dot (L2 keeps the float path). The change
 is read-path only — builds are unchanged. f32 search is unchanged within noise.
+
+**arm64 float×byte kernel.** On arm64 `internal/simd` scores int8 with its own
+NEON kernel (`dot_float_byte_arm64.s`: eight independent accumulators, TBL byte
+widening). The vendored NEON float×byte kernel chains every FMA through one
+register, so it runs at FMA latency — ~3× the f32 `Dot`, not f32 speed. The two
+differ in results only by float summation order. Apple M2, hot cache, median ns:
+
+| dim | vendored NEON | any-store NEON | f32 `Dot` |
+|--:|--:|--:|--:|
+| 128 | 19.9 | 14.3 | 11.0 |
+| 384 | 73.1 | 24.1 | 25.5 |
+| 768 | 154.9 | **45.8** | 50.0 |
+| 1536 | 419.5 | 93.7 | 94.6 |
+
+So on the M2 int8 scoring is at f32 `Dot` speed for dim 384–1536; at dim 128 the
+fixed setup/reduction cost still leaves it ~30% behind.
+
+Phone cores, Pixel 9 Pro (Tensor G4), one benchmark process pinned to each core
+type, median of 5, ns:
+
+| core | dim | vendored NEON | any-store NEON | f32 `Dot` |
+|--|--:|--:|--:|--:|
+| Cortex-A520 (little) | 128 | 149.2 | 73.8 | 104.3 |
+| | 768 | 662.6 | **285.5** | 400.5 |
+| Cortex-A720 (mid) | 128 | 31.7 | 30.4 | 22.0 |
+| | 768 | 155.8 | **154.3** | 92.0 |
+| Cortex-X4 (big) | 128 | 18.5 | 15.5 | 13.6 |
+| | 768 | 118.6 | **81.6** | 61.9 |
+
+The any-store kernel is never slower than the vendored one. On the in-order
+little core it is 2.0–2.4× faster across dim 128–1536 and beats the f32 `Dot`;
+on the big core it is 1.2–1.5× faster and 1.1–1.3× behind f32. On the mid core
+it gains nothing: both kernels take ~16–17 cycles per 32 elements (at the A720's
+nominal 2.6 GHz), at the 16-cycle floor that eight vector `UCVTF` conversions set
+on a core converting at half rate (the Cortex-A76 Software Optimization Guide
+gives Q-form F32 `UCVTF` a throughput of 1/2 per cycle). int8 scoring there looks
+conversion-bound, at ~1.7× the f32 `Dot`.
+
+In-package on the same M2, vendored vs any-store kernel run alternately on a
+loaded machine. IVF-SQ `SearchCandidates` (dim768, 20k vectors, NProbe 32, index
+built once): **cosine ≈845 → ≈451 µs/query (≈1.9×)** total query time, and
+≈280 → ≈162 ns per scanned vector, which is the scan phase's time divided by the
+vectors it scanned, not the total query time. Both are approximate (best of 3 on
+a loaded machine). The per-vector difference, ≈118 ns, is close to the kernel's
+≈109 ns delta at dim 768 in the table above. The HNSW int8 query→stored distance
+(`BenchmarkVindexInt8Dist` byte-kernel, scale/bias correction included; best of
+24) **162 → 51 ns (≈3.2×)**.
 
 The **no-AVX2 x86** path uses the pure-Go unrolled kernel, which *beats* vek's old
 fallback (682 vs 870 ns at dim768).
@@ -251,7 +302,9 @@ Batch insert (768 btree int8): **572/s disabled → 1366/s @16384 (2.4×) → 21
   survivors exactly.
 - **arm64 / on-device:** distance kernels now run **NEON** via `internal/simd`
   (Apple Silicon, Graviton, mobile) — no longer a scalar fallback. int8 is scored
-  by the NEON byte kernel (no dequant). Still favour the tiered mode and int8.
+  by the NEON float×byte kernel (no dequant; ≈ f32 `Dot` speed on the M2 at dim
+  384–1536, faster than f32 on an in-order little core, ~1.7× f32 on a
+  conversion-bound mid core). Still favour the tiered mode and int8.
 
 ## Reproduce
 

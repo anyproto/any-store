@@ -3,6 +3,7 @@ package vivf
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math/rand"
 	"path/filepath"
 	"testing"
@@ -122,6 +123,32 @@ func TestStoreSmall(t *testing.T) {
 		require.NotEqual(t, bid(99999), c.DocID, "deleted vector must not be returned")
 	}
 	require.NoError(t, rtx.Rollback())
+}
+
+// TestStoreSearchDimMismatch: a query of the wrong length is an error, not a
+// panic in the distance kernel (longer) or a score over a prefix (shorter).
+func TestStoreSearchDimMismatch(t *testing.T) {
+	const dim = 16
+	vecs := clusteredVecs(200, dim, 4, 3)
+	for _, normalize := range []bool{true, false} {
+		t.Run(fmt.Sprintf("normalize=%v", normalize), func(t *testing.T) {
+			db := openMem(t)
+			buildStore(t, db, StoreParams{Dim: dim, NList: 4, Assign: 1, NProbe: 4, Normalize: normalize, Seed: 1}, vecs)
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			defer func() { require.NoError(t, rtx.Rollback()) }()
+			ix, err := OpenTx(rtx, "ivf")
+			require.NoError(t, err)
+			for _, n := range []int{0, dim - 1, dim + 1, 2 * dim} {
+				q := make([]float32, n)
+				copy(q, vecs[0])
+				_, err := ix.SearchCandidates(rtx, q, 10)
+				require.ErrorContains(t, err, "vivf: dim mismatch", "len=%d", n)
+			}
+			_, err = ix.SearchCandidates(rtx, vecs[0], 10)
+			require.NoError(t, err)
+		})
+	}
 }
 
 // TestStoreRecallReal builds the index on the real export and confirms its

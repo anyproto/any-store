@@ -533,6 +533,9 @@ func ivfRebuildNList(configured, n int) int {
 // distance on its int8 record, keeps the ef best, and resolves their docIDs.
 // The cell scans are sequential — the btree-fit read pattern.
 func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) ([]Candidate, error) {
+	if len(q) != ix.dim {
+		return nil, fmt.Errorf("vivf: dim mismatch: got %d want %d", len(q), ix.dim)
+	}
 	if ef < 1 {
 		ef = 1
 	}
