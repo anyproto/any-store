@@ -217,7 +217,8 @@ func TestDotFloatByteNEONNonFinite(t *testing.T) {
 var floatByteSink float32
 
 // BenchmarkDotFloatByte compares the any-store NEON float×byte kernel with the
-// vendored one it replaces and with the f32 NEON Dot, hot cache, direct calls.
+// vendored asm.DotFloatByte_Neon and with the f32 NEON Dot, hot cache, direct
+// calls.
 func BenchmarkDotFloatByte(b *testing.B) {
 	for _, dim := range []int{128, 384, 768, 1536} {
 		r := rand.New(rand.NewSource(int64(dim)))

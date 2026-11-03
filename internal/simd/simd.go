@@ -9,7 +9,7 @@
 //
 // One kernel is any-store's own rather than vendored: the arm64 float×byte dot
 // (dot_float_byte_arm64.s). The vendored NEON one chains every FMA through a
-// single register and ran ~3× slower than the f32 Dot (GO-7590).
+// single register, so it runs at FMA latency rather than at issue width.
 //
 // This package replaces the former github.com/viterin/vek/vek32 dependency,
 // which was amd64+AVX2-only and fell back to slow portable Go on arm64.
@@ -31,8 +31,9 @@ var (
 )
 
 // DotFloatByte returns the inner product of a float32 vector q and a byte vector
-// u, where each byte is interpreted as an UNSIGNED value 0..255 (matching the
-// vendored weaviate kernels). Callers using offset-binary int8 storage recover
+// u, where each byte is interpreted as an UNSIGNED value 0..255 by every kernel
+// behind it: the vendored AVX2 one on amd64, any-store's own NEON one on arm64,
+// and the pure-Go fallback. Callers using offset-binary int8 storage recover
 // the signed dot via scale·(DotFloatByte(q,u) − 128·Σq); see internal/vindex.
 //
 // The length is len(q): extra bytes in u are ignored, and a u shorter than q

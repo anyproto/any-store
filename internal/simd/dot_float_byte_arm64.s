@@ -2,9 +2,9 @@
 
 #include "textflag.h"
 
-// any-store-owned NEON float×byte dot product (GO-7590). Replaces the vendored
-// dot_float_byte_neon, whose loop chains every fmla through one register and
-// so runs at FMA latency (~3× slower than the f32 Dot at dim768).
+// any-store's own NEON float×byte dot product, used on arm64 instead of the
+// vendored dot_float_byte_neon, whose loop chains every fmla through one
+// register and so runs at FMA latency (~3× the f32 Dot at dim768).
 //
 // Layout: 32 elements per iteration into eight independent accumulators
 // (V0–V7), so no fmla waits on the previous one and the loop is bounded by
