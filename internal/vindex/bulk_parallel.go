@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sync"
-	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/buildpool"
@@ -220,9 +219,8 @@ func (b *pBuilder) build(threads int) {
 	}
 	threads = max(threads, 1)
 	seedN := min(max(n/seedFraction+1, seedFloor), n)
-	serial := threads <= 1 || n-seedN < threads
-	// The sequential seeding, and the whole build when it stays serial, run on
-	// this goroutine holding a token of the shared budget, as a worker would.
+	// The sequential seeding runs on this goroutine holding a token of the
+	// shared budget, as a worker would.
 	func() {
 		budget.Acquire()
 		defer budget.Release()
@@ -230,33 +228,17 @@ func (b *pBuilder) build(threads int) {
 		for i := 1; i < seedN; i++ { // node 0 is the initial entry, already placed
 			b.insert(uint32(i), sc)
 		}
-		if serial {
-			for i := seedN; i < n; i++ {
-				b.insert(uint32(i), sc)
-			}
-		}
 	}()
-	if serial {
-		return
+	workers := threads
+	if n-seedN < threads {
+		workers = 1
 	}
-	var next int64 = int64(seedN)
-	var wg sync.WaitGroup
-	for w := 0; w < threads; w++ {
-		wg.Go(func() {
-			budget.Acquire() // bound active workers to the shared budget
-			defer budget.Release()
-			lsc := &pScratch{}
-			for {
-				i := atomic.AddInt64(&next, 1) - 1
-				if int(i) >= n {
-					return
-				}
-				b.insert(uint32(i), lsc)
-			}
-		})
-	}
-	wg.Wait()
+	buildpool.Work(budget, workers, n-seedN, newPScratch, func(sc *pScratch, k int) {
+		b.insert(uint32(seedN+k), sc)
+	})
 }
+
+func newPScratch() *pScratch { return &pScratch{} }
 
 // repair runs a second pass over the COMPLETE graph: each node re-searches and
 // adds (bidirectionally, additively — never clobbering) the diverse neighbours it
@@ -296,32 +278,13 @@ func (b *pBuilder) repair(threads int) {
 	if threads <= 0 {
 		threads = budget.Size()
 	}
-	if threads <= 1 || n < threads*2 {
-		budget.Acquire() // serial: this goroutine is the one worker
-		defer budget.Release()
-		sc := &pScratch{}
-		for i := 0; i < n; i++ {
-			do(uint32(i), sc)
-		}
-		return
+	workers := threads
+	if n < threads*2 {
+		workers = 1
 	}
-	var next atomic.Int64
-	var wg sync.WaitGroup
-	for w := 0; w < threads; w++ {
-		wg.Go(func() {
-			budget.Acquire()
-			defer budget.Release()
-			sc := &pScratch{}
-			for {
-				i := next.Add(1) - 1
-				if int(i) >= n {
-					return
-				}
-				do(uint32(i), sc)
-			}
-		})
-	}
-	wg.Wait()
+	buildpool.Work(budget, workers, n, newPScratch, func(sc *pScratch, i int) {
+		do(uint32(i), sc)
+	})
 }
 
 // pScratch is per-worker traversal state (heaps, visited set, buffers).

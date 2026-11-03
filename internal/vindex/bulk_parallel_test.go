@@ -277,6 +277,44 @@ func TestBulkBuildParallelSerialHoldsBudget(t *testing.T) {
 	}
 }
 
+// TestBulkBuildParallelBudgetPartlyHeld: with one of two tokens held elsewhere
+// for the whole build, the parallel build and repair phases finish on the one
+// token left.
+func TestBulkBuildParallelBudgetPartlyHeld(t *testing.T) {
+	defer buildpool.Set(buildpool.Current().Size())
+	buildpool.Set(2)
+	const (
+		n   = seedFloor + 100 // past the sequential seeding, so both phases go parallel
+		dim = 8
+	)
+	vecs := randVecs(n, dim, 4)
+	ids := make([][]byte, n)
+	for i := range ids {
+		ids[i] = docID(i)
+	}
+	db, err := btree.Open(":memory:", btree.Options{InMemory: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	defer wtx.Rollback()
+
+	b := buildpool.Current()
+	b.Acquire()
+	defer b.Release()
+	done := make(chan error, 1)
+	go func() {
+		_, err := BulkBuildParallel(wtx, "vix", Params{Dim: dim, Metric: L2, EfSearch: 64}, 1, ids, vecs, 0)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(60 * time.Second):
+		t.Fatal("build did not complete on the token left")
+	}
+}
+
 // TestBulkBuildParallelEdge covers small / degenerate sizes (empty, single, fewer
 // than the worker count) where the seed/parallel/repair paths must still be correct.
 func TestBulkBuildParallelEdge(t *testing.T) {

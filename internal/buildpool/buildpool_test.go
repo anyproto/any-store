@@ -1,6 +1,7 @@
 package buildpool
 
 import (
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -124,6 +125,81 @@ func TestPhasesBackToBackComplete(t *testing.T) {
 		}()
 		waitDone(t, done)
 		require.Zero(t, len(b.tokens), "size %d: every token returned", size)
+	}
+}
+
+// A worker waiting for a token gives up as soon as its phase's items have all
+// been claimed, instead of waiting on tokens other phases hold. A worker that
+// starts late, after another took the phase's last item, would otherwise
+// queue behind those holders and keep the phase from returning.
+func TestWaitingWorkerGivesUpOnceClaimed(t *testing.T) {
+	b := budgetOf(1)
+	b.Acquire() // another phase holds the only token for as long as it likes
+	defer b.Release()
+	claimed := make(chan struct{})
+	got := make(chan bool, 1)
+	go func() { got <- b.acquireUnless(claimed) }()
+	select {
+	case <-got:
+		t.Fatal("stopped waiting before its phase's items were claimed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(claimed)
+	select {
+	case took := <-got:
+		require.False(t, took)
+	case <-time.After(10 * time.Second):
+		t.Fatal("still waiting for a token after every item was claimed")
+	}
+}
+
+// With one of two tokens held elsewhere, one worker does the whole phase and
+// Run returns while the outside token is still held.
+func TestRunWithBudgetPartlyHeld(t *testing.T) {
+	b := budgetOf(2)
+	b.Acquire()
+	defer b.Release()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.Run(4, func(int) {})
+	}()
+	waitDone(t, done)
+	require.Equal(t, 1, len(b.tokens), "only the outside token is held")
+}
+
+// Work makes one state per worker that does items, and a worker does its items
+// with its own state.
+func TestWorkStatePerWorker(t *testing.T) {
+	type state struct{ items []int }
+	for _, workers := range []int{1, 3} {
+		b := budgetOf(workers)
+		var mu sync.Mutex
+		var states []*state
+		Work(b, workers, 50, func() *state {
+			s := &state{}
+			mu.Lock()
+			states = append(states, s)
+			mu.Unlock()
+			return s
+		}, func(s *state, item int) {
+			s.items = append(s.items, item)
+			time.Sleep(50 * time.Microsecond)
+		})
+		require.LessOrEqual(t, len(states), workers)
+		seen := make(map[int]bool)
+		for _, s := range states {
+			require.NotEmpty(t, s.items, "a state is made only for a worker that does items")
+			for _, item := range s.items {
+				require.False(t, seen[item], "item %d done twice", item)
+				seen[item] = true
+			}
+		}
+		require.Len(t, seen, 50)
+		if workers == 1 {
+			require.Len(t, states, 1)
+			require.True(t, slices.IsSorted(states[0].items), "one worker does the items in order")
+		}
 	}
 }
 
