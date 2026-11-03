@@ -696,3 +696,53 @@ func TestPlaceRejectsWrongLengthRecord(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, sz.Entries, "no :cell record written")
 }
+
+// TestSearchProbesTieGroup: a vector placed under another tie order — by a
+// sort that ranks equal cells lowest index first, say — is still found at
+// nprobe 1, as the search also probes the cells exactly as near as its
+// farthest probed one.
+func TestSearchProbesTieGroup(t *testing.T) {
+	cents := [][]float32{{10}, {0}, {0}, {10}, {10}, {10}, {10}, {10}, {10}, {10}, {10}, {10}, {10}}
+	vecs := make([][]float32, 20)
+	for i := range vecs {
+		vecs[i] = []float32{float32(10 * (i % 2))}
+	}
+	db := openMem(t)
+	serialWrite(t, db, StoreParams{Dim: 1, Assign: 1, NProbe: 1}, cents, seqIDs(20), vecs, lowestFirstCells)
+	for _, q := range [][]float32{{0}, {10}} {
+		got := searchIDs(t, db, q, len(vecs))
+		for i, v := range vecs {
+			if slices.Equal(v, q) {
+				require.True(t, got[string(bid(i))], "query %v misses doc %d", q, i)
+			}
+		}
+	}
+}
+
+// TestProbeCellsTieGroupBounded: the cells added for a tie stop at
+// maxTieProbes, the lowest-index ones when more tie, however many centroids
+// coincide; a query with no exact tie at the boundary probes nprobe cells.
+func TestProbeCellsTieGroupBounded(t *testing.T) {
+	const nlist = 300
+	cents := make([]float32, nlist) // every centroid at 0 but the last
+	cents[nlist-1] = 5
+	ix := &StoreIndex{dim: 1, nlist: nlist, coarse: cents}
+	var scratch []cellDist
+	got := ix.probeCellsInto([]float32{0}, 2, &scratch, nil)
+	require.Len(t, got, 2+maxTieProbes)
+	first := map[int]bool{got[0]: true, got[1]: true}
+	var want []int
+	for c := 0; len(want) < maxTieProbes; c++ {
+		if !first[c] {
+			want = append(want, c)
+		}
+	}
+	require.Equal(t, want, got[2:], "the extra cells are the lowest-index rest of the tie")
+
+	got = ix.probeCellsInto([]float32{5}, 1, &scratch, nil)
+	require.Equal(t, []int{nlist - 1}, got, "no tie at the boundary: nprobe cells")
+	got = ix.probeCellsInto([]float32{4}, 2, &scratch, nil)
+	require.Len(t, got, 2+maxTieProbes, "a tie behind a unique nearest cell")
+	got = ix.probeCellsInto([]float32{float32(math.NaN())}, 3, &scratch, nil)
+	require.Len(t, got, 3, "NaN distances are no tie")
+}
