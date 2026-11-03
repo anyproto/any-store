@@ -71,10 +71,8 @@ shadow in-memory structure that can diverge from disk.
   distance via the float×byte kernel. No codebook beyond the centroids, no encode
   step, no re-rank store — so build/insert are fast and the index is the smallest of
   any mode.
-- Search = probe `NProbe` cells (plus up to 64 more whose centroid is exactly as
-  near as the farthest of them, e.g. duplicated centroids) → score every member →
-  keep the `ef` best → resolve docIDs; results stream back distance-ordered (the
-  planner then skips the sort).
+- Search = probe `NProbe` cells → score every member → keep the `ef` best → resolve
+  docIDs; results stream back distance-ordered (the planner then skips the sort).
 
 ---
 

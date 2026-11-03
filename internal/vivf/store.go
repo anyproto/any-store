@@ -109,14 +109,14 @@ func (ix *StoreIndex) coarseRow(c int) []float32 {
 }
 
 // nearestCellsInto fills out with the n coarse cells nearest (L2) to q, reusing
-// the scratch slice, and leaves every cell in *scratch sorted by distance. The
-// flat-coarse cell finder for both search and build/insert.
+// the scratch slice. The flat-coarse cell finder for both search and
+// build/insert.
 //
 // Cells at an exact distance tie (duplicated centroids, say) come out in the
 // order this distance-only sort of this input leaves them. Every release has
 // placed vectors and probed cells in that order, so it must not change: a
 // vector placed in one cell of a tie by one release would be missed by another
-// release probing a different one (see probeCellsInto).
+// release probing a different one.
 func (ix *StoreIndex) nearestCellsInto(q []float32, n int, scratch *[]cellDist, out []int) []int {
 	cd := *scratch
 	if cap(cd) < ix.nlist {
@@ -136,41 +136,6 @@ func (ix *StoreIndex) nearestCellsInto(q []float32, n int, scratch *[]cellDist, 
 		out = append(out, cd[i].idx)
 	}
 	*scratch = cd
-	return out
-}
-
-// maxTieProbes bounds the cells probeCellsInto adds past nprobe, so a query
-// against many duplicated centroids stays a bounded number of cell seeks.
-const maxTieProbes = 64
-
-// probeCellsInto is the search's cell finder: the nprobe cells nearestCellsInto
-// ranks first — the probe set of every release — plus up to maxTieProbes more
-// cells exactly as near as the farthest of them. Which cell of such a tie a
-// vector went in is down to the sort that ranked the cells when it was
-// written; this release and the earlier ones agree, and the extra cells give
-// bounded additional coverage should another sort or Go version have ranked
-// the tie differently. They come in the sort's order, or, when more than
-// maxTieProbes tie, the lowest-index ones. Without an exact tie at the
-// boundary it is nearestCellsInto.
-func (ix *StoreIndex) probeCellsInto(q []float32, nprobe int, scratch *[]cellDist, out []int) []int {
-	out = ix.nearestCellsInto(q, nprobe, scratch, out)
-	cd := *scratch
-	n := len(out)
-	if n == 0 || n == len(cd) {
-		return out
-	}
-	end := n
-	for end < len(cd) && cd[end].dist == cd[n-1].dist {
-		end++
-	}
-	tied := cd[n:end]
-	if len(tied) > maxTieProbes {
-		slices.SortFunc(tied, func(a, b cellDist) int { return a.idx - b.idx })
-		tied = tied[:maxTieProbes]
-	}
-	for _, c := range tied {
-		out = append(out, c.idx)
-	}
 	return out
 }
 
@@ -692,10 +657,9 @@ func ivfRebuildNList(configured, n int) int {
 }
 
 // SearchCandidates returns up to ef nearest candidates, closest-first. It scans
-// nprobe cells, plus up to maxTieProbes more exactly tied with the farthest of
-// them (see probeCellsInto) — each a contiguous :cell range — scoring every
-// member by exact distance on its int8 record, keeps the ef best, and resolves
-// their docIDs. The cell scans are sequential — the btree-fit read pattern.
+// nprobe cells (each a contiguous :cell range), scoring every member by exact
+// distance on its int8 record, keeps the ef best, and resolves their docIDs.
+// The cell scans are sequential — the btree-fit read pattern.
 func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) ([]Candidate, error) {
 	if ef < 1 {
 		ef = 1
@@ -721,7 +685,7 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 			s.qnorm2 = simd.Dot(qn, qn)
 		}
 	}
-	s.cells = ix.probeCellsInto(qn, ix.nprobe, &s.cd, s.cells)
+	s.cells = ix.nearestCellsInto(qn, ix.nprobe, &s.cd, s.cells)
 
 	// Scan probed cells into s.dedup (label -> best distance).
 	s.dedup.reset()

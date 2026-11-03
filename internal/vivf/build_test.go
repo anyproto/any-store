@@ -526,9 +526,8 @@ func searchIDs(t *testing.T, db *btree.DB, q []float32, ef int) map[string]bool 
 	return out
 }
 
-// requireFindsAll asserts both releases' searches find every doc whose vector
-// equals q, with nprobe 1: this code's SearchCandidates, and the earlier
-// releases' probe.
+// requireFindsAll asserts both searches find every doc whose vector equals q,
+// with nprobe 1: this code's SearchCandidates, and the earlier releases' probe.
 func requireFindsAll(t *testing.T, db *btree.DB, vecs [][]float32, q []float32) {
 	t.Helper()
 	got := searchIDs(t, db, q, len(vecs))
@@ -542,10 +541,12 @@ func requireFindsAll(t *testing.T, db *btree.DB, vecs [][]float32, q []float32) 
 }
 
 // TestTiedCentroidsAcrossReleases builds indexes whose vectors sit at exact
-// ties between duplicated centroids, written by this code and by the releases
-// before it, and searches each both ways with nprobe 1. Ranking a tie
-// differently from those releases (as lowest-index-first did) put a vector in a
-// cell their probe never reaches, and theirs in one this code's probe missed.
+// ties between duplicated centroids, written by this code and by the earlier
+// releases' placement, and searches each with this code's search and the
+// earlier releases' probe at nprobe 1. All of them rank a tie with the same
+// sort, so each search finds every tied vector in either build; a build that
+// ranked the tie another way (lowest index first, say) would put vectors in
+// cells neither search reaches.
 func TestTiedCentroidsAcrossReleases(t *testing.T) {
 	t.Run("alternating", func(t *testing.T) {
 		// 26 docs alternating [0]/[2], NList 13: k-means duplicates the centroids.
@@ -594,53 +595,4 @@ func TestTiedCentroidsAcrossReleases(t *testing.T) {
 		placeWrite(t, newer, p, cents, seqIDs(len(vecs)), vecs)
 		requireSameIndex(t, older, newer)
 	})
-}
-
-// TestSearchProbesTieGroup: a vector placed by another tie order — another
-// sort, another Go version — is still found: the search probes every cell
-// exactly as near as its farthest probed one.
-func TestSearchProbesTieGroup(t *testing.T) {
-	cents := [][]float32{{10}, {0}, {0}, {10}, {10}, {10}, {10}, {10}, {10}, {10}, {10}, {10}, {10}}
-	vecs := make([][]float32, 20)
-	for i := range vecs {
-		vecs[i] = []float32{float32(10 * (i % 2))}
-	}
-	db := openMem(t)
-	serialWrite(t, db, StoreParams{Dim: 1, Assign: 1, NProbe: 1}, cents, seqIDs(20), vecs, lowestFirstCells)
-	for _, q := range [][]float32{{0}, {10}} {
-		got := searchIDs(t, db, q, len(vecs))
-		for i, v := range vecs {
-			if slices.Equal(v, q) {
-				require.True(t, got[string(bid(i))], "query %v misses doc %d", q, i)
-			}
-		}
-	}
-}
-
-// TestProbeCellsTieGroupBounded: the cells added for a tie stop at
-// maxTieProbes (lowest index first), however many centroids coincide, and a
-// query with no exact tie at the boundary probes nprobe cells.
-func TestProbeCellsTieGroupBounded(t *testing.T) {
-	const nlist = 300
-	cents := make([]float32, nlist) // every centroid at 0 but the last
-	cents[nlist-1] = 5
-	ix := &StoreIndex{dim: 1, nlist: nlist, coarse: cents}
-	var scratch []cellDist
-	got := ix.probeCellsInto([]float32{0}, 2, &scratch, nil)
-	require.Len(t, got, 2+maxTieProbes)
-	first := map[int]bool{got[0]: true, got[1]: true}
-	var want []int
-	for c := 0; len(want) < maxTieProbes; c++ {
-		if !first[c] {
-			want = append(want, c)
-		}
-	}
-	require.Equal(t, want, got[2:], "the extra cells are the lowest-index rest of the tie")
-
-	got = ix.probeCellsInto([]float32{5}, 1, &scratch, nil)
-	require.Equal(t, []int{nlist - 1}, got, "no tie at the boundary: nprobe cells")
-	got = ix.probeCellsInto([]float32{4}, 2, &scratch, nil)
-	require.Len(t, got, 2+maxTieProbes, "a tie behind a unique nearest cell")
-	got = ix.probeCellsInto([]float32{float32(math.NaN())}, 3, &scratch, nil)
-	require.Len(t, got, 3, "NaN distances are no tie")
 }
