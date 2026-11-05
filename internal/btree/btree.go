@@ -1673,14 +1673,17 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []pat
 	if err != nil {
 		return err
 	}
-	if err := bt.rebuildLeafPage(pg, leftCells); err != nil {
-		return err
-	}
-	if err := bt.rebuildLeafPage(rightPg, rightCells); err != nil {
-		return err
+	// rightPg is released on every exit, as balance_cleanup releases apNew
+	// (btree.c:9007-9009).
+	err = bt.rebuildLeafPage(pg, leftCells)
+	if err == nil {
+		err = bt.rebuildLeafPage(rightPg, rightCells)
 	}
 	rightPgno := rightPg.pgno
 	bt.pager.releasePage(rightPg)
+	if err != nil {
+		return err
+	}
 
 	if path != nil {
 		return bt.insertIntoParentWithPath(pg, sepKey, rightPgno, path)
@@ -1912,9 +1915,31 @@ func (bt *btree) collectInteriorCells(pg *page) ([]cellData, error) {
 	return cells, nil
 }
 
+// rebuildPageFaultHook is a test-only fault-injection point for
+// rebuildLeafPage and rebuildInteriorPage. It is nil in production, so a
+// rebuild pays one atomic load. Tests install it with setRebuildPageFaultHook
+// to fail the rebuild of a chosen page and check that the split paths release
+// the page they allocated.
+var rebuildPageFaultHook atomic.Pointer[func(pg *page) error]
+
+// setRebuildPageFaultHook installs (fn != nil) or clears (fn == nil) the
+// rebuild fault-injection hook. Test-only.
+func setRebuildPageFaultHook(fn func(pg *page) error) {
+	if fn == nil {
+		rebuildPageFaultHook.Store(nil)
+		return
+	}
+	rebuildPageFaultHook.Store(&fn)
+}
+
 // rebuildLeafPage rewrites a leaf page from a list of cells.
 // Cells with large values will have overflow chains written automatically.
 func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
+	if hook := rebuildPageFaultHook.Load(); hook != nil {
+		if err := (*hook)(pg); err != nil {
+			return err
+		}
+	}
 	pageUsable := bt.usablePageSize()
 	hdrOff := 0
 	if pg.pgno == 1 {
@@ -1997,6 +2022,11 @@ func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
 // Keys that exceed maxLocal are written with overflow chains.
 // DRIFT: rebuildInteriorPage writes 0-cell pages; C rebuildPage asserts nCell>0 See docs/btree/NOTES.md#drift-31-rebuildinteriorpage-accepts-zero-cell-pages
 func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint32) error {
+	if hook := rebuildPageFaultHook.Load(); hook != nil {
+		if err := (*hook)(pg); err != nil {
+			return err
+		}
+	}
 	pageUsable := bt.usablePageSize()
 	hdrOff := 0
 	if pg.pgno == 1 {
@@ -2514,24 +2544,20 @@ func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error 
 		return err
 	}
 
-	// Rebuild left page (reuse current page)
-	if err := bt.rebuildLeafPage(pg, leftCells); err != nil {
-		bt.pager.recycleCellSlice(cells)
-		bt.pager.recycleCellBuf(cellBuf)
-		return err
-	}
-
-	// Build right page
-	if err := bt.rebuildLeafPage(rightPg, rightCells); err != nil {
-		bt.pager.recycleCellSlice(cells)
-		bt.pager.recycleCellBuf(cellBuf)
-		return err
+	// Rebuild the left page in place, then the right page. The cell buffers
+	// and rightPg are returned on every exit, as balance_cleanup releases
+	// apNew (btree.c:9007-9009).
+	err = bt.rebuildLeafPage(pg, leftCells)
+	if err == nil {
+		err = bt.rebuildLeafPage(rightPg, rightCells)
 	}
 	bt.pager.recycleCellSlice(cells)
 	bt.pager.recycleCellBuf(cellBuf)
-
 	rightPgno := rightPg.pgno
 	bt.pager.releasePage(rightPg)
+	if err != nil {
+		return err
+	}
 
 	// Insert separator into parent
 	return bt.insertIntoParent(pg, sepKey, rightPgno)
@@ -2604,6 +2630,8 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 	// Copy old root content to new left page.
 	// Detect whether the root is a leaf or interior page and use the
 	// appropriate collect/rebuild path so we don't misinterpret cell formats.
+	// newLeftPg is released on every exit, as balance_deeper releases pChild
+	// (btree.c:9055-9058).
 	if oldRoot.header.isLeaf() {
 		// Leaf root: collect leaf cells and rebuild as leaf in the new page.
 		cells, cellBuf, cerr := bt.collectLeafCells(oldRoot)
@@ -2612,12 +2640,9 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 			return cerr
 		}
 		newLeftPg.header = oldRoot.header
-		err := bt.rebuildLeafPage(newLeftPg, cells)
+		err = bt.rebuildLeafPage(newLeftPg, cells)
 		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
-		if err != nil {
-			return err
-		}
 	} else {
 		// Interior root: collect interior cells and rebuild as interior in the
 		// new page, preserving the rightChild pointer.
@@ -2627,13 +2652,13 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 			return cerr
 		}
 		newLeftPg.header = oldRoot.header
-		if err := bt.rebuildInteriorPage(newLeftPg, cells, oldRoot.header.rightChild); err != nil {
-			return err
-		}
+		err = bt.rebuildInteriorPage(newLeftPg, cells, oldRoot.header.rightChild)
 	}
-
 	newLeftPgno := newLeftPg.pgno
 	bt.pager.releasePage(newLeftPg)
+	if err != nil {
+		return err
+	}
 
 	// Convert old root into an interior page with one cell
 	cells := []cellData{
