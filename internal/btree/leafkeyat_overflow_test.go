@@ -68,7 +68,9 @@ func TestLeafKeyAt_SpilledKey(t *testing.T) {
 
 // leafKeyAt rejects length varints above maxPayloadAlloc, singly and as a
 // sum, before it looks at the spill threshold. The cell sits low on the page
-// so that the local-part bounds check alone would not catch it.
+// so that the local-part bounds check alone would not catch it. A length with
+// the top bit set converts to a negative int, which only the per-varint cap
+// stops before the slice bounds.
 func TestLeafKeyAt_PayloadAboveAllocCap(t *testing.T) {
 	p := tempPager(t)
 	pg, err := p.allocatePage()
@@ -85,6 +87,8 @@ func TestLeafKeyAt_PayloadAboveAllocCap(t *testing.T) {
 		{"key-above-cap", maxPayloadAlloc + 1, 0},
 		{"value-above-cap", 1, maxPayloadAlloc + 1},
 		{"sum-above-cap", maxPayloadAlloc, 1},
+		{"key-top-bit", 1 << 63, 0},
+		{"value-top-bit", 1, 1 << 63},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const off = 200 // free space between the cell pointers and the content area
@@ -326,7 +330,8 @@ func TestCursor_SeekNearSpilledKeys(t *testing.T) {
 		c, _, cerr := parseLeafCellWithSize(leaf.data, int(off), usable)
 		require.NoError(t, cerr)
 		require.NotZero(t, c.overflowPg, "the first key spills")
-		require.LessOrEqual(t, int(off)+keyLen, len(leaf.data), "keyLen bytes from the first cell stay inside the page")
+		require.LessOrEqual(t, int(off)+varintSize(uint64(keyLen))+1+keyLen, len(leaf.data),
+			"keyLen bytes from the first cell's key start stay inside the page")
 		_, err = leafKeyAt(leaf, int(leaf.header.cellCount)-1, usable)
 		require.NoError(t, err, "the last key is local")
 

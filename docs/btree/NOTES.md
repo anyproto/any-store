@@ -3400,9 +3400,11 @@ load; `-tags btreetesthooks` enables the hook and the two ErrBusySnapshot retry-
 the mechanism (build tag + const vs `#ifdef`); the gating structure follows upstream.
 
 Two fault hooks are compiled into every build instead, as nil-checked atomic pointers: `walReadFrameFaultHook`
-(`wal.go`, `readFrame`/`readFrameRaw`) and `rebuildPageFaultHook` (`btree.go`, `rebuildLeafPage`/`rebuildInteriorPage`).
-Each costs one atomic load on a path that already moves a page of data, and the tests behind them run in the default
-`go test` (no Makefile or CI target passes `-tags btreetesthooks`, so a tag-gated hook would leave them unrun).
+(`wal.readFrame`, `wal.readFrameRaw`, `pager.readWalFrameData`) and `rebuildPageFaultHook` (`btree.rebuildLeafPage`,
+`btree.rebuildInteriorPage`); the plain function-variable test hooks (`testRecycleTempPageHook`,
+`testCommitPrePublishHook`) are always compiled as well. Each costs one nil check on a path that already moves a
+page of data, and the tests behind them run in the default `go test` (no Makefile or CI target passes
+`-tags btreetesthooks`, so a tag-gated hook would leave them unrun).
 
 ---
 
