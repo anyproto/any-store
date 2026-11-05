@@ -1673,14 +1673,17 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []pat
 	if err != nil {
 		return err
 	}
-	if err := bt.rebuildLeafPage(pg, leftCells); err != nil {
-		return err
-	}
-	if err := bt.rebuildLeafPage(rightPg, rightCells); err != nil {
-		return err
+	// rightPg is released on every exit, as balance_cleanup releases apNew
+	// (btree.c:9007-9009).
+	err = bt.rebuildLeafPage(pg, leftCells)
+	if err == nil {
+		err = bt.rebuildLeafPage(rightPg, rightCells)
 	}
 	rightPgno := rightPg.pgno
 	bt.pager.releasePage(rightPg)
+	if err != nil {
+		return err
+	}
 
 	if path != nil {
 		return bt.insertIntoParentWithPath(pg, sepKey, rightPgno, path)
@@ -1912,9 +1915,31 @@ func (bt *btree) collectInteriorCells(pg *page) ([]cellData, error) {
 	return cells, nil
 }
 
+// rebuildPageFaultHook is a test-only fault-injection point for
+// rebuildLeafPage and rebuildInteriorPage. It is nil in production, so a
+// rebuild pays one atomic load. Tests install it with setRebuildPageFaultHook
+// to fail the rebuild of a chosen page and check that the split paths release
+// the page they allocated.
+var rebuildPageFaultHook atomic.Pointer[func(pg *page) error]
+
+// setRebuildPageFaultHook installs (fn != nil) or clears (fn == nil) the
+// rebuild fault-injection hook. Test-only.
+func setRebuildPageFaultHook(fn func(pg *page) error) {
+	if fn == nil {
+		rebuildPageFaultHook.Store(nil)
+		return
+	}
+	rebuildPageFaultHook.Store(&fn)
+}
+
 // rebuildLeafPage rewrites a leaf page from a list of cells.
 // Cells with large values will have overflow chains written automatically.
 func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
+	if hook := rebuildPageFaultHook.Load(); hook != nil {
+		if err := (*hook)(pg); err != nil {
+			return err
+		}
+	}
 	pageUsable := bt.usablePageSize()
 	hdrOff := 0
 	if pg.pgno == 1 {
@@ -1997,6 +2022,11 @@ func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
 // Keys that exceed maxLocal are written with overflow chains.
 // DRIFT: rebuildInteriorPage writes 0-cell pages; C rebuildPage asserts nCell>0 See docs/btree/NOTES.md#drift-31-rebuildinteriorpage-accepts-zero-cell-pages
 func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint32) error {
+	if hook := rebuildPageFaultHook.Load(); hook != nil {
+		if err := (*hook)(pg); err != nil {
+			return err
+		}
+	}
 	pageUsable := bt.usablePageSize()
 	hdrOff := 0
 	if pg.pgno == 1 {
@@ -2514,24 +2544,20 @@ func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error 
 		return err
 	}
 
-	// Rebuild left page (reuse current page)
-	if err := bt.rebuildLeafPage(pg, leftCells); err != nil {
-		bt.pager.recycleCellSlice(cells)
-		bt.pager.recycleCellBuf(cellBuf)
-		return err
-	}
-
-	// Build right page
-	if err := bt.rebuildLeafPage(rightPg, rightCells); err != nil {
-		bt.pager.recycleCellSlice(cells)
-		bt.pager.recycleCellBuf(cellBuf)
-		return err
+	// Rebuild the left page in place, then the right page. rightPg is
+	// released whether or not a rebuild failed, as balance_cleanup releases
+	// apNew (btree.c:9007-9009).
+	err = bt.rebuildLeafPage(pg, leftCells)
+	if err == nil {
+		err = bt.rebuildLeafPage(rightPg, rightCells)
 	}
 	bt.pager.recycleCellSlice(cells)
 	bt.pager.recycleCellBuf(cellBuf)
-
 	rightPgno := rightPg.pgno
 	bt.pager.releasePage(rightPg)
+	if err != nil {
+		return err
+	}
 
 	// Insert separator into parent
 	return bt.insertIntoParent(pg, sepKey, rightPgno)
@@ -2604,6 +2630,8 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 	// Copy old root content to new left page.
 	// Detect whether the root is a leaf or interior page and use the
 	// appropriate collect/rebuild path so we don't misinterpret cell formats.
+	// newLeftPg is released on every exit; balance_deeper releases pChild on
+	// its error exit (btree.c:9055-9058) and hands it to the cursor otherwise.
 	if oldRoot.header.isLeaf() {
 		// Leaf root: collect leaf cells and rebuild as leaf in the new page.
 		cells, cellBuf, cerr := bt.collectLeafCells(oldRoot)
@@ -2612,12 +2640,9 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 			return cerr
 		}
 		newLeftPg.header = oldRoot.header
-		err := bt.rebuildLeafPage(newLeftPg, cells)
+		err = bt.rebuildLeafPage(newLeftPg, cells)
 		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
-		if err != nil {
-			return err
-		}
 	} else {
 		// Interior root: collect interior cells and rebuild as interior in the
 		// new page, preserving the rightChild pointer.
@@ -2627,13 +2652,13 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 			return cerr
 		}
 		newLeftPg.header = oldRoot.header
-		if err := bt.rebuildInteriorPage(newLeftPg, cells, oldRoot.header.rightChild); err != nil {
-			return err
-		}
+		err = bt.rebuildInteriorPage(newLeftPg, cells, oldRoot.header.rightChild)
 	}
-
 	newLeftPgno := newLeftPg.pgno
 	bt.pager.releasePage(newLeftPg)
+	if err != nil {
+		return err
+	}
 
 	// Convert old root into an interior page with one cell
 	cells := []cellData{
@@ -4001,13 +4026,21 @@ func (c *Cursor) seek(key []byte) error {
 	return nil
 }
 
-// leafKeyAt extracts the key at cell index idx from a leaf page.
-// The returned slice points into the page buffer. This is a lightweight
-// alternative to parseLeafCellWithSize when only the key is needed.
-// For overflow cells where the key spills off-page, returns ErrCorrupt
-// so that callers (SeekNear) fall back to full Seek. This avoids needing
-// pager access in this lightweight function.
-func leafKeyAt(pg *page, idx int) ([]byte, error) {
+// leafKeyAt extracts the key at cell index idx from a leaf page without
+// touching the pager. The returned slice points into the page buffer.
+//
+// A spilled cell keeps only nLocal payload bytes on the page, followed by the
+// overflow page number, so a key that continues in the overflow chain cannot
+// be sliced from the page: leafKeyAt returns errLeafKeySpilled and the caller
+// takes the full-key path (leafFullKey). A key that lies entirely in the local
+// part of a spilled cell (only the value overflows) is returned from the page.
+//
+// Matches indexCellCompare (btree.c:5952-5982), which compares the record in
+// place only when it fits on the page and otherwise returns "do not attempt
+// the optimization", so the already-positioned shortcut of
+// sqlite3BtreeIndexMoveto (btree.c:6060-6081) falls back to the full descent.
+// DRIFT: leafKeyAt serves a fully local key from a cell whose value spills; indexCellCompare declines any overflowing record See docs/btree/NOTES.md#drift-2026-11-05-leafkeyat-serves-a-local-key-from-a-value-spilling-cell
+func leafKeyAt(pg *page, idx int, usableSize int) ([]byte, error) {
 	data := pg.data
 	dataLen := len(data)
 	off, err := pg.getCellOffsetSafe(idx)
@@ -4018,52 +4051,51 @@ func leafKeyAt(pg *page, idx int) ([]byte, error) {
 	if pos >= dataLen {
 		return nil, ErrCorrupt
 	}
-	// New format: [varint(keyLen)] [varint(valLen)] [key||value...]
-	b := data[pos]
-	if b < 0x80 {
-		kl := int(b)
-		// Skip valLen varint
-		valOff := pos + 1
-		if valOff >= dataLen {
+	// Leaf cell: [varint(keyLen)] [varint(valLen)] [key||value...]
+	var keyLen, valLen int
+	if b := data[pos]; b < 0x80 {
+		keyLen = int(b)
+		pos++
+	} else {
+		kl, n, kerr := getVarintSafe(data[pos:])
+		if kerr != nil || kl > maxPayloadAlloc {
 			return nil, ErrCorrupt
 		}
-		if data[valOff] < 0x80 {
-			keyStart := valOff + 1
-			end := keyStart + kl
-			if end > dataLen {
-				return nil, ErrCorrupt
-			}
-			return data[keyStart:end], nil
-		}
-		_, vn, verr := getVarintSafe(data[valOff:])
-		if verr != nil {
-			return nil, ErrCorrupt
-		}
-		keyStart := valOff + vn
-		end := keyStart + kl
-		if end > dataLen {
-			return nil, ErrCorrupt
-		}
-		return data[keyStart:end], nil
+		keyLen = int(kl)
+		pos += n
 	}
-	keyLen, kn, kerr := getVarintSafe(data[pos:])
-	if kerr != nil {
-		return nil, ErrCorrupt
-	}
-	pos += kn
 	if pos >= dataLen {
 		return nil, ErrCorrupt
 	}
-	_, vn, verr := getVarintSafe(data[pos:])
-	if verr != nil {
+	if b := data[pos]; b < 0x80 {
+		valLen = int(b)
+		pos++
+	} else {
+		vl, n, verr := getVarintSafe(data[pos:])
+		if verr != nil || vl > maxPayloadAlloc {
+			return nil, ErrCorrupt
+		}
+		valLen = int(vl)
+		pos += n
+	}
+	totalPayload := keyLen + valLen
+	if totalPayload > maxPayloadAlloc {
 		return nil, ErrCorrupt
 	}
-	keyStart := pos + vn
-	end := keyStart + int(keyLen)
-	if int(keyLen) < 0 || end > dataLen {
+	if totalPayload > maxLocalPayload(usableSize) {
+		nLocal := localPayloadSize(totalPayload, usableSize)
+		if pos+nLocal+overflowPtrSize > dataLen {
+			return nil, ErrCorrupt
+		}
+		if keyLen > nLocal {
+			return nil, errLeafKeySpilled
+		}
+	}
+	end := pos + keyLen
+	if end > dataLen {
 		return nil, ErrCorrupt
 	}
-	return data[keyStart:end], nil
+	return data[pos:end], nil
 }
 
 // SeekNear positions the cursor at the first key >= the given key.
@@ -4077,14 +4109,15 @@ func (c *Cursor) SeekNear(key []byte) error {
 		if leaf.pg != nil {
 			n := int(leaf.pg.header.cellCount)
 			if n > 0 {
-				firstKey, err := leafKeyAt(leaf.pg, 0)
+				usable := c.bt.usablePageSize()
+				firstKey, err := leafKeyAt(leaf.pg, 0, usable)
 				if err != nil {
-					// leafKeyAt cannot reconstruct overflow keys. Fall back to full seek.
+					// The key spills to an overflow chain (or the cell is
+					// corrupt): the full seek reads it through leafFullKey.
 					return c.Seek(key)
 				}
-				lastKey, err := leafKeyAt(leaf.pg, n-1)
+				lastKey, err := leafKeyAt(leaf.pg, n-1, usable)
 				if err != nil {
-					// leafKeyAt cannot reconstruct overflow keys. Fall back to full seek.
 					return c.Seek(key)
 				}
 				if bytes.Compare(key, firstKey) >= 0 && bytes.Compare(key, lastKey) <= 0 {
@@ -4169,13 +4202,14 @@ func (c *Cursor) AppendValueByKey(key []byte, buf []byte) ([]byte, error) {
 }
 
 // currentKeyEqual checks whether the cursor's current key is equal to key.
-// Fast path uses in-page key extraction; overflow keys fall back to Key().
+// Fast path uses in-page key extraction; a key that spills to an overflow
+// chain (or a corrupt cell) falls back to Key().
 func (c *Cursor) currentKeyEqual(key []byte) (bool, error) {
 	frame := &c.stack[len(c.stack)-1]
 	if frame.pg == nil {
 		return false, ErrCorrupt
 	}
-	if k, err := leafKeyAt(frame.pg, frame.cellIdx); err == nil {
+	if k, err := leafKeyAt(frame.pg, frame.cellIdx, c.bt.usablePageSize()); err == nil {
 		return bytes.Equal(k, key), nil
 	}
 	k, err := c.Key()

@@ -759,7 +759,7 @@ func TestLeafKeyAtMultiByteVarint(t *testing.T) {
 	longKey := bytes.Repeat([]byte("k"), 200)
 	require.NoError(t, bt.rebuildLeafPage(pg, []cellData{{key: longKey, value: []byte("v")}}))
 
-	k, err := leafKeyAt(pg, 0)
+	k, err := leafKeyAt(pg, 0, p.usableSize())
 	assert.NoError(t, err)
 	assert.Equal(t, longKey, k)
 
@@ -774,7 +774,7 @@ func TestLeafKeyAtShortKeyLongVal(t *testing.T) {
 
 	require.NoError(t, bt.rebuildLeafPage(pg, []cellData{{key: []byte("abc"), value: bytes.Repeat([]byte("v"), 200)}}))
 
-	k, err := leafKeyAt(pg, 0)
+	k, err := leafKeyAt(pg, 0, p.usableSize())
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("abc"), k)
 
@@ -790,7 +790,7 @@ func TestLeafKeyAtCorruptOffset(t *testing.T) {
 	// Corrupt the cell pointer to point beyond page data
 	cpOff := pg.cellPointerOffset()
 	binary.BigEndian.PutUint16(pg.data[cpOff:], uint16(len(pg.data)+10))
-	_, err = leafKeyAt(pg, 0)
+	_, err = leafKeyAt(pg, 0, p.usableSize())
 	assert.Error(t, err)
 	p.releasePage(pg)
 }
@@ -2815,7 +2815,7 @@ func TestLeafKeyAtLargeKeyAndValue(t *testing.T) {
 	bigVal := bytes.Repeat([]byte("V"), 200)
 	require.NoError(t, bt.rebuildLeafPage(pg, []cellData{{key: bigKey, value: bigVal}}))
 
-	k, err := leafKeyAt(pg, 0)
+	k, err := leafKeyAt(pg, 0, p.usableSize())
 	assert.NoError(t, err)
 	assert.Equal(t, bigKey, k)
 	p.releasePage(pg)
@@ -3516,7 +3516,7 @@ func TestLeafKeyAtCorruptKeyEndBeyondData(t *testing.T) {
 	off := int(pg.getCellOffset(0))
 	pg.data[off] = 0x7F // keyLen = 127, but only tiny space after varints
 
-	_, err = leafKeyAt(pg, 0)
+	_, err = leafKeyAt(pg, 0, p.usableSize())
 	// May or may not error depending on page data layout
 	_ = err
 
@@ -3532,7 +3532,7 @@ func TestLeafKeyAtMultiByteValLen(t *testing.T) {
 	// Short key with value > 127 bytes (multi-byte valLen varint)
 	bt.rebuildLeafPage(pg, []cellData{{key: []byte("abc"), value: bytes.Repeat([]byte("V"), 200)}})
 
-	k, err := leafKeyAt(pg, 0)
+	k, err := leafKeyAt(pg, 0, p.usableSize())
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("abc"), k)
 	p.releasePage(pg)
@@ -4613,7 +4613,7 @@ func TestCov_LeafKeyAtValOffBeyondData(t *testing.T) {
 	cpOff := pg.cellPointerOffset()
 	binary.BigEndian.PutUint16(pg.data[cpOff:], uint16(len(pg.data)-1))
 
-	_, err = leafKeyAt(pg, 0)
+	_, err = leafKeyAt(pg, 0, p.usableSize())
 	assert.Error(t, err)
 	p.releasePage(pg)
 }
@@ -4635,7 +4635,7 @@ func TestCov_LeafKeyAtMultiByteValLenError(t *testing.T) {
 	pg.data[target+1] = 0x80 // multi-byte valLen start (continuation bit set)
 	pg.data[target+2] = 0x80 // still continuation, no terminator - truncated
 
-	_, err = leafKeyAt(pg, 0)
+	_, err = leafKeyAt(pg, 0, p.usableSize())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -4659,7 +4659,7 @@ func TestCov_LeafKeyAtMultiByteKeyEndBeyondData(t *testing.T) {
 	pg.data[target+2] = 0x01 // valLen continuation+terminator (value=128)
 	// keyStart = target+3, end = target+3+120 > dataLen
 
-	_, err = leafKeyAt(pg, 0)
+	_, err = leafKeyAt(pg, 0, p.usableSize())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -4681,7 +4681,7 @@ func TestCov_LeafKeyAtMultiByteKeyLenPosError(t *testing.T) {
 	pg.data[target+1] = 0x80 // continuation bit set
 	pg.data[target+2] = 0x80 // continuation bit set, no room for terminator
 
-	_, err = leafKeyAt(pg, 0)
+	_, err = leafKeyAt(pg, 0, p.usableSize())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -4695,7 +4695,7 @@ func TestCov_LeafKeyAtCellOffsetSafeError(t *testing.T) {
 	bt.rebuildLeafPage(pg, []cellData{{key: []byte("k"), value: []byte("v")}})
 
 	// For 4096-byte page with 8-byte leaf header: need 8 + cellIdx*2 + 2 > 4096 => cellIdx > 2043
-	_, err = leafKeyAt(pg, 9999)
+	_, err = leafKeyAt(pg, 9999, p.usableSize())
 	assert.Error(t, err)
 	p.releasePage(pg)
 }
@@ -4712,7 +4712,7 @@ func TestCov_LeafKeyAtPosBeyondDataLen(t *testing.T) {
 	cpOff := pg.cellPointerOffset()
 	binary.BigEndian.PutUint16(pg.data[cpOff:], uint16(len(pg.data)))
 
-	_, err = leafKeyAt(pg, 0)
+	_, err = leafKeyAt(pg, 0, p.usableSize())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -5870,7 +5870,7 @@ func TestCov_LeafKeyAtMultiByteKeyPosGEDataLen(t *testing.T) {
 	pg.data[target] = 0x80   // continuation
 	pg.data[target+1] = 0x01 // terminator, keyLen=128. pos = target+2 == dataLen
 
-	_, err = leafKeyAt(pg, 0)
+	_, err = leafKeyAt(pg, 0, p.usableSize())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -5891,13 +5891,14 @@ func TestCov_LeafKeyAtMultiByteValLenVarintError2(t *testing.T) {
 	pg.data[target+2] = 0x80 // valLen continuation (truncated)
 	pg.data[target+3] = 0x80 // valLen still continuation, no terminator
 
-	_, err = leafKeyAt(pg, 0)
+	_, err = leafKeyAt(pg, 0, p.usableSize())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }
 
 func TestCov_LeafKeyAtMultiByteKeyEndBeyondDataLen2(t *testing.T) {
-	// L2648-2650: end > dataLen with multi-byte keyLen
+	// A multi-byte keyLen far above maxLocal makes the cell look spilled, and
+	// its local part runs past the page end.
 	p := tempPager(t)
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -5911,7 +5912,7 @@ func TestCov_LeafKeyAtMultiByteKeyEndBeyondDataLen2(t *testing.T) {
 	pg.data[target+1] = 0x7f // keyLen terminator (=16256, too large)
 	pg.data[target+2] = 0x01 // valLen = 1 (single byte)
 
-	_, err = leafKeyAt(pg, 0)
+	_, err = leafKeyAt(pg, 0, p.usableSize())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }

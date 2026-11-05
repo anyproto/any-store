@@ -1,8 +1,11 @@
 package anystore
 
 import (
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -336,4 +339,44 @@ func TestAggIterator_DocAfterClose(t *testing.T) {
 	require.NoError(t, iter.Close())
 	_, err = iter.Doc()
 	assert.ErrorIs(t, err, ErrIterClosed)
+}
+
+// Doc() after an in-memory sort re-seeks the data tree by id. A document that
+// overflows keeps only part of a long id on the leaf page, and the exact seek
+// has to compare the id reassembled from the overflow chain.
+func TestIterator_DocAfterSortWithLongIds(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+
+	const n = 40
+	rnd := rand.NewChaCha8([32]byte{1})
+	ids := make([]string, n)
+	for i := range n {
+		ids[i] = fmt.Sprintf("%0600d", i)
+		body := make([]byte, 900+i*150) // 1.2 to 9 KB once encoded, so every document overflows
+		_, err := rnd.Read(body)
+		require.NoError(t, err)
+		doc := fmt.Sprintf(`{"id":%q,"v":%d,"body":%q}`, ids[i], i, base64.StdEncoding.EncodeToString(body))
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(doc)))
+	}
+
+	// The counters show that every Doc() took the re-seek path.
+	EnablePipelinePerfCounters(true)
+	t.Cleanup(func() { EnablePipelinePerfCounters(false) })
+	resetPipelinePerfCounters()
+
+	iter, err := coll.Find(nil).Sort("-v").Iter(ctx)
+	require.NoError(t, err)
+	defer func() { _ = iter.Close() }()
+	rows := 0
+	for iter.Next() {
+		doc, err := iter.Doc()
+		require.NoError(t, err, "row %d", rows)
+		assert.Equal(t, ids[n-1-rows], doc.Value().GetString("id"), "row %d", rows)
+		rows++
+	}
+	require.NoError(t, iter.Err())
+	assert.Equal(t, n, rows)
+	assert.EqualValues(t, n, pipePerf.docFallbacks.Load(), "Doc() re-seeks by id after an in-memory sort")
 }

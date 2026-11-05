@@ -3399,6 +3399,13 @@ with the `btreetesthooks` build tag: default builds define `const walTestHooks =
 load; `-tags btreetesthooks` enables the hook and the two ErrBusySnapshot retry-contract tests. The drift is only
 the mechanism (build tag + const vs `#ifdef`); the gating structure follows upstream.
 
+Two fault hooks are compiled into every build instead, as nil-checked atomic pointers: `walReadFrameFaultHook`
+(`wal.readFrame`, `wal.readFrameRaw`, `pager.readWalFrameData`) and `rebuildPageFaultHook` (`btree.rebuildLeafPage`,
+`btree.rebuildInteriorPage`); the plain function-variable test hooks (for example `testRecycleTempPageHook` and
+`testCommitPrePublishHook`) are always compiled as well. Each costs one nil check on a path that already moves a
+page of data, and the tests behind them run in the default `go test` (no Makefile or CI target passes
+`-tags btreetesthooks`, so a tag-gated hook would leave them unrun).
+
 ---
 
 ## Audit-Discovered Drifts (2026-06-25)
@@ -3702,3 +3709,10 @@ The Go `WalIndexHdr` mirrors SQLite's struct and reserves byte 13 as `bigEndCksu
 - **Affected functions:** `db.go:DB.RenameNamespace` / `db.go:WriteTx.RenameNamespace` (`internal/btree/db.go`, after `DeleteNamespace`).
 
 SQLite's ALTER TABLE ... RENAME is an UPDATE of the existing `sqlite_master` row's `name` column: the row (and the table's `rootpage`) stays put, the statement rewrites SQL text that references the old name (triggers, views, FK clauses — `alter.c:renameTableFunc`), and the schema cookie is bumped by the statement itself. The Go master table (page 1) is keyed BY the namespace name with the root page as the 4-byte value, so a rename is necessarily a re-key: `Delete(oldName)` + `Put(newName, rootPgBuf)` inside the same write tx — the entry is transiently absent within the tx but atomic at commit, and the root page (hence every `*Namespace` handle addressing the tree by root) is untouched. There is no SQL layer, so no stored-text rewriting exists to port. Divergently from the SQLite statement (but consistently with this package's `CreateNamespace`/`DeleteNamespace`), `RenameNamespace` does NOT bump the schema cookie — the caller must invoke `tx.MarkSchemaChanged()`, and the any-store layer's `renameCollection` does, which is what lets cross-process peers detect the rename via `IsSchemaStale`. Error surface: `ErrNamespaceNotFound` (old absent), `ErrNamespaceExists` (new taken), `ErrTxClosed`; a failure between the Delete and the Put dooms the tx (caller must roll back), the same contract as a `CreateNamespace` failure after page allocation. The page-1 spill exclusion (see the pagerStress page-1 guard notes) applies to the master-table dirtying here exactly as it does for create/delete. Regression tests: `internal/btree/namespace_rename_test.go` (happy path, interior master table, rollback/savepoint, delete interplay, freelist accounting).
+
+<a id="drift-2026-11-05-leafkeyat-serves-a-local-key-from-a-value-spilling-cell"></a>
+### Drift: leafKeyAt Serves A Fully Local Key From A Cell Whose Value Spills, Where indexCellCompare Declines Any Overflowing Record
+- **Category:** changed-logic  -  **Severity:** none
+- **Affected functions:** `btree.go:leafKeyAt`; callers `btree.go:*Cursor.SeekNear`, `btree.go:*Cursor.currentKeyEqual`.
+
+SQLite's `indexCellCompare` (`btree.c:5952-5982`) compares a record in place only when its size varint is one or two bytes and the whole record fits on the page; a record that extends into overflow pages returns 99, and the already-positioned shortcut of `sqlite3BtreeIndexMoveto` (`btree.c:6060-6081`) falls back to `moveToRoot`. An index record has no separate value, so "the record spills" and "the key spills" coincide there. The Go leaf cell carries `key||value`, and a document cell with a short id and a large body spills while its key is wholly on the page. `leafKeyAt` returns such a key from the page and declines (`errLeafKeySpilled`) only when the key itself continues in the overflow chain, i.e. when `keyLen > nLocal` under the same `maxLocalPayload`/`localPayloadSize` split that every leaf writer uses, so a key it serves is always complete. It also accepts length varints of any width, capped by `maxPayloadAlloc`. The consequence is that the in-page fast path of `SeekNear` and `currentKeyEqual` stays available for `Iterator.Doc()`'s re-seek by id on overflowing documents; a literal port would send every such lookup through `leafFullKey` and the overflow chain. Regression tests: `internal/btree/leafkeyat_overflow_test.go` (`TestLeafKeyAt_SpilledKey` serves the local key of a value-spilling cell and refuses spilled keys; `TestCursor_SeekNearSpilledKeys/local-first-and-last-keys` runs the in-leaf check over spilled cells).
