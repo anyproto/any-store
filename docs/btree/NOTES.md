@@ -3399,6 +3399,11 @@ with the `btreetesthooks` build tag: default builds define `const walTestHooks =
 load; `-tags btreetesthooks` enables the hook and the two ErrBusySnapshot retry-contract tests. The drift is only
 the mechanism (build tag + const vs `#ifdef`); the gating structure follows upstream.
 
+Two fault hooks are compiled into every build instead, as nil-checked atomic pointers: `walReadFrameFaultHook`
+(`wal.go`, `readFrame`/`readFrameRaw`) and `rebuildPageFaultHook` (`btree.go`, `rebuildLeafPage`/`rebuildInteriorPage`).
+Each costs one atomic load on a path that already moves a page of data, and the tests behind them run in the default
+`go test` (no Makefile or CI target passes `-tags btreetesthooks`, so a tag-gated hook would leave them unrun).
+
 ---
 
 ## Audit-Discovered Drifts (2026-06-25)

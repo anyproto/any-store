@@ -2630,8 +2630,8 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 	// Copy old root content to new left page.
 	// Detect whether the root is a leaf or interior page and use the
 	// appropriate collect/rebuild path so we don't misinterpret cell formats.
-	// newLeftPg is released on every exit, as balance_deeper releases pChild
-	// (btree.c:9055-9058).
+	// newLeftPg is released on every exit; balance_deeper releases pChild on
+	// its error exit (btree.c:9055-9058) and hands it to the cursor otherwise.
 	if oldRoot.header.isLeaf() {
 		// Leaf root: collect leaf cells and rebuild as leaf in the new page.
 		cells, cellBuf, cerr := bt.collectLeafCells(oldRoot)
@@ -4035,7 +4035,7 @@ func (c *Cursor) seek(key []byte) error {
 // takes the full-key path (leafFullKey). A key that lies entirely in the local
 // part of a spilled cell (only the value overflows) is returned from the page.
 //
-// Matches indexCellCompare (btree.c:5952-5978), which compares the record in
+// Matches indexCellCompare (btree.c:5952-5982), which compares the record in
 // place only when it fits on the page and otherwise returns "do not attempt
 // the optimization", so the already-positioned shortcut of
 // sqlite3BtreeIndexMoveto (btree.c:6060-6081) falls back to the full descent.
