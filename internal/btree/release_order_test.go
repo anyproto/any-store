@@ -12,8 +12,9 @@ import (
 
 // slabDBWithNS opens a DB on the global page slab. Temp pages then draw from
 // one LIFO free list shared by every reader, so a buffer one reader releases
-// is the next one another reader fills. Under the default sync.Pool each
-// goroutine gets its own buffer back and two readers never share one.
+// is the next one another reader fills. Under the default sync.Pool the
+// per-P private slot usually hands a goroutine its own buffer back, so two
+// readers rarely exchange one and the race goes unseen.
 func slabDBWithNS(t *testing.T, nsName string) (*DB, *Namespace) {
 	t.Helper()
 	opts := DefaultOptions()
