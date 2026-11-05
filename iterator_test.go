@@ -361,6 +361,11 @@ func TestIterator_DocAfterSortWithLongIds(t *testing.T) {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(doc)))
 	}
 
+	// The counters show that every Doc() took the re-seek path.
+	EnablePipelinePerfCounters(true)
+	t.Cleanup(func() { EnablePipelinePerfCounters(false) })
+	resetPipelinePerfCounters()
+
 	iter, err := coll.Find(nil).Sort("-v").Iter(ctx)
 	require.NoError(t, err)
 	defer func() { _ = iter.Close() }()
@@ -373,4 +378,5 @@ func TestIterator_DocAfterSortWithLongIds(t *testing.T) {
 	}
 	require.NoError(t, iter.Err())
 	assert.Equal(t, n, rows)
+	assert.EqualValues(t, n, pipePerf.docFallbacks.Load(), "Doc() re-seeks by id after an in-memory sort")
 }
