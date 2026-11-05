@@ -12,11 +12,13 @@ import (
 
 var errRebuildInjected = errors.New("injected rebuild failure")
 
-// failRebuildOf makes every rebuild of page pgno fail until the test ends.
-func failRebuildOf(t *testing.T, pgno uint32) {
+// failRebuildOf makes every rebuild of page pgno of p's writer cache fail
+// until the test ends. The hook is process-wide, so matching the cache keeps
+// other pagers' pages out of it.
+func failRebuildOf(t *testing.T, p *pager, pgno uint32) {
 	t.Helper()
 	setRebuildPageFaultHook(func(pg *page) error {
-		if pg.pgno == pgno {
+		if pg.cache == p.writerCache && pg.pgno == pgno {
 			return errRebuildInjected
 		}
 		return nil
@@ -84,9 +86,9 @@ func splitFaultCases(t *testing.T, faults []splitFault, run func(t *testing.T, b
 			newPgno := nextAllocPgno(t, p)
 			switch fault {
 			case leftRebuildFails:
-				failRebuildOf(t, pg.pgno)
+				failRebuildOf(t, p, pg.pgno)
 			case rightRebuildFails:
-				failRebuildOf(t, newPgno)
+				failRebuildOf(t, p, newPgno)
 			}
 
 			err = run(t, bt, pg)
@@ -143,7 +145,7 @@ func TestSplitRoot_ReleasesNewLeftPageOnRebuildError(t *testing.T) {
 
 				newPgno := nextAllocPgno(t, p)
 				if fault == rightRebuildFails {
-					failRebuildOf(t, newPgno)
+					failRebuildOf(t, p, newPgno)
 				}
 				err = bt.splitRoot(pg, []byte("key-000030"), 5)
 				if fault == noFault {
