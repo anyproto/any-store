@@ -99,57 +99,131 @@ func TestCursor_SeekExactSpilledKey(t *testing.T) {
 	assert.ErrorIs(t, verr, ErrKeyNotFound)
 }
 
-// SeekNear positions correctly from a leaf whose first and last keys spill:
-// the in-page range check cannot use them, and the seek takes the full path.
+// SeekNear with spilled keys on the pinned leaf: when the first or last key
+// spills, the in-leaf range check cannot run and the seek takes the full path;
+// when both are local, the check runs and searchLeaf compares against the
+// spilled keys in between through their overflow chains.
 func TestCursor_SeekNearSpilledKeys(t *testing.T) {
-	db, ns := tempDBWithNS(t, "idx")
-	keyLen := spilledKeyLen(db.pager.usableSize())
-	const n = 40 // several leaves
-	keys := make([][]byte, n)
-	tx, err := db.BeginWrite()
-	require.NoError(t, err)
-	for i := range n {
-		keys[i] = spilledIndexKey(2*i, keyLen)
-		require.NoError(t, tx.Put(ns, keys[i], nil))
-	}
-	require.NoError(t, tx.Commit())
+	t.Run("spilled-first-and-last-keys", func(t *testing.T) {
+		db, ns := tempDBWithNS(t, "idx")
+		keyLen := spilledKeyLen(db.pager.usableSize())
+		const n = 40 // several leaves
+		keys := make([][]byte, n)
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		for i := range n {
+			keys[i] = spilledIndexKey(2*i, keyLen)
+			require.NoError(t, tx.Put(ns, keys[i], nil))
+		}
+		require.NoError(t, tx.Commit())
 
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-	defer rtx.Rollback()
-	rns, err := db.getNamespaceLocked("idx")
-	require.NoError(t, err)
-	cur := rtx.NewCursor(rns)
-	defer cur.Close()
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer rtx.Rollback()
+		rns, err := db.getNamespaceLocked("idx")
+		require.NoError(t, err)
+		cur := rtx.NewCursor(rns)
+		defer cur.Close()
 
-	// after(i) sorts between keys[i] and keys[i+1].
-	after := func(i int) []byte { return spilledIndexKey(2*i+1, keyLen) }
-	for _, from := range []int{0, 10, 25, n - 1} {
+		// after(i) sorts between keys[i] and keys[i+1].
+		after := func(i int) []byte { return spilledIndexKey(2*i+1, keyLen) }
+		for _, from := range []int{0, 10, 25, n - 1} {
+			targets := []struct {
+				target []byte
+				want   int // index of the first key >= target; n means past the end
+			}{
+				{keys[from], from},
+				{after(from), from + 1},
+				{keys[(from+1)%n], (from + 1) % n},
+				{keys[(from+n/2)%n], (from + n/2) % n},
+				{keys[0], 0},
+				{keys[n-1], n - 1},
+				{after(n - 1), n},
+			}
+			for _, tc := range targets {
+				// Pin the leaf holding keys[from], then seek near the target.
+				require.NoError(t, cur.Seek(keys[from]))
+				require.True(t, cur.Valid())
+				require.NoError(t, cur.SeekNear(tc.target), "from %d", from)
+				if tc.want == n {
+					assert.False(t, cur.Valid(), "from %d: a target past the end leaves the cursor invalid", from)
+					continue
+				}
+				require.True(t, cur.Valid(), "from %d want %d", from, tc.want)
+				got, kerr := cur.Key()
+				require.NoError(t, kerr)
+				assert.Equal(t, keys[tc.want], got, "from %d want %d", from, tc.want)
+			}
+		}
+	})
+
+	t.Run("local-first-and-last-keys", func(t *testing.T) {
+		// One leaf: a short first key, four spilled keys, and a last cell whose
+		// key is local while its value spills.
+		db, ns := tempDBWithNS(t, "idx")
+		usable := db.pager.usableSize()
+		keyLen := spilledKeyLen(usable)
+		first, last := []byte("a-first"), []byte("z-last")
+		keys := [][]byte{first}
+		for i := range 4 {
+			keys = append(keys, spilledIndexKey(2*i, keyLen))
+		}
+		keys = append(keys, last)
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		for _, k := range keys[:len(keys)-1] {
+			require.NoError(t, tx.Put(ns, k, nil))
+		}
+		require.NoError(t, tx.Put(ns, last, bytes.Repeat([]byte{'v'}, 3*maxLocalPayload(usable))))
+		require.NoError(t, tx.Commit())
+
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer rtx.Rollback()
+		rns, err := db.getNamespaceLocked("idx")
+		require.NoError(t, err)
+		cur := rtx.NewCursor(rns)
+		defer cur.Close()
+
+		// The pinned leaf holds every key, and its first and last keys are
+		// local, so SeekNear runs the in-leaf range check.
+		require.NoError(t, cur.Seek(first))
+		require.True(t, cur.Valid())
+		leaf := cur.stack[len(cur.stack)-1].pg
+		require.NotNil(t, leaf)
+		require.EqualValues(t, len(keys), leaf.header.cellCount, "all keys on one leaf")
+		_, err = leafKeyAt(leaf, 0, usable)
+		require.NoError(t, err, "first key is local")
+		_, err = leafKeyAt(leaf, len(keys)-1, usable)
+		require.NoError(t, err, "last key is local although its value spills")
+
 		targets := []struct {
 			target []byte
-			want   int // index of the first key >= target; n means past the end
+			want   int
 		}{
-			{keys[from], from},
-			{after(from), from + 1},
-			{keys[(from+1)%n], (from + 1) % n},
-			{keys[(from+n/2)%n], (from + n/2) % n},
-			{keys[0], 0},
-			{keys[n-1], n - 1},
-			{after(n - 1), n},
+			{first, 0},
+			{[]byte("b"), 1}, // between the first key and the spilled keys
+			{keys[1], 1},
+			{spilledIndexKey(1, keyLen), 2}, // between two spilled keys
+			{keys[2], 2},
+			{keys[3], 3},
+			{keys[4], 4},
+			{spilledIndexKey(7, keyLen), 5}, // after the last spilled key
+			{last, 5},
 		}
 		for _, tc := range targets {
-			// Pin the leaf holding keys[from], then seek near the target.
-			require.NoError(t, cur.Seek(keys[from]))
-			require.True(t, cur.Valid())
-			require.NoError(t, cur.SeekNear(tc.target), "from %d", from)
-			if tc.want == n {
-				assert.False(t, cur.Valid(), "from %d: a target past the end leaves the cursor invalid", from)
-				continue
-			}
-			require.True(t, cur.Valid(), "from %d want %d", from, tc.want)
+			require.NoError(t, cur.Seek(first))
+			require.NoError(t, cur.SeekNear(tc.target))
+			require.True(t, cur.Valid(), "want %d", tc.want)
 			got, kerr := cur.Key()
 			require.NoError(t, kerr)
-			assert.Equal(t, keys[tc.want], got, "from %d want %d", from, tc.want)
+			assert.Equal(t, keys[tc.want], got, "want %d", tc.want)
 		}
-	}
+		for i, k := range keys {
+			require.NoError(t, cur.Seek(first))
+			require.NoError(t, cur.SeekExact(k), "key %d", i)
+		}
+		require.NoError(t, cur.Seek(first))
+		assert.ErrorIs(t, cur.SeekExact(spilledIndexKey(1, keyLen)), ErrKeyNotFound)
+	})
 }

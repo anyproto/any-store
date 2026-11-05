@@ -2544,8 +2544,8 @@ func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error 
 		return err
 	}
 
-	// Rebuild the left page in place, then the right page. The cell buffers
-	// and rightPg are returned on every exit, as balance_cleanup releases
+	// Rebuild the left page in place, then the right page. rightPg is
+	// released whether or not a rebuild failed, as balance_cleanup releases
 	// apNew (btree.c:9007-9009).
 	err = bt.rebuildLeafPage(pg, leftCells)
 	if err == nil {

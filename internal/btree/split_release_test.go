@@ -96,6 +96,7 @@ func splitFaultCases(t *testing.T, faults []splitFault, run func(t *testing.T, b
 				require.ErrorIs(t, err, errRebuildInjected)
 			}
 			requireUnpinned(t, p, newPgno)
+			assert.Equal(t, 1, pg.pinCount, "the split page keeps the caller's pin")
 		})
 	}
 }
@@ -151,6 +152,7 @@ func TestSplitRoot_ReleasesNewLeftPageOnRebuildError(t *testing.T) {
 					require.ErrorIs(t, err, errRebuildInjected)
 				}
 				requireUnpinned(t, p, newPgno)
+				assert.Equal(t, 1, pg.pinCount, "the root keeps the caller's pin")
 			})
 		}
 	})
