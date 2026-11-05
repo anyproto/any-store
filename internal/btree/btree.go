@@ -4035,9 +4035,10 @@ func (c *Cursor) seek(key []byte) error {
 // takes the full-key path (leafFullKey). A key that lies entirely in the local
 // part of a spilled cell (only the value overflows) is returned from the page.
 //
-// Matches the fast path of sqlite3BtreeIndexMoveto (btree.c:6131-6141), which
-// compares the record in place only when it fits on the page (nCell <=
-// maxLocal) and otherwise reassembles it through accessPayload.
+// Matches indexCellCompare (btree.c:5952-5978), which compares the record in
+// place only when it fits on the page and otherwise returns "do not attempt
+// the optimization", so the already-positioned shortcut of
+// sqlite3BtreeIndexMoveto (btree.c:6060-6081) falls back to the full descent.
 func leafKeyAt(pg *page, idx int, usableSize int) ([]byte, error) {
 	data := pg.data
 	dataLen := len(data)
@@ -4076,7 +4077,11 @@ func leafKeyAt(pg *page, idx int, usableSize int) ([]byte, error) {
 		valLen = int(vl)
 		pos += n
 	}
-	if totalPayload := keyLen + valLen; totalPayload > maxLocalPayload(usableSize) {
+	totalPayload := keyLen + valLen
+	if totalPayload > maxPayloadAlloc {
+		return nil, ErrCorrupt
+	}
+	if totalPayload > maxLocalPayload(usableSize) {
 		nLocal := localPayloadSize(totalPayload, usableSize)
 		if pos+nLocal+overflowPtrSize > dataLen {
 			return nil, ErrCorrupt

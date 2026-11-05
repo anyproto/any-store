@@ -525,8 +525,10 @@
     "note": ""
   },
   "btree.go:leafKeyAt": {
-    "sqlite": [],
-    "note": "any-store light key peek; no overflow"
+    "sqlite": [
+      "btree.c:indexCellCompare"
+    ],
+    "note": "any-store light key peek; errLeafKeySpilled when the key continues in an overflow chain, as indexCellCompare declines the optimization for an overflowing record"
   },
   "btree.go:leafSplitPoint": {
     "sqlite": [
@@ -582,6 +584,10 @@
       "btree.c:sqlite3BtreeIndexMoveto"
     ],
     "note": ""
+  },
+  "btree.go:setRebuildPageFaultHook": {
+    "sqlite": [],
+    "note": "test-only rebuild fault-injection hook"
   },
   "btree.go:writeInteriorCell": {
     "sqlite": [
