@@ -1,11 +1,11 @@
 package anystore
 
 import (
-	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -350,11 +350,12 @@ func TestIterator_DocAfterSortWithLongIds(t *testing.T) {
 	require.NoError(t, err)
 
 	const n = 40
+	rnd := rand.NewChaCha8([32]byte{1})
 	ids := make([]string, n)
 	for i := range n {
 		ids[i] = fmt.Sprintf("%0600d", i)
 		body := make([]byte, 900+i*150) // 1.2 to 9 KB once encoded, so every document overflows
-		_, err := rand.Read(body)
+		_, err := rnd.Read(body)
 		require.NoError(t, err)
 		doc := fmt.Sprintf(`{"id":%q,"v":%d,"body":%q}`, ids[i], i, base64.StdEncoding.EncodeToString(body))
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(doc)))
