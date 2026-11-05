@@ -873,8 +873,9 @@ func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, 
 }
 
 // leafFullKey reads the full key from a leaf cell, reading overflow pages
-// if the key spills. Returns a slice into page buffer for non-overflow keys,
-// or an allocated copy for overflow keys.
+// if the key spills. Returns a slice into data whenever the key is wholly
+// local, including cells whose value alone spills, and an allocated copy
+// only when the key itself spills.
 // Matches SQLite's accessPayload() slow path in sqlite3BtreeIndexMoveto().
 func leafFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame uint32, cache *pcache) ([]byte, error) {
 	dataLen := len(data)
