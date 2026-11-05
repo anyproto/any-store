@@ -1921,10 +1921,18 @@ func (p *pager) acquireTempPage() *page {
 	}
 }
 
+// testRecycleTempPageHook, when non-nil, sees a temp page's buffer right
+// before it returns to the slab or pool. Tests poison it so a read of page
+// bytes after releasePage fails deterministically, without the race detector.
+var testRecycleTempPageHook func(data []byte)
+
 // recycleTempPage returns an uncached page to the pool for reuse.
 // The page's data buffer is returned to the slab/pool and a fresh buffer
 // will be allocated on next acquireTempPage.
 func (p *pager) recycleTempPage(pg *page) {
+	if testRecycleTempPageHook != nil {
+		testRecycleTempPageHook(pg.data)
+	}
 	// Return data buffer to slab/pool before pooling the page struct.
 	freePageBuffer(pg.data, p.useSlab)
 	pg.data = nil
@@ -1945,11 +1953,10 @@ func (p *pager) recycleTempPage(pg *page) {
 	p.pagePool.Put(pg)
 }
 
-// releasePage unpins a page. For uncached (MVCC snapshot) pages, the page is
-// recycled to the pool immediately. This is safe because:
-//   - Cursors keep pages pinned until movement or Close()
-//   - Get() clones the value before releasing
-//   - Count() only reads header.cellCount before releasing
+// releasePage unpins a page. After the call the caller must not read pg or
+// any slice of pg.data: an uncached temp page is recycled at once, and a
+// clean page leaving an overfull cache has its buffer reused as well. Copy
+// before releasing; cursors keep their pages pinned until they move or close.
 func (p *pager) releasePage(pg *page) {
 	if pg == nil {
 		return

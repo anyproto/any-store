@@ -1223,12 +1223,13 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	rootPg.header.cellCount = 0
 	rootPg.header.cellContentOff = uint16(db.pager.usableSize())
 	rootPg.header.serialize(rootPg.data[hdrOff:])
+	rootPgno := rootPg.pgno
 	db.pager.releasePage(rootPg)
 
 	// Store namespace -> root page mapping in master table using proper
 	// btree Put which handles multi-level trees and splits correctly.
 	var rootPgBuf [4]byte
-	binary.BigEndian.PutUint32(rootPgBuf[:], rootPg.pgno)
+	binary.BigEndian.PutUint32(rootPgBuf[:], rootPgno)
 
 	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	return bt.Put([]byte(name), rootPgBuf[:])
@@ -1883,12 +1884,16 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 				return buf, cerr
 			}
 			if cell.overflowPg != 0 {
+				// leafFullKey returns a slice into pg.data when the key is
+				// local: copy before the release.
 				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walHdr.mxFrame, cache)
-				tx.pager.releasePage(pg)
 				if kerr != nil {
+					tx.pager.releasePage(pg)
 					return buf, kerr
 				}
-				return append(buf, fullKey...), nil
+				buf = append(buf, fullKey...)
+				tx.pager.releasePage(pg)
+				return buf, nil
 			}
 			buf = append(buf, cell.key...)
 			tx.pager.releasePage(pg)
@@ -1962,12 +1967,16 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 				return buf, cerr
 			}
 			if cell.overflowPg != 0 {
+				// leafFullKey returns a slice into pg.data when the key is
+				// local: copy before the release.
 				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walHdr.mxFrame, cache)
-				tx.pager.releasePage(pg)
 				if kerr != nil {
+					tx.pager.releasePage(pg)
 					return buf, kerr
 				}
-				return append(buf, fullKey...), nil
+				buf = append(buf, fullKey...)
+				tx.pager.releasePage(pg)
+				return buf, nil
 			}
 			buf = append(buf, cell.key...)
 			tx.pager.releasePage(pg)
