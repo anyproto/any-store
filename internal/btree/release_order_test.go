@@ -10,11 +10,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// slabDBWithNS opens a DB on the global page slab. Temp pages then draw from
-// one LIFO free list shared by every reader, so a buffer one reader releases
-// is the next one another reader fills. Under the default sync.Pool the
-// per-P private slot usually hands a goroutine its own buffer back, so two
-// readers rarely exchange one and the race goes unseen.
+// slabDBWithNS opens a DB on the global page slab and poisons every temp
+// page buffer as it is recycled. The slab is one LIFO free list shared by
+// every reader, so the buffer one reader releases is the next one another
+// reader fills; under the default sync.Pool the per-P private slot usually
+// hands a goroutine its own buffer back and the race is intermittent. The
+// poison makes a copy taken after releasePage wrong on its own, with no
+// second reader and no race detector.
 func slabDBWithNS(t *testing.T, nsName string) (*DB, *Namespace) {
 	t.Helper()
 	opts := DefaultOptions()
@@ -28,6 +30,13 @@ func slabDBWithNS(t *testing.T, nsName string) (*DB, *Namespace) {
 	t.Cleanup(func() { _ = db.Close() })
 	require.True(t, db.pager.useSlab)
 
+	testRecycleTempPageHook = func(data []byte) {
+		for i := range data {
+			data[i] = 0xA5
+		}
+	}
+	t.Cleanup(func() { testRecycleTempPageHook = nil })
+
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
 	ns, err := tx.CreateNamespace(nsName)
@@ -38,7 +47,7 @@ func slabDBWithNS(t *testing.T, nsName string) (*DB, *Namespace) {
 
 // requireSlabBacked fails when any page buffer came from the heap pool
 // instead of the slab: there the readers would not share buffers and the
-// test would pass without exercising the release order.
+// race detector would have nothing to report.
 func requireSlabBacked(t *testing.T) {
 	t.Helper()
 	globalPageSlab.mu.Lock()
@@ -47,21 +56,21 @@ func requireSlabBacked(t *testing.T) {
 	require.Zero(t, nOverflow, "page buffers fell back to the heap pool")
 }
 
-// Point lookups on uncached temp pages: releasePage hands the page buffer
-// back to the slab, so every byte the lookup returns must be copied out
-// before the release. A copy made after the release reads a buffer the other
-// reader may already be filling (-race reports the pair, the value check
-// catches a torn copy).
+// Point lookups on uncached temp pages: every byte the lookup returns must
+// be copied out before the leaf is released. The keys span several leaves,
+// so a buffer a reader releases is refilled with another page's bytes. The
+// values stay local: a btree without a pcache reads overflow chains through
+// the writer cache, which is not a reader path.
 func TestAppendValue_UncachedTempPage_CopiesBeforeRelease(t *testing.T) {
 	db, ns := slabDBWithNS(t, "test")
 	key := func(i int) []byte { return fmt.Appendf(nil, "key-%04d", i) }
 
-	const n = 64
+	const n = 512
 	vals := make([][]byte, n)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
 	for i := range n {
-		vals[i] = bytes.Repeat([]byte{byte(i + 1)}, 48)
+		vals[i] = bytes.Repeat([]byte{byte(i%251 + 1)}, 48)
 		require.NoError(t, tx.Put(ns, key(i), vals[i]))
 	}
 	require.NoError(t, tx.Commit())
@@ -106,10 +115,13 @@ func TestAppendSeekKey_UncachedTempPage_CopiesBeforeRelease(t *testing.T) {
 	key := func(i int) []byte { return fmt.Appendf(nil, "key-%04d", i) }
 
 	const n = 48
+	const valSize = 3000
+	require.Greater(t, len(key(0))+valSize, maxLocalPayload(db.pager.usableSize()),
+		"cells must spill for the seek to take the overflow branch")
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
 	for i := range n {
-		require.NoError(t, tx.Put(ns, key(i), bytes.Repeat([]byte{byte(i + 1)}, 3000)))
+		require.NoError(t, tx.Put(ns, key(i), bytes.Repeat([]byte{byte(i + 1)}, valSize)))
 	}
 	require.NoError(t, tx.Commit())
 

@@ -1921,10 +1921,18 @@ func (p *pager) acquireTempPage() *page {
 	}
 }
 
+// testRecycleTempPageHook, when non-nil, sees a temp page's buffer right
+// before it returns to the slab or pool. Tests poison it so a read of page
+// bytes after releasePage fails deterministically, without the race detector.
+var testRecycleTempPageHook func(data []byte)
+
 // recycleTempPage returns an uncached page to the pool for reuse.
 // The page's data buffer is returned to the slab/pool and a fresh buffer
 // will be allocated on next acquireTempPage.
 func (p *pager) recycleTempPage(pg *page) {
+	if testRecycleTempPageHook != nil {
+		testRecycleTempPageHook(pg.data)
+	}
 	// Return data buffer to slab/pool before pooling the page struct.
 	freePageBuffer(pg.data, p.useSlab)
 	pg.data = nil
