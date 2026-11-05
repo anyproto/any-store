@@ -10,13 +10,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// slabDBWithNS opens a DB on the global page slab and poisons every temp
-// page buffer as it is recycled. The slab is one LIFO free list shared by
-// every reader, so the buffer one reader releases is the next one another
-// reader fills; under the default sync.Pool the per-P private slot usually
-// hands a goroutine its own buffer back and the race is intermittent. The
+// slabDBWithNS opens a DB on the global page slab, the production
+// configuration, and poisons every temp page buffer as it is recycled. The
 // poison makes a copy taken after releasePage wrong on its own, with no
-// second reader and no race detector.
+// second reader and no race detector. The slab is one LIFO free list shared
+// by every reader, so the buffer one reader releases is the next one another
+// reader fills; under the default sync.Pool the per-P private slot usually
+// hands a goroutine its own buffer back.
 func slabDBWithNS(t *testing.T, nsName string) (*DB, *Namespace) {
 	t.Helper()
 	opts := DefaultOptions()
@@ -32,7 +32,7 @@ func slabDBWithNS(t *testing.T, nsName string) (*DB, *Namespace) {
 
 	testRecycleTempPageHook = func(data []byte) {
 		for i := range data {
-			data[i] = 0xA5
+			data[i] = 0xFE // outside every value and key byte the tests write
 		}
 	}
 	t.Cleanup(func() { testRecycleTempPageHook = nil })
@@ -46,8 +46,8 @@ func slabDBWithNS(t *testing.T, nsName string) (*DB, *Namespace) {
 }
 
 // requireSlabBacked fails when any page buffer came from the heap pool
-// instead of the slab: there the readers would not share buffers and the
-// race detector would have nothing to report.
+// instead of the slab: the test would then no longer run the production
+// configuration it is meant to cover.
 func requireSlabBacked(t *testing.T) {
 	t.Helper()
 	globalPageSlab.mu.Lock()
