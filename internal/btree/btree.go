@@ -1237,8 +1237,10 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 				bt.pager.releasePage(pg)
 				return buf, nil
 			}
+			// cell.value points into pg.data: copy before the release.
+			buf = append(buf, cell.value...)
 			bt.pager.releasePage(pg)
-			return append(buf, cell.value...), nil
+			return buf, nil
 		}
 
 		// Interior page - descend
@@ -1676,12 +1678,13 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []pat
 	if err := bt.rebuildLeafPage(rightPg, rightCells); err != nil {
 		return err
 	}
+	rightPgno := rightPg.pgno
 	bt.pager.releasePage(rightPg)
 
 	if path != nil {
-		return bt.insertIntoParentWithPath(pg, sepKey, rightPg.pgno, path)
+		return bt.insertIntoParentWithPath(pg, sepKey, rightPgno, path)
 	}
-	return bt.insertIntoParent(pg, sepKey, rightPg.pgno)
+	return bt.insertIntoParent(pg, sepKey, rightPgno)
 }
 
 // collectLeafCells reads all cells from a leaf page.
@@ -2526,10 +2529,11 @@ func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error 
 	bt.pager.recycleCellSlice(cells)
 	bt.pager.recycleCellBuf(cellBuf)
 
+	rightPgno := rightPg.pgno
 	bt.pager.releasePage(rightPg)
 
 	// Insert separator into parent
-	return bt.insertIntoParent(pg, sepKey, rightPg.pgno)
+	return bt.insertIntoParent(pg, sepKey, rightPgno)
 }
 
 // insertIntoParent inserts a separator key into the parent of leftPg.
@@ -2627,11 +2631,12 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 		}
 	}
 
+	newLeftPgno := newLeftPg.pgno
 	bt.pager.releasePage(newLeftPg)
 
 	// Convert old root into an interior page with one cell
 	cells := []cellData{
-		{leftChild: newLeftPg.pgno, key: bytes.Clone(sepKey)},
+		{leftChild: newLeftPgno, key: bytes.Clone(sepKey)},
 	}
 	return bt.rebuildInteriorPage(oldRoot, cells, rightChildPgno)
 }
