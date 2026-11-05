@@ -2,6 +2,7 @@ package btree
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"testing"
 
@@ -16,47 +17,86 @@ func spilledIndexKey(v, keyLen int) []byte {
 	return fmt.Appendf(bytes.Repeat([]byte{'k'}, keyLen-10), "%010d", v)
 }
 
-// spilledKeyLen is a key length that spills with an empty value.
+// spilledKeyLen is a key length that spills with an empty value. The small
+// margin keeps it below 128 on 512-byte pages, where the one-byte keyLen
+// varint path spills as well.
 func spilledKeyLen(usableSize int) int {
-	return maxLocalPayload(usableSize) + 100
+	return maxLocalPayload(usableSize) + 8
 }
 
 func TestLeafKeyAt_SpilledKey(t *testing.T) {
+	for _, pageSize := range []uint32{512, 4096} {
+		t.Run(fmt.Sprintf("page-%d", pageSize), func(t *testing.T) {
+			p := tempPagerWithPageSize(t, pageSize)
+			pg, err := p.allocatePage()
+			require.NoError(t, err)
+			defer p.releasePage(pg)
+			bt := &btree{pager: p, rootPage: pg.pgno, writable: true}
+			usable := p.usableSize()
+			keyLen := spilledKeyLen(usable)
+
+			// Six index cells whose keys continue in overflow chains, then
+			// one data cell whose short key is local while its value spills.
+			const nSpilled = 6
+			var cells []cellData
+			for i := range nSpilled {
+				cells = append(cells, cellData{key: spilledIndexKey(i, keyLen)})
+			}
+			localKey := []byte("local-key")
+			cells = append(cells, cellData{key: localKey, value: bytes.Repeat([]byte{'v'}, 3*maxLocalPayload(usable))})
+			require.NoError(t, bt.rebuildLeafPage(pg, cells))
+
+			for i := range nSpilled {
+				off, oerr := pg.getCellOffsetSafe(i)
+				require.NoError(t, oerr)
+				c, _, cerr := parseLeafCellWithSize(pg.data, int(off), usable)
+				require.NoError(t, cerr)
+				require.NotZero(t, c.overflowPg, "cell %d spills", i)
+				require.Less(t, len(c.key), keyLen, "cell %d keeps only a key prefix on the page", i)
+
+				got, kerr := leafKeyAt(pg, i, usable)
+				assert.ErrorIs(t, kerr, errLeafKeySpilled, "cell %d", i)
+				assert.Nil(t, got, "cell %d", i)
+			}
+
+			got, kerr := leafKeyAt(pg, nSpilled, usable)
+			require.NoError(t, kerr)
+			assert.Equal(t, localKey, got)
+		})
+	}
+}
+
+// leafKeyAt rejects length varints above maxPayloadAlloc, singly and as a
+// sum, before it looks at the spill threshold. The cell sits low on the page
+// so that the local-part bounds check alone would not catch it.
+func TestLeafKeyAt_PayloadAboveAllocCap(t *testing.T) {
 	p := tempPager(t)
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
 	defer p.releasePage(pg)
 	bt := &btree{pager: p, rootPage: pg.pgno, writable: true}
 	usable := p.usableSize()
-	keyLen := spilledKeyLen(usable)
+	require.NoError(t, bt.rebuildLeafPage(pg, []cellData{{key: []byte("k"), value: []byte("v")}}))
 
-	// Six index cells whose keys continue in overflow chains, then one data
-	// cell whose short key is local while its value spills.
-	const nSpilled = 6
-	var cells []cellData
-	for i := range nSpilled {
-		cells = append(cells, cellData{key: spilledIndexKey(i, keyLen)})
+	for _, tc := range []struct {
+		name           string
+		keyLen, valLen uint64
+	}{
+		{"key-above-cap", maxPayloadAlloc + 1, 0},
+		{"value-above-cap", 1, maxPayloadAlloc + 1},
+		{"sum-above-cap", maxPayloadAlloc, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const off = 200 // free space between the cell pointers and the content area
+			n := putVarint(pg.data[off:], tc.keyLen)
+			putVarint(pg.data[off+n:], tc.valLen)
+			binary.BigEndian.PutUint16(pg.data[pg.cellPointerOffset():], off)
+
+			got, kerr := leafKeyAt(pg, 0, usable)
+			assert.ErrorIs(t, kerr, ErrCorrupt)
+			assert.Nil(t, got)
+		})
 	}
-	localKey := []byte("local-key")
-	cells = append(cells, cellData{key: localKey, value: bytes.Repeat([]byte{'v'}, 3*maxLocalPayload(usable))})
-	require.NoError(t, bt.rebuildLeafPage(pg, cells))
-
-	for i := range nSpilled {
-		off, oerr := pg.getCellOffsetSafe(i)
-		require.NoError(t, oerr)
-		c, _, cerr := parseLeafCellWithSize(pg.data, int(off), usable)
-		require.NoError(t, cerr)
-		require.NotZero(t, c.overflowPg, "cell %d spills", i)
-		require.Less(t, len(c.key), keyLen, "cell %d keeps only a key prefix on the page", i)
-
-		got, kerr := leafKeyAt(pg, i, usable)
-		assert.ErrorIs(t, kerr, errLeafKeySpilled, "cell %d", i)
-		assert.Nil(t, got, "cell %d", i)
-	}
-
-	got, kerr := leafKeyAt(pg, nSpilled, usable)
-	require.NoError(t, kerr)
-	assert.Equal(t, localKey, got)
 }
 
 // An exact seek on a spilled index key finds it: the equality check reads the
@@ -225,5 +265,79 @@ func TestCursor_SeekNearSpilledKeys(t *testing.T) {
 		}
 		require.NoError(t, cur.Seek(first))
 		assert.ErrorIs(t, cur.SeekExact(spilledIndexKey(1, keyLen)), ErrKeyNotFound)
+	})
+
+	t.Run("spilled-first-key-low-on-page", func(t *testing.T) {
+		// The pinned leaf's first key spills and its cell sits low enough on
+		// the page that keyLen bytes from the key start stay inside the page:
+		// read as page bytes, that "key" compares below every target, and the
+		// last key is local, so an in-leaf range check would wrongly keep seeks
+		// for earlier leaves on this leaf.
+		db, ns := tempDBWithNS(t, "idx")
+		usable := db.pager.usableSize()
+		keyLen := spilledKeyLen(usable)
+		const n = 40 // several leaves
+		keys := make([][]byte, n)
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		for i := range n {
+			keys[i] = spilledIndexKey(2*i, keyLen)
+			require.NoError(t, tx.Put(ns, keys[i], nil))
+		}
+		last := []byte("l") // sorts after every spilled key and stays local
+		require.NoError(t, tx.Put(ns, last, nil))
+		require.NoError(t, tx.Commit())
+		rns, err := db.getNamespaceLocked("idx")
+		require.NoError(t, err)
+
+		// firstKeyOfLastLeaf reads cell 0 of the leaf that holds last.
+		firstKeyOfLastLeaf := func() []byte {
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			defer rtx.Rollback()
+			cur := rtx.NewCursor(rns)
+			defer cur.Close()
+			require.NoError(t, cur.Seek(last))
+			cur.stack[len(cur.stack)-1].cellIdx = 0
+			k, kerr := cur.Key()
+			require.NoError(t, kerr)
+			return bytes.Clone(k)
+		}
+		// Deleting and re-inserting the leaf's first key moves its cell from
+		// the end of the content area into the free space below it.
+		moved := firstKeyOfLastLeaf()
+		tx, err = db.BeginWrite()
+		require.NoError(t, err)
+		require.NoError(t, tx.Delete(ns, moved))
+		require.NoError(t, tx.Put(ns, moved, nil))
+		require.NoError(t, tx.Commit())
+		require.Equal(t, moved, firstKeyOfLastLeaf())
+
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer rtx.Rollback()
+		cur := rtx.NewCursor(rns)
+		defer cur.Close()
+		require.NoError(t, cur.Seek(last))
+		leaf := cur.stack[len(cur.stack)-1].pg
+		require.NotNil(t, leaf)
+		off, oerr := leaf.getCellOffsetSafe(0)
+		require.NoError(t, oerr)
+		c, _, cerr := parseLeafCellWithSize(leaf.data, int(off), usable)
+		require.NoError(t, cerr)
+		require.NotZero(t, c.overflowPg, "the first key spills")
+		require.LessOrEqual(t, int(off)+keyLen, len(leaf.data), "keyLen bytes from the first cell stay inside the page")
+		_, err = leafKeyAt(leaf, int(leaf.header.cellCount)-1, usable)
+		require.NoError(t, err, "the last key is local")
+
+		// Targets between keys of earlier leaves must land on the next key.
+		for j := range n - 1 {
+			require.NoError(t, cur.Seek(last))
+			require.NoError(t, cur.SeekNear(spilledIndexKey(2*j+1, keyLen)))
+			require.True(t, cur.Valid(), "target %d", j)
+			got, kerr := cur.Key()
+			require.NoError(t, kerr)
+			assert.Equal(t, keys[j+1], got, "target %d", j)
+		}
 	})
 }

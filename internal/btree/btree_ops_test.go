@@ -5897,7 +5897,8 @@ func TestCov_LeafKeyAtMultiByteValLenVarintError2(t *testing.T) {
 }
 
 func TestCov_LeafKeyAtMultiByteKeyEndBeyondDataLen2(t *testing.T) {
-	// L2648-2650: end > dataLen with multi-byte keyLen
+	// A multi-byte keyLen far above maxLocal makes the cell look spilled, and
+	// its local part runs past the page end.
 	p := tempPager(t)
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
