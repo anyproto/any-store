@@ -4001,13 +4001,19 @@ func (c *Cursor) seek(key []byte) error {
 	return nil
 }
 
-// leafKeyAt extracts the key at cell index idx from a leaf page.
-// The returned slice points into the page buffer. This is a lightweight
-// alternative to parseLeafCellWithSize when only the key is needed.
-// For overflow cells where the key spills off-page, returns ErrCorrupt
-// so that callers (SeekNear) fall back to full Seek. This avoids needing
-// pager access in this lightweight function.
-func leafKeyAt(pg *page, idx int) ([]byte, error) {
+// leafKeyAt extracts the key at cell index idx from a leaf page without
+// touching the pager. The returned slice points into the page buffer.
+//
+// A spilled cell keeps only nLocal payload bytes on the page, followed by the
+// overflow page number, so a key that continues in the overflow chain cannot
+// be sliced from the page: leafKeyAt returns errLeafKeySpilled and the caller
+// takes the full-key path (leafFullKey). A key that lies entirely in the local
+// part of a spilled cell (only the value overflows) is returned from the page.
+//
+// Matches the fast path of sqlite3BtreeIndexMoveto (btree.c:6131-6141), which
+// compares the record in place only when it fits on the page (nCell <=
+// maxLocal) and otherwise reassembles it through accessPayload.
+func leafKeyAt(pg *page, idx int, usableSize int) ([]byte, error) {
 	data := pg.data
 	dataLen := len(data)
 	off, err := pg.getCellOffsetSafe(idx)
@@ -4018,52 +4024,47 @@ func leafKeyAt(pg *page, idx int) ([]byte, error) {
 	if pos >= dataLen {
 		return nil, ErrCorrupt
 	}
-	// New format: [varint(keyLen)] [varint(valLen)] [key||value...]
-	b := data[pos]
-	if b < 0x80 {
-		kl := int(b)
-		// Skip valLen varint
-		valOff := pos + 1
-		if valOff >= dataLen {
+	// Leaf cell: [varint(keyLen)] [varint(valLen)] [key||value...]
+	var keyLen, valLen int
+	if b := data[pos]; b < 0x80 {
+		keyLen = int(b)
+		pos++
+	} else {
+		kl, n, kerr := getVarintSafe(data[pos:])
+		if kerr != nil || kl > maxPayloadAlloc {
 			return nil, ErrCorrupt
 		}
-		if data[valOff] < 0x80 {
-			keyStart := valOff + 1
-			end := keyStart + kl
-			if end > dataLen {
-				return nil, ErrCorrupt
-			}
-			return data[keyStart:end], nil
-		}
-		_, vn, verr := getVarintSafe(data[valOff:])
-		if verr != nil {
-			return nil, ErrCorrupt
-		}
-		keyStart := valOff + vn
-		end := keyStart + kl
-		if end > dataLen {
-			return nil, ErrCorrupt
-		}
-		return data[keyStart:end], nil
+		keyLen = int(kl)
+		pos += n
 	}
-	keyLen, kn, kerr := getVarintSafe(data[pos:])
-	if kerr != nil {
-		return nil, ErrCorrupt
-	}
-	pos += kn
 	if pos >= dataLen {
 		return nil, ErrCorrupt
 	}
-	_, vn, verr := getVarintSafe(data[pos:])
-	if verr != nil {
+	if b := data[pos]; b < 0x80 {
+		valLen = int(b)
+		pos++
+	} else {
+		vl, n, verr := getVarintSafe(data[pos:])
+		if verr != nil || vl > maxPayloadAlloc {
+			return nil, ErrCorrupt
+		}
+		valLen = int(vl)
+		pos += n
+	}
+	if totalPayload := keyLen + valLen; totalPayload > maxLocalPayload(usableSize) {
+		nLocal := localPayloadSize(totalPayload, usableSize)
+		if pos+nLocal+overflowPtrSize > dataLen {
+			return nil, ErrCorrupt
+		}
+		if keyLen > nLocal {
+			return nil, errLeafKeySpilled
+		}
+	}
+	end := pos + keyLen
+	if end > dataLen {
 		return nil, ErrCorrupt
 	}
-	keyStart := pos + vn
-	end := keyStart + int(keyLen)
-	if int(keyLen) < 0 || end > dataLen {
-		return nil, ErrCorrupt
-	}
-	return data[keyStart:end], nil
+	return data[pos:end], nil
 }
 
 // SeekNear positions the cursor at the first key >= the given key.
@@ -4077,14 +4078,15 @@ func (c *Cursor) SeekNear(key []byte) error {
 		if leaf.pg != nil {
 			n := int(leaf.pg.header.cellCount)
 			if n > 0 {
-				firstKey, err := leafKeyAt(leaf.pg, 0)
+				usable := c.bt.usablePageSize()
+				firstKey, err := leafKeyAt(leaf.pg, 0, usable)
 				if err != nil {
-					// leafKeyAt cannot reconstruct overflow keys. Fall back to full seek.
+					// The key spills to an overflow chain (or the cell is
+					// corrupt): the full seek reads it through leafFullKey.
 					return c.Seek(key)
 				}
-				lastKey, err := leafKeyAt(leaf.pg, n-1)
+				lastKey, err := leafKeyAt(leaf.pg, n-1, usable)
 				if err != nil {
-					// leafKeyAt cannot reconstruct overflow keys. Fall back to full seek.
 					return c.Seek(key)
 				}
 				if bytes.Compare(key, firstKey) >= 0 && bytes.Compare(key, lastKey) <= 0 {
@@ -4169,13 +4171,14 @@ func (c *Cursor) AppendValueByKey(key []byte, buf []byte) ([]byte, error) {
 }
 
 // currentKeyEqual checks whether the cursor's current key is equal to key.
-// Fast path uses in-page key extraction; overflow keys fall back to Key().
+// Fast path uses in-page key extraction; a key that spills to an overflow
+// chain (or a corrupt cell) falls back to Key().
 func (c *Cursor) currentKeyEqual(key []byte) (bool, error) {
 	frame := &c.stack[len(c.stack)-1]
 	if frame.pg == nil {
 		return false, ErrCorrupt
 	}
-	if k, err := leafKeyAt(frame.pg, frame.cellIdx); err == nil {
+	if k, err := leafKeyAt(frame.pg, frame.cellIdx, c.bt.usablePageSize()); err == nil {
 		return bytes.Equal(k, key), nil
 	}
 	k, err := c.Key()

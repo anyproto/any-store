@@ -105,3 +105,8 @@ var (
 	// databases in a process must use the same page size.
 	ErrPageBufferPoolSizeMismatch = errors.New("btree: page buffer pool already initialized with a different page size")
 )
+
+// errLeafKeySpilled reports a leaf cell whose key continues in an overflow
+// chain, so leafKeyAt cannot return it from the page alone; callers take the
+// full-key path (leafFullKey) instead.
+var errLeafKeySpilled = errors.New("btree: leaf key spills to an overflow chain")
