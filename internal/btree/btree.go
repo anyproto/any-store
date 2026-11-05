@@ -4039,6 +4039,7 @@ func (c *Cursor) seek(key []byte) error {
 // place only when it fits on the page and otherwise returns "do not attempt
 // the optimization", so the already-positioned shortcut of
 // sqlite3BtreeIndexMoveto (btree.c:6060-6081) falls back to the full descent.
+// DRIFT: leafKeyAt serves a fully local key from a cell whose value spills; indexCellCompare declines any overflowing record See docs/btree/NOTES.md#drift-2026-11-05-leafkeyat-serves-a-local-key-from-a-value-spilling-cell
 func leafKeyAt(pg *page, idx int, usableSize int) ([]byte, error) {
 	data := pg.data
 	dataLen := len(data)
