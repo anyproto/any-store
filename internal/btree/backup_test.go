@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -115,7 +116,7 @@ func TestBackup_Step_OfflineCopy(t *testing.T) {
 
 	// Copy everything in one step — nPage < 0 means "all remaining".
 	// ~ sqlite3_backup_step (backup.c:314); nPage=-1 means unlimited.
-	err = b.Step(-1)
+	err = b.Step(context.Background(), -1)
 	require.ErrorIs(t, err, ErrBackupDone, "Step must signal completion with ErrBackupDone ~ SQLITE_DONE (backup.c:406)")
 
 	require.Equal(t, srcPageCount, b.PageCount())
@@ -157,7 +158,7 @@ func TestBackup_Step_BatchedCopy(t *testing.T) {
 
 	// Batched: each Step copies exactly 2 pages. Keep looping until done.
 	for {
-		err := b.Step(2)
+		err := b.Step(context.Background(), 2)
 		if err == ErrBackupDone {
 			break
 		}
@@ -191,7 +192,7 @@ func TestBackup_OnlineWriteBetweenSteps(t *testing.T) {
 	// page except pgno=nSrc has been copied. Any subsequent modification to
 	// a page <nSrc is an "already copied" case that must go through the
 	// update hook (backup.c:669 "iPage < iNext").
-	err = b.Step(int(nSrc - 1))
+	err = b.Step(context.Background(), int(nSrc-1))
 	require.NoError(t, err, "Step should leave 1 page to copy")
 	require.Equal(t, uint32(1), b.Remaining())
 
@@ -206,7 +207,7 @@ func TestBackup_OnlineWriteBetweenSteps(t *testing.T) {
 
 	// Drain the rest.
 	for {
-		err := b.Step(-1)
+		err := b.Step(context.Background(), -1)
 		if err == ErrBackupDone {
 			break
 		}
@@ -261,7 +262,7 @@ func TestBackup_PostDoneWriteDoesNotReachDst(t *testing.T) {
 	// path (backup.c:553) that attaches the backup to the source pager so it
 	// receives update() callbacks. A single full Step would finish without ever
 	// attaching, and update() would never fire — failing to exercise the drift.
-	require.NoError(t, b.Step(int(nSrc-1)), "partial Step should leave 1 page to copy")
+	require.NoError(t, b.Step(context.Background(), int(nSrc-1)), "partial Step should leave 1 page to copy")
 	require.Equal(t, uint32(1), b.Remaining())
 	b.mu.Lock()
 	attached := b.isAttached
@@ -272,7 +273,7 @@ func TestBackup_PostDoneWriteDoesNotReachDst(t *testing.T) {
 	// its destination has been finalized (schema bump + truncate) but the dst
 	// write tx is still open until Finish commits it. The backup stays attached
 	// to the source pager (detach only happens in Finish, ~ backup.c:589-597).
-	require.ErrorIs(t, b.Step(-1), ErrBackupDone)
+	require.ErrorIs(t, b.Step(context.Background(), -1), ErrBackupDone)
 
 	// Commit a source write touching an already-copied early page ("k-0000"
 	// lives on the leftmost leaf, copied long before completion). With the
@@ -353,7 +354,7 @@ func TestBackup_FinalizedDstReportsTruePageCount(t *testing.T) {
 	// Full backup in one Step, then Finish (commits the dst write tx).
 	b, err := dst.BackupInit(src)
 	require.NoError(t, err)
-	require.ErrorIs(t, b.Step(-1), ErrBackupDone)
+	require.ErrorIs(t, b.Step(context.Background(), -1), ErrBackupDone)
 	require.NoError(t, b.Finish())
 
 	// Reopen dst from disk: DatabaseSize is now read back from the committed
@@ -400,7 +401,7 @@ func TestBackup_RestartOnCheckpointRestart(t *testing.T) {
 
 	b, err := dst.BackupInit(src)
 	require.NoError(t, err)
-	require.NoError(t, b.Step(2)) // partial: iNext advances past 1
+	require.NoError(t, b.Step(context.Background(), 2)) // partial: iNext advances past 1
 	require.Greater(t, src.DatabaseSize(), uint32(2))
 
 	// Observe iNext under lock (race-safe).
@@ -428,7 +429,7 @@ func TestBackup_FinishTwiceIsError(t *testing.T) {
 
 	// Drain Step until done.
 	for {
-		err := b.Step(-1)
+		err := b.Step(context.Background(), -1)
 		if err == ErrBackupDone {
 			break
 		}
@@ -445,7 +446,7 @@ func TestBackup_StepAfterFinishIsError(t *testing.T) {
 	b, err := dst.BackupInit(src)
 	require.NoError(t, err)
 	require.NoError(t, b.Finish())
-	require.ErrorIs(t, b.Step(10), ErrBackupFinished)
+	require.ErrorIs(t, b.Step(context.Background(), 10), ErrBackupFinished)
 }
 
 func TestBackupInit_RejectsDstWithOpenReadTx(t *testing.T) {
@@ -504,7 +505,7 @@ func TestBackup_TruncatesLargerDst(t *testing.T) {
 	b, err := dst.BackupInit(src)
 	require.NoError(t, err)
 	for {
-		err := b.Step(-1)
+		err := b.Step(context.Background(), -1)
 		if err == ErrBackupDone {
 			break
 		}
@@ -528,7 +529,7 @@ func TestBackup_BumpsDstSchemaCookie(t *testing.T) {
 	b, err := dst.BackupInit(src)
 	require.NoError(t, err)
 	for {
-		err := b.Step(-1)
+		err := b.Step(context.Background(), -1)
 		if err == ErrBackupDone {
 			break
 		}
@@ -645,7 +646,7 @@ func TestBackup_PreservesSrcPage1HeaderFields(t *testing.T) {
 	b, err := dst.BackupInit(src)
 	require.NoError(t, err)
 	for {
-		err := b.Step(-1)
+		err := b.Step(context.Background(), -1)
 		if err == ErrBackupDone {
 			break
 		}
@@ -743,7 +744,7 @@ func TestBackup_RestartsOnExternalProcessWrite(t *testing.T) {
 	require.NoError(t, err)
 	// Copy all but the last page so that k-0000's page (low-numbered,
 	// leftmost leaf) is already in "already copied" territory.
-	require.NoError(t, b.Step(int(nSrc-1)))
+	require.NoError(t, b.Step(context.Background(), int(nSrc-1)))
 	b.mu.Lock()
 	iNextBefore := b.iNext
 	b.mu.Unlock()
@@ -765,7 +766,7 @@ func TestBackup_RestartsOnExternalProcessWrite(t *testing.T) {
 	// (nSrc_old), so we'd either skip the last page entirely or mis-
 	// copy it, and the early page containing k-0000 stays stale.
 	for {
-		err := b.Step(-1)
+		err := b.Step(context.Background(), -1)
 		if err == ErrBackupDone {
 			break
 		}
@@ -831,7 +832,7 @@ func TestBackup_FreedLeafGrownInTransactionReadable(t *testing.T) {
 	t.Cleanup(func() { _ = dst.Close() })
 	b, err := dst.BackupInit(src)
 	require.NoError(t, err)
-	stepErr := b.Step(-1)
+	stepErr := b.Step(context.Background(), -1)
 	// Finish before asserting: an unfinished backup keeps its source read
 	// transaction open, and closing the source in cleanup would wait on it.
 	finishErr := b.Finish()
@@ -874,7 +875,7 @@ func TestBackup_ReleasesSourcePages(t *testing.T) {
 	b, err := dst.BackupInit(src)
 	require.NoError(t, err)
 	for {
-		err := b.Step(64)
+		err := b.Step(context.Background(), 64)
 		if err == ErrBackupDone {
 			break
 		}

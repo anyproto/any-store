@@ -333,7 +333,7 @@ type index struct {
 	// sketch is the WRITER-OWNED live selectivity sketch. It is mutated in place
 	// ONLY by the single writer (putEntries/deleteEntries, a savepoint's
 	// restoreImages, the writer's reloadSketch, serialized by the btree
-	// writeMu and the cross-process WAL write lock) and marshaled by
+	// write lock and the cross-process WAL write lock) and marshaled by
 	// persistSketches. No reader ever swaps or mutates it, so a concurrent
 	// read-tx reload can never lose the writer's accumulated increments. Inside a
 	// write tx it is also the planner's view (reflects this tx's own uncommitted
