@@ -6,6 +6,7 @@ package btree
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"slices"
 	"sync/atomic"
@@ -3527,15 +3528,22 @@ func (bt *btree) collapseSingleChild(parentPg *page, childPgno uint32) error {
 // Count returns the total number of key-value pairs in the B-tree.
 // It traverses all pages but only reads page headers (cellCount),
 // avoiding any key/value parsing — similar to SQLite's COUNT(*) optimization.
-// DRIFT: count traversal has no per-iteration interrupt/cancellation check See docs/btree/NOTES.md#drift-16-count-traversal-missing-interrupt-cancellation-check
 func (bt *btree) Count() (int, error) {
-	return bt.countPage(bt.rootPage, 0)
+	return bt.CountContext(context.Background())
+}
+
+// CountContext is Count polling ctx once per interior page — once per
+// fan-out of leaves, where sqlite3BtreeCount polls isInterrupted on every
+// page (btree.c:10502); a leaf costs only its header read, and a poll on
+// each would be a tenth of the walk. A ctx that has ended fails the count
+// with its error.
+func (bt *btree) CountContext(ctx context.Context) (int, error) {
+	return bt.countPage(ctx, bt.rootPage, 0)
 }
 
 // DRIFT: B+tree (leaf-only keys) drops interior-cell positions that SQLite B-tree visits See docs/btree/NOTES.md#drift-14-b-plus-tree-traversal-drops-interior-cell-keys-versus-sqlite
-// DRIFT: count traversal has no per-iteration interrupt/cancellation check See docs/btree/NOTES.md#drift-16-count-traversal-missing-interrupt-cancellation-check
 // DRIFT: Count uses Go int vs C i64 *pnEntry; entry total can truncate See docs/btree/NOTES.md#drift-17-count-return-type-truncates-i64-entry-total-to-go-int
-func (bt *btree) countPage(pgno uint32, depth int) (int, error) {
+func (bt *btree) countPage(ctx context.Context, pgno uint32, depth int) (int, error) {
 	if depth > btCursorMaxDepth {
 		return 0, ErrCorrupt
 	}
@@ -3548,6 +3556,10 @@ func (bt *btree) countPage(pgno uint32, depth int) (int, error) {
 		count := int(pg.header.cellCount)
 		bt.pager.releasePage(pg)
 		return count, nil
+	}
+	if err := ctx.Err(); err != nil {
+		bt.pager.releasePage(pg)
+		return 0, err
 	}
 
 	// Interior page: recurse into children directly from page data
@@ -3568,7 +3580,7 @@ func (bt *btree) countPage(pgno uint32, depth int) (int, error) {
 			return 0, ErrCorrupt
 		}
 		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
-		c, cerr := bt.countPage(childPgno, depth+1)
+		c, cerr := bt.countPage(ctx, childPgno, depth+1)
 		if cerr != nil {
 			bt.pager.releasePage(pg)
 			return 0, cerr
@@ -3578,7 +3590,7 @@ func (bt *btree) countPage(pgno uint32, depth int) (int, error) {
 	rightChild := pg.header.rightChild
 	bt.pager.releasePage(pg)
 
-	c, err := bt.countPage(rightChild, depth+1)
+	c, err := bt.countPage(ctx, rightChild, depth+1)
 	if err != nil {
 		return 0, err
 	}
@@ -3606,10 +3618,14 @@ const btCursorMaxDepth = 20
 // btree.c:896). A cursor whose entry the write removed lands on a
 // neighbour: the move onward in the direction it landed yields the
 // neighbour without stepping over it (CURSOR_SKIPNEXT), a read reports
-// ErrKeyNotFound (the VDBE's nullRow, vdbeaux.c:3830). A move that fails
-// ends the cursor (cursorFault). A cursor is closed inside the transaction
-// that opened it.
+// ErrKeyNotFound (the VDBE's nullRow, vdbeaux.c:3830). A move that fails on
+// a page or a schema fault ends the cursor (cursorFault); one that fails on
+// the cursor's ctx leaves it where it stood. A cursor is closed inside the
+// transaction that opened it.
 type Cursor struct {
+	// ctx is polled once per leaf the cursor leaves (Next, Previous); nil
+	// polls nothing. See ReadTx.NewCursorContext.
+	ctx      context.Context
 	bt       *btree
 	btData   btree // embedded btree data to avoid separate heap allocation
 	stack    []cursorFrame
@@ -4392,12 +4408,20 @@ func (c *Cursor) Next() error {
 
 		// Leaf frame: the page is pinned in frame.pg.
 		if frame.pg != nil {
-			frame.cellIdx++
-			if frame.cellIdx < int(frame.pg.header.cellCount) {
+			if frame.cellIdx+1 < int(frame.pg.header.cellCount) {
+				frame.cellIdx++
 				c.state = cursorValid
 				return nil
 			}
-			// Past end of this leaf — release pinned page, pop frame, go up.
+			// Past end of this leaf. The ctx is polled here, once per leaf,
+			// while the cursor still stands on the leaf's last entry: a ctx
+			// that has ended fails the move and leaves the cursor there.
+			if c.ctx != nil {
+				if err := c.ctx.Err(); err != nil {
+					return err
+				}
+			}
+			// Release pinned page, pop frame, go up.
 			c.bt.pager.releasePage(frame.pg)
 			frame.pg = nil
 			c.stack = c.stack[:len(c.stack)-1]
@@ -4497,12 +4521,18 @@ func (c *Cursor) Previous() error {
 
 		// Leaf frame: the page is pinned in frame.pg.
 		if frame.pg != nil {
-			frame.cellIdx--
-			if frame.cellIdx >= 0 {
+			if frame.cellIdx > 0 {
+				frame.cellIdx--
 				c.state = cursorValid
 				return nil
 			}
-			// Past the beginning of this leaf — release pinned page, pop, go up.
+			// Past the beginning of this leaf: the ctx poll of Next, mirrored.
+			if c.ctx != nil {
+				if err := c.ctx.Err(); err != nil {
+					return err
+				}
+			}
+			// Release pinned page, pop, go up.
 			c.bt.pager.releasePage(frame.pg)
 			frame.pg = nil
 			c.stack = c.stack[:len(c.stack)-1]
