@@ -230,7 +230,7 @@ func buildKnnProbePlan(params *PlanParams, cand *knnCandidate) *Plan {
 		if len(idx.Bounds) > 0 {
 			idx.Bounds = AdjustBoundsForNonUnique(idx.Bounds)
 		}
-		if idx.Info.Unique && idx.fullKeyPointBound() {
+		if idx.coverLookup() {
 			// CoverIter takes the UN-finalized bounds — it seeks the raw
 			// prefix itself; the reverse-tail pad would double-pad and
 			// MergeOverlappingBounds would collapse distinct point probes

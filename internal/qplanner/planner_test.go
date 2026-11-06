@@ -5001,3 +5001,153 @@ func TestBoundsResult_BuildWithProbe_OnePredicatePerFieldIsNeverProbed(t *testin
 		func(string, query.Bounds) bool { t.Fatal("ordered"); return false })
 	assert.Equal(t, 2, br.FieldCount())
 }
+
+// TestIndexSortMatch_PrimaryKey covers the implicit trailing column: every
+// index key ends with the primary key, ascending, so a sort that runs from
+// the declared fields into the primary key is served in either uniform
+// direction, and the rows are distinct from the primary key on.
+func TestIndexSortMatch_PrimaryKey(t *testing.T) {
+	sf := func(spec ...string) []query.SortField {
+		fields := make([]query.SortField, len(spec))
+		for i, s := range spec {
+			fields[i] = query.SortField{Field: strings.TrimPrefix(s, "-"), Reverse: strings.HasPrefix(s, "-")}
+		}
+		return fields
+	}
+	a := &IndexInfo{FieldNames: []string{"a"}}
+	aDesc := &IndexInfo{FieldNames: []string{"a"}, Reverse: []bool{true}}
+	ab := &IndexInfo{FieldNames: []string{"a", "b"}}
+	aUUID := &IndexInfo{FieldNames: []string{"a"}, PrimaryKey: "uuid"}
+	cases := []struct {
+		name           string
+		idx            *IndexInfo
+		sort           []query.SortField
+		eq             int
+		exact, partial bool
+		start          int
+	}{
+		{"pk_after_field_forward", a, sf("a", "id"), 0, true, false, 0},
+		{"pk_after_field_reverse", a, sf("-a", "-id"), 0, true, false, 0},
+		{"pk_against_field_direction_is_partial", a, sf("-a", "id"), 0, false, true, 0},
+		{"pk_against_field_direction_is_partial_2", a, sf("a", "-id"), 0, false, true, 0},
+		{"fields_after_pk_are_satisfied", a, sf("a", "id", "b"), 0, true, false, 0},
+		{"pk_before_fields_no_match", a, sf("id", "a"), 0, false, false, 0},
+		{"pk_alone_unpinned_no_match", a, sf("id"), 0, false, false, 0},
+		{"pk_alone_all_pinned", a, sf("id"), 1, true, false, 1},
+		{"pk_alone_all_pinned_reverse", a, sf("-id"), 1, true, false, 1},
+		{"equality_prefix_past_pk_ignored", a, sf("id"), 2, false, false, 0},
+		{"pk_after_compound", ab, sf("a", "b", "id"), 0, true, false, 0},
+		{"field_between_breaks", ab, sf("a", "id"), 0, false, true, 0},
+		{"compound_equality_prefix_then_pk", ab, sf("b", "id"), 1, true, false, 1},
+		{"compound_equality_prefix_then_pk_reverse", ab, sf("-b", "-id"), 1, true, false, 1},
+		{"compound_all_pinned_pk", ab, sf("id"), 2, true, false, 2},
+		{"descending_index_pk_forward", aDesc, sf("-a", "id"), 0, true, false, 0},
+		{"descending_index_pk_reverse", aDesc, sf("a", "-id"), 0, true, false, 0},
+		{"descending_index_pk_mixed_is_partial", aDesc, sf("-a", "-id"), 0, false, true, 0},
+		{"custom_primary_key", aUUID, sf("a", "uuid"), 0, true, false, 0},
+		{"custom_primary_key_id_is_a_plain_field", aUUID, sf("a", "id"), 0, false, true, 0},
+		{"reverse_shorter_than_fields", &IndexInfo{FieldNames: []string{"a", "b"}, Reverse: []bool{true}}, sf("-a", "b", "id"), 0, true, false, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			exact, partial, start := IndexSortMatch(c.idx, c.sort, c.eq)
+			assert.Equal(t, c.exact, exact, "exact")
+			assert.Equal(t, c.partial, partial, "partial")
+			assert.Equal(t, c.start, start, "matchStart")
+		})
+	}
+}
+
+// TestShouldReverse_PrimaryKeyStart: a run that starts at the primary-key
+// column (every declared field pinned) reads the column's declared direction,
+// ascending, whatever the declared fields' directions are.
+func TestShouldReverse_PrimaryKeyStart(t *testing.T) {
+	idx := &CBOIndex{Reverse: []bool{true}, SortMatchStart: 1}
+	assert.False(t, shouldReverse([]query.SortField{{Field: "id"}}, idx))
+	assert.True(t, shouldReverse([]query.SortField{{Field: "id", Reverse: true}}, idx))
+}
+
+// TestBuildPlan_IndexSeek_PkSortAfterPinnedField: {a:5} + Sort(-id) on (a) is
+// an exact reverse seek — no SortIter, the scan runs backwards.
+func TestBuildPlan_IndexSeek_PkSortAfterPinnedField(t *testing.T) {
+	sorter := &sortFieldStub{fields: []query.SortField{{Field: "id", Reverse: true}}}
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.MustParseCondition(`{"a": 5}`),
+		Sorter:    sorter,
+		Limit:     10,
+		TotalDocs: 1000,
+		Indexes: []CBOIndex{{
+			Info:           &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Sketch:         mockSketch(20),
+			Bounds:         mustParseBounds("a", `{"a": 5}`),
+			PointLookup:    true,
+			BoundFields:    1,
+			ExactSort:      true,
+			SortMatchStart: 1,
+		}},
+	})
+	assert.Equal(t, "IndexSeek", plan.Name)
+	explain := plan.ExplainString()
+	assert.Contains(t, explain, "(reverse)")
+	assert.NotContains(t, explain, "TopK")
+	assert.NotContains(t, explain, "Sort")
+}
+
+// TestBuildPlan_SortByIdThenField_FullScanNoExtraSort: the primary key is
+// unique, so a sort that starts with it is the full scan's own order whatever
+// follows; a sort that starts with a plain field named like a pk is not.
+func TestBuildPlan_SortByIdThenField_FullScanNoExtraSort(t *testing.T) {
+	bare := func(pk string, fields ...query.SortField) bool {
+		plan := BuildPlan(&PlanParams{
+			Filter:     query.All{},
+			Sorter:     &sortFieldStub{fields: fields},
+			PrimaryKey: pk,
+			TotalDocs:  100,
+		})
+		assert.Equal(t, "FullScan", plan.Name)
+		_, isFullScan := plan.Root.(*FullScanIter)
+		return isFullScan
+	}
+	assert.True(t, bare("", query.SortField{Field: "id"}, query.SortField{Field: "a"}))
+	assert.True(t, bare("", query.SortField{Field: "id", Reverse: true}, query.SortField{Field: "a"}))
+	assert.True(t, bare("uuid", query.SortField{Field: "uuid"}, query.SortField{Field: "a"}))
+	assert.False(t, bare("uuid", query.SortField{Field: "id"}, query.SortField{Field: "a"}), "id is a plain field under a custom primary key")
+}
+
+// TestBuildPlan_SortByIdThenField_LimitCredit: a sort that starts with the
+// primary key is priced like a sort by it alone — the full scan stops at the
+// limit instead of being charged every document.
+func TestBuildPlan_SortByIdThenField_LimitCredit(t *testing.T) {
+	fullScanRows := func(fields ...query.SortField) float64 {
+		plan := BuildPlan(&PlanParams{
+			Filter:    query.All{},
+			Sorter:    &sortFieldStub{fields: fields},
+			Limit:     10,
+			TotalDocs: 1000,
+		})
+		for _, c := range plan.Explain.Candidates {
+			if c.Name == "FullScan" {
+				return c.EstRows
+			}
+		}
+		t.Fatal("no FullScan candidate")
+		return 0
+	}
+	byId := fullScanRows(query.SortField{Field: "id"})
+	assert.Less(t, byId, 1000.0, "a sort by the primary key stops at the limit")
+	assert.Equal(t, byId, fullScanRows(query.SortField{Field: "id"}, query.SortField{Field: "a"}))
+	assert.Equal(t, 1000.0, fullScanRows(query.SortField{Field: "a"}, query.SortField{Field: "id"}), "a sort by a plain field reads everything")
+}
+
+// TestBuildPlan_SorterWithoutFields_FullScanSorts: a sorter that declares no
+// fields (a textScore sort on a non-$text query) still gets its SortIter.
+func TestBuildPlan_SorterWithoutFields_FullScanSorts(t *testing.T) {
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.All{},
+		Sorter:    &sortFieldStub{},
+		TotalDocs: 100,
+	})
+	assert.Equal(t, "FullScan", plan.Name)
+	_, isSortIter := plan.Root.(*SortIter)
+	assert.True(t, isSortIter, "root must be a SortIter, got %T", plan.Root)
+}
