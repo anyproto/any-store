@@ -759,4 +759,18 @@ func TestSortPk_TextCoverLookup(t *testing.T) {
 			assert.Equal(t, spWant(docs, keep, tc.order, limit, spID), collectIdsString(t, q), name)
 		}
 	}
+
+	// A wide $in: the cover lookup is a seek candidate priced with its sort,
+	// never an ordered probe scan.
+	var wide []string
+	for _, d := range docs {
+		if d.text == "alpha" && len(wide) < 200 {
+			wide = append(wide, fmt.Sprint(d.u))
+		}
+	}
+	ex, err := coll.Find(fmt.Sprintf(`{"$text":{"$search":"alpha"},"u":{"$in":[%s]}}`, strings.Join(wide, ","))).
+		Sort("-u", "-id").Limit(1).Explain(ctx)
+	require.NoError(t, err)
+	t.Logf("wide $in: %s", iteratorLine(t, ex))
+	assert.NotContains(t, ex.Plan, "FtsProbeScan(u)")
 }

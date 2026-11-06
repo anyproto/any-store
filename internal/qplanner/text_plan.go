@@ -218,7 +218,9 @@ func buildTextPlan(params *PlanParams) *Plan {
 		if needSort {
 			for i := range params.Indexes {
 				idx := &params.Indexes[i]
-				if !idx.ExactSort {
+				// A cover lookup drains its point probes in bound order: it
+				// is the seek candidate above, never an ordered scan.
+				if !idx.ExactSort || idx.coverLookup() {
 					continue
 				}
 				if !sparseIndexComplete(idx, params.Filter) {
