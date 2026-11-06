@@ -516,6 +516,7 @@ func (idx *index) init() (err error) {
 		Unique:     idx.info.Unique,
 		Sparse:     idx.info.Sparse,
 		Ns:         idx.ns,
+		PrimaryKey: idx.c.primaryKey,
 		SharedFrom: sharedFrom,
 	}
 	return nil
