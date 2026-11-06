@@ -5114,6 +5114,31 @@ func TestBuildPlan_SortByIdThenField_FullScanNoExtraSort(t *testing.T) {
 	assert.False(t, bare("uuid", query.SortField{Field: "id"}, query.SortField{Field: "a"}), "id is a plain field under a custom primary key")
 }
 
+// TestBuildPlan_SortByIdThenField_LimitCredit: a sort that starts with the
+// primary key is priced like a sort by it alone — the full scan stops at the
+// limit instead of being charged every document.
+func TestBuildPlan_SortByIdThenField_LimitCredit(t *testing.T) {
+	fullScanRows := func(fields ...query.SortField) float64 {
+		plan := BuildPlan(&PlanParams{
+			Filter:    query.All{},
+			Sorter:    &sortFieldStub{fields: fields},
+			Limit:     10,
+			TotalDocs: 1000,
+		})
+		for _, c := range plan.Explain.Candidates {
+			if c.Name == "FullScan" {
+				return c.EstRows
+			}
+		}
+		t.Fatal("no FullScan candidate")
+		return 0
+	}
+	byId := fullScanRows(query.SortField{Field: "id"})
+	assert.Less(t, byId, 1000.0, "a sort by the primary key stops at the limit")
+	assert.Equal(t, byId, fullScanRows(query.SortField{Field: "id"}, query.SortField{Field: "a"}))
+	assert.Equal(t, 1000.0, fullScanRows(query.SortField{Field: "a"}, query.SortField{Field: "id"}), "a sort by a plain field reads everything")
+}
+
 // TestBuildPlan_SorterWithoutFields_FullScanSorts: a sorter that declares no
 // fields (a textScore sort on a non-$text query) still gets its SortIter.
 func TestBuildPlan_SorterWithoutFields_FullScanSorts(t *testing.T) {

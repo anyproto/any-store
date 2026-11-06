@@ -408,8 +408,8 @@ func TestSortPk_NumericIds(t *testing.T) {
 	}
 }
 
-// Over a multikey index a sort continued by the primary key returns what a
-// full scan returns, whatever plan the index gets.
+// Over a multikey index a sort continued by the primary key, read from the
+// index, returns what a full scan returns.
 func TestSortPk_MultiKey(t *testing.T) {
 	rng := rand.New(rand.NewSource(5))
 	vals := make([]*anyenc.Value, spRows)
@@ -437,11 +437,12 @@ func TestSortPk_MultiKey(t *testing.T) {
 	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}}))
 	require.NoError(t, coll.Insert(ctx, vals...))
 
+	useIndex := anystore.IndexHint{IndexName: "tags", Boost: 1_000_000}
 	noIndex := anystore.IndexHint{IndexName: "tags", Boost: -1_000_000}
 	for _, sort := range [][]any{sortArgs("tags", "id"), sortArgs("-tags", "-id")} {
-		for _, limit := range []uint{0, 7} {
+		for _, limit := range []uint{0, 50, 300} {
 			name := fmt.Sprintf("sort=%v limit=%d", sort, limit)
-			q := coll.Find(nil).Sort(sort...)
+			q := coll.Find(nil).Sort(sort...).IndexHint(useIndex)
 			ref := coll.Find(nil).Sort(sort...).IndexHint(noIndex)
 			if limit > 0 {
 				q, ref = q.Limit(limit), ref.Limit(limit)
@@ -452,6 +453,8 @@ func TestSortPk_MultiKey(t *testing.T) {
 			require.NoError(t, err, name)
 			line, refLine := iteratorLine(t, ex), iteratorLine(t, refEx)
 			t.Logf("%s: %s | reference: %s", name, line, refLine)
+			require.True(t, strings.HasPrefix(line, "IndexScan(tags)"), "%s: plan %s", name, line)
+			require.False(t, sortsInMemory(line), "%s: plan %s", name, line)
 			require.True(t, strings.HasPrefix(refLine, "FullScan"), "%s: reference plan %s", name, refLine)
 
 			want := collectIdsString(t, ref)
@@ -493,7 +496,8 @@ func TestSortPk_Aggregate(t *testing.T) {
 	assert.Equal(t, want, got)
 }
 
-// A $text query with a range on the sort field keeps the (a, id) order.
+// A $text query with a range on the sort field probes along the index in
+// (a, id) order, with no sort in memory.
 func TestSortPk_Text(t *testing.T) {
 	docs := spDocs()
 	fx := newFixture(t)
@@ -517,7 +521,10 @@ func TestSortPk_Text(t *testing.T) {
 			}
 			ex, err := q.Explain(ctx)
 			require.NoError(t, err, name)
-			t.Logf("%s: %s", name, iteratorLine(t, ex))
+			line := iteratorLine(t, ex)
+			t.Logf("%s: %s", name, line)
+			assert.Contains(t, line, "IndexScan(a)", name)
+			assert.False(t, sortsInMemory(line), "%s: %s", name, line)
 			assert.Equal(t, spWant(docs, keep, tc.order, limit, spID), collectIdsString(t, q), name)
 		}
 	}
