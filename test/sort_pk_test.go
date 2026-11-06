@@ -719,3 +719,44 @@ func BenchmarkKeysetPage(b *testing.B) {
 		}
 	}
 }
+
+// A $text query whose unique-index $in runs as cover lookups sorts in memory:
+// the probes come back in bound order, never in a reverse sort's.
+func TestSortPk_TextCoverLookup(t *testing.T) {
+	docs := spDocs()
+	fx := newFixture(t)
+	coll := spCollection(t, fx, "textcover", docs,
+		anystore.IndexInfo{Kind: anystore.IndexKindFulltext, Fields: []string{"text"}},
+		anystore.IndexInfo{Fields: []string{"u"}, Unique: true},
+	)
+	var in []int
+	for _, d := range docs {
+		if d.text == "alpha" && len(in) < 4 {
+			in = append(in, d.u)
+		}
+	}
+	keep := func(d spDoc) bool { return d.text == "alpha" && slices.Contains(in, d.u) }
+	filter := fmt.Sprintf(`{"$text":{"$search":"alpha"},"u":{"$in":[%d,%d,%d,%d]}}`, in[0], in[1], in[2], in[3])
+	for _, tc := range []struct {
+		sort  []any
+		order func(x, y spDoc) int
+	}{
+		{sortArgs("-u"), func(x, y spDoc) int { return cmp.Compare(y.u, x.u) }},
+		{sortArgs("-u", "-id"), func(x, y spDoc) int { return cmp.Or(cmp.Compare(y.u, x.u), cmp.Compare(y.id, x.id)) }},
+		{sortArgs("u", "id"), func(x, y spDoc) int { return cmp.Or(cmp.Compare(x.u, y.u), cmp.Compare(x.id, y.id)) }},
+	} {
+		for _, limit := range []uint{0, 2} {
+			name := fmt.Sprintf("sort=%v limit=%d", tc.sort, limit)
+			q := coll.Find(filter).Sort(tc.sort...)
+			if limit > 0 {
+				q = q.Limit(limit)
+			}
+			ex, err := q.Explain(ctx)
+			require.NoError(t, err, name)
+			line := iteratorLine(t, ex)
+			t.Logf("%s: %s", name, line)
+			require.Contains(t, line, "CoverLookup(u)", name)
+			assert.Equal(t, spWant(docs, keep, tc.order, limit, spID), collectIdsString(t, q), name)
+		}
+	}
+}

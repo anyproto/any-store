@@ -202,7 +202,9 @@ func buildTextPlan(params *PlanParams) *Plan {
 				nSeeks = 1
 			}
 			access := nSeeks*CostIndexSeek + e*CostSeqRead
-			orderedOut := rankMode || (needSort && idx.ExactSort)
+			// A cover lookup returns its point probes in bound order, never
+			// in a reverse sort's (the chain keeps its SortIter below).
+			orderedOut := rankMode || (needSort && idx.ExactSort && !idx.coverLookup())
 			cands = append(cands, textCandidate{
 				name: idx.candidateName("FtsProbeSeek"), idx: idx,
 				cost:    access + finishCost(e, orderedOut),
@@ -390,7 +392,7 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 		}
 		reverse := shouldReverse(params.sortFields(), idx)
 
-		if idx.Info.Unique && idx.fullKeyPointBound() {
+		if idx.coverLookup() {
 			// CoverIter must get the UN-finalized bounds: it seeks the raw
 			// prefix and applies HasExactFieldPrefix itself, so the reverse-
 			// tail pad would double-pad the seek, and MergeOverlappingBounds
@@ -473,7 +475,9 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 		if canonicalWrap != nil {
 			root = canonicalWrap(root)
 		}
-		if needSort && (cand.idx == nil || !cand.idx.ExactSort) {
+		// A cover lookup yields its point probes in bound order, so like the
+		// ordinary seek chain it never stands in for the sort.
+		if needSort && (cand.idx == nil || !cand.idx.ExactSort || cand.idx.coverLookup()) {
 			root = &SortIter{
 				Source: root,
 				Data:   dataCS,

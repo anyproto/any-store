@@ -374,6 +374,13 @@ func (p *Plan) isChosen(name, chosenName string) bool {
 	return strings.Contains(name, p.Name)
 }
 
+// coverLookup reports whether the seek runs as CoverIter point probes: a
+// unique index with every field pinned. The probes come back in bound order,
+// so such a chain keeps its SortIter whatever ExactSort says.
+func (idx *CBOIndex) coverLookup() bool {
+	return idx.Info.Unique && idx.fullKeyPointBound()
+}
+
 // fullKeyPointBound reports whether the bound chain pins EVERY index field
 // with an equality. One definition for its three consumers — the CoverIter
 // routing gate and the two IndexIter.FullKeyBound assignments — so they can
@@ -1774,7 +1781,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// Only safe when ALL index fields are covered by equality bounds;
 	// a partial prefix (BoundFields < len(FieldNames)) can match multiple
 	// entries with different trailing fields, so a range scan is needed.
-	if idx.Info.Unique && idx.fullKeyPointBound() {
+	if idx.coverLookup() {
 		cb := &coverBatch{cs: CursorSource{Tx: params.Tx, Ns: idx.Info.Ns}}
 		cb.cover = CoverIter{
 			Source:       &cb.cs,
