@@ -194,9 +194,9 @@ type PlanParams struct {
 	// planner reads it through sortFields, which resolves it once otherwise.
 	SortFields []query.SortField
 
-	// PrimaryKey is the collection's primary-key field. Empty ⇒ "id". A single
-	// Sort on this field needs no SortIter because a full scan already yields
-	// primary-key order.
+	// PrimaryKey is the collection's primary-key field. Empty ⇒ "id". A sort
+	// that starts with this field needs no SortIter because a full scan already
+	// yields primary-key order, and the key is unique.
 	PrimaryKey string
 
 	Limit  int
@@ -448,8 +448,9 @@ func BuildPlan(params *PlanParams) *Plan {
 			}
 		}
 	}
-	// FullScan naturally reads in primary-key order, so sorting by the primary
-	// key is free.
+	// FullScan naturally reads in primary-key order, so a sort that starts
+	// with the primary key is free: the key is unique, so the fields after it
+	// never reorder the rows.
 	fullScanNeedSort := needSort
 	if needSort {
 		fields := params.sortFields()
@@ -457,7 +458,7 @@ func BuildPlan(params *PlanParams) *Plan {
 		if pk == "" {
 			pk = "id"
 		}
-		if len(fields) == 1 && fields[0].Field == pk {
+		if len(fields) > 0 && fields[0].Field == pk {
 			fullScanNeedSort = false
 		}
 	}
@@ -1667,6 +1668,8 @@ func estimateIndexDocsWithFieldSel(idx *CBOIndex, totalDocs float64, fieldSel []
 func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator {
 	var root Iterator
 
+	// A sort that starts with the primary key is the scan's own order: the
+	// key is unique, so the fields after it never reorder the rows.
 	idSorted := false
 	if needSort {
 		fields := params.sortFields()
@@ -1674,7 +1677,7 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 		if pk == "" {
 			pk = "id"
 		}
-		if len(fields) == 1 && fields[0].Field == pk {
+		if len(fields) > 0 && fields[0].Field == pk {
 			idSorted = true
 			fsi := &FullScanIter{
 				Source: &CursorSource{

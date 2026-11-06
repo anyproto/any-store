@@ -5092,3 +5092,37 @@ func TestBuildPlan_IndexSeek_PkSortAfterPinnedField(t *testing.T) {
 	assert.NotContains(t, explain, "TopK")
 	assert.NotContains(t, explain, "Sort")
 }
+
+// TestBuildPlan_SortByIdThenField_FullScanNoExtraSort: the primary key is
+// unique, so a sort that starts with it is the full scan's own order whatever
+// follows; a sort that starts with a plain field named like a pk is not.
+func TestBuildPlan_SortByIdThenField_FullScanNoExtraSort(t *testing.T) {
+	bare := func(pk string, fields ...query.SortField) bool {
+		plan := BuildPlan(&PlanParams{
+			Filter:     query.All{},
+			Sorter:     &sortFieldStub{fields: fields},
+			PrimaryKey: pk,
+			TotalDocs:  100,
+		})
+		assert.Equal(t, "FullScan", plan.Name)
+		_, isFullScan := plan.Root.(*FullScanIter)
+		return isFullScan
+	}
+	assert.True(t, bare("", query.SortField{Field: "id"}, query.SortField{Field: "a"}))
+	assert.True(t, bare("", query.SortField{Field: "id", Reverse: true}, query.SortField{Field: "a"}))
+	assert.True(t, bare("uuid", query.SortField{Field: "uuid"}, query.SortField{Field: "a"}))
+	assert.False(t, bare("uuid", query.SortField{Field: "id"}, query.SortField{Field: "a"}), "id is a plain field under a custom primary key")
+}
+
+// TestBuildPlan_SorterWithoutFields_FullScanSorts: a sorter that declares no
+// fields (a textScore sort on a non-$text query) still gets its SortIter.
+func TestBuildPlan_SorterWithoutFields_FullScanSorts(t *testing.T) {
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.All{},
+		Sorter:    &sortFieldStub{},
+		TotalDocs: 100,
+	})
+	assert.Equal(t, "FullScan", plan.Name)
+	_, isSortIter := plan.Root.(*SortIter)
+	assert.True(t, isSortIter, "root must be a SortIter, got %T", plan.Root)
+}
