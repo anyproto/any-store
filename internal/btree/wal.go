@@ -1828,7 +1828,7 @@ func (w *wal) syncFromSHMLocked() {
 		w.headerOnDisk = true
 	}
 	// Monotonic updates on shared walIndex atomics. These are safe under
-	// concurrent readers because the writer (single, via writeMu) is the
+	// concurrent readers because the writer (single, via the write lock) is the
 	// only source of increments.
 	w.index.maxFrame.Store(hdr.mxFrame)
 	w.index.mxCommitFrame.Store(hdr.mxFrame)

@@ -54,14 +54,14 @@ func TestBeginRead_ClosingDuringLock(t *testing.T) {
 
 // === BeginWrite error paths (line 222) — 61% ===
 // Uncovered paths:
-// - closing check after writeMu.Lock (line 228-230)
+// - closing check after lockWriter (line 228-230)
 // - closing check after mu.RLock (line 232-236)
 // - beginRead error (line 239-243)
 // - readHeaderCounters error (line 246-252)
 // - beginWrite error (line 254-258)
 
 func TestBeginWrite_ClosingAfterWriteMuLock(t *testing.T) {
-	// This tests the closing flag check after writeMu is acquired.
+	// This tests the closing flag check after the write lock is acquired.
 	db := tempDB(t)
 	db.SetClosing()
 	_, err := db.BeginWrite()
@@ -1281,11 +1281,11 @@ func TestBeginRead_ClosingAfterRLock(t *testing.T) {
 }
 
 func TestBeginWrite_ClosingAfterWriteMuAndRLock(t *testing.T) {
-	// Cover lines 227-230 and 232-236: closing detected after writeMu.Lock and mu.RLock.
+	// Cover lines 227-230 and 232-236: closing detected after lockWriter and mu.RLock.
 	db := tempDB(t)
 
-	// Hold writeMu so BeginWrite blocks at writeMu.Lock (line 226)
-	db.writeMu.Lock()
+	// Hold the write lock so BeginWrite blocks at lockWrite (line 226)
+	db.writeSem <- struct{}{}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -1295,14 +1295,14 @@ func TestBeginWrite_ClosingAfterWriteMuAndRLock(t *testing.T) {
 		_, writeErr = db.BeginWrite()
 	}()
 
-	// Give goroutine time to block on writeMu.Lock
+	// Give goroutine time to block on lockWriter
 	time.Sleep(20 * time.Millisecond)
 
 	// Set closing while goroutine is blocked
 	db.closing.Store(true)
 
-	// Release writeMu — goroutine proceeds to line 227, sees closing=true
-	db.writeMu.Unlock()
+	// Release the write lock — goroutine proceeds to line 227, sees closing=true
+	db.unlockWriter()
 
 	wg.Wait()
 	assert.ErrorIs(t, writeErr, ErrClosed)
@@ -1313,7 +1313,7 @@ func TestBeginWrite_ClosingAfterMuRLock(t *testing.T) {
 	db := tempDB(t)
 
 	// Hold mu exclusively so BeginWrite blocks at mu.RLock (line 231)
-	// after passing the writeMu.Lock (line 226) and the first closing check (line 227)
+	// after passing the lockWriter (line 226) and the first closing check (line 227)
 	db.mu.Lock()
 
 	var wg sync.WaitGroup
@@ -1324,7 +1324,7 @@ func TestBeginWrite_ClosingAfterMuRLock(t *testing.T) {
 		_, writeErr = db.BeginWrite()
 	}()
 
-	// Give goroutine time to acquire writeMu and block on mu.RLock
+	// Give goroutine time to acquire the write lock and block on mu.RLock
 	time.Sleep(20 * time.Millisecond)
 
 	// Set closing while goroutine is blocked at mu.RLock
@@ -1529,7 +1529,7 @@ func TestBeginWrite_BeginWriteError(t *testing.T) {
 	// Disable busy handler so we get immediate ErrBusy
 	db.pager.wal.busyHandler = nil
 
-	// Acquire WAL write lock directly (bypassing DB.writeMu)
+	// Acquire WAL write lock directly (bypassing the DB write lock)
 	// This will cause pager.beginWrite to fail with ErrBusy.
 	err = db.pager.wal.index.lock(lockWrite, lockExclusive)
 	require.NoError(t, err)
@@ -1929,7 +1929,7 @@ func TestBeginWrite_PagerBeginWriteError(t *testing.T) {
 	// Disable busy handler so we get immediate ErrBusy
 	db.pager.wal.busyHandler = nil
 
-	// Acquire WAL write lock directly, bypassing DB.writeMu
+	// Acquire WAL write lock directly, bypassing the DB write lock
 	err = db.pager.wal.index.lock(lockWrite, lockExclusive)
 	require.NoError(t, err)
 
@@ -3406,7 +3406,7 @@ func TestWriteTxAbandonedThenNewWriteTxWorks(t *testing.T) {
 	_ = tx1.pager.rollback()
 	tx1.pager.endRead(tx1.walSlot)
 	db.mu.RUnlock()
-	db.writeMu.Unlock()
+	db.unlockWriter()
 
 	// A new write tx should succeed
 	tx2, err := db.BeginWrite()

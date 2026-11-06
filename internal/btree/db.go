@@ -4,6 +4,7 @@ package btree
 // It manages namespaces, transactions, and the underlying pager/WAL.
 
 import (
+	"context"
 	// BEGIN ENCRYPTION
 	"crypto/rand"
 	// END ENCRYPTION
@@ -328,7 +329,7 @@ var errEmptyFile = errors.New("btree: empty file")
 // DB represents an open database.
 type DB struct {
 	mu              sync.RWMutex
-	writeMu         sync.Mutex // serializes write transactions
+	writeSem        chan struct{} // the write lock of this process: see lockWriter
 	pager           *pager
 	path            string
 	opts            Options
@@ -342,7 +343,7 @@ type DB struct {
 	masterBT *btree
 
 	// Local counter cache for multi-process staleness detection.
-	// Accessed atomically: written by Commit (under writeMu + mu.RLock)
+	// Accessed atomically: written by Commit (under the write lock + mu.RLock)
 	// and read by BeginRead/BeginWrite (under mu.RLock). Since both
 	// paths hold mu.RLock (not exclusive), atomics are required.
 	localFileChangeCounter atomic.Uint32
@@ -379,8 +380,9 @@ type DB struct {
 	// readerSem limits the number of concurrent read transactions.
 	// Buffered channel with capacity MaxReaders; BeginRead sends, Rollback receives.
 	readerSem chan struct{}
-	// closeCh is closed when the DB is shutting down, unblocking any
-	// goroutines waiting on readerSem in BeginRead.
+	// closeCh is closed when the DB is shutting down, unblocking the
+	// goroutines waiting for a reader slot (beginRead) or for the write
+	// lock (lockWriter).
 	closeCh chan struct{}
 
 	// lastAutoCheckpointErr stores the most recent non-nil error from
@@ -435,7 +437,7 @@ func (db *DB) LastWriterUnwindError() error {
 // and Close: exactly once per write transaction (the writerLocksDone CAS —
 // Close may race a finishing writer), it runs pre (the panic-unwind discard,
 // may be nil), releases the writer's WAL read slot, runs post (the
-// auto-checkpoint, may be nil), and releases db.mu.RLock + db.writeMu.
+// auto-checkpoint, may be nil), and releases db.mu.RLock + the write lock.
 //
 // The mutex releases are DEFERRED: once the CAS is consumed, Close's rescue
 // path can never fire again, so a panic in pre/endRead/post re-leaking the
@@ -446,7 +448,7 @@ func (db *DB) releaseWriterLocks(pager *pager, slot int, pre, post func()) bool 
 	if !db.writerLocksDone.CompareAndSwap(false, true) {
 		return false
 	}
-	defer db.writeMu.Unlock()
+	defer db.unlockWriter()
 	defer db.mu.RUnlock()
 	if pre != nil {
 		pre()
@@ -456,6 +458,61 @@ func (db *DB) releaseWriterLocks(pager *pager, slot int, pre, post func()) bool 
 		post()
 	}
 	return true
+}
+
+// lockWriter takes the write lock: one writer at a time in this process (the
+// writer lock across processes is the WAL's, taken in pager.beginWrite). A
+// capacity-1 channel, not a sync.Mutex, so that the wait can end with ctx or
+// with Close. Blocked senders queue FIFO and a release hands the slot to the
+// first of them, so a newcomer never overtakes a waiter; the k-th receive is
+// synchronized before the (k+1)-th send completes, which is the
+// happens-before the writer-owned state (writerLocksDone, writerCache, the
+// header, the codec) relies on. ctx is checked before the wait, as SQLite
+// checks isInterrupted before a statement starts (vdbe.c:902): a ctx that
+// has ended takes no lock. SQLite's default build never blocks on a lock:
+// its busy handler sleeps and retries, and sqlite3_interrupt does not end
+// that sleep; the waits taken here while the lock is held (the busy handler
+// behind another process's writer, a BUSY_SNAPSHOT retry, the WAL_RETRY
+// loop) keep that shape and are bounded by the busy timeout and the retry
+// limit, not by ctx.
+func (db *DB) lockWriter(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case db.writeSem <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case db.writeSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-db.closeCh:
+		return ErrClosed
+	}
+}
+
+// tryLockWrite takes the write lock when it is free.
+func (db *DB) tryLockWriter() bool {
+	select {
+	case db.writeSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// unlockWrite releases the write lock. A release of a lock nobody holds is
+// the bug sync.Mutex reports as "unlock of unlocked mutex"; a receive on the
+// empty channel would block forever instead, so it panics here.
+func (db *DB) unlockWriter() {
+	select {
+	case <-db.writeSem:
+	default:
+		panic("btree: unlock of unlocked write lock")
+	}
 }
 
 // writerUnwind returns the panic-unwind discard step for releaseWriterLocks:
@@ -645,6 +702,7 @@ func Open(path string, opts Options) (*DB, error) {
 		readerCacheSize: readerCacheSize,
 		readerCaches:    make(chan *pcache, maxReaders),
 		readerSem:       make(chan struct{}, maxReaders),
+		writeSem:        make(chan struct{}, 1),
 		closeCh:         make(chan struct{}),
 	}
 
@@ -691,8 +749,8 @@ func (db *DB) Close() error {
 	db.closing.Store(true)
 	db.closeOnce.Do(func() { close(db.closeCh) })
 
-	if !db.writeMu.TryLock() {
-		// Writer holds writeMu. Force-rollback the abandoned/in-flight tx.
+	if !db.tryLockWriter() {
+		// A writer holds the write lock. Force-rollback the abandoned/in-flight tx.
 		// writerOpMu serializes with commit/rollback so we don't interleave
 		// with a concurrent Commit or Rollback call.
 		// Use rollbackForClose which skips writerCache operations to avoid
@@ -708,9 +766,11 @@ func (db *DB) Close() error {
 		// could race with Close, and the writerLocksDone CAS inside
 		// releaseWriterLocks prevents the double-release.
 		db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil)
-		db.writeMu.Lock()
+		// A plain send, not lockWriter: closeCh is closed already, and this
+		// wait is for the holder to leave.
+		db.writeSem <- struct{}{}
 	}
-	db.writeMu.Unlock()
+	db.unlockWriter()
 	// Wait for all active readers to finish
 	db.mu.Lock()
 	db.mu.Unlock()
@@ -728,7 +788,7 @@ drained:
 }
 
 // SetClosing marks the database as closing, causing new transactions to fail.
-// Also unblocks any goroutines waiting on the reader semaphore in BeginRead.
+// Also unblocks the goroutines waiting for a reader slot or the write lock.
 func (db *DB) SetClosing() {
 	db.closing.Store(true)
 	db.closeOnce.Do(func() { close(db.closeCh) })
@@ -792,18 +852,28 @@ func (db *DB) Options() Options {
 // When readCounters is false, disk counters are initialized from local counters
 // without reading page-1 metadata, which is useful for hot point-lookups.
 // When wait is false, a held-up reader slot is ErrReadersBusy, not a wait.
-func (db *DB) beginRead(readCounters, wait bool) (*ReadTx, error) {
+// A wait ends with a slot, with ctx (its Err) or with Close (ErrClosed). ctx
+// is checked before the wait, so a ctx that has ended takes no slot.
+func (db *DB) beginRead(ctx context.Context, readCounters, wait bool) (*ReadTx, error) {
 	if db.closing.Load() {
 		return nil, ErrClosed
 	}
 
 	// Acquire reader semaphore — limits concurrent read transactions.
-	// Uses closeCh to unblock if the DB is closing while we wait.
 	if wait {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		select {
 		case db.readerSem <- struct{}{}:
-		case <-db.closeCh:
-			return nil, ErrClosed
+		default:
+			select {
+			case db.readerSem <- struct{}{}:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-db.closeCh:
+				return nil, ErrClosed
+			}
 		}
 	} else {
 		select {
@@ -958,17 +1028,24 @@ func (db *DB) beginRead(readCounters, wait bool) (*ReadTx, error) {
 	return tx, nil
 }
 
-// BeginRead starts a read-only transaction.
+// BeginRead starts a read-only transaction. Its wait for a reader slot ends
+// with the slot or with Close; BeginReadContext's also ends with a ctx.
 // DRIFT: BeginReadFast skips page-1 counter read; staleness APIs return stale/false See docs/btree/NOTES.md#drift-45-beginreadfast-skips-page-1-staleness-counter-reads
 func (db *DB) BeginRead() (*ReadTx, error) {
-	return db.beginRead(true, true)
+	return db.beginRead(context.Background(), true, true)
+}
+
+// BeginReadContext is BeginRead whose wait for a reader slot also ends with
+// ctx: ctx.Err() when ctx ends first, at once when ctx has ended already.
+func (db *DB) BeginReadContext(ctx context.Context) (*ReadTx, error) {
+	return db.beginRead(ctx, true, true)
 }
 
 // TryBeginRead is BeginRead that does not wait for a reader slot:
 // ErrReadersBusy when every one is held. For a caller that may hold one
 // itself.
 func (db *DB) TryBeginRead() (*ReadTx, error) {
-	return db.beginRead(true, false)
+	return db.beginRead(context.Background(), true, false)
 }
 
 // BeginReadFast starts a read-only transaction without the raised page-1
@@ -977,12 +1054,17 @@ func (db *DB) TryBeginRead() (*ReadTx, error) {
 // staleness detection: the disk counters are the seeded local ones.
 // DRIFT: BeginReadFast skips the raised page-1 counter read; staleness APIs return stale/false See docs/btree/NOTES.md#drift-45-beginreadfast-skips-page-1-staleness-counter-reads
 func (db *DB) BeginReadFast() (*ReadTx, error) {
-	return db.beginRead(false, true)
+	return db.beginRead(context.Background(), false, true)
+}
+
+// BeginReadFastContext is BeginReadFast with BeginReadContext's wait.
+func (db *DB) BeginReadFastContext(ctx context.Context) (*ReadTx, error) {
+	return db.beginRead(ctx, false, true)
 }
 
 // BeginWrite starts a read-write transaction. Only one write transaction
-// can be active at a time (single-writer semantics). Blocks until any
-// existing write transaction completes.
+// can be active at a time (single-writer semantics). Waits until the
+// existing write transaction completes or the DB closes.
 //
 // busySnapshotInnerRetries is the tight-loop budget inside BeginWrite
 // for the BUSY_SNAPSHOT race (wal.c:3714 SQLITE_BUSY_SNAPSHOT). Most
@@ -995,18 +1077,28 @@ func (db *DB) BeginReadFast() (*ReadTx, error) {
 const busySnapshotInnerRetries = 3
 
 func (db *DB) BeginWrite() (*WriteTx, error) {
+	return db.BeginWriteContext(context.Background())
+}
+
+// BeginWriteContext is BeginWrite whose wait for the write lock also ends
+// with ctx: ctx.Err() when ctx ends first, at once when ctx has ended
+// already. Only the wait for this process's lock is ctx's; see lockWriter
+// for the waits behind another process's writer.
+func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	if db.closing.Load() {
 		return nil, ErrClosed
 	}
-	db.writeMu.Lock()
+	if err := db.lockWriter(ctx); err != nil {
+		return nil, err
+	}
 	if db.closing.Load() {
-		db.writeMu.Unlock()
+		db.unlockWriter()
 		return nil, ErrClosed
 	}
 	db.mu.RLock()
 	if db.closing.Load() {
 		db.mu.RUnlock()
-		db.writeMu.Unlock()
+		db.unlockWriter()
 		return nil, ErrClosed
 	}
 
@@ -1025,7 +1117,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 				}
 			}
 			db.mu.RUnlock()
-			db.writeMu.Unlock()
+			db.unlockWriter()
 			return nil, err
 		}
 
@@ -1041,7 +1133,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		db.pager.endRead(slot)
 		if !errors.Is(err, ErrBusySnapshot) {
 			db.mu.RUnlock()
-			db.writeMu.Unlock()
+			db.unlockWriter()
 			return nil, err
 		}
 		// Clear writerCache: another process committed, our cached pages are stale
@@ -1053,7 +1145,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 			xBusy := db.pager.wal.busyHandler
 			if xBusy == nil || !xBusy(attempt-busySnapshotInnerRetries) {
 				db.mu.RUnlock()
-				db.writeMu.Unlock()
+				db.unlockWriter()
 				return nil, ErrBusySnapshot
 			}
 		}
@@ -2068,7 +2160,7 @@ func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 }
 
 // IsWriteTx reports whether this ReadTx is the read view embedded in a write
-// transaction (i.e. the caller is inside a WriteTx and holds db.writeMu, so it is
+// transaction (i.e. the caller is inside a WriteTx and holds the write lock, so it is
 // the sole in-process mutator and can see this tx's own uncommitted pages). It is
 // false for a standalone read-only transaction. The advisory sketch tier uses
 // this to choose an in-place reload (write-tx path, safe to mutate the live
@@ -2291,7 +2383,7 @@ func (tx *WriteTx) Commit() error {
 	tx.closed = true
 	tx.aux = nil
 	// Captured for the defer: on the normal path tx is returned to the pool
-	// before the defer runs (safe — the pool is only drained under writeMu,
+	// before the defer runs (safe — the pool is only drained under the write lock,
 	// still held here — but the defer must not reach through a pooled tx).
 	db, pager, slot := tx.db, tx.pager, tx.walSlot
 	var (

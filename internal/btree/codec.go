@@ -196,7 +196,7 @@ const noncePoolSize = 4096
 // noncePool batches crypto/rand.Read syscalls behind a userspace buffer.
 //
 // NOT safe for concurrent use. any-store's Codec is only invoked for
-// nonce-drawing Encrypt calls by the writer goroutine (writeMu-serialized
+// nonce-drawing Encrypt calls by the writer goroutine (write-lock-serialized
 // at the DB level); readers never call Encrypt. If a future refactor
 // lets multiple goroutines share a codec for encryption, wrap Draw in
 // external synchronization or add a lock here.

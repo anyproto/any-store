@@ -579,7 +579,8 @@ sub-journaling for savepoints.
   checkpoint restart and TOCTOU race)
 - **Max concurrent readers**: `readerSem` channel with capacity `MaxReaders`
   (default 4) limits concurrent read transactions per DB. Bounds memory from
-  persistent reader caches. `closeCh` unblocks waiters on DB close
+  persistent reader caches. A wait ends with a slot, with the caller's ctx
+  (`BeginReadContext`) or with DB close (`closeCh`)
 - Pin counting (similar to SQLite's reference counting)
 - `purgeable` flag matching SQLite's `pcache1.bPurgeable`
 - `page.cache` backpointer for routing releases to the correct cache
@@ -1581,6 +1582,28 @@ before dataVersion increment). Matches SQLite `pager.c:3246-3267`
 memory from persistent reader caches. `closeCh` channel unblocks goroutines
 waiting on the semaphore when `DB.Close()` or `DB.SetClosing()` is called.
 No SQLite equivalent — our addition for the many-open-databases scenario.
+
+**In-Process Write Lock and Context-Bounded Waits** -- Severity: N/A (implemented)
+
+SQLite's default build never blocks on a lock (an `SQLITE_ENABLE_SETLK_TIMEOUT`
+build blocks on the WRITER lock, `btree.c:3664-3737`): a busy lock returns
+`SQLITE_BUSY`, and the busy handler sleeps and retries (`sqlite3InvokeBusyHandler`
+`main.c:1770-1780`, the sleep in `sqliteDefaultBusyCallback` `main.c:1718-1757`, the
+loop in `btreeBeginTrans`); `sqlite3_interrupt` does not end that sleep, only an
+application busy handler that consults `sqlite3_is_interrupted` can. Readers retry
+`walTryBeginRead` on a sleep schedule of its own (`wal.c:3040-3070`, up to
+`WAL_RETRY_PROTOCOL_LIMIT`). The Go port serializes the writers of one process on
+`writeSem`, a capacity-1 channel (`DB.lockWriter`), and its readers on `readerSem`;
+both waits end with the resource, with the caller's ctx (`BeginWriteContext`,
+`BeginReadContext`: `ctx.Err()`) or with close (`ErrClosed`). ctx is checked
+before the wait, as `vdbe.c:902` checks `isInterrupted` before a statement starts,
+so a ctx that has ended takes nothing. A capacity-1 channel hands the lock to its
+waiters in FIFO order and gives the release→acquire happens-before the writer-owned
+state relies on. The waits taken while the write lock is held — the busy handler
+behind another process's writer (`walBusyLock`), the BUSY_SNAPSHOT retry, the
+WAL_RETRY loop — keep SQLite's shape: bounded by the busy timeout and by the
+retry limit (`ErrProtocol`), not by ctx. Our addition for the
+many-goroutines-one-DB scenario.
 
 **Implemented Optimizations:**
 - `dirtyTail` pointer for O(1) spill victim search — walks backward from tail

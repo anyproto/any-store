@@ -6,6 +6,7 @@ package btree
 // any-store-tests:docs/any-store/btree/plans/2026-04-22-sqlite-backup-port.md.
 
 import (
+	"context"
 	"errors"
 	"sync"
 )
@@ -181,7 +182,7 @@ func putUint32BE(buf []byte, v uint32) {
 //
 // ~ sqlite3_backup_step (backup.c:314–566).
 // DRIFT: backup empty-source (nSrcPage==0 -> NewDb) path missing; truncateTo(0) errors See docs/btree/NOTES.md#drift-41-backup-empty-source-finalization-path-missing
-func (b *Backup) Step(nPage int) error {
+func (b *Backup) Step(ctx context.Context, nPage int) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -196,9 +197,14 @@ func (b *Backup) Step(nPage int) error {
 	// DRIFT: SQLite conditionally opens a tx only if none exists, to
 	// support explicit sqlite3_backup_step-inside-a-user-tx patterns.
 	// any-store doesn't expose that; we always open+close our own.
-	rtx, err := b.src.BeginRead()
+	rtx, err := b.src.BeginReadContext(ctx)
 	if err != nil {
-		b.rc = err
+		// The ctx's error is the caller's, not the backup's: a later Step
+		// with a live ctx goes on (SQLite's isFatalError keeps BUSY and
+		// LOCKED out of p->rc the same way, backup.c:217-219).
+		if ctx.Err() == nil {
+			b.rc = err
+		}
 		return err
 	}
 	defer rtx.Rollback()
@@ -216,9 +222,11 @@ func (b *Backup) Step(nPage int) error {
 	// Lock destination (exclusive/write tx) on first Step.
 	// ~ backup.c:366–371: sqlite3BtreeBeginTrans(p->pDest, 2, &iDestSchema).
 	if !b.dstLocked {
-		wtx, err := b.dst.BeginWrite()
+		wtx, err := b.dst.BeginWriteContext(ctx)
 		if err != nil {
-			b.rc = err
+			if ctx.Err() == nil {
+				b.rc = err
+			}
 			return err
 		}
 		b.dstWriteTx = wtx

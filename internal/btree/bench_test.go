@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"math/rand"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
+	"time"
 )
 
 // benchDB creates a temporary on-disk DB for benchmarks with default options.
@@ -584,5 +586,69 @@ func walkForLeaves(bt *btree, pgno uint32, count *int) {
 	bt.pager.releasePage(pg)
 	for _, c := range children {
 		walkForLeaves(bt, c, count)
+	}
+}
+
+// BenchmarkWriteLock_Contended runs g goroutines taking write transactions
+// back to back and reports, besides the time per transaction, the wait each
+// BeginWrite spent on the write lock: p50, p99 and max in µs. The spread
+// between them is the lock's fairness.
+func BenchmarkWriteLock_Contended(b *testing.B) {
+	for _, g := range []int{1, 4, 16} {
+		b.Run(fmt.Sprintf("g=%d", g), func(b *testing.B) {
+			db := benchDB(b)
+			ns := benchPopulate(b, db, 1000, 100)
+			per := b.N / g
+			if per == 0 {
+				per = 1
+			}
+			waits := make([][]time.Duration, g)
+			var wg sync.WaitGroup
+			b.ResetTimer()
+			for i := 0; i < g; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					ws := make([]time.Duration, 0, per)
+					key := make([]byte, 4)
+					val := make([]byte, 100)
+					for j := 0; j < per; j++ {
+						t0 := time.Now()
+						tx, err := db.BeginWrite()
+						ws = append(ws, time.Since(t0))
+						if err != nil {
+							b.Error(err)
+							return
+						}
+						binary.BigEndian.PutUint32(key, uint32(1+(i*per+j)%1000))
+						if err := tx.Put(ns, key, val); err != nil {
+							b.Error(err)
+							return
+						}
+						if err := tx.Commit(); err != nil {
+							b.Error(err)
+							return
+						}
+					}
+					waits[i] = ws
+				}(i)
+			}
+			wg.Wait()
+			b.StopTimer()
+			var all []time.Duration
+			for _, ws := range waits {
+				all = append(all, ws...)
+			}
+			slices.Sort(all)
+			if len(all) == 0 {
+				return
+			}
+			pct := func(q float64) float64 {
+				return float64(all[int(float64(len(all)-1)*q)]) / float64(time.Microsecond)
+			}
+			b.ReportMetric(pct(0.5), "p50-wait-µs")
+			b.ReportMetric(pct(0.99), "p99-wait-µs")
+			b.ReportMetric(pct(1), "max-wait-µs")
+		})
 	}
 }
