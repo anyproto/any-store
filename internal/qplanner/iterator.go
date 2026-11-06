@@ -1,6 +1,7 @@
 package qplanner
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -136,13 +137,17 @@ func EntryValueIsMultiKey(val []byte) bool {
 
 // CursorSource provides cursors and direct lookups for a btree namespace.
 type CursorSource struct {
-	Tx *btree.ReadTx
-	Ns *btree.Namespace
+	// Ctx is polled by the cursors of this source once per leaf they leave
+	// (btree.ReadTx.NewCursorContext); nil polls nothing. A plan's sources
+	// carry the ctx of the call that compiled it (PlanParams.Ctx).
+	Ctx context.Context
+	Tx  *btree.ReadTx
+	Ns  *btree.Namespace
 }
 
 // NewCursor creates a new btree cursor for this source.
 func (cs *CursorSource) NewCursor() *btree.Cursor {
-	return cs.Tx.NewCursor(cs.Ns)
+	return cs.Tx.NewCursorContext(cs.Ctx, cs.Ns)
 }
 
 // Get performs a direct key lookup.

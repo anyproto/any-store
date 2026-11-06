@@ -3,6 +3,7 @@ package qplanner
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"fmt"
 	"math"
 	"slices"
@@ -184,6 +185,10 @@ func formatScanDetails(scanRows, fetchCost float64, hasLimit bool) string {
 
 // PlanParams holds all the parameters needed to build a query plan.
 type PlanParams struct {
+	// Ctx is the ctx of the call the plan runs for: the plan's cursors poll
+	// it once per leaf they leave (CursorSource.Ctx), so a scan ends with
+	// the ctx's error within a page of the ctx ending.
+	Ctx      context.Context
 	Tx       *btree.ReadTx
 	DataNs   *btree.Namespace
 	Filter   query.Filter
@@ -875,7 +880,7 @@ func BuildPlan(params *PlanParams) *Plan {
 // k-cut; Count's LimitIter.CountDistinct fast path computes correctly over the
 // stacked shape.)
 func buildVectorPlan(params *PlanParams) *Plan {
-	dataCS := &CursorSource{Tx: params.Tx, Ns: params.DataNs}
+	dataCS := &CursorSource{Ctx: params.Ctx, Tx: params.Tx, Ns: params.DataNs}
 	source := &VectorIter{
 		Spec: params.Vector,
 		Data: dataCS,
@@ -895,7 +900,7 @@ func buildVectorPlan(params *PlanParams) *Plan {
 // stream flows straight to LimitIter — no SortIter. An explicit sort on a real
 // field inserts a SortIter that re-orders the candidates.
 func buildFtsPlan(params *PlanParams) *Plan {
-	dataCS := &CursorSource{Tx: params.Tx, Ns: params.DataNs}
+	dataCS := &CursorSource{Ctx: params.Ctx, Tx: params.Tx, Ns: params.DataNs}
 	source := &FtsIter{
 		Spec:     params.Fts,
 		Data:     dataCS,
@@ -1678,8 +1683,9 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 			idSorted = true
 			fsi := &FullScanIter{
 				Source: &CursorSource{
-					Tx: params.Tx,
-					Ns: params.DataNs,
+					Ctx: params.Ctx,
+					Tx:  params.Tx,
+					Ns:  params.DataNs,
 				},
 				Filter:   params.Filter,
 				IDBounds: params.IDBounds,
@@ -1697,8 +1703,9 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 	if root == nil {
 		root = &FullScanIter{
 			Source: &CursorSource{
-				Tx: params.Tx,
-				Ns: params.DataNs,
+				Ctx: params.Ctx,
+				Tx:  params.Tx,
+				Ns:  params.DataNs,
 			},
 			Filter:   params.Filter,
 			IDBounds: params.IDBounds,
@@ -1723,8 +1730,9 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 		root = &SortIter{
 			Source: root,
 			Data: &CursorSource{
-				Tx: params.Tx,
-				Ns: params.DataNs,
+				Ctx: params.Ctx,
+				Tx:  params.Tx,
+				Ns:  params.DataNs,
 			},
 			Sorter: params.Sorter,
 			Buf:    params.Buf,
@@ -1772,7 +1780,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// a partial prefix (BoundFields < len(FieldNames)) can match multiple
 	// entries with different trailing fields, so a range scan is needed.
 	if idx.Info.Unique && idx.fullKeyPointBound() {
-		cb := &coverBatch{cs: CursorSource{Tx: params.Tx, Ns: idx.Info.Ns}}
+		cb := &coverBatch{cs: CursorSource{Ctx: params.Ctx, Tx: params.Tx, Ns: idx.Info.Ns}}
 		cb.cover = CoverIter{
 			Source:       &cb.cs,
 			IdxInfo:      idx.Info,
@@ -1811,8 +1819,9 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 			root = &FilterIter{
 				Source: root,
 				Data: &CursorSource{
-					Tx: params.Tx,
-					Ns: params.DataNs,
+					Ctx: params.Ctx,
+					Tx:  params.Tx,
+					Ns:  params.DataNs,
 				},
 				Filter: params.Filter,
 				Buf:    params.Buf,
@@ -1823,8 +1832,9 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 			root = &SortIter{
 				Source: root,
 				Data: &CursorSource{
-					Tx: params.Tx,
-					Ns: params.DataNs,
+					Ctx: params.Ctx,
+					Tx:  params.Tx,
+					Ns:  params.DataNs,
 				},
 				Sorter: params.Sorter,
 				Buf:    params.Buf,
@@ -1846,7 +1856,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// Use batched allocation for the common case: IndexIter + FetchIter + FilterIter.
 	// This replaces 5 separate heap allocations with 1.
 	b := &seekBatch{}
-	b.indexCS = CursorSource{Tx: params.Tx, Ns: idx.Info.Ns}
+	b.indexCS = CursorSource{Ctx: params.Ctx, Tx: params.Tx, Ns: idx.Info.Ns}
 	b.indexIter = IndexIter{
 		Source:       &b.indexCS,
 		IdxInfo:      idx.Info,
@@ -1912,7 +1922,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	}
 
 	// Fetch documents by docId — share CursorSource between FetchIter and FilterIter
-	b.dataCS = CursorSource{Tx: params.Tx, Ns: params.DataNs}
+	b.dataCS = CursorSource{Ctx: params.Ctx, Tx: params.Tx, Ns: params.DataNs}
 	b.fetchIter = FetchIter{
 		Source: root,
 		Data:   &b.dataCS,
@@ -1956,8 +1966,9 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 		root = &SortIter{
 			Source: root,
 			Data: &CursorSource{
-				Tx: params.Tx,
-				Ns: params.DataNs,
+				Ctx: params.Ctx,
+				Tx:  params.Tx,
+				Ns:  params.DataNs,
 			},
 			Sorter:          params.Sorter,
 			Buf:             params.Buf,
@@ -1984,8 +1995,9 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 
 	var root Iterator = &IndexIter{
 		Source: &CursorSource{
-			Tx: params.Tx,
-			Ns: idx.Info.Ns,
+			Ctx: params.Ctx,
+			Tx:  params.Tx,
+			Ns:  idx.Info.Ns,
 		},
 		IdxInfo:      idx.Info,
 		Bounds:       idx.Bounds, // may be nil for full index scan
@@ -2014,8 +2026,9 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 
 	// Fetch documents by docId — share CursorSource between FetchIter and FilterIter
 	scanDataSrc := &CursorSource{
-		Tx: params.Tx,
-		Ns: params.DataNs,
+		Ctx: params.Ctx,
+		Tx:  params.Tx,
+		Ns:  params.DataNs,
 	}
 	root = &FetchIter{
 		Source: root,

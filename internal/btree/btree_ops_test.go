@@ -2,6 +2,7 @@ package btree
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -3179,7 +3180,7 @@ func TestCountPageCorruptInterior(t *testing.T) {
 	binary.BigEndian.PutUint16(pg.data[cpOff:], uint16(len(pg.data)+10))
 	p.releasePage(pg)
 
-	_, cerr := bt.countPage(pg.pgno, 0)
+	_, cerr := bt.countPage(context.Background(), pg.pgno, 0)
 	assert.ErrorIs(t, cerr, ErrCorrupt)
 }
 
@@ -4796,7 +4797,7 @@ func TestCov_CountPageCorruptInteriorCellOffset(t *testing.T) {
 	binary.BigEndian.PutUint16(pg.data[cpOff:], uint16(len(pg.data)-2))
 	p.releasePage(pg)
 
-	_, cerr := bt.countPage(pg.pgno, 0)
+	_, cerr := bt.countPage(context.Background(), pg.pgno, 0)
 	assert.ErrorIs(t, cerr, ErrCorrupt)
 }
 
@@ -5186,7 +5187,7 @@ func TestCov_CountPageGetPageError(t *testing.T) {
 	// L2376-2378: getPage error in countPage
 	p := tempPager(t)
 	bt := &btree{pager: p, rootPage: 0, writable: true}
-	_, err := bt.countPage(0, 0)
+	_, err := bt.countPage(context.Background(), 0, 0)
 	assert.Error(t, err)
 }
 
@@ -5950,7 +5951,7 @@ func TestCov_CountPageInteriorChildGetPageError(t *testing.T) {
 	bt.rebuildInteriorPage(intPg, []cellData{{leftChild: 0, key: []byte("m")}}, intPg.pgno)
 	p.releasePage(intPg)
 
-	_, err = bt.countPage(intPg.pgno, 0)
+	_, err = bt.countPage(context.Background(), intPg.pgno, 0)
 	assert.Error(t, err)
 }
 
@@ -5968,7 +5969,7 @@ func TestCov_CountPageInteriorRightChildGetPageError(t *testing.T) {
 	p.releasePage(intPg)
 	p.releasePage(leafPg)
 
-	_, err = bt.countPage(intPg.pgno, 0)
+	_, err = bt.countPage(context.Background(), intPg.pgno, 0)
 	assert.Error(t, err)
 }
 
@@ -5987,7 +5988,7 @@ func TestCountPageSelfReferentialInteriorCycle(t *testing.T) {
 	bt.rebuildInteriorPage(intPg, []cellData{{leftChild: intPg.pgno, key: []byte("m")}}, intPg.pgno)
 	p.releasePage(intPg)
 
-	_, err = bt.countPage(intPg.pgno, 0)
+	_, err = bt.countPage(context.Background(), intPg.pgno, 0)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	_, err = bt.Count()

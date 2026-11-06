@@ -955,7 +955,7 @@ func (c *collection) Count(ctx context.Context) (count int, err error) {
 		if txErr != nil {
 			return txErr
 		}
-		count, txErr = tx.Count(s.ns)
+		count, txErr = tx.CountContext(ctx, s.ns)
 		return txErr
 	})
 	return

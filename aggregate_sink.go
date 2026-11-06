@@ -153,9 +153,9 @@ func (q *aggQuery) materialize(ctx context.Context, cq *collQuery, rest aggregat
 			if tc.primaryKey != "id" {
 				return fmt.Errorf("%w: collection %q's primary key is %q", errAggMergePrimaryKey, targetName, tc.primaryKey)
 			}
-			written, terr = applyMerge(tx, tc, ts, slab, offs, merge)
+			written, terr = applyMerge(ctx, tx, tc, ts, slab, offs, merge)
 		} else {
-			written, terr = applyOut(tx, tc, ts, slab, offs)
+			written, terr = applyOut(ctx, tx, tc, ts, slab, offs)
 		}
 		if terr != nil {
 			return terr
@@ -178,7 +178,7 @@ func (q *aggQuery) materialize(ctx context.Context, cq *collQuery, rest aggregat
 // path runs. A duplicate id among the results fails with ErrDocExists; a
 // result without tc's primary key fails with ErrDocWithoutId (same contract
 // as Insert).
-func applyOut(tx *btree.WriteTx, tc *collection, ts *collSchema, slab []byte, offs []int) (written int, err error) {
+func applyOut(ctx context.Context, tx *btree.WriteTx, tc *collection, ts *collSchema, slab []byte, offs []int) (written int, err error) {
 	buf := tc.db.syncPool.GetDocBuf()
 	defer tc.db.syncPool.ReleaseDocBuf(buf)
 
@@ -188,7 +188,7 @@ func applyOut(tx *btree.WriteTx, tc *collection, ts *collSchema, slab []byte, of
 		keySlab []byte
 		keyOffs []int
 	)
-	cursor := tx.NewCursor(ts.ns)
+	cursor := tx.NewCursorContext(ctx, ts.ns)
 	if err = cursor.First(); err != nil {
 		cursor.Close()
 		return 0, err
@@ -209,7 +209,12 @@ func applyOut(tx *btree.WriteTx, tc *collection, ts *collSchema, slab []byte, of
 	cursor.Close()
 
 	start := 0
-	for _, end := range keyOffs {
+	for i, end := range keyOffs {
+		if i&(bulkCtxCheckEvery-1) == bulkCtxCheckEvery-1 {
+			if err = ctx.Err(); err != nil {
+				return 0, err
+			}
+		}
 		if err = tc.deleteItem(tx, ts, buf, keySlab[start:end]); err != nil {
 			return 0, err
 		}
@@ -217,7 +222,12 @@ func applyOut(tx *btree.WriteTx, tc *collection, ts *collSchema, slab []byte, of
 	}
 
 	start = 0
-	for _, end := range offs {
+	for i, end := range offs {
+		if i&(bulkCtxCheckEvery-1) == bulkCtxCheckEvery-1 {
+			if err = ctx.Err(); err != nil {
+				return written, err
+			}
+		}
 		buf.Arena.Reset()
 		doc, perr := buf.Parser.ParseOwned(slab[start:end])
 		if perr != nil {
@@ -239,7 +249,7 @@ func applyOut(tx *btree.WriteTx, tc *collection, ts *collSchema, slab []byte, of
 // applyMerge upserts the buffered documents into tc by primary key, inside
 // the caller's tx. Matched/not-matched routing follows spec; a "fail" mode
 // returns an error naming the offending id, aborting the whole tx.
-func applyMerge(tx *btree.WriteTx, tc *collection, ts *collSchema, slab []byte, offs []int, spec aggregate.MergeSpec) (written int, err error) {
+func applyMerge(ctx context.Context, tx *btree.WriteTx, tc *collection, ts *collSchema, slab []byte, offs []int, spec aggregate.MergeSpec) (written int, err error) {
 	buf := tc.db.syncPool.GetDocBuf() // result-doc parse + insert scratch
 	defer tc.db.syncPool.ReleaseDocBuf(buf)
 	bufPrev := tc.db.syncPool.GetDocBuf() // existing-doc load
@@ -248,7 +258,12 @@ func applyMerge(tx *btree.WriteTx, tc *collection, ts *collSchema, slab []byte, 
 	defer tc.db.syncPool.ReleaseDocBuf(bufMerged)
 
 	start := 0
-	for _, end := range offs {
+	for i, end := range offs {
+		if i&(bulkCtxCheckEvery-1) == bulkCtxCheckEvery-1 {
+			if err = ctx.Err(); err != nil {
+				return written, err
+			}
+		}
 		doc, perr := buf.Parser.ParseOwned(slab[start:end])
 		if perr != nil {
 			return written, perr

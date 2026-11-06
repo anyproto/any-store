@@ -2098,6 +2098,24 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 // namespace and restored by its next move or read (see Cursor); it is
 // closed before the transaction ends.
 func (tx *ReadTx) NewCursor(ns *Namespace) *Cursor {
+	return tx.newCursor(ns)
+}
+
+// NewCursorContext is NewCursor with a ctx the cursor polls once per leaf it
+// leaves, in Next and Previous: a ctx that has ended fails the move with its
+// error and leaves the cursor on the entry it stood on, not tripped. Skip,
+// SkipBackward and CountUntil fail the same way at the leaf they were
+// crossing, their count partial. SQLite's VDBE checks isInterrupted once per
+// visited row at the loop bottom (vdbe.c:1078-1092); the port checks once
+// per leaf, where the cursor does its I/O.
+// DRIFT: ctx polled once per leaf, not once per row See docs/btree/NOTES.md#drift-16-count-traversal-missing-interrupt-cancellation-check
+func (tx *ReadTx) NewCursorContext(ctx context.Context, ns *Namespace) *Cursor {
+	c := tx.newCursor(ns)
+	c.ctx = ctx
+	return c
+}
+
+func (tx *ReadTx) newCursor(ns *Namespace) *Cursor {
 	c := &Cursor{}
 	c.btData = btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
 	c.bt = &c.btData
@@ -2113,11 +2131,17 @@ func (tx *ReadTx) NewCursor(ns *Namespace) *Cursor {
 // Count returns the total number of key-value pairs in the namespace.
 // This is a lightweight operation that only reads page headers without parsing cell data.
 func (tx *ReadTx) Count(ns *Namespace) (int, error) {
+	return tx.CountContext(context.Background(), ns)
+}
+
+// CountContext is Count polling ctx once per interior page
+// (btree.CountContext): a ctx that has ended fails the count with its error.
+func (tx *ReadTx) CountContext(ctx context.Context, ns *Namespace) (int, error) {
 	if tx.closed {
 		return 0, ErrTxClosed
 	}
 	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
-	return bt.Count()
+	return bt.CountContext(ctx)
 }
 
 // DatabaseSize returns the number of pages in the database, including page 1

@@ -2238,17 +2238,25 @@ in traversal (no interior-key stops) and in counting (interior cells excluded); 
 B+tree shape both results are correct, but they differ from SQLite's B-tree semantics.
 
 <a id="drift-16-count-traversal-missing-interrupt-cancellation-check"></a>
-### Drift: Count Traversal Missing Interrupt Cancellation Check
-- **Category:** platform-support  -  **Severity:** low
-- **Affected functions:** `btree.go:*btree.Count` (`btree.go:3368-3370`), `btree.go:*btree.countPage` (`btree.go:3375-3424`).
+### Drift: Count Traversal Missing Interrupt Cancellation Check — Resolved 2026-11-06; ctx polled per leaf
+- **Category:** platform-support  -  **Severity:** low (the remaining granularity difference)
+- **Affected functions:** `btree.go:*btree.countPage`, `btree.go:*Cursor.Next`, `btree.go:*Cursor.Previous`, `db.go:*ReadTx.NewCursorContext`, `db.go:*ReadTx.CountContext`.
 
 SQLite's `sqlite3BtreeCount` (`btree.c:10489`) gates its page-walk loop on
-`!AtomicLoad(&db->u1.isInterrupted)` (`btree.c:10502`), so a long count over a huge tree
-can be cancelled via `sqlite3_interrupt` mid-walk and returns the in-progress rc
-(allowing `SQLITE_INTERRUPT`). Go's `countPage` (`btree.go:3375-3424`) has no
-interrupt/context/cancellation hook and always runs to completion or to an error. The
-consequence is that a `Count()` over a very large tree cannot be aborted; this is a
-missing SQLite runtime feature with low correctness impact.
+`!AtomicLoad(&db->u1.isInterrupted)` (`btree.c:10502`), and the VDBE checks the flag
+once per visited row at the loop-bottom opcodes (`vdbe.c:1078-1091`), so a long count
+or scan can be cancelled via `sqlite3_interrupt` mid-walk. The Go port polls the caller's
+ctx in the flag's place: `countPage` once per interior page, one poll per fan-out of leaves
+(`ReadTx.CountContext`; a leaf costs only its header read, so a poll on every page was a
+tenth of the walk), and a cursor
+once per leaf it leaves in `Next`/`Previous` (`ReadTx.NewCursorContext`), which covers
+`Skip`, `SkipBackward` and `CountUntil`. A ctx that has ended fails the move with
+`ctx.Err()` and leaves the cursor on the entry it stood on, not tripped (`cursorFault`
+is for I/O and schema faults); `Skip`, `SkipBackward` and `CountUntil` fail at the leaf
+they were crossing, their count partial — their callers pass the error up and stop. Remaining divergence, deliberate: the VDBE's per-row check is a per-leaf check here,
+where the cursor already pays for I/O, and the count's per-page check is per interior
+page; one leaf's rows, or one fan-out of leaf headers, is the longest a walk runs past
+its ctx.
 
 <a id="drift-17-count-return-type-truncates-i64-entry-total-to-go-int"></a>
 ### Drift: Count Return Type Truncates i64 Entry Total To Go int
