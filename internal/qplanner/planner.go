@@ -470,9 +470,11 @@ func BuildPlan(params *PlanParams) *Plan {
 		}
 	}
 	// When FullScan provides id-order (no sort needed) and there's a LIMIT,
-	// we only need to scan enough docs to find `limit` matching rows.
+	// we only need to scan enough docs to find `limit+offset` matching rows.
+	// An offset alone never stops the scan (Plans B and C price it the same
+	// way).
 	fullScanEffective := fullScanDocs
-	if !fullScanNeedSort && (params.Limit > 0 || params.Offset > 0) {
+	if !fullScanNeedSort && params.Limit > 0 {
 		needed := float64(params.Limit + params.Offset)
 		if pTotal > 0 && pTotal < 1.0 {
 			// Scan needed/selectivity docs on average to find enough matches

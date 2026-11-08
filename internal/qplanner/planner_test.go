@@ -5139,6 +5139,57 @@ func TestBuildPlan_SortByIdThenField_LimitCredit(t *testing.T) {
 	assert.Equal(t, 1000.0, fullScanRows(query.SortField{Field: "a"}, query.SortField{Field: "id"}), "a sort by a plain field reads everything")
 }
 
+// TestBuildPlan_OffsetWithoutLimit_FullScanReadsEverything: an offset alone
+// never stops a scan, so only a limit earns the full scan its early-stop
+// credit; under a limit the offset widens the window.
+func TestBuildPlan_OffsetWithoutLimit_FullScanReadsEverything(t *testing.T) {
+	fullScanRows := func(limit, offset int) float64 {
+		plan := BuildPlan(&PlanParams{
+			Filter:    query.All{},
+			Sorter:    &sortFieldStub{fields: []query.SortField{{Field: "id", Reverse: true}}},
+			Limit:     limit,
+			Offset:    offset,
+			TotalDocs: 1000,
+		})
+		for _, c := range plan.Explain.Candidates {
+			if c.Name == "FullScan" {
+				return c.EstRows
+			}
+		}
+		t.Fatal("no FullScan candidate")
+		return 0
+	}
+	assert.Equal(t, 1000.0, fullScanRows(0, 1))
+	assert.Equal(t, 1000.0, fullScanRows(0, 500))
+	assert.Equal(t, 10.0, fullScanRows(10, 0))
+	assert.Equal(t, 15.0, fullScanRows(10, 5))
+}
+
+// TestBuildPlan_OffsetWithoutLimit_SelectiveSeekWins: a selective filter keeps
+// its index seek under a primary-key sort with an offset and no limit; the
+// full scan reads the whole collection.
+func TestBuildPlan_OffsetWithoutLimit_SelectiveSeekWins(t *testing.T) {
+	for _, fields := range [][]query.SortField{
+		{{Field: "id", Reverse: true}},
+		{{Field: "id", Reverse: true}, {Field: "a"}},
+	} {
+		plan := BuildPlan(&PlanParams{
+			Filter:    query.MustParseCondition(`{"a": 5}`),
+			Sorter:    &sortFieldStub{fields: fields},
+			Offset:    1,
+			TotalDocs: 100000,
+			Indexes: []CBOIndex{{
+				Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+				Sketch:      mockSketch(2000),
+				Bounds:      mustParseBounds("a", `{"a": 5}`),
+				PointLookup: true,
+				BoundFields: 1,
+			}},
+		})
+		assert.Equal(t, "IndexSeek", plan.Name, "sort %v:\n%s", fields, plan.ExplainString())
+	}
+}
+
 // TestBuildPlan_SorterWithoutFields_FullScanSorts: a sorter that declares no
 // fields (a textScore sort on a non-$text query) still gets its SortIter.
 func TestBuildPlan_SorterWithoutFields_FullScanSorts(t *testing.T) {

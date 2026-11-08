@@ -532,6 +532,26 @@ func TestSortPk_Text(t *testing.T) {
 
 // A sort that starts with the primary key is the full scan's own order, so no
 // SortIter follows it whatever fields come after.
+// An offset alone never stops a scan, so a selective filter keeps its index
+// seek under a primary-key sort with an offset and no limit.
+func TestSortPk_OffsetWithoutLimit(t *testing.T) {
+	docs := spDocs()
+	fx := newFixture(t)
+	coll := spCollection(t, fx, "offset", docs, anystore.IndexInfo{Fields: []string{"a"}})
+	keep := func(d spDoc) bool { return d.a < 12 }
+	desc := func(x, y spDoc) int { return cmp.Compare(y.id, x.id) }
+	for _, sort := range [][]any{sortArgs("-id"), sortArgs("-id", "a")} {
+		name := fmt.Sprintf("sort=%v", sort)
+		q := coll.Find(`{"a":{"$lt":12}}`).Sort(sort...).Offset(1)
+		ex, err := q.Explain(ctx)
+		require.NoError(t, err, name)
+		line := iteratorLine(t, ex)
+		t.Logf("%s: %s", name, line)
+		assert.True(t, strings.HasPrefix(line, "IndexScan(a)"), "%s: %s", name, line)
+		assert.Equal(t, spWant(docs, keep, desc, 0, spID)[1:], collectIdsString(t, q), name)
+	}
+}
+
 func TestSortPk_FullScanPkPrefix(t *testing.T) {
 	docs := spDocs()
 	fx := newFixture(t)
