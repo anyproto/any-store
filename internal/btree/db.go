@@ -494,7 +494,7 @@ func (db *DB) lockWriter(ctx context.Context) error {
 	}
 }
 
-// tryLockWrite takes the write lock when it is free.
+// tryLockWriter takes the write lock when it is free.
 func (db *DB) tryLockWriter() bool {
 	select {
 	case db.writeSem <- struct{}{}:
@@ -504,7 +504,7 @@ func (db *DB) tryLockWriter() bool {
 	}
 }
 
-// unlockWrite releases the write lock. A release of a lock nobody holds is
+// unlockWriter releases the write lock. A release of a lock nobody holds is
 // the bug sync.Mutex reports as "unlock of unlocked mutex"; a receive on the
 // empty channel would block forever instead, so it panics here.
 func (db *DB) unlockWriter() {
