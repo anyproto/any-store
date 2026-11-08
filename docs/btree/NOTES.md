@@ -2256,7 +2256,11 @@ is for I/O and schema faults); `Skip`, `SkipBackward` and `CountUntil` fail at t
 they were crossing, their count partial — their callers pass the error up and stop. Remaining divergence, deliberate: the VDBE's per-row check is a per-leaf check here,
 where the cursor already pays for I/O, and the count's per-page check is per interior
 page; one leaf's rows, or one fan-out of leaf headers, is the longest a walk runs past
-its ctx.
+its ctx. A plan that scans an index and fetches each matching document polls the index
+cursor only, so the document fetches for one index leaf (hundreds of entries, an
+overflowing document several pages each) run between polls, and a filter that rejects
+most fetched documents runs past its ctx by that much; a poll every N fetches in the
+fetch step would close the gap.
 
 <a id="drift-17-count-return-type-truncates-i64-entry-total-to-go-int"></a>
 ### Drift: Count Return Type Truncates i64 Entry Total To Go int
