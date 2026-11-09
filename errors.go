@@ -128,7 +128,7 @@ var (
 	ErrIterOpen = errors.New("any-store: an iterator of the transaction is open on the collection")
 
 	// ErrQuickCheckFailed is returned when we did a quick check (e.g. when opening db in a dirty state with sentinel config on) and it failed, indicating possible database corruption.
-	ErrQuickCheckFailed = &nestedError{msg: "any-store: quick check failed on db open", parent: ErrCorrupt}
+	ErrQuickCheckFailed error = &nestedError{msg: "any-store: quick check failed on db open", parent: ErrCorrupt}
 
 	ErrDBIsClosed = btree.ErrClosed
 
@@ -147,6 +147,10 @@ var (
 	//	if errors.Is(err, anystore.ErrCorrupt) { ... }
 	//
 	// It is not returned for a v1 file (ErrV1Database), an incompatible version or a closed database.
+	//
+	// An encrypted database opened with the wrong key also matches: the page authentication fails
+	// the same way as for a damaged page 1, and the two cannot be told apart. Rule out a key
+	// mismatch before discarding the file.
 	// A damaged page that nothing has read yet is not found by Open: it surfaces on the read that
 	// meets it, as ErrPageIntegrity.
 	ErrCorrupt = btree.ErrCorrupt
@@ -155,8 +159,8 @@ var (
 	// inside it or never a database, bad field values, or a size that disagrees with the file.
 	ErrHeaderCorrupt = btree.ErrHeaderCorrupt
 
-	// ErrWALCorrupt is returned (wrapped) when the write-ahead log is damaged beyond what
-	// recovery repairs.
+	// ErrWALCorrupt is returned (wrapped) when the write-ahead log index points at a frame the
+	// file does not hold. Recovery itself repairs a bad WAL header and drops torn frames silently.
 	ErrWALCorrupt = btree.ErrWALCorrupt
 
 	// ErrPageBufferNotInitialized is returned when UseGlobalPageBuffer is set

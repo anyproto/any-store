@@ -61,7 +61,7 @@ var (
 	// ErrValueTooLarge indicates the value exceeds maximum allowed size.
 	ErrValueTooLarge = errors.New("btree: value too large")
 
-	// ErrWALCorrupt indicates the WAL file is corrupted.
+	// ErrWALCorrupt indicates the WAL index points at a frame the file does not hold.
 	ErrWALCorrupt = nestedError("btree: WAL is corrupt", ErrCorrupt)
 
 	// ErrWALVersion indicates the WAL was written by an incompatible (newer)

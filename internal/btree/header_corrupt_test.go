@@ -12,6 +12,8 @@ func TestErrHeaderCorruptIsCorrupt(t *testing.T) {
 	assert.True(t, errors.Is(ErrHeaderCorrupt, ErrCorrupt))
 	assert.False(t, errors.Is(ErrCorrupt, ErrHeaderCorrupt))
 	assert.False(t, errors.Is(ErrSQLiteFormat, ErrHeaderCorrupt), "a v1 file is intact, not corrupt")
+	assert.False(t, errors.Is(ErrOldFormat, ErrCorrupt), "an old schema is intact, not corrupt")
+	assert.False(t, errors.Is(ErrWALVersion, ErrCorrupt), "a newer WAL must never trigger start-fresh recovery")
 }
 
 func TestDeserializeBadHeaderIsHeaderCorrupt(t *testing.T) {
