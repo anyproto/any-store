@@ -25,7 +25,7 @@ import (
 
 // User code (a query.Modifier, a query.Filter) runs inside the write tx.
 // A panic there used to escape without a Rollback, leaking the btree write lock
-// — BeginWrite has no ctx-cancel escape, so every later write, and Close(),
+// — every later write made with a context that never ends, and Close(),
 // blocked forever. The bulk paths were worse: their finalizer committed when
 // `err == nil`, which is exactly the state during a panic, durably persisting
 // the subset modified before it. A panic must roll back and re-panic.

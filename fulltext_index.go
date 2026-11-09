@@ -87,7 +87,7 @@ type ftsIndex struct {
 	// field index keys into the FieldMask / per-field TF of the v2 postings.
 	nFields int
 
-	// scratch buffers, writer-owned (single writer, serialized by btree writeMu)
+	// scratch buffers, writer-owned (single writer, serialized by the btree write lock)
 	keyBuf   []byte
 	valBuf   []byte
 	tokBuf   []fts.Token         // analyze() output (also old-doc tokens in updateDoc)

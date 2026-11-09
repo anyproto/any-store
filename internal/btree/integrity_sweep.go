@@ -92,7 +92,7 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 		defer c.SetVerify(prev)
 	}
 
-	tx, err := db.BeginRead()
+	tx, err := db.BeginReadContext(ctx)
 	if err != nil {
 		return res, err
 	}

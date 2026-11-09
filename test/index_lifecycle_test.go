@@ -2,7 +2,6 @@ package test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -775,21 +774,11 @@ func TestIndex_Persistence_DropIndexThenReopen(t *testing.T) {
 // (4)), or the sketch can persist for a vanished index (orphan from (5)).
 //
 // =========================================================================
-// FINDING — surfaced by writing this audit:
-// =========================================================================
-// EnsureIndex (and the entire collection write path) does NOT honor context
-// cancellation. doWriteTxModified -> WriteTx -> btreeDB.BeginWrite() never
-// checks ctx.Err(); buildIndex's per-doc cursor loop never checks ctx
-// either. A pre-cancelled context passed to EnsureIndex completes the build
-// and returns nil. This is a real bug: callers cannot abort an in-flight
-// index build, and any timeout context they wrap around EnsureIndex is
-// silently ignored. See ContextCancel_IsSilentlyIgnored below for the pin.
-//
-// Because the cancellation is silently ignored, the in-flight tx ALWAYS
-// commits — there is no "partial state after cancellation" to test for via
-// the public API today. The tests below pin the current behavior and stand
-// ready to catch a real partial-state regression if cancellation ever
-// becomes cooperative.
+// Context cancellation: EnsureIndex begins its write transaction with the
+// caller's ctx, so a ctx that has ended before the wait for the writer lock
+// is over fails the call with the ctx's error and nothing is registered.
+// buildIndex's per-doc cursor loop does not poll the ctx: a ctx that ends
+// during the build does not abort it. The tests below pin the first.
 // =========================================================================
 
 // docCountForAbortTests is large enough that buildIndex does meaningful
@@ -809,13 +798,11 @@ func insertAbortTestDocs(t *testing.T, coll anystore.Collection) {
 }
 
 // TestAudit16_EnsureIndexAbort_ContextCancel_RetrySucceeds: build the
-// index with a pre-cancelled context, then build it again with a fresh
-// context. The pin here is that whatever the first call does (today: it
-// silently ignores the cancellation and succeeds; correctly-behaving
-// future code: it errors out and rolls back), the second call MUST
-// produce exactly one fully-populated index. No half-built state, no
-// "index already exists" surprise from a leaked metadata row, no
-// duplicate entries from a leaked namespace.
+// index with a pre-cancelled context (fails with the ctx's error, nothing
+// registered), then build it again with a fresh context: exactly one
+// fully-populated index. No half-built state, no "index already exists"
+// surprise from a leaked metadata row, no duplicate entries from a leaked
+// namespace.
 func TestAudit16_EnsureIndexAbort_ContextCancel_RetrySucceeds(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit16_retry")
@@ -832,23 +819,11 @@ func TestAudit16_EnsureIndexAbort_ContextCancel_RetrySucceeds(t *testing.T) {
 		Name:   "ix_tags",
 		Fields: []string{"tags"},
 	})
-	// Today this returns nil (ctx ignored). If/when ctx becomes
-	// cooperative, this returns a context.Canceled-wrapped error AND
-	// the rollback must wipe steps (1)-(5) above.
-	if abortErr != nil {
-		require.Truef(t, errors.Is(abortErr, context.Canceled),
-			"if EnsureIndex errors on a cancelled ctx, the error must wrap "+
-				"context.Canceled; got: %v", abortErr)
-	} else {
-		t.Log("FINDING: EnsureIndex silently ignored a pre-cancelled context " +
-			"and committed. doWriteTxModified does not check ctx.Err(); " +
-			"buildIndex's cursor loop does not check ctx either.")
-	}
+	require.ErrorIs(t, abortErr, context.Canceled)
+	require.Empty(t, coll.GetIndexes())
 
-	// Retry with a fresh context — must succeed cleanly. EnsureIndex
-	// with ensure=true swallows ErrIndexExists, so even if the first
-	// call committed, this returns nil. Either way, the post-condition
-	// is identical: exactly one index, fully populated.
+	// Retry with a fresh context — must succeed cleanly: exactly one
+	// index, fully populated.
 	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "ix_tags",
 		Fields: []string{"tags"},
@@ -870,8 +845,8 @@ func TestAudit16_EnsureIndexAbort_ContextCancel_RetrySucceeds(t *testing.T) {
 // ErrIndexExists, so a "second comer to find an existing index"
 // returns nil.
 //
-// doWriteTxModified serializes writers via btreeDB.BeginWrite(), so the
-// race is resolved at tx-acquisition not in the index-build code itself.
+// Writers serialize on the btree write lock, so the race is resolved at
+// tx-acquisition not in the index-build code itself.
 // This test pins the API-level outcome regardless of which goroutine
 // wins the race.
 func TestAudit16_EnsureIndexAbort_TwoConcurrentEnsureIndex_OneCancels(t *testing.T) {
@@ -917,13 +892,8 @@ func TestAudit16_EnsureIndexAbort_TwoConcurrentEnsureIndex_OneCancels(t *testing
 		"fresh-ctx EnsureIndex must succeed (ensure=true swallows ErrIndexExists "+
 			"if the cancelled goroutine raced ahead); got error: %v", errFresh)
 
-	// The cancelled-ctx call may either error (ideal — ctx honored) or
-	// return nil (current — ctx ignored). Either is acceptable here as
-	// long as the final state is consistent.
-	if errCancelled != nil {
-		require.Truef(t, errors.Is(errCancelled, context.Canceled),
-			"cancelled goroutine returned a non-cancellation error: %v", errCancelled)
-	}
+	// The cancelled-ctx call begins nothing.
+	require.ErrorIs(t, errCancelled, context.Canceled)
 
 	// Final invariant: exactly ONE index, regardless of who won.
 	// Concurrent EnsureIndex calls with the same name MUST converge to a
@@ -937,18 +907,10 @@ func TestAudit16_EnsureIndexAbort_TwoConcurrentEnsureIndex_OneCancels(t *testing
 	assertIndexLen(t, coll.GetIndexes()[0], concurrentDocs*3)
 }
 
-// TestAudit16_EnsureIndexAbort_ContextCancel_IsSilentlyIgnored pins the
-// FINDING surfaced while writing this audit: EnsureIndex does NOT honor
-// context cancellation. doWriteTxModified -> WriteTx -> BeginWrite never
-// checks ctx.Err(); buildIndex's cursor loop never checks ctx either.
-// Same story for Insert, UpdateOne, Delete, etc. — the entire write
-// path is non-cooperative.
-//
-// This test exists to make the bug LOUD. If/when cancellation becomes
-// cooperative, this test will fail and the corresponding spec line
-// ("ContextCancel_RetrySucceeds: must return an error related to the
-// cancelled context") becomes meaningfully testable.
-func TestAudit16_EnsureIndexAbort_ContextCancel_IsSilentlyIgnored(t *testing.T) {
+// TestAudit16_EnsureIndexAbort_ContextCancel_FailsBeforeTheBuild: a
+// pre-cancelled ctx fails EnsureIndex with context.Canceled before its
+// write transaction begins; no index is registered.
+func TestAudit16_EnsureIndexAbort_ContextCancel_FailsBeforeTheBuild(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit16_silent_ctx")
 	require.NoError(t, err)
@@ -966,31 +928,9 @@ func TestAudit16_EnsureIndexAbort_ContextCancel_IsSilentlyIgnored(t *testing.T) 
 		Fields: []string{"tags"},
 	})
 
-	// CURRENT behavior: nil. If this assertion ever flips, the bug is
-	// fixed and the comment block at the top of this file should be
-	// updated; the other audit16 tests then become much stronger.
-	if abortErr == nil {
-		t.Log("CURRENT BEHAVIOR (BUG): EnsureIndex returned nil for a " +
-			"pre-cancelled ctx; the in-flight tx committed in full. " +
-			"Root cause: db.doWriteTxModified, db.WriteTx, and " +
-			"btreeDB.BeginWrite() do not check ctx.Err(); buildIndex's " +
-			"cursor loop also does not check ctx. Until any of those " +
-			"sites becomes cooperative, callers cannot abort an " +
-			"in-flight index build.")
-
-		// Verify the bug went all the way: the index ACTUALLY committed.
-		require.Len(t, coll.GetIndexes(), 1,
-			"if EnsureIndex returned nil, the index must have committed")
-		assertIndexLen(t, coll.GetIndexes()[0], 3000)
-		return
-	}
-
-	// FUTURE behavior (correct): error wrapping context.Canceled, with
-	// no committed state.
-	require.Truef(t, errors.Is(abortErr, context.Canceled),
-		"EnsureIndex error must wrap context.Canceled; got: %v", abortErr)
+	require.ErrorIs(t, abortErr, context.Canceled)
 	require.Empty(t, coll.GetIndexes(),
-		"on cancellation, no index must be registered (full rollback)")
+		"on cancellation, no index must be registered")
 }
 
 // explainSQL returns explain.Sql for a hinted query on the "a" index.

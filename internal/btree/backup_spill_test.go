@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -46,7 +47,7 @@ func TestBackupWriterCacheBounded(t *testing.T) {
 
 	var spilled bool
 	for {
-		err = b.Step(32)
+		err = b.Step(context.Background(), 32)
 		// The destination writer cache must stay bounded: copied pages beyond
 		// the cache limit spill to the destination WAL instead of accumulating
 		// dirty. Small slack for pages pinned by the in-flight step.

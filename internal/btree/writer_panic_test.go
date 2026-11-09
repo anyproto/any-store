@@ -9,7 +9,7 @@ import (
 )
 
 // A panic inside Commit/Rollback (btree code can panic on corrupt pages) must
-// not leak writeMu/db.mu: the tx has already marked itself closed, so a later
+// not leak the write lock/db.mu: the tx has already marked itself closed, so a later
 // Rollback is an ErrTxClosed no-op and no caller-side recover can release the
 // locks — every subsequent BeginWrite and Close would deadlock permanently.
 // The release lives in a defer; these tests panic at the exact pre-pager spot
