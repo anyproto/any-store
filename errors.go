@@ -151,6 +151,7 @@ var (
 	// An encrypted database opened with the wrong key also matches: the page authentication fails
 	// the same way as for a damaged page 1, and the two cannot be told apart. Rule out a key
 	// mismatch before discarding the file.
+	//
 	// A damaged page that nothing has read yet is not found by Open: it surfaces on the read that
 	// meets it, as ErrPageIntegrity.
 	ErrCorrupt = btree.ErrCorrupt
