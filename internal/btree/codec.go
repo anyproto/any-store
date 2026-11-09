@@ -9,7 +9,6 @@ package btree
 
 import (
 	"crypto/rand"
-	"errors"
 	"fmt"
 	"sync/atomic"
 )
@@ -75,7 +74,7 @@ type aeadScratch struct {
 //
 // Callers that need to switch on the kind without parsing strings can use
 // SweepError.Kind from VerifyIntegrity instead.
-var ErrPageIntegrity = errors.New("btree: page integrity check failed")
+var ErrPageIntegrity = nestedError("btree: page integrity check failed", ErrCorrupt)
 
 // errCksumMismatch / errAEADAuthFail wrap ErrPageIntegrity at package init
 // so the codec hot paths return a constant value with no per-call

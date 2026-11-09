@@ -1,10 +1,17 @@
 package btree
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var (
 	// ErrCorrupt indicates the database file is corrupted.
 	ErrCorrupt = errors.New("btree: database is corrupt")
+
+	// ErrHeaderCorrupt indicates the file header is unusable: a file cut inside it or never a
+	// database, bad field values, or a size that disagrees with the file. It wraps ErrCorrupt.
+	ErrHeaderCorrupt = fmt.Errorf("%w: header", ErrCorrupt)
 
 	// ErrSQLiteFormat reports a file carrying SQLite's header magic — an
 	// any-store v1 database. Deliberately NOT wrapping ErrCorrupt: the file is
@@ -55,7 +62,7 @@ var (
 	ErrValueTooLarge = errors.New("btree: value too large")
 
 	// ErrWALCorrupt indicates the WAL file is corrupted.
-	ErrWALCorrupt = errors.New("btree: WAL is corrupt")
+	ErrWALCorrupt = nestedError("btree: WAL is corrupt", ErrCorrupt)
 
 	// ErrWALVersion indicates the WAL was written by an incompatible (newer)
 	// any-store version. Unlike ErrWALCorrupt it must never trigger
@@ -110,3 +117,17 @@ var (
 // chain, so leafKeyAt cannot return it from the page alone; callers take the
 // full-key path (leafFullKey) instead.
 var errLeafKeySpilled = errors.New("btree: leaf key spills to an overflow chain")
+
+// nestedError is an error whose text is msg and which matches parent under errors.Is, so a
+// specific failure keeps its own message and still belongs to the broader kind.
+func nestedError(msg string, parent error) error {
+	return &nested{msg: msg, parent: parent}
+}
+
+type nested struct {
+	msg    string
+	parent error
+}
+
+func (e *nested) Error() string { return e.msg }
+func (e *nested) Unwrap() error { return e.parent }

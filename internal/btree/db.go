@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -311,6 +312,10 @@ func readInitialHeader(path string) (dbHeader, error) {
 	}
 	buf := make([]byte, dbHeaderSize)
 	if _, err := f.ReadAt(buf, 0); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			// a file shorter than the header was cut or never was a database
+			return h, fmt.Errorf("%w: file of %d bytes is shorter than the header", ErrHeaderCorrupt, info.Size())
+		}
 		return h, err
 	}
 	if err := h.deserialize(buf); err != nil {

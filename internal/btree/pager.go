@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -610,6 +611,9 @@ func (p *pager) open() (err error) {
 	buf := make([]byte, readSize)
 	n, err := f.ReadAt(buf, 0)
 	if err != nil && n < dbHeaderSize {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return fmt.Errorf("%w: file of %d bytes is shorter than the header", ErrHeaderCorrupt, n)
+		}
 		return fmt.Errorf("btree: failed to read database header: %w", err)
 	}
 
@@ -624,7 +628,7 @@ func (p *pager) open() (err error) {
 	// DBs, pre-P3.3 test fixtures) and skip the check rather than
 	// reject. Matches SQLite's defensive-read-only interpretation.
 	if p.header.VersionValidFor != 0 && p.header.VersionValidFor != p.header.FileChangeCount {
-		return fmt.Errorf("%w: VersionValidFor=%d FileChangeCount=%d", ErrCorrupt, p.header.VersionValidFor, p.header.FileChangeCount)
+		return fmt.Errorf("%w: VersionValidFor=%d FileChangeCount=%d", ErrHeaderCorrupt, p.header.VersionValidFor, p.header.FileChangeCount)
 	}
 
 	// Validate the on-disk header page size, mirroring C lockBtree
@@ -635,7 +639,7 @@ func (p *pager) open() (err error) {
 	// engine.
 	if p.header.PageSize < MinPageSize || p.header.PageSize > MaxPageSize ||
 		(p.header.PageSize&(p.header.PageSize-1)) != 0 {
-		return fmt.Errorf("%w: invalid on-disk page size %d", ErrCorrupt, p.header.PageSize)
+		return fmt.Errorf("%w: invalid on-disk page size %d", ErrHeaderCorrupt, p.header.PageSize)
 	}
 
 	// Reconcile the on-disk page size against the process-global page buffer
@@ -659,7 +663,7 @@ func (p *pager) open() (err error) {
 	// floors only the on-disk-open path; the codec-install and new-DB paths
 	// derive usableSize from process-chosen Options, not untrusted bytes.
 	if p.usableSize_ < 480 {
-		return fmt.Errorf("%w: usable size %d < 480", ErrCorrupt, p.usableSize_)
+		return fmt.Errorf("%w: usable size %d < 480", ErrHeaderCorrupt, p.usableSize_)
 	}
 
 	// Reconcile the header page count against the physical file size,
@@ -747,7 +751,7 @@ func (p *pager) open() (err error) {
 			effectiveFileN = walNPage
 		}
 		if p.header.DatabaseSize > effectiveFileN {
-			return fmt.Errorf("%w: header DatabaseSize=%d exceeds file pages=%d wal=%d", ErrCorrupt, p.header.DatabaseSize, fileNPage, walNPage)
+			return fmt.Errorf("%w: header DatabaseSize=%d exceeds file pages=%d wal=%d", ErrHeaderCorrupt, p.header.DatabaseSize, fileNPage, walNPage)
 		}
 	}
 
