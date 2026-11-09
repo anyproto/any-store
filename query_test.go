@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -21,7 +22,7 @@ type fixedCountTx struct {
 	calls *int
 }
 
-func (f fixedCountTx) Count(ns *btree.Namespace) (int, error) {
+func (f fixedCountTx) CountContext(_ context.Context, ns *btree.Namespace) (int, error) {
 	*f.calls++
 	return f.count, nil
 }
@@ -41,10 +42,14 @@ func TestCollQuery_DocCountSkipsWalkWithoutIndexes(t *testing.T) {
 	var calls int
 	tx := fixedCountTx{count: 42, calls: &calls}
 
-	assert.Equal(t, 0, q.docCountForPlan(tx, q.c.cur(), idxs))
+	n, err := q.docCountForPlan(ctx, tx, q.c.cur(), idxs)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n)
 	assert.Equal(t, 0, calls, "plan-path docCount must skip the namespace walk with no secondary indexes")
 
-	assert.Equal(t, 42, q.docCountExact(tx, q.c.cur(), idxs), "explain-path docCount must stay exact")
+	n, err = q.docCountExact(ctx, tx, q.c.cur(), idxs)
+	require.NoError(t, err)
+	assert.Equal(t, 42, n, "explain-path docCount must stay exact")
 	assert.Equal(t, 1, calls)
 }
 

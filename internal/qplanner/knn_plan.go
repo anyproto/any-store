@@ -218,7 +218,7 @@ func buildKnnPlan(params *PlanParams) *Plan {
 // VectorScoreIter owns the residual (it must run over _distance-decorated
 // documents, exactly like the driver plan's FilterIter) and the k-cut.
 func buildKnnProbePlan(params *PlanParams, cand *knnCandidate) *Plan {
-	dataCS := &CursorSource{Tx: params.Tx, Ns: params.DataNs}
+	dataCS := &CursorSource{Ctx: params.Ctx, Tx: params.Tx, Ns: params.DataNs}
 	indexName := params.Vector.IndexName
 
 	var root Iterator
@@ -236,7 +236,7 @@ func buildKnnProbePlan(params *PlanParams, cand *knnCandidate) *Plan {
 			// MergeOverlappingBounds would collapse distinct point probes
 			// (see buildIndexSeekChain).
 			root = &CoverIter{
-				Source:       &CursorSource{Tx: params.Tx, Ns: idx.Info.Ns},
+				Source:       &CursorSource{Ctx: params.Ctx, Tx: params.Tx, Ns: idx.Info.Ns},
 				IdxInfo:      idx.Info,
 				Bounds:       idx.Bounds,
 				ScalarProven: idx.ScalarProven,
@@ -247,7 +247,7 @@ func buildKnnProbePlan(params *PlanParams, cand *knnCandidate) *Plan {
 		} else {
 			finalizeIndexBounds(idx)
 			root = &IndexIter{
-				Source:       &CursorSource{Tx: params.Tx, Ns: idx.Info.Ns},
+				Source:       &CursorSource{Ctx: params.Ctx, Tx: params.Tx, Ns: idx.Info.Ns},
 				IdxInfo:      idx.Info,
 				Bounds:       idx.Bounds,
 				PointLookup:  idx.PointLookup,

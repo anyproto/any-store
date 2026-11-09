@@ -44,10 +44,14 @@ type Query interface {
 	// Count returns the number of documents matching the query.
 	Count(ctx context.Context) (count int, err error)
 
-	// Update modifies documents matching the query.
+	// Update modifies documents matching the query. A ctx that ends while it
+	// runs fails it with the ctx's error and rolls its writes back: its own
+	// transaction, or its savepoint inside the transaction ctx carries, which
+	// stays open.
 	Update(ctx context.Context, modifier any) (res ModifyResult, err error)
 
-	// Delete removes documents matching the query.
+	// Delete removes documents matching the query. A ctx that ends while it
+	// runs fails it and rolls its writes back, as Update's does.
 	Delete(ctx context.Context) (res ModifyResult, err error)
 
 	// Explain provides the query execution plan.
@@ -326,6 +330,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 		// restriction) skips all of it — the unrestricted hot shape pays
 		// nothing over the pre-CBO driver path.
 		params := &qplanner.PlanParams{
+			Ctx:        ctx,
 			Tx:         btx,
 			DataNs:     s.ns,
 			Filter:     ftsResidual,
@@ -340,7 +345,10 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 			NoExplain:  !opts.wantCandidates,
 			Fts:        ftsSpec,
 		}
-		probePossible := q.fillProbeInputs(btx, s, ftsResidual, sorter != nil, opts, params)
+		probePossible, perr := q.fillProbeInputs(btx, s, ftsResidual, sorter != nil, opts, params)
+		if perr != nil {
+			return nil, nil, perr
+		}
 		// With no probe form the stats price nothing: compute them for
 		// Explain only.
 		if probePossible && ftsSpec.StatsFn != nil && (ftsSpec.Probe != nil || opts.wantCandidates) {
@@ -372,6 +380,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 		// CBO inputs for the ANN-driver / exact-probe cost decision — same
 		// assembly and same no-candidate skip as the $text branch.
 		params := &qplanner.PlanParams{
+			Ctx:        ctx,
 			Tx:         btx,
 			DataNs:     s.ns,
 			Filter:     residual,
@@ -386,7 +395,9 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 			NoExplain:  !opts.wantCandidates,
 			Vector:     vspec,
 		}
-		q.fillProbeInputs(btx, s, residual, false, opts, params)
+		if _, err = q.fillProbeInputs(btx, s, residual, false, opts, params); err != nil {
+			return nil, nil, err
+		}
 		plan = qplanner.BuildPlan(params)
 		if opts.wantCandidates {
 			cbo = params.Indexes
@@ -407,9 +418,14 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 	if len(countIdxs) == 0 {
 		countIdxs = visible
 	}
-	totalDocs := q.docCountForPlan(btx, s, countIdxs)
+	totalDocs, err := q.docCountForPlan(ctx, btx, s, countIdxs)
+	if err != nil {
+		return nil, nil, err
+	}
 	if opts.exactTotalDocs {
-		totalDocs = q.docCountExact(btx, s, countIdxs)
+		if totalDocs, err = q.docCountExact(ctx, btx, s, countIdxs); err != nil {
+			return nil, nil, err
+		}
 	}
 	sortFields := q.sortFields()
 	br := q.buildBoundsResult(idxs, btx, totalDocs, sorter != nil, sortFields)
@@ -420,6 +436,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 		planSortFields = sortFields
 	}
 	plan = qplanner.BuildPlan(&qplanner.PlanParams{
+		Ctx:         ctx,
 		Tx:          btx,
 		DataNs:      s.ns,
 		Filter:      q.cond,
@@ -445,6 +462,9 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 
 func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	if err = q.c.alive(); err != nil {
+		return
+	}
+	if err = ctx.Err(); err != nil {
 		return
 	}
 	qb, err := q.makeQuery()
@@ -536,7 +556,12 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		modBuf := q.c.db.syncPool.GetDocBuf()
 		defer q.c.db.syncPool.ReleaseDocBuf(modBuf)
 
-		for _, id := range ids {
+		for i, id := range ids {
+			if i&(bulkCtxCheckEvery-1) == bulkCtxCheckEvery-1 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			var getErr error
 			buf.DocBuf, getErr = btWtx.AppendValue(s.ns, id, buf.DocBuf[:0])
 			if getErr != nil {
@@ -578,7 +603,12 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 
 func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error) {
 	return q.bulkWrite(ctx, func(_ WriteTx, btWtx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error {
-		for _, id := range ids {
+		for i, id := range ids {
+			if i&(bulkCtxCheckEvery-1) == bulkCtxCheckEvery-1 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			if err := q.c.deleteItem(btWtx, s, buf, id); err != nil {
 				return err
 			}
@@ -589,12 +619,23 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	})
 }
 
+// bulkCtxCheckEvery is how many ids a loop of point operations — a bulk
+// write's mutation loop, an id-only count, an aggregation sink — handles
+// between two polls of its ctx. A power of two.
+const bulkCtxCheckEvery = 1024
+
 // bulkWrite is the shared scaffolding of the bulk mutators (Update/Delete):
 // it compiles the query plan inside a write tx, materializes the distinct
 // target ids, releases the plan's cursors and hands the ids to mutate, which
 // applies the per-id mutation and accumulates result.
 func (q *collQuery) bulkWrite(ctx context.Context, mutate func(wtx WriteTx, btWtx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error) (result ModifyResult, err error) {
 	if err = q.c.alive(); err != nil {
+		return
+	}
+	// A ctx that has ended begins nothing, as sqlite3_step checks
+	// isInterrupted before the first opcode (vdbe.c:902). The scan polls it
+	// once per leaf; the mutation loop once per bulkCtxCheckEvery ids.
+	if err = ctx.Err(); err != nil {
 		return
 	}
 	qb, err := q.makeQuery()
@@ -719,6 +760,9 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	if err = q.c.alive(); err != nil {
 		return
 	}
+	if err = ctx.Err(); err != nil {
+		return
+	}
 	// A parse error must be reported before anything else: Cond()/Sort() leave
 	// q.cond nil when they fail, which is indistinguishable from "no filter" to
 	// the fast path below — the fast path would otherwise count the WHOLE
@@ -762,6 +806,11 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 				return rerr
 			}
 			for i := range idBounds {
+				if i&(bulkCtxCheckEvery-1) == bulkCtxCheckEvery-1 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
 				found, gerr := tx.Has(s.ns, idBounds[i].Start)
 				if gerr != nil {
 					return gerr
@@ -856,6 +905,9 @@ func collectDistinctIDs(root qplanner.Iterator) ([][]byte, error) {
 
 func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	if err = q.c.alive(); err != nil {
+		return
+	}
+	if err = ctx.Err(); err != nil {
 		return
 	}
 	qb, err := q.makeQuery()
@@ -975,15 +1027,17 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 // skips the whole assembly: the unrestricted hot shape pays nothing over the
 // pre-CBO driver path. Explain (wantCandidates) always assembles, for its
 // index report.
-func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, s *collSchema, residual query.Filter, needSort bool, opts planOpts, params *qplanner.PlanParams) (probePossible bool) {
+func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, s *collSchema, residual query.Filter, needSort bool, opts planOpts, params *qplanner.PlanParams) (probePossible bool, err error) {
 	idFixed := len(params.IDBounds) > 0 && qplanner.AllBoundsFixed(params.IDBounds)
 	hasResidual := residual != nil && !isAllQueryFilter(residual)
 	if !idFixed && !hasResidual && !needSort && !opts.wantCandidates {
-		return false
+		return false, nil
 	}
 	idxs := plannableIndexes(s.indexes)
 	probePossible = idFixed
-	params.TotalDocs = q.docCountForPlan(btx, s, idxs)
+	if params.TotalDocs, err = q.docCountForPlan(params.Ctx, btx, s, idxs); err != nil {
+		return false, err
+	}
 	if len(idxs) > 0 {
 		sortFields := q.sortFields()
 		br := q.buildBoundsResult(idxs, btx, params.TotalDocs, needSort, sortFields)
@@ -997,7 +1051,7 @@ func (q *collQuery) fillProbeInputs(btx *btree.ReadTx, s *collSchema, residual q
 			}
 		}
 	}
-	return probePossible
+	return probePossible, nil
 }
 
 // ftsIndexName returns the index a $text predicate resolves to (the first
@@ -1058,7 +1112,7 @@ func (q *collQuery) pkBounds() query.Bounds {
 
 // countTx is the read-tx capability docCount needs.
 type countTx interface {
-	Count(ns *btree.Namespace) (int, error)
+	CountContext(ctx context.Context, ns *btree.Namespace) (int, error)
 }
 
 // docCountForPlan returns TotalDocs for the planner's cost model: the first
@@ -1073,29 +1127,42 @@ type countTx interface {
 // caller's plannable snapshot — the same one its CBO candidates are built
 // from, so the count and the candidates can't disagree about the index set —
 // or, when that is empty, its visible one.
-func (q *collQuery) docCountForPlan(tx countTx, s *collSchema, idxs []*index) int {
+func (q *collQuery) docCountForPlan(ctx context.Context, tx countTx, s *collSchema, idxs []*index) (int, error) {
 	for _, idx := range idxs {
 		if s := idx.loadPubSketch(); s != nil {
-			return int(s.GetDocCount())
+			return int(s.GetDocCount()), nil
 		}
 	}
 	if len(idxs) == 0 {
-		return 0
+		return 0, nil
 	}
-	count, _ := tx.Count(s.ns)
-	return count
+	return countForPlan(ctx, tx, s)
+}
+
+// countForPlan is the namespace walk behind the plan's document count. The
+// walk's own error stays advisory — the plan falls back to a clamped count —
+// while the ctx's ends the call: a plan for an ended ctx is not worth a wrong
+// cost model.
+func countForPlan(ctx context.Context, tx countTx, s *collSchema) (int, error) {
+	count, err := tx.CountContext(ctx, s.ns)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return 0, cerr
+		}
+		return 0, nil
+	}
+	return count, nil
 }
 
 // docCountExact is docCountForPlan without the no-indexes shortcut: Explain
 // reports TotalDocs to humans, so it pays the walk for a real number.
-func (q *collQuery) docCountExact(tx countTx, s *collSchema, idxs []*index) int {
+func (q *collQuery) docCountExact(ctx context.Context, tx countTx, s *collSchema, idxs []*index) (int, error) {
 	for _, idx := range idxs {
 		if s := idx.loadPubSketch(); s != nil {
-			return int(s.GetDocCount())
+			return int(s.GetDocCount()), nil
 		}
 	}
-	count, _ := tx.Count(s.ns)
-	return count
+	return countForPlan(ctx, tx, s)
 }
 
 // unsatisfiable reports whether this query's filter provably matches no

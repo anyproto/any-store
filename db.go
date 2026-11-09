@@ -1227,6 +1227,13 @@ func (db *db) ctxWriteTx(ctx context.Context) (wtx WriteTx, held bool, err error
 	if ctxTx == nil {
 		return nil, false, nil
 	}
+	// A ctx that has ended begins nothing, inside a transaction as well:
+	// the begin of an own transaction checks the same (btree.beginRead,
+	// lockWriter), as SQLite checks isInterrupted before a statement's
+	// first opcode (vdbe.c:902).
+	if err = ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	if h, ok := ctxTx.(heldTx); ok {
 		ctxTx, held = h.ReadTx, true
 	}
@@ -1257,6 +1264,10 @@ func (db *db) enterCtxTx(ctx context.Context) (tx, entered ReadTx, err error) {
 	ctxTx := ctx.Value(ctxKeyTx)
 	if ctxTx == nil {
 		return nil, nil, nil
+	}
+	// A ctx that has ended begins nothing; see ctxWriteTx.
+	if err = ctx.Err(); err != nil {
+		return nil, nil, err
 	}
 	held := false
 	if h, ok := ctxTx.(heldTx); ok {
