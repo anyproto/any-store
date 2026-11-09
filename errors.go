@@ -128,7 +128,7 @@ var (
 	ErrIterOpen = errors.New("any-store: an iterator of the transaction is open on the collection")
 
 	// ErrQuickCheckFailed is returned when we did a quick check (e.g. when opening db in a dirty state with sentinel config on) and it failed, indicating possible database corruption.
-	ErrQuickCheckFailed = errors.New("any-store: quick check failed on db open")
+	ErrQuickCheckFailed error = &nestedError{msg: "any-store: quick check failed on db open", parent: ErrCorrupt}
 
 	ErrDBIsClosed = btree.ErrClosed
 
@@ -140,7 +140,40 @@ var (
 	// docs/migration-v1-to-v2.md for moving the data across.
 	ErrV1Database = errors.New("any-store: file is an any-store v1 database, not readable by v2; use github.com/anyproto/any-store or migrate (docs/migration-v1-to-v2.md)")
 
+	// ErrCorrupt is the umbrella for damaged database files: every error below that names a kind
+	// of damage matches it, as does a broken structure found while reading. Match it when the kind
+	// does not matter, for instance to discard and rebuild the database:
+	//
+	//	if errors.Is(err, anystore.ErrCorrupt) { ... }
+	//
+	// It is not returned for a v1 file (ErrV1Database), an incompatible version or a closed database.
+	//
+	// An encrypted database opened with the wrong key also matches: the page authentication fails
+	// the same way as for a damaged page 1, and the two cannot be told apart. Rule out a key
+	// mismatch before discarding the file.
+	//
+	// A damaged page that nothing has read yet is not found by Open: it surfaces on the read that
+	// meets it, as ErrPageIntegrity.
+	ErrCorrupt = btree.ErrCorrupt
+
+	// ErrHeaderCorrupt is returned (wrapped) by Open when the file header is unusable: a file cut
+	// inside it or never a database, bad field values, or a size that disagrees with the file.
+	ErrHeaderCorrupt = btree.ErrHeaderCorrupt
+
+	// ErrWALCorrupt is returned (wrapped) when the write-ahead log index points at a frame the
+	// file does not hold. Recovery itself repairs a bad WAL header and drops torn frames silently.
+	ErrWALCorrupt = btree.ErrWALCorrupt
+
 	// ErrPageBufferNotInitialized is returned when UseGlobalPageBuffer is set
 	// but InitPageBuffer was not called before opening the database.
 	ErrPageBufferNotInitialized = errors.New("any-store: global page buffer not initialized (call InitPageBuffer first)")
 )
+
+// nestedError keeps its own text and matches parent under errors.Is.
+type nestedError struct {
+	msg    string
+	parent error
+}
+
+func (e *nestedError) Error() string { return e.msg }
+func (e *nestedError) Unwrap() error { return e.parent }

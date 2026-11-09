@@ -243,21 +243,21 @@ func (h *dbHeader) serialize(buf []byte) {
 // deserialize reads the database header from the first 100 bytes of buf.
 func (h *dbHeader) deserialize(buf []byte) error {
 	if len(buf) < dbHeaderSize {
-		return ErrCorrupt
+		return ErrHeaderCorrupt
 	}
 
 	if magic := string(buf[0:16]); magic != dbMagicV2 && magic != dbMagicV1 {
 		if magic == sqliteMagic {
 			return ErrSQLiteFormat
 		}
-		return ErrCorrupt
+		return ErrHeaderCorrupt
 	}
 
 	ps := binary.BigEndian.Uint16(buf[16:18])
 	if ps == 1 {
 		h.PageSize = 65536
 	} else if ps < MinPageSize || (ps&(ps-1)) != 0 {
-		return ErrCorrupt // invalid: 0, non-power-of-two, or < 512
+		return ErrHeaderCorrupt // invalid: 0, non-power-of-two, or < 512
 	} else {
 		h.PageSize = uint32(ps)
 	}
@@ -269,7 +269,7 @@ func (h *dbHeader) deserialize(buf []byte) error {
 	// dbHeader prefix), so every DB this package writes round-trips cleanly,
 	// while a non-DB / corrupt file is rejected here before codec setup.
 	if buf[21] != maxEmbeddedPayloadFrac || buf[22] != minEmbeddedPayloadFrac || buf[23] != leafPayloadFrac {
-		return ErrCorrupt
+		return ErrHeaderCorrupt
 	}
 
 	h.WriteVersion = buf[18]
