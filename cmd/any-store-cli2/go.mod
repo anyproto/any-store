@@ -7,7 +7,7 @@ require (
 	github.com/fatih/color v1.19.0
 	github.com/peterh/liner v1.2.3
 	github.com/robertkrimen/otto v0.5.1
-	github.com/spf13/pflag v1.0.10
+	github.com/spf13/pflag v1.1.0
 	github.com/stretchr/testify v1.12.1
 )
 
