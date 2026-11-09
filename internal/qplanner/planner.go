@@ -199,9 +199,9 @@ type PlanParams struct {
 	// planner reads it through sortFields, which resolves it once otherwise.
 	SortFields []query.SortField
 
-	// PrimaryKey is the collection's primary-key field. Empty ⇒ "id". A single
-	// Sort on this field needs no SortIter because a full scan already yields
-	// primary-key order.
+	// PrimaryKey is the collection's primary-key field. Empty ⇒ "id". A sort
+	// that starts with this field needs no SortIter because a full scan already
+	// yields primary-key order, and the key is unique.
 	PrimaryKey string
 
 	Limit  int
@@ -379,6 +379,13 @@ func (p *Plan) isChosen(name, chosenName string) bool {
 	return strings.Contains(name, p.Name)
 }
 
+// coverLookup reports whether the seek runs as CoverIter point probes: a
+// unique index with every field pinned. The probes come back in bound order,
+// so such a chain keeps its SortIter whatever ExactSort says.
+func (idx *CBOIndex) coverLookup() bool {
+	return idx.Info.Unique && idx.fullKeyPointBound()
+}
+
 // fullKeyPointBound reports whether the bound chain pins EVERY index field
 // with an equality. One definition for its three consumers — the CoverIter
 // routing gate and the two IndexIter.FullKeyBound assignments — so they can
@@ -453,8 +460,9 @@ func BuildPlan(params *PlanParams) *Plan {
 			}
 		}
 	}
-	// FullScan naturally reads in primary-key order, so sorting by the primary
-	// key is free.
+	// FullScan naturally reads in primary-key order, so a sort that starts
+	// with the primary key is free: the key is unique, so the fields after it
+	// never reorder the rows.
 	fullScanNeedSort := needSort
 	if needSort {
 		fields := params.sortFields()
@@ -462,14 +470,16 @@ func BuildPlan(params *PlanParams) *Plan {
 		if pk == "" {
 			pk = "id"
 		}
-		if len(fields) == 1 && fields[0].Field == pk {
+		if len(fields) > 0 && fields[0].Field == pk {
 			fullScanNeedSort = false
 		}
 	}
 	// When FullScan provides id-order (no sort needed) and there's a LIMIT,
-	// we only need to scan enough docs to find `limit` matching rows.
+	// we only need to scan enough docs to find `limit+offset` matching rows.
+	// An offset alone never stops the scan (Plans B and C price it the same
+	// way).
 	fullScanEffective := fullScanDocs
-	if !fullScanNeedSort && (params.Limit > 0 || params.Offset > 0) {
+	if !fullScanNeedSort && params.Limit > 0 {
 		needed := float64(params.Limit + params.Offset)
 		if pTotal > 0 && pTotal < 1.0 {
 			// Scan needed/selectivity docs on average to find enough matches
@@ -1672,6 +1682,8 @@ func estimateIndexDocsWithFieldSel(idx *CBOIndex, totalDocs float64, fieldSel []
 func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator {
 	var root Iterator
 
+	// A sort that starts with the primary key is the scan's own order: the
+	// key is unique, so the fields after it never reorder the rows.
 	idSorted := false
 	if needSort {
 		fields := params.sortFields()
@@ -1679,7 +1691,7 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 		if pk == "" {
 			pk = "id"
 		}
-		if len(fields) == 1 && fields[0].Field == pk {
+		if len(fields) > 0 && fields[0].Field == pk {
 			idSorted = true
 			fsi := &FullScanIter{
 				Source: &CursorSource{
@@ -1779,7 +1791,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// Only safe when ALL index fields are covered by equality bounds;
 	// a partial prefix (BoundFields < len(FieldNames)) can match multiple
 	// entries with different trailing fields, so a range scan is needed.
-	if idx.Info.Unique && idx.fullKeyPointBound() {
+	if idx.coverLookup() {
 		cb := &coverBatch{cs: CursorSource{Ctx: params.Ctx, Tx: params.Tx, Ns: idx.Info.Ns}}
 		cb.cover = CoverIter{
 			Source:       &cb.cs,
@@ -2079,7 +2091,9 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 // REVERSE iff they are opposite. The first matched sort field is always
 // fields[0] (IndexSortMatch aligns sortFields[si] → idx.FieldNames[matchStart+si],
 // and the matched run is uniform), so reading idx.Reverse[SortMatchStart] is
-// sufficient for the whole run.
+// sufficient for the whole run. A run that starts at the primary-key column
+// (SortMatchStart == len(FieldNames), every declared field pinned) reads past
+// Reverse and gets the column's declared direction, ascending.
 //
 // Note: this is also called for index-SEEK plans where ExactSort==false; there
 // the output is re-sorted by a SortIter, so the scan direction is immaterial and
@@ -3488,17 +3502,34 @@ func MergeOverlappingBounds(bounds query.Bounds) query.Bounds {
 // equalityPrefix is the number of leading index fields pinned by equality filters;
 // these can be skipped when matching sort fields since they're constant within a range.
 //
+// The index has one column more than it declares: every key ends with the
+// document's primary key (index.go putEntries: Tuple(fields..., docId), the
+// docId never inverted), so the primary key is matched as the column after
+// FieldNames, declared ascending — SQLite's shape, where the rowid is the last
+// column of every index (build.c, aiColumn[nKeyCol] = XN_ROWID). A forward
+// scan yields it ascending within equal declared fields, a reverse scan
+// descending, under the same uniformity rule as the declared fields. Once the
+// sort reaches the primary key the rows are distinct from there, so the sort
+// fields after it are satisfied whatever they are (SQLite's isOrderDistinct).
+//
 // matchStart is the index-field position where the matched sort run begins
-// (0 for a prefix match, or equalityPrefix when the equality-pinned start wins).
-// shouldReverse uses it to read the declared direction of the first matched
-// field (idx.Reverse[matchStart]) and pick the scan direction. It defaults to 0,
-// which is correct when no equality prefix shifts the match.
+// (0 for a prefix match, or equalityPrefix when the equality-pinned start wins;
+// len(FieldNames) when every declared field is pinned and the sort starts at
+// the primary key). shouldReverse uses it to read the declared direction of
+// the first matched field (idx.Reverse[matchStart], ascending past the
+// declared fields) and pick the scan direction. It defaults to 0, which is
+// correct when no equality prefix shifts the match.
 func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix int) (exactSort, partialSort bool, matchStart int) {
 	if len(sortFields) == 0 || len(idx.FieldNames) == 0 {
 		return false, false, 0
 	}
+	pk := idx.PrimaryKey
+	if pk == "" {
+		pk = "id"
+	}
+	nCols := len(idx.FieldNames) + 1 // the declared fields, then the primary key
 	matchAt := func(start int) int {
-		if start < 0 || start >= len(idx.FieldNames) {
+		if start < 0 || start >= nCols {
 			return 0
 		}
 		match := 0
@@ -3506,10 +3537,15 @@ func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix
 		sameMode := false // true: idx dir == sort dir, false: idx dir != sort dir
 		for si, sf := range sortFields {
 			ii := start + si
-			if ii >= len(idx.FieldNames) {
+			if ii >= nCols {
 				break
 			}
-			if idx.FieldNames[ii] != sf.Field {
+			onPk := ii == len(idx.FieldNames)
+			if onPk {
+				if sf.Field != pk {
+					break
+				}
+			} else if idx.FieldNames[ii] != sf.Field {
 				break
 			}
 			// Reverse-flagged fields are stored bitwise-inverted (index.go
@@ -3520,9 +3556,10 @@ func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix
 			// relation: an all-same run is served by a forward scan, an
 			// all-opposite run by a reverse scan, and a run that is mixed
 			// relative to the declared directions (e.g. Sort(a,b) on an (a,-b)
-			// index) breaks here and falls back to an in-memory sort.
+			// index) breaks here and falls back to an in-memory sort. The
+			// primary-key column is never inverted: declared ascending.
 			idxRev := false
-			if ii < len(idx.Reverse) {
+			if !onPk && ii < len(idx.Reverse) {
 				idxRev = idx.Reverse[ii]
 			}
 			curSame := idxRev == sf.Reverse
@@ -3533,13 +3570,17 @@ func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix
 				break
 			}
 			match++
+			if onPk {
+				// Distinct rows from here: the rest of the sort never reorders them.
+				return len(sortFields)
+			}
 		}
 		return match
 	}
 
 	bestMatch := matchAt(0)
 	bestStart := 0
-	if equalityPrefix > 0 && equalityPrefix < len(idx.FieldNames) {
+	if equalityPrefix > 0 && equalityPrefix < nCols {
 		if m := matchAt(equalityPrefix); m > bestMatch {
 			bestMatch = m
 			bestStart = equalityPrefix

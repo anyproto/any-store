@@ -176,6 +176,11 @@ type IndexInfo struct {
 	Unique     bool
 	Sparse     bool
 	Ns         *btree.Namespace
+	// PrimaryKey is the collection's primary-key field, empty ⇒ "id". Every
+	// key of the index ends with it (index.go putEntries: Tuple(fields...,
+	// docId), the docId never inverted), so the planner treats it as one more
+	// index column after FieldNames, declared ascending.
+	PrimaryKey string
 	// SharedFrom is the first field position whose path shares a leading
 	// segment with an earlier field's (len(FieldNames) when none). Fields
 	// that run through the same array of objects iterate it together, one
