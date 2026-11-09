@@ -2145,7 +2145,7 @@ func (p *pager) refreshHeaderFromPage1() error {
 
 // committedCounters returns the FileChangeCount and SchemaCookie from the
 // in-memory header. It is only valid to call while holding the writer
-// (BeginWrite holds db.writeMu and the pager is in pagerWriter state after
+// (BeginWrite holds the write lock and the pager is in pagerWriter state after
 // beginWrite, so p.header is owned exclusively by this writer — no data race
 // with concurrent readers). The values reflect the latest committed page 1:
 // beginWrite refreshes p.header via refreshHeaderFromPage1 on the stateChanged

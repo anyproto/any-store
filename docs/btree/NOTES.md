@@ -579,7 +579,8 @@ sub-journaling for savepoints.
   checkpoint restart and TOCTOU race)
 - **Max concurrent readers**: `readerSem` channel with capacity `MaxReaders`
   (default 4) limits concurrent read transactions per DB. Bounds memory from
-  persistent reader caches. `closeCh` unblocks waiters on DB close
+  persistent reader caches. A wait ends with a slot, with the caller's ctx
+  (`BeginReadContext`) or with DB close (`closeCh`)
 - Pin counting (similar to SQLite's reference counting)
 - `purgeable` flag matching SQLite's `pcache1.bPurgeable`
 - `page.cache` backpointer for routing releases to the correct cache
@@ -1582,6 +1583,28 @@ memory from persistent reader caches. `closeCh` channel unblocks goroutines
 waiting on the semaphore when `DB.Close()` or `DB.SetClosing()` is called.
 No SQLite equivalent — our addition for the many-open-databases scenario.
 
+**In-Process Write Lock and Context-Bounded Waits** -- Severity: N/A (implemented)
+
+SQLite's default build never blocks on a lock (an `SQLITE_ENABLE_SETLK_TIMEOUT`
+build blocks on the WRITER lock, `btree.c:3664-3737`): a busy lock returns
+`SQLITE_BUSY`, and the busy handler sleeps and retries (`sqlite3InvokeBusyHandler`
+`main.c:1770-1780`, the sleep in `sqliteDefaultBusyCallback` `main.c:1718-1757`, the
+loop in `btreeBeginTrans`); `sqlite3_interrupt` does not end that sleep, only an
+application busy handler that consults `sqlite3_is_interrupted` can. Readers retry
+`walTryBeginRead` on a sleep schedule of its own (`wal.c:3040-3070`, up to
+`WAL_RETRY_PROTOCOL_LIMIT`). The Go port serializes the writers of one process on
+`writeSem`, a capacity-1 channel (`DB.lockWriter`), and its readers on `readerSem`;
+both waits end with the resource, with the caller's ctx (`BeginWriteContext`,
+`BeginReadContext`: `ctx.Err()`) or with close (`ErrClosed`). ctx is checked
+before the wait, as `vdbe.c:902` checks `isInterrupted` before a statement starts,
+so a ctx that has ended takes nothing. A capacity-1 channel hands the lock to its
+waiters in FIFO order and gives the release→acquire happens-before the writer-owned
+state relies on. The waits taken while the write lock is held — the busy handler
+behind another process's writer (`walBusyLock`), the BUSY_SNAPSHOT retry, the
+WAL_RETRY loop — keep SQLite's shape: bounded by the busy timeout and by the
+retry limit (`ErrProtocol`), not by ctx. Our addition for the
+many-goroutines-one-DB scenario.
+
 **Implemented Optimizations:**
 - `dirtyTail` pointer for O(1) spill victim search — walks backward from tail
   to find the oldest unpinned dirty page, matching SQLite's `pDirtyTail`
@@ -2215,17 +2238,29 @@ in traversal (no interior-key stops) and in counting (interior cells excluded); 
 B+tree shape both results are correct, but they differ from SQLite's B-tree semantics.
 
 <a id="drift-16-count-traversal-missing-interrupt-cancellation-check"></a>
-### Drift: Count Traversal Missing Interrupt Cancellation Check
-- **Category:** platform-support  -  **Severity:** low
-- **Affected functions:** `btree.go:*btree.Count` (`btree.go:3368-3370`), `btree.go:*btree.countPage` (`btree.go:3375-3424`).
+### Drift: Count Traversal Missing Interrupt Cancellation Check — Resolved 2026-11-06; ctx polled per leaf
+- **Category:** platform-support  -  **Severity:** low (the remaining granularity difference)
+- **Affected functions:** `btree.go:*btree.countPage`, `btree.go:*Cursor.Next`, `btree.go:*Cursor.Previous`, `db.go:*ReadTx.NewCursorContext`, `db.go:*ReadTx.CountContext`.
 
 SQLite's `sqlite3BtreeCount` (`btree.c:10489`) gates its page-walk loop on
-`!AtomicLoad(&db->u1.isInterrupted)` (`btree.c:10502`), so a long count over a huge tree
-can be cancelled via `sqlite3_interrupt` mid-walk and returns the in-progress rc
-(allowing `SQLITE_INTERRUPT`). Go's `countPage` (`btree.go:3375-3424`) has no
-interrupt/context/cancellation hook and always runs to completion or to an error. The
-consequence is that a `Count()` over a very large tree cannot be aborted; this is a
-missing SQLite runtime feature with low correctness impact.
+`!AtomicLoad(&db->u1.isInterrupted)` (`btree.c:10502`), and the VDBE checks the flag
+once per visited row at the loop-bottom opcodes (`vdbe.c:1078-1091`), so a long count
+or scan can be cancelled via `sqlite3_interrupt` mid-walk. The Go port polls the caller's
+ctx in the flag's place: `countPage` once per interior page, one poll per fan-out of leaves
+(`ReadTx.CountContext`; a leaf costs only its header read, so a poll on every page was a
+tenth of the walk), and a cursor
+once per leaf it leaves in `Next`/`Previous` (`ReadTx.NewCursorContext`), which covers
+`Skip`, `SkipBackward` and `CountUntil`. A ctx that has ended fails the move with
+`ctx.Err()` and leaves the cursor on the entry it stood on, not tripped (`cursorFault`
+is for I/O and schema faults); `Skip`, `SkipBackward` and `CountUntil` fail at the leaf
+they were crossing, their count partial — their callers pass the error up and stop. Remaining divergence, deliberate: the VDBE's per-row check is a per-leaf check here,
+where the cursor already pays for I/O, and the count's per-page check is per interior
+page; one leaf's rows, or one fan-out of leaf headers, is the longest a walk runs past
+its ctx. A plan that scans an index and fetches each matching document polls the index
+cursor only, so the document fetches for one index leaf (hundreds of entries, an
+overflowing document several pages each) run between polls, and a filter that rejects
+most fetched documents runs past its ctx by that much; a poll every N fetches in the
+fetch step would close the gap.
 
 <a id="drift-17-count-return-type-truncates-i64-entry-total-to-go-int"></a>
 ### Drift: Count Return Type Truncates i64 Entry Total To Go int

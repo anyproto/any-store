@@ -411,7 +411,7 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 
 	buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], docId)
 	if ctx.Value(ctxKeyTx) == nil {
-		return c.findIdOwnTx(p, buf)
+		return c.findIdOwnTx(ctx, p, buf)
 	}
 
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
@@ -437,8 +437,8 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 // fast read tx around the fetch of the key in buf.SmallBuf. A function of
 // its own to keep its return count low: past returns x defers = 15 the
 // compiler stops open-coding defers, which costs this path about 3%.
-func (c *collection) findIdOwnTx(p *anyenc.Parser, buf *syncpool.DocBuffer) (doc Doc, err error) {
-	tx, err := c.db.btreeDB.BeginReadFast()
+func (c *collection) findIdOwnTx(ctx context.Context, p *anyenc.Parser, buf *syncpool.DocBuffer) (doc Doc, err error) {
+	tx, err := c.db.btreeDB.BeginReadFastContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -601,12 +601,12 @@ func (c *collection) runModifier(wtx WriteTx, mod query.Modifier, a *anyenc.Aren
 // the operation running the modifier loaded the document and resolved the
 // schema it writes with. Checked inside the write scope: a modifier runs
 // in a write transaction, and the btree admits one at a time
-// (btree.DB.BeginWrite, writeMu), so a modifier seen from inside a scope
+// (btree.DB.BeginWrite, writeSem), so a modifier seen from inside a scope
 // runs in the scope's own transaction. A write from another transaction
 // waits for the writer lock instead; one made from inside the modifier
 // with a context that carries no transaction waits for the lock its own
-// transaction holds until the database closes, as such a write to any
-// other collection does.
+// transaction holds until that context ends or the database closes, as
+// such a write to any other collection does.
 func (c *collection) writable() error {
 	if c.modifiers.Load() > 0 {
 		return ErrWriteInModifier
@@ -955,7 +955,7 @@ func (c *collection) Count(ctx context.Context) (count int, err error) {
 		if txErr != nil {
 			return txErr
 		}
-		count, txErr = tx.Count(s.ns)
+		count, txErr = tx.CountContext(ctx, s.ns)
 		return txErr
 	})
 	return
@@ -1700,7 +1700,7 @@ func (c *collection) refreshSketches(tx *btree.ReadTx, s *collSchema) {
 // It is the sqlite_stat1 reload analog and is advisory/fail-soft: a missing key
 // or decode error leaves current state intact and never aborts the transaction.
 //
-//	WRITE tx (writable): the calling goroutine holds the btree writeMu and is the
+//	WRITE tx (writable): the calling goroutine holds the btree write lock and is the
 //	  SOLE mutator of idx.sketch, so it reloads IN PLACE into the live object (0
 //	  alloc) — catching up to a peer's committed counts BEFORE applying its own
 //	  deltas (a reader that consumed the peer's commit first leaves live

@@ -223,6 +223,12 @@
     ],
     "note": ""
   },
+  "btree.go:*btree.CountContext": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeCount"
+    ],
+    "note": "polls ctx once per interior page in place of isInterrupted on every page"
+  },
   "btree.go:*btree.Delete": {
     "sqlite": [
       "btree.c:allocateSpace",
@@ -900,6 +906,12 @@
     ],
     "note": ""
   },
+  "db.go:*ReadTx.CountContext": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeCount"
+    ],
+    "note": "polls ctx once per interior page in place of isInterrupted on every page"
+  },
   "db.go:*ReadTx.DiskFileChangeCounter": {
     "sqlite": [],
     "note": ""
@@ -934,6 +946,13 @@
       "btree.c:sqlite3BtreeCursor"
     ],
     "note": ""
+  },
+  "db.go:*ReadTx.NewCursorContext": {
+    "sqlite": [
+      "btree.c:btreeCursor",
+      "btree.c:sqlite3BtreeCursor"
+    ],
+    "note": "the cursor polls ctx once per leaf it leaves, the VDBE checks isInterrupted per row"
   },
   "db.go:*ReadTx.Rollback": {
     "sqlite": [

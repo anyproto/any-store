@@ -1367,7 +1367,7 @@ func (c *collection) maybeAutoCompactVectors(ctx context.Context) {
 	// momentarily stale count at worst defers a compaction by one write,
 	// which is harmless for this heuristic.
 	var due []string
-	if rtx, rerr := c.db.btreeDB.BeginReadFast(); rerr == nil {
+	if rtx, rerr := c.db.btreeDB.BeginReadFastContext(ctx); rerr == nil {
 		c.db.observeCookie(rtx)
 		if s, err := c.resolve(rtx); err == nil {
 			for _, vi := range s.vindexes {

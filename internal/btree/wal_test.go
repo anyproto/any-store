@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -1815,7 +1816,7 @@ func TestCheckpoint_PhysicalTruncateAfterShrink(t *testing.T) {
 	b, err := dst.BackupInit(src)
 	require.NoError(t, err)
 	for {
-		err := b.Step(-1)
+		err := b.Step(context.Background(), -1)
 		if err == ErrBackupDone {
 			break
 		}

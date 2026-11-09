@@ -365,7 +365,7 @@ func collectFieldSelectivity(params *PlanParams, totalDocs float64, buf []fieldS
 func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) *Plan {
 	needFilter := params.Filter != nil && !isAllFilter(params.Filter)
 	needSort := params.Sorter != nil
-	dataCS := &CursorSource{Tx: params.Tx, Ns: params.DataNs}
+	dataCS := &CursorSource{Ctx: params.Ctx, Tx: params.Tx, Ns: params.DataNs}
 
 	var root Iterator
 	var canonicalWrap func(Iterator) Iterator
@@ -400,7 +400,7 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 			// tail pad would double-pad the seek, and MergeOverlappingBounds
 			// would collapse distinct point probes (see buildIndexSeekChain).
 			root = &CoverIter{
-				Source:       &CursorSource{Tx: params.Tx, Ns: idx.Info.Ns},
+				Source:       &CursorSource{Ctx: params.Ctx, Tx: params.Tx, Ns: idx.Info.Ns},
 				IdxInfo:      idx.Info,
 				Bounds:       idx.Bounds,
 				ScalarProven: idx.ScalarProven,
@@ -411,7 +411,7 @@ func buildTextProbePlan(params *PlanParams, cand *textCandidate, rankMode bool) 
 		} else {
 			dedupB := finalizeIndexBounds(idx)
 			root = &IndexIter{
-				Source:       &CursorSource{Tx: params.Tx, Ns: idx.Info.Ns},
+				Source:       &CursorSource{Ctx: params.Ctx, Tx: params.Tx, Ns: idx.Info.Ns},
 				IdxInfo:      idx.Info,
 				Bounds:       idx.Bounds,
 				Reverse:      reverse,

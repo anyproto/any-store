@@ -2489,3 +2489,16 @@ func TestWriteTx_ModifierPinsItsHandle(t *testing.T) {
 		assertQueryCount(t, x.Find(`{"a":5}`).IndexHint(byIndex...), 0)
 	})
 }
+
+func TestTxFromContext_HeldCtx(t *testing.T) {
+	fx := newFixture(t)
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	// A held ctx (heldCtx) carries the transaction behind its marker.
+	got, ok := TxFromContext(heldCtx(tx.Context(), tx))
+	require.True(t, ok)
+	_, isWrite := got.(WriteTx)
+	require.True(t, isWrite)
+	require.False(t, got.Done())
+}

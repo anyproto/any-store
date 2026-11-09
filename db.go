@@ -476,7 +476,7 @@ func (db *db) init(ctx context.Context) error {
 }
 
 func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
-	btWtx, err := db.btreeDB.BeginWrite()
+	btWtx, err := db.btreeDB.BeginWriteContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -521,7 +521,7 @@ func (db *db) pooledTx() *commonTx {
 }
 
 func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
-	btRtx, err := db.btreeDB.BeginRead()
+	btRtx, err := db.btreeDB.BeginReadContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1171,7 +1171,7 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
-		serr := b.Step(batch)
+		serr := b.Step(ctx, batch)
 		if errors.Is(serr, btree.ErrBackupDone) {
 			break
 		}
@@ -1227,6 +1227,13 @@ func (db *db) ctxWriteTx(ctx context.Context) (wtx WriteTx, held bool, err error
 	if ctxTx == nil {
 		return nil, false, nil
 	}
+	// A ctx that has ended begins nothing, inside a transaction as well:
+	// the begin of an own transaction checks the same (btree.beginRead,
+	// lockWriter), as SQLite checks isInterrupted before a statement's
+	// first opcode (vdbe.c:902).
+	if err = ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	if h, ok := ctxTx.(heldTx); ok {
 		ctxTx, held = h.ReadTx, true
 	}
@@ -1257,6 +1264,10 @@ func (db *db) enterCtxTx(ctx context.Context) (tx, entered ReadTx, err error) {
 	ctxTx := ctx.Value(ctxKeyTx)
 	if ctxTx == nil {
 		return nil, nil, nil
+	}
+	// A ctx that has ended begins nothing; see ctxWriteTx.
+	if err = ctx.Err(); err != nil {
+		return nil, nil, err
 	}
 	held := false
 	if h, ok := ctxTx.(heldTx); ok {
@@ -1364,9 +1375,9 @@ func (db *db) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *b
 	}
 	// User code runs inside this tx (a query.Modifier — UpdateId/UpsertId call
 	// mod.Modify inside the callback — or a DDL callback). A panic must not
-	// escape holding the btree write lock: BeginWrite has no ctx-cancel escape,
-	// so every later write — and Close() — would block forever. Roll back to
-	// release the lock, then re-panic so the caller still sees their bug.
+	// escape holding the btree write lock: every later write would wait for
+	// its context to end or for Close, which rolls the abandoned transaction
+	// back. Roll back here, then re-panic so the caller still sees their bug.
 	// Guarded by TestTxPanic_UpdateIdDoesNotWedgeDB and
 	// TestTxPanic_UpsertIdDoesNotWedgeDB in any-store-tests:apitest.
 	//
