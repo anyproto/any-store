@@ -103,20 +103,69 @@ func splitFaultCases(t *testing.T, faults []splitFault, run func(t *testing.T, b
 	}
 }
 
-func TestSplitLeafAndInsert_ReleasesRightPageOnRebuildError(t *testing.T) {
-	splitFaultCases(t, []splitFault{noFault, leftRebuildFails, rightRebuildFails},
-		func(t *testing.T, bt *btree, pg *page) error {
-			return bt.splitLeafAndInsert(pg, 15, []byte("key-000014x"), []byte("v"))
+// rootLeafFaultCases runs run on a full leaf root pinned for writing, failing
+// the rebuild of one page at a time: the root itself, the child balance_deeper
+// allocates, or the page balance_nonroot allocates after it. Every page the
+// operation allocated must end unpinned and the root must keep only the
+// caller's pin.
+func rootLeafFaultCases(t *testing.T, run func(bt *btree, pg *page) error) {
+	for _, tc := range []struct {
+		name string
+		// failed is the page whose rebuild fails, as an offset from the first
+		// page the operation allocates; -1 is the root, -2 is no fault.
+		failed int
+	}{
+		{name: "ok", failed: -2},
+		{name: "root-rebuild-fails", failed: -1},
+		{name: "child-rebuild-fails", failed: 0},
+		{name: "sibling-rebuild-fails", failed: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// given
+			p := tempPager(t)
+			bt := initLeafBtree(t, p)
+			pg, err := p.getWritablePage(bt.rootPage)
+			require.NoError(t, err)
+			defer p.releasePage(pg)
+			require.NoError(t, bt.rebuildLeafPage(pg, leafCellsFor(30, 100)))
+			firstNew := nextAllocPgno(t, p)
+			switch {
+			case tc.failed == -1:
+				failRebuildOf(t, p, pg.pgno)
+			case tc.failed >= 0:
+				failRebuildOf(t, p, firstNew+uint32(tc.failed))
+			}
+
+			// when
+			err = run(bt, pg)
+
+			// then
+			if tc.failed == -2 {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, errRebuildInjected)
+			}
+			for pgno := firstNew; pgno <= p.dbSize.Load(); pgno++ {
+				requireUnpinned(t, p, pgno)
+			}
+			assert.Equal(t, 1, pg.pinCount, "the root keeps the caller's pin")
 		})
+	}
 }
 
-func TestUpdateLeafCell_ReleasesRightPageOnRebuildError(t *testing.T) {
-	splitFaultCases(t, []splitFault{noFault, leftRebuildFails, rightRebuildFails},
-		func(t *testing.T, bt *btree, pg *page) error {
-			// A value nine times the old one cannot be written in place and
-			// pushes the page over its size, so the slow path splits it.
-			return bt.updateLeafCell(pg, 15, []byte("key-000015"), bytes.Repeat([]byte{'w'}, 900), nil)
-		})
+func TestUpdateLeafCell_ReleasesPagesOnRebuildError(t *testing.T) {
+	rootLeafFaultCases(t, func(bt *btree, pg *page) error {
+		// A value nine times the old one cannot be written in place and
+		// pushes the page over its size: the old cell is dropped and the new
+		// one is balanced in.
+		return bt.updateLeafCell(pg, 15, []byte("key-000015"), bytes.Repeat([]byte{'w'}, 900), nil)
+	})
+}
+
+func TestSplitRootLeafAndInsert_ReleasesPagesOnRebuildError(t *testing.T) {
+	rootLeafFaultCases(t, func(bt *btree, pg *page) error {
+		return bt.splitRootLeafAndInsert(pg, 16, []byte("key-000015x"), bytes.Repeat([]byte{'w'}, 900))
+	})
 }
 
 func TestSplitRoot_ReleasesNewLeftPageOnRebuildError(t *testing.T) {

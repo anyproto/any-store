@@ -277,7 +277,7 @@ func TestCorruptCov_LeafFullKeyBoundsCheck(t *testing.T) {
 					kl, kn := getVarint(data[cellOff:])
 					if kl > 100 && kn > 0 {
 						// This is an overflow cell - corrupt the overflow page pointer
-						nLocal := localPayloadSize(int(kl), pageSize)
+						nLocal := localPayloadSize(int(kl), indexLimits(pageSize))
 						overflowPtrOff := cellOff + kn + nLocal
 						if overflowPtrOff+4 <= len(data) {
 							// Point to page 0 (invalid)

@@ -131,7 +131,7 @@ func findOverflowPageInCell(t *testing.T, data []byte, pageStart, pageSize int) 
 	// Compute local payload size (unified format)
 	usable := pageSize
 	totalPayload := int(keyLen) + int(valLen)
-	nLocal := localPayloadSize(totalPayload, usable)
+	nLocal := localPayloadSize(totalPayload, indexLimits(usable))
 	ovflPtrAbsOff = pos + nLocal
 
 	if ovflPtrAbsOff+4 > len(data) {

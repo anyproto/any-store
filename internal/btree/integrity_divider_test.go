@@ -97,7 +97,7 @@ func subtreeMaxKey(t *testing.T, bt *btree, pgno uint32) uint32 {
 		n := int(pg.header.cellCount)
 		for i := 0; i < n; i++ {
 			off := int(pg.getCellOffset(i))
-			k, _ := leafFullKey(pg.data, off, usable, bt.pager, bt.walMaxFrame, bt.cache)
+			k, _ := leafFullKey(pg.data, off, indexLimits(usable), bt.pager, bt.walMaxFrame, bt.cache)
 			if len(k) == 4 {
 				if v := binary.BigEndian.Uint32(k); v > maxKey {
 					maxKey = v

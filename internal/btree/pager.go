@@ -1640,6 +1640,14 @@ func (p *pager) usableSize() int {
 	return p.usableSize_
 }
 
+// leafLimits returns the local-payload rule of this file's leaf cells, the
+// counterpart of BtShared.maxLeaf / minLeaf (btree.c:3439-3440). Every leaf
+// cell of a file is written and parsed under one rule; interior cells always
+// use indexLimits.
+func (p *pager) leafLimits() payloadLimits {
+	return indexLimits(p.usableSize_)
+}
+
 // freelistMaxLeaves returns the max number of leaf entries per trunk page.
 // DRIFT: trunk fills to usableSize/4-2 (corruption ceiling) not SQLite's conservative -8; pre-3.6.0 See docs/btree/NOTES.md#old-drift-freelist-trunk-fill-corruption-ceiling
 // DRIFT: freelist trunk fills to usableSize/4-2 (corruption ceiling), not SQLite's usableSize/4-8 See docs/btree/NOTES.md#old-drift-freelist-trunk-fill-bound-corruption-ceiling

@@ -148,21 +148,43 @@ func overflowPageUsable(usableSize int) int {
 	return usableSize - 4
 }
 
+// payloadLimits is the local-payload rule of a cell: how many payload bytes
+// stay on the page before the rest moves to an overflow chain. It is the
+// any-store form of MemPage.maxLocal / minLocal, which decodeFlags sets per
+// page from BtShared (btree.c:2043-2086). The zero value means "no overflow
+// detection" to the cell parsers.
+type payloadLimits struct {
+	usable   int // usable page size (pageSize - reserved)
+	maxLocal int // largest payload stored wholly on the page
+	minLocal int // local part kept by a cell whose payload overflows
+}
+
+// indexLimits returns SQLite's index-btree rule (BtShared.maxLocal / minLocal).
+// Interior cells always use it. Leaf cells take their rule from the pager
+// (pager.leafLimits), never from here: see TestLeafCodeTakesLimitsFromPager.
+func indexLimits(usableSize int) payloadLimits {
+	return payloadLimits{usable: usableSize, maxLocal: maxLocalPayload(usableSize), minLocal: minLocalPayload(usableSize)}
+}
+
+// interiorLocalPayloadSize is localPayloadSize under the index rule, which
+// every interior cell uses.
+func interiorLocalPayloadSize(keyLen, usableSize int) int {
+	return localPayloadSize(keyLen, indexLimits(usableSize))
+}
+
 // localPayloadSize computes how many bytes of payload are stored locally
-// when total payload exceeds maxLocal. Uses SQLite's surplus algorithm.
+// when total payload exceeds lim.maxLocal. Port of btreePayloadToLocal
+// (btree.c:1242-1259).
 // DRIFT: Go has only index maxLocal/minLocal; SQLite's table maxLeaf/minLeaf pair absent (no table See docs/btree/NOTES.md#old-drift-index-only-local-payload-no-maxleaf-minleaf
-func localPayloadSize(totalPayload, usableSize int) int {
-	maxLocal := maxLocalPayload(usableSize)
-	if totalPayload <= maxLocal {
+func localPayloadSize(totalPayload int, lim payloadLimits) int {
+	if totalPayload <= lim.maxLocal {
 		return totalPayload
 	}
-	minLocal := minLocalPayload(usableSize)
-	ovflUsable := overflowPageUsable(usableSize)
-	surplus := minLocal + (totalPayload-minLocal)%ovflUsable
-	if surplus <= maxLocal {
+	surplus := lim.minLocal + (totalPayload-lim.minLocal)%overflowPageUsable(lim.usable)
+	if surplus <= lim.maxLocal {
 		return surplus
 	}
-	return minLocal
+	return lim.minLocal
 }
 
 // Leaf cell format (schema format 5+):

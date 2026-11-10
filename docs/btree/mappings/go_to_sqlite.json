@@ -98,7 +98,7 @@
     "sqlite": [
       "btree.c:balance_nonroot"
     ],
-    "note": "the (i\u003e0 ? cntNew[i-1] : 0) boundary guard (btree.c:8601, 8645)"
+    "note": "the (i>0 ? cntNew[i-1] : 0) boundary guard (btree.c:8601, 8645)"
   },
   "btree.go:*Cursor.AppendValue": {
     "sqlite": [
@@ -236,7 +236,7 @@
       "btree.c:dropCell",
       "btree.c:sqlite3BtreeDelete"
     ],
-    "note": "now drives delete-time rebalancing: an underfull (\u003e2/3 free) non-empty leaf funnels through balanceNonroot (deleteRebalanceLeaf), matching the balance() call in sqlite3BtreeDelete (btree.c:10005-10010); also ports the cell-drop (dropCell/allocateSpace). Phase 1 — see any-store-tests:docs/any-store/btree/plans/2026-05-23-delete-time-rebalancing.md"
+    "note": "now drives delete-time rebalancing: an underfull (>2/3 free) non-empty leaf funnels through balanceNonroot (deleteRebalanceLeaf), matching the balance() call in sqlite3BtreeDelete (btree.c:10005-10010); also ports the cell-drop (dropCell/allocateSpace). Phase 1 — see any-store-tests:docs/any-store/btree/plans/2026-05-23-delete-time-rebalancing.md"
   },
   "btree.go:*btree.Get": {
     "sqlite": [],
@@ -259,6 +259,12 @@
       "btree.c:sqlite3BtreeInsert"
     ],
     "note": ""
+  },
+  "btree.go:*btree.balanceDeeper": {
+    "sqlite": [
+      "btree.c:balance_deeper"
+    ],
+    "note": "leaf root only"
   },
   "btree.go:*btree.cellFullKey": {
     "sqlite": [
@@ -303,7 +309,7 @@
     "sqlite": [
       "btree.c:balance_nonroot"
     ],
-    "note": "drives an underfull (\u003e2/3 free) non-empty leaf through balanceNonroot with inject.active=false (k=nOld-1 merge), matching SQLite delete-merge via balance()-\u003ebalance_nonroot (btree.c:10010)"
+    "note": "drives an underfull (>2/3 free) non-empty leaf through balanceNonroot with inject.active=false (k=nOld-1 merge), matching SQLite delete-merge via balance()->balance_nonroot (btree.c:10010)"
   },
   "btree.go:*btree.finishParentRemoval": {
     "sqlite": [
@@ -316,31 +322,10 @@
     "sqlite": [],
     "note": "reader/writer routing shim over pager"
   },
-  "btree.go:*btree.insertIntoInterior": {
-    "sqlite": [],
-    "note": "any-store recursive-split helper (SQLite uses balance())"
-  },
-  "btree.go:*btree.insertIntoLeaf": {
-    "sqlite": [
-      "btree.c:allocateSpace",
-      "btree.c:insertCellFast"
-    ],
-    "note": ""
-  },
   "btree.go:*btree.insertIntoLeafWithPath": {
     "sqlite": [
       "btree.c:allocateSpace",
       "btree.c:insertCellFast"
-    ],
-    "note": ""
-  },
-  "btree.go:*btree.insertIntoPage": {
-    "sqlite": [],
-    "note": ""
-  },
-  "btree.go:*btree.insertIntoParent": {
-    "sqlite": [
-      "btree.c:balance"
     ],
     "note": ""
   },
@@ -379,7 +364,11 @@
     "sqlite": [
       "btree.c:sqlite3BtreeDelete"
     ],
-    "note": "the nFree*3 \u003e usable*2 rebalance gate, negated from btree.c:10005; decides the underfull-parent cascade after a delete-side merge"
+    "note": "the nFree*3 > usable*2 rebalance gate, negated from btree.c:10005; decides the underfull-parent cascade after a delete-side merge"
+  },
+  "btree.go:*btree.leafLimits": {
+    "sqlite": [],
+    "note": "accessor for pager.leafLimits"
   },
   "btree.go:*btree.leafUsedSpace": {
     "sqlite": [],
@@ -423,12 +412,6 @@
     "sqlite": [],
     "note": ""
   },
-  "btree.go:*btree.splitLeafAndInsert": {
-    "sqlite": [
-      "btree.c:balance_nonroot"
-    ],
-    "note": ""
-  },
   "btree.go:*btree.splitLeafAndInsertWithPath": {
     "sqlite": [
       "btree.c:balance_nonroot"
@@ -450,10 +433,9 @@
   },
   "btree.go:*btree.splitRootLeafAndInsert": {
     "sqlite": [
-      "btree.c:balance_deeper",
-      "btree.c:balance_nonroot"
+      "btree.c:balance"
     ],
-    "note": "root-leaf overflow: balance_deeper (btree.c:9052-9097) then a 2-way split of the new child; retains the former splitLeafAndInsertWithPath body for the root case"
+    "note": "root branch of balance(): balance_deeper, balance_nonroot on the child, then balance-shallower"
   },
   "btree.go:*btree.tryMergeLeaf": {
     "sqlite": [
@@ -535,12 +517,6 @@
       "btree.c:indexCellCompare"
     ],
     "note": "any-store light key peek; errLeafKeySpilled when the key continues in an overflow chain, as indexCellCompare declines the optimization for an overflowing record"
-  },
-  "btree.go:leafSplitPoint": {
-    "sqlite": [
-      "btree.c:balance_nonroot"
-    ],
-    "note": ""
   },
   "btree.go:parseInteriorCell": {
     "sqlite": [
@@ -877,7 +853,7 @@
   },
   "db.go:*DB.resolveNamespace": {
     "sqlite": [],
-    "note": "any-store master-table traversal for namespace-\u003erootPage"
+    "note": "any-store master-table traversal for namespace->rootPage"
   },
   "db.go:*Namespace.Name": {
     "sqlite": [],
@@ -1176,7 +1152,7 @@
     "sqlite": [
       "btree.c:checkTreePage"
     ],
-    "note": "any-store analogue of checkTreePage's keyCanBeEqual/maxKey machinery (btree.c:10953-11029); enforces [lower, upper) under any-store's \u003c,\u003e= divider invariant"
+    "note": "any-store analogue of checkTreePage's keyCanBeEqual/maxKey machinery (btree.c:10953-11029); enforces [lower, upper) under any-store's <,>= divider invariant"
   },
   "integrity.go:*integrityChecker.report": {
     "sqlite": [
@@ -1427,6 +1403,18 @@
     "sqlite": [],
     "note": "bounds-checked wrapper around getVarint; same util.c decoder"
   },
+  "page.go:indexLimits": {
+    "sqlite": [
+      "btree.c:lockBtree"
+    ],
+    "note": "BtShared.maxLocal / minLocal"
+  },
+  "page.go:interiorLocalPayloadSize": {
+    "sqlite": [
+      "btree.c:btreePayloadToLocal"
+    ],
+    "note": ""
+  },
   "page.go:localPayloadSize": {
     "sqlite": [
       "btree.c:btreePayloadToLocal"
@@ -1456,7 +1444,7 @@
     "sqlite": [
       "util.c:sqlite3VarintLen"
     ],
-    "note": "caps at 9 bytes for v\u003e=2^56; sqlite3VarintLen returns 10 for v\u003e=2^63 (disagreeing with its own putVarint64). Unreachable here — payload lengths capped at maxPayloadAlloc=1\u003c\u003c30"
+    "note": "caps at 9 bytes for v>=2^56; sqlite3VarintLen returns 10 for v>=2^63 (disagreeing with its own putVarint64). Unreachable here — payload lengths capped at maxPayloadAlloc=1<<30"
   },
   "page_slab.go:*pageSlab.Get": {
     "sqlite": [
@@ -1698,6 +1686,12 @@
   "pager.go:*pager.installCodec": {
     "sqlite": [],
     "note": ""
+  },
+  "pager.go:*pager.leafLimits": {
+    "sqlite": [
+      "btree.c:decodeFlags"
+    ],
+    "note": "one leaf rule per file instead of one per page"
   },
   "pager.go:*pager.open": {
     "sqlite": [
@@ -1958,14 +1952,14 @@
     "sqlite": [
       "pcache1.c:pcache1FetchNoMutex"
     ],
-    "note": "chained-bucket probe apHash[pgno\u0026(nHash-1)] walked by hashNext, the read-only half of pcache1FetchNoMutex step 1 (pcache1.c:1009-1010); shared by fetch/create. Closes NOTES §9 drift #2."
+    "note": "chained-bucket probe apHash[pgno&(nHash-1)] walked by hashNext, the read-only half of pcache1FetchNoMutex step 1 (pcache1.c:1009-1010); shared by fetch/create. Closes NOTES §9 drift #2."
   },
   "pcache.go:*pcache.hashInsert": {
     "sqlite": [
       "pcache1.c:pcache1FetchStage2",
       "pcache1.c:pcache1ResizeHash"
     ],
-    "note": "links page at bucket head, sets page.inCache, bumps nPage, resizes at load factor 1.0 (pcache1.c:894 nPage\u003e=nHash → pcache1ResizeHash)"
+    "note": "links page at bucket head, sets page.inCache, bumps nPage, resizes at load factor 1.0 (pcache1.c:894 nPage>=nHash → pcache1ResizeHash)"
   },
   "pcache.go:*pcache.hashRemove": {
     "sqlite": [
@@ -2021,7 +2015,7 @@
     "sqlite": [
       "pcache1.c:pcache1ResizeHash"
     ],
-    "note": "doubles apHash and rehashes at load factor 1.0; power-of-two sizing (floor 256) so pgno\u0026(nHash-1) is a mask (pcache1.c:535-567)"
+    "note": "doubles apHash and rehashes at load factor 1.0; power-of-two sizing (floor 256) so pgno&(nHash-1) is a mask (pcache1.c:535-567)"
   },
   "pcache.go:*pcache.returnPageBuffer": {
     "sqlite": [
@@ -2041,14 +2035,14 @@
     "sqlite": [
       "pcache1.c:pcache1ResizeHash"
     ],
-    "note": "smallest power-of-two \u003e= n and \u003e= 256, matching pcache1ResizeHash's floor (pcache1.c:543)"
+    "note": "smallest power-of-two >= n and >= 256, matching pcache1ResizeHash's floor (pcache1.c:543)"
   },
   "pcache.go:newPcache": {
     "sqlite": [
       "pcache1.c:pcache1Create",
       "pcache1.c:pcache1ResizeHash"
     ],
-    "note": "seeds apHash to a power-of-two size (\u003e= maxPages, floor 256), mirroring pcache1Create which calls pcache1ResizeHash at creation (pcache1.c:789) to seed nHash=256"
+    "note": "seeds apHash to a power-of-two size (>= maxPages, floor 256), mirroring pcache1Create which calls pcache1ResizeHash at creation (pcache1.c:789) to seed nHash=256"
   },
   "shm.go:*inProcessShm.close": {
     "sqlite": [
@@ -2290,7 +2284,7 @@
     "sqlite": [
       "wal.c:sqlite3WalSavepointUndo"
     ],
-    "note": "ports the iReCksum\u003emxFrame reset fragment of sqlite3WalSavepointUndo (wal.c:3849-3851)"
+    "note": "ports the iReCksum>mxFrame reset fragment of sqlite3WalSavepointUndo (wal.c:3849-3851)"
   },
   "wal.go:*wal.rewriteChecksums": {
     "sqlite": [
@@ -2423,7 +2417,7 @@
     "sqlite": [
       "wal.c:walCleanupHash"
     ],
-    "note": "walCleanupHash analogue — discards pageMap entries above the target frame. The in-tx checksum-chain rewrite is a separate, ported function (wal.rewriteChecksums \u003c- walRewriteChecksums)"
+    "note": "walCleanupHash analogue — discards pageMap entries above the target frame. The in-tx checksum-chain rewrite is a separate, ported function (wal.rewriteChecksums <- walRewriteChecksums)"
   },
   "wal.go:*walIndex.set": {
     "sqlite": [

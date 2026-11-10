@@ -386,7 +386,7 @@ func TestLocalPayloadSize_SurplusExceedsMaxLocal(t *testing.T) {
 	// ovflUsable = 4092, diff = maxLocal - minLocal ~ 512
 	// Pick (tp - minLocal) % ovflUsable = diff + 1
 	totalPayload := minLocal + diff + 1 + ovflUsable
-	result := localPayloadSize(totalPayload, usableSize)
+	result := localPayloadSize(totalPayload, indexLimits(usableSize))
 	// surplus = minLocal + (totalPayload - minLocal) % ovflUsable
 	// = minLocal + (diff + 1 + ovflUsable) % ovflUsable
 	// = minLocal + diff + 1
@@ -399,11 +399,11 @@ func TestLocalPayloadSize_SurplusWithinMaxLocal(t *testing.T) {
 	maxLocal := maxLocalPayload(usableSize)
 
 	// totalPayload exactly at maxLocal boundary
-	result := localPayloadSize(maxLocal, usableSize)
+	result := localPayloadSize(maxLocal, indexLimits(usableSize))
 	assert.Equal(t, maxLocal, result)
 
 	// totalPayload just over maxLocal
-	result = localPayloadSize(maxLocal+1, usableSize)
+	result = localPayloadSize(maxLocal+1, indexLimits(usableSize))
 	// surplus should be within maxLocal in most cases
 	assert.True(t, result > 0)
 	assert.True(t, result <= maxLocal)
@@ -412,7 +412,7 @@ func TestLocalPayloadSize_SurplusWithinMaxLocal(t *testing.T) {
 func TestLocalPayloadSize_UnderMaxLocal(t *testing.T) {
 	usableSize := 4096
 	// Small payload that fits entirely
-	result := localPayloadSize(100, usableSize)
+	result := localPayloadSize(100, indexLimits(usableSize))
 	assert.Equal(t, 100, result)
 }
 
@@ -1470,7 +1470,7 @@ func TestIntegrityCheck_NamespaceRootOutOfRange(t *testing.T) {
 	require.NoError(t, err)
 	cellOff := int(pg1.getCellOffset(0))
 	// Parse the cell to find where the value starts
-	cell, _, cerr := parseLeafCellWithSize(pg1.data, cellOff, 4096)
+	cell, _, cerr := parseLeafCellWithSize(pg1.data, cellOff, indexLimits(4096))
 	if cerr == nil && len(cell.value) >= 4 {
 		// Write invalid root page number into the value portion
 		// The value starts after the key in the cell
@@ -1780,14 +1780,14 @@ func TestIntegrityCheck_DoubleReference(t *testing.T) {
 	var rootPages []int
 	for i := 0; i < nCells; i++ {
 		cellOff := int(pg1.getCellOffset(i))
-		cell, _, cerr := parseLeafCellWithSize(pg1.data, cellOff, 4096)
+		cell, _, cerr := parseLeafCellWithSize(pg1.data, cellOff, indexLimits(4096))
 		if cerr == nil && len(cell.value) >= 4 {
 			rootPages = append(rootPages, cellOff)
 		}
 	}
 	if len(rootPages) >= 2 {
 		// Make second namespace point to first namespace's root page
-		cell0, _, _ := parseLeafCellWithSize(pg1.data, rootPages[0], 4096)
+		cell0, _, _ := parseLeafCellWithSize(pg1.data, rootPages[0], indexLimits(4096))
 		rp0 := binary.BigEndian.Uint32(cell0.value)
 
 		cell1Off := rootPages[1]
@@ -2243,7 +2243,7 @@ func TestIntegrityCheck_InteriorCellExtendsOffPage(t *testing.T) {
 			if mCellOff > usableSize-40 {
 				// Move cell to a safe location
 				newPos := masterCpStart + masterCellCount*2 + 10 + ci*40
-				_, mCellSz, _ := parseLeafCellWithSize(data[:pageSize], mCellOff, 0)
+				_, mCellSz, _ := parseLeafCellWithSize(data[:pageSize], mCellOff, indexLimits(0))
 				if mCellSz > 0 && newPos+mCellSz < usableSize {
 					copy(data[newPos:], data[mCellOff:mCellOff+mCellSz])
 					binary.BigEndian.PutUint16(data[masterCpStart+ci*2:], uint16(newPos))
@@ -2363,7 +2363,7 @@ func TestIntegrityCheck_InteriorCorruptKey(t *testing.T) {
 	// localPayloadSize for this huge key would be small
 	// Fill the rest of the cell with dummy data + a valid-looking overflow page
 	usableSize := pageSize
-	localSz := localPayloadSize(0x40000001, usableSize)
+	localSz := localPayloadSize(0x40000001, indexLimits(usableSize))
 	for j := 0; j < localSz && cellPos+4+5+j < pgOff+pageSize; j++ {
 		data[cellPos+4+5+j] = 'x'
 	}
@@ -2564,7 +2564,7 @@ func TestIntegrityCheck_LeafCellExtendsOffPage(t *testing.T) {
 		}
 		pos++
 		// Already past the varints; the rest is key+value data
-		cell0, cellSz, _ := parseLeafCellWithSize(data[:pageSize], origCellOff, 0)
+		cell0, cellSz, _ := parseLeafCellWithSize(data[:pageSize], origCellOff, indexLimits(0))
 		_ = cell0
 
 		// Place this cell at a position that fits within new usableSize
@@ -2715,7 +2715,7 @@ func TestIntegrityCheck_MasterCellExtendsOffPage_Deterministic(t *testing.T) {
 	origCellOff := int(binary.BigEndian.Uint16(data[masterCpStart : masterCpStart+2]))
 
 	// Read original cell size
-	_, origCellSz, cerr := parseLeafCellWithSize(data[:pageSize], origCellOff, 0)
+	_, origCellSz, cerr := parseLeafCellWithSize(data[:pageSize], origCellOff, indexLimits(0))
 	require.NoError(t, cerr)
 
 	// Place cell at usableSize - (origCellSz - 2) so it extends past usableSize
@@ -2878,7 +2878,7 @@ func TestIntegrityCheck_OverflowChainWrongLength(t *testing.T) {
 	maxFrame, slot, _ := db.pager.beginRead()
 	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	cellOff := int(pg.getCellOffset(0))
-	cell, _, cerr := parseLeafCellWithSize(pg.data, cellOff, 512)
+	cell, _, cerr := parseLeafCellWithSize(pg.data, cellOff, indexLimits(512))
 	db.pager.releasePage(pg)
 	db.pager.endRead(slot)
 

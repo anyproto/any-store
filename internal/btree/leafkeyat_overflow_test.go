@@ -49,17 +49,17 @@ func TestLeafKeyAt_SpilledKey(t *testing.T) {
 			for i := range nSpilled {
 				off, oerr := pg.getCellOffsetSafe(i)
 				require.NoError(t, oerr)
-				c, _, cerr := parseLeafCellWithSize(pg.data, int(off), usable)
+				c, _, cerr := parseLeafCellWithSize(pg.data, int(off), indexLimits(usable))
 				require.NoError(t, cerr)
 				require.NotZero(t, c.overflowPg, "cell %d spills", i)
 				require.Less(t, len(c.key), keyLen, "cell %d keeps only a key prefix on the page", i)
 
-				got, kerr := leafKeyAt(pg, i, usable)
+				got, kerr := leafKeyAt(pg, i, indexLimits(usable))
 				assert.ErrorIs(t, kerr, errLeafKeySpilled, "cell %d", i)
 				assert.Nil(t, got, "cell %d", i)
 			}
 
-			got, kerr := leafKeyAt(pg, nSpilled, usable)
+			got, kerr := leafKeyAt(pg, nSpilled, indexLimits(usable))
 			require.NoError(t, kerr)
 			assert.Equal(t, localKey, got)
 		})
@@ -96,7 +96,7 @@ func TestLeafKeyAt_PayloadAboveAllocCap(t *testing.T) {
 			putVarint(pg.data[off+n:], tc.valLen)
 			binary.BigEndian.PutUint16(pg.data[pg.cellPointerOffset():], off)
 
-			got, kerr := leafKeyAt(pg, 0, usable)
+			got, kerr := leafKeyAt(pg, 0, indexLimits(usable))
 			assert.ErrorIs(t, kerr, ErrCorrupt)
 			assert.Nil(t, got)
 		})
@@ -236,9 +236,9 @@ func TestCursor_SeekNearSpilledKeys(t *testing.T) {
 		leaf := cur.stack[len(cur.stack)-1].pg
 		require.NotNil(t, leaf)
 		require.EqualValues(t, len(keys), leaf.header.cellCount, "all keys on one leaf")
-		_, err = leafKeyAt(leaf, 0, usable)
+		_, err = leafKeyAt(leaf, 0, indexLimits(usable))
 		require.NoError(t, err, "first key is local")
-		_, err = leafKeyAt(leaf, len(keys)-1, usable)
+		_, err = leafKeyAt(leaf, len(keys)-1, indexLimits(usable))
 		require.NoError(t, err, "last key is local although its value spills")
 
 		targets := []struct {
@@ -327,12 +327,12 @@ func TestCursor_SeekNearSpilledKeys(t *testing.T) {
 		require.NotNil(t, leaf)
 		off, oerr := leaf.getCellOffsetSafe(0)
 		require.NoError(t, oerr)
-		c, _, cerr := parseLeafCellWithSize(leaf.data, int(off), usable)
+		c, _, cerr := parseLeafCellWithSize(leaf.data, int(off), indexLimits(usable))
 		require.NoError(t, cerr)
 		require.NotZero(t, c.overflowPg, "the first key spills")
 		require.LessOrEqual(t, int(off)+varintSize(uint64(keyLen))+1+keyLen, len(leaf.data),
 			"keyLen bytes from the first cell's key start stay inside the page")
-		_, err = leafKeyAt(leaf, int(leaf.header.cellCount)-1, usable)
+		_, err = leafKeyAt(leaf, int(leaf.header.cellCount)-1, indexLimits(usable))
 		require.NoError(t, err, "the last key is local")
 
 		// Targets between keys of earlier leaves must land on the next key.

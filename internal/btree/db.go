@@ -1519,11 +1519,11 @@ func (db *DB) freeTreePagesDepth(pgno uint32, depth int) error {
 		}
 	} else {
 		// Leaf page: free any overflow chains
-		usableSize := db.pager.usableSize()
+		lim := db.pager.leafLimits()
 		n := int(pg.header.cellCount)
 		for i := range n {
 			off := pg.getCellOffset(i)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
 			if cerr != nil {
 				db.pager.releasePage(pg)
 				return cerr
@@ -1597,9 +1597,10 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 	}
 
 	usableSize := bt.usablePageSize()
+	lim := bt.leafLimits()
 	for {
 		if pg.header.isLeaf() {
-			idx, found, serr := searchLeafWithOverflow(pg, nameKey, usableSize, bt.pager, bt.walMaxFrame, bt.cache)
+			idx, found, serr := searchLeafWithOverflow(pg, nameKey, lim, bt.pager, bt.walMaxFrame, bt.cache)
 			if serr != nil {
 				bt.pager.releasePage(pg)
 				return nil, serr
@@ -1609,7 +1610,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 				return nil, ErrNamespaceNotFound
 			}
 			off := pg.getCellOffset(idx)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
 			if cerr != nil {
 				bt.pager.releasePage(pg)
 				return nil, cerr
@@ -1619,7 +1620,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 			// chain, so reassemble it the way accessPayload does.
 			value := cell.value
 			if cell.overflowPg != 0 {
-				value, cerr = leafFullValue(pg.data, int(off), usableSize, bt.pager, bt.walMaxFrame, bt.cache)
+				value, cerr = leafFullValue(pg.data, int(off), lim, bt.pager, bt.walMaxFrame, bt.cache)
 				if cerr != nil {
 					bt.pager.releasePage(pg)
 					return nil, cerr
@@ -1786,9 +1787,10 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 
 	// Search without starting a new read tx (we're already in one)
 	usableSize := tx.pager.usableSize()
+	lim := tx.pager.leafLimits()
 	for {
 		if pg.header.isLeaf() {
-			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, tx.pager, tx.walHdr.mxFrame, tx.cache)
+			idx, found, serr := searchLeafWithOverflow(pg, key, lim, tx.pager, tx.walHdr.mxFrame, tx.cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
 				return buf, serr
@@ -1798,7 +1800,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				return buf, ErrKeyNotFound
 			}
 			off := pg.getCellOffset(idx)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
 			if cerr != nil {
 				tx.pager.releasePage(pg)
 				return buf, cerr
@@ -1819,7 +1821,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				}
 
 				totalPayload := int(keyLen) + int(valLen)
-				nLocal := localPayloadSize(totalPayload, usableSize)
+				nLocal := localPayloadSize(totalPayload, lim)
 				localKeyBytes := min(nLocal, int(keyLen))
 				localValBytes := nLocal - localKeyBytes
 				keyOverflow := int(keyLen) - localKeyBytes
@@ -1889,10 +1891,11 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 	}
 
 	usableSize := tx.pager.usableSize()
+	lim := tx.pager.leafLimits()
 	for {
 		if pg.header.isLeaf() {
 			_, found, serr := searchLeafWithOverflow(
-				pg, key, usableSize, tx.pager, tx.walHdr.mxFrame, tx.cache,
+				pg, key, lim, tx.pager, tx.walHdr.mxFrame, tx.cache,
 			)
 			tx.pager.releasePage(pg)
 			if serr != nil {
@@ -1936,6 +1939,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 	}
 
 	usableSize := tx.pager.usableSize()
+	lim := tx.pager.leafLimits()
 	cache := tx.cache // nil for writers, per-connection pcache for readers
 	rightmost := true // tracks if we're on the rightmost path through the tree
 
@@ -1948,7 +1952,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 
 	for {
 		if pg.header.isLeaf() {
-			idx, _, serr := searchLeafWithOverflow(pg, prefix, usableSize, tx.pager, tx.walHdr.mxFrame, cache)
+			idx, _, serr := searchLeafWithOverflow(pg, prefix, lim, tx.pager, tx.walHdr.mxFrame, cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
 				return buf, serr
@@ -1966,7 +1970,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 				return tx.leftmostKeyAfter(fallbackPgno, fallbackIdx, buf)
 			}
 			off := pg.getCellOffset(idx)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
 			if cerr != nil {
 				tx.pager.releasePage(pg)
 				return buf, cerr
@@ -1974,7 +1978,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 			if cell.overflowPg != 0 {
 				// leafFullKey returns a slice into pg.data when the key is
 				// local: copy before the release.
-				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walHdr.mxFrame, cache)
+				fullKey, kerr := leafFullKey(pg.data, int(off), lim, tx.pager, tx.walHdr.mxFrame, cache)
 				if kerr != nil {
 					tx.pager.releasePage(pg)
 					return buf, kerr
@@ -2036,7 +2040,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 	tx.pager.releasePage(pg)
 
 	// Descend to the leftmost key of this subtree.
-	usableSize := tx.pager.usableSize()
+	lim := tx.pager.leafLimits()
 	cache := tx.cache // nil for writers, per-connection pcache for readers
 	pg, err = tx.txDescendChild(nextPgno)
 	if err != nil {
@@ -2049,7 +2053,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 				return buf, ErrKeyNotFound
 			}
 			off := pg.getCellOffset(0)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
 			if cerr != nil {
 				tx.pager.releasePage(pg)
 				return buf, cerr
@@ -2057,7 +2061,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 			if cell.overflowPg != 0 {
 				// leafFullKey returns a slice into pg.data when the key is
 				// local: copy before the release.
-				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walHdr.mxFrame, cache)
+				fullKey, kerr := leafFullKey(pg.data, int(off), lim, tx.pager, tx.walHdr.mxFrame, cache)
 				if kerr != nil {
 					tx.pager.releasePage(pg)
 					return buf, kerr

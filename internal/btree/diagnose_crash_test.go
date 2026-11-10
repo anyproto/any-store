@@ -189,7 +189,7 @@ func findKeyPage(t *testing.T, p *pager, rootPgno, maxFrame uint32, key []byte) 
 					break
 				}
 				off := int(binary.BigEndian.Uint16(pg.data[cpBase:]))
-				cell, _, cerr := parseLeafCellWithSize(pg.data, off, usable)
+				cell, _, cerr := parseLeafCellWithSize(pg.data, off, indexLimits(usable))
 				if cerr != nil {
 					continue
 				}

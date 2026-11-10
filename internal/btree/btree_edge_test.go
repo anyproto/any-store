@@ -24,7 +24,7 @@ func TestFinal_UpdateLeafCellNilPathSplit(t *testing.T) {
 		key := binary.BigEndian.AppendUint32(nil, uint32(i))
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoLeaf(pg, key, make([]byte, 10))
+		err = bt.Put(key, make([]byte, 10))
 		p.releasePage(pg)
 		require.NoError(t, err)
 	}
@@ -34,7 +34,7 @@ func TestFinal_UpdateLeafCellNilPathSplit(t *testing.T) {
 	key := binary.BigEndian.AppendUint32(nil, uint32(10))
 	pg, err := p.getWritablePage(bt.rootPage)
 	require.NoError(t, err)
-	err = bt.insertIntoLeaf(pg, key, make([]byte, 400))
+	err = bt.Put(key, make([]byte, 400))
 	p.releasePage(pg)
 	require.NoError(t, err)
 }
@@ -52,7 +52,7 @@ func TestFinal_InsertIntoLeafDefragPath(t *testing.T) {
 		key := binary.BigEndian.AppendUint32(nil, uint32(i))
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoLeaf(pg, key, make([]byte, 20))
+		err = bt.Put(key, make([]byte, 20))
 		p.releasePage(pg)
 		require.NoError(t, err)
 	}
@@ -65,7 +65,7 @@ func TestFinal_InsertIntoLeafDefragPath(t *testing.T) {
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
 		// Update with a much smaller value - creates waste tracked as fragBytes
-		err = bt.insertIntoLeaf(pg, key, make([]byte, 5))
+		err = bt.Put(key, make([]byte, 5))
 		p.releasePage(pg)
 		require.NoError(t, err)
 	}
@@ -75,7 +75,7 @@ func TestFinal_InsertIntoLeafDefragPath(t *testing.T) {
 	key := binary.BigEndian.AppendUint32(nil, uint32(100))
 	pg, err := p.getWritablePage(bt.rootPage)
 	require.NoError(t, err)
-	err = bt.insertIntoLeaf(pg, key, make([]byte, 20))
+	err = bt.Put(key, make([]byte, 20))
 	p.releasePage(pg)
 	require.NoError(t, err)
 }
@@ -91,7 +91,7 @@ func TestFinal_InsertLeafCellAtOverflow(t *testing.T) {
 	key := binary.BigEndian.AppendUint32(nil, uint32(1))
 	pg, err := p.getWritablePage(bt.rootPage)
 	require.NoError(t, err)
-	err = bt.insertIntoLeaf(pg, key, make([]byte, 400))
+	err = bt.Put(key, make([]byte, 400))
 	p.releasePage(pg)
 	require.NoError(t, err)
 
@@ -115,7 +115,7 @@ func TestFinal_CollectLeafCellsContentAreaError(t *testing.T) {
 		key := binary.BigEndian.AppendUint32(nil, uint32(i))
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoLeaf(pg, key, make([]byte, 20))
+		err = bt.Put(key, make([]byte, 20))
 		p.releasePage(pg)
 		require.NoError(t, err)
 	}
@@ -142,7 +142,7 @@ func TestFinal_CollectLeafCellsNegativeContentSize(t *testing.T) {
 		key := binary.BigEndian.AppendUint32(nil, uint32(i))
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoLeaf(pg, key, make([]byte, 10))
+		err = bt.Put(key, make([]byte, 10))
 		p.releasePage(pg)
 		require.NoError(t, err)
 	}
@@ -223,7 +223,7 @@ func TestFinal_SplitRootViaOldPath(t *testing.T) {
 		key := binary.BigEndian.AppendUint32(nil, uint32(i))
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, key, make([]byte, 15))
+		err = bt.Put(key, make([]byte, 15))
 		p.releasePage(pg)
 		require.NoError(t, err)
 	}
@@ -258,59 +258,6 @@ func TestFinal_SplitRootViaOldPath(t *testing.T) {
 
 // ---- leafSplitPoint and interiorSplitPoint clamping (L287-292, L329-331) ----
 // These are purely defensive checks. Let me call them with edge-case inputs.
-
-func TestFinal_SplitPointEdgeCases(t *testing.T) {
-	// leafSplitPoint with 2 cells where first cell is huge
-	// This should cause cumSize to exceed target immediately after i==0,
-	// setting bestIdx = 1 at L276. The clamp at L287 would be 1, which matches.
-	hugeCells := []cellData{
-		{key: bytes.Repeat([]byte("x"), 3000), value: make([]byte, 1000)},
-		{key: []byte("b"), value: make([]byte, 10)},
-	}
-	mid := leafSplitPoint(hugeCells, 4096)
-	require.Equal(t, 1, mid)
-
-	// leafSplitPoint where all cells are small → cumSize never exceeds target
-	// → bestIdx = len(cells)-1 from L282 fallback
-	smallCells := make([]cellData, 10)
-	for i := range smallCells {
-		smallCells[i] = cellData{key: []byte{byte(i)}, value: []byte{0}}
-	}
-	mid2 := leafSplitPoint(smallCells, 4096)
-	require.LessOrEqual(t, mid2, 9)
-	require.GreaterOrEqual(t, mid2, 1)
-
-	// interiorSplitPoint with large cells → target exceeded at i=1
-	largeIntCells := []cellData{
-		{key: bytes.Repeat([]byte("a"), 2000), leftChild: 1},
-		{key: bytes.Repeat([]byte("b"), 2000), leftChild: 2},
-		{key: bytes.Repeat([]byte("c"), 2000), leftChild: 3},
-	}
-	intMid := interiorSplitPoint(largeIntCells, 4096)
-	require.Equal(t, 1, intMid)
-
-	// interiorSplitPoint where all cells fit → bestIdx = len(cells)-1
-	// then clamp at L332 forces bestIdx to len(cells)-2
-	smallIntCells := make([]cellData, 5)
-	for i := range smallIntCells {
-		smallIntCells[i] = cellData{key: []byte{byte(i)}, leftChild: uint32(i + 1)}
-	}
-	intMid2 := interiorSplitPoint(smallIntCells, 4096)
-	require.LessOrEqual(t, intMid2, 3) // len-2 = 3
-	require.GreaterOrEqual(t, intMid2, 1)
-}
-
-// ---- insertIntoParent getPage error (L1916-1918) ----
-// This is the old non-path insertIntoParent. It calls bt.getPage(bt.rootPage)
-// to traverse from root to find parent. This is I/O error.
-
-// ---- insertIntoParent loop getPage error (L1937-1939) ----
-// Same - I/O error during tree traversal
-
-// ---- Cursor.Previous through rightChild position (L2952-2954) ----
-// When frame.cellIdx == pg.header.cellCount in Previous(),
-// childPgno = pg.header.rightChild. This happens when the cursor was
-// positioned at the rightChild and decrements to access it.
 
 func TestFinal_CursorPreviousFromRightChildPosition(t *testing.T) {
 	db := tempDBWithPageSize(t, 512)
@@ -483,7 +430,7 @@ func TestFinal_ParseLeafCellBoundsCheck(t *testing.T) {
 	// Need enough buffer for the "pos >= dataLen" check
 	fullBuf := make([]byte, n1+n2+100)
 	copy(fullBuf, buf[:n1+n2])
-	_, _, err := parseLeafCellWithSize(fullBuf, 0, 512)
+	_, _, err := parseLeafCellWithSize(fullBuf, 0, indexLimits(512))
 	require.ErrorIs(t, err, ErrCorrupt)
 
 	// Test totalPayload > maxPayloadAlloc (L148-150)
@@ -493,7 +440,7 @@ func TestFinal_ParseLeafCellBoundsCheck(t *testing.T) {
 	n2 = putVarint(buf2[n1:], uint64(maxPayloadAlloc/2+1))
 	fullBuf2 := make([]byte, n1+n2+100)
 	copy(fullBuf2, buf2[:n1+n2])
-	_, _, err = parseLeafCellWithSize(fullBuf2, 0, 512)
+	_, _, err = parseLeafCellWithSize(fullBuf2, 0, indexLimits(512))
 	require.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -853,28 +800,6 @@ func TestRemaining_DeleteEmptyLeafRemoveFromParent(t *testing.T) {
 
 // ---- leafSplitPoint and interiorSplitPoint clamping (L287-292, L329-334) ----
 // These are clamping branches: bestIdx < 1 → 1, bestIdx >= len(cells) → len(cells)-1
-
-func TestRemaining_SplitPointClamping(t *testing.T) {
-	// leafSplitPoint clamping: 2 cells only
-	cells := []cellData{
-		{key: []byte("a"), value: make([]byte, 10)},
-		{key: []byte("b"), value: make([]byte, 10)},
-	}
-	mid := leafSplitPoint(cells, 4096)
-	require.Equal(t, 1, mid)
-
-	// interiorSplitPoint clamping: 3 cells (minimum for split)
-	intCells := []cellData{
-		{key: []byte("a"), leftChild: 2},
-		{key: []byte("b"), leftChild: 3},
-		{key: []byte("c"), leftChild: 4},
-	}
-	intMid := interiorSplitPoint(intCells, 4096)
-	require.GreaterOrEqual(t, intMid, 1)
-	require.LessOrEqual(t, intMid, len(intCells)-2)
-}
-
-// ---- searchLeafWithOverflow — overflow key prefix comparison paths ----
 
 func TestRemaining_SearchLeafOverflowKeyFullRead(t *testing.T) {
 	db := tempDBWithPageSize(t, 512)
@@ -1459,14 +1384,14 @@ func TestTargeted_CollectLeafCells_OverflowReadPanic(t *testing.T) {
 	require.True(t, found)
 
 	cellOff := int(pg.getCellOffset(idx))
-	cell, _, cerr := parseLeafCellWithSize(pg.data, cellOff, usable)
+	cell, _, cerr := parseLeafCellWithSize(pg.data, cellOff, indexLimits(usable))
 	require.NoError(t, cerr)
 	require.NotZero(t, cell.overflowPg, "expected overflow cell")
 
 	// Corrupt the overflow page pointer to point to an invalid page
 	// The overflow pointer is located after the local payload data
 	totalPayload := len(cell.key) + len(cell.value)
-	nLocal := localPayloadSize(totalPayload, usable)
+	nLocal := localPayloadSize(totalPayload, indexLimits(usable))
 	keyLen, kn := getVarint(pg.data[cellOff:])
 	_, vn := getVarint(pg.data[cellOff+kn:])
 	overflowPtrOff := cellOff + kn + vn + nLocal
@@ -1561,7 +1486,7 @@ func TestTargeted_CollectInteriorCells_OverflowReadPanic(t *testing.T) {
 		keyLen, kn := getVarint(wpg.data[pos:])
 		maxLocal := maxLocalPayload(bt.usablePageSize())
 		if int(keyLen) > maxLocal {
-			localSize := localPayloadSize(int(keyLen), bt.usablePageSize())
+			localSize := localPayloadSize(int(keyLen), bt.leafLimits())
 			overflowPtrOff := pos + kn + localSize
 			if overflowPtrOff+4 <= len(wpg.data) {
 				binary.BigEndian.PutUint32(wpg.data[overflowPtrOff:], 0xDEADBEEF)
@@ -1628,13 +1553,13 @@ func TestTargeted_Delete_OverflowFreeChainError(t *testing.T) {
 	require.True(t, found)
 
 	cellOff := int(pg.getCellOffset(idx))
-	cell, _, cerr := parseLeafCellWithSize(pg.data, cellOff, usable)
+	cell, _, cerr := parseLeafCellWithSize(pg.data, cellOff, indexLimits(usable))
 	require.NoError(t, cerr)
 	require.NotZero(t, cell.overflowPg)
 
 	// Corrupt overflow pointer
 	totalPayload := len(cell.key) + len(cell.value)
-	nLocal := localPayloadSize(totalPayload, usable)
+	nLocal := localPayloadSize(totalPayload, indexLimits(usable))
 	_, kn := getVarint(pg.data[cellOff:])
 	_, vn := getVarint(pg.data[cellOff+kn:])
 	overflowPtrOff := cellOff + kn + vn + nLocal

@@ -316,6 +316,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 
 	nCells := int(pg.header.cellCount)
 	isLeaf := pg.header.isLeaf()
+	leafLim := ic.pager.leafLimits()
 
 	// prevDivider tracks the divider key to the LEFT of the next child to be
 	// recursed into (the inclusive lower bound for that child). It starts at
@@ -363,7 +364,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 		// Parse cell and compute its size
 		var cellSize int
 		if isLeaf {
-			cell, sz, cerr := parseLeafCellWithSize(pg.data, cellOff, ic.usableSize)
+			cell, sz, cerr := parseLeafCellWithSize(pg.data, cellOff, leafLim)
 			if cerr != nil {
 				ic.report("%s cell %d: corrupt cell data", context, i)
 				doCoverageCheck = false
@@ -381,7 +382,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 			// Key ordering check — need full key for overflow cells
 			var fullKey []byte
 			if cell.overflowPg != 0 {
-				fk, fkerr := leafFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, ic.cache)
+				fk, fkerr := leafFullKey(pg.data, cellOff, leafLim, ic.pager, ic.walMaxFrame, ic.cache)
 				if fkerr != nil {
 					ic.report("%s cell %d: corrupt leaf key", context, i)
 				} else {
@@ -409,7 +410,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 					valLen, _, verr2 := getVarintSafe(pg.data[pos:])
 					if verr2 == nil {
 						totalPayload := int(keyLen) + int(valLen)
-						nLocal := localPayloadSize(totalPayload, ic.usableSize)
+						nLocal := localPayloadSize(totalPayload, leafLim)
 						overflowBytes := totalPayload - nLocal
 						ovflUsable := overflowPageUsable(ic.usableSize)
 						nOverflow := (overflowBytes + ovflUsable - 1) / ovflUsable
@@ -437,7 +438,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 				}
 				hookVal := cell.value
 				if cell.overflowPg != 0 {
-					fv, fverr := leafFullValue(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, ic.cache)
+					fv, fverr := leafFullValue(pg.data, cellOff, leafLim, ic.pager, ic.walMaxFrame, ic.cache)
 					if fverr != nil {
 						// Surface the error class (I/O vs geometry) beside the
 						// hook's generic corrupt-value report, mirroring the
@@ -486,7 +487,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 				pos := cellOff + 4
 				keyLen, _, verr := getVarintSafe(pg.data[pos:])
 				if verr == nil {
-					localSz := localPayloadSize(int(keyLen), ic.usableSize)
+					localSz := interiorLocalPayloadSize(int(keyLen), ic.usableSize)
 					overflowBytes := int(keyLen) - localSz
 					ovflUsable := overflowPageUsable(ic.usableSize)
 					nOverflow := (overflowBytes + ovflUsable - 1) / ovflUsable

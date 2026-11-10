@@ -389,7 +389,7 @@ func TestDeep_InsertIntoParentViaInsertIntoPage(t *testing.T) {
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
 
-		ierr := bt.insertIntoPage(pg, k, v)
+		ierr := bt.Put(k, v)
 		require.NoError(t, ierr)
 		p.releasePage(pg)
 	}
@@ -447,7 +447,7 @@ func TestDeep_InsertIntoParentSmallPage(t *testing.T) {
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
 
-		ierr := bt.insertIntoPage(pg, k, v)
+		ierr := bt.Put(k, v)
 		require.NoError(t, ierr)
 		p.releasePage(pg)
 	}
@@ -620,77 +620,11 @@ func TestDeep_OverflowKeySearchFullKeyRead(t *testing.T) {
 // For 3 cells where the first cell alone exceeds target, bestIdx stays at
 // len(cells)/2 = 1, which is already valid. We need a scenario where bestIdx
 // would be set to 0.
-func TestDeep_LeafSplitPointClampBestIdxLow(t *testing.T) {
-	// The clamp at L287-289 fires when bestIdx < 1.
-	// bestIdx starts at len(cells)/2. For len(cells)=3, that's 1.
-	// The loop can set bestIdx=i where i starts at 1. If cumSize+cellSz > target
-	// at i=1, bestIdx=1. The clamp to >=1 never fires in practice for the leaf
-	// version because bestIdx = len(cells)/2 >= 1 for len >= 3.
-	//
-	// However, we can still test the function with edge cases.
-	// The bestIdx >= len(cells) clamp at L290-292 is reachable when all cells
-	// fit on the left and the last cell sets bestIdx = len(cells)-1 (from L282).
-	// That IS valid. But if we create cells that all fit into target, the loop
-	// sets bestIdx = len(cells)-1 at i = len(cells)-1, which equals len(cells)-1.
-	// The clamp at L290 never fires because bestIdx = len(cells)-1 < len(cells).
-	//
-	// Both clamps are safety guards. Let's test the split point function directly.
-	cells := []cellData{
-		{key: []byte("a"), value: []byte("1")},
-		{key: []byte("b"), value: []byte("2")},
-		{key: []byte("c"), value: []byte("3")},
-	}
-	mid := leafSplitPoint(cells, 4096)
-	assert.True(t, mid >= 1 && mid < len(cells),
-		"splitPoint=%d should be in [1, %d)", mid, len(cells))
-}
-
 // TestDeep_LeafSplitPointLargeCells tests with cells so large each one nearly
 // fills a page. With overflow cells, the on-page size is smaller than the
 // value size, so all 3 overflow cells may fit within the 2/3 target.
-func TestDeep_LeafSplitPointLargeCells(t *testing.T) {
-	bigVal := bytes.Repeat([]byte("X"), 2000)
-	cells := []cellData{
-		{key: []byte("a"), value: bigVal},
-		{key: []byte("b"), value: bigVal},
-		{key: []byte("c"), value: bigVal},
-	}
-	mid := leafSplitPoint(cells, 4096)
-	// With overflow, on-page size per cell is ~484 bytes.
-	// 3 cells * 484 = 1452 < target(2725), so bestIdx = len(cells)-1 = 2
-	assert.True(t, mid >= 1 && mid < len(cells),
-		"splitPoint=%d should be in [1, %d)", mid, len(cells))
-
-	// Try with truly page-filling non-overflow cells (3500 byte values with big page)
-	// to trigger the "first cell exceeds target" path
-	hugeVal := bytes.Repeat([]byte("X"), 3500)
-	cells2 := []cellData{
-		{key: []byte("a"), value: hugeVal},
-		{key: []byte("b"), value: hugeVal},
-		{key: []byte("c"), value: hugeVal},
-	}
-	// Use a very large page size so these don't become overflow cells
-	// maxLocal for 65536 = ((65536-12)*64/255)-23 = 16361
-	// So 3500+1 = 3501 < 16361, no overflow
-	mid2 := leafSplitPoint(cells2, 65536)
-	// target = (65536-8)*2/3 = 43685. Each cell = ~3505 bytes + 2 = 3507.
-	// cumSize after cell 0: 3507. At i=1: 3507+3507=7014 <= 43685. cumSize=7014.
-	// At i=2: last cell, bestIdx=2. So still 2.
-	assert.True(t, mid2 >= 1 && mid2 < len(cells2))
-}
-
 // TestDeep_LeafSplitPointAllSmall tests with very small cells that all fit
 // comfortably, pushing bestIdx to len(cells)-1 (from the i==len(cells)-1 guard).
-func TestDeep_LeafSplitPointAllSmall(t *testing.T) {
-	cells := make([]cellData, 5)
-	for i := range cells {
-		cells[i] = cellData{key: []byte{byte('a' + i)}, value: []byte{byte(i)}}
-	}
-	mid := leafSplitPoint(cells, 4096)
-	// All cells fit easily, so bestIdx = len(cells)-1 = 4
-	assert.Equal(t, len(cells)-1, mid)
-}
-
 // TestDeep_InteriorSplitPointEdgeCases tests interiorSplitPoint with edge cases.
 func TestDeep_InteriorSplitPointEdgeCases(t *testing.T) {
 	// len(cells) == 1
@@ -907,7 +841,7 @@ func TestDeep_InsertIntoLeafDefragmentation(t *testing.T) {
 
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		ierr := bt.insertIntoPage(pg, k, v)
+		ierr := bt.Put(k, v)
 		require.NoError(t, ierr)
 		p.releasePage(pg)
 	}
@@ -919,7 +853,7 @@ func TestDeep_InsertIntoLeafDefragmentation(t *testing.T) {
 
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		ierr := bt.insertIntoPage(pg, k, v)
+		ierr := bt.Put(k, v)
 		require.NoError(t, ierr)
 		p.releasePage(pg)
 	}
@@ -1284,7 +1218,7 @@ func TestDeepCov_InsertLeafCellAt_ContentAreaOffsetError(t *testing.T) {
 	// Insert a key so the page has content
 	pg, err := p.getWritablePage(bt.rootPage)
 	require.NoError(t, err)
-	require.NoError(t, bt.insertIntoPage(pg, []byte("aaa"), []byte("val")))
+	require.NoError(t, bt.Put([]byte("aaa"), []byte("val")))
 	p.releasePage(pg)
 
 	// Get the page again and corrupt cellContentOff to be beyond usableSize
@@ -1351,7 +1285,7 @@ func TestDeepCov_UpdateLeafCell_ParseCellError(t *testing.T) {
 	// Insert a key via the normal path
 	pg, err := p.getWritablePage(bt.rootPage)
 	require.NoError(t, err)
-	require.NoError(t, bt.insertIntoPage(pg, []byte("key1"), []byte("val1")))
+	require.NoError(t, bt.Put([]byte("key1"), []byte("val1")))
 	p.releasePage(pg)
 
 	// Get page and corrupt the cell data
@@ -1410,7 +1344,7 @@ func TestDeepCov_UpdateLeafCell_Page1HdrOff(t *testing.T) {
 	// fragmentation path where hdrOff = dbHeaderSize (L1349-1351)
 	pg, err = p.getWritablePage(1)
 	require.NoError(t, err)
-	require.NoError(t, bt.insertIntoPage(pg, []byte("testkey"), []byte("longvalue123456")))
+	require.NoError(t, bt.Put([]byte("testkey"), []byte("longvalue123456")))
 	p.releasePage(pg)
 
 	// Update with shorter value — should trigger waste > 0, newFrag <= 255
@@ -1743,7 +1677,7 @@ func TestDeepCov_UpdateLeafCell_HdrOff_NonPage1(t *testing.T) {
 	// Insert then update with shorter value to trigger fragmentation path
 	pg, err := p.getWritablePage(bt.rootPage)
 	require.NoError(t, err)
-	require.NoError(t, bt.insertIntoPage(pg, []byte("k1"), []byte("long_value_here_123")))
+	require.NoError(t, bt.Put([]byte("k1"), []byte("long_value_here_123")))
 	p.releasePage(pg)
 
 	pg, err = p.getWritablePage(bt.rootPage)
@@ -1960,7 +1894,7 @@ func TestDeepCov_DB_AppendValue_OverflowReadError(t *testing.T) {
 	valLen, vn := getVarint(data[cellPos:])
 	cellPos += vn
 	totalPayload := int(keyLen) + int(valLen)
-	nLocal := localPayloadSize(totalPayload, usableSize)
+	nLocal := localPayloadSize(totalPayload, indexLimits(usableSize))
 
 	// Overflow pointer is at cellPos + nLocal
 	ovfPtrOff := cellPos + nLocal
