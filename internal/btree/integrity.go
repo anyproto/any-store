@@ -316,7 +316,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 
 	nCells := int(pg.header.cellCount)
 	isLeaf := pg.header.isLeaf()
-	leafLim := ic.pager.leafLimits()
+	leafLim := ic.pager.leafLimitsFor(ic.usableSize)
 
 	// prevDivider tracks the divider key to the LEFT of the next child to be
 	// recursed into (the inclusive lower bound for that child). It starts at

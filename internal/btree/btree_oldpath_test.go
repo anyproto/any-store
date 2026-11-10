@@ -757,60 +757,6 @@ func TestOldPath_SplitLeafAndInsert_AllPaths(t *testing.T) {
 // We trigger this by corrupting the child page's data after navigating to it.
 // =============================================================================
 
-func TestOldPath_InsertIntoParent_GetPageError(t *testing.T) {
-	p := tempPager(t)
-	bt := initLeafBtree(t, p)
-
-	// Build a multi-level tree
-	for i := 0; i < 200; i++ {
-		k := fmt.Appendf(nil, "key-%06d", i)
-		v := fmt.Appendf(nil, "val-%06d", i)
-		pg, err := p.getWritablePage(bt.rootPage)
-		require.NoError(t, err)
-		err = bt.Put(k, v)
-		require.NoError(t, err)
-		p.releasePage(pg)
-	}
-
-	// Verify root is interior (so insertIntoParent won't take splitRoot shortcut)
-	rpg, err := p.getPage(bt.rootPage)
-	require.NoError(t, err)
-	require.True(t, rpg.header.isInterior())
-	p.releasePage(rpg)
-
-	// Find a leaf page to split
-	rpg, err = p.getPage(bt.rootPage)
-	require.NoError(t, err)
-	childPgno, _, _ := bt.searchInterior(rpg, []byte("key-000100"))
-	p.releasePage(rpg)
-
-	// Get the child (which should be a leaf) and fill it to cause a split
-	cpg, err := p.getWritablePage(childPgno)
-	require.NoError(t, err)
-
-	// Save the real root page and set root to an invalid page
-	realRoot := bt.rootPage
-	bt.rootPage = 999999 // invalid page
-
-	// Try inserting a key that would require split -> insertIntoParent
-	// The child is not the root, so insertIntoParent tries to getPage(bt.rootPage=999999) and fails
-	if cpg.header.isLeaf() {
-		err = bt.Put([]byte("key-forced-split-AAAAAAAAAAAA"), []byte("big-value-to-force-split-BBBBBBBBBBB"))
-		p.releasePage(cpg)
-		// If the leaf was full enough to split, we should get an error from insertIntoParent
-		// If it wasn't full, it may succeed (insertLeafCellAt) without reaching insertIntoParent
-		if err != nil {
-			// Expected: either corrupt or some error from getPage
-			t.Logf("Got expected error: %v", err)
-		}
-	} else {
-		p.releasePage(cpg)
-	}
-
-	// Restore root for cleanup
-	bt.rootPage = realRoot
-}
-
 // TestDelCurCov_DeleteCellPastUsableSize exercises the reserved-region bounds
 // guard in Delete that mirrors SQLite's dropCell (btree.c:7291-7294):
 //

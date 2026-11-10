@@ -1486,7 +1486,7 @@ func TestTargeted_CollectInteriorCells_OverflowReadPanic(t *testing.T) {
 		keyLen, kn := getVarint(wpg.data[pos:])
 		maxLocal := maxLocalPayload(bt.usablePageSize())
 		if int(keyLen) > maxLocal {
-			localSize := localPayloadSize(int(keyLen), bt.leafLimits())
+			localSize := interiorLocalPayloadSize(int(keyLen), bt.usablePageSize())
 			overflowPtrOff := pos + kn + localSize
 			if overflowPtrOff+4 <= len(wpg.data) {
 				binary.BigEndian.PutUint32(wpg.data[overflowPtrOff:], 0xDEADBEEF)

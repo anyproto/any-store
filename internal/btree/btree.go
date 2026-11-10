@@ -347,6 +347,40 @@ func interiorSplitPoint(cells []cellData, usableSize int) int {
 	return bestIdx
 }
 
+// interiorSplitPointFitting is interiorSplitPoint with both halves checked
+// against their pages. The 2/3 target alone looks only at the left page: when
+// the cells differ much in size (a balance below can replace short dividers
+// with long ones) it can leave more on the right than a page holds. The split
+// index nearest the target whose halves both fit is returned; when none does,
+// the target index is returned and the rebuild of the over-full half reports it.
+//
+// The left half is rebuilt in the page being split, which on page 1 has
+// leftHdrOff fewer bytes; the right half goes to a fresh page.
+func interiorSplitPointFitting(cells []cellData, usableSize, leftHdrOff int) int {
+	mid := interiorSplitPoint(cells, usableSize)
+	n := len(cells)
+	if n <= 2 {
+		return mid
+	}
+	// before[i] is the page space taken by cells[:i], pointers included.
+	before := make([]int, n+1)
+	for i, c := range cells {
+		before[i+1] = before[i] + interiorCellSizeWithOverflow(c.key, usableSize) + 2
+	}
+	fits := func(i int) bool {
+		return before[i] <= usableSize-12-leftHdrOff && before[n]-before[i+1] <= usableSize-12
+	}
+	for d := 0; d < n; d++ {
+		if i := mid + d; i <= n-2 && fits(i) {
+			return i
+		}
+		if i := mid - d; i >= 1 && fits(i) {
+			return i
+		}
+	}
+	return mid
+}
+
 // leafCellSizeWithOverflow returns the in-page size of a leaf cell, accounting for overflow.
 // The payload (key||value) is treated as a single blob for overflow purposes.
 // DRIFT: leaf cell-size computation omits SQLite's `if nSize<4 nSize=4` clamp See docs/btree/NOTES.md#drift-26-leaf-cell-size-missing-four-byte-minimum-clamp
@@ -2054,7 +2088,7 @@ func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte
 
 	// Root leaf with no parent: there is nowhere to gather siblings from. Push
 	// the leaf down one level with balance_deeper and balance the new child
-	// under the root, as SQLite's balance() does (btree.c:9152-9169).
+	// under the root, as SQLite's balance() does (btree.c:9134-9151).
 	if len(path) == 0 || pg.pgno == bt.rootPage {
 		return bt.splitRootLeafAndInsert(pg, idx, key, value)
 	}
@@ -2090,7 +2124,7 @@ func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte
 
 // splitRootLeafAndInsert handles an over-full LEAF that is the btree root (no
 // parent to gather siblings from). It is SQLite's balance() for a root page
-// (btree.c:9152-9169): balance_deeper moves the root's cells to a new child and
+// (btree.c:9134-9151): balance_deeper moves the root's cells to a new child and
 // leaves the root an interior page with no cells and that child as its right
 // child, then balance_nonroot balances the child, with the new cell folded in,
 // under the root. The child is split into as many pages as the cells need, so
@@ -2100,6 +2134,7 @@ func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte
 // into the root. On page 1 the child has dbHeaderSize more room than the root,
 // so it may not fit back: the root then stays a zero-cell interior page with
 // one child, as in SQLite (btree.c:8942).
+// DRIFT: a cell that fits the root with under two bytes to spare arrives here, because the insert fit check counts its pointer twice; balance-shallower then restores the root. See docs/btree/NOTES.md#drift-2026-11-10-2-leaf-insert-fit-check-counts-the-cell-pointer-twice
 func (bt *btree) splitRootLeafAndInsert(pg *page, idx int, key, value []byte) error {
 	if err := bt.balanceDeeper(pg); err != nil {
 		return err
@@ -2130,7 +2165,7 @@ func (bt *btree) splitRootLeafAndInsert(pg *page, idx int, key, value []byte) er
 
 // balanceDeeper moves the cells of a root LEAF to a newly allocated child and
 // turns the root into an interior page with no cells whose right child is that
-// page. Port of balance_deeper (btree.c:9052-9097) for a leaf root; the caller
+// page. Port of balance_deeper (btree.c:9034-9079) for a leaf root; the caller
 // balances the child next. The root keeps its pin, the child's is released.
 func (bt *btree) balanceDeeper(root *page) error {
 	childPg, err := bt.pager.allocatePage()
@@ -2346,7 +2381,11 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 	}
 
 	// Find split point targeting ~2/3 fill on the left page (SQLite-style).
-	midIdx := interiorSplitPoint(cells, bt.usablePageSize())
+	rootHdrOff := 0
+	if parentPg.pgno == 1 {
+		rootHdrOff = dbHeaderSize
+	}
+	midIdx := interiorSplitPointFitting(cells, bt.usablePageSize(), rootHdrOff)
 	leftCells := cells[:midIdx]
 	sepCellKey := bytes.Clone(cells[midIdx].key)
 	rightCells := cells[midIdx+1:]

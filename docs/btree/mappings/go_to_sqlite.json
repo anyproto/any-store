@@ -488,6 +488,12 @@
     ],
     "note": ""
   },
+  "btree.go:interiorSplitPointFitting": {
+    "sqlite": [
+      "btree.c:balance_nonroot"
+    ],
+    "note": "2-way interior split index whose halves both fit"
+  },
   "btree.go:leafCellSize": {
     "sqlite": [
       "btree.c:cellSizePtrIdxLeaf"
@@ -1692,6 +1698,12 @@
       "btree.c:decodeFlags"
     ],
     "note": "one leaf rule per file instead of one per page"
+  },
+  "pager.go:*pager.leafLimitsFor": {
+    "sqlite": [
+      "btree.c:decodeFlags"
+    ],
+    "note": "leaf rule for a usable size read by the caller (integrity check)"
   },
   "pager.go:*pager.open": {
     "sqlite": [

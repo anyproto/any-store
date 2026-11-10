@@ -4780,7 +4780,7 @@ func TestCov_CollectInteriorCellsOverflowReadError(t *testing.T) {
 	pos := off + 4
 	_, kn := getVarint(pg.data[pos:])
 	pos += kn
-	localSize := localPayloadSize(len(bigKey), p.leafLimits())
+	localSize := interiorLocalPayloadSize(len(bigKey), p.usableSize())
 	pos += localSize
 	// Write invalid overflow page number
 	binary.BigEndian.PutUint32(pg.data[pos:], 99999)

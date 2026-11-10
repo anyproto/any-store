@@ -1644,8 +1644,17 @@ func (p *pager) usableSize() int {
 // counterpart of BtShared.maxLeaf / minLeaf (btree.c:3439-3440). Every leaf
 // cell of a file is written and parsed under one rule; interior cells always
 // use indexLimits.
+// DRIFT: the leaf rule is one per file, held by the pager; SQLite picks it per page in decodeFlags. See docs/btree/NOTES.md#drift-2026-11-10-3-leaf-payload-limits-come-from-the-pager-not-the-page
 func (p *pager) leafLimits() payloadLimits {
-	return indexLimits(p.usableSize_)
+	return p.leafLimitsFor(p.usableSize_)
+}
+
+// leafLimitsFor is leafLimits for a usable size the caller read itself. The
+// integrity check takes its geometry from the header of the snapshot it
+// walks, which a backup into this handle can leave different from
+// usableSize_.
+func (p *pager) leafLimitsFor(usableSize int) payloadLimits {
+	return indexLimits(usableSize)
 }
 
 // freelistMaxLeaves returns the max number of leaf entries per trunk page.

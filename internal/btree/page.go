@@ -174,7 +174,7 @@ func interiorLocalPayloadSize(keyLen, usableSize int) int {
 
 // localPayloadSize computes how many bytes of payload are stored locally
 // when total payload exceeds lim.maxLocal. Port of btreePayloadToLocal
-// (btree.c:1242-1259).
+// (btree.c:1213-1226).
 // DRIFT: Go has only index maxLocal/minLocal; SQLite's table maxLeaf/minLeaf pair absent (no table See docs/btree/NOTES.md#old-drift-index-only-local-payload-no-maxleaf-minleaf
 func localPayloadSize(totalPayload int, lim payloadLimits) int {
 	if totalPayload <= lim.maxLocal {

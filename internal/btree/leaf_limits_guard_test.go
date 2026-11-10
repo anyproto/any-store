@@ -18,19 +18,40 @@ import (
 // computed the index rule itself would write or parse cells under a different
 // rule from the rest of the file, which shows up only as corruption.
 func TestLeafCodeTakesLimitsFromPager(t *testing.T) {
-	// the index rule itself, and the interior-cell code that always uses it
-	allowed := map[string]bool{
-		"indexLimits":                  true,
-		"interiorLocalPayloadSize":     true,
-		"leafLimits":                   true, // pager.leafLimits: the one place the leaf rule is chosen
-		"parseInteriorCell":            true,
-		"interiorCellSizeWithOverflow": true,
-		"interiorFullKey":              true,
-		"collectInteriorCellsKeepBuf":  true,
-		"rebuildInteriorPage":          true,
-		"insertSepIntoInterior":        true,
+	// Callers are named with their receiver type, so a method of another type
+	// with an allowed name is not let through.
+	//
+	// The index rule: its constructor, the one place the leaf rule is chosen,
+	// and the interior-cell code, which always uses it.
+	indexRule := map[string]bool{
+		"indexLimits":                       true,
+		"interiorLocalPayloadSize":          true,
+		"pager.leafLimitsFor":               true,
+		"parseInteriorCell":                 true,
+		"interiorCellSizeWithOverflow":      true,
+		"interiorFullKey":                   true,
+		"btree.collectInteriorCellsKeepBuf": true,
+		"btree.rebuildInteriorPage":         true,
+		"btree.insertSepIntoInterior":       true,
 	}
-	guarded := map[string]bool{"maxLocalPayload": true, "minLocalPayload": true, "indexLimits": true}
+	// interiorLocalPayloadSize is the index rule too: only interior-cell code
+	// may call it. checkTreePage walks both kinds of page and uses it in its
+	// interior branch.
+	interiorSize := map[string]bool{
+		"parseInteriorCell":                 true,
+		"interiorCellSizeWithOverflow":      true,
+		"interiorFullKey":                   true,
+		"btree.collectInteriorCellsKeepBuf": true,
+		"btree.rebuildInteriorPage":         true,
+		"btree.insertSepIntoInterior":       true,
+		"integrityChecker.checkTreePage":    true,
+	}
+	guarded := map[string]map[string]bool{
+		"maxLocalPayload":          indexRule,
+		"minLocalPayload":          indexRule,
+		"indexLimits":              indexRule,
+		"interiorLocalPayloadSize": interiorSize,
+	}
 
 	entries, err := os.ReadDir(".")
 	require.NoError(t, err)
@@ -49,18 +70,32 @@ func TestLeafCodeTakesLimitsFromPager(t *testing.T) {
 				continue
 			}
 			checked++
+			caller := fn.Name.Name
+			if fn.Recv != nil && len(fn.Recv.List) == 1 {
+				recv := fn.Recv.List[0].Type
+				if star, ok := recv.(*ast.StarExpr); ok {
+					recv = star.X
+				}
+				if id, ok := recv.(*ast.Ident); ok {
+					caller = id.Name + "." + caller
+				}
+			}
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
 				if !ok {
 					return true
 				}
 				id, ok := call.Fun.(*ast.Ident)
-				if !ok || !guarded[id.Name] {
+				if !ok {
 					return true
 				}
-				assert.True(t, allowed[fn.Name.Name],
+				allowed, ok := guarded[id.Name]
+				if !ok {
+					return true
+				}
+				assert.True(t, allowed[caller],
 					"%s: %s calls %s; leaf code takes its limits from pager.leafLimits",
-					fset.Position(call.Pos()), fn.Name.Name, id.Name)
+					fset.Position(call.Pos()), caller, id.Name)
 				return true
 			})
 		}
