@@ -725,8 +725,15 @@ func (p *pager) open() (err error) {
 			if err := p.wal.readFramePage(frame, 1, walBuf, nil, nil); err != nil {
 				return err
 			}
+			// The WAL copy passes the same format checks as the file's own
+			// header (dbHeader.deserialize), and it must name the same magic
+			// family: no commit moves a file between them.
+			fileVersioned := p.header.versioned
 			if err := p.header.deserialize(walBuf[:dbHeaderSize]); err != nil {
 				return err
+			}
+			if p.header.versioned != fileVersioned {
+				return fmt.Errorf("%w: header magic differs between the file and its WAL", ErrHeaderCorrupt)
 			}
 		}
 		// Use max of DB file's DatabaseSize and WAL's maxPage.
@@ -829,7 +836,7 @@ func (p *pager) initNewDB() error {
 		ReservedSpace:    0,
 		FileChangeCount:  1,
 		DatabaseSize:     1, // Just page 1
-		SchemaFormat:     5,
+		SchemaFormat:     maxSchemaFormat,
 		DefaultCacheSize: defaultCacheSize,
 		TextEncoding:     1, // UTF-8
 	}

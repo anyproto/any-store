@@ -1405,6 +1405,13 @@
     ],
     "note": ""
   },
+  "page.go:checkHeaderFormat": {
+    "sqlite": [
+      "btree.c:lockBtree",
+      "prepare.c:sqlite3InitOne"
+    ],
+    "note": "version bytes as lockBtree, schema format bound as sqlite3InitOne; also checks the magic family against the schema format"
+  },
   "page.go:checksum": {
     "sqlite": [],
     "note": "CRC32 helper; SQLite uses custom walChecksumBytes in WAL only"

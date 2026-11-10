@@ -6,10 +6,11 @@ package btree
 //
 //	Offset  Size  Description
 //	0       16    Magic string "any-store v2\000" (zero-padded to 16;
-//	              "BTree format 1\000" still accepted, see dbMagicV1)
+//	              "BTree format 1\000" still accepted, see dbMagicV1), or
+//	              "any-store v2 fmt" for schema formats 6 and later (dbMagicFmt)
 //	16      2     Page size in bytes
-//	18      1     File format write version (1=legacy, 2=WAL)
-//	19      1     File format read version (1=legacy, 2=WAL)
+//	18      1     File format write version (2=WAL; above maxWriteVersion refused)
+//	19      1     File format read version (2=WAL; above maxReadVersion refused)
 //	20      1     Reserved space at end of each page
 //	21      1     Max embedded payload fraction (must be 64)
 //	22      1     Min embedded payload fraction (must be 32)
@@ -55,6 +56,7 @@ package btree
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 )
 
@@ -79,6 +81,12 @@ const (
 	// dbMagicV1 is the magic used before the rename. It is still accepted so that
 	// databases created by earlier v2 builds keep opening.
 	dbMagicV1 = "BTree format 1\x00\x00"
+	// dbMagicFmt marks a versioned header: the file's on-disk format is named by
+	// the schema format field alone, which is 6 or later. It fills all 16 bytes,
+	// so releases that know only the two magics above refuse such a file at the
+	// header, before reading a page of it. It is the last magic: a later format
+	// raises the schema format and keeps this one.
+	dbMagicFmt = "any-store v2 fmt"
 	// sqliteMagic is the header any-store v1 databases start with. Recognised
 	// only so it can be reported distinctly; never accepted.
 	sqliteMagic = "SQLite format 3\x00"
@@ -100,6 +108,18 @@ const (
 
 	// leafPayloadFrac is the fraction of page for leaf payload.
 	leafPayloadFrac = 32
+
+	// minSchemaFormat and maxSchemaFormat bound the schema formats this binary
+	// reads and writes. firstVersionedSchemaFormat is the first one written
+	// under dbMagicFmt.
+	minSchemaFormat            = 5
+	maxSchemaFormat            = 5
+	firstVersionedSchemaFormat = 6
+
+	// maxReadVersion and maxWriteVersion are the highest header version bytes
+	// (offsets 19 and 18) this binary accepts, as in lockBtree (btree.c:3322-3327).
+	maxReadVersion  = 2
+	maxWriteVersion = 2
 
 	// overflowPtrSize is the size of the overflow page pointer at the end
 	// of a leaf cell that has overflowed.
@@ -181,6 +201,9 @@ type dbHeader struct {
 	UserVersion      uint32
 	AppID            uint32
 	VersionValidFor  uint32
+	// versioned records that the file carries dbMagicFmt. serialize writes the
+	// same magic back, so a commit never moves a file between the two families.
+	versioned bool
 	// BEGIN ENCRYPTION
 	// Salt is the PBKDF2 salt for key derivation. Stored plaintext at
 	// bytes 72-87 of page 1 (within the "reserved for expansion" range
@@ -192,7 +215,11 @@ type dbHeader struct {
 // serialize writes the database header to the first 100 bytes of buf.
 // DRIFT: DB header: 'any-store v2' magic (legacy 'BTree format 1' still read), version=1, KDF salt at 72-87, auto/incr-vacuum fields z See docs/btree/NOTES.md#old-drift-db-file-header-magic-version-salt-vacuum
 func (h *dbHeader) serialize(buf []byte) {
-	copy(buf[0:16], dbMagicV2)
+	if h.versioned {
+		copy(buf[0:16], dbMagicFmt)
+	} else {
+		copy(buf[0:16], dbMagicV2)
+	}
 
 	var ps uint16
 	if h.PageSize >= 65536 {
@@ -246,12 +273,20 @@ func (h *dbHeader) deserialize(buf []byte) error {
 		return ErrHeaderCorrupt
 	}
 
-	if magic := string(buf[0:16]); magic != dbMagicV2 && magic != dbMagicV1 {
-		if magic == sqliteMagic {
-			return ErrSQLiteFormat
-		}
+	var versioned bool
+	switch string(buf[0:16]) {
+	case dbMagicV2, dbMagicV1:
+	case dbMagicFmt:
+		versioned = true
+	case sqliteMagic:
+		return ErrSQLiteFormat
+	default:
 		return ErrHeaderCorrupt
 	}
+	if err := checkHeaderFormat(versioned, buf[19], buf[18], binary.BigEndian.Uint32(buf[44:48])); err != nil {
+		return err
+	}
+	h.versioned = versioned
 
 	ps := binary.BigEndian.Uint16(buf[16:18])
 	if ps == 1 {
@@ -291,6 +326,41 @@ func (h *dbHeader) deserialize(buf []byte) error {
 	// END ENCRYPTION
 	h.VersionValidFor = binary.BigEndian.Uint32(buf[92:96])
 
+	return nil
+}
+
+// checkHeaderFormat decides whether this binary can use a file with the given
+// magic family, version bytes and schema format. It runs before any other
+// header field is trusted, so a file from a later release is reported as
+// ErrNewerFormat whatever else its header holds.
+//
+// The version bytes follow lockBtree (btree.c:3322-3327) and the schema format
+// bound follows sqlite3InitOne ("unsupported file format", prepare.c:344).
+// DRIFT: a write version above the maximum refuses the open; SQLite opens the file read-only (btree.c:3322-3324). See docs/btree/NOTES.md#drift-2026-11-10-1-header-format-gate
+func checkHeaderFormat(versioned bool, readVersion, writeVersion uint8, schemaFormat uint32) error {
+	if readVersion > maxReadVersion {
+		return fmt.Errorf("%w: read version %d, this binary supports %d", ErrNewerFormat, readVersion, maxReadVersion)
+	}
+	if writeVersion > maxWriteVersion {
+		return fmt.Errorf("%w: write version %d, this binary supports %d", ErrNewerFormat, writeVersion, maxWriteVersion)
+	}
+	if schemaFormat > maxSchemaFormat {
+		return fmt.Errorf("%w: schema format %d, this binary supports %d", ErrNewerFormat, schemaFormat, maxSchemaFormat)
+	}
+	if versioned {
+		// dbMagicFmt is only ever written with a schema format of 6 or later.
+		if schemaFormat < firstVersionedSchemaFormat {
+			return fmt.Errorf("%w: schema format %d under the versioned magic", ErrHeaderCorrupt, schemaFormat)
+		}
+		return nil
+	}
+	// Schema format 5 introduced unified leaf cell overflow (key+value as a
+	// single payload blob). Older formats stored the key fully on-page and
+	// only let the value overflow; this parser misreads them. Zero is a header
+	// that never recorded a format.
+	if schemaFormat != 0 && schemaFormat < minSchemaFormat {
+		return ErrOldFormat
+	}
 	return nil
 }
 

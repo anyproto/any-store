@@ -193,6 +193,9 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		if errors.Is(err, btree.ErrSQLiteFormat) {
 			return nil, ErrV1Database
 		}
+		if errors.Is(err, btree.ErrNewerFormat) {
+			return nil, fmt.Errorf("%w: %w", ErrIncompatibleVersion, err)
+		}
 		return nil, err
 	}
 	// ContinueOnIntegrityError only applies to checksum mode. AEAD mode

@@ -680,15 +680,6 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 
-	// Reject databases created with an older schema format.
-	// Schema format 5 introduced unified leaf cell overflow (key+value as a
-	// single payload blob). Older formats stored key fully on-page and only
-	// allowed value overflow, which panics on large keys.
-	if p.header.SchemaFormat != 0 && p.header.SchemaFormat < 5 {
-		_ = p.close()
-		return nil, ErrOldFormat
-	}
-
 	readerCacheSize := opts.CacheSize
 
 	maxReaders := opts.MaxReaders
