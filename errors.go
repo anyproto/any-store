@@ -132,7 +132,7 @@ var (
 
 	ErrDBIsClosed = btree.ErrClosed
 
-	ErrDBIsNotOpened       = errors.New("any-store: database is not opened")
+	ErrDBIsNotOpened = errors.New("any-store: database is not opened")
 	// ErrIncompatibleVersion is returned (wrapped) by Open when the file was written in a format
 	// newer than this release reads. The file is intact and is left unchanged; open it with a
 	// release that knows the format. It does not match ErrCorrupt.
