@@ -3434,7 +3434,20 @@ func (p *pager) close() error {
 				if debugTrace {
 					trace("close: starting passive checkpoint before WAL truncation, dbSize=%d lockedWrite=%v", p.dbSize.Load(), lockedWrite)
 				}
-				cpErr := p.wal.checkpointPassive(p.file, p.master)
+				// A torn wal-index header must be repaired before the
+				// checkpoint reads its frontier. The PASSIVE checkpoint
+				// would take the write lock for that itself, but this
+				// close already holds it, so do it here, as
+				// walIndexReadHdr does for a caller with
+				// pWal->writeLock set (wal.c:2692-2697). On failure the
+				// checkpoint and the truncate are skipped.
+				var cpErr error
+				if lockedWrite {
+					_, cpErr = p.wal.indexReadHdr(true, false)
+				}
+				if cpErr == nil {
+					cpErr = p.wal.checkpointPassive(p.file, p.master)
+				}
 				if cpErr != nil {
 					if debugTrace {
 						trace("close: checkpointPassive incomplete or failed: %v", cpErr)

@@ -161,6 +161,32 @@ func TestTornWalIndexHeader_PassiveCheckpointKeepsPeerCommits(t *testing.T) {
 	requireTornHeaderRowsAfterReopen(t, db, path)
 }
 
+// TestTornWalIndexHeader_CloseKeepsPeerCommits: the survivor closes as the
+// last process attached. Its close-time checkpoint runs under the write
+// lock, and a WAL truncate follows a complete backfill, so the header has to
+// be repaired first there too.
+func TestTornWalIndexHeader_CloseKeepsPeerCommits(t *testing.T) {
+	const env = "TEST_TORNHDR_CLOSE_DB_PATH"
+	if dbPath := os.Getenv(env); dbPath != "" {
+		tornHeaderChildMain(t, dbPath)
+		return
+	}
+	db, path := runTornHeaderWriter(t, "TestTornWalIndexHeader_CloseKeepsPeerCommits", env)
+
+	require.NoError(t, db.Close())
+	// The close repaired the header, backfilled the whole log and, as the
+	// last client, emptied the WAL: the rows are in the database file.
+	info, err := os.Stat(path + "-wal")
+	require.NoError(t, err)
+	require.Zero(t, info.Size(), "the last client's close must checkpoint the recovered log and truncate the WAL")
+
+	db2, err := testOpen(t, path, tornHdrOpts)
+	require.NoError(t, err)
+	defer func() { _ = db2.Close() }()
+	requireTornHeaderRows(t, db2)
+	require.NoError(t, db2.IntegrityCheck())
+}
+
 // TestTornWalIndexHeader_ReaderRecovers: a read transaction in the survivor
 // repairs the header itself and reads the committed data, instead of
 // retrying until ErrProtocol.
