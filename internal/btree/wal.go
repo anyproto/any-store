@@ -376,11 +376,11 @@ func walChecksum(data []byte, s1, s2 uint32) (uint32, uint32) {
 const readMarkNotUsed = uint32(0xFFFFFFFF)
 
 // errWALRetry is an internal sentinel signaling that the caller should retry.
-// Used by (a) tryBeginRead when SHM state changed between metadata read and
-// lock acquisition (beginRead's 5000-attempt loop consumes it), and (b) the
-// ensureHeaderInitialized helper when a peer holds a blocking lock and the
-// operation must be re-attempted. Callers outside beginRead must implement
-// their own retry loop or propagate as BUSY-equivalent.
+// Used by tryBeginRead when SHM state changed between metadata read and lock
+// acquisition, or when the wal-index header is invalid and a lock its repair
+// needs is busy (indexReadHdr); beginReadHdr's retry loop consumes it.
+// Callers outside beginReadHdr must implement their own retry loop or
+// propagate as BUSY-equivalent.
 var errWALRetry = errors.New("btree: WAL retry")
 
 // walIndexHdrSize is the size of one WalIndexHdr in the SHM (48 bytes),
@@ -1454,13 +1454,6 @@ type wal struct {
 	// when the first write transaction commits.
 	headerOnDisk bool
 
-	// inProcessInit gates the in-process lazy init path in
-	// ensureHeaderInitializedInProcess so we only run initHeaderState /
-	// recover once per wal instance. Heap-backed SHM is zero-initialized
-	// per process, so the first call always needs to publish a header;
-	// subsequent calls are no-ops.
-	inProcessInit bool
-
 	// inProcess uses heap-backed shm instead of mmap+fcntl (faster, single-process only)
 	inProcess bool
 
@@ -1626,8 +1619,8 @@ func (w *wal) open() (err error) {
 	//
 	// Lock order write → checkpoint → recover matches SQLite's
 	// walIndexRecover (wal.c:1395-1401 `assert( pWal->writeLock )`) and
-	// any-store's ensureHeaderInitialized slow path — the two open-class
-	// paths cannot deadlock against each other.
+	// indexReadHdr — the two recovery paths cannot deadlock against each
+	// other.
 	//
 	// In-process mode: no SHM coordination needed; w.mu serializes all
 	// writers in the same process and heap SHM has no cross-process races.
@@ -1677,131 +1670,6 @@ func (w *wal) open() (err error) {
 	w.initHeaderStateLocked(false)
 
 	return nil
-}
-
-// ensureHeaderInitialized is the lazy counterpart to wal.open — it guarantees
-// that w.index has a valid SHM header and that w's process-local state (salts,
-// nFrame, cksum1/2, writerHdr) is synced to it. Safe to call repeatedly; idempotent.
-//
-// Matches SQLite's walIndexReadHdr (wal.c:2640-2745):
-//   - Non-blocking readHeader first (walIndexTryHdr equivalent).
-//   - On !valid, take WAL_WRITE_LOCK exclusive, retry readHeader.
-//   - If still !valid under WRITE lock, run recover() to reconstruct from the
-//     WAL file. Recovery requires WAL_WRITE_LOCK per wal.c:1399, and additionally
-//     WAL_CKPT_LOCK + WAL_RECOVER_LOCK exclusive to serialize against siblings
-//     that may be trying to initialize concurrently (wal.c:1400-1404).
-//
-// DRIFT: recovery takes WAL_CKPT_LOCK + WAL_RECOVER_LOCK beyond WAL_WRITE_LOCK. See docs/btree/NOTES.md#old-drift-ensureheader-triple-lock-recovery-gate
-//
-// ensureHeaderInitialized guarantees the SHM header is published and returns
-// a snapshot of it so callers can stamp it onto their per-tx walHdr. It also
-// calls syncFromSHMLocked to update process-global writer state
-// (w.header.salt*, w.cksum1/2, w.nFrame, w.writerHdr); narrowing that to
-// writer paths only is a remaining per-connection-hdr migration step.
-//
-// The returned hdr is the live SHM header value at the moment of observation.
-// On error, the zero hdr is returned and the error signals the retry class.
-func (w *wal) ensureHeaderInitialized() (WalIndexHdr, error) {
-	if w.inProcess || w.inMemory {
-		return w.ensureHeaderInitializedInProcess()
-	}
-
-	// Fast path: a peer (or we) already published a valid header.
-	if hdr, valid := w.index.readHeader(); valid {
-		w.mu.Lock()
-		w.syncFromSHMLocked()
-		w.mu.Unlock()
-		return hdr, nil
-	}
-
-	// Slow path: acquire WAL_WRITE_LOCK exclusive, retry, then recover if still bad.
-	if err := w.index.lock(lockWrite, lockExclusive); err != nil {
-		if err == ErrBusy {
-			if e := w.index.lock(lockRecover, lockShared); e == nil {
-				_ = w.index.unlock(lockRecover, lockShared)
-			}
-			if hdr, valid := w.index.readHeader(); valid {
-				w.mu.Lock()
-				w.syncFromSHMLocked()
-				w.mu.Unlock()
-				return hdr, nil
-			}
-			return WalIndexHdr{}, ErrBusyRecovery
-		}
-		return WalIndexHdr{}, err
-	}
-	defer func() { _ = w.index.unlock(lockWrite, lockExclusive) }()
-
-	// Re-check under WAL_WRITE_LOCK: a peer may have just published.
-	if hdr, valid := w.index.readHeader(); valid {
-		w.mu.Lock()
-		w.syncFromSHMLocked()
-		w.mu.Unlock()
-		return hdr, nil
-	}
-
-	// Header still bad → run recovery. Acquire CKPT + RECOVER exclusive too.
-	if err := w.index.lock(lockCheckpoint, lockExclusive); err != nil {
-		if err == ErrBusy {
-			return WalIndexHdr{}, ErrBusyRecovery
-		}
-		return WalIndexHdr{}, err
-	}
-	defer func() { _ = w.index.unlock(lockCheckpoint, lockExclusive) }()
-	if err := w.index.lock(lockRecover, lockExclusive); err != nil {
-		if err == ErrBusy {
-			return WalIndexHdr{}, ErrBusyRecovery
-		}
-		return WalIndexHdr{}, err
-	}
-	defer func() { _ = w.index.unlock(lockRecover, lockExclusive) }()
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	// Final race check under all three locks.
-	if hdr, valid := w.index.readHeader(); valid {
-		w.syncFromSHMLocked()
-		return hdr, nil
-	}
-
-	info, err := w.file.Stat()
-	if err != nil {
-		return WalIndexHdr{}, err
-	}
-	if info.Size() >= walHeaderSize {
-		if err := w.recoverLocked(); err != nil {
-			return WalIndexHdr{}, err
-		}
-	} else {
-		w.initHeaderStateLocked(false)
-	}
-	hdr, _ := w.index.readHeader()
-	return hdr, nil
-}
-
-// ensureHeaderInitializedInProcess is the in-process analog. Heap SHM is
-// zero-initialized per process, so on first call we always run initHeaderState.
-func (w *wal) ensureHeaderInitializedInProcess() (WalIndexHdr, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if !w.inProcessInit {
-		if !w.inMemory && w.file != nil {
-			info, err := w.file.Stat()
-			if err == nil && info.Size() >= walHeaderSize {
-				if err := w.recoverLocked(); err != nil {
-					return WalIndexHdr{}, err
-				}
-				w.inProcessInit = true
-				hdr, _ := w.index.readHeader()
-				return hdr, nil
-			}
-		}
-		w.initHeaderStateLocked(false)
-		w.inProcessInit = true
-	}
-	hdr, _ := w.index.readHeader()
-	return hdr, nil
 }
 
 // indexReadHdr returns the validated wal-index header. When the header is
@@ -1884,43 +1752,6 @@ func (w *wal) indexReadHdr(haveWriteLock, haveCkptLock bool) (WalIndexHdr, error
 		return WalIndexHdr{}, fmt.Errorf("%w: wal-index header invalid after recovery", ErrCorrupt)
 	}
 	return hdr, nil
-}
-
-// syncFromSHMLocked synchronizes process-global state from a valid SHM hdr.
-// After the per-tx walHdr migration (step 4), writer-private fields
-// (w.header.salt*, w.cksum1/2, w.writerHdr) are owned by beginWrite's
-// inline sync under lockWrite — this helper only updates the shared
-// atomics on w.index and w.nFrame that both readers and writers consult
-// for WAL offset + backfill tracking.
-//
-// Caller must hold w.mu and have observed a valid SHM header.
-// DRIFT: headerOnDisk inferred from hdr.mxFrame>0 not fstat (relies on flushHeader-before-frame invariant) See docs/btree/NOTES.md#old-drift-headerondisk-mxframe-inference
-func (w *wal) syncFromSHMLocked() {
-	hdr, valid := w.index.readHeader()
-	if !valid {
-		return
-	}
-	// w.nFrame is the shared physical append cursor; readers and writers
-	// both look at it. Safe to advance monotonically (the writer in peer
-	// process always writes higher values).
-	if hdr.mxFrame > w.nFrame.Load() {
-		w.nFrame.Store(hdr.mxFrame)
-	}
-	if !w.headerOnDisk && hdr.mxFrame > 0 {
-		w.headerOnDisk = true
-	}
-	// Monotonic updates on shared walIndex atomics. These are safe under
-	// concurrent readers because the writer (single, via the write lock) is the
-	// only source of increments.
-	w.index.maxFrame.Store(hdr.mxFrame)
-	w.index.mxCommitFrame.Store(hdr.mxFrame)
-	for {
-		old := w.index.maxPage.Load()
-		if hdr.nPage <= old || w.index.maxPage.CompareAndSwap(old, hdr.nPage) {
-			break
-		}
-	}
-	w.index.nBackfill.Store(w.index.shmNBackfill())
 }
 
 // adoptSHMState synchronizes the process-local WAL state (salts, nFrame,
@@ -2050,12 +1881,11 @@ func (w *wal) writeHeader() error {
 //   - Region 0's memcpy skips the 136-byte header area (htHdrSize), matching
 //     SQLite wal.c:1533: `memcpy(&aShare[nHdr32], &aPrivate[nHdr32], WALINDEX_PGSZ-nHdr)`.
 //
-// Caller must hold w.mu AND lockCheckpoint + lockRecover exclusive (see
-// wal.open and ensureHeaderInitialized). SQLite additionally acquires
-// WAL_ALL_BUT_WRITE..READ_LOCK(0) exclusive during recovery (wal.c:1401);
-// any-store relies on recoverLocked only being invoked from wal.open (before
-// any peer reader/writer has attached) or from ensureHeaderInitialized
-// (which holds lockWrite + lockCheckpoint + lockRecover exclusive).
+// Caller must hold w.mu AND, in multi-process mode, lockWrite +
+// lockCheckpoint + lockRecover exclusive (wal.open and indexReadHdr) — the
+// range SQLite's walIndexRecover holds (the caller's WAL_WRITE_LOCK plus
+// WAL_ALL_BUT_WRITE up to READ_LOCK(0), wal.c:1395-1401). Peers, and readers
+// of this process, may be attached while it runs.
 // DRIFT: recoverLocked sets all read-marks NOT_USED; C pre-seeds slot 1 to mxFrame See docs/btree/NOTES.md#drift-88-wal-recovery-does-not-pre-seed-read-mark-slot-1
 func (w *wal) recoverLocked() error {
 	w.headerOnDisk = true

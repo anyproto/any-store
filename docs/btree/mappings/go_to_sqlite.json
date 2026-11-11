@@ -2237,14 +2237,6 @@
     ],
     "note": ""
   },
-  "wal.go:*wal.ensureHeaderInitialized": {
-    "sqlite": [],
-    "note": ""
-  },
-  "wal.go:*wal.ensureHeaderInitializedInProcess": {
-    "sqlite": [],
-    "note": ""
-  },
   "wal.go:*wal.flushHeader": {
     "sqlite": [],
     "note": "lazy WAL header flush on first write (any-store optimization)"
@@ -2296,10 +2288,6 @@
       "wal.c:walRewriteChecksums"
     ],
     "note": "in-tx frame-reuse checksum-chain rewrite (wal.c:3966-4009), called from writeFrames"
-  },
-  "wal.go:*wal.syncFromSHMLocked": {
-    "sqlite": [],
-    "note": ""
   },
   "wal.go:*wal.truncateFile": {
     "sqlite": [
