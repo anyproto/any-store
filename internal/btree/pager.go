@@ -91,6 +91,10 @@ type pager struct {
 	dbSize      atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
 	state       atomic.Int32  // pagerState
 
+	// noWalCommitSize memoizes the database file's size for readers whose
+	// snapshot header carries no committed size. See effectiveReaderDbSize.
+	noWalCommitSize atomic.Pointer[noWalCommitSize]
+
 	// balanceQuickDispatchCount counts dispatches into splitLeafRightmostAppend.
 	// Test-only: production code never reads it (atomic load is ~ns). Used to
 	// verify the dispatch guard exercises both branches in the test matrix.
@@ -1998,27 +2002,56 @@ func (p *pager) getHasContent(pgno uint32) bool {
 }
 
 // effectiveReaderDbSize returns the database size in pages for a reader's
-// captured snapshot header. It returns hdr.nPage (the committed page count
-// recorded in the WAL-index header at the reader's snapshot, visible cross-
-// process via SHM), falling back to the process-local p.dbSize when the
-// header carries no committed size — hdr not initialized (in-process mode,
-// where writers don't publish the SHM header) or an empty/checkpointed WAL.
+// captured snapshot header: SQLite's pagerPagecount (pager.c:3279-3306).
 //
-// Mirrors SQLite's sqlite3WalDbsize (wal.c:3672 — returns pWal->hdr.nPage)
-// plus pagerPagecount's fallback when WalDbsize returns 0 (pager.c:3292 call,
-// 3299-3305 fallback). SQLite falls back there to the file size; we fall back
-// to p.dbSize, which is equivalent: the WAL header lacks a committed size only
-// in in-process mode (writers don't publish the SHM header, and p.dbSize is the
-// authoritative same-process counter) or for a genuinely empty DB.
-// Readers must never bound-check against p.dbSize directly: that atomic is the
-// writer's allocation counter and is only refreshed on the write path
-// (beginWrite -> refreshHeaderFromPage1), so a pure reader would reject pages
-// a peer allocated after this process opened.
+//   - hdr.nPage, the committed page count recorded in the wal-index header at
+//     the reader's snapshot (sqlite3WalDbsize, wal.c:3672), when the header
+//     carries one. A WAL reset keeps it (doResetWAL).
+//   - Otherwise the WAL has had no commit since its index was built (a fresh
+//     open of a checkpointed database), and the size is the database file's,
+//     rounded up, as pagerPagecount takes it from sqlite3OsFileSize.
+//
+// In-process mode has no file fallback: its writers publish no wal-index
+// header (the snapshot header is synthesized without a size), no other
+// process can change the database, and p.dbSize is the authoritative
+// same-process counter.
+//
+// Multi-process readers must never bound-check against p.dbSize: that atomic
+// is the writer's allocation counter, refreshed only on the write path
+// (beginWrite -> refreshHeaderFromPage1), so a process that has not written
+// since a peer grew the database would reject the peer's pages as corrupt.
+// DRIFT: the file-size fallback is memoized per wal-index header; C fstats every transaction See docs/btree/NOTES.md#drift-2026-11-11-3-reader-size-without-a-wal-commit-is-memoized
 func (p *pager) effectiveReaderDbSize(hdr WalIndexHdr) uint32 {
 	if hdr.isInit != 0 && hdr.nPage != 0 {
 		return hdr.nPage
 	}
+	if !p.inProcess && !p.inMemory && p.file != nil {
+		// One fstat per wal-index header, not per read begin (measured:
+		// ~390 ns and an allocation, about a sixth of a point read on a
+		// freshly opened database, which is in exactly this state). The
+		// file's size cannot change while the header stays these 48 bytes:
+		// it changes only when a checkpoint copies frames into it, frames
+		// need a commit, and a commit publishes a header with a size, which
+		// every later reset keeps. A header without a size appears again
+		// only when the index is rebuilt over a WAL with no commit, with the
+		// salts of a new WAL generation.
+		if m := p.noWalCommitSize.Load(); m != nil && m.hdr == hdr {
+			return m.nPage
+		}
+		if info, err := p.file.Stat(); err == nil {
+			n := uint32((info.Size() + int64(p.pageSize) - 1) / int64(p.pageSize))
+			p.noWalCommitSize.Store(&noWalCommitSize{hdr: hdr, nPage: n})
+			return n
+		}
+	}
 	return p.dbSize.Load()
+}
+
+// noWalCommitSize is effectiveReaderDbSize's memo: the database file's size
+// in pages as read under a wal-index header that carries no committed size.
+type noWalCommitSize struct {
+	hdr   WalIndexHdr
+	nPage uint32
 }
 
 // readerDbSizeBound returns the page-count upper bound to validate pgno

@@ -1874,7 +1874,21 @@ func (w *wal) adoptSHMState(hdr WalIndexHdr, walHasHeader bool) {
 // Caller must hold w.mu.
 // readMarksLocked: see walIndex.reset — true only on the RESTART/TRUNCATE
 // checkpoint path (doResetWAL), whose caller holds reader slots 1-4 exclusive.
+//
+// The published wal-index header carries no database size: the WAL holds no
+// commit, and readers take the database file's size (pagerPagecount,
+// pager.c:3292-3306). The restart path uses restartHeaderStateLocked.
 func (w *wal) initHeaderStateLocked(readMarksLocked bool) {
+	w.restartHeaderStateLocked(readMarksLocked, 0)
+}
+
+// restartHeaderStateLocked is initHeaderStateLocked with the database size
+// the published wal-index header carries. A WAL restart passes the size of
+// the last commit, which the reset must not drop: SQLite's walRestartHdr
+// zeroes mxFrame and leaves hdr.nPage as it is (wal.c:2146-2160), so
+// sqlite3WalDbsize keeps answering with the committed size after a RESTART
+// or TRUNCATE.
+func (w *wal) restartHeaderStateLocked(readMarksLocked bool, nPage uint32) {
 	w.header = walHeader{
 		magic:      walMagic,
 		version:    walVersion,
@@ -1893,7 +1907,7 @@ func (w *wal) initHeaderStateLocked(readMarksLocked bool) {
 	w.index.reset(readMarksLocked)
 
 	// Update shm header with initial checksums and salts
-	_ = w.index.writeHeader(0, 0, 0,
+	_ = w.index.writeHeader(0, nPage, 0,
 		[2]uint32{w.cksum1, w.cksum2},
 		[2]uint32{w.header.salt1, w.header.salt2})
 }
@@ -4094,6 +4108,21 @@ func (w *wal) doResetWAL(truncate bool) error {
 	// preventing TOCTOU races where readFrame passes the nFrame check
 	// but gets EOF from the truncated file. Matches SQLite's ordering:
 	// walRestartHdr (reset header) → sqlite3OsTruncate (wal.c:2363-2364).
+	// The database size of the last commit, which the reset header keeps
+	// (walRestartHdr leaves hdr.nPage alone, wal.c:2146-2160). The whole log
+	// has been backfilled, so this is the size of the database file's
+	// content. Readers in processes that have not written since a peer grew
+	// the database bound their page numbers by it; published as 0 it sent
+	// them to their stale process-local size, and valid pages read as
+	// corrupt. The caller holds the write lock, so the live header is the
+	// last commit's.
+	nPage := w.index.maxPage.Load()
+	if !w.inProcess && !w.inMemory {
+		if hdr, valid := w.index.readHeader(); valid {
+			nPage = hdr.nPage
+		}
+	}
+
 	// readMarksLocked: tryResetWALWithBusy holds reader slots 1-4 exclusive
 	// across this call (matching wal.c:2361 before walRestartHdr).
 	w.index.reset(true)
@@ -4114,7 +4143,7 @@ func (w *wal) doResetWAL(truncate bool) error {
 
 	if w.inMemory {
 		// InMemory: just reinitialize header state, no disk write
-		w.initHeaderStateLocked(true)
+		w.restartHeaderStateLocked(true, nPage)
 		return nil
 	}
 
@@ -4123,7 +4152,7 @@ func (w *wal) doResetWAL(truncate bool) error {
 	// publishes the SHM header (fresh salt, so peers detect the wrap); on TRUNCATE
 	// the WAL stays 0 bytes. Durability unchanged (flushHeader fdatasyncs at the
 	// first-frame write); avoids an eager header fsync per RESTART/TRUNCATE checkpoint.
-	w.initHeaderStateLocked(true)
+	w.restartHeaderStateLocked(true, nPage)
 	return nil
 }
 

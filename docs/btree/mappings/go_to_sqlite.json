@@ -1605,6 +1605,13 @@
     ],
     "note": "fans out the per-page update hook to all attached Backups after each committed write so already-copied pages stay current"
   },
+  "pager.go:*pager.effectiveReaderDbSize": {
+    "sqlite": [
+      "pager.c:pagerPagecount",
+      "wal.c:sqlite3WalDbsize"
+    ],
+    "note": "a reader's page count for its snapshot; the file-size fallback is memoized per wal-index header (drift-2026-11-11-3)"
+  },
   "pager.go:*pager.encryptPage": {
     "sqlite": [],
     "note": ""
@@ -2284,6 +2291,12 @@
       "wal.c:sqlite3WalSavepointUndo"
     ],
     "note": "ports the iReCksum\u003emxFrame reset fragment of sqlite3WalSavepointUndo (wal.c:3849-3851)"
+  },
+  "wal.go:*wal.restartHeaderStateLocked": {
+    "sqlite": [
+      "wal.c:walRestartHdr"
+    ],
+    "note": "header half of a WAL restart: mxFrame 0, hdr.nPage kept; salts and nCkpt per drift-97/98"
   },
   "wal.go:*wal.rewriteChecksums": {
     "sqlite": [
