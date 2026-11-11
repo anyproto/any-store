@@ -2,6 +2,7 @@ package btree
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -9221,4 +9222,133 @@ func TestPagerClose_RemovesOnlyOwnRegistryEntry(t *testing.T) {
 	require.NoError(t, newer.close())
 	_, held = openDBs.Load(key)
 	require.False(t, held)
+}
+
+// ============================================================
+// Open after a WAL-committed shrink
+// ============================================================
+
+// shrinkDstInWAL builds a destination whose DB file holds many pages and
+// whose WAL then commits a much smaller database (a backup from a small
+// source truncates the destination at commit, and nothing checkpoints it).
+// Returns the open destination, its path and the committed (small) size.
+func shrinkDstInWAL(t *testing.T, opts Options) (dst *DB, dstPath string, committed uint32) {
+	t.Helper()
+	dir := t.TempDir()
+	opts.DisableAutoCheckpoint = true
+
+	src, err := testOpen(t, filepath.Join(dir, "src.db"), opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = src.Close() })
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	sns, err := stx.CreateNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, stx.Put(sns, []byte("small"), []byte("v")))
+	require.NoError(t, stx.Commit())
+
+	dstPath = filepath.Join(dir, "dst.db")
+	dst, err = testOpen(t, dstPath, opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dst.Close() })
+	dtx, err := dst.BeginWrite()
+	require.NoError(t, err)
+	dns, err := dtx.CreateNamespace("data")
+	require.NoError(t, err)
+	fat := make([]byte, 1000)
+	for i := 0; i < 400; i++ {
+		require.NoError(t, dtx.Put(dns, fmt.Appendf(nil, "dst-%04d", i), fat))
+	}
+	require.NoError(t, dtx.Commit())
+	// The large image reaches the DB file, page-1 header included.
+	require.NoError(t, dst.Checkpoint(CheckpointFull))
+	large := dst.DatabaseSize()
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	for {
+		err := b.Step(context.Background(), -1)
+		if err == ErrBackupDone {
+			break
+		}
+		require.NoError(t, err)
+	}
+	require.NoError(t, b.Finish())
+	committed = dst.DatabaseSize()
+	require.Equal(t, src.DatabaseSize(), committed)
+	require.Less(t, committed*10, large, "test setup: the WAL must commit a much smaller database")
+
+	info, err := os.Stat(dstPath)
+	require.NoError(t, err)
+	require.Equal(t, int64(large)*int64(dst.pager.pageSize), info.Size(),
+		"test setup: the DB file must still hold the large image")
+	return dst, dstPath, committed
+}
+
+// assertOpensAtCommittedSize checks a freshly opened handle on a database
+// whose WAL committed a shrink: it starts at the WAL's committed size, and
+// its first commit does not bring the dropped pages back.
+func assertOpensAtCommittedSize(t *testing.T, db *DB, committed uint32) {
+	t.Helper()
+	assert.Equal(t, committed, db.DatabaseSize(),
+		"open must take the database size from the WAL's last commit, not from the larger DB file")
+	assert.Equal(t, committed, db.pager.header.DatabaseSize)
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.GetNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns, []byte("after-open"), []byte("v")))
+	require.NoError(t, wtx.Commit())
+
+	// One small row: the size may not grow by more than a page or two.
+	require.LessOrEqual(t, db.DatabaseSize(), committed+2,
+		"the first commit after open resurrected the pages the shrink dropped")
+	require.Equal(t, db.DatabaseSize(), db.pager.header.DatabaseSize)
+	_, nPage := db.pager.wal.authoritativeMxFrameAndPage()
+	require.Equal(t, db.DatabaseSize(), nPage, "the commit frame carries the same size")
+	require.NoError(t, db.IntegrityCheck())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	rns, err := rtx.GetNamespace("data")
+	require.NoError(t, err)
+	got, err := rtx.Get(rns, []byte("small"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), got)
+	require.NoError(t, rtx.Rollback())
+}
+
+// TestOpenAfterWALCommittedShrink: the WAL's last commit made the database
+// smaller than the not-yet-checkpointed DB file. Open must use the WAL's
+// committed size even though it is the smaller one, as SQLite's
+// pagerPagecount does (pager.c:3279-3306: sqlite3WalDbsize first, the file
+// size only when the WAL has no commit).
+func TestOpenAfterWALCommittedShrink(t *testing.T) {
+	// A second process attaches while the first is still open: it adopts the
+	// live wal-index header.
+	t.Run("peer attached", func(t *testing.T) {
+		_, dstPath, committed := shrinkDstInWAL(t, Options{PageSize: 4096})
+		allowDoubleOpen(dstPath)
+		db2, err := testOpen(t, dstPath, Options{PageSize: 4096})
+		require.NoError(t, err)
+		defer db2.Close()
+		assertOpensAtCommittedSize(t, db2, committed)
+	})
+
+	// The first process dies before any checkpoint: the next open recovers
+	// the WAL.
+	t.Run("after crash", func(t *testing.T) {
+		_, dstPath, committed := shrinkDstInWAL(t, Options{PageSize: 4096, InProcess: true})
+		crashDir := t.TempDir()
+		crashPath := filepath.Join(crashDir, "dst.db")
+		// Copy from a child process: closing a descriptor of these files in
+		// this process would drop its own locks on them.
+		require.NoError(t, exec.Command("cp", dstPath, crashPath).Run())
+		require.NoError(t, exec.Command("cp", dstPath+"-wal", crashPath+"-wal").Run())
+		db2, err := testOpen(t, crashPath, Options{PageSize: 4096, InProcess: true})
+		require.NoError(t, err)
+		defer db2.Close()
+		assertOpensAtCommittedSize(t, db2, committed)
+	})
 }

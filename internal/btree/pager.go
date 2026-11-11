@@ -674,23 +674,9 @@ func (p *pager) open() (err error) {
 		return fmt.Errorf("%w: usable size %d < 480", ErrHeaderCorrupt, p.usableSize_)
 	}
 
-	// Reconcile the header page count against the physical file size,
-	// mirroring C lockBtree (btree.c:3304-3308). C derives nPageFile via
-	// sqlite3PagerPagecount and falls back to it when the header count is
-	// zero or the change-counter sentinel (FileChangeCount bytes 24-27 vs
-	// VersionValidFor bytes 92-95) mismatches. The VersionValidFor!=0
-	// mismatch is already rejected above; this fallback arm covers the
-	// nPage==0 / legacy-sentinel (VersionValidFor==0) case. When the header
-	// count is untrusted, clamp dbSize to the file page count (C sets
-	// nPage=nPageFile); a trusted-but-too-large header is rejected below
-	// after the WAL is opened, not here.
+	// The page count is settled after the WAL is open (see below): the WAL's
+	// last commit, when there is one, decides it, not the DB file.
 	fileNPage := uint32((info.Size() + int64(p.pageSize) - 1) / int64(p.pageSize))
-	headerNPageTrusted := p.header.DatabaseSize != 0 && p.header.VersionValidFor == p.header.FileChangeCount
-	if headerNPageTrusted {
-		p.dbSize.Store(p.header.DatabaseSize)
-	} else {
-		p.dbSize.Store(fileNPage)
-	}
 	p.initCellScratch()
 	p.writerCache = newPcache(int(p.pageSize), p.writerCache.maxPages, p.writerCache.purgeable)
 	p.writerCache.useSlab = p.useSlab
@@ -737,30 +723,41 @@ func (p *pager) open() (err error) {
 				return err
 			}
 		}
-		// Use max of DB file's DatabaseSize and WAL's maxPage.
-		// After checkpoint + WAL reset, the DB file may have a larger
-		// DatabaseSize than what survives in the WAL after recovery.
-		if p.wal.index.maxPage.Load() > p.dbSize.Load() {
-			p.dbSize.Store(p.wal.index.maxPage.Load())
-		}
 	}
 
-	// Reject a trusted header whose DatabaseSize exceeds the available pages,
-	// mirroring C lockBtree (btree.c:3411-3417): outside writable-schema mode
-	// (which any-store never enables) nPage>nPageFile is SQLITE_CORRUPT, not a
-	// clamp. nPageFile here is the file page count, but C's pagerPagecount
-	// (pager.c:3292) prefers the WAL-committed size when larger, so account
-	// for pages committed to the WAL but not yet checkpointed into the DB file
-	// to avoid false-positively rejecting WAL-extended databases.
-	if headerNPageTrusted {
-		walNPage := p.wal.index.maxPage.Load()
-		effectiveFileN := fileNPage
-		if walNPage > effectiveFileN {
-			effectiveFileN = walNPage
-		}
-		if p.header.DatabaseSize > effectiveFileN {
+	// Settle the page count the way SQLite does at open.
+	//
+	// pagerPagecount (pager.c:3279-3306): the size recorded by the WAL's last
+	// commit when the WAL holds one, the DB file's size otherwise. The WAL's
+	// size wins even when it is the smaller one: a commit that shrank the
+	// database (a backup into a larger destination) leaves the DB file long
+	// until a checkpoint truncates it, and taking the file's size here would
+	// let the first commit after open write the dropped pages back into the
+	// database.
+	//
+	// lockBtree (btree.c:3294-3298, 3401-3408): the page-1 size (read through
+	// the WAL above) is used when it is non-zero and the change-counter
+	// sentinel matches (FileChangeCount bytes 24-27 vs VersionValidFor bytes
+	// 92-95); otherwise the pager's count stands in. A trusted page-1 size
+	// larger than the pager's count is SQLITE_CORRUPT outside writable-schema
+	// mode, which any-store never enables. A non-zero VersionValidFor that
+	// mismatches was already rejected above, so "untrusted" here means a zero
+	// size or the legacy VersionValidFor==0.
+	nPageFile := fileNPage
+	walNPage := uint32(0)
+	if p.wal.index.maxFrame.Load() > 0 {
+		walNPage = p.wal.index.maxPage.Load()
+	}
+	if walNPage != 0 {
+		nPageFile = walNPage
+	}
+	if p.header.DatabaseSize != 0 && p.header.VersionValidFor == p.header.FileChangeCount {
+		if p.header.DatabaseSize > nPageFile {
 			return fmt.Errorf("%w: header DatabaseSize=%d exceeds file pages=%d wal=%d", ErrHeaderCorrupt, p.header.DatabaseSize, fileNPage, walNPage)
 		}
+		p.dbSize.Store(p.header.DatabaseSize)
+	} else {
+		p.dbSize.Store(nPageFile)
 	}
 
 	p.state.Store(int32(pagerOpen))
