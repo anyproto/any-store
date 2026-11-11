@@ -339,3 +339,156 @@ func TestTornWalIndexHeader_CheckpointBusyWhenWriteLockHeld(t *testing.T) {
 	require.NoError(t, db.Checkpoint(CheckpointTruncate))
 	require.Equal(t, tornHdrSeedRows, countKeys(t, db, "t1"))
 }
+
+// TestCheckpointResetUsesSharedBackfill: the survivor's process-local
+// nBackfill is left over from an earlier WAL generation and is larger than
+// the current log. A peer restarted the WAL and committed into it; a reader
+// pins slot 0, so the survivor's TRUNCATE cannot backfill anything. The
+// reset decision must read the shared nBackfill, as walCheckpoint does
+// (pInfo->nBackfill<pWal->hdr.mxFrame, wal.c:2341): judged on the stale local
+// count the log looks fully backfilled and the peer's commits are truncated
+// away.
+func TestCheckpointResetUsesSharedBackfill(t *testing.T) {
+	const env = "TEST_CKPT_SHARED_BACKFILL_DB_PATH"
+	const total = 210
+	if dbPath := os.Getenv(env); dbPath != "" {
+		// The peer: restart the WAL, commit a few frames into the new
+		// generation, die.
+		db, err := testOpen(t, dbPath, tornHdrOpts)
+		require.NoError(t, err)
+		require.NoError(t, db.Checkpoint(CheckpointTruncate))
+		dmsPutRange(t, db, "t1", 200, total)
+		os.Exit(0)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	db, err := testOpen(t, path, tornHdrOpts)
+	require.NoError(t, err)
+	closed := false
+	defer func() {
+		if !closed {
+			_ = db.Close()
+		}
+	}()
+	dmsPutRange(t, db, "t1", 0, 200)
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+	w := db.pager.wal
+	staleLocal := w.index.nBackfill.Load()
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCheckpointResetUsesSharedBackfill$", "-test.v", "-test.timeout=60s")
+	cmd.Env = append(os.Environ(), env+"="+path)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "peer process failed:\n%s", out)
+
+	hdr, valid := w.index.readHeader()
+	require.True(t, valid)
+	require.Greater(t, hdr.mxFrame, uint32(0))
+	require.Equal(t, uint32(0), w.index.shmNBackfill(), "setup: nothing of the new generation is backfilled")
+	require.Equal(t, staleLocal, w.index.nBackfill.Load(), "setup: the local nBackfill is the old generation's")
+	require.Greater(t, staleLocal, hdr.mxFrame, "setup: the stale local count must cover the new log")
+
+	// A reader on slot 0 (it began when the WAL was empty).
+	require.NoError(t, w.index.lock(lockRead0, lockShared))
+	w.busyHandler = nil
+	err = db.Checkpoint(CheckpointTruncate)
+	require.NoError(t, w.index.unlock(lockRead0, lockShared))
+	require.ErrorIs(t, err, ErrBusy, "nothing was backfilled: the checkpoint must not reset the WAL")
+
+	live, valid := w.index.readHeader()
+	require.True(t, valid)
+	require.Equal(t, hdr, live, "the wal-index header must be untouched")
+
+	closed = true
+	require.NoError(t, db.Close())
+	db2, err := testOpen(t, path, tornHdrOpts)
+	require.NoError(t, err)
+	defer func() { _ = db2.Close() }()
+	require.Equal(t, total, countKeys(t, db2, "t1"), "the peer's commits must survive")
+}
+
+// TestWalIndexFutureVersionRefused: both header copies agree and checksum,
+// but carry a wal-index version this build does not know. That is another
+// build's index, not a torn one: it is refused, never rebuilt
+// (walIndexReadHdr, wal.c:2722-2728: SQLITE_CANTOPEN with no recovery).
+func TestWalIndexFutureVersionRefused(t *testing.T) {
+	dir := t.TempDir()
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), tornHdrOpts)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	dmsPutRange(t, db, "t1", 0, tornHdrSeedRows)
+
+	w := db.pager.wal
+	hdr, valid := w.index.readHeader()
+	require.True(t, valid)
+	region, err := w.index.shm.region(0, true)
+	require.NoError(t, err)
+	var orig [walIndexHdrSize * 2]byte
+	copy(orig[:], region[:walIndexHdrSize*2])
+
+	future := hdr
+	future.iVersion = walVersion + 1
+	future.computeCksum()
+	var buf [walIndexHdrSize]byte
+	future.serialize(buf[:])
+	copy(region[walIndexHdrSize:walIndexHdrSize*2], buf[:])
+	copy(region[0:walIndexHdrSize], buf[:])
+	var planted [walIndexHdrSize * 2]byte
+	copy(planted[:], region[:walIndexHdrSize*2])
+
+	_, err = db.BeginRead()
+	require.ErrorIs(t, err, ErrWALVersion)
+	_, err = db.BeginWrite()
+	require.ErrorIs(t, err, ErrWALVersion)
+	require.ErrorIs(t, db.Checkpoint(CheckpointTruncate), ErrWALVersion)
+
+	var now [walIndexHdrSize * 2]byte
+	copy(now[:], region[:walIndexHdrSize*2])
+	require.Equal(t, planted, now, "an index of another version must not be rewritten")
+
+	// Put the real header back so the close-time checkpoint runs normally.
+	copy(region[:walIndexHdrSize*2], orig[:])
+	require.Equal(t, tornHdrSeedRows, countKeys(t, db, "t1"))
+}
+
+// TestTornWalIndexHeader_BusyRecoveryWhenRecoverLockHeld: the header is
+// invalid, the write lock is taken, and so is the RECOVER lock: another
+// connection is running recovery. The reader reports ErrBusyRecovery
+// (SQLITE_BUSY_RECOVERY, wal.c:3089-3094), which the begin paths hand to the
+// busy handler, instead of spinning in the retry loop.
+func TestTornWalIndexHeader_BusyRecoveryWhenRecoverLockHeld(t *testing.T) {
+	dir := t.TempDir()
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), tornHdrOpts)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	dmsPutRange(t, db, "t1", 0, tornHdrSeedRows)
+
+	w := db.pager.wal
+	require.NoError(t, w.index.lock(lockWrite, lockExclusive))
+	require.NoError(t, w.index.lock(lockRecover, lockExclusive))
+	tearHeaderCopy(t, db)
+
+	_, _, _, _, err = w.tryBeginReadHdr()
+	require.ErrorIs(t, err, ErrBusyRecovery)
+
+	// With no busy handler the begin returns it at once.
+	w.busyHandler = nil
+	start := time.Now()
+	_, err = db.BeginRead()
+	require.ErrorIs(t, err, ErrBusyRecovery)
+	require.Less(t, time.Since(start), 2*time.Second, "must not sit in the WAL retry loop")
+
+	// With a busy handler the begin waits for the recoverer: release the
+	// locks from the handler and the read goes through (it repairs the
+	// header itself, since the "recoverer" here did not).
+	var calls int
+	w.busyHandler = func(int) bool {
+		calls++
+		if calls == 1 {
+			_ = w.index.unlock(lockRecover, lockExclusive)
+			_ = w.index.unlock(lockWrite, lockExclusive)
+		}
+		return calls < 50
+	}
+	require.Equal(t, tornHdrSeedRows, countKeys(t, db, "t1"))
+	require.GreaterOrEqual(t, calls, 1)
+}

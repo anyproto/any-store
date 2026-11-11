@@ -763,10 +763,21 @@ func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) (uint32, error
 // make recycled frame numbers of the NEW WAL generation pass their old
 // snapshot's maxFrame bound.
 func (wi *walIndex) liveMinFrame() uint32 {
+	return wi.liveNBackfill() + 1
+}
+
+// liveNBackfill returns the current checkpoint frontier: the shared
+// WalCkptInfo.nBackfill in multi-process mode (SQLite reads pInfo->nBackfill
+// from shared memory every time), the process-local counter for heap shm.
+// The process-local wi.nBackfill mirror is refreshed only at some read and
+// write begins, so in multi-process mode it can be left over from an earlier
+// WAL generation and exceed the current log; no decision to reset or
+// truncate the WAL may be taken on it.
+func (wi *walIndex) liveNBackfill() uint32 {
 	if wi.inProcess {
-		return wi.nBackfill.Load() + 1
+		return wi.nBackfill.Load()
 	}
-	return wi.shmNBackfill() + 1
+	return wi.shmNBackfill()
 }
 
 // testInProcessReadSnapshotHook, when non-nil, runs in the in-process read
@@ -954,15 +965,38 @@ func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32, frameCksum,
 // the header is corrupt or the two copies don't match.
 // DRIFT: wal-index szPage neither encoded nor decoded (szPage transform absent) See docs/btree/NOTES.md#drift-90-wal-index-szpage-field-not-encoded-or-decoded
 func (wi *walIndex) readHeader() (WalIndexHdr, bool) {
+	hdr, state := wi.readHeaderState()
+	return hdr, state == walHdrValid
+}
+
+// walHdrState is what a read of the wal-index header found.
+type walHdrState int
+
+const (
+	// walHdrValid: both copies agree, checksum, and carry this build's
+	// wal-index version.
+	walHdrValid walHdrState = iota
+	// walHdrTorn: the copies disagree, are uninitialized, or fail the
+	// checksum (walIndexTryHdr returning non-zero, wal.c:2599-2608). A
+	// writer is between its two copies, or the header needs recovery.
+	walHdrTorn
+	// walHdrBadVersion: a consistent, checksummed header of another
+	// wal-index version. Not damage and never rebuilt: SQLite returns
+	// SQLITE_CANTOPEN for it without running recovery (wal.c:2722-2728).
+	walHdrBadVersion
+)
+
+// readHeaderState is readHeader that tells a torn header from one written
+// with an incompatible wal-index version.
+func (wi *walIndex) readHeaderState() (WalIndexHdr, walHdrState) {
 	region, err := wi.shm.region(0, false)
 	if err != nil {
-		return WalIndexHdr{}, false
+		return WalIndexHdr{}, walHdrTorn
 	}
 
 	if len(region) < walIndexHdrSize*2 {
-		return WalIndexHdr{}, false
+		return WalIndexHdr{}, walHdrTorn
 	}
-
 	// Read copy 1 (offset 0). Plain copy under readHeader's dual-copy +
 	// memcmp protocol, matching walIndexTryHdr (wal.c:2570-2620). The
 	// subsequent memcmp against copy 2 is the torn-read detector; per-word
@@ -987,30 +1021,30 @@ func (wi *walIndex) readHeader() (WalIndexHdr, bool) {
 	hdr1.serialize(buf1[:])
 	hdr2.serialize(buf2[:])
 	if buf1 != buf2 {
-		return WalIndexHdr{}, false
+		return WalIndexHdr{}, walHdrTorn
 	}
 
 	// Verify isInit flag
 	if hdr1.isInit != 1 {
-		return WalIndexHdr{}, false
+		return WalIndexHdr{}, walHdrTorn
 	}
 
 	// Verify checksum: recompute aCksum over bytes 0..39 and compare
 	saved := hdr1.aCksum
 	hdr1.computeCksum()
 	if hdr1.aCksum != saved {
-		return WalIndexHdr{}, false
+		return WalIndexHdr{}, walHdrTorn
 	}
 
 	// Reject a SHM wal-index header written with an incompatible/future
 	// format version. Matches SQLite's walIndexReadHdr gate
-	// (wal.c:2740-2742: iVersion != WALINDEX_MAX_VERSION -> SQLITE_CANTOPEN).
+	// (wal.c:2722-2728: iVersion != WALINDEX_MAX_VERSION -> SQLITE_CANTOPEN).
 	// any-store uses its own walVersion (1000000) instead of 3007000.
 	if hdr1.iVersion != walVersion {
-		return WalIndexHdr{}, false
+		return WalIndexHdr{}, walHdrBadVersion
 	}
 
-	return hdr1, true
+	return hdr1, walHdrValid
 }
 
 // walShmBarrier issues a full memory barrier for cross-process mmap'd memory.
@@ -1684,7 +1718,10 @@ func (w *wal) open() (err error) {
 //
 // A busy lock returns ErrBusy and repairs nothing; the caller retries or
 // reports busy, as SQLite's callers do with SQLITE_BUSY (walTryBeginRead
-// turns it into WAL_RETRY, wal.c:3070-3094; sqlite3WalCheckpoint returns it).
+// turns it into WAL_RETRY or SQLITE_BUSY_RECOVERY, wal.c:3070-3094;
+// sqlite3WalCheckpoint returns it). A consistent header of another wal-index
+// version is refused with an ErrWALVersion error and never rebuilt
+// (wal.c:2722-2728).
 // Every lock here is a non-blocking try-lock, so the write → checkpoint →
 // recover order cannot deadlock against checkpointWithMode's checkpoint →
 // write order: the loser sees ErrBusy.
@@ -1703,8 +1740,12 @@ func (w *wal) open() (err error) {
 // holds is left alone (recoverLocked).
 // DRIFT: recovery takes w.mu and resets process-shared writer state (one *wal serves all of a process's transactions) See docs/btree/NOTES.md#drift-2026-11-11-1-attached-wal-index-recovery
 func (w *wal) indexReadHdr(haveWriteLock, haveCkptLock bool) (WalIndexHdr, error) {
-	if hdr, valid := w.index.readHeader(); valid {
+	hdr, state := w.index.readHeaderState()
+	switch state {
+	case walHdrValid:
 		return hdr, nil
+	case walHdrBadVersion:
+		return WalIndexHdr{}, errWalIndexVersion
 	}
 
 	if !haveWriteLock {
@@ -1713,8 +1754,12 @@ func (w *wal) indexReadHdr(haveWriteLock, haveCkptLock bool) (WalIndexHdr, error
 		}
 		defer func() { _ = w.index.unlock(lockWrite, lockExclusive) }()
 	}
-	if hdr, valid := w.index.readHeader(); valid {
+	hdr, state = w.index.readHeaderState()
+	switch state {
+	case walHdrValid:
 		return hdr, nil
+	case walHdrBadVersion:
+		return WalIndexHdr{}, errWalIndexVersion
 	}
 
 	// walIndexRecover's locks (wal.c:1395-1401): everything between the
@@ -1753,6 +1798,12 @@ func (w *wal) indexReadHdr(haveWriteLock, haveCkptLock bool) (WalIndexHdr, error
 	}
 	return hdr, nil
 }
+
+// errWalIndexVersion is indexReadHdr's refusal of a wal-index written with
+// another wal-index version: the shared memory belongs to a build this one
+// cannot share it with. Matches ErrWALVersion, the same refusal for the WAL
+// file itself.
+var errWalIndexVersion = fmt.Errorf("%w: wal-index", ErrWALVersion)
 
 // adoptSHMState synchronizes the process-local WAL state (salts, nFrame,
 // checksums, header-on-disk flag) from an already-initialized SHM header.
@@ -1946,9 +1997,18 @@ func (w *wal) recoverLocked() error {
 		s1, s2                             = headerCksum1, headerCksum2
 		offset                             = int64(walHeaderSize)
 	)
+	// The loop is bounded by the file size taken above (SQLite: iLastFrame
+	// from sqlite3OsFileSize, wal.c:1467), so every frame it asks for lies
+	// inside the file and a failed read is an I/O error, not the end of the
+	// log. It aborts recovery with nothing published, as walIndexRecover
+	// keeps the read's rc (wal.c:1502-1503) and writes the header only under
+	// rc==SQLITE_OK (wal.c:1561-1566). Publishing the prefix read so far
+	// would present an earlier commit as the end of the log, and the next
+	// checkpoint would truncate the acknowledged commits behind it. Only a
+	// frame that fails validation (salts, pgno, checksum) ends the scan.
 	for offset+frameSize <= info.Size() {
 		if _, err := w.file.ReadAt(scratch, offset); err != nil {
-			break
+			return fmt.Errorf("btree: WAL recovery: read frame %d: %w", len(parsed)+1, err)
 		}
 		fr.deserialize(scratch[:walFrameSize])
 		if fr.salt1 != w.header.salt1 || fr.salt2 != w.header.salt2 {
@@ -2980,13 +3040,22 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame
 			return WalIndexHdr{}, 0, 0, 0, err
 		}
 		// A lock the repair needs is taken: a writer is publishing, or a
-		// sibling is already in recovery. SQLite wal.c:3070-3094: take
-		// WAL_RECOVER_LOCK shared as a fence against an in-progress
-		// recoverer, release it, and retry from the top of the loop.
-		if err := w.index.lock(lockRecover, lockShared); err == nil {
+		// sibling is in recovery. SQLite wal.c:3070-3094 probes
+		// WAL_RECOVER_LOCK shared to tell the two apart: if the probe
+		// succeeds no recovery is running, so release it and retry from the
+		// top of the loop (WAL_RETRY); if it is busy a recovery is in
+		// progress and the caller gets SQLITE_BUSY_RECOVERY, which goes to
+		// the busy handler instead of the short retry loop; any other probe
+		// error is returned.
+		probeErr := w.index.lock(lockRecover, lockShared)
+		if probeErr == nil {
 			_ = w.index.unlock(lockRecover, lockShared)
+			return WalIndexHdr{}, 0, 0, 0, errWALRetry
 		}
-		return WalIndexHdr{}, 0, 0, 0, errWALRetry
+		if errors.Is(probeErr, ErrBusy) {
+			return WalIndexHdr{}, 0, 0, 0, ErrBusyRecovery
+		}
+		return WalIndexHdr{}, 0, 0, 0, probeErr
 	}
 	mxFrame := hdr.mxFrame
 
@@ -3314,7 +3383,7 @@ func (w *wal) checkpointPassive(dbFile fileHandle, master *masterStore) error {
 	// committed frames we haven't backfilled. Callers (notably pager.close)
 	// then truncate the WAL and destroy the peer's data. See
 	// authoritativeMxFrame for rationale.
-	nb, mx := w.index.nBackfill.Load(), w.authoritativeMxFrame()
+	nb, mx := w.index.liveNBackfill(), w.authoritativeMxFrame()
 	if debugTrace {
 		trace("ckptPassive: completeness nBackfill=%d authoritativeMxFrame=%d localMxCommit=%d maxFrame=%d",
 			nb, mx, w.index.mxCommitFrame.LoadLocal(), w.index.maxFrame.Load())
@@ -3928,7 +3997,11 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 // completed a full checkpoint. For non-PASSIVE modes with an incomplete
 // backfill it returns ErrBusy (SQLite walCheckpoint, wal.c:2351-2356).
 func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler) error {
-	backfill := w.index.nBackfill.Load()
+	// The shared nBackfill, as walCheckpoint tests pInfo->nBackfill
+	// (wal.c:2341). This is reached without any backfill having run (nothing
+	// new, or reader slot 0 busy), when the process-local mirror may still
+	// hold a count from an earlier WAL generation: see liveNBackfill.
+	backfill := w.index.liveNBackfill()
 
 	// Use mxCommitFrame (not nFrame) so spilled uncommitted frames don't
 	// prevent WAL reset when all committed frames are checkpointed.

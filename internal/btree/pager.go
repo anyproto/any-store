@@ -967,8 +967,21 @@ func (p *pager) beginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot
 		p.mu.RUnlock()
 		return WalIndexHdr{}, 0, 0, 0, ErrCorrupt
 	}
-	hdr, maxFrame, minFrame, slot, err = p.wal.beginReadHdr()
-	if err != nil {
+	// ErrBusyRecovery: another connection is rebuilding the wal-index. It
+	// goes to the busy handler, which backs off until the recovery is done
+	// or its budget is spent, as sqlite3BtreeBeginTrans does for every
+	// SQLITE_BUSY flavour of a begin (btree.c:3735-3737). Recovery of a large
+	// WAL takes longer than the WAL retry loop waits.
+	for attempt := 0; ; attempt++ {
+		hdr, maxFrame, minFrame, slot, err = p.wal.beginReadHdr()
+		if err == nil {
+			break
+		}
+		if errors.Is(err, ErrBusyRecovery) {
+			if xBusy := p.wal.busyHandler; xBusy != nil && xBusy(attempt) {
+				continue
+			}
+		}
 		p.mu.RUnlock()
 		return WalIndexHdr{}, 0, 0, 0, err
 	}
@@ -2946,7 +2959,7 @@ func (p *pager) tryCheckpoint() error {
 	// trail a peer's recent commit; comparing nBackfill against a stale local
 	// cursor can return true prematurely and schedule a RESTART that races
 	// the peer's fresh frames. See docs/btree/NOTES.md §"Checkpoint mxFrame source fix".
-	if p.wal.index.nBackfill.Load() >= p.wal.authoritativeMxFrame() {
+	if p.wal.index.liveNBackfill() >= p.wal.authoritativeMxFrame() {
 		if err := p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil); err == nil {
 			// ~ sqlite3BackupRestart (backup.c:701-707) also applies to
 			// auto-checkpoint's best-effort restart.
