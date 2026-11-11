@@ -562,19 +562,29 @@ func (db *DB) IntegrityCheck() error {
 	return db.IntegrityCheckN(100)
 }
 
+// testIntegritySnapshotHook runs in IntegrityCheckN once its read
+// transaction is open and page 1 has been read. Nil outside tests.
+var testIntegritySnapshotHook func()
+
 // IntegrityCheckN is like IntegrityCheck but stops after maxErrors issues.
 // Pass 0 for unlimited.
 func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// Start a read transaction
-	walHdr, maxFrame, _, slot, err := db.pager.beginReadHdr()
+	walHdr, maxFrame, minFrame, slot, err := db.pager.beginReadHdr()
 	if err != nil {
 		return err
 	}
 	defer db.pager.endRead(slot)
 
 	// Use a private reader cache to avoid racing with the writer's cache.
+	// Its WAL floor is the snapshot's, as for every reader cache: on slot 0
+	// (minFrame = maxFrame+1) the check reads nothing from the WAL
+	// (walFindFrame, wal.c:3524-3527). A WAL restart needs only slots 1-4,
+	// so it can run under the check, and the live floor would let the next
+	// generation's frames, numbered from 1 again, into this snapshot.
 	cache := newPcache(int(db.pager.pageSize), 200, true)
 	cache.useSlab = db.pager.useSlab
+	cache.minFrame = minFrame
 	defer cache.destroy()
 
 	// Read page 1 to get the current header
@@ -588,6 +598,9 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 		return err
 	}
 	db.pager.releasePage(pg1)
+	if testIntegritySnapshotHook != nil {
+		testIntegritySnapshotHook()
+	}
 
 	nPages := hdr.DatabaseSize
 	if nPages == 0 {
