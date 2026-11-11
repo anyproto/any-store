@@ -141,3 +141,44 @@ func putKey(t *testing.T, db *DB, nsName string, key uint32, val []byte) {
 	require.NoError(t, tx.Put(ns, binary.BigEndian.AppendUint32(nil, key), val))
 	require.NoError(t, tx.Commit())
 }
+
+// useLegacyFormat makes the databases this test creates schema format 5
+// files: zero-padded magic and the index payload rule (997 bytes on 4 KiB
+// pages) on leaf cells. For tests of that rule, which existing files keep,
+// and for fixtures built around it.
+func useLegacyFormat(t testing.TB) {
+	t.Helper()
+	SetCreateLegacyFormatForTest(true)
+	t.Cleanup(func() { SetCreateLegacyFormatForTest(legacyFormatSuite) })
+}
+
+// useCurrentFormat makes the databases created from here on in this test
+// files of the current schema format, whatever the suite runs on.
+func useCurrentFormat(t testing.TB) {
+	t.Helper()
+	SetCreateLegacyFormatForTest(false)
+	t.Cleanup(func() { SetCreateLegacyFormatForTest(legacyFormatSuite) })
+}
+
+// legacyFormatSuite is set when the whole suite runs on schema format 5
+// (ANYSTORE_TEST_LEGACY_FORMAT=1, see TestMain).
+var legacyFormatSuite bool
+
+// skipInLegacyFormatSuite skips a test that is about schema format 6.
+func skipInLegacyFormatSuite(t testing.TB) {
+	t.Helper()
+	if legacyFormatSuite {
+		t.Skip("schema format 6 only")
+	}
+}
+
+// TestMain runs the suite on schema format 5 files when
+// ANYSTORE_TEST_LEGACY_FORMAT=1, so the rule existing files keep stays covered
+// by every test, not only the ones that pin it.
+func TestMain(m *testing.M) {
+	if os.Getenv("ANYSTORE_TEST_LEGACY_FORMAT") == "1" {
+		legacyFormatSuite = true
+		SetCreateLegacyFormatForTest(true)
+	}
+	os.Exit(m.Run())
+}

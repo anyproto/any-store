@@ -21,6 +21,13 @@ var (
 	// (any-store is always WAL, so this always applies).
 	ErrBackupPageSizeMismatch = errors.New("btree: backup source and destination must have equal page size")
 
+	// ErrBackupFormatMismatch — the destination's on-disk format differs from
+	// the source's. A backup copies the source's pages, page 1 included, so
+	// it would turn the destination into a file of the source's format under
+	// handles and snapshots that read it by the old one. Create the
+	// destination with Options.SchemaFormat set to the source's SchemaFormat.
+	ErrBackupFormatMismatch = errors.New("btree: backup source and destination must have the same schema format")
+
 	// ErrBackupDstBusy — ~ checkReadTransaction (backup.c:124–130)
 	// ("destination database is in use"). Raised when dst already has an
 	// open read/write transaction at BackupInit time.
@@ -102,6 +109,11 @@ func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 	// always WAL, so a size mismatch is always SQLITE_READONLY-equivalent.
 	if dst.PageSize() != src.PageSize() {
 		return nil, ErrBackupPageSizeMismatch
+	}
+
+	// DRIFT: SQLite's backup turns the destination into the source's file format; here the two must already agree, because the leaf payload rule is held per open file, not per page. See docs/btree/NOTES.md#drift-2026-11-11-2-backup-refuses-a-destination-of-another-schema-format
+	if dst.pager.tableLeaf.Load() != src.pager.tableLeaf.Load() {
+		return nil, ErrBackupFormatMismatch
 	}
 
 	return &Backup{
@@ -316,6 +328,7 @@ func (b *Backup) PageCount() uint32 {
 // Caller holds b.mu.
 // DRIFT: backup empty-source (nSrcPage==0 -> NewDb) path missing; truncateTo(0) errors See docs/btree/NOTES.md#drift-41-backup-empty-source-finalization-path-missing
 // DRIFT: backup finalize omits SetVersion(2) for WAL dest (page-1 bytes 18/19) See docs/btree/NOTES.md#drift-42-backup-finalize-omits-setversion-for-wal-destination
+// DRIFT: the in-memory header is reloaded from the copied page 1 and written back at commit; SQLite keeps the copied page image and patches fields in it. See docs/btree/NOTES.md#drift-2026-11-11-6-backup-reloads-the-header-from-the-copied-page-1
 func (b *Backup) finalize(nSrcPage uint32) error {
 	// 1. Re-sync the in-memory header from the source page-1 bytes, then
 	// bump the dst schema cookie. ~ sqlite3BtreeUpdateMeta writes meta

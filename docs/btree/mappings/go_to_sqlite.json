@@ -87,6 +87,12 @@
     ],
     "note": "editPage replacement (deviation 2): wholesale parent rebuild subsuming put4byte (btree.c:8759) and per-divider insertCell (btree.c:8888)"
   },
+  "balance.go:*btree.splitParentThreeWays": {
+    "sqlite": [
+      "btree.c:balance_nonroot"
+    ],
+    "note": "parent rewrite that needs three pages; SQLite balances the parent instead"
+  },
   "balance.go:*cellArray.cachedCellSize": {
     "sqlite": [
       "btree.c:cachedCellSize",
@@ -374,6 +380,10 @@
     "sqlite": [],
     "note": ""
   },
+  "btree.go:*btree.pathToChild": {
+    "sqlite": [],
+    "note": "re-descent to the parent of a page after the tree above was rewritten (three-way parent split)"
+  },
   "btree.go:*btree.rebuildInteriorPage": {
     "sqlite": [
       "btree.c:defragmentPage",
@@ -464,6 +474,10 @@
     "sqlite": [],
     "note": ""
   },
+  "btree.go:interiorCellPrefixSizes": {
+    "sqlite": [],
+    "note": "helper for the interior split index"
+  },
   "btree.go:interiorCellSize": {
     "sqlite": [
       "btree.c:cellSizePtr"
@@ -515,6 +529,13 @@
   "btree.go:leafFullKey": {
     "sqlite": [
       "btree.c:accessPayload"
+    ],
+    "note": ""
+  },
+  "btree.go:leafFullValue": {
+    "sqlite": [
+      "btree.c:accessPayload",
+      "btree.c:sqlite3BtreePayload"
     ],
     "note": ""
   },
@@ -805,6 +826,10 @@
       "pager.c:sqlite3PagerFilename"
     ],
     "note": ""
+  },
+  "db.go:*DB.SchemaFormat": {
+    "sqlite": [],
+    "note": "accessor"
   },
   "db.go:*DB.SetClosing": {
     "sqlite": [],
@@ -1421,6 +1446,12 @@
     ],
     "note": ""
   },
+  "page.go:leafLimitsOf": {
+    "sqlite": [
+      "btree.c:decodeFlags"
+    ],
+    "note": "leaf rule by schema format instead of by page flag"
+  },
   "page.go:localPayloadSize": {
     "sqlite": [
       "btree.c:btreePayloadToLocal"
@@ -1445,6 +1476,12 @@
       "util.c:sqlite3PutVarint"
     ],
     "note": "putVarint64 is the static encoder; sqlite3PutVarint the public wrapper (util.c)"
+  },
+  "page.go:tableLeafLimits": {
+    "sqlite": [
+      "btree.c:lockBtree"
+    ],
+    "note": "BtShared.maxLeaf / minLeaf"
   },
   "page.go:varintSize": {
     "sqlite": [
@@ -1557,6 +1594,12 @@
       "pager.c:sqlite3PagerBegin"
     ],
     "note": ""
+  },
+  "pager.go:*pager.checkRefreshedHeader": {
+    "sqlite": [
+      "btree.c:lockBtree"
+    ],
+    "note": "format checks on a header reloaded under an open handle"
   },
   "pager.go:*pager.checkpointWithMode": {
     "sqlite": [
@@ -1703,7 +1746,7 @@
     "sqlite": [
       "btree.c:decodeFlags"
     ],
-    "note": "leaf rule for a usable size read by the caller (integrity check)"
+    "note": "the file's leaf rule for a given usable size"
   },
   "pager.go:*pager.open": {
     "sqlite": [
@@ -1843,6 +1886,12 @@
     ],
     "note": ""
   },
+  "pager.go:*pager.setLeafRule": {
+    "sqlite": [
+      "btree.c:decodeFlags"
+    ],
+    "note": "records the file's leaf rule from its schema format"
+  },
   "pager.go:*pager.takeCellBuf": {
     "sqlite": [],
     "note": ""
@@ -1882,6 +1931,10 @@
       "btree.c:fillInCell"
     ],
     "note": ""
+  },
+  "pager.go:SetCreateLegacyFormatForTest": {
+    "sqlite": [],
+    "note": "test hook: create schema format 5 files"
   },
   "pager.go:newPager": {
     "sqlite": [

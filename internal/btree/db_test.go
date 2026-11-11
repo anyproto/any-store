@@ -92,6 +92,7 @@ func TestOpen_PageSizeNotPowerOf2(t *testing.T) {
 }
 
 func TestOpen_OldSchemaFormat(t *testing.T) {
+	useLegacyFormat(t)
 	// Create a valid database, then corrupt the schema format field
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
@@ -145,6 +146,7 @@ func readOnDiskSchemaFormat(t *testing.T, path string) uint32 {
 //     value 0 is intentionally allowed through (mirrors SQLite normalize-0-to-1),
 //     and the current value 5 must continue to open.
 func TestSchemaFormat_Drift_WriteAndGate(t *testing.T) {
+	useLegacyFormat(t)
 	// --- Invariant 1: production WRITES SchemaFormat == 5 on disk ---
 	// Open a REAL new DB through the normal Open/initNewDB path (we do NOT
 	// write the header byte ourselves), persist it to the main file via a
@@ -775,6 +777,7 @@ func TestFreeTreePages_InteriorNodes(t *testing.T) {
 // Cover the overflow path where key spills into overflow
 
 func TestAppendValue_LargeKeyOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDB(t)
 
 	tx, err := db.BeginWrite()
@@ -1806,6 +1809,7 @@ func TestDeleteNamespace_InteriorMasterBtree(t *testing.T) {
 }
 
 func TestFreeTreePages_InteriorAndOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDB(t)
 
 	// Create namespace with many large values — both interior pages AND overflow chains

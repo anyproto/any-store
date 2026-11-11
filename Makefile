@@ -1,4 +1,4 @@
-.PHONY: build test cover deps
+.PHONY: build test test-legacy-format cover deps
 SHELL=/bin/bash
 export GOPRIVATE=github.com/anyproto
 export PATH:=deps:$(PATH)
@@ -17,6 +17,11 @@ build:
 
 test:
 	go test ./... --cover $(TAGS)
+
+# the same suites on schema format 5 files, the on-disk format of every release
+# before v2.5.0; existing databases keep it
+test-legacy-format:
+	ANYSTORE_TEST_LEGACY_FORMAT=1 go test ./internal/btree/ . ./test/ $(TAGS)
 
 # statement coverage of the library, counting the test/ suites that drive it
 # from outside the package

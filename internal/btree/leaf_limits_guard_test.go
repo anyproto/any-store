@@ -27,6 +27,8 @@ func TestLeafCodeTakesLimitsFromPager(t *testing.T) {
 		"indexLimits":                       true,
 		"interiorLocalPayloadSize":          true,
 		"pager.leafLimitsFor":               true,
+		"tableLeafLimits":                   true,
+		"leafLimitsOf":                      true,
 		"parseInteriorCell":                 true,
 		"interiorCellSizeWithOverflow":      true,
 		"interiorFullKey":                   true,

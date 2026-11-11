@@ -34,11 +34,12 @@ type integrityChecker struct {
 	pager       *pager
 	cache       *pcache // private reader cache (avoids racing with writerCache)
 	walMaxFrame uint32
-	nPages      uint32   // total database pages
-	pageRef     []byte   // bit-packed: 1 bit per page
-	usableSize  int      // pageSize - reservedSpace
-	maxErrors   int      // stop after this many errors
-	errors      []string // accumulated error messages
+	nPages      uint32        // total database pages
+	pageRef     []byte        // bit-packed: 1 bit per page
+	usableSize  int           // pageSize - reservedSpace
+	leafLim     payloadLimits // leaf-cell rule of the snapshot's schema format
+	maxErrors   int           // stop after this many errors
+	errors      []string      // accumulated error messages
 
 	// Context for error messages
 	treeName string // current tree name (e.g., "master" or namespace name)
@@ -289,6 +290,8 @@ func (ic *integrityChecker) keyInBounds(key, lower, upper []byte, context string
 // strict cell ordering check this enforces
 //
 //	max(subtree[child i]) < D_i <= min(subtree[child i+1]).
+//
+// DRIFT: child depths are compared with the first child's, not with the previous one's. See docs/btree/NOTES.md#drift-2026-06-25-11-checktreepage-anchors-child-depth-comparison-on-the-first-child-and-ne
 func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLeafCell func(key, value []byte)) int {
 	if ic.tooManyErrors() {
 		return 0
@@ -316,7 +319,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 
 	nCells := int(pg.header.cellCount)
 	isLeaf := pg.header.isLeaf()
-	leafLim := ic.pager.leafLimitsFor(ic.usableSize)
+	leafLim := ic.leafLim
 
 	// prevDivider tracks the divider key to the LEFT of the next child to be
 	// recursed into (the inclusive lower bound for that child). It starts at
@@ -355,8 +358,13 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 		cellOff := int(pg.getCellOffset(i))
 
 		// Validate cell pointer is within the cell content area
-		if cellOff < contentOffset || cellOff > ic.usableSize-4 {
-			ic.report("%s cell %d: offset %d out of range %d..%d", context, i, cellOff, contentOffset, ic.usableSize-4)
+		// SQLite bounds the offset by usableSize-4 (btree.c:10954), its minimum
+		// cell size. any-store's leaf cells have no such floor (a one-byte key
+		// with an empty value takes three bytes), so only the page end bounds
+		// the offset here; the cell's own extent is checked below.
+		// DRIFT: cell offsets up to usableSize-1 are accepted, because leaf cells smaller than four bytes exist. See docs/btree/NOTES.md#drift-26-leaf-cell-size-missing-four-byte-minimum-clamp
+		if cellOff < contentOffset || cellOff >= ic.usableSize {
+			ic.report("%s cell %d: offset %d out of range %d..%d", context, i, cellOff, contentOffset, ic.usableSize-1)
 			doCoverageCheck = false
 			continue
 		}
@@ -633,6 +641,7 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 		pageRef:     make([]byte, nPages/8+1),
 		nPages:      nPages,
 		usableSize:  int(db.pager.pageSize) - int(hdr.ReservedSpace),
+		leafLim:     leafLimitsOf(hdr.SchemaFormat, int(db.pager.pageSize)-int(hdr.ReservedSpace)),
 		maxErrors:   maxErrors,
 	}
 

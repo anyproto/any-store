@@ -147,6 +147,7 @@ func (bt *btree) leafLimits() payloadLimits {
 }
 
 // cellData represents a parsed cell from a B-tree page.
+// DRIFT: one kind of tree for documents and indexes: blob keys, a value on the leaf, index page types. See docs/btree/NOTES.md#old-drift-index-only-btrees-no-intkey-table
 type cellData struct {
 	key        []byte
 	value      []byte
@@ -169,6 +170,7 @@ func parseLeafCell(data []byte, offset int) (cellData, int, error) {
 // c.key may be a prefix (not the full key). Callers needing the full key must
 // check c.overflowPg != 0 and use leafFullKey.
 // DRIFT: leaf cell-size computation omits SQLite's `if nSize<4 nSize=4` clamp See docs/btree/NOTES.md#drift-26-leaf-cell-size-missing-four-byte-minimum-clamp
+// DRIFT: payload lengths are capped at maxPayloadAlloc, not checked against the database size. See docs/btree/NOTES.md#old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation
 func parseLeafCellWithSize(data []byte, offset int, lim payloadLimits) (cellData, int, error) {
 	var c cellData
 	pos := offset
@@ -226,6 +228,14 @@ func parseLeafCellWithSize(data []byte, offset int, lim payloadLimits) (cellData
 		}
 		c.overflowPg = binary.BigEndian.Uint32(data[pos : pos+4])
 		pos += 4
+		// The payload does not fit the page, so a chain must follow. Page 0
+		// is no page: callers tell an overflowing cell by overflowPg != 0,
+		// and would hand back the local part as if it were the whole.
+		// accessPayload reports the same state when the chain ends with
+		// payload left to read (btree.c:5309-5311).
+		if c.overflowPg == 0 {
+			return c, 0, ErrCorrupt
+		}
 	} else {
 		if int(keyLen) < 0 || pos+int(keyLen) > dataLen {
 			return c, 0, ErrCorrupt
@@ -351,34 +361,73 @@ func interiorSplitPoint(cells []cellData, usableSize int) int {
 // against their pages. The 2/3 target alone looks only at the left page: when
 // the cells differ much in size (a balance below can replace short dividers
 // with long ones) it can leave more on the right than a page holds. The split
-// index nearest the target whose halves both fit is returned; when none does,
-// the target index is returned and the rebuild of the over-full half reports it.
+// index nearest the target whose halves both fit is returned; ok is false when
+// no index does and the cells need three pages.
 //
 // The left half is rebuilt in the page being split, which on page 1 has
 // leftHdrOff fewer bytes; the right half goes to a fresh page.
-func interiorSplitPointFitting(cells []cellData, usableSize, leftHdrOff int) int {
-	mid := interiorSplitPoint(cells, usableSize)
+func interiorSplitPointFitting(cells []cellData, usableSize, leftHdrOff int) (mid int, ok bool) {
+	mid = interiorSplitPoint(cells, usableSize)
 	n := len(cells)
 	if n <= 2 {
-		return mid
+		return mid, true
 	}
-	// before[i] is the page space taken by cells[:i], pointers included.
-	before := make([]int, n+1)
-	for i, c := range cells {
-		before[i+1] = before[i] + interiorCellSizeWithOverflow(c.key, usableSize) + 2
-	}
+	before := interiorCellPrefixSizes(cells, usableSize)
 	fits := func(i int) bool {
 		return before[i] <= usableSize-12-leftHdrOff && before[n]-before[i+1] <= usableSize-12
 	}
 	for d := 0; d < n; d++ {
 		if i := mid + d; i <= n-2 && fits(i) {
-			return i
+			return i, true
 		}
 		if i := mid - d; i >= 1 && fits(i) {
-			return i
+			return i, true
 		}
 	}
-	return mid
+	return mid, false
+}
+
+// interiorCellPrefixSizes returns before, where before[i] is the page space
+// taken by cells[:i], cell pointers included.
+func interiorCellPrefixSizes(cells []cellData, usableSize int) []int {
+	before := make([]int, len(cells)+1)
+	for i, c := range cells {
+		before[i+1] = before[i] + interiorCellSizeWithOverflow(c.key, usableSize) + 2
+	}
+	return before
+}
+
+// pathToChild descends from the root by key until it meets the interior page
+// whose child is childPgno, and returns the path to that page, its entry last.
+// The balance paths carry their path down from Put or Delete; this is for the
+// one place that needs a parent again after the tree above it was rewritten.
+// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
+func (bt *btree) pathToChild(key []byte, childPgno uint32) ([]pathEntry, error) {
+	var path []pathEntry
+	pg, err := bt.getPage(bt.rootPage)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		if !pg.header.isInterior() {
+			bt.pager.releasePage(pg)
+			return nil, ErrCorrupt
+		}
+		nCell := pg.header.cellCount
+		child, idx, serr := bt.searchInterior(pg, key)
+		pgno := pg.pgno
+		bt.pager.releasePage(pg)
+		if serr != nil {
+			return nil, serr
+		}
+		path = append(path, pathEntry{pgno: pgno, cellIdx: uint16(idx), nCell: nCell})
+		if child == childPgno {
+			return path, nil
+		}
+		if pg, err = bt.descendChild(child); err != nil {
+			return nil, err
+		}
+	}
 }
 
 // leafCellSizeWithOverflow returns the in-page size of a leaf cell, accounting for overflow.
@@ -616,6 +665,11 @@ func searchLeafWithOverflow(pg *page, key []byte, lim payloadLimits, p *pager, w
 		}
 		payloadStart := pos + vn
 
+		// The same bounds as parseLeafCellWithSize, before the lengths are
+		// added or used as slice bounds.
+		if keyLen > maxPayloadAlloc || valLen > maxPayloadAlloc {
+			return 0, false, ErrCorrupt
+		}
 		totalPayload := int(keyLen) + int(valLen)
 		var cellKey []byte
 		if totalPayload <= maxLocal {
@@ -1127,6 +1181,7 @@ func (bt *btree) searchInterior(pg *page, key []byte) (childPgno uint32, cellIdx
 // AppendValue looks up a key in the B-tree and appends its value to buf.
 // The returned slice is safe to retain after the page is released.
 // Pass nil for buf to allocate a new slice (equivalent to Get).
+// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 	maxFrame, slot, err := bt.pager.beginRead()
 	if err != nil {
@@ -1279,6 +1334,7 @@ func (bt *btree) Has(key []byte) (bool, error) {
 const maxKeySize = 1 << 30 // 1GB
 
 // Put inserts or updates a key-value pair in the B-tree.
+// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 func (bt *btree) Put(key, value []byte) error {
 	// Validate key size. Both leaf and interior cells support overflow,
 	// so this is just a sanity limit to prevent absurd allocations.
@@ -1347,6 +1403,8 @@ func (bt *btree) Put(key, value []byte) error {
 }
 
 // insertIntoLeafWithPath inserts into a leaf page, using path for split propagation.
+// DRIFT: the fit check counts the new cell's pointer twice (hdrSize already has its slot, then cellSize+2). See docs/btree/NOTES.md#drift-2026-11-10-2-leaf-insert-fit-check-counts-the-cell-pointer-twice
+// DRIFT: freed cell space is tracked as fragment bytes and reclaimed by a rebuild, not kept on a freeblock chain. See docs/btree/NOTES.md#old-drift-no-freeblock-chain-fragbytes-rebuild
 func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []pathEntry) error {
 	idx, found, serr := bt.searchLeaf(pg, key)
 	if serr != nil {
@@ -1477,6 +1535,7 @@ func (bt *btree) insertLeafCellAt(pg *page, idx int, key, value []byte) error {
 // using the path for parent propagation. This mirrors SQLite's approach in
 // sqlite3BtreeInsert (btree.c): dropCell + insertCell, then balance() if the
 // page overflows.
+// DRIFT: space left by a smaller replacement is tracked as fragment bytes, not a freeblock. See docs/btree/NOTES.md#old-drift-no-freeblock-chain-fragbytes-rebuild
 func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []pathEntry) error {
 	lim := bt.leafLimits()
 
@@ -1559,7 +1618,10 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []pat
 	defer bt.pager.recycleCellSlice(cells)
 	defer bt.pager.recycleCellBuf(cellBuf)
 	if cells[idx].overflowPg != 0 {
-		_ = bt.pager.freeOverflowChain(cells[idx].overflowPg)
+		// clearCellOverflow's failure fails the update (btree.c:7020-7026).
+		if err := bt.pager.freeOverflowChain(cells[idx].overflowPg); err != nil {
+			return err
+		}
 	}
 	cells[idx] = cellData{key: key, value: value} // rawCell=nil → will be encoded fresh
 
@@ -1738,6 +1800,7 @@ func (bt *btree) cellFullKey(c *cellData) ([]byte, error) {
 // For cells with overflow keys the full key is read from overflow pages and the
 // overflow chain is freed (the caller will rebuild the page); such keys are
 // freshly allocated and do not alias buf.
+// DRIFT: an overflowing divider is read in full and its chain freed here, then rewritten by rebuildInteriorPage; SQLite moves the raw cell and leaves the chain alone. See docs/btree/NOTES.md#drift-2026-11-11-3-interior-collection-rewrites-overflowing-divider-chains
 func (bt *btree) collectInteriorCellsKeepBuf(pg *page) ([]cellData, []byte, error) {
 	n := int(pg.header.cellCount)
 	// Draw the descriptor slice from the pager free-list (SQLite apCell[]); this
@@ -1774,7 +1837,14 @@ func (bt *btree) collectInteriorCellsKeepBuf(pg *page) ([]cellData, []byte, erro
 
 	for i := range n {
 		off := pg.getCellOffset(i)
-		cells[i], _, _ = parseInteriorCell(pg.data, int(off), usable)
+		var perr error
+		cells[i], _, perr = parseInteriorCell(pg.data, int(off), usable)
+		if perr != nil {
+			// A malformed cell is corruption, not an empty divider to write
+			// back (rebuildPage checks its source cells, btree.c:7663-7669).
+			bt.pager.recycleCellBuf(buf)
+			return nil, nil, perr
+		}
 		if cells[i].overflowPg != 0 {
 			// Read full key from overflow pages
 			pos := int(off) + 4
@@ -1794,7 +1864,10 @@ func (bt *btree) collectInteriorCellsKeepBuf(pg *page) ([]cellData, []byte, erro
 				bt.pager.recycleCellBuf(buf)
 				return nil, nil, err
 			}
-			_ = bt.pager.freeOverflowChain(overflowPg)
+			if err := bt.pager.freeOverflowChain(overflowPg); err != nil {
+				bt.pager.recycleCellBuf(buf)
+				return nil, nil, err
+			}
 			cells[i].key = fullKey
 			cells[i].overflowPg = 0
 		} else {
@@ -2026,6 +2099,7 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 // matching SQLite's balance() do-loop (btree.c:9123).
 // Ports balance_quick's `nCell==0 -> CORRUPT` over-full-empty-page guard
 // (btree.c:8020).
+// DRIFT: the divider is the new key (first key of the right page), not the largest key of the left page. See docs/btree/NOTES.md#old-drift-balance-quick-first-key-divider
 func (bt *btree) splitLeafRightmostAppend(pg *page, key, value []byte, path []pathEntry) error {
 	// Corruption guard. Mirror balance_quick's first statement (btree.c:8020,
 	// added for dbfuzz001.test): an over-full page reporting zero cells is
@@ -2167,6 +2241,7 @@ func (bt *btree) splitRootLeafAndInsert(pg *page, idx int, key, value []byte) er
 // turns the root into an interior page with no cells whose right child is that
 // page. Port of balance_deeper (btree.c:9034-9079) for a leaf root; the caller
 // balances the child next. The root keeps its pin, the child's is released.
+// DRIFT: no anotherValidCursor check before deepening the root (btree.c:9135); cursors on the tree are saved by Put instead. See docs/btree/NOTES.md#drift-34-splitroot-missing-anothervalidcursor-corruption-guard
 func (bt *btree) balanceDeeper(root *page) error {
 	childPg, err := bt.pager.allocatePage()
 	if err != nil {
@@ -2252,6 +2327,8 @@ func (bt *btree) insertSepIntoAncestor(leftPgno uint32, key []byte, rightPgno ui
 // Invariant: 0 <= insertIdx <= parentPg.header.cellCount. When
 // insertIdx == cellCount we descended via rightChild; when less, we
 // descended via the cell at that index.
+// DRIFT: the fit check counts the new divider's pointer twice, as the leaf one does. See docs/btree/NOTES.md#drift-2026-11-10-2-leaf-insert-fit-check-counts-the-cell-pointer-twice
+// DRIFT: a full ROOT interior page is split two ways here, not balanced. See docs/btree/NOTES.md#drift-29-root-interior-overflow-uses-2-way-split-not-balance-deeper-p
 func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []byte, rightPgno uint32, insertIdx int, parentPath []pathEntry) error {
 	// Insert separator into parent interior page
 	n := int(parentPg.header.cellCount)
@@ -2385,7 +2462,9 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 	if parentPg.pgno == 1 {
 		rootHdrOff = dbHeaderSize
 	}
-	midIdx := interiorSplitPointFitting(cells, bt.usablePageSize(), rootHdrOff)
+	// One new cell on a full page: the half past the cell that crosses the
+	// end of the left page is smaller than that one cell, so a split fits.
+	midIdx, _ := interiorSplitPointFitting(cells, bt.usablePageSize(), rootHdrOff)
 	leftCells := cells[:midIdx]
 	sepCellKey := bytes.Clone(cells[midIdx].key)
 	rightCells := cells[midIdx+1:]
@@ -2487,6 +2566,9 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 //
 // When fragmentation exceeds the threshold (60 bytes, matching SQLite's limit),
 // a full rebuild is triggered to defragment the page.
+// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
+// DRIFT: the under-full trigger counts fragment bytes as used. See docs/btree/NOTES.md#drift-37-delete-rebalance-underfull-trigger-counts-fragbytes-as-used
+// DRIFT: a dropped cell's space becomes fragment bytes, not a freeblock. See docs/btree/NOTES.md#old-drift-no-freeblock-chain-fragbytes-rebuild
 func (bt *btree) Delete(key []byte) error {
 	// The cursors open on this tree are saved first (sqlite3BtreeDelete →
 	// saveAllCursors, btree.c:9917): the delete rewrites the leaf they pin in
@@ -2651,7 +2733,7 @@ func (bt *btree) Delete(key []byte) error {
 
 	// Empty leaf (0 cells) on a non-root page: keep the existing free-empty-leaf
 	// fast path. This is the any-store equivalent of balance_nonroot freeing a
-	// 0-cell page as surplus (btree.c:9000-9004), reached without a gather.
+	// 0-cell page as surplus (btree.c:8982-8986), reached without a gather.
 	if wpg.header.cellCount == 0 && wpg.pgno != bt.rootPage {
 		bt.pager.releasePage(wpg)
 		if err := bt.pager.freePage(leafPgno); err != nil {
@@ -2774,6 +2856,13 @@ func (bt *btree) completeMergeUpward(pgno uint32, parentPath []pathEntry) error 
 		return err
 	}
 
+	// The root became an empty leaf: its last child was emptied and removed
+	// (removeChildFromParent). Nothing is left to complete.
+	if pg.header.isLeaf() {
+		bt.pager.releasePage(pg)
+		return nil
+	}
+
 	nCell := int(pg.header.cellCount)
 
 	// (b) Balance-shallower — ROOT ONLY (SQLite gates on isRoot, btree.c:8942). A
@@ -2870,6 +2959,7 @@ func (bt *btree) interiorUnderfull(pg *page) bool {
 
 // tryMergeLeaf attempts to merge a leaf page with a sibling.
 // Only merges if both pages' content fits in a single page.
+// DRIFT: a two-leaf merge with no production caller; deletes rebalance through balanceNonroot. See docs/btree/NOTES.md#old-drift-balance-nonroot-3sibling-index-btree-deviations
 func (bt *btree) tryMergeLeaf(leafPgno uint32, path []pathEntry) error {
 	if len(path) == 0 {
 		return nil
@@ -3179,10 +3269,22 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []pathEntry) error
 			rightChild = cells[len(cells)-1].leftChild
 			cells = cells[:len(cells)-1]
 		} else {
-			// 0-cell parent whose only child (rightChild) is the just-freed
+			// A zero-cell ROOT whose only child was just emptied and freed: the
+			// tree holds nothing. Only page 1 keeps a zero-cell root (a child too
+			// full to copy back, see collapseSingleChild), and a child of one
+			// page-sized cell goes from full to empty in one delete, with no
+			// balance in between to collapse it. SQLite reaches the same state
+			// through balance-shallower copying the empty child into the root
+			// (btree.c:8942-8967).
+			if len(path) == 1 && parentPgno == bt.rootPage {
+				err = bt.rebuildLeafPage(parentPg, nil)
+				bt.pager.releasePage(parentPg)
+				return err
+			}
+			// 0-cell NON-ROOT parent whose only child (rightChild) is the just-freed
 			// childPgno. SQLite's balance() treats this configuration as an
 			// asserted impossibility (a non-root single-child interior pointing
-			// at a freed page never persists: btree.c:9000-9004 frees surplus
+			// at a freed page never persists: btree.c:8982-8986 frees surplus
 			// apOld pages only after editPage re-homes their cells, and the
 			// shallower collapse is isRoot-gated, btree.c:8942). Persisting the
 			// no-op would leave rightChild dangling at the freed page and
@@ -3266,6 +3368,7 @@ func (bt *btree) finishParentRemoval(parentPg *page, cells []cellData, rightChil
 // collapse is skipped (SQLite's `hdrOffset<=nFree` gate, btree.c:8942): parentPg
 // is rebuilt as a 0-cell interior whose rightChild is childPgno — page 1's legal
 // "virtual root" shape — and the child is NOT freed.
+// DRIFT: on page 1 the child's contiguous gap is compared with the header size, without defragmenting; SQLite compares nFree. See docs/btree/NOTES.md#drift-2026-11-11-4-root-collapse-tests-the-contiguous-gap-only
 func (bt *btree) collapseSingleChild(parentPg *page, childPgno uint32) error {
 	childPg, err := bt.getPage(childPgno)
 	if err != nil {
@@ -3424,6 +3527,7 @@ const btCursorMaxDepth = 20
 // a page or a schema fault ends the cursor (cursorFault); one that fails on
 // the cursor's ctx leaves it where it stood. A cursor is closed inside the
 // transaction that opened it.
+// DRIFT: a read-only cursor with two states, saved and restored around writes. See docs/btree/NOTES.md#old-drift-readonly-two-state-cursor
 type Cursor struct {
 	// ctx is polled once per leaf the cursor leaves (Next, Previous); nil
 	// polls nothing. See ReadTx.NewCursorContext.
@@ -3955,6 +4059,7 @@ func (c *Cursor) SeekExact(key []byte) error {
 // AppendValueByKey seeks an exact key and appends its value bytes into buf.
 // It combines seek, exact-match check, and value extraction in one path,
 // allowing cursor-based callers to avoid extra key/value parsing work.
+// DRIFT: an API with no SQLite counterpart. See docs/btree/NOTES.md#drift-115-cursor-skip-and-appendvaluebykey-new-apis-beyond-sqlite-surf
 func (c *Cursor) AppendValueByKey(key []byte, buf []byte) ([]byte, error) {
 	if err := c.SeekNear(key); err != nil {
 		return buf, err

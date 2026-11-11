@@ -84,6 +84,7 @@ func TestFinal_InsertIntoLeafDefragPath(t *testing.T) {
 // When inserting a leaf cell that needs overflow pages via insertLeafCellAt
 
 func TestFinal_InsertLeafCellAtOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	p := tempPagerWithPageSize(t, 512)
 	bt := initLeafBtree(t, p)
 
@@ -305,6 +306,7 @@ func TestFinal_CursorPreviousFromRightChildPosition(t *testing.T) {
 // Combine overflow deletion with high fragmentation
 
 func TestFinal_DeleteOverflowWithHighFrag(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -802,6 +804,7 @@ func TestRemaining_DeleteEmptyLeafRemoveFromParent(t *testing.T) {
 // These are clamping branches: bestIdx < 1 → 1, bestIdx >= len(cells) → len(cells)-1
 
 func TestRemaining_SearchLeafOverflowKeyFullRead(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -1098,6 +1101,7 @@ func TestRemaining_OverflowKeyInteriorPage(t *testing.T) {
 // ---- updateLeafCell with overflow → new overflow chain ----
 
 func TestRemaining_UpdateLeafCellOverflowToOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -1188,6 +1192,7 @@ func TestRemaining_RebuildInteriorWithOverflowKeys(t *testing.T) {
 // ---- writeOverflowChain in rebuildLeafPage (btree.go L1573-1576) ----
 
 func TestRemaining_RebuildLeafPageOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -1363,6 +1368,7 @@ func TestTargeted_CountPage_CellCountOverflow_NonRoot(t *testing.T) {
 // overflow page pointer, then trigger collectLeafCells (via an update that
 // causes a rebuild).
 func TestTargeted_CollectLeafCells_OverflowReadPanic(t *testing.T) {
+	useLegacyFormat(t)
 	p := tempPagerWithPageSize(t, 512)
 	bt := initLeafBtree(t, p)
 
@@ -1530,6 +1536,7 @@ func TestTargeted_CollectInteriorCells_OverflowReadPanic(t *testing.T) {
 // TestTargeted_Delete_OverflowFreeChainError corrupts the overflow page pointer
 // of a cell and then deletes it, expecting the freeOverflowChain call to fail.
 func TestTargeted_Delete_OverflowFreeChainError(t *testing.T) {
+	useLegacyFormat(t)
 	p := tempPagerWithPageSize(t, 512)
 	bt := initLeafBtree(t, p)
 
@@ -1654,6 +1661,7 @@ func TestTargeted_SeekExact_KeyError(t *testing.T) {
 // getVarintSafe could fail. Both read the same data, making divergence unlikely
 // without fault injection.
 func TestTargeted_AppendValue_OverflowReRead(t *testing.T) {
+	useLegacyFormat(t)
 	p := tempPagerWithPageSize(t, 512)
 	bt := initLeafBtree(t, p)
 

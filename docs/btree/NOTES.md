@@ -122,20 +122,21 @@ SQLite has **two sets** of local payload limits:
 From page.go:
 
 ```go
-func maxLocalPayload(usableSize int) int {
-    return ((usableSize - 12) * 64 / 255) - 23
+// index rule: interior cells, and leaf cells of schema format 5 files
+func indexLimits(usableSize int) payloadLimits {
+    return payloadLimits{usable: usableSize,
+        maxLocal: (usableSize-12)*64/255 - 23, minLocal: (usableSize-12)*32/255 - 23}
 }
-func minLocalPayload(usableSize int) int {
-    return ((usableSize - 12) * 32 / 255) - 23
+// table-leaf rule: leaf cells of schema format 6 files
+func tableLeafLimits(usableSize int) payloadLimits {
+    return payloadLimits{usable: usableSize,
+        maxLocal: usableSize - 35, minLocal: (usableSize-12)*32/255 - 23}
 }
-func localPayloadSize(totalPayload, usableSize int) int {
-    maxLocal := maxLocalPayload(usableSize)
-    if totalPayload <= maxLocal { return totalPayload }
-    minLocal := minLocalPayload(usableSize)
-    ovflUsable := overflowPageUsable(usableSize)
-    surplus := minLocal + (totalPayload-minLocal)%ovflUsable
-    if surplus <= maxLocal { return surplus }
-    return minLocal
+func localPayloadSize(totalPayload int, lim payloadLimits) int {
+    if totalPayload <= lim.maxLocal { return totalPayload }
+    surplus := lim.minLocal + (totalPayload-lim.minLocal)%overflowPageUsable(lim.usable)
+    if surplus <= lim.maxLocal { return surplus }
+    return lim.minLocal
 }
 ```
 
@@ -146,16 +147,33 @@ func localPayloadSize(totalPayload, usableSize int) int {
 
 | Aspect | SQLite | Go |
 |--------|--------|-----|
-| maxLocal (index) | `(usableSize-12)*64/255 - 23` | `(usableSize-12)*64/255 - 23` |
-| minLocal (index) | `(usableSize-12)*32/255 - 23` | `(usableSize-12)*32/255 - 23` |
-| maxLeaf (table) | `usableSize - 35` | Not applicable (no table B-trees) |
-| minLeaf (table) | `(usableSize-12)*32/255 - 23` | Not applicable |
-| Surplus formula | Identical | Identical |
+| maxLocal / minLocal | Index leaves and index interior pages | Every interior page; leaf pages of schema format 5 files |
+| maxLeaf / minLeaf | Table leaves | Every leaf page of schema format 6 files, index namespaces included |
+| Where the pair is chosen | Per page, from its flag byte (`decodeFlags`, `btree.c:2043-2086`) | Per file, from the schema format (`pager.leafLimits`) |
+| Surplus formula | `btreePayloadToLocal` | Identical (`localPayloadSize`) |
 
-**Classification: Structural** -- The formulas are identical for index B-trees. The
-Go implementation only has index-style B-trees and therefore only implements the
-`maxLocal`/`minLocal` pair. The `maxLeaf`/`minLeaf` pair (for table B-trees) is
-absent because Go does not implement table B-trees.
+**Classification: Intentional.** Up to v2.4.x any-store used the index pair for every cell:
+a leaf cell kept at most 997 bytes of `key||value` on a 4 KiB page with the default
+16-byte checksum reserve, and a larger one kept a stub of 487 to 997 bytes (the surplus
+formula) and put the rest on overflow pages that nothing shares, so a 1-4 KB document cost
+a whole extra page. SQLite caps index cells that low because an index entry
+is moved whole into an interior page when its leaf splits, and at least four cells must
+fit there (`btreeInt.h:90-94`, `btree.c:3424-3436`). any-store never moves a leaf entry
+up: on every tree the parent gets a key-only copy of the boundary key (`balance.go`,
+deviation 1), written under the index pair. The cap therefore protects interior pages
+only, and from schema format 6 every leaf cell uses SQLite's table-leaf pair
+(`maxLeaf = usableSize - 35`, `btree.c:3439-3440`), on document trees and index trees
+alike. Interior cells keep the index pair, so interior fanout stays at four or more.
+
+Two things differ from SQLite's table trees. The pair is one per file, not one per page:
+all pages keep the index page types (10 and 2), so the flag byte does not say which pair
+a leaf uses and the schema format does. And an index leaf can now hold a key of up to
+`usableSize - 35` bytes on the page while the copy of it in the parent spills at the
+index limit.
+
+Schema format 5 files keep the index pair on their leaves for good; nothing converts a
+file in place. `TestLeafCodeTakesLimitsFromPager` keeps leaf code from computing a pair
+itself. Regression tests: `internal/btree/table_leaf_format_test.go`.
 
 ---
 
@@ -250,7 +268,7 @@ Both implementations follow the same 100-byte layout:
 
 | Aspect | SQLite | Go |
 |--------|--------|-----|
-| Magic string | `"SQLite format 3\000"` | `"any-store v2\000"` written; `"BTree format 1\000"` still accepted; `"any-store v2 fmt"` for schema formats 6 and later (see [the header format gate](#drift-2026-11-10-1-header-format-gate)) |
+| Magic string | `"SQLite format 3\000"` | `"any-store v2 fmt"` for schema format 6, which new files get; schema format 5 files carry `"any-store v2\000"` (an older `"BTree format 1\000"` is accepted and rewritten as it on the next commit). See [the header format gate](#drift-2026-11-10-1-header-format-gate) |
 | Version number (offset 96) | SQLite library version (e.g., 3049000) | Hardcoded `1` |
 | Auto-vacuum field (offset 52) | Largest root B-tree page number | Always 0 |
 | Incremental vacuum (offset 64) | 0 or 1 | Always 0 |
@@ -293,11 +311,13 @@ SQLite defines 4 schema format versions:
 
 ### Go
 
-The Go implementation uses `SchemaFormat = 5` (set in `pager.go:initNewDB()`).
+The Go implementation creates files with `SchemaFormat = 6` (`maxSchemaFormat`, set in
+`pager.go:initNewDB()`); releases before v2.5.0 wrote 5.
 
 ```go
 p.header = dbHeader{
-    SchemaFormat: 5,
+    SchemaFormat: maxSchemaFormat, // 6
+    versioned:    true,            // magic "any-store v2 fmt"
     ...
 }
 ```
@@ -325,10 +345,19 @@ if p.header.SchemaFormat != 0 && p.header.SchemaFormat < 5 {
 
 **Severity:** low
 
-**Classification: Intentional** -- Go's "format 5" is NOT the same as SQLite's schema
-format 4. It is a custom version number for the Go implementation's own format evolution.
-The Go implementation never supported SQLite's schema formats 1-4. Format 5 specifically
-signifies the two-varint leaf cell format with unified key/value overflow.
+**Classification: Intentional** -- Go's schema format is NOT SQLite's schema format
+(1-4). It is the version of any-store's own on-disk format, and the Go implementation
+never supported SQLite's formats.
+
+| Schema format | Magic | Meaning | Written by |
+|---|---|---|---|
+| 5 | `any-store v2\0` (or the older `BTree format 1\0`) | Two-varint leaf cell with unified key/value overflow; index payload limit on every cell | v2.0.0 - v2.4.x |
+| 6 | `any-store v2 fmt` | As 5, with SQLite's table-leaf payload limit on every leaf cell (see [the local-payload drift](#old-drift-index-only-local-payload-no-maxleaf-minleaf)) | v2.5.0 and later |
+
+A file keeps the format it was created with. Opening a format 5 file with a later release
+reads and writes it under format 5 rules, including namespaces created afterwards. Open
+refuses a format above the newest it knows (see
+[the header format gate](#drift-2026-11-10-1-header-format-gate)).
 
 ---
 
@@ -781,7 +810,7 @@ The Go implementation has:
 
 | Aspect | SQLite | Go |
 |--------|--------|-----|
-| Max local payload | `BT_MAX_LOCAL = 65501` | `maxLocalPayload()` computed from usableSize |
+| Max local payload | `BT_MAX_LOCAL = 65501` | `payloadLimits.maxLocal` computed from usableSize: the index limit for interior cells, the file's leaf limit (`pager.leafLimits`) for leaf cells |
 | Max total payload | Validated against `nPage * usableSize` | `maxPayloadAlloc = 1 << 30` |
 | Approach | Per-access bounds checking with macros | Per-access bounds checking with error returns |
 | Overflow protection | Trust chain structure | `maxIter` + bounds checks |
@@ -1060,7 +1089,7 @@ semantics:
 | Value storage | In leaves alongside key |
 | Leaf cell format | `[varint(keyLen)] [varint(valLen)] [key\|\|value]` |
 | Interior cell | `[4B child] [varint(keyLen)] [key]` |
-| Overflow limits | `maxLocal` / `minLocal` (index formulas) |
+| Overflow limits | Interior cells: `maxLocal` / `minLocal`. Leaf cells: `maxLeaf` / `minLeaf` in schema format 6 files, `maxLocal` / `minLocal` in format 5 files |
 
 <a id="old-drift-index-only-btrees-no-intkey-table"></a>
 **Severity:** medium
@@ -1073,7 +1102,9 @@ store key/value pairs by adding a second varint for value length. This means:
 1. No integer-key lookups (all keys are byte-comparable blobs)
 2. No `PTF_INTKEY` / `PTF_LEAFDATA` page types
 3. Values are stored inline with keys using the two-varint format
-4. The `maxLeaf` / `minLeaf` overflow formulas are never used
+4. The `maxLeaf` / `minLeaf` formulas apply to every leaf of a schema format 6 file, and
+   to no leaf of a format 5 file (see
+   [the local-payload drift](#old-drift-index-only-local-payload-no-maxleaf-minleaf))
 
 ---
 
@@ -1195,10 +1226,10 @@ counter.
 |------|-----------|----------|-------|
 | 1. Leaf cell format | Intentional | Low | Two varints vs one; functionally equivalent |
 | 2. Interior cell format | Intentional | None | Semantically identical |
-| 3. Overflow formula | Structural | None | Same formulas; table B-tree variants absent |
+| 3. Overflow formula | Intentional | Low | Same formulas; the table-leaf pair is chosen per file (schema format 6), not per page |
 | 4. Binary search | Divergent | Medium | Raw byte comparison vs record comparison; prefix optimization |
 | 5. Page header | Intentional | Low | Different magic string; same layout |
-| 6. Schema format | Intentional | Low | Format 5 is Go-specific |
+| 6. Schema format | Intentional | Low | Formats 5 and 6 are Go-specific |
 | 7. WAL | Intentional + Divergent | Medium | Different magic/version; Go map for lookups |
 | 8. Pager | Structural | High | WAL-only; no rollback journal; simplified states |
 | 9. Page cache | Structural | Low | Slab allocator, bulk alloc, LRU, admission control, persistent cache, reader limiter |
@@ -1693,14 +1724,15 @@ chained hash (`pcache.apHash []*page` + `page.hashNext`), a direct port of
 
 A faithful port of SQLite's `balance_nonroot()` lives in `balance.go` (`balanceNonroot`):
 it gathers the over-/under-full child plus up to two adjacent siblings (NB=3), pools their
-cells with the parent dividers, recomputes the minimum output-page count k ∈ {nOld-1, nOld,
-nOld+1}, packs each page full then backs off the last for balance, and rewrites the parent
+cells with the parent dividers, recomputes the minimum output-page count k (from nOld-1 up to
+nOld+2 = `nbMaxOut`; more than nOld+1 only with cells larger than half a page, which schema
+format 6 leaves can hold), packs each page full then backs off the last for balance, and rewrites the parent
 dividers — producing SQLite's high, even fill. It is now the live path for **both** sides:
 inserts funnel an over-full leaf through it (`splitLeafAndInsertWithPath` → `balanceNonroot`,
 btree.go:2055), and deletes funnel an under-full (>2/3 free) leaf through the same balancer
 with `inject.active=false` (`deleteRebalanceLeaf` → `balanceNonroot`, btree.go:2799;
 `completeMergeUpward` cascades parent under-fullness, gating single-child collapse on root per
-btree.c:8960). A root leaf goes through `balance_deeper` and then the same balancer
+btree.c:8942). A root leaf goes through `balance_deeper` and then the same balancer
 (`splitRootLeafAndInsert`), and so does an update that grows a cell past its page
 (`updateLeafCell`); no 2-way leaf split remains. `balance_quick` is retained as the rightmost-append fast path
 (below). See `balance.go`'s header for the enumerated index-btree deviations, and
@@ -2292,9 +2324,13 @@ size). Go's size and parse routines (`leafCellSize` `btree.go:298-300`,
 `leafCellSizeFromLengths`, `leafCellSizeWithOverflow`, and `parseLeafCellWithSize`) all
 omit this minimum-cell-size clamp, returning the raw `hdr + payload` with no lower bound.
 The consequence is that a degenerate tiny cell (sub-4-byte) would be sized below the
-freeblock minimum, so freeing it could not store a valid freeblock header -- a latent
-deviation from SQLite's free-space format guarantee, mitigated in practice only because
-real key/value cells comfortably exceed 4 bytes.
+freeblock minimum, so freeing it could not store a valid freeblock header -- a deviation
+from SQLite's free-space format guarantee that is harmless here because freed cells are
+tracked as fragment bytes, not as freeblocks. Such cells are real: a one-byte key with an
+empty value is a three-byte cell, placed at `usableSize-3` on an empty leaf. The integrity
+check used to keep SQLite's `usableSize-4` bound on cell offsets (`btree.c:10954`) and
+reported that cell as out of range; it now bounds the offset by the page end and relies on
+the per-cell extent check (2026-11-11, `TestIntegrityCheck_ThreeByteCell`).
 
 <a id="drift-28-searchleafpage-missing-overflow-cell-compare-guard"></a>
 ### Drift: searchLeafPage Missing Overflow Cell Compare Guard
@@ -2316,22 +2352,20 @@ production search paths use `searchLeafWithOverflow` (`btree.go:601`), which han
 <a id="drift-29-root-interior-overflow-uses-2-way-split-not-balance-deeper-p"></a>
 ### Drift: Root Interior Overflow Uses 2 Way Split Not balance_deeper plus balance_nonroot
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `btree.go:*btree.insertSepIntoInterior` (`internal/btree/btree.go:2193`, root-overflow block `btree.go:2300-2357`), `btree.go:*btree.insertIntoParent` (`internal/btree/btree.go:2466-2468`), `btree.go:*btree.rewriteParentAfterBalance` (`balance.go:905-940`).
+- **Affected functions:** `btree.go:*btree.insertSepIntoInterior` (root-overflow block), `btree.go:interiorSplitPointFitting`, `btree.go:*btree.splitRoot`.
 
 When a separator must be inserted into a full interior page that is the btree ROOT (no
 grandparent to gather siblings from), Go does not run SQLite's `balance_deeper` +
-`balance_nonroot` even-fill packing (`btree.c:9134-9154` routes a root overflow to
+`balance_nonroot` even-fill packing (`btree.c:9134-9151` routes a root overflow to
 `balance_deeper`; `btree.c:9195-9214` then redistributes via `balance_nonroot`). Instead
-`insertSepIntoInterior` falls to a classic
-2-way median split (`btree.go:2300-2357`): collect the root's interior cells, splice in the
-new divider, pick a split via `interiorSplitPoint` (a ~2/3 left-fill target,
-`btree.go:357-371`, called at `btree.go:2322`), rebuild into two interior pages, and grow a new root through
-`splitRoot`. The same fill-factor deviation recurs in `rewriteParentAfterBalance`'s
-over-full fallback (`balance.go:905-940`, `interiorSplitPoint` at `balance.go:911`) and in the legacy non-path `insertIntoParent`,
-which on a failed re-descent unconditionally calls `splitRoot` as a "safety net"
-(`btree.go:2466-2468`) rather than reporting corruption. The consequence is that root-level
-interior overflow produces a different (and looser) page-fill distribution than SQLite's
-balanced redistribution.
+`insertSepIntoInterior` falls to a classic 2-way split: collect the root's interior cells,
+splice in the new divider, pick a split via `interiorSplitPointFitting` (a ~2/3 left-fill
+target, moved until both halves fit), rebuild into two interior pages, and grow a new root
+through `splitRoot`. The consequence is that root-level interior overflow produces a
+different (and looser) page-fill distribution than SQLite's balanced redistribution. A root
+LEAF does follow SQLite (`splitRootLeafAndInsert`). The parent rewrite after a balance
+splits in place too; see
+[its own entry](#drift-2026-11-11-1-parent-rewrite-after-a-balance-splits-in-place).
 
 <a id="drift-31-rebuildinteriorpage-accepts-zero-cell-pages"></a>
 ### Drift: rebuildInteriorPage Accepts Zero Cell Pages
@@ -2342,11 +2376,13 @@ C's `rebuildPage` hard-asserts `nCell>0` (`btree.c:7648`) and its only callers
 (`balance_quick`, the `editPage` fallback) guarantee at least one cell. Go's
 `rebuildInteriorPage` is instead deliberately invoked with zero cells -- e.g. the
 `removeChildFromParent` / collapse paths and `rebuildInteriorPage(rootPg, nil, ...)` -- and
-faithfully produces an interior page carrying only a `rightChild` with `cellCount=0`. The
-consequence is that Go's structural contract for interior pages is looser than SQLite's:
-degenerate single-child interior pages are a normal, accepted state rather than an asserted
-impossibility, which is the structural foundation that lets the underfullness-cascade drifts
-(see Drift 20/21) leave such pages in the tree.
+faithfully produces an interior page carrying only a `rightChild` with `cellCount=0`. For a
+ROOT this is a state SQLite has too: `balance_deeper` leaves the root with no cells and one
+child (`btree.c:9074-9075`), and page 1 keeps it when the child does not fit back
+(`btree.c:8942`); Go's root-leaf path and `collapseSingleChild` produce exactly that. The
+drift is the rebuild helper's contract, and non-root pages: Go's structural contract for
+interior pages is looser than SQLite's, which is the foundation that lets the
+underfullness-cascade drifts (see Drift 20/21) leave single-child interior pages in the tree.
 
 <a id="drift-33-missing-balance-self-ancestor-refcount-corruption-guard"></a>
 ### Drift: Missing balance Self Ancestor Refcount Corruption Guard
@@ -2440,10 +2476,12 @@ When the destination is in WAL mode, SQLite's `finalize` calls
 to 2 (`backup.c:429-431`; `btree.c:11509-11510` writes `aData[18]=aData[19]=2`). Go's
 `finalize` (`backup.go:307-356`) performs only the schema-cookie bump and `DatabaseSize`
 re-application and omits this `SetVersion` step. For any-store this is benign by invariant:
-the engine is always WAL, so the source bytes copied into the destination are already 2 and
-the destination's in-memory header carries the WAL version regardless. The consequence is a
-latent divergence that would only matter if a non-WAL source were ever backed up to a WAL
-destination, which any-store's always-WAL design precludes.
+the engine is always WAL and every release has created files with both bytes set to 2, so
+the source bytes copied into the destination are already 2. The destination's own header
+does not guarantee it: `finalize` reloads the in-memory header from the source's page 1, so
+a source whose bytes were 1 (accepted by the format gate, which only refuses values above 2)
+is copied as 1. The consequence is a latent divergence that would only matter for such a
+source, which no release writes.
 
 <a id="drift-43-backup-commit-point-moved-from-step-to-finish"></a>
 ### Drift: Backup Commit Point Moved From Step To Finish
@@ -3487,9 +3525,9 @@ SQLite distinguishes transient contention from real failure: `isFatalError` (`ba
 <a id="drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b"></a>
 ### Drift: Point-Lookup And Mutation Descent Loops Omit SQLite's BTCURSOR_MAX_DEPTH Bound
 - **Category:** error-handling  -  **Severity:** medium
-- **Affected functions:** `btree.go:AppendValue` (`internal/btree/btree.go:1076`), `btree.go:Put` (`internal/btree/btree.go:1217`), `btree.go:Delete` (`internal/btree/btree.go:2576`), `btree.go:insertIntoParent` (`internal/btree/btree.go:2438`), `btree.go:descendChild` (`internal/btree/btree.go:123`).
+- **Affected functions:** `btree.go:AppendValue` (`internal/btree/btree.go:1076`), `btree.go:Put` (`internal/btree/btree.go:1217`), `btree.go:Delete` (`internal/btree/btree.go:2576`), `btree.go:*btree.pathToChild`, `btree.go:descendChild` (`internal/btree/btree.go:123`).
 
-Go's point-lookup and mutation paths walk the tree with unbounded `for` loops that carry no depth counter. `AppendValue` (the engine behind `Get`/`Has`) spins `for {` until it hits a leaf (`internal/btree/btree.go:1076`), while `Put` (`internal/btree/btree.go:1217`), `Delete` (`internal/btree/btree.go:2576`), and `insertIntoParent` (`internal/btree/btree.go:2438`) loop on `for pg.header.isInterior()`. Each iteration descends via `descendChild` (`internal/btree/btree.go:123`), which validates only that the child pgno is in range (`childPgno != 0 && childPgno <= readerDbSizeBound`) and that a descended interior page has `cellCount >= 1`; neither check tracks how many levels have been traversed. SQLite instead caps cursor descent at `BTCURSOR_MAX_DEPTH` (20, `btreeInt.h:497`): `moveToChild` returns `SQLITE_CORRUPT_BKPT` once `pCur->iPage >= BTCURSOR_MAX_DEPTH-1` (`btree.c:5448`), and the inlined descent in `sqlite3BtreeIndexMoveto` applies the identical guard (`btree.c:6227`), so any chain deeper than 20 levels — including a cyclic interior loop — is rejected as corruption rather than followed indefinitely.
+Go's point-lookup and mutation paths walk the tree with unbounded `for` loops that carry no depth counter. `AppendValue` (the engine behind `Get`/`Has`) spins `for {` until it hits a leaf (`internal/btree/btree.go:1076`), while `Put`, `Delete` and `pathToChild` (the re-descent of a three-way parent split) loop on interior pages without a counter. Each iteration descends via `descendChild` (`internal/btree/btree.go:123`), which validates only that the child pgno is in range (`childPgno != 0 && childPgno <= readerDbSizeBound`) and that a descended interior page has `cellCount >= 1`; neither check tracks how many levels have been traversed. SQLite instead caps cursor descent at `BTCURSOR_MAX_DEPTH` (20, `btreeInt.h:497`): `moveToChild` returns `SQLITE_CORRUPT_BKPT` once `pCur->iPage >= BTCURSOR_MAX_DEPTH-1` (`btree.c:5448`), and the inlined descent in `sqlite3BtreeIndexMoveto` applies the identical guard (`btree.c:6227`), so any chain deeper than 20 levels — including a cyclic interior loop — is rejected as corruption rather than followed indefinitely.
 
 The consequence is that a corrupt or malicious database whose interior pages form a cycle of in-bounds page numbers (each cell passing `descendChild`'s pgno-range and `nCell >= 1` checks) makes a plain `Get`/`Has`/`Put`/`Delete` spin forever — a hang/DoS — whereas SQLite returns `SQLITE_CORRUPT` after 20 levels; the `pathBuf [8]pathEntry` stacks in `Put`/`Delete`/`insertIntoParent` additionally reallocate and grow without bound on every loop, leaking memory until the process is killed.
 
@@ -3593,7 +3631,7 @@ The consequence is that a signal delivered to the calling goroutine's OS thread 
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `integrity.go:checkTreePage` (`internal/btree/integrity.go:488-493`, `internal/btree/integrity.go:507-514`).
 
-When walking an interior page, Go's `checkTreePage` anchors the expected subtree depth on the FIRST child it recurses into (`if i == 0 { depth = childDepth }`, `internal/btree/integrity.go:489-490`) and thereafter only compares against that fixed anchor: every later child whose depth differs emits a separate `"child page depth differs"` message without ever updating `depth` (`internal/btree/integrity.go:491-493`), and the right child is checked against the same un-updated anchor at the end (`internal/btree/integrity.go:508-511`). SQLite instead anchors `depth` on the right child first (`depth = checkTreePage(...)`, `src/btree.c:10935`) and, in the per-cell loop, RE-anchors after each mismatch: `d2 = checkTreePage(...)`; `if( d2!=depth ){ checkAppendMsg(pCheck, "Child page depth differs"); depth = d2; }` (`src/btree.c:11000-11005`). Because SQLite reassigns `depth = d2` it treats a single outlier child as the new expected depth, so a lone divergent child yields exactly one message; Go, holding the first child's depth as the immutable reference, reports against every subsequent divergence. The consequence is that on a corrupt interior page whose first-anchored child carries the outlier depth, Go emits one redundant "child page depth differs" message per remaining child (and the right child) where SQLite emits a single message and re-anchors, draining the bounded `maxErrors` budget faster and potentially suppressing other distinct corruption diagnostics later in the walk; it is a read-only diagnostic divergence with no data-correctness impact.
+When walking an interior page, Go's `checkTreePage` anchors the expected subtree depth on the FIRST child it recurses into (`if i == 0 { depth = childDepth }`, `internal/btree/integrity.go:489-490`) and thereafter only compares against that fixed anchor: every later child whose depth differs emits a separate `"child page depth differs"` message without ever updating `depth` (`internal/btree/integrity.go:491-493`), and the right child is checked against the same un-updated anchor at the end (`internal/btree/integrity.go:508-511`). SQLite instead anchors `depth` on the right child first (`depth = checkTreePage(...)`, `src/btree.c:10935`) and, in the per-cell loop, RE-anchors after each mismatch: `d2 = checkTreePage(...)`; `if( d2!=depth ){ checkAppendMsg(pCheck, "Child page depth differs"); depth = d2; }` (`src/btree.c:11000-11005`). Because SQLite reassigns `depth = d2` it compares each child with the one checked before it (child depths 2, 3, 2 give two messages, one per change); Go, holding the first child's depth as the immutable reference, reports every child that differs from the first. The consequence is that on a corrupt interior page whose first-anchored child carries the outlier depth, Go emits one redundant "child page depth differs" message per remaining child (and the right child) where SQLite emits a single message and re-anchors, draining the bounded `maxErrors` budget faster and potentially suppressing other distinct corruption diagnostics later in the walk; it is a read-only diagnostic divergence with no data-correctness impact.
 
 <a id="drift-2026-06-25-13-checksum-sweep-fires-the-onerror-errcksummismatch-hook-even-for-plain-"></a>
 ### Drift: Checksum Sweep Fires The OnError(errCksumMismatch) Hook Even For Plain File-I/O Read Errors
@@ -3659,7 +3697,7 @@ SQLite's `full_fsync` likewise issues a raw `fdatasync(fd)` with no EINTR loop o
 
 <a id="drift-2026-06-25-21-dbheader-deserialize-does-not-validate-file-format-read-write-version-"></a>
 ### Drift: dbHeader.deserialize Does Not Validate File-Format Read/Write Version Bytes (Offsets 18/19)
-- **Category:** error-handling  -  **Severity:** low
+- **Category:** error-handling  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-10: `deserialize` calls `checkHeaderFormat`, which refuses a read or write version above 2 and a schema format above the newest known; see [the header format gate](#drift-2026-11-10-1-header-format-gate) for what still differs (a newer write version refuses instead of opening read-only, and a header reloaded after another process commits is checked for the format only).
 - **Affected functions:** `page.go:*dbHeader.deserialize` (`internal/btree/page.go:262-264`).
 
 `dbHeader.deserialize` reads the file-format write-version (byte 18) and read-version (byte 19) verbatim into `h.WriteVersion = buf[18]` / `h.ReadVersion = buf[19]` without any range check (`internal/btree/page.go:262-264`). It validates the magic string, the page-size byte, and the embedded-payload-fraction constants at offsets 21-23, but never inspects the version bytes themselves. SQLite, in `lockBtree`, treats these bytes as a compatibility gate: `page1[18]>2` forces `BTS_READ_ONLY` and `page1[19]>2` does `goto page1_init_failed`, which has already set `rc = SQLITE_NOTADB`, so an unknown read-version makes the open fail (`btree.c:3314-3327`, with the `SQLITE_OMIT_WAL` build using the stricter `>1` bounds at `btree.c:3315-3320`).
@@ -3751,7 +3789,7 @@ SQLite's ALTER TABLE ... RENAME is an UPDATE of the existing `sqlite_master` row
 - **Category:** changed-logic  -  **Severity:** none
 - **Affected functions:** `btree.go:leafKeyAt`; callers `btree.go:*Cursor.SeekNear`, `btree.go:*Cursor.currentKeyEqual`.
 
-SQLite's `indexCellCompare` (`btree.c:5952-5982`) compares a record in place only when its size varint is one or two bytes and the whole record fits on the page; a record that extends into overflow pages returns 99, and the already-positioned shortcut of `sqlite3BtreeIndexMoveto` (`btree.c:6060-6081`) falls back to `moveToRoot`. An index record has no separate value, so "the record spills" and "the key spills" coincide there. The Go leaf cell carries `key||value`, and a document cell with a short id and a large body spills while its key is wholly on the page. `leafKeyAt` returns such a key from the page and declines (`errLeafKeySpilled`) only when the key itself continues in the overflow chain, i.e. when `keyLen > nLocal` under the same `maxLocalPayload`/`localPayloadSize` split that every leaf writer uses, so a key it serves is always complete. It also accepts length varints of any width, capped by `maxPayloadAlloc`. The consequence is that the in-page fast path of `SeekNear` and `currentKeyEqual` stays available for `Iterator.Doc()`'s re-seek by id on overflowing documents; a literal port would send every such lookup through `leafFullKey` and the overflow chain. Regression tests: `internal/btree/leafkeyat_overflow_test.go` (`TestLeafKeyAt_SpilledKey` serves the local key of a value-spilling cell and refuses spilled keys; `TestCursor_SeekNearSpilledKeys/local-first-and-last-keys` runs the in-leaf check over spilled cells).
+SQLite's `indexCellCompare` (`btree.c:5952-5982`) compares a record in place only when its size varint is one or two bytes and the whole record fits on the page; a record that extends into overflow pages returns 99, and the already-positioned shortcut of `sqlite3BtreeIndexMoveto` (`btree.c:6060-6081`) falls back to `moveToRoot`. An index record has no separate value, so "the record spills" and "the key spills" coincide there. The Go leaf cell carries `key||value`, and a document cell with a short id and a large body spills while its key is wholly on the page. `leafKeyAt` returns such a key from the page and declines (`errLeafKeySpilled`) only when the key itself continues in the overflow chain, i.e. when `keyLen > nLocal` under the same `pager.leafLimits`/`localPayloadSize` split that every leaf writer uses (in a schema format 6 file a key of up to `usableSize-35` bytes is local), so a key it serves is always complete. It also accepts length varints of any width, capped by `maxPayloadAlloc`. The consequence is that the in-page fast path of `SeekNear` and `currentKeyEqual` stays available for `Iterator.Doc()`'s re-seek by id on overflowing documents; a literal port would send every such lookup through `leafFullKey` and the overflow chain. Regression tests: `internal/btree/leafkeyat_overflow_test.go` (`TestLeafKeyAt_SpilledKey` serves the local key of a value-spilling cell and refuses spilled keys; `TestCursor_SeekNearSpilledKeys/local-first-and-last-keys` runs the in-leaf check over spilled cells).
 
 <a id="drift-2026-11-10-1-header-format-gate"></a>
 ### Drift: The Header Format Gate Uses A Second Magic, And A Newer Write Version Refuses The Open
@@ -3760,20 +3798,64 @@ SQLite's `indexCellCompare` (`btree.c:5952-5982`) compares a record in place onl
 
 SQLite never changes its magic. A file from a later release is told apart by the version bytes, which `lockBtree` checks on every read of page 1 (`btree.c:3322-3327`: a write version above 2 makes the connection read-only, a read version above 2 is `SQLITE_NOTADB`), and by the schema file format, which `sqlite3InitOne` bounds with "unsupported file format" (`prepare.c:344`). any-store wrote both version bytes as 2 and the schema format as 5 but checked only the format's lower bound, so releases up to v2.4.3 open a file of any later format and parse it under their own rules. `checkHeaderFormat` now applies all three bounds before any other header field is trusted, and reports a value above the maximum as `ErrNewerFormat`, which is not under `ErrCorrupt`: the file is intact and a caller that discards a corrupt database must keep it.
 
-Two things differ from SQLite. First, the bounds cannot protect a file from the releases that never checked them, so schema formats 6 and later are written under a second magic, `"any-store v2 fmt"`. It fills all 16 bytes, and those releases compare the whole field, so they refuse the file at the header (as `ErrHeaderCorrupt`) before reading a page of it. The magic changes this once: later formats raise the schema format only. The magic and the schema format must agree (the second magic with a format below 6 is `ErrHeaderCorrupt`), `serialize` writes back the magic the header was read with, so no commit moves a file between the two families, and the copy of page 1 that `pager.open` reads from the WAL must name the same family as the file. Second, a write version above the maximum refuses the open instead of opening read-only: the btree has no read-only open.
+Two things differ from SQLite. First, the bounds cannot protect a file from the releases that never checked them, so schema formats 6 and later are written under a second magic, `"any-store v2 fmt"` (v2.5.0 is the first release to create such files). It fills all 16 bytes, and those releases compare the whole field, so they refuse the file at the header (as a corrupt file: `ErrHeaderCorrupt` from v2.4.3, plain `ErrCorrupt` before it) before reading a page of it. The magic changes this once: later formats raise the schema format only. The magic and the schema format must agree (the second magic with a format below 6, or a zero-padded magic with format 6, is `ErrHeaderCorrupt`; a format above the newest known is `ErrNewerFormat` under either magic, because that check runs first). `serialize` writes back the family of the magic the header was read with (an older `"BTree format 1"` becomes `"any-store v2"`), so no commit moves a file between the two families; a backup refuses a destination of the other family for the same reason (see [its entry](#drift-2026-11-11-2-backup-refuses-a-destination-of-another-schema-format)); and the copy of page 1 that `pager.open` reads from the WAL must name the same family as the file. Second, a write version above the maximum refuses the open instead of opening read-only: the btree has no read-only open.
 
-The checks live in `dbHeader.deserialize`, whose first caller on the open path is `readInitialHeader`, before the file is locked or its WAL and wal-index are touched; a refused open leaves all three files as they were. A newer format found only in the WAL's copy of page 1 is refused after WAL recovery has run, which may have rewritten the wal-index. Regression tests: `internal/btree/format_gate_test.go` (`TestCheckHeaderFormat`, `TestOpen_RefusedFormatLeavesFilesUntouched`, `TestHeaderSerialize_KeepsMagicFamily`, `TestOpen_FirstMagicStillOpensAndIsRewritten`), `corrupt_open_test.go:TestOpen_NewerFormat`.
+The checks live in `dbHeader.deserialize`, whose first caller on the open path is `readInitialHeader`, before the file is locked or its WAL and wal-index are touched; a refused open leaves all three files as they were. A newer format found only in the WAL's copy of page 1 is refused after WAL recovery has run, which may have rewritten the wal-index. A handle that is already open reloads the header after another process commits (`refreshHeaderFromPage1`); there `ErrNewerFormat` and a change of leaf rule fail the transaction (`checkRefreshedHeader`), while the other header checks are not applied, as before: SQLite re-runs all of `lockBtree` on every such read. Regression tests: `internal/btree/format_gate_test.go` (`TestCheckHeaderFormat`, `TestOpen_RefusedFormatLeavesFilesUntouched`, `TestHeaderSerialize_KeepsMagicFamily`, `TestOpen_FirstMagicStillOpensAndIsRewritten`), `corrupt_open_test.go:TestOpen_NewerFormat`.
 
 <a id="drift-2026-11-10-2-leaf-insert-fit-check-counts-the-cell-pointer-twice"></a>
 ### Drift: The Leaf Insert Fit Check Counts The New Cell's Pointer Twice
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `btree.go:*btree.insertIntoLeafWithPath`, `btree.go:*btree.splitRootLeafAndInsert`.
+- **Affected functions:** `btree.go:*btree.insertIntoLeafWithPath`, `btree.go:*btree.insertSepIntoInterior`, `btree.go:*btree.splitRootLeafAndInsert`.
 
-SQLite's `insertCellFast` sends a cell to `balance()` when `sz+2 > pPage->nFree` (`btree.c:7433`): the cell and its two-byte pointer must fit the free space. `insertIntoLeafWithPath` computes the gap as the content start minus the header and the pointer array *including the new cell's slot*, then asks for `cellSize+2` of it, so the pointer is counted twice and a cell that fits with less than two bytes to spare is treated as over-full. On a non-root leaf this only means a balance that redistributes cells that would have fit. On a root leaf the cell arrives at `splitRootLeafAndInsert`, where the child made by `balanceDeeper` then holds every cell on one page; balance-shallower (`btree.c:8942-8967`) copies it back into the root, as SQLite does for a root left with no cells, and the tree keeps its depth. Fixing the check would change which inserts split and is left for a change of its own. Regression tests: `root_leaf_balance_test.go` (`TestRootLeaf_ExactFitCollapsesBack`, `TestRootLeaf_Page1ExactFitCollapsesBack`, `TestRootLeaf_Page1ChildDoesNotFitBack`).
+SQLite's `insertCellFast` sends a cell to `balance()` when `sz+2 > pPage->nFree` (`btree.c:7433`): the cell and its two-byte pointer must fit the free space. `insertIntoLeafWithPath` computes the gap as the content start minus the header and the pointer array *including the new cell's slot*, then asks for `cellSize+2` of it, so the pointer is counted twice and a cell that fits with less than two bytes to spare is treated as over-full. On a non-root leaf this only means a balance that redistributes cells that would have fit. On a root leaf the cell arrives at `splitRootLeafAndInsert`, where the child made by `balanceDeeper` then holds every cell on one page; balance-shallower (`btree.c:8942-8967`) copies it back into the root, as SQLite does for a root left with no cells, and the tree keeps its depth. `insertSepIntoInterior` makes the same double count for a divider, so a divider that fits its parent exactly is treated as over-full and the parent is balanced or split. Fixing the checks would change which inserts split and is left for a change of its own. Regression tests: `root_leaf_balance_test.go` (`TestRootLeaf_ExactFitCollapsesBack`, `TestRootLeaf_Page1ExactFitCollapsesBack`, `TestRootLeaf_Page1ChildDoesNotFitBack`).
 
 <a id="drift-2026-11-10-3-leaf-payload-limits-come-from-the-pager-not-the-page"></a>
 ### Drift: A Leaf Cell's Local-Payload Limits Come From The Pager, Not From The Page
 - **Category:** changed-logic  -  **Severity:** none
 - **Affected functions:** `page.go:payloadLimits`, `page.go:indexLimits`, `page.go:localPayloadSize`, `pager.go:*pager.leafLimits`, `pager.go:*pager.leafLimitsFor`, every leaf-cell parser and writer in `btree.go`.
 
-SQLite's `decodeFlags` copies `maxLocal`/`minLocal` into each `MemPage` from `BtShared`, choosing the index pair or the table-leaf pair by the page's flag byte (`btree.c:2043-2086`), and `btreePayloadToLocal` reads them from the page (`btree.c:1213-1226`). any-store has one leaf page type, so the pair is not chosen per page: leaf code takes a `payloadLimits` from `pager.leafLimits`, and interior code uses `indexLimits`. Both currently return the index pair. `TestLeafCodeTakesLimitsFromPager` fails when production code outside the interior-cell functions calls `maxLocalPayload`, `minLocalPayload` or `indexLimits` directly.
+SQLite's `decodeFlags` copies `maxLocal`/`minLocal` into each `MemPage` from `BtShared`, choosing the index pair or the table-leaf pair by the page's flag byte (`btree.c:2043-2086`), and `btreePayloadToLocal` reads them from the page (`btree.c:1213-1226`). any-store has one leaf page type, so the pair is not chosen per page: leaf code takes a `payloadLimits` from `pager.leafLimits`, which returns the table-leaf pair for a schema format 6 file and the index pair for a format 5 one, and interior code uses `indexLimits`. `TestLeafCodeTakesLimitsFromPager` fails when production code outside the interior-cell functions calls `maxLocalPayload`, `minLocalPayload` or `indexLimits` directly.
+
+<a id="drift-2026-11-11-1-parent-rewrite-after-a-balance-splits-in-place"></a>
+### Drift: The Parent Rewrite After A Balance Splits The Parent In Place Instead Of Balancing It
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `balance.go:*btree.rewriteParentAfterBalance`, `balance.go:*btree.splitParentThreeWays`, `btree.go:interiorSplitPointFitting`, `btree.go:*btree.pathToChild`.
+
+SQLite's `balance_nonroot` inserts each new divider into the parent with `insertCell` (`btree.c:8870`); a divider that does not fit becomes an overflow cell of the parent, and the `balance()` loop then balances the parent itself (`btree.c:9213`, `9232-9236`): against its own siblings with `balance_nonroot`, or through `balance_deeper` when it is the root. A parent that overflows is therefore redistributed over up to three siblings and as many pages as it needs. any-store rebuilds the parent wholesale from the spliced child and divider lists (`balance.go` header, deviation 2) and, when the list does not fit, splits that one page in place and passes the promoted divider up with `insertSepIntoAncestor` (deviation 6): its siblings are not gathered, so the fill of interior pages differs from SQLite's. The header's "semantically identical" describes the cascade order, not the result.
+
+The split index is chosen so that both halves fit (`interiorSplitPointFitting`), because the new dividers can be much longer than the ones they replace. Two pages are enough unless the new dividers alone exceed a page: a balance writes at most `nbMaxOut` pages, hence at most four new dividers, and four interior cells of the largest size take slightly more than a page once the usable size passes about 10 KiB (`maxLocal` is `(usable-12)*64/255-23`, a little over a quarter). Then `splitParentThreeWays` writes three pages and promotes two dividers. The first goes up the path as usual; that can rewrite the pages above, so the parent of the middle page is found again from the root by key (`pathToChild`) before the second is inserted. Regression tests: `root_leaf_balance_test.go` (`TestInteriorSplitPointFitting_LongTail`, `TestRewriteParentAfterBalance_ThreeWaySplit`).
+
+<a id="drift-2026-11-11-2-backup-refuses-a-destination-of-another-schema-format"></a>
+### Drift: A Backup Refuses A Destination Of Another Schema Format
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `backup.go:*DB.BackupInit`, `db.go:Open` (`Options.SchemaFormat`), root `db.go:*db.Backup`.
+
+`sqlite3_backup` copies every page of the source, page 1 included, so the destination becomes a file of the source's format whatever it was before; the next read of page 1 by any connection re-runs `lockBtree` and each page carries its own payload rule in its flag byte (`btree.c:2028-2085`). In any-store the leaf payload rule is held once per open file (`pager.leafLimits`), fixed at open. Replacing a format 6 destination with a format 5 source under it would leave other handles, and read transactions opened before the backup committed, parsing the new pages by the old rule, and a crash before the next checkpoint would leave a database file and a WAL whose headers name different magics. `BackupInit` therefore returns `ErrBackupFormatMismatch` when the two files' leaf rules differ, and a destination is created in the source's format with `Options.SchemaFormat` (the root package's `Backup` does this), so a backup of a database created before v2.5.0 is a schema format 5 file. With that, the format of a file never changes after creation. Regression tests: `table_leaf_format_test.go` (`TestBackup_SchemaFormats`, `TestOpen_SchemaFormatOption`), root `format_test.go` (`TestBackup_KeepsSourceFormat`).
+
+<a id="drift-2026-11-11-3-interior-collection-rewrites-overflowing-divider-chains"></a>
+### Drift: Collecting An Interior Page Frees And Rewrites The Overflow Chains Of Its Dividers
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.collectInteriorCellsKeepBuf`, `btree.go:*btree.rebuildInteriorPage`.
+
+`balance_nonroot` moves cells as raw bytes: a cell whose payload overflows keeps its 4-byte pointer and its chain is neither read nor written (`btree.c:8447-8493`, `rebuildPage` at `7629`). any-store does the same for leaf cells (`collectLeafCells` passes them through as `rawCell`), but an interior cell whose key overflows is materialised: `collectInteriorCellsKeepBuf` reads the full key from the chain and frees the chain, and `rebuildInteriorPage` writes a new one. Rewriting a parent that holds an unchanged divider longer than the index limit therefore reads and reallocates its overflow pages, and can fail on a read SQLite would not make. The result on disk is equivalent. A read, parse or free failure is returned rather than replaced by an empty divider.
+
+<a id="drift-2026-11-11-4-root-collapse-tests-the-contiguous-gap-only"></a>
+### Drift: The Root Collapse On Page 1 Tests The Child's Contiguous Gap, Not Its Free Space
+- **Category:** changed-logic  -  **Severity:** none
+- **Affected functions:** `btree.go:*btree.collapseSingleChild`.
+
+Balance-shallower copies the only child back into a root with no cells when `pParent->hdrOffset <= apNew[0]->nFree` (`btree.c:8942`), after `defragmentPage` (`btree.c:8959-8967`); `nFree` counts freeblocks and fragment bytes. `collapseSingleChild` compares `dbHeaderSize` with the gap between the child's pointer array and its content area, and does not defragment: a child with a 90-byte gap and 20 fragment bytes is left under a zero-cell page 1 where SQLite would collapse it. The tree is one level deeper until a later balance rebuilds the child packed. The copy itself keeps cell content at the same offsets, so it is exact whenever it is made.
+
+<a id="drift-2026-11-11-5-versionvalidfor-mismatch-refuses-the-open"></a>
+### Drift: A VersionValidFor Mismatch Refuses The Open
+- **Category:** error-handling  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.open`.
+
+When the header's version-valid-for field (offset 92) differs from the change counter (offset 24), `lockBtree` distrusts only the page count in the header and takes the pager's file-size count instead (`btree.c:3294-3297`). `pager.open` returns `ErrHeaderCorrupt` for two non-zero values that differ: any-store writes both fields in every commit, so a difference means a header not written by one commit. A zero version-valid-for is treated as SQLite does (the page count comes from the file size).
+
+<a id="drift-2026-11-11-6-backup-reloads-the-header-from-the-copied-page-1"></a>
+### Drift: Backup Finalize Reloads The In-Memory Header From The Copied Page 1
+- **Category:** changed-logic  -  **Severity:** none
+- **Affected functions:** `backup.go:*Backup.finalize`.
+
+`sqlite3_backup` copies page 1 like any other page and then patches fields in the destination's page image (the schema cookie through `sqlite3BtreeUpdateMeta`, the version bytes through `sqlite3BtreeSetVersion`; `backup.c:420-431`); there is no header kept apart from the page. any-store's pager keeps a parsed `dbHeader` and writes it over page 1 at every commit, so `finalize` deserialises the copied page 1 into the destination's header, bumps the schema cookie there, and lets the commit serialise it back. The header that reaches disk is the source's, field for field, except for the cookie and the page count; a field `dbHeader` does not model would not survive, and there is none today. The magic family and schema format are the source's as well, which is why the destination must already have them (see [the backup format entry](#drift-2026-11-11-2-backup-refuses-a-destination-of-another-schema-format)).

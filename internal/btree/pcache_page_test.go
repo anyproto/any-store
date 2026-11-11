@@ -1134,6 +1134,7 @@ func TestIntegrityCheck_InteriorTreePage(t *testing.T) {
 }
 
 func TestIntegrityCheck_OverflowChainValidation(t *testing.T) {
+	useLegacyFormat(t)
 	// Use a small page size to force overflow with smaller values
 	db := tempDBWithPageSize(t, 512)
 
@@ -1822,6 +1823,7 @@ func TestIntegrityError_Error(t *testing.T) {
 }
 
 func TestIntegrityCheck_TooManyErrors_CheckList(t *testing.T) {
+	useLegacyFormat(t)
 	// Trigger tooManyErrors at the start of checkList (line 85).
 	// Strategy: use a freelist with a leaf page that is already referenced
 	// (generating one error), then the freelist count mismatch generates

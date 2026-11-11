@@ -923,6 +923,7 @@ func TestIO_ReadOverflowChain_OutOfBoundsPage(t *testing.T) {
 // Mirrors C accessPayload's post-loop completeness check (btree.c:5327-5330:
 // `if( rc==SQLITE_OK && amt>0 ) return SQLITE_CORRUPT_PAGE(pPage)`).
 func TestIO_ReadOverflowChain_PrematureTerminator(t *testing.T) {
+	useLegacyFormat(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 

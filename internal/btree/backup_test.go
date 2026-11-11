@@ -845,6 +845,7 @@ func TestBackup_FreedLeafGrownInTransactionReadable(t *testing.T) {
 // pin the whole source, getPageReader falls back to uncached temp pages, and
 // an unreleased temp page is a slab page lost for the life of the process.
 func TestBackup_ReleasesSourcePages(t *testing.T) {
+	useLegacyFormat(t)
 	const slabPages = 1000
 	globalPageSlab.Reset()
 	globalPageSlab.Init(4096, slabPages)

@@ -493,6 +493,7 @@ func TestSeekKey_LeftmostKeyAfterRightChild(t *testing.T) {
 // leftmostKeyAfter. The first key on the sibling leaf is large enough to
 // overflow, so leftmostKeyAfter must read overflow pages to reconstruct it.
 func TestSeekKey_LeftmostKeyAfterOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	dir := t.TempDir()
 	db, err := testOpen(t, dir+"/test.db", Options{PageSize: 512})
 	require.NoError(t, err)
@@ -652,6 +653,7 @@ func TestSeekKey_MatchesCursorExhaustive(t *testing.T) {
 
 // TestSeekKey_OverflowKey tests seeking with keys large enough to cause overflow pages.
 func TestSeekKey_OverflowKey(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "data")
 
 	// Create keys large enough to overflow (> ~1/4 of usable page).

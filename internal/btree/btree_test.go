@@ -1497,9 +1497,13 @@ func TestRebuildInteriorPageOnPage1(t *testing.T) {
 	bt.rebuildInteriorPage(pg, cells, 6)
 
 	// Page 1 carries the database header; the rebuild must not clobber it.
-	// Literal on purpose: a rename or edit of dbMagicV2 must fail here rather
+	// Literal on purpose: a rename or edit of the magic must fail here rather
 	// than pass by comparing the constant against itself.
-	assert.Equal(t, "any-store v2\x00\x00\x00\x00", string(pg.data[0:16]))
+	wantMagic := "any-store v2 fmt"
+	if legacyFormatSuite {
+		wantMagic = "any-store v2\x00\x00\x00\x00"
+	}
+	assert.Equal(t, wantMagic, string(pg.data[0:16]))
 	assert.Equal(t, uint8(pageTypeIntIdx), pg.data[dbHeaderSize])
 
 	p.releasePage(pg)
@@ -1862,6 +1866,7 @@ func TestMoveToChild_DescentNeverHitsZeroCellInterior(t *testing.T) {
 // fail this test loudly. Production behavior is unchanged: the probe is nil
 // outside tests.
 func TestSearchLeafOverflow_PrefixShortcutInvariant(t *testing.T) {
+	useLegacyFormat(t)
 	// Small page so a modest key overflows on-page.
 	p := tempPagerWithPageSize(t, 512)
 	pg, err := p.allocatePage()
@@ -1994,6 +1999,7 @@ func TestSearchLeafOverflow_PrefixShortcutInvariant(t *testing.T) {
 // report stored > search. This is a focused complement to the table above so a
 // regression in the "stored extends search" direction is unmissable.
 func TestSearchLeafOverflow_StoredKeyExtendsSearchKey(t *testing.T) {
+	useLegacyFormat(t)
 	p := tempPagerWithPageSize(t, 512)
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -2037,6 +2043,7 @@ func TestSearchLeafOverflow_StoredKeyExtendsSearchKey(t *testing.T) {
 // inert unless a test installs it: searchLeafWithOverflow must produce correct
 // results with searchLeafOverflowProbe == nil (the production configuration).
 func TestSearchLeafOverflow_ProbeNilInProduction(t *testing.T) {
+	useLegacyFormat(t)
 	require.Nil(t, searchLeafOverflowProbe, "probe must be nil by default (production behavior)")
 
 	p := tempPagerWithPageSize(t, 512)

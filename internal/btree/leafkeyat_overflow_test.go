@@ -25,6 +25,7 @@ func spilledKeyLen(usableSize int) int {
 }
 
 func TestLeafKeyAt_SpilledKey(t *testing.T) {
+	useLegacyFormat(t)
 	for _, pageSize := range []uint32{512, 4096} {
 		t.Run(fmt.Sprintf("page-%d", pageSize), func(t *testing.T) {
 			p := tempPagerWithPageSize(t, pageSize)
@@ -107,6 +108,7 @@ func TestLeafKeyAt_PayloadAboveAllocCap(t *testing.T) {
 // key reassembled from the overflow chain, not the page bytes after the local
 // prefix.
 func TestCursor_SeekExactSpilledKey(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "idx")
 	keyLen := spilledKeyLen(db.pager.usableSize())
 	const n = 6 // one leaf
@@ -148,6 +150,7 @@ func TestCursor_SeekExactSpilledKey(t *testing.T) {
 // when both are local, the check runs and searchLeaf compares against the
 // spilled keys in between through their overflow chains.
 func TestCursor_SeekNearSpilledKeys(t *testing.T) {
+	useLegacyFormat(t)
 	t.Run("spilled-first-and-last-keys", func(t *testing.T) {
 		db, ns := tempDBWithNS(t, "idx")
 		keyLen := spilledKeyLen(db.pager.usableSize())
