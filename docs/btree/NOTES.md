@@ -2082,7 +2082,7 @@ bounded by the per-snapshot `dbSize` check.
 
 <a id="drift-6-wal-frame-read-failure-falls-through-to-disk-read"></a>
 ### Drift: WAL Frame Read Failure Falls Through To Disk Read
-- **Category:** changed-logic  -  **Severity:** high  -  **Status:** RESOLVED 2026-07-10 (2026-07 pre-beta review): all four getters (`getPageWriter`, `readTempPage`, `getPageReader`, `readRawPage`) now propagate `readFrame`/`readFrameRaw` errors wrapped with page/frame context, matching C `readDbPage`, where with `iFrame != 0` the DB-file read is the unreachable else branch and a WAL read error becomes the page-get error (`sqlitec/src/pager.c:3035-3046`, 3.52.0). The "benign reset between lookup and read" TOCTOU race the fallthrough covered (introduced with commit `1e2cec7`) is structurally excluded: the writer path holds `lockWrite`, which any restart requires (`checkpointWithMode`; PASSIVE never resets, `checkpointPost`); readers hold a slot 1-4 shared lock that `tryResetWALWithBusy` must take exclusively; slot-0 snapshots carry `minFrame = mxFrame+1` so `walIndex.get` never resolves a frame for them (C `readLock==0` short-circuit); and the in-process slot-0 fallback now re-validates after acquiring read-0 (see the 2026-07-10 fallback re-validation fix, mirroring C's READ_LOCK(0) re-check at `wal.c:3136-3139`). Caveat: API calls that begin pager reads without the `db.mu` drain (`GetNamespace`, `ListNamespaces`, `IntegrityCheckN`) and race `DB.Close`'s WAL truncate may now surface a read error where they previously silently succeeded (contract-gray; follow-up). Adjacent residual: `refreshHeaderFromPage1`'s single-failure-with-successful-fallback path (deliberate 2026-07-10 design) still adopts a DB-file page-1 header under the write lock — open follow-up. Regression tests: `TestWALReadFrameErrorPropagates{,_Writer,_TempPage}`, `TestReadRawPageWALErrorPropagates`, `TestWALDecryptFailurePropagatesFromReadFrame`, `TestReadFrameNoBenignFailuresUnderTruncateStress`, `TestInProcessSlot0FallbackTruncateStress`.
+- **Category:** changed-logic  -  **Severity:** high  -  **Status:** RESOLVED 2026-07-10 (2026-07 pre-beta review): all four getters (`getPageWriter`, `readTempPage`, `getPageReader`, `readRawPage`) now propagate `readFrame`/`readFrameRaw` errors wrapped with page/frame context, matching C `readDbPage`, where with `iFrame != 0` the DB-file read is the unreachable else branch and a WAL read error becomes the page-get error (`sqlitec/src/pager.c:3035-3046`, 3.52.0). The "benign reset between lookup and read" TOCTOU race the fallthrough covered (introduced with commit `1e2cec7`) is structurally excluded: the writer path holds `lockWrite`, which any restart requires (`checkpointWithMode`; PASSIVE never resets, `checkpointPost`); readers hold a slot 1-4 shared lock that `tryResetWALWithBusy` must take exclusively; slot-0 snapshots carry `minFrame = mxFrame+1` so `walIndex.get` never resolves a frame for them (C `readLock==0` short-circuit); and the in-process slot-0 fallback now re-validates after acquiring read-0 (see the 2026-07-10 fallback re-validation fix, mirroring C's READ_LOCK(0) re-check at `wal.c:3136-3139`). Caveat: API calls that begin pager reads without the `db.mu` drain (`GetNamespace`, `ListNamespaces`, `IntegrityCheckN`) and race `DB.Close`'s WAL truncate may now surface a read error where they previously silently succeeded (contract-gray; follow-up). The adjacent residual in `refreshHeaderFromPage1` (a failed page-1 frame read fell back to the DB file's older page 1 under the write lock) is closed as of 2026-11-11: see the error-propagation paragraph of drift-76. Regression tests: `TestWALReadFrameErrorPropagates{,_Writer,_TempPage}`, `TestReadRawPageWALErrorPropagates`, `TestWALDecryptFailurePropagatesFromReadFrame`, `TestReadFrameNoBenignFailuresUnderTruncateStress`, `TestInProcessSlot0FallbackTruncateStress`.
 - **Affected functions:** `pager.go:*pager.getPageWriter` (`internal/btree/pager.go:1014-1028`), `pager.go:*pager.readTempPage` (`internal/btree/pager.go:1114-1123`); the same fall-through also appears in the `getPageReader` cache path (`internal/btree/pager.go:1247`) and the `readFrameRaw` path (`internal/btree/pager.go:1357`).
 
 In C `readDbPage`, once `sqlite3WalFindFrame` resolves a WAL frame (`iFrame != 0`) the
@@ -2800,6 +2800,27 @@ disk and overwrites BOTH `p.header` and `p.dbSize` (`p.dbSize.Store(p.header.Dat
 `pager.go:2016,2034`). The consequence is a structural divergence in when and where the cached
 header/size are reconciled with the on-disk image: Go performs this reconciliation lazily at the
 start of a write when the underlying WAL state changed, rather than during reads as SQLite does.
+
+Error propagation (2026-11-11). The re-read takes page 1 from exactly one source, as `readDbPage`
+does (`pager.c:3031-3046`): the WAL frame when the wal-index resolves one, the DB file otherwise.
+A failed lookup, a failed read of the selected source, and a page-1 image that does not decode as
+a database header (SQLite: the `lockBtree` checks, `btree.c:3288-3373`) all abort `beginWrite` and
+leave `p.header` / `p.dbSize` untouched; the DB file's older page 1 never stands in for a frame
+whose read failed. Before this, a failed frame read fell back to the DB file and returned nil, so
+a writer could start with a peer-outgrown `dbSize` and freelist and allocate over the peer's
+pages; a failed decode and a lone DB-file read failure were ignored as well.
+
+Residual divergence: SQLite needs no "refresh pending" state, because a transaction whose page-1
+read failed never keeps the page (`lockBtree` releases it and leaves `pBt->pPage1` zero,
+`btree.c:3288-3289`, `3451-3454`) and the next transaction reads it again. Go keeps the header in
+a struct and detects the peer change in the WAL layer, whose `writerHdr` baseline has already
+moved to the live header by the time the page-1 re-read runs. `pager.headerStale` carries the
+pending refresh across a failed begin: it is set before the re-read and cleared only when one
+succeeds, and `beginWrite` refreshes when either `stateChanged` or `headerStale` is set.
+Regression tests: `TestBeginWritePage1Refresh_WALReadFailureNoStaleFallback`,
+`TestRefreshHeaderFromPage1_DecodeErrorPropagates`,
+`TestRefreshHeaderFromPage1_DBFileReadErrorPropagates`,
+`TestRefreshHeaderFromPage1_DoubleIOFailure`, `TestBeginWriteHeaderRefreshError_DoubleIOFailure`.
 
 <a id="drift-77-filechangecount-bumped-conditionally-not-unconditionally"></a>
 ### Drift: FileChangeCount Bumped Conditionally Not Unconditionally

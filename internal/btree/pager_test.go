@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -8442,6 +8443,155 @@ func TestBeginWriteHeaderRefreshError_DoubleIOFailure(t *testing.T) {
 	assert.NotEqual(t, int32(pagerWriter), p.state.Load(),
 		"pager must not be in writer state after an aborted beginWrite")
 	_ = maxFrame
+}
+
+// TestBeginWritePage1Refresh_WALReadFailureNoStaleFallback: a peer grew the
+// database in the WAL, and this process's page-1 frame read fails once at
+// write begin. The begin must fail instead of adopting the DB file's older
+// page 1, and the retry must refresh: the writer must never allocate over
+// the peer's pages. SQLite reads page 1 from the WAL frame or from the DB
+// file, never one in place of the other (readDbPage, pager.c:3031-3046).
+func TestBeginWritePage1Refresh_WALReadFailureNoStaleFallback(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db1.Close()
+
+	allowDoubleOpen(dbPath)
+	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db2.Close()
+
+	// db2 seeds and checkpoints: the DB file now holds a valid page 1 with
+	// the small size, and db2 has a writer baseline.
+	wtx, err := db2.BeginWrite()
+	require.NoError(t, err)
+	ns2, err := wtx.CreateNamespace("seed")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns2, []byte("k"), []byte("v")))
+	require.NoError(t, wtx.Commit())
+	require.NoError(t, db2.Checkpoint(CheckpointPassive))
+
+	// db1 (the peer) grows the database; the growth lives only in the WAL.
+	const nPeer = 200
+	peerVal := bytes.Repeat([]byte{0xA5}, 1000)
+	wtx, err = db1.BeginWrite()
+	require.NoError(t, err)
+	ns1, err := wtx.GetNamespace("seed")
+	require.NoError(t, err)
+	for i := 0; i < nPeer; i++ {
+		require.NoError(t, wtx.Put(ns1, []byte(fmt.Sprintf("peer-%04d", i)), peerVal))
+	}
+	require.NoError(t, wtx.Commit())
+	peerSize := db1.pager.dbSize.Load()
+
+	// The next WAL frame read fails once: that is db2's page-1 re-read at
+	// write begin.
+	errInjected := errors.New("injected wal frame read failure")
+	var fired atomic.Int32
+	setWalReadFrameFaultHook(func(uint32) error {
+		if fired.CompareAndSwap(0, 1) {
+			return errInjected
+		}
+		return nil
+	})
+	defer setWalReadFrameFaultHook(nil)
+
+	wtx, beginErr := db2.BeginWrite()
+	if beginErr != nil {
+		// Retry: the failed begin must not have left a baseline that lets
+		// this one skip the refresh.
+		wtx, err = db2.BeginWrite()
+		require.NoError(t, err)
+	}
+	require.Equal(t, int32(1), fired.Load(), "the injected read failure must have fired")
+	assert.Equal(t, peerSize, db2.pager.dbSize.Load(),
+		"the writer must hold the peer's committed database size")
+
+	ownVal := bytes.Repeat([]byte{0x5A}, 1000)
+	ns2, err = wtx.GetNamespace("seed")
+	require.NoError(t, err)
+	for i := 0; i < nPeer; i++ {
+		require.NoError(t, wtx.Put(ns2, []byte(fmt.Sprintf("own-%04d", i)), ownVal))
+	}
+	require.NoError(t, wtx.Commit())
+
+	// The peer's rows survive db2's commit.
+	rtx, err := db1.BeginRead()
+	require.NoError(t, err)
+	ns1r, err := rtx.GetNamespace("seed")
+	require.NoError(t, err)
+	for i := 0; i < nPeer; i++ {
+		got, err := rtx.Get(ns1r, []byte(fmt.Sprintf("peer-%04d", i)))
+		require.NoError(t, err, "peer row %d", i)
+		require.True(t, bytes.Equal(peerVal, got), "peer row %d overwritten", i)
+	}
+	require.NoError(t, rtx.Rollback())
+	require.NoError(t, db2.IntegrityCheck())
+
+	require.ErrorIs(t, beginErr, errInjected,
+		"the begin whose page-1 frame read failed must return that error")
+}
+
+// TestRefreshHeaderFromPage1_DecodeErrorPropagates: a page-1 WAL frame that
+// does not decode as a database header is an error, and the cached header
+// stays as it was.
+func TestRefreshHeaderFromPage1_DecodeErrorPropagates(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
+	pg, err := p.getWritablePage(1)
+	require.NoError(t, err)
+	p.releasePage(pg)
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot)
+
+	frame := mustWiGet(t, p.wal.index, 1, p.wal.index.mxCommitFrame.LoadLocal())
+	require.Greater(t, frame, uint32(0))
+
+	// Overwrite the frame's page-1 header prefix with bytes that are not a
+	// database header.
+	frameSize := int64(walFrameSize) + int64(p.pageSize)
+	off := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
+	_, err = p.wal.file.WriteAt(bytes.Repeat([]byte{0xEE}, dbHeaderSize), off)
+	require.NoError(t, err)
+
+	before := p.header
+	beforeSize := p.dbSize.Load()
+	err = p.refreshHeaderFromPage1()
+	require.ErrorIs(t, err, ErrHeaderCorrupt)
+	assert.Equal(t, before, p.header, "a failed refresh must not change the cached header")
+	assert.Equal(t, beforeSize, p.dbSize.Load())
+}
+
+// TestRefreshHeaderFromPage1_DBFileReadErrorPropagates: with no page-1 frame
+// in the WAL, page 1 comes from the DB file, and a failed read there is an
+// error too.
+func TestRefreshHeaderFromPage1_DBFileReadErrorPropagates(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	p := newPager(dbPath, 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	require.Equal(t, uint32(0), p.wal.index.mxCommitFrame.LoadLocal(), "no WAL frames yet")
+	require.NoError(t, os.Truncate(dbPath, 10))
+
+	before := p.header
+	err := p.refreshHeaderFromPage1()
+	require.Error(t, err)
+	assert.Equal(t, before, p.header, "a failed refresh must not change the cached header")
 }
 
 // ============================================================
