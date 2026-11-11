@@ -2249,6 +2249,12 @@
     "sqlite": [],
     "note": "lazy WAL header flush on first write (any-store optimization)"
   },
+  "wal.go:*wal.indexReadHdr": {
+    "sqlite": [
+      "wal.c:walIndexReadHdr"
+    ],
+    "note": "validated header read; rebuilds the wal-index under the write lock when the header is invalid"
+  },
   "wal.go:*wal.initHeaderStateLocked": {
     "sqlite": [],
     "note": "lazy WAL header init without disk write"
