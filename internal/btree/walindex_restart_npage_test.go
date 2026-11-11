@@ -172,3 +172,16 @@ func TestReaderSizeWithoutWalCommit(t *testing.T) {
 	requireRestartNPageRows(t, db)
 	require.NoError(t, db.IntegrityCheck())
 }
+
+// TestIntegrityCheckAfterPeerGrowth: the peer's new pages are still only in
+// the WAL. IntegrityCheck in the process that has not written since must
+// bound page numbers by its snapshot, like every other reader.
+func TestIntegrityCheckAfterPeerGrowth(t *testing.T) {
+	if restartNPageChild(t) {
+		return
+	}
+	db, path := openRestartNPageSurvivor(t)
+	runRestartNPageChild(t, "TestIntegrityCheckAfterPeerGrowth", path, "grow")
+	requireRestartNPageRows(t, db)
+	require.NoError(t, db.IntegrityCheck())
+}

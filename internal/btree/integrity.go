@@ -566,7 +566,7 @@ func (db *DB) IntegrityCheck() error {
 // Pass 0 for unlimited.
 func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// Start a read transaction
-	maxFrame, slot, err := db.pager.beginRead()
+	walHdr, maxFrame, _, slot, err := db.pager.beginReadHdr()
 	if err != nil {
 		return err
 	}
@@ -594,31 +594,17 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 		return nil
 	}
 
-	// Cap nPages against the actual database size to protect against corrupted
-	// headers claiming billions of pages. This matches SQLite's approach where
-	// btreePagecount() uses the actual file/WAL size, not the header field.
-	//
-	// Use max(filePages, walIndex.maxPage) because pages allocated in the WAL
-	// may have page numbers beyond the current physical DB file size (they get
-	// written to the DB file during checkpoint).
-	pageSize := db.pager.pageSize
-	if pageSize > 0 {
-		var maxPossible uint32
-		if db.pager.file != nil {
-			fi, statErr := db.pager.file.Stat()
-			if statErr == nil {
-				maxPossible = uint32(fi.Size() / int64(pageSize))
-			}
-		}
-		// WAL's maxPage tracks the committed database size including
-		// pages that only exist in the WAL (not yet checkpointed).
-		walMaxPage := db.pager.wal.index.maxPage.Load()
-		if walMaxPage > maxPossible {
-			maxPossible = walMaxPage
-		}
-		if maxPossible > 0 && nPages > maxPossible {
-			nPages = maxPossible
-		}
+	// Cap nPages against the snapshot's database size to protect against
+	// corrupted headers claiming billions of pages. This matches SQLite's
+	// approach where btreePagecount() is the pager's count, not the header
+	// field. The count is the one every reader of this snapshot uses
+	// (effectiveReaderDbSize: the wal-index header's committed size, else
+	// the file's). The process-local walIndex.maxPage must not be the cap:
+	// in a process that has not begun a write since a peer grew the
+	// database it is stale, and the peer's pages, still only in the WAL,
+	// were reported as invalid page numbers.
+	if maxPossible := db.pager.effectiveReaderDbSize(walHdr); maxPossible > 0 && nPages > maxPossible {
+		nPages = maxPossible
 	}
 
 	// Bound reader page/overflow reads against this snapshot's (capped) page
