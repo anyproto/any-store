@@ -1514,7 +1514,10 @@ material (measurement shows it is secondary to syscall cost).
 after deserializing the DB header and returns `ErrCorrupt` on a
 nonzero mismatch (zero is treated as "field not tracked" — legacy /
 test fixtures skip the check). Commit path now advances both fields
-in lockstep. Catches crash-mid-header-update corruption. This is
+in lockstep. Catches crash-mid-header-update corruption. Since
+2026-11-11 the comparison is made by `lockBtreePageCount` on the page 1
+the open snapshot reads (`pager.readPage1AtOpen`): a WAL page 1 that
+supersedes a damaged file header is what gets judged. This is
 stricter than SQLite, which only stops trusting the in-header size:
 see [drift-2026-11-11-2](#drift-2026-11-11-2-nonzero-change-counter-mismatch-is-corruption).
 
@@ -2814,7 +2817,12 @@ the start of a transaction (`btree.c:3284-3298`, `3401-3408`):
 - The size is `lockBtreePageCount` (`btree.c:3294-3298`, `3401-3408`) against `pagerPageCount`
   (`pagerPagecount`, `pager.c:3279-3306`: the live wal-index `nPage`, else the file size): a zero
   or untrusted page-1 size gives way to the pager's count, and a trusted size above it is
-  `ErrHeaderCorrupt`. `pager.open` is meant to use the same two helpers.
+  `ErrHeaderCorrupt`. `pager.open` uses the same two helpers in `readPage1AtOpen`, which reads
+  page 1 and the count under one WAL read transaction (`pagerBeginReadTransaction` then
+  `pagerPagecount`, `pager.c:5444-5448`; `lockBtree`, `btree.c:3284-3298`), so a peer's checkpoint
+  during open cannot pair a stale file header with a newer WAL size. Open used to take the larger
+  of the file-derived size and the WAL's, which brought back the pages of a WAL-committed shrink
+  at the first commit.
 - A failed lookup, a failed read, a page-1 image that does not decode as a database header, and a
   rejected size all abort `beginWrite` and leave `p.header` / `p.dbSize` untouched.
 

@@ -1695,9 +1695,10 @@
   "pager.go:*pager.open": {
     "sqlite": [
       "btree.c:lockBtree",
+      "pager.c:pagerPagecount",
       "pager.c:sqlite3PagerOpen"
     ],
-    "note": ""
+    "note": "page 1 and the page count are read at one snapshot in readPage1AtOpen"
   },
   "pager.go:*pager.pagerError": {
     "sqlite": [
@@ -1745,6 +1746,14 @@
       "btree.c:getOverflowPage"
     ],
     "note": ""
+  },
+  "pager.go:*pager.readPage1AtOpen": {
+    "sqlite": [
+      "btree.c:lockBtree",
+      "pager.c:pagerBeginReadTransaction",
+      "pager.c:pagerPagecount"
+    ],
+    "note": "open-time page-1 read and page count under one WAL read transaction"
   },
   "pager.go:*pager.readRawPage": {
     "sqlite": [],
