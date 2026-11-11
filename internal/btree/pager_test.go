@@ -8370,6 +8370,7 @@ func TestRefreshHeaderFromPage1_DoubleIOFailure(t *testing.T) {
 		p.file = dbFile
 	}()
 
+	p.writerCache.clear() // as beginWrite does before the refresh
 	err = p.refreshHeaderFromPage1()
 	require.Error(t, err, "refreshHeaderFromPage1 must propagate the double I/O read failure")
 	assert.ErrorIs(t, err, ErrWALCorrupt)
@@ -8535,6 +8536,84 @@ func TestBeginWritePage1Refresh_WALReadFailureNoStaleFallback(t *testing.T) {
 		"the begin whose page-1 frame read failed must return that error")
 }
 
+// TestBeginWritePage1Refresh_PageCountRule: the write-begin refresh applies
+// lockBtree's page-count rule (btree.c:3294-3298, 3401-3408) to the page 1 it
+// read, against the pager's count (the WAL's committed size): a zero size
+// gives way to the pager's count, and a trusted size above it is corruption.
+// A non-zero change-counter mismatch is rejected (any-store's stricter rule).
+func TestBeginWritePage1Refresh_PageCountRule(t *testing.T) {
+	// setup returns a second handle whose next write begin must re-read
+	// page 1, and a patch function for the header bytes of the peer's
+	// newest page-1 WAL frame.
+	setup := func(t *testing.T) (db2 *DB, committed uint32, patch func(off int, v uint32)) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "test.db")
+		db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = db1.Close() })
+		allowDoubleOpen(dbPath)
+		db2, err = testOpen(t, dbPath, Options{PageSize: 4096})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = db2.Close() })
+
+		wtx, err := db2.BeginWrite()
+		require.NoError(t, err)
+		_, err = wtx.CreateNamespace("seed")
+		require.NoError(t, err)
+		require.NoError(t, wtx.Commit())
+
+		wtx, err = db1.BeginWrite()
+		require.NoError(t, err)
+		ns1, err := wtx.GetNamespace("seed")
+		require.NoError(t, err)
+		val := bytes.Repeat([]byte{0xA5}, 1000)
+		for i := 0; i < 50; i++ {
+			require.NoError(t, wtx.Put(ns1, []byte(fmt.Sprintf("peer-%04d", i)), val))
+		}
+		require.NoError(t, wtx.Commit())
+
+		w := db1.pager.wal
+		hdr, valid := w.index.readHeader()
+		require.True(t, valid)
+		frame := mustWiGet(t, w.index, 1, hdr.mxFrame)
+		require.Greater(t, frame, uint32(0))
+		frameSize := int64(walFrameSize) + int64(w.pageSize)
+		base := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
+		patch = func(off int, v uint32) {
+			var b [4]byte
+			binary.BigEndian.PutUint32(b[:], v)
+			_, err := w.file.WriteAt(b[:], base+int64(off))
+			require.NoError(t, err)
+		}
+		return db2, hdr.nPage, patch
+	}
+
+	t.Run("zero size uses the pager count", func(t *testing.T) {
+		db2, committed, patch := setup(t)
+		patch(28, 0)
+		wtx, err := db2.BeginWrite()
+		require.NoError(t, err)
+		defer func() { _ = wtx.Rollback() }()
+		require.Equal(t, committed, db2.pager.dbSize.Load())
+	})
+
+	t.Run("trusted size above the pager count is corrupt", func(t *testing.T) {
+		db2, committed, patch := setup(t)
+		before := db2.pager.dbSize.Load()
+		patch(28, committed+5)
+		_, err := db2.BeginWrite()
+		require.ErrorIs(t, err, ErrHeaderCorrupt)
+		require.Equal(t, before, db2.pager.dbSize.Load(), "a rejected page 1 must not change the size")
+	})
+
+	t.Run("change-counter mismatch is corrupt", func(t *testing.T) {
+		db2, _, patch := setup(t)
+		patch(92, 0x7fffffff)
+		_, err := db2.BeginWrite()
+		require.ErrorIs(t, err, ErrHeaderCorrupt)
+	})
+}
+
 // TestRefreshHeaderFromPage1_DecodeErrorPropagates: a page-1 WAL frame that
 // does not decode as a database header is an error, and the cached header
 // stays as it was.
@@ -8568,6 +8647,7 @@ func TestRefreshHeaderFromPage1_DecodeErrorPropagates(t *testing.T) {
 
 	before := p.header
 	beforeSize := p.dbSize.Load()
+	p.writerCache.clear() // as beginWrite does before the refresh
 	err = p.refreshHeaderFromPage1()
 	require.ErrorIs(t, err, ErrHeaderCorrupt)
 	assert.Equal(t, before, p.header, "a failed refresh must not change the cached header")
@@ -8589,6 +8669,7 @@ func TestRefreshHeaderFromPage1_DBFileReadErrorPropagates(t *testing.T) {
 	require.NoError(t, os.Truncate(dbPath, 10))
 
 	before := p.header
+	p.writerCache.clear() // as beginWrite does before the refresh
 	err := p.refreshHeaderFromPage1()
 	require.Error(t, err)
 	assert.Equal(t, before, p.header, "a failed refresh must not change the cached header")

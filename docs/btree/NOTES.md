@@ -1514,7 +1514,9 @@ material (measurement shows it is secondary to syscall cost).
 after deserializing the DB header and returns `ErrCorrupt` on a
 nonzero mismatch (zero is treated as "field not tracked" — legacy /
 test fixtures skip the check). Commit path now advances both fields
-in lockstep. Catches crash-mid-header-update corruption.
+in lockstep. Catches crash-mid-header-update corruption. This is
+stricter than SQLite, which only stops trusting the in-header size:
+see [drift-2026-11-11-2](#drift-2026-11-11-2-nonzero-change-counter-mismatch-is-corruption).
 
 **Auto-Checkpoint Errors Surfaced** -- Resolved 2026-04-22
 
@@ -2801,14 +2803,31 @@ disk and overwrites BOTH `p.header` and `p.dbSize` (`p.dbSize.Store(p.header.Dat
 header/size are reconciled with the on-disk image: Go performs this reconciliation lazily at the
 start of a write when the underlying WAL state changed, rather than during reads as SQLite does.
 
-Error propagation (2026-11-11). The re-read takes page 1 from exactly one source, as `readDbPage`
-does (`pager.c:3031-3046`): the WAL frame when the wal-index resolves one, the DB file otherwise.
-A failed lookup, a failed read of the selected source, and a page-1 image that does not decode as
-a database header (SQLite: the `lockBtree` checks, `btree.c:3288-3373`) all abort `beginWrite` and
-leave `p.header` / `p.dbSize` untouched; the DB file's older page 1 never stands in for a frame
-whose read failed. Before this, a failed frame read fell back to the DB file and returned nil, so
-a writer could start with a peer-outgrown `dbSize` and freelist and allocate over the peer's
-pages; a failed decode and a lone DB-file read failure were ignored as well.
+Error propagation and the page-count rule (2026-11-11). The re-read is now what `lockBtree` does at
+the start of a transaction (`btree.c:3284-3298`, `3401-3408`):
+
+- Page 1 is fetched whole through the writer cache (`btreeGetPage` → `readDbPage`,
+  `pager.c:3031-3046`), from exactly one source: the WAL frame when the wal-index resolves one, the
+  DB file otherwise. The DB file's older page 1 never stands in for a frame whose read failed.
+  The page stays in the cache the begin has just cleared, where the commit would load it anyway,
+  so the full-page read replaces a later one rather than adding one.
+- The size is `lockBtreePageCount` (`btree.c:3294-3298`, `3401-3408`) against `pagerPageCount`
+  (`pagerPagecount`, `pager.c:3279-3306`: the live wal-index `nPage`, else the file size): a zero
+  or untrusted page-1 size gives way to the pager's count, and a trusted size above it is
+  `ErrHeaderCorrupt`. `pager.open` is meant to use the same two helpers.
+- A failed lookup, a failed read, a page-1 image that does not decode as a database header, and a
+  rejected size all abort `beginWrite` and leave `p.header` / `p.dbSize` untouched.
+
+Before this, a failed frame read fell back to the DB file and returned nil, so a writer could
+start with a peer-outgrown `dbSize` and freelist and allocate over the peer's pages; a failed
+decode and a lone DB-file read failure were ignored, only the 100-byte prefix was read, and the
+page-1 size was installed unchecked (a zero made every page unreachable).
+
+Error classes. SQLite's `SQLITE_NOTADB` for a page 1 that is not a database header
+(`btree.c:3306`) is `ErrHeaderCorrupt` here, as at open: any-store has one error for "unusable
+header", and it matches `ErrCorrupt`. A DB file too short to hold page 1 is a read error
+(`io.EOF`) rather than a zero-filled `NOTADB`, because the page getters do not zero-fill a short
+read ([drift-7](#drift-7-short-db-file-read-treated-as-hard-error)); the begin fails either way.
 
 Residual divergence: SQLite needs no "refresh pending" state, because a transaction whose page-1
 read failed never keeps the page (`lockBtree` releases it and leaves `pBt->pPage1` zero,
@@ -2818,9 +2837,21 @@ moved to the live header by the time the page-1 re-read runs. `pager.headerStale
 pending refresh across a failed begin: it is set before the re-read and cleared only when one
 succeeds, and `beginWrite` refreshes when either `stateChanged` or `headerStale` is set.
 Regression tests: `TestBeginWritePage1Refresh_WALReadFailureNoStaleFallback`,
+`TestBeginWritePage1Refresh_PageCountRule`,
 `TestRefreshHeaderFromPage1_DecodeErrorPropagates`,
 `TestRefreshHeaderFromPage1_DBFileReadErrorPropagates`,
 `TestRefreshHeaderFromPage1_DoubleIOFailure`, `TestBeginWriteHeaderRefreshError_DoubleIOFailure`.
+
+<a id="drift-2026-11-11-2-nonzero-change-counter-mismatch-is-corruption"></a>
+### Drift: A Non-Zero Change-Counter Mismatch On Page 1 Is Corruption, Not An Untrusted Size
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:lockBtreePageCount` (callers `pager.go:*pager.refreshHeaderFromPage1`, `pager.go:*pager.open`).
+
+SQLite's `lockBtree` uses the in-header page count (offset 28) only when it is non-zero and bytes 24..27 (change counter) equal bytes 92..95 (version-valid-for); on any mismatch it falls back to the pager's count and carries on (`btree.c:3294-3298`). The mismatch is a normal state there: a library older than 3.7.0 updates the change counter without knowing about offsets 28 and 92, so the stored size may be stale and is simply not trusted.
+
+`lockBtreePageCount` applies the same rule for a zero size and for `VersionValidFor == 0` (files and fixtures that never tracked the field), but returns `ErrHeaderCorrupt` when `VersionValidFor` is non-zero and differs from `FileChangeCount`. No any-store writer can produce that state: every commit sets the two fields together before serializing page 1 (`pager.commit`), both live in the first 100 bytes of the page so no sector boundary separates them, and there is no older any-store format that maintains one without the other. A non-zero mismatch therefore means the header bytes were damaged, and the same damage may have hit the freelist head and count next to them (offsets 32 and 36), which nothing cross-checks; continuing on the pager's count would let the next commit write that header back. SQLite's leniency exists for a compatibility case any-store does not have.
+
+The cost is that a database whose page-1 header is damaged in exactly these bytes is refused where SQLite would open it. Revisit if a writer that updates the counters separately is ever introduced. Regression tests: `TestBeginWritePage1Refresh_PageCountRule/change-counter_mismatch_is_corrupt`, and the open-time `VersionValidFor` test in `pager_test.go`.
 
 <a id="drift-77-filechangecount-bumped-conditionally-not-unconditionally"></a>
 ### Drift: FileChangeCount Bumped Conditionally Not Unconditionally
