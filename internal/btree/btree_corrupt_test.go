@@ -234,6 +234,7 @@ func TestCorruptCov_SearchLeafVarintCorruption(t *testing.T) {
 // When leaf has overflow cells, key reading from overflow pages can fail
 
 func TestCorruptCov_LeafFullKeyBoundsCheck(t *testing.T) {
+	useLegacyFormat(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 	db, err := testOpen(t, path, Options{PageSize: 512})

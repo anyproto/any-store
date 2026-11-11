@@ -121,6 +121,12 @@ type Options struct {
 
 	PageSize uint32 // Page size in bytes (default: 4096)
 
+	// SchemaFormat is the on-disk format of a database file this Open
+	// creates: 0 for the current one, or 5 for the format of releases before
+	// v2.5.0. An existing file keeps its own format whatever is asked. Used by
+	// a backup, whose destination must have its source's format.
+	SchemaFormat uint32
+
 	// DisableAutoCheckpoint disables auto-checkpoint entirely (manual Checkpoint() only).
 	DisableAutoCheckpoint bool
 
@@ -585,7 +591,11 @@ func Open(path string, opts Options) (*DB, error) {
 		}
 	}
 
+	if opts.SchemaFormat != 0 && (opts.SchemaFormat < minSchemaFormat || opts.SchemaFormat > maxSchemaFormat) {
+		return nil, fmt.Errorf("btree: cannot create a database of schema format %d", opts.SchemaFormat)
+	}
 	p := newPager(path, opts.PageSize, opts.CacheSize, !opts.InMemory)
+	p.createFormat = opts.SchemaFormat
 	p.useSlab = opts.UsePageSlab
 	p.writerCache.useSlab = opts.UsePageSlab
 	p.inProcess = opts.InProcess
@@ -842,6 +852,13 @@ func (db *DB) HasOpenTransaction() bool {
 // uses attached-db paths to imply options.
 func (db *DB) Options() Options {
 	return db.opts
+}
+
+// SchemaFormat returns the on-disk format of the open file (5 or 6; 0 for a
+// file whose header never recorded one, which is read as 5). A file keeps the
+// format it was created with.
+func (db *DB) SchemaFormat() uint32 {
+	return db.pager.schemaFormat.Load()
 }
 
 // beginRead starts a read-only transaction.

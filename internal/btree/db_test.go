@@ -777,6 +777,7 @@ func TestFreeTreePages_InteriorNodes(t *testing.T) {
 // Cover the overflow path where key spills into overflow
 
 func TestAppendValue_LargeKeyOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDB(t)
 
 	tx, err := db.BeginWrite()
@@ -1808,6 +1809,7 @@ func TestDeleteNamespace_InteriorMasterBtree(t *testing.T) {
 }
 
 func TestFreeTreePages_InteriorAndOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDB(t)
 
 	// Create namespace with many large values — both interior pages AND overflow chains

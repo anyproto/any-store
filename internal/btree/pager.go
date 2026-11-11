@@ -93,8 +93,13 @@ type pager struct {
 	// the header at open (setLeafRule); atomic because a backup into this
 	// handle can replace the header while readers are open.
 	tableLeaf atomic.Bool
-	dbSize    atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
-	state     atomic.Int32  // pagerState
+	// schemaFormat is the header's schema format as of open, for DB.SchemaFormat.
+	schemaFormat atomic.Uint32
+	// createFormat is Options.SchemaFormat: the schema format initNewDB writes,
+	// 0 for the current one.
+	createFormat uint32
+	dbSize       atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
+	state        atomic.Int32  // pagerState
 
 	// balanceQuickDispatchCount counts dispatches into splitLeafRightmostAppend.
 	// Test-only: production code never reads it (atomic load is ~ns). Used to
@@ -631,7 +636,8 @@ func (p *pager) open() (err error) {
 	// and the header on disk is half-new / half-old. Treat
 	// VersionValidFor==0 as "not initialized by this writer" (legacy
 	// DBs, pre-P3.3 test fixtures) and skip the check rather than
-	// reject. Matches SQLite's defensive-read-only interpretation.
+	// reject.
+	// DRIFT: two differing non-zero values refuse the open; SQLite only distrusts the header's page count then (btree.c:3294-3297). See docs/btree/NOTES.md#drift-2026-11-11-5-versionvalidfor-mismatch-refuses-the-open
 	if p.header.VersionValidFor != 0 && p.header.VersionValidFor != p.header.FileChangeCount {
 		return fmt.Errorf("%w: VersionValidFor=%d FileChangeCount=%d", ErrHeaderCorrupt, p.header.VersionValidFor, p.header.FileChangeCount)
 	}
@@ -859,10 +865,12 @@ func (p *pager) initNewDB() error {
 		DefaultCacheSize: defaultCacheSize,
 		TextEncoding:     1, // UTF-8
 	}
-	if createLegacyFormat.Load() {
+	if p.createFormat != 0 {
+		p.header.SchemaFormat = p.createFormat
+	} else if createLegacyFormat.Load() {
 		p.header.SchemaFormat = 5
-		p.header.versioned = false
 	}
+	p.header.versioned = p.header.SchemaFormat >= firstVersionedSchemaFormat
 	p.setLeafRule()
 	// BEGIN ENCRYPTION
 	if p.codec != nil {
@@ -1673,10 +1681,7 @@ func (p *pager) leafLimits() payloadLimits {
 	return p.leafLimitsFor(p.usableSize_)
 }
 
-// leafLimitsFor is leafLimits for a usable size the caller read itself. The
-// integrity check takes its geometry from the header of the snapshot it
-// walks, which a backup into this handle can leave different from
-// usableSize_.
+// leafLimitsFor is the file's leaf rule for a given usable size.
 func (p *pager) leafLimitsFor(usableSize int) payloadLimits {
 	if p.tableLeaf.Load() {
 		return tableLeafLimits(usableSize)
@@ -1685,10 +1690,27 @@ func (p *pager) leafLimitsFor(usableSize int) payloadLimits {
 }
 
 // setLeafRule records the leaf-cell rule of the file from its schema format.
-// Called wherever the header is first read or replaced as a whole: open, a new
-// database, and a backup that copies another file's page 1 over this one.
+// Called once, when the header is first known: at open or when a new database
+// is created. The format of a file never changes afterwards (a backup refuses
+// a destination of another format, see BackupInit), so the rule holds for
+// every snapshot and every process that has the file open.
 func (p *pager) setLeafRule() {
 	p.tableLeaf.Store(p.header.SchemaFormat >= schemaFormatTableLeaf)
+	p.schemaFormat.Store(p.header.SchemaFormat)
+}
+
+// checkRefreshedHeader is applied to a header reloaded from page 1 after
+// another process committed. deserialize has already refused a format this
+// binary does not know; this refuses a leaf rule other than the one the handle
+// was opened with, which no supported operation produces.
+func (p *pager) checkRefreshedHeader(err error) error {
+	if errors.Is(err, ErrNewerFormat) {
+		return err
+	}
+	if err == nil && (p.header.SchemaFormat >= schemaFormatTableLeaf) != p.tableLeaf.Load() {
+		return fmt.Errorf("%w: schema format changed to %d under an open handle", ErrHeaderCorrupt, p.header.SchemaFormat)
+	}
+	return nil
 }
 
 // freelistMaxLeaves returns the max number of leaf entries per trunk page.
@@ -2154,7 +2176,9 @@ func (p *pager) refreshHeaderFromPage1() error {
 		if frame > 0 {
 			var buf [dbHeaderSize]byte
 			if err := p.readWalFrameData(frame, buf[:]); err == nil {
-				_ = p.header.deserialize(buf[:])
+				if herr := p.checkRefreshedHeader(p.header.deserialize(buf[:])); herr != nil {
+					return herr
+				}
 				p.dbSize.Store(p.header.DatabaseSize)
 				if debugTrace {
 					trace("refreshHeaderFromPage1: source=wal frame=%d maxFrame=%d nBackfill=%d dbSize=%d firstFree=%d totalFree=%d",
@@ -2172,7 +2196,9 @@ func (p *pager) refreshHeaderFromPage1() error {
 	if p.file != nil {
 		var buf [dbHeaderSize]byte
 		if _, err := p.file.ReadAt(buf[:], 0); err == nil {
-			_ = p.header.deserialize(buf[:])
+			if herr := p.checkRefreshedHeader(p.header.deserialize(buf[:])); herr != nil {
+				return herr
+			}
 			p.dbSize.Store(p.header.DatabaseSize)
 			if debugTrace {
 				trace("refreshHeaderFromPage1: source=db maxFrame=%d nBackfill=%d dbSize=%d firstFree=%d totalFree=%d",

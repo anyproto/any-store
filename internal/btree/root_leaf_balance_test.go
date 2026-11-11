@@ -308,14 +308,16 @@ func TestInteriorSplitPointFitting_LongTail(t *testing.T) {
 	require.Greater(t, size(cells[target+1:]), usable, "the fixture needs a 2/3 split whose right half does not fit")
 
 	// when
-	mid := interiorSplitPointFitting(cells, usable, 0)
+	mid, ok := interiorSplitPointFitting(cells, usable, 0)
 
 	// then
+	require.True(t, ok)
 	assert.LessOrEqual(t, size(cells[:mid]), usable)
 	assert.LessOrEqual(t, size(cells[mid+1:]), usable)
 
 	// and with the left half on page 1
-	mid = interiorSplitPointFitting(cells, usable, dbHeaderSize)
+	mid, ok = interiorSplitPointFitting(cells, usable, dbHeaderSize)
+	require.True(t, ok)
 	assert.LessOrEqual(t, size(cells[:mid]), usable-dbHeaderSize)
 	assert.LessOrEqual(t, size(cells[mid+1:]), usable)
 }
@@ -367,4 +369,122 @@ func TestBalanceNonroot_PoolFailureReleasesAllSiblings(t *testing.T) {
 	for _, pgno := range children {
 		requireUnpinned(t, p, pgno)
 	}
+}
+
+// On 64 KiB pages four interior cells of the largest size take slightly more
+// than a page. A balance that writes five leaves hands the parent four such
+// dividers; with a parent that was nearly full no two-way split fits, and it
+// is split three ways.
+func TestRewriteParentAfterBalance_ThreeWaySplit(t *testing.T) {
+	// given: a root over [A | P], where P is nearly full and three of its
+	// children were just balanced into five
+	p := tempPagerWithPageSize(t, 65536)
+	usable := p.usableSize()
+	require.Equal(t, 65536, usable)
+	maxKey := maxLocalPayload(usable)
+	rootPg, err := p.allocatePage()
+	require.NoError(t, err)
+	parentPg, err := p.allocatePage()
+	require.NoError(t, err)
+	bt := &btree{pager: p, rootPage: rootPg.pgno, writable: true}
+	const childA = 1000
+	require.NoError(t, bt.rebuildInteriorPage(rootPg, []cellData{{leftChild: childA, key: []byte("0")}}, parentPg.pgno))
+
+	rep := func(c byte, n int) []byte { return bytes.Repeat([]byte{c}, n) }
+	oldCells := []cellData{
+		{leftChild: 2000, key: rep('a', 16231)},
+		{leftChild: 2001, key: []byte("b")},
+		{leftChild: 2002, key: []byte("e")},
+		{leftChild: 2003, key: rep('f', 16358)},
+		{leftChild: 2004, key: rep('g', 16358)},
+		{leftChild: 2005, key: rep('h', 16357)},
+	}
+	const oldRightChild = 2006
+	require.NoError(t, bt.rebuildInteriorPage(parentPg, oldCells, oldRightChild))
+	newPgno := []uint32{3001, 3002, 3003, 3004, 3005} // replace children 2001, 2002, 2003
+	newDivKey := [][]byte{rep('b', maxKey), rep('c', maxKey), rep('d', maxKey), rep('e', maxKey)}
+	want := []cellData{
+		{leftChild: 2000, key: oldCells[0].key},
+		{leftChild: 3001, key: newDivKey[0]},
+		{leftChild: 3002, key: newDivKey[1]},
+		{leftChild: 3003, key: newDivKey[2]},
+		{leftChild: 3004, key: newDivKey[3]},
+		{leftChild: 3005, key: oldCells[3].key},
+		{leftChild: 2004, key: oldCells[4].key},
+		{leftChild: 2005, key: oldCells[5].key},
+	}
+	_, fits := interiorSplitPointFitting(want, usable, 0)
+	require.False(t, fits, "the fixture needs a parent that no two-way split fits")
+
+	// when
+	err = bt.rewriteParentAfterBalance(parentPg, 1, 3, 3, newPgno, newDivKey, false,
+		[]pathEntry{{pgno: rootPg.pgno, cellIdx: 1, nCell: 1}})
+	p.releasePage(parentPg)
+	p.releasePage(rootPg)
+
+	// then: the root lists three pages; read in order they hold the cells
+	require.NoError(t, err)
+	root, err := bt.getPage(bt.rootPage)
+	require.NoError(t, err)
+	rootCells, err := bt.collectInteriorCells(root)
+	require.NoError(t, err)
+	require.Len(t, rootCells, 3)
+	assert.Equal(t, uint32(childA), rootCells[0].leftChild)
+	pages := []uint32{rootCells[1].leftChild, rootCells[2].leftChild, root.header.rightChild}
+	dividers := [][]byte{bytes.Clone(rootCells[1].key), bytes.Clone(rootCells[2].key)}
+	p.releasePage(root)
+	assert.Equal(t, parentPg.pgno, pages[0])
+
+	var got []cellData
+	for i, pgno := range pages {
+		pg, err := bt.getPage(pgno)
+		require.NoError(t, err)
+		cells, err := bt.collectInteriorCells(pg)
+		require.NoError(t, err)
+		require.NotEmpty(t, cells, "page %d", i)
+		for _, c := range cells {
+			got = append(got, cellData{leftChild: c.leftChild, key: bytes.Clone(c.key)})
+		}
+		if i < len(dividers) {
+			// the page's right child and the promoted divider are the next cell
+			got = append(got, cellData{leftChild: pg.header.rightChild, key: dividers[i]})
+		} else {
+			assert.Equal(t, uint32(oldRightChild), pg.header.rightChild)
+		}
+		p.releasePage(pg)
+	}
+	require.Len(t, got, len(want))
+	for i := range want {
+		assert.Equal(t, want[i].leftChild, got[i].leftChild, "cell %d child", i)
+		assert.True(t, bytes.Equal(want[i].key, got[i].key), "cell %d key", i)
+	}
+}
+
+// A catalog cell too large for page 1 leaves it a zero-cell root over one
+// leaf. Deleting that entry empties the leaf in one step, with no balance in
+// between to collapse it: the root must become an empty leaf again.
+func TestRootLeaf_Page1DeleteLastLargeEntry(t *testing.T) {
+	skipInLegacyFormatSuite(t)
+	// given
+	db := tempDBWithPageSize(t, 512)
+	name := strings.Repeat("n", 473)
+	createNamespaces(t, db, name)
+	hdr := pageHeaderOf(t, db, 1)
+	require.True(t, hdr.isInterior(), "the fixture needs the entry on a child of page 1")
+	require.Equal(t, uint16(0), hdr.cellCount)
+
+	// when
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, tx.DeleteNamespace(name))
+	require.NoError(t, tx.Commit())
+
+	// then
+	hdr = pageHeaderOf(t, db, 1)
+	assert.True(t, hdr.isLeaf())
+	assert.Equal(t, uint16(0), hdr.cellCount)
+	require.NoError(t, db.IntegrityCheck())
+	createNamespaces(t, db, "again")
+	requireNamespaces(t, db, "again")
+	require.NoError(t, db.IntegrityCheck())
 }

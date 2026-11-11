@@ -1142,6 +1142,12 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 	// identical Options to the source so page sizes match.
 	dstOpts := db.btreeDB.Options()
 	dstOpts.InMemory = false // destination is always a file (user gave us a path)
+	// The copy has its source's on-disk format: a backup of a database created
+	// before v2.5.0 is such a database too.
+	dstOpts.SchemaFormat = db.btreeDB.SchemaFormat()
+	if dstOpts.SchemaFormat == 0 {
+		dstOpts.SchemaFormat = 5
+	}
 
 	dstDB, err := btree.Open(path, dstOpts)
 	if err != nil {

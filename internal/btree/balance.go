@@ -6,12 +6,12 @@ import (
 )
 
 // balance.go — faithful port of SQLite's general balancer balance_nonroot()
-// (../sqlitec/src/btree.c:8248-9030), specialised to any-store's index btree.
+// (../sqlitec/src/btree.c:8230-9012), specialised to any-store's index btree.
 //
 // SQLite's balance_nonroot gathers the over-full child plus up to two adjacent
 // siblings (NB=3), pools all their cells together with the parent divider
-// cells, recomputes the minimum number of output pages k ∈ {nOld-1, nOld,
-// nOld+1}, packs each output page as full as it will go (then backs off the
+// cells, recomputes the minimum number of output pages k (nOld-1 up to
+// nOld+2), packs each output page as full as it will go (then backs off the
 // last one for balance), reassigns dividers into the parent, and frees/reuses
 // pages. This is what produces SQLite's high, even page fill. any-store's
 // previous splitter used a 2-way split, which never gathered siblings and left
@@ -30,7 +30,7 @@ import (
 //       - interior siblings  ->  SQLite "index-interior" (leafData==0, !leaf):
 //         divider cells are pooled BETWEEN siblings ({leftChild, key}, with the
 //         left child's rightChild folded into the divider's child slot, exactly
-//         btree.c:8506-8511), redistributed as whole cells, and the boundary
+//         btree.c:8488-8493), redistributed as whole cells, and the boundary
 //         cell at cntNew[i] is PROMOTED to the parent (the +1 skip on rebuild).
 //       - leaf siblings      ->  SQLite "table-leaf" (leafData==1) for the SIZE
 //         accounting: no divider cell is pooled between leaves, no +1 skip, and
@@ -49,28 +49,30 @@ import (
 //     nbMaxOut pages, as SQLite's does for table leaves.
 //  2. rebuild*Page instead of editPage. any-store already has the wholesale
 //     rebuildLeafPage / rebuildInteriorPage (btree.go:1648 / 1716) == SQLite's
-//     rebuildPage (btree.c:7647), which is editPage's own fallback. We use it
+//     rebuildPage (btree.c:7629), which is editPage's own fallback. We use it
 //     for every output page rather than porting editPage's incremental
-//     pageInsertArray/pageFreeArray two-pass (btree.c:7740-7983). This is the
+//     pageInsertArray/pageFreeArray two-pass (btree.c:7722-7965). This is the
 //     plan's deviation (4). Because every source cell is fully materialised into
 //     []cellData (with overflow bytes cloned) BEFORE any output page is written,
-//     the two-pass abDone ordering (btree.c:8915-8952) is unnecessary — no
+//     the two-pass abDone ordering (btree.c:8897-8934) is unnecessary — no
 //     output write can clobber a not-yet-read source page. SQLite's apEnd[] /
-//     ixNx[] machinery (btree.c:7594-7595), which only serves editPage's
+//     ixNx[] machinery (btree.c:7576-7577), which only serves editPage's
 //     in-place edits and rebuildPage's source-page corruption checks, is omitted
 //     for the same reason.
 //  3. No ptrmap / auto-vacuum (any-store has none): the ISAUTOVACUUM blocks
-//     (btree.c:8692-8697, 8790-8830, 8986-8993) are dropped.
-//  4. No PagerRekey ascending-pgno sort (btree.c:8713-8741): any-store has no
+//     (btree.c:8674-8679, 8772-8812, 8968-8975) are dropped.
+//  4. No PagerRekey ascending-pgno sort (btree.c:8695-8723): any-store has no
 //     pager rekey primitive; this is a pure locality optimisation. Omitted
 //     (accepted micro-drift; pages still come from the freelist/grow so order is
 //     already roughly ascending).
-//  5. No BTS_FAST_SECURE divider-copy-into-ovflspace (btree.c:8375-8385): no
+//  5. No BTS_FAST_SECURE divider-copy-into-ovflspace (btree.c:8357-8367): no
 //     secure-delete mode.
 //  6. Cascade via insertSepIntoAncestor recursion instead of SQLite's balance()
-//     do-loop unwinding the cursor stack (btree.c:9133-9256): any-store carries a
-//     path []pathEntry, not a persistent write cursor. Semantically identical —
-//     balance the parent next, up to the root.
+//     do-loop unwinding the cursor stack (btree.c:9115-9244): any-store carries a
+//     path []pathEntry, not a persistent write cursor. The order is the same —
+//     the parent next, up to the root — but an over-full parent is split in
+//     place, two or three ways, where SQLite balances it with its siblings
+//     (see rewriteParentAfterBalance).
 
 const (
 	// nbSiblings is SQLite NB (btree.c:7523): the maximum number of pages
@@ -186,17 +188,22 @@ type injectedCell struct {
 //	inject     — the new over-full cell to fold into the pool (see injectedCell);
 //	             inject.active==false for a re-balance with no new cell.
 //
-// On the INSERT path the pooled cell count only ever grows (one cell was just
-// added to the over-full child), so nNew ∈ {nOld, nOld+1} and the parent gains
-// at most one net cell — it never shrinks, so the parent cannot become under-full
-// from an insert. On the DELETE/merge path the new cell is absent
-// (inject.active==false) so the pooled count only shrinks: nNew ∈ {nOld-1, nOld},
-// k=nOld-1 is a genuine merge that frees the surplus page (Step 11,
-// btree.c:9000-9004), and the parent loses a divider. The resulting parent
+// On the INSERT path one cell was just added to the over-full child. The pool
+// usually needs nOld or nOld+1 pages; with cells larger than half a page it can
+// need nOld+2 (nbMaxOut), and when the over-full child's neighbours are sparse
+// it can need fewer than nOld. The parent's dividers are replaced by copies of
+// other keys, which may be longer or shorter, so the parent can grow past its
+// page (rewriteParentAfterBalance splits it) or shrink. On the DELETE/merge
+// path the new cell is absent (inject.active==false) and the pooled count only
+// shrinks: nNew ∈ {nOld-1, nOld}, k=nOld-1 is a genuine merge that frees the
+// surplus page (Step 11, btree.c:8982-8986), and the parent loses a divider.
+// The resulting parent
 // under-fullness/emptiness is completed by completeMergeUpward after this returns
 // (spec §4; see the rewriteParentAfterBalance OWNERSHIP note). This is exactly
 // SQLite's design: ONE balancer for insert-split and delete-merge (btree.c:10010
 // drives delete through the same balance() → balance_nonroot()).
+// DRIFT: the deviations from balance_nonroot listed in this file's header. See docs/btree/NOTES.md#old-drift-balance-nonroot-3sibling-index-btree-deviations
+// DRIFT: gathered siblings are not checked for a reference count above one. See docs/btree/NOTES.md#drift-2026-06-25-03-balancenonroot-omits-sqlite-s-per-gathered-sibling-refcount-guard-so-a
 func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, parentPath []pathEntry, inject injectedCell) error {
 	bt.pager.balanceNonrootDispatchCount.Add(1)
 	usableSize := bt.usablePageSize()
@@ -270,6 +277,10 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 		childSlot := nxDiv + g
 		childPgno, err := getChild(childSlot)
 		if err != nil {
+			// Release siblings already acquired (balance_cleanup).
+			for j := 0; j < g; j++ {
+				bt.pager.releasePage(apOld[j])
+			}
 			return err
 		}
 		apOld[g], err = bt.pager.getWritablePage(childPgno)
@@ -594,7 +605,7 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 
 	// ---- Step 7: allocate k pages, reuse old (btree.c:8668-8699) ------------
 	// Reuse apOld[0..min(nOld,nNew)-1] in place; allocate the rest. The pgno
-	// ascending sort (btree.c:8713-8741) is omitted — deviation 4.
+	// ascending sort (btree.c:8695-8723) is omitted — deviation 4.
 	var apNewArr [nbMaxOut]*page
 	apNew := apNewArr[:nNew]
 	for g := 0; g < nNew; g++ {
@@ -631,7 +642,7 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 	// Because all source cells were materialised into b.cells before this loop,
 	// rebuilding apNew[g] (which may alias apOld[g]) can never clobber an
 	// unread source page — so SQLite's two-pass abDone ordering
-	// (btree.c:8915-8952) is unnecessary (deviation 2).
+	// (btree.c:8897-8934) is unnecessary (deviation 2).
 	var newDivKeyArr [nbMaxOut - 1][]byte
 	newDivKey := newDivKeyArr[:nNew-1] // divider key between apNew[g], apNew[g+1]
 
@@ -694,7 +705,7 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 		newPgno[g] = apNew[g].pgno
 	}
 
-	// ---- Free surplus old pages (btree.c:9000-9004) -------------------------
+	// ---- Free surplus old pages (btree.c:8982-8986) -------------------------
 	// Pages apOld[nNew..nOld) were not reused. Release our pin first (freePage
 	// re-acquires the trunk via getWritablePage), matching the merge path in
 	// btree.go.
@@ -784,7 +795,7 @@ func (bt *btree) parentDividerFullKey(parentPg *page, slot int, usableSize int) 
 }
 
 // freePageDeferred frees a page that is no longer reachable, used for the
-// surplus old siblings after a balance (btree.c:9000-9004). The page's pin must
+// surplus old siblings after a balance (btree.c:8982-8986). The page's pin must
 // already have been released by the caller (freePage re-acquires the freelist
 // trunk via getWritablePage), matching the merge path's freePage usage in
 // btree.go.
@@ -811,17 +822,17 @@ func (bt *btree) freePageDeferred(pgno uint32) error {
 // release the parent's pin before re-acquiring it as a gathered sibling under its
 // grandparent (as SQLite does, btree.c:9251).
 //
-// On the INSERT direction nNew ∈ {nOld, nOld+1}, so the rewritten parent only
-// ever fits (nNew==nOld) or over-fills (nNew==nOld+1, the 2-way split below); it
-// never under-fills. On the DELETE direction nNew ∈ {nOld-1, nOld}; the merge
-// (nNew==nOld-1) removes a divider, so the parent always FITS here (fewer cells
-// than before) — the over-full split below is unreachable from delete — and any
-// resulting under-fullness/emptiness is handled by completeMergeUpward.
+// In either direction the rewritten parent may fit or over-fill: the new
+// dividers are copies of other keys and can be longer than the ones they
+// replace, also when a delete-side balance leaves the page count unchanged.
+// An over-full parent is split below. Under-fullness and emptiness after a
+// merge are handled by completeMergeUpward.
 //
 // Parent child/divider geometry (any-store <,>= invariant, searchInterior
 // btree.go:907): for an interior page with cells P_0..P_{nc-1} and rightChild,
 // the children are P_0.leftChild..P_{nc-1}.leftChild, rightChild (nc+1 of them),
 // and the divider key separating child c and child c+1 is P_c.key (0<=c<nc).
+// DRIFT: an over-full parent is split in place and its dividers cascade one at a time; SQLite balances the parent with its siblings. See docs/btree/NOTES.md#drift-2026-11-11-1-parent-rewrite-after-a-balance-splits-in-place
 func (bt *btree) rewriteParentAfterBalance(
 	parentPg *page,
 	nxDiv, nOld, rightmostChildSlot int,
@@ -942,19 +953,23 @@ func (bt *btree) rewriteParentAfterBalance(
 		return bt.rebuildInteriorPage(parentPg, newCells, newRightChild)
 	}
 
-	// Over-full parent: split 2-way and cascade up (deviation 6). The parent
-	// gained at most nNew-nOld cells, but the new dividers can be much longer
-	// than the ones they replace, so the split index is chosen for both halves
-	// to fit (interiorSplitPointFitting). SQLite inserts the dividers as overflow
-	// cells and balances the parent with balance_nonroot. Two pages are always
-	// enough here: a balance writes at most nbMaxOut pages, so at most four new
-	// dividers, and four interior cells fit one page by the index rule. Fill the
-	// left page to the cell that crosses its end and promote that cell; what is
-	// left over is less than those four cells. The middle cell is
+	// Over-full parent: split and cascade up (deviation 6). The parent gained
+	// at most nNew-nOld cells, but the new dividers can be much longer than the
+	// ones they replace, so the split index is chosen for both halves to fit
+	// (interiorSplitPointFitting). SQLite inserts the dividers as overflow cells
+	// and balances the parent with balance_nonroot, which spreads it over as
+	// many pages as it needs. Two pages are enough here unless the new dividers
+	// alone fill a page: a balance writes at most nbMaxOut pages, so at most
+	// four new dividers, and four interior cells of the largest size take
+	// slightly more than a page once the usable size passes about 10 KiB. Then
+	// the parent is split three ways (splitParentThreeWays). The middle cell is
 	// promoted; its leftChild becomes the left page's rightChild; the right
 	// page keeps newRightChild. This is the same shape as insertSepIntoInterior's
 	// slow path (btree.go:2039-2075).
-	mid := interiorSplitPointFitting(newCells, usableSize, hdrOff)
+	mid, fits := interiorSplitPointFitting(newCells, usableSize, hdrOff)
+	if !fits {
+		return bt.splitParentThreeWays(parentPg, newCells, newRightChild, hdrOff, parentPath)
+	}
 	leftCells := newCells[:mid]
 	sepKey := bytes.Clone(newCells[mid].key)
 	rightCells := newCells[mid+1:]
@@ -984,4 +999,76 @@ func (bt *btree) rewriteParentAfterBalance(
 	// threaded only for the balance-shallower note in balanceNonroot.
 	_ = isRoot
 	return bt.insertSepIntoAncestor(parentPgno, sepKey, newRightPgno, parentPath)
+}
+
+// splitParentThreeWays writes cells, which do not fit two pages, as three
+// interior pages: parentPg keeps the first run, two new pages take the rest,
+// and the two cells between the runs are promoted. The first divider goes up
+// the path as in a two-way split. That can rewrite the pages above, so the
+// second divider's parent is found again from the root.
+//
+// Three pages always suffice: the cells are those of one page plus at most
+// four new dividers, each no larger than about a quarter page.
+// DRIFT: an over-full parent is split here in place, two or three ways, and its dividers cascade one at a time; SQLite inserts them as overflow cells of the parent and runs balance_nonroot on it. See docs/btree/NOTES.md#drift-2026-11-11-1-parent-rewrite-after-a-balance-splits-in-place
+func (bt *btree) splitParentThreeWays(parentPg *page, cells []cellData, rightChild uint32, leftHdrOff int, parentPath []pathEntry) error {
+	usableSize := bt.usablePageSize()
+	n := len(cells)
+	before := interiorCellPrefixSizes(cells, usableSize)
+	room := usableSize - 12
+
+	// Fill the left page, then the middle one, as far as each goes while
+	// leaving a cell to promote and a cell for the page after it.
+	i := 0
+	for i+1 <= n-4 && before[i+1] <= room-leftHdrOff {
+		i++
+	}
+	j := i + 1
+	for j+1 <= n-2 && before[j+1]-before[i+1] <= room {
+		j++
+	}
+	if i < 1 || j < i+2 || before[i] > room-leftHdrOff ||
+		before[j]-before[i+1] > room || before[n]-before[j+1] > room {
+		return ErrCorrupt
+	}
+	sep1 := bytes.Clone(cells[i].key)
+	sep2 := bytes.Clone(cells[j].key)
+
+	midPg, err := bt.pager.allocatePage()
+	if err != nil {
+		return err
+	}
+	midPgno := midPg.pgno
+	err = bt.rebuildInteriorPage(midPg, cells[i+1:j], cells[j].leftChild)
+	bt.pager.releasePage(midPg)
+	if err != nil {
+		return err
+	}
+	rightPg, err := bt.pager.allocatePage()
+	if err != nil {
+		return err
+	}
+	rightPgno := rightPg.pgno
+	err = bt.rebuildInteriorPage(rightPg, cells[j+1:], rightChild)
+	bt.pager.releasePage(rightPg)
+	if err != nil {
+		return err
+	}
+	if err := bt.rebuildInteriorPage(parentPg, cells[:i], cells[i].leftChild); err != nil {
+		return err
+	}
+
+	if err := bt.insertSepIntoAncestor(parentPg.pgno, sep1, midPgno, parentPath); err != nil {
+		return err
+	}
+	// sep1 now routes to the middle page; its parent takes the second divider.
+	path, err := bt.pathToChild(sep1, midPgno)
+	if err != nil {
+		return err
+	}
+	last := path[len(path)-1]
+	midParent, err := bt.pager.getWritablePage(last.pgno)
+	if err != nil {
+		return err
+	}
+	return bt.insertSepIntoInterior(midParent, midPgno, sep2, rightPgno, int(last.cellIdx), path[:len(path)-1])
 }

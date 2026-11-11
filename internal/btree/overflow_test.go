@@ -298,6 +298,7 @@ func TestOverflowNamespaceDelete(t *testing.T) {
 //
 //	tx.pager.readOverflowChainAt(cell.overflowPg, ..., tx.walMaxFrame)
 func TestOverflowConcurrentReaderCorruption(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "data")
 	_ = ns
 
@@ -383,6 +384,7 @@ func TestOverflowConcurrentReaderCorruption(t *testing.T) {
 // snapshot isolation bug. It runs many iterations with concurrent readers and
 // writers to trigger the race reliably.
 func TestOverflowConcurrentReaderStress(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "data")
 	_ = ns
 
@@ -673,6 +675,7 @@ func TestOverflowUpdateInlinePageOverflow(t *testing.T) {
 // exercising the new unified payload overflow format (schema v5).
 
 func TestLeafKeyOverflow_PutGet(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "data")
 	_ = ns
 
@@ -697,6 +700,7 @@ func TestLeafKeyOverflow_PutGet(t *testing.T) {
 }
 
 func TestLeafKeyOverflow_CursorIteration(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "data")
 	_ = ns
 
@@ -789,6 +793,7 @@ func TestLeafKeyOverflow_Delete(t *testing.T) {
 }
 
 func TestLeafKeyOverflow_Update(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "data")
 	_ = ns
 
@@ -818,6 +823,7 @@ func TestLeafKeyOverflow_Update(t *testing.T) {
 }
 
 func TestLeafKeyOverflow_Split(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "data")
 	_ = ns
 
@@ -851,6 +857,7 @@ func TestLeafKeyOverflow_Split(t *testing.T) {
 }
 
 func TestLeafKeyOverflow_IntegrityCheck(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "data")
 	_ = ns
 
@@ -879,6 +886,7 @@ func TestLeafKeyOverflow_IntegrityCheck(t *testing.T) {
 }
 
 func TestLeafKeyOverflow_MixedSizes(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "data")
 	_ = ns
 

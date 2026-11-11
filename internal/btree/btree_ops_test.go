@@ -485,6 +485,7 @@ func TestDeleteContentAreaBoundary(t *testing.T) {
 }
 
 func TestDeleteOverflowCell(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 1024)
 
 	tx, err := db.BeginWrite()
@@ -814,6 +815,7 @@ func TestAppendValueOverflow(t *testing.T) {
 }
 
 func TestAppendValueOverflowMultiLevel(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "data")
 
 	tx, err := db.BeginWrite()
@@ -917,6 +919,7 @@ func TestSplitInteriorRoot(t *testing.T) {
 // =============================================================================
 
 func TestUpdateLeafCellOverflowToOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "data")
 
 	tx, err := db.BeginWrite()
@@ -1280,6 +1283,7 @@ func TestParseInteriorCellOversizedKeyLen(t *testing.T) {
 }
 
 func TestSearchLeafWithOverflowPrefixCompare(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 
 	tx, err := db.BeginWrite()
@@ -1318,6 +1322,7 @@ func TestSearchLeafWithOverflowPrefixCompare(t *testing.T) {
 }
 
 func TestInsertLeafCellAtWithOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 1024)
 
 	tx, err := db.BeginWrite()
@@ -1799,6 +1804,7 @@ func TestSeekNearFastPath(t *testing.T) {
 }
 
 func TestSeekNearFallbackOnOverflowBoundaryKey(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -1920,6 +1926,7 @@ func TestDeleteHighFragmentationRebuild(t *testing.T) {
 // =============================================================================
 
 func TestUpdateLeafCellOverflowToSmall(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 1024)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -2050,6 +2057,7 @@ func TestAppendValueWritableBtreeOverflow(t *testing.T) {
 // =============================================================================
 
 func TestSearchLeafWithOverflowKeyLocalOverflowValue(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 1024)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -2080,6 +2088,7 @@ func TestSearchLeafWithOverflowKeyLocalOverflowValue(t *testing.T) {
 // =============================================================================
 
 func TestSearchLeafWithOverflowKeyOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -2224,6 +2233,7 @@ func TestCursorNextMultiLevel(t *testing.T) {
 // =============================================================================
 
 func TestLeafFullKeyOverflowValueOnly(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 1024)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -2254,6 +2264,7 @@ func TestLeafFullKeyOverflowValueOnly(t *testing.T) {
 }
 
 func TestLeafFullKeyOverflowKeyOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -2374,6 +2385,7 @@ func TestParseInteriorCellVarintError(t *testing.T) {
 // =============================================================================
 
 func TestCollectLeafCellsOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 1024)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -2937,6 +2949,7 @@ func TestInsertAfterDeleteCausesDefrag(t *testing.T) {
 // =============================================================================
 
 func TestSearchLeafWithOverflowPrefixMismatch(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -3293,6 +3306,7 @@ func TestDeleteMiddleCellFastPath(t *testing.T) {
 // =============================================================================
 
 func TestUpdateLeafCellOverflowNewOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 1024)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -4807,6 +4821,7 @@ func TestCov_CollectInteriorCellsOverflowReadError(t *testing.T) {
 // =============================================================================
 
 func TestCov_CollectLeafCellsOverflowReadError(t *testing.T) {
+	useLegacyFormat(t)
 	// L1454-1459: readOverflowChainAt error in collectLeafCells
 	db := tempDBWithPageSize(t, 1024)
 	tx, err := db.BeginWrite()

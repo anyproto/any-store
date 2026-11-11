@@ -100,6 +100,7 @@ func TestDelCurCov_DeleteHighFragRebuildSmallPage(t *testing.T) {
 // TestDelCurCov_DeleteOverflowFastPath triggers the overflow chain free in
 // the fast path (L2111-2115).
 func TestDelCurCov_DeleteOverflowFastPath(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 
 	tx, err := db.BeginWrite()
@@ -710,6 +711,7 @@ func TestDelCurCov_SeekNearFastPathIdxGEn(t *testing.T) {
 // TestDelCurCov_SeekNearIdxGEnOverflow uses overflow cells so leafKeyAt
 // returns ErrCorrupt and falls back to full Seek.
 func TestDelCurCov_SeekNearIdxGEnOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 
 	tx, err := db.BeginWrite()
@@ -807,6 +809,7 @@ func TestDelCurCov_SeekExactKeyError(t *testing.T) {
 // TestDelCurCov_ValueOverflowCorruptVarint exercises the Value() overflow path
 // getVarintSafe keyLen error (L2770-2772).
 func TestDelCurCov_ValueOverflowCorruptVarint(t *testing.T) {
+	useLegacyFormat(t)
 	path, data := setupCorruptDBForDelCur(t, 512, func(db *DB) {
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
@@ -883,6 +886,7 @@ func TestDelCurCov_ValueOverflowCorruptVarint(t *testing.T) {
 // TestDelCurCov_ValueOverflowCorruptValLenVarint specifically corrupts the
 // valLen varint in an overflow cell to trigger L2775-2777.
 func TestDelCurCov_ValueOverflowCorruptValLenVarint(t *testing.T) {
+	useLegacyFormat(t)
 	path, data := setupCorruptDBForDelCur(t, 512, func(db *DB) {
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
@@ -960,6 +964,7 @@ func TestDelCurCov_ValueOverflowCorruptValLenVarint(t *testing.T) {
 // TestDelCurCov_ValueOverflowReadChainError exercises the readOverflowChain
 // error path in Value() (L2795-2797).
 func TestDelCurCov_ValueOverflowReadChainError(t *testing.T) {
+	useLegacyFormat(t)
 	path, data := setupCorruptDBForDelCur(t, 512, func(db *DB) {
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
@@ -1314,6 +1319,7 @@ func TestDelCurCov_BulkDeleteWithMergeAndCollapse(t *testing.T) {
 // TestDelCurCov_DeleteHighFragThenOverflow creates fragmentation then
 // inserts+deletes overflow cells.
 func TestDelCurCov_DeleteHighFragThenOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 
 	tx, err := db.BeginWrite()
@@ -1433,6 +1439,7 @@ func TestDelCurCov_CursorNextPreviousInterleave(t *testing.T) {
 
 // TestDelCurCov_ValueOverflowWriteTx exercises Value() overflow via read tx.
 func TestDelCurCov_ValueOverflowWriteTx(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 
 	tx, err := db.BeginWrite()
@@ -1712,6 +1719,7 @@ func TestDelCurCov_DirectDeleteOverflowFastPath(t *testing.T) {
 // TestDelCurCov_DirectCursorValueOverflowKeyLenCorrupt exercises Value()
 // overflow path where getVarintSafe(keyLen) fails (L2770-2772).
 func TestDelCurCov_DirectCursorValueOverflowKeyLenCorrupt(t *testing.T) {
+	useLegacyFormat(t)
 	p := tempPagerWithPageSize(t, 512)
 	bt := initLeafBtree(t, p)
 
@@ -1751,6 +1759,7 @@ func TestDelCurCov_DirectCursorValueOverflowKeyLenCorrupt(t *testing.T) {
 // TestDelCurCov_DirectCursorValueOverflowValLenCorrupt exercises Value()
 // overflow path where getVarintSafe(valLen) fails (L2775-2777).
 func TestDelCurCov_DirectCursorValueOverflowValLenCorrupt(t *testing.T) {
+	useLegacyFormat(t)
 	p := tempPagerWithPageSize(t, 512)
 	bt := initLeafBtree(t, p)
 
@@ -1788,6 +1797,7 @@ func TestDelCurCov_DirectCursorValueOverflowValLenCorrupt(t *testing.T) {
 // TestDelCurCov_DirectCursorValueOverflowReadChainError exercises Value()
 // overflow path where readOverflowChain fails (L2795-2797).
 func TestDelCurCov_DirectCursorValueOverflowReadChainError(t *testing.T) {
+	useLegacyFormat(t)
 	p := tempPagerWithPageSize(t, 512)
 	bt := initLeafBtree(t, p)
 

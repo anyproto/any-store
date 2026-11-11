@@ -128,7 +128,27 @@ func TestLegacyFormat_KeptAcrossWrites(t *testing.T) {
 // that every operation returns it whole.
 func TestTableLeafFormat_PayloadBoundaries(t *testing.T) {
 	skipInLegacyFormatSuite(t)
-	db := tempDB(t)
+	for _, tc := range []struct {
+		name string
+		opts Options
+	}{
+		{name: "plain", opts: Options{PageSize: 4096}},
+		{name: "checksum", opts: Options{PageSize: 4096, Checksum: true}},
+		{name: "encrypted", opts: Options{PageSize: 4096, Key: []byte("passphrase")}},
+		{name: "512-byte pages", opts: Options{PageSize: 512}},
+		{name: "64 KiB pages", opts: Options{PageSize: 65536}},
+		{name: "in memory", opts: Options{PageSize: 4096, InMemory: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := testOpen(t, filepath.Join(t.TempDir(), "t.db"), tc.opts)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, db.Close()) }()
+			testPayloadBoundaries(t, db)
+		})
+	}
+}
+
+func testPayloadBoundaries(t *testing.T, db *DB) {
 	createNamespaces(t, db, "t1")
 	ns, err := db.getNamespaceLocked("t1")
 	require.NoError(t, err)
@@ -142,11 +162,11 @@ func TestTableLeafFormat_PayloadBoundaries(t *testing.T) {
 	}{
 		{oldMax, true},
 		{oldMax + 1, true},
-		{2000, true},
+		{(oldMax + lim.maxLocal) / 2, true},
 		{lim.maxLocal - 1, true},
 		{lim.maxLocal, true},
 		{lim.maxLocal + 1, false},
-		{5000, false},
+		{lim.maxLocal + 1000, false},
 		{3 * db.pager.usableSize(), false},
 	}
 	put := func(i, payload int) {
@@ -480,59 +500,175 @@ func TestLeafCells_RandomMutationsAgainstModel(t *testing.T) {
 	}
 }
 
-// Backing a schema format 5 database up into a newly created file leaves a
-// schema format 5 file: page 1 is the source's, and the handle follows it.
-func TestBackup_LegacySourceIntoNewFile(t *testing.T) {
-	// given
-	useLegacyFormat(t)
-	dir := t.TempDir()
-	src, err := testOpen(t, filepath.Join(dir, "src.db"), DefaultOptions())
-	require.NoError(t, err)
-	defer func() { require.NoError(t, src.Close()) }()
-	createNamespaces(t, src, "t1")
-	ns, err := src.getNamespaceLocked("t1")
-	require.NoError(t, err)
-	tx, err := src.BeginWrite()
-	require.NoError(t, err)
-	for i := 0; i < 50; i++ {
-		require.NoError(t, tx.Put(ns, u32key(i), filled(2000, i)))
-	}
-	require.NoError(t, tx.Commit())
-	useCurrentFormat(t)
-	dstPath := filepath.Join(dir, "dst.db")
-	dst, err := Open(dstPath, DefaultOptions())
-	require.NoError(t, err)
-	require.True(t, dst.pager.tableLeaf.Load(), "the destination starts as a schema format 6 file")
-
-	// when
-	b, err := dst.BackupInit(src)
-	require.NoError(t, err)
-	require.ErrorIs(t, b.Step(context.Background(), -1), ErrBackupDone)
-	require.NoError(t, b.Finish())
-
-	// then: the open handle reads the copy under the source's rule
-	assert.False(t, dst.pager.tableLeaf.Load())
-	require.NoError(t, dst.IntegrityCheck())
-	dns, err := dst.getNamespaceLocked("t1")
-	require.NoError(t, err)
-	rtx, err := dst.BeginRead()
-	require.NoError(t, err)
-	for i := 0; i < 50; i++ {
-		v, err := rtx.Get(dns, u32key(i))
+// A backup copies the source's pages, page 1 included, so the destination must
+// already be a file of the source's format: created so, or refused.
+func TestBackup_SchemaFormats(t *testing.T) {
+	fill := func(t *testing.T, db *DB) {
+		createNamespaces(t, db, "t1")
+		ns, err := db.getNamespaceLocked("t1")
 		require.NoError(t, err)
-		require.Equal(t, filled(2000, i), v)
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		for i := 0; i < 50; i++ {
+			require.NoError(t, tx.Put(ns, u32key(i), filled(2000, i)))
+		}
+		require.NoError(t, tx.Commit())
 	}
-	require.NoError(t, rtx.Rollback())
-	require.NoError(t, dst.Checkpoint(CheckpointFull))
-	require.NoError(t, dst.Close())
+	open := func(t *testing.T, path string, format uint32) *DB {
+		opts := DefaultOptions()
+		opts.SchemaFormat = format
+		opts.DisableAutoCheckpoint = true
+		db, err := testOpen(t, path, opts)
+		require.NoError(t, err)
+		return db
+	}
 
-	// and so does a fresh open of it
-	data, err := os.ReadFile(dstPath)
+	for _, format := range []uint32{5, 6} {
+		t.Run(fmt.Sprintf("format %d into a destination created like it", format), func(t *testing.T) {
+			// given
+			dir := t.TempDir()
+			src := open(t, filepath.Join(dir, "src.db"), format)
+			defer func() { require.NoError(t, src.Close()) }()
+			require.Equal(t, format, src.SchemaFormat())
+			fill(t, src)
+			dstPath := filepath.Join(dir, "dst.db")
+			dst := open(t, dstPath, src.SchemaFormat())
+
+			// when
+			b, err := dst.BackupInit(src)
+			require.NoError(t, err)
+			require.ErrorIs(t, b.Step(context.Background(), -1), ErrBackupDone)
+			require.NoError(t, b.Finish())
+
+			// then: the copy reads back through the handle that received it
+			require.Equal(t, format, dst.SchemaFormat())
+			require.NoError(t, dst.IntegrityCheck())
+			ns, err := dst.getNamespaceLocked("t1")
+			require.NoError(t, err)
+			assert.Equal(t, format == 5, overflowPageOf(t, dst, ns, u32key(0)) != 0)
+			require.NoError(t, dst.Close())
+
+			// and through a fresh open, whatever format new files get
+			dst, err = testOpen(t, dstPath, DefaultOptions())
+			require.NoError(t, err)
+			require.Equal(t, format, dst.SchemaFormat())
+			require.NoError(t, dst.IntegrityCheck())
+			rtx, err := dst.BeginRead()
+			require.NoError(t, err)
+			ns, err = rtx.GetNamespace("t1")
+			require.NoError(t, err)
+			for i := 0; i < 50; i++ {
+				v, err := rtx.Get(ns, u32key(i))
+				require.NoError(t, err)
+				require.Equal(t, filled(2000, i), v)
+			}
+			require.NoError(t, rtx.Rollback())
+			require.NoError(t, dst.Close())
+		})
+	}
+
+	for _, formats := range [][2]uint32{{5, 6}, {6, 5}} {
+		t.Run(fmt.Sprintf("format %d into format %d is refused", formats[0], formats[1]), func(t *testing.T) {
+			// given
+			dir := t.TempDir()
+			src := open(t, filepath.Join(dir, "src.db"), formats[0])
+			defer func() { require.NoError(t, src.Close()) }()
+			fill(t, src)
+			dst := open(t, filepath.Join(dir, "dst.db"), formats[1])
+			defer func() { require.NoError(t, dst.Close()) }()
+			fill(t, dst)
+
+			// when
+			_, err := dst.BackupInit(src)
+
+			// then
+			require.ErrorIs(t, err, ErrBackupFormatMismatch)
+			require.Equal(t, formats[1], dst.SchemaFormat())
+			require.NoError(t, dst.IntegrityCheck())
+		})
+	}
+}
+
+func TestOpen_SchemaFormatOption(t *testing.T) {
+	// an unknown format is refused before a file is created
+	path := filepath.Join(t.TempDir(), "t.db")
+	opts := DefaultOptions()
+	opts.SchemaFormat = 4
+	_, err := testOpen(t, path, opts)
+	require.Error(t, err)
+	_, statErr := os.Stat(path)
+	require.True(t, os.IsNotExist(statErr))
+
+	// an existing file keeps its format whatever is asked
+	opts.SchemaFormat = 5
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
-	assert.Equal(t, "any-store v2\x00\x00\x00\x00", string(data[:16]))
-	assert.Equal(t, uint32(5), binary.BigEndian.Uint32(data[44:48]))
-	dst, err = testOpen(t, dstPath, DefaultOptions())
+	require.NoError(t, db.Close())
+	opts.SchemaFormat = 6
+	db, err = testOpen(t, path, opts)
 	require.NoError(t, err)
-	require.NoError(t, dst.IntegrityCheck())
-	require.NoError(t, dst.Close())
+	assert.Equal(t, uint32(5), db.SchemaFormat())
+	require.NoError(t, db.Close())
+}
+
+// A cell over the limit must have a chain. A zeroed pointer or a chain that
+// ends early is reported, not read as a shorter value.
+func TestTableLeafFormat_BrokenOverflowChain(t *testing.T) {
+	skipInLegacyFormatSuite(t)
+	for _, tc := range []struct {
+		name   string
+		break_ func(t *testing.T, db *DB, leaf *page, ptrOff int)
+	}{
+		{name: "zeroed pointer in the cell", break_: func(t *testing.T, db *DB, leaf *page, ptrOff int) {
+			binary.BigEndian.PutUint32(leaf.data[ptrOff:], 0)
+		}},
+		{name: "chain ends after its first page", break_: func(t *testing.T, db *DB, leaf *page, ptrOff int) {
+			first, err := db.pager.getWritablePage(binary.BigEndian.Uint32(leaf.data[ptrOff:]))
+			require.NoError(t, err)
+			binary.BigEndian.PutUint32(first.data[0:], 0)
+			db.pager.releasePage(first)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// given: a value three pages long
+			db := tempDB(t)
+			createNamespaces(t, db, "t1")
+			ns, err := db.getNamespaceLocked("t1")
+			require.NoError(t, err)
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			require.NoError(t, tx.Put(ns, []byte("k"), filled(3*db.pager.usableSize(), 1)))
+
+			// when
+			leaf, err := db.pager.getWritablePage(ns.rootPage)
+			require.NoError(t, err)
+			off := int(leaf.getCellOffset(0))
+			keyLen, kn := getVarint(leaf.data[off:])
+			valLen, vn := getVarint(leaf.data[off+kn:])
+			nLocal := localPayloadSize(int(keyLen)+int(valLen), db.pager.leafLimits())
+			tc.break_(t, db, leaf, off+kn+vn+nLocal)
+			db.pager.releasePage(leaf)
+
+			// then
+			_, err = tx.Get(ns, []byte("k"))
+			require.Error(t, err)
+			require.NoError(t, tx.Commit())
+			require.Error(t, db.IntegrityCheck())
+		})
+	}
+}
+
+// A one-byte key with an empty value is a three-byte cell, which an empty
+// leaf places three bytes before its end. The integrity check accepts it.
+func TestIntegrityCheck_ThreeByteCell(t *testing.T) {
+	db := tempDB(t)
+	createNamespaces(t, db, "t1")
+	ns, err := db.getNamespaceLocked("t1")
+	require.NoError(t, err)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("a"), nil))
+	require.NoError(t, tx.Commit())
+
+	require.NoError(t, db.IntegrityCheck())
 }

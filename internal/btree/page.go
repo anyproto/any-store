@@ -7,8 +7,10 @@ package btree
 //	Offset  Size  Description
 //	0       16    Magic string "any-store v2 fmt" (dbMagicFmt), written with
 //	              schema formats 6 and later. Schema format 5 files carry
-//	              "any-store v2\000" (zero-padded to 16) or the older
-//	              "BTree format 1\000" (dbMagicV1) and keep it.
+//	              "any-store v2\000" (zero-padded to 16); the older
+//	              "BTree format 1\000" (dbMagicV1) is accepted and rewritten
+//	              as it by the next commit. A file never moves between the
+//	              two families.
 //	16      2     Page size in bytes
 //	18      1     File format write version (2=WAL; above maxWriteVersion refused)
 //	19      1     File format read version (2=WAL; above maxReadVersion refused)
@@ -262,7 +264,7 @@ type dbHeader struct {
 }
 
 // serialize writes the database header to the first 100 bytes of buf.
-// DRIFT: DB header: 'any-store v2' magic (legacy 'BTree format 1' still read), version=1, KDF salt at 72-87, auto/incr-vacuum fields z See docs/btree/NOTES.md#old-drift-db-file-header-magic-version-salt-vacuum
+// DRIFT: DB header: own magics ('any-store v2 fmt', or 'any-store v2' for schema format 5), library version field = 1, KDF salt at 72-87, auto/incr-vacuum fields zero. See docs/btree/NOTES.md#old-drift-db-file-header-magic-version-salt-vacuum
 func (h *dbHeader) serialize(buf []byte) {
 	if h.versioned {
 		copy(buf[0:16], dbMagicFmt)

@@ -315,6 +315,7 @@ func TestDeep_DeleteAllFromMultiLevelTree(t *testing.T) {
 // TestDeep_DeleteOverflowCellMultiLevel deletes a cell with overflow data from
 // a multi-level tree to exercise the overflow chain freeing path (L2111-2115).
 func TestDeep_DeleteOverflowCellMultiLevel(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 
 	tx, err := db.BeginWrite()
@@ -470,6 +471,7 @@ func TestDeep_InsertIntoParentSmallPage(t *testing.T) {
 // TestDeep_OverflowKeySearch inserts keys that are larger than a page can hold
 // locally, forcing the overflow key reading path in searchLeafWithOverflow.
 func TestDeep_OverflowKeySearch(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 
 	tx, err := db.BeginWrite()
@@ -515,6 +517,7 @@ func TestDeep_OverflowKeySearch(t *testing.T) {
 // TestDeep_OverflowKeySearchPrefixComparison exercises the prefix comparison
 // path where the prefix alone determines ordering (L585-592).
 func TestDeep_OverflowKeySearchPrefixComparison(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 
 	tx, err := db.BeginWrite()
@@ -560,6 +563,7 @@ func TestDeep_OverflowKeySearchPrefixComparison(t *testing.T) {
 // TestDeep_OverflowKeySearchFullKeyRead exercises the path where the prefix
 // matches but the full key needs to be read from overflow (L594-599).
 func TestDeep_OverflowKeySearchFullKeyRead(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 
 	tx, err := db.BeginWrite()
@@ -706,6 +710,7 @@ func TestDeep_OverflowInteriorKeySearch(t *testing.T) {
 // TestDeep_PrevWithOverflowValues exercises Previous traversal where cells
 // have overflow values, ensuring the cursor correctly navigates.
 func TestDeep_PrevWithOverflowValues(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDBWithPageSize(t, 512)
 
 	tx, err := db.BeginWrite()

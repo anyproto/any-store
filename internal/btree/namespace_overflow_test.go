@@ -62,6 +62,7 @@ func TestCreateNamespaceLongNameOverflowCell(t *testing.T) {
 }
 
 func TestRenameNamespaceLongNameOverflowCell(t *testing.T) {
+	useLegacyFormat(t)
 	resetPageBufferPool()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")

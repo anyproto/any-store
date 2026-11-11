@@ -108,6 +108,7 @@ func TestLeafKeyAt_PayloadAboveAllocCap(t *testing.T) {
 // key reassembled from the overflow chain, not the page bytes after the local
 // prefix.
 func TestCursor_SeekExactSpilledKey(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "idx")
 	keyLen := spilledKeyLen(db.pager.usableSize())
 	const n = 6 // one leaf
