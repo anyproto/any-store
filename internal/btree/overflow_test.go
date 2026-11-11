@@ -755,6 +755,7 @@ func TestLeafKeyOverflow_CursorIteration(t *testing.T) {
 }
 
 func TestLeafKeyOverflow_Delete(t *testing.T) {
+	useLegacyFormat(t)
 	db, ns := tempDBWithNS(t, "data")
 	_ = ns
 

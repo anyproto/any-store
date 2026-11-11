@@ -34,11 +34,12 @@ type integrityChecker struct {
 	pager       *pager
 	cache       *pcache // private reader cache (avoids racing with writerCache)
 	walMaxFrame uint32
-	nPages      uint32   // total database pages
-	pageRef     []byte   // bit-packed: 1 bit per page
-	usableSize  int      // pageSize - reservedSpace
-	maxErrors   int      // stop after this many errors
-	errors      []string // accumulated error messages
+	nPages      uint32        // total database pages
+	pageRef     []byte        // bit-packed: 1 bit per page
+	usableSize  int           // pageSize - reservedSpace
+	leafLim     payloadLimits // leaf-cell rule of the snapshot's schema format
+	maxErrors   int           // stop after this many errors
+	errors      []string      // accumulated error messages
 
 	// Context for error messages
 	treeName string // current tree name (e.g., "master" or namespace name)
@@ -316,7 +317,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 
 	nCells := int(pg.header.cellCount)
 	isLeaf := pg.header.isLeaf()
-	leafLim := ic.pager.leafLimitsFor(ic.usableSize)
+	leafLim := ic.leafLim
 
 	// prevDivider tracks the divider key to the LEFT of the next child to be
 	// recursed into (the inclusive lower bound for that child). It starts at
@@ -633,6 +634,7 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 		pageRef:     make([]byte, nPages/8+1),
 		nPages:      nPages,
 		usableSize:  int(db.pager.pageSize) - int(hdr.ReservedSpace),
+		leafLim:     leafLimitsOf(hdr.SchemaFormat, int(db.pager.pageSize)-int(hdr.ReservedSpace)),
 		maxErrors:   maxErrors,
 	}
 

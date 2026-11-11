@@ -87,9 +87,14 @@ type pager struct {
 	header      dbHeader
 	pageSize    uint32
 	path        string
-	usableSize_ int           // pageSize - ReservedSpace; immutable after open, safe for concurrent reads
-	dbSize      atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
-	state       atomic.Int32  // pagerState
+	usableSize_ int // pageSize - ReservedSpace; immutable after open, safe for concurrent reads
+	// tableLeaf is the file's leaf-cell rule: set, leaf cells use the table-leaf
+	// payload limit (schema format 6 and later); clear, the index rule. Fixed by
+	// the header at open (setLeafRule); atomic because a backup into this
+	// handle can replace the header while readers are open.
+	tableLeaf atomic.Bool
+	dbSize    atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
+	state     atomic.Int32  // pagerState
 
 	// balanceQuickDispatchCount counts dispatches into splitLeafRightmostAppend.
 	// Test-only: production code never reads it (atomic load is ~ns). Used to
@@ -654,6 +659,7 @@ func (p *pager) open() (err error) {
 
 	p.pageSize = p.header.PageSize
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
+	p.setLeafRule()
 
 	// Mirror C lockBtree (btree.c:3422-3424): the usable size (pageSize minus
 	// the on-disk reserved-space byte) is not allowed to be less than 480 — at
@@ -814,9 +820,21 @@ func (p *pager) decryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
 
 // END ENCRYPTION
 
+// createLegacyFormat makes initNewDB write a schema format 5 file, the format
+// of every release before the table-leaf limit. Tests only: it keeps the
+// format-5 leaf rule covered without a file from an old release.
+var createLegacyFormat atomic.Bool
+
+// SetCreateLegacyFormatForTest makes databases created from now on schema
+// format 5 files (zero-padded magic, index rule on leaf cells). It is
+// process-wide; a test that sets it must clear it before it ends.
+func SetCreateLegacyFormatForTest(on bool) {
+	createLegacyFormat.Store(on)
+}
+
 // initNewDB initializes a brand new database file.
 // DRIFT: new-DB page 1 written+fdatasynced direct to file, bypassing WAL (C defers to WAL) See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
-// DRIFT: SchemaFormat=5 is a Go-specific value (unified key||value overflow), unrelated to SQLite's See docs/btree/NOTES.md#old-drift-schema-format-5-custom-not-sqlite-fmt4
+// DRIFT: the schema format (6; 5 before v2.5.0) is any-store's own format version, unrelated to SQLite's schema formats 1-4. See docs/btree/NOTES.md#old-drift-schema-format-5-custom-not-sqlite-fmt4
 func (p *pager) initNewDB() error {
 	if p.pageSize == 0 {
 		p.pageSize = DefaultPageSize
@@ -837,9 +855,15 @@ func (p *pager) initNewDB() error {
 		FileChangeCount:  1,
 		DatabaseSize:     1, // Just page 1
 		SchemaFormat:     maxSchemaFormat,
+		versioned:        true,
 		DefaultCacheSize: defaultCacheSize,
 		TextEncoding:     1, // UTF-8
 	}
+	if createLegacyFormat.Load() {
+		p.header.SchemaFormat = 5
+		p.header.versioned = false
+	}
+	p.setLeafRule()
 	// BEGIN ENCRYPTION
 	if p.codec != nil {
 		p.header.ReservedSpace = savedReserve
@@ -1654,7 +1678,17 @@ func (p *pager) leafLimits() payloadLimits {
 // walks, which a backup into this handle can leave different from
 // usableSize_.
 func (p *pager) leafLimitsFor(usableSize int) payloadLimits {
+	if p.tableLeaf.Load() {
+		return tableLeafLimits(usableSize)
+	}
 	return indexLimits(usableSize)
+}
+
+// setLeafRule records the leaf-cell rule of the file from its schema format.
+// Called wherever the header is first read or replaced as a whole: open, a new
+// database, and a backup that copies another file's page 1 over this one.
+func (p *pager) setLeafRule() {
+	p.tableLeaf.Store(p.header.SchemaFormat >= schemaFormatTableLeaf)
 }
 
 // freelistMaxLeaves returns the max number of leaf entries per trunk page.

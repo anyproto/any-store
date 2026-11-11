@@ -230,6 +230,19 @@ Whole-file page-level AEAD; bring-your-own key management via `EncryptionConfig.
 
 An independent Go implementation following design conventions from [SQLCipher](https://www.zetetic.net/sqlcipher/) (BSD-3-Clause) — reserved-tail page overhead, the page-1 plaintext-prefix rule, PBKDF2-HMAC-SHA256 key derivation. No SQLCipher code is included; the cryptography is Go-native and uses AEAD rather than SQLCipher's encrypt-then-MAC construction. Not SQLCipher-compatible on disk. See [NOTICE.md](NOTICE.md).
 
+## File format versions
+
+A database file keeps the on-disk format it was created with.
+
+| Format | Created by | Opened by |
+| ------ | ---------- | --------- |
+| 5 | v2.0.0 – v2.4.x | every v2 release |
+| 6 | v2.5.0 and later | v2.5.0 and later |
+
+Format 6 keeps a document or index entry of up to about one page (4,045 bytes on the default page size) on its b-tree leaf; format 5 moves anything over 997 bytes to a page of its own. A format 5 file opened by v2.5.0 or later stays format 5 and is read and written as before.
+
+Opening a format 6 file with v2.4.4 fails with `ErrIncompatibleVersion` and leaves the file unchanged. Releases before v2.4.4 report it as `ErrHeaderCorrupt` and do not read it either: do not go back past v2.4.4 once a release that creates format 6 files has run.
+
 ## Documentation
 
 * **API reference** — [pkg.go.dev/github.com/anyproto/any-store/v2](https://pkg.go.dev/github.com/anyproto/any-store/v2)

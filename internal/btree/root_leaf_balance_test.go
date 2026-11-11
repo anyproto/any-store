@@ -44,7 +44,7 @@ func requireNamespaces(t *testing.T, db *DB, names ...string) {
 	defer func() { require.NoError(t, rtx.Rollback()) }()
 	for _, name := range names {
 		_, err = rtx.GetNamespace(name)
-		require.NoError(t, err, "namespace %q", name[:8])
+		require.NoError(t, err, "namespace %.8q", name)
 	}
 }
 

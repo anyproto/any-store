@@ -1351,9 +1351,13 @@ func TestRebuildLeafPageOnPage1(t *testing.T) {
 	bt := &btree{pager: p, rootPage: 1, writable: true}
 	require.NoError(t, bt.rebuildLeafPage(pg, []cellData{{key: []byte("ns1"), value: []byte{0, 0, 0, 2}}}))
 	// Page 1 carries the database header; the rebuild must not clobber it.
-	// Literal on purpose: a rename or edit of dbMagicV2 must fail here rather
+	// Literal on purpose: a rename or edit of the magic must fail here rather
 	// than pass by comparing the constant against itself.
-	assert.Equal(t, "any-store v2\x00\x00\x00\x00", string(pg.data[0:16]))
+	wantMagic := "any-store v2 fmt"
+	if legacyFormatSuite {
+		wantMagic = "any-store v2\x00\x00\x00\x00"
+	}
+	assert.Equal(t, wantMagic, string(pg.data[0:16]))
 	p.releasePage(pg)
 }
 
@@ -1374,6 +1378,7 @@ func TestRebuildInteriorPageWithOverflowKeys(t *testing.T) {
 }
 
 func TestRebuildLeafPageWithOverflow(t *testing.T) {
+	useLegacyFormat(t)
 	p := tempPager(t)
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -3741,6 +3746,7 @@ func TestCov_SearchLeafWithOverflowNoOverflowKeyEndBeyondData(t *testing.T) {
 }
 
 func TestCov_SearchLeafWithOverflowKeyLocalEndBeyondData(t *testing.T) {
+	useLegacyFormat(t)
 	// L573-575: end > dataLen for overflow cell where key fits locally
 	p := tempPager(t)
 	pg, err := p.allocatePage()
@@ -4466,6 +4472,7 @@ func TestCov_CursorValueCellOffsetError(t *testing.T) {
 // =============================================================================
 
 func TestCov_CursorValueOverflowKeyLenVarintError(t *testing.T) {
+	useLegacyFormat(t)
 	// L2770-2772, L2775-2777: varint error in Value overflow path
 	db := tempDBWithPageSize(t, 1024)
 	tx, err := db.BeginWrite()

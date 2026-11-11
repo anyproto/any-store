@@ -165,6 +165,7 @@ func TestSqlite_Corrupt3_1_1_Setup(t *testing.T) {
 // page's own page number into its "next overflow page" pointer (bytes 0-3 of
 // overflow page). IntegrityCheck detects "2nd reference to page N".
 func TestSqlite_Corrupt3_OverflowSelfLoop(t *testing.T) {
+	useLegacyFormat(t)
 	path, template, rootPage := setupCorrupt29DB(t)
 	pageSize := 1024
 
@@ -216,6 +217,7 @@ func TestSqlite_Corrupt3_OverflowSelfLoop(t *testing.T) {
 // Original: Changes the overflow pointer to point to a non-existent page (beyond
 // the DB file). SELECT fails with malformed. IntegrityCheck reports invalid page.
 func TestSqlite_Corrupt3_OverflowInvalidPage(t *testing.T) {
+	useLegacyFormat(t)
 	path, template, rootPage := setupCorrupt29DB(t)
 	pageSize := 1024
 
@@ -268,6 +270,7 @@ func TestSqlite_Corrupt3_OverflowInvalidPage(t *testing.T) {
 // Original: Changes the overflow pointer to 0 (truncating the overflow chain).
 // SELECT fails. IntegrityCheck reports "overflow list length is 0 but should be N".
 func TestSqlite_Corrupt3_OverflowZeroed(t *testing.T) {
+	useLegacyFormat(t)
 	path, template, rootPage := setupCorrupt29DB(t)
 	pageSize := 1024
 

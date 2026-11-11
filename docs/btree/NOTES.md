@@ -122,20 +122,21 @@ SQLite has **two sets** of local payload limits:
 From page.go:
 
 ```go
-func maxLocalPayload(usableSize int) int {
-    return ((usableSize - 12) * 64 / 255) - 23
+// index rule: interior cells, and leaf cells of schema format 5 files
+func indexLimits(usableSize int) payloadLimits {
+    return payloadLimits{usable: usableSize,
+        maxLocal: (usableSize-12)*64/255 - 23, minLocal: (usableSize-12)*32/255 - 23}
 }
-func minLocalPayload(usableSize int) int {
-    return ((usableSize - 12) * 32 / 255) - 23
+// table-leaf rule: leaf cells of schema format 6 files
+func tableLeafLimits(usableSize int) payloadLimits {
+    return payloadLimits{usable: usableSize,
+        maxLocal: usableSize - 35, minLocal: (usableSize-12)*32/255 - 23}
 }
-func localPayloadSize(totalPayload, usableSize int) int {
-    maxLocal := maxLocalPayload(usableSize)
-    if totalPayload <= maxLocal { return totalPayload }
-    minLocal := minLocalPayload(usableSize)
-    ovflUsable := overflowPageUsable(usableSize)
-    surplus := minLocal + (totalPayload-minLocal)%ovflUsable
-    if surplus <= maxLocal { return surplus }
-    return minLocal
+func localPayloadSize(totalPayload int, lim payloadLimits) int {
+    if totalPayload <= lim.maxLocal { return totalPayload }
+    surplus := lim.minLocal + (totalPayload-lim.minLocal)%overflowPageUsable(lim.usable)
+    if surplus <= lim.maxLocal { return surplus }
+    return lim.minLocal
 }
 ```
 
@@ -146,16 +147,32 @@ func localPayloadSize(totalPayload, usableSize int) int {
 
 | Aspect | SQLite | Go |
 |--------|--------|-----|
-| maxLocal (index) | `(usableSize-12)*64/255 - 23` | `(usableSize-12)*64/255 - 23` |
-| minLocal (index) | `(usableSize-12)*32/255 - 23` | `(usableSize-12)*32/255 - 23` |
-| maxLeaf (table) | `usableSize - 35` | Not applicable (no table B-trees) |
-| minLeaf (table) | `(usableSize-12)*32/255 - 23` | Not applicable |
-| Surplus formula | Identical | Identical |
+| maxLocal / minLocal | Index leaves and index interior pages | Every interior page; leaf pages of schema format 5 files |
+| maxLeaf / minLeaf | Table leaves | Every leaf page of schema format 6 files, index namespaces included |
+| Where the pair is chosen | Per page, from its flag byte (`decodeFlags`, `btree.c:2043-2086`) | Per file, from the schema format (`pager.leafLimits`) |
+| Surplus formula | `btreePayloadToLocal` | Identical (`localPayloadSize`) |
 
-**Classification: Structural** -- The formulas are identical for index B-trees. The
-Go implementation only has index-style B-trees and therefore only implements the
-`maxLocal`/`minLocal` pair. The `maxLeaf`/`minLeaf` pair (for table B-trees) is
-absent because Go does not implement table B-trees.
+**Classification: Intentional.** Up to v2.4.x any-store used the index pair for every cell:
+a leaf cell kept at most 997 bytes of `key||value` on a 4 KiB page, and a larger one kept
+a 487-byte stub and put the rest on overflow pages that nothing shares, so a 1-4 KB
+document cost a whole extra page. SQLite caps index cells that low because an index entry
+is moved whole into an interior page when its leaf splits, and at least four cells must
+fit there (`btreeInt.h:90-94`, `btree.c:3424-3436`). any-store never moves a leaf entry
+up: on every tree the parent gets a key-only copy of the boundary key (`balance.go`,
+deviation 1), written under the index pair. The cap therefore protects interior pages
+only, and from schema format 6 every leaf cell uses SQLite's table-leaf pair
+(`maxLeaf = usableSize - 35`, `btree.c:3439-3440`), on document trees and index trees
+alike. Interior cells keep the index pair, so interior fanout stays at four or more.
+
+Two things differ from SQLite's table trees. The pair is one per file, not one per page:
+all pages keep the index page types (10 and 2), so the flag byte does not say which pair
+a leaf uses and the schema format does. And an index leaf can now hold a key of up to
+`usableSize - 35` bytes on the page while the copy of it in the parent spills at the
+index limit.
+
+Schema format 5 files keep the index pair on their leaves for good; nothing converts a
+file in place. `TestLeafCodeTakesLimitsFromPager` keeps leaf code from computing a pair
+itself. Regression tests: `internal/btree/table_leaf_format_test.go`.
 
 ---
 
@@ -325,10 +342,19 @@ if p.header.SchemaFormat != 0 && p.header.SchemaFormat < 5 {
 
 **Severity:** low
 
-**Classification: Intentional** -- Go's "format 5" is NOT the same as SQLite's schema
-format 4. It is a custom version number for the Go implementation's own format evolution.
-The Go implementation never supported SQLite's schema formats 1-4. Format 5 specifically
-signifies the two-varint leaf cell format with unified key/value overflow.
+**Classification: Intentional** -- Go's schema format is NOT SQLite's schema format
+(1-4). It is the version of any-store's own on-disk format, and the Go implementation
+never supported SQLite's formats.
+
+| Schema format | Magic | Meaning | Written by |
+|---|---|---|---|
+| 5 | `any-store v2\0` (or the older `BTree format 1\0`) | Two-varint leaf cell with unified key/value overflow; index payload limit on every cell | v2.0.0 - v2.4.x |
+| 6 | `any-store v2 fmt` | As 5, with SQLite's table-leaf payload limit on every leaf cell (see [the local-payload drift](#old-drift-index-only-local-payload-no-maxleaf-minleaf)) | v2.5.0 and later |
+
+A file keeps the format it was created with. Opening a format 5 file with a later release
+reads and writes it under format 5 rules, including namespaces created afterwards. Open
+refuses a format above the newest it knows (see
+[the header format gate](#drift-2026-11-10-1-header-format-gate)).
 
 ---
 
@@ -3760,7 +3786,7 @@ SQLite's `indexCellCompare` (`btree.c:5952-5982`) compares a record in place onl
 
 SQLite never changes its magic. A file from a later release is told apart by the version bytes, which `lockBtree` checks on every read of page 1 (`btree.c:3322-3327`: a write version above 2 makes the connection read-only, a read version above 2 is `SQLITE_NOTADB`), and by the schema file format, which `sqlite3InitOne` bounds with "unsupported file format" (`prepare.c:344`). any-store wrote both version bytes as 2 and the schema format as 5 but checked only the format's lower bound, so releases up to v2.4.3 open a file of any later format and parse it under their own rules. `checkHeaderFormat` now applies all three bounds before any other header field is trusted, and reports a value above the maximum as `ErrNewerFormat`, which is not under `ErrCorrupt`: the file is intact and a caller that discards a corrupt database must keep it.
 
-Two things differ from SQLite. First, the bounds cannot protect a file from the releases that never checked them, so schema formats 6 and later are written under a second magic, `"any-store v2 fmt"`. It fills all 16 bytes, and those releases compare the whole field, so they refuse the file at the header (as `ErrHeaderCorrupt`) before reading a page of it. The magic changes this once: later formats raise the schema format only. The magic and the schema format must agree (the second magic with a format below 6 is `ErrHeaderCorrupt`), `serialize` writes back the magic the header was read with, so no commit moves a file between the two families, and the copy of page 1 that `pager.open` reads from the WAL must name the same family as the file. Second, a write version above the maximum refuses the open instead of opening read-only: the btree has no read-only open.
+Two things differ from SQLite. First, the bounds cannot protect a file from the releases that never checked them, so schema formats 6 and later are written under a second magic, `"any-store v2 fmt"` (v2.5.0 is the first release to create such files). It fills all 16 bytes, and those releases compare the whole field, so they refuse the file at the header (as `ErrHeaderCorrupt`) before reading a page of it. The magic changes this once: later formats raise the schema format only. The magic and the schema format must agree (the second magic with a format below 6, or a zero-padded magic with format 6 or later, is `ErrHeaderCorrupt`), `serialize` writes back the magic the header was read with, so no commit moves a file between the two families, and the copy of page 1 that `pager.open` reads from the WAL must name the same family as the file. Second, a write version above the maximum refuses the open instead of opening read-only: the btree has no read-only open.
 
 The checks live in `dbHeader.deserialize`, whose first caller on the open path is `readInitialHeader`, before the file is locked or its WAL and wal-index are touched; a refused open leaves all three files as they were. A newer format found only in the WAL's copy of page 1 is refused after WAL recovery has run, which may have rewritten the wal-index. Regression tests: `internal/btree/format_gate_test.go` (`TestCheckHeaderFormat`, `TestOpen_RefusedFormatLeavesFilesUntouched`, `TestHeaderSerialize_KeepsMagicFamily`, `TestOpen_FirstMagicStillOpensAndIsRewritten`), `corrupt_open_test.go:TestOpen_NewerFormat`.
 
@@ -3776,4 +3802,4 @@ SQLite's `insertCellFast` sends a cell to `balance()` when `sz+2 > pPage->nFree`
 - **Category:** changed-logic  -  **Severity:** none
 - **Affected functions:** `page.go:payloadLimits`, `page.go:indexLimits`, `page.go:localPayloadSize`, `pager.go:*pager.leafLimits`, `pager.go:*pager.leafLimitsFor`, every leaf-cell parser and writer in `btree.go`.
 
-SQLite's `decodeFlags` copies `maxLocal`/`minLocal` into each `MemPage` from `BtShared`, choosing the index pair or the table-leaf pair by the page's flag byte (`btree.c:2043-2086`), and `btreePayloadToLocal` reads them from the page (`btree.c:1213-1226`). any-store has one leaf page type, so the pair is not chosen per page: leaf code takes a `payloadLimits` from `pager.leafLimits`, and interior code uses `indexLimits`. Both currently return the index pair. `TestLeafCodeTakesLimitsFromPager` fails when production code outside the interior-cell functions calls `maxLocalPayload`, `minLocalPayload` or `indexLimits` directly.
+SQLite's `decodeFlags` copies `maxLocal`/`minLocal` into each `MemPage` from `BtShared`, choosing the index pair or the table-leaf pair by the page's flag byte (`btree.c:2043-2086`), and `btreePayloadToLocal` reads them from the page (`btree.c:1213-1226`). any-store has one leaf page type, so the pair is not chosen per page: leaf code takes a `payloadLimits` from `pager.leafLimits`, which returns the table-leaf pair for a schema format 6 file and the index pair for a format 5 one, and interior code uses `indexLimits`. `TestLeafCodeTakesLimitsFromPager` fails when production code outside the interior-cell functions calls `maxLocalPayload`, `minLocalPayload` or `indexLimits` directly.

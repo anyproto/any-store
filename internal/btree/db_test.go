@@ -92,6 +92,7 @@ func TestOpen_PageSizeNotPowerOf2(t *testing.T) {
 }
 
 func TestOpen_OldSchemaFormat(t *testing.T) {
+	useLegacyFormat(t)
 	// Create a valid database, then corrupt the schema format field
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
@@ -145,6 +146,7 @@ func readOnDiskSchemaFormat(t *testing.T, path string) uint32 {
 //     value 0 is intentionally allowed through (mirrors SQLite normalize-0-to-1),
 //     and the current value 5 must continue to open.
 func TestSchemaFormat_Drift_WriteAndGate(t *testing.T) {
+	useLegacyFormat(t)
 	// --- Invariant 1: production WRITES SchemaFormat == 5 on disk ---
 	// Open a REAL new DB through the normal Open/initNewDB path (we do NOT
 	// write the header byte ourselves), persist it to the main file via a

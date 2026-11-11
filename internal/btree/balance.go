@@ -43,6 +43,10 @@ import (
 //         divider is routing-only and the entry stays in the leaf. This is the
 //         plan's deviation (2). Concretely the per-balance leafData flag is the
 //         negation of "siblings are interior": leafDataLike := b.leaf.
+//     Leaf cells are sized under the file's leaf rule (cellArray.leafLim).
+//     From schema format 6 that is SQLite's table-leaf rule, so a leaf cell
+//     can take nearly a page and a balance of three leaves can write up to
+//     nbMaxOut pages, as SQLite's does for table leaves.
 //  2. rebuild*Page instead of editPage. any-store already has the wholesale
 //     rebuildLeafPage / rebuildInteriorPage (btree.go:1648 / 1716) == SQLite's
 //     rebuildPage (btree.c:7647), which is editPage's own fallback. We use it
@@ -942,9 +946,11 @@ func (bt *btree) rewriteParentAfterBalance(
 	// gained at most nNew-nOld cells, but the new dividers can be much longer
 	// than the ones they replace, so the split index is chosen for both halves
 	// to fit (interiorSplitPointFitting). SQLite inserts the dividers as overflow
-	// cells and balances the parent with balance_nonroot, which can spread it
-	// over more than two pages; a parent that needs three is not handled here
-	// and fails the rebuild below. The middle cell is
+	// cells and balances the parent with balance_nonroot. Two pages are always
+	// enough here: a balance writes at most nbMaxOut pages, so at most four new
+	// dividers, and four interior cells fit one page by the index rule. Fill the
+	// left page to the cell that crosses its end and promote that cell; what is
+	// left over is less than those four cells. The middle cell is
 	// promoted; its leftChild becomes the left page's rightChild; the right
 	// page keeps newRightChild. This is the same shape as insertSepIntoInterior's
 	// slow path (btree.go:2039-2075).

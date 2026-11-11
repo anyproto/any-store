@@ -1670,6 +1670,7 @@ func TestDelCurCov_DirectDeleteNeedsRebuild(t *testing.T) {
 // TestDelCurCov_DirectDeleteOverflowFastPath inserts an overflow cell
 // and deletes it via the fast path (L2111-2115).
 func TestDelCurCov_DirectDeleteOverflowFastPath(t *testing.T) {
+	useLegacyFormat(t)
 	p := tempPagerWithPageSize(t, 512)
 	bt := initLeafBtree(t, p)
 

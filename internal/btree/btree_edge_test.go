@@ -1363,6 +1363,7 @@ func TestTargeted_CountPage_CellCountOverflow_NonRoot(t *testing.T) {
 // overflow page pointer, then trigger collectLeafCells (via an update that
 // causes a rebuild).
 func TestTargeted_CollectLeafCells_OverflowReadPanic(t *testing.T) {
+	useLegacyFormat(t)
 	p := tempPagerWithPageSize(t, 512)
 	bt := initLeafBtree(t, p)
 
@@ -1530,6 +1531,7 @@ func TestTargeted_CollectInteriorCells_OverflowReadPanic(t *testing.T) {
 // TestTargeted_Delete_OverflowFreeChainError corrupts the overflow page pointer
 // of a cell and then deletes it, expecting the freeOverflowChain call to fail.
 func TestTargeted_Delete_OverflowFreeChainError(t *testing.T) {
+	useLegacyFormat(t)
 	p := tempPagerWithPageSize(t, 512)
 	bt := initLeafBtree(t, p)
 

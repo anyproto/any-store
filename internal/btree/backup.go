@@ -338,6 +338,10 @@ func (b *Backup) finalize(nSrcPage uint32) error {
 	// the WAL version bytes are patched). This mirrors the established
 	// savepoint page-1 restore at pager.go:2274.
 	b.dst.pager.header.deserialize(dstPg1.data[:dbHeaderSize])
+	// The destination is the source's file now, schema format included: a
+	// format 5 source copied into a newly created format 6 file leaves a
+	// format 5 file, and its leaf cells follow that rule.
+	b.dst.pager.setLeafRule()
 	// Bump the schema cookie AFTER the deserialize so it is not overwritten.
 	// ~ sqlite3BtreeUpdateMeta writes meta value #1 (the cookie) to offset 40.
 	newCookie := b.iDstSchema + 1

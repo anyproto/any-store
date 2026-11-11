@@ -1421,6 +1421,12 @@
     ],
     "note": ""
   },
+  "page.go:leafLimitsOf": {
+    "sqlite": [
+      "btree.c:decodeFlags"
+    ],
+    "note": "leaf rule by schema format instead of by page flag"
+  },
   "page.go:localPayloadSize": {
     "sqlite": [
       "btree.c:btreePayloadToLocal"
@@ -1445,6 +1451,12 @@
       "util.c:sqlite3PutVarint"
     ],
     "note": "putVarint64 is the static encoder; sqlite3PutVarint the public wrapper (util.c)"
+  },
+  "page.go:tableLeafLimits": {
+    "sqlite": [
+      "btree.c:lockBtree"
+    ],
+    "note": "BtShared.maxLeaf / minLeaf"
   },
   "page.go:varintSize": {
     "sqlite": [
@@ -1843,6 +1855,12 @@
     ],
     "note": ""
   },
+  "pager.go:*pager.setLeafRule": {
+    "sqlite": [
+      "btree.c:decodeFlags"
+    ],
+    "note": "records the file's leaf rule from its schema format"
+  },
   "pager.go:*pager.takeCellBuf": {
     "sqlite": [],
     "note": ""
@@ -1882,6 +1900,10 @@
       "btree.c:fillInCell"
     ],
     "note": ""
+  },
+  "pager.go:SetCreateLegacyFormatForTest": {
+    "sqlite": [],
+    "note": "test hook: create schema format 5 files"
   },
   "pager.go:newPager": {
     "sqlite": [
