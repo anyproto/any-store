@@ -2540,7 +2540,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	// Appended frames are contiguous in the file (frame n+1 starts where
 	// frame n ends), so they are staged header + payload in frameBatch and
 	// flushed whenever the next frame would not fit. walWriteOneFrame
-	// (wal.c:3940-3956) instead writes each frame's header and page with
+	// (wal.c:3954-3970) instead writes each frame's header and page with
 	// two writes; the bytes and their offsets are the same either way. A
 	// chunk holds whole frames, at least one.
 	var frameHdr [walFrameSize]byte
