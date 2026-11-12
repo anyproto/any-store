@@ -87,17 +87,21 @@ func openRecordingWAL(t *testing.T, path string, opts Options) (*DB, *recordingW
 
 func batchValue(i int) []byte { return bytes.Repeat([]byte{byte('a' + i%26)}, 180) }
 
-// One small commit is one WAL write: its frames (the changed leaf and page 1)
-// are staged together, not written as a header and a page each.
+// One small commit is one WAL write: its frames (the two changed leaves, and
+// page 1 in schema format 5) are staged together, not written as a header and
+// a page each. Two namespaces, because a schema format 6 commit that changes
+// one leaf and no header field writes that leaf alone.
 func TestWriteFrames_SmallCommitIsOneWrite(t *testing.T) {
 	opts := Options{PageSize: 4096, DisableAutoCheckpoint: true}
 	db, rec := openRecordingWAL(t, filepath.Join(t.TempDir(), "t.db"), opts)
 	t.Cleanup(func() { _ = db.Close() })
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
-	ns, err := tx.CreateNamespace("data")
-	require.NoError(t, err)
-	require.NoError(t, tx.Put(ns, saveKey(0), []byte("v")))
+	for _, name := range []string{"a", "b"} {
+		ns, err := tx.CreateNamespace(name)
+		require.NoError(t, err)
+		require.NoError(t, tx.Put(ns, saveKey(0), []byte("v")))
+	}
 	require.NoError(t, tx.Commit())
 	require.NotNil(t, rec)
 
@@ -105,14 +109,16 @@ func TestWriteFrames_SmallCommitIsOneWrite(t *testing.T) {
 	rec.arm(0)
 	tx, err = db.BeginWrite()
 	require.NoError(t, err)
-	ns, err = tx.GetNamespace("data")
-	require.NoError(t, err)
-	require.NoError(t, tx.Put(ns, saveKey(1), []byte("w")))
+	for _, name := range []string{"a", "b"} {
+		ns, err := tx.GetNamespace(name)
+		require.NoError(t, err)
+		require.NoError(t, tx.Put(ns, saveKey(1), []byte("w")))
+	}
 	require.NoError(t, tx.Commit())
 	writes := rec.disarm()
 
 	frames := int(db.pager.wal.nFrame.Load() - before)
-	require.GreaterOrEqual(t, frames, 2, "a commit writes the leaf and page 1")
+	require.GreaterOrEqual(t, frames, 2, "a commit writes both leaves")
 	require.Len(t, writes, 1)
 	require.Equal(t, frames*rec.frameSize, writes[0].n)
 	require.Equal(t, int64(walHeaderSize)+int64(before)*int64(rec.frameSize), writes[0].off)
