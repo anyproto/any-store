@@ -390,3 +390,55 @@ func TestWalWriterRestart_AutoCheckpointBoundsLog(t *testing.T) {
 		require.NoError(t, db.IntegrityCheck())
 	})
 }
+
+// The heap-shm read begin falls back to reader slot 0 with part of the log
+// still to read when slots 1-4 are briefly held exclusive
+// (tryBeginReadInProcessHdr). A writer that began that way holds none of
+// slots 1-4, so nothing but the explicit nBackfill == mxFrame test keeps it
+// from starting the log over and dropping the frames that are only in the
+// log. (SQLite's read lock 0 implies a full backfill, wal.c:3128-3136, and
+// walRestartLog only asserts it, wal.c:3872.)
+func TestWalWriterRestart_NotFromSlot0Fallback(t *testing.T) {
+	forEachRestartMode(t, func(t *testing.T, m restartMode) {
+		if !m.opts.InProcess && !m.opts.InMemory {
+			t.Skip("shared memory grants slot 0 only after a full backfill")
+		}
+		db, path := openRestartDB(t, m)
+		restartPut(t, db, 0, 60, 1)
+		w := db.pager.wal
+		n1 := w.index.mxCommitFrame.LoadLocal()
+
+		rtx, err := db.BeginRead() // pins n1
+		require.NoError(t, err)
+		restartPut(t, db, 60, 120, 2)
+		n2 := w.index.mxCommitFrame.LoadLocal()
+		require.NoError(t, db.Checkpoint(CheckpointPassive))
+		require.NoError(t, rtx.Rollback())
+		require.Equal(t, n1, w.index.liveNBackfill(), "setup: the backfill stopped at the reader")
+
+		// Slots 1-4 held exclusive for the length of the write begin, as a
+		// checkpoint or another begin's claim holds them for an instant.
+		for i := 1; i <= 4; i++ {
+			require.NoError(t, w.index.lock(lockRead0+i, lockExclusive))
+		}
+		wtx, err := db.BeginWrite()
+		for i := 1; i <= 4; i++ {
+			require.NoError(t, w.index.unlock(lockRead0+i, lockExclusive))
+		}
+		require.NoError(t, err)
+		require.Zero(t, wtx.walSlot, "setup: the writer's snapshot fell back to slot 0")
+
+		restartPutTx(t, wtx, 0, 2, 3)
+		require.NoError(t, wtx.Commit())
+		require.Greater(t, w.index.mxCommitFrame.LoadLocal(), n2, "frames are appended: part of the log is not backfilled")
+
+		restartCheck(t, db, 0, 2, 3)
+		restartCheck(t, db, 2, 60, 1)
+		restartCheck(t, db, 60, 120, 2)
+		db = restartReopen(t, db, path, m)
+		restartCheck(t, db, 0, 2, 3)
+		restartCheck(t, db, 2, 60, 1)
+		restartCheck(t, db, 60, 120, 2)
+		require.NoError(t, db.IntegrityCheck())
+	})
+}

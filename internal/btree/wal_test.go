@@ -2480,7 +2480,7 @@ func TestWALReaderSlotReuseSucceedsWhenStateStable(t *testing.T) {
 //	    the authoritative WAL frame within the reader's snapshot is served
 //	    from the WAL (the normal, non-faulting path).
 //	(2) A checkpoint cannot truncate / reset the WAL out from under a held
-//	    reader slot (tryResetWALWithBusy needs slots 1-4 exclusive), slot-0
+//	    reader slot (waitReadersAndTruncate needs slots 1-4 exclusive), slot-0
 //	    snapshots never resolve frames (minFrame = mxFrame+1, C readLock==0
 //	    short-circuit), and the writer path holds the write lock that any
 //	    restart requires. A readFrame failure after a successful lookup is
@@ -2601,7 +2601,7 @@ func TestWALReadFrameErrorPropagates(t *testing.T) {
 	// --- Protection (2): truncation/reset cannot occur under a held reader slot. ---
 	// The structural guarantee that makes hard propagation correct: a reader
 	// holding its read-mark slot blocks the checkpointer from RESET/TRUNCATE
-	// (tryResetWALWithBusy must exclusively lock the reader slots, which ErrBusy-fails
+	// (waitReadersAndTruncate must exclusively lock the reader slots, which ErrBusy-fails
 	// while one is held), so the WAL frame numbering and salt are NOT recycled under
 	// the reader. A passive backfill may copy frames to the DB file and raise
 	// nBackfill (transparently shifting the reader's reads to the now-durable disk

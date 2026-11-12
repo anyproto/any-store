@@ -45,13 +45,14 @@ func TestIntegrityCheckSlot0IgnoresNewWALGeneration(t *testing.T) {
 	go func() { done <- db.IntegrityCheck() }()
 	<-inside
 
-	// Under the check: restart the WAL, then a commit that empties the tree.
-	// Its frames (1..k, k far below the check's mxFrame) free every page but
-	// the root.
+	// Under the check: a commit that empties the tree. The log is fully
+	// backfilled and no reader is in it (the check is on slot 0), so the
+	// writer starts the log over: its frames (1..k, k far below the check's
+	// mxFrame) free every page but the root.
 	require.NoError(t, db.Checkpoint(CheckpointRestart))
 	after, valid := db.pager.wal.index.readHeader()
 	require.True(t, valid)
-	require.Equal(t, uint32(0), after.mxFrame, "setup: the restart ran under the check")
+	require.Equal(t, hdr, after, "a RESTART checkpoint leaves the header as it is")
 	wtx, err := db.BeginWrite()
 	require.NoError(t, err)
 	ns, err := wtx.GetNamespace("t1")

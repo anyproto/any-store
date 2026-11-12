@@ -132,26 +132,25 @@ const (
 	CheckpointFull
 
 	// CheckpointRestart works the same as CheckpointFull with the addition
-	// that after checkpointing it blocks (calls the busy handler) until all
-	// readers are reading from the database file only. This ensures that the
-	// next writer will restart the log file from the beginning. Blocks new
-	// writers while pending, but does not impede readers.
+	// that after checkpointing the log file it blocks (calls the busy
+	// handler) until all readers are reading from the database file only.
+	// This ensures that the next writer starts the log file over from its
+	// beginning (wal.restartLogLocked). The checkpoint itself leaves the
+	// wal-index header and the WAL file as they are (wal.c:2357-2362, 2380).
 	//
-	// Returns ErrBusy (and does NOT reset the WAL) if the backfill was
-	// incomplete because active readers/writers blocked it, or if the mode was
-	// downgraded to PASSIVE because the writer lock was busy — so the caller
-	// can tell the WAL was not actually reset and can retry. Mirrors SQLite
-	// (wal.c:2352-2356 short-circuits before the eMode>=RESTART reset branch;
-	// wal.c:4425 re-surfaces BUSY on a write-lock downgrade).
+	// Returns ErrBusy if the backfill was incomplete because active
+	// readers/writers blocked it, if a reader still used the log when the
+	// busy handler gave up (wal.c:2361), or if the mode was downgraded to
+	// PASSIVE because the writer lock was busy (wal.c:4439).
 	CheckpointRestart
 
 	// CheckpointTruncate works the same as CheckpointRestart with the addition
-	// that it also truncates the log file to zero bytes.
+	// that it also resets the wal-index header and truncates the log file to
+	// zero bytes (wal.c:2363-2378). It does so with no committed frame in
+	// the log as well.
 	//
 	// Returns ErrBusy (and does NOT truncate/reset the WAL) under the same
-	// incomplete-backfill or write-lock-downgrade conditions as
-	// CheckpointRestart, so the caller can tell the WAL was not truncated and
-	// can retry. Mirrors SQLite (wal.c:2352-2356, wal.c:4425).
+	// conditions as CheckpointRestart.
 	CheckpointTruncate
 )
 
@@ -884,11 +883,11 @@ func (wi *walIndex) getLatest(pgno uint32) (uint32, error) {
 	return wi.shmHashGet(pgno, wi.mxCommitFrame.LoadLocal(), minFrame)
 }
 
-// reset clears the WAL index (after a checkpoint + WAL truncate).
+// reset clears the WAL index when the log is started over.
 // readMarksLocked tells shmPublishReadMarks whether the caller already holds
-// exclusive locks on reader slots 1-4 (the RESTART/TRUNCATE checkpoint path)
+// exclusive locks on reader slots 1-4 (a TRUNCATE checkpoint, a writer's restart)
 // or the marks must be published under per-slot try-locks (recovery/open).
-// DRIFT: reset() clobbers aReadMark[0]/[1] to NOT_USED + drops nCkpt/salt increments See docs/btree/NOTES.md#drift-99-wal-restart-read-mark-reset-diverges-from-walrestarthdr
+// DRIFT: reset() clobbers aReadMark[0]/[1] to NOT_USED See docs/btree/NOTES.md#drift-99-wal-restart-read-mark-reset-diverges-from-walrestarthdr
 func (wi *walIndex) reset(readMarksLocked bool) {
 	wi.mu.Lock()
 	clear(wi.pageMap)
@@ -1388,8 +1387,9 @@ func (wi *walIndex) shmWriteNBackfillAttempted() {
 // holding WAL_READ_LOCK(K) exclusive:
 //
 //   - readMarksLocked=true: the caller already holds slots 1-4 exclusive —
-//     the checkpoint RESTART/TRUNCATE path (tryResetWALWithBusy), matching
-//     walRestartHdr's caller (wal.c:2361) — so the marks are written directly.
+//     a TRUNCATE checkpoint (waitReadersAndTruncate) or a writer's restart
+//     (restartLogLocked), matching walRestartHdr's callers (wal.c:2361,
+//     wal.c:3876) — so the marks are written directly.
 //   - readMarksLocked=false (recovery/open paths): each slot is try-locked
 //     exclusively first, and a BUSY slot — a live peer reader — is left
 //     untouched, matching walIndexRecover (wal.c:1573-1588). Overwriting a
@@ -1542,6 +1542,17 @@ type wal struct {
 	// because our readers use per-connection pcache isolation and never share
 	// pWal->hdr with the writer.
 	writerHdr WalIndexHdr
+
+	// logGen counts the times this process started the log over
+	// (restartHeaderStateLocked); genSeed1/2 are the checksums a frame chain
+	// starts from in the current generation. Together they are what
+	// SQLite's nCkpt is to a savepoint (wal.c:3814, 3829-3835): a position
+	// saved in an earlier generation names frames that no longer exist, and
+	// base maps it to the start of the current one. Atomic because
+	// rollbackForClose reads them from the closing goroutine.
+	logGen   atomic.Uint64
+	genSeed1 atomic.Uint32
+	genSeed2 atomic.Uint32
 
 	// iReCksum is the earliest WAL frame overwritten by the current
 	// write transaction via frame-reuse. Zero when no overwrites are
@@ -1890,15 +1901,16 @@ func (w *wal) adoptSHMState(hdr WalIndexHdr, walHasHeader bool) {
 // commit, and readers take the database file's size (pagerPagecount,
 // pager.c:3292-3306). The restart path uses restartHeaderStateLocked.
 func (w *wal) initHeaderStateLocked(readMarksLocked bool) {
-	w.restartHeaderStateLocked(readMarksLocked, 0)
+	// No log to continue: both salts are drawn, as SQLite draws them for the
+	// first frame of a WAL it has no checkpoint sequence for (wal.c:4087).
+	w.restartHeaderStateLocked(readMarksLocked, 0, rand.Uint32())
 }
 
 // restartHeaderStateLocked is initHeaderStateLocked with the database size
 // the published wal-index header carries. A WAL restart passes the size of
 // the last commit, which the reset must not drop: SQLite's walRestartHdr
 // zeroes mxFrame and leaves hdr.nPage as it is (wal.c:2146-2160), so
-// sqlite3WalDbsize keeps answering with the committed size after a RESTART
-// or TRUNCATE.
+// sqlite3WalDbsize keeps answering with the committed size after a restart.
 //
 // The index is cleared (hash tables, nBackfill, read marks) before the reset
 // header is published; walRestartHdr writes the header first. A process that
@@ -1906,16 +1918,26 @@ func (w *wal) initHeaderStateLocked(readMarksLocked bool) {
 // backfilled WAL, which peers read and append to correctly; the other order
 // would leave a header without frames over the old checkpoint frontier.
 // DRIFT: the index is cleared before the reset header is published; C publishes first See docs/btree/NOTES.md#drift-2026-11-12-1-wal-restart-clears-the-index-before-it-publishes-the-reset-header
-// DRIFT: WAL restart randomizes both salts; C increments salt0 (+1), randomizes salt1 only See docs/btree/NOTES.md#drift-97-wal-restart-randomizes-both-salts-instead-of-incrementing-sa
+// DRIFT: reset() clobbers aReadMark[0]/[1] to NOT_USED See docs/btree/NOTES.md#drift-99-wal-restart-read-mark-reset-diverges-from-walrestarthdr
+//
+// salt1 is the new header's first salt: a restart passes the previous one
+// plus one, as walRestartHdr does (wal.c:2152); the second salt is always
+// drawn (wal.c:2153).
+//
+// The checkpoint sequence stays 0 and the published aFrameCksum is the
+// checksum of the new WAL header, where walRestartHdr keeps the old one until
+// the first frame replaces it (wal.c:4086, 4095-4096): a writer here, a
+// v2.4.x one included, writes the WAL header from its own fields with
+// checkpoint 0 and seeds its frame chain from the published aFrameCksum
+// (beginWriteWithSnapshot).
 // DRIFT: WAL header checkpoint-seq nCkpt hardcoded 0, never incremented on restart See docs/btree/NOTES.md#drift-98-wal-checkpoint-sequence-number-nckpt-never-incremented
-// DRIFT: reset() clobbers aReadMark[0]/[1] to NOT_USED + drops nCkpt/salt increments See docs/btree/NOTES.md#drift-99-wal-restart-read-mark-reset-diverges-from-walrestarthdr
-func (w *wal) restartHeaderStateLocked(readMarksLocked bool, nPage uint32) {
+func (w *wal) restartHeaderStateLocked(readMarksLocked bool, nPage uint32, salt1 uint32) {
 	w.header = walHeader{
 		magic:      walMagic,
 		version:    walVersion,
 		pageSize:   w.pageSize,
 		checkpoint: 0,
-		salt1:      rand.Uint32(),
+		salt1:      salt1,
 		salt2:      rand.Uint32(),
 	}
 
@@ -1923,6 +1945,12 @@ func (w *wal) restartHeaderStateLocked(readMarksLocked bool, nPage uint32) {
 	var buf [walHeaderSize]byte
 	w.header.serialize(buf[:])
 	w.cksum1, w.cksum2 = walChecksum(buf[0:24], 0, 0)
+	// A new generation of the log: positions saved in the previous one map
+	// to its start (base). The seed before the count, for rollbackForClose's
+	// unlocked read.
+	w.genSeed1.Store(w.cksum1)
+	w.genSeed2.Store(w.cksum2)
+	w.logGen.Add(1)
 	w.nFrame.Store(0)
 	w.headerOnDisk = false
 	w.index.reset(readMarksLocked)
@@ -1934,6 +1962,129 @@ func (w *wal) restartHeaderStateLocked(readMarksLocked bool, nPage uint32) {
 	_ = w.index.writeHeader(0, nPage, 0,
 		[2]uint32{w.cksum1, w.cksum2},
 		[2]uint32{w.header.salt1, w.header.salt2})
+}
+
+// walPos is a position in the log that a transaction can go back to: the
+// number of frames before it and the checksums the next frame chains from,
+// in the log generation gen.
+type walPos struct {
+	gen            uint64
+	frame          uint32
+	cksum1, cksum2 uint32
+}
+
+// pos returns the current end of the log. Writer-owned: the caller holds the
+// write lock.
+func (w *wal) pos() walPos {
+	return walPos{gen: w.logGen.Load(), frame: w.nFrame.Load(), cksum1: w.cksum1, cksum2: w.cksum2}
+}
+
+// base returns the position a transaction that saved pos goes back to. If
+// the log was started over since (restartLogLocked, inside the same write
+// transaction), the saved frame number and checksums belong to the previous
+// generation, and the transaction's own frames start at frame 1 of this one:
+// the base is frame 0 with the generation's seed. SQLite reaches the same
+// result from the restarted pWal->hdr in sqlite3WalUndo (wal.c:3775) and from
+// the nCkpt test in sqlite3WalSavepointUndo (wal.c:3829-3835). Every
+// comparison against a saved position goes through this, not only undo: a
+// transaction's frames are "the frames above its base".
+func (w *wal) base(saved walPos) walPos {
+	gen := w.logGen.Load()
+	if saved.gen == gen {
+		return saved
+	}
+	return walPos{gen: gen, cksum1: w.genSeed1.Load(), cksum2: w.genSeed2.Load()}
+}
+
+// testCheckpointRead0Hook, when non-nil, runs in a checkpoint once it holds
+// reader slot 0, before it compares the salts. Test-only.
+var testCheckpointRead0Hook func()
+
+// testRestartLogHook, when non-nil, runs as a writer starts the log over,
+// with the step about to be taken: "restart" before the reset, "restarted"
+// after it and before the WAL header is written. Test-only.
+var testRestartLogHook func(step string)
+
+// restartLogLocked starts the log over if the next frames can go to the
+// start of the WAL file instead of its end. ~ walRestartLog (wal.c:3866-3906),
+// called by walFrames before it writes (wal.c:4070). The caller holds the
+// write lock and w.mu, and is about to write the first frames of its
+// transaction.
+//
+// The conditions, all checked here:
+//   - No frame of this transaction is in the log yet.
+//   - The whole log is in the database file: the authoritative nBackfill
+//     equals the committed mxFrame and is not zero. SQLite only asserts this
+//     (wal.c:3872), because its read lock 0 is granted only after a full
+//     backfill (wal.c:3128-3136); here the in-process read begin also falls
+//     back to slot 0 with part of the log still to read
+//     (tryBeginReadInProcessHdr), so it is tested.
+//   - No reader uses the log: reader slots 1-4 can be locked exclusive
+//     without waiting (wal.c:3876). A writer whose own snapshot is on one of
+//     those slots holds it shared, so this also is SQLite's "pWal->readLock
+//     == 0" (wal.c:3870).
+//   - No checkpoint is running, in any process (see the DRIFT below).
+//
+// A busy lock means append (wal.c:3889-3890); any other lock error fails the
+// write.
+// DRIFT: the writer's restart also try-locks lockCheckpoint; C's walRestartLog does not See docs/btree/NOTES.md#drift-2026-11-12-2-writer-restart-takes-the-checkpoint-lock
+// DRIFT: the writer keeps reader slot 0 after a restart; C moves to a WAL slot (wal.c:3893-3899) See docs/btree/NOTES.md#drift-2026-11-12-3-writer-keeps-slot-0-after-a-restart
+func (w *wal) restartLogLocked() error {
+	mx := w.index.mxCommitFrame.LoadLocal()
+	if w.nFrame.Load() != mx {
+		return nil // this transaction has frames in the log already
+	}
+	// The cheap test first: on most commits part of the log is not
+	// backfilled, and this is all a commit pays.
+	if nb := w.index.liveNBackfill(); nb == 0 || nb != mx {
+		return nil
+	}
+	multiProcess := !w.inProcess && !w.inMemory
+	if multiProcess {
+		// mx is the committed mxFrame only if it is the live header's.
+		hdr, valid := w.index.readHeader()
+		if !valid || hdr.mxFrame != mx {
+			return nil
+		}
+	}
+	if err := w.index.lock(lockCheckpoint, lockExclusive); err != nil {
+		if errors.Is(err, ErrBusy) {
+			return nil
+		}
+		return err
+	}
+	defer func() { _ = w.index.unlock(lockCheckpoint, lockExclusive) }()
+	for i := 1; i <= 4; i++ {
+		if err := w.index.lock(lockRead0+i, lockExclusive); err != nil {
+			for j := 1; j < i; j++ {
+				_ = w.index.unlock(lockRead0+j, lockExclusive)
+			}
+			if errors.Is(err, ErrBusy) {
+				return nil
+			}
+			return err
+		}
+	}
+	defer func() {
+		for i := 1; i <= 4; i++ {
+			_ = w.index.unlock(lockRead0+i, lockExclusive)
+		}
+	}()
+	if testRestartLogHook != nil {
+		testRestartLogHook("restart")
+	}
+	if err := w.doResetWAL(false); err != nil {
+		return err
+	}
+	if multiProcess {
+		// The restart header is this writer's: as walRestartHdr updates
+		// pWal->hdr before it publishes it (wal.c:2151-2154).
+		w.writerHdr = w.index.hdr
+	}
+	if testRestartLogHook != nil {
+		testRestartLogHook("restarted")
+	}
+	return nil
 }
 
 // flushHeader writes the already-initialized in-memory header to disk.
@@ -1956,8 +2107,8 @@ func (w *wal) flushHeader() error {
 	return nil
 }
 
-// writeHeader writes a fresh WAL header to disk.
-// DRIFT: WAL restart randomizes both salts; C increments salt0 (+1), randomizes salt1 only See docs/btree/NOTES.md#drift-97-wal-restart-randomizes-both-salts-instead-of-incrementing-sa
+// writeHeader writes a fresh WAL header to disk. There is no log to
+// continue, so both salts are drawn (wal.c:4087).
 // DRIFT: WAL header checkpoint-seq nCkpt hardcoded 0, never incremented on restart See docs/btree/NOTES.md#drift-98-wal-checkpoint-sequence-number-nckpt-never-incremented
 func (w *wal) writeHeader() error {
 	w.header = walHeader{
@@ -2246,6 +2397,11 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// See if these frames can go to the start of the log (wal.c:4067-4072).
+	if err := w.restartLogLocked(); err != nil {
+		return err
+	}
+
 	// Lazily write the WAL header to disk on first frame write.
 	// The header was initialized in memory during open() but not flushed
 	// to keep the WAL file empty until actual writes occur.
@@ -2498,6 +2654,15 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 // END ENCRYPTION
 // DRIFT: InMemory+NoSync WAL stores page data in arena, skipping checksums entirely; no disk persistence See docs/btree/NOTES.md#old-drift-inmemory-wal-skips-checksums
 func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
+	// See if these frames can go to the start of the log (wal.c:4067-4072).
+	if err := func() error {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.restartLogLocked()
+	}(); err != nil {
+		return err
+	}
+
 	w.mu.Lock()
 
 	nf := w.nFrame.Load()
@@ -3094,9 +3259,9 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 	// own READ_LOCK(0) re-check (walTryBeginRead memcmps the live header after
 	// taking the lock and returns WAL_RETRY on change, wal.c:3136-3139).
 	// Between the lock-free snapshot and this read-0 acquisition, a checkpoint
-	// may have completed backfill (releasing read-0) and entered
-	// tryResetWALWithBusy — which locks only slots 1-4 — so a WAL reset could
-	// slip in and recycle frame numbers; the stale [minFrame, maxFrame] window
+	// may have completed backfill (releasing read-0), and a TRUNCATE
+	// checkpoint or a writer — both lock only slots 1-4 — may then have
+	// started the log over and recycled frame numbers; the stale [minFrame, maxFrame] window
 	// would then match new-generation frames in walIndex.get. A change in
 	// either counter means the snapshot may span such a reset → drop the lock
 	// and retry with fresh values.
@@ -3375,8 +3540,8 @@ func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, e
 		w.header.salt2 = hdr.aSalt[1]
 		w.index.mxCommitFrame.Store(hdr.mxFrame)
 		// Re-sync maxFrame from the authoritative SHM hdr. Without this, a
-		// peer's CheckpointRestart (doResetWAL — wal.go:2712, matching
-		// SQLite's walRestartLog at wal.c:3852-3884) that drops mxFrame back
+		// peer's WAL reset (doResetWAL: a TRUNCATE checkpoint, or a writer's
+		// restart as in SQLite's walRestartLog) that drops mxFrame back
 		// to 0 leaves our local maxFrame stale at the pre-reset high-water
 		// mark. setBatch's monotonic guard `if f > maxFrame.Load()` then
 		// never lowers it, and writeFrames (line 1849) publishes the stale
@@ -3509,8 +3674,10 @@ func (w *wal) checkpointPassive(dbFile fileHandle, master *masterStore) error {
 //     Does NOT acquire the write lock. The busy handler is never invoked.
 //   - CheckpointFull: acquires write lock to block new writers, uses busy
 //     handler to wait for readers blocking progress.
-//   - CheckpointRestart: like Full, but also resets the WAL.
-//   - CheckpointTruncate: like Restart, but also truncates the WAL file.
+//   - CheckpointRestart: like Full, but also waits until no reader uses the
+//     WAL, so that the next writer starts it over.
+//   - CheckpointTruncate: like Restart, but also resets the WAL and
+//     truncates its file.
 //
 // The busy handler (issue 1.7 + 6.3) is invoked when waiting for reader locks
 // in FULL/RESTART/TRUNCATE modes. In PASSIVE mode it is never called.
@@ -3770,7 +3937,15 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 		nf, mxPage = w.index.mxCommitFrame.LoadLocal(), w.index.maxPage.Load()
 	}
 	if nf == 0 {
-		return nil
+		// Nothing to copy. The modes above PASSIVE still do what follows a
+		// backfill, as walCheckpoint does with mxFrame and nBackfill both 0
+		// (wal.c:2216, 2352-2380): a TRUNCATE checkpoint truncates a WAL
+		// file that holds the frames of a rolled-back transaction, or of a
+		// log the writer started over and then abandoned.
+		if mode == CheckpointPassive {
+			return downgradeResult(nil)
+		}
+		return downgradeResult(w.checkpointPost(mode, xBusy))
 	}
 
 	// Compute mxSafeFrame: the highest frame we can safely copy to DB.
@@ -3857,6 +4032,24 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	}
 	if lockErr != nil {
 		return lockErr
+	}
+
+	// With reader slot 0 locked, check that the log was not started over
+	// since the header was read for this checkpoint (version-3.52.0
+	// wal.c:2256-2267). If it was, there was nothing to do: the nBackfill
+	// test above passed only because the writer that started the log over
+	// had set nBackfill to 0, and the WAL file may hold fewer than nf valid
+	// frames. Every restart in this code base holds the checkpoint lock
+	// (restartLogLocked's DRIFT), so this is reached only against a writer
+	// that follows SQLite's protocol to the letter.
+	if testCheckpointRead0Hook != nil {
+		testCheckpointRead0Hook()
+	}
+	if multiProcess {
+		if live, valid := w.index.readHeader(); !valid || live.aSalt != ckptHdr.aSalt {
+			_ = w.index.unlock(lockRead0, lockExclusive)
+			return downgradeResult(w.checkpointPost(mode, xBusy))
+		}
 	}
 
 	// Set nBackfillAttempted BEFORE starting the backfill (issue 7.7).
@@ -4100,9 +4293,10 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	return downgradeResult(w.checkpointPost(mode, xBusy))
 }
 
-// checkpointPost handles post-backfill logic: WAL reset for modes that
-// completed a full checkpoint. For non-PASSIVE modes with an incomplete
-// backfill it returns ErrBusy (SQLite walCheckpoint, wal.c:2351-2356).
+// checkpointPost is what a checkpoint does after its backfill, for the modes
+// above PASSIVE (walCheckpoint, wal.c:2352-2383): an incomplete backfill is
+// ErrBusy; RESTART waits until no reader uses the log; TRUNCATE also resets
+// the wal-index header and truncates the WAL file.
 func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler) error {
 	// The shared nBackfill, as walCheckpoint tests pInfo->nBackfill
 	// (wal.c:2341). This is reached without any backfill having run (nothing
@@ -4115,7 +4309,7 @@ func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler) error {
 	//
 	// Source mxCommitFrame from SHM in multi-process mode: see
 	// authoritativeMxFrame. A stale process-local value could make us
-	// proceed to tryResetWAL after only backfilling our own frames, wiping
+	// proceed to the reset after only backfilling our own frames, wiping
 	// a peer's committed frames that we never saw.
 	if backfill < w.authoritativeMxFrame() {
 		// Not everything was checkpointed. Can't reset the WAL.
@@ -4136,57 +4330,57 @@ func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler) error {
 		return nil
 	}
 
-	// All frames are checkpointed. Only RESTART/TRUNCATE modes reset the WAL.
-	// FULL mode preserves the WAL as a crash-safety net: if a subsequent
-	// checkpoint partially writes pages to the DB and SIGKILL hits mid-backfill,
-	// the WAL data is still available for recovery.
+	// All frames are checkpointed (wal.c:2357).
 	if mode >= CheckpointRestart {
-		return w.tryResetWALWithBusy(xBusy, mode == CheckpointTruncate)
+		return w.waitReadersAndTruncate(xBusy, mode == CheckpointTruncate)
 	}
 
 	return nil
 }
 
-// tryResetWALWithBusy attempts to reset the WAL, using the busy handler
-// to wait for reader locks on slots 1-4 (issue 6.3).
-// Used by CheckpointRestart and CheckpointTruncate modes.
-// The truncate parameter controls whether to truncate the WAL file to zero
-// (CheckpointTruncate) or just reset it (CheckpointRestart).
-func (w *wal) tryResetWALWithBusy(xBusy BusyHandler, truncate bool) error {
-	// Try to acquire exclusive locks on all reader slots 1-4,
-	// using the busy handler. Matching SQLite:
-	// "rc = walBusyLock(pWal, xBusy, pBusyArg, WAL_READ_LOCK(1), WAL_NREADER-1)"
-	//
+// waitReadersAndTruncate is the RESTART and TRUNCATE tail of a checkpoint
+// whose backfill is complete (wal.c:2357-2382). It takes reader slots 1-4
+// exclusive, waiting through the busy handler, so that when it returns no
+// reader is using the log and the next writer can start it over
+// (restartLogLocked). RESTART stops there and leaves the wal-index header as
+// it is. TRUNCATE resets the header and then truncates the WAL file
+// (wal.c:2363-2378).
+//
+// A reader that keeps a slot past the busy handler makes this ErrBusy, as
+// walBusyLock's result is walCheckpoint's (wal.c:2361).
+//
+// Caller holds w.mu, the write lock and the checkpoint lock.
+func (w *wal) waitReadersAndTruncate(xBusy BusyHandler, truncate bool) error {
 	// SQLite locks slots 1..4 as a single range. We lock them individually
 	// since our shm interface works per-slot.
 	for i := 1; i <= 4; i++ {
 		lockSlot := lockRead0 + i
 		if err := walBusyLock(w.index, xBusy, lockSlot, lockExclusive); err != nil {
-			// Release any locks we already acquired
 			for j := 1; j < i; j++ {
 				_ = w.index.unlock(lockRead0+j, lockExclusive)
-			}
-			if err == ErrBusy {
-				return nil // can't reset, but not fatal
 			}
 			return err
 		}
 	}
-	// Release all reader locks after reset
 	defer func() {
 		for i := 1; i <= 4; i++ {
 			_ = w.index.unlock(lockRead0+i, lockExclusive)
 		}
 	}()
-
-	return w.doResetWAL(truncate)
+	if !truncate {
+		return nil
+	}
+	return w.doResetWAL(true)
 }
 
-// doResetWAL performs the actual WAL reset.
-// Must be called with w.mu held and all necessary locks acquired.
-// If truncate is true, the WAL file is truncated to zero bytes (CheckpointTruncate).
-// If false, the WAL is just restarted with a new header (CheckpointRestart).
-// DRIFT: WAL header checkpoint-seq nCkpt hardcoded 0, never incremented on restart See docs/btree/NOTES.md#drift-98-wal-checkpoint-sequence-number-nckpt-never-incremented
+// doResetWAL starts the log over: it publishes a wal-index header with no
+// frames and new salts (~ walRestartHdr, wal.c:2146-2160). Its two callers
+// are the writer about to write the first frames of a transaction
+// (restartLogLocked, truncate false) and a TRUNCATE checkpoint
+// (waitReadersAndTruncate, truncate true: the WAL file is then cut to zero
+// bytes, wal.c:2378).
+// Caller holds w.mu, the write lock, the checkpoint lock and reader slots
+// 1-4 exclusive.
 func (w *wal) doResetWAL(truncate bool) error {
 	if debugTrace {
 		trace("doResetWAL: truncate=%v nFrame=%d maxFrame=%d nBackfill=%d",
@@ -4201,9 +4395,15 @@ func (w *wal) doResetWAL(truncate bool) error {
 	// corrupt. The caller holds the write lock, so the live header is the
 	// last commit's.
 	nPage := w.index.maxPage.Load()
+	// The first salt goes up by one from the log being replaced
+	// (wal.c:2152). The caller holds the write lock, so the live header's is
+	// that log's; a process that has not written since a peer's reset has an
+	// older one in w.header.
+	salt1 := w.header.salt1
 	if !w.inProcess && !w.inMemory {
 		if hdr, valid := w.index.readHeader(); valid {
 			nPage = hdr.nPage
+			salt1 = hdr.aSalt[0]
 		}
 	}
 
@@ -4222,9 +4422,9 @@ func (w *wal) doResetWAL(truncate bool) error {
 	// writes none either (the reset only publishes the shm header, whose
 	// fresh salt makes peers rewrite it); on TRUNCATE the WAL stays 0 bytes.
 	//
-	// readMarksLocked: tryResetWALWithBusy holds reader slots 1-4 exclusive
-	// across this call (matching wal.c:2361 before walRestartHdr).
-	w.restartHeaderStateLocked(true, nPage)
+	// readMarksLocked: the caller holds reader slots 1-4 exclusive across
+	// this call (wal.c:2361 and wal.c:3876, before walRestartHdr).
+	w.restartHeaderStateLocked(true, nPage, salt1+1)
 	if w.inMemory {
 		w.memFrames = w.memFrames[:0]
 		w.memArenaOff = 0

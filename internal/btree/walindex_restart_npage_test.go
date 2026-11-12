@@ -106,7 +106,7 @@ func requireRestartNPageRows(t *testing.T, db *DB) {
 }
 
 // TestWalRestartKeepsNPage_PeerResets: a peer grows the database and resets
-// the WAL (TRUNCATE, RESTART). A process that only reads must keep reading
+// the WAL (TRUNCATE) or checkpoints it all (RESTART). A process that only reads must keep reading
 // every row; it used to get ErrCorrupt for pages beyond its stale size.
 func TestWalRestartKeepsNPage_PeerResets(t *testing.T) {
 	if restartNPageChild(t) {
@@ -120,8 +120,15 @@ func TestWalRestartKeepsNPage_PeerResets(t *testing.T) {
 
 			hdr, valid := db.pager.wal.index.readHeader()
 			require.True(t, valid)
-			require.Equal(t, uint32(0), hdr.mxFrame, "setup: the peer reset the WAL")
-			require.Greater(t, hdr.nPage, stale, "the reset header must keep the committed database size")
+			if mode == "grow-truncate" {
+				require.Equal(t, uint32(0), hdr.mxFrame, "setup: the peer reset the WAL")
+			} else {
+				// A RESTART checkpoint only waits for the readers; the header
+				// stays the last commit's. A writer's restart keeps the size
+				// too: TestWalWriterRestart_PeerDiesAfterRestart.
+				require.NotZero(t, hdr.mxFrame, "a RESTART checkpoint does not reset the WAL")
+			}
+			require.Greater(t, hdr.nPage, stale, "the header must keep the committed database size")
 			require.Equal(t, stale, db.pager.dbSize.Load(), "setup: the local size is stale")
 
 			requireRestartNPageRows(t, db)

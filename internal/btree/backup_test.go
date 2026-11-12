@@ -410,13 +410,22 @@ func TestBackup_RestartOnCheckpointRestart(t *testing.T) {
 	b.mu.Unlock()
 	require.NotEqual(t, uint32(1), iNextBefore, "Step(2) should have advanced iNext past 1")
 
-	// CheckpointRestart resets WAL. ~ backup.c:701 trigger.
+	// A RESTART checkpoint only waits for the readers (wal.c:2357-2362): it
+	// resets nothing, and the backup goes on.
 	require.NoError(t, src.Checkpoint(CheckpointRestart))
 
 	b.mu.Lock()
 	iNextAfter := b.iNext
 	b.mu.Unlock()
-	require.Equal(t, uint32(1), iNextAfter, "CheckpointRestart must trigger Backup.restart (backup.c:701-707)")
+	require.Equal(t, iNextBefore, iNextAfter, "a RESTART checkpoint does not restart a backup")
+
+	// A TRUNCATE checkpoint resets the WAL. ~ backup.c:701 trigger.
+	require.NoError(t, src.Checkpoint(CheckpointTruncate))
+
+	b.mu.Lock()
+	iNextAfter = b.iNext
+	b.mu.Unlock()
+	require.Equal(t, uint32(1), iNextAfter, "CheckpointTruncate must trigger Backup.restart (backup.c:701-707)")
 
 	// Clean up so Finish doesn't leave the write tx hanging.
 	_ = b.Finish()

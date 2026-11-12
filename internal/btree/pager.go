@@ -160,6 +160,12 @@ type pager struct {
 	savedWalCksum1 uint32
 	savedWalCksum2 uint32
 
+	// savedWalGen is the log generation savedWalFrame and the checksums
+	// were taken in (wal.pos). They are read through walBase only: once the
+	// writer has started the log over inside the transaction, they name
+	// frames of the previous generation.
+	savedWalGen atomic.Uint64
+
 	// doNotSpill is a bitmask of spillFlag* constants that inhibit the
 	// pagerStress callback. Modeled after SQLite's Pager.doNotSpill (pager.c:648).
 	doNotSpill uint8
@@ -314,6 +320,10 @@ type savepointState struct {
 	// savepoint's WAL snapshot a peer of the tx-level walHdr — see
 	// rollbackToSavepoint in pager.go.
 	walHdr WalIndexHdr
+	// walGen is the log generation walHdr's frame count and checksums were
+	// taken in; rollbackToSavepoint reads them through wal.base
+	// (sqlite3WalSavepoint's aWalData[3] = nCkpt, wal.c:3814).
+	walGen uint64
 	header dbHeader // snapshot of database header at savepoint time (fix 9.3)
 }
 
@@ -1049,10 +1059,34 @@ func (p *pager) beginWrite(readSnap WalIndexHdr) error {
 	p.savedHeader = p.header
 	// Save WAL frame count and checksums so rollback can clean up spilled frames
 	// and restore the checksum chain for the next transaction.
-	p.savedWalFrame.Store(p.wal.nFrame.Load())
-	p.savedWalCksum1 = p.wal.cksum1
-	p.savedWalCksum2 = p.wal.cksum2
+	pos := p.wal.pos()
+	p.savedWalGen.Store(pos.gen)
+	p.savedWalFrame.Store(pos.frame)
+	p.savedWalCksum1 = pos.cksum1
+	p.savedWalCksum2 = pos.cksum2
 	return nil
+}
+
+// walBase is the log position the open write transaction started from: its
+// frames are the ones above it, and a rollback goes back to it. It is the
+// position saved by beginWrite unless the transaction started the log over,
+// when it is the start of the new log (wal.base).
+func (p *pager) walBase() walPos {
+	return p.wal.base(walPos{
+		gen:    p.savedWalGen.Load(),
+		frame:  p.savedWalFrame.Load(),
+		cksum1: p.savedWalCksum1,
+		cksum2: p.savedWalCksum2,
+	})
+}
+
+// walBaseFrame is walBase's frame number alone. It reads atomics only:
+// rollbackForClose calls it from the closing goroutine.
+func (p *pager) walBaseFrame() uint32 {
+	if p.savedWalGen.Load() != p.wal.logGen.Load() {
+		return 0
+	}
+	return p.savedWalFrame.Load()
 }
 
 // getPage returns the page with the given page number, reading from WAL or disk as needed.
@@ -1223,7 +1257,7 @@ func (p *pager) readTempPage(pgno, walMaxFrame, walMinFrame, dbSizeBound uint32,
 			// — never fall through to the older DB-file copy. Callers reach
 			// readTempPage only via getPageReader, whose read tx holds a
 			// reader-slot shared lock: a WAL reset needs slots 1-4 exclusive
-			// (tryResetWALWithBusy), and slot-0 snapshots carry
+			// (waitReadersAndTruncate, restartLogLocked), and slot-0 snapshots carry
 			// minFrame = mxFrame+1 so the lookup above never resolves a
 			// frame for them (C readLock==0 short-circuit). The failure is
 			// therefore always genuine. See getPageWriter for the writer-
@@ -2409,7 +2443,7 @@ func (p *pager) pagerStress(pg *page) error {
 // transaction without changes commits empty, leaving the counters alone.
 func (p *pager) hasChanges() bool {
 	return p.writerCache.nDirty > 0 || p.header != p.savedHeader ||
-		p.wal.nFrame.Load() > p.savedWalFrame.Load()
+		p.wal.nFrame.Load() > p.walBaseFrame()
 }
 
 // dataChanged/schemaChanged control whether FileChangeCount/SchemaCookie are
@@ -2582,7 +2616,7 @@ func (p *pager) unwindWriter() {
 		p.wal.endWrite()
 		return
 	}
-	if p.wal.index.mxCommitFrame.LoadLocal() > p.savedWalFrame.Load() {
+	if p.wal.index.mxCommitFrame.LoadLocal() > p.walBaseFrame() {
 		// Published: the commit is real. Writer-side discard only.
 		for _, pg := range p.writerCache.dirtyPages() {
 			p.writerCache.discard(pg.pgno)
@@ -2624,20 +2658,21 @@ func (p *pager) rollbackLocked() error {
 	// Roll back spilled frames in the WAL index. Spilled frames in the WAL
 	// file are harmless (no commit marker), but pageMap entries and maxFrame
 	// must be restored to the pre-transaction state.
-	p.wal.index.rollbackToFrame(p.savedWalFrame.Load())
+	base := p.walBase()
+	p.wal.index.rollbackToFrame(base.frame)
 	// Restore nFrame so the next transaction overwrites the dead spill frames
 	// instead of writing past them. Also restore cumulative checksums so the
 	// checksum chain is correct when frames are overwritten.
-	p.wal.nFrame.Store(p.savedWalFrame.Load())
-	p.wal.cksum1 = p.savedWalCksum1
-	p.wal.cksum2 = p.savedWalCksum2
+	p.wal.nFrame.Store(base.frame)
+	p.wal.cksum1 = base.cksum1
+	p.wal.cksum2 = base.cksum2
 
 	// Truncate in-memory WAL frames to match restored nFrame. Without this,
 	// writeFramesMem appends past the stale entries, and readFrame(N) reads
 	// memFrames[N-1] which points to rolled-back data instead of new data.
 	if p.wal.inMemory {
 		p.wal.mu.Lock()
-		p.wal.memFrames = p.wal.memFrames[:p.savedWalFrame.Load()]
+		p.wal.memFrames = p.wal.memFrames[:base.frame]
 		p.wal.mu.Unlock()
 	}
 
@@ -2678,12 +2713,13 @@ func (p *pager) rollbackForClose() {
 
 	// Roll back spilled frames in the WAL index.
 	// index.rollbackToFrame and nFrame are safe (own locking / atomic).
-	p.wal.index.rollbackToFrame(p.savedWalFrame.Load())
-	p.wal.nFrame.Store(p.savedWalFrame.Load())
+	baseFrame := p.walBaseFrame()
+	p.wal.index.rollbackToFrame(baseFrame)
+	p.wal.nFrame.Store(baseFrame)
 
 	if p.wal.inMemory {
 		p.wal.mu.Lock()
-		p.wal.memFrames = p.wal.memFrames[:p.savedWalFrame.Load()]
+		p.wal.memFrames = p.wal.memFrames[:baseFrame]
 		p.wal.mu.Unlock()
 	}
 
@@ -2727,21 +2763,22 @@ func (p *pager) pagerError() {
 	// Roll back spilled frames in the WAL index and restore nFrame/checksums.
 	// Without this, pageMap and nFrame remain inflated after error recovery,
 	// causing checkpoint to copy uncommitted spill data to the database.
-	p.wal.index.rollbackToFrame(p.savedWalFrame.Load())
-	p.wal.nFrame.Store(p.savedWalFrame.Load())
-	p.wal.cksum1 = p.savedWalCksum1
-	p.wal.cksum2 = p.savedWalCksum2
+	base := p.walBase()
+	p.wal.index.rollbackToFrame(base.frame)
+	p.wal.nFrame.Store(base.frame)
+	p.wal.cksum1 = base.cksum1
+	p.wal.cksum2 = base.cksum2
 
 	// Restore mxCommitFrame: the commit path advances mxCommitFrame before
 	// writeHeader (wal.go), so a writeHeader failure leaves mxCommitFrame
 	// ahead of the rolled-back WAL state. At beginWrite() time,
 	// mxCommitFrame == nFrame == savedWalFrame, so restore to that value.
-	p.wal.index.mxCommitFrame.Store(p.savedWalFrame.Load())
+	p.wal.index.mxCommitFrame.Store(base.frame)
 
 	// Truncate in-memory WAL frames to match restored nFrame.
 	if p.wal.inMemory {
 		p.wal.mu.Lock()
-		p.wal.memFrames = p.wal.memFrames[:p.savedWalFrame.Load()]
+		p.wal.memFrames = p.wal.memFrames[:base.frame]
 		p.wal.mu.Unlock()
 	}
 
@@ -2798,6 +2835,7 @@ func (p *pager) savepoint() (int, error) {
 			mxFrame:     walFr,
 			aFrameCksum: [2]uint32{p.wal.cksum1, p.wal.cksum2},
 		},
+		walGen: p.wal.logGen.Load(),
 		header: p.header, // snapshot header for rollback (fix 9.3)
 	})
 	return id, nil
@@ -2826,22 +2864,26 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	p.writerCache.truncate(sp.dbSize)
 
 	// Roll back spilled frames in the WAL index to the savepoint's WAL position.
-	p.wal.index.rollbackToFrame(sp.walHdr.mxFrame)
+	// The savepoint's position in the log, or the start of the new log if the
+	// writer started it over after the savepoint was taken
+	// (sqlite3WalSavepointUndo, wal.c:3829-3835).
+	spBase := p.wal.base(walPos{gen: sp.walGen, frame: sp.walHdr.mxFrame, cksum1: sp.walHdr.aFrameCksum[0], cksum2: sp.walHdr.aFrameCksum[1]})
+	p.wal.index.rollbackToFrame(spBase.frame)
 	// Restore nFrame and cumulative checksums so the next write overwrites
 	// the dead spill frames with a correct checksum chain.
-	p.wal.nFrame.Store(sp.walHdr.mxFrame)
-	p.wal.cksum1 = sp.walHdr.aFrameCksum[0]
-	p.wal.cksum2 = sp.walHdr.aFrameCksum[1]
+	p.wal.nFrame.Store(spBase.frame)
+	p.wal.cksum1 = spBase.cksum1
+	p.wal.cksum2 = spBase.cksum2
 
 	// If an in-tx frame-reuse overwrote a frame past the savepoint's
 	// position, drop the pending checksum rewrite — that frame is
 	// now discarded. Mirrors SQLite wal.c:3832-3834.
-	p.wal.resetIReCksumIfPast(sp.walHdr.mxFrame)
+	p.wal.resetIReCksumIfPast(spBase.frame)
 
 	// Truncate in-memory WAL frames to match restored nFrame.
 	if p.wal.inMemory {
 		p.wal.mu.Lock()
-		p.wal.memFrames = p.wal.memFrames[:sp.walHdr.mxFrame]
+		p.wal.memFrames = p.wal.memFrames[:spBase.frame]
 		p.wal.mu.Unlock()
 	}
 
@@ -2966,40 +3008,22 @@ func (p *pager) releaseSavepoint(id int) error {
 // restart on success, so a BUSY result correctly suppresses it.
 func (p *pager) checkpointWithMode(mode CheckpointMode) error {
 	err := p.wal.checkpointWithMode(p.file, p.master, mode, p.wal.busyHandler)
-	if err == nil && (mode == CheckpointRestart || mode == CheckpointTruncate) {
+	if err == nil && mode == CheckpointTruncate {
 		// ~ sqlite3BackupRestart (backup.c:701-707). WAL frame numbering
-		// has reset, so any in-flight backup must start over.
+		// has reset, so any in-flight backup must start over. (A RESTART
+		// checkpoint resets nothing.)
 		p.dispatchBackupRestart()
 	}
 	return err
 }
 
-// tryCheckpoint attempts a passive checkpoint for auto-checkpoint.
-// Uses PASSIVE mode to avoid blocking writers or readers, matching SQLite.
-// DRIFT: auto-checkpoint escalates to WAL-RESTART; SQLite auto-checkpoint is PASSIVE-only See docs/btree/NOTES.md#drift-53-auto-checkpoint-escalates-to-wal-restart-beyond-passive
+// tryCheckpoint is the automatic checkpoint after a commit: PASSIVE, as
+// SQLite's is (sqlite3WalDefaultHook → sqlite3_wal_checkpoint, main.c). It
+// never blocks a writer or a reader and never resets the log; once the whole
+// log is in the database file, the next writer starts it over
+// (wal.restartLogLocked).
 func (p *pager) tryCheckpoint() error {
-	// First run a non-blocking backfill (PASSIVE), matching SQLite's
-	// auto-checkpoint behavior.
-	if err := p.wal.checkpointPassive(p.file, p.master); err != nil {
-		return err
-	}
-
-	// If all frames are backfilled, try a best-effort RESTART to recycle WAL
-	// frame numbers and prevent unbounded WAL growth. With xBusy=nil this does
-	// not wait for readers; it simply skips reset when locks are busy.
-	//
-	// Authoritative read: in multi-process mode the process-local cursor can
-	// trail a peer's recent commit; comparing nBackfill against a stale local
-	// cursor can return true prematurely and schedule a RESTART that races
-	// the peer's fresh frames. See docs/btree/NOTES.md §"Checkpoint mxFrame source fix".
-	if p.wal.index.liveNBackfill() >= p.wal.authoritativeMxFrame() {
-		if err := p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil); err == nil {
-			// ~ sqlite3BackupRestart (backup.c:701-707) also applies to
-			// auto-checkpoint's best-effort restart.
-			p.dispatchBackupRestart()
-		}
-	}
-	return nil
+	return p.wal.checkpointPassive(p.file, p.master)
 }
 
 // writeOverflowChain writes data to a chain of overflow pages and returns

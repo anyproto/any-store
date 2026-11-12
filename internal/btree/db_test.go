@@ -712,8 +712,9 @@ func TestCommit_AutoCheckpoint_LongReader_WALRecyclesAfterRelease(t *testing.T) 
 	nFramePinned := db.pager.wal.nFrame.Load()
 	require.Greater(t, nFramePinned, uint32(0))
 
-	// Release reader and perform one more write to trigger tryCheckpoint()
-	// and best-effort restart.
+	// Release reader and perform one more write: its automatic checkpoint,
+	// PASSIVE as SQLite's, now copies the whole log into the database file.
+	// It does not reset the log.
 	require.NoError(t, pinReader.Rollback())
 
 	wtx, err := db.BeginWrite()
@@ -723,10 +724,20 @@ func TestCommit_AutoCheckpoint_LongReader_WALRecyclesAfterRelease(t *testing.T) 
 	require.NoError(t, wtx.Put(ns2, []byte("post-release"), []byte("v")))
 	require.NoError(t, wtx.Commit())
 
-	// After reader release, auto-checkpoint should be able to recycle WAL.
-	// Allow <=1 frame in case the final write raced with reset timing.
-	nFrameAfter := db.pager.wal.nFrame.Load()
-	assert.LessOrEqual(t, nFrameAfter, uint32(1))
+	w := db.pager.wal
+	nFrameBackfilled := w.nFrame.Load()
+	require.Greater(t, nFrameBackfilled, nFramePinned, "the checkpoint leaves the log in place")
+	require.Equal(t, nFrameBackfilled, w.index.liveNBackfill(), "the whole log is backfilled")
+
+	// The next writer starts the log over (walRestartLog, wal.c:3870-3888):
+	// its frames are the only ones in it.
+	wtx, err = db.BeginWrite()
+	require.NoError(t, err)
+	ns2, err = wtx.GetNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns2, []byte("post-restart"), []byte("v")))
+	require.NoError(t, wtx.Commit())
+	assert.LessOrEqual(t, w.nFrame.Load(), uint32(4), "the log was started over")
 
 	// Verify data remains readable.
 	rtx, err := db.BeginRead()
