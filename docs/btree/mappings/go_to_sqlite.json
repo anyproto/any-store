@@ -1877,7 +1877,7 @@
     "sqlite": [
       "wal.c:sqlite3WalUndo"
     ],
-    "note": "walBase's frame number, atomics only (rollbackForClose)"
+    "note": "frame number of the open write transaction's base, by wal.base's rule over atomics only: hasChanges, unwindWriter, commit's spill test, rollbackForClose"
   },
   "pager.go:*pager.withWriteLock": {
     "sqlite": [],
@@ -2337,6 +2337,12 @@
       "wal.c:sqlite3WalSavepointUndo"
     ],
     "note": "ports the iReCksum\u003emxFrame reset fragment of sqlite3WalSavepointUndo (wal.c:3849-3851)"
+  },
+  "wal.go:*wal.restartCandidate": {
+    "sqlite": [
+      "wal.c:walRestartLog"
+    ],
+    "note": "the lock-free part of the restart test: no frame of this transaction in the log, nBackfill == mxFrame \u003e 0"
   },
   "wal.go:*wal.restartHeaderStateLocked": {
     "sqlite": [
