@@ -2889,6 +2889,8 @@ header", and it matches `ErrCorrupt`. A DB file too short to hold page 1 is a re
 (`io.EOF`) rather than a zero-filled `NOTADB`, because the page getters do not zero-fill a short
 read ([drift-7](#drift-7-short-db-file-read-treated-as-hard-error)); the begin fails either way.
 
+Every write begin (2026-11-12). The refresh now runs at every `beginWrite`, not only when another process's change was seen: `lockBtree` reads page 1 at the start of every SQLite transaction (`sqlite3BtreeBeginTrans`, `btree.c:3707`), and a schema format 6 commit no longer rewrites page 1 each time, so the header must not be carried over from the last transaction. Page 1 normally comes from the writer cache; the cache is cleared first only when a change was seen, or a refresh failed. The count is `committedPageCount`: the live wal-index header's size, the file's size when the WAL has no commit (the readers' memo, so no `fstat` per begin), the committed position's size in the in-process and in-memory modes. Rollback and `pagerError` restore the page count the transaction began with (`savedDbSize`), not the header's size field, which is 0 for an untrusted header.
+
 Residual divergence: SQLite needs no "refresh pending" state, because a transaction whose page-1
 read failed never keeps the page (`lockBtree` releases it and leaves `pBt->pPage1` zero,
 `btree.c:3288-3289`, `3451-3454`) and the next transaction reads it again. Go keeps the header in

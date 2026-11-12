@@ -11,6 +11,7 @@ import (
 // ANYSTORE_TEST_LEGACY_FORMAT=1 (make test-legacy-format): the on-disk format
 // of every release before v2.5.0, which existing databases keep.
 func TestMain(m *testing.M) {
+	btree.SetCheckPage1ForTest(true)
 	if os.Getenv("ANYSTORE_TEST_LEGACY_FORMAT") == "1" {
 		btree.SetCreateLegacyFormatForTest(true)
 	}

@@ -185,6 +185,13 @@ type pager struct {
 	// frames of the previous generation.
 	savedWalGen atomic.Uint64
 
+	// savedDbSize is p.dbSize at beginWrite() time: the page count the
+	// transaction began with, which rollback and pagerError restore. It is
+	// not always the header's DatabaseSize: an untrusted header size (0, or
+	// a legacy VersionValidFor of 0) gives way to the pager's count
+	// (lockBtreePageCount).
+	savedDbSize uint32
+
 	// savedCommitNPage is the committed size at beginWrite() time, the size
 	// half of the committed position (walIndex.mxCommitFrame). A failed
 	// commit restores the position as (walBase().frame, savedCommitNPage).
@@ -1160,30 +1167,42 @@ func (p *pager) beginWrite(readSnap WalIndexHdr) error {
 	// tables are consulted in multi-process mode.
 	if stateChanged || p.headerStale {
 		p.writerCache.clear()
-		// A failed page-1 re-read aborts the begin: continuing would let
-		// commit() serialize a stale header over the peer's page 1, and
-		// allocatePage hand out pages the peer already wrote. SQLite
-		// propagates the page-1 read error out of lockBtree the same way
-		// (btree.c:3288-3289), and re-reads page 1 at the next transaction
-		// because it never kept the failed page. headerStale is that
-		// "page 1 not held" state here: wal.beginWriteWithSnapshot has
-		// already moved its writerHdr baseline to the live header, so
-		// without the flag a retry would see no state change and skip the
-		// refresh. We release the exclusive WAL write lock that
-		// beginWriteWithSnapshot acquired (the pager never reached
-		// pagerWriter, so the caller's error path only ends the read tx via
-		// endRead and would otherwise leak the write lock); the caller's
-		// read transaction itself is left intact.
-		p.headerStale = true
-		if err := p.refreshHeaderFromPage1(); err != nil {
+	}
+	// The header and the page count come from page 1 at every write begin,
+	// as lockBtree reads page 1 at the start of every SQLite transaction
+	// (sqlite3BtreeBeginTrans, btree.c:3707 -> btree.c:3278-3298): from the
+	// writer cache when it holds page 1, which is then the committed one,
+	// else from the WAL or the database file. A schema format 6 commit
+	// writes page 1 only when it has to, so the header is never carried
+	// over from the last transaction.
+	//
+	// A failed page-1 read aborts the begin: continuing would let commit()
+	// serialize a stale header over the peer's page 1, and allocatePage
+	// hand out pages the peer already wrote. SQLite propagates the page-1
+	// read error out of lockBtree the same way (btree.c:3288-3289), and
+	// re-reads page 1 at the next transaction because it never kept the
+	// failed page. headerStale is that "page 1 not held" state here: the
+	// next begin clears the cache even if no state change is seen. We
+	// release the exclusive WAL write lock that beginWriteWithSnapshot
+	// acquired (the pager never reached pagerWriter, so the caller's error
+	// path only ends the read tx via endRead and would otherwise leak the
+	// write lock); the caller's read transaction itself is left intact.
+	p.headerStale = true
+	if err := p.refreshHeaderFromPage1(); err != nil {
+		p.wal.endWrite()
+		return err
+	}
+	p.headerStale = false
+	if checkPage1Invariant.Load() {
+		if err := p.checkPage1AtBegin(); err != nil {
 			p.wal.endWrite()
 			return err
 		}
-		p.headerStale = false
 	}
 	p.state.Store(int32(pagerWriter))
 	// Save a snapshot of the database header so rollback can restore it (fix 5.2).
 	p.savedHeader = p.header
+	p.savedDbSize = p.dbSize.Load()
 	// Save WAL frame count and checksums so rollback can clean up spilled frames
 	// and restore the checksum chain for the next transaction.
 	pos := p.wal.pos()
@@ -2351,26 +2370,49 @@ func (p *pager) pagerPageCount(walNPage uint32) (nPage uint32, ok bool, err erro
 }
 
 // refreshHeaderFromPage1 refreshes p.header and p.dbSize from the committed
-// page 1. Called from beginWrite, under the WAL write lock and after the
-// writer cache was cleared, when another process's commit or checkpoint has
-// been detected. It is what lockBtree does at the start of every SQLite
+// page 1. Called from every beginWrite, under the WAL write lock; the writer
+// cache has been cleared first when another process's commit or checkpoint
+// has been detected. It is what lockBtree does at the start of every SQLite
 // transaction (btree.c:3284-3298, 3401-3408):
 //
 //   - Page 1 is fetched whole through the writer cache (btreeGetPage →
-//     readDbPage, pager.c:3031-3046): from the WAL frame when the wal-index
-//     resolves one, from the database file otherwise, never one in place of
-//     the other. The file's copy is older than a resolved frame. The page
-//     stays cached, where the commit would have loaded it anyway.
+//     readDbPage, pager.c:3031-3046): from the cache when it holds page 1,
+//     else from the WAL frame when the wal-index resolves one, from the
+//     database file otherwise, never one in place of the other. The file's
+//     copy is older than a resolved frame. The page stays cached, where the
+//     commit would have loaded it anyway.
 //   - Its header must decode as a database header. An image that is not
 //     one is SQLite's SQLITE_NOTADB (btree.c:3306), which any-store reports
 //     as ErrHeaderCorrupt here as it does at open. A database file too short
 //     to hold page 1 is a read error instead: the page getters do not
 //     zero-fill a short read (drift-7), where SQLite would zero-fill and
 //     then fail the magic check. Either way the begin fails.
-//   - The size comes out of lockBtreePageCount against the pager's count.
+//   - The size comes out of lockBtreePageCount against the pager's count
+//     (committedPageCount).
 //
 // Every failure is returned and leaves p.header and p.dbSize as they were;
 // the caller keeps the header marked stale until a refresh succeeds.
+// committedPageCount is the pager's count for the write transaction being
+// begun (pagerPagecount, pager.c:3279-3306), the count its readers use
+// (effectiveReaderDbSize): the committed size of the live wal-index header,
+// which under the write lock is the snapshot page 1 is read at, or the
+// database file's size when the WAL has had no commit; in the in-process and
+// in-memory modes, the committed position's size.
+func (p *pager) committedPageCount() (uint32, error) {
+	if p.inProcess || p.inMemory {
+		f, n := p.wal.index.mxCommitFrame.LoadPos()
+		return p.effectiveReaderDbSize(p.wal.index.synthHdr(f, n))
+	}
+	if live, valid := p.wal.index.readHeader(); valid {
+		return p.effectiveReaderDbSize(live)
+	}
+	n, ok, err := p.pagerPageCount(0)
+	if err == nil && !ok {
+		n = p.header.DatabaseSize
+	}
+	return n, err
+}
+
 func (p *pager) refreshHeaderFromPage1() error {
 	pg, err := p.getPageWriter(1, p.wal.nFrame.Load())
 	if err != nil {
@@ -2390,18 +2432,9 @@ func (p *pager) refreshHeaderFromPage1() error {
 		return fmt.Errorf("refreshHeaderFromPage1: page 1: %w", err)
 	}
 
-	// The pager's count. The write lock is held, so the live wal-index
-	// header is the snapshot page 1 was just read at.
-	var walNPage uint32
-	if live, valid := p.wal.index.readHeader(); valid {
-		walNPage = live.nPage
-	}
-	nPageFile, ok, err := p.pagerPageCount(walNPage)
+	nPageFile, err := p.committedPageCount()
 	if err != nil {
 		return fmt.Errorf("refreshHeaderFromPage1: page count: %w", err)
-	}
-	if !ok {
-		nPageFile = hdr.DatabaseSize
 	}
 	nPage, err := lockBtreePageCount(&hdr, nPageFile)
 	if err != nil {
@@ -2411,8 +2444,8 @@ func (p *pager) refreshHeaderFromPage1() error {
 	p.header = hdr
 	p.dbSize.Store(nPage)
 	if debugTrace {
-		trace("refreshHeaderFromPage1: nFrame=%d nBackfill=%d walNPage=%d dbSize=%d headerSize=%d firstFree=%d totalFree=%d",
-			p.wal.nFrame.Load(), p.wal.index.nBackfill.Load(), walNPage, nPage,
+		trace("refreshHeaderFromPage1: nFrame=%d nBackfill=%d count=%d dbSize=%d headerSize=%d firstFree=%d totalFree=%d",
+			p.wal.nFrame.Load(), p.wal.index.nBackfill.Load(), nPageFile, nPage,
 			p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs)
 	}
 	return nil
@@ -2755,6 +2788,9 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	if testCommitPostPublishHook != nil {
 		testCommitPostPublishHook()
 	}
+	if checkPage1Invariant.Load() {
+		p.assertPage1AfterCommit(true)
+	}
 
 	// Notify online backups that these pages have new committed content.
 	// ~ sqlite3BackupUpdate dispatch (backup.c:687). Must happen here,
@@ -2892,8 +2928,10 @@ func (p *pager) rollbackLocked() error {
 	// Restore the database header from the snapshot saved at beginWrite (fix 5.2).
 	// This ensures FirstFreelistPg, TotalFreelistPgs, and DatabaseSize are
 	// reverted to their pre-transaction values after dirty pages are discarded.
+	// The page count is the one the transaction began with, not the header's
+	// field, which an untrusted header leaves at 0.
 	p.header = p.savedHeader
-	p.dbSize.Store(p.header.DatabaseSize)
+	p.dbSize.Store(p.savedDbSize)
 
 	p.doNotSpill &^= spillFlagRollback
 	p.freeSavepointPageBuffers(0, len(p.savepoints))
@@ -3003,9 +3041,10 @@ func (p *pager) pagerError() {
 		p.wal.mu.Unlock()
 	}
 
-	// Restore the database header to pre-transaction state.
+	// Restore the database header to pre-transaction state, and the page
+	// count the transaction began with.
 	p.header = p.savedHeader
-	p.dbSize.Store(p.header.DatabaseSize)
+	p.dbSize.Store(p.savedDbSize)
 
 	p.freeSavepointPageBuffers(0, len(p.savepoints))
 	p.savepoints = p.savepoints[:0]

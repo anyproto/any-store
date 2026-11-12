@@ -1519,6 +1519,22 @@
     ],
     "note": "caps at 9 bytes for v>=2^56; sqlite3VarintLen returns 10 for v>=2^63 (disagreeing with its own putVarint64). Unreachable here — payload lengths capped at maxPayloadAlloc=1<<30"
   },
+  "page1_check.go:*pager.assertPage1AfterCommit": {
+    "sqlite": [],
+    "note": "test-build check, in the place of SQLite assert()s: the committed page 1 serializes the committed header"
+  },
+  "page1_check.go:*pager.checkPage1AtBegin": {
+    "sqlite": [],
+    "note": "test-build check, in the place of SQLite assert()s: the header a write transaction begins with is the committed page 1's"
+  },
+  "page1_check.go:*pager.committedPage1": {
+    "sqlite": [],
+    "note": "test-build check helper: page 1 read past the writer cache"
+  },
+  "page1_check.go:SetCheckPage1ForTest": {
+    "sqlite": [],
+    "note": "test hook: turns the page-1 checks on"
+  },
   "page_slab.go:*pageSlab.Get": {
     "sqlite": [
       "pcache1.c:pcache1Alloc"
@@ -1662,6 +1678,13 @@
       "btree.c:sqlite3BtreeGetMeta"
     ],
     "note": "reads FileChangeCount/SchemaCookie from the writer-owned in-memory page-1 header, mirroring SQLite reading meta from the cached page-1 PgHdr rather than re-reading the WAL"
+  },
+  "pager.go:*pager.committedPageCount": {
+    "sqlite": [
+      "pager.c:pagerPagecount",
+      "wal.c:sqlite3WalDbsize"
+    ],
+    "note": "the pager's count for a write begin, the one its readers use"
   },
   "pager.go:*pager.decryptPage": {
     "sqlite": [],
