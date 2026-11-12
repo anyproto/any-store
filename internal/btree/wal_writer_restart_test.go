@@ -638,3 +638,50 @@ func TestWalWriterRestart_ReusesStorage(t *testing.T) {
 		restartCheck(t, db, 1, 400, 1)
 	})
 }
+
+// A transaction that started the log over and has no frame above its base in
+// the new log, no dirty page and an unchanged header has no changes: "the
+// log was started over" alone is not one.
+func TestWalWriterRestart_AllUndoneIsEmpty(t *testing.T) {
+	forEachRestartMode(t, func(t *testing.T, m restartMode) {
+		db, path := openRestartDB(t, m)
+		restartPut(t, db, 0, 200, 1)
+		require.NoError(t, db.Checkpoint(CheckpointPassive))
+		w := db.pager.wal
+		gen := w.logGen.Load()
+
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		require.Equal(t, gen, db.pager.savedWalGen.Load())
+		sp, err := wtx.Savepoint()
+		require.NoError(t, err)
+		restartPutTx(t, wtx, 0, 100, 2)
+		restartSpillAll(t, db)
+		require.True(t, wtx.HasChanges())
+		require.NoError(t, wtx.RollbackToSavepoint(sp))
+		// The savepoint rollback put the old content back into the pages
+		// that were spilled and left them dirty, to be logged again (as
+		// SQLite's does). Take that away by hand to reach the state under
+		// test: a new log generation and nothing else.
+		require.True(t, wtx.HasChanges(), "pages restored by the savepoint rollback are to be logged again")
+		for _, pg := range db.pager.writerCache.dirtyPages() {
+			db.pager.writerCache.makeClean(pg)
+		}
+
+		require.Equal(t, gen, db.pager.savedWalGen.Load(), "the transaction's saved position is of the old log")
+		require.Equal(t, gen+1, w.logGen.Load(), "setup: the log was started over")
+		require.Zero(t, w.nFrame.Load(), "setup: every frame of the transaction is undone")
+		require.Zero(t, db.pager.writerCache.nDirty, "setup: no dirty page")
+		require.Equal(t, db.pager.savedHeader, db.pager.header, "setup: the header is unchanged")
+		require.False(t, wtx.HasChanges(), "a new log generation alone is not a change")
+		require.NoError(t, wtx.Rollback())
+		require.Zero(t, w.index.mxCommitFrame.LoadLocal())
+
+		restartCheck(t, db, 0, 200, 1)
+		restartPut(t, db, 0, 3, 3)
+		restartRecoverCopy(t, path, "crash", m, func(cdb *DB) {
+			restartCheck(t, cdb, 0, 3, 3)
+			restartCheck(t, cdb, 3, 200, 1)
+		})
+	})
+}

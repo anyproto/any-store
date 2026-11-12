@@ -1974,10 +1974,12 @@ register and C↔Go coverage table. Key entry points:
 - `(*Backup).PageCount() uint32` -- ~ `sqlite3_backup_pagecount`
 
 Hooks in `pager.commit()` (post-`wal.writeFrames`) and
-`pager.checkpointWithMode()` (Restart/Truncate modes) dispatch the C
-equivalents of `sqlite3BackupUpdate` and `sqlite3BackupRestart`
-respectively. See `pager.dispatchBackupUpdate` /
-`pager.dispatchBackupRestart`. External-process writes are detected at
+`pager.checkpointWithMode()` (Truncate mode, the one that resets the WAL)
+dispatch the C equivalents of `sqlite3BackupUpdate` and
+`sqlite3BackupRestart` respectively. See `pager.dispatchBackupUpdate` /
+`pager.dispatchBackupRestart`. A commit whose transaction spilled pages also
+restarts the attached backups, for now
+([drift-2026-11-12-4](#drift-2026-11-12-4-a-commit-that-spilled-restarts-attached-backups)). External-process writes are detected at
 each Step's read tx via the page-1 `FileChangeCounter` and trigger the
 same restart.
 
