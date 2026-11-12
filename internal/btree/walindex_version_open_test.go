@@ -58,7 +58,7 @@ func futureIndexHolder(t *testing.T) bool {
 // a newer version. Opening the database from another process is refused
 // with ErrWALVersion, and the index is not rebuilt: SQLite's walIndexReadHdr
 // returns SQLITE_CANTOPEN for a consistent header of another version and
-// runs no recovery (wal.c:2722-2728).
+// runs no recovery (wal.c:2740-2741).
 func TestWalIndexFutureVersionRefusedAtOpen(t *testing.T) {
 	if futureIndexHolder(t) {
 		return

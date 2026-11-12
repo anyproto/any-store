@@ -86,7 +86,7 @@ var (
 
 	// ErrBusyRecovery indicates another connection is currently executing
 	// WAL recovery (walIndexRecover). Equivalent to SQLite's
-	// SQLITE_BUSY_RECOVERY (wal.c:3070-3094). Callers should back off
+	// SQLITE_BUSY_RECOVERY (wal.c:3084-3108). Callers should back off
 	// before retrying — recovery can take seconds on a large WAL and
 	// tight-spinning just burns CPU and amplifies lock contention.
 	ErrBusyRecovery = errors.New("btree: busy recovery")

@@ -226,7 +226,7 @@ func walBusyLock(wi *walIndex, xBusy BusyHandler, slot int, lockType int) error 
 
 // beginBusy is the busy-handler state of one transaction begin: SQLite's
 // BusyHandler and its nBusy count (sqlite3InvokeBusyHandler,
-// main.c:1763-1772). sqlite3BtreeBeginTrans retries the whole begin from one
+// main.c:1770-1780). sqlite3BtreeBeginTrans retries the whole begin from one
 // loop for every SQLITE_BUSY flavour (btree.c:3730-3737), so the count runs
 // across all of the begin's retries, and once the handler has declined it is
 // not asked again: the begin's budget is the handler's, once.
@@ -1004,12 +1004,12 @@ const (
 	// wal-index version.
 	walHdrValid walHdrState = iota
 	// walHdrTorn: the copies disagree, are uninitialized, or fail the
-	// checksum (walIndexTryHdr returning non-zero, wal.c:2599-2608). A
+	// checksum (walIndexTryHdr returning non-zero, wal.c:2613-2622). A
 	// writer is between its two copies, or the header needs recovery.
 	walHdrTorn
 	// walHdrBadVersion: a consistent, checksummed header of another
 	// wal-index version. Not damage and never rebuilt: SQLite returns
-	// SQLITE_CANTOPEN for it without running recovery (wal.c:2722-2728).
+	// SQLITE_CANTOPEN for it without running recovery (wal.c:2740-2741).
 	walHdrBadVersion
 )
 
@@ -1065,7 +1065,7 @@ func (wi *walIndex) readHeaderState() (WalIndexHdr, walHdrState) {
 
 	// Reject a SHM wal-index header written with an incompatible/future
 	// format version. Matches SQLite's walIndexReadHdr gate
-	// (wal.c:2722-2728: iVersion != WALINDEX_MAX_VERSION -> SQLITE_CANTOPEN).
+	// (wal.c:2740-2741: iVersion != WALINDEX_MAX_VERSION -> SQLITE_CANTOPEN).
 	// any-store uses its own walVersion (1000000) instead of 3007000.
 	if hdr1.iVersion != walVersion {
 		return WalIndexHdr{}, walHdrBadVersion
@@ -1734,7 +1734,7 @@ func (w *wal) open() (err error) {
 		}
 	}
 
-	// SQLite's version gate (walIndexReadHdr, wal.c:2722-2728): a consistent
+	// SQLite's version gate (walIndexReadHdr, wal.c:2740-2741): a consistent
 	// wal-index header of another version is a live peer's index, written by
 	// a build this one cannot share it with. The open is refused and the
 	// index left alone; rebuilding it would overwrite the peer's. readHeader
@@ -1766,7 +1766,7 @@ func (w *wal) open() (err error) {
 
 // indexReadHdr returns the validated wal-index header. When the header is
 // invalid it rebuilds the wal-index from the WAL file first, under the write
-// lock. Port of SQLite's walIndexReadHdr (wal.c:2640-2745):
+// lock. Port of SQLite's walIndexReadHdr (wal.c:2654-2759):
 //
 //   - Read the header without a lock (walIndexTryHdr). This usually works.
 //   - If it is invalid, a writer may be between its two header copies: take
@@ -1776,10 +1776,10 @@ func (w *wal) open() (err error) {
 //
 // A busy lock returns ErrBusy and repairs nothing; the caller retries or
 // reports busy, as SQLite's callers do with SQLITE_BUSY (walTryBeginRead
-// turns it into WAL_RETRY or SQLITE_BUSY_RECOVERY, wal.c:3070-3094;
+// turns it into WAL_RETRY or SQLITE_BUSY_RECOVERY, wal.c:3084-3108;
 // sqlite3WalCheckpoint returns it). A consistent header of another wal-index
 // version is refused with an ErrWALVersion error and never rebuilt
-// (wal.c:2722-2728).
+// (wal.c:2740-2741).
 // Every lock here is a non-blocking try-lock, so the write → checkpoint →
 // recover order cannot deadlock against checkpointWithMode's checkpoint →
 // write order: the loser sees ErrBusy.
@@ -3027,7 +3027,7 @@ func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot i
 
 // beginReadHdrBusy is beginReadHdr under the busy state of the begin it is
 // part of. ErrBusyRecovery (SQLITE_BUSY_RECOVERY: another connection is
-// rebuilding the wal-index, wal.c:3070-3094) goes to the busy handler, which
+// rebuilding the wal-index, wal.c:3084-3108) goes to the busy handler, which
 // backs off until the recovery is done or the begin's budget is spent;
 // recovery of a large WAL takes longer than the WAL retry loop waits. SQLite
 // invokes the handler from sqlite3BtreeBeginTrans (btree.c:3730-3737); here
@@ -3331,7 +3331,7 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame
 			return WalIndexHdr{}, 0, 0, 0, err
 		}
 		// A lock the repair needs is taken: a writer is publishing, or a
-		// sibling is in recovery. SQLite wal.c:3070-3094 probes
+		// sibling is in recovery. SQLite wal.c:3084-3108 probes
 		// WAL_RECOVER_LOCK shared to tell the two apart: if the probe
 		// succeeds no recovery is running, so release it and retry from the
 		// top of the loop (WAL_RETRY); if it is busy a recovery is in
@@ -3905,7 +3905,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 
 	// Read the wal-index header, repairing it first if it is invalid. SQLite
 	// does this before anything else in a checkpoint (walIndexReadHdr at
-	// wal.c:4359, then walCheckpoint works from that pWal->hdr): the header
+	// wal.c:4373, then walCheckpoint works from that pWal->hdr): the header
 	// read here is the checkpoint's frontier. If the header is torn and the
 	// write lock cannot be had (PASSIVE, or a downgraded mode), this is
 	// ErrBusy and the checkpoint does nothing.
@@ -4321,7 +4321,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 // the wal-index header and truncates the WAL file.
 func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler) error {
 	// The shared nBackfill, as walCheckpoint tests pInfo->nBackfill
-	// (wal.c:2341). This is reached without any backfill having run (nothing
+	// (wal.c:2355). This is reached without any backfill having run (nothing
 	// new, or reader slot 0 busy), when the process-local mirror may still
 	// hold a count from an earlier WAL generation: see liveNBackfill.
 	backfill := w.index.liveNBackfill()

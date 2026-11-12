@@ -5,8 +5,8 @@ package btree
 // A wal-index header left torn by a writer that died between its two header
 // copies, while other processes keep the database open. SQLite repairs it
 // from whichever connection next reads the header: walIndexReadHdr takes the
-// WRITE lock and runs walIndexRecover (wal.c:2640-2715), and walCheckpoint's
-// caller reads the header that way before it copies anything (wal.c:4359).
+// WRITE lock and runs walIndexRecover (wal.c:2654-2729), and walCheckpoint's
+// caller reads the header that way before it copies anything (wal.c:4373).
 //
 // The cross-process tests re-exec the test binary (the pattern of
 // multiprocess_dms_test.go): the child is the writer that dies, the parent
@@ -142,7 +142,7 @@ func TestTornWalIndexHeader_CheckpointKeepsPeerCommits(t *testing.T) {
 
 // TestTornWalIndexHeader_PassiveCheckpointKeepsPeerCommits: the same through
 // the PASSIVE mode, which does not hold the write lock when it reads the
-// header and so takes it for the repair (walIndexReadHdr, wal.c:2685-2697).
+// header and so takes it for the repair (walIndexReadHdr, wal.c:2699-2711).
 func TestTornWalIndexHeader_PassiveCheckpointKeepsPeerCommits(t *testing.T) {
 	const env = "TEST_TORNHDR_PASSIVE_DB_PATH"
 	if dbPath := os.Getenv(env); dbPath != "" {
@@ -345,7 +345,7 @@ func TestTornWalIndexHeader_CheckpointBusyWhenWriteLockHeld(t *testing.T) {
 // the current log. A peer restarted the WAL and committed into it; a reader
 // pins slot 0, so the survivor's TRUNCATE cannot backfill anything. The
 // reset decision must read the shared nBackfill, as walCheckpoint does
-// (pInfo->nBackfill<pWal->hdr.mxFrame, wal.c:2341): judged on the stale local
+// (pInfo->nBackfill<pWal->hdr.mxFrame, wal.c:2355): judged on the stale local
 // count the log looks fully backfilled and the peer's commits are truncated
 // away.
 func TestCheckpointResetUsesSharedBackfill(t *testing.T) {
@@ -409,7 +409,7 @@ func TestCheckpointResetUsesSharedBackfill(t *testing.T) {
 // TestWalIndexFutureVersionRefused: both header copies agree and checksum,
 // but carry a wal-index version this build does not know. That is another
 // build's index, not a torn one: it is refused, never rebuilt
-// (walIndexReadHdr, wal.c:2722-2728: SQLITE_CANTOPEN with no recovery).
+// (walIndexReadHdr, wal.c:2740-2741: SQLITE_CANTOPEN with no recovery).
 func TestWalIndexFutureVersionRefused(t *testing.T) {
 	dir := t.TempDir()
 	db, err := testOpen(t, filepath.Join(dir, "test.db"), tornHdrOpts)
@@ -453,7 +453,7 @@ func TestWalIndexFutureVersionRefused(t *testing.T) {
 // TestTornWalIndexHeader_BusyRecoveryWhenRecoverLockHeld: the header is
 // invalid, the write lock is taken, and so is the RECOVER lock: another
 // connection is running recovery. The reader reports ErrBusyRecovery
-// (SQLITE_BUSY_RECOVERY, wal.c:3089-3094), which the begin paths hand to the
+// (SQLITE_BUSY_RECOVERY, wal.c:3103-3108), which the begin paths hand to the
 // busy handler, instead of spinning in the retry loop.
 func TestTornWalIndexHeader_BusyRecoveryWhenRecoverLockHeld(t *testing.T) {
 	dir := t.TempDir()
@@ -497,7 +497,7 @@ func TestTornWalIndexHeader_BusyRecoveryWhenRecoverLockHeld(t *testing.T) {
 // and the write and RECOVER locks stay held, a recovery that does not
 // finish. A begin waits one busy-handler budget and gives up: SQLite runs
 // one loop with one count around the whole begin (sqlite3BtreeBeginTrans,
-// btree.c:3730-3737; sqlite3InvokeBusyHandler, main.c:1763-1772), never a
+// btree.c:3730-3737; sqlite3InvokeBusyHandler, main.c:1770-1780), never a
 // fresh budget per retry.
 func TestTornWalIndexHeader_BusyRecoveryOneBudgetPerBegin(t *testing.T) {
 	dir := t.TempDir()
@@ -573,26 +573,51 @@ func TestTornWalIndexHeader_WALReadBeginWaitsOutRecovery(t *testing.T) {
 }
 
 // TestBeginWrite_PeerCommitsBeforeTimeoutOneBudget: a peer holds the write
-// lock, commits just before the waiting begin's busy budget runs out,
-// releases it, and has it again when the begin tries next. SQLite tries the
-// write lock once per attempt (walBeginWriteTransaction, wal.c:3714-3717)
-// and retries the whole begin from one loop with one busy count
-// (btree.c:3730-3737), so the begin gives up, or gets in, within one budget.
-// A write-lock wait with a count of its own would start a fresh budget after
-// every one of the peer's commits.
+// lock. SQLite tries the write lock once per attempt (walBeginWriteTransaction,
+// wal.c:3714-3717) and retries the whole begin from one loop with one busy
+// count (btree.c:3730-3737), so the handler sees one count rising 0, 1, 2, ...
+// through the begin, and the begin's wait is one budget.
+//
+//   - The peer commits just before the waiting begin's budget runs out,
+//     releases the lock, and has it again when the begin tries next. The
+//     begin gives up, or gets in, within one budget; a write-lock wait with a
+//     count of its own started a fresh budget after every commit.
+//   - The peer releases the lock within the budget and stays away: the begin
+//     gets in.
 //
 // The peer works through this handle's lock table, which refuses the begin's
 // write lock as fcntl refuses another process's. It "commits" by publishing
 // a header that differs from the begin's snapshot.
 func TestBeginWrite_PeerCommitsBeforeTimeoutOneBudget(t *testing.T) {
-	dir := t.TempDir()
-	db, err := testOpen(t, filepath.Join(dir, "test.db"), tornHdrOpts)
-	require.NoError(t, err)
-	defer func() { _ = db.Close() }()
-	dmsPutRange(t, db, "t1", 0, tornHdrSeedRows)
-	w := db.pager.wal
+	const budget = 200 * time.Millisecond
+	// A budget of 200 ms is 11 handler calls that sleep.
+	const commitAfter = 10
 
-	peerCommit := func() {
+	type peer struct {
+		holds  bool
+		waited int
+		counts []int // the count of every handler call
+	}
+	setup := func(t *testing.T) (*DB, *peer) {
+		dir := t.TempDir()
+		db, err := testOpen(t, filepath.Join(dir, "test.db"), tornHdrOpts)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = db.Close() })
+		dmsPutRange(t, db, "t1", 0, tornHdrSeedRows)
+		return db, &peer{}
+	}
+	lock := func(t *testing.T, db *DB, p *peer) {
+		require.NoError(t, db.pager.wal.index.lock(lockWrite, lockExclusive))
+		p.holds, p.waited = true, 0
+	}
+	release := func(db *DB, p *peer) {
+		if p.holds {
+			_ = db.pager.wal.index.unlock(lockWrite, lockExclusive)
+			p.holds = false
+		}
+	}
+	commit := func(t *testing.T, db *DB) {
+		w := db.pager.wal
 		hdr, valid := w.index.readHeader()
 		require.True(t, valid)
 		hdr.iChange++
@@ -604,51 +629,70 @@ func TestBeginWrite_PeerCommitsBeforeTimeoutOneBudget(t *testing.T) {
 		copy(region[walIndexHdrSize:walIndexHdrSize*2], buf[:])
 		copy(region[0:walIndexHdrSize], buf[:])
 	}
-
-	const budget = 200 * time.Millisecond
-	base := DefaultBusyTimeout(budget)
-	// A budget of 200 ms is 11 handler calls that sleep; the peer commits
-	// and lets go after the begin has waited through 10 of them.
-	const commitAfter = 10
-	peerHolds := false
-	waited := 0
-	relock := func() {
-		require.NoError(t, w.index.lock(lockWrite, lockExclusive))
-		peerHolds, waited = true, 0
+	// begin runs BeginWrite with the peer's script in the busy handler and
+	// returns its error and duration.
+	begin := func(t *testing.T, db *DB, p *peer, onCall func()) (error, time.Duration) {
+		w := db.pager.wal
+		base := DefaultBusyTimeout(budget)
+		w.busyHandler = func(n int) bool {
+			p.counts = append(p.counts, n)
+			ok := base(n)
+			onCall()
+			return ok
+		}
+		defer func() { w.busyHandler = DefaultBusyTimeout(5 * time.Second) }()
+		start := time.Now()
+		wtx, err := db.BeginWrite()
+		elapsed := time.Since(start)
+		if err == nil {
+			_ = wtx.Rollback()
+		}
+		release(db, p)
+		return err, elapsed
 	}
-	release := func() {
-		if peerHolds {
-			_ = w.index.unlock(lockWrite, lockExclusive)
-			peerHolds = false
+	requireOneCount := func(t *testing.T, p *peer) {
+		t.Helper()
+		require.NotEmpty(t, p.counts, "the begin must wait through the busy handler")
+		for i, n := range p.counts {
+			require.Equal(t, i, n, "one count for the whole begin, rising by one: %v", p.counts)
 		}
 	}
-	defer release()
-	w.busyHandler = func(n int) bool {
-		ok := base(n)
-		if peerHolds {
-			if waited++; waited == commitAfter {
-				peerCommit()
-				release()
+
+	t.Run("peer commits before each timeout", func(t *testing.T) {
+		db, p := setup(t)
+		testBeginWriteRetryHook = func(error) {
+			if !p.holds {
+				lock(t, db, p) // the peer is back before the begin's next try
 			}
 		}
-		return ok
-	}
-	testBeginWriteRetryHook = func(error) {
-		if !peerHolds {
-			relock() // the peer is back before the begin's next try
-		}
-	}
-	defer func() { testBeginWriteRetryHook = nil }()
+		defer func() { testBeginWriteRetryHook = nil }()
+		lock(t, db, p)
+		err, elapsed := begin(t, db, p, func() {
+			if p.holds {
+				if p.waited++; p.waited == commitAfter {
+					commit(t, db)
+					release(db, p)
+				}
+			}
+		})
+		require.Less(t, elapsed, 2*budget, "one busy budget per begin (err=%v)", err)
+		require.GreaterOrEqual(t, len(p.counts), commitAfter, "the begin waited through the peer's hold")
+		requireOneCount(t, p)
+	})
 
-	relock()
-	start := time.Now()
-	wtx, err := db.BeginWrite()
-	elapsed := time.Since(start)
-	if err == nil {
-		_ = wtx.Rollback()
-	}
-	release()
-	testBeginWriteRetryHook = nil
-	w.busyHandler = DefaultBusyTimeout(5 * time.Second)
-	require.Less(t, elapsed, 2*budget, "one busy budget per begin (err=%v)", err)
+	t.Run("peer releases within the budget", func(t *testing.T) {
+		db, p := setup(t)
+		lock(t, db, p)
+		err, elapsed := begin(t, db, p, func() {
+			if p.holds {
+				if p.waited++; p.waited == 3 {
+					release(db, p)
+				}
+			}
+		})
+		require.NoError(t, err, "the write lock came free within the budget")
+		require.Less(t, elapsed, budget)
+		require.Len(t, p.counts, 3)
+		requireOneCount(t, p)
+	})
 }

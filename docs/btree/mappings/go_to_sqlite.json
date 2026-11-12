@@ -2180,7 +2180,7 @@
     "sqlite": [
       "btree.c:btreeInvokeBusyHandler"
     ],
-    "note": "one begin's busy count, as sqlite3InvokeBusyHandler keeps nBusy (main.c:1763-1772): once the handler declines it is not asked again"
+    "note": "one begin's busy count, as sqlite3InvokeBusyHandler keeps nBusy (main.c:1770-1780): once the handler declines it is not asked again"
   },
   "wal.go:*wal.adoptSHMState": {
     "sqlite": [],
@@ -2468,7 +2468,7 @@
     "sqlite": [
       "wal.c:walCheckpoint"
     ],
-    "note": "the shared pInfo-\u003enBackfill that the reset and completeness tests read (wal.c:2341), not the process-local mirror"
+    "note": "the shared pInfo-\u003enBackfill that the reset and completeness tests read (wal.c:2355-2360), not the process-local mirror"
   },
   "wal.go:*walIndex.lock": {
     "sqlite": [],
@@ -2486,7 +2486,7 @@
       "wal.c:walIndexReadHdr",
       "wal.c:walIndexTryHdr"
     ],
-    "note": "walIndexTryHdr plus walIndexReadHdr's version gate: a consistent header of another wal-index version is refused, not torn (wal.c:2722-2728)"
+    "note": "walIndexTryHdr plus walIndexReadHdr's version gate: a consistent header of another wal-index version is refused, not torn (wal.c:2740-2741)"
   },
   "wal.go:*walIndex.reset": {
     "sqlite": [

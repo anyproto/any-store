@@ -3527,7 +3527,7 @@ func (p *pager) close() error {
 				// would take the write lock for that itself, but this
 				// close already holds it, so do it here, as
 				// walIndexReadHdr does for a caller with
-				// pWal->writeLock set (wal.c:2692-2697). On failure the
+				// pWal->writeLock set (wal.c:2706-2711). On failure the
 				// checkpoint and the truncate are skipped.
 				var cpErr error
 				if lockedWrite {
