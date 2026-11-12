@@ -1292,17 +1292,25 @@
     "sqlite": [],
     "note": ""
   },
-  "mxframe.go:*commitFrameCounter.CompareAndSwap": {
-    "sqlite": [],
-    "note": ""
-  },
   "mxframe.go:*commitFrameCounter.LoadLocal": {
     "sqlite": [],
     "note": ""
   },
+  "mxframe.go:*commitFrameCounter.LoadPos": {
+    "sqlite": [
+      "wal.c:sqlite3WalDbsize"
+    ],
+    "note": "the committed position: pWal->hdr's mxFrame and nPage, read together"
+  },
   "mxframe.go:*commitFrameCounter.Store": {
     "sqlite": [],
-    "note": ""
+    "note": "sets the frame and keeps the size, as walRestartHdr keeps nPage"
+  },
+  "mxframe.go:*commitFrameCounter.StorePos": {
+    "sqlite": [
+      "wal.c:sqlite3WalFrames"
+    ],
+    "note": "frame and size in one store, as walFrames sets pWal->hdr.mxFrame and nPage once a commit is written and synced"
   },
   "namespace_size.go:*ReadTx.NamespaceSize": {
     "sqlite": [],
@@ -2419,6 +2427,10 @@
       "wal.c:sqlite3WalClose"
     ],
     "note": ""
+  },
+  "wal.go:*wal.committedSize": {
+    "sqlite": [],
+    "note": "the size a commit records: the pager's, or the last commit's for a caller that passes none"
   },
   "wal.go:*wal.doResetWAL": {
     "sqlite": [

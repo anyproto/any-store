@@ -6390,7 +6390,7 @@ func TestWalRecover_WithCommittedFrames(t *testing.T) {
 	require.NoError(t, err)
 	// Only the committed frame (frame 1) should be indexed.
 	assert.Equal(t, uint32(1), w.nFrame.Load())
-	assert.Equal(t, uint32(3), w.index.maxPage.Load())
+	assert.Equal(t, uint32(3), committedNPage(w.index))
 	w.close(false)
 }
 

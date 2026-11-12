@@ -979,7 +979,7 @@ func (db *DB) beginRead(ctx context.Context, readCounters, wait bool) (*ReadTx, 
 	// validity key, the memo key and tx.walHdr below.
 	snapHdr := hdr
 	if hdr.isInit == 0 {
-		snapHdr = db.pager.wal.index.synthHdr(maxFrame)
+		snapHdr = db.pager.wal.index.synthHdr(maxFrame, hdr.nPage)
 	}
 
 	localFCC := db.localFileChangeCounter.Load()
@@ -1273,7 +1273,8 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	if readSnap.isInit != 0 {
 		tx.ReadTx.walHdr = readSnap
 	} else {
-		tx.ReadTx.walHdr = db.pager.wal.index.synthHdr(maxFrame)
+		_, nPage := db.pager.wal.index.mxCommitFrame.LoadPos()
+		tx.ReadTx.walHdr = db.pager.wal.index.synthHdr(maxFrame, nPage)
 	}
 	tx.ReadTx.walSlot = slot
 	tx.ReadTx.writable = true

@@ -110,7 +110,7 @@ func assertOpensAtCommittedSize(t *testing.T, db *DB, committed uint32) {
 	require.LessOrEqual(t, db.DatabaseSize(), committed+2,
 		"the first commit after open resurrected the pages the shrink dropped")
 	require.Equal(t, db.DatabaseSize(), db.pager.header.DatabaseSize)
-	require.Equal(t, db.DatabaseSize(), db.pager.wal.index.maxPage.Load(), "the commit frame carries the same size")
+	require.Equal(t, db.DatabaseSize(), committedNPage(db.pager.wal.index), "the commit frame carries the same size")
 	require.NoError(t, db.IntegrityCheck())
 
 	rtx, err := db.BeginRead()
@@ -253,7 +253,7 @@ func TestOpenAfterWALCommittedShrink(t *testing.T) {
 		require.NoError(t, err)
 		defer db2.Close()
 		require.Equal(t, committed, db2.DatabaseSize())
-		require.Equal(t, committed, db2.pager.wal.index.maxPage.Load(), "setup: the patched WAL must recover in full")
+		require.Equal(t, committed, committedNPage(db2.pager.wal.index), "setup: the patched WAL must recover in full")
 	})
 
 	// A trusted page-1 size above the WAL commit's size is corruption

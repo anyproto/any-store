@@ -243,7 +243,7 @@ func TestWALRecoveryCommitted(t *testing.T) {
 	require.NoError(t, w2.open())
 
 	assert.Equal(t, uint32(1), w2.nFrame.Load())
-	assert.Equal(t, uint32(5), w2.index.maxPage.Load())
+	assert.Equal(t, uint32(5), committedNPage(w2.index))
 
 	// Verify we can read the recovered frame
 	buf := make([]byte, 4096)
@@ -279,7 +279,7 @@ func TestWALRecoveryUncommittedTruncated(t *testing.T) {
 	require.NoError(t, w2.open())
 
 	assert.Equal(t, uint32(1), w2.nFrame.Load())
-	assert.Equal(t, uint32(1), w2.index.maxPage.Load())
+	assert.Equal(t, uint32(1), committedNPage(w2.index))
 
 	// Frame for page 2 should not be in index
 	frame := mustWiGet(t, w2.index, 2, w2.nFrame.Load())
@@ -356,7 +356,7 @@ func TestWALRecoveryStopsAtPgnoZeroFrame(t *testing.T) {
 	require.NoError(t, w2.open())
 
 	assert.Equal(t, uint32(1), w2.nFrame.Load(), "recovery must stop at the pgno==0 frame")
-	assert.Equal(t, uint32(5), w2.index.maxPage.Load())
+	assert.Equal(t, uint32(5), committedNPage(w2.index))
 
 	// The pgno==0 frame lives at frame index 2; it must not be indexed.
 	assert.Equal(t, uint32(0), mustWiGet(t, w2.index, 0, w2.nFrame.Load()))
@@ -632,7 +632,7 @@ func TestWALRecoveryMultipleCommits(t *testing.T) {
 	require.NoError(t, w2.open())
 
 	assert.Equal(t, uint32(2), w2.nFrame.Load())
-	assert.Equal(t, uint32(2), w2.index.maxPage.Load())
+	assert.Equal(t, uint32(2), committedNPage(w2.index))
 
 	buf := make([]byte, 4096)
 	require.NoError(t, w2.readFrame(1, buf, nil, nil))
@@ -1016,7 +1016,7 @@ func TestRecoveryIgnoresSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(3), w2.nFrame.Load(), "recovery: nFrame should be 3")
 	assert.Equal(t, uint32(3), w2.index.maxFrame.Load(), "recovery: maxFrame should be 3")
 	assert.Equal(t, uint32(3), w2.index.mxCommitFrame.LoadLocal(), "recovery: mxCommitFrame should be 3")
-	assert.Equal(t, uint32(3), w2.index.maxPage.Load(), "recovery: maxPage should be 3")
+	assert.Equal(t, uint32(3), committedNPage(w2.index), "recovery: maxPage should be 3")
 
 	// Committed pages should be in index
 	assert.Equal(t, uint32(1), mustWiGet(t, w2.index, 1, 3), "recovery: page 1 at frame 1")

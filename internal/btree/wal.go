@@ -546,12 +546,12 @@ type walIndex struct {
 	shm      shm                 // platform-specific shared memory
 	pageMap  map[uint32][]uint32 // pgno -> sorted list of frame indices (1-based)
 	maxFrame atomic.Uint32       // highest valid frame (committed + spilled)
-	// mxCommitFrame is the process-local commit-frame cursor. Do NOT read
+	// mxCommitFrame is the process-local committed position: the
+	// commit-frame cursor and the database size at that commit. Do NOT read
 	// via bare .Load — the compiler blocks that. For local reads use
-	// mxCommitFrame.LoadLocal(); for cross-process authoritative reads
-	// use (*wal).authoritativeMxFrame(). See mxframe.go for rationale.
+	// mxCommitFrame.LoadLocal() or LoadPos(); for cross-process authoritative
+	// reads use (*wal).authoritativeMxFrame(). See mxframe.go for rationale.
 	mxCommitFrame commitFrameCounter
-	maxPage       atomic.Uint32 // database size at last commit
 	nBackfill     atomic.Uint32 // frames already checkpointed
 
 	// restarts counts the WAL restarts of this process's index (reset),
@@ -825,11 +825,23 @@ var (
 // commit there, as a failed sync does. Test-only.
 var testCommitPublishErrHook func() error
 
+// committedSize is the database size a commit records: the size the pager
+// passes, or, for a caller that passes none (tests driving the WAL
+// directly), the last commit's.
+func (w *wal) committedSize(dbSize uint32) uint32 {
+	if dbSize > 0 {
+		return dbSize
+	}
+	_, n := w.index.mxCommitFrame.LoadPos()
+	return n
+}
+
 // synthHdr is the header of a snapshot in the in-process and in-memory
-// modes, which keep no WAL-index header: the frame ceiling and the restart
-// count (iChange, unused otherwise), no salts (WalIndexHdr.synthesized).
-func (wi *walIndex) synthHdr(mxFrame uint32) WalIndexHdr {
-	return WalIndexHdr{isInit: 1, mxFrame: mxFrame, iChange: wi.restarts.Load()}
+// modes, which keep no WAL-index header: the frame ceiling, the database size
+// at that commit, and the restart count (iChange, unused otherwise), no salts
+// (WalIndexHdr.synthesized).
+func (wi *walIndex) synthHdr(mxFrame, nPage uint32) WalIndexHdr {
+	return WalIndexHdr{isInit: 1, mxFrame: mxFrame, nPage: nPage, iChange: wi.restarts.Load()}
 }
 
 // get returns the frame containing the latest version of pgno within
@@ -1917,8 +1929,7 @@ func (w *wal) adoptSHMState(hdr WalIndexHdr, walHasHeader bool) {
 	w.nFrame.Store(hdr.mxFrame)
 	w.headerOnDisk = walHasHeader
 	w.index.maxFrame.Store(hdr.mxFrame)
-	w.index.mxCommitFrame.Store(hdr.mxFrame)
-	w.index.maxPage.Store(hdr.nPage)
+	w.index.mxCommitFrame.StorePos(hdr.mxFrame, hdr.nPage)
 	w.index.nBackfill.Store(w.index.shmNBackfill())
 	// Adopt the snapshot so the first beginWrite's stateChanged logic
 	// compares apples to apples.
@@ -2393,8 +2404,7 @@ func (w *wal) recoverLocked() error {
 		w.cksum1 = lastCommitCksum1
 		w.cksum2 = lastCommitCksum2
 		w.index.maxFrame.Store(lastCommitFrame)
-		w.index.mxCommitFrame.Store(lastCommitFrame)
-		w.index.maxPage.Store(lastCommitDbSize)
+		w.index.mxCommitFrame.StorePos(lastCommitFrame, lastCommitDbSize)
 		// SQLite wal.c:1598: nBackfillAttempted = mxFrame after recovery.
 		w.index.nBackfillAttempted.Store(lastCommitFrame)
 	} else {
@@ -2402,8 +2412,7 @@ func (w *wal) recoverLocked() error {
 		w.cksum1 = headerCksum1
 		w.cksum2 = headerCksum2
 		w.index.maxFrame.Store(0)
-		w.index.mxCommitFrame.Store(0)
-		w.index.maxPage.Store(0)
+		w.index.mxCommitFrame.StorePos(0, 0)
 		w.index.nBackfillAttempted.Store(0)
 	}
 	w.index.nBackfill.Store(0)
@@ -2665,9 +2674,6 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 			}
 		}
 
-		if dbSize > 0 {
-			w.index.maxPage.Store(dbSize)
-		}
 		if !w.noCommitSync {
 			if err := fdatasync(w.file); err != nil {
 				return err
@@ -2678,24 +2684,19 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 				return err
 			}
 		}
-		// Advance mxCommitFrame AFTER fdatasync so in-process readers only
-		// see committed frames once they are durable on disk. This matches
-		// SQLite where walIndexWriteHdr (which publishes mxFrame) is called
-		// after fdatasync.
+		// Advance the committed position AFTER fdatasync, frame and size in
+		// one store, so in-process readers only see committed frames once
+		// they are durable on disk, and a commit that fails before this
+		// point leaves both as they were. This matches SQLite, where the
+		// private header's mxFrame and nPage move together after the sync
+		// (wal.c:4203, 4238-4250).
 		mxCommit := w.index.maxFrame.Load()
-		w.index.mxCommitFrame.Store(mxCommit)
+		w.index.mxCommitFrame.StorePos(mxCommit, w.committedSize(dbSize))
 		if w.inProcess && w.onPublish != nil {
-			w.onPublish(w.index.synthHdr(mxCommit))
+			w.onPublish(w.index.synthHdr(w.index.mxCommitFrame.LoadPos()))
 		}
 		if !w.inProcess {
-			// Use dbSize directly instead of maxPage.Load() because a
-			// concurrent reader's tryBeginRead may have overwritten maxPage
-			// with a stale value from the SHM header (race between the
-			// Store above and this writeHeader call).
-			nPage := dbSize
-			if nPage == 0 {
-				nPage = w.index.maxPage.Load()
-			}
+			_, nPage := w.index.mxCommitFrame.LoadPos()
 			if testRestartLogHook != nil {
 				testRestartLogHook("publish")
 			}
@@ -2843,14 +2844,12 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 				return err
 			}
 		}
-		// Advance mxCommitFrame so readers can see the committed frames.
+		// Advance the committed position, frame and size in one store, so
+		// readers see the committed frames and their size together.
 		mxCommit := w.index.maxFrame.Load()
-		w.index.mxCommitFrame.Store(mxCommit)
-		if dbSize > 0 {
-			w.index.maxPage.Store(dbSize)
-		}
+		w.index.mxCommitFrame.StorePos(mxCommit, w.committedSize(dbSize))
 		if w.onPublish != nil {
-			w.onPublish(w.index.synthHdr(mxCommit))
+			w.onPublish(w.index.synthHdr(w.index.mxCommitFrame.LoadPos()))
 		}
 	}
 
@@ -3198,14 +3197,18 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 	if testInProcessReadSnapshotHook != nil {
 		testInProcessReadSnapshotHook()
 	}
-	mxFrame := w.index.mxCommitFrame.LoadLocal()
+	// The frame ceiling and the page count from one load: the snapshot's
+	// size is that of the commit it ends at (sqlite3WalDbsize,
+	// wal.c:3669-3674), never what an open write transaction has made of it.
+	mxFrame, nPage := w.index.mxCommitFrame.LoadPos()
 	nBackfill := w.index.nBackfill.Load()
 	if testInProcessFramesReadHook != nil {
 		testInProcessFramesReadHook()
 	}
-	hdr = WalIndexHdr{isInit: 1, mxFrame: mxFrame, iChange: restarts}
+	hdr = WalIndexHdr{isInit: 1, mxFrame: mxFrame, nPage: nPage, iChange: restarts}
 	revalidate := func() bool {
-		return w.index.mxCommitFrame.LoadLocal() == mxFrame && w.index.nBackfill.Load() == nBackfill &&
+		f, n := w.index.mxCommitFrame.LoadPos()
+		return f == mxFrame && n == nPage && w.index.nBackfill.Load() == nBackfill &&
 			w.index.restarts.Load() == restarts
 	}
 
@@ -3634,7 +3637,8 @@ func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, e
 		w.cksum2 = hdr.aFrameCksum[1]
 		w.header.salt1 = hdr.aSalt[0]
 		w.header.salt2 = hdr.aSalt[1]
-		w.index.mxCommitFrame.Store(hdr.mxFrame)
+		// The committed position is the live header's, frame and size.
+		w.index.mxCommitFrame.StorePos(hdr.mxFrame, hdr.nPage)
 		// Re-sync maxFrame from the authoritative SHM hdr. Without this, a
 		// peer's WAL reset (doResetWAL: a TRUNCATE checkpoint, or a writer's
 		// restart as in SQLite's walRestartLog) that drops mxFrame back
@@ -3653,14 +3657,6 @@ func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, e
 		// atomics instead of shmNBackfill()/shmReadCkptInfo() would see
 		// stale pre-reset values.
 		w.index.shmReadCkptInfo()
-		// Monotonic update: same guard as tryBeginRead — prevent concurrent
-		// reader from racing with the previous commit's writeHeader.
-		for {
-			old := w.index.maxPage.Load()
-			if hdr.nPage <= old || w.index.maxPage.CompareAndSwap(old, hdr.nPage) {
-				break
-			}
-		}
 		// Snapshot the re-synced header so future beginWrite calls can
 		// detect external changes relative to this baseline. With pageMap
 		// removed from the multi-process read path, stateChanged no longer
@@ -4030,7 +4026,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	// never skip a legitimate page.
 	nf, mxPage := ckptHdr.mxFrame, ckptHdr.nPage
 	if !multiProcess {
-		nf, mxPage = w.index.mxCommitFrame.LoadLocal(), w.index.maxPage.Load()
+		nf, mxPage = w.index.mxCommitFrame.LoadPos()
 	}
 	if nf == 0 {
 		// Nothing to copy. The modes above PASSIVE still do what follows a
@@ -4375,7 +4371,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 
 	if debugTrace {
 		trace("ckpt: backfill done, advancing nBackfill %d -> %d (skippedOrphans=%d) liveMxFrame=%d liveNPage=%d",
-			nBackfill, mxSafeFrame, skippedOrphans, w.authoritativeMxFrame(), w.index.maxPage.Load())
+			nBackfill, mxSafeFrame, skippedOrphans, w.authoritativeMxFrame(), mxPage)
 	}
 
 	// Update nBackfill; publish the counter alone (wal.c:2331) — never the
@@ -4490,7 +4486,7 @@ func (w *wal) doResetWAL(truncate bool) error {
 	// them to their stale process-local size, and valid pages read as
 	// corrupt. The caller holds the write lock, so the live header is the
 	// last commit's.
-	nPage := w.index.maxPage.Load()
+	_, nPage := w.index.mxCommitFrame.LoadPos()
 	// The first salt goes up by one from the log being replaced
 	// (wal.c:2152). The caller holds the write lock, so the live header's is
 	// that log's; a process that has not written since a peer's reset has an

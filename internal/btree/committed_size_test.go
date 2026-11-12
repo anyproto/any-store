@@ -24,6 +24,12 @@ const (
 	committedSizeSrc  = 10
 )
 
+// committedNPage is the size half of wi's committed position.
+func committedNPage(wi *walIndex) uint32 {
+	_, n := wi.mxCommitFrame.LoadPos()
+	return n
+}
+
 // committedSizeShrinkFixture opens a database of about 100 pages whose last
 // commits are still only in the WAL, and a small source to back up over it.
 func committedSizeShrinkFixture(t *testing.T, m restartMode) (dst, src *DB, dstPath string) {

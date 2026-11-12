@@ -185,6 +185,11 @@ type pager struct {
 	// frames of the previous generation.
 	savedWalGen atomic.Uint64
 
+	// savedCommitNPage is the committed size at beginWrite() time, the size
+	// half of the committed position (walIndex.mxCommitFrame). A failed
+	// commit restores the position as (walBase().frame, savedCommitNPage).
+	savedCommitNPage uint32
+
 	// doNotSpill is a bitmask of spillFlag* constants that inhibit the
 	// pagerStress callback. Modeled after SQLite's Pager.doNotSpill (pager.c:648).
 	doNotSpill uint8
@@ -819,17 +824,9 @@ func (p *pager) readPage1AtOpen() error {
 		return fmt.Errorf("%w: header magic differs between the file and its WAL", ErrHeaderCorrupt)
 	}
 
-	// sqlite3WalDbsize: the snapshot header's nPage. Heap shm publishes no
-	// header on commit (the snapshot header is synthesized), so there the
-	// size is the wal's own record of the last commit.
-	walNPage := hdr.nPage
-	if p.inProcess || p.inMemory {
-		walNPage = 0
-		if maxFrame > 0 {
-			walNPage = p.wal.index.maxPage.Load()
-		}
-	}
-	nPageFile, _, err := p.pagerPageCount(walNPage)
+	// sqlite3WalDbsize: the snapshot header's nPage. In the heap-shm modes
+	// the synthesized header carries the committed position's size.
+	nPageFile, _, err := p.pagerPageCount(hdr.nPage)
 	if err != nil {
 		return err
 	}
@@ -839,6 +836,15 @@ func (p *pager) readPage1AtOpen() error {
 	}
 	p.header = header
 	p.dbSize.Store(nPage)
+	// With no commit in the WAL, the heap-shm modes' committed size is the
+	// file's, the count pagerPagecount falls back to (pager.c:3299-3306):
+	// from here on every snapshot carries it, and no open transaction
+	// changes it.
+	if p.inProcess || p.inMemory {
+		if f, n := p.wal.index.mxCommitFrame.LoadPos(); n == 0 {
+			p.wal.index.mxCommitFrame.StorePos(f, nPageFile)
+		}
+	}
 	return nil
 }
 
@@ -1021,6 +1027,15 @@ func (p *pager) initNewDB() error {
 	if err := p.wal.open(); err != nil {
 		return err
 	}
+	// A new database is one page, page 1, before its first commit
+	// (newDatabase sets nPage = 1, btree.c:3540-3541). In the heap-shm modes
+	// that is the committed size every snapshot carries until a commit
+	// records another.
+	if p.inProcess || p.inMemory {
+		if f, n := p.wal.index.mxCommitFrame.LoadPos(); n == 0 {
+			p.wal.index.mxCommitFrame.StorePos(f, 1)
+		}
+	}
 
 	p.state.Store(int32(pagerOpen))
 	return nil
@@ -1176,6 +1191,7 @@ func (p *pager) beginWrite(readSnap WalIndexHdr) error {
 	p.savedWalFrame.Store(pos.frame)
 	p.savedWalCksum1 = pos.cksum1
 	p.savedWalCksum2 = pos.cksum2
+	_, p.savedCommitNPage = p.wal.index.mxCommitFrame.LoadPos()
 	return nil
 }
 
@@ -2204,15 +2220,17 @@ func (p *pager) getHasContent(pgno uint32) bool {
 //     open of a checkpointed database), and the size is the database file's,
 //     rounded up, as pagerPagecount takes it from sqlite3OsFileSize.
 //
-// In-process mode has no file fallback: its writers publish no wal-index
-// header (the snapshot header is synthesized without a size), no other
-// process can change the database, and p.dbSize is the authoritative
-// same-process counter.
+// The in-process and in-memory modes publish no wal-index header; their
+// synthesized snapshot header carries the committed position's size
+// (walIndex.mxCommitFrame), which open and database creation seed and only a
+// published commit moves. There is no fallback for them.
 //
-// Multi-process readers must never bound-check against p.dbSize: that atomic
-// is the writer's allocation counter, refreshed only on the write path
-// (beginWrite -> refreshHeaderFromPage1), so a process that has not written
-// since a peer grew the database would reject the peer's pages as corrupt.
+// No reader bound-checks against p.dbSize: that atomic is the writer's
+// allocation counter. An open write transaction moves it (a backup's shrink,
+// a growth), and in multi-process mode it is refreshed only on the write
+// path (beginWrite -> refreshHeaderFromPage1), so a process that has not
+// written since a peer grew the database would reject the peer's pages as
+// corrupt.
 //
 // A failed file-size query is the read begin's error, as pagerPagecount
 // returns it (pager.c:3299-3303); there is no fallback to p.dbSize.
@@ -2241,6 +2259,9 @@ func (p *pager) effectiveReaderDbSize(hdr WalIndexHdr) (uint32, error) {
 		n := uint32((info.Size() + int64(p.pageSize) - 1) / int64(p.pageSize))
 		p.noWalCommitSize.Store(&noWalCommitSize{hdr: hdr, nPage: n})
 		return n, nil
+	}
+	if p.inProcess || p.inMemory {
+		return 0, errors.New("btree: internal error: an in-process snapshot without a committed size")
 	}
 	return p.dbSize.Load(), nil
 }
@@ -2965,11 +2986,15 @@ func (p *pager) pagerError() {
 	p.wal.cksum1 = base.cksum1
 	p.wal.cksum2 = base.cksum2
 
-	// Restore mxCommitFrame: the commit path advances mxCommitFrame before
-	// writeHeader (wal.go), so a writeHeader failure leaves mxCommitFrame
-	// ahead of the rolled-back WAL state. At beginWrite() time,
-	// mxCommitFrame == nFrame == savedWalFrame, so restore to that value.
-	p.wal.index.mxCommitFrame.Store(base.frame)
+	// Restore the committed position: the commit path advances it before
+	// writeHeader (wal.go), so a writeHeader failure leaves it ahead of the
+	// rolled-back WAL state. At beginWrite() time its frame equals nFrame,
+	// the transaction's base, and a restart inside the transaction moves
+	// the base to the start of the new log while keeping the size
+	// (walRestartHdr, wal.c:2146-2160); SQLite's undo goes back to that
+	// start too (wal.c:3829-3835). The base frame then, and the size the
+	// transaction began with.
+	p.wal.index.mxCommitFrame.StorePos(base.frame, p.savedCommitNPage)
 
 	// Truncate in-memory WAL frames to match restored nFrame.
 	if p.wal.inMemory {
