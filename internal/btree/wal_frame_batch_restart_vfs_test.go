@@ -562,3 +562,105 @@ func TestWriteFrames_Format6NoPage1Chunks(t *testing.T) {
 		}
 	}
 }
+
+// A transaction that spilled pages and then changed them again writes them
+// over their spilled frames in place (wal.c:4138-4153), between the chunks of
+// its appended frames, and its commit rewrites the checksum chain from the
+// first frame written over before the sync (walRewriteChecksums,
+// wal.c:4166-4169). Appended to the log, or after a restart by the spill: the
+// commit succeeds and the database and WAL without the shm recover it, which
+// they do only if the chain was rewritten.
+func TestWriteFrames_ReusedFramesWithChunks(t *testing.T) {
+	for _, m := range chunkModes()[:2] { // the modes with a WAL file
+		for _, restart := range []bool{false, true} {
+			name := m.name + "/append"
+			if restart {
+				name = m.name + "/after-restart"
+			}
+			t.Run(name, func(t *testing.T) {
+				db, path := openRestartDB(t, m)
+				restartPut(t, db, 0, 200, 1)
+				w := db.pager.wal
+				if restart {
+					require.NoError(t, db.Checkpoint(CheckpointPassive))
+					require.Equal(t, w.index.mxCommitFrame.LoadLocal(), w.index.liveNBackfill(), "setup: the whole log is backfilled")
+				}
+				gen := w.logGen.Load()
+				committed, _ := w.index.mxCommitFrame.LoadPos()
+				if restart {
+					committed = 0
+				}
+				ow := wrapWAL(t, w)
+
+				wtx, err := db.BeginWrite()
+				require.NoError(t, err)
+				restartPutTx(t, wtx, 0, 100, 2)
+				restartSpillAll(t, db)
+				if restart {
+					require.Equal(t, gen+1, w.logGen.Load(), "setup: the spill started the log over")
+				}
+				spilled := w.nFrame.Load()
+				require.Greater(t, spilled, committed, "setup: frames spilled")
+				// The spilled rows again, new values of the same size: their
+				// pages are dirty again and go over their spilled frames. The
+				// new rows are appended, in chunks.
+				restartPutTx(t, wtx, 0, 100, 3)
+				restartPutTx(t, wtx, 200, chunkRows, 3)
+				b := appendBase(w)
+				reused := DiagReuseFrames.Load()
+				ow.arm("")
+				require.NoError(t, wtx.Commit())
+				ev, _ := ow.disarm()
+
+				require.Greater(t, DiagReuseFrames.Load(), reused, "the spilled pages were written over their frames")
+				frames, chunks := checkChunks(t, ev, b, ow.frameSize, ow.shm)
+				require.GreaterOrEqual(t, chunks, 3, "setup: the commit spans several chunks")
+				mx := w.index.mxCommitFrame.LoadLocal()
+				require.Equal(t, spilled+uint32(frames), mx)
+				lo := int64(walHeaderSize) + int64(committed)*int64(ow.frameSize)
+				hi := int64(walHeaderSize) + int64(spilled)*int64(ow.frameSize)
+				// Indexes in ev: the writes over spilled frames, the frame
+				// header rewrites, the last chunk, and the commit's sync.
+				var inPlace, rewrites []int
+				lastChunk, commitSync := -1, -1
+				for i, e := range ev {
+					switch {
+					case e.kind == "pre-publish":
+						if commitSync < 0 && i > 0 && ev[i-1].kind == "sync" {
+							commitSync = i - 1
+						}
+					case e.kind != "write":
+					case e.n == int(w.pageSize) && e.off >= lo && e.off < hi:
+						inPlace = append(inPlace, i)
+					case e.n == walFrameSize:
+						rewrites = append(rewrites, i)
+					case e.off >= walHeaderSize && e.n%ow.frameSize == 0:
+						lastChunk = i
+					}
+				}
+				require.NotEmpty(t, inPlace, "page writes into the spilled frames")
+				require.GreaterOrEqual(t, commitSync, 0, "the commit's sync, then its publication: %v", ev)
+
+				restartCheck(t, db, 0, 100, 3)
+				restartCheck(t, db, 100, 200, 1)
+				restartCheck(t, db, 200, chunkRows, 3)
+				restartRecoverCopy(t, path, "after-commit", m, func(cdb *DB) {
+					require.Equal(t, mx, cdb.pager.wal.index.mxCommitFrame.LoadLocal(), "recovery found the whole commit")
+					restartCheck(t, cdb, 0, 100, 3)
+					restartCheck(t, cdb, 100, 200, 1)
+					restartCheck(t, cdb, 200, chunkRows, 3)
+				})
+				// SQLite's order: the chain is rewritten after the last frame is
+				// written and before the commit's sync.
+				require.NotEmpty(t, rewrites, "the frame headers from the first frame written over were rewritten")
+				require.Greater(t, rewrites[0], lastChunk, "the rewrite follows the last chunk")
+				require.Less(t, rewrites[len(rewrites)-1], commitSync, "the rewrite precedes the commit's sync")
+				db = restartReopen(t, db, path, m)
+				restartCheck(t, db, 0, 100, 3)
+				restartCheck(t, db, 100, 200, 1)
+				restartCheck(t, db, 200, chunkRows, 3)
+				require.NoError(t, db.IntegrityCheck())
+			})
+		}
+	}
+}
