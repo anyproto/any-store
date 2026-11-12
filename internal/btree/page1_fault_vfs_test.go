@@ -33,6 +33,7 @@ func TestPage1Rule_FailedCommitThenRetry_WALFile(t *testing.T) {
 		t.Run(m.name+"/frame-write", func(t *testing.T) {
 			db, path := openRestartDB(t, m)
 			restartPut(t, db, 0, 50, 1)
+			before := page1FaultSnap(db)
 			ff := &walFrameFaultFile{File: db.pager.wal.file}
 			db.pager.wal.file = ff
 			wtx, err := db.BeginWrite()
@@ -40,18 +41,19 @@ func TestPage1Rule_FailedCommitThenRetry_WALFile(t *testing.T) {
 			restartPutTx(t, wtx, 50, 60, 9)
 			ff.armed.Store(true)
 			require.ErrorIs(t, wtx.Commit(), errInjectedFrameWrite)
-			page1FaultCheck(t, db, path, m, 50)
+			page1FaultCheck(t, db, path, m, 50, before)
 		})
 		t.Run(m.name+"/sync", func(t *testing.T) {
 			db, path := openRestartDB(t, m)
 			restartPut(t, db, 0, 50, 1)
+			before := page1FaultSnap(db)
 			wtx, err := db.BeginWrite()
 			require.NoError(t, err)
 			restartPutTx(t, wtx, 50, 60, 9)
 			failNextWALSync(t, db)
 			require.ErrorIs(t, wtx.Commit(), errInjectedWALSync)
 			ResetVFS()
-			page1FaultCheck(t, db, path, m, 50)
+			page1FaultCheck(t, db, path, m, 50, before)
 		})
 	}
 }

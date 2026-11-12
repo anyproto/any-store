@@ -16,11 +16,15 @@ package btree
 //	               WAL is truncated
 //	restart        a writer that started the log over, before its header
 //
-// Recovery: (a) a fresh process opens a copy of the files taken right after
-// the kill, before any checkpoint; (b) the parent, attached throughout,
-// checkpoints with TRUNCATE and then reopens. Every acknowledged commit must
-// be there, the in-flight transaction all or nothing, the structure sound,
-// and a growing commit afterwards must not reuse a page.
+// Recovery: (a) a fresh open, in this process, of a copy of the database file
+// and the WAL taken right after the kill, without the wal-index, so the index
+// is rebuilt from the WAL before any checkpoint; (b) the parent, attached
+// throughout, checkpoints with TRUNCATE and then reopens. Every acknowledged
+// commit must be there with its values. The in-flight transaction is there
+// with all its values when it was synced before the kill (post-publish,
+// between-copies), and absent otherwise; a key counts as absent only on
+// ErrKeyNotFound. The structure must be sound, and a growing commit afterwards
+// must not reuse a page.
 
 import (
 	"bufio"
@@ -171,6 +175,9 @@ func runP1Crash(t *testing.T, codec bool, point string) {
 		}
 	}
 
+	// The in-flight commit's frames were written and synced before the kill
+	// at these points, so recovery must keep it whole.
+	inflightSynced := point == "post-publish" || point == "between-copies"
 	check := func(t *testing.T, cdb *DB, where string) {
 		t.Helper()
 		rtx, err := cdb.BeginRead()
@@ -182,14 +189,23 @@ func runP1Crash(t *testing.T, codec bool, point string) {
 			require.NoError(t, err, "%s: acknowledged key %d", where, k)
 			require.Equal(t, want, got, "%s: acknowledged key %d", where, k)
 		}
+		inflight := bytes.Repeat([]byte{p1CrashInflight.fill}, p1CrashInflight.size)
 		present := 0
 		for _, k := range p1CrashInflight.keys {
-			if _, err := rtx.Get(ns, p1Key(k)); err == nil {
-				present++
+			got, err := rtx.Get(ns, p1Key(k))
+			if err != nil {
+				require.ErrorIs(t, err, ErrKeyNotFound, "%s: in-flight key %d", where, k)
+				continue
 			}
+			require.Equal(t, inflight, got, "%s: in-flight key %d", where, k)
+			present++
 		}
 		require.NoError(t, rtx.Rollback())
-		require.Contains(t, []int{0, len(p1CrashInflight.keys)}, present, "%s: the in-flight transaction is all or nothing", where)
+		want := 0
+		if inflightSynced {
+			want = len(p1CrashInflight.keys)
+		}
+		require.Equal(t, want, present, "%s: in-flight keys present (synced before the kill: %v)", where, inflightSynced)
 		require.NoError(t, cdb.IntegrityCheck(), where)
 		p1Write(t, cdb, func(tx *WriteTx, ns *Namespace) { // grows
 			for i := 0; i < 5; i++ {
@@ -199,11 +215,12 @@ func runP1Crash(t *testing.T, codec bool, point string) {
 		require.NoError(t, cdb.IntegrityCheck(), where+", after a growing commit")
 	}
 
-	// (a) A fresh process, before any checkpoint: a copy of the files.
+	// (a) A fresh open of a copy of the database and the WAL (no
+	// wal-index), before any checkpoint.
 	copyPath := restartCopyFiles(t, path, "fresh")
 	fresh, err := testOpen(t, copyPath, opts)
 	require.NoError(t, err)
-	check(t, fresh, "fresh open")
+	check(t, fresh, "fresh open of a copy")
 	require.NoError(t, fresh.Close())
 
 	// (b) The parent, attached throughout: TRUNCATE, then a reopen.
@@ -211,6 +228,11 @@ func runP1Crash(t *testing.T, codec bool, point string) {
 	check(t, db, "attached parent")
 	for k := 0; k < 5; k++ {
 		model[5000+k] = p1Big(7)
+	}
+	if inflightSynced {
+		for _, k := range p1CrashInflight.keys {
+			model[k] = bytes.Repeat([]byte{p1CrashInflight.fill}, p1CrashInflight.size)
+		}
 	}
 	require.NoError(t, db.Close())
 	db, err = testOpen(t, path, opts)
@@ -224,6 +246,12 @@ func runP1Crash(t *testing.T, codec bool, point string) {
 		got, err := rtx.Get(ns, p1Key(k))
 		require.NoError(t, err, "reopen: key %d", k)
 		require.Equal(t, want, got, "reopen: key %d", k)
+	}
+	if !inflightSynced {
+		for _, k := range p1CrashInflight.keys {
+			_, err := rtx.Get(ns, p1Key(k))
+			require.ErrorIs(t, err, ErrKeyNotFound, "reopen: in-flight key %d", k)
+		}
 	}
 	require.NoError(t, rtx.Rollback())
 	require.NoError(t, db.IntegrityCheck())

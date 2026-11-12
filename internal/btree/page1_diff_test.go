@@ -103,7 +103,12 @@ func TestPage1Diff_Format5Dump(t *testing.T) {
 }
 
 // p1DiffDumpCommit writes the frames of db's last commit: those after the
-// previous commit mark, up to its commit frame.
+// previous commit mark, up to its commit frame. Before the salts and
+// checksums are left out of the dump, the log is validated as recovery
+// validates it (walIndexRecover, wal.c:1501-1517; walDecodeFrame,
+// wal.c:1012-1038): the WAL header's checksum, each frame's salts against
+// the header's, and the cumulative checksum chain through every frame up to
+// the last commit.
 func p1DiffDumpCommit(t *testing.T, w *bytes.Buffer, path string, db *DB, n int) {
 	t.Helper()
 	data, err := os.ReadFile(path + "-wal")
@@ -114,10 +119,21 @@ func p1DiffDumpCommit(t *testing.T, w *bytes.Buffer, path string, db *DB, n int)
 		pgno, nTrunc uint32
 		sum          [32]byte
 	}
+	require.GreaterOrEqual(t, len(data), walHeaderSize)
+	s1, s2 := walChecksum(data[0:24], 0, 0)
+	require.Equal(t, binary.BigEndian.Uint32(data[24:28]), s1, "commit %d: WAL header checksum", n)
+	require.Equal(t, binary.BigEndian.Uint32(data[28:32]), s2, "commit %d: WAL header checksum", n)
+	salt1, salt2 := binary.BigEndian.Uint32(data[16:20]), binary.BigEndian.Uint32(data[20:24])
 	frames := make([]rec, 0, last)
 	for i, off := 0, walHeaderSize; i < last; i, off = i+1, off+walFrameSize+pageSize {
 		require.LessOrEqual(t, off+walFrameSize+pageSize, len(data))
 		h := data[off : off+walFrameSize]
+		require.Equal(t, salt1, binary.BigEndian.Uint32(h[8:12]), "commit %d, frame %d: salt", n, i+1)
+		require.Equal(t, salt2, binary.BigEndian.Uint32(h[12:16]), "commit %d, frame %d: salt", n, i+1)
+		s1, s2 = walChecksum(h[0:8], s1, s2)
+		s1, s2 = walChecksum(data[off+walFrameSize:off+walFrameSize+pageSize], s1, s2)
+		require.Equal(t, binary.BigEndian.Uint32(h[16:20]), s1, "commit %d, frame %d: checksum chain", n, i+1)
+		require.Equal(t, binary.BigEndian.Uint32(h[20:24]), s2, "commit %d, frame %d: checksum chain", n, i+1)
 		frames = append(frames, rec{
 			pgno:   binary.BigEndian.Uint32(h[0:4]),
 			nTrunc: binary.BigEndian.Uint32(h[4:8]),
