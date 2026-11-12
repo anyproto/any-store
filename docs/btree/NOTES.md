@@ -1146,9 +1146,11 @@ Two mechanisms coexist in the implementation, each solving a distinct problem:
    cross-process at `BeginRead`, set in lockstep with `walMaxFrame` at every
    snapshot-establish site. It is derived by `pager.effectiveReaderDbSize`
    (pager.go:1664-1686), which mirrors `sqlite3WalDbsize` (wal.c:3672, returning
-   `pWal->hdr.nPage`) and falls back to `pager.dbSize` when the WAL header carries
-   no committed size -- mirroring `pagerPagecount`'s file-size fallback
-   (pager.c:3299-3305). Every reader bound check consults this via
+   `pWal->hdr.nPage`) and, when the WAL header carries no committed size, falls back
+   to the database file's size as `pagerPagecount` does (pager.c:3299-3305); only
+   in-process mode falls back to `pager.dbSize`. Until 2026-11-11 the fallback was
+   `pager.dbSize` in every mode, and a WAL reset published a header without a size:
+   see [drift-2026-11-11-3](#drift-2026-11-11-3-reader-size-without-a-wal-commit-is-memoized). Every reader bound check consults this via
    `pager.readerDbSizeBound` (pager.go:1688-1699), which returns `cache.dbSize`
    when set and otherwise degrades safely to `pager.dbSize.Load()` for the
    writer/uncached paths. `IntegrityCheckN` sets `cache.dbSize = nPages` likewise
@@ -3057,10 +3059,36 @@ sets only `aReadMark[2..4]=READMARK_NOT_USED` (`wal.c:2158`), and additionally p
 via `for i := range wi.aReadMark { wi.aReadMark[i].Store(readMarkNotUsed) }` (`wal.go:824-826`), and the
 `doResetWAL`/`writeHeader` pair drops the nCkpt and salt-1 increments (`wal.go:1801-1830`, `wal.go:1754-1776`;
 `doResetWAL` at `wal.go:3833-3871`). This is the same
-root as the restart counter/salt drifts (97, 98) surfacing on the read-mark/reset path: the consequence is
+root as the restart counter/salt drifts (97, 98) surfacing on the read-mark/reset path (the fourth
+`walRestartHdr` rule, that `hdr.nPage` survives the reset, was missing too and is ported as of 2026-11-11:
+`doResetWAL` passes the last commit's size to `restartHeaderStateLocked`): the consequence is
 that the `aReadMark[0]==0` invariant is broken on restart (a slot-0 reader normally views only the db file)
 and the deterministic restart sequence/salt advances are lost. Note the recovery path (`wal.go:2006-2009`)
 does correctly restore `aReadMark[0]=0` after clobbering all slots, unlike `reset()`.
+
+<a id="drift-2026-11-11-3-reader-size-without-a-wal-commit-is-memoized"></a>
+### Drift: A Reader's Database Size Without A WAL Commit Is The File Size Memoized Per wal-index Header
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.effectiveReaderDbSize`; `wal.go:*wal.doResetWAL`, `wal.go:*wal.restartHeaderStateLocked` (ported rule); `integrity.go:*DB.IntegrityCheckN` (uses the same size).
+
+SQLite sizes the database at the start of every transaction with `pagerPagecount` (`pager.c:3279-3306`): `sqlite3WalDbsize`, i.e. `pWal->hdr.nPage`, when it is non-zero, else an `fstat` of the database file. `walRestartHdr` zeroes `mxFrame` and leaves `hdr.nPage` alone (`wal.c:2146-2160`), so the first branch keeps answering after a RESTART or TRUNCATE.
+
+Go had neither half. `doResetWAL` published the reset header with `nPage = 0`, and `effectiveReaderDbSize` fell back to the process-local `pager.dbSize`, which only a write begin refreshes. A process that had not written since a peer grew the database therefore bounded its readers by its own stale size as soon as any process reset the WAL, and valid pages failed with `ErrCorrupt` ("invalid page number" from `IntegrityCheck`, whose cap used the equally process-local `walIndex.maxPage`). Both rules are now ported: the reset header keeps the last commit's size, and without a committed size a multi-process reader takes the file's. A failed file-size query fails the read begin, as `pagerPagecount` returns the `fstat` error (`pager.c:3299-3303`); until 2026-11-12 it fell back to the local size (regression test `TestReaderSizeStatErrorPropagates`, vfs tag). In-process mode keeps `pager.dbSize`: its writers publish no wal-index header and no other process can change the database.
+
+The remaining difference is that the file size is read once per wal-index header, not once per transaction (`pager.noWalCommitSize`). Measured on an M2: the `fstat` costs about 390 ns and one allocation, a sixth of a point read on a freshly opened, checkpointed database — the state a read-mostly process stays in. The memo is exact as long as the file's size cannot change under an unchanged 48-byte header that carries no size: the file changes only when a checkpoint copies frames into it; frames need a commit; a commit publishes a header with a size, and every later reset keeps it; a header without a size reappears only when a process rebuilds the index over a WAL holding no commit, which after a TRUNCATE means freshly drawn salts. The one way back to the identical header is a WAL whose frames have been destroyed behind an intact WAL header, and then the stale (smaller) size fails closed: pages beyond it read as corrupt, none are served wrongly.
+
+The salt and checkpoint-sequence halves of `walRestartHdr`, and the read-mark values, remain as drift-97, drift-98 and drift-99 (annotated on `restartHeaderStateLocked`). Their behaviour is deliberately unchanged here: whether to port them is being decided separately, together with the change detection that depends on the salts. Regression tests (`internal/btree/walindex_restart_npage_test.go`, two processes): `TestWalRestartKeepsNPage_PeerResets` (TRUNCATE and RESTART), `TestWalRestartKeepsNPage_OwnCheckpoint`, `TestReaderSizeWithoutWalCommit`, `TestIntegrityCheckAfterPeerGrowth`.
+
+<a id="drift-2026-11-12-1-wal-restart-clears-the-index-before-it-publishes-the-reset-header"></a>
+### Drift: A WAL Restart Clears The Index Before It Publishes The Reset Header
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.restartHeaderStateLocked`, `wal.go:*walIndex.reset`, `wal.go:*wal.doResetWAL`.
+
+SQLite's `walRestartHdr` (`wal.c:2146-2160`) writes the reset wal-index header first and then zeroes `nBackfill` and `nBackfillAttempted` and resets the read marks. It leaves the hash tables alone: `walIndexAppend` clears each one when the next generation adds its first frame to it (`wal.c:1312-1319`). Go's `restartHeaderStateLocked` runs `walIndex.reset` first, which clears the hash tables and publishes `nBackfill = 0`, `nBackfillAttempted = 0` and the read marks, and only then writes the header.
+
+The order decides what peers see when the resetting process dies between the two steps. In SQLite's order they see a header with no frames over a `nBackfill` still at the old frontier N. The next writer's frames 1..k then lie below the frontier: readers skip them (their `minFrame` is N+1, or they take slot 0 once k reaches N), and a checkpoint counts them as backfilled, so a later reset discards them. In Go's order the peers see the old header over the intact WAL and the fully backfilled database file, with an empty hash and a zero frontier. Readers resolve no frame and read the file, which holds the same content. The next writer appends after frame N, a checkpoint copies only its frames, and recovery reads the whole WAL. The window is a few stores to shared memory with no system call in either order, but only Go's order survives a death inside it.
+
+Both steps come before the truncate, as in SQLite (`walRestartHdr`, then `sqlite3OsTruncate`, `wal.c:2363-2364`). Until 2026-11-12 `doResetWAL` truncated the WAL between the index clear and the header publish. A checkpointer that died there left peers the old header over an empty WAL: a surviving writer acknowledged its commit as frames after the missing ones, and the next recovery stopped at the hole and dropped it. Regression test (two processes, the checkpointer exits at each reset step): `TestWalResetCrash_SurvivorCommitsKept` (`internal/btree/wal_reset_crash_test.go`).
 
 <a id="drift-102-reader-slot-tie-break-selects-lowest-not-highest"></a>
 ### Drift: Reader Slot Tie Break Selects Lowest Not Highest

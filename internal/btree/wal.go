@@ -811,13 +811,16 @@ func (wi *walIndex) liveNBackfill() uint32 {
 // lock; testInProcessReuseSlotHook between the scan of the marks and the
 // shared lock on the slot it chose; testInProcessFreshSlotHook once a fresh
 // slot is held shared, before its re-validation; testResetMidHook inside a
-// WAL restart, the frame numbers zeroed and the count still odd. Test-only.
+// WAL restart, the frame numbers zeroed and the count still odd;
+// testResetWALHook at each step of a WAL reset, named by the step about to
+// run ("publish", "truncate") or just done ("truncated"). Test-only.
 var (
 	testInProcessReadSnapshotHook func()
 	testInProcessFramesReadHook   func()
 	testInProcessReuseSlotHook    func()
 	testInProcessFreshSlotHook    func()
 	testResetMidHook              func()
+	testResetWALHook              func(step string)
 )
 
 // synthHdr is the header of a snapshot in the in-process and in-memory
@@ -1882,7 +1885,31 @@ func (w *wal) adoptSHMState(hdr WalIndexHdr, walHasHeader bool) {
 // Caller must hold w.mu.
 // readMarksLocked: see walIndex.reset — true only on the RESTART/TRUNCATE
 // checkpoint path (doResetWAL), whose caller holds reader slots 1-4 exclusive.
+//
+// The published wal-index header carries no database size: the WAL holds no
+// commit, and readers take the database file's size (pagerPagecount,
+// pager.c:3292-3306). The restart path uses restartHeaderStateLocked.
 func (w *wal) initHeaderStateLocked(readMarksLocked bool) {
+	w.restartHeaderStateLocked(readMarksLocked, 0)
+}
+
+// restartHeaderStateLocked is initHeaderStateLocked with the database size
+// the published wal-index header carries. A WAL restart passes the size of
+// the last commit, which the reset must not drop: SQLite's walRestartHdr
+// zeroes mxFrame and leaves hdr.nPage as it is (wal.c:2146-2160), so
+// sqlite3WalDbsize keeps answering with the committed size after a RESTART
+// or TRUNCATE.
+//
+// The index is cleared (hash tables, nBackfill, read marks) before the reset
+// header is published; walRestartHdr writes the header first. A process that
+// dies between the two leaves the old header over the intact, fully
+// backfilled WAL, which peers read and append to correctly; the other order
+// would leave a header without frames over the old checkpoint frontier.
+// DRIFT: the index is cleared before the reset header is published; C publishes first See docs/btree/NOTES.md#drift-2026-11-12-1-wal-restart-clears-the-index-before-it-publishes-the-reset-header
+// DRIFT: WAL restart randomizes both salts; C increments salt0 (+1), randomizes salt1 only See docs/btree/NOTES.md#drift-97-wal-restart-randomizes-both-salts-instead-of-incrementing-sa
+// DRIFT: WAL header checkpoint-seq nCkpt hardcoded 0, never incremented on restart See docs/btree/NOTES.md#drift-98-wal-checkpoint-sequence-number-nckpt-never-incremented
+// DRIFT: reset() clobbers aReadMark[0]/[1] to NOT_USED + drops nCkpt/salt increments See docs/btree/NOTES.md#drift-99-wal-restart-read-mark-reset-diverges-from-walrestarthdr
+func (w *wal) restartHeaderStateLocked(readMarksLocked bool, nPage uint32) {
 	w.header = walHeader{
 		magic:      walMagic,
 		version:    walVersion,
@@ -1899,9 +1926,12 @@ func (w *wal) initHeaderStateLocked(readMarksLocked bool) {
 	w.nFrame.Store(0)
 	w.headerOnDisk = false
 	w.index.reset(readMarksLocked)
+	if testResetWALHook != nil {
+		testResetWALHook("publish")
+	}
 
 	// Update shm header with initial checksums and salts
-	_ = w.index.writeHeader(0, 0, 0,
+	_ = w.index.writeHeader(0, nPage, 0,
 		[2]uint32{w.cksum1, w.cksum2},
 		[2]uint32{w.header.salt1, w.header.salt2})
 }
@@ -4162,41 +4192,55 @@ func (w *wal) doResetWAL(truncate bool) error {
 		trace("doResetWAL: truncate=%v nFrame=%d maxFrame=%d nBackfill=%d",
 			truncate, w.nFrame.Load(), w.index.maxFrame.Load(), w.index.nBackfill.Load())
 	}
-	// Reset metadata BEFORE truncating the file. This ensures concurrent
-	// readers see nFrame=0 / empty pageMap before the file shrinks,
-	// preventing TOCTOU races where readFrame passes the nFrame check
-	// but gets EOF from the truncated file. Matches SQLite's ordering:
-	// walRestartHdr (reset header) → sqlite3OsTruncate (wal.c:2363-2364).
-	// readMarksLocked: tryResetWALWithBusy holds reader slots 1-4 exclusive
-	// across this call (matching wal.c:2361 before walRestartHdr).
-	w.index.reset(true)
-	w.nFrame.Store(0)
-
-	if truncate && w.file != nil {
-		// CheckpointTruncate: truncate WAL file to zero bytes
-		if err := w.file.Truncate(0); err != nil {
-			return err
+	// The database size of the last commit, which the reset header keeps
+	// (walRestartHdr leaves hdr.nPage alone, wal.c:2146-2160). The whole log
+	// has been backfilled, so this is the size of the database file's
+	// content. Readers in processes that have not written since a peer grew
+	// the database bound their page numbers by it; published as 0 it sent
+	// them to their stale process-local size, and valid pages read as
+	// corrupt. The caller holds the write lock, so the live header is the
+	// last commit's.
+	nPage := w.index.maxPage.Load()
+	if !w.inProcess && !w.inMemory {
+		if hdr, valid := w.index.readHeader(); valid {
+			nPage = hdr.nPage
 		}
 	}
 
-	// Reset memFrames and arena for reuse
+	// SQLite's order (wal.c:2363-2364): walRestartHdr publishes the reset
+	// header, then the WAL is truncated. Until the publish a peer sees the
+	// old header, and the WAL it describes must still be there: a writer
+	// appends its next commit after the old last frame, and recovery, which
+	// reads the WAL from its start, stops at a truncated prefix and drops
+	// that commit. After the publish no reader or writer resolves a frame of
+	// the old generation, so the file can shrink. Readers of this process
+	// likewise see the cleared index before the file shrinks, so none
+	// resolves a frame and then reads past the end of the file.
+	//
+	// The on-disk WAL header is not written here: the next writer's first
+	// frame writes and fdatasyncs it (flushHeader), as SQLite's walRestartHdr
+	// writes none either (the reset only publishes the shm header, whose
+	// fresh salt makes peers rewrite it); on TRUNCATE the WAL stays 0 bytes.
+	//
+	// readMarksLocked: tryResetWALWithBusy holds reader slots 1-4 exclusive
+	// across this call (matching wal.c:2361 before walRestartHdr).
+	w.restartHeaderStateLocked(true, nPage)
 	if w.inMemory {
 		w.memFrames = w.memFrames[:0]
 		w.memArenaOff = 0
 	}
 
-	if w.inMemory {
-		// InMemory: just reinitialize header state, no disk write
-		w.initHeaderStateLocked(true)
-		return nil
+	if truncate && w.file != nil {
+		if testResetWALHook != nil {
+			testResetWALHook("truncate")
+		}
+		if err := w.file.Truncate(0); err != nil {
+			return err
+		}
+		if testResetWALHook != nil {
+			testResetWALHook("truncated")
+		}
 	}
-
-	// Defer the on-disk WAL-header write+fdatasync to the next writer's first frame
-	// (flushHeader), matching SQLite walRestartHdr (wal.c:2363-2389): the reset only
-	// publishes the SHM header (fresh salt, so peers detect the wrap); on TRUNCATE
-	// the WAL stays 0 bytes. Durability unchanged (flushHeader fdatasyncs at the
-	// first-frame write); avoids an eager header fsync per RESTART/TRUNCATE checkpoint.
-	w.initHeaderStateLocked(true)
 	return nil
 }
 

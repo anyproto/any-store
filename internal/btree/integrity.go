@@ -562,19 +562,29 @@ func (db *DB) IntegrityCheck() error {
 	return db.IntegrityCheckN(100)
 }
 
+// testIntegritySnapshotHook runs in IntegrityCheckN once its read
+// transaction is open and page 1 has been read. Nil outside tests.
+var testIntegritySnapshotHook func()
+
 // IntegrityCheckN is like IntegrityCheck but stops after maxErrors issues.
 // Pass 0 for unlimited.
 func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// Start a read transaction
-	maxFrame, slot, err := db.pager.beginRead()
+	walHdr, maxFrame, minFrame, slot, err := db.pager.beginReadHdr()
 	if err != nil {
 		return err
 	}
 	defer db.pager.endRead(slot)
 
 	// Use a private reader cache to avoid racing with the writer's cache.
+	// Its WAL floor is the snapshot's, as for every reader cache: on slot 0
+	// (minFrame = maxFrame+1) the check reads nothing from the WAL
+	// (walFindFrame, wal.c:3524-3527). A WAL restart needs only slots 1-4,
+	// so it can run under the check, and the live floor would let the next
+	// generation's frames, numbered from 1 again, into this snapshot.
 	cache := newPcache(int(db.pager.pageSize), 200, true)
 	cache.useSlab = db.pager.useSlab
+	cache.minFrame = minFrame
 	defer cache.destroy()
 
 	// Read page 1 to get the current header
@@ -588,37 +598,30 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 		return err
 	}
 	db.pager.releasePage(pg1)
+	if testIntegritySnapshotHook != nil {
+		testIntegritySnapshotHook()
+	}
 
 	nPages := hdr.DatabaseSize
 	if nPages == 0 {
 		return nil
 	}
 
-	// Cap nPages against the actual database size to protect against corrupted
-	// headers claiming billions of pages. This matches SQLite's approach where
-	// btreePagecount() uses the actual file/WAL size, not the header field.
-	//
-	// Use max(filePages, walIndex.maxPage) because pages allocated in the WAL
-	// may have page numbers beyond the current physical DB file size (they get
-	// written to the DB file during checkpoint).
-	pageSize := db.pager.pageSize
-	if pageSize > 0 {
-		var maxPossible uint32
-		if db.pager.file != nil {
-			fi, statErr := db.pager.file.Stat()
-			if statErr == nil {
-				maxPossible = uint32(fi.Size() / int64(pageSize))
-			}
-		}
-		// WAL's maxPage tracks the committed database size including
-		// pages that only exist in the WAL (not yet checkpointed).
-		walMaxPage := db.pager.wal.index.maxPage.Load()
-		if walMaxPage > maxPossible {
-			maxPossible = walMaxPage
-		}
-		if maxPossible > 0 && nPages > maxPossible {
-			nPages = maxPossible
-		}
+	// Cap nPages against the snapshot's database size to protect against
+	// corrupted headers claiming billions of pages. This matches SQLite's
+	// approach where btreePagecount() is the pager's count, not the header
+	// field. The count is the one every reader of this snapshot uses
+	// (effectiveReaderDbSize: the wal-index header's committed size, else
+	// the file's). The process-local walIndex.maxPage must not be the cap:
+	// in a process that has not begun a write since a peer grew the
+	// database it is stale, and the peer's pages, still only in the WAL,
+	// were reported as invalid page numbers.
+	maxPossible, err := db.pager.effectiveReaderDbSize(walHdr)
+	if err != nil {
+		return err
+	}
+	if maxPossible > 0 && nPages > maxPossible {
+		nPages = maxPossible
 	}
 
 	// Bound reader page/overflow reads against this snapshot's (capped) page
