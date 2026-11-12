@@ -1973,15 +1973,17 @@ register and C↔Go coverage table. Key entry points:
 - `(*Backup).Remaining() uint32` -- ~ `sqlite3_backup_remaining`
 - `(*Backup).PageCount() uint32` -- ~ `sqlite3_backup_pagecount`
 
-Hooks in `pager.commit()` (post-`wal.writeFrames`) and
-`pager.checkpointWithMode()` (Truncate mode, the one that resets the WAL)
-dispatch the C equivalents of `sqlite3BackupUpdate` and
-`sqlite3BackupRestart` respectively. See `pager.dispatchBackupUpdate` /
-`pager.dispatchBackupRestart`. A commit whose transaction spilled pages also
-restarts the attached backups, for now
-([drift-2026-11-12-4](#drift-2026-11-12-4-a-commit-that-spilled-restarts-attached-backups)). External-process writes are detected at
-each Step's read tx via the page-1 `FileChangeCounter` and trigger the
-same restart.
+`pager.commit()` (after `wal.writeFrames`) and `pager.pagerStress()` (a
+spill) dispatch the C equivalent of `sqlite3BackupUpdate`
+(`pager.dispatchBackupUpdate`); a rollback, the error cleanup and any other
+end of a write transaction that still owes the backups dispatch
+`sqlite3BackupRestart` (`pager.dispatchBackupRestart`, `dischargeBackups`).
+Another process's writes restart the copy through the change epoch each
+Step's read transaction reports (`ReadTx.ChangeEpoch`). A `Step` returns
+`ErrBusy`, without effect, while this process has a write transaction open on
+the source. See
+[drift-2026-11-13-1](#drift-2026-11-13-1-the-change-state-is-one-value-under-compare-and-swap),
+"Backups".
 
 Anystore-level `(*db).Backup(ctx, path)` drives the engine by opening
 a fresh destination DB at `path` with matching options.
