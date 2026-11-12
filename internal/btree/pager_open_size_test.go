@@ -17,12 +17,15 @@ package btree
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -306,4 +309,106 @@ func TestOpenReadsPage1AndSizeAtOneSnapshot(t *testing.T) {
 	defer db.Close()
 	require.Equal(t, 1, fired)
 	assertOpensAtCommittedSize(t, db, committed)
+}
+
+// recoverBusySpy reports the first attempt on the RECOVER lock that finds it
+// taken: a read begin that has seen a recovery in progress.
+type recoverBusySpy struct {
+	shm
+	busy chan struct{}
+	once sync.Once
+}
+
+func (s *recoverBusySpy) lock(slot, lockType int) error {
+	err := s.shm.lock(slot, lockType)
+	if slot == lockRecover && errors.Is(err, ErrBusy) {
+		s.once.Do(func() { close(s.busy) })
+	}
+	return err
+}
+
+// TestOpenWaitsOutRecoveryBeforePage1Read: between the opener's WAL attach
+// and its page-1 read, another connection starts rebuilding the wal-index:
+// the header is torn and the write and RECOVER locks are taken. Open waits
+// for the rebuild, as every transaction begin waits out
+// SQLITE_BUSY_RECOVERY through the busy handler (wal.c:3084-3108,
+// btree.c:3730-3737), and reads page 1 once the rebuilt header is out. The
+// rebuilder is simulated on the opener's own wal-index: the in-process lock
+// table refuses the opener's locks as fcntl refuses another process's. It
+// finishes only after the opener has found the RECOVER lock taken, so the
+// open must have met the recovery in progress.
+func TestOpenWaitsOutRecoveryBeforePage1Read(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := testOpen(t, path, openSizeOpts)
+	require.NoError(t, err)
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("t")
+	require.NoError(t, err)
+	for i := 0; i < 50; i++ {
+		require.NoError(t, wtx.Put(ns, binary.BigEndian.AppendUint32(nil, uint32(i)), make([]byte, 300)))
+	}
+	require.NoError(t, wtx.Commit())
+	require.NoError(t, db.Close())
+
+	released := make(chan struct{})
+	// openReturned guards the rebuilder against an open that gave up: a
+	// failed open has already unmapped the index the rebuilder writes to.
+	var mu sync.Mutex
+	openReturned := false
+	var spy *recoverBusySpy
+	testOpenAfterWALOpenHook = func(p *pager) {
+		if p.path != path {
+			return
+		}
+		wi := p.wal.index
+		require.NoError(t, wi.lock(lockWrite, lockExclusive))
+		require.NoError(t, wi.lock(lockRecover, lockExclusive))
+		region, err := wi.shm.region(0, true)
+		require.NoError(t, err)
+		var rebuilt [walIndexHdrSize]byte
+		copy(rebuilt[:], region[:walIndexHdrSize])
+		region[16] ^= 0x01 // copy 1 no longer matches copy 2
+		_, valid := wi.readHeader()
+		require.False(t, valid, "setup: the header must be torn")
+		spy = &recoverBusySpy{shm: wi.shm, busy: make(chan struct{})}
+		wi.shm = spy
+		go func() {
+			defer close(released)
+			select {
+			case <-spy.busy:
+			case <-time.After(20 * time.Second):
+			}
+			// Give an open that fails on the busy RECOVER lock time to
+			// return before the rebuild is published.
+			time.Sleep(50 * time.Millisecond)
+			mu.Lock()
+			defer mu.Unlock()
+			if openReturned {
+				return
+			}
+			// The rebuild publishes its header and lets go of its locks.
+			copy(region[:walIndexHdrSize], rebuilt[:])
+			_ = wi.unlock(lockRecover, lockExclusive)
+			_ = wi.unlock(lockWrite, lockExclusive)
+		}()
+	}
+	t.Cleanup(func() { testOpenAfterWALOpenHook = nil })
+
+	db, err = testOpen(t, path, openSizeOpts)
+	mu.Lock()
+	openReturned = true
+	mu.Unlock()
+	<-released
+	require.NotNil(t, spy, "the hook did not run")
+	select {
+	case <-spy.busy:
+	default:
+		t.Fatal("the open never found the RECOVER lock taken")
+	}
+	require.NoError(t, err, "a rebuild in progress must make open wait, not fail")
+	defer db.Close()
+	_, valid := db.pager.wal.index.readHeader()
+	require.True(t, valid, "open read page 1 before the rebuild was done")
+	require.Equal(t, 50, countKeys(t, db, "t"))
 }
