@@ -5,8 +5,8 @@ package btree
 // A wal-index header left torn by a writer that died between its two header
 // copies, while other processes keep the database open. SQLite repairs it
 // from whichever connection next reads the header: walIndexReadHdr takes the
-// WRITE lock and runs walIndexRecover (wal.c:2640-2715), and walCheckpoint's
-// caller reads the header that way before it copies anything (wal.c:4359).
+// WRITE lock and runs walIndexRecover (wal.c:2654-2729), and walCheckpoint's
+// caller reads the header that way before it copies anything (wal.c:4373).
 //
 // The cross-process tests re-exec the test binary (the pattern of
 // multiprocess_dms_test.go): the child is the writer that dies, the parent
@@ -142,7 +142,7 @@ func TestTornWalIndexHeader_CheckpointKeepsPeerCommits(t *testing.T) {
 
 // TestTornWalIndexHeader_PassiveCheckpointKeepsPeerCommits: the same through
 // the PASSIVE mode, which does not hold the write lock when it reads the
-// header and so takes it for the repair (walIndexReadHdr, wal.c:2685-2697).
+// header and so takes it for the repair (walIndexReadHdr, wal.c:2699-2711).
 func TestTornWalIndexHeader_PassiveCheckpointKeepsPeerCommits(t *testing.T) {
 	const env = "TEST_TORNHDR_PASSIVE_DB_PATH"
 	if dbPath := os.Getenv(env); dbPath != "" {
@@ -345,7 +345,7 @@ func TestTornWalIndexHeader_CheckpointBusyWhenWriteLockHeld(t *testing.T) {
 // the current log. A peer restarted the WAL and committed into it; a reader
 // pins slot 0, so the survivor's TRUNCATE cannot backfill anything. The
 // reset decision must read the shared nBackfill, as walCheckpoint does
-// (pInfo->nBackfill<pWal->hdr.mxFrame, wal.c:2341): judged on the stale local
+// (pInfo->nBackfill<pWal->hdr.mxFrame, wal.c:2355): judged on the stale local
 // count the log looks fully backfilled and the peer's commits are truncated
 // away.
 func TestCheckpointResetUsesSharedBackfill(t *testing.T) {
@@ -409,7 +409,7 @@ func TestCheckpointResetUsesSharedBackfill(t *testing.T) {
 // TestWalIndexFutureVersionRefused: both header copies agree and checksum,
 // but carry a wal-index version this build does not know. That is another
 // build's index, not a torn one: it is refused, never rebuilt
-// (walIndexReadHdr, wal.c:2722-2728: SQLITE_CANTOPEN with no recovery).
+// (walIndexReadHdr, wal.c:2740-2741: SQLITE_CANTOPEN with no recovery).
 func TestWalIndexFutureVersionRefused(t *testing.T) {
 	dir := t.TempDir()
 	db, err := testOpen(t, filepath.Join(dir, "test.db"), tornHdrOpts)
@@ -453,7 +453,7 @@ func TestWalIndexFutureVersionRefused(t *testing.T) {
 // TestTornWalIndexHeader_BusyRecoveryWhenRecoverLockHeld: the header is
 // invalid, the write lock is taken, and so is the RECOVER lock: another
 // connection is running recovery. The reader reports ErrBusyRecovery
-// (SQLITE_BUSY_RECOVERY, wal.c:3089-3094), which the begin paths hand to the
+// (SQLITE_BUSY_RECOVERY, wal.c:3103-3108), which the begin paths hand to the
 // busy handler, instead of spinning in the retry loop.
 func TestTornWalIndexHeader_BusyRecoveryWhenRecoverLockHeld(t *testing.T) {
 	dir := t.TempDir()
@@ -497,7 +497,7 @@ func TestTornWalIndexHeader_BusyRecoveryWhenRecoverLockHeld(t *testing.T) {
 // and the write and RECOVER locks stay held, a recovery that does not
 // finish. A begin waits one busy-handler budget and gives up: SQLite runs
 // one loop with one count around the whole begin (sqlite3BtreeBeginTrans,
-// btree.c:3730-3737; sqlite3InvokeBusyHandler, main.c:1763-1772), never a
+// btree.c:3730-3737; sqlite3InvokeBusyHandler, main.c:1770-1780), never a
 // fresh budget per retry.
 func TestTornWalIndexHeader_BusyRecoveryOneBudgetPerBegin(t *testing.T) {
 	dir := t.TempDir()
