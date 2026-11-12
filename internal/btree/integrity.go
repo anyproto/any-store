@@ -611,24 +611,33 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 		testIntegritySnapshotHook()
 	}
 
+	// The pager's count for this snapshot, the one every reader of it uses
+	// (effectiveReaderDbSize: the wal-index header's committed size, else
+	// the file's). The process-local committed position must not be used: in
+	// a process that has not begun a write since a peer grew the database it
+	// is stale, and the peer's pages, still only in the WAL, were reported as
+	// invalid page numbers.
+	maxPossible, err := db.pager.effectiveReaderDbSize(walHdr)
+	if err != nil {
+		return err
+	}
+	// The page count by lockBtree's rule (btree.c:3294-3298), which is the
+	// btreePagecount the integrity check walks (btree.c:11163-11168): page
+	// 1's size when it is non-zero and the change counter matches
+	// VersionValidFor, the pager's count otherwise. An untrusted 0 is not an
+	// empty database.
 	nPages := hdr.DatabaseSize
+	if nPages == 0 || hdr.VersionValidFor != hdr.FileChangeCount {
+		nPages = maxPossible
+	}
 	if nPages == 0 {
 		return nil
 	}
 
 	// Cap nPages against the snapshot's database size to protect against
-	// corrupted headers claiming billions of pages. This matches SQLite's
-	// approach where btreePagecount() is the pager's count, not the header
-	// field. The count is the one every reader of this snapshot uses
-	// (effectiveReaderDbSize: the wal-index header's committed size, else
-	// the file's). The process-local walIndex.maxPage must not be the cap:
-	// in a process that has not begun a write since a peer grew the
-	// database it is stale, and the peer's pages, still only in the WAL,
-	// were reported as invalid page numbers.
-	maxPossible, err := db.pager.effectiveReaderDbSize(walHdr)
-	if err != nil {
-		return err
-	}
+	// corrupted headers claiming billions of pages: SQLite fails lockBtree on
+	// a trusted size above the pager's count (btree.c:3401-3408); the check
+	// here goes on with the pages that exist.
 	if maxPossible > 0 && nPages > maxPossible {
 		nPages = maxPossible
 	}
