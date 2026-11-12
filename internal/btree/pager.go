@@ -2702,8 +2702,15 @@ func (p *pager) pagerStress(pg *page) error {
 	// Mark the page as clean so it becomes evictable (SQLite pager.c:4677).
 	p.writerCache.makeClean(pg)
 
+	if testAfterSpillHook != nil {
+		testAfterSpillHook()
+	}
 	return nil
 }
+
+// testAfterSpillHook, when non-nil, runs once pagerStress has written a
+// spilled page to the WAL. Test-only.
+var testAfterSpillHook func()
 
 // commit writes all dirty pages to WAL and commits the transaction.
 // hasChanges reports whether the write transaction has anything to commit:
