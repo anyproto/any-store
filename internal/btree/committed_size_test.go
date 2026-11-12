@@ -12,6 +12,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -90,6 +92,14 @@ func TestCommittedSize_ShrinkFailsBeforePublication(t *testing.T) {
 			dst = restartReopen(t, dst, dstPath, m)
 			restartCheck(t, dst, 0, 3, 2)
 			restartCheck(t, dst, 3, committedSizeRows, 1)
+			require.NoError(t, dst.IntegrityCheck())
+		})
+		t.Run("reopen", func(t *testing.T) {
+			dst, src, dstPath := committedSizeShrinkFixture(t, m)
+			shrinkingBackupFails(t, dst, src)
+			require.NoError(t, dst.IntegrityCheck())
+			dst = restartReopen(t, dst, dstPath, m) // Close's own checkpoint only
+			restartCheck(t, dst, 0, committedSizeRows, 1)
 			require.NoError(t, dst.IntegrityCheck())
 		})
 		t.Run("truncate", func(t *testing.T) {
@@ -180,4 +190,119 @@ func TestCommittedSize_NewDatabase(t *testing.T) {
 		restartCheck(t, db, 0, 50, 1)
 		require.NoError(t, db.IntegrityCheck())
 	})
+}
+
+// heldRead reads rows of the committed 100 pages through rtx, which began
+// before the shrinks the caller runs in between, and ends it.
+func heldRead(rtx *ReadTx, between func() error) error {
+	defer func() { _ = rtx.Rollback() }()
+	if err := between(); err != nil {
+		return err
+	}
+	ns, err := rtx.GetNamespace("t1")
+	if err != nil {
+		return err
+	}
+	for i := 0; i < committedSizeRows; i++ {
+		v, err := rtx.Get(ns, binary.BigEndian.AppendUint32(nil, uint32(i)))
+		if err != nil {
+			return fmt.Errorf("row %d of the held snapshot: %w", i, err)
+		}
+		if len(v) != 300 || v[0] != 1 {
+			return fmt.Errorf("row %d of the held snapshot is not its own", i)
+		}
+	}
+	return nil
+}
+
+// TestCommittedSize_ReaderHeldThroughFailedShrink: a reader of the committed
+// 100 pages keeps its snapshot through a shrinking commit that fails, an
+// integrity check right after it, and the commit that then succeeds. A
+// backup's destination cannot have a transaction open when the backup starts
+// (BackupInit, as sqlite3_backup_init), so the reader begins once the pages
+// are copied, and the commit after the failure is an ordinary one.
+func TestCommittedSize_ReaderHeldThroughFailedShrink(t *testing.T) {
+	forEachRestartMode(t, func(t *testing.T, m restartMode) {
+		dst, src, _ := committedSizeShrinkFixture(t, m)
+		b, err := dst.BackupInit(src)
+		require.NoError(t, err)
+		require.ErrorIs(t, b.Step(context.Background(), -1), ErrBackupDone)
+		rtx, err := dst.BeginRead()
+		require.NoError(t, err)
+		require.NoError(t, heldRead(rtx, func() error {
+			failPublication(t)
+			if err := b.Finish(); !errors.Is(err, errInjectedPublish) {
+				return fmt.Errorf("the shrinking commit: %v", err)
+			}
+			testCommitPublishErrHook = nil
+			if err := dst.IntegrityCheck(); err != nil {
+				return err
+			}
+			wtx, err := dst.BeginWrite()
+			if err != nil {
+				return err
+			}
+			restartPutTx(t, wtx, committedSizeRows, committedSizeRows+3, 2)
+			return wtx.Commit()
+		}))
+		restartCheck(t, dst, 0, committedSizeRows, 1)
+		restartCheck(t, dst, committedSizeRows, committedSizeRows+3, 2)
+		require.NoError(t, dst.IntegrityCheck())
+
+		b, err = dst.BackupInit(src)
+		require.NoError(t, err)
+		require.ErrorIs(t, b.Step(context.Background(), -1), ErrBackupDone)
+		require.NoError(t, b.Finish())
+		restartCheck(t, dst, 0, committedSizeSrc, 9)
+		require.NoError(t, dst.IntegrityCheck())
+	})
+}
+
+// TestCommittedSize_BackupCopiesTheLogicalSize: a backup copies the pages of
+// the source's logical size, page 1's when it is trusted, not every page of
+// its file. sqlite3_backup_step takes sqlite3BtreeLastPage (backup.c:388),
+// which is lockBtree's count (btree.c:2364-2369, 3294-3298). A file with a
+// trailing page past that size, and no commit in its WAL, gave the pager's
+// count instead, and the destination held a page nothing uses.
+func TestCommittedSize_BackupCopiesTheLogicalSize(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		for _, m := range restartModes[:2] { // a file to append to
+			name := m.name + "/format6"
+			if legacy {
+				name = m.name + "/format5"
+			}
+			t.Run(name, func(t *testing.T) {
+				prev := createLegacyFormat.Load()
+				SetCreateLegacyFormatForTest(legacy)
+				defer SetCreateLegacyFormatForTest(prev)
+
+				srcPath := filepath.Join(t.TempDir(), "src.db")
+				src, err := testOpen(t, srcPath, m.opts)
+				require.NoError(t, err)
+				restartPut(t, src, 0, 1, 7)
+				require.NoError(t, src.Checkpoint(CheckpointTruncate))
+				logical := src.pager.dbSize.Load()
+				require.NoError(t, src.Close())
+				f, err := os.OpenFile(srcPath, os.O_WRONLY|os.O_APPEND, 0)
+				require.NoError(t, err)
+				_, err = f.Write(make([]byte, m.opts.PageSize))
+				require.NoError(t, err)
+				require.NoError(t, f.Close())
+
+				src, err = testOpen(t, srcPath, m.opts)
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = src.Close() })
+				require.Equal(t, logical, src.pager.dbSize.Load(), "setup: page 1's size is trusted")
+
+				dst, _ := openRestartDB(t, m)
+				b, err := dst.BackupInit(src)
+				require.NoError(t, err)
+				require.ErrorIs(t, b.Step(context.Background(), -1), ErrBackupDone)
+				require.NoError(t, b.Finish())
+				require.Equal(t, logical, dst.pager.dbSize.Load(), "the destination has the source's logical size")
+				require.NoError(t, dst.IntegrityCheck())
+				restartCheck(t, dst, 0, 1, 7)
+			})
+		}
+	}
 }
