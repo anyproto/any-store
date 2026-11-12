@@ -604,3 +604,37 @@ func TestWalWriterRestart_NotFromSlot0Fallback(t *testing.T) {
 		require.NoError(t, db.IntegrityCheck())
 	})
 }
+
+// Starting the log over reuses its storage and gives none back: after a long
+// log, a short one leaves the WAL file at its old size (a frame of the new
+// log overwrites the start of the old), and in in-memory mode the frames go
+// into the arena the long log allocated.
+func TestWalWriterRestart_ReusesStorage(t *testing.T) {
+	forEachRestartMode(t, func(t *testing.T, m restartMode) {
+		db, path := openRestartDB(t, m)
+		restartPut(t, db, 0, 400, 1)
+		w := db.pager.wal
+		n := w.index.mxCommitFrame.LoadLocal()
+		var size int64
+		var arena *byte
+		if m.opts.InMemory {
+			require.NotEmpty(t, w.memArena)
+			arena = &w.memArena[0]
+		} else {
+			size = restartWalSize(t, path)
+			require.Equal(t, int64(walHeaderSize)+int64(n)*(int64(walFrameSize)+int64(w.pageSize)), size)
+		}
+		require.NoError(t, db.Checkpoint(CheckpointPassive))
+
+		restartPut(t, db, 0, 1, 2)
+		require.Less(t, w.index.mxCommitFrame.LoadLocal(), n/4, "setup: a short log replaced the long one")
+		if m.opts.InMemory {
+			require.Same(t, arena, &w.memArena[0], "the arena is the one the long log allocated")
+			require.LessOrEqual(t, w.memArenaOff, int(n/4)*int(w.pageSize), "and it is filled from its start")
+		} else {
+			require.Equal(t, size, restartWalSize(t, path), "the file is reused, not shrunk")
+		}
+		restartCheck(t, db, 0, 1, 2)
+		restartCheck(t, db, 1, 400, 1)
+	})
+}

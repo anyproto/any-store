@@ -105,6 +105,83 @@ func openDBWithFault(t *testing.T, dir string, opts Options) (*DB, *faultFile) {
 }
 
 // writeDocuments writes n documents to a namespace, each with unique key and data.
+// holdWALSlotReader begins a read transaction whose snapshot is in the log
+// (reader slots 1-4) and returns its release. While it is held no writer
+// starts the log over (wal.restartLogLocked needs those slots), so frames
+// written after a checkpoint are numbered above the checkpoint's frontier.
+// A reader of an older snapshot does not cap a later checkpoint here: the
+// caller releases it before the checkpoint under test.
+func holdWALSlotReader(t *testing.T, db *DB) (release func()) {
+	t.Helper()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	require.NotZero(t, rtx.walSlot, "setup: the reader's snapshot is in the log")
+	released := false
+	release = func() {
+		if !released {
+			released = true
+			require.NoError(t, rtx.Rollback())
+		}
+	}
+	t.Cleanup(func() {
+		if !released {
+			released = true
+			_ = rtx.Rollback()
+		}
+	})
+	return release
+}
+
+// TestMinFrameFilter_FailedCheckpointInRestartedLog is
+// TestMinFrameFilter_SuccessThenFailThenRead without a reader in the log: the
+// second batch's writer starts the log over, so its frames are numbered from
+// 1 and the checkpoint frontier is 0 again. A checkpoint that fails partway
+// leaves that frontier where it was, and every document reads back: batch 1
+// from the database file, batch 2 from the new log.
+func TestMinFrameFilter_FailedCheckpointInRestartedLog(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.DisableAutoCheckpoint = true
+	opts.InProcess = true
+
+	db, ff := openDBWithFault(t, dir, opts)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	writeDocuments(t, db, "data", 0, 100)
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+	w := db.pager.wal
+	end1 := w.index.maxFrame.Load()
+	require.Equal(t, end1, w.index.nBackfill.Load(), "setup: the first log is fully backfilled")
+
+	writeDocuments(t, db, "data", 100, 100)
+	end2 := w.index.maxFrame.Load()
+	require.Less(t, end2, end1+100, "setup: the log was started over")
+	before := w.index.nBackfill.Load()
+	require.Zero(t, before, "the new log's frontier starts at 0")
+
+	ff.enableFault(2)
+	err = db.Checkpoint(CheckpointFull)
+	require.ErrorIs(t, err, errInjectedIO)
+	require.Positive(t, ff.failedWriteAts.Load(), "the injected fault must have actually fired")
+	ff.disableFault()
+	require.Equal(t, before, w.index.nBackfill.Load(), "a failed checkpoint does not advance the frontier")
+	require.Equal(t, end2, w.index.maxFrame.Load())
+
+	verifyDocuments(t, db, "data", 200)
+
+	require.NoError(t, db.Close())
+	ResetVFS()
+	db2, err := testOpen(t, filepath.Join(dir, "test.db"), opts)
+	require.NoError(t, err)
+	defer func() { _ = db2.Close() }()
+	verifyDocuments(t, db2, "data", 200)
+}
+
 func writeDocuments(t *testing.T, db *DB, nsName string, start, count int) {
 	t.Helper()
 	for i := start; i < start+count; i++ {
@@ -918,6 +995,10 @@ func TestMinFrameFilter_ReadAfterSuccessfulCheckpoint(t *testing.T) {
 	writeDocuments(t, db, "data", 0, 30)
 
 	// Checkpoint successfully — nBackfill should advance
+	// A reader in the log (slots 1-4), from before the checkpoint until the
+	// next batch is written: the writer cannot start the log over under it,
+	// so the batch goes above the checkpoint's frontier, in the same log.
+	releaseReader := holdWALSlotReader(t, db)
 	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	nBackfill := db.pager.wal.index.nBackfill.Load()
@@ -930,6 +1011,7 @@ func TestMinFrameFilter_ReadAfterSuccessfulCheckpoint(t *testing.T) {
 
 	// Write more data — this creates new WAL frames above nBackfill
 	writeDocuments(t, db, "data", 30, 20)
+	releaseReader()
 
 	maxFrame2 := db.pager.wal.index.maxFrame.Load()
 	t.Logf("After more writes: nBackfill=%d maxFrame=%d", nBackfill, maxFrame2)
@@ -1021,6 +1103,10 @@ func TestMinFrameFilter_SuccessThenFailThenRead(t *testing.T) {
 
 	// Phase 1: Write batch 1 and checkpoint successfully.
 	writeDocuments(t, db, "data", 0, 100)
+	// A reader in the log (slots 1-4), from before the checkpoint until the
+	// next batch is written: the writer cannot start the log over under it,
+	// so the batch goes above the checkpoint's frontier, in the same log.
+	releaseReader := holdWALSlotReader(t, db)
 	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	nBackfill1 := db.pager.wal.index.nBackfill.Load()
@@ -1030,6 +1116,9 @@ func TestMinFrameFilter_SuccessThenFailThenRead(t *testing.T) {
 
 	// Phase 2: Write batch 2 (creates new WAL frames above nBackfill).
 	writeDocuments(t, db, "data", 100, 100)
+	releaseReader()
+	require.Equal(t, nBackfill1, db.pager.wal.index.nBackfill.Load(),
+		"setup: the frontier before the failing checkpoint is the first checkpoint's, in one log")
 
 	maxFrame2 := db.pager.wal.index.maxFrame.Load()
 	t.Logf("After batch 2: nBackfill=%d maxFrame=%d", nBackfill1, maxFrame2)
@@ -1229,6 +1318,10 @@ func TestMinFrameFilter_OverwriteCheckpointedPages(t *testing.T) {
 
 	// Phase 1: Write docs 0-99 and checkpoint successfully.
 	writeDocuments(t, db, "data", 0, 100)
+	// A reader in the log (slots 1-4), from before the checkpoint until the
+	// next batch is written: the writer cannot start the log over under it,
+	// so the batch goes above the checkpoint's frontier, in the same log.
+	releaseReader := holdWALSlotReader(t, db)
 	require.NoError(t, db.Checkpoint(CheckpointFull))
 	nBackfill1 := db.pager.wal.index.nBackfill.Load()
 	t.Logf("Phase 1: nBackfill=%d", nBackfill1)
@@ -1248,6 +1341,9 @@ func TestMinFrameFilter_OverwriteCheckpointedPages(t *testing.T) {
 		require.NoError(t, tx.Commit())
 	}
 
+	releaseReader()
+	require.Equal(t, nBackfill1, db.pager.wal.index.nBackfill.Load(),
+		"setup: the frontier before the failing checkpoint is the first checkpoint's, in one log")
 	maxFrame2 := db.pager.wal.index.maxFrame.Load()
 	t.Logf("Phase 2: nBackfill=%d maxFrame=%d", nBackfill1, maxFrame2)
 	require.Greater(t, maxFrame2, nBackfill1)
@@ -1346,6 +1442,10 @@ func TestMinFrameFilter_NonInProcess(t *testing.T) {
 
 	// Write and checkpoint
 	writeDocuments(t, db, "data", 0, 30)
+	// A reader in the log (slots 1-4), from before the checkpoint until the
+	// next batch is written: the writer cannot start the log over under it,
+	// so the batch goes above the checkpoint's frontier, in the same log.
+	releaseReader := holdWALSlotReader(t, db)
 	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	nBackfill := db.pager.wal.index.nBackfill.Load()
@@ -1353,6 +1453,7 @@ func TestMinFrameFilter_NonInProcess(t *testing.T) {
 
 	// Write more and do a failed checkpoint
 	writeDocuments(t, db, "data", 30, 20)
+	releaseReader()
 	ff.enableFault(3)
 	_ = db.Checkpoint(CheckpointFull)
 	ff.disableFault()
@@ -1469,6 +1570,10 @@ func TestCheckpointBackfill_ShortWrite_NoError(t *testing.T) {
 
 	// Phase 1: Write batch 1 and checkpoint successfully
 	writeDocuments(t, db, "data", 0, 30)
+	// A reader in the log (slots 1-4), from before the checkpoint until the
+	// next batch is written: the writer cannot start the log over under it,
+	// so the batch goes above the checkpoint's frontier, in the same log.
+	releaseReader := holdWALSlotReader(t, db)
 	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	nBackfill1 := db.pager.wal.index.nBackfill.Load()
@@ -1478,6 +1583,7 @@ func TestCheckpointBackfill_ShortWrite_NoError(t *testing.T) {
 
 	// Phase 2: Write batch 2 (new WAL frames above nBackfill)
 	writeDocuments(t, db, "data", 30, 30)
+	releaseReader()
 
 	maxFrame2 := db.pager.wal.index.maxFrame.Load()
 	t.Logf("After batch 2: nBackfill=%d maxFrame=%d", nBackfill1, maxFrame2)
@@ -1557,6 +1663,10 @@ func TestCheckpointBackfill_ShortWrite_InlineRead(t *testing.T) {
 	// Phase 1: write batch 1 and checkpoint successfully (these pages are fully
 	// and correctly written to the DB file).
 	writeDocuments(t, db, "data", 0, 40)
+	// A reader in the log (slots 1-4), from before the checkpoint until the
+	// next batch is written: the writer cannot start the log over under it,
+	// so the batch goes above the checkpoint's frontier, in the same log.
+	releaseReader := holdWALSlotReader(t, db)
 	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	nBackfill := db.pager.wal.index.nBackfill.Load()
@@ -1565,6 +1675,9 @@ func TestCheckpointBackfill_ShortWrite_InlineRead(t *testing.T) {
 
 	// Phase 2: write batch 2 (new WAL frames above nBackfill).
 	writeDocuments(t, db, "data", 40, 40)
+	releaseReader()
+	require.Equal(t, nBackfill, db.pager.wal.index.nBackfill.Load(),
+		"setup: the frontier before the failing checkpoint is the first checkpoint's, in one log")
 	maxFrame := db.pager.wal.index.maxFrame.Load()
 	require.Greater(t, maxFrame, nBackfill)
 

@@ -249,6 +249,10 @@ const (
 //	wrap:   commit rows [60, 200), checkpoint everything, then start a
 //	        transaction that starts the log over, spill it, and exit without
 //	        committing or closing
+//	commit-torn: commit rows [60, 200), checkpoint everything, commit a
+//	        transaction that starts the log over, then put wal-index header
+//	        copy 1 back to the restart header and exit: the shm as a crash
+//	        between the two copies of the commit's header leaves it
 //	commit-unpublished: commit rows [60, 200), checkpoint everything, then
 //	        commit a transaction that starts the log over and exit once its
 //	        frames are synced, before its wal-index header is written
@@ -280,6 +284,29 @@ func restartPeerChild(t *testing.T) bool {
 		restartPutTx(t, wtx, 0, 30, 2)
 		restartSpillAll(t, db)
 		require.Less(t, db.pager.wal.nFrame.Load(), n, "the peer started the log over")
+	case "commit-torn":
+		restartPut(t, db, 60, 200, 1)
+		require.NoError(t, db.Checkpoint(CheckpointPassive))
+		region, err := db.pager.wal.index.shm.region(0, true)
+		require.NoError(t, err)
+		var restartCopy [walIndexHdrSize]byte
+		restarted := false
+		testRestartLogHook = func(step string) {
+			switch step {
+			case "restarted":
+				restarted = true
+			case "publish": // copy 1 is still the restart header
+				copy(restartCopy[:], region[0:walIndexHdrSize])
+			}
+		}
+		restartPut(t, db, 0, 30, 2)
+		testRestartLogHook = nil
+		require.True(t, restarted, "the commit started the log over")
+		// Writers publish copy 2 first and copy 1 second
+		// (walIndex.writeHeader).
+		copy(region[0:walIndexHdrSize], restartCopy[:])
+		_, valid := db.pager.wal.index.readHeader()
+		require.False(t, valid, "child setup: the header must be torn")
 	case "commit-unpublished":
 		restartPut(t, db, 60, 200, 1)
 		require.NoError(t, db.Checkpoint(CheckpointPassive))
@@ -402,8 +429,8 @@ func TestWalWriterRestart_PeerDiesAfterRestart(t *testing.T) {
 // still has the restart header, with no frames, over a WAL file that holds
 // the peer's frames. It must read a consistent database, and its next commit
 // must take the log over from frame 1 and be recovered by a later open. A
-// fresh recovery of the files as the peer left them finds either state of
-// the peer's transaction, whole.
+// fresh recovery of the files as the peer left them finds the peer's commit,
+// which was synced.
 func TestWalWriterRestart_PeerDiesBeforePublishingCommit(t *testing.T) {
 	if restartPeerChild(t) {
 		return
@@ -421,16 +448,10 @@ func TestWalWriterRestart_PeerDiesBeforePublishingCommit(t *testing.T) {
 	require.Greater(t, restartWalSize(t, path), int64(walHeaderSize), "setup: the peer's frames are in the WAL file")
 	restartCheck(t, db, 0, 200, 1)
 
-	// The files alone: the peer's transaction is all there or not at all.
+	// The files alone: the peer's commit was written and synced, so a
+	// recovery from the WAL's bytes finds it.
 	restartRecoverCopy(t, path, "crash", m, func(cdb *DB) {
-		rtx, err := cdb.BeginRead()
-		require.NoError(t, err)
-		ns, err := rtx.GetNamespace("t1")
-		require.NoError(t, err)
-		val, err := rtx.Get(ns, []byte{0, 0, 0, 0})
-		require.NoError(t, err)
-		require.NoError(t, rtx.Rollback())
-		restartCheck(t, cdb, 0, 30, val[0])
+		restartCheck(t, cdb, 0, 30, 2)
 		restartCheck(t, cdb, 30, 200, 1)
 	})
 
@@ -440,6 +461,43 @@ func TestWalWriterRestart_PeerDiesBeforePublishingCommit(t *testing.T) {
 	restartRecoverCopy(t, path, "crash-after", m, func(cdb *DB) {
 		restartCheck(t, cdb, 0, 3, 3)
 		restartCheck(t, cdb, 3, 200, 1)
+	})
+	require.NoError(t, db.IntegrityCheck())
+}
+
+// A peer starts the log over, commits in the new log, and dies between the
+// two copies of the commit's wal-index header: copy 2 is the commit's, copy 1
+// still the restart header's. The surviving process finds the header invalid,
+// rebuilds the wal-index from the WAL file, and reads the peer's commit; its
+// own next commit goes after it and a later recovery finds both.
+func TestWalWriterRestart_PeerDiesBetweenHeaderCopies(t *testing.T) {
+	if restartPeerChild(t) {
+		return
+	}
+	m := restartModes[0]
+	db, path := openRestartDB(t, m)
+	restartPut(t, db, 0, 60, 1)
+
+	peer := startRestartPeer(t, "TestWalWriterRestart_PeerDiesBetweenHeaderCopies", path, "commit-torn")
+	require.NoError(t, peer.Wait())
+
+	_, valid := db.pager.wal.index.readHeader()
+	require.False(t, valid, "setup: the peer left the header torn")
+
+	restartCheck(t, db, 0, 30, 2) // the survivor's read recovers the wal-index
+	restartCheck(t, db, 30, 200, 1)
+	hdr, valid := db.pager.wal.index.readHeader()
+	require.True(t, valid, "the read repaired the header")
+	require.NotZero(t, hdr.mxFrame)
+
+	restartPut(t, db, 0, 3, 3)
+	restartCheck(t, db, 0, 3, 3)
+	restartCheck(t, db, 3, 30, 2)
+	restartCheck(t, db, 30, 200, 1)
+	restartRecoverCopy(t, path, "crash", m, func(cdb *DB) {
+		restartCheck(t, cdb, 0, 3, 3)
+		restartCheck(t, cdb, 3, 30, 2)
+		restartCheck(t, cdb, 30, 200, 1)
 	})
 	require.NoError(t, db.IntegrityCheck())
 }
