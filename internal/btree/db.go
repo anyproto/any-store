@@ -2224,20 +2224,35 @@ func (tx *ReadTx) CountContext(ctx context.Context, ns *Namespace) (int, error) 
 }
 
 // DatabaseSize returns the number of pages in the database, including page 1
-// (the header page), as of this transaction's snapshot.
-// ~ sqlite3BtreeLastPage / sqlite3PagerPagecount (btree.c:2371, pager.c:3925):
-// SQLite returns the per-connection pPager->dbSize, which is set from the
-// reader's captured WAL-index header (sqlite3WalDbsize == pWal->hdr.nPage,
-// pager.c:5448). Here it is the per-reader snapshot bound carried on the
-// reader cache (tx.cache.dbSize, set at BeginRead from effectiveReaderDbSize),
-// so the count is consistent with the same snapshot used for page reads —
-// not the live global writer counter that DB.DatabaseSize exposes.
+// (the header page), as of this transaction's snapshot: sqlite3BtreeLastPage
+// (btree.c:2364-2369), the btree's nPage. lockBtree takes that from page 1
+// when page 1's size is non-zero and its change counter matches
+// VersionValidFor, and from the pager's count otherwise (btree.c:3294-3298);
+// lockBtreePageCount applies the rule to the snapshot's page 1. The pager's
+// count (sqlite3WalDbsize, or the database file's size when the WAL has no
+// commit) is the bound page reads use (tx.cache.dbSize, from
+// effectiveReaderDbSize). It can be larger: a file may hold pages past the
+// logical size, which are no part of the database, and a backup that copied
+// them would leave pages nothing uses in its destination.
 //
-// For a write transaction (embedded ReadTx, cache==nil), readerDbSizeBound
-// falls back to p.dbSize, which is the writer's live page count and matches
-// sqlite3BtreeLastPage's pBt->nPage for the writing connection.
-func (tx *ReadTx) DatabaseSize() uint32 {
-	return tx.pager.readerDbSizeBound(tx.cache)
+// For a write transaction (embedded ReadTx, cache==nil) it is p.dbSize, the
+// writer's live page count, which beginWrite derived by the same rule and
+// which matches sqlite3BtreeLastPage's pBt->nPage for the writing connection.
+func (tx *ReadTx) DatabaseSize() (uint32, error) {
+	if tx.cache == nil {
+		return tx.pager.dbSize.Load(), nil
+	}
+	pg, err := tx.pager.getPageReader(1, tx.walMaxFrame, tx.cache)
+	if err != nil {
+		return 0, err
+	}
+	var h dbHeader
+	err = h.deserialize(pg.data[:dbHeaderSize])
+	tx.pager.releasePage(pg)
+	if err != nil {
+		return 0, err
+	}
+	return lockBtreePageCount(&h, tx.pager.readerDbSizeBound(tx.cache))
 }
 
 // GetNamespace returns a Namespace handle for the given name, respecting the

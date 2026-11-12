@@ -1178,10 +1178,19 @@ Two mechanisms coexist in the implementation, each solving a distinct problem:
    snapshot-establish site. It is derived by `pager.effectiveReaderDbSize`
    (pager.go:1664-1686), which mirrors `sqlite3WalDbsize` (wal.c:3672, returning
    `pWal->hdr.nPage`) and, when the WAL header carries no committed size, falls back
-   to the database file's size as `pagerPagecount` does (pager.c:3299-3305); only
-   in-process mode falls back to `pager.dbSize`. Until 2026-11-11 the fallback was
-   `pager.dbSize` in every mode, and a WAL reset published a header without a size:
-   see [drift-2026-11-11-3](#drift-2026-11-11-3-reader-size-without-a-wal-commit-is-memoized). Every reader bound check consults this via
+   to the database file's size as `pagerPagecount` does (pager.c:3299-3305). The
+   in-process and in-memory modes publish no wal-index header: their synthesized
+   snapshot header carries the size of the walIndex's committed position, the
+   commit frame and its size in one word (`mxframe.go`), which only a published
+   commit moves and which open and database creation seed; no reader there uses
+   `pager.dbSize` either (until 2026-11-12 they did, and a reader of the committed
+   snapshot failed on its pages above an uncommitted shrink). Until 2026-11-11 the
+   fallback was `pager.dbSize` in every mode, and a WAL reset published a header
+   without a size: see [drift-2026-11-11-3](#drift-2026-11-11-3-reader-size-without-a-wal-commit-is-memoized).
+   This is the pager's count, the bound for page reads; the database's logical
+   size, which `ReadTx.DatabaseSize` returns and a backup copies, is lockBtree's
+   count from the snapshot's page 1 (`sqlite3BtreeLastPage`, btree.c:2364-2369).
+   Every reader bound check consults this via
    `pager.readerDbSizeBound` (pager.go:1688-1699), which returns `cache.dbSize`
    when set and otherwise degrades safely to `pager.dbSize.Load()` for the
    writer/uncached paths. `IntegrityCheckN` sets `cache.dbSize = nPages` likewise
@@ -3179,7 +3188,7 @@ does correctly restore `aReadMark[0]=0` after clobbering all slots, unlike `rese
 
 SQLite sizes the database at the start of every transaction with `pagerPagecount` (`pager.c:3279-3306`): `sqlite3WalDbsize`, i.e. `pWal->hdr.nPage`, when it is non-zero, else an `fstat` of the database file. `walRestartHdr` zeroes `mxFrame` and leaves `hdr.nPage` alone (`wal.c:2146-2160`), so the first branch keeps answering after a RESTART or TRUNCATE.
 
-Go had neither half. `doResetWAL` published the reset header with `nPage = 0`, and `effectiveReaderDbSize` fell back to the process-local `pager.dbSize`, which only a write begin refreshes. A process that had not written since a peer grew the database therefore bounded its readers by its own stale size as soon as any process reset the WAL, and valid pages failed with `ErrCorrupt` ("invalid page number" from `IntegrityCheck`, whose cap used the equally process-local `walIndex.maxPage`). Both rules are now ported: the reset header keeps the last commit's size, and without a committed size a multi-process reader takes the file's. A failed file-size query fails the read begin, as `pagerPagecount` returns the `fstat` error (`pager.c:3299-3303`); until 2026-11-12 it fell back to the local size (regression test `TestReaderSizeStatErrorPropagates`, vfs tag). In-process mode keeps `pager.dbSize`: its writers publish no wal-index header and no other process can change the database.
+Go had neither half. `doResetWAL` published the reset header with `nPage = 0`, and `effectiveReaderDbSize` fell back to the process-local `pager.dbSize`, which only a write begin refreshes. A process that had not written since a peer grew the database therefore bounded its readers by its own stale size as soon as any process reset the WAL, and valid pages failed with `ErrCorrupt` ("invalid page number" from `IntegrityCheck`, whose cap used the equally process-local `walIndex.maxPage`). Both rules are now ported: the reset header keeps the last commit's size, and without a committed size a multi-process reader takes the file's. A failed file-size query fails the read begin, as `pagerPagecount` returns the `fstat` error (`pager.c:3299-3303`); until 2026-11-12 it fell back to the local size (regression test `TestReaderSizeStatErrorPropagates`, vfs tag). The in-process and in-memory modes publish no wal-index header; their readers take the size of the committed position, frame and size kept in one word and moved only by a published commit (`commitFrameCounter`). Until 2026-11-12 they took `pager.dbSize`, which an open write transaction moves.
 
 The remaining difference is that the file size is read once per wal-index header, not once per transaction (`pager.noWalCommitSize`). Measured on an M2: the `fstat` costs about 390 ns and one allocation, a sixth of a point read on a freshly opened, checkpointed database — the state a read-mostly process stays in. The memo is exact as long as the file's size cannot change under an unchanged 48-byte header that carries no size: the file changes only when a checkpoint copies frames into it; frames need a commit; a commit publishes a header with a size, and every later reset keeps it; a header without a size reappears only when a process rebuilds the index over a WAL holding no commit, which after a TRUNCATE means freshly drawn salts. The one way back to the identical header is a WAL whose frames have been destroyed behind an intact WAL header, and then the stale (smaller) size fails closed: pages beyond it read as corrupt, none are served wrongly.
 

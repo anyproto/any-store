@@ -324,9 +324,14 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 	// ~ backup.c:394: nSrcPage = sqlite3BtreeLastPage(pSrc), read once under
 	// the source read-lock. Derive from the read-tx snapshot opened above so
 	// the loop bound, nPagecount/nRemaining, finalize, and the page-1 size
-	// patch are all consistent with the same snapshot (and with the bound
-	// getPageReader validates copied pages against, pager.go:952).
-	nSrcPage := rtx.DatabaseSize()
+	// patch are all consistent with the same snapshot. It is the logical
+	// size lockBtree derives from page 1, not the pager's count, which can
+	// include pages past it (ReadTx.DatabaseSize).
+	nSrcPage, err := rtx.DatabaseSize()
+	if err != nil {
+		b.rc = err
+		return err
+	}
 	srcPgsz := b.src.PageSize()
 
 	// Main copy loop. ~ backup.c:390–401.

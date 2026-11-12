@@ -946,6 +946,13 @@
     ],
     "note": "polls ctx once per interior page in place of isInterrupted on every page"
   },
+  "db.go:*ReadTx.DatabaseSize": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeLastPage",
+      "btree.c:lockBtree"
+    ],
+    "note": "the logical page count of the snapshot: lockBtree's rule applied to the snapshot's page 1"
+  },
   "db.go:*ReadTx.DiskSchemaCookie": {
     "sqlite": [],
     "note": ""

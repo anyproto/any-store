@@ -371,7 +371,9 @@ func TestBackup_FinalizedDstReportsTruePageCount(t *testing.T) {
 	rtx, err := d2.BeginRead()
 	require.NoError(t, err)
 	defer rtx.Rollback()
-	require.Equal(t, nSrc, rtx.DatabaseSize(),
+	snapSize, err := rtx.DatabaseSize()
+	require.NoError(t, err)
+	require.Equal(t, nSrc, snapSize,
 		"snapshot DatabaseSize must equal the true page count")
 
 	// Descent over the dst must succeed for every key. With a stale
