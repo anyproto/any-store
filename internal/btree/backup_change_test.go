@@ -521,3 +521,52 @@ func TestClose_BeginWriteNotYetRegistered(t *testing.T) {
 		require.NoError(t, closeErr)
 	})
 }
+
+// A backup that is done stays done: a further Step copies nothing and
+// returns ErrBackupDone again (isFatalError(SQLITE_DONE) is true,
+// backup.c:217-219, so sqlite3_backup_step returns at once, backup.c:329-330).
+// The source's commits after that are not sent to the backup either, so a
+// Step that went on would copy the pages the source grew by next to pages of
+// the state before: Finish must commit the snapshot the backup completed at.
+func TestBackupChange_DoneIsTerminal(t *testing.T) {
+	forEachRestartMode(t, func(t *testing.T, m restartMode) {
+		f := newBackupFixture(t, m)
+		for {
+			err := f.b.Step(context.Background(), 64)
+			if errors.Is(err, ErrBackupDone) {
+				break
+			}
+			require.NoError(t, err)
+		}
+		done := f.src.DatabaseSize()
+
+		// The source changes every row and grows.
+		wtx, err := f.src.BeginWrite()
+		require.NoError(t, err)
+		restartPutTx(t, wtx, 0, 3*backupRows, 2)
+		wtx.MarkDataChanged()
+		require.NoError(t, wtx.Commit())
+		require.Greater(t, f.src.DatabaseSize(), done, "setup: the source grew")
+
+		require.ErrorIs(t, f.b.Step(context.Background(), -1), ErrBackupDone)
+		require.ErrorIs(t, f.b.Step(context.Background(), 4), ErrBackupDone)
+		require.NoError(t, f.b.Finish())
+
+		check := func(db *DB) {
+			restartCheck(t, db, 0, backupRows, 1)
+			require.Equal(t, done, db.DatabaseSize(), "the copy is the snapshot the backup completed at")
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			ns, err := rtx.GetNamespace("t1")
+			require.NoError(t, err)
+			n, err := rtx.Count(ns)
+			require.NoError(t, err)
+			require.NoError(t, rtx.Rollback())
+			require.Equal(t, backupRows, n)
+			require.NoError(t, db.IntegrityCheck())
+		}
+		check(f.dst)
+		f.dst = restartReopen(t, f.dst, f.dstPath, restartModes[0])
+		check(f.dst)
+	})
+}
