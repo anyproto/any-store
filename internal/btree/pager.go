@@ -2714,6 +2714,11 @@ func (p *pager) hasChanges() bool {
 		p.wal.nFrame.Load() > p.walBaseFrame()
 }
 
+// testIgnorePage1HeaderDiff leaves the header comparison out of
+// commitNeedsPage1: a deliberate fault the page-1 property test must catch.
+// Test-only; set before any transaction runs.
+var testIgnorePage1HeaderDiff bool
+
 // page1OnChange reports whether this file's commits write page 1 only when
 // they have to (commitNeedsPage1): schema format 6 and later. The format of
 // a file is fixed when it is opened or created (setLeafRule) and never
@@ -2739,7 +2744,7 @@ func (p *pager) page1OnChange() bool {
 // counter is set.
 // DRIFT: page 1 is written when its header bytes change, not whenever a freelist or size write touched it; net-zero header changes skip the frame See docs/btree/NOTES.md#drift-2026-11-12-5-page-1-written-when-its-header-changes
 func (p *pager) commitNeedsPage1() bool {
-	if p.header != p.savedHeader || p.writerCache.nDirty == 0 {
+	if (p.header != p.savedHeader && !testIgnorePage1HeaderDiff) || p.writerCache.nDirty == 0 {
 		return true
 	}
 	pg := p.writerCache.hashFind(1)
