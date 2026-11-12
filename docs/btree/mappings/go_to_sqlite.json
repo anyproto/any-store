@@ -1861,11 +1861,23 @@
     "sqlite": [
       "pager.c:sqlite3PagerCheckpoint"
     ],
-    "note": ""
+    "note": "automatic checkpoint: PASSIVE only, as sqlite3WalDefaultHook's"
   },
   "pager.go:*pager.usableSize": {
     "sqlite": [],
     "note": ""
+  },
+  "pager.go:*pager.walBase": {
+    "sqlite": [
+      "wal.c:sqlite3WalUndo"
+    ],
+    "note": "the open write transaction's starting position in the log, through wal.base"
+  },
+  "pager.go:*pager.walBaseFrame": {
+    "sqlite": [
+      "wal.c:sqlite3WalUndo"
+    ],
+    "note": "walBase's frame number, atomics only (rollbackForClose)"
   },
   "pager.go:*pager.withWriteLock": {
     "sqlite": [],
@@ -2178,6 +2190,13 @@
     "sqlite": [],
     "note": ""
   },
+  "wal.go:*wal.base": {
+    "sqlite": [
+      "wal.c:sqlite3WalSavepointUndo",
+      "wal.c:sqlite3WalUndo"
+    ],
+    "note": "a position saved before the log was started over maps to frame 0 of the new log: the nCkpt test of wal.c:3829-3835 and the reloaded header of wal.c:3775"
+  },
   "wal.go:*wal.beginRead": {
     "sqlite": [
       "wal.c:sqlite3WalBeginReadTransaction",
@@ -2241,7 +2260,7 @@
       "wal.c:walIteratorNext",
       "wal.c:walMergesort"
     ],
-    "note": ""
+    "note": "includes the salt re-check after read lock 0 (version-3.52.0 wal.c:2256-2267)"
   },
   "wal.go:*wal.close": {
     "sqlite": [
@@ -2251,10 +2270,9 @@
   },
   "wal.go:*wal.doResetWAL": {
     "sqlite": [
-      "wal.c:walRestartHdr",
-      "wal.c:walRestartLog"
+      "wal.c:walRestartHdr"
     ],
-    "note": ""
+    "note": "starts the log over; called by restartLogLocked and by a TRUNCATE checkpoint"
   },
   "wal.go:*wal.endRead": {
     "sqlite": [
@@ -2288,6 +2306,12 @@
     ],
     "note": ""
   },
+  "wal.go:*wal.pos": {
+    "sqlite": [
+      "wal.c:sqlite3WalSavepoint"
+    ],
+    "note": "frame count, checksums and log generation (aWalData, wal.c:3811-3815)"
+  },
   "wal.go:*wal.readFrame": {
     "sqlite": [
       "wal.c:sqlite3WalReadFrame"
@@ -2318,7 +2342,13 @@
     "sqlite": [
       "wal.c:walRestartHdr"
     ],
-    "note": "header half of a WAL restart: mxFrame 0, hdr.nPage kept; salts and nCkpt per drift-97/98"
+    "note": "header half of a WAL restart: mxFrame 0, hdr.nPage kept, salt1+1 and a random salt2; nCkpt stays 0 and aFrameCksum is the new WAL header's checksum (drift-98)"
+  },
+  "wal.go:*wal.restartLogLocked": {
+    "sqlite": [
+      "wal.c:walRestartLog"
+    ],
+    "note": "writer-side log restart before a transaction's first frames (wal.c:3870-3888); explicit nBackfill==mxFrame test; also try-locks the checkpoint lock (drift-2026-11-12-2); keeps reader slot 0 (drift-2026-11-12-3)"
   },
   "wal.go:*wal.rewriteChecksums": {
     "sqlite": [
@@ -2364,11 +2394,11 @@
     ],
     "note": "multi-process (mmap shm) arm of tryBeginReadHdr"
   },
-  "wal.go:*wal.tryResetWALWithBusy": {
+  "wal.go:*wal.waitReadersAndTruncate": {
     "sqlite": [
-      "wal.c:walRestartLog"
+      "wal.c:walCheckpoint"
     ],
-    "note": ""
+    "note": "RESTART/TRUNCATE tail (wal.c:2357-2382): RESTART only waits for reader slots 1-4, TRUNCATE also resets the header and truncates; a busy reader lock is the checkpoint's result"
   },
   "wal.go:*wal.writeFrames": {
     "sqlite": [

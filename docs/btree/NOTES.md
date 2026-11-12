@@ -2587,7 +2587,7 @@ than a correctness defect.
 
 <a id="drift-53-auto-checkpoint-escalates-to-wal-restart-beyond-passive"></a>
 ### Drift: Auto Checkpoint Escalates To WAL Restart Beyond Passive
-- **Category:** new-feature  -  **Severity:** medium
+- **Category:** new-feature  -  **Severity:** medium  -  **Status:** RESOLVED 2026-11-12: `tryCheckpoint` is a PASSIVE checkpoint and nothing else. The escalation existed because nothing else recycled the WAL; the writer now starts the log over itself, as SQLite's does (see [the RESTART port](#resolved-2026-11-12-restart-checkpoint-reset-the-wal)). What follows describes the code before that.
 - **Affected functions:** `pager.go:*pager.tryCheckpoint` (`internal/btree/pager.go:2757-2783`).
 
 SQLite's auto-checkpoint is strictly PASSIVE: the default WAL hook
@@ -3010,7 +3010,7 @@ or content changed) is effectively dead in the Go port, diverging from SQLite's 
 
 <a id="drift-97-wal-restart-randomizes-both-salts-instead-of-incrementing-sa"></a>
 ### Drift: WAL Restart Randomizes Both Salts Instead Of Incrementing Salt0
-- **Category:** changed-logic  -  **Severity:** low
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-12: a restart (`doResetWAL` → `restartHeaderStateLocked`) publishes the replaced log's first salt plus one and draws only the second, as `walRestartHdr` does (`wal.c:2152-2153`). The replaced log's salt is read from the live wal-index header under the write lock, since a process that has not written since a peer's reset holds an older one. A WAL with no log to continue (`initHeaderStateLocked`, `writeHeader`) still draws both, as SQLite does for the first frame of a WAL it has no checkpoint sequence for (`wal.c:4087`). Test: `TestWalCheckpointTruncate_ResetsAndIncrementsSalt`. What follows describes the code before that.
 - **Affected functions:** `wal.go:*wal.initHeaderStateLocked` (`internal/btree/wal.go:1754-1761`, the restart path reached from `doResetWAL` at `wal.go:3870`); `wal.go:*wal.writeHeader` (`internal/btree/wal.go:1801-1808`).
 
 SQLite's `walRestartHdr` (`wal.c:2146-2153`) deterministically advances salt-1 by `aSalt[0] = 1 + aSalt[0]`
@@ -3026,7 +3026,7 @@ salt pair simply differing from the previous generation.
 
 <a id="drift-98-wal-checkpoint-sequence-number-nckpt-never-incremented"></a>
 ### Drift: WAL Checkpoint Sequence Number nCkpt Never Incremented
-- **Category:** changed-logic  -  **Severity:** low
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** kept deliberately (2026-11-12), together with one more difference of the same origin: the restart header's `aFrameCksum`. SQLite's `walRestartHdr` leaves the old `aFrameCksum` in the header and the first frame of the new log replaces it with the checksum of the WAL header it writes, `nCkpt` included (`wal.c:4086`, `4095-4096`). Here the restart computes the new WAL header at once and publishes its checksum as `aFrameCksum`; a writer then writes the WAL header from its own fields, with checkpoint sequence 0, and seeds its frame chain from the published `aFrameCksum` (`beginWriteWithSnapshot`). Every released version does this, v2.4.x included. Publishing the old checksum, or a non-zero `nCkpt`, would make such a writer chain its frames from a seed that does not match the header on disk: recovery (`recoverLocked`) would reject frame 1 and an acknowledged commit would be lost. So `nCkpt` stays 0 and the seed stays the new header's while any such writer may attach. What `nCkpt` tells a SQLite savepoint, that the log was started over inside the transaction (`wal.c:3829-3835`), comes from a process-local generation count instead (`wal.logGen`, `wal.base`).
 - **Affected functions:** `wal.go:*wal.doResetWAL`
   (`internal/btree/wal.go:1801-1806` writeHeader sets `checkpoint:0`; doResetWAL `wal.go:3833-3871` calls
   writeHeader; initHeaderStateLocked `wal.go:1754-1759`),
@@ -3077,7 +3077,7 @@ Go had neither half. `doResetWAL` published the reset header with `nPage = 0`, a
 
 The remaining difference is that the file size is read once per wal-index header, not once per transaction (`pager.noWalCommitSize`). Measured on an M2: the `fstat` costs about 390 ns and one allocation, a sixth of a point read on a freshly opened, checkpointed database — the state a read-mostly process stays in. The memo is exact as long as the file's size cannot change under an unchanged 48-byte header that carries no size: the file changes only when a checkpoint copies frames into it; frames need a commit; a commit publishes a header with a size, and every later reset keeps it; a header without a size reappears only when a process rebuilds the index over a WAL holding no commit, which after a TRUNCATE means freshly drawn salts. The one way back to the identical header is a WAL whose frames have been destroyed behind an intact WAL header, and then the stale (smaller) size fails closed: pages beyond it read as corrupt, none are served wrongly.
 
-The salt and checkpoint-sequence halves of `walRestartHdr`, and the read-mark values, remain as drift-97, drift-98 and drift-99 (annotated on `restartHeaderStateLocked`). Their behaviour is deliberately unchanged here: whether to port them is being decided separately, together with the change detection that depends on the salts. Regression tests (`internal/btree/walindex_restart_npage_test.go`, two processes): `TestWalRestartKeepsNPage_PeerResets` (TRUNCATE and RESTART), `TestWalRestartKeepsNPage_OwnCheckpoint`, `TestReaderSizeWithoutWalCommit`, `TestIntegrityCheckAfterPeerGrowth`.
+The salt and checkpoint-sequence halves of `walRestartHdr`, and the read-mark values, remain as drift-97, drift-98 and drift-99 (annotated on `restartHeaderStateLocked`). Their behaviour is deliberately unchanged here: whether to port them is being decided separately, together with the change detection that depends on the salts. Regression tests (`internal/btree/walindex_restart_npage_test.go`, two processes): `TestWalRestartKeepsNPage_PeerResets` (TRUNCATE; a writer's restart is `TestWalWriterRestart_PeerDiesAfterRestart`), `TestWalRestartKeepsNPage_OwnCheckpoint`, `TestReaderSizeWithoutWalCommit`, `TestIntegrityCheckAfterPeerGrowth`.
 
 <a id="drift-2026-11-12-1-wal-restart-clears-the-index-before-it-publishes-the-reset-header"></a>
 ### Drift: A WAL Restart Clears The Index Before It Publishes The Reset Header
@@ -3089,6 +3089,61 @@ SQLite's `walRestartHdr` (`wal.c:2146-2160`) writes the reset wal-index header f
 The order decides what peers see when the resetting process dies between the two steps. In SQLite's order they see a header with no frames over a `nBackfill` still at the old frontier N. The next writer's frames 1..k then lie below the frontier: readers skip them (their `minFrame` is N+1, or they take slot 0 once k reaches N), and a checkpoint counts them as backfilled, so a later reset discards them. In Go's order the peers see the old header over the intact WAL and the fully backfilled database file, with an empty hash and a zero frontier. Readers resolve no frame and read the file, which holds the same content. The next writer appends after frame N, a checkpoint copies only its frames, and recovery reads the whole WAL. The window is a few stores to shared memory with no system call in either order, but only Go's order survives a death inside it.
 
 Both steps come before the truncate, as in SQLite (`walRestartHdr`, then `sqlite3OsTruncate`, `wal.c:2363-2364`). Until 2026-11-12 `doResetWAL` truncated the WAL between the index clear and the header publish. A checkpointer that died there left peers the old header over an empty WAL: a surviving writer acknowledged its commit as frames after the missing ones, and the next recovery stopped at the hole and dropped it. Regression test (two processes, the checkpointer exits at each reset step): `TestWalResetCrash_SurvivorCommitsKept` (`internal/btree/wal_reset_crash_test.go`).
+
+<a id="resolved-2026-11-12-restart-checkpoint-reset-the-wal"></a>
+### Resolved 2026-11-12: A RESTART Checkpoint Reset The WAL; No Writer Started The Log Over
+- **Category:** changed-logic  -  **Severity:** medium  -  **Status:** RESOLVED 2026-11-12
+- **Affected functions:** `wal.go:*wal.restartLogLocked` (new), `wal.go:*wal.waitReadersAndTruncate` (was `tryResetWALWithBusy`), `wal.go:*wal.checkpointPost`, `wal.go:*wal.checkpointWithMode`, `wal.go:*wal.doResetWAL`, `wal.go:*wal.base` (new), `pager.go:*pager.tryCheckpoint`, `pager.go:*pager.walBase` (new).
+
+SQLite recycles the WAL in the writer. A RESTART checkpoint, once the whole log is in the database file, takes the reader locks and releases them: it only makes sure no reader still uses the log (`wal.c:2357-2362`, `2380`). A TRUNCATE checkpoint also resets the wal-index header and truncates the file (`wal.c:2363-2378`). The next writer, before the first frame of a transaction, starts the log over if it holds read lock 0, the log is fully backfilled and it can take the other reader locks without waiting (`walRestartLog`, `wal.c:3870-3888`, called from `walFrames` at `wal.c:4070`); its first frame then writes and syncs the new WAL header (`wal.c:4074-4115`).
+
+Until 2026-11-12 the port had no writer-side restart. `doResetWAL` stood in for it inside the checkpoint: RESTART reset the header at once, and the automatic checkpoint escalated from PASSIVE to RESTART so that the WAL was recycled at all (drift-53). The cost showed once another process's commits were to be detected by the wal-index header instead of a page-1 counter: a RESTART by a process that committed nothing changed the header under everyone else, where SQLite's leaves it alone.
+
+Now, as in SQLite:
+
+- **RESTART** waits for reader slots 1-4 and releases them. **TRUNCATE** resets the header and truncates, also when no frame is committed: the `mxFrame == 0` shortcut skips only the backfill, so the frames of a rolled-back transaction or of an abandoned restart are cut off (`wal.c:2216`, `2352-2380`).
+- **A reader that keeps a slot past the busy handler makes both `ErrBusy`** (`wal.c:2361`); before, the checkpoint reported success and did nothing.
+- **The writer** calls `restartLogLocked` at the top of `writeFrames` and `writeFramesMem`. It restarts when no frame of the transaction is in the log yet, the authoritative `nBackfill` equals the committed `mxFrame` and is not zero, and the checkpoint lock and reader slots 1-4 can be taken without waiting. A busy lock means append (`wal.c:3889-3890`). The heap-shm modes (in-process, in-memory) relied on the same escalation and get the same restart; in in-memory mode it is what reuses the frame arena.
+- **The automatic checkpoint** is PASSIVE (drift-53 resolved).
+- **A checkpoint re-checks the salts** once it holds reader slot 0 and copies nothing if the log was started over since it read the header. This is SQLite's fix for the race between a checkpointer and a wrapping writer, which is in `version-3.52.0` (`wal.c:2256-2267`) and not in the sibling `sqlitec` working tree, which is an earlier commit.
+
+**Rollback after a restart.** A transaction saves its position in the log when it begins and at each savepoint. After a restart inside the transaction those frame numbers and checksums belong to the previous log. SQLite's undo reloads the restarted header (`wal.c:3775`) and its savepoint undo tests `nCkpt` (`wal.c:3829-3835`). Here the WAL keeps a generation count and the checksum seed of the current log (`wal.logGen`, `genSeed1/2`), every saved position carries its generation, and `wal.base` maps a position of an earlier generation to frame 0 of the current one. The pager never reads a saved position directly: `hasChanges`, the "was the commit published" test of `unwindWriter`, `rollbackLocked`, `pagerError`, `rollbackForClose` and `rollbackToSavepoint` all go through it. A transaction's changes are "frames above its base", so a transaction whose pages were all spilled after a restart still commits, and one whose frames were all undone is still empty. Nothing has to run between the restart and a failure for the cleanup to be right.
+
+**Crash ordering is SQLite's.** The database file is synced before `nBackfill` is published (`wal.c:2322-2332`), so a log that may be started over is entirely in a synced database file. The restart writes nothing to the WAL file. The new WAL header is written and synced before the first frame of the new log (`flushHeader`; `wal.c:4099-4115`). At every point in between, the file recovers to the last commit (`TestWalWriterRestart_CrashPoints`).
+
+**What each mode does to the file.** RESTART and a writer's restart reuse the file from its start; neither gives space back. Only TRUNCATE (and the last close) shrinks it. There is no size limit ([drift-105](#drift-105-journal-size-limit-wal-truncation-feature-unimplemented)).
+
+**With v2.4.x processes attached** (they have no writer-side restart and reset on RESTART):
+
+- The header a restart publishes is the one their checkpoint-time reset publishes (see drift-98 for the checksum seed and `nCkpt`), so a v2.4.x writer or reader that meets it behaves as it does today, whether the restarting writer then commits, rolls back or dies.
+- A v2.4.x writer whose automatic checkpoint is off, next to a newer process that only checkpoints: RESTART from the newer process no longer recycles the WAL. Use TRUNCATE there.
+- v2.4.3 decides a reset from a process-local `nBackfill`. After any new log of M frames, where M is not above the count it remembers, its RESTART can reset frames that are not in the database file and lose an acknowledged commit. This is in v2.4.3 as shipped and happens whoever started the new log, a checkpoint-time reset or a writer; nothing here prevents it.
+
+Tests: `internal/btree/wal_writer_restart_test.go` (three WAL modes), `wal_writer_restart_crash_test.go` (crash points, panic after a restart, two-process cases, the salt re-check), `wal_writer_restart_fault_vfs_test.go` (WAL-header write and sync failures).
+
+<a id="drift-2026-11-12-2-writer-restart-takes-the-checkpoint-lock"></a>
+### Drift: A Writer Takes The Checkpoint Lock To Start The Log Over
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.restartLogLocked`.
+
+SQLite's `walRestartLog` holds the write lock and takes the reader locks (`wal.c:3876`); it does not touch `WAL_CKPT_LOCK`. A checkpointer that read the header before the restart is kept from copying stale frames by the salt re-check it makes once it holds read lock 0 (`version-3.52.0`, `wal.c:2256-2267`).
+
+`restartLogLocked` also try-locks `lockCheckpoint` exclusive, and appends if it is busy. Reason: a v2.4.x process may be attached to the same file, and its checkpoint has no salt re-check. It was safe only because every reset held the checkpoint lock for as long as a checkpoint does; a restart that did not take the lock could land between that checkpoint's header read and its backfill, and the checkpoint would then copy frames of the old log, read at their old offsets from a file the new log is overwriting, over newer pages. With the lock, the invariant "every reset holds the checkpoint lock" still holds for both versions.
+
+Cost: a writer appends instead of restarting while any checkpoint runs, in any process. The salt re-check is ported as well, so the lock can go when no version without the re-check can attach. The re-check is reachable only against a writer that does not take the lock: `TestWalCheckpoint_SkipsBackfillAfterLogWrapped` reaches it through a hook.
+
+<a id="drift-2026-11-12-3-writer-keeps-slot-0-after-a-restart"></a>
+### Drift: A Writer Keeps Reader Slot 0 After It Started The Log Over
+- **Category:** structural  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.restartLogLocked`.
+
+After `walRestartHdr`, SQLite's `walRestartLog` releases read lock 0 and takes a WAL read lock through `walTryBeginRead` (`wal.c:3893-3899`). It has to: a connection on lock 0 ignores the WAL (`walFindFrame` returns no frame when `readLock == 0`), and the writer must read back the frames it is about to write.
+
+The writer here does not read through its reader slot. `getPageWriter` looks pages up to `wal.nFrame`, above the live checkpoint frontier (`liveMinFrame`), whatever slot the transaction's snapshot took. So it keeps slot 0 until the transaction ends. Every first writer after a reset already wrote from slot 0 before this change (a reset left `mxFrame == 0`, and a begin then takes slot 0).
+
+For the same reason the restart does not test "the writer is on slot 0" as `wal.c:3870` does: a writer whose snapshot is on slots 1-4 holds that slot shared, and the exclusive locks the restart needs fail on it.
+
+**Other holders of slot 0.** With shared memory, slot 0 is granted only after a full backfill, with `minFrame = mxFrame + 1`: such a reader resolves no frame, of the old log or the new. The heap-shm read begin also falls back to slot 0 with part of the log still to read (`tryBeginReadInProcessHdr`, when slots 1-4 are briefly held exclusive); SQLite retries instead (`wal.c:3128-3136`, then WAL_RETRY). That reader blocks the backfill, so `nBackfill` stays below `mxFrame` for as long as it lives, and the restart, which tests `nBackfill == mxFrame` explicitly where SQLite asserts it (`wal.c:3872`), does not happen. Tests: `TestWalWriterRestart_NotBeforeBackfill`, `_NotAfterPartialBackfill`. Whether the fallback itself should become SQLite's retry is a separate question of reader admission latency.
 
 <a id="drift-102-reader-slot-tie-break-selects-lowest-not-highest"></a>
 ### Drift: Reader Slot Tie Break Selects Lowest Not Highest
