@@ -70,6 +70,10 @@ type Backup struct {
 	exact   bool
 	stepped bool
 
+	// busy is the busy error of the last Step, nil if that Step was not
+	// busy: see stepBusy.
+	busy error
+
 	dstLocked bool // ~ bDestLocked (backup.c:25)
 
 	// isAttached mirrors backup.c:39 — once true, this Backup is in the
@@ -186,9 +190,22 @@ func putUint32BE(buf []byte, v uint32) {
 // SQLITE_BUSY and SQLITE_LOCKED out of p->rc.
 // DRIFT: ErrBusyRecovery is not sticky for a backup; C's isFatalError compares exact codes, so SQLITE_BUSY_RECOVERY is fatal there See docs/btree/NOTES.md#drift-2026-11-13-2-a-backup-step-that-met-a-recovery-can-be-retried
 func backupBusy(ctx context.Context, err error) bool {
-	return ctx.Err() != nil ||
-		errors.Is(err, ErrBusy) || errors.Is(err, ErrBusySnapshot) ||
+	if cerr := ctx.Err(); cerr != nil && errors.Is(err, cerr) {
+		return true // the ctx's own error; any other error keeps its meaning
+	}
+	return errors.Is(err, ErrBusy) || errors.Is(err, ErrBusySnapshot) ||
 		errors.Is(err, ErrBusyRecovery) || errors.Is(err, ErrReadersBusy)
+}
+
+// stepBusy records a Step's busy result for Finish and returns it.
+// sqlite3_backup_step stores SQLITE_BUSY in p->rc (backup.c:558), where it
+// stops no later step (isFatalError) and is what sqlite3_backup_finish
+// returns if no later step replaced it (backup.c:603).
+func (b *Backup) stepBusy(err error) error {
+	if backupBusy(context.Background(), err) { // a busy error, not the ctx's
+		b.busy = err
+	}
+	return err
 }
 
 // Step copies up to nPage pages from the source to the destination.
@@ -225,9 +242,15 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 	if b.finished {
 		return ErrBackupFinished
 	}
-	if b.rc != nil && b.rc != ErrBackupDone {
-		return b.rc // ~ isFatalError check at backup.c:329
+	// ~ isFatalError check at backup.c:329. A backup that is done is not
+	// stepped again either: SQLITE_DONE is fatal in that sense
+	// (backup.c:217-219), and the source's commits since are not sent to it
+	// (update), so the pages a further Step copied would be of a later
+	// state than the rest.
+	if b.rc != nil {
+		return b.rc
 	}
+	b.busy = nil
 
 	// Lock destination (exclusive/write tx) on first Step.
 	// ~ backup.c:366–371: sqlite3BtreeBeginTrans(p->pDest, 2, &iDestSchema).
@@ -237,8 +260,9 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 		if err != nil {
 			if !backupBusy(ctx, err) {
 				b.rc = err
+				return err
 			}
-			return err
+			return b.stepBusy(err)
 		}
 		b.dstWriteTx = wtx
 		b.iDstSchema = b.dst.localSchemaCookie.Load() // ~ iDestSchema capture
@@ -248,7 +272,7 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 	// ~ backup.c:337-344: "If the source pager is currently in a
 	// write-transaction, return SQLITE_BUSY immediately."
 	if !b.src.tryLockWriter() {
-		return ErrBusy
+		return b.stepBusy(ErrBusy)
 	}
 	defer b.src.unlockWriter()
 
@@ -259,12 +283,13 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 	rtx, err := b.src.beginRead(ctx, false, false)
 	if err != nil {
 		if errors.Is(err, ErrReadersBusy) {
-			return ErrBusy
+			return b.stepBusy(ErrBusy)
 		}
 		if !backupBusy(ctx, err) {
 			b.rc = err
+			return err
 		}
-		return err
+		return b.stepBusy(err)
 	}
 	defer rtx.Rollback()
 
@@ -496,6 +521,14 @@ func (b *Backup) Finish() error {
 			return finishErr
 		}
 		return nil
+	}
+	if b.rc == nil && finishErr == nil {
+		// Not done and not failed: the last Step's busy result, if it was
+		// busy (backup.c:603 returns p->rc, where the step left it).
+		return b.busy
+	}
+	if b.rc == nil {
+		return finishErr
 	}
 	return b.rc
 }

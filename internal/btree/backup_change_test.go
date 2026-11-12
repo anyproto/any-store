@@ -239,7 +239,10 @@ func TestBackupChange_ReciprocalBackupsAreBusy(t *testing.T) {
 	// a → b now finds a's (its source) held by the other's destination.
 	require.ErrorIs(t, ab.Step(context.Background(), 1), ErrBusy)
 
-	require.NoError(t, ba.Finish()) // rolls a's destination transaction back
+	// Finish rolls a's destination transaction back and returns what the
+	// backup's last Step did (sqlite3_backup_finish returns p->rc,
+	// backup.c:603).
+	require.ErrorIs(t, ba.Finish(), ErrBusy)
 	for {
 		err := ab.Step(context.Background(), -1)
 		if errors.Is(err, ErrBackupDone) {
