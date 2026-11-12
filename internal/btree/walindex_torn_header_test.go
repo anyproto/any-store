@@ -571,3 +571,84 @@ func TestTornWalIndexHeader_WALReadBeginWaitsOutRecovery(t *testing.T) {
 	_, valid := w.index.readHeader()
 	require.True(t, valid, "the read begin repaired the header once the locks were free")
 }
+
+// TestBeginWrite_PeerCommitsBeforeTimeoutOneBudget: a peer holds the write
+// lock, commits just before the waiting begin's busy budget runs out,
+// releases it, and has it again when the begin tries next. SQLite tries the
+// write lock once per attempt (walBeginWriteTransaction, wal.c:3714-3717)
+// and retries the whole begin from one loop with one busy count
+// (btree.c:3730-3737), so the begin gives up, or gets in, within one budget.
+// A write-lock wait with a count of its own would start a fresh budget after
+// every one of the peer's commits.
+//
+// The peer works through this handle's lock table, which refuses the begin's
+// write lock as fcntl refuses another process's. It "commits" by publishing
+// a header that differs from the begin's snapshot.
+func TestBeginWrite_PeerCommitsBeforeTimeoutOneBudget(t *testing.T) {
+	dir := t.TempDir()
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), tornHdrOpts)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	dmsPutRange(t, db, "t1", 0, tornHdrSeedRows)
+	w := db.pager.wal
+
+	peerCommit := func() {
+		hdr, valid := w.index.readHeader()
+		require.True(t, valid)
+		hdr.iChange++
+		hdr.computeCksum()
+		var buf [walIndexHdrSize]byte
+		hdr.serialize(buf[:])
+		region, err := w.index.shm.region(0, true)
+		require.NoError(t, err)
+		copy(region[walIndexHdrSize:walIndexHdrSize*2], buf[:])
+		copy(region[0:walIndexHdrSize], buf[:])
+	}
+
+	const budget = 200 * time.Millisecond
+	base := DefaultBusyTimeout(budget)
+	// A budget of 200 ms is 11 handler calls that sleep; the peer commits
+	// and lets go after the begin has waited through 10 of them.
+	const commitAfter = 10
+	peerHolds := false
+	waited := 0
+	relock := func() {
+		require.NoError(t, w.index.lock(lockWrite, lockExclusive))
+		peerHolds, waited = true, 0
+	}
+	release := func() {
+		if peerHolds {
+			_ = w.index.unlock(lockWrite, lockExclusive)
+			peerHolds = false
+		}
+	}
+	defer release()
+	w.busyHandler = func(n int) bool {
+		ok := base(n)
+		if peerHolds {
+			if waited++; waited == commitAfter {
+				peerCommit()
+				release()
+			}
+		}
+		return ok
+	}
+	testBeginWriteRetryHook = func(error) {
+		if !peerHolds {
+			relock() // the peer is back before the begin's next try
+		}
+	}
+	defer func() { testBeginWriteRetryHook = nil }()
+
+	relock()
+	start := time.Now()
+	wtx, err := db.BeginWrite()
+	elapsed := time.Since(start)
+	if err == nil {
+		_ = wtx.Rollback()
+	}
+	release()
+	testBeginWriteRetryHook = nil
+	w.busyHandler = DefaultBusyTimeout(5 * time.Second)
+	require.Less(t, elapsed, 2*budget, "one busy budget per begin (err=%v)", err)
+}

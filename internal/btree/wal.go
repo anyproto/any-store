@@ -3258,8 +3258,11 @@ func (w *wal) endRead(slot int) {
 	_ = w.index.unlock(lockRead0+slot, lockShared)
 }
 
-// beginWrite acquires the exclusive write lock.
-// Uses the busy handler for retry/backoff if configured (issue 1.7).
+// beginWrite acquires the exclusive write lock, with one try: BUSY is
+// returned to the caller, as walBeginWriteTransaction returns it
+// (wal.c:3714-3717). A transaction begin retries it from its one busy loop
+// (DB.BeginWriteContext), which releases the read snapshot, backs off on the
+// begin's busy count and starts the begin over.
 //
 // For multi-process mode, performs a BUSY_SNAPSHOT check after acquiring the
 // lock: compares the caller's read snapshot (tx.walHdr, captured at BeginRead
@@ -3285,7 +3288,7 @@ func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, e
 	if walTestHooks && w.forceBusySnapshotForTest.Load() {
 		return false, ErrBusySnapshot
 	}
-	if err := walBusyLock(w.index, w.busyHandler, lockWrite, lockExclusive); err != nil {
+	if err := w.index.lock(lockWrite, lockExclusive); err != nil {
 		return false, err
 	}
 	if w.inProcess || w.inMemory {
