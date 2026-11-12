@@ -2434,7 +2434,6 @@ func (w *wal) recoverLocked() error {
 // writeFrames appends frames to the WAL. If commit is true, the last frame
 // is marked as a commit frame with the given dbSize.
 // All frames are batched into a single write call for performance.
-// DRIFT: wal-index header iChange counter never incremented (always 0) See docs/btree/NOTES.md#drift-96-wal-index-change-counter-ichange-never-incremented
 // DRIFT: padToSectorBoundary commit-frame sector padding not ported See docs/btree/NOTES.md#drift-104-padtosectorboundary-sector-padding-of-commit-frames-not-port
 // DRIFT: journal_size_limit/mxWalSize WAL truncation unimplemented (truncateOnCommit/walLimitSize) See docs/btree/NOTES.md#drift-105-journal-size-limit-wal-truncation-feature-unimplemented
 // DRIFT: in-process mode skips SHM hdr write on commit; BeginRead/Write synthesize a minimal walHdr See docs/btree/NOTES.md#old-drift-inprocess-skips-shm-hdr-on-commit

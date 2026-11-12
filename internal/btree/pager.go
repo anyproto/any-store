@@ -2483,7 +2483,7 @@ func (p *pager) hasChanges() bool {
 
 // dataChanged/schemaChanged control whether FileChangeCount/SchemaCookie are
 // incremented. Returns the WAL frame count and the new counter values.
-// DRIFT: FileChangeCount bumped only on dataChanged=true, not every data-page commit See docs/btree/NOTES.md#drift-77-filechangecount-bumped-conditionally-not-unconditionally
+// DRIFT: FileChangeCount bumped only on dataChanged=true, not every data-page commit; read by v2.4.x peers only See docs/btree/NOTES.md#drift-77-filechangecount-bumped-conditionally-not-unconditionally
 // DRIFT: commit doesn't prune dirty pages pgno>dbSize before WAL write (no nTruncate prune) See docs/btree/NOTES.md#drift-78-commit-does-not-prune-dirty-pages-above-dbsize-before-wal-wr
 // testCommitPrePublishHook / testCommitPostPublishHook, when non-nil, run
 // inside commit immediately before / after wal.writeFrames publishes the
