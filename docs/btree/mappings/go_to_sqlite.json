@@ -3,7 +3,7 @@
     "sqlite": [
       "backup.c:sqlite3_backup_finish"
     ],
-    "note": "commits or rolls back the destination tx based on b.rc; releases backup state"
+    "note": "commits or rolls back the destination tx based on b.rc; returns the last Step's busy error if neither done nor failed (backup.c:603)"
   },
   "backup.go:*Backup.PageCount": {
     "sqlite": [
@@ -21,7 +21,7 @@
     "sqlite": [
       "backup.c:sqlite3_backup_step"
     ],
-    "note": "copies up to nPage pages; returns ErrBackupDone when source exhausted"
+    "note": "copies up to nPage pages under the source's process write lock (try-lock, ErrBusy); DONE and every non-busy error are sticky; restarts by the change epoch"
   },
   "backup.go:*Backup.finalize": {
     "sqlite": [
@@ -41,13 +41,19 @@
     "sqlite": [
       "backup.c:sqlite3BackupRestart"
     ],
-    "note": "called by source pager when WAL reset/page-cache invalidation makes already-copied tracking meaningless"
+    "note": "called by the source pager when a write transaction that sent the backup pages ends without committing them all (rollback, error cleanup, unwind); no-op on a finished backup"
+  },
+  "backup.go:*Backup.stepBusy": {
+    "sqlite": [
+      "backup.c:sqlite3_backup_step"
+    ],
+    "note": "keeps a Step's busy result for Finish (p-\u003erc = rc, backup.c:558)"
   },
   "backup.go:*Backup.update": {
     "sqlite": [
       "backup.c:backupUpdate"
     ],
-    "note": "re-copies a page that was already backed up if it changed under us"
+    "note": "re-copies an already-copied page the source logged, at a commit or a spill; no-op on a done or finished backup"
   },
   "backup.go:*DB.BackupInit": {
     "sqlite": [
@@ -1619,13 +1625,13 @@
     "sqlite": [
       "backup.c:sqlite3BackupRestart"
     ],
-    "note": "fans out a restart signal to all attached Backups when WAL reset or page-cache invalidation makes already-copied tracking meaningless"
+    "note": "fans out a restart to all attached Backups: rollbackLocked, pagerError, dischargeBackups"
   },
   "pager.go:*pager.dispatchBackupUpdate": {
     "sqlite": [
       "backup.c:backupUpdate"
     ],
-    "note": "fans out the per-page update hook to all attached Backups after each committed write so already-copied pages stay current"
+    "note": "fans out the per-page update to all attached Backups for every page the source logs: a commit's pages and each spilled page (pager.c:3219-3225)"
   },
   "pager.go:*pager.effectiveReaderDbSize": {
     "sqlite": [

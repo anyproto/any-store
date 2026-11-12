@@ -217,9 +217,9 @@ func (b *Backup) stepBusy(err error) error {
 // a write transaction open in this process (as sqlite3_backup_step returns
 // SQLITE_BUSY for one, backup.c:340-341), or no reader slot is free. The
 // other busy errors of a transaction begin, and the error of a ctx that
-// ended, are returned the same way (backupBusy). Any other error is sticky:
-// recorded in b.rc and re-returned by future calls (~ backup.c:329 +
-// backup.c:558).
+// ended, are returned the same way (backupBusy). Any other error is sticky,
+// and so is ErrBackupDone: recorded in b.rc and re-returned by future calls
+// (~ backup.c:329 + backup.c:558).
 //
 // A Step holds the source's write lock of this process from its start to its
 // end, so no write transaction of this process overlaps it: a commit and the

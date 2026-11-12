@@ -426,9 +426,18 @@ func TestChangeEpoch_ZeroSaltsStillDetect(t *testing.T) {
 	live, valid := w.index.readHeader()
 	require.True(t, valid)
 	require.Equal(t, [2]uint32{0, 0}, live.aSalt, "setup: a log generation with zero salts")
+	// A commit of this process makes the generation durable: its WAL header,
+	// with the zero salts, and frames. The peer's attach rebuilds the
+	// wal-index from that file and stays in the generation.
+	restartPut(t, db, 0, 2, 5)
+	live, _ = w.index.readHeader()
+	require.Equal(t, [2]uint32{0, 0}, live.aSalt)
 
 	e0, _ := changeEpochOf(t, db)
 	runChangePeer(t, path, "commit", 6)
+	live, valid = w.index.readHeader()
+	require.True(t, valid)
+	require.Equal(t, [2]uint32{0, 0}, live.aSalt, "the peer committed in the zero-salt generation")
 	e, exact := changeEpochOf(t, db)
 	require.Equal(t, e0+1, e, "a peer's commit in a zero-salt log is a change")
 	require.True(t, exact)

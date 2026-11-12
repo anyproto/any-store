@@ -885,3 +885,18 @@ func TestTxSchemaOf_RawTxMemo(t *testing.T) {
 	memoPut(tx, c, c.cur())
 	assert.Same(t, c.cur(), memoGet(tx, c))
 }
+
+// Schema cookies are ordered modulo 2^32: one that wrapped past the largest
+// value is later than the one before it. (The same comparison used to be
+// made on the btree's local page-1 counters, which are gone; the schema
+// state's is the one ordering of cookies left.)
+func TestCookieLE_Wraps(t *testing.T) {
+	const top = ^uint32(0)
+	assert.True(t, cookieLE(5, 5))
+	assert.True(t, cookieLE(5, 6))
+	assert.False(t, cookieLE(6, 5))
+	assert.True(t, cookieLE(top, 0), "0 follows the largest cookie")
+	assert.True(t, cookieLE(top-1, 1))
+	assert.False(t, cookieLE(0, top))
+	assert.False(t, cookieLE(1, top-1))
+}

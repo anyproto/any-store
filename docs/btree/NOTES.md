@@ -3196,7 +3196,7 @@ What differs from SQLite, and why it is kept:
 
 Tests: `internal/btree/walchange_test.go`, `backup_change_test.go`, `backup_change_fault_vfs_test.go`, `cache_invalidation_test.go`; root `change_epoch_test.go`; `test/backup_busy_test.go`.
 
-To measure (not yet): allocations per changed begin and per publication (one `walChange` each), CAS retries under concurrent readers, the fast read path, and how far a backup gets between the write transactions of a busy writer.
+To measure (not yet): allocations per changed begin (one `walChange`) and per publication (two, at the announcement and at the settle, plus the copy of the pending header), CAS retries under concurrent readers, the fast read path, and how far a backup gets between the write transactions of a busy writer.
 
 <a id="drift-2026-11-13-2-a-backup-step-that-met-a-recovery-can-be-retried"></a>
 ### Drift: A Backup Step That Met A Recovery In Progress Can Be Retried
@@ -3205,7 +3205,7 @@ To measure (not yet): allocations per changed begin and per publication (one `wa
 
 SQLite's `isFatalError` keeps exactly `SQLITE_BUSY` and `SQLITE_LOCKED` out of a backup's sticky `rc` (`backup.c:217-219`). It compares whole codes, so `SQLITE_BUSY_RECOVERY` and `SQLITE_BUSY_SNAPSHOT` (`SQLITE_BUSY | n<<8`) are fatal for a backup there.
 
-`Step` treats `ErrBusy`, `ErrBusySnapshot`, `ErrBusyRecovery`, `ErrReadersBusy` and the error of a ctx that ended alike: returned, not kept. A begin that failed its admission holds no transaction and has copied nothing, so a later Step on the same `Backup` continues correctly, and another process rebuilding the wal-index is an ordinary event of multi-process use, not a reason to abandon a copy. `ErrProtocol` stays fatal, as `SQLITE_PROTOCOL` is. Test: `TestBackupChange_StepBusy`; the recovery case is exercised by `TestBackupChange_StepRunsRecovery`, where the Step's own begin does the rebuild.
+`Step` treats `ErrBusy`, `ErrBusySnapshot`, `ErrBusyRecovery`, `ErrReadersBusy` and the ctx's own error alike: returned, not kept. (Any other error stays sticky even if the ctx has ended meanwhile.) `Finish` returns the last Step's busy error when the backup is neither done nor failed, as `sqlite3_backup_finish` returns the `p->rc` the step left (`backup.c:558`, `603`). A begin that failed its admission holds no transaction and has copied nothing, so a later Step on the same `Backup` continues correctly, and another process rebuilding the wal-index is an ordinary event of multi-process use, not a reason to abandon a copy. `ErrProtocol` stays fatal, as `SQLITE_PROTOCOL` is. Test: `TestBackupChange_StepBusy`; the recovery case is exercised by `TestBackupChange_StepRunsRecovery`, where the Step's own begin does the rebuild.
 
 <a id="drift-102-reader-slot-tie-break-selects-lowest-not-highest"></a>
 ### Drift: Reader Slot Tie Break Selects Lowest Not Highest
@@ -3673,7 +3673,7 @@ After WAL recovery, `pager.open` refreshes the full in-memory header from the WA
 
 <a id="drift-2026-06-25-02-step-after-errbackupdone-re-enters-and-re-runs-finalize-and-can-copy-n"></a>
 ### Drift: Step After ErrBackupDone Re-Enters And Re-Runs Finalize Instead Of Being A No-Op
-- **Category:** changed-logic  -  **Severity:** low
+- **Category:** changed-logic  -  **Severity:** low (critical once backups stopped restarting at own commits)  -  **Status:** RESOLVED 2026-11-13: `Step` returns `b.rc` whenever it is set, `ErrBackupDone` included, as `isFatalError(SQLITE_DONE)` makes `sqlite3_backup_step` return at once (`backup.c:217-219`, `329-330`). While a backup restarted at every marked commit of its own process, the re-entered Step started over and the result was at least consistent; with the restart by the change epoch it would have copied only the pages the source grew by since, next to pages no update had refreshed. Test: `TestBackupChange_DoneIsTerminal`. What follows describes the code before that.
 - **Affected functions:** `backup.go:*Backup.Step` (`internal/btree/backup.go:191`).
 
 In C, `sqlite3_backup_step` reads `rc = p->rc` and only does work inside `if( !isFatalError(rc) )` (`backup.c:329-330`); since `isFatalError` returns true for any non-`OK`/`BUSY`/`LOCKED` code (`backup.c:217-218`), a sticky `SQLITE_DONE` left in `p->rc` after the prior completion (`backup.c:405-406`) makes the whole body a no-op — the function skips the copy loop and finalize and just re-returns `SQLITE_DONE`. The Go `Step` guard at `internal/btree/backup.go:191` instead reads `if b.rc != nil && b.rc != ErrBackupDone { return b.rc }`, explicitly excluding `ErrBackupDone` from the early return, so a Step call after completion falls through and re-executes the full body: it re-opens a fresh source read transaction (`backup.go:199`), re-reads the source size from that snapshot (`nSrcPage := rtx.DatabaseSize()`, `backup.go:234`), runs the copy loop again, and re-enters the `b.iNext > nSrcPage` finalize branch (`backup.go:263-266`) that re-runs `finalize` and re-sets `b.rc = ErrBackupDone`.

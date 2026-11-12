@@ -1048,6 +1048,9 @@ func (p *pager) endRead(slot int) {
 // correctness hazard (docs/btree/NOTES.md P0.2 drift, resolved).
 // DRIFT: beginWrite refreshes page-1 header/dbSize on stateChanged (C does it on read path) See docs/btree/NOTES.md#drift-76-beginwrite-re-reads-page-1-header-on-state-change
 func (p *pager) beginWrite(readSnap WalIndexHdr) error {
+	if testBeforeBeginWriteHook != nil {
+		testBeforeBeginWriteHook(p)
+	}
 	stateChanged, err := p.wal.beginWriteWithSnapshot(readSnap)
 	if err != nil {
 		return err
@@ -3460,6 +3463,10 @@ func (p *pager) dispatchBackupUpdate(dirty []*page) {
 		}
 	}
 }
+
+// testBeforeBeginWriteHook, when non-nil, runs at the top of beginWrite: the
+// caller holds its read snapshot and not yet the WAL write lock. Test-only.
+var testBeforeBeginWriteHook func(p *pager)
 
 // testBackupDispatchHook, when non-nil, runs in dispatchBackupUpdate: with 0
 // once the list of backups is copied, then with each page number before the

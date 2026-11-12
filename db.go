@@ -75,12 +75,23 @@ type DB interface {
 	// open, or no reader slot is free, for longer than the busy timeout,
 	// Backup returns an error that matches ErrBusy, and can be called again.
 	// A ctx that carries a write transaction of this database returns it at
-	// once: the backup would wait for the caller. The ctx is consulted
-	// between the batches of the copy, not inside one.
+	// once: the backup would wait for the caller. Two backups in opposite
+	// directions between the same two databases are busy for each other
+	// until one has ended.
 	//
-	// After an error the file at path is left as the failed transaction
-	// left it: a destination that existed keeps its content, a new one is
-	// an empty database. Backup never removes it.
+	// The ctx is consulted between the batches of the copy, not inside one.
+	// A batch begins a transaction on the source and, the first time, on the
+	// destination, each with the ordinary waits behind another process: up
+	// to the busy timeout for a lock, and up to about ten seconds for each
+	// attempt that finds the shared index being written. Backup can
+	// therefore return later than the busy timeout after it last copied.
+	//
+	// Backup never removes the file at path. If it fails before the copy is
+	// committed, the destination's transaction is rolled back: a destination
+	// that existed keeps its content, a new one is an empty database. The
+	// copy is committed in one step at the end; an error after that (the
+	// copy's own bookkeeping, or closing it, was busy or failed) leaves the
+	// completed copy in the file.
 	Backup(ctx context.Context, path string) (err error)
 
 	// ReadTx starts a new read-only transaction.
@@ -1208,10 +1219,20 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 	if err = b.Finish(); err != nil {
 		return err
 	}
+	if testBackupCopiedHook != nil {
+		testBackupCopiedHook()
+	}
+	// The copy is committed. What follows is bookkeeping on it: an error
+	// from here on leaves the completed copy in the file.
+	//
 	// The copy is a database of its own for the format settled record (see
 	// dropFormatSettled).
 	return dropFormatSettled(dstDB)
 }
+
+// testBackupCopiedHook, when non-nil, runs in Backup once the copy is
+// committed, before the bookkeeping on it. Test-only.
+var testBackupCopiedHook func()
 
 // backupBusyTimeout is how long Backup retries busy Steps after the last one
 // that copied: the busy timeout of a transaction begin. A variable for tests.

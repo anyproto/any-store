@@ -134,9 +134,10 @@ var (
 
 	// ErrBusy is returned when a lock stayed held past the busy timeout:
 	// another process's writer or checkpoint, or, for Backup, a write
-	// transaction of this process. The operation did nothing and can be
-	// tried again. Match it with errors.Is: the busy errors of the storage
-	// layer that are not this value wrap it by the time they leave Backup.
+	// transaction of this process. The operation can be tried again. Match
+	// it with errors.Is: the busy errors of the storage layer that are not
+	// this value wrap it by the time they leave Backup. What a Backup that
+	// returned it has done is described at DB.Backup.
 	ErrBusy = btree.ErrBusy
 
 	ErrDBIsNotOpened       = errors.New("any-store: database is not opened")
