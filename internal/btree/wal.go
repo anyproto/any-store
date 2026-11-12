@@ -1695,6 +1695,25 @@ func (w *wal) open() (err error) {
 		}
 	}
 
+	// SQLite's version gate (walIndexReadHdr, wal.c:2722-2728): a consistent
+	// wal-index header of another version is a live peer's index, written by
+	// a build this one cannot share it with. The open is refused and the
+	// index left alone; rebuilding it would overwrite the peer's. readHeader
+	// above cannot tell: on a fresh attach region(create=false) maps none of
+	// the peer's index (drift-2026-07-10-3), so region 0 is mapped here, as
+	// walIndexReadHdr maps it through walIndexPage. A consistent header of
+	// this version still goes to recovery below, as on every fresh attach.
+	// A first attacher's shm is the election's 3-byte stump, which maps as
+	// zeros (torn).
+	if !w.inProcess {
+		if _, err := w.index.shm.region(0, true); err != nil {
+			return err
+		}
+		if _, state := w.index.readHeaderState(); state == walHdrBadVersion {
+			return errWalIndexVersion
+		}
+	}
+
 	if info.Size() >= walHeaderSize {
 		return w.recoverLocked()
 	}
