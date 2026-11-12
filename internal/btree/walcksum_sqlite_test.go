@@ -263,15 +263,20 @@ func TestSqlite_WALCksum_1(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, tx.Put(ns, intKey(89), []byte("eightynine")))
 		require.NoError(t, tx.Commit())
+		// The checkpoint backfilled the whole log, so the insert's writer
+		// started it over: its frames are frames 1..n.
+		n := int(db.pager.wal.index.mxCommitFrame.LoadLocal())
 
 		// rawClose to keep WAL on disk for inspection
 		rawClose(db)
 
-		// Count total valid frames after checkpoint + insert.
-		// FULL checkpoint preserves WAL, so all frames (old + new) remain valid.
+		// walcksum-1.8.1-3: the frames written to the start of the log
+		// verify, and the next one, left from the log before, does not.
+		// SQLite's insert wrote two frames, the leaf and page 1; a schema
+		// format 6 commit leaves page 1 out when its header is unchanged.
 		validFrames := verifyWALFrameChecksums(t, walPath, 1024)
 		t.Logf("Valid frames after checkpoint + insert: %d", validFrames)
-		assert.True(t, validFrames >= 2, "should have at least 2 valid frames")
+		assert.Equal(t, n, validFrames, "the insert's frames, and no frame of the log before")
 
 		t.Run("f=1", func(t *testing.T) {
 			ok := verifyWALFrameChecksumAt(t, walPath, 1024, 1)
