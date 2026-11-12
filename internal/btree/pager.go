@@ -2371,7 +2371,6 @@ func (p *pager) readerMinFrame(cache *pcache) uint32 {
 // falls back to the pager's count; a non-zero VersionValidFor that differs
 // from FileChangeCount is rejected here.
 // DRIFT: non-zero change-counter mismatch is corruption, not an untrusted size See docs/btree/NOTES.md#drift-2026-11-11-2-nonzero-change-counter-mismatch-is-corruption
-// DRIFT: two differing non-zero values refuse the open; SQLite only distrusts the header's page count then (btree.c:3294-3297). See docs/btree/NOTES.md#drift-2026-11-11-5-versionvalidfor-mismatch-refuses-the-open
 func lockBtreePageCount(h *dbHeader, nPageFile uint32) (uint32, error) {
 	if h.VersionValidFor != 0 && h.VersionValidFor != h.FileChangeCount {
 		return 0, fmt.Errorf("%w: VersionValidFor=%d FileChangeCount=%d", ErrHeaderCorrupt, h.VersionValidFor, h.FileChangeCount)

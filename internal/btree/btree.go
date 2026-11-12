@@ -1800,7 +1800,7 @@ func (bt *btree) cellFullKey(c *cellData) ([]byte, error) {
 // For cells with overflow keys the full key is read from overflow pages and the
 // overflow chain is freed (the caller will rebuild the page); such keys are
 // freshly allocated and do not alias buf.
-// DRIFT: an overflowing divider is read in full and its chain freed here, then rewritten by rebuildInteriorPage; SQLite moves the raw cell and leaves the chain alone. See docs/btree/NOTES.md#drift-2026-11-11-3-interior-collection-rewrites-overflowing-divider-chains
+// DRIFT: an overflowing divider is read in full and its chain freed here, then rewritten by rebuildInteriorPage; SQLite moves the raw cell and leaves the chain alone. See docs/btree/NOTES.md#drift-2026-11-11-9-interior-collection-rewrites-overflowing-divider-chains
 func (bt *btree) collectInteriorCellsKeepBuf(pg *page) ([]cellData, []byte, error) {
 	n := int(pg.header.cellCount)
 	// Draw the descriptor slice from the pager free-list (SQLite apCell[]); this

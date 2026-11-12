@@ -120,7 +120,7 @@ func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 		return nil, ErrBackupPageSizeMismatch
 	}
 
-	// DRIFT: SQLite's backup turns the destination into the source's file format; here the two must already agree, because the leaf payload rule is held per open file, not per page. See docs/btree/NOTES.md#drift-2026-11-11-2-backup-refuses-a-destination-of-another-schema-format
+	// DRIFT: SQLite's backup turns the destination into the source's file format; here the two must already agree, because the leaf payload rule is held per open file, not per page. See docs/btree/NOTES.md#drift-2026-11-11-8-backup-refuses-a-destination-of-another-schema-format
 	if dst.pager.tableLeaf.Load() != src.pager.tableLeaf.Load() {
 		return nil, ErrBackupFormatMismatch
 	}
