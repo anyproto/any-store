@@ -1547,7 +1547,12 @@ material (measurement shows it is secondary to syscall cost).
 after deserializing the DB header and returns `ErrCorrupt` on a
 nonzero mismatch (zero is treated as "field not tracked" — legacy /
 test fixtures skip the check). Commit path now advances both fields
-in lockstep. Catches crash-mid-header-update corruption.
+in lockstep. Catches crash-mid-header-update corruption. Since
+2026-11-11 the comparison is made by `lockBtreePageCount` on the page 1
+the open snapshot reads (`pager.readPage1AtOpen`): a WAL page 1 that
+supersedes a damaged file header is what gets judged. This is
+stricter than SQLite, which only stops trusting the in-header size:
+see [drift-2026-11-11-2](#drift-2026-11-11-2-nonzero-change-counter-mismatch-is-corruption).
 
 **Auto-Checkpoint Errors Surfaced** -- Resolved 2026-04-22
 
@@ -2116,7 +2121,7 @@ bounded by the per-snapshot `dbSize` check.
 
 <a id="drift-6-wal-frame-read-failure-falls-through-to-disk-read"></a>
 ### Drift: WAL Frame Read Failure Falls Through To Disk Read
-- **Category:** changed-logic  -  **Severity:** high  -  **Status:** RESOLVED 2026-07-10 (2026-07 pre-beta review): all four getters (`getPageWriter`, `readTempPage`, `getPageReader`, `readRawPage`) now propagate `readFrame`/`readFrameRaw` errors wrapped with page/frame context, matching C `readDbPage`, where with `iFrame != 0` the DB-file read is the unreachable else branch and a WAL read error becomes the page-get error (`sqlitec/src/pager.c:3035-3046`, 3.52.0). The "benign reset between lookup and read" TOCTOU race the fallthrough covered (introduced with commit `1e2cec7`) is structurally excluded: the writer path holds `lockWrite`, which any restart requires (`checkpointWithMode`; PASSIVE never resets, `checkpointPost`); readers hold a slot 1-4 shared lock that `tryResetWALWithBusy` must take exclusively; slot-0 snapshots carry `minFrame = mxFrame+1` so `walIndex.get` never resolves a frame for them (C `readLock==0` short-circuit); and the in-process slot-0 fallback now re-validates after acquiring read-0 (see the 2026-07-10 fallback re-validation fix, mirroring C's READ_LOCK(0) re-check at `wal.c:3136-3139`). Caveat: API calls that begin pager reads without the `db.mu` drain (`GetNamespace`, `ListNamespaces`, `IntegrityCheckN`) and race `DB.Close`'s WAL truncate may now surface a read error where they previously silently succeeded (contract-gray; follow-up). Adjacent residual: `refreshHeaderFromPage1`'s single-failure-with-successful-fallback path (deliberate 2026-07-10 design) still adopts a DB-file page-1 header under the write lock — open follow-up. Regression tests: `TestWALReadFrameErrorPropagates{,_Writer,_TempPage}`, `TestReadRawPageWALErrorPropagates`, `TestWALDecryptFailurePropagatesFromReadFrame`, `TestReadFrameNoBenignFailuresUnderTruncateStress`, `TestInProcessSlot0FallbackTruncateStress`.
+- **Category:** changed-logic  -  **Severity:** high  -  **Status:** RESOLVED 2026-07-10 (2026-07 pre-beta review): all four getters (`getPageWriter`, `readTempPage`, `getPageReader`, `readRawPage`) now propagate `readFrame`/`readFrameRaw` errors wrapped with page/frame context, matching C `readDbPage`, where with `iFrame != 0` the DB-file read is the unreachable else branch and a WAL read error becomes the page-get error (`sqlitec/src/pager.c:3035-3046`, 3.52.0). The "benign reset between lookup and read" TOCTOU race the fallthrough covered (introduced with commit `1e2cec7`) is structurally excluded: the writer path holds `lockWrite`, which any restart requires (`checkpointWithMode`; PASSIVE never resets, `checkpointPost`); readers hold a slot 1-4 shared lock that `tryResetWALWithBusy` must take exclusively; slot-0 snapshots carry `minFrame = mxFrame+1` so `walIndex.get` never resolves a frame for them (C `readLock==0` short-circuit); and the in-process slot-0 fallback now re-validates after acquiring read-0 (see the 2026-07-10 fallback re-validation fix, mirroring C's READ_LOCK(0) re-check at `wal.c:3136-3139`). Caveat: API calls that begin pager reads without the `db.mu` drain (`GetNamespace`, `ListNamespaces`, `IntegrityCheckN`) and race `DB.Close`'s WAL truncate may now surface a read error where they previously silently succeeded (contract-gray; follow-up). The adjacent residual in `refreshHeaderFromPage1` (a failed page-1 frame read fell back to the DB file's older page 1 under the write lock) is closed as of 2026-11-11: see the error-propagation paragraph of drift-76. Regression tests: `TestWALReadFrameErrorPropagates{,_Writer,_TempPage}`, `TestReadRawPageWALErrorPropagates`, `TestWALDecryptFailurePropagatesFromReadFrame`, `TestReadFrameNoBenignFailuresUnderTruncateStress`, `TestInProcessSlot0FallbackTruncateStress`.
 - **Affected functions:** `pager.go:*pager.getPageWriter` (`internal/btree/pager.go:1014-1028`), `pager.go:*pager.readTempPage` (`internal/btree/pager.go:1114-1123`); the same fall-through also appears in the `getPageReader` cache path (`internal/btree/pager.go:1247`) and the `readFrameRaw` path (`internal/btree/pager.go:1357`).
 
 In C `readDbPage`, once `sqlite3WalFindFrame` resolves a WAL frame (`iFrame != 0`) the
@@ -2840,6 +2845,64 @@ disk and overwrites BOTH `p.header` and `p.dbSize` (`p.dbSize.Store(p.header.Dat
 `pager.go:2016,2034`). The consequence is a structural divergence in when and where the cached
 header/size are reconciled with the on-disk image: Go performs this reconciliation lazily at the
 start of a write when the underlying WAL state changed, rather than during reads as SQLite does.
+
+Error propagation and the page-count rule (2026-11-11). The re-read is now what `lockBtree` does at
+the start of a transaction (`btree.c:3284-3298`, `3401-3408`):
+
+- Page 1 is fetched whole through the writer cache (`btreeGetPage` → `readDbPage`,
+  `pager.c:3031-3046`), from exactly one source: the WAL frame when the wal-index resolves one, the
+  DB file otherwise. The DB file's older page 1 never stands in for a frame whose read failed.
+  The page stays in the cache the begin has just cleared, where the commit would load it anyway,
+  so the full-page read replaces a later one rather than adding one.
+- The size is `lockBtreePageCount` (`btree.c:3294-3298`, `3401-3408`) against `pagerPageCount`
+  (`pagerPagecount`, `pager.c:3279-3306`: the live wal-index `nPage`, else the file size): a zero
+  or untrusted page-1 size gives way to the pager's count, and a trusted size above it is
+  `ErrHeaderCorrupt`. `pager.open` uses the same two helpers in `readPage1AtOpen`, which reads
+  page 1 and the count under one WAL read transaction (`pagerBeginReadTransaction` then
+  `pagerPagecount`, `pager.c:5444-5448`; `lockBtree`, `btree.c:3284-3298`), so a peer's checkpoint
+  during open cannot pair a stale file header with a newer WAL size. It reads page 1 whole from
+  either source, as `readDbPage` does (`pager.c:3031-3046`), so a read error past the header fails
+  the open (test `TestOpenPage1ReadErrorPastHeaderFails`, vfs tag); a short file read is not an
+  error there, as in `readDbPage` (the rest reads as zeros), unless the header itself is cut off. Open used to take the larger
+  of the file-derived size and the WAL's, which brought back the pages of a WAL-committed shrink
+  at the first commit.
+- A failed lookup, a failed read, a page-1 image that does not decode as a database header, and a
+  rejected size all abort `beginWrite` and leave `p.header` / `p.dbSize` untouched.
+
+Before this, a failed frame read fell back to the DB file and returned nil, so a writer could
+start with a peer-outgrown `dbSize` and freelist and allocate over the peer's pages; a failed
+decode and a lone DB-file read failure were ignored, only the 100-byte prefix was read, and the
+page-1 size was installed unchecked (a zero made every page unreachable).
+
+Error classes. SQLite's `SQLITE_NOTADB` for a page 1 that is not a database header
+(`btree.c:3306`) is `ErrHeaderCorrupt` here, as at open: any-store has one error for "unusable
+header", and it matches `ErrCorrupt`. A DB file too short to hold page 1 is a read error
+(`io.EOF`) rather than a zero-filled `NOTADB`, because the page getters do not zero-fill a short
+read ([drift-7](#drift-7-short-db-file-read-treated-as-hard-error)); the begin fails either way.
+
+Residual divergence: SQLite needs no "refresh pending" state, because a transaction whose page-1
+read failed never keeps the page (`lockBtree` releases it and leaves `pBt->pPage1` zero,
+`btree.c:3288-3289`, `3451-3454`) and the next transaction reads it again. Go keeps the header in
+a struct and detects the peer change in the WAL layer, whose `writerHdr` baseline has already
+moved to the live header by the time the page-1 re-read runs. `pager.headerStale` carries the
+pending refresh across a failed begin: it is set before the re-read and cleared only when one
+succeeds, and `beginWrite` refreshes when either `stateChanged` or `headerStale` is set.
+Regression tests: `TestBeginWritePage1Refresh_WALReadFailureNoStaleFallback`,
+`TestBeginWritePage1Refresh_PageCountRule`,
+`TestRefreshHeaderFromPage1_DecodeErrorPropagates`,
+`TestRefreshHeaderFromPage1_DBFileReadErrorPropagates`,
+`TestRefreshHeaderFromPage1_DoubleIOFailure`, `TestBeginWriteHeaderRefreshError_DoubleIOFailure`.
+
+<a id="drift-2026-11-11-2-nonzero-change-counter-mismatch-is-corruption"></a>
+### Drift: A Non-Zero Change-Counter Mismatch On Page 1 Is Corruption, Not An Untrusted Size
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:lockBtreePageCount` (callers `pager.go:*pager.refreshHeaderFromPage1`, `pager.go:*pager.open`).
+
+SQLite's `lockBtree` uses the in-header page count (offset 28) only when it is non-zero and bytes 24..27 (change counter) equal bytes 92..95 (version-valid-for); on any mismatch it falls back to the pager's count and carries on (`btree.c:3294-3298`). The mismatch is a normal state there: a library older than 3.7.0 updates the change counter without knowing about offsets 28 and 92, so the stored size may be stale and is simply not trusted.
+
+`lockBtreePageCount` applies the same rule for a zero size and for `VersionValidFor == 0` (files and fixtures that never tracked the field), but returns `ErrHeaderCorrupt` when `VersionValidFor` is non-zero and differs from `FileChangeCount`. No any-store writer can produce that state: every commit sets the two fields together before serializing page 1 (`pager.commit`), both live in the first 100 bytes of the page so no sector boundary separates them, and there is no older any-store format that maintains one without the other. A non-zero mismatch therefore means the header bytes were damaged, and the same damage may have hit the freelist head and count next to them (offsets 32 and 36), which nothing cross-checks; continuing on the pager's count would let the next commit write that header back. SQLite's leniency exists for a compatibility case any-store does not have.
+
+The cost is that a database whose page-1 header is damaged in exactly these bytes is refused where SQLite would open it. Revisit if a writer that updates the counters separately is ever introduced. Regression tests: `TestBeginWritePage1Refresh_PageCountRule/change-counter_mismatch_is_corrupt`, and the open-time `VersionValidFor` test in `pager_test.go`.
 
 <a id="drift-77-filechangecount-bumped-conditionally-not-unconditionally"></a>
 ### Drift: FileChangeCount Bumped Conditionally Not Unconditionally
@@ -3956,7 +4019,7 @@ SQLite never changes its magic. A file from a later release is told apart by the
 
 Two things differ from SQLite. First, the bounds cannot protect a file from the releases that never checked them, so schema formats 6 and later are written under a second magic, `"any-store v2 fmt"` (v2.5.0 is the first release to create such files). It fills all 16 bytes, and those releases compare the whole field, so they refuse the file at the header (as a corrupt file: `ErrHeaderCorrupt` from v2.4.3, plain `ErrCorrupt` before it) before reading a page of it. The magic changes this once: later formats raise the schema format only. The magic and the schema format must agree (the second magic with a format below 6, or a zero-padded magic with format 6, is `ErrHeaderCorrupt`; a format above the newest known is `ErrNewerFormat` under either magic, because that check runs first). `serialize` writes back the family of the magic the header was read with (an older `"BTree format 1"` becomes `"any-store v2"`), so no commit moves a file between the two families; a backup refuses a destination of the other family for the same reason (see [its entry](#drift-2026-11-11-2-backup-refuses-a-destination-of-another-schema-format)); and the copy of page 1 that `pager.open` reads from the WAL must name the same family as the file. Second, a write version above the maximum refuses the open instead of opening read-only: the btree has no read-only open.
 
-The checks live in `dbHeader.deserialize`, whose first caller on the open path is `readInitialHeader`, before the file is locked or its WAL and wal-index are touched; a refused open leaves all three files as they were. A newer format found only in the WAL's copy of page 1 is refused after WAL recovery has run, which may have rewritten the wal-index. A handle that is already open reloads the header after another process commits (`refreshHeaderFromPage1`); there `ErrNewerFormat` and a change of leaf rule fail the transaction (`checkRefreshedHeader`), while the other header checks are not applied, as before: SQLite re-runs all of `lockBtree` on every such read. Regression tests: `internal/btree/format_gate_test.go` (`TestCheckHeaderFormat`, `TestOpen_RefusedFormatLeavesFilesUntouched`, `TestHeaderSerialize_KeepsMagicFamily`, `TestOpen_FirstMagicStillOpensAndIsRewritten`), `corrupt_open_test.go:TestOpen_NewerFormat`.
+The checks live in `dbHeader.deserialize`, whose first caller on the open path is `readInitialHeader`, before the file is locked or its WAL and wal-index are touched; a refused open leaves all three files as they were. A newer format found only in the WAL's copy of page 1 is refused after WAL recovery has run, which may have rewritten the wal-index. A handle that is already open reloads the header after another process commits (`refreshHeaderFromPage1`); there every check of `dbHeader.deserialize`, `ErrNewerFormat` included, and a change of leaf rule (`checkRefreshedHeader`) fail the transaction, as SQLite re-runs all of `lockBtree` on every such read. Regression tests: `internal/btree/format_gate_test.go` (`TestCheckHeaderFormat`, `TestOpen_RefusedFormatLeavesFilesUntouched`, `TestHeaderSerialize_KeepsMagicFamily`, `TestOpen_FirstMagicStillOpensAndIsRewritten`), `corrupt_open_test.go:TestOpen_NewerFormat`.
 
 <a id="drift-2026-11-10-2-leaf-insert-fit-check-counts-the-cell-pointer-twice"></a>
 ### Drift: The Leaf Insert Fit Check Counts The New Cell's Pointer Twice

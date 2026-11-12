@@ -1553,18 +1553,13 @@ func TestBeginWrite_BeginWriteError(t *testing.T) {
 }
 
 func TestBeginWrite_ReadHeaderCountersError(t *testing.T) {
-	// Reader-path corruption detection: readHeaderCounters reads page 1 from
-	// the db file when no WAL frame exists for it. Truncating the file makes
-	// that read fail, so BeginRead (which reads on-disk counters for staleness
-	// detection) errors.
-	//
-	// BeginWrite, by contrast, no longer re-reads page 1 from the WAL/file per
-	// transaction: it takes the staleness counters from the in-memory header,
-	// which beginWrite refreshes only on the stateChanged edge (peer
-	// commit/checkpoint), mirroring SQLite keeping the header in the in-memory
-	// page-1 PgHdr (pager.c). So BeginWrite succeeds on the truncated file —
-	// the corruption is instead caught when the writer first touches a page
-	// that must be read from the now-truncated file.
+	// Page 1 lives only in the db file (no WAL frame for it), and the file
+	// is truncated below the header. BeginRead reads the on-disk counters
+	// for staleness detection and fails. BeginWrite fails too: the first
+	// write begin of a handle re-reads page 1 (the stateChanged edge), and
+	// a page 1 that cannot be read aborts the begin, as SQLite's lockBtree
+	// does (btree.c:3288-3289) — the writer never starts on a header it
+	// could not reconcile with the file.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
@@ -1593,17 +1588,10 @@ func TestBeginWrite_ReadHeaderCountersError(t *testing.T) {
 	_, err = db2.BeginRead()
 	assert.Error(t, err)
 
-	// BeginWrite no longer reads page 1 per-tx, so it succeeds: the staleness
-	// counters come from the in-memory header.
-	wtx, err := db2.BeginWrite()
-	require.NoError(t, err)
-
-	// The corruption is still caught: resolving a namespace forces a read of a
-	// page beyond the 10-byte truncation, which fails.
-	_, err = wtx.GetNamespace("test")
-	assert.Error(t, err)
-
-	_ = wtx.Rollback()
+	_, err = db2.BeginWrite()
+	require.Error(t, err)
+	assert.NotEqual(t, int32(pagerWriter), db2.pager.state.Load(),
+		"the failed begin must not leave a write transaction open")
 
 	// Restore for cleanup
 	db2.pager.state.Store(int32(pagerOpen))

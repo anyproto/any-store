@@ -1786,13 +1786,20 @@
   "pager.go:*pager.open": {
     "sqlite": [
       "btree.c:lockBtree",
+      "pager.c:pagerPagecount",
       "pager.c:sqlite3PagerOpen"
     ],
-    "note": ""
+    "note": "page 1 and the page count are read at one snapshot in readPage1AtOpen"
   },
   "pager.go:*pager.pagerError": {
     "sqlite": [
       "pager.c:pager_error"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.pagerPageCount": {
+    "sqlite": [
+      "pager.c:pagerPagecount"
     ],
     "note": ""
   },
@@ -1831,6 +1838,14 @@
     ],
     "note": ""
   },
+  "pager.go:*pager.readPage1AtOpen": {
+    "sqlite": [
+      "btree.c:lockBtree",
+      "pager.c:pagerBeginReadTransaction",
+      "pager.c:pagerPagecount"
+    ],
+    "note": "open-time page-1 read and page count under one WAL read transaction"
+  },
   "pager.go:*pager.readRawPage": {
     "sqlite": [],
     "note": ""
@@ -1862,8 +1877,11 @@
     "note": ""
   },
   "pager.go:*pager.refreshHeaderFromPage1": {
-    "sqlite": [],
-    "note": ""
+    "sqlite": [
+      "btree.c:lockBtree",
+      "pager.c:readDbPage"
+    ],
+    "note": "page-1 re-read at write begin after a peer's change: one source, whole page, lockBtree's page-count rule"
   },
   "pager.go:*pager.releasePage": {
     "sqlite": [
@@ -1982,6 +2000,12 @@
   "pager.go:SetCreateLegacyFormatForTest": {
     "sqlite": [],
     "note": "test hook: create schema format 5 files"
+  },
+  "pager.go:lockBtreePageCount": {
+    "sqlite": [
+      "btree.c:lockBtree"
+    ],
+    "note": "the page-count rule only (offset 28 vs the pager's count); a non-zero 24/92 mismatch is rejected, see drift-2026-11-11-2"
   },
   "pager.go:newPager": {
     "sqlite": [
