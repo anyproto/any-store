@@ -46,10 +46,19 @@ func changePeerChild(t *testing.T) bool {
 	switch mode {
 	case "commit":
 		restartPut(t, db, 0, rows, byte(fill))
-	case "commit-loop": // fill is the number of commits; fills 2, 3, ...
+	case "commit-signal": // fill is the number of commits; fills 2, 3, ...
+		// Each commit waits for the parent's go-<i> file and is followed by
+		// done-<i>.
 		for i := 0; i < fill; i++ {
+			for n := 0; ; n++ {
+				if _, err := os.Stat(changePeerSignal(path, "go", i)); err == nil {
+					break
+				}
+				require.Less(t, n, 6000, "never told to make commit %d", i)
+				time.Sleep(time.Millisecond)
+			}
 			restartPut(t, db, 0, rows, byte(2+i))
-			time.Sleep(5 * time.Millisecond)
+			require.NoError(t, os.WriteFile(changePeerSignal(path, "done", i), nil, 0o644))
 		}
 	case "truncate":
 		require.NoError(t, db.Checkpoint(CheckpointTruncate))
@@ -83,6 +92,11 @@ func runChangePeer(t *testing.T, path, mode string, fill byte) {
 		changePeerEnvFill+"="+strconv.Itoa(int(fill)))
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "peer (%s) failed:\n%s", mode, out)
+}
+
+// changePeerSignal names a file a test and its peer signal each other by.
+func changePeerSignal(path, what string, i int) string {
+	return path + "." + what + "-" + strconv.Itoa(i)
 }
 
 // startChangePeer starts a peer and returns without waiting for it.

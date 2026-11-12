@@ -100,3 +100,14 @@ func SetTestBeforeBeginWriteHook(f func(s TestSeam)) {
 		}
 	}
 }
+
+// SetTestWalRetryHook installs the hook that runs in the WAL protocol's
+// retry loop of every read begin of this process each time an attempt has
+// to be made again (the header is being written, or a lock is held for an
+// instant), with the number of attempts so far. Nil removes it.
+func SetTestWalRetryHook(f func(cnt int)) { testWalRetryHook = f }
+
+// SetTestBeginWriteRetryHook installs the hook that runs in every write
+// begin of this process after an attempt failed with a busy error and
+// before the next one, with that error. Nil removes it.
+func SetTestBeginWriteRetryHook(f func(err error)) { testBeginWriteRetryHook = f }

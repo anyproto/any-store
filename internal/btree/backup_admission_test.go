@@ -11,6 +11,7 @@ package btree
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -102,16 +103,25 @@ func TestBackupAdmission_CloseDuringRecoveryWait(t *testing.T) {
 	require.NoError(t, w.index.lock(lockRecover, lockExclusive))
 
 	sawRegistered := true
-	testCloseWriterCheckedHook = func(registered bool) { sawRegistered = registered }
+	closeLooked := make(chan struct{})
+	testCloseWriterCheckedHook = func(registered bool) {
+		sawRegistered = registered
+		close(closeLooked)
+	}
 	defer func() { testCloseWriterCheckedHook = nil }()
 
 	// The Step's begin calls the busy handler while the rebuild is in
 	// progress: the first call says the Step is in its wait.
+	// It stays there until Close has found the write lock of the process
+	// held and looked for a write transaction.
 	inWait := make(chan struct{})
 	var once sync.Once
 	base := w.busyHandler
 	w.busyHandler = func(n int) bool {
-		once.Do(func() { close(inWait) })
+		once.Do(func() {
+			close(inWait)
+			<-closeLooked
+		})
 		return base(n)
 	}
 
@@ -150,39 +160,71 @@ func TestBackupAdmission_CancelAndCloseDuringProtocolWait(t *testing.T) {
 	region, err := w.index.shm.region(0, true)
 	require.NoError(t, err)
 
-	pause := func(d time.Duration) {
+	// publisher leaves the header torn under the write lock and returns
+	// the function that lets it finish.
+	publisher := func() (finish func()) {
 		region[16] ^= 0x01
 		require.NoError(t, w.index.lock(lockWrite, lockExclusive))
-		time.AfterFunc(d, func() {
+		return func() {
 			region[16] ^= 0x01
-			_ = w.index.unlock(lockWrite, lockExclusive)
-		})
+			require.NoError(t, w.index.unlock(lockWrite, lockExclusive))
+		}
 	}
+	// inRetryLoop is closed once a begin is asleep in the retry loop.
+	armRetryLoop := func() (inRetryLoop chan struct{}) {
+		inRetryLoop = make(chan struct{})
+		var once sync.Once
+		testWalRetryHook = func(cnt int) {
+			if cnt >= 12 {
+				once.Do(func() { close(inRetryLoop) })
+			}
+		}
+		return inRetryLoop
+	}
+	defer func() { testWalRetryHook = nil }()
 
 	// Cancel during the wait.
 	ctx, cancel := context.WithCancel(context.Background())
-	pause(300 * time.Millisecond)
-	time.AfterFunc(50*time.Millisecond, cancel)
-	start := time.Now()
-	require.NoError(t, f.b.Step(ctx, 4), "the Step does not look at ctx inside its begin")
-	require.GreaterOrEqual(t, time.Since(start), 250*time.Millisecond)
+	finish := publisher()
+	inRetryLoop := armRetryLoop()
+	stepDone := make(chan error, 1)
+	go func() { stepDone <- f.b.Step(ctx, 4) }()
+	<-inRetryLoop
+	cancel()
+	select {
+	case err := <-stepDone:
+		t.Fatalf("the Step returned (%v) while the publisher held the header", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	finish()
+	require.NoError(t, <-stepDone, "the Step does not look at ctx inside its begin")
 	after := f.next(t)
 	require.Greater(t, after, before)
 	require.ErrorIs(t, f.b.Step(ctx, 4), context.Canceled)
 	require.Equal(t, after, f.next(t))
 
 	// Close during the wait.
-	pause(300 * time.Millisecond)
-	stepDone := make(chan error, 1)
+	closeLooked := make(chan bool, 1)
+	testCloseWriterCheckedHook = func(registered bool) { closeLooked <- registered }
+	defer func() { testCloseWriterCheckedHook = nil }()
+	finish = publisher()
+	inRetryLoop = armRetryLoop()
 	go func() { stepDone <- f.b.Step(context.Background(), 4) }()
-	time.Sleep(50 * time.Millisecond) // the Step is in the retry loop: nothing to witness it by
-	closeStart := time.Now()
-	require.NoError(t, f.src.Close())
-	require.GreaterOrEqual(t, time.Since(closeStart), 150*time.Millisecond, "Close waited for the Step")
-	err = <-stepDone
-	if err != nil { // the Step ended before Close set closing, or found it set
-		require.ErrorIs(t, err, ErrClosed)
+	<-inRetryLoop
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- f.src.Close() }()
+	require.False(t, <-closeLooked, "Close found the write lock held and no write transaction to rescue")
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned (%v) while the Step held the write lock of the process", err)
+	case <-time.After(20 * time.Millisecond):
 	}
+	finish() // the publisher is done; the Step goes on, then Close
+	stepErr := <-stepDone
+	if stepErr != nil { // the database is closing by now
+		require.ErrorIs(t, stepErr, ErrClosed)
+	}
+	require.NoError(t, <-closeDone)
 	_ = f.b.Finish()
 }
 
@@ -201,13 +243,19 @@ func TestBackupAdmission_PausedPublisher(t *testing.T) {
 		require.NoError(t, err)
 		region[16] ^= 0x01
 		require.NoError(t, w.index.lock(lockWrite, lockExclusive))
-		time.AfterFunc(300*time.Millisecond, func() {
-			region[16] ^= 0x01
-			_ = w.index.unlock(lockWrite, lockExclusive)
-		})
-		start := time.Now()
+		// The publisher finishes once the Step's begin is asleep in the
+		// retry loop.
+		retries := 0
+		testWalRetryHook = func(cnt int) {
+			if retries = cnt; cnt == 30 {
+				region[16] ^= 0x01
+				_ = w.index.unlock(lockWrite, lockExclusive)
+			}
+		}
+		defer func() { testWalRetryHook = nil }()
 		require.NoError(t, f.b.Step(context.Background(), 4))
-		require.GreaterOrEqual(t, time.Since(start), 250*time.Millisecond, "the Step waited the pause out")
+		testWalRetryHook = nil
+		require.GreaterOrEqual(t, retries, 30, "the Step waited the pause out in the retry loop")
 		require.Greater(t, f.next(t), before)
 		f.finish(t, 1)
 	})
@@ -473,9 +521,11 @@ func TestBackupChange_StepDuringAPendingPublication(t *testing.T) {
 }
 
 // A backup whose Steps overlap the commits of a writer in another process,
-// beside readers of its own: the peer commits in a loop while the backup
-// steps without pause. Whatever the interleaving, once the peer is done the
-// backup ends as one committed state, and it was restarted on the way.
+// beside readers of its own. The peer commits when told to, and it is told
+// from inside a Step, once the Step has its snapshot and before it copies:
+// each of those commits lands while a Step is active. Every copy the backup
+// completes on the way is one committed state, each such commit restarts the
+// backup, and the last copy is the peer's last state.
 func TestBackupChange_OverlappingForeignWriter(t *testing.T) {
 	if changePeerChild(t) {
 		return
@@ -483,6 +533,7 @@ func TestBackupChange_OverlappingForeignWriter(t *testing.T) {
 	f := newBackupFixture(t, restartModes[0])
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	readErrs := make(chan error, 3)
 	for g := 0; g < 3; g++ {
 		wg.Add(1)
 		go func() {
@@ -493,57 +544,102 @@ func TestBackupChange_OverlappingForeignWriter(t *testing.T) {
 					return
 				default:
 				}
-				if rtx, err := f.src.BeginRead(); err == nil {
-					if ns, err := rtx.GetNamespace("t1"); err == nil {
-						_, _ = rtx.Get(ns, []byte{0, 0, 0, 7})
+				rtx, err := f.src.BeginRead()
+				if err == nil {
+					var ns *Namespace
+					if ns, err = rtx.GetNamespace("t1"); err == nil {
+						_, err = rtx.Get(ns, []byte{0, 0, 0, 7})
 					}
 					_ = rtx.Rollback()
+				}
+				if err != nil {
+					readErrs <- err
+					return
 				}
 			}
 		}()
 	}
 
-	peer := startChangePeer(t, f.srcPath, "commit-loop-all", 20)
-	peerDone := make(chan error, 1)
-	go func() { peerDone <- peer.Wait() }()
+	const commits = 8
+	peer := startChangePeer(t, f.srcPath, "commit-signal-all", commits)
+	defer func() { _ = peer.Process.Kill() }()
 
-	restarts, prev := 0, f.next(t)
-	running := true
-	for running {
+	// uniformFill checks that the destination's rows are of one fill and
+	// returns it.
+	uniformFill := func() byte {
+		rtx, err := f.dst.BeginRead()
+		require.NoError(t, err)
+		ns, err := rtx.GetNamespace("t1")
+		require.NoError(t, err)
+		val, err := rtx.Get(ns, []byte{0, 0, 0, 0})
+		require.NoError(t, err)
+		require.NoError(t, rtx.Rollback())
+		restartCheck(t, f.dst, 0, backupRows, val[0])
+		return val[0]
+	}
+
+	overlapped, restarts, steps := 0, 0, 0
+	testBackupSampledHook = func() { // inside a Step: snapshot taken, nothing copied yet
+		if steps++; overlapped == commits || steps%3 != 0 {
+			return
+		}
+		// Tell the peer to commit, and wait until it has: the commit is
+		// made while this Step is active.
+		require.NoError(t, os.WriteFile(changePeerSignal(f.srcPath, "go", overlapped), nil, 0o644))
+		require.Eventually(t, func() bool {
+			_, err := os.Stat(changePeerSignal(f.srcPath, "done", overlapped))
+			return err == nil
+		}, 30*time.Second, time.Millisecond, "the peer never committed")
+		overlapped++
+	}
+	defer func() { testBackupSampledHook = nil }()
+
+	prev := f.next(t)
+	for extra := 0; extra < 2; { // until the last commit, and two Steps more
+		if overlapped == commits {
+			extra++
+		}
 		select {
-		case err := <-peerDone:
-			require.NoError(t, err)
-			running = false
+		case err := <-readErrs:
+			t.Fatalf("a reader failed: %v", err)
 		default:
 		}
-		// One page at a time, slowly: a pass over the source takes longer
-		// than the peer's pause between commits, so commits land inside it.
-		time.Sleep(300 * time.Microsecond)
 		err := f.b.Step(context.Background(), 1)
-		if errors.Is(err, ErrBusy) || errors.Is(err, ErrBusySnapshot) || errors.Is(err, ErrBusyRecovery) {
+		if errors.Is(err, ErrBusy) { // every reader slot taken for an instant
 			continue
 		}
 		if errors.Is(err, ErrBackupDone) {
-			// Done between two of the peer's commits: a consistent copy of
-			// an earlier state. Start a new backup to go on overlapping.
+			// A copy completed between two of the peer's commits: it is
+			// one committed state. Check it, then go on with a new backup.
 			require.NoError(t, f.b.Finish())
+			uniformFill()
 			f.b, err = f.dst.BackupInit(f.src)
 			require.NoError(t, err)
 			prev = 1
 			continue
 		}
 		require.NoError(t, err)
-		if next := f.next(t); next < prev {
-			restarts++
-			prev = next
-		} else {
-			prev = next
+		next := f.next(t)
+		if next < prev {
+			restarts++ // the Step started over: iNext went back
+		}
+		prev = next
+		if steps > 100000 {
+			t.Fatalf("no end: %d overlapping commits, %d restarts", overlapped, restarts)
 		}
 	}
+	testBackupSampledHook = nil
+	require.NoError(t, peer.Wait())
 	close(stop)
 	wg.Wait()
-	require.Positive(t, restarts, "the peer's commits restarted the backup while it was stepping")
-	f.finish(t, 21) // the peer's last fill: 2 + 19
+	select {
+	case err := <-readErrs:
+		t.Fatalf("a reader failed: %v", err)
+	default:
+	}
+	require.Equal(t, commits, overlapped, "every commit of the peer was made while a Step was active")
+	require.GreaterOrEqual(t, restarts, 1, "commits made under a Step restarted the backup")
+	f.finish(t, byte(1+commits)) // the peer's last fill
 }
 
 // Two begins find the same change at once. The first to swap the change

@@ -2192,7 +2192,15 @@
     "sqlite": [],
     "note": "test seam"
   },
+  "testseam.go:SetTestBeginWriteRetryHook": {
+    "sqlite": [],
+    "note": "test seam"
+  },
   "testseam.go:SetTestPublishHeaderHook": {
+    "sqlite": [],
+    "note": "test seam"
+  },
+  "testseam.go:SetTestWalRetryHook": {
     "sqlite": [],
     "note": "test seam"
   },
