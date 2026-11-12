@@ -819,6 +819,12 @@ var (
 	testResetWALHook              func(step string)
 )
 
+// testCommitPublishErrHook, when non-nil, runs in writeFrames and
+// writeFramesMem once a commit's frames are written (and, with a WAL file,
+// synced), before the commit is made visible; an error it returns fails the
+// commit there, as a failed sync does. Test-only.
+var testCommitPublishErrHook func() error
+
 // synthHdr is the header of a snapshot in the in-process and in-memory
 // modes, which keep no WAL-index header: the frame ceiling and the restart
 // count (iChange, unused otherwise), no salts (WalIndexHdr.synthesized).
@@ -2667,6 +2673,11 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 				return err
 			}
 		}
+		if f := testCommitPublishErrHook; f != nil {
+			if err := f(); err != nil {
+				return err
+			}
+		}
 		// Advance mxCommitFrame AFTER fdatasync so in-process readers only
 		// see committed frames once they are durable on disk. This matches
 		// SQLite where walIndexWriteHdr (which publishes mxFrame) is called
@@ -2827,6 +2838,11 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	}
 
 	if commit {
+		if f := testCommitPublishErrHook; f != nil {
+			if err := f(); err != nil {
+				return err
+			}
+		}
 		// Advance mxCommitFrame so readers can see the committed frames.
 		mxCommit := w.index.maxFrame.Load()
 		w.index.mxCommitFrame.Store(mxCommit)

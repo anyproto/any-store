@@ -9,7 +9,10 @@ package btree
 // open recovers.
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 
@@ -49,6 +52,7 @@ func TestWalWriterRestart_HeaderWriteAndSyncFailure(t *testing.T) {
 				require.NoError(t, db.Checkpoint(CheckpointPassive))
 				w := db.pager.wal
 				n := w.index.mxCommitFrame.LoadLocal()
+				size := db.pager.dbSize.Load()
 				ff := &walHeaderFaultFile{File: w.file}
 				w.file = ff
 
@@ -65,7 +69,33 @@ func TestWalWriterRestart_HeaderWriteAndSyncFailure(t *testing.T) {
 				require.Zero(t, w.index.mxCommitFrame.LoadLocal())
 				restartCheck(t, db, 0, 200, 1)
 
-				restartPut(t, db, 0, 3, 3)
+				// A reader of the unwound state, held across the retry: its
+				// snapshot is the new log's start with the last commit's size,
+				// so the retry's frames 1, 2, ... are not in it.
+				rtx, err := db.BeginRead()
+				require.NoError(t, err)
+				held := func() error {
+					defer func() { _ = rtx.Rollback() }()
+					if got := db.pager.readerDbSizeBound(rtx.cache); got != size {
+						return fmt.Errorf("held reader's page count %d, the last commit's %d", got, size)
+					}
+					restartPut(t, db, 0, 3, 3)
+					ns, err := rtx.GetNamespace("t1")
+					if err != nil {
+						return err
+					}
+					for i := 0; i < 3; i++ {
+						v, err := rtx.Get(ns, binary.BigEndian.AppendUint32(nil, uint32(i)))
+						if err != nil {
+							return err
+						}
+						if !bytes.Equal(v, bytes.Repeat([]byte{1}, 300)) {
+							return fmt.Errorf("row %d: the held reader sees the retry's commit", i)
+						}
+					}
+					return nil
+				}()
+				require.NoError(t, held)
 				restartCheck(t, db, 0, 3, 3)
 				restartCheck(t, db, 3, 200, 1)
 				// Recovered from the WAL's bytes, before any Close
