@@ -571,3 +571,128 @@ func TestTornWalIndexHeader_WALReadBeginWaitsOutRecovery(t *testing.T) {
 	_, valid := w.index.readHeader()
 	require.True(t, valid, "the read begin repaired the header once the locks were free")
 }
+
+// TestBeginWrite_PeerCommitsBeforeTimeoutOneBudget: a peer holds the write
+// lock. SQLite tries the write lock once per attempt (walBeginWriteTransaction,
+// wal.c:3714-3717) and retries the whole begin from one loop with one busy
+// count (btree.c:3730-3737), so the handler sees one count rising 0, 1, 2, ...
+// through the begin, and the begin's wait is one budget.
+//
+//   - The peer commits just before the waiting begin's budget runs out,
+//     releases the lock, and has it again when the begin tries next. The
+//     begin gives up, or gets in, within one budget; a write-lock wait with a
+//     count of its own started a fresh budget after every commit.
+//   - The peer releases the lock within the budget and stays away: the begin
+//     gets in.
+//
+// The peer works through this handle's lock table, which refuses the begin's
+// write lock as fcntl refuses another process's. It "commits" by publishing
+// a header that differs from the begin's snapshot.
+func TestBeginWrite_PeerCommitsBeforeTimeoutOneBudget(t *testing.T) {
+	const budget = 200 * time.Millisecond
+	// A budget of 200 ms is 11 handler calls that sleep.
+	const commitAfter = 10
+
+	type peer struct {
+		holds  bool
+		waited int
+		counts []int // the count of every handler call
+	}
+	setup := func(t *testing.T) (*DB, *peer) {
+		dir := t.TempDir()
+		db, err := testOpen(t, filepath.Join(dir, "test.db"), tornHdrOpts)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = db.Close() })
+		dmsPutRange(t, db, "t1", 0, tornHdrSeedRows)
+		return db, &peer{}
+	}
+	lock := func(t *testing.T, db *DB, p *peer) {
+		require.NoError(t, db.pager.wal.index.lock(lockWrite, lockExclusive))
+		p.holds, p.waited = true, 0
+	}
+	release := func(db *DB, p *peer) {
+		if p.holds {
+			_ = db.pager.wal.index.unlock(lockWrite, lockExclusive)
+			p.holds = false
+		}
+	}
+	commit := func(t *testing.T, db *DB) {
+		w := db.pager.wal
+		hdr, valid := w.index.readHeader()
+		require.True(t, valid)
+		hdr.iChange++
+		hdr.computeCksum()
+		var buf [walIndexHdrSize]byte
+		hdr.serialize(buf[:])
+		region, err := w.index.shm.region(0, true)
+		require.NoError(t, err)
+		copy(region[walIndexHdrSize:walIndexHdrSize*2], buf[:])
+		copy(region[0:walIndexHdrSize], buf[:])
+	}
+	// begin runs BeginWrite with the peer's script in the busy handler and
+	// returns its error and duration.
+	begin := func(t *testing.T, db *DB, p *peer, onCall func()) (error, time.Duration) {
+		w := db.pager.wal
+		base := DefaultBusyTimeout(budget)
+		w.busyHandler = func(n int) bool {
+			p.counts = append(p.counts, n)
+			ok := base(n)
+			onCall()
+			return ok
+		}
+		defer func() { w.busyHandler = DefaultBusyTimeout(5 * time.Second) }()
+		start := time.Now()
+		wtx, err := db.BeginWrite()
+		elapsed := time.Since(start)
+		if err == nil {
+			_ = wtx.Rollback()
+		}
+		release(db, p)
+		return err, elapsed
+	}
+	requireOneCount := func(t *testing.T, p *peer) {
+		t.Helper()
+		require.NotEmpty(t, p.counts, "the begin must wait through the busy handler")
+		for i, n := range p.counts {
+			require.Equal(t, i, n, "one count for the whole begin, rising by one: %v", p.counts)
+		}
+	}
+
+	t.Run("peer commits before each timeout", func(t *testing.T) {
+		db, p := setup(t)
+		testBeginWriteRetryHook = func(error) {
+			if !p.holds {
+				lock(t, db, p) // the peer is back before the begin's next try
+			}
+		}
+		defer func() { testBeginWriteRetryHook = nil }()
+		lock(t, db, p)
+		err, elapsed := begin(t, db, p, func() {
+			if p.holds {
+				if p.waited++; p.waited == commitAfter {
+					commit(t, db)
+					release(db, p)
+				}
+			}
+		})
+		require.Less(t, elapsed, 2*budget, "one busy budget per begin (err=%v)", err)
+		require.GreaterOrEqual(t, len(p.counts), commitAfter, "the begin waited through the peer's hold")
+		requireOneCount(t, p)
+	})
+
+	t.Run("peer releases within the budget", func(t *testing.T) {
+		db, p := setup(t)
+		lock(t, db, p)
+		err, elapsed := begin(t, db, p, func() {
+			if p.holds {
+				if p.waited++; p.waited == 3 {
+					release(db, p)
+				}
+			}
+		})
+		require.NoError(t, err, "the write lock came free within the budget")
+		require.Less(t, elapsed, budget)
+		require.Len(t, p.counts, 3)
+		requireOneCount(t, p)
+	})
+}
