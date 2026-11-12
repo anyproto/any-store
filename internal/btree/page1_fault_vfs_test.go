@@ -15,14 +15,16 @@ import (
 
 var errInjectedFrameWrite = errors.New("injected WAL frame write failure")
 
-// walFrameFaultFile fails, once, the next write of a frame header.
+// walFrameFaultFile fails, once, the next write of frames: anything past the
+// WAL header. writeFrames writes a commit's appended frames in chunks of
+// whole frames (walFrameBatchMax), not a frame header and a page each.
 type walFrameFaultFile struct {
 	File
 	armed atomic.Bool
 }
 
 func (f *walFrameFaultFile) WriteAt(b []byte, off int64) (int, error) {
-	if len(b) == walFrameSize && f.armed.CompareAndSwap(true, false) {
+	if off >= walHeaderSize && f.armed.CompareAndSwap(true, false) {
 		return 0, errInjectedFrameWrite
 	}
 	return f.File.WriteAt(b, off)
