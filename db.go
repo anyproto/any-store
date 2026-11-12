@@ -66,8 +66,21 @@ type DB interface {
 	// When waitIdleDuration > 0, wait for waitIdleTime since the last write tx got released
 	Flush(ctx context.Context, waitIdleDuration time.Duration, mode FlushMode) error
 
-	// Backup creates a backup of the database at the specified file path.
-	// Returns an error if the operation fails.
+	// Backup copies the database into the database file at path, which is
+	// created if it does not exist and replaced, as one transaction, if it
+	// does. The copy is one committed state of the source; commits made
+	// while it runs, by this process or another, do not break that.
+	//
+	// The copy advances between this process's write transactions. If one is
+	// open, or no reader slot is free, for longer than the busy timeout,
+	// Backup returns an error that matches ErrBusy, and can be called again.
+	// A ctx that carries a write transaction of this database returns it at
+	// once: the backup would wait for the caller. The ctx is consulted
+	// between the batches of the copy, not inside one.
+	//
+	// After an error the file at path is left as the failed transaction
+	// left it: a destination that existed keeps its content, a new one is
+	// an empty database. Backup never removes it.
 	Backup(ctx context.Context, path string) (err error)
 
 	// ReadTx starts a new read-only transaction.
@@ -203,7 +216,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 			c.SetVerify(false)
 		}
 	}
-	_, cookie := ds.btreeDB.LocalCounters()
+	cookie := ds.btreeDB.LocalSchemaCookie()
 	ds.epoch.Store(&schemaEpoch{gen: 1, start: cookie, known: cookie})
 
 	if err = ds.init(ctx); err != nil {
@@ -303,11 +316,6 @@ type db struct {
 	epoch     atomic.Pointer[schemaEpoch]
 	ownCookie atomic.Uint64
 	settling  atomic.Uint64
-	// sketchEpoch counts the commits of other processes this one noticed:
-	// each may have moved the sketches of any collection (see
-	// collection.refreshSketches).
-	sketchEpoch atomic.Uint64
-
 	// sketchDirty and ftsDirty list the collections whose writer state the
 	// end of a transaction has to visit: an index whose live sketch may hold
 	// unpersisted deltas (index.sketchModified), and buffered full-text
@@ -556,37 +564,20 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 //	  touches.
 //
 //	STATISTICAL (advisory): a commit of another process may have moved the
-//	  selectivity sketches of any collection. sketchEpoch records that one
-//	  was noticed, and each handle reloads its sketches when a transaction
-//	  next plans with them or writes through it (collection.refreshSketches).
+//	  selectivity sketches of any collection. The btree counts such commits
+//	  as it finds them, in whatever transaction of this process begins first
+//	  after one (btree.ReadTx.ChangeEpoch), and each handle reloads its
+//	  sketches when a transaction next plans with them or writes through it
+//	  and the count has moved (collection.refreshSketches). Nothing is done
+//	  for it here: a transaction that never comes this way (a fast read, a
+//	  backup step, an integrity sweep) counts the commit just the same.
 //	  A stale sketch only affects which index the planner CHOOSES, never
 //	  query RESULTS (the any-store analog of sqlite_stat1).
 //
 // Neither tier reads anything here: what a begin costs does not depend on how
 // many collections are open.
-//
-// The begin-time disk counters driving the sketch verdict are RAISED to the
-// newest committed frame (see btree.ReadTx.SnapshotHeaderCounters), so a read
-// tx can detect staleness its own snapshot does not yet contain. The pass
-// consumes only up to the SNAPSHOT counters; left short, the verdict stays
-// stale and the next begin converges.
-//
-// A verdict a commit of THIS process produced — it landed between the begin's
-// read of the local counters and its read of the disk ones — is none: the
-// writer published its sketches in-process and recorded the committed
-// counters. The pass returns once the local counters have reached the
-// counters this tx saw on disk (LocalCaughtUp), and the consumption below
-// never moves them back (AdvanceLocalCounters).
 func (db *db) checkStale(tx *btree.ReadTx) {
 	db.observeCookie(tx)
-	if !tx.IsSchemaStale() && !tx.IsDataStale() {
-		return
-	}
-	if tx.LocalCaughtUp() {
-		return
-	}
-	db.sketchEpoch.Add(1)
-	db.btreeDB.AdvanceLocalCounters(tx.SnapshotFileChangeCounter(), tx.SnapshotSchemaCookie())
 }
 
 // resetUncommittedSketches discards leftover, never-committed sketch deltas at
@@ -1133,6 +1124,18 @@ func (db *db) IntegrityCheck(ctx context.Context) (err error) {
 }
 
 func (db *db) Backup(ctx context.Context, path string) (err error) {
+	// Whatever busy error ends the backup, at any step of it, is the one
+	// the caller matches.
+	defer func() { err = busyErr(err) }()
+
+	// ~ backup.c:337-344: "If the source pager is currently in a
+	// write-transaction, return SQLITE_BUSY immediately." A Step would say
+	// so at every retry until the budget is spent; the caller holds the
+	// transaction and cannot end it meanwhile.
+	if db.carriesOwnWriteTx(ctx) {
+		return ErrBusy
+	}
+
 	// ~ SQLite's recommended online-backup pattern (see backup.c header
 	// comment at lines 11-13 and the sqlite3_backup_init/step/finish
 	// sequence). We open a fresh destination DB at `path` with
@@ -1144,12 +1147,15 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 	if err != nil {
 		return fmt.Errorf("open backup destination: %w", err)
 	}
+	// The destination is closed and never removed: sqlite3_backup_finish
+	// rolls an unfinished destination back and leaves the file
+	// (backup.c:599-600). Whether this call created the file cannot be
+	// known (the open creates without O_EXCL, and another process may have
+	// created and filled it since), and a destination that existed keeps its
+	// content through the rollback.
 	defer func() {
 		if cerr := dstDB.Close(); cerr != nil && err == nil {
 			err = cerr
-		}
-		if err != nil {
-			_ = osRemove(path)
 		}
 	}()
 
@@ -1166,8 +1172,20 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 	// Copy in bounded batches so ctx cancellation is responsive.
 	// SQLite's sqlite3BtreeCopyFile (backup.c:751) uses 0x7FFFFFFF in one
 	// shot; we prefer yielding.
+	//
+	// A Step that is busy did nothing and can be tried again (btree
+	// Backup.Step): this process has a write transaction open on the source,
+	// or no reader slot is free, or a begin's own busy wait ran out. It is
+	// retried here, with nothing of the source held in between, on the
+	// busy handler's schedule, until the busy timeout has passed since the
+	// last Step that copied. One loop and one clock: a Step that copies
+	// starts the clock again, nothing else does. A Step may itself wait
+	// inside its begins, as any transaction begin does, so the time until
+	// Backup gives up is this timeout plus the waits of the last Step's
+	// begins, not the timeout alone.
 	const batch = 256
-	for {
+	lastCopied := time.Now()
+	for busy := 0; ; {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
@@ -1175,9 +1193,17 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 		if errors.Is(serr, btree.ErrBackupDone) {
 			break
 		}
-		if serr != nil {
+		if serr == nil {
+			lastCopied, busy = time.Now(), 0
+			continue
+		}
+		if !isBusyErr(serr) || time.Since(lastCopied) >= backupBusyTimeout {
 			return serr
 		}
+		if werr := backupBusyWait(ctx, busy); werr != nil {
+			return werr
+		}
+		busy++
 	}
 	if err = b.Finish(); err != nil {
 		return err
@@ -1185,6 +1211,40 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 	// The copy is a database of its own for the format settled record (see
 	// dropFormatSettled).
 	return dropFormatSettled(dstDB)
+}
+
+// backupBusyTimeout is how long Backup retries busy Steps after the last one
+// that copied: the busy timeout of a transaction begin. A variable for tests.
+var backupBusyTimeout = btree.BusyTimeout
+
+// backupBusyWait sleeps before the busy-th retry of a busy Step, on the
+// schedule of the busy handler (SQLite's delays[], main.c:1717-1720), or
+// until ctx ends.
+func backupBusyWait(ctx context.Context, busy int) error {
+	delays := [...]time.Duration{1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100}
+	d := delays[len(delays)-1]
+	if busy < len(delays) {
+		d = delays[busy]
+	}
+	t := time.NewTimer(d * time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// carriesOwnWriteTx reports that ctx carries a write transaction of this
+// database that has not ended.
+func (db *db) carriesOwnWriteTx(ctx context.Context) bool {
+	v := ctx.Value(ctxKeyTx)
+	if h, ok := v.(heldTx); ok {
+		v = h.ReadTx
+	}
+	w, ok := v.(WriteTx)
+	return ok && db.usable(w) == nil
 }
 
 func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {

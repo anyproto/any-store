@@ -132,6 +132,13 @@ var (
 
 	ErrDBIsClosed = btree.ErrClosed
 
+	// ErrBusy is returned when a lock stayed held past the busy timeout:
+	// another process's writer or checkpoint, or, for Backup, a write
+	// transaction of this process. The operation did nothing and can be
+	// tried again. Match it with errors.Is: the busy errors of the storage
+	// layer that are not this value wrap it by the time they leave Backup.
+	ErrBusy = btree.ErrBusy
+
 	ErrDBIsNotOpened       = errors.New("any-store: database is not opened")
 	ErrIncompatibleVersion = errors.New("any-store: incompatible version")
 
@@ -177,3 +184,19 @@ type nestedError struct {
 
 func (e *nestedError) Error() string { return e.msg }
 func (e *nestedError) Unwrap() error { return e.parent }
+
+// isBusyErr reports one of the storage layer's "not now" errors: a lock that
+// stayed busy, a snapshot another process's commit overtook, a wal-index
+// being rebuilt, or no free reader slot.
+func isBusyErr(err error) bool {
+	return errors.Is(err, btree.ErrBusy) || errors.Is(err, btree.ErrBusySnapshot) ||
+		errors.Is(err, btree.ErrBusyRecovery) || errors.Is(err, btree.ErrReadersBusy)
+}
+
+// busyErr makes every busy error match ErrBusy, keeping the original.
+func busyErr(err error) error {
+	if err == nil || errors.Is(err, ErrBusy) || !isBusyErr(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrBusy, err)
+}

@@ -530,7 +530,6 @@ func TestCommit_EmptySchemaCommitAnnouncesNothingToTheNextWriter(t *testing.T) {
 		fired = true
 		// The other process: index k on c, at the cookie this commit
 		// announced and did not produce.
-		fcc, sc := dbi.btreeDB.LocalCounters()
 		ptx, err := dbi.btreeDB.BeginWrite()
 		require.NoError(t, err)
 		info := IndexInfo{Name: "k", Fields: []string{"k"}}
@@ -543,7 +542,6 @@ func TestCommit_EmptySchemaCommitAnnouncesNothingToTheNextWriter(t *testing.T) {
 		ptx.MarkSchemaChanged()
 		ptx.MarkDataChanged()
 		require.NoError(t, ptx.Commit())
-		dbi.btreeDB.UpdateLocalCounters(fcc, sc)
 		// A writer of this process, beginning now: held at the gate until
 		// the announcement is withdrawn.
 		go func() { inserted <- coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"k":2}`)) }()

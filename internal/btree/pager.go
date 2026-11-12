@@ -340,6 +340,10 @@ type savepointState struct {
 	header dbHeader // snapshot of database header at savepoint time (fix 9.3)
 }
 
+// BusyTimeout is how long a transaction begin or a checkpoint waits, through
+// its busy handler, for a lock another process holds.
+const BusyTimeout = 5 * time.Second
+
 // newPager creates a new pager for the given database path.
 // purgeable controls whether the page cache can evict pages (false for InMemory databases).
 // DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
@@ -720,7 +724,7 @@ func (p *pager) open() (err error) {
 	p.wal.inProcess = p.inProcess
 	p.wal.noCommitSync = p.noCommitSync
 	p.wal.inMemory = p.inMemory
-	p.wal.busyHandler = DefaultBusyTimeout(5 * time.Second)
+	p.wal.busyHandler = DefaultBusyTimeout(BusyTimeout)
 	// BEGIN ENCRYPTION
 	// Propagate codec to the WAL so frame writes/reads use the same
 	// cipher as the DB file.
@@ -931,7 +935,7 @@ func (p *pager) initNewDB() error {
 	p.wal.inProcess = p.inProcess
 	p.wal.noCommitSync = p.noCommitSync
 	p.wal.inMemory = p.inMemory
-	p.wal.busyHandler = DefaultBusyTimeout(5 * time.Second)
+	p.wal.busyHandler = DefaultBusyTimeout(BusyTimeout)
 	// BEGIN ENCRYPTION
 	// Propagate codec to the WAL so frame writes/reads use the same
 	// cipher as the DB file.

@@ -1081,8 +1081,6 @@ func (db *DB) beginRead(ctx context.Context, readCounters, wait bool) (*ReadTx, 
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
 	tx.diskSchemaCookie = sc
-	tx.localFileChangeCounter = localFCC
-	tx.localSchemaCookie = localSC
 	tx.snapFileChangeCounter = snapFCC
 	tx.snapSchemaCookie = snapSC
 	return tx, nil
@@ -1231,9 +1229,7 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	// equals what this process last wrote, so the on-disk counters are
 	// unchanged and p.header still matches. SQLite likewise keeps the header
 	// in the in-memory page-1 PgHdr and does not re-read it from the WAL per
-	// statement. The staleness signal (diskFileChangeCounter vs
-	// localFileChangeCounter, consumed by checkStale → IsDataStale) is
-	// therefore preserved on the identical invalidation edge.
+	// statement.
 	fcc, sc := db.pager.committedCounters()
 
 	// Register the write transaction and reset its cleanup guard, unless
@@ -1278,8 +1274,6 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	// the latest state, so the snapshot-bounded pair equals the disk pair.
 	tx.ReadTx.snapFileChangeCounter = fcc
 	tx.ReadTx.snapSchemaCookie = sc
-	tx.ReadTx.localFileChangeCounter = db.localFileChangeCounter.Load()
-	tx.ReadTx.localSchemaCookie = db.localSchemaCookie.Load()
 	tx.dataChanged = false   // pool reuse safety
 	tx.schemaChanged = false // pool reuse safety
 	tx.onCommitted = nil
@@ -1329,45 +1323,25 @@ func (db *DB) Checkpoint(mode CheckpointMode) error {
 	return db.pager.checkpointWithMode(mode)
 }
 
-// UpdateLocalCounters sets the local counter cache: the page-1 counters the
-// in-memory state is known to reflect. Commit sets them to the committed
-// values; a caller that rebuilt its in-memory state from a snapshot records
-// that snapshot with AdvanceLocalCounters. This raw store exists for tests,
-// which also wind the cache back to model a peer's commit.
-func (db *DB) UpdateLocalCounters(fileChangeCounter, schemaCookie uint32) {
-	db.localFileChangeCounter.Store(fileChangeCounter)
-	db.localSchemaCookie.Store(schemaCookie)
+// LocalSchemaCookie returns the schema cookie of this process's last commit,
+// or of the database as it was opened if it has not committed.
+func (db *DB) LocalSchemaCookie() uint32 {
+	return db.localSchemaCookie.Load()
 }
 
-// AdvanceLocalCounters records that the in-memory state reflects the given
-// counters, never moving either one back: a commit that landed meanwhile
-// already recorded newer values, and the state it published must not be
-// reported stale again by the next transaction.
-func (db *DB) AdvanceLocalCounters(fileChangeCounter, schemaCookie uint32) {
-	advanceCounter(&db.localFileChangeCounter, fileChangeCounter)
-	advanceCounter(&db.localSchemaCookie, schemaCookie)
-}
-
-// LocalCounters returns the local counter cache.
-func (db *DB) LocalCounters() (fileChangeCounter, schemaCookie uint32) {
-	return db.localFileChangeCounter.Load(), db.localSchemaCookie.Load()
-}
-
-// advanceCounter stores v unless c already holds v or a later value; the
-// counters increment per commit and are compared modulo 2^32.
-func advanceCounter(c *atomic.Uint32, v uint32) {
+// ForgetSeenHeader makes the next transaction begin find the committed state
+// as another process's: the change state forgets the wal-index header it
+// holds, so the begin's snapshot is news and the change epoch moves
+// (ReadTx.ChangeEpoch). For tests, which model a peer's commit with it; no
+// effect on an in-process or in-memory database.
+func (db *DB) ForgetSeenHeader() {
+	w := db.pager.wal
 	for {
-		old := c.Load()
-		if int32(v-old) <= 0 || c.CompareAndSwap(old, v) {
+		cur := w.chg.Load()
+		if cur == nil || w.chg.CompareAndSwap(cur, &walChange{epoch: cur.epoch, pending: cur.pending}) {
 			return
 		}
 	}
-}
-
-// counterReached reports whether have has reached target, comparing
-// modulo 2^32 like advanceCounter.
-func counterReached(have, target uint32) bool {
-	return int32(have-target) >= 0
 }
 
 // CreateNamespace creates a new namespace. Must be called within a write transaction.
@@ -1814,10 +1788,8 @@ type ReadTx struct {
 	walHdr WalIndexHdr
 
 	// Disk counters from page 1 at transaction start (for staleness detection).
-	diskFileChangeCounter  uint32
-	diskSchemaCookie       uint32
-	localFileChangeCounter uint32 // snapshot of DB's local value
-	localSchemaCookie      uint32 // snapshot of DB's local value
+	diskFileChangeCounter uint32
+	diskSchemaCookie      uint32
 	// Snapshot-bounded page-1 counters, baked at begin: what THIS tx's tree
 	// reads can actually see. Equal to the disk pair unless the begin-time
 	// read was raised past the snapshot (begin racing a commit, or a pinned
@@ -2286,35 +2258,6 @@ func (tx *ReadTx) IsWriteTx() bool {
 	return tx.writable
 }
 
-// LocalCaughtUp reports whether the local counter cache has reached the
-// counters this tx read from disk at begin: the state the cache stands for
-// already covers everything the tx can see. With the cache moving only
-// forward, a stale verdict can then only have come from a commit of this
-// process that landed during the begin and recorded its counters since.
-func (tx *ReadTx) LocalCaughtUp() bool {
-	fcc, sc := tx.db.LocalCounters()
-	return counterReached(fcc, tx.diskFileChangeCounter) && counterReached(sc, tx.diskSchemaCookie)
-}
-
-// IsDataStale returns true if the on-disk FileChangeCount differs from the
-// locally cached value, indicating another process has committed data changes
-// since this DB last committed or synced counters.
-func (tx *ReadTx) IsDataStale() bool {
-	return tx.diskFileChangeCounter != tx.localFileChangeCounter
-}
-
-// IsSchemaStale returns true if the on-disk SchemaCookie differs from the
-// locally cached value, indicating another process has committed schema changes.
-func (tx *ReadTx) IsSchemaStale() bool {
-	return tx.diskSchemaCookie != tx.localSchemaCookie
-}
-
-// DiskFileChangeCounter returns the FileChangeCount read from page 1 at
-// the start of this transaction.
-func (tx *ReadTx) DiskFileChangeCounter() uint32 {
-	return tx.diskFileChangeCounter
-}
-
 // DiskSchemaCookie returns the SchemaCookie read from page 1 at the start
 // of this transaction.
 func (tx *ReadTx) DiskSchemaCookie() uint32 {
@@ -2343,10 +2286,8 @@ func (tx *ReadTx) ChangeEpoch() (epoch uint64, exact bool) {
 // SnapshotHeaderCounters returns the page-1 FileChangeCount and SchemaCookie
 // as of THIS tx's snapshot — baked at begin from the tx's captured
 // [minFrame, maxFrame] window, both sides fixed for the tx's life
-// (SQLite's pWal->minFrame/mxFrame). Unlike
-// DiskFileChangeCounter/DiskSchemaCookie — whose begin-time read is raised to
-// the newest committed frame so staleness detection notices peer commits —
-// these values never exceed what the tx's tree reads can actually see: a
+// (SQLite's pWal->minFrame/mxFrame). Unlike DiskSchemaCookie, whose
+// begin-time read is raised to the newest committed frame, these values never exceed what the tx's tree reads can actually see: a
 // begin that raced a commit, or a reader slot pinned to an older snapshot,
 // reports the older counters here. They are exact on a fast begin too. Judgments about snapshot contents (e.g.
 // whether a catalog key committed at cookie C must be visible) require this
@@ -2375,11 +2316,6 @@ func (tx *ReadTx) SetAux(v any) {
 // without the error plumbing — for per-query visibility checks.
 func (tx *ReadTx) SnapshotSchemaCookie() uint32 {
 	return tx.snapSchemaCookie
-}
-
-// SnapshotFileChangeCounter is the change-counter half, same contract.
-func (tx *ReadTx) SnapshotFileChangeCounter() uint32 {
-	return tx.snapFileChangeCounter
 }
 
 // Rollback ends the read transaction (for ReadTx, this is the same as commit).
