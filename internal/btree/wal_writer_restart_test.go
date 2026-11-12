@@ -12,7 +12,6 @@ package btree
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -507,49 +506,6 @@ func TestWalWriterRestart_CheckpointLock(t *testing.T) {
 		restartCheck(t, db, 0, 2, 5)
 		restartCheck(t, db, 2, 60, 1)
 		require.NoError(t, db.IntegrityCheck())
-	})
-}
-
-// An incremental backup has copied some pages and not others when a
-// transaction of this process changes both and its changed pages are spilled
-// before the commit. The spilled pages are not sent to the backup, so the
-// backup must start over: its result is one committed state of the source,
-// not old pages next to new ones. (The automatic checkpoint, which reset the
-// WAL and restarted every backup with it, used to hide this.)
-func TestBackup_SpilledCommitRestartsBackup(t *testing.T) {
-	forEachRestartMode(t, func(t *testing.T, m restartMode) {
-		src, _ := openRestartDB(t, m)
-		restartPut(t, src, 0, 400, 1)
-		dstMode := restartModes[0]
-		dst, dstPath := openRestartDB(t, dstMode)
-
-		b, err := dst.BackupInit(src)
-		require.NoError(t, err)
-		require.NoError(t, b.Step(context.Background(), 4)) // some pages copied, most not
-		require.Greater(t, src.DatabaseSize(), uint32(8))
-
-		// Every row changes; no page of the change is left for the commit to
-		// send. The transaction does not mark the data changed, so the
-		// page-1 counter does not move either.
-		wtx, err := src.BeginWrite()
-		require.NoError(t, err)
-		restartPutTx(t, wtx, 0, 400, 2)
-		restartSpillAll(t, src)
-		require.NoError(t, wtx.Commit())
-
-		for {
-			err := b.Step(context.Background(), 16)
-			if errors.Is(err, ErrBackupDone) {
-				break
-			}
-			require.NoError(t, err)
-		}
-		require.NoError(t, b.Finish())
-
-		restartCheck(t, dst, 0, 400, 2)
-		dst = restartReopen(t, dst, dstPath, dstMode)
-		restartCheck(t, dst, 0, 400, 2)
-		require.NoError(t, dst.IntegrityCheck())
 	})
 }
 

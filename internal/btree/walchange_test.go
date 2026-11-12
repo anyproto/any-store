@@ -25,6 +25,7 @@ const (
 // changePeerChild is a peer process. Modes:
 //
 //	commit:    write rows [0, 60) with the fill byte, exit without closing
+//	           ("commit-all", "torn-all": rows [0, backupRows) instead)
 //	truncate:  a TRUNCATE checkpoint, exit without closing
 //	torn:      commit as above, then put header copy 1 back to what it was
 //	           before the commit and exit: a crash between the two copies
@@ -36,9 +37,14 @@ func changePeerChild(t *testing.T) bool {
 	db, err := testOpen(t, path, restartModes[0].opts)
 	require.NoError(t, err)
 	fill, _ := strconv.Atoi(os.Getenv(changePeerEnvFill))
-	switch mode := os.Getenv(changePeerEnvMode); mode {
+	rows := 60
+	mode := os.Getenv(changePeerEnvMode)
+	if len(mode) > 4 && mode[len(mode)-4:] == "-all" { // every row of the backup tests
+		mode, rows = mode[:len(mode)-4], backupRows
+	}
+	switch mode {
 	case "commit":
-		restartPut(t, db, 0, 60, byte(fill))
+		restartPut(t, db, 0, rows, byte(fill))
 	case "truncate":
 		require.NoError(t, db.Checkpoint(CheckpointTruncate))
 	case "torn":
@@ -46,7 +52,7 @@ func changePeerChild(t *testing.T) bool {
 		require.NoError(t, err)
 		var before [walIndexHdrSize]byte
 		copy(before[:], region[0:walIndexHdrSize])
-		restartPut(t, db, 0, 60, byte(fill))
+		restartPut(t, db, 0, rows, byte(fill))
 		copy(region[0:walIndexHdrSize], before[:])
 		_, valid := db.pager.wal.index.readHeader()
 		require.False(t, valid, "child setup: the header must be torn")

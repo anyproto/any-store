@@ -419,13 +419,16 @@ func TestBackup_RestartOnCheckpointRestart(t *testing.T) {
 	b.mu.Unlock()
 	require.Equal(t, iNextBefore, iNextAfter, "a RESTART checkpoint does not restart a backup")
 
-	// A TRUNCATE checkpoint resets the WAL. ~ backup.c:701 trigger.
+	// A TRUNCATE checkpoint of this process resets the WAL, and the backup
+	// goes on all the same: the reset is the process's own (walRestartHdr
+	// changes the connection's pWal->hdr, wal.c:2151-2154, so its next read
+	// is no pager_reset), and a backup holds no frame number between Steps.
 	require.NoError(t, src.Checkpoint(CheckpointTruncate))
 
 	b.mu.Lock()
 	iNextAfter = b.iNext
 	b.mu.Unlock()
-	require.Equal(t, uint32(1), iNextAfter, "CheckpointTruncate must trigger Backup.restart (backup.c:701-707)")
+	require.Equal(t, iNextBefore, iNextAfter, "an own TRUNCATE checkpoint does not restart a backup")
 
 	// Clean up so Finish doesn't leave the write tx hanging.
 	_ = b.Finish()

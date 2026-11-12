@@ -341,6 +341,18 @@ type DB struct {
 	closing         atomic.Bool // set to reject new transactions
 	closed          atomic.Bool // set when Close() is actually called
 	writerLocksDone atomic.Bool // CAS guard: writer lock cleanup (endRead+RUnlock+Unlock) runs exactly once
+
+	// writerRegistered says that the holder of the write lock is a write
+	// transaction whose teardown (releaseWriterLocks) is valid: it holds its
+	// reader slot, db.mu and the pager's write state. The lock is also held,
+	// without any of that, by a BeginWrite still on its way and by a
+	// Backup.Step. writerRegMu orders the registration against Close: a
+	// BeginWrite that finds the database closing there backs out, and a Close
+	// that finds no registered transaction waits for the holder instead of
+	// tearing down a transaction that is not one. (SQLite serializes close
+	// with everything else through the connection mutex, main.c:1263.)
+	writerRegMu      sync.Mutex
+	writerRegistered bool
 	closeOnce       sync.Once   // guards closing closeCh
 
 	// Namespace root pages are stored in a master table on page 1.
@@ -455,15 +467,38 @@ func (db *DB) releaseWriterLocks(pager *pager, slot int, pre, post func()) bool 
 	}
 	defer db.unlockWriter()
 	defer db.mu.RUnlock()
+	defer db.unregisterWriter()
 	if pre != nil {
 		pre()
 	}
+	// Whatever way the transaction ended, the backups do not go on with
+	// pages it sent them and did not commit, or without pages it committed
+	// and did not send (pager.backupOwed). Before the write lock goes: no
+	// Step runs until then.
+	pager.dischargeBackups()
 	pager.endRead(slot)
 	if post != nil {
 		post()
 	}
 	return true
 }
+
+// unregisterWriter ends the registration of the write transaction whose
+// locks releaseWriterLocks is releasing.
+func (db *DB) unregisterWriter() {
+	db.writerRegMu.Lock()
+	db.writerRegistered = false
+	db.writerRegMu.Unlock()
+}
+
+// Test hooks of the Close / BeginWrite handshake: testWriterRegisterHook runs
+// in BeginWrite once it holds everything a write transaction holds, before
+// it registers; testCloseWriterCheckedHook in Close once it found the write
+// lock held and looked for a registered transaction.
+var (
+	testWriterRegisterHook     func()
+	testCloseWriterCheckedHook func(registered bool)
+)
 
 // lockWriter takes the write lock: one writer at a time in this process (the
 // writer lock across processes is the WAL's, taken in pager.beginWrite). A
@@ -710,6 +745,8 @@ func Open(path string, opts Options) (*DB, error) {
 		writeSem:        make(chan struct{}, 1),
 		closeCh:         make(chan struct{}),
 	}
+	// No write transaction: its teardown has nothing to run on (Close).
+	db.writerLocksDone.Store(true)
 
 	// A reader that pins a commit while it is still on its way out of
 	// pager.commit finds its counters remembered: the pager has them in its
@@ -755,22 +792,34 @@ func (db *DB) Close() error {
 	db.closeOnce.Do(func() { close(db.closeCh) })
 
 	if !db.tryLockWriter() {
-		// A writer holds the write lock. Force-rollback the abandoned/in-flight tx.
-		// writerOpMu serializes with commit/rollback so we don't interleave
-		// with a concurrent Commit or Rollback call.
-		// Use rollbackForClose which skips writerCache operations to avoid
-		// racing with the writer's B-tree ops (pcache has no mutex).
-		db.pager.writerOpMu.Lock()
-		if pagerState(db.pager.state.Load()) == pagerWriter {
-			db.pager.rollbackForClose()
+		// The write lock is held: by a write transaction, by a BeginWrite
+		// that has not got that far, or by a Backup.Step. Only a registered
+		// write transaction is rescued; the other two end by themselves (a
+		// BeginWrite sees closing when it comes to register).
+		db.writerRegMu.Lock()
+		registered := db.writerRegistered
+		db.writerRegMu.Unlock()
+		if testCloseWriterCheckedHook != nil {
+			testCloseWriterCheckedHook(registered)
 		}
-		db.pager.writerOpMu.Unlock()
+		if registered {
+			// Force-rollback the abandoned/in-flight tx.
+			// writerOpMu serializes with commit/rollback so we don't interleave
+			// with a concurrent Commit or Rollback call.
+			// Use rollbackForClose which skips writerCache operations to avoid
+			// racing with the writer's B-tree ops (pcache has no mutex).
+			db.pager.writerOpMu.Lock()
+			if pagerState(db.pager.state.Load()) == pagerWriter {
+				db.pager.rollbackForClose()
+			}
+			db.pager.writerOpMu.Unlock()
 
-		// Exactly-once writer lock cleanup (endRead + RUnlock + Unlock) via
-		// the shared teardown: a writer goroutine completing concurrently
-		// could race with Close, and the writerLocksDone CAS inside
-		// releaseWriterLocks prevents the double-release.
-		db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil)
+			// Exactly-once writer lock cleanup (endRead + RUnlock + Unlock) via
+			// the shared teardown: a writer goroutine completing concurrently
+			// could race with Close, and the writerLocksDone CAS inside
+			// releaseWriterLocks prevents the double-release.
+			db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil)
+		}
 		// A plain send, not lockWriter: closeCh is closed already, and this
 		// wait is for the holder to leave.
 		db.writeSem <- struct{}{}
@@ -1187,8 +1236,24 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	// therefore preserved on the identical invalidation edge.
 	fcc, sc := db.pager.committedCounters()
 
-	// Reset the cleanup guard for this write transaction.
+	// Register the write transaction and reset its cleanup guard, unless
+	// the database started closing while this begin was on its way: Close
+	// then waits for the lock and rescues nothing (writerRegistered).
+	if testWriterRegisterHook != nil {
+		testWriterRegisterHook()
+	}
+	db.writerRegMu.Lock()
+	if db.closing.Load() {
+		db.writerRegMu.Unlock()
+		_ = db.pager.rollback()
+		db.pager.endRead(slot)
+		db.mu.RUnlock()
+		db.unlockWriter()
+		return nil, ErrClosed
+	}
+	db.writerRegistered = true
 	db.writerLocksDone.Store(false)
+	db.writerRegMu.Unlock()
 
 	tx := db.getWriteTx()
 	tx.ReadTx.db = db
