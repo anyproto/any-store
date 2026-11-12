@@ -225,6 +225,31 @@ func walBusyLock(wi *walIndex, xBusy BusyHandler, slot int, lockType int) error 
 	}
 }
 
+// beginBusy is the busy-handler state of one transaction begin: SQLite's
+// BusyHandler and its nBusy count (sqlite3InvokeBusyHandler,
+// main.c:1763-1772). sqlite3BtreeBeginTrans retries the whole begin from one
+// loop for every SQLITE_BUSY flavour (btree.c:3730-3737), so the count runs
+// across all of the begin's retries, and once the handler has declined it is
+// not asked again: the begin's budget is the handler's, once.
+type beginBusy struct {
+	xBusy BusyHandler
+	n     int
+}
+
+// retry invokes the handler with the begin's count and reports whether to
+// try again.
+func (b *beginBusy) retry() bool {
+	if b == nil || b.xBusy == nil || b.n < 0 {
+		return false
+	}
+	if !b.xBusy(b.n) {
+		b.n = -1
+		return false
+	}
+	b.n++
+	return true
+}
+
 // walHeader represents the WAL file header.
 type walHeader struct {
 	magic      uint32
@@ -2775,7 +2800,37 @@ func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
 // nBackfill-derived floor would let NEW-generation frames pass the OLD
 // snapshot's maxFrame bound (observed as torn overflow chains in the
 // cross-process reader test).
+//
+// A read begin waits out a peer's recovery (ErrBusyRecovery) through the
+// busy handler, with a count of its own. See beginReadHdrBusy.
 func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
+	busy := beginBusy{xBusy: w.busyHandler}
+	return w.beginReadHdrBusy(&busy)
+}
+
+// beginReadHdrBusy is beginReadHdr under the busy state of the begin it is
+// part of. ErrBusyRecovery (SQLITE_BUSY_RECOVERY: another connection is
+// rebuilding the wal-index, wal.c:3070-3094) goes to the busy handler, which
+// backs off until the recovery is done or the begin's budget is spent;
+// recovery of a large WAL takes longer than the WAL retry loop waits. SQLite
+// invokes the handler from sqlite3BtreeBeginTrans (btree.c:3730-3737); here
+// the loop sits at the WAL read begin, which every begin goes through,
+// including the open-time read of page 1. A nil busy makes one attempt and
+// returns ErrBusyRecovery: DB.BeginWriteContext retries it from its own
+// loop, the one loop of a write begin.
+// DRIFT: the busy loop for a recovery in progress runs at the WAL read begin; C runs it in sqlite3BtreeBeginTrans See docs/btree/NOTES.md#drift-2026-11-11-1-attached-wal-index-recovery
+func (w *wal) beginReadHdrBusy(busy *beginBusy) (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
+	for {
+		hdr, maxFrame, minFrame, slot, err = w.beginReadHdrRetry()
+		if busy == nil || !errors.Is(err, ErrBusyRecovery) || !busy.retry() {
+			return hdr, maxFrame, minFrame, slot, err
+		}
+	}
+}
+
+// beginReadHdrRetry is one read begin attempt with walTryBeginRead's
+// WAL_RETRY loop around it.
+func (w *wal) beginReadHdrRetry() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	// Retry loop matching SQLite's WAL_RETRY protocol (wal.c:3022-3056,
 	// 3391-3393). After 5 retries we begin sleeping; from the 10th retry
 	// onward the delay grows quadratically up to ~10s total before

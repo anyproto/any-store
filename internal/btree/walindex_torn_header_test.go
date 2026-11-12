@@ -492,3 +492,82 @@ func TestTornWalIndexHeader_BusyRecoveryWhenRecoverLockHeld(t *testing.T) {
 	require.Equal(t, tornHdrSeedRows, countKeys(t, db, "t1"))
 	require.GreaterOrEqual(t, calls, 1)
 }
+
+// TestTornWalIndexHeader_BusyRecoveryOneBudgetPerBegin: the header is torn
+// and the write and RECOVER locks stay held, a recovery that does not
+// finish. A begin waits one busy-handler budget and gives up: SQLite runs
+// one loop with one count around the whole begin (sqlite3BtreeBeginTrans,
+// btree.c:3730-3737; sqlite3InvokeBusyHandler, main.c:1763-1772), never a
+// fresh budget per retry.
+func TestTornWalIndexHeader_BusyRecoveryOneBudgetPerBegin(t *testing.T) {
+	dir := t.TempDir()
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), tornHdrOpts)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	dmsPutRange(t, db, "t1", 0, tornHdrSeedRows)
+
+	w := db.pager.wal
+	require.NoError(t, w.index.lock(lockWrite, lockExclusive))
+	require.NoError(t, w.index.lock(lockRecover, lockExclusive))
+	tearHeaderCopy(t, db)
+
+	const budget = 200 * time.Millisecond
+	base := DefaultBusyTimeout(budget)
+	var calls int
+	w.busyHandler = func(n int) bool {
+		calls++
+		return base(n)
+	}
+
+	start := time.Now()
+	_, err = db.BeginRead()
+	require.ErrorIs(t, err, ErrBusyRecovery)
+	require.Less(t, time.Since(start), 4*budget, "BeginRead: one budget")
+	readCalls := calls
+	require.Greater(t, readCalls, 1)
+
+	calls = 0
+	start = time.Now()
+	_, err = db.BeginWrite()
+	require.ErrorIs(t, err, ErrBusyRecovery)
+	require.Less(t, time.Since(start), 4*budget, "BeginWrite: one budget, not one per retry")
+	require.Equal(t, readCalls, calls, "BeginWrite: the handler's count runs once through")
+
+	w.busyHandler = DefaultBusyTimeout(5 * time.Second)
+	require.NoError(t, w.index.unlock(lockRecover, lockExclusive))
+	require.NoError(t, w.index.unlock(lockWrite, lockExclusive))
+	require.Equal(t, tornHdrSeedRows, countKeys(t, db, "t1"))
+}
+
+// TestTornWalIndexHeader_WALReadBeginWaitsOutRecovery: the busy loop sits at
+// the WAL read begin, so a read begun below the pager (open's read of page
+// 1) waits out a recovery in progress as BeginRead does.
+func TestTornWalIndexHeader_WALReadBeginWaitsOutRecovery(t *testing.T) {
+	dir := t.TempDir()
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), tornHdrOpts)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	dmsPutRange(t, db, "t1", 0, tornHdrSeedRows)
+
+	w := db.pager.wal
+	require.NoError(t, w.index.lock(lockWrite, lockExclusive))
+	require.NoError(t, w.index.lock(lockRecover, lockExclusive))
+	tearHeaderCopy(t, db)
+
+	var calls int
+	w.busyHandler = func(int) bool {
+		calls++
+		if calls == 1 {
+			_ = w.index.unlock(lockRecover, lockExclusive)
+			_ = w.index.unlock(lockWrite, lockExclusive)
+		}
+		return calls < 50
+	}
+	_, maxFrame, _, slot, err := w.beginReadHdr()
+	require.NoError(t, err)
+	w.endRead(slot)
+	require.Greater(t, maxFrame, uint32(0))
+	require.Equal(t, 1, calls)
+	_, valid := w.index.readHeader()
+	require.True(t, valid, "the read begin repaired the header once the locks were free")
+}

@@ -1111,15 +1111,18 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	var slot int
 	var readSnap WalIndexHdr
 
-	for attempt := 0; ; attempt++ {
+	// One loop and one busy count for the whole begin, as
+	// sqlite3BtreeBeginTrans (btree.c:3730-3737): a peer's recovery in
+	// progress (ErrBusyRecovery) and a snapshot that moved (ErrBusySnapshot,
+	// after its tight retries) share the handler's budget, which is spent
+	// once, not once per retry.
+	busy := beginBusy{xBusy: db.pager.wal.busyHandler}
+	for attempt := 0; ; {
 		var err error
-		readSnap, maxFrame, _, slot, err = db.pager.beginReadHdr()
+		readSnap, maxFrame, _, slot, err = db.pager.beginReadHdrBusy(nil)
 		if err != nil {
-			if errors.Is(err, ErrBusyRecovery) {
-				xBusy := db.pager.wal.busyHandler
-				if xBusy != nil && xBusy(attempt) {
-					continue
-				}
+			if errors.Is(err, ErrBusyRecovery) && busy.retry() {
+				continue
 			}
 			db.mu.RUnlock()
 			db.unlockWriter()
@@ -1146,14 +1149,12 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 		// After a small tight-retry budget, route through the busy handler so
 		// we back off instead of spinning. When busyHandler returns false
 		// (budget exhausted) or is nil, surface ErrBusySnapshot to the caller.
-		if attempt >= busySnapshotInnerRetries {
-			xBusy := db.pager.wal.busyHandler
-			if xBusy == nil || !xBusy(attempt-busySnapshotInnerRetries) {
-				db.mu.RUnlock()
-				db.unlockWriter()
-				return nil, ErrBusySnapshot
-			}
+		if attempt >= busySnapshotInnerRetries && !busy.retry() {
+			db.mu.RUnlock()
+			db.unlockWriter()
+			return nil, ErrBusySnapshot
 		}
+		attempt++
 	}
 
 	// Read the committed page-1 counters for staleness detection from the

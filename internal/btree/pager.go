@@ -961,27 +961,22 @@ func (p *pager) beginRead() (maxFrame uint32, slot int, err error) {
 // beginReadHdr is beginRead plus the exact WAL header snapshot used to claim
 // the reader slot. Callers that may escalate to a write transaction should use
 // this so BUSY_SNAPSHOT compares against the same snapshot the read lock used.
+// A read begin, with its own busy state (wal.beginReadHdr).
 func (p *pager) beginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
+	busy := beginBusy{xBusy: p.wal.busyHandler}
+	return p.beginReadHdrBusy(&busy)
+}
+
+// beginReadHdrBusy is beginReadHdr under the busy state of the begin it is
+// part of (wal.beginReadHdrBusy).
+func (p *pager) beginReadHdrBusy(busy *beginBusy) (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	p.mu.RLock()
 	if pagerState(p.state.Load()) == pagerError {
 		p.mu.RUnlock()
 		return WalIndexHdr{}, 0, 0, 0, ErrCorrupt
 	}
-	// ErrBusyRecovery: another connection is rebuilding the wal-index. It
-	// goes to the busy handler, which backs off until the recovery is done
-	// or its budget is spent, as sqlite3BtreeBeginTrans does for every
-	// SQLITE_BUSY flavour of a begin (btree.c:3735-3737). Recovery of a large
-	// WAL takes longer than the WAL retry loop waits.
-	for attempt := 0; ; attempt++ {
-		hdr, maxFrame, minFrame, slot, err = p.wal.beginReadHdr()
-		if err == nil {
-			break
-		}
-		if errors.Is(err, ErrBusyRecovery) {
-			if xBusy := p.wal.busyHandler; xBusy != nil && xBusy(attempt) {
-				continue
-			}
-		}
+	hdr, maxFrame, minFrame, slot, err = p.wal.beginReadHdrBusy(busy)
+	if err != nil {
 		p.mu.RUnlock()
 		return WalIndexHdr{}, 0, 0, 0, err
 	}

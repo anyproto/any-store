@@ -1551,6 +1551,12 @@
     "sqlite": [],
     "note": ""
   },
+  "pager.go:*pager.beginReadHdrBusy": {
+    "sqlite": [
+      "btree.c:btreeBeginTrans"
+    ],
+    "note": "beginReadHdr under the busy state of the begin it is part of (DB.BeginWriteContext's)"
+  },
   "pager.go:*pager.beginWrite": {
     "sqlite": [
       "pager.c:sqlite3PagerBegin"
@@ -2151,6 +2157,12 @@
     "sqlite": [],
     "note": ""
   },
+  "wal.go:*beginBusy.retry": {
+    "sqlite": [
+      "btree.c:btreeInvokeBusyHandler"
+    ],
+    "note": "one begin's busy count, as sqlite3InvokeBusyHandler keeps nBusy (main.c:1763-1772): once the handler declines it is not asked again"
+  },
   "wal.go:*wal.adoptSHMState": {
     "sqlite": [],
     "note": ""
@@ -2169,6 +2181,18 @@
   "wal.go:*wal.beginReadHdr": {
     "sqlite": [],
     "note": ""
+  },
+  "wal.go:*wal.beginReadHdrBusy": {
+    "sqlite": [
+      "btree.c:btreeBeginTrans"
+    ],
+    "note": "the begin's busy loop for SQLITE_BUSY_RECOVERY (btree.c:3730-3737), at the WAL read begin so open's page-1 read is covered too"
+  },
+  "wal.go:*wal.beginReadHdrRetry": {
+    "sqlite": [
+      "wal.c:walBeginReadTransaction"
+    ],
+    "note": "one read begin attempt: walTryBeginRead's WAL_RETRY loop"
   },
   "wal.go:*wal.beginWrite": {
     "sqlite": [
