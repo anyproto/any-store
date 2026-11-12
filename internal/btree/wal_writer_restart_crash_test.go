@@ -10,7 +10,6 @@ package btree
 import (
 	"os"
 	"os/exec"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -92,16 +91,6 @@ func TestWalCheckpoint_SkipsBackfillAfterLogWrapped(t *testing.T) {
 	require.Zero(t, hdr.mxFrame)
 }
 
-func restartCopyFiles(t *testing.T, path, name string) string {
-	t.Helper()
-	dir := filepath.Join(filepath.Dir(path), name)
-	require.NoError(t, os.MkdirAll(dir, 0o755))
-	dst := filepath.Join(dir, "test.db")
-	copyFileForTest(t, path, dst)
-	copyFileForTest(t, path+"-wal", dst+"-wal") // no -shm: the copy recovers from the WAL
-	return dst
-}
-
 // The files as a crash would leave them at each step of a restart must
 // recover to the last commit: right after the restart is published (the WAL
 // file still holds the old log, all of it backfilled), with the new log's
@@ -113,10 +102,13 @@ func TestWalWriterRestart_CrashPoints(t *testing.T) {
 			restartPut(t, db, 0, 200, 1)
 			require.NoError(t, db.Checkpoint(CheckpointPassive))
 
-			var atRestart string
+			var atRestart, atHeader string
 			testRestartLogHook = func(step string) {
-				if step == "restarted" {
+				switch step {
+				case "restarted":
 					atRestart = restartCopyFiles(t, path, "at-restart")
+				case "header-synced": // the new log's header, no frame yet
+					atHeader = restartCopyFiles(t, path, "at-header")
 				}
 			}
 			defer func() { testRestartLogHook = nil }()
@@ -126,6 +118,7 @@ func TestWalWriterRestart_CrashPoints(t *testing.T) {
 			restartPutTx(t, wtx, 0, 100, 2)
 			restartSpillAll(t, db)
 			require.NotEmpty(t, atRestart, "setup: the log was started over")
+			require.NotEmpty(t, atHeader, "setup: the new WAL header was written")
 			testRestartLogHook = nil
 			afterSpill := restartCopyFiles(t, path, "after-spill")
 			require.NoError(t, wtx.Commit())
@@ -134,7 +127,7 @@ func TestWalWriterRestart_CrashPoints(t *testing.T) {
 			for _, c := range []struct {
 				path string
 				fill byte
-			}{{atRestart, 1}, {afterSpill, 1}, {afterCommit, 2}} {
+			}{{atRestart, 1}, {atHeader, 1}, {afterSpill, 1}, {afterCommit, 2}} {
 				cdb, err := testOpen(t, c.path, m.opts)
 				require.NoError(t, err, c.path)
 				restartCheck(t, cdb, 0, 100, c.fill)
@@ -196,6 +189,54 @@ func TestWalWriterRestart_PanicAfterRestart(t *testing.T) {
 	})
 }
 
+// A commit that started the log over ends on a frame number below the one
+// its transaction began at. A panic after that commit is published must find
+// it committed: the unwind compares the committed frame with the
+// transaction's base in the new log, not with the old frame number.
+func TestWalWriterRestart_PanicAfterPublishedCommit(t *testing.T) {
+	forEachRestartMode(t, func(t *testing.T, m restartMode) {
+		db, path := openRestartDB(t, m)
+		restartPut(t, db, 0, 200, 1)
+		require.NoError(t, db.Checkpoint(CheckpointPassive))
+		w := db.pager.wal
+		n := w.index.mxCommitFrame.LoadLocal()
+
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		restartPutTx(t, wtx, 0, 2, 2)
+		testCommitPostPublishHook = func() {
+			testCommitPostPublishHook = nil
+			panic("injected: after the commit was published")
+		}
+		defer func() { testCommitPostPublishHook = nil }()
+		require.Panics(t, func() { _ = wtx.Commit() })
+		mx := w.index.mxCommitFrame.LoadLocal()
+		require.NotZero(t, mx, "the published commit is kept")
+		require.Less(t, mx, n, "setup: the commit ends below the frame the transaction began at")
+		require.Equal(t, mx, w.nFrame.Load())
+
+		restartCheck(t, db, 0, 2, 2)
+		restartCheck(t, db, 2, 200, 1)
+		restartRecoverCopy(t, path, "crash-1", m, func(cdb *DB) {
+			restartCheck(t, cdb, 0, 2, 2)
+			restartCheck(t, cdb, 2, 200, 1)
+		})
+		restartPut(t, db, 2, 4, 3)
+		restartCheck(t, db, 0, 2, 2)
+		restartCheck(t, db, 2, 4, 3)
+		restartRecoverCopy(t, path, "crash-2", m, func(cdb *DB) {
+			restartCheck(t, cdb, 0, 2, 2)
+			restartCheck(t, cdb, 2, 4, 3)
+			restartCheck(t, cdb, 4, 200, 1)
+		})
+		db = restartReopen(t, db, path, m)
+		restartCheck(t, db, 0, 2, 2)
+		restartCheck(t, db, 2, 4, 3)
+		restartCheck(t, db, 4, 200, 1)
+		require.NoError(t, db.IntegrityCheck())
+	})
+}
+
 const (
 	restartPeerEnvPath = "TEST_WAL_RESTART_PEER_DB_PATH"
 	restartPeerEnvMode = "TEST_WAL_RESTART_PEER_MODE"
@@ -208,6 +249,9 @@ const (
 //	wrap:   commit rows [60, 200), checkpoint everything, then start a
 //	        transaction that starts the log over, spill it, and exit without
 //	        committing or closing
+//	commit-unpublished: commit rows [60, 200), checkpoint everything, then
+//	        commit a transaction that starts the log over and exit once its
+//	        frames are synced, before its wal-index header is written
 func restartPeerChild(t *testing.T) bool {
 	path := os.Getenv(restartPeerEnvPath)
 	if path == "" {
@@ -236,6 +280,26 @@ func restartPeerChild(t *testing.T) bool {
 		restartPutTx(t, wtx, 0, 30, 2)
 		restartSpillAll(t, db)
 		require.Less(t, db.pager.wal.nFrame.Load(), n, "the peer started the log over")
+	case "commit-unpublished":
+		restartPut(t, db, 60, 200, 1)
+		require.NoError(t, db.Checkpoint(CheckpointPassive))
+		restarted := false
+		testRestartLogHook = func(step string) {
+			switch step {
+			case "restarted":
+				restarted = true
+			case "publish":
+				if restarted {
+					os.Exit(0)
+				}
+				t.Error("the commit did not start the log over")
+			}
+		}
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		restartPutTx(t, wtx, 0, 30, 2)
+		_ = wtx.Commit()
+		t.Error("the commit never reached its publication")
 	default:
 		t.Fatalf("unknown mode %q", mode)
 	}
@@ -331,4 +395,51 @@ func TestWalWriterRestart_PeerDiesAfterRestart(t *testing.T) {
 	restartCheck(t, db2, 0, 3, 3)
 	restartCheck(t, db2, 3, 200, 1)
 	require.NoError(t, db2.IntegrityCheck())
+}
+
+// A peer starts the log over, writes and syncs a commit in the new log, and
+// dies before it writes the commit's wal-index header. The surviving process
+// still has the restart header, with no frames, over a WAL file that holds
+// the peer's frames. It must read a consistent database, and its next commit
+// must take the log over from frame 1 and be recovered by a later open. A
+// fresh recovery of the files as the peer left them finds either state of
+// the peer's transaction, whole.
+func TestWalWriterRestart_PeerDiesBeforePublishingCommit(t *testing.T) {
+	if restartPeerChild(t) {
+		return
+	}
+	m := restartModes[0]
+	db, path := openRestartDB(t, m)
+	restartPut(t, db, 0, 60, 1)
+
+	peer := startRestartPeer(t, "TestWalWriterRestart_PeerDiesBeforePublishingCommit", path, "commit-unpublished")
+	require.NoError(t, peer.Wait())
+
+	hdr, valid := db.pager.wal.index.readHeader()
+	require.True(t, valid)
+	require.Zero(t, hdr.mxFrame, "setup: the peer's commit was never published")
+	require.Greater(t, restartWalSize(t, path), int64(walHeaderSize), "setup: the peer's frames are in the WAL file")
+	restartCheck(t, db, 0, 200, 1)
+
+	// The files alone: the peer's transaction is all there or not at all.
+	restartRecoverCopy(t, path, "crash", m, func(cdb *DB) {
+		rtx, err := cdb.BeginRead()
+		require.NoError(t, err)
+		ns, err := rtx.GetNamespace("t1")
+		require.NoError(t, err)
+		val, err := rtx.Get(ns, []byte{0, 0, 0, 0})
+		require.NoError(t, err)
+		require.NoError(t, rtx.Rollback())
+		restartCheck(t, cdb, 0, 30, val[0])
+		restartCheck(t, cdb, 30, 200, 1)
+	})
+
+	restartPut(t, db, 0, 3, 3)
+	restartCheck(t, db, 0, 3, 3)
+	restartCheck(t, db, 3, 200, 1)
+	restartRecoverCopy(t, path, "crash-after", m, func(cdb *DB) {
+		restartCheck(t, cdb, 0, 3, 3)
+		restartCheck(t, cdb, 3, 200, 1)
+	})
+	require.NoError(t, db.IntegrityCheck())
 }

@@ -12,7 +12,10 @@ package btree
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -106,6 +109,34 @@ func restartReopen(t *testing.T, db *DB, path string, m restartMode) *DB {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db2.Close() })
 	return db2
+}
+
+// restartCopyFiles copies the database and its WAL, without the shm, as a
+// crash at this instant would leave them, and returns the copy's path.
+func restartCopyFiles(t *testing.T, path, name string) string {
+	t.Helper()
+	dir := filepath.Join(filepath.Dir(path), name)
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	dst := filepath.Join(dir, "test.db")
+	copyFileForTest(t, path, dst)
+	copyFileForTest(t, path+"-wal", dst+"-wal")
+	return dst
+}
+
+// restartRecoverCopy opens a crash copy of the files as they are now, so
+// that the WAL is recovered from its bytes: an orderly Close would
+// checkpoint and truncate it first, and a log whose frames chain from the
+// wrong checksums would go unnoticed. Nothing to do in in-memory mode.
+func restartRecoverCopy(t *testing.T, path, name string, m restartMode, check func(db *DB)) {
+	t.Helper()
+	if m.opts.InMemory {
+		return
+	}
+	cdb, err := testOpen(t, restartCopyFiles(t, path, name), m.opts)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, cdb.Close()) }()
+	check(cdb)
+	require.NoError(t, cdb.IntegrityCheck())
 }
 
 func restartWalSize(t *testing.T, path string) int64 {
@@ -293,6 +324,10 @@ func TestWalWriterRestart_AllSpilledCommit(t *testing.T) {
 
 		restartCheck(t, db, 0, 1, 2)
 		restartCheck(t, db, 1, 200, 1)
+		restartRecoverCopy(t, path, "crash", m, func(cdb *DB) {
+			restartCheck(t, cdb, 0, 1, 2)
+			restartCheck(t, cdb, 1, 200, 1)
+		})
 		db = restartReopen(t, db, path, m)
 		restartCheck(t, db, 0, 1, 2)
 		restartCheck(t, db, 1, 200, 1)
@@ -323,9 +358,19 @@ func TestWalWriterRestart_RollbackThenCommit(t *testing.T) {
 			require.False(t, wtx.HasChanges(), "a new transaction has no changes")
 			require.NoError(t, wtx.Rollback())
 
-			restartPut(t, db, 0, 3, 3)
+			// The next transaction's frames chain from the new log's seed,
+			// through a spill and the commit; recovery verifies the chain.
+			wtx, err = db.BeginWrite()
+			require.NoError(t, err)
+			restartPutTx(t, wtx, 0, 3, 3)
+			restartSpillAll(t, db)
+			require.NoError(t, wtx.Commit())
 			restartCheck(t, db, 0, 3, 3)
 			restartCheck(t, db, 3, 200, 1)
+			restartRecoverCopy(t, path, fmt.Sprintf("crash-%v", spill), m, func(cdb *DB) {
+				restartCheck(t, cdb, 0, 3, 3)
+				restartCheck(t, cdb, 3, 200, 1)
+			})
 			db = restartReopen(t, db, path, m)
 			restartCheck(t, db, 0, 3, 3)
 			restartCheck(t, db, 3, 200, 1)
@@ -359,6 +404,10 @@ func TestWalWriterRestart_SavepointRollback(t *testing.T) {
 
 		restartCheck(t, db, 0, 3, 3)
 		restartCheck(t, db, 3, 200, 1)
+		restartRecoverCopy(t, path, "crash", m, func(cdb *DB) {
+			restartCheck(t, cdb, 0, 3, 3)
+			restartCheck(t, cdb, 3, 200, 1)
+		})
 		db = restartReopen(t, db, path, m)
 		restartCheck(t, db, 0, 3, 3)
 		restartCheck(t, db, 3, 200, 1)
@@ -387,7 +436,120 @@ func TestWalWriterRestart_AutoCheckpointBoundsLog(t *testing.T) {
 			}
 		}
 		require.Less(t, maxFrames, uint32(80), "the log is started over, not grown")
+		w := db.pager.wal
+		if m.opts.InMemory {
+			// The frame arena is reused from its start by each restart.
+			require.LessOrEqual(t, len(w.memFrames), 80)
+			require.LessOrEqual(t, w.memArenaOff, 80*int(w.pageSize))
+		} else {
+			// The file is reused, not shrunk: it stays as long as the
+			// longest log was, and no longer.
+			frameSize := int64(walFrameSize) + int64(w.pageSize)
+			size := restartWalSize(t, path)
+			require.Greater(t, size, int64(0))
+			require.LessOrEqual(t, size, int64(walHeaderSize)+80*frameSize, "the WAL file does not grow with the number of commits")
+			// Only TRUNCATE gives the space back.
+			require.NoError(t, db.Checkpoint(CheckpointTruncate))
+			require.Equal(t, int64(0), restartWalSize(t, path))
+		}
 		require.NoError(t, db.IntegrityCheck())
+	})
+}
+
+// A writer does not start the log over while a checkpoint runs, in this
+// process or another: it takes the checkpoint lock without waiting and
+// appends if it is busy (restartLogLocked's DRIFT). Any other error of that
+// lock fails the write.
+func TestWalWriterRestart_CheckpointLock(t *testing.T) {
+	forEachRestartMode(t, func(t *testing.T, m restartMode) {
+		db, _ := openRestartDB(t, m)
+		restartPut(t, db, 0, 60, 1)
+		require.NoError(t, db.Checkpoint(CheckpointPassive))
+		w := db.pager.wal
+		n := w.index.mxCommitFrame.LoadLocal()
+		require.Equal(t, n, w.index.liveNBackfill(), "setup: the whole log is backfilled")
+		salts := [2]uint32{w.header.salt1, w.header.salt2}
+
+		// A checkpoint holds the lock; nothing else is in the way.
+		require.NoError(t, w.index.lock(lockCheckpoint, lockExclusive))
+		restartPut(t, db, 0, 2, 2)
+		require.NoError(t, w.index.unlock(lockCheckpoint, lockExclusive))
+		n2 := w.index.mxCommitFrame.LoadLocal()
+		require.Greater(t, n2, n, "frames are appended while a checkpoint runs")
+		require.Equal(t, salts, [2]uint32{w.header.salt1, w.header.salt2}, "the log was not started over")
+
+		// With the lock free and the log backfilled again, the writer
+		// starts it over.
+		require.NoError(t, db.Checkpoint(CheckpointPassive))
+		restartPut(t, db, 0, 2, 3)
+		require.Less(t, w.index.mxCommitFrame.LoadLocal(), n2, "the writer started the log over")
+		require.Equal(t, salts[0]+1, w.header.salt1)
+
+		// An error of the checkpoint lock that is not busy fails the write
+		// and leaves the log as it was.
+		require.NoError(t, db.Checkpoint(CheckpointPassive))
+		n3 := w.index.mxCommitFrame.LoadLocal()
+		salt1 := w.header.salt1
+		errLock := errors.New("injected checkpoint lock failure")
+		orig := w.index.shm
+		w.index.shm = &selectiveErrorLockShm{shm: orig, failSlot: lockCheckpoint, failLockType: lockExclusive, lockErr: errLock}
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		restartPutTx(t, wtx, 0, 2, 4)
+		err = wtx.Commit()
+		w.index.shm = orig
+		require.ErrorIs(t, err, errLock)
+		require.Equal(t, n3, w.index.mxCommitFrame.LoadLocal())
+		require.Equal(t, salt1, w.header.salt1)
+		restartCheck(t, db, 0, 2, 3)
+
+		restartPut(t, db, 0, 2, 5)
+		restartCheck(t, db, 0, 2, 5)
+		restartCheck(t, db, 2, 60, 1)
+		require.NoError(t, db.IntegrityCheck())
+	})
+}
+
+// An incremental backup has copied some pages and not others when a
+// transaction of this process changes both and its changed pages are spilled
+// before the commit. The spilled pages are not sent to the backup, so the
+// backup must start over: its result is one committed state of the source,
+// not old pages next to new ones. (The automatic checkpoint, which reset the
+// WAL and restarted every backup with it, used to hide this.)
+func TestBackup_SpilledCommitRestartsBackup(t *testing.T) {
+	forEachRestartMode(t, func(t *testing.T, m restartMode) {
+		src, _ := openRestartDB(t, m)
+		restartPut(t, src, 0, 400, 1)
+		dstMode := restartModes[0]
+		dst, dstPath := openRestartDB(t, dstMode)
+
+		b, err := dst.BackupInit(src)
+		require.NoError(t, err)
+		require.NoError(t, b.Step(context.Background(), 4)) // some pages copied, most not
+		require.Greater(t, src.DatabaseSize(), uint32(8))
+
+		// Every row changes; no page of the change is left for the commit to
+		// send. The transaction does not mark the data changed, so the
+		// page-1 counter does not move either.
+		wtx, err := src.BeginWrite()
+		require.NoError(t, err)
+		restartPutTx(t, wtx, 0, 400, 2)
+		restartSpillAll(t, src)
+		require.NoError(t, wtx.Commit())
+
+		for {
+			err := b.Step(context.Background(), 16)
+			if errors.Is(err, ErrBackupDone) {
+				break
+			}
+			require.NoError(t, err)
+		}
+		require.NoError(t, b.Finish())
+
+		restartCheck(t, dst, 0, 400, 2)
+		dst = restartReopen(t, dst, dstPath, dstMode)
+		restartCheck(t, dst, 0, 400, 2)
+		require.NoError(t, dst.IntegrityCheck())
 	})
 }
 

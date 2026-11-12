@@ -68,6 +68,12 @@ func TestWalWriterRestart_HeaderWriteAndSyncFailure(t *testing.T) {
 				restartPut(t, db, 0, 3, 3)
 				restartCheck(t, db, 0, 3, 3)
 				restartCheck(t, db, 3, 200, 1)
+				// Recovered from the WAL's bytes, before any Close
+				// checkpoints it away.
+				restartRecoverCopy(t, path, "crash", m, func(cdb *DB) {
+					restartCheck(t, cdb, 0, 3, 3)
+					restartCheck(t, cdb, 3, 200, 1)
+				})
 				db = restartReopen(t, db, path, m)
 				restartCheck(t, db, 0, 3, 3)
 				restartCheck(t, db, 3, 200, 1)

@@ -1986,8 +1986,9 @@ func (w *wal) pos() walPos {
 // the base is frame 0 with the generation's seed. SQLite reaches the same
 // result from the restarted pWal->hdr in sqlite3WalUndo (wal.c:3775) and from
 // the nCkpt test in sqlite3WalSavepointUndo (wal.c:3829-3835). Every
-// comparison against a saved position goes through this, not only undo: a
-// transaction's frames are "the frames above its base".
+// comparison against a saved position follows this rule, not only undo: a
+// transaction's frames are "the frames above its base". (pager.walBaseFrame
+// applies it to the frame number alone, over atomics.)
 func (w *wal) base(saved walPos) walPos {
 	gen := w.logGen.Load()
 	if saved.gen == gen {
@@ -2002,7 +2003,10 @@ var testCheckpointRead0Hook func()
 
 // testRestartLogHook, when non-nil, runs as a writer starts the log over,
 // with the step about to be taken: "restart" before the reset, "restarted"
-// after it and before the WAL header is written. Test-only.
+// after it and before the WAL header is written, "header-synced" once the
+// WAL header is written and synced and before any frame, "publish" once a
+// commit's frames are synced and before its wal-index header is written.
+// Test-only.
 var testRestartLogHook func(step string)
 
 // restartLogLocked starts the log over if the next frames can go to the
@@ -2030,15 +2034,10 @@ var testRestartLogHook func(step string)
 // DRIFT: the writer's restart also try-locks lockCheckpoint; C's walRestartLog does not See docs/btree/NOTES.md#drift-2026-11-12-2-writer-restart-takes-the-checkpoint-lock
 // DRIFT: the writer keeps reader slot 0 after a restart; C moves to a WAL slot (wal.c:3893-3899) See docs/btree/NOTES.md#drift-2026-11-12-3-writer-keeps-slot-0-after-a-restart
 func (w *wal) restartLogLocked() error {
-	mx := w.index.mxCommitFrame.LoadLocal()
-	if w.nFrame.Load() != mx {
-		return nil // this transaction has frames in the log already
-	}
-	// The cheap test first: on most commits part of the log is not
-	// backfilled, and this is all a commit pays.
-	if nb := w.index.liveNBackfill(); nb == 0 || nb != mx {
+	if !w.restartCandidate() {
 		return nil
 	}
+	mx := w.index.mxCommitFrame.LoadLocal()
 	multiProcess := !w.inProcess && !w.inMemory
 	if multiProcess {
 		// mx is the committed mxFrame only if it is the live header's.
@@ -2085,6 +2084,19 @@ func (w *wal) restartLogLocked() error {
 		testRestartLogHook("restarted")
 	}
 	return nil
+}
+
+// restartCandidate is the first two conditions of restartLogLocked: no frame
+// of this transaction is in the log, and the whole log is backfilled. It
+// takes no lock of its own and is all that most writes pay: part of the log
+// is usually not backfilled.
+func (w *wal) restartCandidate() bool {
+	mx := w.index.mxCommitFrame.LoadLocal()
+	if w.nFrame.Load() != mx {
+		return false // this transaction has frames in the log already
+	}
+	nb := w.index.liveNBackfill()
+	return nb != 0 && nb == mx
 }
 
 // flushHeader writes the already-initialized in-memory header to disk.
@@ -2409,6 +2421,9 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		if err := w.flushHeader(); err != nil {
 			return err
 		}
+		if testRestartLogHook != nil {
+			testRestartLogHook("header-synced")
+		}
 	}
 
 	frameSize := int(walFrameSize) + int(w.pageSize)
@@ -2619,6 +2634,9 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 			if nPage == 0 {
 				nPage = w.index.maxPage.Load()
 			}
+			if testRestartLogHook != nil {
+				testRestartLogHook("publish")
+			}
 			if err := w.index.writeHeader(mxCommit, nPage, w.index.nBackfill.Load(),
 				[2]uint32{w.cksum1, w.cksum2},
 				[2]uint32{w.header.salt1, w.header.salt2}); err != nil {
@@ -2655,12 +2673,16 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 // DRIFT: InMemory+NoSync WAL stores page data in arena, skipping checksums entirely; no disk persistence See docs/btree/NOTES.md#old-drift-inmemory-wal-skips-checksums
 func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	// See if these frames can go to the start of the log (wal.c:4067-4072).
-	if err := func() error {
-		w.mu.Lock()
-		defer w.mu.Unlock()
-		return w.restartLogLocked()
-	}(); err != nil {
-		return err
+	// In a call of its own, so that w.mu is released if it unwinds; the
+	// writer is the only one to change what restartCandidate reads.
+	if w.restartCandidate() {
+		if err := func() error {
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			return w.restartLogLocked()
+		}(); err != nil {
+			return err
+		}
 	}
 
 	w.mu.Lock()

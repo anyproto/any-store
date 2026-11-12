@@ -161,7 +161,8 @@ type pager struct {
 	savedWalCksum2 uint32
 
 	// savedWalGen is the log generation savedWalFrame and the checksums
-	// were taken in (wal.pos). They are read through walBase only: once the
+	// were taken in (wal.pos). They are read through walBase and
+	// walBaseFrame only: once the
 	// writer has started the log over inside the transaction, they name
 	// frames of the previous generation.
 	savedWalGen atomic.Uint64
@@ -2533,6 +2534,11 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		trace("commit: writing %d dirty pages to WAL %v", len(p.dirtyBuf), dirtyPgnos)
 	}
 
+	// Frames of this transaction already in the log are pages the cache
+	// spilled. They are not in dirtyBuf, so the dispatch below does not send
+	// them to an attached backup.
+	spilled := p.wal.nFrame.Load() > p.walBaseFrame()
+
 	if testCommitPrePublishHook != nil {
 		testCommitPrePublishHook()
 	}
@@ -2554,6 +2560,18 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// ~ sqlite3BackupUpdate dispatch (backup.c:687). Must happen here,
 	// AFTER the WAL frames are durable, so dst sees committed data only.
 	p.dispatchBackupUpdate(p.dirtyBuf)
+	if spilled {
+		// The backup did not get the spilled pages: it starts over.
+		// SQLite sends a backup every page it logs, spills included
+		// (pagerWalFrames, pager.c:3219-3225, from pagerStress at
+		// pager.c:4649), and restarts it only when such a transaction is
+		// rolled back (pager.c:3139). Until the spill sends its page too,
+		// a transaction that spilled restarts the backups at its commit.
+		// The automatic checkpoint used to hide this: it reset the WAL and
+		// restarted every backup with it.
+		// DRIFT: a commit that spilled restarts attached backups; C updates them page by page See docs/btree/NOTES.md#drift-2026-11-12-4-a-commit-that-spilled-restarts-attached-backups
+		p.dispatchBackupRestart()
+	}
 
 	// Mark all pages as clean
 	for _, pg := range p.dirtyBuf {

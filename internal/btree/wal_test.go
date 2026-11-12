@@ -2612,8 +2612,15 @@ func TestWALReadFrameErrorPropagates(t *testing.T) {
 	nFrameBefore := pager.wal.nFrame.Load()
 	require.Greater(t, nFrameBefore, uint32(0), "WAL must hold frames before the checkpoint")
 
-	require.NoError(t, db.Checkpoint(CheckpointTruncate),
-		"truncate checkpoint must not error while a reader holds a slot")
+	// The checkpoint backfills and then reports busy: it could not take the
+	// reader's slot (walBusyLock's result is walCheckpoint's, wal.c:2361).
+	// Without a busy handler, so that it does not wait out the timeout.
+	busyHandler := pager.wal.busyHandler
+	pager.wal.busyHandler = nil
+	err = db.Checkpoint(CheckpointTruncate)
+	pager.wal.busyHandler = busyHandler
+	require.ErrorIs(t, err, ErrBusy,
+		"a truncate checkpoint is busy while a reader holds a slot")
 
 	saltAfter := [2]uint32{pager.wal.header.salt1, pager.wal.header.salt2}
 	assert.Equal(t, saltBefore, saltAfter,
