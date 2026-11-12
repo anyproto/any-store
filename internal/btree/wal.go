@@ -1602,6 +1602,13 @@ type wal struct {
 	// overwrite. Mirrors SQLite's Wal.iReCksum (wal.c:533).
 	iReCksum uint32
 
+	// frameBatch stages writeFrames' appended frames (header + payload,
+	// contiguous as they lie in the file) so they go out in one WriteAt per
+	// walFrameBatchMax bytes rather than two per frame. Sized by the largest
+	// commit seen, capped at one chunk; writes are single-writer-serialized,
+	// so one buffer is safe.
+	frameBatch []byte
+
 	// memFrames stores page data in memory for InMemory mode,
 	// eliminating per-commit file I/O. Frames are flushed to pcache on checkpoint.
 	memFrames []memFrame
@@ -2451,9 +2458,16 @@ func (w *wal) recoverLocked() error {
 	return nil
 }
 
+// walFrameBatchMax bounds the bytes writeFrames stages per WriteAt. A chunk
+// always holds at least one frame, so pages above this size go out one frame
+// per write.
+const walFrameBatchMax = 256 << 10
+
 // writeFrames appends frames to the WAL. If commit is true, the last frame
 // is marked as a commit frame with the given dbSize.
-// All frames are batched into a single write call for performance.
+// Appended frames are staged in w.frameBatch and written in chunks of up to
+// walFrameBatchMax bytes; frames reused in place are written directly.
+// DRIFT: appended frames written in chunked WriteAt calls, not two writes per frame (walWriteOneFrame) See docs/btree/NOTES.md#drift-2026-11-11-10-writeframes-writes-appended-frames-in-chunks-not-two-writes-per-frame
 // DRIFT: padToSectorBoundary commit-frame sector padding not ported See docs/btree/NOTES.md#drift-104-padtosectorboundary-sector-padding-of-commit-frames-not-port
 // DRIFT: journal_size_limit/mxWalSize WAL truncation unimplemented (truncateOnCommit/walLimitSize) See docs/btree/NOTES.md#drift-105-journal-size-limit-wal-truncation-feature-unimplemented
 // DRIFT: in-process mode skips SHM hdr write on commit; BeginRead/Write synthesize a minimal walHdr See docs/btree/NOTES.md#old-drift-inprocess-skips-shm-hdr-on-commit
@@ -2523,9 +2537,22 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	var nAppended uint32
 	appended := make([]*page, 0, len(pages))
 
-	// Per-frame writes matching SQLite's walWriteOneFrame pattern:
-	// 24-byte stack header + direct page data write — zero heap allocation.
+	// Appended frames are contiguous in the file (frame n+1 starts where
+	// frame n ends), so they are staged header + payload in frameBatch and
+	// flushed whenever the next frame would not fit. walWriteOneFrame
+	// (wal.c:3940-3956) instead writes each frame's header and page with
+	// two writes; the bytes and their offsets are the same either way. A
+	// chunk holds whole frames, at least one.
 	var frameHdr [walFrameSize]byte
+	perChunk := walFrameBatchMax / frameSize
+	if perChunk < 1 {
+		perChunk = 1
+	}
+	if need := min(len(pages), perChunk) * frameSize; cap(w.frameBatch) < need {
+		w.frameBatch = make([]byte, 0, need)
+	}
+	batch := w.frameBatch[:0]
+	var batchOff int64
 
 	for i, p := range pages {
 		isLast := i == len(pages)-1
@@ -2616,16 +2643,31 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		binary.BigEndian.PutUint32(frameHdr[16:20], s1)
 		binary.BigEndian.PutUint32(frameHdr[20:24], s2)
 
-		// Write frame header
-		if _, err := w.file.WriteAt(frameHdr[:], off); err != nil {
-			return err
+		// Stage the frame header and its page data (plaintext or
+		// ciphertext depending on codec; payload may be codecScratch, so it
+		// is copied now). A chunk's frames are placed by position, so a
+		// payload must be exactly one page.
+		if len(payload) != int(w.pageSize) {
+			return fmt.Errorf("btree: WAL frame for page %d has %d payload bytes, page size %d", p.pgno, len(payload), w.pageSize)
 		}
-		// Write page data (plaintext or ciphertext depending on codec).
-		if _, err := w.file.WriteAt(payload, off+walFrameSize); err != nil {
-			return err
+		if len(batch) == 0 {
+			batchOff = off
+		}
+		batch = append(batch, frameHdr[:]...)
+		batch = append(batch, payload...)
+		if len(batch)+frameSize > cap(batch) {
+			if _, err := w.file.WriteAt(batch, batchOff); err != nil {
+				return err
+			}
+			batch = batch[:0]
 		}
 		appended = append(appended, p)
 		nAppended++
+	}
+	if len(batch) > 0 {
+		if _, err := w.file.WriteAt(batch, batchOff); err != nil {
+			return err
+		}
 	}
 
 	// Only advance nFrame and checksums after successful write. If
