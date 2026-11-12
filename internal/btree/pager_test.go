@@ -8675,6 +8675,55 @@ func TestRefreshHeaderFromPage1_DBFileReadErrorPropagates(t *testing.T) {
 	assert.Equal(t, before, p.header, "a failed refresh must not change the cached header")
 }
 
+// TestBeginWritePage1Refresh_TruncatedFrameTailFails: the newest page-1 WAL
+// frame keeps its frame header and the start of its page, the database
+// header included, but the WAL ends inside the page. The write-begin refresh
+// reads page 1 whole (readDbPage → sqlite3WalReadFrame with the page size,
+// pager.c:3036), so the short read fails the begin; a read of the 100-byte
+// database header alone would have succeeded.
+func TestBeginWritePage1Refresh_TruncatedFrameTailFails(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db1.Close()
+	allowDoubleOpen(dbPath)
+	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db2.Close()
+
+	wtx, err := db2.BeginWrite()
+	require.NoError(t, err)
+	_, err = wtx.CreateNamespace("seed")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Commit())
+
+	// The peer commits; db2's next write begin must re-read page 1.
+	wtx, err = db1.BeginWrite()
+	require.NoError(t, err)
+	ns1, err := wtx.GetNamespace("seed")
+	require.NoError(t, err)
+	for i := 0; i < 50; i++ {
+		require.NoError(t, wtx.Put(ns1, []byte(fmt.Sprintf("peer-%04d", i)), bytes.Repeat([]byte{0xA5}, 1000)))
+	}
+	require.NoError(t, wtx.Commit())
+
+	w := db1.pager.wal
+	hdr, valid := w.index.readHeader()
+	require.True(t, valid)
+	frame := mustWiGet(t, w.index, 1, hdr.mxFrame)
+	require.Greater(t, frame, uint32(0))
+	frameSize := int64(walFrameSize) + int64(w.pageSize)
+	page := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
+	require.NoError(t, w.file.Truncate(page+2*dbHeaderSize))
+
+	wtx, err = db2.BeginWrite()
+	if err == nil {
+		_ = wtx.Rollback()
+	}
+	require.Error(t, err, "a page-1 frame cut short inside the page must fail the refresh")
+}
+
 // ============================================================
 // Merged from pager_stress_dontwrite_test.go
 // ============================================================
