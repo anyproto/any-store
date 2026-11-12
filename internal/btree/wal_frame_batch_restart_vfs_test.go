@@ -39,14 +39,43 @@ func chunkModes() []restartMode {
 
 // walEvent is a write or a sync of the WAL file, or a writer step (a
 // testRestartLogHook step, "pre-publish" from testCommitPublishErrHook), with
-// the committed frame at that instant and, with shared memory, the live
-// wal-index header's mxFrame.
+// the writer's append position at that instant (nFrame and the running
+// checksums), the committed position (frame and size) and, with shared
+// memory, the live wal-index header's.
 type walEvent struct {
-	kind  string
-	off   int64
-	n     int
-	mx    uint32
-	shmMx uint32
+	kind     string
+	off      int64
+	n        int
+	nFrame   uint32
+	ck1, ck2 uint32
+	mx       uint32
+	size     uint32
+	shmMx    uint32
+	shmSize  uint32
+}
+
+// chunkBase is where one commit's writeFrames call starts, after any restart:
+// the frame it appends after and the checksum chain there, which must not
+// move until every chunk is written, and the committed position (frame and
+// size), which must stay published until the frames are written and synced.
+type chunkBase struct {
+	start          uint32
+	cksum1, cksum2 uint32
+	committed      uint32
+	size           uint32
+}
+
+// restartBase is a chunkBase after a restart: frame 0 of the new log with its
+// seed checksums, the restart's committed frame 0 and the kept size.
+func restartBase(w *wal, size uint32) chunkBase {
+	return chunkBase{cksum1: w.genSeed1.Load(), cksum2: w.genSeed2.Load(), size: size}
+}
+
+// appendBase is a chunkBase at w's position now, before a commit that does
+// not start the log over.
+func appendBase(w *wal) chunkBase {
+	committed, size := w.index.mxCommitFrame.LoadPos()
+	return chunkBase{start: w.nFrame.Load(), cksum1: w.cksum1, cksum2: w.cksum2, committed: committed, size: size}
 }
 
 // orderedWAL logs the WAL file's writes and syncs while armed, and can fail
@@ -80,11 +109,14 @@ func wrapWAL(t *testing.T, w *wal) *orderedWAL {
 	return ow
 }
 
+// event runs on the writer's goroutine, inside writeFrames: the running
+// checksums are the writer's own fields.
 func (f *orderedWAL) event(kind string, off int64, n int) walEvent {
-	e := walEvent{kind: kind, off: off, n: n, mx: f.w.index.mxCommitFrame.LoadLocal()}
+	mx, size := f.w.index.mxCommitFrame.LoadPos()
+	e := walEvent{kind: kind, off: off, n: n, nFrame: f.w.nFrame.Load(), ck1: f.w.cksum1, ck2: f.w.cksum2, mx: mx, size: size}
 	if f.shm {
 		if hdr, ok := f.w.index.readHeader(); ok {
-			e.shmMx = hdr.mxFrame
+			e.shmMx, e.shmSize = hdr.mxFrame, hdr.nPage
 		}
 	}
 	return e
@@ -143,24 +175,41 @@ func (f *orderedWAL) disarm() ([]walEvent, bool) {
 	return f.events, f.failed
 }
 
-// checkChunks checks the chunk writes of one commit's writeFrames call that
-// appends after frame start: contiguous from start's end, whole frames, at
-// most walFrameBatchMax each, and every one written while the committed frame
-// (and the live wal-index header) still named committed, the transaction's
-// base. It returns their frame count and their number.
-func checkChunks(t *testing.T, ev []walEvent, start, committed uint32, frameSize int, shm bool) (frames, chunks int) {
+// checkChunks checks the events of one commit's writeFrames call that
+// appends after b.start (the events before a restart in it are skipped). The
+// chunk writes are contiguous from b.start's end, whole frames, at most
+// walFrameBatchMax each, and each is written while nFrame and the running
+// checksums are still b's: they advance only once every chunk is written.
+// Every event up to the publication ("pre-publish", after the sync) sees the
+// committed position, frame and size, and the live wal-index header's, still
+// at b's. It returns the chunks' frame count and their number.
+func checkChunks(t *testing.T, ev []walEvent, b chunkBase, frameSize int, shm bool) (frames, chunks int) {
 	t.Helper()
-	next := int64(walHeaderSize) + int64(start)*int64(frameSize)
+	for i := len(ev) - 1; i >= 0; i-- {
+		if ev[i].kind == "restarted" {
+			ev = ev[i+1:]
+			break
+		}
+	}
+	next := int64(walHeaderSize) + int64(b.start)*int64(frameSize)
+	published := false
 	for i, e := range ev {
+		if !published {
+			require.Equal(t, b.committed, e.mx, "event %d (%s): the committed frame moved before the publication", i, e.kind)
+			require.Equal(t, b.size, e.size, "event %d (%s): the committed size moved before the publication", i, e.kind)
+			if shm {
+				require.Equal(t, b.committed, e.shmMx, "event %d (%s): the wal-index header named the commit before the publication", i, e.kind)
+				require.Equal(t, b.size, e.shmSize, "event %d (%s): the wal-index header's size moved before the publication", i, e.kind)
+			}
+			published = e.kind == "pre-publish"
+		}
 		if (e.kind != "write" && e.kind != "failed-write") || e.off < walHeaderSize || e.n%frameSize != 0 {
 			continue
 		}
 		require.Equal(t, next, e.off, "event %d: chunk %d not contiguous with the frames before it", i, chunks+1)
 		require.LessOrEqual(t, e.n, walFrameBatchMax, "event %d", i)
-		require.Equal(t, committed, e.mx, "event %d: chunk %d written after the commit was published", i, chunks+1)
-		if shm {
-			require.Equal(t, committed, e.shmMx, "event %d: chunk %d written after the wal-index header named the commit", i, chunks+1)
-		}
+		require.Equal(t, b.start, e.nFrame, "event %d: nFrame advanced before chunk %d was written", i, chunks+1)
+		require.Equal(t, [2]uint32{b.cksum1, b.cksum2}, [2]uint32{e.ck1, e.ck2}, "event %d: the checksums advanced before chunk %d was written", i, chunks+1)
 		next += int64(e.n)
 		frames += e.n / frameSize
 		chunks++
@@ -173,7 +222,7 @@ func checkChunks(t *testing.T, ev []walEvent, start, committed uint32, frameSize
 // synced before the first chunk (wal.c:4074-4116), the chunks hold the
 // commit's frames numbered from 1, and the sync after the last chunk comes
 // before the commit is published.
-func checkRestartOrder(t *testing.T, ev []walEvent, frameSize int, shm bool, wantFrames uint32) {
+func checkRestartOrder(t *testing.T, ev []walEvent, b chunkBase, frameSize int, shm bool, wantFrames uint32) {
 	t.Helper()
 	at := func(kind string) int {
 		for i, e := range ev {
@@ -194,7 +243,7 @@ func checkRestartOrder(t *testing.T, ev []walEvent, frameSize int, shm bool, wan
 		"the first write after the restart is the new log's header: %v", ev)
 	require.Equal(t, "sync", rest[1].kind, "the header is synced before any frame: %v", ev)
 	require.Equal(t, "header-synced", rest[2].kind, "%v", ev)
-	frames, chunks := checkChunks(t, rest[3:], 0, 0, frameSize, shm)
+	frames, chunks := checkChunks(t, rest[3:], b, frameSize, shm)
 	require.Equal(t, int(wantFrames), frames, "the chunks hold the commit's frames, from frame 1")
 	require.GreaterOrEqual(t, chunks, 3, "setup: the commit spans several chunks")
 
@@ -248,6 +297,7 @@ func TestWriteFrames_RestartThenChunkedCommit(t *testing.T) {
 			old := w.index.mxCommitFrame.LoadLocal()
 			require.Equal(t, old, w.index.liveNBackfill(), "setup: the whole log is backfilled")
 			gen := w.logGen.Load()
+			_, size := w.index.mxCommitFrame.LoadPos()
 
 			var ow *orderedWAL
 			var atHeader, atChunk1 string
@@ -277,7 +327,7 @@ func TestWriteFrames_RestartThenChunkedCommit(t *testing.T) {
 				require.Len(t, w.memFrames, int(frames), "the commit's frames start the in-memory log")
 			} else {
 				ev, _ := ow.disarm()
-				checkRestartOrder(t, ev, ow.frameSize, ow.shm, frames)
+				checkRestartOrder(t, ev, restartBase(w, size), ow.frameSize, ow.shm, frames)
 			}
 			restartCheck(t, db, 0, chunkRows, 2)
 			require.NoError(t, db.IntegrityCheck())
@@ -343,16 +393,19 @@ func TestWriteFrames_ChunkFaultAfterRestart(t *testing.T) {
 					require.NotZero(t, w.nFrame.Load(), "setup: spilled frames in the new log")
 				}
 				restartPutTx(t, wtx, 0, chunkRows, 2)
-				var start uint32 // the commit's first frame follows the restart, or the spilled frames
+				var b chunkBase // after the spill, the commit appends to the spilled frames
 				if c.spill {
-					start = w.nFrame.Load()
+					b = appendBase(w)
 				}
 				ow.arm(c.fail)
 				require.ErrorIs(t, wtx.Commit(), errInjectedChunk)
 				ev, failed := ow.disarm()
 				require.True(t, failed, "setup: a chunk failed")
 				require.Equal(t, gen+1, w.logGen.Load(), "setup: the log was started over")
-				_, chunks := checkChunks(t, ev, start, 0, ow.frameSize, ow.shm)
+				if !c.spill {
+					b = restartBase(w, size)
+				}
+				_, chunks := checkChunks(t, ev, b, ow.frameSize, ow.shm)
 				if c.fail == "commit" {
 					require.GreaterOrEqual(t, chunks, 3, "setup: the commit chunk is not the first")
 				}
@@ -384,7 +437,7 @@ func TestWriteFrames_ChunkFaultAfterRestart(t *testing.T) {
 				ow.arm("")
 				restartPut(t, db, 0, chunkRows, 3)
 				ev, _ = ow.disarm()
-				frames, _ := checkChunks(t, ev, 0, 0, ow.frameSize, ow.shm)
+				frames, _ := checkChunks(t, ev, restartBase(w, size), ow.frameSize, ow.shm)
 				require.Equal(t, int(w.nFrame.Load()), frames)
 				require.Equal(t, w.nFrame.Load(), w.index.mxCommitFrame.LoadLocal())
 				restartCheck(t, db, 0, chunkRows, 3)
@@ -430,6 +483,7 @@ func TestWriteFrames_Format6NoPage1Chunks(t *testing.T) {
 				ow := wrapWAL(t, w)
 
 				// The same rows, the same sizes: every leaf, no header field.
+				b := appendBase(w)
 				ow.arm("commit")
 				wtx, err := db.BeginWrite()
 				require.NoError(t, err)
@@ -452,7 +506,10 @@ func TestWriteFrames_Format6NoPage1Chunks(t *testing.T) {
 						require.NotEqual(t, "write", e.kind, "a frame before the new log's header: %v", ev)
 					}
 				}
-				_, chunks := checkChunks(t, ev, base, base, ow.frameSize, ow.shm)
+				if restart {
+					b = restartBase(w, size)
+				}
+				_, chunks := checkChunks(t, ev, b, ow.frameSize, ow.shm)
 				require.GreaterOrEqual(t, chunks, 3, "setup: the commit spans several chunks")
 
 				f, n := w.index.mxCommitFrame.LoadPos()
@@ -472,10 +529,11 @@ func TestWriteFrames_Format6NoPage1Chunks(t *testing.T) {
 					require.Equal(t, size, readerPageCount(t, cdb))
 				})
 
+				b = appendBase(w)
 				ow.arm("")
 				restartPut(t, db, 0, chunkRows, 3)
 				ev, _ = ow.disarm()
-				frames, chunks := checkChunks(t, ev, base, base, ow.frameSize, ow.shm)
+				frames, chunks := checkChunks(t, ev, b, ow.frameSize, ow.shm)
 				require.GreaterOrEqual(t, chunks, 3, "setup: the retry spans several chunks")
 				mx := w.index.mxCommitFrame.LoadLocal()
 				require.Equal(t, base+uint32(frames), mx)
