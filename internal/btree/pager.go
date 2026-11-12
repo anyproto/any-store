@@ -990,10 +990,18 @@ func (p *pager) beginReadHdrBusy(busy *beginBusy) (hdr WalIndexHdr, maxFrame, mi
 		p.mu.RUnlock()
 		return WalIndexHdr{}, 0, 0, 0, ErrCorrupt
 	}
+	// The change state before the snapshot is taken: see wal.noteSnapshot.
+	// ~ pagerBeginReadTransaction (pager.c:3246-3267): every begin of every
+	// kind passes here, so none can take a snapshot holding another
+	// process's commit without the commit being counted.
+	pre := p.wal.chg.Load()
 	hdr, maxFrame, minFrame, slot, err = p.wal.beginReadHdrBusy(busy)
 	if err != nil {
 		p.mu.RUnlock()
 		return WalIndexHdr{}, 0, 0, 0, err
+	}
+	if pre != nil {
+		p.wal.noteSnapshot(pre, &hdr)
 	}
 	// Update pager's walMaxFrame monotonically: never decrease, since a reader
 	// with an older snapshot must not overwrite a newer value set by the writer.

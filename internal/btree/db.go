@@ -2256,6 +2256,25 @@ func (tx *ReadTx) DiskSchemaCookie() uint32 {
 	return tx.diskSchemaCookie
 }
 
+// ChangeEpoch returns the invalidation epoch of this process, and whether
+// this transaction's snapshot is exact for it: it holds every change of
+// another process the epoch counts and none it does not count.
+//
+// The epoch moves when a transaction of this process, of any kind, begins at
+// a wal-index header the process neither wrote nor had seen (another
+// process's commit or WAL reset), and when the process rebuilds the wal-index
+// (pager_reset's iDataVersion++, pager.c:1772-1773, with own commits
+// cancelled as btree.c:4417 does). State derived from the database content
+// and kept across transactions is valid for an epoch: it is loaded through a
+// transaction that is exact for the epoch, and loaded again when the epoch
+// has moved.
+//
+// In-process and in-memory databases have no other process: the epoch stays
+// 0 and every snapshot is exact.
+func (tx *ReadTx) ChangeEpoch() (epoch uint64, exact bool) {
+	return tx.pager.wal.changeEpoch(&tx.walHdr)
+}
+
 // SnapshotHeaderCounters returns the page-1 FileChangeCount and SchemaCookie
 // as of THIS tx's snapshot — baked at begin from the tx's captured
 // [minFrame, maxFrame] window, both sides fixed for the tx's life
