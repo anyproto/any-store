@@ -170,7 +170,7 @@ func checkChunks(t *testing.T, ev []walEvent, start, committed uint32, frameSize
 
 // checkRestartOrder checks one commit's writeFrames that started the log over:
 // nothing is written before the restart, the new log's header is written and
-// synced before the first chunk (wal.c:4077-4115), the chunks hold the
+// synced before the first chunk (wal.c:4074-4116), the chunks hold the
 // commit's frames numbered from 1, and the sync after the last chunk comes
 // before the commit is published.
 func checkRestartOrder(t *testing.T, ev []walEvent, frameSize int, shm bool, wantFrames uint32) {
