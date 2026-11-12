@@ -9,9 +9,9 @@ read format version (offset 19), max embedded payload fraction (offset 21),
 min embedded payload fraction (offset 22), and leaf payload fraction (offset 23).
 
 Deviations from original:
-  - corruptA-2.1: Original corrupts offset 19 (ReadVersion) which our impl does NOT
-    validate. Adapted to corrupt magic string byte at offset 0 instead. The original
-    offset is tested as a secondary subtest documenting our behavioral difference.
+  - corruptA-2.1: Original corrupts offset 19 (ReadVersion). Both that and a
+    corrupt magic byte at offset 0 are tested; the read version is refused as a
+    newer format rather than as "not a database".
   - corruptA-2.2: Original corrupts offset 21 (max embedded payload frac) which our
     impl does NOT read (hardcoded constant). Adapted to corrupt magic byte at offset 5.
   - corruptA-2.3: Original corrupts offset 22 (min embedded payload frac) which our
@@ -98,7 +98,7 @@ func TestSqlite_CorruptA_1_1(t *testing.T) {
 
 // Port of corruptA-2.1 (lines 51-56 in corruptA.test)
 // Original: Corrupt offset 19 (ReadVersion) to 0x03, expect "file is not a database".
-// DEVIATION: Our impl does not validate ReadVersion. Adapted to corrupt magic byte 0.
+// The read version is validated as in SQLite; the magic-byte case is kept as well.
 func TestSqlite_CorruptA_2_1(t *testing.T) {
 	t.Run("magic_byte_0", func(t *testing.T) {
 		path, template := setupCorruptTestDB(t)
@@ -116,7 +116,8 @@ func TestSqlite_CorruptA_2_1(t *testing.T) {
 		assert.Error(t, err, "expected error when magic byte 0 is corrupted")
 	})
 
-	// DEVIATION: Document that original offset 19 corruption is not detected by our impl.
+	// A read version above the maximum refuses the open, as lockBtree does
+	// (btree.c:3325). The error names a newer format, not corruption.
 	t.Run("original_offset_19", func(t *testing.T) {
 		path, template := setupCorruptTestDB(t)
 
@@ -128,13 +129,9 @@ func TestSqlite_CorruptA_2_1(t *testing.T) {
 		_ = os.Remove(path + "-wal")
 		_ = os.Remove(path + "-shm")
 
-		// Our impl does NOT validate ReadVersion, so Open may succeed.
-		// DEVIATION: SQLite would return "file is not a database" here.
-		db, err := testOpen(t, path, DefaultOptions())
-		if err == nil {
-			_ = db.Close()
-		}
-		// We just document the behavior; no assertion on success/failure.
+		_, err := testOpen(t, path, DefaultOptions())
+		require.ErrorIs(t, err, ErrNewerFormat)
+		assert.NotErrorIs(t, err, ErrCorrupt)
 	})
 }
 

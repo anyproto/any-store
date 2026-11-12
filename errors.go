@@ -132,7 +132,10 @@ var (
 
 	ErrDBIsClosed = btree.ErrClosed
 
-	ErrDBIsNotOpened       = errors.New("any-store: database is not opened")
+	ErrDBIsNotOpened = errors.New("any-store: database is not opened")
+	// ErrIncompatibleVersion is returned (wrapped) by Open when the file was written in a format
+	// newer than this release reads. The file is intact and is left unchanged; open it with a
+	// release that knows the format. It does not match ErrCorrupt.
 	ErrIncompatibleVersion = errors.New("any-store: incompatible version")
 
 	// ErrV1Database is returned by Open when the file was created by any-store
@@ -146,7 +149,8 @@ var (
 	//
 	//	if errors.Is(err, anystore.ErrCorrupt) { ... }
 	//
-	// It is not returned for a v1 file (ErrV1Database), an incompatible version or a closed database.
+	// It is not returned for a v1 file (ErrV1Database), a file from a newer release
+	// (ErrIncompatibleVersion) or a closed database.
 	//
 	// An encrypted database opened with the wrong key also matches: the page authentication fails
 	// the same way as for a damaged page 1, and the two cannot be told apart. Rule out a key

@@ -146,3 +146,24 @@ func TestErrCorrupt_Nesting(t *testing.T) {
 	assert.NotErrorIs(t, ErrPageIntegrity, ErrHeaderCorrupt)
 	assert.NotErrorIs(t, ErrCorrupt, ErrHeaderCorrupt)
 }
+
+func TestOpen_NewerFormat(t *testing.T) {
+	// given
+	path := writeDB(t)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	// a schema format one above anything this release writes, under the magic that carries it
+	copy(data[:16], "any-store v2 fmt")
+	data[47] = 99
+	require.NoError(t, os.WriteFile(path, data, 0o644))
+
+	// when
+	_, err = Open(ctx, path, nil)
+
+	// then
+	require.ErrorIs(t, err, ErrIncompatibleVersion)
+	assert.NotErrorIs(t, err, ErrCorrupt)
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, data, after, "a refused open must leave the file as it was")
+}

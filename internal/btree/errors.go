@@ -75,6 +75,13 @@ var (
 	// that is no longer supported. The database must be recreated.
 	ErrOldFormat = errors.New("btree: unsupported old schema format (requires version 5+)")
 
+	// ErrNewerFormat indicates the file was written in a format this binary does
+	// not know: a header read version, write version or schema format above its
+	// maximum. Deliberately NOT wrapping ErrCorrupt: the file is intact, and a
+	// caller that discards a corrupt database must not discard this one. Open
+	// fails without changing the file; a newer binary opens it.
+	ErrNewerFormat = errors.New("btree: database format is newer than this version supports")
+
 	// ErrBusySnapshot indicates another connection committed since this
 	// transaction's snapshot was taken, so proceeding would violate
 	// snapshot isolation. Equivalent to SQLite's SQLITE_BUSY_SNAPSHOT
