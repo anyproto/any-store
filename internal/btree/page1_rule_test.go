@@ -12,6 +12,7 @@ package btree
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -582,4 +583,205 @@ func restartPutNS(t *testing.T, db *DB, name string) {
 	require.NoError(t, tx.Put(ns, p1Key(1<<20), p1Big(5)))
 	require.NoError(t, tx.Commit())
 	require.NoError(t, db.IntegrityCheck())
+}
+
+const p1ChildEnv = "BTREE_TEST_P1_CHILD"
+
+// runP1Child runs TestPage1Rule_Child on path in another process, with ops
+// separated by ";":
+//
+//	get:NS:K   print "GET NS K <first byte> <length>" of key K in NS
+//	put:NS:K   commit one big value (fill 6) at key K in NS
+//	check      IntegrityCheck
+//
+// and returns its "GET" lines.
+func runP1Child(t *testing.T, path string, opts Options, ops string) []string {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPage1Rule_Child$", "-test.timeout=60s")
+	mode := "mp"
+	if opts.CacheSize != 0 {
+		mode = strconv.Itoa(opts.CacheSize)
+	}
+	cmd.Env = append(os.Environ(), p1ChildEnv+"="+path+"|"+mode+"|"+ops)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "child: %s", out)
+	var gets []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "GET ") {
+			gets = append(gets, line)
+		}
+	}
+	return gets
+}
+
+// TestPage1Rule_Child is the child of runP1Child.
+func TestPage1Rule_Child(t *testing.T) {
+	arg := os.Getenv(p1ChildEnv)
+	if arg == "" {
+		t.Skip("child process only")
+	}
+	parts := strings.SplitN(arg, "|", 3)
+	opts := Options{PageSize: 4096, DisableAutoCheckpoint: true}
+	if parts[1] != "mp" {
+		n, err := strconv.Atoi(parts[1])
+		require.NoError(t, err)
+		opts.CacheSize = n
+	}
+	db, err := Open(parts[0], opts)
+	require.NoError(t, err)
+	defer db.Close()
+	for _, op := range strings.Split(parts[2], ";") {
+		f := strings.Split(op, ":")
+		switch f[0] {
+		case "get":
+			k, err := strconv.Atoi(f[2])
+			require.NoError(t, err)
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			ns, err := rtx.GetNamespace(f[1])
+			require.NoError(t, err)
+			v, err := rtx.Get(ns, p1Key(k))
+			require.NoError(t, err)
+			require.NotEmpty(t, v)
+			fmt.Printf("GET %s %d %d %d\n", f[1], k, v[0], len(v))
+			require.NoError(t, rtx.Rollback())
+		case "put":
+			k, err := strconv.Atoi(f[2])
+			require.NoError(t, err)
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			ns, err := tx.GetNamespace(f[1])
+			require.NoError(t, err)
+			require.NoError(t, tx.Put(ns, p1Key(k), p1Big(6)))
+			require.NoError(t, tx.Commit())
+		case "check":
+			require.NoError(t, db.IntegrityCheck())
+		default:
+			t.Fatalf("unknown op %q", op)
+		}
+	}
+}
+
+// TestPage1Rule_Page1NeverSpilled: page 1 dirtied by a catalog change, then
+// enough writes to spill a 10-page cache many times over. Page 1 is never a
+// spill victim (pcache.findSpillVictim, pagerStress; SQLite keeps it
+// referenced for the transaction, btree.c:3447), so the one page-1 frame of
+// the transaction is in its commit, after every spilled frame.
+func TestPage1Rule_Page1NeverSpilled(t *testing.T) {
+	db, path := p1Open(t, Options{CacheSize: 10})
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("t")
+	require.NoError(t, err)
+	for i := 0; i < 3000; i++ {
+		require.NoError(t, tx.Put(ns, p1Key(i), bytes.Repeat([]byte{byte(i)}, 300)))
+	}
+	spilled := db.pager.wal.nFrame.Load()
+	require.Greater(t, spilled, uint32(100), "setup: the transaction spilled")
+	for i, f := range p1Frames(t, path, 4096, spilled) {
+		require.NotEqual(t, uint32(1), f.pgno, "frame %d: page 1 spilled", i+1)
+	}
+	require.NoError(t, tx.Commit())
+	frames := p1Frames(t, path, 4096, db.pager.wal.nFrame.Load())
+	var page1 []int
+	for i, f := range frames {
+		if f.pgno == 1 {
+			page1 = append(page1, i+1)
+		}
+	}
+	require.Len(t, page1, 1, "page 1 written once")
+	require.Greater(t, uint32(page1[0]), spilled, "in the commit, after the spilled frames")
+	require.NotZero(t, frames[len(frames)-1].nTrunc, "the commit's last frame carries the mark")
+	require.LessOrEqual(t, page1[0], len(frames))
+	require.NoError(t, db.IntegrityCheck())
+}
+
+// TestPage1Rule_SpilledOnlyCommitCarriesPage1: every dirty page spilled
+// before the commit and the header unchanged: the commit still needs a frame
+// with the commit mark, and page 1 carries it (pager.c:6500-6512). Another
+// process reads the commit, and the file reopens with it.
+func TestPage1Rule_SpilledOnlyCommitCarriesPage1(t *testing.T) {
+	db, path := p1Open(t, Options{CacheSize: 100})
+	p1Write(t, db, func(tx *WriteTx, _ *Namespace) {
+		ns, err := tx.CreateNamespace("t")
+		require.NoError(t, err)
+		for i := 0; i < 50; i++ {
+			require.NoError(t, tx.Put(ns, p1Key(i), []byte("old-value")))
+		}
+	})
+	r := newP1Recorder(t, db, path)
+	p1Write(t, db, func(tx *WriteTx, ns *Namespace) {
+		for i := 0; i < 50; i++ {
+			require.NoError(t, tx.Put(ns, p1Key(i), []byte("new-value"))) // same size
+		}
+		restartSpillAll(t, db)
+		require.Zero(t, db.pager.writerCache.nDirty, "everything spilled")
+	})
+	c := r.next()
+	require.True(t, c.page1, "page 1 carries the commit mark")
+	frames := p1Frames(t, path, 4096, db.pager.wal.nFrame.Load())
+	require.Equal(t, uint32(1), frames[len(frames)-1].pgno, "as the last frame")
+
+	gets := runP1Child(t, path, Options{}, "get:t:7;check")
+	require.Equal(t, []string{fmt.Sprintf("GET t 7 %d %d", 'n', len("new-value"))}, gets)
+
+	require.NoError(t, db.Close())
+	db, err := testOpen(t, path, Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns, err := rtx.GetNamespace("t")
+	require.NoError(t, err)
+	v, err := rtx.Get(ns, p1Key(7))
+	require.NoError(t, err)
+	require.Equal(t, "new-value", string(v))
+	require.NoError(t, db.IntegrityCheck())
+}
+
+// TestPage1Rule_BackupDestinationHeader: a backup shrinks a larger,
+// checkpointed destination; its commit writes page 1 with the source's
+// header and the smaller size. The destination stays open without a
+// checkpoint, and another process opens it, reads, writes and checks it.
+func TestPage1Rule_BackupDestinationHeader(t *testing.T) {
+	dst, dstPath := p1Open(t, Options{})
+	p1Write(t, dst, func(tx *WriteTx, _ *Namespace) {
+		ns, err := tx.CreateNamespace("t")
+		require.NoError(t, err)
+		for i := 0; i < 100; i++ {
+			require.NoError(t, tx.Put(ns, p1Key(i), p1Big(1)))
+		}
+	})
+	require.NoError(t, dst.Checkpoint(CheckpointTruncate))
+	large := dst.pager.dbSize.Load()
+
+	src, _ := p1Open(t, Options{})
+	p1Write(t, src, func(tx *WriteTx, _ *Namespace) {
+		ns, err := tx.CreateNamespace("t")
+		require.NoError(t, err)
+		for i := 0; i < 5; i++ {
+			require.NoError(t, tx.Put(ns, p1Key(i), p1Big(2)))
+		}
+		tx.MarkSchemaChanged()
+	})
+	srcSize := src.pager.dbSize.Load()
+	require.Less(t, srcSize, large)
+
+	r := newP1Recorder(t, dst, dstPath)
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	require.ErrorIs(t, b.Step(context.Background(), -1), ErrBackupDone)
+	require.NoError(t, b.Finish())
+	c := r.next()
+	require.True(t, c.page1, "the backup's commit writes page 1")
+	require.Equal(t, srcSize, c.nTrunc)
+	require.Equal(t, srcSize, dst.pager.header.DatabaseSize)
+	require.Equal(t, src.pager.header.FirstFreelistPg, dst.pager.header.FirstFreelistPg)
+	require.Equal(t, src.pager.header.TotalFreelistPgs, dst.pager.header.TotalFreelistPgs)
+
+	gets := runP1Child(t, dstPath, Options{}, "get:t:3;put:t:200;check;get:t:200")
+	require.Equal(t, []string{"GET t 3 2 3000", "GET t 200 6 3000"}, gets)
+	restartPutNS(t, dst, "t")
+	require.NoError(t, dst.IntegrityCheck())
 }
