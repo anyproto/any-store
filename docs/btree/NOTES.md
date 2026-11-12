@@ -3198,6 +3198,22 @@ Tests: `internal/btree/walchange_test.go`, `backup_change_test.go`, `backup_chan
 
 To measure (not yet): allocations per changed begin (one `walChange`) and per publication (two, at the announcement and at the settle, plus the copy of the pending header), CAS retries under concurrent readers, the fast read path, and how far a backup gets between the write transactions of a busy writer.
 
+<a id="how-long-a-backup-can-wait"></a>
+### How Long A Backup Can Wait
+
+Not a divergence: the waits are SQLite's, added up. `sqlite3_backup_step` begins a transaction on the source and, the first time, on the destination, each through the btree's ordinary busy loop (`backup.c:351`, `367`; `btree.c:3736-3737`), and every read attempt inside a begin starts a fresh WAL protocol count (`cnt = 0` in `walBeginReadTransaction`, `wal.c:3370`, `3405-3407`).
+
+- `T` is the busy timeout (`BusyTimeout`, 5 s). `H(T)` is the number of times the busy handler agrees to retry: 12 steps cover the first 328 ms, then one per 100 ms (`DefaultBusyTimeout`; SQLite's `delays[]`, `main.c:1717-1720`), so `H = 12 + ceil((T - 328 ms) / 100 ms)` for `T ≥ 328 ms`; `H(5 s) = 59`.
+- `P` is the WAL protocol allowance of one read attempt: 100 retries with sleeps of `(cnt-9)² × 39 µs`, about 10 s in all, after which the attempt fails with `ErrProtocol` (`wal.beginReadHdrRetry`).
+- A write begin makes at most `N_w = 1 + 3 + H(T)` read attempts: the first, `busySnapshotInnerRetries = 3` tight retries, and one per handler call (`DB.BeginWriteContext`). It takes at most `T + N_w × (P + one write-lock try)`.
+- A read begin makes at most `N_r = 1 + H(T)` attempts and takes at most `T + N_r × P`.
+
+The public `Backup` gives up on busy Steps once `T` has passed since the last Step that copied. Its worst case is that window, plus the begins of the last Step (one read begin on the source; one write begin on the destination, at the first Step), plus one begin each for opening the destination, for the bookkeeping on the committed copy, and for the write-lock attempt of the destination's close.
+
+With `T = 5 s`, `N_w = 63`: one write begin can take about `5 + 63 × 10 ≈ 635 s` if another process leaves the header torn for just under `P` before each of its commits. That takes an adversarial peer; an ordinary one costs a begin milliseconds. A ctx is looked at between Steps, not inside a begin, as in every other transaction begin.
+
+Tests (`backup_public_test.go`, with short budgets): `TestBackupPublic_PausedPublisher`, `_EveryBusyMatchesErrBusy/destination-snapshot`, and `_PausedPublisherAndSnapshotInvalidation`, which runs the schedule above against the bound.
+
 <a id="drift-2026-11-13-2-a-backup-step-that-met-a-recovery-can-be-retried"></a>
 ### Drift: A Backup Step That Met A Recovery In Progress Can Be Retried
 - **Category:** changed-logic  -  **Severity:** low

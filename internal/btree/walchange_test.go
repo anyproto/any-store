@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -45,6 +46,11 @@ func changePeerChild(t *testing.T) bool {
 	switch mode {
 	case "commit":
 		restartPut(t, db, 0, rows, byte(fill))
+	case "commit-loop": // fill is the number of commits; fills 2, 3, ...
+		for i := 0; i < fill; i++ {
+			restartPut(t, db, 0, rows, byte(2+i))
+			time.Sleep(5 * time.Millisecond)
+		}
 	case "truncate":
 		require.NoError(t, db.Checkpoint(CheckpointTruncate))
 	case "torn":
@@ -77,6 +83,21 @@ func runChangePeer(t *testing.T, path, mode string, fill byte) {
 		changePeerEnvFill+"="+strconv.Itoa(int(fill)))
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "peer (%s) failed:\n%s", mode, out)
+}
+
+// startChangePeer starts a peer and returns without waiting for it.
+func startChangePeer(t *testing.T, path, mode string, fill byte) *exec.Cmd {
+	t.Helper()
+	name := t.Name()
+	if i := indexByte(name, '/'); i >= 0 {
+		name = name[:i]
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^"+name+"$", "-test.v", "-test.timeout=120s")
+	cmd.Env = append(os.Environ(), changePeerEnvPath+"="+path, changePeerEnvMode+"="+mode,
+		changePeerEnvFill+"="+strconv.Itoa(int(fill)))
+	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+	require.NoError(t, cmd.Start())
+	return cmd
 }
 
 func indexByte(s string, c byte) int {

@@ -208,6 +208,10 @@ func (b *Backup) stepBusy(err error) error {
 	return err
 }
 
+// testBackupSampledHook, when non-nil, runs in Step right after it read the
+// change epoch for its snapshot. Test-only.
+var testBackupSampledHook func()
+
 // Step copies up to nPage pages from the source to the destination.
 // nPage < 0 means "copy all remaining pages in one call". Returns
 // ErrBackupDone when every source page has been copied; returns nil
@@ -297,6 +301,9 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 	// when the Step's read transaction finds the source changed
 	// (pager.c:1774). See the epoch field.
 	epoch, exact := rtx.ChangeEpoch()
+	if testBackupSampledHook != nil {
+		testBackupSampledHook()
+	}
 	if b.stepped && (!exact || !b.exact || epoch != b.epoch) {
 		b.iNext = 1
 	}

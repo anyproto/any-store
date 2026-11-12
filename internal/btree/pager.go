@@ -234,6 +234,9 @@ type pager struct {
 	backupOwed atomic.Bool
 	spillBuf   [1]*page // pagerStress's argument to dispatchBackupUpdate
 
+	// testOwner is the DB this pager belongs to, for the test seam's hooks.
+	testOwner *DB
+
 	// hasContent tracks pages that were freed as freelist leaf pages during
 	// the current write transaction. When such a page is re-allocated from
 	// the freelist, it must NOT use the NOCONTENT optimization because the

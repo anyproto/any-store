@@ -105,33 +105,84 @@ func TestBackupAdmission_CloseDuringRecoveryWait(t *testing.T) {
 	testCloseWriterCheckedHook = func(registered bool) { sawRegistered = registered }
 	defer func() { testCloseWriterCheckedHook = nil }()
 
-	var stepErr, closeErr error
-	var wg sync.WaitGroup
-	wg.Add(2)
-	stepStarted := make(chan struct{})
+	// The Step's begin calls the busy handler while the rebuild is in
+	// progress: the first call says the Step is in its wait.
+	inWait := make(chan struct{})
+	var once sync.Once
+	base := w.busyHandler
+	w.busyHandler = func(n int) bool {
+		once.Do(func() { close(inWait) })
+		return base(n)
+	}
+
+	var stepErr error
+	stepDone := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		close(stepStarted)
+		defer close(stepDone)
 		stepErr = f.b.Step(context.Background(), 4)
 	}()
-	<-stepStarted
-	time.Sleep(100 * time.Millisecond) // the Step is in its begin's wait
-	closeStart := time.Now()
-	go func() {
-		defer wg.Done()
-		// The peer goes away while Close waits.
-		time.AfterFunc(500*time.Millisecond, func() {
+	<-inWait
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- f.src.Close() }()
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned while the Step held the write lock of the process")
+	case <-stepDone: // the Step's budget ran out: Close may go on now
+	}
+	require.ErrorIs(t, stepErr, ErrBusyRecovery)
+	// The peer goes away; Close's own checkpoint needs the locks it held.
+	region[16] ^= 0x01
+	require.NoError(t, w.index.unlock(lockRecover, lockExclusive))
+	require.NoError(t, w.index.unlock(lockWrite, lockExclusive))
+	require.NoError(t, <-closeDone)
+	require.False(t, sawRegistered, "Close found no write transaction to rescue")
+	_ = f.b.Finish()
+}
+
+// A ctx that ends, and a Close, while a Step waits out a publisher that is
+// between its header copies (the WAL protocol's retry loop, not the busy
+// handler): the Step goes on to copy when the publisher is done, the ctx's
+// error is the next Step's, and Close waits for the Step.
+func TestBackupAdmission_CancelAndCloseDuringProtocolWait(t *testing.T) {
+	f := newBackupFixture(t, restartModes[0])
+	w := f.src.pager.wal
+	before := f.next(t)
+	region, err := w.index.shm.region(0, true)
+	require.NoError(t, err)
+
+	pause := func(d time.Duration) {
+		region[16] ^= 0x01
+		require.NoError(t, w.index.lock(lockWrite, lockExclusive))
+		time.AfterFunc(d, func() {
 			region[16] ^= 0x01
-			_ = w.index.unlock(lockRecover, lockExclusive)
 			_ = w.index.unlock(lockWrite, lockExclusive)
 		})
-		closeErr = f.src.Close()
-	}()
-	wg.Wait()
-	require.ErrorIs(t, stepErr, ErrBusyRecovery)
-	require.NoError(t, closeErr)
-	require.GreaterOrEqual(t, time.Since(closeStart), 200*time.Millisecond, "Close waited for the Step")
-	require.False(t, sawRegistered, "Close found no write transaction to rescue")
+	}
+
+	// Cancel during the wait.
+	ctx, cancel := context.WithCancel(context.Background())
+	pause(300 * time.Millisecond)
+	time.AfterFunc(50*time.Millisecond, cancel)
+	start := time.Now()
+	require.NoError(t, f.b.Step(ctx, 4), "the Step does not look at ctx inside its begin")
+	require.GreaterOrEqual(t, time.Since(start), 250*time.Millisecond)
+	after := f.next(t)
+	require.Greater(t, after, before)
+	require.ErrorIs(t, f.b.Step(ctx, 4), context.Canceled)
+	require.Equal(t, after, f.next(t))
+
+	// Close during the wait.
+	pause(300 * time.Millisecond)
+	stepDone := make(chan error, 1)
+	go func() { stepDone <- f.b.Step(context.Background(), 4) }()
+	time.Sleep(50 * time.Millisecond) // the Step is in the retry loop: nothing to witness it by
+	closeStart := time.Now()
+	require.NoError(t, f.src.Close())
+	require.GreaterOrEqual(t, time.Since(closeStart), 150*time.Millisecond, "Close waited for the Step")
+	err = <-stepDone
+	if err != nil { // the Step ended before Close set closing, or found it set
+		require.ErrorIs(t, err, ErrClosed)
+	}
 	_ = f.b.Finish()
 }
 
@@ -345,4 +396,192 @@ func TestBackupChange_BesideReadersAndAForeignWriter(t *testing.T) {
 	require.NoError(t, readErr)
 	readMu.Unlock()
 	f.finish(t, byte(1+commits))
+}
+
+// A Step whose snapshot is the header a recovery is replacing, read while
+// the recovery's publication is pending: the header is announced and written
+// and the change state not settled, so the state still holds the old header
+// next to an epoch that already counts the rebuild. The Step's snapshot
+// equals that retained header and is not exact: it starts over, and so does
+// the next Step, with the epoch unchanged between the two.
+func TestBackupChange_StepDuringAPendingPublication(t *testing.T) {
+	if changePeerChild(t) {
+		return
+	}
+	f := newBackupFixture(t, restartModes[0])
+	require.NoError(t, f.b.Step(context.Background(), 4))
+	require.Greater(t, f.next(t), uint32(5))
+	w := f.src.pager.wal
+
+	pending := make(chan struct{})
+	sampled := make(chan struct{})
+	var wg sync.WaitGroup
+	var duringEpoch uint64
+	var duringPending bool
+	ran := false
+	testReadSlotClaimedHook = func() { // the Step has its snapshot, at H0
+		if ran {
+			return
+		}
+		ran = true
+		runChangePeer(t, f.srcPath, "torn-all", 2)
+		testPublishHeaderHook = func(step string) {
+			if step != "stored" {
+				return
+			}
+			testPublishHeaderHook = nil
+			cur := w.chg.Load()
+			duringEpoch, duringPending = cur.epoch, cur.pending != nil
+			close(pending) // announced and written
+			<-sampled      // not settled until the Step has read the state
+		}
+		wg.Add(1)
+		go func() { // another begin of this process rebuilds the wal-index
+			defer wg.Done()
+			rtx, err := f.src.beginRead(context.Background(), false, true)
+			if err == nil {
+				_ = rtx.Rollback()
+			}
+		}()
+		<-pending
+	}
+	testBackupSampledHook = func() {
+		testBackupSampledHook = nil
+		close(sampled)
+	}
+	defer func() { testReadSlotClaimedHook, testPublishHeaderHook, testBackupSampledHook = nil, nil, nil }()
+
+	require.NoError(t, f.b.Step(context.Background(), 4))
+	wg.Wait()
+	testReadSlotClaimedHook = nil
+	require.True(t, ran)
+	require.True(t, duringPending, "setup: the Step read the state between the announcement and the settle")
+	f.b.mu.Lock()
+	epoch, exact := f.b.epoch, f.b.exact
+	f.b.mu.Unlock()
+	require.Equal(t, duringEpoch, epoch, "the epoch the Step read already counts the rebuild")
+	require.False(t, exact, "the retained header certifies nothing while a publication is pending")
+	require.LessOrEqual(t, f.next(t), uint32(5), "the Step started over")
+
+	require.NoError(t, f.b.Step(context.Background(), 4))
+	f.b.mu.Lock()
+	epoch2 := f.b.epoch
+	f.b.mu.Unlock()
+	require.Equal(t, epoch, epoch2, "setup: the epoch did not move between the two Steps")
+	require.LessOrEqual(t, f.next(t), uint32(5), "the next Step starts over too")
+	f.finish(t, 2)
+}
+
+// A backup whose Steps overlap the commits of a writer in another process,
+// beside readers of its own: the peer commits in a loop while the backup
+// steps without pause. Whatever the interleaving, once the peer is done the
+// backup ends as one committed state, and it was restarted on the way.
+func TestBackupChange_OverlappingForeignWriter(t *testing.T) {
+	if changePeerChild(t) {
+		return
+	}
+	f := newBackupFixture(t, restartModes[0])
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := 0; g < 3; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if rtx, err := f.src.BeginRead(); err == nil {
+					if ns, err := rtx.GetNamespace("t1"); err == nil {
+						_, _ = rtx.Get(ns, []byte{0, 0, 0, 7})
+					}
+					_ = rtx.Rollback()
+				}
+			}
+		}()
+	}
+
+	peer := startChangePeer(t, f.srcPath, "commit-loop-all", 20)
+	peerDone := make(chan error, 1)
+	go func() { peerDone <- peer.Wait() }()
+
+	restarts, prev := 0, f.next(t)
+	running := true
+	for running {
+		select {
+		case err := <-peerDone:
+			require.NoError(t, err)
+			running = false
+		default:
+		}
+		// One page at a time, slowly: a pass over the source takes longer
+		// than the peer's pause between commits, so commits land inside it.
+		time.Sleep(300 * time.Microsecond)
+		err := f.b.Step(context.Background(), 1)
+		if errors.Is(err, ErrBusy) || errors.Is(err, ErrBusySnapshot) || errors.Is(err, ErrBusyRecovery) {
+			continue
+		}
+		if errors.Is(err, ErrBackupDone) {
+			// Done between two of the peer's commits: a consistent copy of
+			// an earlier state. Start a new backup to go on overlapping.
+			require.NoError(t, f.b.Finish())
+			f.b, err = f.dst.BackupInit(f.src)
+			require.NoError(t, err)
+			prev = 1
+			continue
+		}
+		require.NoError(t, err)
+		if next := f.next(t); next < prev {
+			restarts++
+			prev = next
+		} else {
+			prev = next
+		}
+	}
+	close(stop)
+	wg.Wait()
+	require.Positive(t, restarts, "the peer's commits restarted the backup while it was stepping")
+	f.finish(t, 21) // the peer's last fill: 2 + 19
+}
+
+// Two begins find the same change at once. The first to swap the change
+// state counts it; the other's swap fails, and on its second look the header
+// is its snapshot's: it counts nothing. A change is counted once however
+// many begins race for it.
+func TestChangeEpoch_RacingBeginsCountOnce(t *testing.T) {
+	if changePeerChild(t) {
+		return
+	}
+	db, path := openChangeDB(t)
+	w := db.pager.wal
+	e0, _ := changeEpochOf(t, db)
+	runChangePeer(t, path, "commit", 3)
+
+	swaps := 0
+	testChangeSwapHook = func() {
+		swaps++
+		if swaps > 1 {
+			return
+		}
+		// This begin is about to swap. Another begin gets there first.
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rtx, err := db.beginRead(context.Background(), false, true)
+			if err == nil {
+				_ = rtx.Rollback()
+			}
+		}()
+		wg.Wait()
+	}
+	defer func() { testChangeSwapHook = nil }()
+	e, exact := changeEpochOf(t, db)
+	testChangeSwapHook = nil
+	require.Equal(t, 2, swaps, "setup: two begins went for the swap, and the loser did not try again")
+	require.Equal(t, e0+1, e, "the change is counted once")
+	require.True(t, exact)
+	require.Nil(t, w.chg.Load().pending)
 }

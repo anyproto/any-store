@@ -21,7 +21,7 @@
     "sqlite": [
       "backup.c:sqlite3_backup_step"
     ],
-    "note": "copies up to nPage pages under the source's process write lock (try-lock, ErrBusy); DONE and every non-busy error are sticky; restarts by the change epoch"
+    "note": "copies up to nPage pages under the source's process write lock (try-lock, ErrBusy); DONE and every error other than a busy one and the ctx's own are sticky; restarts by the change epoch"
   },
   "backup.go:*Backup.finalize": {
     "sqlite": [
@@ -2183,6 +2183,38 @@
   "shm_other.go:newPlatformShm": {
     "sqlite": [],
     "note": "heap-backed shm fallback for platforms without mmap support"
+  },
+  "testseam.go:*DB.TestSeam": {
+    "sqlite": [],
+    "note": "test seam for the packages above"
+  },
+  "testseam.go:SetTestBeforeBeginWriteHook": {
+    "sqlite": [],
+    "note": "test seam"
+  },
+  "testseam.go:SetTestPublishHeaderHook": {
+    "sqlite": [],
+    "note": "test seam"
+  },
+  "testseam.go:TestSeam.Lock": {
+    "sqlite": [],
+    "note": "test seam: a WAL lock through the handle's lock table"
+  },
+  "testseam.go:TestSeam.Path": {
+    "sqlite": [],
+    "note": "test seam"
+  },
+  "testseam.go:TestSeam.PeerPublish": {
+    "sqlite": [],
+    "note": "test seam: another process's commit, as a begin sees it"
+  },
+  "testseam.go:TestSeam.SetBusyTimeout": {
+    "sqlite": [],
+    "note": "test seam"
+  },
+  "testseam.go:TestSeam.TearHeader": {
+    "sqlite": [],
+    "note": "test seam: the header as a writer between its two copies leaves it"
   },
   "wal.go:*WalIndexHdr.computeCksum": {
     "sqlite": [

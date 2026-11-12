@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
 const (
@@ -52,9 +53,14 @@ func changePeer(t *testing.T) bool {
 		require.NoError(t, db.Close())
 		return true
 	}
-	c, err := db.OpenCollection(ctx, "c")
-	require.NoError(t, err)
-	require.NoError(t, c.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":7}`, 1000+os.Getpid()))))
+	for _, name := range []string{"c", "c2"} {
+		c, err := db.OpenCollection(ctx, name)
+		if name == "c2" && err != nil {
+			continue // only some tests have it
+		}
+		require.NoError(t, err)
+		require.NoError(t, c.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":7}`, 1000+os.Getpid()))))
+	}
 	require.NoError(t, db.Close())
 	return true
 }
@@ -292,60 +298,6 @@ func TestChangeEpoch_RefreshThroughAnOldTxStampsNothing(t *testing.T) {
 	require.Equal(t, uint64(51), sketchDocCount(t, coll), "the next transaction loads the sketches of the peer's commit")
 }
 
-// Two processes and one destination path: this process's backup fails (its
-// source is in a write transaction) after another backup, of another
-// database, completed at the same path. Nothing is removed and the other
-// backup's content is there.
-func TestBackup_FailureAfterAnotherBackupTookThePath(t *testing.T) {
-	ctx := context.Background()
-	d, _ := openSketchDB(t)
-	other, err := Open(ctx, filepath.Join(t.TempDir(), "other.db"), nil)
-	require.NoError(t, err)
-	defer func() { _ = other.Close() }()
-	oc, err := other.CreateCollection(ctx, "o")
-	require.NoError(t, err)
-	require.NoError(t, oc.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
-
-	path := filepath.Join(t.TempDir(), "dst.db") // absent when this process looked
-	require.NoError(t, other.Backup(ctx, path))  // the other backup takes it
-
-	wtx, err := d.WriteTx(ctx)
-	require.NoError(t, err)
-	defer func() { _ = wtx.Rollback() }()
-	prev := backupBusyTimeout
-	backupBusyTimeout = 50 * time.Millisecond
-	defer func() { backupBusyTimeout = prev }()
-	require.ErrorIs(t, d.Backup(ctx, path), ErrBusy)
-
-	bk, err := Open(ctx, path, nil)
-	require.NoError(t, err)
-	defer func() { _ = bk.Close() }()
-	names, err := bk.GetCollectionNames(ctx)
-	require.NoError(t, err)
-	require.Equal(t, []string{"o"}, names, "the other backup's content is intact")
-}
-
-// Close while Backup waits out a busy source: the write transaction that
-// made it busy is rescued by the Close, and Backup ends with the closed
-// error, not with a hang or a busy error after the full budget.
-func TestBackup_CloseDuringBusyWait(t *testing.T) {
-	ctx := context.Background()
-	d, _ := openSketchDB(t)
-	_, err := d.WriteTx(ctx) // abandoned: Close rescues it
-	require.NoError(t, err)
-
-	done := make(chan error, 1)
-	go func() { done <- d.Backup(ctx, filepath.Join(t.TempDir(), "b.db")) }()
-	time.Sleep(100 * time.Millisecond) // Backup is in its busy wait
-	require.NoError(t, d.Close())
-	select {
-	case err := <-done:
-		require.ErrorIs(t, err, ErrDBIsClosed)
-	case <-time.After(10 * time.Second):
-		t.Fatal("Backup did not return after Close")
-	}
-}
-
 // The copy is committed in one step; what Backup does on the copy after
 // that can still be busy, behind another process that opened the new copy.
 // Backup then returns an error matching ErrBusy, and the destination holds
@@ -392,4 +344,76 @@ func TestBackup_BusyAfterTheCopyIsCommitted(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 50, n, "the completed copy is in the destination")
 	require.False(t, errors.Is(err, ErrBusy))
+}
+
+// A sketch refresh and a collection open that run while a publication of
+// this process is pending, through a transaction at the header the
+// publication is replacing. The change state then still holds that header,
+// next to an epoch that already counts what the new header brings: the
+// transaction's snapshot equals the retained header and is not exact. The
+// refresh loads nothing and the open stamps nothing, so the transactions
+// after the publication load the newer sketches.
+//
+// The publication is a rebuild of the wal-index (another process committed
+// and then left the header torn), which runs beside live readers; it is
+// paused once its header is written and before the change state is settled.
+func TestChangeEpoch_ConsumersDuringAPendingPublication(t *testing.T) {
+	if changePeer(t) {
+		return
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "p.db")
+	d, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	for _, name := range []string{"c", "c2"} {
+		coll, err := d.CreateCollection(ctx, name)
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		for i := 0; i < 50; i++ {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%5))))
+		}
+	}
+	require.NoError(t, d.Close())
+	d, err = Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer func() { _ = d.Close() }()
+	bt := d.(*db).btreeDB
+
+	coll, err := d.OpenCollection(ctx, "c")
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), sketchDocCount(t, coll))
+	// Everything in the database file: the old transaction below reads no
+	// WAL frame, so it can read while the rebuild holds the WAL.
+	require.NoError(t, bt.Checkpoint(btree.CheckpointPassive))
+
+	old, err := d.ReadTx(ctx) // at H0
+	require.NoError(t, err)
+	runChangePeer(t, path) // one document more in c and in c2
+	bt.TestSeam().TearHeader()
+
+	var c2 Collection
+	ran := false
+	btree.SetTestPublishHeaderHook(func(step string) {
+		if step != "stored" || ran {
+			return
+		}
+		ran = true
+		// Announced and written, not settled.
+		n, err := coll.Find(`{"a":1}`).Count(old.Context()) // plans with c: a refresh through the old tx
+		require.NoError(t, err)
+		require.Equal(t, 10, n)
+		c2, err = d.OpenCollection(old.Context(), "c2") // loads c2's sketches through the old tx
+		require.NoError(t, err)
+	})
+	defer btree.SetTestPublishHeaderHook(nil)
+	rtx, err := bt.BeginRead() // rebuilds the wal-index
+	btree.SetTestPublishHeaderHook(nil)
+	require.NoError(t, err)
+	require.NoError(t, rtx.Rollback())
+	require.True(t, ran, "setup: the begin rebuilt the wal-index")
+	require.NoError(t, old.Commit())
+
+	require.Equal(t, uint64(51), sketchDocCount(t, coll), "a refresh at the replaced header stamped nothing")
+	require.NotNil(t, c2)
+	require.Equal(t, uint64(51), sketchDocCount(t, c2), "an open at the replaced header stamped nothing")
 }

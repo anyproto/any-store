@@ -747,6 +747,7 @@ func Open(path string, opts Options) (*DB, error) {
 	}
 	// No write transaction: its teardown has nothing to run on (Close).
 	db.writerLocksDone.Store(true)
+	p.testOwner = db
 
 	// A reader that pins a commit while it is still on its way out of
 	// pager.commit finds its counters remembered: the pager has them in its

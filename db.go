@@ -84,7 +84,9 @@ type DB interface {
 	// destination, each with the ordinary waits behind another process: up
 	// to the busy timeout for a lock, and up to about ten seconds for each
 	// attempt that finds the shared index being written. Backup can
-	// therefore return later than the busy timeout after it last copied.
+	// therefore return later than the busy timeout after it last copied;
+	// the bound is worked out in docs/btree/NOTES.md, "How Long A Backup Can
+	// Wait".
 	//
 	// Backup never removes the file at path. If it fails before the copy is
 	// committed, the destination's transaction is rolled back: a destination
@@ -1154,9 +1156,15 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 	dstOpts := db.btreeDB.Options()
 	dstOpts.InMemory = false // destination is always a file (user gave us a path)
 
+	if testBackupOpenHook != nil {
+		testBackupOpenHook(nil)
+	}
 	dstDB, err := btree.Open(path, dstOpts)
 	if err != nil {
 		return fmt.Errorf("open backup destination: %w", err)
+	}
+	if testBackupOpenHook != nil {
+		testBackupOpenHook(dstDB)
 	}
 	// The destination is closed and never removed: sqlite3_backup_finish
 	// rolls an unfinished destination back and leaves the file
@@ -1211,6 +1219,9 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 		if !isBusyErr(serr) || time.Since(lastCopied) >= backupBusyTimeout {
 			return serr
 		}
+		if testBackupBusyWaitHook != nil {
+			testBackupBusyWaitHook()
+		}
 		if werr := backupBusyWait(ctx, busy); werr != nil {
 			return werr
 		}
@@ -1230,9 +1241,16 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 	return dropFormatSettled(dstDB)
 }
 
-// testBackupCopiedHook, when non-nil, runs in Backup once the copy is
-// committed, before the bookkeeping on it. Test-only.
-var testBackupCopiedHook func()
+// Test hooks of Backup. testBackupOpenHook runs twice: with nil right before
+// the destination is opened, and with the destination once it is open.
+// testBackupBusyWaitHook runs each time Backup is about to wait before it
+// retries a busy Step. testBackupCopiedHook runs once the copy is committed,
+// before the bookkeeping on it.
+var (
+	testBackupOpenHook     func(dst *btree.DB)
+	testBackupBusyWaitHook func()
+	testBackupCopiedHook   func()
+)
 
 // backupBusyTimeout is how long Backup retries busy Steps after the last one
 // that copied: the busy timeout of a transaction begin. A variable for tests.
