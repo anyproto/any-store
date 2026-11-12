@@ -3314,7 +3314,7 @@ The public `Backup` gives up on busy Steps once `T` has passed since the last St
 
 With `T = 5 s`, `N_w = 63`: one write begin can take about `5 + 63 × 10 ≈ 635 s` if another process leaves the header torn for just under `P` before each of its commits. That takes an adversarial peer; an ordinary one costs a begin milliseconds. A ctx is looked at between Steps, not inside a begin, as in every other transaction begin.
 
-Tests (`backup_public_test.go`, with short budgets): `TestBackupPublic_PausedPublisher`, `_EveryBusyMatchesErrBusy/destination-snapshot`, and `_PausedPublisherAndSnapshotInvalidation`, which runs the schedule above against the bound.
+Tests (`backup_public_test.go`, with short budgets and a pause far below `P`): `TestBackupPublic_PausedPublisher` (one protocol wait, waited out; and the full allowance ending in `ErrProtocol`), `_EveryBusyMatchesErrBusy/destination-snapshot` (a snapshot overtaken at every attempt, no protocol wait), and `_PausedPublisherAndSnapshotInvalidation`, which combines the two on one write begin: every attempt first waits for a paused publisher and is then overtaken, each attempt's error is checked to be `ErrBusySnapshot`, and the public return is timed against `T + N_w × (pause + slack)`. The full-length bound (`P` of ten seconds at every attempt) is not run.
 
 <a id="drift-2026-11-13-2-a-backup-step-that-met-a-recovery-can-be-retried"></a>
 ### Drift: A Backup Step That Met A Recovery In Progress Can Be Retried

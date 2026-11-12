@@ -2045,6 +2045,11 @@ func (w *wal) base(saved walPos) walPos {
 // reader slot 0, before it compares the salts. Test-only.
 var testCheckpointRead0Hook func()
 
+// testWalRetryHook, when non-nil, runs in the WAL protocol's retry loop of a
+// read begin each time an attempt has to be made again, with the number of
+// attempts so far. Test-only.
+var testWalRetryHook func(cnt int)
+
 // testRestartLogHook, when non-nil, runs as a writer starts the log over,
 // with the step about to be taken: "restart" before the reset, "restarted"
 // after it and before the WAL header is written, "header-synced" once the
@@ -3118,6 +3123,9 @@ func (w *wal) beginReadHdrRetry() (hdr WalIndexHdr, maxFrame, minFrame uint32, s
 		hdr, maxFrame, minFrame, slot, err = w.tryBeginReadHdr()
 		if !errors.Is(err, errWALRetry) {
 			return hdr, maxFrame, minFrame, slot, err
+		}
+		if testWalRetryHook != nil {
+			testWalRetryHook(cnt)
 		}
 		if cnt < 5 {
 			runtime.Gosched()

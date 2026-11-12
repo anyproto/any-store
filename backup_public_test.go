@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -188,14 +189,23 @@ func TestBackupPublic_PausedPublisher(t *testing.T) {
 		restore := seam.TearHeader()
 		unlock, err := seam.Lock("write")
 		require.NoError(t, err)
-		const pause = 400 * time.Millisecond
-		time.AfterFunc(pause, func() {
-			restore()
-			unlock()
+		// The publisher finishes once the copy's begin has been through the
+		// WAL protocol's retry loop long enough to be sleeping in it.
+		retries := 0
+		var released sync.WaitGroup
+		released.Add(1)
+		btree.SetTestWalRetryHook(func(cnt int) {
+			if retries = cnt; cnt == 40 {
+				restore()
+				unlock()
+				released.Done()
+			}
 		})
-		start := time.Now()
+		defer btree.SetTestWalRetryHook(nil)
 		require.NoError(t, db.Backup(ctx, path))
-		require.GreaterOrEqual(t, time.Since(start), pause-50*time.Millisecond, "the pause, longer than the busy budget, was waited out")
+		btree.SetTestWalRetryHook(nil)
+		released.Wait()
+		require.GreaterOrEqual(t, retries, 40, "the begin waited in the retry loop until the publisher was done")
 		requireBackupOf(t, path, 200)
 	})
 	t.Run("long", func(t *testing.T) {
@@ -222,57 +232,91 @@ func TestBackupPublic_PausedPublisher(t *testing.T) {
 	})
 }
 
-// The schedule the documented bound is about: every read attempt of the
-// destination's write begin first waits for a publisher that is between its
-// header copies, for a pause just short enough to be waited out, and then
-// finds its snapshot overtaken before it has the write lock. Each attempt
-// gets a fresh protocol allowance, so the begin takes far longer than its
-// busy budget; it still ends within
+// The schedule the documented bound is about, on the destination's write
+// begin. At every attempt:
+//
+//  1. the read begin finds a publisher between its two header copies, the
+//     write lock held, and waits in the WAL protocol's retry loop until the
+//     publisher is done (a pause short enough to be waited out);
+//  2. it takes its snapshot;
+//  3. before it has the write lock, which is free by then, another commit is
+//     published: the snapshot is overtaken and the attempt ends as
+//     ErrBusySnapshot.
+//
+// Each attempt gets a fresh protocol allowance, so the begin takes far longer
+// than its busy budget. It still ends within
 //
 //	T + N_w × (pause + one write-lock try),  N_w = 1 + 3 + H(T),
 //
-// and Backup returns a busy error.
+// and Backup returns a busy error whose cause is the overtaken snapshot.
 func TestBackupPublic_PausedPublisherAndSnapshotInvalidation(t *testing.T) {
 	ctx := context.Background()
 	db := openPublicDB(t, nil)
 	path := shortBudgets(t, db)
 
 	const pause = 60 * time.Millisecond
+	var dst btree.TestSeam
+	var released sync.WaitGroup
+	// publisherPauses leaves the header torn under the write lock for the
+	// pause: step 1 of the next attempt.
+	publisherPauses := func() {
+		restore := dst.TearHeader()
+		unlock, err := dst.Lock("write")
+		if err != nil {
+			restore()
+			t.Errorf("the publisher could not take the write lock: %v", err)
+			return
+		}
+		released.Add(1)
+		time.AfterFunc(pause, func() {
+			restore()
+			unlock()
+			released.Done()
+		})
+	}
 	attempts := 0
 	btree.SetTestBeforeBeginWriteHook(func(s btree.TestSeam) {
 		if s.Path() != path {
 			return
 		}
+		// Step 3: the attempt has its snapshot; the write lock is free (the
+		// publisher of step 1 let go before the snapshot could be taken).
+		dst = s
 		attempts++
 		s.PeerPublish()
-		// The publisher of that commit goes on to its next one and stops
-		// between the header copies, the write lock held.
-		restore := s.TearHeader()
-		unlock, err := s.Lock("write")
-		if err != nil {
-			restore()
-			return
-		}
-		time.AfterFunc(pause, func() {
-			restore()
-			unlock()
-		})
 	})
 	defer btree.SetTestBeforeBeginWriteHook(nil)
+	var causes []error
+	btree.SetTestBeginWriteRetryHook(func(err error) {
+		// The attempt failed and released its snapshot. Before the next
+		// one: the publisher goes on and stops between its copies.
+		causes = append(causes, err)
+		publisherPauses()
+	})
+	defer btree.SetTestBeginWriteRetryHook(nil)
 
 	start := time.Now()
 	err := db.Backup(ctx, path)
 	elapsed := time.Since(start)
 	btree.SetTestBeforeBeginWriteHook(nil)
-	time.Sleep(2 * pause) // the last publisher lets go before the cleanup closes
+	btree.SetTestBeginWriteRetryHook(nil)
+	released.Wait() // the last publisher lets go before the cleanup closes
 	require.True(t, errors.Is(err, anystore.ErrBusy), "got %v", err)
+	require.True(t, errors.Is(err, btree.ErrBusySnapshot), "the cause is the overtaken snapshot: %v", err)
 
 	nw := 1 + 3 + handlerCalls(budget)
 	require.LessOrEqual(t, attempts, nw)
+	require.Greater(t, attempts, 4, "the three tight retries and then the busy handler's")
+	require.Len(t, causes, attempts)
+	for i, cause := range causes {
+		require.ErrorIs(t, cause, btree.ErrBusySnapshot, "attempt %d (the first four are the begin's first try and its tight retries)", i)
+	}
 	const slack = 150 * time.Millisecond // scheduling, per attempt
 	bound := budget + time.Duration(nw)*(pause+slack)
 	require.Less(t, elapsed, bound+2*time.Second, "within the documented bound (%v for %d attempts)", bound, nw)
-	require.Greater(t, elapsed, budget, "and beyond the busy budget alone: each attempt waited for the publisher")
+	// Every attempt but the first waited for the publisher.
+	require.Greater(t, elapsed, time.Duration(attempts-2)*pause, "each attempt had a protocol wait of its own")
+	require.Greater(t, elapsed, budget, "and the begin outlasted its busy budget")
 }
 
 const publicPeerEnv = "ANYSTORE_TEST_PUBLIC_PEER_DST"
