@@ -192,6 +192,16 @@ type pager struct {
 	// (lockBtreePageCount).
 	savedDbSize uint32
 
+	// dbFileVers is page 1's change counter (bytes 24..27) as last read from
+	// the WAL or the database file, or restored by a savepoint rollback:
+	// SQLite's Pager.dbFileVers (pager.c:670), set by readDbPage
+	// (pager.c:3047-3065) and pager_playback_one_page (pager.c:2481-2484).
+	// A schema format 6 commit that writes page 1 stores dbFileVers+1 in
+	// the change counter and in VersionValidFor (pager_write_changecounter,
+	// pager.c:3084-3097). Atomic: the writer owns it, but a page getter may
+	// load page 1 from another goroutine.
+	dbFileVers atomic.Uint32
+
 	// savedCommitNPage is the committed size at beginWrite() time, the size
 	// half of the committed position (walIndex.mxCommitFrame). A failed
 	// commit restores the position as (walBase().frame, savedCommitNPage).
@@ -843,6 +853,8 @@ func (p *pager) readPage1AtOpen() error {
 	}
 	p.header = header
 	p.dbSize.Store(nPage)
+	// Page 1 as read (readDbPage, pager.c:3063-3064).
+	p.dbFileVers.Store(header.FileChangeCount)
 	// With no commit in the WAL, the heap-shm modes' committed size is the
 	// file's, the count pagerPagecount falls back to (pager.c:3299-3306):
 	// from here on every snapshot carries it, and no open transaction
@@ -1034,6 +1046,8 @@ func (p *pager) initNewDB() error {
 	if err := p.wal.open(); err != nil {
 		return err
 	}
+	// The change counter initNewDB wrote is page 1's as this pager knows it.
+	p.dbFileVers.Store(p.header.FileChangeCount)
 	// A new database is one page, page 1, before its first commit
 	// (newDatabase sets nPage = 1, btree.c:3540-3541). In the heap-shm modes
 	// that is the committed size every snapshot carries until a commit
@@ -1305,6 +1319,7 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 			// contract via the reader-slot lock — see readTempPage.
 			if err := p.wal.readFramePage(frame, pgno, pg.data, p.codecScratch, &p.codecAEAD); err != nil {
 				p.writerCache.discard(pg.pgno)
+				p.notePage1Read(pgno, nil)
 				return nil, fmt.Errorf("btree: failed to read page %d (WAL frame %d): %w", pgno, frame, err)
 			}
 			// Parse page header
@@ -1313,6 +1328,7 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 				off = dbHeaderSize
 			}
 			pg.header.deserialize(pg.data[off:])
+			p.notePage1Read(pgno, pg.data)
 			return pg, nil
 		}
 	}
@@ -1324,6 +1340,7 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 	if p.file != nil {
 		if err := p.readDBPage(pgno, pg.data); err != nil {
 			p.writerCache.discard(pg.pgno)
+			p.notePage1Read(pgno, nil)
 			return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 		} else {
 			// BEGIN ENCRYPTION
@@ -1331,6 +1348,7 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 				plain, derr := p.decryptPage(p.codecScratch, pg.data, pgno)
 				if derr != nil {
 					p.writerCache.discard(pg.pgno)
+					p.notePage1Read(pgno, nil)
 					return nil, fmt.Errorf("btree: page %d: %w", pgno, derr)
 				}
 				copy(pg.data, plain)
@@ -1355,7 +1373,24 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 		pg.header.deserialize(pg.data[off:])
 	}
 
+	p.notePage1Read(pgno, pg.data)
 	return pg, nil
+}
+
+// notePage1Read is readDbPage's page-1 step (pager.c:3047-3065): after page 1
+// is read from the WAL or the database file, dbFileVers takes its change
+// counter (bytes 24..27); after a failed read it takes a value no committed
+// page 1 has (SQLite fills dbFileVers with 0xff). data is nil for a failed
+// read. Other pages leave it alone.
+func (p *pager) notePage1Read(pgno uint32, data []byte) {
+	if pgno != 1 {
+		return
+	}
+	if data == nil {
+		p.dbFileVers.Store(0xffffffff)
+		return
+	}
+	p.dbFileVers.Store(binary.BigEndian.Uint32(data[24:28]))
 }
 
 // readTempPage reads a page into a standalone temporary page object that is
@@ -2680,9 +2715,43 @@ func (p *pager) hasChanges() bool {
 		p.wal.nFrame.Load() > p.walBaseFrame()
 }
 
-// dataChanged/schemaChanged control whether FileChangeCount/SchemaCookie are
-// incremented. Returns the WAL frame count and the new counter values.
-// DRIFT: FileChangeCount bumped only on dataChanged=true, not every data-page commit; read by v2.4.x peers only See docs/btree/NOTES.md#drift-77-filechangecount-bumped-conditionally-not-unconditionally
+// page1OnChange reports whether this file's commits write page 1 only when
+// they have to (commitNeedsPage1): schema format 6 and later. The format of
+// a file is fixed when it is opened or created (setLeafRule) and never
+// changes under an open handle, so neither does the rule.
+func (p *pager) page1OnChange() bool {
+	return p.schemaFormat.Load() >= schemaFormatPage1OnChange
+}
+
+// commitNeedsPage1 decides whether a schema format 6 commit writes page 1. In
+// SQLite page 1 is in a WAL commit when it is dirty, or as the frame that
+// carries the commit mark when no other page is (pager.c:6500-6512), and every
+// write to its header makes it dirty (sqlite3PagerWrite on pPage1 at each
+// freelist change, growth and meta write). Here the header is a struct the
+// commit serializes, so page 1 is written when
+//
+//   - the header differs from the one the transaction began with (its size,
+//     freelist, schema cookie, any other field), or
+//   - page 1 itself is dirty (the catalog's root, a savepoint restore), or
+//   - no page is dirty: every change was spilled, and page 1 carries the
+//     commit mark.
+//
+// It is called once the schema cookie has moved and before the change
+// counter is set.
+// DRIFT: page 1 is written when its header bytes change, not whenever a freelist or size write touched it; net-zero header changes skip the frame See docs/btree/NOTES.md#drift-2026-11-12-5-page-1-written-when-its-header-changes
+func (p *pager) commitNeedsPage1() bool {
+	if p.header != p.savedHeader || p.writerCache.nDirty == 0 {
+		return true
+	}
+	pg := p.writerCache.hashFind(1)
+	return pg != nil && pg.dirty
+}
+
+// schemaChanged increments SchemaCookie; in a schema format 5 file
+// dataChanged increments FileChangeCount, which a schema format 6 file sets
+// from dbFileVers whenever page 1 is written. Returns the WAL frame count and
+// the new counter values.
+// DRIFT: in schema format 5 FileChangeCount is bumped only on dataChanged=true, in every commit; read by v2.4.x peers only See docs/btree/NOTES.md#drift-77-filechangecount-bumped-conditionally-not-unconditionally
 // DRIFT: commit doesn't prune dirty pages pgno>dbSize before WAL write (no nTruncate prune) See docs/btree/NOTES.md#drift-78-commit-does-not-prune-dirty-pages-above-dbsize-before-wal-wr
 // testCommitPrePublishHook / testCommitPostPublishHook, when non-nil, run
 // inside commit immediately before / after wal.writeFrames publishes the
@@ -2728,35 +2797,56 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		return 0, p.header.FileChangeCount, p.header.SchemaCookie, nil
 	}
 
-	// There are real changes — apply counter increments if flagged.
-	if dataChanged {
-		p.header.FileChangeCount++
-	}
+	// There are real changes. The schema cookie is part of the header the
+	// commit writes, so it moves before page 1 is decided on, as SQLite's
+	// sqlite3BtreeUpdateMeta makes page 1 writable when it writes the cookie
+	// (btree.c:10466-10468).
 	if schemaChanged {
 		p.header.SchemaCookie++
 	}
-	// Keep VersionValidFor in lockstep with FileChangeCount. pager.open
-	// asserts they match; a writer that advances FileChangeCount must
-	// also update VersionValidFor or the next opener will reject the
-	// DB as corrupt.
-	p.header.VersionValidFor = p.header.FileChangeCount
-
-	// Ensure page 1 is always written with the updated header (fix 5.3).
-	pg1, err := p.getWritablePage(1)
-	if err != nil {
-		p.pagerError()
-		return 0, 0, 0, err
+	page1OnChange := p.page1OnChange()
+	writePage1 := true
+	if page1OnChange {
+		writePage1 = p.commitNeedsPage1()
+	} else {
+		// Schema format 5: page 1 in every commit, its change counter
+		// moved by MarkDataChanged, for v2.4.x processes, which watch it.
+		if dataChanged {
+			p.header.FileChangeCount++
+		}
+		// Keep VersionValidFor in lockstep with FileChangeCount. pager.open
+		// asserts they match; a writer that advances FileChangeCount must
+		// also update VersionValidFor or the next opener will reject the
+		// DB as corrupt.
+		p.header.VersionValidFor = p.header.FileChangeCount
 	}
-	p.header.serialize(pg1.data[:dbHeaderSize])
-	if debugTrace {
-		trace("commit: page1 dbSize=%d firstFree=%d totalFree=%d fcc=%d sc=%d",
-			p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs,
-			p.header.FileChangeCount, p.header.SchemaCookie)
-	}
-	p.releasePage(pg1)
 
-	// Collect the authoritative dirty set once, now that page 1 has been
-	// dirtied. Single collection mirrors SQLite (pager.c:6502).
+	if writePage1 {
+		pg1, err := p.getWritablePage(1)
+		if err != nil {
+			p.pagerError()
+			return 0, 0, 0, err
+		}
+		if page1OnChange {
+			// pager_write_changecounter (pager.c:3084-3097): page 1 as last
+			// read, plus one, in the change counter and in VersionValidFor.
+			// Computed once page 1 is in hand, as SQLite fetches the carrier
+			// (pager.c:6506) before pagerWalFrames writes it (pager.c:3218):
+			// a load of page 1 just now has refreshed dbFileVers.
+			p.header.FileChangeCount = p.dbFileVers.Load() + 1
+			p.header.VersionValidFor = p.header.FileChangeCount
+		}
+		p.header.serialize(pg1.data[:dbHeaderSize])
+		if debugTrace {
+			trace("commit: page1 dbSize=%d firstFree=%d totalFree=%d fcc=%d sc=%d",
+				p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs,
+				p.header.FileChangeCount, p.header.SchemaCookie)
+		}
+		p.releasePage(pg1)
+	}
+
+	// Collect the authoritative dirty set once, now that page 1 is dirty if
+	// the commit writes it. Single collection mirrors SQLite (pager.c:6502).
 	p.dirtyBuf = p.writerCache.appendDirtyPages(p.dirtyBuf[:0])
 
 	if debugTrace {
@@ -2789,7 +2879,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		testCommitPostPublishHook()
 	}
 	if checkPage1Invariant.Load() {
-		p.assertPage1AfterCommit(true)
+		p.assertPage1AfterCommit(writePage1)
 	}
 
 	// Notify online backups that these pages have new committed content.
@@ -3126,6 +3216,15 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	// Suppress spills during savepoint rollback (SQLite pager.c:2457).
 	p.doNotSpill |= spillFlagRollback
 
+	// Whether the header moved since the savepoint: its fields, or the page
+	// count, which growth moves before commit writes it into the header.
+	// SQLite writes every such change into page 1 and so journals page 1
+	// at the savepoint (sqlite3PagerWrite on pPage1 at btree.c:6555,
+	// 6761-6785, 6844), and its playback restores dbFileVers from the
+	// journaled image (pager.c:2481-2484).
+	headerMoved := p.header != sp.header || p.dbSize.Load() != sp.dbSize
+	page1Restored := false
+
 	// Discard pages allocated after the savepoint.
 	p.writerCache.truncate(sp.dbSize)
 
@@ -3191,10 +3290,14 @@ func (p *pager) rollbackToSavepoint(id int) error {
 				if pg.data[off] != 0 {
 					pg.header.deserialize(pg.data[off:])
 				}
-				// Also restore the database header if this is page 1 (fix 9.3).
+				// Also restore the database header if this is page 1 (fix 9.3),
+				// and dbFileVers from the restored image (pager.c:2481-2484).
+				// The oldest copy is restored last, so it is the one kept.
 				if pgno == 1 {
 					p.header.deserialize(pg.data[:dbHeaderSize])
 					p.dbSize.Store(p.header.DatabaseSize)
+					p.dbFileVers.Store(binary.BigEndian.Uint32(data[24:28]))
+					page1Restored = true
 				}
 				// Re-dirty pages that were made clean by pagerStress spill.
 				// Without this, spilled pages remain clean after data
@@ -3211,6 +3314,12 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	// Restore database header from savepoint snapshot (fix 9.3).
 	// This covers the case where page 1 was not in any savepoint's page map
 	// but the header was modified in memory (e.g., freelist changes).
+	// SQLite would have journaled page 1 at that change and restores
+	// dbFileVers from it: page 1's change counter as the savepoint found it,
+	// which is the header's.
+	if !page1Restored && headerMoved {
+		p.dbFileVers.Store(sp.header.FileChangeCount)
+	}
 	p.header = sp.header
 	p.dbSize.Store(sp.dbSize)
 

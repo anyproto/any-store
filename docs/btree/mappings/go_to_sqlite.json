@@ -1669,9 +1669,16 @@
     "sqlite": [
       "btree.c:sqlite3BtreeUpdateMeta",
       "pager.c:sqlite3PagerCommitPhaseOne",
-      "pager.c:sqlite3PagerCommitPhaseTwo"
+      "pager.c:sqlite3PagerCommitPhaseTwo",
+      "pager.c:pager_write_changecounter"
     ],
-    "note": "schema-cookie bump at pager.go:1864 (FileChangeCount at 1861) is the sqlite3BtreeUpdateMeta equivalent"
+    "note": "the schema-cookie bump before the page-1 decision is the sqlite3BtreeUpdateMeta equivalent; in schema format 6 the change counter is dbFileVers+1 once page 1 is fetched"
+  },
+  "pager.go:*pager.commitNeedsPage1": {
+    "sqlite": [
+      "pager.c:sqlite3PagerCommitPhaseOne"
+    ],
+    "note": "schema format 6: page 1 when its header changed, it is dirty, or it carries the commit mark (drift-2026-11-12-5)"
   },
   "pager.go:*pager.committedCounters": {
     "sqlite": [
@@ -1821,6 +1828,12 @@
     ],
     "note": "the file's leaf rule for a given usable size"
   },
+  "pager.go:*pager.notePage1Read": {
+    "sqlite": [
+      "pager.c:readDbPage"
+    ],
+    "note": "dbFileVers from a page-1 read, 0xffffffff after a failed one"
+  },
   "pager.go:*pager.open": {
     "sqlite": [
       "btree.c:lockBtree",
@@ -1828,6 +1841,10 @@
       "pager.c:sqlite3PagerOpen"
     ],
     "note": "page 1 and the page count are read at one snapshot in readPage1AtOpen"
+  },
+  "pager.go:*pager.page1OnChange": {
+    "sqlite": [],
+    "note": "schema format 6 and later write page 1 only when needed"
   },
   "pager.go:*pager.pagerError": {
     "sqlite": [

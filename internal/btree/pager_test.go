@@ -6002,8 +6002,10 @@ func TestCheckpointWithMode_ReaderLockNonBusyError(t *testing.T) {
 	_, _, _, err = p.commit(true, false)
 	require.NoError(t, err)
 
-	// Set aReadMark[1] to a small value so the checkpoint tries to lock it.
-	p.wal.index.aReadMark[1].Store(1)
+	// Set aReadMark[1] below the last frame so the checkpoint tries to lock
+	// it. The commit wrote one frame, page 2, in a schema format 6 file and
+	// two, page 1 as well, in a format 5 one.
+	p.wal.index.aReadMark[1].Store(p.wal.index.mxCommitFrame.LoadLocal() - 1)
 
 	// Replace shm to make reader lock slot (lockRead0+1) fail with non-ErrBusy.
 	p.wal.index.shm = &errorLockShm{

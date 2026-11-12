@@ -4,10 +4,12 @@ package btree
 //
 // Another process's commit is found by the wal-index header: the change
 // epoch moves at the first begin after it (ReadTx.ChangeEpoch). The handle's
-// own commits move nothing. The page-1 counters are still written as before:
-// FileChangeCount goes up at each commit marked as a data change and the
-// schema cookie at each one marked as a schema change, which is what a
-// v2.4.x process attached to the same file reads.
+// own commits move nothing. The schema cookie goes up at each commit marked
+// as a schema change. In a schema format 5 file FileChangeCount goes up at
+// each commit marked as a data change, which is what a v2.4.x process
+// attached to the same file reads; in a schema format 6 file, which no such
+// process opens, it moves only when a commit writes page 1, to page 1's
+// counter as last read plus one (pager_write_changecounter).
 //
 // The "other process" here is a second handle on the same file in this
 // process, with a change state of its own.
@@ -128,9 +130,11 @@ func TestCacheInvalidation_SchemaCookie(t *testing.T) {
 	assert.Equal(t, e1, e, "db1: its own schema change is no change to it")
 }
 
-// A commit that marks nothing leaves both page-1 counters as they were. The
-// other handle still finds it: the wal-index header changed.
+// A commit that marks nothing leaves both page-1 counters of a schema format 5
+// file as they were. The other handle still finds it: the wal-index header
+// changed.
 func TestCacheInvalidation_NoMarks_CountersUnchanged(t *testing.T) {
+	useLegacyFormat(t)
 	db1, db2 := cacheInvPair(t)
 	e0, _, fcc0, sc0 := cacheInvState(t, db2)
 
@@ -211,9 +215,11 @@ func TestCacheInvalidation_Rollback_NoCounterChange(t *testing.T) {
 	assert.Equal(t, e2, e, "a rollback is no change to the other handle")
 }
 
-// Each commit marked as a data change raises FileChangeCount by one: the
-// signal a v2.4.x process attached to the file watches.
+// Each commit marked as a data change raises a schema format 5 file's
+// FileChangeCount by one: the signal a v2.4.x process attached to the file
+// watches.
 func TestCacheInvalidation_MultipleWrites_CounterIncrements(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDB(t)
 	_, _, prev, _ := cacheInvState(t, db)
 	for i := 0; i < 3; i++ {
@@ -347,4 +353,29 @@ func TestCacheInvalidation_InProcessMode(t *testing.T) {
 	assert.Zero(t, e)
 	assert.True(t, exact)
 	assert.Equal(t, fcc0+1, fcc)
+}
+
+// In a schema format 6 file marks do not move FileChangeCount: a commit that
+// leaves page 1 out leaves it as it is, and one that writes page 1 sets it to
+// page 1's counter as last read plus one, marked or not. The other handle
+// finds every commit all the same.
+func TestCacheInvalidation_Format6_CounterMovesWithPage1(t *testing.T) {
+	skipInLegacyFormatSuite(t)
+	db1, db2 := cacheInvPair(t)
+	cacheInvWrite(t, db1, false, false) // creates the namespace: page 1
+	e0, _, fcc0, _ := cacheInvState(t, db2)
+
+	cacheInvWrite(t, db1, true, false) // in place, marked: no page 1
+	e, exact, fcc, _ := cacheInvState(t, db2)
+	assert.Equal(t, fcc0, fcc, "no page 1, no new counter")
+	assert.Equal(t, e0+1, e, "the commit is found without the counter")
+	assert.True(t, exact)
+
+	wtx, err := db1.BeginWrite()
+	require.NoError(t, err)
+	_, err = wtx.CreateNamespace("more") // page 1, unmarked
+	require.NoError(t, err)
+	require.NoError(t, wtx.Commit())
+	_, _, fcc, _ = cacheInvState(t, db2)
+	assert.Equal(t, fcc0, fcc, "db1 read page 1 last at its own commit's counter minus one, and writes the same value again")
 }

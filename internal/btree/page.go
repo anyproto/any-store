@@ -124,6 +124,13 @@ const (
 	// schema format 5 keep the index rule on their leaves.
 	schemaFormatTableLeaf = 6
 
+	// schemaFormatPage1OnChange is the schema format from which a commit
+	// writes page 1 only when it has to (pager.commit): its header changed,
+	// its content is dirty, or the commit has no other page to carry its
+	// commit mark. Files of schema format 5 keep page 1 in every commit,
+	// with the change counter that releases up to v2.4.x watch.
+	schemaFormatPage1OnChange = 6
+
 	// maxReadVersion and maxWriteVersion are the highest header version bytes
 	// (offsets 19 and 18) this binary accepts, as in lockBtree (btree.c:3322-3327).
 	maxReadVersion  = 2
