@@ -579,7 +579,7 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// Use a private reader cache to avoid racing with the writer's cache.
 	// Its WAL floor is the snapshot's, as for every reader cache: on slot 0
 	// (minFrame = maxFrame+1) the check reads nothing from the WAL
-	// (walFindFrame, wal.c:3524-3527). A WAL restart needs only slots 1-4,
+	// (walFindFrame, wal.c:3538-3541). A WAL restart needs only slots 1-4,
 	// so it can run under the check, and the live floor would let the next
 	// generation's frames, numbered from 1 again, into this snapshot.
 	cache := newPcache(int(db.pager.pageSize), 200, true)

@@ -11,7 +11,7 @@ import (
 
 // TestIntegrityCheckSlot0IgnoresNewWALGeneration: an integrity check that
 // begins on a fully checkpointed WAL holds read slot 0, and a slot-0 reader
-// reads nothing from the WAL (walFindFrame, wal.c:3524-3527). A WAL restart
+// reads nothing from the WAL (walFindFrame, wal.c:3538-3541). A WAL restart
 // needs only slots 1-4, so it can run under the check, and the next writer's
 // frames are numbered from 1 again, below the check's snapshot mxFrame. The
 // check must keep reading its own snapshot, the database file, and report no
