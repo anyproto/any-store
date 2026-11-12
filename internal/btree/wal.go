@@ -4429,7 +4429,7 @@ func (w *wal) doResetWAL(truncate bool) error {
 		}
 	}
 
-	// SQLite's order (wal.c:2363-2364): walRestartHdr publishes the reset
+	// SQLite's order (wal.c:2377-2378): walRestartHdr publishes the reset
 	// header, then the WAL is truncated. Until the publish a peer sees the
 	// old header, and the WAL it describes must still be there: a writer
 	// appends its next commit after the old last frame, and recovery, which

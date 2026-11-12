@@ -5,7 +5,7 @@ package btree
 // A TRUNCATE checkpoint that dies partway through its WAL reset, while
 // another process keeps the database open. SQLite publishes the reset
 // wal-index header before it truncates the WAL (walRestartHdr, then
-// sqlite3OsTruncate, wal.c:2363-2364), so at every point a survivor either
+// sqlite3OsTruncate, wal.c:2377-2378), so at every point a survivor either
 // sees the old header over the old, intact WAL, or the reset header (no
 // frames) over whatever is left of it. A survivor must never see the old
 // header over a truncated WAL: it would append its next commit after frames
