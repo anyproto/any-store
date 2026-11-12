@@ -32,8 +32,7 @@ func (c *commitFrameCounter) LoadLocal() uint32 { return c.v.Load() }
 // just advanced the WAL frame ceiling (commit path, recovery, reset).
 func (c *commitFrameCounter) Store(v uint32) { c.v.Store(v) }
 
-// CompareAndSwap is a CAS on the local cursor. Used by the monotonic
-// advance path in syncFromSHMLocked.
+// CompareAndSwap is a CAS on the local cursor.
 func (c *commitFrameCounter) CompareAndSwap(old, new uint32) bool {
 	return c.v.CompareAndSwap(old, new)
 }

@@ -1160,7 +1160,7 @@ func BenchmarkWALReadFramePage(b *testing.B) {
 	})
 }
 
-func TestEnsureHeaderInitialized_FreshSHM(t *testing.T) {
+func TestIndexReadHdr_ClearedSHMEmptyWAL(t *testing.T) {
 	dir := t.TempDir()
 	w := newWal(filepath.Join(dir, "t.db-wal"), 4096)
 	w.inProcess = false
@@ -1172,19 +1172,20 @@ func TestEnsureHeaderInitialized_FreshSHM(t *testing.T) {
 	require.NoError(t, err)
 	clear(region[:walIndexHdrSize*2])
 
-	// ensureHeaderInitialized must leave SHM in a valid state with isInit==1
-	// and return the published hdr.
-	_, err = w.ensureHeaderInitialized()
+	// indexReadHdr must leave SHM in a valid state with isInit==1 and
+	// return the published hdr.
+	got, err := w.indexReadHdr(false, false)
 	require.NoError(t, err)
 	hdr, valid := w.index.readHeader()
 	require.True(t, valid)
+	require.Equal(t, hdr, got)
 	require.Equal(t, uint8(1), hdr.isInit)
 	require.Equal(t, uint32(0), hdr.mxFrame)
 	require.Equal(t, w.header.salt1, hdr.aSalt[0])
 	require.Equal(t, w.header.salt2, hdr.aSalt[1])
 }
 
-func TestEnsureHeaderInitialized_AdoptsValidSHM(t *testing.T) {
+func TestIndexReadHdr_ValidSHMIsNoOp(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "t.db")
 
@@ -1210,13 +1211,13 @@ func TestEnsureHeaderInitialized_AdoptsValidSHM(t *testing.T) {
 	// Open a raw wal against the existing -wal file. rawClose deletes -shm
 	// (last-connection DMS upgrade succeeds), so w2 gets a fresh SHM mapped
 	// and the current eager wal.open will run recoverLocked to rebuild it
-	// from the on-disk WAL header. ensureHeaderInitialized must be a no-op
-	// idempotent follow-up that keeps the adopted state intact.
+	// from the on-disk WAL header. indexReadHdr on the valid header must be
+	// a no-op that keeps the adopted state intact.
 	w2 := newWal(dbPath+"-wal", 4096)
 	w2.inProcess = false
 	require.NoError(t, w2.open())
 	defer w2.close(false)
-	_, err = w2.ensureHeaderInitialized()
+	_, err = w2.indexReadHdr(false, false)
 	require.NoError(t, err)
 
 	require.Equal(t, saltsA[0], w2.header.salt1, "must adopt salts, not generate new ones")
@@ -1225,7 +1226,7 @@ func TestEnsureHeaderInitialized_AdoptsValidSHM(t *testing.T) {
 	require.Equal(t, expectedFrames, w2.nFrame.Load(), "nFrame must reflect recovered frames")
 }
 
-func TestEnsureHeaderInitialized_TriggersRecoveryWhenSHMInvalid(t *testing.T) {
+func TestIndexReadHdr_RecoversWhenSHMInvalid(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "t.db")
 
@@ -1247,14 +1248,14 @@ func TestEnsureHeaderInitialized_TriggersRecoveryWhenSHMInvalid(t *testing.T) {
 
 	// rawClose removed -shm; w2 creates a new SHM mapping. The current eager
 	// wal.open already recovers from the WAL file into SHM — so to exercise
-	// ensureHeaderInitialized's recovery path we clear the SHM header after
-	// open and then invoke the helper explicitly.
+	// indexReadHdr's recovery path we clear the SHM header after open and
+	// then invoke it explicitly.
 	w2 := newWal(dbPath+"-wal", 4096)
 	w2.inProcess = false
 	require.NoError(t, w2.open())
 	defer w2.close(false)
 
-	// Clear the SHM header to force ensureHeaderInitialized into the slow path.
+	// Clear the SHM header to force indexReadHdr into the slow path.
 	region, err := w2.index.shm.region(0, true)
 	require.NoError(t, err)
 	clear(region[:walIndexHdrSize*2])
@@ -1262,7 +1263,7 @@ func TestEnsureHeaderInitialized_TriggersRecoveryWhenSHMInvalid(t *testing.T) {
 	_, validBefore := w2.index.readHeader()
 	require.False(t, validBefore, "SHM should be invalid after manual clear")
 
-	_, err = w2.ensureHeaderInitialized()
+	_, err = w2.indexReadHdr(false, false)
 	require.NoError(t, err)
 
 	// After, SHM must be valid and mxFrame must match recovered frames.
@@ -1477,8 +1478,8 @@ func TestRollbackReadvanceTrailingSegmentConsistency(t *testing.T) {
 }
 
 // clearHeaderForTest zeroes the shm header so the next reader's
-// readHeader() returns valid=false and ensureHeaderInitialized takes
-// the slow path. Test-only helper.
+// readHeader() returns valid=false and indexReadHdr takes the slow path.
+// Test-only helper.
 func (wi *walIndex) clearHeaderForTest() error {
 	region, err := wi.shm.region(0, true)
 	if err != nil {
@@ -1490,17 +1491,16 @@ func (wi *walIndex) clearHeaderForTest() error {
 	return nil
 }
 
-// TestEnsureHeaderInitialized_SurfacesBusyRecovery exercises the
-// slow-path in ensureHeaderInitialized where the RECOVER lock is held
-// exclusive (simulating "peer is mid-walIndexRecover"). The helper
-// must return ErrBusyRecovery (not the generic errWALRetry) so upstream
-// callers can back off via busyHandler instead of spinning.
+// TestIndexReadHdr_BusyWhenRecoverLockHeld: the header is invalid and the
+// RECOVER lock is held exclusive ("a peer is mid-walIndexRecover").
+// indexReadHdr must report ErrBusy and leave the index alone, as
+// walIndexRecover returns SQLITE_BUSY when it cannot take its locks
+// (wal.c:1401-1404).
 //
 // Uses a single wal instance: the in-process mmapShm.locks[] counters
 // serialize exclusive-vs-exclusive on the same slot even within the
-// same process, so preholding RECOVER exclusive is enough to trip the
-// helper's third branch.
-func TestEnsureHeaderInitialized_SurfacesBusyRecovery(t *testing.T) {
+// same process, so preholding RECOVER exclusive is enough.
+func TestIndexReadHdr_BusyWhenRecoverLockHeld(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "t.db")
 
@@ -1521,9 +1521,19 @@ func TestEnsureHeaderInitialized_SurfacesBusyRecovery(t *testing.T) {
 	}
 	defer func() { _ = w.index.unlock(lockRecover, lockExclusive) }()
 
-	_, err := w.ensureHeaderInitialized()
-	if !errors.Is(err, ErrBusyRecovery) {
-		t.Fatalf("expected ErrBusyRecovery, got %v", err)
+	_, err := w.indexReadHdr(false, false)
+	if !errors.Is(err, ErrBusy) {
+		t.Fatalf("expected ErrBusy, got %v", err)
+	}
+	if _, valid := w.index.readHeader(); valid {
+		t.Fatal("the header must not be rebuilt without the RECOVER lock")
+	}
+	// The write and checkpoint locks taken on the way were released.
+	for _, slot := range []int{lockWrite, lockCheckpoint} {
+		if err := w.index.lock(slot, lockExclusive); err != nil {
+			t.Fatalf("lock %d still held after the busy return: %v", slot, err)
+		}
+		_ = w.index.unlock(slot, lockExclusive)
 	}
 }
 
@@ -2470,7 +2480,7 @@ func TestWALReaderSlotReuseSucceedsWhenStateStable(t *testing.T) {
 //	    the authoritative WAL frame within the reader's snapshot is served
 //	    from the WAL (the normal, non-faulting path).
 //	(2) A checkpoint cannot truncate / reset the WAL out from under a held
-//	    reader slot (tryResetWALWithBusy needs slots 1-4 exclusive), slot-0
+//	    reader slot (waitReadersAndTruncate needs slots 1-4 exclusive), slot-0
 //	    snapshots never resolve frames (minFrame = mxFrame+1, C readLock==0
 //	    short-circuit), and the writer path holds the write lock that any
 //	    restart requires. A readFrame failure after a successful lookup is
@@ -2591,7 +2601,7 @@ func TestWALReadFrameErrorPropagates(t *testing.T) {
 	// --- Protection (2): truncation/reset cannot occur under a held reader slot. ---
 	// The structural guarantee that makes hard propagation correct: a reader
 	// holding its read-mark slot blocks the checkpointer from RESET/TRUNCATE
-	// (tryResetWALWithBusy must exclusively lock the reader slots, which ErrBusy-fails
+	// (waitReadersAndTruncate must exclusively lock the reader slots, which ErrBusy-fails
 	// while one is held), so the WAL frame numbering and salt are NOT recycled under
 	// the reader. A passive backfill may copy frames to the DB file and raise
 	// nBackfill (transparently shifting the reader's reads to the now-durable disk
@@ -2602,8 +2612,15 @@ func TestWALReadFrameErrorPropagates(t *testing.T) {
 	nFrameBefore := pager.wal.nFrame.Load()
 	require.Greater(t, nFrameBefore, uint32(0), "WAL must hold frames before the checkpoint")
 
-	require.NoError(t, db.Checkpoint(CheckpointTruncate),
-		"truncate checkpoint must not error while a reader holds a slot")
+	// The checkpoint backfills and then reports busy: it could not take the
+	// reader's slot (walBusyLock's result is walCheckpoint's, wal.c:2361).
+	// Without a busy handler, so that it does not wait out the timeout.
+	busyHandler := pager.wal.busyHandler
+	pager.wal.busyHandler = nil
+	err = db.Checkpoint(CheckpointTruncate)
+	pager.wal.busyHandler = busyHandler
+	require.ErrorIs(t, err, ErrBusy,
+		"a truncate checkpoint is busy while a reader holds a slot")
 
 	saltAfter := [2]uint32{pager.wal.header.salt1, pager.wal.header.salt2}
 	assert.Equal(t, saltBefore, saltAfter,

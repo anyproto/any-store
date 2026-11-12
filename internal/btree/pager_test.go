@@ -99,8 +99,11 @@ func TestTryCheckpoint(t *testing.T) {
 	err = p.tryCheckpoint()
 	require.NoError(t, err)
 
-	// Auto-checkpoint should backfill and then restart WAL when possible.
-	assert.Equal(t, uint32(0), p.wal.nFrame.Load())
+	// The automatic checkpoint is PASSIVE: it backfills the log and leaves it
+	// for the next writer to start over (wal.restartLogLocked).
+	nFrame := p.wal.nFrame.Load()
+	require.NotZero(t, nFrame)
+	assert.Equal(t, nFrame, p.wal.index.liveNBackfill())
 }
 
 // ============================================================
@@ -2116,7 +2119,7 @@ func TestCheckpointPost_IncompleteBackfill(t *testing.T) {
 }
 
 // ============================================================
-// tryResetWALWithBusy — branches (58.3%)
+// waitReadersAndTruncate — the RESTART and TRUNCATE tail of a checkpoint
 // ============================================================
 
 func TestTryResetWALWithBusy_AllSlotsAvailable(t *testing.T) {
@@ -2135,10 +2138,12 @@ func TestTryResetWALWithBusy_AllSlotsAvailable(t *testing.T) {
 	w.endWrite()
 
 	w.mu.Lock()
-	err := w.tryResetWALWithBusy(nil, false) // Restart
+	err := w.waitReadersAndTruncate(nil, false) // Restart
 	w.mu.Unlock()
 	require.NoError(t, err)
-	assert.Equal(t, uint32(0), w.nFrame.Load())
+	// RESTART only waits for the readers (wal.c:2357-2362, 2380): the log
+	// stays, for the next writer to start over.
+	assert.Equal(t, uint32(1), w.nFrame.Load())
 }
 
 func TestTryResetWALWithBusy_Truncate(t *testing.T) {
@@ -2156,7 +2161,7 @@ func TestTryResetWALWithBusy_Truncate(t *testing.T) {
 	w.endWrite()
 
 	w.mu.Lock()
-	err := w.tryResetWALWithBusy(nil, true) // Truncate
+	err := w.waitReadersAndTruncate(nil, true) // Truncate
 	w.mu.Unlock()
 	require.NoError(t, err)
 
@@ -2185,9 +2190,10 @@ func TestTryResetWALWithBusy_SlotsBusy(t *testing.T) {
 	require.NoError(t, w.index.lock(lockRead0+1, lockShared))
 
 	w.mu.Lock()
-	err := w.tryResetWALWithBusy(nil, false) // nil handler -> ErrBusy -> returns nil
+	err := w.waitReadersAndTruncate(nil, true) // nil handler -> ErrBusy
 	w.mu.Unlock()
-	require.NoError(t, err)                     // returns nil on ErrBusy
+	// walBusyLock's result is the checkpoint's (wal.c:2361).
+	require.ErrorIs(t, err, ErrBusy)
 	assert.Equal(t, uint32(1), w.nFrame.Load()) // WAL was NOT reset
 
 	_ = w.index.unlock(lockRead0+1, lockShared)
@@ -2211,9 +2217,12 @@ func TestTryResetWALWithBusy_PartialLockFail(t *testing.T) {
 	require.NoError(t, w.index.lock(lockRead0+3, lockShared))
 
 	w.mu.Lock()
-	err := w.tryResetWALWithBusy(nil, false)
+	err := w.waitReadersAndTruncate(nil, false)
 	w.mu.Unlock()
-	require.NoError(t, err) // returns nil on ErrBusy
+	require.ErrorIs(t, err, ErrBusy) // walBusyLock's result (wal.c:2361)
+	// The slots taken before the busy one were released.
+	require.NoError(t, w.index.lock(lockRead0+1, lockExclusive))
+	require.NoError(t, w.index.unlock(lockRead0+1, lockExclusive))
 
 	_ = w.index.unlock(lockRead0+3, lockShared)
 }
@@ -4648,7 +4657,7 @@ func TestCheckpointWithMode_FdatasyncDbFileError(t *testing.T) {
 	p.close()
 }
 
-// --- wal.go:1765 tryResetWALWithBusy() non-busy error ---
+// --- waitReadersAndTruncate: a busy reader slot ---
 func TestTryResetWALWithBusy_NonBusyError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.wal")
@@ -4665,9 +4674,9 @@ func TestTryResetWALWithBusy_NonBusyError(t *testing.T) {
 	// Hold reader lock on slot 1 exclusively to prevent reset
 	require.NoError(t, w.index.lock(lockRead0+1, lockExclusive))
 
-	// tryResetWALWithBusy should get ErrBusy on slot 1 and return nil (not fatal)
-	err := w.tryResetWALWithBusy(nil, false)
-	assert.NoError(t, err)
+	// ErrBusy on slot 1 is the result (wal.c:2361).
+	err := w.waitReadersAndTruncate(nil, false)
+	assert.ErrorIs(t, err, ErrBusy)
 
 	_ = w.index.unlock(lockRead0+1, lockExclusive)
 	w.close(false)
@@ -6062,7 +6071,7 @@ func (s *selectiveErrorLockShm) lock(slot int, lockType int) error {
 	return s.shm.lock(slot, lockType)
 }
 
-// --- wal.go:1765 tryResetWALWithBusy non-ErrBusy reader lock error ---
+// --- wal.go:1765 waitReadersAndTruncate non-ErrBusy reader lock error ---
 func TestTryResetWAL_NonBusyReaderLockError(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
@@ -6085,7 +6094,7 @@ func TestTryResetWAL_NonBusyReaderLockError(t *testing.T) {
 	require.NoError(t, err)
 
 	// Replace shm to make reader slot lock fail with non-ErrBusy.
-	// tryResetWALWithBusy locks reader slots exclusively starting from lockRead0+1.
+	// waitReadersAndTruncate locks reader slots exclusively starting from lockRead0+1.
 	origShm := p.wal.index.shm
 	p.wal.index.shm = &selectiveErrorLockShm{
 		shm:          origShm,
@@ -6094,7 +6103,7 @@ func TestTryResetWAL_NonBusyReaderLockError(t *testing.T) {
 		lockErr:      os.ErrPermission,
 	}
 
-	// checkpointWithMode with RESTART mode calls tryResetWALWithBusy.
+	// checkpointWithMode with RESTART mode calls waitReadersAndTruncate.
 	// First need nBackfill == maxFrame to reach the tryResetWAL path.
 	p.wal.index.nBackfill.Store(p.wal.index.maxFrame.Load())
 

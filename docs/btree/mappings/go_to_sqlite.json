@@ -3,7 +3,7 @@
     "sqlite": [
       "backup.c:sqlite3_backup_finish"
     ],
-    "note": "commits or rolls back the destination tx based on b.rc; releases backup state"
+    "note": "commits or rolls back the destination tx based on b.rc; returns the last Step's busy error if neither done nor failed (backup.c:603)"
   },
   "backup.go:*Backup.PageCount": {
     "sqlite": [
@@ -21,7 +21,7 @@
     "sqlite": [
       "backup.c:sqlite3_backup_step"
     ],
-    "note": "copies up to nPage pages; returns ErrBackupDone when source exhausted"
+    "note": "copies up to nPage pages under the source's process write lock (try-lock, ErrBusy); DONE and every error other than a busy one and the ctx's own are sticky; restarts by the change epoch"
   },
   "backup.go:*Backup.finalize": {
     "sqlite": [
@@ -41,19 +41,31 @@
     "sqlite": [
       "backup.c:sqlite3BackupRestart"
     ],
-    "note": "called by source pager when WAL reset/page-cache invalidation makes already-copied tracking meaningless"
+    "note": "called by the source pager when a write transaction that sent the backup pages ends without committing them all (rollback, error cleanup, unwind); no-op on a finished backup"
+  },
+  "backup.go:*Backup.stepBusy": {
+    "sqlite": [
+      "backup.c:sqlite3_backup_step"
+    ],
+    "note": "keeps a Step's busy result for Finish (p-\u003erc = rc, backup.c:558)"
   },
   "backup.go:*Backup.update": {
     "sqlite": [
       "backup.c:backupUpdate"
     ],
-    "note": "re-copies a page that was already backed up if it changed under us"
+    "note": "re-copies an already-copied page the source logged, at a commit or a spill; no-op on a done or finished backup"
   },
   "backup.go:*DB.BackupInit": {
     "sqlite": [
       "backup.c:sqlite3_backup_init"
     ],
     "note": "minus the handle/name resolution (DRIFT #2 in any-store-tests:docs/any-store/btree/plans/2026-04-22-sqlite-backup-port.md): takes (dst, src *btree.DB) directly"
+  },
+  "backup.go:backupBusy": {
+    "sqlite": [
+      "backup.c:isFatalError"
+    ],
+    "note": "busy errors and a ctx that ended are not kept (drift-2026-11-13-2 for the two extended busy codes)"
   },
   "backup.go:putUint32BE": {
     "sqlite": [
@@ -792,6 +804,10 @@
     ],
     "note": ""
   },
+  "db.go:*DB.ForgetSeenHeader": {
+    "sqlite": [],
+    "note": "test helper: models another process's commit"
+  },
   "db.go:*DB.GetNamespace": {
     "sqlite": [],
     "note": "any-store namespace lookup in master btree"
@@ -809,6 +825,10 @@
   "db.go:*DB.ListNamespaces": {
     "sqlite": [],
     "note": "any-store master-table enumeration (SQLite does this via SQL over sqlite_master)"
+  },
+  "db.go:*DB.LocalSchemaCookie": {
+    "sqlite": [],
+    "note": "any-store: the schema cookie of this process's last commit"
   },
   "db.go:*DB.Options": {
     "sqlite": [],
@@ -834,10 +854,6 @@
   "db.go:*DB.SetClosing": {
     "sqlite": [],
     "note": "any-store cooperative shutdown signal"
-  },
-  "db.go:*DB.UpdateLocalCounters": {
-    "sqlite": [],
-    "note": "any-store multi-process staleness bookkeeping"
   },
   "db.go:*DB.WriterCacheLen": {
     "sqlite": [],
@@ -886,6 +902,10 @@
     "sqlite": [],
     "note": "any-store master-table traversal for namespace->rootPage"
   },
+  "db.go:*DB.unregisterWriter": {
+    "sqlite": [],
+    "note": "any-store: Close / BeginWrite handshake (drift-2026-11-13-1, Close)"
+  },
   "db.go:*Namespace.Name": {
     "sqlite": [],
     "note": ""
@@ -907,6 +927,13 @@
     ],
     "note": ""
   },
+  "db.go:*ReadTx.ChangeEpoch": {
+    "sqlite": [
+      "pager.c:sqlite3PagerDataVersion",
+      "btree.c:sqlite3BtreeGetMeta"
+    ],
+    "note": "BTREE_DATA_VERSION: changes made elsewhere only (btree.c:10436-10437), plus exactness of this snapshot"
+  },
   "db.go:*ReadTx.Count": {
     "sqlite": [
       "btree.c:sqlite3BtreeCount"
@@ -918,10 +945,6 @@
       "btree.c:sqlite3BtreeCount"
     ],
     "note": "polls ctx once per interior page in place of isInterrupted on every page"
-  },
-  "db.go:*ReadTx.DiskFileChangeCounter": {
-    "sqlite": [],
-    "note": ""
   },
   "db.go:*ReadTx.DiskSchemaCookie": {
     "sqlite": [],
@@ -938,14 +961,6 @@
   "db.go:*ReadTx.Has": {
     "sqlite": [],
     "note": "any-store existence-check wrapper"
-  },
-  "db.go:*ReadTx.IsDataStale": {
-    "sqlite": [],
-    "note": "any-store multi-process staleness check"
-  },
-  "db.go:*ReadTx.IsSchemaStale": {
-    "sqlite": [],
-    "note": "any-store multi-process staleness check"
   },
   "db.go:*ReadTx.NewCursor": {
     "sqlite": [
@@ -1589,6 +1604,12 @@
     "sqlite": [],
     "note": ""
   },
+  "pager.go:*pager.beginReadHdrBusy": {
+    "sqlite": [
+      "btree.c:btreeBeginTrans"
+    ],
+    "note": "beginReadHdr under the busy state of the begin it is part of (DB.BeginWriteContext's)"
+  },
   "pager.go:*pager.beginWrite": {
     "sqlite": [
       "pager.c:sqlite3PagerBegin"
@@ -1637,17 +1658,31 @@
     ],
     "note": "inverse of attachBackupObject; called by Backup.Finish (backup.c:589–597)"
   },
+  "pager.go:*pager.dischargeBackups": {
+    "sqlite": [
+      "pager.c:pager_reset",
+      "pager.c:pagerUndoCallback"
+    ],
+    "note": "restart the backups a write transaction still owes (backupOwed); SQLite restarts in rollback and error cleanup"
+  },
   "pager.go:*pager.dispatchBackupRestart": {
     "sqlite": [
       "backup.c:sqlite3BackupRestart"
     ],
-    "note": "fans out a restart signal to all attached Backups when WAL reset or page-cache invalidation makes already-copied tracking meaningless"
+    "note": "fans out a restart to all attached Backups: rollbackLocked, pagerError, dischargeBackups"
   },
   "pager.go:*pager.dispatchBackupUpdate": {
     "sqlite": [
       "backup.c:backupUpdate"
     ],
-    "note": "fans out the per-page update hook to all attached Backups after each committed write so already-copied pages stay current"
+    "note": "fans out the per-page update to all attached Backups for every page the source logs: a commit's pages and each spilled page (pager.c:3219-3225)"
+  },
+  "pager.go:*pager.effectiveReaderDbSize": {
+    "sqlite": [
+      "pager.c:pagerPagecount",
+      "wal.c:sqlite3WalDbsize"
+    ],
+    "note": "a reader's page count for its snapshot; the file-size fallback is memoized per wal-index header (drift-2026-11-11-3)"
   },
   "pager.go:*pager.encryptPage": {
     "sqlite": [],
@@ -1910,11 +1945,23 @@
     "sqlite": [
       "pager.c:sqlite3PagerCheckpoint"
     ],
-    "note": ""
+    "note": "automatic checkpoint: PASSIVE only, as sqlite3WalDefaultHook's"
   },
   "pager.go:*pager.usableSize": {
     "sqlite": [],
     "note": ""
+  },
+  "pager.go:*pager.walBase": {
+    "sqlite": [
+      "wal.c:sqlite3WalUndo"
+    ],
+    "note": "the open write transaction's starting position in the log, through wal.base"
+  },
+  "pager.go:*pager.walBaseFrame": {
+    "sqlite": [
+      "wal.c:sqlite3WalUndo"
+    ],
+    "note": "frame number of the open write transaction's base, by wal.base's rule over atomics only: hasChanges, unwindWriter, commit's spill test, rollbackForClose"
   },
   "pager.go:*pager.withWriteLock": {
     "sqlite": [],
@@ -2203,6 +2250,38 @@
     "sqlite": [],
     "note": "heap-backed shm fallback for platforms without mmap support"
   },
+  "testseam.go:*DB.TestSeam": {
+    "sqlite": [],
+    "note": "test seam for the packages above"
+  },
+  "testseam.go:SetTestBeforeBeginWriteHook": {
+    "sqlite": [],
+    "note": "test seam"
+  },
+  "testseam.go:SetTestPublishHeaderHook": {
+    "sqlite": [],
+    "note": "test seam"
+  },
+  "testseam.go:TestSeam.Lock": {
+    "sqlite": [],
+    "note": "test seam: a WAL lock through the handle's lock table"
+  },
+  "testseam.go:TestSeam.Path": {
+    "sqlite": [],
+    "note": "test seam"
+  },
+  "testseam.go:TestSeam.PeerPublish": {
+    "sqlite": [],
+    "note": "test seam: another process's commit, as a begin sees it"
+  },
+  "testseam.go:TestSeam.SetBusyTimeout": {
+    "sqlite": [],
+    "note": "test seam"
+  },
+  "testseam.go:TestSeam.TearHeader": {
+    "sqlite": [],
+    "note": "test seam: the header as a writer between its two copies leaves it"
+  },
   "wal.go:*WalIndexHdr.computeCksum": {
     "sqlite": [
       "wal.c:walChecksumBytes"
@@ -2217,6 +2296,12 @@
     "sqlite": [],
     "note": ""
   },
+  "wal.go:*beginBusy.retry": {
+    "sqlite": [
+      "btree.c:btreeInvokeBusyHandler"
+    ],
+    "note": "one begin's busy count, as sqlite3InvokeBusyHandler keeps nBusy (main.c:1770-1780): once the handler declines it is not asked again"
+  },
   "wal.go:*wal.adoptSHMState": {
     "sqlite": [],
     "note": ""
@@ -2224,6 +2309,13 @@
   "wal.go:*wal.authoritativeMxFrame": {
     "sqlite": [],
     "note": ""
+  },
+  "wal.go:*wal.base": {
+    "sqlite": [
+      "wal.c:sqlite3WalSavepointUndo",
+      "wal.c:sqlite3WalUndo"
+    ],
+    "note": "a position saved before the log was started over maps to frame 0 of the new log: the nCkpt test of wal.c:3829-3835 and the reloaded header of wal.c:3775"
   },
   "wal.go:*wal.beginRead": {
     "sqlite": [
@@ -2235,6 +2327,18 @@
   "wal.go:*wal.beginReadHdr": {
     "sqlite": [],
     "note": ""
+  },
+  "wal.go:*wal.beginReadHdrBusy": {
+    "sqlite": [
+      "btree.c:btreeBeginTrans"
+    ],
+    "note": "the begin's busy loop for SQLITE_BUSY_RECOVERY (btree.c:3730-3737), at the WAL read begin so open's page-1 read is covered too"
+  },
+  "wal.go:*wal.beginReadHdrRetry": {
+    "sqlite": [
+      "wal.c:walBeginReadTransaction"
+    ],
+    "note": "one read begin attempt: walTryBeginRead's WAL_RETRY loop"
   },
   "wal.go:*wal.beginWrite": {
     "sqlite": [
@@ -2276,7 +2380,7 @@
       "wal.c:walIteratorNext",
       "wal.c:walMergesort"
     ],
-    "note": ""
+    "note": "includes the salt re-check after read lock 0 (version-3.52.0 wal.c:2256-2267)"
   },
   "wal.go:*wal.close": {
     "sqlite": [
@@ -2286,10 +2390,9 @@
   },
   "wal.go:*wal.doResetWAL": {
     "sqlite": [
-      "wal.c:walRestartHdr",
-      "wal.c:walRestartLog"
+      "wal.c:walRestartHdr"
     ],
-    "note": ""
+    "note": "starts the log over; called by restartLogLocked and by a TRUNCATE checkpoint"
   },
   "wal.go:*wal.endRead": {
     "sqlite": [
@@ -2303,17 +2406,15 @@
     ],
     "note": ""
   },
-  "wal.go:*wal.ensureHeaderInitialized": {
-    "sqlite": [],
-    "note": ""
-  },
-  "wal.go:*wal.ensureHeaderInitializedInProcess": {
-    "sqlite": [],
-    "note": ""
-  },
   "wal.go:*wal.flushHeader": {
     "sqlite": [],
     "note": "lazy WAL header flush on first write (any-store optimization)"
+  },
+  "wal.go:*wal.indexReadHdr": {
+    "sqlite": [
+      "wal.c:walIndexReadHdr"
+    ],
+    "note": "validated header read; rebuilds the wal-index under the write lock when the header is invalid"
   },
   "wal.go:*wal.initHeaderStateLocked": {
     "sqlite": [],
@@ -2324,6 +2425,12 @@
       "wal.c:sqlite3WalOpen"
     ],
     "note": ""
+  },
+  "wal.go:*wal.pos": {
+    "sqlite": [
+      "wal.c:sqlite3WalSavepoint"
+    ],
+    "note": "frame count, checksums and log generation (aWalData, wal.c:3811-3815)"
   },
   "wal.go:*wal.readFrame": {
     "sqlite": [
@@ -2351,15 +2458,29 @@
     ],
     "note": "ports the iReCksum>mxFrame reset fragment of sqlite3WalSavepointUndo (wal.c:3849-3851)"
   },
+  "wal.go:*wal.restartCandidate": {
+    "sqlite": [
+      "wal.c:walRestartLog"
+    ],
+    "note": "the lock-free part of the restart test: no frame of this transaction in the log, nBackfill == mxFrame \u003e 0"
+  },
+  "wal.go:*wal.restartHeaderStateLocked": {
+    "sqlite": [
+      "wal.c:walRestartHdr"
+    ],
+    "note": "header half of a WAL restart: mxFrame 0, hdr.nPage kept, salt1+1 and a random salt2; nCkpt stays 0 and aFrameCksum is the new WAL header's checksum (drift-98)"
+  },
+  "wal.go:*wal.restartLogLocked": {
+    "sqlite": [
+      "wal.c:walRestartLog"
+    ],
+    "note": "writer-side log restart before a transaction's first frames (wal.c:3870-3888); explicit nBackfill==mxFrame test; also try-locks the checkpoint lock (drift-2026-11-12-2); keeps reader slot 0 (drift-2026-11-12-3)"
+  },
   "wal.go:*wal.rewriteChecksums": {
     "sqlite": [
       "wal.c:walRewriteChecksums"
     ],
     "note": "in-tx frame-reuse checksum-chain rewrite (wal.c:3966-4009), called from writeFrames"
-  },
-  "wal.go:*wal.syncFromSHMLocked": {
-    "sqlite": [],
-    "note": ""
   },
   "wal.go:*wal.truncateFile": {
     "sqlite": [
@@ -2394,14 +2515,16 @@
     "note": ""
   },
   "wal.go:*wal.tryBeginReadMultiProcessHdr": {
-    "sqlite": [],
-    "note": ""
-  },
-  "wal.go:*wal.tryResetWALWithBusy": {
     "sqlite": [
-      "wal.c:walRestartLog"
+      "wal.c:walTryBeginRead"
     ],
-    "note": ""
+    "note": "multi-process (mmap shm) arm of tryBeginReadHdr"
+  },
+  "wal.go:*wal.waitReadersAndTruncate": {
+    "sqlite": [
+      "wal.c:walCheckpoint"
+    ],
+    "note": "RESTART/TRUNCATE tail (wal.c:2357-2382): RESTART only waits for reader slots 1-4, TRUNCATE also resets the header and truncates; a busy reader lock is the checkpoint's result"
   },
   "wal.go:*wal.writeFrames": {
     "sqlite": [
@@ -2461,9 +2584,21 @@
     "sqlite": [],
     "note": "cache-invalidation lookup; no direct SQLite counterpart"
   },
+  "wal.go:*walIndex.liveNBackfill": {
+    "sqlite": [
+      "wal.c:walCheckpoint"
+    ],
+    "note": "the shared pInfo-\u003enBackfill that the reset and completeness tests read (wal.c:2355-2360), not the process-local mirror"
+  },
   "wal.go:*walIndex.lock": {
     "sqlite": [],
     "note": ""
+  },
+  "wal.go:*walIndex.prepareHeader": {
+    "sqlite": [
+      "wal.c:walIndexWriteHdr"
+    ],
+    "note": "first half: fills wi.hdr and its checksum"
   },
   "wal.go:*walIndex.readHeader": {
     "sqlite": [
@@ -2471,6 +2606,13 @@
       "wal.c:walIndexTryHdr"
     ],
     "note": ""
+  },
+  "wal.go:*walIndex.readHeaderState": {
+    "sqlite": [
+      "wal.c:walIndexReadHdr",
+      "wal.c:walIndexTryHdr"
+    ],
+    "note": "walIndexTryHdr plus walIndexReadHdr's version gate: a consistent header of another wal-index version is refused, not torn (wal.c:2740-2741)"
   },
   "wal.go:*walIndex.reset": {
     "sqlite": [
@@ -2540,6 +2682,12 @@
   "wal.go:*walIndex.shmWriteReadMark": {
     "sqlite": [],
     "note": ""
+  },
+  "wal.go:*walIndex.storeHeader": {
+    "sqlite": [
+      "wal.c:walIndexWriteHdr"
+    ],
+    "note": "second half: copy 2, barrier, copy 1 (wal.c:951-953)"
   },
   "wal.go:*walIndex.unlock": {
     "sqlite": [],
@@ -2614,5 +2762,41 @@
       "wal.c:walShmBarrier"
     ],
     "note": ""
+  },
+  "walchange.go:*wal.announce": {
+    "sqlite": [
+      "wal.c:walFrames",
+      "wal.c:walRestartHdr",
+      "wal.c:sqlite3WalCheckpoint"
+    ],
+    "note": "an own header is known before it is published, as pWal-\u003ehdr is written first (wal.c:4243-4250, 2151-2154); a reset over an unseen header owes a step (wal.c:4399-4406); a recovery always does (wal.c:2724-2725)"
+  },
+  "walchange.go:*wal.changeEpoch": {
+    "sqlite": [
+      "pager.c:sqlite3PagerDataVersion"
+    ],
+    "note": "the epoch and whether a snapshot is exact for it"
+  },
+  "walchange.go:*wal.noteSnapshot": {
+    "sqlite": [
+      "wal.c:walIndexTryHdr",
+      "pager.c:pagerBeginReadTransaction",
+      "pager.c:pager_reset"
+    ],
+    "note": "the *pChanged test of wal.c:2624-2626 and pager_reset's iDataVersion++ (pager.c:1773), against the process-wide change state (drift-2026-11-13-1)"
+  },
+  "walchange.go:*wal.publishHeader": {
+    "sqlite": [
+      "wal.c:walIndexWriteHdr"
+    ],
+    "note": "walIndex.prepareHeader + storeHeader between announce and settle; sets iChange"
+  },
+  "walchange.go:*wal.settle": {
+    "sqlite": [],
+    "note": "any-store: decides the change state from the live header on every way out of a publication (drift-2026-11-13-1)"
+  },
+  "walchange.go:*walChange.exact": {
+    "sqlite": [],
+    "note": "any-store: a snapshot holds exactly the changes the epoch counts (drift-2026-11-13-1)"
   }
 }
