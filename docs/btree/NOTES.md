@@ -2820,7 +2820,10 @@ the start of a transaction (`btree.c:3284-3298`, `3401-3408`):
   `ErrHeaderCorrupt`. `pager.open` uses the same two helpers in `readPage1AtOpen`, which reads
   page 1 and the count under one WAL read transaction (`pagerBeginReadTransaction` then
   `pagerPagecount`, `pager.c:5444-5448`; `lockBtree`, `btree.c:3284-3298`), so a peer's checkpoint
-  during open cannot pair a stale file header with a newer WAL size. Open used to take the larger
+  during open cannot pair a stale file header with a newer WAL size. It reads page 1 whole from
+  either source, as `readDbPage` does (`pager.c:3031-3046`), so a read error past the header fails
+  the open (test `TestOpenPage1ReadErrorPastHeaderFails`, vfs tag); a short file read is not an
+  error there, as in `readDbPage` (the rest reads as zeros), unless the header itself is cut off. Open used to take the larger
   of the file-derived size and the WAL's, which brought back the pages of a WAL-committed shrink
   at the first commit.
 - A failed lookup, a failed read, a page-1 image that does not decode as a database header, and a

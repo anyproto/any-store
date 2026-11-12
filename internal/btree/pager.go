@@ -714,7 +714,8 @@ func (p *pager) open() (err error) {
 //   - Page 1 comes from the snapshot's WAL frame when there is one, else from
 //     the database file, re-read here because the checkpoint that removed
 //     the frame from the snapshot's range has also rewritten the file's
-//     page 1 since open first read it. A failed read fails the open.
+//     page 1 since open first read it. It is read whole either way, as
+//     lockBtree fetches it (btree.c:3288), and a failed read fails the open.
 //   - The pager's count is pagerPagecount (pager.c:3279-3306): the size the
 //     WAL's last commit recorded, even when it is smaller than the file (a
 //     commit that shrank the database leaves the file long until a
@@ -744,14 +745,23 @@ func (p *pager) readPage1AtOpen() error {
 			return err
 		}
 	} else {
-		var buf [dbHeaderSize]byte
-		if n, err := p.file.ReadAt(buf[:], 0); err != nil && n < dbHeaderSize {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		// The whole page, as readDbPage reads it from the file
+		// (pager.c:3039-3043): a read error anywhere in page 1 fails the
+		// open, as it fails lockBtree (btree.c:3288-3289). A short read is
+		// not an error there, the rest of the page reads as zeros; only a
+		// file too short to hold the header is unusable.
+		buf := make([]byte, p.pageSize)
+		n, err := p.file.ReadAt(buf, 0)
+		if err != nil {
+			short := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+			if !short {
+				return fmt.Errorf("btree: failed to read database page 1: %w", err)
+			}
+			if n < dbHeaderSize {
 				return fmt.Errorf("%w: file of %d bytes is shorter than the header", ErrHeaderCorrupt, n)
 			}
-			return fmt.Errorf("btree: failed to read database header: %w", err)
 		}
-		if err := header.deserialize(buf[:]); err != nil {
+		if err := header.deserialize(buf[:dbHeaderSize]); err != nil {
 			return err
 		}
 	}
