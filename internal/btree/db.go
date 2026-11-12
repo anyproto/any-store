@@ -341,6 +341,7 @@ type DB struct {
 	closing         atomic.Bool // set to reject new transactions
 	closed          atomic.Bool // set when Close() is actually called
 	writerLocksDone atomic.Bool // CAS guard: writer lock cleanup (endRead+RUnlock+Unlock) runs exactly once
+	closeOnce       sync.Once   // guards closing closeCh
 
 	// writerRegistered says that the holder of the write lock is a write
 	// transaction whose teardown (releaseWriterLocks) is valid: it holds its
@@ -353,7 +354,6 @@ type DB struct {
 	// with everything else through the connection mutex, main.c:1263.)
 	writerRegMu      sync.Mutex
 	writerRegistered bool
-	closeOnce       sync.Once   // guards closing closeCh
 
 	// Namespace root pages are stored in a master table on page 1.
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
