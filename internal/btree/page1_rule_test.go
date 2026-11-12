@@ -203,6 +203,8 @@ func TestPage1Rule_FrameShape(t *testing.T) {
 	sc := rtx.SnapshotSchemaCookie()
 	require.NoError(t, rtx.Rollback())
 	require.Equal(t, cookie+1, sc, "a reader sees the committed cookie")
+	require.Equal(t, []string{fmt.Sprintf("GET cookie %d", cookie+1)}, runP1Child(t, path, Options{}, "cookie"),
+		"another process sees it")
 
 	// Every dirty page spilled before the commit: page 1 carries the mark.
 	tx, err := db.BeginWrite()
@@ -507,6 +509,34 @@ func TestPage1Rule_FCCCycles(t *testing.T) {
 			require.Equal(t, c+uint32(k)+1, p1CounterOf(t, r, "grow"), "cycle %d", k)
 		}
 	})
+	t.Run("savepoint-net-zero", func(t *testing.T) {
+		// SQLite: one more, c+1. The page taken from the freelist and given
+		// back journals page 1 at the savepoint, and the rollback restores
+		// dbFileVers from that image (pager.c:2481-2484). Here the header is
+		// back where the savepoint had it, so nothing tells the rollback
+		// page 1 was touched (drift-2026-11-12-5).
+		db, r, c := setup(t)
+		grow(t, db, 0)
+		require.Equal(t, c, p1CounterOf(t, r, "grow"))
+		p1Write(t, db, func(tx *WriteTx, ns *Namespace) { require.NoError(t, tx.Delete(ns, p1Key(0))) })
+		require.Equal(t, c, p1CounterOf(t, r, "a freed page"))
+		require.NotZero(t, db.pager.header.TotalFreelistPgs, "setup: a free page")
+		p1Write(t, db, func(tx *WriteTx, ns *Namespace) {
+			sp, err := tx.Savepoint()
+			require.NoError(t, err)
+			before := db.pager.header
+			pg, err := db.pager.allocatePage() // takes a page from the freelist
+			require.NoError(t, err)
+			pgno := pg.pgno
+			db.pager.releasePage(pg)
+			require.NoError(t, db.pager.freePage(pgno)) // and gives it back
+			require.Equal(t, before, db.pager.header, "setup: the header is back where it was")
+			require.NoError(t, tx.RollbackToSavepoint(sp))
+			_, err = tx.CreateNamespace("catalog")
+			require.NoError(t, err)
+		})
+		require.Equal(t, c, p1CounterOf(t, r, "a catalog change after the savepoint"))
+	})
 	t.Run("carrier", func(t *testing.T) {
 		db, r, c := setup(t)
 		grow(t, db, 0)
@@ -593,6 +623,7 @@ const p1ChildEnv = "BTREE_TEST_P1_CHILD"
 //	get:NS:K   print "GET NS K <first byte> <length>" of key K in NS
 //	put:NS:K   commit one big value (fill 6) at key K in NS
 //	check      IntegrityCheck
+//	cookie     print "GET cookie <schema cookie>" of a read transaction
 //
 // and returns its "GET" lines.
 func runP1Child(t *testing.T, path string, opts Options, ops string) []string {
@@ -656,6 +687,11 @@ func TestPage1Rule_Child(t *testing.T) {
 			require.NoError(t, tx.Commit())
 		case "check":
 			require.NoError(t, db.IntegrityCheck())
+		case "cookie":
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			fmt.Printf("GET cookie %d\n", rtx.SnapshotSchemaCookie())
+			require.NoError(t, rtx.Rollback())
 		default:
 			t.Fatalf("unknown op %q", op)
 		}

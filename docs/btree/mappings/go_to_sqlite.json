@@ -1974,10 +1974,11 @@
   "pager.go:*pager.rollbackToSavepoint": {
     "sqlite": [
       "pager.c:pagerPlaybackSavepoint",
+      "pager.c:pager_playback_one_page",
       "pager.c:sqlite3PagerSavepoint",
       "wal.c:sqlite3WalSavepointUndo"
     ],
-    "note": ""
+    "note": "dbFileVers is restored as pager_playback_one_page restores it for page 1 (pager.c:2481-2484), approximated by a header or page-count change (drift-2026-11-12-5)"
   },
   "pager.go:*pager.savepoint": {
     "sqlite": [

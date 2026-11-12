@@ -3209,6 +3209,7 @@ func (p *pager) savepoint() (int, error) {
 }
 
 // rollbackToSavepoint rolls back to the given savepoint, restoring pages.
+// DRIFT: dbFileVers is restored when page 1 was restored or the header or page count moved since the savepoint; SQLite restores it whenever page 1 was journaled, a net-zero header change included See docs/btree/NOTES.md#drift-2026-11-12-5-page-1-written-when-its-header-changes
 func (p *pager) rollbackToSavepoint(id int) error {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return p.writeStateErr()
