@@ -2020,10 +2020,13 @@ func (p *pager) getHasContent(pgno uint32) bool {
 // is the writer's allocation counter, refreshed only on the write path
 // (beginWrite -> refreshHeaderFromPage1), so a process that has not written
 // since a peer grew the database would reject the peer's pages as corrupt.
+//
+// A failed file-size query is the read begin's error, as pagerPagecount
+// returns it (pager.c:3299-3303); there is no fallback to p.dbSize.
 // DRIFT: the file-size fallback is memoized per wal-index header; C fstats every transaction See docs/btree/NOTES.md#drift-2026-11-11-3-reader-size-without-a-wal-commit-is-memoized
-func (p *pager) effectiveReaderDbSize(hdr WalIndexHdr) uint32 {
+func (p *pager) effectiveReaderDbSize(hdr WalIndexHdr) (uint32, error) {
 	if hdr.isInit != 0 && hdr.nPage != 0 {
-		return hdr.nPage
+		return hdr.nPage, nil
 	}
 	if !p.inProcess && !p.inMemory && p.file != nil {
 		// One fstat per wal-index header, not per read begin (measured:
@@ -2036,15 +2039,17 @@ func (p *pager) effectiveReaderDbSize(hdr WalIndexHdr) uint32 {
 		// only when the index is rebuilt over a WAL with no commit, with the
 		// salts of a new WAL generation.
 		if m := p.noWalCommitSize.Load(); m != nil && m.hdr == hdr {
-			return m.nPage
+			return m.nPage, nil
 		}
-		if info, err := p.file.Stat(); err == nil {
-			n := uint32((info.Size() + int64(p.pageSize) - 1) / int64(p.pageSize))
-			p.noWalCommitSize.Store(&noWalCommitSize{hdr: hdr, nPage: n})
-			return n
+		info, err := p.file.Stat()
+		if err != nil {
+			return 0, fmt.Errorf("btree: database file size: %w", err)
 		}
+		n := uint32((info.Size() + int64(p.pageSize) - 1) / int64(p.pageSize))
+		p.noWalCommitSize.Store(&noWalCommitSize{hdr: hdr, nPage: n})
+		return n, nil
 	}
-	return p.dbSize.Load()
+	return p.dbSize.Load(), nil
 }
 
 // noWalCommitSize is effectiveReaderDbSize's memo: the database file's size

@@ -981,7 +981,13 @@ func (db *DB) beginRead(ctx context.Context, readCounters, wait bool) (*ReadTx, 
 	// Snapshot DB page count for this reader (hdr.nPage, fallback p.dbSize).
 	// Carried on the cache so reader bound checks accept pages a peer
 	// allocated after open. Set in lockstep with walHdr.
-	snapDbSize := db.pager.effectiveReaderDbSize(hdr)
+	snapDbSize, err := db.pager.effectiveReaderDbSize(hdr)
+	if err != nil {
+		db.pager.endRead(slot)
+		db.mu.RUnlock()
+		<-db.readerSem
+		return nil, err
+	}
 	var cache *pcache
 	select {
 	case cache = <-db.readerCaches:
@@ -1567,9 +1573,13 @@ func (db *DB) GetNamespace(name string) (*Namespace, error) {
 	}
 	defer db.pager.endRead(slot)
 
+	dbSize, err := db.pager.effectiveReaderDbSize(hdr)
+	if err != nil {
+		return nil, err
+	}
 	cache := newPcache(int(db.pager.pageSize), 200, true)
 	cache.useSlab = db.pager.useSlab
-	cache.dbSize = db.pager.effectiveReaderDbSize(hdr)
+	cache.dbSize = dbSize
 	cache.minFrame = minFrame
 	defer cache.destroy()
 
@@ -1669,9 +1679,13 @@ func (db *DB) ListNamespaces() ([]string, error) {
 	}
 	defer db.pager.endRead(slot)
 
+	dbSize, err := db.pager.effectiveReaderDbSize(hdr)
+	if err != nil {
+		return nil, err
+	}
 	cache := newPcache(int(db.pager.pageSize), 200, true)
 	cache.useSlab = db.pager.useSlab
-	cache.dbSize = db.pager.effectiveReaderDbSize(hdr)
+	cache.dbSize = dbSize
 	cache.minFrame = minFrame
 	defer cache.destroy()
 

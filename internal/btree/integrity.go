@@ -616,7 +616,11 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// in a process that has not begun a write since a peer grew the
 	// database it is stale, and the peer's pages, still only in the WAL,
 	// were reported as invalid page numbers.
-	if maxPossible := db.pager.effectiveReaderDbSize(walHdr); maxPossible > 0 && nPages > maxPossible {
+	maxPossible, err := db.pager.effectiveReaderDbSize(walHdr)
+	if err != nil {
+		return err
+	}
+	if maxPossible > 0 && nPages > maxPossible {
 		nPages = maxPossible
 	}
 
