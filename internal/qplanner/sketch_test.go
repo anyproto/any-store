@@ -509,6 +509,32 @@ func TestIndexSketch_UnmarshalCorruptCompressed(t *testing.T) {
 	assert.Equal(t, uint64(0), fresh.GetDocCount())
 }
 
+// A blob under a sketch tag this release does not know is left unread: a later
+// release's encoding must not be taken for legacy buckets, which would zero the
+// shallow level, flag a rebuild and be saved back.
+func TestIndexSketch_UnmarshalUnknownTag(t *testing.T) {
+	s := sketchWith(8, []uint64{5, 5}, []uint64{0, 0, 9})
+	want := s.Snapshot(nil)
+	body := make([]byte, 8*8+8)
+	for i := range body {
+		body[i] = byte(i + 1)
+	}
+	for _, tag := range []string{"SK04", "SK10", "SK99", "SK00", "SK01"} {
+		for _, blob := range [][]byte{[]byte(tag), append([]byte(tag), body...)} {
+			assert.True(t, s.SameShape(blob), tag)
+			s.UnmarshalBinary(blob)
+			assert.Equal(t, want, s.Snapshot(nil), tag)
+			assert.False(t, s.NeedsRebuild(), tag)
+		}
+	}
+	// Bytes that are not a tag are legacy buckets, as before.
+	for _, tag := range []string{"SKxx", "SK0", "sk04", "XK04"} {
+		legacy := sketchWith(8, []uint64{5, 5}, []uint64{0, 0, 9})
+		legacy.UnmarshalBinary(append([]byte(tag), body...))
+		assert.True(t, legacy.NeedsRebuild(), tag)
+	}
+}
+
 // packLevel starts from the width the counters had when they were scanned. A
 // counter that has grown past it since is still stored whole.
 func TestIndexSketch_PackLevelWidens(t *testing.T) {
@@ -574,6 +600,7 @@ func FuzzIndexSketch_UnmarshalBinary(f *testing.F) {
 	f.Add(make([]byte, 8*8+8))
 	f.Add([]byte("SK03"))
 	f.Add([]byte("SK020000000X"))
+	f.Add(append([]byte("SK04"), make([]byte, 8*8+8)...))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		s := sketchWith(8, []uint64{5, 5}, []uint64{0, 0, 9})
 		before := s.Snapshot(nil)
@@ -585,9 +612,9 @@ func FuzzIndexSketch_UnmarshalBinary(f *testing.F) {
 		if same && (s.Size != 8 || s.Levels != 2) {
 			t.Fatalf("reshaped to %dx%d by bytes SameShape accepted", s.Levels, s.Size)
 		}
-		if len(data) >= 4 && [4]byte(data[:4]) == sketchMagicS2 {
+		if len(data) >= 4 && sketchTagged([4]byte(data[:4])) && [4]byte(data[:4]) != sketchMagic {
 			if s.NeedsRebuild() {
-				t.Fatal("a compressed blob loaded as legacy buckets")
+				t.Fatal("a tagged blob loaded as legacy buckets")
 			}
 			// loaded, or left alone
 			if _, _, _, block, _, ok := s2Shape(data); ok {

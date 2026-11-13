@@ -82,6 +82,13 @@ var sketchMagic = [4]byte{'S', 'K', '0', '2'}
 // sketchMagicS2 tags the compressed on-disk format (MarshalCompressed).
 var sketchMagicS2 = [4]byte{'S', 'K', '0', '3'}
 
+// sketchTagged reports whether tag has the form of a sketch tag: the letters
+// SK and two digits. One this release does not know is an encoding of a later
+// release.
+func sketchTagged(tag [4]byte) bool {
+	return tag[0] == 'S' && tag[1] == 'K' && tag[2] >= '0' && tag[2] <= '9' && tag[3] >= '0' && tag[3] <= '9'
+}
+
 // sketchHeaderLen is the V2 header size: magic(4) + levels(4) + size(4). The
 // compressed format has one more byte per level after it.
 const sketchHeaderLen = 12
@@ -421,7 +428,8 @@ func putSketchScratch(p *[]byte) {
 // magic) is loaded into the full-key level with the shallow levels left empty
 // and flagged for rebuild. The magic alone decides which: a tagged blob that
 // does not parse, down to a cut-off header, leaves the sketch as it was and is
-// never read as legacy buckets.
+// never read as legacy buckets. Nor is a blob under a tag of a later release:
+// it gives this one no statistics, not wrong ones.
 //
 // Atomic stores into Buckets/levelTotals/docCount let concurrent readers see
 // consistent values without locking. Reshaping (reallocating the backing slices
@@ -437,6 +445,9 @@ func (s *IndexSketch) UnmarshalBinary(data []byte) {
 			return
 		case sketchMagicS2:
 			s.unmarshalS2(data)
+			return
+		}
+		if sketchTagged([4]byte(data[:4])) {
 			return
 		}
 	}
