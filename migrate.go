@@ -90,10 +90,10 @@ type CopyReport struct {
 //
 // Nothing is replaced. If dstPath, dstPath+"-wal", dstPath+"-wal-shm" or
 // dstPath+".lock" exists, the call returns ErrDestinationExists and touches
-// nothing. The copy is built under a private name beside dstPath, verified
-// (each collection's options, document count and index definitions against
-// the source's snapshot, then IntegrityCheck), checkpointed and closed, and
-// then published at dstPath by a hard link, which fails with
+// nothing. The copy is built under a private name beside dstPath,
+// checkpointed, verified (each collection's options, document count and
+// index definitions against the source's snapshot, then IntegrityCheck) and
+// closed, and then published at dstPath by a hard link, which fails with
 // ErrDestinationExists if a file appeared there meanwhile: of two calls
 // copying to one dstPath, one publishes. A link that fails otherwise, as on
 // a filesystem without hard links (FAT, exFAT), fails the call with
