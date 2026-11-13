@@ -1066,6 +1066,27 @@ func TestCopyToLatestFormat_PublicationOrder(t *testing.T) {
 	assert.Equal(t, []string{"copy.db"}, dirNames(t, dstDir))
 }
 
+// A failure after the link comes back saying the copy is published: the
+// complete copy stays at the destination, and the staging name goes.
+func TestCopyToLatestFormat_FailureAfterPublication(t *testing.T) {
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1}`)
+	errSync := errors.New("cannot sync")
+	prevSync := dirSync
+	dirSync = func(string) error { return errSync }
+	defer func() { dirSync = prevSync }()
+
+	dstDir := t.TempDir()
+	dstPath := filepath.Join(dstDir, "copy.db")
+	_, err = CopyToLatestFormat(ctx, src, dstPath, nil)
+	require.ErrorIs(t, err, errSync)
+	assert.Contains(t, err.Error(), "the copy is published at "+dstPath)
+	assert.Equal(t, []string{"copy.db"}, dirNames(t, dstDir))
+	assertSameDatabase(t, src, openCopy(t, dstPath, nil))
+}
+
 // syncDir runs on Unix, where it fsyncs the directory, and does nothing
 // elsewhere; a directory that does not open is no error, as in SQLite.
 func TestSyncDir(t *testing.T) {

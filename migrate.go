@@ -106,11 +106,20 @@ type CopyReport struct {
 // replace a file published meanwhile. The copy is never returned open; it
 // has no -wal or -wal-shm beside it.
 //
-// On a failure before publication the call closes the copy and removes the
-// files it created; a removal that fails is joined to the error, with the
-// file's name. A file at dstPath after a call that returned an error, or
-// that did not return, is never a valid copy, even if it opens and passes
-// IntegrityCheck: remove it and copy again. On an error the report is zero.
+// dstPath is created only by the publication, as a complete, verified,
+// closed copy. On a failure before it the call closes the copy and removes
+// its files, all under the staging name: dstPath+".tmp-" and 16 hex digits,
+// with the -wal, -wal-shm and .lock of that name. A removal that fails is
+// joined to the error, with the file's name. Those staging files are the
+// only ones a failed call owns, and the only ones a crash before the
+// publication leaves; remove them once no copy runs. After
+// ErrDestinationExists the files at and beside dstPath are not this call's:
+// they were there before, or another caller put them there, and the error
+// is no reason to remove them. A failure after the link (the directory
+// sync, the removal of the staging name) is returned with the copy
+// published at dstPath, and the error says so; a crash at that point leaves
+// the complete copy at dstPath, maybe with its staging name as a second
+// name of the same file. On an error the report is zero.
 //
 // The call never renames or removes a file of src.
 func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Config) (report CopyReport, err error) {
@@ -609,14 +618,16 @@ func publishStaging(stage, dstPath string) error {
 		}
 		return discardStaging(err, stage, nil)
 	}
+	// The copy is published: what fails from here on says so.
+	published := fmt.Sprintf("any-store: copy to latest format: the copy is published at %s, but", dstPath)
 	var errs []error
 	if err := dirSync(dstPath); err != nil {
-		errs = append(errs, fmt.Errorf("any-store: copy to latest format: syncing the directory of %s: %w", dstPath, err))
+		errs = append(errs, fmt.Errorf("%s syncing its directory failed: %w", published, err))
 	}
 	if err := osRemove(stage); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		errs = append(errs, fmt.Errorf("any-store: copy to latest format: left on disk: %s: %w", stage, err))
+		errs = append(errs, fmt.Errorf("%s its staging name is left on disk: %s: %w", published, stage, err))
 	} else if err := dirSync(stage); err != nil {
-		errs = append(errs, fmt.Errorf("any-store: copy to latest format: syncing the directory of %s: %w", filepath.Dir(stage), err))
+		errs = append(errs, fmt.Errorf("%s syncing the directory of %s failed: %w", published, filepath.Dir(stage), err))
 	}
 	return errors.Join(errs...)
 }
