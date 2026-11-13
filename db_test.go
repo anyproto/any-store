@@ -1614,7 +1614,7 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 
 		// Bytes that do not decode leave the published counters alone, every
 		// one of them: a row of the index's shape, and one whose header names
-		// another shape. Read as legacy buckets they would land in the counters.
+		// another shape.
 		counters := pub.Snapshot(nil)
 		for levels := 1; levels <= 2; levels++ {
 			row := enc.marshal(qplanner.NewIndexSketch(qplanner.DefaultSketchSize, levels))

@@ -67,27 +67,16 @@ type IndexSketch struct {
 	levelTotals []uint64
 	// docCount is the collection document count (see type doc).
 	docCount atomic.Uint64
-	// needsRebuild is set when a legacy single-level blob was loaded into a
-	// multi-level sketch: the deep (full-key) level is populated but the shallow
-	// levels are empty and must be re-accrued by a background rescan. Not
-	// serialized.
-	needsRebuild atomic.Bool
 }
 
-// sketchMagic tags the V2 multi-level on-disk format. Legacy V1 blobs (a single
-// flat bucket row, optionally followed by an 8-byte docCount) carry no magic and
-// are detected by its absence, then loaded into the full-key level.
+// sketchMagic tags the V2 multi-level on-disk format. Every stored sketch
+// carries a tag: bytes under none this release knows are not read. Builds
+// before v2.0.0-alpha.13 wrote a single untagged bucket row, which is such
+// bytes now.
 var sketchMagic = [4]byte{'S', 'K', '0', '2'}
 
 // sketchMagicS2 tags the compressed on-disk format (MarshalCompressed).
 var sketchMagicS2 = [4]byte{'S', 'K', '0', '3'}
-
-// sketchTagged reports whether tag has the form of a sketch tag: the letters
-// SK and two digits. One this release does not know is an encoding of a later
-// release.
-func sketchTagged(tag [4]byte) bool {
-	return tag[0] == 'S' && tag[1] == 'K' && tag[2] >= '0' && tag[2] <= '9' && tag[3] >= '0' && tag[3] <= '9'
-}
 
 // sketchHeaderLen is the V2 header size: magic(4) + levels(4) + size(4). The
 // compressed format has one more byte per level after it.
@@ -118,14 +107,6 @@ func NewIndexSketch(size, levels int) *IndexSketch {
 
 // NumLevels returns the number of prefix levels.
 func (s *IndexSketch) NumLevels() int { return s.Levels }
-
-// NeedsRebuild reports whether shallow levels were left empty by a legacy load
-// and should be re-accrued by a full rescan.
-func (s *IndexSketch) NeedsRebuild() bool { return s.needsRebuild.Load() }
-
-// MarkRebuilt clears the rebuild flag after a rescan has repopulated the
-// shallow levels.
-func (s *IndexSketch) MarkRebuilt() { s.needsRebuild.Store(false) }
 
 func (s *IndexSketch) validLevel(level int) bool {
 	return level >= 0 && level < s.Levels
@@ -423,18 +404,15 @@ func putSketchScratch(p *[]byte) {
 	sketchScratch.Put(p)
 }
 
-// UnmarshalBinary deserializes the sketch. A V2 or compressed blob
-// (magic-tagged) is loaded directly, adopting its shape; a legacy V1 blob (no
-// magic) is loaded into the full-key level with the shallow levels left empty
-// and flagged for rebuild. The magic alone decides which: a tagged blob that
-// does not parse, down to a cut-off header, leaves the sketch as it was and is
-// never read as legacy buckets. Nor is a blob under a tag of a later release:
-// it gives this one no statistics, not wrong ones. The result reports whether
-// data was loaded.
+// UnmarshalBinary deserializes the sketch from a V2 or compressed blob,
+// adopting its shape, and reports whether it did. Any other bytes leave the
+// sketch as it was: a tagged blob that does not parse, down to a cut-off
+// header, and bytes under no tag this release knows, which give it no
+// statistics, not wrong ones.
 //
 // Atomic stores into Buckets/levelTotals/docCount let concurrent readers see
 // consistent values without locking. Reshaping (reallocating the backing slices
-// to match a tagged blob's declared shape) only happens for a not-yet-published
+// to match a blob's declared shape) only happens for a not-yet-published
 // sketch — construction or InspectIndexSketch. A live, published sketch always
 // carries the index's fixed (Size, Levels), so the reshape branch never
 // reallocates a slice a concurrent reader might hold.
@@ -446,12 +424,8 @@ func (s *IndexSketch) UnmarshalBinary(data []byte) bool {
 		case sketchMagicS2:
 			return s.unmarshalS2(data)
 		}
-		if sketchTagged([4]byte(data[:4])) {
-			return false
-		}
 	}
-	s.unmarshalLegacy(data)
-	return true
+	return false
 }
 
 // v2Shape parses a V2 blob's header into its levels and size. ok is false
@@ -504,9 +478,9 @@ func s2Shape(data []byte) (levels, size int, planes, block []byte, bodyLen int, 
 
 // SameShape reports whether UnmarshalBinary would load data without
 // reshaping the sketch: a V2 or compressed blob of its size and levels, or
-// bytes that load into the existing shape or leave it alone (legacy, corrupt,
-// truncated). A published sketch may be reloaded in place only when this
-// holds, since a reshape replaces slices a concurrent reader holds.
+// bytes that leave it alone (untagged, corrupt, truncated). A published
+// sketch may be reloaded in place only when this holds, since a reshape
+// replaces slices a concurrent reader holds.
 func (s *IndexSketch) SameShape(data []byte) bool {
 	levels, size, ok := v2Shape(data)
 	if !ok {
@@ -537,7 +511,6 @@ func (s *IndexSketch) unmarshalV2(data []byte) bool {
 	}
 	off += 8 * levels
 	s.docCount.Store(binary.LittleEndian.Uint64(data[off:]))
-	s.needsRebuild.Store(false)
 	return true
 }
 
@@ -571,44 +544,7 @@ func (s *IndexSketch) unmarshalS2(data []byte) bool {
 	}
 	off += 8 * levels
 	s.docCount.Store(binary.LittleEndian.Uint64(body[off:]))
-	s.needsRebuild.Store(false)
 	return true
-}
-
-// unmarshalLegacy loads an old single-row blob (the combined-key sketch) into the
-// full-key level. The shallow prefix levels have no historical data, so they are
-// zeroed and the sketch is flagged for rebuild (unless Levels==1, where the
-// single level already IS the full key). Backward compatible with the even older
-// docCount-less format: when the trailing docCount is absent the existing
-// docCount is left untouched.
-func (s *IndexSketch) unmarshalLegacy(data []byte) {
-	nWords := len(data) / 8
-	hasDocCount := nWords > s.Size
-	nBuckets := min(nWords, s.Size)
-	full := s.Levels - 1
-	base := full * s.Size
-	var sum uint64
-	for i := 0; i < nBuckets; i++ {
-		v := binary.LittleEndian.Uint64(data[i*8:])
-		atomic.StoreUint64(&s.Buckets[base+i], v)
-		sum += v
-	}
-	for i := nBuckets; i < s.Size; i++ {
-		atomic.StoreUint64(&s.Buckets[base+i], 0)
-	}
-	// Zero shallow levels — no historical data exists for them.
-	for l := 0; l < full; l++ {
-		b := l * s.Size
-		for i := 0; i < s.Size; i++ {
-			atomic.StoreUint64(&s.Buckets[b+i], 0)
-		}
-		atomic.StoreUint64(&s.levelTotals[l], 0)
-	}
-	atomic.StoreUint64(&s.levelTotals[full], sum)
-	if hasDocCount && len(data) >= 8*s.Size+8 {
-		s.docCount.Store(binary.LittleEndian.Uint64(data[8*s.Size:]))
-	}
-	s.needsRebuild.Store(s.Levels > 1)
 }
 
 // SketchDistribution summarizes the frequency distribution held in one level of
@@ -724,5 +660,4 @@ func (s *IndexSketch) Reset() {
 		atomic.StoreUint64(&s.levelTotals[i], 0)
 	}
 	s.docCount.Store(0)
-	s.needsRebuild.Store(false)
 }

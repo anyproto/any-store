@@ -283,8 +283,7 @@ func TestSketchRows_OtherEncodingReadThenRewritten(t *testing.T) {
 
 // A compressed row that does not decode is no statistics, not wrong ones: the
 // index opens with an empty sketch, queries answer from the data, and the next
-// commit saves a sound row. The index has two fields: read as legacy buckets,
-// its sketch would be flagged for a rebuild.
+// commit saves a sound row.
 func TestSketchRows_CorruptCompressedRow(t *testing.T) {
 	const block = 12 + 2 // header, then a planes byte per level
 	damage := map[string]func(row []byte) []byte{
@@ -331,7 +330,6 @@ func TestSketchRows_CorruptCompressedRow(t *testing.T) {
 			sk := coll.(*collection).loadIndexes()[0].loadPubSketch()
 			sameSketches(t, map[string][]uint64{"ab": make([]uint64, 2*qplanner.DefaultSketchSize+3)},
 				map[string][]uint64{"ab": sk.Snapshot(nil)}, "an empty sketch")
-			assert.False(t, sk.NeedsRebuild(), "not read as legacy buckets")
 			info, err := dbi.InspectIndexSketch(ctx, "docs", "ab")
 			require.NoError(t, err)
 			assert.Equal(t, uint64(0), info.DocCount)
@@ -346,6 +344,62 @@ func TestSketchRows_CorruptCompressedRow(t *testing.T) {
 			saved := sketchRow(t, dbi, "docs", "ab")
 			assert.Equal(t, "SK03", string(saved[:4]))
 			info, err = dbi.InspectIndexSketch(ctx, "docs", "ab")
+			require.NoError(t, err)
+			assert.Equal(t, uint64(1), info.DocCount)
+		})
+	}
+}
+
+// An untagged row, the layout builds before v2.0.0-alpha.13 wrote (buckets,
+// then the document count), is not read: the index opens with an empty sketch
+// and the next commit saves a row in the file's own encoding.
+func TestSketchRows_UntaggedRowIsLeftUnread(t *testing.T) {
+	for _, legacy := range []bool{true, false} {
+		t.Run(fmt.Sprintf("legacy=%v", legacy), func(t *testing.T) {
+			// given
+			createFormat(t, legacy)
+			path := filepath.Join(t.TempDir(), "s.db")
+			db1, err := Open(ctx, path, nil)
+			require.NoError(t, err)
+			coll, err := db1.CreateCollection(ctx, "docs")
+			require.NoError(t, err)
+			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+			for i := 0; i < 20; i++ {
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%4))))
+			}
+			oldRow := make([]byte, 8*qplanner.DefaultSketchSize+8)
+			for i := 0; i < qplanner.DefaultSketchSize; i++ {
+				binary.LittleEndian.PutUint64(oldRow[i*8:], uint64(i%3))
+			}
+			binary.LittleEndian.PutUint64(oldRow[8*qplanner.DefaultSketchSize:], 20)
+			rawPut(t, db1.(*db), sketchKey("docs", "a"), oldRow)
+			require.NoError(t, db1.Close())
+
+			// when
+			db2, err := Open(ctx, path, nil)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, db2.Close()) }()
+			dbi := db2.(*db)
+			coll, err = db2.Collection(ctx, "docs")
+			require.NoError(t, err)
+
+			// then: no statistics from it, and the row is not touched by the load
+			sameSketches(t, map[string][]uint64{"a": make([]uint64, qplanner.DefaultSketchSize+2)}, sketchCounters(coll), "an empty sketch")
+			assert.True(t, bytes.Equal(oldRow, sketchRow(t, dbi, "docs", "a")), "a load rewrites nothing")
+			count, err := coll.Find(`{"a":1}`).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 5, count)
+
+			// when
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":100,"a":1}`)))
+
+			// then
+			tag := "SK03"
+			if legacy {
+				tag = "SK02"
+			}
+			assert.Equal(t, tag, string(sketchRow(t, dbi, "docs", "a")[:4]))
+			info, err := dbi.InspectIndexSketch(ctx, "docs", "a")
 			require.NoError(t, err)
 			assert.Equal(t, uint64(1), info.DocCount)
 		})

@@ -105,7 +105,6 @@ func TestIndexSketch_MarshalUnmarshal(t *testing.T) {
 	assert.Equal(t, uint64(2), s2.EntryCount(1))
 	assert.Equal(t, uint64(1), s2.EntryCount(2))
 	assert.Equal(t, uint64(2), s2.GetDocCount())
-	assert.False(t, s2.NeedsRebuild())
 
 	// Round-trip into a differently-shaped sketch: UnmarshalBinary adopts the
 	// blob's shape (the inspect path).
@@ -116,80 +115,38 @@ func TestIndexSketch_MarshalUnmarshal(t *testing.T) {
 	assert.Equal(t, s.Estimate(1, []byte("ab")), s3.Estimate(1, []byte("ab")))
 }
 
-// TestIndexSketch_LegacyMigration covers loading an old single-row (V1) blob into
-// a multi-level sketch: it lands in the full-key level, shallow levels stay empty,
-// and the sketch is flagged for rebuild.
-func TestIndexSketch_LegacyMigration(t *testing.T) {
-	// Build a genuine V1 blob: [Size*8 buckets][docCount 8], no magic.
-	const size = DefaultSketchSize
-	legacy := make([]byte, size*8+8)
-	// Pick a value, write its count into the V1 bucket it would hash to.
-	v1 := NewIndexSketch(size, 1)
-	v1.Increment(0, []byte("full-key"))
-	v1.Increment(0, []byte("full-key"))
-	v1Data := v1.MarshalBinary(nil) // V2 format
-	// Re-encode as legacy V1 (strip header + levelTotals): just buckets+docCount.
-	// Reconstruct from v1's level-0 buckets.
+// Bytes under no tag this release knows are not a sketch to it: the counters
+// stay as they were. That holds for the untagged bucket row builds before
+// v2.0.0-alpha.13 wrote, with or without its trailing document count, for a
+// tag of some later encoding, and for anything else.
+func TestIndexSketch_UnmarshalUntagged(t *testing.T) {
+	const size = 8
+	oldRow := make([]byte, size*8+8) // buckets, then the document count
 	for i := 0; i < size; i++ {
-		off := i * 8
-		// little-endian copy of bucket i
-		b := v1.Buckets[i]
-		legacy[off+0] = byte(b)
-		legacy[off+1] = byte(b >> 8)
-		legacy[off+2] = byte(b >> 16)
-		legacy[off+3] = byte(b >> 24)
-		legacy[off+4] = byte(b >> 32)
-		legacy[off+5] = byte(b >> 40)
-		legacy[off+6] = byte(b >> 48)
-		legacy[off+7] = byte(b >> 56)
+		binary.LittleEndian.PutUint64(oldRow[i*8:], uint64(i+1))
 	}
-	// docCount = 7 in the trailing 8 bytes.
-	legacy[size*8] = 7
-	_ = v1Data
+	binary.LittleEndian.PutUint64(oldRow[size*8:], 7)
 
-	// Load into a 3-level sketch.
-	s := NewIndexSketch(size, 3)
-	s.UnmarshalBinary(legacy)
-
-	full := s.NumLevels() - 1
-	assert.Equal(t, uint64(2), s.Estimate(full, []byte("full-key")),
-		"legacy combined-key data must load into the full-key level")
-	assert.Equal(t, uint64(0), s.Estimate(0, []byte("full-key")),
-		"shallow levels have no historical data")
-	assert.Equal(t, uint64(7), s.GetDocCount())
-	assert.Equal(t, uint64(2), s.EntryCount(full),
-		"full-key level total = sum of loaded buckets")
-	assert.True(t, s.NeedsRebuild(), "compound sketch with empty shallow levels needs rebuild")
-
-	// A single-level sketch loading legacy is complete (level 0 == full key).
-	s1 := NewIndexSketch(size, 1)
-	s1.UnmarshalBinary(legacy)
-	assert.Equal(t, uint64(2), s1.Estimate(0, []byte("full-key")))
-	assert.False(t, s1.NeedsRebuild())
-}
-
-// TestIndexSketch_LegacyMigration_NoDocCount covers the even-older docCount-less
-// format: a missing trailing docCount must leave the pre-existing value untouched.
-func TestIndexSketch_LegacyMigration_NoDocCount(t *testing.T) {
-	const size = 4
-	v1 := NewIndexSketch(size, 1)
-	v1.Increment(0, []byte("k"))
-	// Legacy buckets only (no docCount): size*8 bytes.
-	legacy := make([]byte, size*8)
-	for i := 0; i < size; i++ {
-		b := v1.Buckets[i]
-		for j := 0; j < 8; j++ {
-			legacy[i*8+j] = byte(b >> (8 * j))
+	for name, data := range map[string][]byte{
+		"old row":                    oldRow,
+		"old row, no document count": oldRow[:size*8],
+		"empty":                      nil,
+		"three bytes":                []byte("SK0"),
+		"a later tag":                append([]byte("SK04"), oldRow...),
+		"a later tag alone":          []byte("SK99"),
+		"lower case":                 append([]byte("sk02"), oldRow...),
+		"zeros":                      make([]byte, 64),
+	} {
+		for _, s := range []*IndexSketch{
+			sketchWith(size, []uint64{5, 5}),                 // one level, the old row's shape
+			sketchWith(size, []uint64{5, 5}, []uint64{0, 9}), // a compound index
+		} {
+			want := s.Snapshot(nil)
+			assert.True(t, s.SameShape(data), name)
+			assert.False(t, s.UnmarshalBinary(data), name)
+			sameCounters(t, want, s.Snapshot(nil), name)
 		}
 	}
-
-	s := NewIndexSketch(size, 2)
-	s.IncrementDocCount()
-	s.IncrementDocCount()
-	s.IncrementDocCount() // sentinel docCount = 3
-	s.UnmarshalBinary(legacy)
-	assert.Equal(t, uint64(3), s.GetDocCount(),
-		"data missing docCount must LEAVE the pre-existing value untouched")
 }
 
 // TestIndexSketch_Reset pins Reset — all buckets, level totals and docCount go to
@@ -272,8 +229,7 @@ func TestIndexSketch_Distribution(t *testing.T) {
 	})
 }
 
-// A tagged blob cut off inside its header or body leaves the sketch as it was:
-// the legacy path would zero the shallow level and flag a rebuild.
+// A tagged blob cut off inside its header or body leaves the sketch as it was.
 func TestIndexSketch_UnmarshalTruncatedV2(t *testing.T) {
 	s := NewIndexSketch(8, 2)
 	s.Increment(0, []byte("a"))
@@ -285,7 +241,6 @@ func TestIndexSketch_UnmarshalTruncatedV2(t *testing.T) {
 	for n := len(sketchMagic); n < len(blob); n++ {
 		assert.False(t, s.UnmarshalBinary(blob[:n]), "prefix of %d bytes", n)
 		assert.Equal(t, want, s.Snapshot(nil), "prefix of %d bytes", n)
-		assert.False(t, s.NeedsRebuild(), "prefix of %d bytes", n)
 	}
 }
 
@@ -322,7 +277,7 @@ func TestIndexSketch_SameShape(t *testing.T) {
 	assert.False(t, s.SameShape(otherLevels))
 	assert.False(t, s.SameShape(otherSize))
 	// Bytes UnmarshalBinary loads into the existing shape or leaves alone.
-	assert.True(t, s.SameShape(make([]byte, 8*64)), "legacy")
+	assert.True(t, s.SameShape(make([]byte, 8*64)), "untagged")
 	assert.True(t, s.SameShape(nil))
 	assert.True(t, s.SameShape(otherSize[:len(otherSize)-1]), "truncated")
 	corrupt := append([]byte(nil), otherLevels...)
@@ -416,13 +371,11 @@ func TestIndexSketch_MarshalCompressed(t *testing.T) {
 			got := NewIndexSketch(tc.s.Size, tc.s.Levels)
 			got.Buckets[0], got.levelTotals[0] = 99, 99 // overwritten by the load
 			got.docCount.Store(99)
-			got.needsRebuild.Store(true)
 			buckets := &got.Buckets[0]
 			require.True(t, got.SameShape(blob))
 			require.True(t, got.UnmarshalBinary(blob))
 			sameCounters(t, tc.s.Snapshot(nil), got.Snapshot(nil))
 			assert.Same(t, buckets, &got.Buckets[0], "loaded in place")
-			assert.False(t, got.NeedsRebuild())
 
 			// into a sketch of another shape, which adopts the blob's
 			other := NewIndexSketch(tc.s.Size+1, tc.s.Levels+1)
@@ -518,9 +471,8 @@ func TestIndexSketch_UnmarshalCompressedHeaderChecks(t *testing.T) {
 	}
 }
 
-// A compressed blob that does not parse leaves the sketch as it was: its
-// counters stay, and it is never read as legacy buckets, which would zero the
-// shallow level and flag a rebuild.
+// A compressed blob that does not parse leaves the sketch as it was: every
+// counter stays.
 func TestIndexSketch_UnmarshalCorruptCompressed(t *testing.T) {
 	src := sketchWith(8, []uint64{300, 0, 7}, []uint64{1, 2, 3, 70000})
 	blob := src.MarshalCompressed(nil)
@@ -532,7 +484,6 @@ func TestIndexSketch_UnmarshalCorruptCompressed(t *testing.T) {
 		t.Helper()
 		assert.False(t, s.UnmarshalBinary(data), name)
 		assert.Equal(t, want, s.Snapshot(nil), name)
-		assert.False(t, s.NeedsRebuild(), name)
 	}
 	mutate := func(f func(b []byte)) []byte {
 		b := append([]byte(nil), blob...)
@@ -576,32 +527,6 @@ func TestIndexSketch_UnmarshalCorruptCompressed(t *testing.T) {
 	assert.Equal(t, DefaultSketchSize, fresh.Size)
 	assert.Equal(t, 1, fresh.NumLevels())
 	assert.Equal(t, uint64(0), fresh.GetDocCount())
-}
-
-// A blob under a sketch tag this release does not know is left unread: a later
-// release's encoding must not be taken for legacy buckets, which would zero the
-// shallow level, flag a rebuild and be saved back.
-func TestIndexSketch_UnmarshalUnknownTag(t *testing.T) {
-	s := sketchWith(8, []uint64{5, 5}, []uint64{0, 0, 9})
-	want := s.Snapshot(nil)
-	body := make([]byte, 8*8+8)
-	for i := range body {
-		body[i] = byte(i + 1)
-	}
-	for _, tag := range []string{"SK04", "SK10", "SK99", "SK00", "SK01"} {
-		for _, blob := range [][]byte{[]byte(tag), append([]byte(tag), body...)} {
-			assert.True(t, s.SameShape(blob), tag)
-			assert.False(t, s.UnmarshalBinary(blob), tag)
-			assert.Equal(t, want, s.Snapshot(nil), tag)
-			assert.False(t, s.NeedsRebuild(), tag)
-		}
-	}
-	// Bytes that are not a tag are legacy buckets, as before.
-	for _, tag := range []string{"SKxx", "SK0", "sk04", "XK04"} {
-		legacy := sketchWith(8, []uint64{5, 5}, []uint64{0, 0, 9})
-		assert.True(t, legacy.UnmarshalBinary(append([]byte(tag), body...)), tag)
-		assert.True(t, legacy.NeedsRebuild(), tag)
-	}
 }
 
 // packLevel starts from the width the counters had when they were scanned. A
@@ -718,13 +643,13 @@ func FuzzIndexSketch_UnmarshalBinary(f *testing.F) {
 		before := s.Snapshot(nil)
 		same := s.SameShape(data)
 		loaded := s.UnmarshalBinary(data)
-		tagged := len(data) >= 4 && sketchTagged([4]byte(data[:4]))
+		known := len(data) >= 4 && ([4]byte(data[:4]) == sketchMagic || [4]byte(data[:4]) == sketchMagicS2)
 
 		// Whatever the bytes, what is left is a sketch that works.
 		if s.Size < 1 || s.Levels < 1 || len(s.Buckets) != s.Size*s.Levels || len(s.levelTotals) != s.Levels {
 			t.Fatalf("shape %dx%d with %d buckets, %d totals", s.Levels, s.Size, len(s.Buckets), len(s.levelTotals))
 		}
-		if tagged && [4]byte(data[:4]) == sketchMagicS2 && s.Size*s.Levels > maxCompressedBuckets {
+		if known && [4]byte(data[:4]) == sketchMagicS2 && s.Size*s.Levels > maxCompressedBuckets {
 			t.Fatalf("a compressed blob gave %d buckets", s.Size*s.Levels)
 		}
 		if (same || !loaded) && (s.Size != 8 || s.Levels != 2) {
@@ -733,11 +658,8 @@ func FuzzIndexSketch_UnmarshalBinary(f *testing.F) {
 		if !loaded && !slices.Equal(before, s.Snapshot(nil)) {
 			t.Fatal("bytes that were not loaded changed the sketch")
 		}
-		if tagged && s.NeedsRebuild() {
-			t.Fatal("a tagged blob loaded as legacy buckets")
-		}
-		if !tagged && !loaded {
-			t.Fatal("untagged bytes are legacy buckets and always load")
+		if loaded && !known {
+			t.Fatal("bytes under no known tag were loaded")
 		}
 		for l := 0; l < s.Levels; l++ {
 			s.Estimate(l, key)
