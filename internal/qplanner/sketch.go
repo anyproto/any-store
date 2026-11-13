@@ -518,7 +518,7 @@ func (s *IndexSketch) unmarshalV2(data []byte) {
 	}
 	off := sketchHeaderLen
 	for i := 0; i < nb; i++ {
-		atomic.StoreUint64(&s.Buckets[i], binary.LittleEndian.Uint64(data[off+i*8:]))
+		setCounter(&s.Buckets[i], binary.LittleEndian.Uint64(data[off+i*8:]))
 	}
 	off += 8 * nb
 	for l := 0; l < levels; l++ {
@@ -693,7 +693,7 @@ func (s *IndexSketch) Restore(src []uint64) bool {
 		return false
 	}
 	for i := range s.Buckets {
-		atomic.StoreUint64(&s.Buckets[i], src[i])
+		setCounter(&s.Buckets[i], src[i])
 	}
 	for l := range s.levelTotals {
 		atomic.StoreUint64(&s.levelTotals[l], src[nb+l])
