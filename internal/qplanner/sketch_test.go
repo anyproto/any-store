@@ -281,7 +281,7 @@ func TestIndexSketch_UnmarshalTruncatedV2(t *testing.T) {
 	blob := s.MarshalBinary(nil)
 
 	for n := len(sketchMagic); n < len(blob); n++ {
-		s.UnmarshalBinary(blob[:n])
+		assert.False(t, s.UnmarshalBinary(blob[:n]), "prefix of %d bytes", n)
 		assert.Equal(t, want, s.Snapshot(nil), "prefix of %d bytes", n)
 		assert.False(t, s.NeedsRebuild(), "prefix of %d bytes", n)
 	}
@@ -306,7 +306,7 @@ func TestIndexSketch_UnmarshalV2HugeShape(t *testing.T) {
 		blob = binary.LittleEndian.AppendUint32(blob, shape[0])
 		blob = binary.LittleEndian.AppendUint32(blob, shape[1])
 		assert.True(t, s.SameShape(blob), "%v", shape)
-		s.UnmarshalBinary(blob)
+		assert.False(t, s.UnmarshalBinary(blob), "%v", shape)
 		assert.Equal(t, want, s.Snapshot(nil), "%v", shape)
 	}
 }
@@ -387,7 +387,7 @@ func TestIndexSketch_MarshalCompressed(t *testing.T) {
 			got.needsRebuild.Store(true)
 			buckets := &got.Buckets[0]
 			require.True(t, got.SameShape(blob))
-			got.UnmarshalBinary(blob)
+			require.True(t, got.UnmarshalBinary(blob))
 			assert.Equal(t, tc.s.Snapshot(nil), got.Snapshot(nil))
 			assert.Same(t, buckets, &got.Buckets[0], "loaded in place")
 			assert.False(t, got.NeedsRebuild())
@@ -461,7 +461,7 @@ func TestIndexSketch_UnmarshalCorruptCompressed(t *testing.T) {
 	want := s.Snapshot(nil)
 	check := func(name string, data []byte) {
 		t.Helper()
-		s.UnmarshalBinary(data)
+		assert.False(t, s.UnmarshalBinary(data), name)
 		assert.Equal(t, want, s.Snapshot(nil), name)
 		assert.False(t, s.NeedsRebuild(), name)
 	}
@@ -522,7 +522,7 @@ func TestIndexSketch_UnmarshalUnknownTag(t *testing.T) {
 	for _, tag := range []string{"SK04", "SK10", "SK99", "SK00", "SK01"} {
 		for _, blob := range [][]byte{[]byte(tag), append([]byte(tag), body...)} {
 			assert.True(t, s.SameShape(blob), tag)
-			s.UnmarshalBinary(blob)
+			assert.False(t, s.UnmarshalBinary(blob), tag)
 			assert.Equal(t, want, s.Snapshot(nil), tag)
 			assert.False(t, s.NeedsRebuild(), tag)
 		}
@@ -530,7 +530,7 @@ func TestIndexSketch_UnmarshalUnknownTag(t *testing.T) {
 	// Bytes that are not a tag are legacy buckets, as before.
 	for _, tag := range []string{"SKxx", "SK0", "sk04", "XK04"} {
 		legacy := sketchWith(8, []uint64{5, 5}, []uint64{0, 0, 9})
-		legacy.UnmarshalBinary(append([]byte(tag), body...))
+		assert.True(t, legacy.UnmarshalBinary(append([]byte(tag), body...)), tag)
 		assert.True(t, legacy.NeedsRebuild(), tag)
 	}
 }

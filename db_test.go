@@ -11,6 +11,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1578,7 +1579,7 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 	// The bytes on disk change under a peer, in either stored encoding: the
 	// reload decodes them into the same reader-owned object, and the live
 	// sketch keeps its count.
-	docs := uint64(40)
+	docs, liveDocs := uint64(40), uint64(2)
 	for _, enc := range []struct {
 		name    string
 		marshal func(*qplanner.IndexSketch) []byte
@@ -1590,6 +1591,9 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 			docs++
 			onDisk := qplanner.NewIndexSketch(qplanner.DefaultSketchSize, levels)
 			for i := uint64(0); i < docs; i++ {
+				for l := 0; l < levels; l++ {
+					onDisk.Increment(l, []byte{byte(i), byte(l)})
+				}
 				onDisk.IncrementDocCount()
 			}
 			row := enc.marshal(onDisk)
@@ -1606,15 +1610,20 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 		peerWrites(1)
 		assert.Same(t, pub, idx.loadPubSketch(), "%s: the reader-owned sketch is reused", enc.name)
 		assert.Equal(t, docs, pub.GetDocCount(), enc.name)
-		assert.Equal(t, uint64(2), live.GetDocCount(), enc.name)
+		assert.Equal(t, liveDocs, live.GetDocCount(), enc.name)
 
-		// Bytes that do not decode leave the published counters alone.
-		row := peerWrites(1)
-		rawPut(t, dbi, sketchKey("c", idx.info.Name), row[:len(row)-1])
-		rewindLocalCounters()
-		stalePass()
-		assert.Same(t, pub, idx.loadPubSketch(), enc.name)
-		assert.Equal(t, docs, pub.GetDocCount(), "%s: a truncated row", enc.name)
+		// Bytes that do not decode leave the published counters alone, every
+		// one of them: a row of the index's shape, and one whose header names
+		// another shape. Read as legacy buckets they would land in the counters.
+		counters := pub.Snapshot(nil)
+		for levels := 1; levels <= 2; levels++ {
+			row := enc.marshal(qplanner.NewIndexSketch(qplanner.DefaultSketchSize, levels))
+			rawPut(t, dbi, sketchKey("c", idx.info.Name), row[:len(row)-1])
+			rewindLocalCounters()
+			stalePass()
+			assert.Same(t, pub, idx.loadPubSketch(), "%s: a truncated row of %d levels", enc.name, levels)
+			assert.True(t, slices.Equal(counters, pub.Snapshot(nil)), "%s: a truncated row of %d levels changed the counters", enc.name, levels)
+		}
 
 		// Bytes of another shape never reshape the published object: they are
 		// decoded into a fresh one.
@@ -1624,6 +1633,22 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 		assert.Equal(t, 2, idx.loadPubSketch().Levels, enc.name)
 		assert.Equal(t, docs, idx.loadPubSketch().GetDocCount(), enc.name)
 		assert.Same(t, live, idx.sketch, enc.name)
+
+		// After a commit of this process the published sketch is the live
+		// one, and a reload decodes into a fresh object. A row that does not
+		// decode must not publish that object, empty, over the live counts.
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"own-%s","a":7}`, enc.name))))
+		liveDocs++
+		require.Same(t, live, idx.loadPubSketch(), enc.name)
+		settled, err := dbi.btreeDB.BeginRead()
+		require.NoError(t, err)
+		e0 = epochOf(settled)
+		require.NoError(t, settled.Rollback())
+		row := enc.marshal(qplanner.NewIndexSketch(qplanner.DefaultSketchSize, 1))
+		rawPut(t, dbi, sketchKey("c", idx.info.Name), row[:len(row)-1])
+		rewindLocalCounters()
+		stalePass()
+		assert.Same(t, live, idx.loadPubSketch(), "%s: a truncated row while the live sketch is published", enc.name)
 	}
 }
 

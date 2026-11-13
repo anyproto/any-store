@@ -1758,13 +1758,18 @@ func (c *collection) reloadSketch(tx *btree.ReadTx, collName string, idx *index,
 	// republishes live concurrently (settleSketches takes no c.mu) is
 	// overtaken by this snapshot's bytes, as a fresh object would be. Bytes
 	// of another shape (a snapshot older than this handle's definition) go
-	// into a fresh object: a published one is never reshaped.
+	// into a fresh object: a published one is never reshaped. Bytes that do
+	// not decode publish nothing: the fresh object would be an empty sketch
+	// in place of the counts readers have.
 	pub := idx.loadPubSketch()
+	into := pub
 	if pub == nil || pub == idx.sketch || !pub.SameShape(data) {
-		pub = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
+		into = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
 	}
-	pub.UnmarshalBinary(data)
-	idx.storePubSketch(pub)
+	if !into.UnmarshalBinary(data) && pub != nil {
+		return
+	}
+	idx.storePubSketch(into)
 }
 
 // indexInfoEqual reports whether two IndexInfo values describe the same index

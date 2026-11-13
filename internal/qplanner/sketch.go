@@ -429,7 +429,8 @@ func putSketchScratch(p *[]byte) {
 // and flagged for rebuild. The magic alone decides which: a tagged blob that
 // does not parse, down to a cut-off header, leaves the sketch as it was and is
 // never read as legacy buckets. Nor is a blob under a tag of a later release:
-// it gives this one no statistics, not wrong ones.
+// it gives this one no statistics, not wrong ones. The result reports whether
+// data was loaded.
 //
 // Atomic stores into Buckets/levelTotals/docCount let concurrent readers see
 // consistent values without locking. Reshaping (reallocating the backing slices
@@ -437,21 +438,20 @@ func putSketchScratch(p *[]byte) {
 // sketch — construction or InspectIndexSketch. A live, published sketch always
 // carries the index's fixed (Size, Levels), so the reshape branch never
 // reallocates a slice a concurrent reader might hold.
-func (s *IndexSketch) UnmarshalBinary(data []byte) {
+func (s *IndexSketch) UnmarshalBinary(data []byte) bool {
 	if len(data) >= len(sketchMagic) {
 		switch [4]byte(data[:4]) {
 		case sketchMagic:
-			s.unmarshalV2(data)
-			return
+			return s.unmarshalV2(data)
 		case sketchMagicS2:
-			s.unmarshalS2(data)
-			return
+			return s.unmarshalS2(data)
 		}
 		if sketchTagged([4]byte(data[:4])) {
-			return
+			return false
 		}
 	}
 	s.unmarshalLegacy(data)
+	return true
 }
 
 // v2Shape parses a V2 blob's header into its levels and size. ok is false
@@ -515,10 +515,10 @@ func (s *IndexSketch) SameShape(data []byte) bool {
 	return !ok || (levels == s.Levels && size == s.Size)
 }
 
-func (s *IndexSketch) unmarshalV2(data []byte) {
+func (s *IndexSketch) unmarshalV2(data []byte) bool {
 	levels, size, ok := v2Shape(data)
 	if !ok {
-		return // corrupt header or truncated body: preserve current state
+		return false // corrupt header or truncated body: preserve current state
 	}
 	nb := size * levels
 	if size != s.Size || levels != s.Levels {
@@ -538,12 +538,13 @@ func (s *IndexSketch) unmarshalV2(data []byte) {
 	off += 8 * levels
 	s.docCount.Store(binary.LittleEndian.Uint64(data[off:]))
 	s.needsRebuild.Store(false)
+	return true
 }
 
-func (s *IndexSketch) unmarshalS2(data []byte) {
+func (s *IndexSketch) unmarshalS2(data []byte) bool {
 	levels, size, planes, block, bodyLen, ok := s2Shape(data)
 	if !ok {
-		return // corrupt header or block length: preserve current state
+		return false // corrupt header or block length: preserve current state
 	}
 	// Decoded in full before the first store: a block that fails partway
 	// leaves the counters alone.
@@ -551,7 +552,7 @@ func (s *IndexSketch) unmarshalS2(data []byte) {
 	defer putSketchScratch(scratch)
 	body, err := s2.Decode(*scratch, block)
 	if err != nil {
-		return // corrupt block: preserve current state
+		return false // corrupt block: preserve current state
 	}
 	if size != s.Size || levels != s.Levels {
 		s.Buckets = make([]uint64, size*levels)
@@ -571,6 +572,7 @@ func (s *IndexSketch) unmarshalS2(data []byte) {
 	off += 8 * levels
 	s.docCount.Store(binary.LittleEndian.Uint64(body[off:]))
 	s.needsRebuild.Store(false)
+	return true
 }
 
 // unmarshalLegacy loads an old single-row blob (the combined-key sketch) into the
