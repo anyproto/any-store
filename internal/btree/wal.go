@@ -573,9 +573,6 @@ type walIndex struct {
 	// Contains all 11 fields from the SQLite WalIndexHdr struct.
 	hdr WalIndexHdr
 
-	// iChange is incremented on each write transaction.
-	iChange uint32
-
 	// inProcess indicates heap-backed shm (no multi-process coordination needed).
 	inProcess bool
 
@@ -929,11 +926,24 @@ func (wi *walIndex) reset(readMarksLocked bool) {
 //
 // The dual-copy + barrier design allows readers to detect torn writes
 // by comparing both copies.
-// DRIFT: wal-index header iChange counter never incremented (always 0) See docs/btree/NOTES.md#drift-96-wal-index-change-counter-ichange-never-incremented
+//
+// The header's iChange is left as it is: callers that make a header of their
+// own go through wal.publishHeader, which sets it.
 func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32, frameCksum, salt [2]uint32) error {
-	region, err := wi.shm.region(0, true)
+	region, err := wi.prepareHeader(wi.hdr.iChange, maxFrame, maxPage, frameCksum, salt)
 	if err != nil {
 		return err
+	}
+	wi.storeHeader(region)
+	return nil
+}
+
+// prepareHeader is the first half of writeHeader: it maps region 0 and fills
+// wi.hdr, checksum included. Nothing is written to shared memory.
+func (wi *walIndex) prepareHeader(iChange, maxFrame, maxPage uint32, frameCksum, salt [2]uint32) ([]byte, error) {
+	region, err := wi.shm.region(0, true)
+	if err != nil {
+		return nil, err
 	}
 
 	// Populate the header struct.
@@ -942,13 +952,18 @@ func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32, frameCksum,
 	wi.hdr.iVersion = walVersion
 	wi.hdr.mxFrame = maxFrame
 	wi.hdr.nPage = maxPage
-	wi.hdr.iChange = wi.iChange
+	wi.hdr.iChange = iChange
 	wi.hdr.aFrameCksum = frameCksum
 	wi.hdr.aSalt = salt
 
 	// Compute the header checksum over bytes 0..39 (all fields except aCksum)
 	wi.hdr.computeCksum()
+	return region, nil
+}
 
+// storeHeader is the second half of writeHeader: it writes wi.hdr, as
+// prepareHeader left it, to both header copies in region.
+func (wi *walIndex) storeHeader(region []byte) {
 	// Serialize header to a buffer
 	var buf [walIndexHdrSize]byte
 	wi.hdr.serialize(buf[:])
@@ -980,10 +995,11 @@ func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32, frameCksum,
 	if !wi.inProcess {
 		walShmBarrier()
 	}
+	if testPublishHeaderHook != nil {
+		testPublishHeaderHook("between")
+	}
 
 	copy(region[0:walIndexHdrSize], buf[:])
-
-	return nil
 }
 
 // readHeader reads and validates the WAL index header from SHM region 0.
@@ -1543,6 +1559,11 @@ type wal struct {
 	// pWal->hdr with the writer.
 	writerHdr WalIndexHdr
 
+	// chg is the change state: the newest wal-index header this process
+	// produced or consumed, and the count of changes made elsewhere
+	// (walchange.go). Nil in the heap-shm modes and until open is done.
+	chg atomic.Pointer[walChange]
+
 	// logGen counts the times this process started the log over
 	// (restartHeaderStateLocked); genSeed1/2 are the checksums a frame chain
 	// starts from in the current generation. Together they are what
@@ -1609,6 +1630,15 @@ func newWal(path string, pageSize uint32) *wal {
 func (w *wal) open() (err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	defer func() {
+		// The change state starts at the header the open leaves. Whatever
+		// the open itself published (a recovery, a fresh header) is nobody's
+		// news: nothing of this process has seen an earlier state.
+		if err == nil && !w.inProcess && !w.inMemory {
+			hdr, _ := w.index.readHeader()
+			w.chg.Store(&walChange{hdr: hdr})
+		}
+	}()
 
 	if w.inMemory {
 		// InMemory mode: no WAL file, heap-backed everything
@@ -1903,7 +1933,7 @@ func (w *wal) adoptSHMState(hdr WalIndexHdr, walHasHeader bool) {
 func (w *wal) initHeaderStateLocked(readMarksLocked bool) {
 	// No log to continue: both salts are drawn, as SQLite draws them for the
 	// first frame of a WAL it has no checkpoint sequence for (wal.c:4087).
-	w.restartHeaderStateLocked(readMarksLocked, 0, rand.Uint32())
+	w.restartHeaderStateLocked(readMarksLocked, 0, rand.Uint32(), nil)
 }
 
 // restartHeaderStateLocked is initHeaderStateLocked with the database size
@@ -1931,7 +1961,14 @@ func (w *wal) initHeaderStateLocked(readMarksLocked bool) {
 // checkpoint 0 and seeds its frame chain from the published aFrameCksum
 // (beginWriteWithSnapshot).
 // DRIFT: WAL header checkpoint-seq nCkpt hardcoded 0, never incremented on restart See docs/btree/NOTES.md#drift-98-wal-checkpoint-sequence-number-nckpt-never-incremented
-func (w *wal) restartHeaderStateLocked(readMarksLocked bool, nPage uint32, salt1 uint32) {
+//
+// replaced is the live wal-index header the new one supersedes, read under
+// the write lock: a restart keeps its iChange, as walRestartHdr does
+// (wal.c:2150-2154), and it is what the change state is compared with
+// (wal.announce). Nil when there is none to continue (initHeaderStateLocked):
+// the header was invalid, and its rebuild is a recovery to this process's
+// readers (wal.c:2724-2725).
+func (w *wal) restartHeaderStateLocked(readMarksLocked bool, nPage uint32, salt1 uint32, replaced *WalIndexHdr) {
 	w.header = walHeader{
 		magic:      walMagic,
 		version:    walVersion,
@@ -1959,7 +1996,14 @@ func (w *wal) restartHeaderStateLocked(readMarksLocked bool, nPage uint32, salt1
 	}
 
 	// Update shm header with initial checksums and salts
-	_ = w.index.writeHeader(0, nPage, 0,
+	// By value: replaced may be the index's own copy, which the publication
+	// overwrites.
+	var prev WalIndexHdr
+	recovery := replaced == nil
+	if !recovery {
+		prev = *replaced
+	}
+	_ = w.publishHeader(&prev, recovery, prev.iChange, 0, nPage,
 		[2]uint32{w.cksum1, w.cksum2},
 		[2]uint32{w.header.salt1, w.header.salt2})
 }
@@ -2000,6 +2044,11 @@ func (w *wal) base(saved walPos) walPos {
 // testCheckpointRead0Hook, when non-nil, runs in a checkpoint once it holds
 // reader slot 0, before it compares the salts. Test-only.
 var testCheckpointRead0Hook func()
+
+// testWalRetryHook, when non-nil, runs in the WAL protocol's retry loop of a
+// read begin each time an attempt has to be made again, with the number of
+// attempts so far. Test-only.
+var testWalRetryHook func(cnt int)
 
 // testRestartLogHook, when non-nil, runs as a writer starts the log over,
 // with the step about to be taken: "restart" before the reset, "restarted"
@@ -2151,7 +2200,7 @@ func (w *wal) writeHeader() error {
 	w.index.reset(false)
 
 	// Update shm header
-	return w.index.writeHeader(0, 0, 0,
+	return w.publishHeader(&WalIndexHdr{}, true, 0, 0, 0,
 		[2]uint32{w.cksum1, w.cksum2},
 		[2]uint32{w.header.salt1, w.header.salt2})
 }
@@ -2361,7 +2410,10 @@ func (w *wal) recoverLocked() error {
 	// release barrier between the hash copy above and the new mxFrame. The
 	// SQLite order (wal.c:1566 → 1572-1574) is writeHdr, then aReadMark and
 	// nBackfillAttempted — matched here.
-	if err := w.index.writeHeader(lastCommitFrame, lastCommitDbSize, 0,
+	// iChange is 0 after a recovery (walIndexRecover's memset, wal.c:1408),
+	// and the rebuilt header is a change to every reader of this process
+	// whatever its bytes (*pChanged = 1, wal.c:2724-2725).
+	if err := w.publishHeader(&WalIndexHdr{}, true, 0, lastCommitFrame, lastCommitDbSize,
 		[2]uint32{w.cksum1, w.cksum2},
 		[2]uint32{w.header.salt1, w.header.salt2}); err != nil {
 		return err
@@ -2387,7 +2439,6 @@ func (w *wal) recoverLocked() error {
 // writeFrames appends frames to the WAL. If commit is true, the last frame
 // is marked as a commit frame with the given dbSize.
 // All frames are batched into a single write call for performance.
-// DRIFT: wal-index header iChange counter never incremented (always 0) See docs/btree/NOTES.md#drift-96-wal-index-change-counter-ichange-never-incremented
 // DRIFT: padToSectorBoundary commit-frame sector padding not ported See docs/btree/NOTES.md#drift-104-padtosectorboundary-sector-padding-of-commit-frames-not-port
 // DRIFT: journal_size_limit/mxWalSize WAL truncation unimplemented (truncateOnCommit/walLimitSize) See docs/btree/NOTES.md#drift-105-journal-size-limit-wal-truncation-feature-unimplemented
 // DRIFT: in-process mode skips SHM hdr write on commit; BeginRead/Write synthesize a minimal walHdr See docs/btree/NOTES.md#old-drift-inprocess-skips-shm-hdr-on-commit
@@ -2637,7 +2688,11 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 			if testRestartLogHook != nil {
 				testRestartLogHook("publish")
 			}
-			if err := w.index.writeHeader(mxCommit, nPage, w.index.nBackfill.Load(),
+			// The commit's header replaces the one this writer began from,
+			// or the restart header it published since (writerHdr), and
+			// counts one more transaction (pWal->hdr.iChange++, wal.c:4245).
+			replaced := w.writerHdr
+			if err := w.publishHeader(&replaced, false, replaced.iChange+1, mxCommit, nPage,
 				[2]uint32{w.cksum1, w.cksum2},
 				[2]uint32{w.header.salt1, w.header.salt2}); err != nil {
 				return err
@@ -3068,6 +3123,9 @@ func (w *wal) beginReadHdrRetry() (hdr WalIndexHdr, maxFrame, minFrame uint32, s
 		hdr, maxFrame, minFrame, slot, err = w.tryBeginReadHdr()
 		if !errors.Is(err, errWALRetry) {
 			return hdr, maxFrame, minFrame, slot, err
+		}
+		if testWalRetryHook != nil {
+			testWalRetryHook(cnt)
 		}
 		if cnt < 5 {
 			runtime.Gosched()
@@ -4422,10 +4480,18 @@ func (w *wal) doResetWAL(truncate bool) error {
 	// that log's; a process that has not written since a peer's reset has an
 	// older one in w.header.
 	salt1 := w.header.salt1
+	// The header being replaced. In the heap-shm modes it is the index's own
+	// copy; with shared memory it is the live one, which under the write
+	// lock is the last one published by anybody. A live header that does not
+	// validate cannot be continued: the reset is then a rebuild.
+	replaced := &w.index.hdr
 	if !w.inProcess && !w.inMemory {
 		if hdr, valid := w.index.readHeader(); valid {
 			nPage = hdr.nPage
 			salt1 = hdr.aSalt[0]
+			replaced = &hdr
+		} else {
+			replaced = nil
 		}
 	}
 
@@ -4446,7 +4512,7 @@ func (w *wal) doResetWAL(truncate bool) error {
 	//
 	// readMarksLocked: the caller holds reader slots 1-4 exclusive across
 	// this call (wal.c:2361 and wal.c:3876, before walRestartHdr).
-	w.restartHeaderStateLocked(true, nPage, salt1+1)
+	w.restartHeaderStateLocked(true, nPage, salt1+1, replaced)
 	if w.inMemory {
 		w.memFrames = w.memFrames[:0]
 		w.memArenaOff = 0

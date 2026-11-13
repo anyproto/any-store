@@ -343,6 +343,18 @@ type DB struct {
 	writerLocksDone atomic.Bool // CAS guard: writer lock cleanup (endRead+RUnlock+Unlock) runs exactly once
 	closeOnce       sync.Once   // guards closing closeCh
 
+	// writerRegistered says that the holder of the write lock is a write
+	// transaction whose teardown (releaseWriterLocks) is valid: it holds its
+	// reader slot, db.mu and the pager's write state. The lock is also held,
+	// without any of that, by a BeginWrite still on its way and by a
+	// Backup.Step. writerRegMu orders the registration against Close: a
+	// BeginWrite that finds the database closing there backs out, and a Close
+	// that finds no registered transaction waits for the holder instead of
+	// tearing down a transaction that is not one. (SQLite serializes close
+	// with everything else through the connection mutex, main.c:1263.)
+	writerRegMu      sync.Mutex
+	writerRegistered bool
+
 	// Namespace root pages are stored in a master table on page 1.
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
 	masterBT *btree
@@ -455,15 +467,38 @@ func (db *DB) releaseWriterLocks(pager *pager, slot int, pre, post func()) bool 
 	}
 	defer db.unlockWriter()
 	defer db.mu.RUnlock()
+	defer db.unregisterWriter()
 	if pre != nil {
 		pre()
 	}
+	// Whatever way the transaction ended, the backups do not go on with
+	// pages it sent them and did not commit, or without pages it committed
+	// and did not send (pager.backupOwed). Before the write lock goes: no
+	// Step runs until then.
+	pager.dischargeBackups()
 	pager.endRead(slot)
 	if post != nil {
 		post()
 	}
 	return true
 }
+
+// unregisterWriter ends the registration of the write transaction whose
+// locks releaseWriterLocks is releasing.
+func (db *DB) unregisterWriter() {
+	db.writerRegMu.Lock()
+	db.writerRegistered = false
+	db.writerRegMu.Unlock()
+}
+
+// Test hooks of the Close / BeginWrite handshake: testWriterRegisterHook runs
+// in BeginWrite once it holds everything a write transaction holds, before
+// it registers; testCloseWriterCheckedHook in Close once it found the write
+// lock held and looked for a registered transaction.
+var (
+	testWriterRegisterHook     func()
+	testCloseWriterCheckedHook func(registered bool)
+)
 
 // lockWriter takes the write lock: one writer at a time in this process (the
 // writer lock across processes is the WAL's, taken in pager.beginWrite). A
@@ -710,6 +745,9 @@ func Open(path string, opts Options) (*DB, error) {
 		writeSem:        make(chan struct{}, 1),
 		closeCh:         make(chan struct{}),
 	}
+	// No write transaction: its teardown has nothing to run on (Close).
+	db.writerLocksDone.Store(true)
+	p.testOwner = db
 
 	// A reader that pins a commit while it is still on its way out of
 	// pager.commit finds its counters remembered: the pager has them in its
@@ -755,22 +793,34 @@ func (db *DB) Close() error {
 	db.closeOnce.Do(func() { close(db.closeCh) })
 
 	if !db.tryLockWriter() {
-		// A writer holds the write lock. Force-rollback the abandoned/in-flight tx.
-		// writerOpMu serializes with commit/rollback so we don't interleave
-		// with a concurrent Commit or Rollback call.
-		// Use rollbackForClose which skips writerCache operations to avoid
-		// racing with the writer's B-tree ops (pcache has no mutex).
-		db.pager.writerOpMu.Lock()
-		if pagerState(db.pager.state.Load()) == pagerWriter {
-			db.pager.rollbackForClose()
+		// The write lock is held: by a write transaction, by a BeginWrite
+		// that has not got that far, or by a Backup.Step. Only a registered
+		// write transaction is rescued; the other two end by themselves (a
+		// BeginWrite sees closing when it comes to register).
+		db.writerRegMu.Lock()
+		registered := db.writerRegistered
+		db.writerRegMu.Unlock()
+		if testCloseWriterCheckedHook != nil {
+			testCloseWriterCheckedHook(registered)
 		}
-		db.pager.writerOpMu.Unlock()
+		if registered {
+			// Force-rollback the abandoned/in-flight tx.
+			// writerOpMu serializes with commit/rollback so we don't interleave
+			// with a concurrent Commit or Rollback call.
+			// Use rollbackForClose which skips writerCache operations to avoid
+			// racing with the writer's B-tree ops (pcache has no mutex).
+			db.pager.writerOpMu.Lock()
+			if pagerState(db.pager.state.Load()) == pagerWriter {
+				db.pager.rollbackForClose()
+			}
+			db.pager.writerOpMu.Unlock()
 
-		// Exactly-once writer lock cleanup (endRead + RUnlock + Unlock) via
-		// the shared teardown: a writer goroutine completing concurrently
-		// could race with Close, and the writerLocksDone CAS inside
-		// releaseWriterLocks prevents the double-release.
-		db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil)
+			// Exactly-once writer lock cleanup (endRead + RUnlock + Unlock) via
+			// the shared teardown: a writer goroutine completing concurrently
+			// could race with Close, and the writerLocksDone CAS inside
+			// releaseWriterLocks prevents the double-release.
+			db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil)
+		}
 		// A plain send, not lockWriter: closeCh is closed already, and this
 		// wait is for the holder to leave.
 		db.writeSem <- struct{}{}
@@ -1032,8 +1082,6 @@ func (db *DB) beginRead(ctx context.Context, readCounters, wait bool) (*ReadTx, 
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
 	tx.diskSchemaCookie = sc
-	tx.localFileChangeCounter = localFCC
-	tx.localSchemaCookie = localSC
 	tx.snapFileChangeCounter = snapFCC
 	tx.snapSchemaCookie = snapSC
 	return tx, nil
@@ -1182,13 +1230,27 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	// equals what this process last wrote, so the on-disk counters are
 	// unchanged and p.header still matches. SQLite likewise keeps the header
 	// in the in-memory page-1 PgHdr and does not re-read it from the WAL per
-	// statement. The staleness signal (diskFileChangeCounter vs
-	// localFileChangeCounter, consumed by checkStale → IsDataStale) is
-	// therefore preserved on the identical invalidation edge.
+	// statement.
 	fcc, sc := db.pager.committedCounters()
 
-	// Reset the cleanup guard for this write transaction.
+	// Register the write transaction and reset its cleanup guard, unless
+	// the database started closing while this begin was on its way: Close
+	// then waits for the lock and rescues nothing (writerRegistered).
+	if testWriterRegisterHook != nil {
+		testWriterRegisterHook()
+	}
+	db.writerRegMu.Lock()
+	if db.closing.Load() {
+		db.writerRegMu.Unlock()
+		_ = db.pager.rollback()
+		db.pager.endRead(slot)
+		db.mu.RUnlock()
+		db.unlockWriter()
+		return nil, ErrClosed
+	}
+	db.writerRegistered = true
 	db.writerLocksDone.Store(false)
+	db.writerRegMu.Unlock()
 
 	tx := db.getWriteTx()
 	tx.ReadTx.db = db
@@ -1213,8 +1275,6 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	// the latest state, so the snapshot-bounded pair equals the disk pair.
 	tx.ReadTx.snapFileChangeCounter = fcc
 	tx.ReadTx.snapSchemaCookie = sc
-	tx.ReadTx.localFileChangeCounter = db.localFileChangeCounter.Load()
-	tx.ReadTx.localSchemaCookie = db.localSchemaCookie.Load()
 	tx.dataChanged = false   // pool reuse safety
 	tx.schemaChanged = false // pool reuse safety
 	tx.onCommitted = nil
@@ -1264,45 +1324,25 @@ func (db *DB) Checkpoint(mode CheckpointMode) error {
 	return db.pager.checkpointWithMode(mode)
 }
 
-// UpdateLocalCounters sets the local counter cache: the page-1 counters the
-// in-memory state is known to reflect. Commit sets them to the committed
-// values; a caller that rebuilt its in-memory state from a snapshot records
-// that snapshot with AdvanceLocalCounters. This raw store exists for tests,
-// which also wind the cache back to model a peer's commit.
-func (db *DB) UpdateLocalCounters(fileChangeCounter, schemaCookie uint32) {
-	db.localFileChangeCounter.Store(fileChangeCounter)
-	db.localSchemaCookie.Store(schemaCookie)
+// LocalSchemaCookie returns the schema cookie of this process's last commit,
+// or of the database as it was opened if it has not committed.
+func (db *DB) LocalSchemaCookie() uint32 {
+	return db.localSchemaCookie.Load()
 }
 
-// AdvanceLocalCounters records that the in-memory state reflects the given
-// counters, never moving either one back: a commit that landed meanwhile
-// already recorded newer values, and the state it published must not be
-// reported stale again by the next transaction.
-func (db *DB) AdvanceLocalCounters(fileChangeCounter, schemaCookie uint32) {
-	advanceCounter(&db.localFileChangeCounter, fileChangeCounter)
-	advanceCounter(&db.localSchemaCookie, schemaCookie)
-}
-
-// LocalCounters returns the local counter cache.
-func (db *DB) LocalCounters() (fileChangeCounter, schemaCookie uint32) {
-	return db.localFileChangeCounter.Load(), db.localSchemaCookie.Load()
-}
-
-// advanceCounter stores v unless c already holds v or a later value; the
-// counters increment per commit and are compared modulo 2^32.
-func advanceCounter(c *atomic.Uint32, v uint32) {
+// ForgetSeenHeader makes the next transaction begin find the committed state
+// as another process's: the change state forgets the wal-index header it
+// holds, so the begin's snapshot is news and the change epoch moves
+// (ReadTx.ChangeEpoch). For tests, which model a peer's commit with it; no
+// effect on an in-process or in-memory database.
+func (db *DB) ForgetSeenHeader() {
+	w := db.pager.wal
 	for {
-		old := c.Load()
-		if int32(v-old) <= 0 || c.CompareAndSwap(old, v) {
+		cur := w.chg.Load()
+		if cur == nil || w.chg.CompareAndSwap(cur, &walChange{epoch: cur.epoch, pending: cur.pending}) {
 			return
 		}
 	}
-}
-
-// counterReached reports whether have has reached target, comparing
-// modulo 2^32 like advanceCounter.
-func counterReached(have, target uint32) bool {
-	return int32(have-target) >= 0
 }
 
 // CreateNamespace creates a new namespace. Must be called within a write transaction.
@@ -1749,10 +1789,8 @@ type ReadTx struct {
 	walHdr WalIndexHdr
 
 	// Disk counters from page 1 at transaction start (for staleness detection).
-	diskFileChangeCounter  uint32
-	diskSchemaCookie       uint32
-	localFileChangeCounter uint32 // snapshot of DB's local value
-	localSchemaCookie      uint32 // snapshot of DB's local value
+	diskFileChangeCounter uint32
+	diskSchemaCookie      uint32
 	// Snapshot-bounded page-1 counters, baked at begin: what THIS tx's tree
 	// reads can actually see. Equal to the disk pair unless the begin-time
 	// read was raised past the snapshot (begin racing a commit, or a pinned
@@ -2221,48 +2259,36 @@ func (tx *ReadTx) IsWriteTx() bool {
 	return tx.writable
 }
 
-// LocalCaughtUp reports whether the local counter cache has reached the
-// counters this tx read from disk at begin: the state the cache stands for
-// already covers everything the tx can see. With the cache moving only
-// forward, a stale verdict can then only have come from a commit of this
-// process that landed during the begin and recorded its counters since.
-func (tx *ReadTx) LocalCaughtUp() bool {
-	fcc, sc := tx.db.LocalCounters()
-	return counterReached(fcc, tx.diskFileChangeCounter) && counterReached(sc, tx.diskSchemaCookie)
-}
-
-// IsDataStale returns true if the on-disk FileChangeCount differs from the
-// locally cached value, indicating another process has committed data changes
-// since this DB last committed or synced counters.
-func (tx *ReadTx) IsDataStale() bool {
-	return tx.diskFileChangeCounter != tx.localFileChangeCounter
-}
-
-// IsSchemaStale returns true if the on-disk SchemaCookie differs from the
-// locally cached value, indicating another process has committed schema changes.
-func (tx *ReadTx) IsSchemaStale() bool {
-	return tx.diskSchemaCookie != tx.localSchemaCookie
-}
-
-// DiskFileChangeCounter returns the FileChangeCount read from page 1 at
-// the start of this transaction.
-func (tx *ReadTx) DiskFileChangeCounter() uint32 {
-	return tx.diskFileChangeCounter
-}
-
 // DiskSchemaCookie returns the SchemaCookie read from page 1 at the start
 // of this transaction.
 func (tx *ReadTx) DiskSchemaCookie() uint32 {
 	return tx.diskSchemaCookie
 }
 
+// ChangeEpoch returns the invalidation epoch of this process, and whether
+// this transaction's snapshot is exact for it: it holds every change of
+// another process the epoch counts and none it does not count.
+//
+// The epoch moves when a transaction of this process, of any kind, begins at
+// a wal-index header the process neither wrote nor had seen (another
+// process's commit or WAL reset), and when the process rebuilds the wal-index
+// (pager_reset's iDataVersion++, pager.c:1772-1773, with own commits
+// cancelled as btree.c:4417 does). State derived from the database content
+// and kept across transactions is valid for an epoch: it is loaded through a
+// transaction that is exact for the epoch, and loaded again when the epoch
+// has moved.
+//
+// In-process and in-memory databases have no other process: the epoch stays
+// 0 and every snapshot is exact.
+func (tx *ReadTx) ChangeEpoch() (epoch uint64, exact bool) {
+	return tx.pager.wal.changeEpoch(&tx.walHdr)
+}
+
 // SnapshotHeaderCounters returns the page-1 FileChangeCount and SchemaCookie
 // as of THIS tx's snapshot — baked at begin from the tx's captured
 // [minFrame, maxFrame] window, both sides fixed for the tx's life
-// (SQLite's pWal->minFrame/mxFrame). Unlike
-// DiskFileChangeCounter/DiskSchemaCookie — whose begin-time read is raised to
-// the newest committed frame so staleness detection notices peer commits —
-// these values never exceed what the tx's tree reads can actually see: a
+// (SQLite's pWal->minFrame/mxFrame). Unlike DiskSchemaCookie, whose
+// begin-time read is raised to the newest committed frame, these values never exceed what the tx's tree reads can actually see: a
 // begin that raced a commit, or a reader slot pinned to an older snapshot,
 // reports the older counters here. They are exact on a fast begin too. Judgments about snapshot contents (e.g.
 // whether a catalog key committed at cookie C must be visible) require this
@@ -2291,11 +2317,6 @@ func (tx *ReadTx) SetAux(v any) {
 // without the error plumbing — for per-query visibility checks.
 func (tx *ReadTx) SnapshotSchemaCookie() uint32 {
 	return tx.snapSchemaCookie
-}
-
-// SnapshotFileChangeCounter is the change-counter half, same contract.
-func (tx *ReadTx) SnapshotFileChangeCounter() uint32 {
-	return tx.snapFileChangeCounter
 }
 
 // Rollback ends the read transaction (for ReadTx, this is the same as commit).

@@ -222,6 +222,21 @@ type pager struct {
 	backups   []*Backup
 	backupsMu sync.Mutex
 
+	// backupOwed is set while the open write transaction owes the attached
+	// backups something: it sent them a spilled page, which is not committed
+	// yet, or it is committing and has not sent them the commit's pages.
+	// The commit clears it once every page is sent; any other way out of
+	// the transaction restarts the backups instead (dischargeBackups).
+	// SQLite needs no such flag: its rollback restarts the backups
+	// (pager.c:3139), so does its error cleanup (pager_reset, pager.c:1912),
+	// and nothing unwinds past a commit. Atomic: Close's rescue of an
+	// abandoned writer reads it from the closing goroutine.
+	backupOwed atomic.Bool
+	spillBuf   [1]*page // pagerStress's argument to dispatchBackupUpdate
+
+	// testOwner is the DB this pager belongs to, for the test seam's hooks.
+	testOwner *DB
+
 	// hasContent tracks pages that were freed as freelist leaf pages during
 	// the current write transaction. When such a page is re-allocated from
 	// the freelist, it must NOT use the NOCONTENT optimization because the
@@ -327,6 +342,10 @@ type savepointState struct {
 	walGen uint64
 	header dbHeader // snapshot of database header at savepoint time (fix 9.3)
 }
+
+// BusyTimeout is how long a transaction begin or a checkpoint waits, through
+// its busy handler, for a lock another process holds.
+const BusyTimeout = 5 * time.Second
 
 // newPager creates a new pager for the given database path.
 // purgeable controls whether the page cache can evict pages (false for InMemory databases).
@@ -708,7 +727,7 @@ func (p *pager) open() (err error) {
 	p.wal.inProcess = p.inProcess
 	p.wal.noCommitSync = p.noCommitSync
 	p.wal.inMemory = p.inMemory
-	p.wal.busyHandler = DefaultBusyTimeout(5 * time.Second)
+	p.wal.busyHandler = DefaultBusyTimeout(BusyTimeout)
 	// BEGIN ENCRYPTION
 	// Propagate codec to the WAL so frame writes/reads use the same
 	// cipher as the DB file.
@@ -919,7 +938,7 @@ func (p *pager) initNewDB() error {
 	p.wal.inProcess = p.inProcess
 	p.wal.noCommitSync = p.noCommitSync
 	p.wal.inMemory = p.inMemory
-	p.wal.busyHandler = DefaultBusyTimeout(5 * time.Second)
+	p.wal.busyHandler = DefaultBusyTimeout(BusyTimeout)
 	// BEGIN ENCRYPTION
 	// Propagate codec to the WAL so frame writes/reads use the same
 	// cipher as the DB file.
@@ -990,10 +1009,18 @@ func (p *pager) beginReadHdrBusy(busy *beginBusy) (hdr WalIndexHdr, maxFrame, mi
 		p.mu.RUnlock()
 		return WalIndexHdr{}, 0, 0, 0, ErrCorrupt
 	}
+	// The change state before the snapshot is taken: see wal.noteSnapshot.
+	// ~ pagerBeginReadTransaction (pager.c:3246-3267): every begin of every
+	// kind passes here, so none can take a snapshot holding another
+	// process's commit without the commit being counted.
+	pre := p.wal.chg.Load()
 	hdr, maxFrame, minFrame, slot, err = p.wal.beginReadHdrBusy(busy)
 	if err != nil {
 		p.mu.RUnlock()
 		return WalIndexHdr{}, 0, 0, 0, err
+	}
+	if pre != nil {
+		p.wal.noteSnapshot(pre, &hdr)
 	}
 	// Update pager's walMaxFrame monotonically: never decrease, since a reader
 	// with an older snapshot must not overwrite a newer value set by the writer.
@@ -1024,6 +1051,9 @@ func (p *pager) endRead(slot int) {
 // correctness hazard (docs/btree/NOTES.md P0.2 drift, resolved).
 // DRIFT: beginWrite refreshes page-1 header/dbSize on stateChanged (C does it on read path) See docs/btree/NOTES.md#drift-76-beginwrite-re-reads-page-1-header-on-state-change
 func (p *pager) beginWrite(readSnap WalIndexHdr) error {
+	if testBeforeBeginWriteHook != nil {
+		testBeforeBeginWriteHook(p)
+	}
 	stateChanged, err := p.wal.beginWriteWithSnapshot(readSnap)
 	if err != nil {
 		return err
@@ -2432,6 +2462,16 @@ func (p *pager) pagerStress(pg *page) error {
 		return err
 	}
 
+	// The page is in the log: tell the backups, as pagerWalFrames does for
+	// every page it logs, a spill as much as a commit (pager.c:3219-3225,
+	// called from pagerStress at pager.c:4649). What they get is not
+	// committed; no Step runs while this transaction is open (Backup.Step),
+	// and if it does not commit they start over (backupOwed).
+	p.backupOwed.Store(true)
+	p.spillBuf[0] = pg
+	p.dispatchBackupUpdate(p.spillBuf[:])
+	p.spillBuf[0] = nil
+
 	// Mark the page as clean so it becomes evictable (SQLite pager.c:4677).
 	p.writerCache.makeClean(pg)
 
@@ -2449,7 +2489,7 @@ func (p *pager) hasChanges() bool {
 
 // dataChanged/schemaChanged control whether FileChangeCount/SchemaCookie are
 // incremented. Returns the WAL frame count and the new counter values.
-// DRIFT: FileChangeCount bumped only on dataChanged=true, not every data-page commit See docs/btree/NOTES.md#drift-77-filechangecount-bumped-conditionally-not-unconditionally
+// DRIFT: FileChangeCount bumped only on dataChanged=true, not every data-page commit; read by v2.4.x peers only See docs/btree/NOTES.md#drift-77-filechangecount-bumped-conditionally-not-unconditionally
 // DRIFT: commit doesn't prune dirty pages pgno>dbSize before WAL write (no nTruncate prune) See docs/btree/NOTES.md#drift-78-commit-does-not-prune-dirty-pages-above-dbsize-before-wal-wr
 // testCommitPrePublishHook / testCommitPostPublishHook, when non-nil, run
 // inside commit immediately before / after wal.writeFrames publishes the
@@ -2534,10 +2574,10 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		trace("commit: writing %d dirty pages to WAL %v", len(p.dirtyBuf), dirtyPgnos)
 	}
 
-	// Frames of this transaction already in the log are pages the cache
-	// spilled. They are not in dirtyBuf, so the dispatch below does not send
-	// them to an attached backup.
-	spilled := p.wal.nFrame.Load() > p.walBaseFrame()
+	// From here until every page is sent, the backups are owed this
+	// commit's pages: if the commit is published and then unwinds, they
+	// must not go on as if nothing was committed.
+	p.backupOwed.Store(true)
 
 	if testCommitPrePublishHook != nil {
 		testCommitPrePublishHook()
@@ -2560,18 +2600,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// ~ sqlite3BackupUpdate dispatch (backup.c:687). Must happen here,
 	// AFTER the WAL frames are durable, so dst sees committed data only.
 	p.dispatchBackupUpdate(p.dirtyBuf)
-	if spilled {
-		// The backup did not get the spilled pages: it starts over.
-		// SQLite sends a backup every page it logs, spills included
-		// (pagerWalFrames, pager.c:3219-3225, from pagerStress at
-		// pager.c:4649), and restarts it only when such a transaction is
-		// rolled back (pager.c:3139). Until the spill sends its page too,
-		// a transaction that spilled restarts the backups at its commit.
-		// The automatic checkpoint used to hide this: it reset the WAL and
-		// restarted every backup with it.
-		// DRIFT: a commit that spilled restarts attached backups; C updates them page by page See docs/btree/NOTES.md#drift-2026-11-12-4-a-commit-that-spilled-restarts-attached-backups
-		p.dispatchBackupRestart()
-	}
+	p.backupOwed.Store(false)
 
 	// Mark all pages as clean
 	for _, pg := range p.dirtyBuf {
@@ -2659,6 +2688,12 @@ func (p *pager) rollbackLocked() error {
 		return nil
 	}
 
+	// A rollback that undoes anything restarts the backups: pagerRollbackWal
+	// runs pagerUndoCallback for every logged and every dirty page, and it
+	// ends in sqlite3BackupRestart (pager.c:3147-3166, 3139). A spilled
+	// page's uncommitted content was sent to them.
+	undid := p.writerCache.nDirty > 0 || p.wal.nFrame.Load() > p.walBaseFrame()
+
 	// Suppress spills during rollback (SQLite pager.c:2457).
 	p.doNotSpill |= spillFlagRollback
 
@@ -2705,6 +2740,10 @@ func (p *pager) rollbackLocked() error {
 	p.savepoints = p.savepoints[:0]
 	p.resetCursors()
 	clear(p.hasContent)
+	if undid || p.backupOwed.Load() {
+		p.backupOwed.Store(false)
+		p.dispatchBackupRestart()
+	}
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
 	return nil
@@ -2808,6 +2847,12 @@ func (p *pager) pagerError() {
 	p.savepoints = p.savepoints[:0]
 
 	clear(p.hasContent)
+
+	// The transaction is gone, with whatever it sent the backups: they
+	// start over, as pager_reset restarts them in SQLite's error cleanup
+	// (pager.c:1910-1912).
+	p.backupOwed.Store(false)
+	p.dispatchBackupRestart()
 
 	// Release the WAL write lock so other writers are not blocked (fix 2.2).
 	p.wal.endWrite()
@@ -3026,12 +3071,11 @@ func (p *pager) releaseSavepoint(id int) error {
 // restart on success, so a BUSY result correctly suppresses it.
 func (p *pager) checkpointWithMode(mode CheckpointMode) error {
 	err := p.wal.checkpointWithMode(p.file, p.master, mode, p.wal.busyHandler)
-	if err == nil && mode == CheckpointTruncate {
-		// ~ sqlite3BackupRestart (backup.c:701-707). WAL frame numbering
-		// has reset, so any in-flight backup must start over. (A RESTART
-		// checkpoint resets nothing.)
-		p.dispatchBackupRestart()
-	}
+	// A TRUNCATE checkpoint of this process resets the WAL and restarts no
+	// backup: walRestartHdr changes the connection's own pWal->hdr
+	// (wal.c:2151-2154), so its next read sees no change and pager_reset,
+	// which is what restarts backups (pager.c:1774), does not run. A backup
+	// holds no frame number between Steps.
 	return err
 }
 
@@ -3410,10 +3454,35 @@ func (p *pager) dispatchBackupUpdate(dirty []*page) {
 	copy(bs, p.backups)
 	p.backupsMu.Unlock()
 
+	if testBackupDispatchHook != nil {
+		testBackupDispatchHook(0)
+	}
 	for _, pg := range dirty {
+		if testBackupDispatchHook != nil {
+			testBackupDispatchHook(pg.pgno)
+		}
 		for _, b := range bs {
 			b.update(pg.pgno, pg.data)
 		}
+	}
+}
+
+// testBeforeBeginWriteHook, when non-nil, runs at the top of beginWrite: the
+// caller holds its read snapshot and not yet the WAL write lock. Test-only.
+var testBeforeBeginWriteHook func(p *pager)
+
+// testBackupDispatchHook, when non-nil, runs in dispatchBackupUpdate: with 0
+// once the list of backups is copied, then with each page number before the
+// page is sent. Test-only.
+var testBackupDispatchHook func(pgno uint32)
+
+// dischargeBackups restarts the attached backups if the write transaction
+// that is ending still owes them (backupOwed). Called on every way out of a
+// write transaction, before the write lock of this process is released, so
+// no Step can run in between.
+func (p *pager) dischargeBackups() {
+	if p.backupOwed.CompareAndSwap(true, false) {
+		p.dispatchBackupRestart()
 	}
 }
 

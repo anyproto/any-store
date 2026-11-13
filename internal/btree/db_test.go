@@ -894,11 +894,17 @@ func TestCommit_DataChanged(t *testing.T) {
 	tx.MarkDataChanged()
 	require.NoError(t, tx.Commit())
 
-	// Verify local counters were updated
+	// The commit is the handle's own: the next transaction reads the new
+	// counter and finds no change.
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)
-	assert.False(t, rtx.IsDataStale())
+	fcc, _, err := rtx.SnapshotHeaderCounters()
+	require.NoError(t, err)
+	epoch, exact := rtx.ChangeEpoch()
 	require.NoError(t, rtx.Rollback())
+	assert.Equal(t, db.localFileChangeCounter.Load(), fcc)
+	assert.Zero(t, epoch)
+	assert.True(t, exact)
 }
 
 func TestCommit_SchemaChanged(t *testing.T) {
@@ -913,7 +919,7 @@ func TestCommit_SchemaChanged(t *testing.T) {
 
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)
-	assert.False(t, rtx.IsSchemaStale())
+	assert.Equal(t, db.LocalSchemaCookie(), rtx.DiskSchemaCookie(), "the handle recorded the cookie it committed")
 	require.NoError(t, rtx.Rollback())
 }
 
@@ -931,8 +937,8 @@ func TestBeginReadFast(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, rtx.writable)
 	// Fast read skips on-disk counter fetch and uses local counters.
-	assert.Equal(t, rtx.localFileChangeCounter, rtx.diskFileChangeCounter)
-	assert.Equal(t, rtx.localSchemaCookie, rtx.diskSchemaCookie)
+	assert.Equal(t, db.localFileChangeCounter.Load(), rtx.diskFileChangeCounter)
+	assert.Equal(t, db.localSchemaCookie.Load(), rtx.diskSchemaCookie)
 
 	ns2, err := rtx.GetNamespace("fast")
 	require.NoError(t, err)
@@ -973,7 +979,7 @@ func testFastBeginSnapshotCounters(t *testing.T, db *DB) {
 			tx.MarkSchemaChanged()
 		}
 		require.NoError(t, tx.Commit())
-		return db.LocalCounters()
+		return db.localFileChangeCounter.Load(), db.localSchemaCookie.Load()
 	}
 	snapshot := func() (fcc, sc uint32) {
 		rtx, err := db.BeginReadFast()
@@ -990,13 +996,15 @@ func testFastBeginSnapshotCounters(t *testing.T, db *DB) {
 
 	// A peer's commit: the local cache lags, and nothing here remembers the
 	// snapshot's counters.
-	db.UpdateLocalCounters(fcc-1, sc-1)
+	db.localFileChangeCounter.Store(fcc - 1)
+	db.localSchemaCookie.Store(sc - 1)
 	db.snapCounters.put(0, &WalIndexHdr{aSalt: [2]uint32{1, 1}}, 0, 0)
 	gotFCC, gotSC = snapshot()
 	assert.Equal(t, [2]uint32{fcc, sc}, [2]uint32{gotFCC, gotSC}, "read from page 1, not the lagging cache")
 	gotFCC, gotSC = snapshot()
 	assert.Equal(t, [2]uint32{fcc, sc}, [2]uint32{gotFCC, gotSC}, "remembered")
-	db.UpdateLocalCounters(fcc, sc)
+	db.localFileChangeCounter.Store(fcc)
+	db.localSchemaCookie.Store(sc)
 
 	// A reader that pinned its snapshot before a commit keeps that
 	// snapshot's counters; one that begins after gets the new ones.
@@ -1178,21 +1186,6 @@ func TestOpen_OnDiskPageSizeMismatchSharedPool(t *testing.T) {
 	require.ErrorIs(t, err, ErrPageBufferPoolSizeMismatch)
 }
 
-// === UpdateLocalCounters ===
-
-func TestUpdateLocalCounters(t *testing.T) {
-	db := tempDB(t)
-
-	db.UpdateLocalCounters(42, 99)
-
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-	// The local counters should now reflect our update
-	assert.Equal(t, uint32(42), rtx.localFileChangeCounter)
-	assert.Equal(t, uint32(99), rtx.localSchemaCookie)
-	require.NoError(t, rtx.Rollback())
-}
-
 // === Has error propagation ===
 
 func TestHas_ClosedTx(t *testing.T) {
@@ -1212,13 +1205,12 @@ func TestHas_ClosedTx(t *testing.T) {
 	assert.ErrorIs(t, err, ErrTxClosed)
 }
 
-// === Staleness detection ===
+// === The page-1 counters a transaction reads ===
 
-func TestStalenessDetection(t *testing.T) {
+// A commit marked as a data and a schema change writes both page-1
+// counters, and the next transaction reads them at its snapshot.
+func TestCommittedCountersAreRead(t *testing.T) {
 	db := tempDB(t)
-
-	// Set different local counters to simulate another process modifying the DB
-	db.UpdateLocalCounters(100, 200)
 
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -1228,14 +1220,14 @@ func TestStalenessDetection(t *testing.T) {
 	tx.MarkSchemaChanged()
 	require.NoError(t, tx.Commit())
 
-	// Now read tx should see the actual disk counters vs local counters
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)
-	// After commit, the local counters are updated
-	assert.False(t, rtx.IsDataStale())
-	assert.False(t, rtx.IsSchemaStale())
-	assert.NotEqual(t, uint32(0), rtx.DiskFileChangeCounter())
-	assert.NotEqual(t, uint32(0), rtx.DiskSchemaCookie())
+	fcc, sc, err := rtx.SnapshotHeaderCounters()
+	require.NoError(t, err)
+	assert.NotEqual(t, uint32(0), fcc)
+	assert.NotEqual(t, uint32(0), sc)
+	assert.Equal(t, sc, rtx.DiskSchemaCookie())
+	assert.Equal(t, sc, db.LocalSchemaCookie())
 	require.NoError(t, rtx.Rollback())
 }
 

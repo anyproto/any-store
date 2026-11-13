@@ -1973,15 +1973,17 @@ register and C↔Go coverage table. Key entry points:
 - `(*Backup).Remaining() uint32` -- ~ `sqlite3_backup_remaining`
 - `(*Backup).PageCount() uint32` -- ~ `sqlite3_backup_pagecount`
 
-Hooks in `pager.commit()` (post-`wal.writeFrames`) and
-`pager.checkpointWithMode()` (Truncate mode, the one that resets the WAL)
-dispatch the C equivalents of `sqlite3BackupUpdate` and
-`sqlite3BackupRestart` respectively. See `pager.dispatchBackupUpdate` /
-`pager.dispatchBackupRestart`. A commit whose transaction spilled pages also
-restarts the attached backups, for now
-([drift-2026-11-12-4](#drift-2026-11-12-4-a-commit-that-spilled-restarts-attached-backups)). External-process writes are detected at
-each Step's read tx via the page-1 `FileChangeCounter` and trigger the
-same restart.
+`pager.commit()` (after `wal.writeFrames`) and `pager.pagerStress()` (a
+spill) dispatch the C equivalent of `sqlite3BackupUpdate`
+(`pager.dispatchBackupUpdate`); a rollback, the error cleanup and any other
+end of a write transaction that still owes the backups dispatch
+`sqlite3BackupRestart` (`pager.dispatchBackupRestart`, `dischargeBackups`).
+Another process's writes restart the copy through the change epoch each
+Step's read transaction reports (`ReadTx.ChangeEpoch`). A `Step` returns
+`ErrBusy`, without effect, while this process has a write transaction open on
+the source. See
+[drift-2026-11-13-1](#drift-2026-11-13-1-the-change-state-is-one-value-under-compare-and-swap),
+"Backups".
 
 Anystore-level `(*db).Backup(ctx, path)` drives the engine by opening
 a fresh destination DB at `path` with matching options.
@@ -2802,7 +2804,7 @@ start of a write when the underlying WAL state changed, rather than during reads
 
 <a id="drift-77-filechangecount-bumped-conditionally-not-unconditionally"></a>
 ### Drift: FileChangeCount Bumped Conditionally Not Unconditionally
-- **Category:** changed-logic  -  **Severity:** medium
+- **Category:** changed-logic  -  **Severity:** low (was medium)  -  **Status:** the writer rule below is unchanged; what depended on it is not. Since 2026-11-13 nothing in this code base detects another process's commit by this counter: derived state and backups follow the wal-index header ([the change state](#drift-2026-11-13-1-the-change-state-is-one-value-under-compare-and-swap)), so a commit that does not mark its data is found like any other. The counter is still written, as described here, for v2.4.x processes attached to the same file, which do watch it; the `IsDataStale` consumer the last sentence names is removed.
 - **Affected functions:** `pager.go:*pager.commit` (`internal/btree/pager.go:2247`).
 
 SQLite always advances the page-1 change counter (header offset 24, mirrored at offset 92) on a
@@ -2994,7 +2996,7 @@ zero-init would re-clear any reused segment anyway — no correctness risk. (The
 
 <a id="drift-96-wal-index-change-counter-ichange-never-incremented"></a>
 ### Drift: WAL Index Change Counter iChange Never Incremented
-- **Category:** changed-logic  -  **Severity:** low
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-13: a commit publishes the replaced header's `iChange` plus one (`wal.c:4245`), a WAL restart or reset keeps it (`walRestartHdr`, `wal.c:2150-2154`), and a recovery leaves 0 (`wal.c:1408`); the process-local `wi.iChange` is gone, the value always comes from the live header read under the write lock (`wal.publishHeader`). A v2.4.x writer on the same file still publishes 0; nothing orders headers by `iChange`, here or in SQLite. Test: `TestChangeEpoch_RecoveryAndIChange`. What follows describes the code before that.
 - **Affected functions:** `wal.go:*wal.writeFrames`
   (`internal/btree/wal.go:853` writeHeader writes wi.iChange, never incremented; commit path
   `wal.go:2036`),
@@ -3151,7 +3153,7 @@ For the same reason the restart does not test "the writer is on slot 0" as `wal.
 
 <a id="drift-2026-11-12-4-a-commit-that-spilled-restarts-attached-backups"></a>
 ### Drift: A Commit That Spilled Pages Restarts The Attached Backups
-- **Category:** changed-logic  -  **Severity:** low  -  **Status:** interim
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-13: `pagerStress` sends the spilled page to the attached backups, and `Backup.Step` is kept out of a source write transaction of the process, so the interim restart is gone (see [the change state](#drift-2026-11-13-1-the-change-state-is-one-value-under-compare-and-swap), "Backups"). Test: `TestBackupChange_OwnSpilledCommit`. What follows describes the interim rule.
 - **Affected functions:** `pager.go:*pager.commit`, `pager.go:*pager.pagerStress`.
 
 SQLite sends an attached backup every page it writes to the WAL, a spill as much as a commit (`pagerWalFrames`, `pager.c:3219-3225`, called from `pagerStress` at `pager.c:4649`), and restarts the backup only when such a transaction is rolled back (`pagerUndoCallback`, `pager.c:3139`). `backup_step` cannot run in between: it returns `SQLITE_BUSY` while the source is in a write transaction (`backup.c:340-341`).
@@ -3159,6 +3161,67 @@ SQLite sends an attached backup every page it writes to the WAL, a spill as much
 `pagerStress` here writes the frame and marks the page clean without telling the backups, and `commit` sends them only the pages that are still dirty. A backup that had copied a spilled page kept its old content next to the commit's other pages. Before 2026-11-12 the automatic checkpoint reset the WAL and restarted every backup with it, which hid this for the default configuration.
 
 Until the spill sends its page (which needs `Step` kept out of a source write transaction, as SQLite does, so that an uncommitted page never reaches a finished backup), a commit whose transaction has frames in the log before the commit's own write restarts the attached backups after its update dispatch. A rolled-back transaction needs nothing: its spilled pages never reached a backup. Cost: a backup running beside transactions larger than the writer cache starts over at each of them. Test: `TestBackup_SpilledCommitRestartsBackup`.
+
+<a id="drift-2026-11-13-1-the-change-state-is-one-value-under-compare-and-swap"></a>
+### Drift: Another Process's Commit Is Found By The wal-index Header, Through One Process-Wide Value Under Compare-And-Swap
+- **Category:** structural  -  **Severity:** low
+- **Affected functions:** `walchange.go` (`*wal.noteSnapshot`, `announce`, `settle`, `publishHeader`, `*walChange.exact`), `pager.go:*pager.beginReadHdrBusy`, `db.go:*ReadTx.ChangeEpoch`, `backup.go:*Backup.Step`; root `collection.go:*collection.refreshSketches`, `newCollection`.
+
+**SQLite.** A connection keeps the wal-index header it last used in `pWal->hdr`. `walIndexTryHdr` compares the header it reads for a new transaction with it, and on a difference sets `*pChanged` and copies the new one in (`wal.c:2624-2626`); `pagerBeginReadTransaction` then calls `pager_reset` (`pager.c:3261-3263`), which raises `iDataVersion`, restarts the connection's backups and clears its cache (`pager.c:1772-1776`). The connection's own commit writes `pWal->hdr` before it publishes it (`wal.c:4243-4250`), and so does its WAL restart (`wal.c:2151-2154`), so neither is a change to it; the btree cancels the `iDataVersion++` of its own commit (`pager.c:6709`, `btree.c:4417`). A recovery always is a change (`wal.c:2724-2725`), and so is a checkpoint that loaded a header the connection had not seen (`wal.c:4399-4407`).
+
+**Before 2026-11-13.** The port had the header comparison for its page caches only. Derived state (the root package's sketches) and backups watched the page-1 `FileChangeCount`, which is why every commit wrote page 1, and which missed a commit that did not mark its data (drift-77) and took every marked commit of the process itself for news.
+
+**Now.** The comparison is SQLite's, the state it is made against is not a connection's. One `*wal` serves every transaction of a process, at many snapshots at once, so the header last seen and the count of resets cannot be two fields changed by one thread: a consumer could read a count that already includes a change whose header is not stored yet, load state at an older snapshot, and stamp it current for good. They are one immutable value, `walChange{hdr, epoch, pending}`, behind one pointer, changed by compare-and-swap:
+
+- **A begin** (`pager.beginReadHdrBusy`, which every begin of every kind passes) loads the value before it takes its snapshot. A snapshot equal to the value's header, or to a pending own header, is no news. Any other is a change: the epoch is raised, and the header becomes the snapshot's if it is still the one loaded before the snapshot was taken (the snapshot is then the newer of the two). If the header moved in between, by an own commit or another begin, the two cannot be ordered: the change is counted and the header left for the next begin to move. The header therefore never goes back.
+- **An own publication** (a commit, a WAL restart, a TRUNCATE reset, a recovery, all under the write lock, all through `wal.publishHeader`) announces its header as `pending` before the first byte is written, so a reader that snapshots it before the committing goroutine has finished its bookkeeping does not take it for another process's. If the value's header is not the one being replaced, a change made elsewhere lies between them and the new header will hold it: its epoch step is taken at the announcement. A recovery always takes one. On every way out, a panic included, `settle` decides from what shared memory holds: the header if it is the announced one, one more epoch step and no pending header if it is not.
+- **A consumer** asks for the epoch and whether its transaction's snapshot is exact for it (`ReadTx.ChangeEpoch`): equal to the pending header while there is one, to the value's header otherwise. State loaded through an exact snapshot holds every change the epoch counts, and any change it lacks will raise the epoch. A transaction at an older snapshot is not exact and stamps nothing.
+
+What differs from SQLite, and why it is kept:
+
+1. **Process-wide, under CAS,** for the reason above.
+2. **The "order unknown" step** has no SQLite counterpart. It is a false positive only: one extra reload or backup restart.
+3. **No epoch step for a failed begin.** SQLite resets on `rc != SQLITE_OK` as well, because `walIndexTryHdr` may already have replaced `pWal->hdr`; here nothing is stored until the snapshot is held, and the next begin finds the change again.
+4. **Heap-shm modes** (in-process, in-memory) have no state at all: no other process can attach, the epoch stays 0 and every snapshot is exact. Which mode a database is in is its flags, not its salts (`TestChangeEpoch_ZeroSaltsStillDetect`).
+
+**Backups** (`backup.go`, `pager.go`). With the epoch as the restart signal, the copy has to be kept right across the process's own commits by SQLite's other half, which the old signal's restart-at-every-commit had been hiding:
+
+- A spill sends its page to the attached backups, as a commit does (`pagerWalFrames`, `pager.c:3219-3225`, from `pagerStress` at `pager.c:4649`).
+- `Step` holds the write lock of the source's process from its start to its end, taken without waiting, and returns `ErrBusy` if it cannot have it (`sqlite3_backup_step` under the source mutexes, `backup.c:323-324`, and `SQLITE_BUSY` for a source in a write transaction, `backup.c:340-341`). So a commit and the updates it sends are wholly before a Step's snapshot or wholly after the Step, and a page of a transaction that is not committed never reaches a finished copy. The reader slot is taken without waiting too. The destination's write transaction is begun first, with the ordinary waits.
+- A transaction that sent pages and did not commit restarts the backups: a rollback that undid anything (`pagerUndoCallback`, `pager.c:3139`), the error cleanup (`pager_reset`, `pager.c:1910-1912`), and, through the writer-owned `pager.backupOwed`, every other way out, including a commit that unwinds after it was published and before all its pages were sent. That flag has no SQLite counterpart: nothing there unwinds past a commit.
+- `Step` restarts when its snapshot, or the previous Step's, is not exact for the epoch, or the epoch moved. The process's own commits, WAL restarts and TRUNCATE checkpoints restart nothing.
+- `update` and `restart` leave a finished backup alone: the source calls them outside its list's lock, and `Finish` may have run in between.
+
+**Close.** `Step` holding the write lock made visible that `Close` took any holder of that lock for a write transaction and ran the writer's teardown on it. A write transaction now registers under a small mutex, at the point where its teardown is valid; a `BeginWrite` that finds the database closing there backs out with `ErrClosed`, and a `Close` that finds no registered transaction waits for the holder.
+
+Tests: `internal/btree/walchange_test.go`, `backup_change_test.go`, `backup_change_fault_vfs_test.go`, `cache_invalidation_test.go`; root `change_epoch_test.go`; `test/backup_busy_test.go`.
+
+To measure (not yet): allocations per changed begin (one `walChange`) and per publication (two, at the announcement and at the settle, plus the copy of the pending header), CAS retries under concurrent readers, the fast read path, and how far a backup gets between the write transactions of a busy writer.
+
+<a id="how-long-a-backup-can-wait"></a>
+### How Long A Backup Can Wait
+
+Not a divergence: the waits are SQLite's, added up. `sqlite3_backup_step` begins a transaction on the source and, the first time, on the destination, each through the btree's ordinary busy loop (`backup.c:351`, `367`; `btree.c:3736-3737`), and every read attempt inside a begin starts a fresh WAL protocol count (`cnt = 0` in `walBeginReadTransaction`, `wal.c:3370`, `3405-3407`).
+
+- `T` is the busy timeout (`BusyTimeout`, 5 s). `H(T)` is the number of times the busy handler agrees to retry: 12 steps cover the first 328 ms, then one per 100 ms (`DefaultBusyTimeout`; SQLite's `delays[]`, `main.c:1717-1720`), so `H = 12 + ceil((T - 328 ms) / 100 ms)` for `T ≥ 328 ms`; `H(5 s) = 59`.
+- `P` is the WAL protocol allowance of one read attempt: 100 retries with sleeps of `(cnt-9)² × 39 µs`, about 10 s in all, after which the attempt fails with `ErrProtocol` (`wal.beginReadHdrRetry`).
+- A write begin makes at most `N_w = 1 + 3 + H(T)` read attempts: the first, `busySnapshotInnerRetries = 3` tight retries, and one per handler call (`DB.BeginWriteContext`). It takes at most `T + N_w × (P + one write-lock try)`.
+- A read begin makes at most `N_r = 1 + H(T)` attempts and takes at most `T + N_r × P`.
+
+The public `Backup` gives up on busy Steps once `T` has passed since the last Step that copied. Its worst case is that window, plus the begins of the last Step (one read begin on the source; one write begin on the destination, at the first Step), plus one begin each for opening the destination, for the bookkeeping on the committed copy, and for the write-lock attempt of the destination's close.
+
+With `T = 5 s`, `N_w = 63`: one write begin can take about `5 + 63 × 10 ≈ 635 s` if another process leaves the header torn for just under `P` before each of its commits. That takes an adversarial peer; an ordinary one costs a begin milliseconds. A ctx is looked at between Steps, not inside a begin, as in every other transaction begin.
+
+Tests (`backup_public_test.go`, with short budgets and a pause far below `P`): `TestBackupPublic_PausedPublisher` (one protocol wait, waited out; and the full allowance ending in `ErrProtocol`), `_EveryBusyMatchesErrBusy/destination-snapshot` (a snapshot overtaken at every attempt, no protocol wait), and `_PausedPublisherAndSnapshotInvalidation`, which combines the two on one write begin: every attempt first waits for a paused publisher and is then overtaken, each attempt's error is checked to be `ErrBusySnapshot`, and the public return is timed against `T + N_w × (pause + slack)`. The full-length bound (`P` of ten seconds at every attempt) is not run.
+
+<a id="drift-2026-11-13-2-a-backup-step-that-met-a-recovery-can-be-retried"></a>
+### Drift: A Backup Step That Met A Recovery In Progress Can Be Retried
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `backup.go:backupBusy`, `backup.go:*Backup.Step`.
+
+SQLite's `isFatalError` keeps exactly `SQLITE_BUSY` and `SQLITE_LOCKED` out of a backup's sticky `rc` (`backup.c:217-219`). It compares whole codes, so `SQLITE_BUSY_RECOVERY` and `SQLITE_BUSY_SNAPSHOT` (`SQLITE_BUSY | n<<8`) are fatal for a backup there.
+
+`Step` treats `ErrBusy`, `ErrBusySnapshot`, `ErrBusyRecovery`, `ErrReadersBusy` and the ctx's own error alike: returned, not kept. (Any other error stays sticky even if the ctx has ended meanwhile.) `Finish` returns the last Step's busy error when the backup is neither done nor failed, as `sqlite3_backup_finish` returns the `p->rc` the step left (`backup.c:558`, `603`). A begin that failed its admission holds no transaction and has copied nothing, so a later Step on the same `Backup` continues correctly, and another process rebuilding the wal-index is an ordinary event of multi-process use, not a reason to abandon a copy. `ErrProtocol` stays fatal, as `SQLITE_PROTOCOL` is. Test: `TestBackupChange_StepBusy`; the recovery case is exercised by `TestBackupChange_StepRunsRecovery`, where the Step's own begin does the rebuild.
 
 <a id="drift-102-reader-slot-tie-break-selects-lowest-not-highest"></a>
 ### Drift: Reader Slot Tie Break Selects Lowest Not Highest
@@ -3619,14 +3682,14 @@ After WAL recovery, `pager.open` refreshes the full in-memory header from the WA
 
 <a id="drift-2026-06-25-32-cross-process-online-backup-can-silently-produce-a-torn-snapshot-backu"></a>
 ### Drift: Cross-process online backup can silently produce a torn snapshot: backup restart-detection depends on FileChangeCounter that the conditional-bump commit (drift-77) leaves unadvanced for external data commits
-- **Category:** changed-logic  -  **Severity:** medium
+- **Category:** changed-logic  -  **Severity:** medium  -  **Status:** RESOLVED 2026-11-13: `Backup.Step` restarts by the change epoch (`ReadTx.ChangeEpoch`), which moves when any transaction of the process begins at a wal-index header the process neither wrote nor had seen, as SQLite's Step restarts in the `pager_reset` of its own read transaction (`pager.c:1774`, `backup.c:351`). The page-1 counter plays no part. The same change ended the opposite fault, a restart at every marked commit of the process itself, which could keep a backup from ever finishing beside a steady writer. Tests: `TestBackupChange_ForeignCommits` (the peer marks nothing), `_ForeignCommitSeenByAnotherReader`, `_OwnCommits`, `_FinishesBesideOwnWriter`. What follows describes the code before that.
 - **Affected functions:** `backup.go:*Backup.Step` (`internal/btree/backup.go:206-214`), `pager.go:2308-2319`.
 
 `Backup.Step` detects external (other-process) writes and forces a full restart (`b.iNext = 1`) purely on `rtx.diskFileChangeCounter != b.lastFCC` (`backup.go:206-214`), with a comment asserting "Page-1 FileChangeCounter changes on every write commit, including from other processes." That assumption is false here: `pager.commit` bumps `FileChangeCount` only when the caller-supplied `dataChanged` flag is true (`pager.go:2308-2319`), and the btree mutation entry points `Put`/`Delete` (`db.go:1881-1896`) do not auto-set it — it is opt-in via `WriteTx.MarkDataChanged` (`db.go:1868-1872`), the documented [drift-77](#drift-77-filechangecount-bumped-conditionally-not-unconditionally) behavior. SQLite's `pager_write_changecounter` bumps unconditionally on the first write of a transaction (`pager.c:3084`, `pager.c:6363`), so `sqlite3BackupRestart`/`backupUpdate` (`backup.c:661-707`) reliably restart. The consequence is that a peer process committing real data-page changes without `MarkDataChanged` leaves page-1 `FileChangeCount` unchanged; a concurrent cross-process `Backup` then fails to restart after already copying pre-write versions of some pages while later Steps copy post-write versions — yielding a silently inconsistent (torn) destination that passes `Finish()` without error.
 
 <a id="drift-2026-06-25-02-step-after-errbackupdone-re-enters-and-re-runs-finalize-and-can-copy-n"></a>
 ### Drift: Step After ErrBackupDone Re-Enters And Re-Runs Finalize Instead Of Being A No-Op
-- **Category:** changed-logic  -  **Severity:** low
+- **Category:** changed-logic  -  **Severity:** low (critical once backups stopped restarting at own commits)  -  **Status:** RESOLVED 2026-11-13: `Step` returns `b.rc` whenever it is set, `ErrBackupDone` included, as `isFatalError(SQLITE_DONE)` makes `sqlite3_backup_step` return at once (`backup.c:217-219`, `329-330`). While a backup restarted at every marked commit of its own process, the re-entered Step started over and the result was at least consistent; with the restart by the change epoch it would have copied only the pages the source grew by since, next to pages no update had refreshed. Test: `TestBackupChange_DoneIsTerminal`. What follows describes the code before that.
 - **Affected functions:** `backup.go:*Backup.Step` (`internal/btree/backup.go:191`).
 
 In C, `sqlite3_backup_step` reads `rc = p->rc` and only does work inside `if( !isFatalError(rc) )` (`backup.c:329-330`); since `isFatalError` returns true for any non-`OK`/`BUSY`/`LOCKED` code (`backup.c:217-218`), a sticky `SQLITE_DONE` left in `p->rc` after the prior completion (`backup.c:405-406`) makes the whole body a no-op — the function skips the copy loop and finalize and just re-returns `SQLITE_DONE`. The Go `Step` guard at `internal/btree/backup.go:191` instead reads `if b.rc != nil && b.rc != ErrBackupDone { return b.rc }`, explicitly excluding `ErrBackupDone` from the early return, so a Step call after completion falls through and re-executes the full body: it re-opens a fresh source read transaction (`backup.go:199`), re-reads the source size from that snapshot (`nSrcPage := rtx.DatabaseSize()`, `backup.go:234`), runs the copy loop again, and re-enters the `b.iNext > nSrcPage` finalize branch (`backup.go:263-266`) that re-runs `finalize` and re-sets `b.rc = ErrBackupDone`.
@@ -3859,7 +3922,7 @@ Until 2026-11-11 the Go port did neither. A reader that found the header invalid
 What still differs from SQLite, and why:
 
 1. **Process-shared state.** A SQLite `Wal` belongs to one connection, and recovery rewrites that connection's `pWal->hdr`. One Go `*wal` serves every transaction of the process, so `recoverLocked` runs under `w.mu` and resets the writer-owned fields (`nFrame`, `cksum1/2`, salts, the local index atomics). It only does so while `indexReadHdr` holds `lockWrite`, `lockCheckpoint` and `lockRecover` exclusively; the in-process lock table makes that exclusive against this process's own writer and checkpointer as well as against peers, so no user of those fields is active. In-flight readers of the process are unaffected for SQLite's reasons: hash tables are rebuilt privately and copied over identical content for every frame a live snapshot can reach, and a read-mark whose slot is held is left alone.
-2. **No `pChanged`.** After recovery SQLite sets `*pChanged = 1` (`wal.c:2724-2725`), which resets the pager cache (`pager.c:3261-3263`), and a checkpoint that loaded a new header zeroes `pWal->hdr` (`wal.c:4399-4407`). Go's reader caches are keyed by the full header plus `dataVersion`, and the writer compares the live header with `writerHdr` at write begin, so a recovery that publishes a different header invalidates both; one that reproduces the same header leaves caches of the same WAL content in place.
+2. **`pChanged`** (ported 2026-11-13). After recovery SQLite sets `*pChanged = 1` (`wal.c:2724-2725`), which resets the pager (`pager.c:3261-3263`), and a checkpoint that loaded a new header zeroes `pWal->hdr` (`wal.c:4399-4407`). Here the rebuilt header is published through `wal.publishHeader` as a recovery, which always raises the change epoch, and a reset over a header the process had not seen raises it too. Reader caches are still keyed by the full header plus `dataVersion`, and the writer still compares the live header with `writerHdr` at write begin.
 3. **Where the busy handler runs for `ErrBusyRecovery`.** The mapping itself is SQLite's (`wal.c:3084-3108`): a busy lock with the `WAL_RECOVER_LOCK` probe free is a retry, a busy probe is `ErrBusyRecovery` (`SQLITE_BUSY_RECOVERY`), any other probe error is returned. SQLite invokes the busy handler for it in `sqlite3BtreeBeginTrans`, from the one loop around the whole begin, with one count (`btree.c:3730-3737`; `sqlite3InvokeBusyHandler`, `main.c:1770-1780`, never asks again once the handler has declined). Go has several begin entry points (read, write, backup step, integrity sweep, and open's read of page 1, which is below the pager), so a read begin's loop sits at the WAL read begin, `wal.beginReadHdrBusy`, with the begin's count in a `beginBusy`. `DB.BeginWriteContext` is a write begin's one loop: it makes single read attempts (`beginReadHdrBusy(nil)`), tries the write lock once per attempt (`beginWriteWithSnapshot`, as `walBeginWriteTransaction` does, `wal.c:3714-3717`), and retries `ErrBusyRecovery`, a busy write lock (`ErrBusy`) and, after its tight retries, `ErrBusySnapshot` under one `beginBusy`, each retry from a fresh read snapshot. Until 2026-11-12 there were three counts: the pager's recovery loop and `BeginWriteContext`'s loop each had one, and the inner loop restarted from 0 on every outer retry (with a recovery that did not finish, the default 5 s budget became about 300 s, the process's writer reservation held throughout); and `beginWriteWithSnapshot` waited for the write lock through `walBusyLock` with a count of its own, so a peer that committed just before each timeout made every snapshot retry start a fresh budget (about 60 retries, 5 minutes, at the default). `walBusyLock`'s per-call count (drift-108) is now left only to the checkpoint's, open's and close's lock waits. Tests: `TestTornWalIndexHeader_BusyRecoveryOneBudgetPerBegin`, `_WALReadBeginWaitsOutRecovery`, `TestBeginWrite_PeerCommitsBeforeTimeoutOneBudget`.
 4. **`mxFrameUnknown`.** SQLite needs no such value: after `walIndexReadHdr` it works from its private `pWal->hdr`, and the one live re-read (`wal.c:2322`) is unvalidated. The Go callers outside `checkpointWithMode`'s frontier (`checkpointPassive`, `checkpointPost`, the DB-file truncate guard, `tryCheckpoint`) re-read the shared header and can catch a peer between its two copies; treating that as "more frames may exist" costs at most a skipped reset or truncate.
 

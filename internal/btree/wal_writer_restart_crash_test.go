@@ -79,7 +79,7 @@ func TestWalCheckpoint_SkipsBackfillAfterLogWrapped(t *testing.T) {
 		// The checkpoint holds w.mu, as this function's callers do.
 		hdr, valid := w.index.readHeader()
 		require.True(t, valid)
-		w.restartHeaderStateLocked(false, hdr.nPage, hdr.aSalt[0]+1)
+		w.restartHeaderStateLocked(false, hdr.nPage, hdr.aSalt[0]+1, &hdr)
 	}
 	defer func() { testCheckpointRead0Hook = nil }()
 
