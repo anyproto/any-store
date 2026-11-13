@@ -283,6 +283,30 @@ func TestIndexSketch_UnmarshalTruncatedV2(t *testing.T) {
 	}
 }
 
+// A V2 header may claim any shape. One whose size in bytes overflows is
+// refused like any other shape the blob is too short for.
+func TestIndexSketch_UnmarshalV2HugeShape(t *testing.T) {
+	s := NewIndexSketch(8, 2)
+	s.Increment(0, []byte("a"))
+	s.IncrementDocCount()
+	want := s.Snapshot(nil)
+
+	for _, shape := range [][2]uint32{
+		{0x30303030, 0x58303030}, // 8*levels*size wraps to a negative int
+		{1 << 31, 1 << 31},
+		{1<<32 - 1, 1<<32 - 1},
+		{1, 1<<32 - 1},
+		{1<<32 - 1, 1},
+	} {
+		blob := append([]byte(nil), sketchMagic[:]...)
+		blob = binary.LittleEndian.AppendUint32(blob, shape[0])
+		blob = binary.LittleEndian.AppendUint32(blob, shape[1])
+		assert.True(t, s.SameShape(blob), "%v", shape)
+		s.UnmarshalBinary(blob)
+		assert.Equal(t, want, s.Snapshot(nil), "%v", shape)
+	}
+}
+
 func TestIndexSketch_SameShape(t *testing.T) {
 	s := NewIndexSketch(64, 2)
 	same := NewIndexSketch(64, 2).MarshalBinary(nil)

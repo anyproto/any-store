@@ -257,12 +257,15 @@ func v2Shape(data []byte) (levels, size int, ok bool) {
 	if len(data) < sketchHeaderLen || [4]byte{data[0], data[1], data[2], data[3]} != sketchMagic {
 		return 0, 0, false
 	}
-	levels = int(binary.LittleEndian.Uint32(data[4:]))
-	size = int(binary.LittleEndian.Uint32(data[8:]))
-	if levels < 1 || size < 1 || len(data) < sketchHeaderLen+8*size*levels+8*levels+8 {
+	l := uint64(binary.LittleEndian.Uint32(data[4:]))
+	sz := uint64(binary.LittleEndian.Uint32(data[8:]))
+	n := uint64(len(data))
+	// Bounded by the blob before any arithmetic in bytes: a header may claim
+	// a shape whose byte size does not fit an int.
+	if l < 1 || sz < 1 || l*sz > n/8 || n < sketchHeaderLen+8*l*sz+8*l+8 {
 		return 0, 0, false
 	}
-	return levels, size, true
+	return int(l), int(sz), true
 }
 
 // SameShape reports whether UnmarshalBinary would load data without
