@@ -1,10 +1,17 @@
 package qplanner
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
+	"math"
+	"slices"
+	"sync"
 	"testing"
 
+	"github.com/klauspost/compress/s2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestIndexSketch_Increment_DecrementEstimate covers Increment, Decrement,
@@ -99,7 +106,6 @@ func TestIndexSketch_MarshalUnmarshal(t *testing.T) {
 	assert.Equal(t, uint64(2), s2.EntryCount(1))
 	assert.Equal(t, uint64(1), s2.EntryCount(2))
 	assert.Equal(t, uint64(2), s2.GetDocCount())
-	assert.False(t, s2.NeedsRebuild())
 
 	// Round-trip into a differently-shaped sketch: UnmarshalBinary adopts the
 	// blob's shape (the inspect path).
@@ -110,80 +116,38 @@ func TestIndexSketch_MarshalUnmarshal(t *testing.T) {
 	assert.Equal(t, s.Estimate(1, []byte("ab")), s3.Estimate(1, []byte("ab")))
 }
 
-// TestIndexSketch_LegacyMigration covers loading an old single-row (V1) blob into
-// a multi-level sketch: it lands in the full-key level, shallow levels stay empty,
-// and the sketch is flagged for rebuild.
-func TestIndexSketch_LegacyMigration(t *testing.T) {
-	// Build a genuine V1 blob: [Size*8 buckets][docCount 8], no magic.
-	const size = DefaultSketchSize
-	legacy := make([]byte, size*8+8)
-	// Pick a value, write its count into the V1 bucket it would hash to.
-	v1 := NewIndexSketch(size, 1)
-	v1.Increment(0, []byte("full-key"))
-	v1.Increment(0, []byte("full-key"))
-	v1Data := v1.MarshalBinary(nil) // V2 format
-	// Re-encode as legacy V1 (strip header + levelTotals): just buckets+docCount.
-	// Reconstruct from v1's level-0 buckets.
+// Bytes under no tag this release knows are not a sketch to it: the counters
+// stay as they were. That holds for the untagged bucket row builds before
+// v2.0.0-alpha.13 wrote, with or without its trailing document count, for a
+// tag of some later encoding, and for anything else.
+func TestIndexSketch_UnmarshalUntagged(t *testing.T) {
+	const size = 8
+	oldRow := make([]byte, size*8+8) // buckets, then the document count
 	for i := 0; i < size; i++ {
-		off := i * 8
-		// little-endian copy of bucket i
-		b := v1.Buckets[i]
-		legacy[off+0] = byte(b)
-		legacy[off+1] = byte(b >> 8)
-		legacy[off+2] = byte(b >> 16)
-		legacy[off+3] = byte(b >> 24)
-		legacy[off+4] = byte(b >> 32)
-		legacy[off+5] = byte(b >> 40)
-		legacy[off+6] = byte(b >> 48)
-		legacy[off+7] = byte(b >> 56)
+		binary.LittleEndian.PutUint64(oldRow[i*8:], uint64(i+1))
 	}
-	// docCount = 7 in the trailing 8 bytes.
-	legacy[size*8] = 7
-	_ = v1Data
+	binary.LittleEndian.PutUint64(oldRow[size*8:], 7)
 
-	// Load into a 3-level sketch.
-	s := NewIndexSketch(size, 3)
-	s.UnmarshalBinary(legacy)
-
-	full := s.NumLevels() - 1
-	assert.Equal(t, uint64(2), s.Estimate(full, []byte("full-key")),
-		"legacy combined-key data must load into the full-key level")
-	assert.Equal(t, uint64(0), s.Estimate(0, []byte("full-key")),
-		"shallow levels have no historical data")
-	assert.Equal(t, uint64(7), s.GetDocCount())
-	assert.Equal(t, uint64(2), s.EntryCount(full),
-		"full-key level total = sum of loaded buckets")
-	assert.True(t, s.NeedsRebuild(), "compound sketch with empty shallow levels needs rebuild")
-
-	// A single-level sketch loading legacy is complete (level 0 == full key).
-	s1 := NewIndexSketch(size, 1)
-	s1.UnmarshalBinary(legacy)
-	assert.Equal(t, uint64(2), s1.Estimate(0, []byte("full-key")))
-	assert.False(t, s1.NeedsRebuild())
-}
-
-// TestIndexSketch_LegacyMigration_NoDocCount covers the even-older docCount-less
-// format: a missing trailing docCount must leave the pre-existing value untouched.
-func TestIndexSketch_LegacyMigration_NoDocCount(t *testing.T) {
-	const size = 4
-	v1 := NewIndexSketch(size, 1)
-	v1.Increment(0, []byte("k"))
-	// Legacy buckets only (no docCount): size*8 bytes.
-	legacy := make([]byte, size*8)
-	for i := 0; i < size; i++ {
-		b := v1.Buckets[i]
-		for j := 0; j < 8; j++ {
-			legacy[i*8+j] = byte(b >> (8 * j))
+	for name, data := range map[string][]byte{
+		"old row":                    oldRow,
+		"old row, no document count": oldRow[:size*8],
+		"empty":                      nil,
+		"three bytes":                []byte("SK0"),
+		"a later tag":                append([]byte("SK04"), oldRow...),
+		"a later tag alone":          []byte("SK99"),
+		"lower case":                 append([]byte("sk02"), oldRow...),
+		"zeros":                      make([]byte, 64),
+	} {
+		for _, s := range []*IndexSketch{
+			sketchWith(size, []uint64{5, 5}),                 // one level, the old row's shape
+			sketchWith(size, []uint64{5, 5}, []uint64{0, 9}), // a compound index
+		} {
+			want := s.Snapshot(nil)
+			assert.True(t, s.SameShape(data), name)
+			assert.False(t, s.UnmarshalBinary(data), name)
+			sameCounters(t, want, s.Snapshot(nil), name)
 		}
 	}
-
-	s := NewIndexSketch(size, 2)
-	s.IncrementDocCount()
-	s.IncrementDocCount()
-	s.IncrementDocCount() // sentinel docCount = 3
-	s.UnmarshalBinary(legacy)
-	assert.Equal(t, uint64(3), s.GetDocCount(),
-		"data missing docCount must LEAVE the pre-existing value untouched")
 }
 
 // TestIndexSketch_Reset pins Reset — all buckets, level totals and docCount go to
@@ -266,6 +230,45 @@ func TestIndexSketch_Distribution(t *testing.T) {
 	})
 }
 
+// A tagged blob cut off inside its header or body leaves the sketch as it was.
+func TestIndexSketch_UnmarshalTruncatedV2(t *testing.T) {
+	s := NewIndexSketch(8, 2)
+	s.Increment(0, []byte("a"))
+	s.Increment(1, []byte("ab"))
+	s.IncrementDocCount()
+	want := s.Snapshot(nil)
+	blob := s.MarshalBinary(nil)
+
+	for n := len(sketchMagic); n < len(blob); n++ {
+		assert.False(t, s.UnmarshalBinary(blob[:n]), "prefix of %d bytes", n)
+		assert.Equal(t, want, s.Snapshot(nil), "prefix of %d bytes", n)
+	}
+}
+
+// A V2 header may claim any shape. One whose size in bytes overflows is
+// refused like any other shape the blob is too short for.
+func TestIndexSketch_UnmarshalV2HugeShape(t *testing.T) {
+	s := NewIndexSketch(8, 2)
+	s.Increment(0, []byte("a"))
+	s.IncrementDocCount()
+	want := s.Snapshot(nil)
+
+	for _, shape := range [][2]uint32{
+		{0x30303030, 0x58303030}, // 8*levels*size wraps to a negative int
+		{1 << 31, 1 << 31},
+		{1<<32 - 1, 1<<32 - 1},
+		{1, 1<<32 - 1},
+		{1<<32 - 1, 1},
+	} {
+		blob := append([]byte(nil), sketchMagic[:]...)
+		blob = binary.LittleEndian.AppendUint32(blob, shape[0])
+		blob = binary.LittleEndian.AppendUint32(blob, shape[1])
+		assert.True(t, s.SameShape(blob), "%v", shape)
+		assert.False(t, s.UnmarshalBinary(blob), "%v", shape)
+		assert.Equal(t, want, s.Snapshot(nil), "%v", shape)
+	}
+}
+
 func TestIndexSketch_SameShape(t *testing.T) {
 	s := NewIndexSketch(64, 2)
 	same := NewIndexSketch(64, 2).MarshalBinary(nil)
@@ -275,10 +278,546 @@ func TestIndexSketch_SameShape(t *testing.T) {
 	assert.False(t, s.SameShape(otherLevels))
 	assert.False(t, s.SameShape(otherSize))
 	// Bytes UnmarshalBinary loads into the existing shape or leaves alone.
-	assert.True(t, s.SameShape(make([]byte, 8*64)), "legacy")
+	assert.True(t, s.SameShape(make([]byte, 8*64)), "untagged")
 	assert.True(t, s.SameShape(nil))
 	assert.True(t, s.SameShape(otherSize[:len(otherSize)-1]), "truncated")
 	corrupt := append([]byte(nil), otherLevels...)
 	binary.LittleEndian.PutUint32(corrupt[4:], 0)
 	assert.True(t, s.SameShape(corrupt), "corrupt header")
+
+	// A compressed blob counts by its header, as a V2 one does.
+	same = NewIndexSketch(64, 2).MarshalCompressed(nil)
+	otherLevels = NewIndexSketch(64, 1).MarshalCompressed(nil)
+	otherSize = NewIndexSketch(32, 2).MarshalCompressed(nil)
+	assert.True(t, s.SameShape(same))
+	assert.False(t, s.SameShape(otherLevels))
+	assert.False(t, s.SameShape(otherSize))
+	assert.True(t, s.SameShape(otherSize[:sketchHeaderLen+1]), "truncated header")
+	corrupt = append([]byte(nil), otherLevels...)
+	binary.LittleEndian.PutUint32(corrupt[4:], 0)
+	assert.True(t, s.SameShape(corrupt), "corrupt header")
+	corrupt = append([]byte(nil), otherLevels...)
+	corrupt[sketchHeaderLen] = 1 // a plane the block does not hold
+	assert.True(t, s.SameShape(corrupt), "block of another length")
+}
+
+// sameCounters fails with the first counter that differs: two snapshots
+// printed side by side run to thousands of lines.
+func sameCounters(t *testing.T, want, got []uint64, msgAndArgs ...any) bool {
+	t.Helper()
+	if len(want) != len(got) {
+		return assert.Fail(t, fmt.Sprintf("%d counters, want %d", len(got), len(want)), msgAndArgs...)
+	}
+	for i := range want {
+		if want[i] != got[i] {
+			return assert.Fail(t, fmt.Sprintf("counter %d is %d, want %d", i, got[i], want[i]), msgAndArgs...)
+		}
+	}
+	return true
+}
+
+// craftCompressed builds a compressed blob with the given header over a block
+// of zeros that declares exactly the length the header implies: only a check
+// on the header itself can refuse it.
+func craftCompressed(levels, size uint32, planes ...byte) []byte {
+	blob := append([]byte(nil), sketchMagicS2[:]...)
+	blob = binary.LittleEndian.AppendUint32(blob, levels)
+	blob = binary.LittleEndian.AppendUint32(blob, size)
+	blob = append(blob, planes...)
+	body := 8*int(levels) + 8
+	for _, p := range planes {
+		body += int(p) * int(size)
+	}
+	return append(blob, s2.Encode(nil, make([]byte, body))...)
+}
+
+// sketchWith returns a sketch of the given shape whose counters are set by
+// hand: bucket i of level l holds counts[l][i].
+func sketchWith(size int, counts ...[]uint64) *IndexSketch {
+	s := NewIndexSketch(size, len(counts))
+	for l, level := range counts {
+		var total uint64
+		for i, c := range level {
+			s.Buckets[l*size+i] = c
+			total += c
+		}
+		s.levelTotals[l] = total
+	}
+	s.docCount.Store(uint64(len(counts)) * 1000003)
+	return s
+}
+
+// The compressed format keeps every counter, whatever its width, and stores
+// per level only the planes its widest count needs.
+func TestIndexSketch_MarshalCompressed(t *testing.T) {
+	type roundTrip struct {
+		name   string
+		s      *IndexSketch
+		planes []byte
+	}
+	cases := []roundTrip{
+		{"empty", NewIndexSketch(DefaultSketchSize, 2), []byte{0, 0}},
+		{"width per level", sketchWith(4, []uint64{70000, 0, 2}, nil, []uint64{0, 9}, []uint64{1 << 40}), []byte{3, 0, 1, 6}},
+		{"counted", filledSketch(5000, 2, 0), []byte{2, 1}},
+	}
+	// Every width a count can have, at its smallest and its largest value.
+	for w := 1; w <= 8; w++ {
+		least, most := uint64(1)<<(8*(w-1)), uint64(math.MaxUint64)>>(8*(8-w))
+		cases = append(cases, roundTrip{
+			fmt.Sprintf("%d-byte counts", w),
+			sketchWith(8, []uint64{least, 0, most, 3, least | 1}),
+			[]byte{byte(w)},
+		})
+	}
+	// Level totals and the document count take all 64 bits whatever the buckets hold.
+	full := sketchWith(8, []uint64{1, 2}, []uint64{0, 0, math.MaxUint64})
+	full.levelTotals[0], full.levelTotals[1] = math.MaxUint64, math.MaxUint64-1
+	full.docCount.Store(math.MaxUint64)
+	cases = append(cases, roundTrip{"full totals and document count", full, []byte{1, 8}})
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			blob := tc.s.MarshalCompressed(nil)
+			assert.Equal(t, sketchMagicS2[:], blob[:4])
+			assert.Equal(t, tc.planes, blob[sketchHeaderLen:sketchHeaderLen+tc.s.Levels])
+
+			// into a sketch of the same shape, in place
+			got := NewIndexSketch(tc.s.Size, tc.s.Levels)
+			got.Buckets[0], got.levelTotals[0] = 99, 99 // overwritten by the load
+			got.docCount.Store(99)
+			buckets := &got.Buckets[0]
+			require.True(t, got.SameShape(blob))
+			require.True(t, got.UnmarshalBinary(blob))
+			sameCounters(t, tc.s.Snapshot(nil), got.Snapshot(nil))
+			assert.Same(t, buckets, &got.Buckets[0], "loaded in place")
+
+			// into a sketch of another shape, which adopts the blob's
+			other := NewIndexSketch(tc.s.Size+1, tc.s.Levels+1)
+			require.False(t, other.SameShape(blob))
+			other.UnmarshalBinary(blob)
+			assert.Equal(t, tc.s.Size, other.Size)
+			assert.Equal(t, tc.s.Levels, other.NumLevels())
+			sameCounters(t, tc.s.Snapshot(nil), other.Snapshot(nil), "into another shape")
+
+			// the buffer is reused, and a second encoding is the same bytes
+			again := tc.s.MarshalCompressed(blob[:0])
+			assert.Same(t, &blob[0], &again[0])
+			assert.True(t, bytes.Equal(blob, again), "a second encoding differs")
+
+			// the V2 format carries the same counters
+			v2 := NewIndexSketch(tc.s.Size, tc.s.Levels)
+			v2.UnmarshalBinary(tc.s.MarshalBinary(nil))
+			sameCounters(t, got.Snapshot(nil), v2.Snapshot(nil), "against the V2 encoding")
+		})
+	}
+}
+
+// The sizes the compressed format is for: a near-empty sketch is a small row
+// and a saturated one stays well under a page per level.
+func TestIndexSketch_MarshalCompressedSizes(t *testing.T) {
+	assert.Less(t, len(NewIndexSketch(DefaultSketchSize, 1).MarshalCompressed(nil)), 40)
+	assert.Less(t, len(filledSketch(20, 1, 0).MarshalCompressed(nil)), 200)
+	assert.Less(t, len(filledSketch(20, 2, 0).MarshalCompressed(nil)), 400)
+	assert.Less(t, len(filledSketch(100_000, 1, 0).MarshalCompressed(nil)), 1200)
+	assert.Less(t, len(filledSketch(100_000, 2, 0).MarshalCompressed(nil)), 1500)
+}
+
+// A sketch too large for the compressed format's bound is written in the V2
+// format, so that what MarshalCompressed returns always loads.
+func TestIndexSketch_MarshalCompressedBound(t *testing.T) {
+	atBound := NewIndexSketch(maxCompressedBuckets/2, 2)
+	atBound.Increment(1, []byte("k"))
+	blob := atBound.MarshalCompressed(nil)
+	assert.Equal(t, sketchMagicS2[:], blob[:4])
+	got := NewIndexSketch(maxCompressedBuckets/2, 2)
+	got.UnmarshalBinary(blob)
+	assert.Equal(t, uint64(1), got.Estimate(1, []byte("k")))
+
+	over := NewIndexSketch(maxCompressedBuckets/2+1, 2)
+	over.Increment(1, []byte("k"))
+	blob = over.MarshalCompressed(nil)
+	assert.True(t, bytes.Equal(over.MarshalBinary(nil), blob), "not the V2 bytes")
+	got = NewIndexSketch(maxCompressedBuckets/2+1, 2)
+	got.UnmarshalBinary(blob)
+	assert.Equal(t, uint64(1), got.Estimate(1, []byte("k")))
+
+	// The reader's bound is the writer's: a header at it parses, one above
+	// it is refused, each over a block of the length its header implies.
+	_, _, _, _, _, ok := s2Shape(craftCompressed(2, maxCompressedBuckets/2, 0, 0))
+	assert.True(t, ok)
+	_, _, _, _, _, ok = s2Shape(craftCompressed(2, maxCompressedBuckets/2+1, 0, 0))
+	assert.False(t, ok)
+}
+
+// Each check on a compressed header refuses on its own: the block under these
+// headers declares the length the header implies, so nothing else stops them.
+// Loaded, a sketch without buckets divides by zero at the first estimate, and
+// one of a claimed shape allocates what the header says.
+func TestIndexSketch_UnmarshalCompressedHeaderChecks(t *testing.T) {
+	key := []byte("k")
+	sound := NewIndexSketch(8, 2)
+	require.True(t, sound.UnmarshalBinary(craftCompressed(2, 8, 1, 0)), "the crafted form loads under a sound header")
+
+	for _, tc := range []struct {
+		name string
+		blob []byte
+	}{
+		{"no levels", craftCompressed(0, 8)},
+		{"no buckets", craftCompressed(2, 0, 1, 1)},
+		{"no buckets, no planes", craftCompressed(2, 0, 0, 0)},
+		{"above the bound", craftCompressed(2, maxCompressedBuckets/2+1, 0, 0)},
+		{"above the bound, one level", craftCompressed(1, maxCompressedBuckets+1, 0)},
+		{"nine planes", craftCompressed(2, 8, 9, 0)},
+		{"nine planes on the last level", craftCompressed(2, 8, 0, 9)},
+	} {
+		for _, s := range []*IndexSketch{
+			sketchWith(8, []uint64{5, 5}, []uint64{0, 0, 9}), // the blob's shape, where it has one
+			NewIndexSketch(DefaultSketchSize, 1),             // another: a load would reshape
+		} {
+			want, size, levels := s.Snapshot(nil), s.Size, s.Levels
+			assert.True(t, s.SameShape(tc.blob), tc.name)
+			assert.False(t, s.UnmarshalBinary(tc.blob), tc.name)
+			assert.Equal(t, [2]int{size, levels}, [2]int{s.Size, s.Levels}, tc.name)
+			sameCounters(t, want, s.Snapshot(nil), tc.name)
+			s.Increment(0, key)
+			assert.Equal(t, want[s.bucket(0, key)]+1, s.Estimate(0, key), tc.name)
+		}
+	}
+}
+
+// A compressed blob that does not parse leaves the sketch as it was: every
+// counter stays.
+func TestIndexSketch_UnmarshalCorruptCompressed(t *testing.T) {
+	src := sketchWith(8, []uint64{300, 0, 7}, []uint64{1, 2, 3, 70000})
+	blob := src.MarshalCompressed(nil)
+	block := sketchHeaderLen + src.Levels
+
+	s := sketchWith(8, []uint64{5, 5}, []uint64{0, 0, 9})
+	want := s.Snapshot(nil)
+	check := func(name string, data []byte) {
+		t.Helper()
+		assert.False(t, s.UnmarshalBinary(data), name)
+		assert.Equal(t, want, s.Snapshot(nil), name)
+	}
+	mutate := func(f func(b []byte)) []byte {
+		b := append([]byte(nil), blob...)
+		f(b)
+		return b
+	}
+
+	// cut off anywhere after the tag: inside the header, the planes, the block
+	for n := len(sketchMagicS2); n < len(blob); n++ {
+		check(fmt.Sprintf("prefix of %d bytes", n), blob[:n])
+	}
+	check("trailing byte", append(append([]byte(nil), blob...), 0))
+	check("no levels", mutate(func(b []byte) { binary.LittleEndian.PutUint32(b[4:], 0) }))
+	check("no buckets", mutate(func(b []byte) { binary.LittleEndian.PutUint32(b[8:], 0) }))
+	check("more levels", mutate(func(b []byte) { binary.LittleEndian.PutUint32(b[4:], 3) }))
+	check("another size", mutate(func(b []byte) { binary.LittleEndian.PutUint32(b[8:], 9) }))
+	check("huge shape", mutate(func(b []byte) {
+		binary.LittleEndian.PutUint32(b[4:], 1<<31)
+		binary.LittleEndian.PutUint32(b[8:], 1<<31)
+	}))
+	check("nine planes", mutate(func(b []byte) { b[sketchHeaderLen] = 9 }))
+	check("a plane less", mutate(func(b []byte) { b[sketchHeaderLen]-- }))
+	check("a plane more", mutate(func(b []byte) { b[sketchHeaderLen+1]++ }))
+	check("another block length", mutate(func(b []byte) { b[block]++ }))
+
+	// a block of the declared length whose content does not decode
+	bad := mutate(func(b []byte) {
+		for i := block + 1; i < len(b); i++ {
+			b[i] = 0xff
+		}
+	})
+	_, err := s2.Decode(nil, bad[block:])
+	require.Error(t, err)
+	_, _, _, _, _, ok := s2Shape(bad)
+	require.True(t, ok, "the header and the declared length are intact")
+	check("corrupt block", bad)
+
+	// the same bytes into a sketch of another shape: not reshaped either
+	fresh := NewIndexSketch(DefaultSketchSize, 1)
+	fresh.UnmarshalBinary(bad)
+	assert.Equal(t, DefaultSketchSize, fresh.Size)
+	assert.Equal(t, 1, fresh.NumLevels())
+	assert.Equal(t, uint64(0), fresh.GetDocCount())
+}
+
+// packLevel starts from the width the counters had when they were scanned. A
+// counter that has grown past it since is still stored whole.
+func TestIndexSketch_PackLevelWidens(t *testing.T) {
+	level := []uint64{3, 0x1234, 0, 0x01020304}
+	for estimate := 1; estimate <= 4; estimate++ {
+		out := make([]byte, 8*len(level))
+		planes := packLevel(out, level, estimate)
+		require.Equal(t, 4, planes, "estimate %d", estimate)
+		got := make([]uint64, len(level))
+		readPlanes(got, out[:planes*len(level)], planes)
+		assert.Equal(t, level, got, "estimate %d", estimate)
+	}
+	// wider than needed is stored as asked
+	out := make([]byte, 8*len(level))
+	assert.Equal(t, 6, packLevel(out, level, 6))
+	// an all-zero scan writes nothing
+	assert.Equal(t, 0, packLevel(nil, level, 0))
+
+	// what is left above the planes written, over all counters
+	assert.Equal(t, uint64(0x12|0x010203), writePlanes(make([]byte, 4), level, 1))
+	assert.Equal(t, uint64(0x0102), writePlanes(make([]byte, 8), level, 2))
+	assert.Equal(t, uint64(0x01), writePlanes(make([]byte, 12), level, 3))
+	assert.Equal(t, uint64(0), writePlanes(make([]byte, 32), level, 8))
+}
+
+// A marshal beside the writer, for the race detector: the counts of a counter
+// that only grows never go down from one blob to the next. Whether the two
+// overlap at a width boundary is up to the scheduler; the widening itself is
+// pinned by TestIndexSketch_PackLevelWidens.
+func TestIndexSketch_MarshalCompressedBesideWriter(t *testing.T) {
+	const incs = 70_000 // crosses one and two bytes
+	s := NewIndexSketch(4, 1)
+	key := []byte("k")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < incs; i++ {
+			s.Increment(0, key)
+		}
+	}()
+	got := NewIndexSketch(4, 1)
+	var blob []byte
+	var last uint64
+	for running := true; running; {
+		select {
+		case <-done:
+			running = false
+		default:
+		}
+		blob = s.MarshalCompressed(blob)
+		got.UnmarshalBinary(blob)
+		v := got.Estimate(0, key)
+		require.GreaterOrEqual(t, v, last)
+		last = v
+	}
+	assert.Equal(t, uint64(incs), last)
+}
+
+// Marshals and loads on many goroutines share nothing but the scratch pool:
+// each round trip must give back its own counters.
+func TestIndexSketch_CompressedConcurrent(t *testing.T) {
+	const workers, rounds = 8, 300
+	var wg sync.WaitGroup
+	errs := make(chan string, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			size := 64 << (w % 3)
+			level := make([]uint64, size)
+			for i := range level {
+				level[i] = uint64(w+1) << (8 * (i % 3))
+			}
+			src := sketchWith(size, level, level[:size/2])
+			want := src.Snapshot(nil)
+			got := NewIndexSketch(size, 2)
+			var blob []byte
+			for r := 0; r < rounds; r++ {
+				blob = src.MarshalCompressed(blob)
+				got.Reset()
+				if !got.UnmarshalBinary(blob) || !slices.Equal(want, got.Snapshot(nil)) {
+					errs <- fmt.Sprintf("worker %d, round %d: another sketch's counters", w, r)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+}
+
+func FuzzIndexSketch_UnmarshalBinary(f *testing.F) {
+	src := sketchWith(8, []uint64{300, 0, 7}, []uint64{1, 2, 3, 70000})
+	f.Add(src.MarshalBinary(nil))
+	f.Add(src.MarshalCompressed(nil))
+	f.Add(NewIndexSketch(8, 2).MarshalCompressed(nil))
+	f.Add(make([]byte, 8*8+8))
+	f.Add([]byte("SK03"))
+	f.Add([]byte("SK020000000X"))
+	f.Add(append([]byte("SK04"), make([]byte, 8*8+8)...))
+	f.Add(craftCompressed(2, 8, 1, 0))
+	f.Add(craftCompressed(0, 8))
+	f.Add(craftCompressed(2, 0, 1, 1))
+	f.Add(craftCompressed(2, 8, 9, 0))
+	f.Add(craftCompressed(1, maxCompressedBuckets+1, 0))
+	key := []byte("k")
+	f.Fuzz(func(t *testing.T, data []byte) {
+		s := sketchWith(8, []uint64{5, 5}, []uint64{0, 0, 9})
+		before := s.Snapshot(nil)
+		same := s.SameShape(data)
+		loaded := s.UnmarshalBinary(data)
+		known := len(data) >= 4 && ([4]byte(data[:4]) == sketchMagic || [4]byte(data[:4]) == sketchMagicS2)
+
+		// Whatever the bytes, what is left is a sketch that works.
+		if s.Size < 1 || s.Levels < 1 || len(s.Buckets) != s.Size*s.Levels || len(s.levelTotals) != s.Levels {
+			t.Fatalf("shape %dx%d with %d buckets, %d totals", s.Levels, s.Size, len(s.Buckets), len(s.levelTotals))
+		}
+		if known && [4]byte(data[:4]) == sketchMagicS2 && s.Size*s.Levels > maxCompressedBuckets {
+			t.Fatalf("a compressed blob gave %d buckets", s.Size*s.Levels)
+		}
+		if (same || !loaded) && (s.Size != 8 || s.Levels != 2) {
+			t.Fatalf("reshaped to %dx%d (same shape %v, loaded %v)", s.Levels, s.Size, same, loaded)
+		}
+		if !loaded && !slices.Equal(before, s.Snapshot(nil)) {
+			t.Fatal("bytes that were not loaded changed the sketch")
+		}
+		if loaded && !known {
+			t.Fatal("bytes under no known tag were loaded")
+		}
+		for l := 0; l < s.Levels; l++ {
+			s.Estimate(l, key)
+			s.Distribution(l)
+		}
+		// And it is one that both encodings carry.
+		want := s.Snapshot(nil)
+		for _, blob := range [][]byte{s.MarshalCompressed(nil), s.MarshalBinary(nil)} {
+			again := NewIndexSketch(s.Size, s.Levels)
+			if !again.UnmarshalBinary(blob) || !slices.Equal(want, again.Snapshot(nil)) {
+				t.Fatalf("what was loaded does not survive tag %s", blob[:4])
+			}
+		}
+	})
+}
+
+func FuzzIndexSketch_CompressedRoundTrip(f *testing.F) {
+	f.Add([]byte{1, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}, uint8(2), uint8(3))
+	f.Add([]byte{}, uint8(1), uint8(1))
+	f.Fuzz(func(t *testing.T, counters []byte, levels, size uint8) {
+		s := NewIndexSketch(int(size%32)+1, int(levels%4)+1)
+		for i := 0; i+8 <= len(counters) && i/8 < len(s.Buckets); i += 8 {
+			s.Buckets[i/8] = binary.LittleEndian.Uint64(counters[i:])
+		}
+		for l := range s.levelTotals {
+			s.levelTotals[l] = uint64(len(counters)) << (8 * l)
+		}
+		s.docCount.Store(uint64(len(counters)))
+		got := NewIndexSketch(s.Size, s.Levels)
+		got.UnmarshalBinary(s.MarshalCompressed(nil))
+		if want, have := s.Snapshot(nil), got.Snapshot(nil); !slices.Equal(want, have) {
+			t.Fatalf("round trip: want %v, have %v", want, have)
+		}
+	})
+}
+
+// sketchFixtures are the counter distributions the stored formats are
+// measured on: docs unique values in one field, or a compound index whose
+// first field has few values.
+var sketchFixtures = []struct {
+	name string
+	make func() *IndexSketch
+}{
+	{"empty", func() *IndexSketch { return NewIndexSketch(DefaultSketchSize, 1) }},
+	{"docs=20", func() *IndexSketch { return filledSketch(20, 1, 0) }},
+	{"docs=5k", func() *IndexSketch { return filledSketch(5_000, 1, 0) }},
+	{"docs=100k", func() *IndexSketch { return filledSketch(100_000, 1, 0) }},
+	{"docs=1M", func() *IndexSketch { return filledSketch(1_000_000, 1, 0) }},
+	{"docs=100k,hot=50", func() *IndexSketch { return filledSketch(100_000, 1, 50) }},
+	{"docs=20,levels=2", func() *IndexSketch { return filledSketch(20, 2, 0) }},
+	{"docs=100k,levels=2", func() *IndexSketch { return filledSketch(100_000, 2, 0) }},
+}
+
+// filledSketch counts docs documents into a sketch of the given levels. The
+// deepest level sees a value per document, or one of hot values when hot is
+// set; a shallower level sees ten values.
+func filledSketch(docs, levels, hot int) *IndexSketch {
+	s := NewIndexSketch(DefaultSketchSize, levels)
+	var key [16]byte
+	for i := 0; i < docs; i++ {
+		for l := 0; l < levels; l++ {
+			v := uint64(i)
+			if l < levels-1 {
+				v = uint64(i % 10)
+			} else if hot > 0 {
+				// squared: the low values take most of the documents
+				v = uint64(i%hot) * uint64(i%hot) / uint64(hot)
+			}
+			binary.LittleEndian.PutUint64(key[:], v)
+			binary.LittleEndian.PutUint64(key[8:], uint64(l))
+			s.Increment(l, key[:])
+		}
+		s.IncrementDocCount()
+	}
+	return s
+}
+
+// plainS2 is the V2 body under S2 with no byte planes: what the compressed
+// format is measured against.
+func plainS2(s *IndexSketch, dst, scratch []byte) (out, v2 []byte) {
+	v2 = s.MarshalBinary(scratch)
+	return s2.Encode(dst[:cap(dst)], v2[sketchHeaderLen:]), v2
+}
+
+func BenchmarkIndexSketch_Marshal(b *testing.B) {
+	for _, fx := range sketchFixtures {
+		s := fx.make()
+		b.Run("V2/"+fx.name, func(b *testing.B) {
+			var buf []byte
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				buf = s.MarshalBinary(buf)
+			}
+			b.ReportMetric(float64(len(buf)), "B/blob")
+		})
+		b.Run("PlainS2/"+fx.name, func(b *testing.B) {
+			var buf, scratch []byte
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				buf, scratch = plainS2(s, buf, scratch)
+			}
+			b.ReportMetric(float64(len(buf)), "B/blob")
+		})
+		b.Run("Compressed/"+fx.name, func(b *testing.B) {
+			var buf []byte
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				buf = s.MarshalCompressed(buf)
+			}
+			b.ReportMetric(float64(len(buf)), "B/blob")
+		})
+	}
+}
+
+// BenchmarkIndexSketch_Unmarshal loads a blob into a sketch of its shape.
+// "same" loads it over the counters it already holds, as a reload that finds
+// nothing changed; "changed" alternates it with an empty sketch's blob, so
+// every non-zero counter is stored on each load.
+func BenchmarkIndexSketch_Unmarshal(b *testing.B) {
+	for _, fx := range sketchFixtures {
+		s := fx.make()
+		empty := NewIndexSketch(s.Size, s.Levels)
+		for _, enc := range []struct {
+			name        string
+			blob, blank []byte
+		}{
+			{"V2", s.MarshalBinary(nil), empty.MarshalBinary(nil)},
+			{"Compressed", s.MarshalCompressed(nil), empty.MarshalCompressed(nil)},
+		} {
+			b.Run(enc.name+"/same/"+fx.name, func(b *testing.B) {
+				dst := NewIndexSketch(s.Size, s.Levels)
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					dst.UnmarshalBinary(enc.blob)
+				}
+			})
+			b.Run(enc.name+"/changed/"+fx.name, func(b *testing.B) {
+				dst := NewIndexSketch(s.Size, s.Levels)
+				blobs := [2][]byte{enc.blob, enc.blank}
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					dst.UnmarshalBinary(blobs[i&1])
+				}
+			})
+		}
+	}
 }

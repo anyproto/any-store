@@ -17,6 +17,7 @@ import (
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/durability"
 	"github.com/anyproto/any-store/v2/internal/durability/sentinel"
+	"github.com/anyproto/any-store/v2/internal/qplanner"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
 
@@ -399,6 +400,22 @@ func indexKey(collName, indexName string) []byte {
 
 func sketchKey(collName, indexName string) []byte {
 	return []byte("stat_data:" + collName + ":" + indexName)
+}
+
+// sketchCompressedFormat is the schema format from which the stat_data rows
+// of a file hold sketches in the compressed encoding. A file of an earlier
+// format keeps the V2 encoding: the releases that open it read any other
+// bytes as legacy bucket counts.
+const sketchCompressedFormat = 6
+
+// marshalSketch encodes sk into dst the way this file stores it. The encoding
+// is chosen where a row is saved and nowhere else: a load reads either, and
+// in memory a sketch is plain counters.
+func (db *db) marshalSketch(sk *qplanner.IndexSketch, dst []byte) []byte {
+	if db.btreeDB.SchemaFormat() >= sketchCompressedFormat {
+		return sk.MarshalCompressed(dst)
+	}
+	return sk.MarshalBinary(dst)
 }
 
 // multikeyKey is the system-namespace key of an index's sticky multikey flag.
