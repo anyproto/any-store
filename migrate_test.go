@@ -1109,3 +1109,45 @@ func TestCopyToLatestFormat_CleanupFailureIsReported(t *testing.T) {
 	assert.Contains(t, err.Error(), "left on disk: "+left)
 	assert.Equal(t, []string{filepath.Base(left)}, dirNames(t, dstDir), "everything else is removed")
 }
+
+// A staging file whose creation cannot be finished is removed, and one that
+// cannot be removed either is named in the error.
+func TestCopyToLatestFormat_StagingFileNotClosed(t *testing.T) {
+	src, _ := openSource(t, nil)
+	prevOpen, prevRemove := osOpenFile, osRemove
+	defer func() { osOpenFile, osRemove = prevOpen, prevRemove }()
+	// The file comes back closed already, so closing it fails.
+	osOpenFile = func(name string, flag int, perm os.FileMode) (*os.File, error) {
+		f, err := prevOpen(name, flag, perm)
+		if err == nil {
+			_ = f.Close()
+		}
+		return f, err
+	}
+	errRemove := errors.New("cannot remove")
+
+	for _, removable := range []bool{true, false} {
+		t.Run(fmt.Sprintf("removable=%v", removable), func(t *testing.T) {
+			var stage string
+			osRemove = func(name string) error {
+				if strings.Contains(name, ".tmp-") && !removable {
+					stage = name
+					return errRemove
+				}
+				return prevRemove(name)
+			}
+			dstDir := t.TempDir()
+			_, err := CopyToLatestFormat(ctx, src, filepath.Join(dstDir, "copy.db"), nil)
+			require.ErrorIs(t, err, os.ErrClosed)
+			if removable {
+				assert.NotErrorIs(t, err, errRemove)
+				assert.Empty(t, dirNames(t, dstDir))
+				return
+			}
+			require.ErrorIs(t, err, errRemove)
+			require.NotEmpty(t, stage)
+			assert.Contains(t, err.Error(), "left on disk: "+stage)
+			assert.Equal(t, []string{filepath.Base(stage)}, dirNames(t, dstDir))
+		})
+	}
+}

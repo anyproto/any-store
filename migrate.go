@@ -519,7 +519,7 @@ func reserveStaging(dstPath string) (string, error) {
 		if taken = destinationFree(stage); taken != nil {
 			continue
 		}
-		f, err := os.OpenFile(stage, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
+		f, err := osOpenFile(stage, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
 		if errors.Is(err, fs.ErrExist) {
 			taken = err
 			continue
@@ -528,8 +528,11 @@ func reserveStaging(dstPath string) (string, error) {
 			return "", fmt.Errorf("any-store: copy to latest format: %w", err)
 		}
 		if err = f.Close(); err != nil {
-			_ = osRemove(stage)
-			return "", fmt.Errorf("any-store: copy to latest format: %w", err)
+			err = fmt.Errorf("any-store: copy to latest format: %w", err)
+			if rerr := osRemove(stage); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+				err = errors.Join(err, fmt.Errorf("any-store: left on disk: %s: %w", stage, rerr))
+			}
+			return "", err
 		}
 		return stage, nil
 	}
