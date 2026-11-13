@@ -1,8 +1,20 @@
 package btree
 
+// What a database handle is told about commits, and by which signal.
+//
+// Another process's commit is found by the wal-index header: the change
+// epoch moves at the first begin after it (ReadTx.ChangeEpoch). The handle's
+// own commits move nothing. The schema cookie goes up at each commit marked
+// as a schema change. In a schema format 5 file FileChangeCount goes up at
+// each commit marked as a data change, which is what a v2.4.x process
+// attached to the same file reads; in a schema format 6 file, which no such
+// process opens, it moves only when a commit writes page 1, to page 1's
+// counter as last read plus one (pager_write_changecounter).
+//
+// The "other process" here is a second handle on the same file in this
+// process, with a change state of its own.
+
 import (
-	"math"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -21,255 +33,171 @@ func allowDoubleOpen(path string) {
 	openDBs.Delete(key)
 }
 
-// TestCacheInvalidation_SingleProcess_NotStaleAfterOwnWrite verifies that
-// after a process writes and commits with MarkDataChanged, its next
-// transaction does NOT report staleness (same-process avoidance).
-func TestCacheInvalidation_SingleProcess_NotStaleAfterOwnWrite(t *testing.T) {
-	db := tempDB(t)
-
-	// Write some data with MarkDataChanged
-	wtx, err := db.BeginWrite()
-	require.NoError(t, err)
-	ns, err := wtx.CreateNamespace("test")
-	require.NoError(t, err)
-	require.NoError(t, wtx.Put(ns, []byte("key1"), []byte("val1")))
-	wtx.MarkDataChanged()
-	require.NoError(t, wtx.Commit())
-
-	// Next read transaction should NOT be stale
+// cacheInvState begins and ends a read transaction on db and returns what it
+// saw: the change epoch, whether its snapshot is exact for it, and the
+// page-1 counters of its snapshot.
+func cacheInvState(t *testing.T, db *DB) (epoch uint64, exact bool, fcc, sc uint32) {
+	t.Helper()
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)
-	assert.False(t, rtx.IsDataStale(), "should not be stale after own write")
-	assert.False(t, rtx.IsSchemaStale(), "schema should not be stale")
+	epoch, exact = rtx.ChangeEpoch()
+	fcc, sc, err = rtx.SnapshotHeaderCounters()
+	require.NoError(t, err)
+	require.Equal(t, sc, rtx.DiskSchemaCookie())
 	require.NoError(t, rtx.Rollback())
+	return epoch, exact, fcc, sc
 }
 
-// TestCacheInvalidation_MultiProcess_DetectsExternalWrite verifies that
-// when two DB handles share the same file, writes from one are detected
-// as stale by the other.
-func TestCacheInvalidation_MultiProcess_DetectsExternalWrite(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
-	// Open first DB handle
-	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
+// cacheInvWrite commits one Put, marked as the flags say.
+func cacheInvWrite(t *testing.T, db *DB, data, schema bool) {
+	t.Helper()
+	wtx, err := db.BeginWrite()
 	require.NoError(t, err)
-	defer db1.Close()
-
-	// Open second DB handle (simulates another process)
-	allowDoubleOpen(dbPath)
-	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
-	require.NoError(t, err)
-	defer db2.Close()
-
-	// Both should start clean (not stale)
-	rtx1, err := db1.BeginRead()
-	require.NoError(t, err)
-	assert.False(t, rtx1.IsDataStale())
-	assert.False(t, rtx1.IsSchemaStale())
-	require.NoError(t, rtx1.Rollback())
-
-	rtx2, err := db2.BeginRead()
-	require.NoError(t, err)
-	assert.False(t, rtx2.IsDataStale())
-	assert.False(t, rtx2.IsSchemaStale())
-	require.NoError(t, rtx2.Rollback())
-
-	// DB1 writes data
-	wtx, err := db1.BeginWrite()
-	require.NoError(t, err)
-	ns, err := wtx.CreateNamespace("test")
-	require.NoError(t, err)
-	require.NoError(t, wtx.Put(ns, []byte("key1"), []byte("val1")))
-	wtx.MarkDataChanged()
-	require.NoError(t, wtx.Commit())
-
-	// DB1 should NOT be stale (own write)
-	rtx1, err = db1.BeginRead()
-	require.NoError(t, err)
-	assert.False(t, rtx1.IsDataStale(), "db1 should not be stale after own write")
-	require.NoError(t, rtx1.Rollback())
-
-	// DB2 should detect staleness (external write)
-	rtx2, err = db2.BeginRead()
-	require.NoError(t, err)
-	assert.True(t, rtx2.IsDataStale(), "db2 should be stale after db1's write")
-	require.NoError(t, rtx2.Rollback())
-}
-
-// TestCacheInvalidation_SchemaCookie verifies that MarkSchemaChanged
-// increments the schema cookie and is detected by other handles.
-func TestCacheInvalidation_SchemaCookie(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
-	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
-	require.NoError(t, err)
-	defer db1.Close()
-
-	allowDoubleOpen(dbPath)
-	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
-	require.NoError(t, err)
-	defer db2.Close()
-
-	// DB1 makes a schema change
-	wtx, err := db1.BeginWrite()
-	require.NoError(t, err)
-	_, err = wtx.CreateNamespace("newcollection")
-	require.NoError(t, err)
-	wtx.MarkSchemaChanged()
-	wtx.MarkDataChanged()
-	require.NoError(t, wtx.Commit())
-
-	// DB2 should detect schema staleness
-	rtx, err := db2.BeginRead()
-	require.NoError(t, err)
-	assert.True(t, rtx.IsSchemaStale(), "db2 should detect schema change")
-	assert.True(t, rtx.IsDataStale(), "db2 should detect data change")
-	require.NoError(t, rtx.Rollback())
-
-	// DB1 should NOT be stale
-	rtx, err = db1.BeginRead()
-	require.NoError(t, err)
-	assert.False(t, rtx.IsSchemaStale(), "db1 should not be stale after own schema change")
-	assert.False(t, rtx.IsDataStale(), "db1 should not be stale after own data change")
-	require.NoError(t, rtx.Rollback())
-}
-
-// TestCacheInvalidation_NoMarks_CountersUnchanged verifies that committing
-// without calling MarkDataChanged/MarkSchemaChanged does NOT increment counters.
-func TestCacheInvalidation_NoMarks_CountersUnchanged(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
-	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
-	require.NoError(t, err)
-	defer db1.Close()
-
-	allowDoubleOpen(dbPath)
-	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
-	require.NoError(t, err)
-	defer db2.Close()
-
-	// Read initial counter values via db2
-	rtx, err := db2.BeginRead()
-	require.NoError(t, err)
-	initialFCC := rtx.DiskFileChangeCounter()
-	initialSC := rtx.DiskSchemaCookie()
-	require.NoError(t, rtx.Rollback())
-
-	// DB1 writes data but does NOT call MarkDataChanged
-	wtx, err := db1.BeginWrite()
-	require.NoError(t, err)
-	ns, err := wtx.CreateNamespace("test")
-	require.NoError(t, err)
-	require.NoError(t, wtx.Put(ns, []byte("key1"), []byte("val1")))
-	// Intentionally NOT calling MarkDataChanged() or MarkSchemaChanged()
-	require.NoError(t, wtx.Commit())
-
-	// DB2 should see unchanged counters
-	rtx, err = db2.BeginRead()
-	require.NoError(t, err)
-	assert.Equal(t, initialFCC, rtx.DiskFileChangeCounter(), "FileChangeCount should not have changed")
-	assert.Equal(t, initialSC, rtx.DiskSchemaCookie(), "SchemaCookie should not have changed")
-	assert.False(t, rtx.IsDataStale(), "should not be stale when counters unchanged")
-	assert.False(t, rtx.IsSchemaStale(), "schema should not be stale when counters unchanged")
-	require.NoError(t, rtx.Rollback())
-}
-
-// TestCacheInvalidation_UpdateLocalCounters verifies that calling
-// UpdateLocalCounters clears staleness detection.
-func TestCacheInvalidation_UpdateLocalCounters(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
-	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
-	require.NoError(t, err)
-	defer db1.Close()
-
-	allowDoubleOpen(dbPath)
-	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
-	require.NoError(t, err)
-	defer db2.Close()
-
-	// DB1 writes data
-	wtx, err := db1.BeginWrite()
-	require.NoError(t, err)
-	ns, err := wtx.CreateNamespace("test")
-	require.NoError(t, err)
-	require.NoError(t, wtx.Put(ns, []byte("key1"), []byte("val1")))
-	wtx.MarkDataChanged()
-	wtx.MarkSchemaChanged()
-	require.NoError(t, wtx.Commit())
-
-	// DB2 detects staleness
-	rtx, err := db2.BeginRead()
-	require.NoError(t, err)
-	assert.True(t, rtx.IsDataStale())
-	assert.True(t, rtx.IsSchemaStale())
-	// Get the current disk values to sync
-	fcc := rtx.DiskFileChangeCounter()
-	sc := rtx.DiskSchemaCookie()
-	require.NoError(t, rtx.Rollback())
-
-	// Update local counters to sync
-	db2.UpdateLocalCounters(fcc, sc)
-
-	// DB2 should no longer be stale
-	rtx, err = db2.BeginRead()
-	require.NoError(t, err)
-	assert.False(t, rtx.IsDataStale(), "should not be stale after UpdateLocalCounters")
-	assert.False(t, rtx.IsSchemaStale(), "schema should not be stale after UpdateLocalCounters")
-	require.NoError(t, rtx.Rollback())
-}
-
-// AdvanceLocalCounters never moves a counter back, and compares modulo 2^32
-// so a wrapped counter still counts as newer; LocalCaughtUp applies the same
-// comparison between the cache and a tx's begin-time disk counters.
-func TestCacheInvalidation_AdvanceLocalCounters(t *testing.T) {
-	db := &DB{}
-	db.UpdateLocalCounters(10, 5)
-	db.AdvanceLocalCounters(8, 7)
-	fcc, sc := db.LocalCounters()
-	assert.Equal(t, [2]uint32{10, 7}, [2]uint32{fcc, sc})
-	db.AdvanceLocalCounters(12, 3)
-	fcc, sc = db.LocalCounters()
-	assert.Equal(t, [2]uint32{12, 7}, [2]uint32{fcc, sc})
-	db.UpdateLocalCounters(math.MaxUint32, math.MaxUint32)
-	db.AdvanceLocalCounters(0, 1)
-	fcc, sc = db.LocalCounters()
-	assert.Equal(t, [2]uint32{0, 1}, [2]uint32{fcc, sc})
-
-	caughtUp := func(localFCC, localSC, diskFCC, diskSC uint32) bool {
-		db.UpdateLocalCounters(localFCC, localSC)
-		tx := &ReadTx{db: db, diskFileChangeCounter: diskFCC, diskSchemaCookie: diskSC}
-		return tx.LocalCaughtUp()
+	ns, err := wtx.GetNamespace("test")
+	if err != nil {
+		ns, err = wtx.CreateNamespace("test")
+		require.NoError(t, err)
 	}
-	assert.True(t, caughtUp(6, 6, 6, 6))
-	assert.True(t, caughtUp(7, 6, 6, 6))
-	assert.False(t, caughtUp(5, 6, 6, 6))
-	assert.False(t, caughtUp(6, 5, 6, 6))
-	assert.True(t, caughtUp(0, 0, math.MaxUint32, math.MaxUint32))
-	assert.False(t, caughtUp(math.MaxUint32, 0, 0, 0))
+	require.NoError(t, wtx.Put(ns, []byte("key1"), []byte("val1")))
+	if data {
+		wtx.MarkDataChanged()
+	}
+	if schema {
+		wtx.MarkSchemaChanged()
+	}
+	require.NoError(t, wtx.Commit())
 }
 
-// TestCacheInvalidation_Rollback_NoCounterChange verifies that rolling
-// back a write transaction does NOT change counters, even if marks were set.
-func TestCacheInvalidation_Rollback_NoCounterChange(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
+func cacheInvPair(t *testing.T) (db1, db2 *DB) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "test.db")
 	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
-	defer db1.Close()
-
-	// Get initial counter
-	rtx, err := db1.BeginRead()
+	t.Cleanup(func() { _ = db1.Close() })
+	allowDoubleOpen(dbPath)
+	db2, err = testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
-	initialFCC := rtx.DiskFileChangeCounter()
-	require.NoError(t, rtx.Rollback())
+	t.Cleanup(func() { _ = db2.Close() })
+	return db1, db2
+}
 
-	// Write with marks, then rollback
+// A handle's own commit is not a change to it.
+func TestCacheInvalidation_SingleProcess_NotStaleAfterOwnWrite(t *testing.T) {
+	db := tempDB(t)
+	e0, _, _, _ := cacheInvState(t, db)
+	cacheInvWrite(t, db, true, false)
+	e, exact, _, _ := cacheInvState(t, db)
+	assert.Equal(t, e0, e, "an own commit does not move the change epoch")
+	assert.True(t, exact)
+}
+
+// Another handle's commit is a change, counted once; the writing handle sees
+// none.
+func TestCacheInvalidation_MultiProcess_DetectsExternalWrite(t *testing.T) {
+	db1, db2 := cacheInvPair(t)
+	e1, _, _, _ := cacheInvState(t, db1)
+	e2, _, _, _ := cacheInvState(t, db2)
+
+	cacheInvWrite(t, db1, true, false)
+
+	e, exact, _, _ := cacheInvState(t, db1)
+	assert.Equal(t, e1, e, "db1: its own write is no change")
+	assert.True(t, exact)
+	e, exact, _, _ = cacheInvState(t, db2)
+	assert.Equal(t, e2+1, e, "db2: db1's write is a change")
+	assert.True(t, exact)
+	e, _, _, _ = cacheInvState(t, db2)
+	assert.Equal(t, e2+1, e, "and it is counted once")
+}
+
+// A commit marked as a schema change raises the schema cookie, which the
+// other handle reads in its snapshot; the writing handle's own cookie is the
+// new one too, and its change epoch does not move.
+func TestCacheInvalidation_SchemaCookie(t *testing.T) {
+	db1, db2 := cacheInvPair(t)
+	e1, _, _, sc0 := cacheInvState(t, db1)
+	e2, _, _, _ := cacheInvState(t, db2)
+
+	cacheInvWrite(t, db1, true, true)
+
+	e, _, _, sc := cacheInvState(t, db2)
+	assert.Equal(t, sc0+1, sc, "db2 reads the new schema cookie")
+	assert.Equal(t, e2+1, e, "and counts the commit")
+
+	e, _, _, sc = cacheInvState(t, db1)
+	assert.Equal(t, sc0+1, sc)
+	assert.Equal(t, sc0+1, db1.LocalSchemaCookie(), "db1 recorded the cookie it committed")
+	assert.Equal(t, e1, e, "db1: its own schema change is no change to it")
+}
+
+// A commit that marks nothing leaves both page-1 counters of a schema format 5
+// file as they were. The other handle still finds it: the wal-index header
+// changed.
+func TestCacheInvalidation_NoMarks_CountersUnchanged(t *testing.T) {
+	useLegacyFormat(t)
+	db1, db2 := cacheInvPair(t)
+	e0, _, fcc0, sc0 := cacheInvState(t, db2)
+
+	cacheInvWrite(t, db1, false, false)
+
+	e, exact, fcc, sc := cacheInvState(t, db2)
+	assert.Equal(t, fcc0, fcc, "FileChangeCount should not have changed")
+	assert.Equal(t, sc0, sc, "SchemaCookie should not have changed")
+	assert.Equal(t, e0+1, e, "the commit is found without the counters")
+	assert.True(t, exact)
+}
+
+// A change is consumed by the begin that finds it: transactions after it see
+// the same epoch, each with an exact snapshot, and the next change moves it
+// again. (This replaces the manual acknowledgement through
+// UpdateLocalCounters.)
+func TestCacheInvalidation_ChangeIsConsumedByTheBeginThatFindsIt(t *testing.T) {
+	db1, db2 := cacheInvPair(t)
+	e0, _, _, _ := cacheInvState(t, db2)
+
+	cacheInvWrite(t, db1, true, true)
+	for i := 0; i < 3; i++ {
+		e, exact, _, _ := cacheInvState(t, db2)
+		assert.Equal(t, e0+1, e, "begin %d", i)
+		assert.True(t, exact)
+	}
+	cacheInvWrite(t, db1, true, false)
+	e, exact, _, _ := cacheInvState(t, db2)
+	assert.Equal(t, e0+2, e)
+	assert.True(t, exact)
+}
+
+// A transaction whose snapshot is older than the newest change the handle
+// has counted is not exact for the epoch: what it loads must not be taken
+// for current. (This replaces the ordering of page-1 counters by
+// AdvanceLocalCounters and LocalCaughtUp.)
+func TestCacheInvalidation_OlderSnapshotIsNotExact(t *testing.T) {
+	db1, db2 := cacheInvPair(t)
+	cacheInvWrite(t, db1, true, false)
+
+	old, err := db2.BeginRead()
+	require.NoError(t, err)
+	e0, exact := old.ChangeEpoch()
+	require.True(t, exact)
+
+	cacheInvWrite(t, db1, true, false)
+	e, exact, _, _ := cacheInvState(t, db2) // another transaction counts it
+	require.Equal(t, e0+1, e)
+	require.True(t, exact)
+
+	e, exact = old.ChangeEpoch()
+	assert.Equal(t, e0+1, e, "the epoch is the handle's, not the transaction's")
+	assert.False(t, exact, "the older snapshot does not hold the change the epoch counts")
+	require.NoError(t, old.Rollback())
+}
+
+// A rolled-back transaction changes no committed counter and is no change to
+// anybody, whatever it marked.
+func TestCacheInvalidation_Rollback_NoCounterChange(t *testing.T) {
+	db1, db2 := cacheInvPair(t)
+	e1, _, fcc0, sc0 := cacheInvState(t, db1)
+	e2, _, _, _ := cacheInvState(t, db2)
+
 	wtx, err := db1.BeginWrite()
 	require.NoError(t, err)
 	ns, err := wtx.CreateNamespace("test")
@@ -279,242 +207,175 @@ func TestCacheInvalidation_Rollback_NoCounterChange(t *testing.T) {
 	wtx.MarkSchemaChanged()
 	require.NoError(t, wtx.Rollback())
 
-	// Counter should be unchanged
-	rtx, err = db1.BeginRead()
-	require.NoError(t, err)
-	assert.Equal(t, initialFCC, rtx.DiskFileChangeCounter(), "counter should not change after rollback")
-	assert.False(t, rtx.IsDataStale(), "should not be stale after rollback")
-	require.NoError(t, rtx.Rollback())
+	e, _, fcc, sc := cacheInvState(t, db1)
+	assert.Equal(t, fcc0, fcc, "counter should not change after rollback")
+	assert.Equal(t, sc0, sc)
+	assert.Equal(t, e1, e)
+	e, _, _, _ = cacheInvState(t, db2)
+	assert.Equal(t, e2, e, "a rollback is no change to the other handle")
 }
 
-// TestCacheInvalidation_MultipleWrites_CounterIncrements verifies that
-// each committed write with MarkDataChanged increments the counter.
+// Each commit marked as a data change raises a schema format 5 file's
+// FileChangeCount by one: the signal a v2.4.x process attached to the file
+// watches.
 func TestCacheInvalidation_MultipleWrites_CounterIncrements(t *testing.T) {
+	useLegacyFormat(t)
 	db := tempDB(t)
-
-	var counters []uint32
+	_, _, prev, _ := cacheInvState(t, db)
 	for i := 0; i < 3; i++ {
-		wtx, err := db.BeginWrite()
-		require.NoError(t, err)
-		ns, err := wtx.GetNamespace("test")
-		if err != nil {
-			ns, err = wtx.CreateNamespace("test")
-			require.NoError(t, err)
-		}
-		require.NoError(t, wtx.Put(ns, []byte("key"), []byte("val")))
-		wtx.MarkDataChanged()
-		require.NoError(t, wtx.Commit())
-
-		rtx, err := db.BeginRead()
-		require.NoError(t, err)
-		counters = append(counters, rtx.DiskFileChangeCounter())
-		require.NoError(t, rtx.Rollback())
-	}
-
-	// Each counter should be strictly greater than the previous
-	for i := 1; i < len(counters); i++ {
-		assert.Greater(t, counters[i], counters[i-1],
-			"counter should increment: counters[%d]=%d should be > counters[%d]=%d",
-			i, counters[i], i-1, counters[i-1])
+		cacheInvWrite(t, db, true, false)
+		_, _, fcc, _ := cacheInvState(t, db)
+		assert.Equal(t, prev+1, fcc, "commit %d", i)
+		prev = fcc
 	}
 }
 
-// TestCacheInvalidation_WriteTx_StaleCheck verifies that IsDataStale/IsSchemaStale
-// work on WriteTx too (inherited from ReadTx).
+// A write begin can be the first transaction to find another handle's
+// commit.
 func TestCacheInvalidation_WriteTx_StaleCheck(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
+	db1, db2 := cacheInvPair(t)
+	e0, _, _, _ := cacheInvState(t, db2)
 
-	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
-	require.NoError(t, err)
-	defer db1.Close()
+	cacheInvWrite(t, db1, true, false)
 
-	allowDoubleOpen(dbPath)
-	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
-	require.NoError(t, err)
-	defer db2.Close()
-
-	// DB1 writes data
-	wtx, err := db1.BeginWrite()
-	require.NoError(t, err)
-	ns, err := wtx.CreateNamespace("test")
-	require.NoError(t, err)
-	require.NoError(t, wtx.Put(ns, []byte("key1"), []byte("val1")))
-	wtx.MarkDataChanged()
-	require.NoError(t, wtx.Commit())
-
-	// DB2 write transaction should detect staleness
 	wtx2, err := db2.BeginWrite()
 	require.NoError(t, err)
-	assert.True(t, wtx2.IsDataStale(), "write tx on db2 should detect data staleness")
+	e, exact := wtx2.ChangeEpoch()
+	assert.Equal(t, e0+1, e, "the write begin on db2 counted db1's commit")
+	assert.True(t, exact)
 	require.NoError(t, wtx2.Rollback())
+	e, _, _, _ = cacheInvState(t, db2)
+	assert.Equal(t, e0+1, e, "once")
 }
 
-// TestCacheInvalidation_EmptyWrite_NoCounterChange verifies that committing
-// an empty write transaction (no Put/Delete) does not change counters
-// even with marks set.
+// A write transaction that wrote nothing commits nothing, whatever it
+// marked: no counter moves and no other handle is told.
 func TestCacheInvalidation_EmptyWrite_NoCounterChange(t *testing.T) {
-	db := tempDB(t)
+	db1, db2 := cacheInvPair(t)
+	_, _, fcc0, _ := cacheInvState(t, db1)
+	e0, _, _, _ := cacheInvState(t, db2)
 
-	// Get initial counter
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-	initialFCC := rtx.DiskFileChangeCounter()
-	require.NoError(t, rtx.Rollback())
-
-	// Empty write with marks
-	wtx, err := db.BeginWrite()
+	wtx, err := db1.BeginWrite()
 	require.NoError(t, err)
 	wtx.MarkDataChanged()
 	require.NoError(t, wtx.Commit())
 
-	// Counter should be unchanged (no dirty pages)
-	rtx, err = db.BeginRead()
-	require.NoError(t, err)
-	assert.Equal(t, initialFCC, rtx.DiskFileChangeCounter(),
-		"counter should not change for empty transaction")
-	require.NoError(t, rtx.Rollback())
+	_, _, fcc, _ := cacheInvState(t, db1)
+	assert.Equal(t, fcc0, fcc, "counter should not change for empty transaction")
+	e, _, _, _ := cacheInvState(t, db2)
+	assert.Equal(t, e0, e, "an empty commit publishes nothing")
 }
 
-// TestCacheInvalidation_DataOnly_SchemaUnchanged verifies that
-// MarkDataChanged does NOT affect SchemaCookie.
+// A data change does not touch the schema cookie.
 func TestCacheInvalidation_DataOnly_SchemaUnchanged(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
+	db1, db2 := cacheInvPair(t)
+	e0, _, fcc0, sc0 := cacheInvState(t, db2)
 
-	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
-	require.NoError(t, err)
-	defer db1.Close()
+	cacheInvWrite(t, db1, true, false)
 
-	allowDoubleOpen(dbPath)
-	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
-	require.NoError(t, err)
-	defer db2.Close()
-
-	// DB1 writes data only (no schema change)
-	wtx, err := db1.BeginWrite()
-	require.NoError(t, err)
-	ns, err := wtx.CreateNamespace("test")
-	require.NoError(t, err)
-	require.NoError(t, wtx.Put(ns, []byte("key1"), []byte("val1")))
-	wtx.MarkDataChanged()
-	// NOT calling MarkSchemaChanged
-	require.NoError(t, wtx.Commit())
-
-	// DB2: data stale, schema NOT stale
-	rtx, err := db2.BeginRead()
-	require.NoError(t, err)
-	assert.True(t, rtx.IsDataStale(), "data should be stale")
-	assert.False(t, rtx.IsSchemaStale(), "schema should NOT be stale")
-	require.NoError(t, rtx.Rollback())
+	e, _, fcc, sc := cacheInvState(t, db2)
+	assert.Equal(t, fcc0+1, fcc, "the data change is counted on page 1")
+	assert.Equal(t, sc0, sc, "the schema cookie is as it was")
+	assert.Equal(t, e0+1, e)
 }
 
-// TestCacheInvalidation_FileReopened verifies counters survive close/reopen.
+// The page-1 counters survive a close and reopen, and a freshly opened
+// handle starts with nothing to find.
 func TestCacheInvalidation_FileReopened(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
-	// Write some data and bump counters
+	dbPath := filepath.Join(t.TempDir(), "test.db")
 	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
-
-	wtx, err := db1.BeginWrite()
-	require.NoError(t, err)
-	ns, err := wtx.CreateNamespace("test")
-	require.NoError(t, err)
-	require.NoError(t, wtx.Put(ns, []byte("key1"), []byte("val1")))
-	wtx.MarkDataChanged()
-	wtx.MarkSchemaChanged()
-	require.NoError(t, wtx.Commit())
-
-	// Checkpoint to ensure data is in the main file
+	cacheInvWrite(t, db1, true, true)
 	require.NoError(t, db1.Checkpoint(CheckpointFull))
-
-	// Get the counter values
-	rtx, err := db1.BeginRead()
-	require.NoError(t, err)
-	fcc := rtx.DiskFileChangeCounter()
-	sc := rtx.DiskSchemaCookie()
-	require.NoError(t, rtx.Rollback())
+	_, _, fcc0, sc0 := cacheInvState(t, db1)
 	require.NoError(t, db1.Close())
 
-	// Reopen and verify counters are preserved
 	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()
-
-	rtx, err = db2.BeginRead()
-	require.NoError(t, err)
-	assert.Equal(t, fcc, rtx.DiskFileChangeCounter(), "FileChangeCounter should survive reopen")
-	assert.Equal(t, sc, rtx.DiskSchemaCookie(), "SchemaCookie should survive reopen")
-	assert.False(t, rtx.IsDataStale(), "should not be stale on fresh open")
-	assert.False(t, rtx.IsSchemaStale(), "schema should not be stale on fresh open")
-	require.NoError(t, rtx.Rollback())
+	e, exact, fcc, sc := cacheInvState(t, db2)
+	assert.Equal(t, fcc0, fcc, "FileChangeCounter should survive reopen")
+	assert.Equal(t, sc0, sc, "SchemaCookie should survive reopen")
+	assert.Equal(t, sc0, db2.LocalSchemaCookie())
+	assert.Zero(t, e, "a fresh open has nothing to find")
+	assert.True(t, exact)
 }
 
-// TestCacheInvalidation_Checkpoint checks that Checkpoint() is available on DB.
+// A FULL checkpoint keeps the data and is no change to the handle that ran
+// it, nor, changing no wal-index header, to another.
 func TestCacheInvalidation_Checkpoint(t *testing.T) {
-	db := tempDB(t)
+	db1, db2 := cacheInvPair(t)
+	cacheInvWrite(t, db1, true, false)
+	e1, _, _, _ := cacheInvState(t, db1)
+	e2, _, _, _ := cacheInvState(t, db2)
 
-	// Write data
-	wtx, err := db.BeginWrite()
-	require.NoError(t, err)
-	ns, err := wtx.CreateNamespace("test")
-	require.NoError(t, err)
-	require.NoError(t, wtx.Put(ns, []byte("key1"), []byte("val1")))
-	wtx.MarkDataChanged()
-	require.NoError(t, wtx.Commit())
+	require.NoError(t, db1.Checkpoint(CheckpointFull))
 
-	// Verify data survives checkpoint
-	require.NoError(t, db.Checkpoint(CheckpointFull))
-
-	rtx, err := db.BeginRead()
+	rtx, err := db1.BeginRead()
 	require.NoError(t, err)
-	ns, err = rtx.GetNamespace("test")
+	ns, err := rtx.GetNamespace("test")
 	require.NoError(t, err)
 	val, err := rtx.Get(ns, []byte("key1"))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("val1"), val)
-	assert.False(t, rtx.IsDataStale())
+	e, _ := rtx.ChangeEpoch()
 	require.NoError(t, rtx.Rollback())
+	assert.Equal(t, e1, e)
+	e, _, _, _ = cacheInvState(t, db2)
+	assert.Equal(t, e2, e, "a checkpoint that resets nothing is no change")
 }
 
-// TestCacheInvalidation_InProcessMode verifies the mechanism works
-// with InProcess mode too.
+// An in-process database has no other process: the epoch stays 0, every
+// snapshot is exact, and own writes are visible to the next transaction.
 func TestCacheInvalidation_InProcessMode(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
+	dbPath := filepath.Join(t.TempDir(), "test.db")
 	db, err := testOpen(t, dbPath, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 	defer db.Close()
 
-	// Initial state: not stale
+	e, exact, fcc0, _ := cacheInvState(t, db)
+	assert.Zero(t, e)
+	assert.True(t, exact)
+
+	cacheInvWrite(t, db, true, false)
+
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)
-	assert.False(t, rtx.IsDataStale())
+	ns, err := rtx.GetNamespace("test")
+	require.NoError(t, err)
+	val, err := rtx.Get(ns, []byte("key1"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("val1"), val, "the own write is visible")
+	e, exact = rtx.ChangeEpoch()
+	fcc, _, err := rtx.SnapshotHeaderCounters()
+	require.NoError(t, err)
 	require.NoError(t, rtx.Rollback())
-
-	// Write and mark
-	wtx, err := db.BeginWrite()
-	require.NoError(t, err)
-	ns, err := wtx.CreateNamespace("test")
-	require.NoError(t, err)
-	require.NoError(t, wtx.Put(ns, []byte("k"), []byte("v")))
-	wtx.MarkDataChanged()
-	require.NoError(t, wtx.Commit())
-
-	// Not stale after own write
-	rtx, err = db.BeginRead()
-	require.NoError(t, err)
-	assert.False(t, rtx.IsDataStale())
-	require.NoError(t, rtx.Rollback())
+	assert.Zero(t, e)
+	assert.True(t, exact)
+	assert.Equal(t, fcc0+1, fcc)
 }
 
-// checkpointHelper forces a checkpoint. tempDB databases may not have
-// a Checkpoint method exposed, so we call it via the pager if needed.
-func init() {
-	// Ensure os and filepath are used
-	_ = os.Remove
-	_ = filepath.Join
+// In a schema format 6 file marks do not move FileChangeCount: a commit that
+// leaves page 1 out leaves it as it is, and one that writes page 1 sets it to
+// page 1's counter as last read plus one, marked or not. The other handle
+// finds every commit all the same.
+func TestCacheInvalidation_Format6_CounterMovesWithPage1(t *testing.T) {
+	skipInLegacyFormatSuite(t)
+	db1, db2 := cacheInvPair(t)
+	cacheInvWrite(t, db1, false, false) // creates the namespace: page 1
+	e0, _, fcc0, _ := cacheInvState(t, db2)
+
+	cacheInvWrite(t, db1, true, false) // in place, marked: no page 1
+	e, exact, fcc, _ := cacheInvState(t, db2)
+	assert.Equal(t, fcc0, fcc, "no page 1, no new counter")
+	assert.Equal(t, e0+1, e, "the commit is found without the counter")
+	assert.True(t, exact)
+
+	wtx, err := db1.BeginWrite()
+	require.NoError(t, err)
+	_, err = wtx.CreateNamespace("more") // page 1, unmarked
+	require.NoError(t, err)
+	require.NoError(t, wtx.Commit())
+	_, _, fcc, _ = cacheInvState(t, db2)
+	assert.Equal(t, fcc0, fcc, "db1 read page 1 last at its own commit's counter minus one, and writes the same value again")
 }

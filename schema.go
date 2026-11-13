@@ -122,7 +122,7 @@ func (s *collSchema) sameAs(o *collSchema) bool {
 }
 
 // cookieLE reports a <= b for schema cookies: they increment per commit and
-// are compared modulo 2^32, like the counters in btree.
+// are compared modulo 2^32, so a cookie that wrapped still counts as later.
 func cookieLE(a, b uint32) bool {
 	return int32(a-b) <= 0
 }

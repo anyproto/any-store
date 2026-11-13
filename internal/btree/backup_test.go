@@ -371,7 +371,9 @@ func TestBackup_FinalizedDstReportsTruePageCount(t *testing.T) {
 	rtx, err := d2.BeginRead()
 	require.NoError(t, err)
 	defer rtx.Rollback()
-	require.Equal(t, nSrc, rtx.DatabaseSize(),
+	snapSize, err := rtx.DatabaseSize()
+	require.NoError(t, err)
+	require.Equal(t, nSrc, snapSize,
 		"snapshot DatabaseSize must equal the true page count")
 
 	// Descent over the dst must succeed for every key. With a stale
@@ -410,13 +412,25 @@ func TestBackup_RestartOnCheckpointRestart(t *testing.T) {
 	b.mu.Unlock()
 	require.NotEqual(t, uint32(1), iNextBefore, "Step(2) should have advanced iNext past 1")
 
-	// CheckpointRestart resets WAL. ~ backup.c:701 trigger.
+	// A RESTART checkpoint only waits for the readers (wal.c:2357-2362): it
+	// resets nothing, and the backup goes on.
 	require.NoError(t, src.Checkpoint(CheckpointRestart))
 
 	b.mu.Lock()
 	iNextAfter := b.iNext
 	b.mu.Unlock()
-	require.Equal(t, uint32(1), iNextAfter, "CheckpointRestart must trigger Backup.restart (backup.c:701-707)")
+	require.Equal(t, iNextBefore, iNextAfter, "a RESTART checkpoint does not restart a backup")
+
+	// A TRUNCATE checkpoint of this process resets the WAL, and the backup
+	// goes on all the same: the reset is the process's own (walRestartHdr
+	// changes the connection's pWal->hdr, wal.c:2151-2154, so its next read
+	// is no pager_reset), and a backup holds no frame number between Steps.
+	require.NoError(t, src.Checkpoint(CheckpointTruncate))
+
+	b.mu.Lock()
+	iNextAfter = b.iNext
+	b.mu.Unlock()
+	require.Equal(t, iNextBefore, iNextAfter, "an own TRUNCATE checkpoint does not restart a backup")
 
 	// Clean up so Finish doesn't leave the write tx hanging.
 	_ = b.Finish()

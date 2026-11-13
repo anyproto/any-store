@@ -832,7 +832,7 @@ func TestOlderReaderLeavesUncommittedIndexDDLAlone(t *testing.T) {
 
 	rtx, err := dbi.btreeDB.BeginRead()
 	require.NoError(t, err)
-	fcc, sc := rtx.DiskFileChangeCounter(), rtx.DiskSchemaCookie()
+	sc := rtx.DiskSchemaCookie()
 	require.NoError(t, rtx.Rollback())
 
 	committed := coll.cur()
@@ -846,7 +846,7 @@ func TestOlderReaderLeavesUncommittedIndexDDLAlone(t *testing.T) {
 
 	// Another process's schema change, noticed by a reader while the DDL is
 	// in flight: the reader resolves the handle for its snapshot.
-	modelPeerSchemaChange(dbi, fcc, sc)
+	modelPeerSchemaChange(dbi, sc)
 	n, err := coll.Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)

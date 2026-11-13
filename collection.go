@@ -149,8 +149,17 @@ type Collection interface {
 // transaction alone (see resolveSlow).
 func newCollection(db *db, name string, tx *btree.ReadTx) (*collection, *collSchema, error) {
 	c := &collection{db: db, openName: name}
-	// The sketches are about to be read: as of the epoch before that.
-	c.sketchSeen.Store(db.sketchEpoch.Load())
+	// The sketches are about to be read through tx. They are current for the
+	// change epoch only if tx's snapshot is exact for it; a transaction at
+	// an older snapshot (the open may run inside one that began before
+	// another process's commit was counted) loads older sketches, which the
+	// first use then loads again. A write transaction's snapshot is the
+	// latest there is: nothing of another process commits under it.
+	if epoch, exact := tx.ChangeEpoch(); exact || tx.IsWriteTx() {
+		c.sketchSeen.Store(epoch)
+	} else {
+		c.sketchSeen.Store(sketchEpochNone)
+	}
 	s, err := c.loadSchema(tx, name, nil)
 	if err != nil {
 		return nil, nil, err
@@ -207,7 +216,7 @@ type collection struct {
 	// allocating a fresh read buffer per index.
 	sketchReadBuf []byte
 
-	// sketchSeen is the db.sketchEpoch the sketches of this handle were last
+	// sketchSeen is the change epoch (btree.ReadTx.ChangeEpoch) the sketches of this handle were last
 	// brought up to (refreshSketches).
 	sketchSeen atomic.Uint64
 
@@ -1669,19 +1678,28 @@ func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, collName string, idx *in
 	idx.storePubSketch(idx.sketch)
 }
 
+// sketchEpochNone is the sketchSeen of a handle whose sketches were loaded
+// at a snapshot that was not exact for any epoch: no epoch equals it.
+const sketchEpochNone = ^uint64(0)
+
 // refreshSketches reloads the sketches of the version s, resolved for tx, if
-// another process committed since they were last loaded (db.sketchEpoch).
-// Called where sketches are used: a reader's plan, and a writer's first
-// operation on the collection, before its own deltas go on top. A reader at
-// a snapshot older than the newest this process has consumed loads nothing:
-// what it would publish is older than what is published.
+// another process committed since they were last loaded: the change epoch
+// moved (btree.ReadTx.ChangeEpoch). Called where sketches are used: a
+// reader's plan, and a writer's first operation on the collection, before
+// its own deltas go on top.
+//
+// What is loaded is stamped with the epoch, so it has to hold every change
+// the epoch counts. A reader loads only if its snapshot is exact for the
+// epoch: one at an older snapshot would publish older sketches as current,
+// over newer ones, and nothing would reload them until the next commit of
+// another process. A writer's snapshot is the latest there is.
 func (c *collection) refreshSketches(tx *btree.ReadTx, s *collSchema) {
-	epoch := c.db.sketchEpoch.Load()
+	epoch, exact := tx.ChangeEpoch()
 	if c.sketchSeen.Load() == epoch {
 		return
 	}
 	writable := tx.IsWriteTx()
-	if fcc, _ := c.db.btreeDB.LocalCounters(); !writable && !cookieLE(fcc, tx.SnapshotFileChangeCounter()) {
+	if !writable && !exact {
 		return
 	}
 	c.mu.Lock()

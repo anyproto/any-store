@@ -65,12 +65,21 @@ type Backup struct {
 	nRemaining uint32 // pages left to copy
 	nPagecount uint32 // total pages in source (as of last Step)
 
-	// lastFCC is the FileChangeCounter observed at the previous Step's
-	// read-tx open. A jump between Steps signals an external-process
-	// commit: the in-process dispatchBackupUpdate hook can't observe
-	// cross-process writes, so we restart per backup.c:701-707.
-	// 0 = "no prior Step" (init state).
-	lastFCC uint32
+	// epoch and exact are what the previous Step's snapshot saw of the
+	// source's change state (ReadTx.ChangeEpoch); stepped is whether there
+	// was one. The pages copied so far are of one committed state of the
+	// source as long as every Step's snapshot is exact for the same epoch:
+	// this process's own commits reach the copy through update, and anything
+	// else moves the epoch. Otherwise the copy starts over, as SQLite's does
+	// when the Step's own read transaction resets the pager
+	// (sqlite3BackupRestart from pager_reset, pager.c:1774; backup.c:351).
+	epoch   uint64
+	exact   bool
+	stepped bool
+
+	// busy is the busy error of the last Step, nil if that Step was not
+	// busy: see stepBusy.
+	busy error
 
 	dstLocked bool // ~ bDestLocked (backup.c:25)
 
@@ -111,7 +120,7 @@ func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 		return nil, ErrBackupPageSizeMismatch
 	}
 
-	// DRIFT: SQLite's backup turns the destination into the source's file format; here the two must already agree, because the leaf payload rule is held per open file, not per page. See docs/btree/NOTES.md#drift-2026-11-11-2-backup-refuses-a-destination-of-another-schema-format
+	// DRIFT: SQLite's backup turns the destination into the source's file format; here the two must already agree, because the leaf payload rule is held per open file, not per page. See docs/btree/NOTES.md#drift-2026-11-11-8-backup-refuses-a-destination-of-another-schema-format
 	if dst.pager.tableLeaf.Load() != src.pager.tableLeaf.Load() {
 		return nil, ErrBackupFormatMismatch
 	}
@@ -186,72 +195,143 @@ func putUint32BE(buf []byte, v uint32) {
 	buf[3] = byte(v)
 }
 
+// backupBusy reports an error that says "not now" and nothing about the
+// backup: a busy lock, a recovery in progress, no free reader slot, or the
+// caller's ctx ending. Such an error is returned and not kept: a later Step
+// on the same Backup goes on. ~ isFatalError (backup.c:217-219), which keeps
+// SQLITE_BUSY and SQLITE_LOCKED out of p->rc.
+// DRIFT: ErrBusyRecovery is not sticky for a backup; C's isFatalError compares exact codes, so SQLITE_BUSY_RECOVERY is fatal there See docs/btree/NOTES.md#drift-2026-11-13-2-a-backup-step-that-met-a-recovery-can-be-retried
+func backupBusy(ctx context.Context, err error) bool {
+	if cerr := ctx.Err(); cerr != nil && errors.Is(err, cerr) {
+		return true // the ctx's own error; any other error keeps its meaning
+	}
+	return errors.Is(err, ErrBusy) || errors.Is(err, ErrBusySnapshot) ||
+		errors.Is(err, ErrBusyRecovery) || errors.Is(err, ErrReadersBusy)
+}
+
+// stepBusy records a Step's busy result for Finish and returns it.
+// sqlite3_backup_step stores SQLITE_BUSY in p->rc (backup.c:558), where it
+// stops no later step (isFatalError) and is what sqlite3_backup_finish
+// returns if no later step replaced it (backup.c:603).
+func (b *Backup) stepBusy(err error) error {
+	if backupBusy(context.Background(), err) { // a busy error, not the ctx's
+		b.busy = err
+	}
+	return err
+}
+
+// testBackupSampledHook, when non-nil, runs in Step right after it read the
+// change epoch for its snapshot. Test-only.
+var testBackupSampledHook func()
+
 // Step copies up to nPage pages from the source to the destination.
 // nPage < 0 means "copy all remaining pages in one call". Returns
 // ErrBackupDone when every source page has been copied; returns nil
-// when more work remains. Any other error is sticky — recorded in b.rc
-// and re-returned by future calls (~ backup.c:329 + backup.c:558).
+// when more work remains.
+//
+// ErrBusy means the Step did nothing and can be tried again: the source has
+// a write transaction open in this process (as sqlite3_backup_step returns
+// SQLITE_BUSY for one, backup.c:340-341), or no reader slot is free. The
+// other busy errors of a transaction begin, and the error of a ctx that
+// ended, are returned the same way (backupBusy). Any other error is sticky,
+// and so is ErrBackupDone: recorded in b.rc and re-returned by future calls
+// (~ backup.c:329 + backup.c:558).
+//
+// A Step holds the source's write lock of this process from its start to its
+// end, so no write transaction of this process overlaps it: a commit and the
+// updates it sends this backup are either wholly before the Step's snapshot
+// or wholly after the Step (backup.c:323-324, 668). It takes that lock, and
+// its reader slot, without waiting: the caller may be the one holding them.
 //
 // ~ sqlite3_backup_step (backup.c:314–566).
 // DRIFT: backup empty-source (nSrcPage==0 -> NewDb) path missing; truncateTo(0) errors See docs/btree/NOTES.md#drift-41-backup-empty-source-finalization-path-missing
 func (b *Backup) Step(ctx context.Context, nPage int) error {
+	// Before anything is taken: the non-waiting begin below does not look
+	// at ctx.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if b.finished {
 		return ErrBackupFinished
 	}
-	if b.rc != nil && b.rc != ErrBackupDone {
-		return b.rc // ~ isFatalError check at backup.c:329
+	// ~ isFatalError check at backup.c:329. A backup that is done is not
+	// stepped again either: SQLITE_DONE is fatal in that sense
+	// (backup.c:217-219), and the source's commits since are not sent to it
+	// (update), so the pages a further Step copied would be of a later
+	// state than the rest.
+	if b.rc != nil {
+		return b.rc
 	}
-
-	// Open a read transaction on source for this Step. ~ backup.c:346–353.
-	// DRIFT: SQLite conditionally opens a tx only if none exists, to
-	// support explicit sqlite3_backup_step-inside-a-user-tx patterns.
-	// any-store doesn't expose that; we always open+close our own.
-	rtx, err := b.src.BeginReadContext(ctx)
-	if err != nil {
-		// The ctx's error is the caller's, not the backup's: a later Step
-		// with a live ctx goes on (SQLite's isFatalError keeps BUSY and
-		// LOCKED out of p->rc the same way, backup.c:217-219).
-		if ctx.Err() == nil {
-			b.rc = err
-		}
-		return err
-	}
-	defer rtx.Rollback()
-
-	// ~ sqlite3BackupRestart (backup.c:701-707) external-trigger path.
-	// Page-1 FileChangeCounter changes on every write commit, including
-	// from other processes. The in-process dispatchBackupUpdate hook
-	// only fires for same-process commits (same DB handle), so this
-	// detects the rest. Inline the iNext reset to avoid re-acquiring b.mu.
-	if b.lastFCC != 0 && rtx.diskFileChangeCounter != b.lastFCC {
-		b.iNext = 1
-	}
-	b.lastFCC = rtx.diskFileChangeCounter
+	b.busy = nil
 
 	// Lock destination (exclusive/write tx) on first Step.
 	// ~ backup.c:366–371: sqlite3BtreeBeginTrans(p->pDest, 2, &iDestSchema).
+	// Before the source's lock is taken: this begin can wait.
 	if !b.dstLocked {
 		wtx, err := b.dst.BeginWriteContext(ctx)
 		if err != nil {
-			if ctx.Err() == nil {
+			if !backupBusy(ctx, err) {
 				b.rc = err
+				return err
 			}
-			return err
+			return b.stepBusy(err)
 		}
 		b.dstWriteTx = wtx
 		b.iDstSchema = b.dst.localSchemaCookie.Load() // ~ iDestSchema capture
 		b.dstLocked = true
 	}
 
+	// ~ backup.c:337-344: "If the source pager is currently in a
+	// write-transaction, return SQLITE_BUSY immediately."
+	if !b.src.tryLockWriter() {
+		return b.stepBusy(ErrBusy)
+	}
+	defer b.src.unlockWriter()
+
+	// Open a read transaction on source for this Step. ~ backup.c:346–353.
+	// DRIFT: SQLite conditionally opens a tx only if none exists, to
+	// support explicit sqlite3_backup_step-inside-a-user-tx patterns.
+	// any-store doesn't expose that; we always open+close our own.
+	rtx, err := b.src.beginRead(ctx, false, false)
+	if err != nil {
+		if errors.Is(err, ErrReadersBusy) {
+			return b.stepBusy(ErrBusy)
+		}
+		if !backupBusy(ctx, err) {
+			b.rc = err
+			return err
+		}
+		return b.stepBusy(err)
+	}
+	defer rtx.Rollback()
+
+	// ~ sqlite3BackupRestart (backup.c:701-707), as pager_reset calls it
+	// when the Step's read transaction finds the source changed
+	// (pager.c:1774). See the epoch field.
+	epoch, exact := rtx.ChangeEpoch()
+	if testBackupSampledHook != nil {
+		testBackupSampledHook()
+	}
+	if b.stepped && (!exact || !b.exact || epoch != b.epoch) {
+		b.iNext = 1
+	}
+	b.epoch, b.exact, b.stepped = epoch, exact, true
+
 	// ~ backup.c:394: nSrcPage = sqlite3BtreeLastPage(pSrc), read once under
 	// the source read-lock. Derive from the read-tx snapshot opened above so
 	// the loop bound, nPagecount/nRemaining, finalize, and the page-1 size
-	// patch are all consistent with the same snapshot (and with the bound
-	// getPageReader validates copied pages against, pager.go:952).
-	nSrcPage := rtx.DatabaseSize()
+	// patch are all consistent with the same snapshot. It is the logical
+	// size lockBtree derives from page 1, not the pager's count, which can
+	// include pages past it (ReadTx.DatabaseSize).
+	nSrcPage, err := rtx.DatabaseSize()
+	if err != nil {
+		b.rc = err
+		return err
+	}
 	srcPgsz := b.src.PageSize()
 
 	// Main copy loop. ~ backup.c:390–401.
@@ -397,7 +477,13 @@ func (b *Backup) update(iPage uint32, data []byte) {
 	// isFatalError(SQLITE_DONE)==TRUE (backup.c:217-219, DONE is neither
 	// SQLITE_OK/BUSY/LOCKED), so backupUpdate never re-touches a DONE backup's
 	// finalized destination.
-	if b.rc != nil {
+	//
+	// A finished backup is not touched either. The source copies its list of
+	// backups and calls them outside the list's lock, so Finish can run
+	// between the copy and this call, and the destination may be in a
+	// transaction of its owner's by now. SQLite's finish holds the source
+	// mutex that backupUpdate asserts (backup.c:579-580, 668).
+	if b.finished || b.rc != nil {
 		return
 	}
 	if iPage >= b.iNext {
@@ -418,6 +504,9 @@ func (b *Backup) update(iPage uint32, data []byte) {
 func (b *Backup) restart() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.finished {
+		return // see update
+	}
 	b.iNext = 1
 }
 
@@ -457,6 +546,14 @@ func (b *Backup) Finish() error {
 			return finishErr
 		}
 		return nil
+	}
+	if b.rc == nil && finishErr == nil {
+		// Not done and not failed: the last Step's busy result, if it was
+		// busy (backup.c:603 returns p->rc, where the step left it).
+		return b.busy
+	}
+	if b.rc == nil {
+		return finishErr
 	}
 	return b.rc
 }

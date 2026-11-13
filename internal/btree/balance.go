@@ -832,7 +832,7 @@ func (bt *btree) freePageDeferred(pgno uint32) error {
 // btree.go:907): for an interior page with cells P_0..P_{nc-1} and rightChild,
 // the children are P_0.leftChild..P_{nc-1}.leftChild, rightChild (nc+1 of them),
 // and the divider key separating child c and child c+1 is P_c.key (0<=c<nc).
-// DRIFT: an over-full parent is split in place and its dividers cascade one at a time; SQLite balances the parent with its siblings. See docs/btree/NOTES.md#drift-2026-11-11-1-parent-rewrite-after-a-balance-splits-in-place
+// DRIFT: an over-full parent is split in place and its dividers cascade one at a time; SQLite balances the parent with its siblings. See docs/btree/NOTES.md#drift-2026-11-11-7-parent-rewrite-after-a-balance-splits-in-place
 func (bt *btree) rewriteParentAfterBalance(
 	parentPg *page,
 	nxDiv, nOld, rightmostChildSlot int,
@@ -1009,7 +1009,7 @@ func (bt *btree) rewriteParentAfterBalance(
 //
 // Three pages always suffice: the cells are those of one page plus at most
 // four new dividers, each no larger than about a quarter page.
-// DRIFT: an over-full parent is split here in place, two or three ways, and its dividers cascade one at a time; SQLite inserts them as overflow cells of the parent and runs balance_nonroot on it. See docs/btree/NOTES.md#drift-2026-11-11-1-parent-rewrite-after-a-balance-splits-in-place
+// DRIFT: an over-full parent is split here in place, two or three ways, and its dividers cascade one at a time; SQLite inserts them as overflow cells of the parent and runs balance_nonroot on it. See docs/btree/NOTES.md#drift-2026-11-11-7-parent-rewrite-after-a-balance-splits-in-place
 func (bt *btree) splitParentThreeWays(parentPg *page, cells []cellData, rightChild uint32, leftHdrOff int, parentPath []pathEntry) error {
 	usableSize := bt.usablePageSize()
 	n := len(cells)

@@ -176,6 +176,7 @@ func skipInLegacyFormatSuite(t testing.TB) {
 // ANYSTORE_TEST_LEGACY_FORMAT=1, so the rule existing files keep stays covered
 // by every test, not only the ones that pin it.
 func TestMain(m *testing.M) {
+	SetCheckPage1ForTest(true)
 	if os.Getenv("ANYSTORE_TEST_LEGACY_FORMAT") == "1" {
 		legacyFormatSuite = true
 		SetCreateLegacyFormatForTest(true)

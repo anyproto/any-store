@@ -433,7 +433,7 @@ Both support: PASSIVE, FULL, RESTART, TRUNCATE with identical semantics.
 | Big-endian only checksums | **Intentional** -- simplifies implementation |
 | Go map for same-process reads | **Divergent** -- O(1) map vs hash table scan |
 | Heap SHM fallback | **Divergent** -- enables non-mmap platforms |
-| WAL undo (`sqlite3WalUndo`) | **Missing** -- Go uses pager-level rollback instead |
+| WAL undo (`sqlite3WalUndo`) | **Missing** -- Go uses pager-level rollback instead. The rollback clears the whole writer cache, where `pagerRollbackWal` reloads only logged and dirty pages (`pager.c:3147-3166`): a clean page 1 is read again by the next transaction, and in a schema format 6 file that sets the change counter's `dbFileVers` (2026-11-12, [drift-77](#drift-77-filechangecount-bumped-conditionally-not-unconditionally)) |
 | First-opener `ftruncate(shm, 3)` marker | **Aligned (2026-07-10)** -- `newPlatformShm` now runs SQLite's full DMS first-attacher election (`unixLockSharedMemory`, os_unix.c:4860-4913, 3.52.0): F_GETLK probe → three-way branch (F_UNLCK: WRLCK + UNCONDITIONAL truncate-to-3 + atomic downgrade to RDLCK; F_RDLCK: join shared; F_WRLCK: back off BUSY, never join — the os_unix.c:4864-4871 race). The `Size()==0` gate is gone; a crash-persisted stale shm is physically reset by the first attacher and `recoverLocked` rebuilds from the WAL. See [§drift-2026-06-25-25](#drift-2026-06-25-25-first-opener-does-not-reset-a-stale-persisted-shm-trusts-checksum-vali) (RESOLVED) and item 2 below |
 | Orphan-inode handling on open race | **Aligned** -- DB-file flock serializes last-client-unlink (see §SHM open/close protocol drift) |
 
@@ -1177,9 +1177,20 @@ Two mechanisms coexist in the implementation, each solving a distinct problem:
    cross-process at `BeginRead`, set in lockstep with `walMaxFrame` at every
    snapshot-establish site. It is derived by `pager.effectiveReaderDbSize`
    (pager.go:1664-1686), which mirrors `sqlite3WalDbsize` (wal.c:3672, returning
-   `pWal->hdr.nPage`) and falls back to `pager.dbSize` when the WAL header carries
-   no committed size -- mirroring `pagerPagecount`'s file-size fallback
-   (pager.c:3299-3305). Every reader bound check consults this via
+   `pWal->hdr.nPage`) and, when the WAL header carries no committed size, falls back
+   to the database file's size as `pagerPagecount` does (pager.c:3299-3305). The
+   in-process and in-memory modes publish no wal-index header: their synthesized
+   snapshot header carries the size of the walIndex's committed position, the
+   commit frame and its size in one word (`mxframe.go`), which only a published
+   commit moves and which open and database creation seed; no reader there uses
+   `pager.dbSize` either (until 2026-11-12 they did, and a reader of the committed
+   snapshot failed on its pages above an uncommitted shrink). Until 2026-11-11 the
+   fallback was `pager.dbSize` in every mode, and a WAL reset published a header
+   without a size: see [drift-2026-11-11-3](#drift-2026-11-11-3-reader-size-without-a-wal-commit-is-memoized).
+   This is the pager's count, the bound for page reads; the database's logical
+   size, which `ReadTx.DatabaseSize` returns and a backup copies, is lockBtree's
+   count from the snapshot's page 1 (`sqlite3BtreeLastPage`, btree.c:2364-2369).
+   Every reader bound check consults this via
    `pager.readerDbSizeBound` (pager.go:1688-1699), which returns `cache.dbSize`
    when set and otherwise degrades safely to `pager.dbSize.Load()` for the
    writer/uncached paths. `IntegrityCheckN` sets `cache.dbSize = nPages` likewise
@@ -1289,7 +1300,11 @@ comments in source):
 
 <a id="old-drift-pagerstress-page1-exclusion"></a>
 2. **Page-1 explicit exclusion** (`pager.go:pagerStress` AND
-   `pcache.go:findSpillVictim`) — **Severity:** low.
+   `pcache.go:findSpillVictim`) — **Severity:** low. Consequence for the change
+   counter (2026-11-12): page 1 is not held for the transaction, so a clean page 1
+   can be evicted during one and read again at the commit, and that read sets
+   `dbFileVers` ([schema format 6 counter](#drift-77-filechangecount-bumped-conditionally-not-unconditionally)),
+   where SQLite's referenced page 1 keeps its value.
    SQLite does not check
    `pgno==1` in `pagerStress()`. Page 1 is structurally protected: it stays pinned
    (referenced) throughout the transaction, so pcache never selects it as a spill
@@ -1545,7 +1560,12 @@ material (measurement shows it is secondary to syscall cost).
 after deserializing the DB header and returns `ErrCorrupt` on a
 nonzero mismatch (zero is treated as "field not tracked" — legacy /
 test fixtures skip the check). Commit path now advances both fields
-in lockstep. Catches crash-mid-header-update corruption.
+in lockstep. Catches crash-mid-header-update corruption. Since
+2026-11-11 the comparison is made by `lockBtreePageCount` on the page 1
+the open snapshot reads (`pager.readPage1AtOpen`): a WAL page 1 that
+supersedes a damaged file header is what gets judged. This is
+stricter than SQLite, which only stops trusting the in-header size:
+see [drift-2026-11-11-2](#drift-2026-11-11-2-nonzero-change-counter-mismatch-is-corruption).
 
 **Auto-Checkpoint Errors Surfaced** -- Resolved 2026-04-22
 
@@ -1864,49 +1884,44 @@ needed for auto-vacuum and locality hints.
    fields are deleted. See the "Per-connection `walHdr`" section below for the
    current design.
 
-### Lazy `ensureHeaderInitialized` helper (commits 2026-04-18)
+### Lazy `ensureHeaderInitialized` helper (commits 2026-04-18; removed 2026-11-11)
 
-`wal.go:ensureHeaderInitialized` is an experimental lazy counterpart to
-`walIndexReadHdr` (wal.c:2640-2745). Structure matches SQLite:
+`wal.go:ensureHeaderInitialized` was an experimental lazy counterpart to
+`walIndexReadHdr` (wal.c:2654-2759) that only tests called; production code
+used eager SHM init via `wal.open` and never repaired an invalid header
+afterwards. It is replaced by `wal.indexReadHdr`, the production port of
+`walIndexReadHdr`, called from the multi-process read path and from
+`checkpointWithMode`: see
+[drift-2026-11-11-1](#drift-2026-11-11-1-attached-wal-index-recovery).
+`ensureHeaderInitialized`, its in-process variant, the `inProcessInit` flag
+and `syncFromSHMLocked` (its only caller) are deleted; `indexReadHdr` does
+not sync process-global state on the valid-header path, which the reader
+path must not do.
 
-- Fast path: `readHeader()` → if valid, return.
-- Slow path: `walLockExclusive(WAL_WRITE_LOCK)` → retry `readHeader` → if still
-  invalid, recover.
-- Busy-path fence: `walLockShared(WAL_RECOVER_LOCK)` then release, matching
-  wal.c:3089.
-
-Currently the helper is invoked defensively from 3 targeted tests
-(`TestEnsureHeaderInitialized_*`) but NOT from production code. Production
-code continues to use eager SHM init via `wal.open` + `adoptSHMState` /
-`recoverLocked` / `initHeaderStateLocked`. See "SQLite-alignment blocker"
-below for why cold-open was attempted and reverted.
-
-**Drifts from SQLite's `walIndexReadHdr` preserved:**
+**Drifts from SQLite's `walIndexReadHdr`, as they stand for `indexReadHdr`:**
 
 <a id="old-drift-ensureheader-triple-lock-recovery-gate"></a>
-**Severity:** low
+**Severity:** none
 
-1. **Triple-lock recovery gate**: SQLite `walIndexRecover` takes
-   `WAL_ALL_BUT_WRITE..READ_LOCK(0)` exclusive (wal.c:1400-1401). Our
-   `recoverLocked` requires callers to hold `lockCheckpoint + lockRecover`
-   exclusive. The helper takes `lockWrite → lockCheckpoint → lockRecover` under
-   non-blocking `F_SETLK`; under contention with `checkpointWithMode` (which
-   uses `CKPT → WRITE` order) the loser observes `ErrBusy` — no deadlock.
+1. **Recovery lock set.** SQLite `walIndexRecover` holds the caller's
+   `WAL_WRITE_LOCK` and takes `WAL_ALL_BUT_WRITE` up to `READ_LOCK(0)`
+   exclusive, i.e. `WAL_CKPT_LOCK` (unless the caller holds it) and
+   `WAL_RECOVER_LOCK` (wal.c:1395-1401). `indexReadHdr` takes the same set,
+   `lockWrite → lockCheckpoint → lockRecover`, each a non-blocking `F_SETLK`;
+   under contention with `checkpointWithMode` (which uses `CKPT → WRITE`
+   order) the loser observes `ErrBusy` — no deadlock. Not a divergence.
 
-2. **BUSY_RECOVERY signal — resolved 2026-04-22.** The three contended
-   branches in `ensureHeaderInitialized` now return `ErrBusyRecovery`
-   (distinct from the generic `errWALRetry`) when a peer holds the
-   RECOVER / CKPT exclusive locks — matching SQLite's
-   `SQLITE_BUSY_RECOVERY` (`sqlitec/src/wal.c:3063-3090`, probe at
-   `sqlitec/src/os_unix.c:4872-4907`). Upstream `DB.BeginWrite` routes
-   `ErrBusyRecovery` through the configured `BusyHandler` for proper
-   backoff instead of spinning.
+2. **BUSY_RECOVERY signal.** SQLite's `walTryBeginRead` returns
+   `SQLITE_BUSY_RECOVERY` when the `WAL_RECOVER_LOCK` probe is itself busy
+   (`sqlitec/src/wal.c:3084-3108`). `tryBeginReadMultiProcessHdr` returns
+   `ErrBusyRecovery` there, and `pager.beginReadHdr` hands it to the
+   `BusyHandler` for every begin (see drift-2026-11-11-1). Not a divergence.
 
 <a id="old-drift-headerondisk-mxframe-inference"></a>
 **Severity:** none
 
-3. **`headerOnDisk` shortcut in `syncFromSHMLocked`** (`wal.go:1694-1721`):
-   we infer "on-disk WAL header exists" from `hdr.mxFrame > 0` rather than
+3. **`headerOnDisk` shortcut in `syncFromSHMLocked`** (removed 2026-11-11
+   with the function; kept for the history of the anchor): we inferred "on-disk WAL header exists" from `hdr.mxFrame > 0` rather than
    `fstat`-ing, relying on the invariant that `flushHeader` (the lazy
    header-write gate in `writeFrames`, `wal.go:2054-2061`) precedes every
    frame write. This is faithful to SQLite: `sqlite3WalFrames`
@@ -2009,13 +2024,17 @@ register and C↔Go coverage table. Key entry points:
 - `(*Backup).Remaining() uint32` -- ~ `sqlite3_backup_remaining`
 - `(*Backup).PageCount() uint32` -- ~ `sqlite3_backup_pagecount`
 
-Hooks in `pager.commit()` (post-`wal.writeFrames`) and
-`pager.checkpointWithMode()` (Restart/Truncate modes) dispatch the C
-equivalents of `sqlite3BackupUpdate` and `sqlite3BackupRestart`
-respectively. See `pager.dispatchBackupUpdate` /
-`pager.dispatchBackupRestart`. External-process writes are detected at
-each Step's read tx via the page-1 `FileChangeCounter` and trigger the
-same restart.
+`pager.commit()` (after `wal.writeFrames`) and `pager.pagerStress()` (a
+spill) dispatch the C equivalent of `sqlite3BackupUpdate`
+(`pager.dispatchBackupUpdate`); a rollback, the error cleanup and any other
+end of a write transaction that still owes the backups dispatch
+`sqlite3BackupRestart` (`pager.dispatchBackupRestart`, `dischargeBackups`).
+Another process's writes restart the copy through the change epoch each
+Step's read transaction reports (`ReadTx.ChangeEpoch`). A `Step` returns
+`ErrBusy`, without effect, while this process has a write transaction open on
+the source. See
+[drift-2026-11-13-1](#drift-2026-11-13-1-the-change-state-is-one-value-under-compare-and-swap),
+"Backups".
 
 Anystore-level `(*db).Backup(ctx, path)` drives the engine by opening
 a fresh destination DB at `path` with matching options.
@@ -2115,7 +2134,7 @@ bounded by the per-snapshot `dbSize` check.
 
 <a id="drift-6-wal-frame-read-failure-falls-through-to-disk-read"></a>
 ### Drift: WAL Frame Read Failure Falls Through To Disk Read
-- **Category:** changed-logic  -  **Severity:** high  -  **Status:** RESOLVED 2026-07-10 (2026-07 pre-beta review): all four getters (`getPageWriter`, `readTempPage`, `getPageReader`, `readRawPage`) now propagate `readFrame`/`readFrameRaw` errors wrapped with page/frame context, matching C `readDbPage`, where with `iFrame != 0` the DB-file read is the unreachable else branch and a WAL read error becomes the page-get error (`sqlitec/src/pager.c:3035-3046`, 3.52.0). The "benign reset between lookup and read" TOCTOU race the fallthrough covered (introduced with commit `1e2cec7`) is structurally excluded: the writer path holds `lockWrite`, which any restart requires (`checkpointWithMode`; PASSIVE never resets, `checkpointPost`); readers hold a slot 1-4 shared lock that `tryResetWALWithBusy` must take exclusively; slot-0 snapshots carry `minFrame = mxFrame+1` so `walIndex.get` never resolves a frame for them (C `readLock==0` short-circuit); and the in-process slot-0 fallback now re-validates after acquiring read-0 (see the 2026-07-10 fallback re-validation fix, mirroring C's READ_LOCK(0) re-check at `wal.c:3136-3139`). Caveat: API calls that begin pager reads without the `db.mu` drain (`GetNamespace`, `ListNamespaces`, `IntegrityCheckN`) and race `DB.Close`'s WAL truncate may now surface a read error where they previously silently succeeded (contract-gray; follow-up). Adjacent residual: `refreshHeaderFromPage1`'s single-failure-with-successful-fallback path (deliberate 2026-07-10 design) still adopts a DB-file page-1 header under the write lock — open follow-up. Regression tests: `TestWALReadFrameErrorPropagates{,_Writer,_TempPage}`, `TestReadRawPageWALErrorPropagates`, `TestWALDecryptFailurePropagatesFromReadFrame`, `TestReadFrameNoBenignFailuresUnderTruncateStress`, `TestInProcessSlot0FallbackTruncateStress`.
+- **Category:** changed-logic  -  **Severity:** high  -  **Status:** RESOLVED 2026-07-10 (2026-07 pre-beta review): all four getters (`getPageWriter`, `readTempPage`, `getPageReader`, `readRawPage`) now propagate `readFrame`/`readFrameRaw` errors wrapped with page/frame context, matching C `readDbPage`, where with `iFrame != 0` the DB-file read is the unreachable else branch and a WAL read error becomes the page-get error (`sqlitec/src/pager.c:3035-3046`, 3.52.0). The "benign reset between lookup and read" TOCTOU race the fallthrough covered (introduced with commit `1e2cec7`) is structurally excluded: the writer path holds `lockWrite`, which any restart requires (`checkpointWithMode`; PASSIVE never resets, `checkpointPost`); readers hold a slot 1-4 shared lock that `tryResetWALWithBusy` must take exclusively; slot-0 snapshots carry `minFrame = mxFrame+1` so `walIndex.get` never resolves a frame for them (C `readLock==0` short-circuit); and the in-process slot-0 fallback now re-validates after acquiring read-0 (see the 2026-07-10 fallback re-validation fix, mirroring C's READ_LOCK(0) re-check at `wal.c:3136-3139`). Caveat: API calls that begin pager reads without the `db.mu` drain (`GetNamespace`, `ListNamespaces`, `IntegrityCheckN`) and race `DB.Close`'s WAL truncate may now surface a read error where they previously silently succeeded (contract-gray; follow-up). The adjacent residual in `refreshHeaderFromPage1` (a failed page-1 frame read fell back to the DB file's older page 1 under the write lock) is closed as of 2026-11-11: see the error-propagation paragraph of drift-76. Regression tests: `TestWALReadFrameErrorPropagates{,_Writer,_TempPage}`, `TestReadRawPageWALErrorPropagates`, `TestWALDecryptFailurePropagatesFromReadFrame`, `TestReadFrameNoBenignFailuresUnderTruncateStress`, `TestInProcessSlot0FallbackTruncateStress`.
 - **Affected functions:** `pager.go:*pager.getPageWriter` (`internal/btree/pager.go:1014-1028`), `pager.go:*pager.readTempPage` (`internal/btree/pager.go:1114-1123`); the same fall-through also appears in the `getPageReader` cache path (`internal/btree/pager.go:1247`) and the `readFrameRaw` path (`internal/btree/pager.go:1357`).
 
 In C `readDbPage`, once `sqlite3WalFindFrame` resolves a WAL frame (`iFrame != 0`) the
@@ -2365,7 +2384,7 @@ through `splitRoot`. The consequence is that root-level interior overflow produc
 different (and looser) page-fill distribution than SQLite's balanced redistribution. A root
 LEAF does follow SQLite (`splitRootLeafAndInsert`). The parent rewrite after a balance
 splits in place too; see
-[its own entry](#drift-2026-11-11-1-parent-rewrite-after-a-balance-splits-in-place).
+[its own entry](#drift-2026-11-11-7-parent-rewrite-after-a-balance-splits-in-place).
 
 <a id="drift-31-rebuildinteriorpage-accepts-zero-cell-pages"></a>
 ### Drift: rebuildInteriorPage Accepts Zero Cell Pages
@@ -2629,7 +2648,7 @@ than a correctness defect.
 
 <a id="drift-53-auto-checkpoint-escalates-to-wal-restart-beyond-passive"></a>
 ### Drift: Auto Checkpoint Escalates To WAL Restart Beyond Passive
-- **Category:** new-feature  -  **Severity:** medium
+- **Category:** new-feature  -  **Severity:** medium  -  **Status:** RESOLVED 2026-11-12: `tryCheckpoint` is a PASSIVE checkpoint and nothing else. The escalation existed because nothing else recycled the WAL; the writer now starts the log over itself, as SQLite's does (see [the RESTART port](#resolved-2026-11-12-restart-checkpoint-reset-the-wal)). What follows describes the code before that.
 - **Affected functions:** `pager.go:*pager.tryCheckpoint` (`internal/btree/pager.go:2757-2783`).
 
 SQLite's auto-checkpoint is strictly PASSIVE: the default WAL hook
@@ -2840,9 +2859,69 @@ disk and overwrites BOTH `p.header` and `p.dbSize` (`p.dbSize.Store(p.header.Dat
 header/size are reconciled with the on-disk image: Go performs this reconciliation lazily at the
 start of a write when the underlying WAL state changed, rather than during reads as SQLite does.
 
+Error propagation and the page-count rule (2026-11-11). The re-read is now what `lockBtree` does at
+the start of a transaction (`btree.c:3284-3298`, `3401-3408`):
+
+- Page 1 is fetched whole through the writer cache (`btreeGetPage` → `readDbPage`,
+  `pager.c:3031-3046`), from exactly one source: the WAL frame when the wal-index resolves one, the
+  DB file otherwise. The DB file's older page 1 never stands in for a frame whose read failed.
+  The page stays in the cache the begin has just cleared, where the commit would load it anyway,
+  so the full-page read replaces a later one rather than adding one.
+- The size is `lockBtreePageCount` (`btree.c:3294-3298`, `3401-3408`) against `pagerPageCount`
+  (`pagerPagecount`, `pager.c:3279-3306`: the live wal-index `nPage`, else the file size): a zero
+  or untrusted page-1 size gives way to the pager's count, and a trusted size above it is
+  `ErrHeaderCorrupt`. `pager.open` uses the same two helpers in `readPage1AtOpen`, which reads
+  page 1 and the count under one WAL read transaction (`pagerBeginReadTransaction` then
+  `pagerPagecount`, `pager.c:5444-5448`; `lockBtree`, `btree.c:3284-3298`), so a peer's checkpoint
+  during open cannot pair a stale file header with a newer WAL size. It reads page 1 whole from
+  either source, as `readDbPage` does (`pager.c:3031-3046`), so a read error past the header fails
+  the open (test `TestOpenPage1ReadErrorPastHeaderFails`, vfs tag); a short file read is not an
+  error there, as in `readDbPage` (the rest reads as zeros), unless the header itself is cut off. Open used to take the larger
+  of the file-derived size and the WAL's, which brought back the pages of a WAL-committed shrink
+  at the first commit.
+- A failed lookup, a failed read, a page-1 image that does not decode as a database header, and a
+  rejected size all abort `beginWrite` and leave `p.header` / `p.dbSize` untouched.
+
+Before this, a failed frame read fell back to the DB file and returned nil, so a writer could
+start with a peer-outgrown `dbSize` and freelist and allocate over the peer's pages; a failed
+decode and a lone DB-file read failure were ignored, only the 100-byte prefix was read, and the
+page-1 size was installed unchecked (a zero made every page unreachable).
+
+Error classes. SQLite's `SQLITE_NOTADB` for a page 1 that is not a database header
+(`btree.c:3306`) is `ErrHeaderCorrupt` here, as at open: any-store has one error for "unusable
+header", and it matches `ErrCorrupt`. A DB file too short to hold page 1 is a read error
+(`io.EOF`) rather than a zero-filled `NOTADB`, because the page getters do not zero-fill a short
+read ([drift-7](#drift-7-short-db-file-read-treated-as-hard-error)); the begin fails either way.
+
+Every write begin (2026-11-12). The refresh now runs at every `beginWrite`, not only when another process's change was seen: `lockBtree` reads page 1 at the start of every SQLite transaction (`sqlite3BtreeBeginTrans`, `btree.c:3707`), and a schema format 6 commit no longer rewrites page 1 each time, so the header must not be carried over from the last transaction. Page 1 normally comes from the writer cache; the cache is cleared first only when a change was seen, or a refresh failed. The count is `committedPageCount`: the live wal-index header's size, the file's size when the WAL has no commit (the readers' memo, so no `fstat` per begin), the committed position's size in the in-process and in-memory modes. Rollback and `pagerError` restore the page count the transaction began with (`savedDbSize`), not the header's size field, which is 0 for an untrusted header.
+
+Residual divergence: SQLite needs no "refresh pending" state, because a transaction whose page-1
+read failed never keeps the page (`lockBtree` releases it and leaves `pBt->pPage1` zero,
+`btree.c:3288-3289`, `3451-3454`) and the next transaction reads it again. Go keeps the header in
+a struct and detects the peer change in the WAL layer, whose `writerHdr` baseline has already
+moved to the live header by the time the page-1 re-read runs. `pager.headerStale` carries the
+pending refresh across a failed begin: it is set before the re-read and cleared only when one
+succeeds, and `beginWrite` refreshes when either `stateChanged` or `headerStale` is set.
+Regression tests: `TestBeginWritePage1Refresh_WALReadFailureNoStaleFallback`,
+`TestBeginWritePage1Refresh_PageCountRule`,
+`TestRefreshHeaderFromPage1_DecodeErrorPropagates`,
+`TestRefreshHeaderFromPage1_DBFileReadErrorPropagates`,
+`TestRefreshHeaderFromPage1_DoubleIOFailure`, `TestBeginWriteHeaderRefreshError_DoubleIOFailure`.
+
+<a id="drift-2026-11-11-2-nonzero-change-counter-mismatch-is-corruption"></a>
+### Drift: A Non-Zero Change-Counter Mismatch On Page 1 Is Corruption, Not An Untrusted Size
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:lockBtreePageCount` (callers `pager.go:*pager.refreshHeaderFromPage1`, `pager.go:*pager.open`).
+
+SQLite's `lockBtree` uses the in-header page count (offset 28) only when it is non-zero and bytes 24..27 (change counter) equal bytes 92..95 (version-valid-for); on any mismatch it falls back to the pager's count and carries on (`btree.c:3294-3298`). The mismatch is a normal state there: a library older than 3.7.0 updates the change counter without knowing about offsets 28 and 92, so the stored size may be stale and is simply not trusted.
+
+`lockBtreePageCount` applies the same rule for a zero size and for `VersionValidFor == 0` (files and fixtures that never tracked the field), but returns `ErrHeaderCorrupt` when `VersionValidFor` is non-zero and differs from `FileChangeCount`. No any-store writer can produce that state: every write of page 1 sets the two fields together before serializing it (`pager.commit`; a schema format 6 commit that leaves page 1 out changes neither), both live in the first 100 bytes of the page so no sector boundary separates them, and there is no older any-store format that maintains one without the other. A non-zero mismatch therefore means the header bytes were damaged, and the same damage may have hit the freelist head and count next to them (offsets 32 and 36), which nothing cross-checks; continuing on the pager's count would let the next commit write that header back. SQLite's leniency exists for a compatibility case any-store does not have.
+
+The cost is that a database whose page-1 header is damaged in exactly these bytes is refused where SQLite would open it. Revisit if a writer that updates the counters separately is ever introduced. The rule applies at open (`readPage1AtOpen`, which reads page 1 at the open snapshot, so the check is on the page 1 that snapshot reads, the WAL's when it holds a newer one) and at every write begin (`refreshHeaderFromPage1`). Regression tests: `TestBeginWritePage1Refresh_PageCountRule/change-counter_mismatch_is_corrupt`, and the open-time `VersionValidFor` test in `pager_test.go`.
+
 <a id="drift-77-filechangecount-bumped-conditionally-not-unconditionally"></a>
 ### Drift: FileChangeCount Bumped Conditionally Not Unconditionally
-- **Category:** changed-logic  -  **Severity:** medium
+- **Category:** changed-logic  -  **Severity:** low (was medium)  -  **Status:** schema format 5 only since 2026-11-12. The premise below is wrong for WAL mode: SQLite's `pager_write_changecounter` stores `dbFileVers+1`, page 1's counter as last read plus one, and only into page-1 frames (`pager.c:3084-3097`, `3218`); `pager_incr_changecounter` is a rollback-journal path (`pager.c:6363`, reached from `6574-6590`). So consecutive commits of one connection write the same value, and the counter is not a commit count. A schema format 6 file now does exactly that: when a commit writes page 1 ([which commits do](#drift-2026-11-12-5-page-1-written-when-its-header-changes)) the counter and VersionValidFor get `dbFileVers+1`, computed once page 1 is fetched, and `dbFileVers` is set where `readDbPage` and `pager_playback_one_page` set it (`pager.c:3047-3065`, `2481-2484`): at open, at every page-1 load into the writer cache, and at a savepoint rollback that restores page 1, or that undoes a header or page-count change, which in SQLite would have journaled page 1. The sequence of values still depends on when page 1 is read, which follows any-store's cache: a rollback clears the whole writer cache ([wal undo](#old-drift-wal-undo-via-pager-rollback)), and page 1 is not held for the transaction ([page-1 exclusion](#old-drift-pagerstress-page1-exclusion)), so the values can run ahead of SQLite's, by one for each such reload. Equality of the two fields is all anything reads. Schema format 5 keeps the rule below for the v2.4.x processes that read it. The writer rule below is otherwise unchanged; what depended on it is not. Since 2026-11-13 nothing in this code base detects another process's commit by this counter: derived state and backups follow the wal-index header ([the change state](#drift-2026-11-13-1-the-change-state-is-one-value-under-compare-and-swap)), so a commit that does not mark its data is found like any other. The counter is still written, as described here, for v2.4.x processes attached to the same file, which do watch it; the `IsDataStale` consumer the last sentence names is removed.
 - **Affected functions:** `pager.go:*pager.commit` (`internal/btree/pager.go:2247`).
 
 SQLite always advances the page-1 change counter (header offset 24, mirrored at offset 92) on a
@@ -3034,7 +3113,7 @@ zero-init would re-clear any reused segment anyway — no correctness risk. (The
 
 <a id="drift-96-wal-index-change-counter-ichange-never-incremented"></a>
 ### Drift: WAL Index Change Counter iChange Never Incremented
-- **Category:** changed-logic  -  **Severity:** low
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-13: a commit publishes the replaced header's `iChange` plus one (`wal.c:4245`), a WAL restart or reset keeps it (`walRestartHdr`, `wal.c:2150-2154`), and a recovery leaves 0 (`wal.c:1408`); the process-local `wi.iChange` is gone, the value always comes from the live header read under the write lock (`wal.publishHeader`). A v2.4.x writer on the same file still publishes 0; nothing orders headers by `iChange`, here or in SQLite. Test: `TestChangeEpoch_RecoveryAndIChange`. What follows describes the code before that.
 - **Affected functions:** `wal.go:*wal.writeFrames`
   (`internal/btree/wal.go:853` writeHeader writes wi.iChange, never incremented; commit path
   `wal.go:2036`),
@@ -3052,7 +3131,7 @@ or content changed) is effectively dead in the Go port, diverging from SQLite's 
 
 <a id="drift-97-wal-restart-randomizes-both-salts-instead-of-incrementing-sa"></a>
 ### Drift: WAL Restart Randomizes Both Salts Instead Of Incrementing Salt0
-- **Category:** changed-logic  -  **Severity:** low
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-12: a restart (`doResetWAL` → `restartHeaderStateLocked`) publishes the replaced log's first salt plus one and draws only the second, as `walRestartHdr` does (`wal.c:2152-2153`). The replaced log's salt is read from the live wal-index header under the write lock, since a process that has not written since a peer's reset holds an older one. A WAL with no log to continue (`initHeaderStateLocked`, `writeHeader`) still draws both, as SQLite does for the first frame of a WAL it has no checkpoint sequence for (`wal.c:4087`). Test: `TestWalCheckpointTruncate_ResetsAndIncrementsSalt`. What follows describes the code before that.
 - **Affected functions:** `wal.go:*wal.initHeaderStateLocked` (`internal/btree/wal.go:1754-1761`, the restart path reached from `doResetWAL` at `wal.go:3870`); `wal.go:*wal.writeHeader` (`internal/btree/wal.go:1801-1808`).
 
 SQLite's `walRestartHdr` (`wal.c:2146-2153`) deterministically advances salt-1 by `aSalt[0] = 1 + aSalt[0]`
@@ -3068,7 +3147,7 @@ salt pair simply differing from the previous generation.
 
 <a id="drift-98-wal-checkpoint-sequence-number-nckpt-never-incremented"></a>
 ### Drift: WAL Checkpoint Sequence Number nCkpt Never Incremented
-- **Category:** changed-logic  -  **Severity:** low
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** kept deliberately (2026-11-12), together with one more difference of the same origin: the restart header's `aFrameCksum`. SQLite's `walRestartHdr` leaves the old `aFrameCksum` in the header and the first frame of the new log replaces it with the checksum of the WAL header it writes, `nCkpt` included (`wal.c:4086`, `4095-4096`). Here the restart computes the new WAL header at once and publishes its checksum as `aFrameCksum`; a writer then writes the WAL header from its own fields, with checkpoint sequence 0, and seeds its frame chain from the published `aFrameCksum` (`beginWriteWithSnapshot`). Every released version does this, v2.4.x included. Publishing the old checksum, or a non-zero `nCkpt`, would make such a writer chain its frames from a seed that does not match the header on disk: recovery (`recoverLocked`) would reject frame 1 and an acknowledged commit would be lost. So `nCkpt` stays 0 and the seed stays the new header's while any such writer may attach. What `nCkpt` tells a SQLite savepoint, that the log was started over inside the transaction (`wal.c:3829-3835`), comes from a process-local generation count instead (`wal.logGen`, `wal.base`).
 - **Affected functions:** `wal.go:*wal.doResetWAL`
   (`internal/btree/wal.go:1801-1806` writeHeader sets `checkpoint:0`; doResetWAL `wal.go:3833-3871` calls
   writeHeader; initHeaderStateLocked `wal.go:1754-1759`),
@@ -3077,7 +3156,7 @@ salt pair simply differing from the previous generation.
 SQLite's `walRestartHdr` does `pWal->nCkpt++` on every WAL restart (`wal.c:2150`) and serializes it into the
 WAL header (`wal.c:4072`), making the on-disk WAL
 header "Checkpoint sequence number" field (offset 12) a monotonically increasing counter that advances on each
-RESTART/TRUNCATE checkpoint and each writer-initiated log wrap. The Go reset path always constructs the header
+TRUNCATE checkpoint and each writer-initiated log wrap, the two callers of `walRestartHdr` (`wal.c:2377`, `3887`); a RESTART checkpoint does not run it (`wal.c:2357-2362`). The Go reset path always constructs the header
 with `checkpoint: 0` at both sites — `writeHeader` (`wal.go:1801-1806`) and `initHeaderStateLocked` (`wal.go:1754-1759`)
 — and `doResetWAL` (`wal.go:3833-3871`) invokes one of those on every reset, so the field is serialized at
 offset 12 (`wal.go:244`), deserialized (`wal.go:262`), but never fed back to re-increment. The consequence is
@@ -3101,10 +3180,182 @@ sets only `aReadMark[2..4]=READMARK_NOT_USED` (`wal.c:2158`), and additionally p
 via `for i := range wi.aReadMark { wi.aReadMark[i].Store(readMarkNotUsed) }` (`wal.go:824-826`), and the
 `doResetWAL`/`writeHeader` pair drops the nCkpt and salt-1 increments (`wal.go:1801-1830`, `wal.go:1754-1776`;
 `doResetWAL` at `wal.go:3833-3871`). This is the same
-root as the restart counter/salt drifts (97, 98) surfacing on the read-mark/reset path: the consequence is
+root as the restart counter/salt drifts (97, 98) surfacing on the read-mark/reset path (the fourth
+`walRestartHdr` rule, that `hdr.nPage` survives the reset, was missing too and is ported as of 2026-11-11:
+`doResetWAL` passes the last commit's size to `restartHeaderStateLocked`): the consequence is
 that the `aReadMark[0]==0` invariant is broken on restart (a slot-0 reader normally views only the db file)
 and the deterministic restart sequence/salt advances are lost. Note the recovery path (`wal.go:2006-2009`)
 does correctly restore `aReadMark[0]=0` after clobbering all slots, unlike `reset()`.
+
+<a id="drift-2026-11-11-3-reader-size-without-a-wal-commit-is-memoized"></a>
+### Drift: A Reader's Database Size Without A WAL Commit Is The File Size Memoized Per wal-index Header
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.effectiveReaderDbSize`; `wal.go:*wal.doResetWAL`, `wal.go:*wal.restartHeaderStateLocked` (ported rule); `integrity.go:*DB.IntegrityCheckN` (uses the same size).
+
+SQLite sizes the database at the start of every transaction with `pagerPagecount` (`pager.c:3279-3306`): `sqlite3WalDbsize`, i.e. `pWal->hdr.nPage`, when it is non-zero, else an `fstat` of the database file. `walRestartHdr` zeroes `mxFrame` and leaves `hdr.nPage` alone (`wal.c:2146-2160`), so the first branch keeps answering after a RESTART or TRUNCATE.
+
+Go had neither half. `doResetWAL` published the reset header with `nPage = 0`, and `effectiveReaderDbSize` fell back to the process-local `pager.dbSize`, which only a write begin refreshes. A process that had not written since a peer grew the database therefore bounded its readers by its own stale size as soon as any process reset the WAL, and valid pages failed with `ErrCorrupt` ("invalid page number" from `IntegrityCheck`, whose cap used the equally process-local `walIndex.maxPage`). Both rules are now ported: the reset header keeps the last commit's size, and without a committed size a multi-process reader takes the file's. A failed file-size query fails the read begin, as `pagerPagecount` returns the `fstat` error (`pager.c:3299-3303`); until 2026-11-12 it fell back to the local size (regression test `TestReaderSizeStatErrorPropagates`, vfs tag). The in-process and in-memory modes publish no wal-index header; their readers take the size of the committed position, frame and size kept in one word and moved only by a published commit (`commitFrameCounter`). Until 2026-11-12 they took `pager.dbSize`, which an open write transaction moves.
+
+The remaining difference is that the file size is read once per wal-index header, not once per transaction (`pager.noWalCommitSize`). Measured on an M2: the `fstat` costs about 390 ns and one allocation, a sixth of a point read on a freshly opened, checkpointed database — the state a read-mostly process stays in. The memo is exact as long as the file's size cannot change under an unchanged 48-byte header that carries no size: the file changes only when a checkpoint copies frames into it; frames need a commit; a commit publishes a header with a size, and every later reset keeps it; a header without a size reappears only when a process rebuilds the index over a WAL holding no commit, which after a TRUNCATE means freshly drawn salts. The one way back to the identical header is a WAL whose frames have been destroyed behind an intact WAL header, and then the stale (smaller) size fails closed: pages beyond it read as corrupt, none are served wrongly.
+
+Of the other halves of `walRestartHdr`, the salts are ported as of 2026-11-12 (drift-97, resolved); the checkpoint sequence stays 0, deliberately (drift-98); the read-mark values remain as drift-99. Regression tests (`internal/btree/walindex_restart_npage_test.go`, two processes): `TestWalRestartKeepsNPage_PeerResets` (TRUNCATE; a writer's restart is `TestWalWriterRestart_PeerDiesAfterRestart`), `TestWalRestartKeepsNPage_OwnCheckpoint`, `TestReaderSizeWithoutWalCommit`, `TestIntegrityCheckAfterPeerGrowth`.
+
+<a id="drift-2026-11-12-1-wal-restart-clears-the-index-before-it-publishes-the-reset-header"></a>
+### Drift: A WAL Restart Clears The Index Before It Publishes The Reset Header
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.restartHeaderStateLocked`, `wal.go:*walIndex.reset`, `wal.go:*wal.doResetWAL`.
+
+SQLite's `walRestartHdr` (`wal.c:2146-2160`) writes the reset wal-index header first and then zeroes `nBackfill` and `nBackfillAttempted` and resets the read marks. It leaves the hash tables alone: `walIndexAppend` clears each one when the next generation adds its first frame to it (`wal.c:1312-1319`). Go's `restartHeaderStateLocked` runs `walIndex.reset` first, which clears the hash tables and publishes `nBackfill = 0`, `nBackfillAttempted = 0` and the read marks, and only then writes the header.
+
+The order decides what peers see when the resetting process dies between the two steps. In SQLite's order they see a header with no frames over a `nBackfill` still at the old frontier N. The next writer's frames 1..k then lie below the frontier: readers skip them (their `minFrame` is N+1, or they take slot 0 once k reaches N), and a checkpoint counts them as backfilled, so a later reset discards them. In Go's order the peers see the old header over the intact WAL and the fully backfilled database file, with an empty hash and a zero frontier. Readers resolve no frame and read the file, which holds the same content. The next writer appends after frame N, a checkpoint copies only its frames, and recovery reads the whole WAL. The window is a few stores to shared memory with no system call in either order, but only Go's order survives a death inside it.
+
+Both steps come before the truncate, as in SQLite (`walRestartHdr`, then `sqlite3OsTruncate`, `wal.c:2377-2378`). Until 2026-11-12 `doResetWAL` truncated the WAL between the index clear and the header publish. A checkpointer that died there left peers the old header over an empty WAL: a surviving writer acknowledged its commit as frames after the missing ones, and the next recovery stopped at the hole and dropped it. Regression test (two processes, the checkpointer exits at each reset step): `TestWalResetCrash_SurvivorCommitsKept` (`internal/btree/wal_reset_crash_test.go`).
+
+<a id="resolved-2026-11-12-restart-checkpoint-reset-the-wal"></a>
+### Resolved 2026-11-12: A RESTART Checkpoint Reset The WAL; No Writer Started The Log Over
+- **Category:** changed-logic  -  **Severity:** medium  -  **Status:** RESOLVED 2026-11-12
+- **Affected functions:** `wal.go:*wal.restartLogLocked` (new), `wal.go:*wal.waitReadersAndTruncate` (was `tryResetWALWithBusy`), `wal.go:*wal.checkpointPost`, `wal.go:*wal.checkpointWithMode`, `wal.go:*wal.doResetWAL`, `wal.go:*wal.base` (new), `pager.go:*pager.tryCheckpoint`, `pager.go:*pager.walBase` (new).
+
+SQLite recycles the WAL in the writer. A RESTART checkpoint, once the whole log is in the database file, takes the reader locks and releases them: it only makes sure no reader still uses the log (`wal.c:2357-2362`, `2380`). A TRUNCATE checkpoint also resets the wal-index header and truncates the file (`wal.c:2363-2378`). The next writer, before the first frame of a transaction, starts the log over if it holds read lock 0, the log is fully backfilled and it can take the other reader locks without waiting (`walRestartLog`, `wal.c:3870-3888`, called from `walFrames` at `wal.c:4070`); its first frame then writes and syncs the new WAL header (`wal.c:4074-4115`).
+
+Until 2026-11-12 the port had no writer-side restart. `doResetWAL` stood in for it inside the checkpoint: RESTART reset the header at once, and the automatic checkpoint escalated from PASSIVE to RESTART so that the WAL was recycled at all (drift-53). The cost showed once another process's commits were to be detected by the wal-index header instead of a page-1 counter: a RESTART by a process that committed nothing changed the header under everyone else, where SQLite's leaves it alone.
+
+Now, as in SQLite:
+
+- **RESTART** waits for reader slots 1-4 and releases them. **TRUNCATE** resets the header and truncates, also when no frame is committed: the `mxFrame == 0` shortcut skips only the backfill, so the frames of a rolled-back transaction or of an abandoned restart are cut off (`wal.c:2216`, `2352-2380`).
+- **A reader that keeps a slot past the busy handler makes both `ErrBusy`** (`wal.c:2361`); before, the checkpoint reported success and did nothing.
+- **The writer** calls `restartLogLocked` at the top of `writeFrames` and `writeFramesMem`. It restarts when no frame of the transaction is in the log yet, the authoritative `nBackfill` equals the committed `mxFrame` and is not zero, and the checkpoint lock and reader slots 1-4 can be taken without waiting. A busy lock means append (`wal.c:3889-3890`). The heap-shm modes (in-process, in-memory) relied on the same escalation and get the same restart; in in-memory mode it is what reuses the frame arena.
+- **The automatic checkpoint** is PASSIVE (drift-53 resolved).
+- **A checkpoint re-checks the salts** once it holds reader slot 0 and copies nothing if the log was started over since it read the header. This is SQLite's fix for the race between a checkpointer and a wrapping writer, which is in `version-3.52.0` (`wal.c:2256-2267`) and not in the sibling `sqlitec` working tree, which is an earlier commit.
+
+**Rollback after a restart.** A transaction saves its position in the log when it begins and at each savepoint. After a restart inside the transaction those frame numbers and checksums belong to the previous log. SQLite's undo reloads the restarted header (`wal.c:3775`) and its savepoint undo tests `nCkpt` (`wal.c:3829-3835`). Here the WAL keeps a generation count and the checksum seed of the current log (`wal.logGen`, `genSeed1/2`), every saved position carries its generation, and `wal.base` maps a position of an earlier generation to frame 0 of the current one. The pager never reads a saved position directly. `rollbackLocked`, `pagerError` and `rollbackToSavepoint` take the whole position from `wal.base` (through `pager.walBase` for the transaction's own). `hasChanges`, the "was the commit published" test of `unwindWriter`, the "did this transaction spill" test of `commit` and `rollbackForClose` need the frame number alone and take it from `pager.walBaseFrame`, the same rule over atomics only, because `rollbackForClose` runs on the closing goroutine. A transaction's changes are "frames above its base", so a transaction whose pages were all spilled after a restart still commits, and one whose frames were all undone is still empty. Nothing has to run between the restart and a failure for the cleanup to be right.
+
+**Crash ordering is SQLite's.** The database file is synced before `nBackfill` is published (`wal.c:2322-2332`), so a log that may be started over is entirely in a synced database file. The restart writes nothing to the WAL file. The new WAL header is written and synced before the first frame of the new log (`flushHeader`; `wal.c:4099-4115`). At every point in between, the file recovers to the last commit (`TestWalWriterRestart_CrashPoints`).
+
+**What each mode does to the file.** RESTART and a writer's restart reuse the file from its start; neither gives space back. Only TRUNCATE (and the last close) shrinks it. There is no size limit ([drift-105](#drift-105-journal-size-limit-wal-truncation-feature-unimplemented)).
+
+**With v2.4.x processes attached** (they have no writer-side restart and reset on RESTART):
+
+- The header a restart publishes is the one their checkpoint-time reset publishes (see drift-98 for the checksum seed and `nCkpt`), so a v2.4.x writer or reader that meets it behaves as it does today, whether the restarting writer then commits, rolls back or dies.
+- A v2.4.x writer whose automatic checkpoint is off, next to a newer process that only checkpoints: RESTART from the newer process no longer recycles the WAL. Use TRUNCATE there.
+- v2.4.3 decides a reset from a process-local `nBackfill`. After any new log of M frames, where M is not above the count it remembers, its RESTART can reset frames that are not in the database file and lose an acknowledged commit. This is in v2.4.3 as shipped and happens whoever started the new log, a checkpoint-time reset or a writer; nothing here prevents it.
+
+Tests: `internal/btree/wal_writer_restart_test.go` (three WAL modes; logs written after a rollback are recovered from a crash copy, not after an orderly close), `wal_writer_restart_crash_test.go` (crash points, a panic after a restart and after a restarted commit is published, two-process cases, the salt re-check), `wal_writer_restart_fault_vfs_test.go` (WAL-header write and sync failures).
+
+To measure (not yet): `restartCandidate` runs on every write of frames and reads the shared `nBackfill`, which in shared-memory mode goes through the shm region lookup.
+
+<a id="drift-2026-11-12-2-writer-restart-takes-the-checkpoint-lock"></a>
+### Drift: A Writer Takes The Checkpoint Lock To Start The Log Over
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.restartLogLocked`.
+
+SQLite's `walRestartLog` holds the write lock and takes the reader locks (`wal.c:3876`); it does not touch `WAL_CKPT_LOCK`. A checkpointer that read the header before the restart is kept from copying stale frames by the salt re-check it makes once it holds read lock 0 (`version-3.52.0`, `wal.c:2256-2267`).
+
+`restartLogLocked` also try-locks `lockCheckpoint` exclusive, and appends if it is busy. Reason: a v2.4.x process may be attached to the same file, and its checkpoint has no salt re-check. It was safe only because every reset held the checkpoint lock for as long as a checkpoint does; a restart that did not take the lock could land between that checkpoint's header read and its backfill, and the checkpoint would then copy frames of the old log, read at their old offsets from a file the new log is overwriting, over newer pages. With the lock, the invariant "every reset holds the checkpoint lock" still holds for both versions.
+
+Cost: a writer appends instead of restarting while any checkpoint runs, in any process. The salt re-check is ported as well, so the lock can go when no version without the re-check can attach. The re-check is reachable only against a writer that does not take the lock: `TestWalCheckpoint_SkipsBackfillAfterLogWrapped` reaches it through a hook.
+
+<a id="drift-2026-11-12-3-writer-keeps-slot-0-after-a-restart"></a>
+### Drift: A Writer Keeps Reader Slot 0 After It Started The Log Over
+- **Category:** structural  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.restartLogLocked`.
+
+After `walRestartHdr`, SQLite's `walRestartLog` releases read lock 0 and takes a WAL read lock through `walTryBeginRead` (`wal.c:3893-3899`). It has to: a connection on lock 0 ignores the WAL (`walFindFrame` returns no frame when `readLock == 0`), and the writer must read back the frames it is about to write.
+
+The writer here does not read through its reader slot. `getPageWriter` looks pages up to `wal.nFrame`, above the live checkpoint frontier (`liveMinFrame`), whatever slot the transaction's snapshot took. So it keeps slot 0 until the transaction ends. Every first writer after a reset already wrote from slot 0 before this change (a reset left `mxFrame == 0`, and a begin then takes slot 0).
+
+For the same reason the restart does not test "the writer is on slot 0" as `wal.c:3870` does: a writer whose snapshot is on slots 1-4 holds that slot shared, and the exclusive locks the restart needs fail on it.
+
+**Other holders of slot 0.** With shared memory, slot 0 is granted only after a full backfill, with `minFrame = mxFrame + 1`: such a reader resolves no frame, of the old log or the new. The heap-shm read begin also falls back to slot 0 with part of the log still to read (`tryBeginReadInProcessHdr`, when slots 1-4 are briefly held exclusive); SQLite retries instead (`wal.c:3128-3136`, then WAL_RETRY). That reader blocks the backfill, so `nBackfill` stays below `mxFrame` for as long as it lives, and the restart, which tests `nBackfill == mxFrame` explicitly where SQLite asserts it (`wal.c:3872`), does not happen. Tests: `TestWalWriterRestart_NotBeforeBackfill`, `_NotAfterPartialBackfill`. Whether the fallback itself should become SQLite's retry is a separate question of reader admission latency.
+
+<a id="drift-2026-11-12-4-a-commit-that-spilled-restarts-attached-backups"></a>
+### Drift: A Commit That Spilled Pages Restarts The Attached Backups
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-13: `pagerStress` sends the spilled page to the attached backups, and `Backup.Step` is kept out of a source write transaction of the process, so the interim restart is gone (see [the change state](#drift-2026-11-13-1-the-change-state-is-one-value-under-compare-and-swap), "Backups"). Test: `TestBackupChange_OwnSpilledCommit`. What follows describes the interim rule.
+- **Affected functions:** `pager.go:*pager.commit`, `pager.go:*pager.pagerStress`.
+
+SQLite sends an attached backup every page it writes to the WAL, a spill as much as a commit (`pagerWalFrames`, `pager.c:3219-3225`, called from `pagerStress` at `pager.c:4649`), and restarts the backup only when such a transaction is rolled back (`pagerUndoCallback`, `pager.c:3139`). `backup_step` cannot run in between: it returns `SQLITE_BUSY` while the source is in a write transaction (`backup.c:340-341`).
+
+`pagerStress` here writes the frame and marks the page clean without telling the backups, and `commit` sends them only the pages that are still dirty. A backup that had copied a spilled page kept its old content next to the commit's other pages. Before 2026-11-12 the automatic checkpoint reset the WAL and restarted every backup with it, which hid this for the default configuration.
+
+Until the spill sends its page (which needs `Step` kept out of a source write transaction, as SQLite does, so that an uncommitted page never reaches a finished backup), a commit whose transaction has frames in the log before the commit's own write restarts the attached backups after its update dispatch. A rolled-back transaction needs nothing: its spilled pages never reached a backup. Cost: a backup running beside transactions larger than the writer cache starts over at each of them. Test: `TestBackup_SpilledCommitRestartsBackup`.
+
+<a id="drift-2026-11-12-5-page-1-written-when-its-header-changes"></a>
+### Drift: A Schema Format 6 Commit Writes Page 1 When Its Header Changes, Not Whenever A Write Touched It
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.commitNeedsPage1`, `pager.go:*pager.commit`, `pager.go:*pager.page1OnChange`.
+
+SQLite puts page 1 in a WAL commit when it is on the dirty list, and fetches it as the frame that carries the commit mark when the list is empty, every dirty page having been spilled (`pager.c:6500-6512`, ticket 2d1a5c67). Every write to the header makes page 1 dirty first: a freelist pop or push (`btree.c:6555-6557`, `6844-6847`), growth (`6760`, `6785`), a meta write such as the schema cookie (`10466-10468`), the size fix-up at write begin (`3774-3778`). The change counter goes into each page-1 frame ([the counter](#drift-77-filechangecount-bumped-conditionally-not-unconditionally)).
+
+any-store keeps the header as a struct that `commit` serializes into page 1. In a schema format 6 file `commit` writes page 1 when the struct differs from the one the transaction began with (compared once the schema cookie has moved, before the counters are set), when page 1 itself is dirty (the catalog's root, a savepoint restore), or when no page is dirty (the carrier). Schema format 5 files write page 1 in every non-empty commit, for the v2.4.x processes that may be attached to them. The contract: after every commit, page 1's bytes 0..99, apart from the change counter (24) and VersionValidFor (92), serialize the header that commit committed, and its b-tree content is the committed content.
+
+The difference is the transactions whose header writes net to zero and that leave page 1's content alone. SQLite writes page 1 in them, with only 24 and 92 changed; any-store leaves the frame out. Such transactions are a page taken from the freelist and another freed onto it, or a page freed and taken back, with the trunk and count back where they were; in particular a value whose cell changes size and keeps an overflow chain of the same length, when the freelist can supply it: `sqlite3BtreeInsert` builds the new cell with `fillInCell`, which takes the chain's pages, then frees the old cell's chain with `BTREE_CLEAR_CELL` (`btree.c:9586`, `9607`). For a value rewritten at the same size SQLite writes neither page 1 nor the freelist: `btreeOverwriteCell` overwrites the cell and its chain in place (`btree.c:9482-9490`, `9307-9336`). any-store frees and allocates the chain even then (`btree.go:*btree.updateLeafCell`), a net-zero freelist change, so both leave page 1 out, for different reasons.
+
+How often it matters was measured on the prototype, on the schema format 5 layout, in an indexed small-update workload of 3,000 commits: page 1 went into 39 of them under this rule (37 freelist changes, 2 growths). An instrumentation model that counted every allocation, free, growth and truncation in Go put it into all 3,000, because the index's sketch blob is an overflow chain rewritten at every commit. That model is not SQLite: SQLite would overwrite a same-size blob in place and write page 1 only when its size changed. So the measurement bounds the saving against Go's own free-and-allocate path, not against SQLite running the workload; it is to be repeated on schema format 6, with a port of `btreeOverwriteCell` as the comparison if that is cheap.
+
+A savepoint is where the two can also differ in the change counter, not only in frames. SQLite journals page 1 at the first header write after a savepoint, and its rollback restores `dbFileVers` from the journaled page (`pager_playback_one_page`, `pager.c:2481-2484`). Here `rollbackToSavepoint` restores it when page 1 itself was restored, or when the header or the page count differs from the savepoint's at the rollback. A net-zero header change inside the savepoint is missed: take a page from the freelist and free it again, roll back to the savepoint, then commit a catalog change. SQLite writes counter 3 there (the restored image's 2, plus one, `pager.c:3089`), any-store writes 2. Nothing reads the counter's progression (see [drift-77](#drift-77-filechangecount-bumped-conditionally-not-unconditionally)).
+
+Nothing reads what the skipped frame would have carried. A write begin derives the header from page 1 at every transaction (`refreshHeaderFromPage1`, as `lockBtree` does at every SQLite transaction, `btree.c:3707`); open reads the newest page-1 frame of its snapshot; readers take the schema cookie at their snapshot's bounds; the counters are compared only with each other (`lockBtreePageCount`). Two inherited dirtying differences are not part of the rule: SQLite's large-sector path makes every page of a sector writable, page 1 included (`pager.c:2728-2740`, `6176-6187`, `6244-6246`), and SQLite does not dirty a cell rewritten with identical bytes (`btree.c:9275-9282`), where any-store makes the leaf writable first (`btree.go:1392-1400`), so a catalog cell rewritten unchanged writes page 1. In test builds every btree, root and `test/` suite checks the contract at every write begin and after every commit (`page1_check.go`). Regression tests: `page1_rule_test.go` (`TestPage1Rule_FrameShape`, `_Format5EveryCommit`, `_FCCLikeSQLite`, `_FCCCycles`, `_FCCWraps`, `_Page1NeverSpilled`, `_SpilledOnlyCommitCarriesPage1`, `_BackupDestinationHeader`), `page1_begin_test.go`, `page1_fault_test.go` and `page1_fault_vfs_test.go` (`TestPage1Rule_FailedCommitThenRetry`), `page1_prop_test.go` (`TestPage1Prop_Lockstep`, two processes in lockstep from a seed, and `_MutationIsCaught`, which leaves the header comparison out and must fail), `page1_crash_test.go` (`TestPage1Crash_Matrix`: six kill points, a fresh-open and an attached-checkpoint recovery), `cache_invalidation_test.go:TestCacheInvalidation_Format6_CounterMovesWithPage1`. The SQLite values the counter tests cite come from the CLI of SQLite 3.52.0 built from the `version-3.52.0` tag (source id `2026-03-06 16:01:44 557aeb43…`).
+
+<a id="drift-2026-11-13-1-the-change-state-is-one-value-under-compare-and-swap"></a>
+### Drift: Another Process's Commit Is Found By The wal-index Header, Through One Process-Wide Value Under Compare-And-Swap
+- **Category:** structural  -  **Severity:** low
+- **Affected functions:** `walchange.go` (`*wal.noteSnapshot`, `announce`, `settle`, `publishHeader`, `*walChange.exact`), `pager.go:*pager.beginReadHdrBusy`, `db.go:*ReadTx.ChangeEpoch`, `backup.go:*Backup.Step`; root `collection.go:*collection.refreshSketches`, `newCollection`.
+
+**SQLite.** A connection keeps the wal-index header it last used in `pWal->hdr`. `walIndexTryHdr` compares the header it reads for a new transaction with it, and on a difference sets `*pChanged` and copies the new one in (`wal.c:2624-2626`); `pagerBeginReadTransaction` then calls `pager_reset` (`pager.c:3261-3263`), which raises `iDataVersion`, restarts the connection's backups and clears its cache (`pager.c:1772-1776`). The connection's own commit writes `pWal->hdr` before it publishes it (`wal.c:4243-4250`), and so does its WAL restart (`wal.c:2151-2154`), so neither is a change to it; the btree cancels the `iDataVersion++` of its own commit (`pager.c:6709`, `btree.c:4417`). A recovery always is a change (`wal.c:2724-2725`), and so is a checkpoint that loaded a header the connection had not seen (`wal.c:4399-4407`).
+
+**Before 2026-11-13.** The port had the header comparison for its page caches only. Derived state (the root package's sketches) and backups watched the page-1 `FileChangeCount`, which is why every commit wrote page 1, and which missed a commit that did not mark its data (drift-77) and took every marked commit of the process itself for news.
+
+**Now.** The comparison is SQLite's, the state it is made against is not a connection's. One `*wal` serves every transaction of a process, at many snapshots at once, so the header last seen and the count of resets cannot be two fields changed by one thread: a consumer could read a count that already includes a change whose header is not stored yet, load state at an older snapshot, and stamp it current for good. They are one immutable value, `walChange{hdr, epoch, pending}`, behind one pointer, changed by compare-and-swap:
+
+- **A begin** (`pager.beginReadHdrBusy`, which every begin of every kind passes) loads the value before it takes its snapshot. A snapshot equal to the value's header, or to a pending own header, is no news. Any other is a change: the epoch is raised, and the header becomes the snapshot's if it is still the one loaded before the snapshot was taken (the snapshot is then the newer of the two). If the header moved in between, by an own commit or another begin, the two cannot be ordered: the change is counted and the header left for the next begin to move. The header therefore never goes back.
+- **An own publication** (a commit, a WAL restart, a TRUNCATE reset, a recovery, all under the write lock, all through `wal.publishHeader`) announces its header as `pending` before the first byte is written, so a reader that snapshots it before the committing goroutine has finished its bookkeeping does not take it for another process's. If the value's header is not the one being replaced, a change made elsewhere lies between them and the new header will hold it: its epoch step is taken at the announcement. A recovery always takes one. On every way out, a panic included, `settle` decides from what shared memory holds: the header if it is the announced one, one more epoch step and no pending header if it is not.
+- **A consumer** asks for the epoch and whether its transaction's snapshot is exact for it (`ReadTx.ChangeEpoch`): equal to the pending header while there is one, to the value's header otherwise. State loaded through an exact snapshot holds every change the epoch counts, and any change it lacks will raise the epoch. A transaction at an older snapshot is not exact and stamps nothing.
+
+What differs from SQLite, and why it is kept:
+
+1. **Process-wide, under CAS,** for the reason above.
+2. **The "order unknown" step** has no SQLite counterpart. It is a false positive only: one extra reload or backup restart.
+3. **No epoch step for a failed begin.** SQLite resets on `rc != SQLITE_OK` as well, because `walIndexTryHdr` may already have replaced `pWal->hdr`; here nothing is stored until the snapshot is held, and the next begin finds the change again.
+4. **Heap-shm modes** (in-process, in-memory) have no state at all: no other process can attach, the epoch stays 0 and every snapshot is exact. Which mode a database is in is its flags, not its salts (`TestChangeEpoch_ZeroSaltsStillDetect`).
+
+**Backups** (`backup.go`, `pager.go`). With the epoch as the restart signal, the copy has to be kept right across the process's own commits by SQLite's other half, which the old signal's restart-at-every-commit had been hiding:
+
+- A spill sends its page to the attached backups, as a commit does (`pagerWalFrames`, `pager.c:3219-3225`, from `pagerStress` at `pager.c:4649`).
+- `Step` holds the write lock of the source's process from its start to its end, taken without waiting, and returns `ErrBusy` if it cannot have it (`sqlite3_backup_step` under the source mutexes, `backup.c:323-324`, and `SQLITE_BUSY` for a source in a write transaction, `backup.c:340-341`). So a commit and the updates it sends are wholly before a Step's snapshot or wholly after the Step, and a page of a transaction that is not committed never reaches a finished copy. The reader slot is taken without waiting too. The destination's write transaction is begun first, with the ordinary waits.
+- A transaction that sent pages and did not commit restarts the backups: a rollback that undid anything (`pagerUndoCallback`, `pager.c:3139`), the error cleanup (`pager_reset`, `pager.c:1910-1912`), and, through the writer-owned `pager.backupOwed`, every other way out, including a commit that unwinds after it was published and before all its pages were sent. That flag has no SQLite counterpart: nothing there unwinds past a commit.
+- `Step` restarts when its snapshot, or the previous Step's, is not exact for the epoch, or the epoch moved. The process's own commits, WAL restarts and TRUNCATE checkpoints restart nothing.
+- `update` and `restart` leave a finished backup alone: the source calls them outside its list's lock, and `Finish` may have run in between.
+
+**Close.** `Step` holding the write lock made visible that `Close` took any holder of that lock for a write transaction and ran the writer's teardown on it. A write transaction now registers under a small mutex, at the point where its teardown is valid; a `BeginWrite` that finds the database closing there backs out with `ErrClosed`, and a `Close` that finds no registered transaction waits for the holder.
+
+Tests: `internal/btree/walchange_test.go`, `backup_change_test.go`, `backup_change_fault_vfs_test.go`, `cache_invalidation_test.go`; root `change_epoch_test.go`; `test/backup_busy_test.go`.
+
+To measure (not yet): allocations per changed begin (one `walChange`) and per publication (two, at the announcement and at the settle, plus the copy of the pending header), CAS retries under concurrent readers, the fast read path, and how far a backup gets between the write transactions of a busy writer.
+
+<a id="how-long-a-backup-can-wait"></a>
+### How Long A Backup Can Wait
+
+Not a divergence: the waits are SQLite's, added up. `sqlite3_backup_step` begins a transaction on the source and, the first time, on the destination, each through the btree's ordinary busy loop (`backup.c:351`, `367`; `btree.c:3736-3737`), and every read attempt inside a begin starts a fresh WAL protocol count (`cnt = 0` in `walBeginReadTransaction`, `wal.c:3370`, `3405-3407`).
+
+- `T` is the busy timeout (`BusyTimeout`, 5 s). `H(T)` is the number of times the busy handler agrees to retry: 12 steps cover the first 328 ms, then one per 100 ms (`DefaultBusyTimeout`; SQLite's `delays[]`, `main.c:1717-1720`), so `H = 12 + ceil((T - 328 ms) / 100 ms)` for `T ≥ 328 ms`; `H(5 s) = 59`.
+- `P` is the WAL protocol allowance of one read attempt: 100 retries with sleeps of `(cnt-9)² × 39 µs`, about 10 s in all, after which the attempt fails with `ErrProtocol` (`wal.beginReadHdrRetry`).
+- A write begin makes at most `N_w = 1 + 3 + H(T)` read attempts: the first, `busySnapshotInnerRetries = 3` tight retries, and one per handler call (`DB.BeginWriteContext`). It takes at most `T + N_w × (P + one write-lock try)`.
+- A read begin makes at most `N_r = 1 + H(T)` attempts and takes at most `T + N_r × P`.
+
+The public `Backup` gives up on busy Steps once `T` has passed since the last Step that copied. Its worst case is that window, plus the begins of the last Step (one read begin on the source; one write begin on the destination, at the first Step), plus one begin each for opening the destination, for the bookkeeping on the committed copy, and for the write-lock attempt of the destination's close.
+
+With `T = 5 s`, `N_w = 63`: one write begin can take about `5 + 63 × 10 ≈ 635 s` if another process leaves the header torn for just under `P` before each of its commits. That takes an adversarial peer; an ordinary one costs a begin milliseconds. A ctx is looked at between Steps, not inside a begin, as in every other transaction begin.
+
+Tests (`backup_public_test.go`, with short budgets and a pause far below `P`): `TestBackupPublic_PausedPublisher` (one protocol wait, waited out; and the full allowance ending in `ErrProtocol`), `_EveryBusyMatchesErrBusy/destination-snapshot` (a snapshot overtaken at every attempt, no protocol wait), and `_PausedPublisherAndSnapshotInvalidation`, which combines the two on one write begin: every attempt first waits for a paused publisher and is then overtaken, each attempt's error is checked to be `ErrBusySnapshot`, and the public return is timed against `T + N_w × (pause + slack)`. The full-length bound (`P` of ten seconds at every attempt) is not run.
+
+<a id="drift-2026-11-13-2-a-backup-step-that-met-a-recovery-can-be-retried"></a>
+### Drift: A Backup Step That Met A Recovery In Progress Can Be Retried
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `backup.go:backupBusy`, `backup.go:*Backup.Step`.
+
+SQLite's `isFatalError` keeps exactly `SQLITE_BUSY` and `SQLITE_LOCKED` out of a backup's sticky `rc` (`backup.c:217-219`). It compares whole codes, so `SQLITE_BUSY_RECOVERY` and `SQLITE_BUSY_SNAPSHOT` (`SQLITE_BUSY | n<<8`) are fatal for a backup there.
+
+`Step` treats `ErrBusy`, `ErrBusySnapshot`, `ErrBusyRecovery`, `ErrReadersBusy` and the ctx's own error alike: returned, not kept. (Any other error stays sticky even if the ctx has ended meanwhile.) `Finish` returns the last Step's busy error when the backup is neither done nor failed, as `sqlite3_backup_finish` returns the `p->rc` the step left (`backup.c:558`, `603`). A begin that failed its admission holds no transaction and has copied nothing, so a later Step on the same `Backup` continues correctly, and another process rebuilding the wal-index is an ordinary event of multi-process use, not a reason to abandon a copy. `ErrProtocol` stays fatal, as `SQLITE_PROTOCOL` is. Test: `TestBackupChange_StepBusy`; the recovery case is exercised by `TestBackupChange_StepRunsRecovery`, where the Step's own begin does the rebuild.
 
 <a id="drift-102-reader-slot-tie-break-selects-lowest-not-highest"></a>
 ### Drift: Reader Slot Tie Break Selects Lowest Not Highest
@@ -3135,6 +3386,17 @@ Go's `wal.open` has no `padToSectorBoundary` concept (`wal.go:1431`) and `writeF
 powersafe logic anywhere. The consequence is that on devices where a torn write at the synced offset can
 corrupt an adjacent partially-written sector, the Go WAL lacks SQLite's defensive sector alignment, so a
 power-loss mid-write could leave the committed region straddling a sector that hardware partially overwrote.
+
+<a id="drift-2026-11-11-10-writeframes-writes-appended-frames-in-chunks-not-two-writes-per-frame"></a>
+### Drift: writeFrames Writes Appended Frames In Chunks, Not Two Writes Per Frame
+- **Category:** performance  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.writeFrames` (`internal/btree/wal.go`, the `frameBatch` staging in the append branch; `walFrameBatchMax`).
+
+C `walFrames` writes every frame through `walWriteOneFrame` (`wal.c:4159`, `wal.c:4194`), which issues two `sqlite3OsWrite` calls per frame: the 24-byte header, then the page (`wal.c:3954-3970`, through `walWriteToLog`, `wal.c:3929-3949`). Go's `writeFrames` stages each appended frame's header and payload contiguously in `w.frameBatch` and writes the staged frames with one `WriteAt` whenever the next frame would not fit in `walFrameBatchMax` (256 KiB) and once after the loop, so a commit of up to 63 frames on 4 KiB pages is one write instead of 2 × frames. Frames reused in place (`wal.c:4138-4153`) are not contiguous with the appends and keep their direct write.
+
+The bytes written and their offsets are the same, so the file and crash recovery are unchanged: appended frames lie past the last commit frame until the commit frame itself lands, recovery stops at the first frame whose checksum fails, and a torn chunk is the same state as a crash partway through the per-frame writes. A failed chunk returns before `nFrame` and the checksums advance, as a failed per-frame write did. Each Go `WriteAt` is a syscall plus runtime overhead, so writing per frame costs relatively more than it does in C; a small commit (two leaves, or a leaf and page 1) goes from four writes to one. `walWriteToLog` also splits a write at `iSyncPoint` for sector padding; Go has no sync point (drift-104), and porting padding would have to split a chunk there too.
+
+The writer restart keeps SQLite's order around the chunks. `restartLogLocked` (~ `walRestartLog`, `wal.c:3866-3906`, called at `wal.c:4070`) runs before the first frame is staged, and a restarted log's WAL header is written and synced by `flushHeader` before the first chunk goes out (`wal.c:4074-4116`); the header is never part of a chunk, so a chunk carries frames only, numbered from 1 of the new log. A chunk that fails after a restart leaves `nFrame` at 0 and the checksums at the new log's seed, and the unwind goes to `walBase()`, the start of the new log, with the size the transaction began with. Tests: `TestWriteFrames_RestartThenChunkedCommit`, `TestWriteFrames_ChunkFaultAfterRestart`, `TestWriteFrames_Format6NoPage1Chunks`, `TestWriteFrames_ReusedFramesWithChunks` (frames written over in place between chunks, then `walRewriteChecksums` before the sync, `wal.c:4166-4169`) (`wal_frame_batch_restart_vfs_test.go`).
 
 <a id="drift-105-journal-size-limit-wal-truncation-feature-unimplemented"></a>
 ### Drift: journal_size_limit WAL Truncation Feature Unimplemented
@@ -3489,7 +3751,7 @@ A follow-up per-function C-vs-Go audit refresh (2026-06-25). Each drift below wa
 <a id="drift-2026-06-25-25-first-opener-does-not-reset-a-stale-persisted-shm-trusts-checksum-vali"></a>
 ### Drift: First Opener Does Not Reset A Stale Persisted Shm; Trusts Checksum-Valid WAL-Index Header After A Crash Instead Of Forcing WAL Recovery
 - **Category:** missing-feature  -  **Severity:** high  -  **Status:** RESOLVED 2026-07-10 (2026-07 pre-beta review): `newPlatformShm` now runs the complete `unixLockSharedMemory` first-attacher election (`os_unix.c:4860-4913`, 3.52.0) — `F_GETLK` probe of the DMS byte, then: `F_UNLCK` → DMS EXCLUSIVE + **unconditional** `Truncate(3)` + atomic downgrade to SHARED; `F_RDLCK` → join shared (a live process maintains the shm); `F_WRLCK` → BUSY back-off and re-probe, never a shared-join (the `os_unix.c:4864-4871` crash-mid-election race). Bounded 100×10ms in-open retry on contention (see [drift-2026-07-10-2](#drift-2026-07-10-2-dms-busy-retried-in-open-instead-of-surfacing)). Intra-process soundness rests on `openDBs` forbidding same-process double-open by file identity (fcntl record locks are per-(process,inode)), registered in `pager.open` at DB-fd open before any lock, the WAL open or the shm attach (SQLite's `findInodeInfo` point, `os_unix.c:6138`, since 2026-10-15), so a refused open never opens the shm; the shm file must never be open+closed by an attached process (any fd close drops the process's record locks). One mechanism correction to the original entry: the adopt fast paths cited below were in fact unreachable on a *fresh* attach, because `region(create=false)` never maps existing file content — every cold attach already funneled into `recoverLocked` (see [drift-2026-07-10-3](#drift-2026-07-10-3-region-create-false-never-maps-existing-content)); the hazard was latent behind that accident rather than live, and the election now makes the guarantee structural instead of accidental. Regression tests: `TestDMSFirstAttacherTruncatesStaleShm`, `TestDMSNonFirstAttacherDoesNotTruncate`, `TestDMSMidElectionBacksOff`, `TestDMSDowngradeFailureFailsOpen`, `TestStaleShmMxFrameBehind_CommittedTailVisible`, `TestStaleShmMxFrameAhead_UncommittedNotResurrected`, `TestStaleShmGarbageDiscardedOnReopen`, `TestShmStumpCrashBeforeRecoverySelfHeals`, plus the multi-process election tests (`multiprocess_dms_test.go`) and the refused same-process open tests (`double_open_test.go`: the live handle's wal-index header and DMS lock are unchanged, a live reader survives repeated refused opens).
-- **Affected functions:** `shm_mmap.go:newPlatformShm` (`internal/btree/shm_mmap.go:93`, `internal/btree/shm_mmap.go:105`), `wal.go:*wal.ensureHeaderInitialized` (`internal/btree/wal.go:1589`).
+- **Affected functions:** `shm_mmap.go:newPlatformShm` (`internal/btree/shm_mmap.go:93`, `internal/btree/shm_mmap.go:105`), `wal.go:*wal.ensureHeaderInitialized` (`internal/btree/wal.go:1589`; removed 2026-11-11, see `wal.open`'s adopt path).
 
 In SQLite's `unixLockSharedMemory`, the connection that finds the DMS byte unlocked (`F_GETLK` reports `F_UNLCK`, `os_unix.c:4876`) is the first attacher: it takes an EXCLUSIVE DMS lock (`unixShmSystemLock(..., F_WRLCK, ...)`, `os_unix.c:4893`) and then *unconditionally* truncates the `*-shm` file to 3 bytes (`robust_ftruncate(pShmNode->hShm, 3)`, `os_unix.c:4902`) before downgrading to SHARED — and any peer that observes the DMS already held EXCLUSIVE backs off with `SQLITE_BUSY` (`os_unix.c:4906`) so the truncation is never raced. The 3-byte stump is smaller than the wal-index header, so the next `readHeader` necessarily fails validation and `walIndexRecover` rebuilds the index from the authoritative WAL file. The header comment (`os_unix.c:4864-4871`) spells out exactly why the truncate is unconditional: the shm is volatile and may be torn or stale after a power failure or crash, and trusting it can corrupt the database. The Go `newPlatformShm` acquires the DMS lock (`internal/btree/shm_mmap.go:93`) but then only truncates the shm to the 3-byte marker when the file was *freshly created* (`info.Size() == 0`, `internal/btree/shm_mmap.go:105`); if a `*-shm` file persists from a process that died without running `mmapShm.close` (so the file was never unlinked), the new opener sees `Size() > 0`, skips the truncate entirely, and `wal.ensureHeaderInitialized` takes its fast path (`if hdr, valid := w.index.readHeader(); valid`, `internal/btree/wal.go:1589`) — trusting the stale-but-checksum-valid header's `mxFrame`/salts/hash slots instead of recovering from the WAL. The consequence is that Go can resurrect a crashed writer's uncommitted frames, miss the real committed tail, or read against a mismatched salt generation, where SQLite's mandatory first-open truncate-to-3 would have forced a full WAL rebuild.
 
@@ -3565,14 +3827,14 @@ After WAL recovery, `pager.open` refreshes the full in-memory header from the WA
 
 <a id="drift-2026-06-25-32-cross-process-online-backup-can-silently-produce-a-torn-snapshot-backu"></a>
 ### Drift: Cross-process online backup can silently produce a torn snapshot: backup restart-detection depends on FileChangeCounter that the conditional-bump commit (drift-77) leaves unadvanced for external data commits
-- **Category:** changed-logic  -  **Severity:** medium
+- **Category:** changed-logic  -  **Severity:** medium  -  **Status:** RESOLVED 2026-11-13: `Backup.Step` restarts by the change epoch (`ReadTx.ChangeEpoch`), which moves when any transaction of the process begins at a wal-index header the process neither wrote nor had seen, as SQLite's Step restarts in the `pager_reset` of its own read transaction (`pager.c:1774`, `backup.c:351`). The page-1 counter plays no part. The same change ended the opposite fault, a restart at every marked commit of the process itself, which could keep a backup from ever finishing beside a steady writer. Tests: `TestBackupChange_ForeignCommits` (the peer marks nothing), `_ForeignCommitSeenByAnotherReader`, `_OwnCommits`, `_FinishesBesideOwnWriter`. What follows describes the code before that.
 - **Affected functions:** `backup.go:*Backup.Step` (`internal/btree/backup.go:206-214`), `pager.go:2308-2319`.
 
 `Backup.Step` detects external (other-process) writes and forces a full restart (`b.iNext = 1`) purely on `rtx.diskFileChangeCounter != b.lastFCC` (`backup.go:206-214`), with a comment asserting "Page-1 FileChangeCounter changes on every write commit, including from other processes." That assumption is false here: `pager.commit` bumps `FileChangeCount` only when the caller-supplied `dataChanged` flag is true (`pager.go:2308-2319`), and the btree mutation entry points `Put`/`Delete` (`db.go:1881-1896`) do not auto-set it — it is opt-in via `WriteTx.MarkDataChanged` (`db.go:1868-1872`), the documented [drift-77](#drift-77-filechangecount-bumped-conditionally-not-unconditionally) behavior. SQLite's `pager_write_changecounter` bumps unconditionally on the first write of a transaction (`pager.c:3084`, `pager.c:6363`), so `sqlite3BackupRestart`/`backupUpdate` (`backup.c:661-707`) reliably restart. The consequence is that a peer process committing real data-page changes without `MarkDataChanged` leaves page-1 `FileChangeCount` unchanged; a concurrent cross-process `Backup` then fails to restart after already copying pre-write versions of some pages while later Steps copy post-write versions — yielding a silently inconsistent (torn) destination that passes `Finish()` without error.
 
 <a id="drift-2026-06-25-02-step-after-errbackupdone-re-enters-and-re-runs-finalize-and-can-copy-n"></a>
 ### Drift: Step After ErrBackupDone Re-Enters And Re-Runs Finalize Instead Of Being A No-Op
-- **Category:** changed-logic  -  **Severity:** low
+- **Category:** changed-logic  -  **Severity:** low (critical once backups stopped restarting at own commits)  -  **Status:** RESOLVED 2026-11-13: `Step` returns `b.rc` whenever it is set, `ErrBackupDone` included, as `isFatalError(SQLITE_DONE)` makes `sqlite3_backup_step` return at once (`backup.c:217-219`, `329-330`). While a backup restarted at every marked commit of its own process, the re-entered Step started over and the result was at least consistent; with the restart by the change epoch it would have copied only the pages the source grew by since, next to pages no update had refreshed. Test: `TestBackupChange_DoneIsTerminal`. What follows describes the code before that.
 - **Affected functions:** `backup.go:*Backup.Step` (`internal/btree/backup.go:191`).
 
 In C, `sqlite3_backup_step` reads `rc = p->rc` and only does work inside `if( !isFatalError(rc) )` (`backup.c:329-330`); since `isFatalError` returns true for any non-`OK`/`BUSY`/`LOCKED` code (`backup.c:217-218`), a sticky `SQLITE_DONE` left in `p->rc` after the prior completion (`backup.c:405-406`) makes the whole body a no-op — the function skips the copy loop and finalize and just re-returns `SQLITE_DONE`. The Go `Step` guard at `internal/btree/backup.go:191` instead reads `if b.rc != nil && b.rc != ErrBackupDone { return b.rc }`, explicitly excluding `ErrBackupDone` from the early return, so a Step call after completion falls through and re-executes the full body: it re-opens a fresh source read transaction (`backup.go:199`), re-reads the source size from that snapshot (`nSrcPage := rtx.DatabaseSize()`, `backup.go:234`), runs the copy loop again, and re-enters the `b.iNext > nSrcPage` finalize branch (`backup.go:263-266`) that re-runs `finalize` and re-sets `b.rc = ErrBackupDone`.
@@ -3798,9 +4060,9 @@ SQLite's `indexCellCompare` (`btree.c:5952-5982`) compares a record in place onl
 
 SQLite never changes its magic. A file from a later release is told apart by the version bytes, which `lockBtree` checks on every read of page 1 (`btree.c:3322-3327`: a write version above 2 makes the connection read-only, a read version above 2 is `SQLITE_NOTADB`), and by the schema file format, which `sqlite3InitOne` bounds with "unsupported file format" (`prepare.c:344`). any-store wrote both version bytes as 2 and the schema format as 5 but checked only the format's lower bound, so releases up to v2.4.3 open a file of any later format and parse it under their own rules. `checkHeaderFormat` now applies all three bounds before any other header field is trusted, and reports a value above the maximum as `ErrNewerFormat`, which is not under `ErrCorrupt`: the file is intact and a caller that discards a corrupt database must keep it.
 
-Two things differ from SQLite. First, the bounds cannot protect a file from the releases that never checked them, so schema formats 6 and later are written under a second magic, `"any-store v2 fmt"` (v2.5.0 is the first release to create such files). It fills all 16 bytes, and those releases compare the whole field, so they refuse the file at the header (as a corrupt file: `ErrHeaderCorrupt` from v2.4.3, plain `ErrCorrupt` before it) before reading a page of it. The magic changes this once: later formats raise the schema format only. The magic and the schema format must agree (the second magic with a format below 6, or a zero-padded magic with format 6, is `ErrHeaderCorrupt`; a format above the newest known is `ErrNewerFormat` under either magic, because that check runs first). `serialize` writes back the family of the magic the header was read with (an older `"BTree format 1"` becomes `"any-store v2"`), so no commit moves a file between the two families; a backup refuses a destination of the other family for the same reason (see [its entry](#drift-2026-11-11-2-backup-refuses-a-destination-of-another-schema-format)); and the copy of page 1 that `pager.open` reads from the WAL must name the same family as the file. Second, a write version above the maximum refuses the open instead of opening read-only: the btree has no read-only open.
+Two things differ from SQLite. First, the bounds cannot protect a file from the releases that never checked them, so schema formats 6 and later are written under a second magic, `"any-store v2 fmt"` (v2.5.0 is the first release to create such files). It fills all 16 bytes, and those releases compare the whole field, so they refuse the file at the header (as a corrupt file: `ErrHeaderCorrupt` from v2.4.3, plain `ErrCorrupt` before it) before reading a page of it. The magic changes this once: later formats raise the schema format only. The magic and the schema format must agree (the second magic with a format below 6, or a zero-padded magic with format 6, is `ErrHeaderCorrupt`; a format above the newest known is `ErrNewerFormat` under either magic, because that check runs first). `serialize` writes back the family of the magic the header was read with (an older `"BTree format 1"` becomes `"any-store v2"`), so no commit moves a file between the two families; a backup refuses a destination of the other family for the same reason (see [its entry](#drift-2026-11-11-8-backup-refuses-a-destination-of-another-schema-format)); and the copy of page 1 that `pager.open` reads from the WAL must name the same family as the file. Second, a write version above the maximum refuses the open instead of opening read-only: the btree has no read-only open.
 
-The checks live in `dbHeader.deserialize`, whose first caller on the open path is `readInitialHeader`, before the file is locked or its WAL and wal-index are touched; a refused open leaves all three files as they were. A newer format found only in the WAL's copy of page 1 is refused after WAL recovery has run, which may have rewritten the wal-index. A handle that is already open reloads the header after another process commits (`refreshHeaderFromPage1`); there `ErrNewerFormat` and a change of leaf rule fail the transaction (`checkRefreshedHeader`), while the other header checks are not applied, as before: SQLite re-runs all of `lockBtree` on every such read. Regression tests: `internal/btree/format_gate_test.go` (`TestCheckHeaderFormat`, `TestOpen_RefusedFormatLeavesFilesUntouched`, `TestHeaderSerialize_KeepsMagicFamily`, `TestOpen_FirstMagicStillOpensAndIsRewritten`), `corrupt_open_test.go:TestOpen_NewerFormat`.
+The checks live in `dbHeader.deserialize`, whose first caller on the open path is `readInitialHeader`, before the file is locked or its WAL and wal-index are touched; a refused open leaves all three files as they were. A newer format found only in the WAL's copy of page 1 is refused after WAL recovery has run, which may have rewritten the wal-index. A handle that is already open reloads the header after another process commits (`refreshHeaderFromPage1`); there every check of `dbHeader.deserialize`, `ErrNewerFormat` included, and a change of leaf rule (`checkRefreshedHeader`) fail the transaction, as SQLite re-runs all of `lockBtree` on every such read. Regression tests: `internal/btree/format_gate_test.go` (`TestCheckHeaderFormat`, `TestOpen_RefusedFormatLeavesFilesUntouched`, `TestHeaderSerialize_KeepsMagicFamily`, `TestOpen_FirstMagicStillOpensAndIsRewritten`), `corrupt_open_test.go:TestOpen_NewerFormat`.
 
 <a id="drift-2026-11-10-2-leaf-insert-fit-check-counts-the-cell-pointer-twice"></a>
 ### Drift: The Leaf Insert Fit Check Counts The New Cell's Pointer Twice
@@ -3816,7 +4078,7 @@ SQLite's `insertCellFast` sends a cell to `balance()` when `sz+2 > pPage->nFree`
 
 SQLite's `decodeFlags` copies `maxLocal`/`minLocal` into each `MemPage` from `BtShared`, choosing the index pair or the table-leaf pair by the page's flag byte (`btree.c:2043-2086`), and `btreePayloadToLocal` reads them from the page (`btree.c:1213-1226`). any-store has one leaf page type, so the pair is not chosen per page: leaf code takes a `payloadLimits` from `pager.leafLimits`, which returns the table-leaf pair for a schema format 6 file and the index pair for a format 5 one, and interior code uses `indexLimits`. `TestLeafCodeTakesLimitsFromPager` fails when production code outside the interior-cell functions calls `maxLocalPayload`, `minLocalPayload` or `indexLimits` directly.
 
-<a id="drift-2026-11-11-1-parent-rewrite-after-a-balance-splits-in-place"></a>
+<a id="drift-2026-11-11-7-parent-rewrite-after-a-balance-splits-in-place"></a>
 ### Drift: The Parent Rewrite After A Balance Splits The Parent In Place Instead Of Balancing It
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `balance.go:*btree.rewriteParentAfterBalance`, `balance.go:*btree.splitParentThreeWays`, `btree.go:interiorSplitPointFitting`, `btree.go:*btree.pathToChild`.
@@ -3825,14 +4087,14 @@ SQLite's `balance_nonroot` inserts each new divider into the parent with `insert
 
 The split index is chosen so that both halves fit (`interiorSplitPointFitting`), because the new dividers can be much longer than the ones they replace. Two pages are enough unless the new dividers alone exceed a page: a balance writes at most `nbMaxOut` pages, hence at most four new dividers, and four interior cells of the largest size take slightly more than a page once the usable size passes about 10 KiB (`maxLocal` is `(usable-12)*64/255-23`, a little over a quarter). Then `splitParentThreeWays` writes three pages and promotes two dividers. The first goes up the path as usual; that can rewrite the pages above, so the parent of the middle page is found again from the root by key (`pathToChild`) before the second is inserted. Regression tests: `root_leaf_balance_test.go` (`TestInteriorSplitPointFitting_LongTail`, `TestRewriteParentAfterBalance_ThreeWaySplit`).
 
-<a id="drift-2026-11-11-2-backup-refuses-a-destination-of-another-schema-format"></a>
+<a id="drift-2026-11-11-8-backup-refuses-a-destination-of-another-schema-format"></a>
 ### Drift: A Backup Refuses A Destination Of Another Schema Format
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `backup.go:*DB.BackupInit`, `db.go:Open` (`Options.SchemaFormat`), root `db.go:*db.Backup`.
 
 `sqlite3_backup` copies every page of the source, page 1 included, so the destination becomes a file of the source's format whatever it was before; the next read of page 1 by any connection re-runs `lockBtree` and each page carries its own payload rule in its flag byte (`btree.c:2028-2085`). In any-store the leaf payload rule is held once per open file (`pager.leafLimits`), fixed at open. Replacing a format 6 destination with a format 5 source under it would leave other handles, and read transactions opened before the backup committed, parsing the new pages by the old rule, and a crash before the next checkpoint would leave a database file and a WAL whose headers name different magics. `BackupInit` therefore returns `ErrBackupFormatMismatch` when the two files' leaf rules differ, and a destination is created in the source's format with `Options.SchemaFormat` (the root package's `Backup` does this), so a backup of a database created before v2.5.0 is a schema format 5 file. With that, the format of a file never changes after creation. Regression tests: `table_leaf_format_test.go` (`TestBackup_SchemaFormats`, `TestOpen_SchemaFormatOption`), root `format_test.go` (`TestBackup_KeepsSourceFormat`).
 
-<a id="drift-2026-11-11-3-interior-collection-rewrites-overflowing-divider-chains"></a>
+<a id="drift-2026-11-11-9-interior-collection-rewrites-overflowing-divider-chains"></a>
 ### Drift: Collecting An Interior Page Frees And Rewrites The Overflow Chains Of Its Dividers
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `btree.go:*btree.collectInteriorCellsKeepBuf`, `btree.go:*btree.rebuildInteriorPage`.
@@ -3846,16 +4108,35 @@ The split index is chosen so that both halves fit (`interiorSplitPointFitting`),
 
 Balance-shallower copies the only child back into a root with no cells when `pParent->hdrOffset <= apNew[0]->nFree` (`btree.c:8942`), after `defragmentPage` (`btree.c:8959-8967`); `nFree` counts freeblocks and fragment bytes. `collapseSingleChild` compares `dbHeaderSize` with the gap between the child's pointer array and its content area, and does not defragment: a child with a 90-byte gap and 20 fragment bytes is left under a zero-cell page 1 where SQLite would collapse it. The tree is one level deeper until a later balance rebuilds the child packed. The copy itself keeps cell content at the same offsets, so it is exact whenever it is made.
 
-<a id="drift-2026-11-11-5-versionvalidfor-mismatch-refuses-the-open"></a>
-### Drift: A VersionValidFor Mismatch Refuses The Open
-- **Category:** error-handling  -  **Severity:** low
-- **Affected functions:** `pager.go:*pager.open`.
-
-When the header's version-valid-for field (offset 92) differs from the change counter (offset 24), `lockBtree` distrusts only the page count in the header and takes the pager's file-size count instead (`btree.c:3294-3297`). `pager.open` returns `ErrHeaderCorrupt` for two non-zero values that differ: any-store writes both fields in every commit, so a difference means a header not written by one commit. A zero version-valid-for is treated as SQLite does (the page count comes from the file size).
-
 <a id="drift-2026-11-11-6-backup-reloads-the-header-from-the-copied-page-1"></a>
 ### Drift: Backup Finalize Reloads The In-Memory Header From The Copied Page 1
 - **Category:** changed-logic  -  **Severity:** none
 - **Affected functions:** `backup.go:*Backup.finalize`.
 
-`sqlite3_backup` copies page 1 like any other page and then patches fields in the destination's page image (the schema cookie through `sqlite3BtreeUpdateMeta`, the version bytes through `sqlite3BtreeSetVersion`; `backup.c:420-431`); there is no header kept apart from the page. any-store's pager keeps a parsed `dbHeader` and writes it over page 1 at every commit, so `finalize` deserialises the copied page 1 into the destination's header, bumps the schema cookie there, and lets the commit serialise it back. The header that reaches disk is the source's, field for field, except for the cookie and the page count; a field `dbHeader` does not model would not survive, and there is none today. The magic family and schema format are the source's as well, which is why the destination must already have them (see [the backup format entry](#drift-2026-11-11-2-backup-refuses-a-destination-of-another-schema-format)).
+`sqlite3_backup` copies page 1 like any other page and then patches fields in the destination's page image (the schema cookie through `sqlite3BtreeUpdateMeta`, the version bytes through `sqlite3BtreeSetVersion`; `backup.c:420-431`); there is no header kept apart from the page. any-store's pager keeps a parsed `dbHeader` and writes it over page 1 at every commit, so `finalize` deserialises the copied page 1 into the destination's header, bumps the schema cookie there, and lets the commit serialise it back. The header that reaches disk is the source's, field for field, except for the cookie and the page count; a field `dbHeader` does not model would not survive, and there is none today. The magic family and schema format are the source's as well, which is why the destination must already have them (see [the backup format entry](#drift-2026-11-11-8-backup-refuses-a-destination-of-another-schema-format)).
+
+<a id="drift-2026-11-11-1-attached-wal-index-recovery"></a>
+### Drift: Recovery Of A Torn wal-index Header With Peers Attached Runs On The Process-Shared `*wal`
+- **Category:** structural  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.indexReadHdr`, `wal.go:*wal.tryBeginReadMultiProcessHdr`, `wal.go:*wal.checkpointWithMode`, `wal.go:*wal.authoritativeMxFrame`, `pager.go:*pager.close`.
+
+SQLite's `walIndexReadHdr` (`wal.c:2654-2759`) reads the wal-index header without a lock; when it is invalid it takes `WAL_WRITE_LOCK`, reads again, and if the header is still invalid runs `walIndexRecover` (`wal.c:2694-2729`). Every read transaction goes through it (`walTryBeginRead`, `wal.c:3076`), and so does every checkpoint before it copies a frame (`sqlite3WalCheckpoint`, `wal.c:4373`). A header left torn by a writer that died between its two header copies is therefore repaired by the next connection that looks at it.
+
+Until 2026-11-11 the Go port did neither. A reader that found the header invalid only fenced on `lockRecover` and retried, ending in `ErrProtocol` after the retry budget (about 10 s); a write begin went through the same read path. A checkpoint took its frontier from `authoritativeMxFrame` / `authoritativeMxFrameAndPage`, which fell back to the process-local frame count on an invalid header: a surviving process that had not read since a peer's last commits backfilled only through its own stale count, judged the backfill complete, and a RESTART/TRUNCATE (including the close-time checkpoint) then discarded the peer's acknowledged frames.
+
+`wal.indexReadHdr(haveWriteLock, haveCkptLock)` is now the port of `walIndexReadHdr`, called from `tryBeginReadMultiProcessHdr` and at the top of `checkpointWithMode` (whose frontier `nf`/`mxPage` is the header it returns, as `walCheckpoint` works from `pWal->hdr`). A busy lock yields `ErrBusy`: the reader probes `lockRecover` and retries, or reports `ErrBusyRecovery` when the probe is busy (`wal.c:3084-3108`); the checkpoint returns it (`SQLITE_BUSY`). `pager.close` holds the write lock around its close-time checkpoint, so it calls `indexReadHdr(true, false)` itself first (the `pWal->writeLock` branch, `wal.c:2706-2711`); otherwise the PASSIVE checkpoint inside could not take the lock for the repair. `authoritativeMxFrame` no longer substitutes the local count in multi-process mode: an unreadable header reads as `mxFrameUnknown` (larger than any frame), so every "whole log backfilled" test fails closed. `authoritativeMxFrameAndPage` is gone.
+
+What still differs from SQLite, and why:
+
+1. **Process-shared state.** A SQLite `Wal` belongs to one connection, and recovery rewrites that connection's `pWal->hdr`. One Go `*wal` serves every transaction of the process, so `recoverLocked` runs under `w.mu` and resets the writer-owned fields (`nFrame`, `cksum1/2`, salts, the local index atomics). It only does so while `indexReadHdr` holds `lockWrite`, `lockCheckpoint` and `lockRecover` exclusively; the in-process lock table makes that exclusive against this process's own writer and checkpointer as well as against peers, so no user of those fields is active. In-flight readers of the process are unaffected for SQLite's reasons: hash tables are rebuilt privately and copied over identical content for every frame a live snapshot can reach, and a read-mark whose slot is held is left alone.
+2. **`pChanged`** (ported 2026-11-13). After recovery SQLite sets `*pChanged = 1` (`wal.c:2724-2725`), which resets the pager (`pager.c:3261-3263`), and a checkpoint that loaded a new header zeroes `pWal->hdr` (`wal.c:4399-4407`). Here the rebuilt header is published through `wal.publishHeader` as a recovery, which always raises the change epoch, and a reset over a header the process had not seen raises it too. Reader caches are still keyed by the full header plus `dataVersion`, and the writer still compares the live header with `writerHdr` at write begin.
+3. **Where the busy handler runs for `ErrBusyRecovery`.** The mapping itself is SQLite's (`wal.c:3084-3108`): a busy lock with the `WAL_RECOVER_LOCK` probe free is a retry, a busy probe is `ErrBusyRecovery` (`SQLITE_BUSY_RECOVERY`), any other probe error is returned. SQLite invokes the busy handler for it in `sqlite3BtreeBeginTrans`, from the one loop around the whole begin, with one count (`btree.c:3730-3737`; `sqlite3InvokeBusyHandler`, `main.c:1770-1780`, never asks again once the handler has declined). Go has several begin entry points (read, write, backup step, integrity sweep, and open's read of page 1, which is below the pager), so a read begin's loop sits at the WAL read begin, `wal.beginReadHdrBusy`, with the begin's count in a `beginBusy`. `DB.BeginWriteContext` is a write begin's one loop: it makes single read attempts (`beginReadHdrBusy(nil)`), tries the write lock once per attempt (`beginWriteWithSnapshot`, as `walBeginWriteTransaction` does, `wal.c:3714-3717`), and retries `ErrBusyRecovery`, a busy write lock (`ErrBusy`) and, after its tight retries, `ErrBusySnapshot` under one `beginBusy`, each retry from a fresh read snapshot. Until 2026-11-12 there were three counts: the pager's recovery loop and `BeginWriteContext`'s loop each had one, and the inner loop restarted from 0 on every outer retry (with a recovery that did not finish, the default 5 s budget became about 300 s, the process's writer reservation held throughout); and `beginWriteWithSnapshot` waited for the write lock through `walBusyLock` with a count of its own, so a peer that committed just before each timeout made every snapshot retry start a fresh budget (about 60 retries, 5 minutes, at the default). `walBusyLock`'s per-call count (drift-108) is now left only to the checkpoint's, open's and close's lock waits. Tests: `TestTornWalIndexHeader_BusyRecoveryOneBudgetPerBegin`, `_WALReadBeginWaitsOutRecovery`, `TestBeginWrite_PeerCommitsBeforeTimeoutOneBudget`.
+4. **`mxFrameUnknown`.** SQLite needs no such value: after `walIndexReadHdr` it works from its private `pWal->hdr`, and the one live re-read (`wal.c:2322`) is unvalidated. The Go callers outside `checkpointWithMode`'s frontier (`checkpointPassive`, `checkpointPost`, the DB-file truncate guard, `tryCheckpoint`) re-read the shared header and can catch a peer between its two copies; treating that as "more frames may exist" costs at most a skipped reset or truncate.
+
+Three further rules of the same SQLite routines were ported with it (2026-11-11), none of them a divergence any more:
+
+- **A read error during the recovery scan is an error.** `recoverLocked` used to `break` on a failed frame read and publish the prefix it had as the whole log; with recovery now reachable from attached readers and checkpointers, a transient I/O error would have presented an earlier commit as the end of the log and let the next TRUNCATE delete the commits behind it (open-time recovery had the same defect). `walIndexRecover` keeps the read's `rc` (`wal.c:1502-1503`) and publishes only under `rc==SQLITE_OK` (`wal.c:1561-1566`); `recoverLocked` now returns the error with nothing published. Tests (`-tags vfs`): `TestRecoverReadErrorNotEndOfLog_AttachedRecovery`, `_Open`.
+- **Reset decisions read the shared `nBackfill`.** `checkpointPost`, `checkpointPassive`'s completeness result (which gates the close-time WAL truncate) and `tryCheckpoint`'s restart test compared the process-local `walIndex.nBackfill` mirror with the shared frontier. The mirror is refreshed only at some begins, so after a peer's WAL restart it can hold the previous generation's larger count; `checkpointPost` is reached without any backfill when reader slot 0 is busy, and then reset a log none of which had been copied. `walCheckpoint` tests `pInfo->nBackfill` in shared memory (`wal.c:2355`); the three sites now go through `walIndex.liveNBackfill`. Test: `TestCheckpointResetUsesSharedBackfill`.
+- **A wal-index of another version is refused, not rebuilt.** `readHeader` reported a consistent, checksummed header with a foreign `iVersion` as invalid, which `indexReadHdr` would have "repaired" over another build's live index. `walIndexReadHdr` returns `SQLITE_CANTOPEN` for it without recovery (`wal.c:2740-2741`); `readHeaderState` separates the case and `indexReadHdr` returns an error matching `ErrWALVersion`. `wal.open` refuses it the same way, under its recovery locks and before it rebuilds anything: a process attaching to a database a newer build keeps open must not overwrite that build's index. On a fresh attach `region(create=false)` maps none of the peer's index ([drift-2026-07-10-3](#drift-2026-07-10-3-region-create-false-never-maps-existing-content)), so the gate maps region 0 first, as `walIndexReadHdr` does through `walIndexPage`; a consistent header of this version still goes to recovery, as before. Tests: `TestWalIndexFutureVersionRefused`, `TestWalIndexFutureVersionRefusedAtOpen` (two processes).
+
+Regression tests (`internal/btree/walindex_torn_header_test.go`): `TestTornWalIndexHeader_CheckpointKeepsPeerCommits`, `_PassiveCheckpointKeepsPeerCommits`, `_CloseKeepsPeerCommits`, `_ReaderRecovers`, `_WriterRecovers` (two processes: the writer dies between the header copies), `_ReaderRetriesWhileWriteLockBusy`, `_BusyRecoveryWhenRecoverLockHeld`, `_CheckpointBusyWhenWriteLockHeld`.

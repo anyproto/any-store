@@ -98,8 +98,8 @@ func TestTryBeginReadInProcessHdr_Slot0FallbackClaims(t *testing.T) {
 	require.Greater(t, mxFrame, uint32(0))
 	require.Less(t, nBackfill, mxFrame, "fallback requires an un-backfilled WAL tail")
 
-	// Hold slots 1..4 exclusive — exactly what tryResetWALWithBusy does while
-	// resetting the WAL (wal.go tryResetWALWithBusy) — so the reader can
+	// Hold slots 1..4 exclusive — exactly what waitReadersAndTruncate does while
+	// resetting the WAL (wal.go waitReadersAndTruncate) — so the reader can
 	// neither reuse nor claim a slot and must take the slot-0 fallback.
 	for i := 1; i <= 4; i++ {
 		require.NoError(t, w.index.lock(lockRead0+i, lockExclusive))
@@ -236,7 +236,7 @@ func TestInProcessSlot0FallbackTruncateStress(t *testing.T) {
 	// slots so a steady share of BeginRead traffic genuinely flows through
 	// the slot-0 fallback while the writer and checkpointer churn the
 	// counters it re-validates. Resets are excluded during a squat window
-	// (tryResetWALWithBusy needs these locks) but proceed between windows.
+	// (waitReadersAndTruncate needs these locks) but proceed between windows.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

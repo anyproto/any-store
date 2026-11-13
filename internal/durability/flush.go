@@ -11,9 +11,13 @@ import (
 type FlushMode string
 
 const (
-	FlushModeCheckpointPassive  FlushMode = "CHECKPOINT_PASSIVE"
-	FlushModeCheckpointFull     FlushMode = "CHECKPOINT_FULL"
-	FlushModeCheckpointRestart  FlushMode = "CHECKPOINT_RESTART"
+	FlushModeCheckpointPassive FlushMode = "CHECKPOINT_PASSIVE"
+	FlushModeCheckpointFull    FlushMode = "CHECKPOINT_FULL"
+	// FlushModeCheckpointRestart checkpoints everything and waits until no
+	// reader uses the WAL; the next write transaction then starts the WAL
+	// over. The WAL itself is not reset or shrunk by the flush.
+	FlushModeCheckpointRestart FlushMode = "CHECKPOINT_RESTART"
+	// FlushModeCheckpointTruncate also resets the WAL and truncates its file.
 	FlushModeCheckpointTruncate FlushMode = "CHECKPOINT_TRUNCATE"
 )
 

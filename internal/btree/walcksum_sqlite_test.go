@@ -257,32 +257,40 @@ func TestSqlite_WALCksum_1(t *testing.T) {
 		require.NoError(t, db.Checkpoint(CheckpointFull))
 
 		// INSERT INTO t1 VALUES(89, 'eightynine')
+		saltBefore := walFileSalts(t, walPath)
+		genBefore := db.pager.wal.logGen.Load()
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
 		ns, err := db.getNamespaceLocked("t1")
 		require.NoError(t, err)
 		require.NoError(t, tx.Put(ns, intKey(89), []byte("eightynine")))
 		require.NoError(t, tx.Commit())
+		// The checkpoint backfilled the whole log, so the insert's writer
+		// started it over (walRestartLog): a new log generation, new salts.
+		require.Greater(t, db.pager.wal.logGen.Load(), genBefore, "the insert's writer started the log over")
 
 		// rawClose to keep WAL on disk for inspection
 		rawClose(db)
+		require.NotEqual(t, saltBefore, walFileSalts(t, walPath), "the restarted log has new salts")
 
-		// Count total valid frames after checkpoint + insert.
-		// FULL checkpoint preserves WAL, so all frames (old + new) remain valid.
+		// The insert's frames, counted from their headers alone: the frames
+		// at the start of the file that carry the new salts, up to the first
+		// commit mark. SQLite's insert wrote two, the leaf and page 1; a
+		// schema format 6 commit leaves page 1 out when its header is
+		// unchanged.
+		n, total := walInsertFrames(t, walPath, 1024)
+		require.Positive(t, n)
+		require.Greater(t, total, n, "setup: frames of the log before follow the insert's")
+
+		// walcksum-1.8.1-3: the frames written to the start of the log
+		// verify, and the next one, left from the log before, does not.
 		validFrames := verifyWALFrameChecksums(t, walPath, 1024)
-		t.Logf("Valid frames after checkpoint + insert: %d", validFrames)
-		assert.True(t, validFrames >= 2, "should have at least 2 valid frames")
-
-		t.Run("f=1", func(t *testing.T) {
-			ok := verifyWALFrameChecksumAt(t, walPath, 1024, 1)
-			assert.True(t, ok, "frame 1 checksum should be valid")
-		})
-		if validFrames >= 2 {
-			t.Run("f=2", func(t *testing.T) {
-				ok := verifyWALFrameChecksumAt(t, walPath, 1024, 2)
-				assert.True(t, ok, "frame 2 checksum should be valid")
-			})
+		t.Logf("insert frames %d, valid prefix %d, frames in the file %d", n, validFrames, total)
+		assert.Equal(t, n, validFrames, "the insert's frames, and no frame of the log before")
+		for f := 1; f <= n; f++ {
+			assert.True(t, verifyWALFrameChecksumAt(t, walPath, 1024, f), "frame %d checksum should be valid", f)
 		}
+		assert.False(t, verifyWALFrameChecksumAt(t, walPath, 1024, n+1), "frame %d, of the log before, must not verify", n+1)
 	})
 
 	// Clean up for next tests
@@ -863,4 +871,36 @@ func TestSqlite_WALCksum_5(t *testing.T) {
 				"second read should also produce keys 1, 2, 3, 8, 9")
 		})
 	})
+}
+
+// walFileSalts returns the salts in the WAL file's header.
+func walFileSalts(t *testing.T, walPath string) [2]uint32 {
+	t.Helper()
+	data, err := os.ReadFile(walPath)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(data), walHeaderSize)
+	return [2]uint32{binary.BigEndian.Uint32(data[16:20]), binary.BigEndian.Uint32(data[20:24])}
+}
+
+// walInsertFrames counts, from frame headers only, the frames at the start
+// of the WAL file that carry the header's salts up to and including the
+// first commit mark, and returns that count and the number of whole frames
+// in the file.
+func walInsertFrames(t *testing.T, walPath string, pageSize int) (n, total int) {
+	t.Helper()
+	data, err := os.ReadFile(walPath)
+	require.NoError(t, err)
+	salts := walFileSalts(t, walPath)
+	frameSize := walFrameSize + pageSize
+	total = (len(data) - walHeaderSize) / frameSize
+	for i := 0; i < total; i++ {
+		h := data[walHeaderSize+i*frameSize:]
+		if binary.BigEndian.Uint32(h[8:12]) != salts[0] || binary.BigEndian.Uint32(h[12:16]) != salts[1] {
+			return 0, total
+		}
+		if binary.BigEndian.Uint32(h[4:8]) != 0 {
+			return i + 1, total
+		}
+	}
+	return 0, total
 }
