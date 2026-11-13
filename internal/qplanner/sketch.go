@@ -232,6 +232,9 @@ func (s *IndexSketch) MarshalBinary(dst []byte) []byte {
 // UnmarshalBinary deserializes the sketch. A V2 blob (magic-tagged) is loaded
 // directly, adopting its shape; a legacy V1 blob (no magic) is loaded into the
 // full-key level with the shallow levels left empty and flagged for rebuild.
+// The magic alone decides which: a tagged blob that does not parse, down to a
+// cut-off header, leaves the sketch as it was and is never read as legacy
+// buckets.
 //
 // Atomic stores into Buckets/levelTotals/docCount let concurrent readers see
 // consistent values without locking. Reshaping (reallocating the backing slices
@@ -240,7 +243,7 @@ func (s *IndexSketch) MarshalBinary(dst []byte) []byte {
 // carries the index's fixed (Size, Levels), so the reshape branch never
 // reallocates a slice a concurrent reader might hold.
 func (s *IndexSketch) UnmarshalBinary(data []byte) {
-	if len(data) >= sketchHeaderLen && [4]byte{data[0], data[1], data[2], data[3]} == sketchMagic {
+	if len(data) >= len(sketchMagic) && [4]byte(data[:4]) == sketchMagic {
 		s.unmarshalV2(data)
 		return
 	}

@@ -266,6 +266,23 @@ func TestIndexSketch_Distribution(t *testing.T) {
 	})
 }
 
+// A tagged blob cut off inside its header or body leaves the sketch as it was:
+// the legacy path would zero the shallow level and flag a rebuild.
+func TestIndexSketch_UnmarshalTruncatedV2(t *testing.T) {
+	s := NewIndexSketch(8, 2)
+	s.Increment(0, []byte("a"))
+	s.Increment(1, []byte("ab"))
+	s.IncrementDocCount()
+	want := s.Snapshot(nil)
+	blob := s.MarshalBinary(nil)
+
+	for n := len(sketchMagic); n < len(blob); n++ {
+		s.UnmarshalBinary(blob[:n])
+		assert.Equal(t, want, s.Snapshot(nil), "prefix of %d bytes", n)
+		assert.False(t, s.NeedsRebuild(), "prefix of %d bytes", n)
+	}
+}
+
 func TestIndexSketch_SameShape(t *testing.T) {
 	s := NewIndexSketch(64, 2)
 	same := NewIndexSketch(64, 2).MarshalBinary(nil)
