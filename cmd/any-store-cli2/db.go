@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -88,7 +89,7 @@ func (c *Conn) makeAutocomplete() (err error) {
 	}
 	c.syncCollections(collNames)
 	c.autocomplete = append(c.autocomplete[:0], "show collections", "show stats", "db.", "help", "it")
-	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(", "db.backup(", "db.quickCheck()")
+	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(", "db.backup(", "db.migrate(", "db.quickCheck()")
 	c.autocompleteQuery = append(c.autocompleteQuery[:0], "limit(", "offset(", "sort(", "hint(", "project(", "pretty()", "count()", "explain()", "delete()", "update(", "groupLimit(", "accumArrayLimit(", "memoryLimit(")
 	c.autocompleteColl = c.autocompleteColl[:0]
 	for _, collName := range collNames {
@@ -160,6 +161,8 @@ func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
 		return c.CreateCollection(cmd)
 	case "backup":
 		return c.Backup(cmd)
+	case "migrate":
+		return c.Migrate(cmd)
 	case "rename":
 		return c.Rename(cmd)
 	case "insert":
@@ -208,6 +211,7 @@ var helpData = map[string]string{
 	"quickCheck":       "Description: Perform a quick check of the database integrity\nExample: db.quickCheck()",
 	"createCollection": "Description: Create a new collection\nExample: db.createCollection(\"myCollection\")",
 	"backup":           "Description: Backup the database to a file\nExample: db.backup(\"backup.db\")",
+	"migrate":          "Description: Copy the database into a new file in the latest on-disk format and print what was copied. The new file must not exist; the open file is neither changed nor replaced\nExample: db.migrate(\"new.db\")",
 	"rename":           "Description: Rename the collection\nExample: db.collection.rename(\"newName\")",
 	"insert":           "Description: Insert one or more documents into a collection\nExample: db.collection.insert({id: \"1\", name: \"test\"})",
 	"update":           "Description: Update documents in a collection\nExample: db.collection.update({$set: {name: \"new name\"}})",
@@ -247,6 +251,7 @@ func (c *Conn) Help(cmd Cmd) (string, error) {
 		sb.WriteString("  db\n")
 		sb.WriteString("    .createCollection(name)\n")
 		sb.WriteString("    .backup(path)\n")
+		sb.WriteString("    .migrate(path)\n")
 		sb.WriteString("    .quickCheck()\n")
 		sb.WriteString("    .{collection}\n")
 		sb.WriteString("      .insert(doc, ...)\n")
@@ -438,6 +443,30 @@ func (c *Conn) Backup(cmd Cmd) (result string, err error) {
 		return "", err
 	}
 	return "ok", nil
+}
+
+// Migrate copies the open database into a new file at cmd.Path in the
+// latest schema format (anystore.CopyToLatestFormat) and reports what was
+// copied. The open file stays as it is.
+func (c *Conn) Migrate(cmd Cmd) (result string, err error) {
+	if cmd.Path == "" {
+		return "", fmt.Errorf("migrate path is required")
+	}
+	from, err := anystore.SchemaFormat(c.db)
+	if err != nil {
+		return "", err
+	}
+	report, err := anystore.CopyToLatestFormat(mainCtx.Ctx(), c.db, cmd.Path, nil)
+	if err != nil {
+		return "", err
+	}
+	var buf strings.Builder
+	fmt.Fprintf(&buf, "Format:\t%d -> %d\n", from, anystore.LatestSchemaFormat)
+	fmt.Fprintf(&buf, "Collections:\t%d\n", report.Collections)
+	fmt.Fprintf(&buf, "Documents:\t%d\n", report.Documents)
+	fmt.Fprintf(&buf, "Indexes:\t%d\n", report.Indexes)
+	fmt.Fprintf(&buf, "Duration:\t%s", report.Duration.Round(time.Millisecond))
+	return buf.String(), nil
 }
 
 func (c *Conn) Rename(cmd Cmd) (result string, err error) {

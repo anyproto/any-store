@@ -9,6 +9,11 @@ import (
 var (
 	osStat   = os.Stat
 	osRemove = os.Remove
+	// osOpenFile creates the staging file of a copy, and osLink and dirSync
+	// publish the finished copy (CopyToLatestFormat).
+	osOpenFile = os.OpenFile
+	osLink     = os.Link
+	dirSync    = syncDir
 )
 
 // File and VFS are always available for type-checking.
