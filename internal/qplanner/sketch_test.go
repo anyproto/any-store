@@ -1,9 +1,11 @@
 package qplanner
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/klauspost/compress/s2"
@@ -343,6 +345,36 @@ func TestIndexSketch_SameShape(t *testing.T) {
 	assert.True(t, s.SameShape(corrupt), "block of another length")
 }
 
+// sameCounters fails with the first counter that differs: two snapshots
+// printed side by side run to thousands of lines.
+func sameCounters(t *testing.T, want, got []uint64, msgAndArgs ...any) bool {
+	t.Helper()
+	if len(want) != len(got) {
+		return assert.Fail(t, fmt.Sprintf("%d counters, want %d", len(got), len(want)), msgAndArgs...)
+	}
+	for i := range want {
+		if want[i] != got[i] {
+			return assert.Fail(t, fmt.Sprintf("counter %d is %d, want %d", i, got[i], want[i]), msgAndArgs...)
+		}
+	}
+	return true
+}
+
+// craftCompressed builds a compressed blob with the given header over a block
+// of zeros that declares exactly the length the header implies: only a check
+// on the header itself can refuse it.
+func craftCompressed(levels, size uint32, planes ...byte) []byte {
+	blob := append([]byte(nil), sketchMagicS2[:]...)
+	blob = binary.LittleEndian.AppendUint32(blob, levels)
+	blob = binary.LittleEndian.AppendUint32(blob, size)
+	blob = append(blob, planes...)
+	body := 8*int(levels) + 8
+	for _, p := range planes {
+		body += int(p) * int(size)
+	}
+	return append(blob, s2.Encode(nil, make([]byte, body))...)
+}
+
 // sketchWith returns a sketch of the given shape whose counters are set by
 // hand: bucket i of level l holds counts[l][i].
 func sketchWith(size int, counts ...[]uint64) *IndexSketch {
@@ -388,7 +420,7 @@ func TestIndexSketch_MarshalCompressed(t *testing.T) {
 			buckets := &got.Buckets[0]
 			require.True(t, got.SameShape(blob))
 			require.True(t, got.UnmarshalBinary(blob))
-			assert.Equal(t, tc.s.Snapshot(nil), got.Snapshot(nil))
+			sameCounters(t, tc.s.Snapshot(nil), got.Snapshot(nil))
 			assert.Same(t, buckets, &got.Buckets[0], "loaded in place")
 			assert.False(t, got.NeedsRebuild())
 
@@ -398,17 +430,17 @@ func TestIndexSketch_MarshalCompressed(t *testing.T) {
 			other.UnmarshalBinary(blob)
 			assert.Equal(t, tc.s.Size, other.Size)
 			assert.Equal(t, tc.s.Levels, other.NumLevels())
-			assert.Equal(t, tc.s.Snapshot(nil), other.Snapshot(nil))
+			sameCounters(t, tc.s.Snapshot(nil), other.Snapshot(nil), "into another shape")
 
 			// the buffer is reused, and a second encoding is the same bytes
 			again := tc.s.MarshalCompressed(blob[:0])
 			assert.Same(t, &blob[0], &again[0])
-			assert.Equal(t, blob, again)
+			assert.True(t, bytes.Equal(blob, again), "a second encoding differs")
 
 			// the V2 format carries the same counters
 			v2 := NewIndexSketch(tc.s.Size, tc.s.Levels)
 			v2.UnmarshalBinary(tc.s.MarshalBinary(nil))
-			assert.Equal(t, got.Snapshot(nil), v2.Snapshot(nil))
+			sameCounters(t, got.Snapshot(nil), v2.Snapshot(nil), "against the V2 encoding")
 		})
 	}
 }
@@ -437,16 +469,53 @@ func TestIndexSketch_MarshalCompressedBound(t *testing.T) {
 	over := NewIndexSketch(maxCompressedBuckets/2+1, 2)
 	over.Increment(1, []byte("k"))
 	blob = over.MarshalCompressed(nil)
-	assert.Equal(t, over.MarshalBinary(nil), blob)
+	assert.True(t, bytes.Equal(over.MarshalBinary(nil), blob), "not the V2 bytes")
 	got = NewIndexSketch(maxCompressedBuckets/2+1, 2)
 	got.UnmarshalBinary(blob)
 	assert.Equal(t, uint64(1), got.Estimate(1, []byte("k")))
 
-	// a header that claims more is refused before its block is looked at
-	blob = atBound.MarshalCompressed(nil)
-	binary.LittleEndian.PutUint32(blob[8:], maxCompressedBuckets/2+1)
-	_, _, _, _, _, ok := s2Shape(blob)
+	// The reader's bound is the writer's: a header at it parses, one above
+	// it is refused, each over a block of the length its header implies.
+	_, _, _, _, _, ok := s2Shape(craftCompressed(2, maxCompressedBuckets/2, 0, 0))
+	assert.True(t, ok)
+	_, _, _, _, _, ok = s2Shape(craftCompressed(2, maxCompressedBuckets/2+1, 0, 0))
 	assert.False(t, ok)
+}
+
+// Each check on a compressed header refuses on its own: the block under these
+// headers declares the length the header implies, so nothing else stops them.
+// Loaded, a sketch without buckets divides by zero at the first estimate, and
+// one of a claimed shape allocates what the header says.
+func TestIndexSketch_UnmarshalCompressedHeaderChecks(t *testing.T) {
+	key := []byte("k")
+	sound := NewIndexSketch(8, 2)
+	require.True(t, sound.UnmarshalBinary(craftCompressed(2, 8, 1, 0)), "the crafted form loads under a sound header")
+
+	for _, tc := range []struct {
+		name string
+		blob []byte
+	}{
+		{"no levels", craftCompressed(0, 8)},
+		{"no buckets", craftCompressed(2, 0, 1, 1)},
+		{"no buckets, no planes", craftCompressed(2, 0, 0, 0)},
+		{"above the bound", craftCompressed(2, maxCompressedBuckets/2+1, 0, 0)},
+		{"above the bound, one level", craftCompressed(1, maxCompressedBuckets+1, 0)},
+		{"nine planes", craftCompressed(2, 8, 9, 0)},
+		{"nine planes on the last level", craftCompressed(2, 8, 0, 9)},
+	} {
+		for _, s := range []*IndexSketch{
+			sketchWith(8, []uint64{5, 5}, []uint64{0, 0, 9}), // the blob's shape, where it has one
+			NewIndexSketch(DefaultSketchSize, 1),             // another: a load would reshape
+		} {
+			want, size, levels := s.Snapshot(nil), s.Size, s.Levels
+			assert.True(t, s.SameShape(tc.blob), tc.name)
+			assert.False(t, s.UnmarshalBinary(tc.blob), tc.name)
+			assert.Equal(t, [2]int{size, levels}, [2]int{s.Size, s.Levels}, tc.name)
+			sameCounters(t, want, s.Snapshot(nil), tc.name)
+			s.Increment(0, key)
+			assert.Equal(t, want[s.bucket(0, key)]+1, s.Estimate(0, key), tc.name)
+		}
+	}
 }
 
 // A compressed blob that does not parse leaves the sketch as it was: its
@@ -560,9 +629,10 @@ func TestIndexSketch_PackLevelWidens(t *testing.T) {
 	assert.Equal(t, uint64(0), writePlanes(make([]byte, 32), level, 8))
 }
 
-// A marshal beside the writer never stores a counter cut short: every loaded
-// count is one the counter held, so the counts of a counter that only grows
-// never go down from one blob to the next.
+// A marshal beside the writer, for the race detector: the counts of a counter
+// that only grows never go down from one blob to the next. Whether the two
+// overlap at a width boundary is up to the scheduler; the widening itself is
+// pinned by TestIndexSketch_PackLevelWidens.
 func TestIndexSketch_MarshalCompressedBesideWriter(t *testing.T) {
 	const incs = 70_000 // crosses one and two bytes
 	s := NewIndexSketch(4, 1)
@@ -592,6 +662,42 @@ func TestIndexSketch_MarshalCompressedBesideWriter(t *testing.T) {
 	assert.Equal(t, uint64(incs), last)
 }
 
+// Marshals and loads on many goroutines share nothing but the scratch pool:
+// each round trip must give back its own counters.
+func TestIndexSketch_CompressedConcurrent(t *testing.T) {
+	const workers, rounds = 8, 300
+	var wg sync.WaitGroup
+	errs := make(chan string, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			size := 64 << (w % 3)
+			level := make([]uint64, size)
+			for i := range level {
+				level[i] = uint64(w+1) << (8 * (i % 3))
+			}
+			src := sketchWith(size, level, level[:size/2])
+			want := src.Snapshot(nil)
+			got := NewIndexSketch(size, 2)
+			var blob []byte
+			for r := 0; r < rounds; r++ {
+				blob = src.MarshalCompressed(blob)
+				got.Reset()
+				if !got.UnmarshalBinary(blob) || !slices.Equal(want, got.Snapshot(nil)) {
+					errs <- fmt.Sprintf("worker %d, round %d: another sketch's counters", w, r)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+}
+
 func FuzzIndexSketch_UnmarshalBinary(f *testing.F) {
 	src := sketchWith(8, []uint64{300, 0, 7}, []uint64{1, 2, 3, 70000})
 	f.Add(src.MarshalBinary(nil))
@@ -601,29 +707,48 @@ func FuzzIndexSketch_UnmarshalBinary(f *testing.F) {
 	f.Add([]byte("SK03"))
 	f.Add([]byte("SK020000000X"))
 	f.Add(append([]byte("SK04"), make([]byte, 8*8+8)...))
+	f.Add(craftCompressed(2, 8, 1, 0))
+	f.Add(craftCompressed(0, 8))
+	f.Add(craftCompressed(2, 0, 1, 1))
+	f.Add(craftCompressed(2, 8, 9, 0))
+	f.Add(craftCompressed(1, maxCompressedBuckets+1, 0))
+	key := []byte("k")
 	f.Fuzz(func(t *testing.T, data []byte) {
 		s := sketchWith(8, []uint64{5, 5}, []uint64{0, 0, 9})
 		before := s.Snapshot(nil)
 		same := s.SameShape(data)
-		s.UnmarshalBinary(data)
-		if len(s.Buckets) != s.Size*s.Levels || len(s.levelTotals) != s.Levels {
+		loaded := s.UnmarshalBinary(data)
+		tagged := len(data) >= 4 && sketchTagged([4]byte(data[:4]))
+
+		// Whatever the bytes, what is left is a sketch that works.
+		if s.Size < 1 || s.Levels < 1 || len(s.Buckets) != s.Size*s.Levels || len(s.levelTotals) != s.Levels {
 			t.Fatalf("shape %dx%d with %d buckets, %d totals", s.Levels, s.Size, len(s.Buckets), len(s.levelTotals))
 		}
-		if same && (s.Size != 8 || s.Levels != 2) {
-			t.Fatalf("reshaped to %dx%d by bytes SameShape accepted", s.Levels, s.Size)
+		if tagged && [4]byte(data[:4]) == sketchMagicS2 && s.Size*s.Levels > maxCompressedBuckets {
+			t.Fatalf("a compressed blob gave %d buckets", s.Size*s.Levels)
 		}
-		if len(data) >= 4 && sketchTagged([4]byte(data[:4])) && [4]byte(data[:4]) != sketchMagic {
-			if s.NeedsRebuild() {
-				t.Fatal("a tagged blob loaded as legacy buckets")
-			}
-			// loaded, or left alone
-			if _, _, _, block, _, ok := s2Shape(data); ok {
-				if _, err := s2.Decode(nil, block); err == nil {
-					return
-				}
-			}
-			if got := s.Snapshot(nil); !slices.Equal(before, got) {
-				t.Fatal("a blob that does not parse changed the sketch")
+		if (same || !loaded) && (s.Size != 8 || s.Levels != 2) {
+			t.Fatalf("reshaped to %dx%d (same shape %v, loaded %v)", s.Levels, s.Size, same, loaded)
+		}
+		if !loaded && !slices.Equal(before, s.Snapshot(nil)) {
+			t.Fatal("bytes that were not loaded changed the sketch")
+		}
+		if tagged && s.NeedsRebuild() {
+			t.Fatal("a tagged blob loaded as legacy buckets")
+		}
+		if !tagged && !loaded {
+			t.Fatal("untagged bytes are legacy buckets and always load")
+		}
+		for l := 0; l < s.Levels; l++ {
+			s.Estimate(l, key)
+			s.Distribution(l)
+		}
+		// And it is one that both encodings carry.
+		want := s.Snapshot(nil)
+		for _, blob := range [][]byte{s.MarshalCompressed(nil), s.MarshalBinary(nil)} {
+			again := NewIndexSketch(s.Size, s.Levels)
+			if !again.UnmarshalBinary(blob) || !slices.Equal(want, again.Snapshot(nil)) {
+				t.Fatalf("what was loaded does not survive tag %s", blob[:4])
 			}
 		}
 	})
