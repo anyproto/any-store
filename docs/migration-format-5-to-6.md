@@ -62,7 +62,9 @@ every collection, document and index of `db`:
   inheriting, from `config.DisableCompression`.
 - **Nothing is replaced.** If the destination path, or its `-wal`,
   `-wal-shm` or `.lock` file, exists, or the destination is one of those
-  names of an existing file (`app.db-wal` beside `app.db`), the call returns
+  names of an existing file (`app.db-wal` beside `app.db`, in any case:
+  `app.db-WAL` is `app.db`'s log on a case-insensitive filesystem, and is
+  refused on every filesystem), the call returns
   `ErrDestinationExists` and leaves it alone. The copy is built under a
   private name beside the destination (the destination's name, `.tmp-` and
   16 hex digits), checkpointed, verified and closed, and only then given the

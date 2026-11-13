@@ -1019,6 +1019,51 @@ func TestCopyToLatestFormat_OverlappingDestinations(t *testing.T) {
 	})
 }
 
+// The names a database keeps beside it are refused as destinations whatever
+// their case: on a case-insensitive filesystem app.db-WAL is app.db's log,
+// and the open of app.db would take a copy published there for its log and
+// truncate it. The refusal holds on every filesystem, at the start and at
+// the check before the link.
+func TestCopyToLatestFormat_SidecarNameInAnotherCase(t *testing.T) {
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1}`)
+	defer func() { testHookBeforePublish = nil }()
+	suffixes := []string{"-WAL", "-Wal-Shm", "-wAL-sHM", ".LOCK", ".Lock"}
+
+	t.Run("the database is there before", func(t *testing.T) {
+		testHookBeforePublish = nil
+		dir := t.TempDir()
+		p := filepath.Join(dir, "app.db")
+		_, err := CopyToLatestFormat(ctx, src, p, nil)
+		require.NoError(t, err)
+		for _, suffix := range suffixes {
+			_, err = CopyToLatestFormat(ctx, src, p+suffix, nil)
+			require.ErrorIs(t, err, ErrDestinationExists, suffix)
+		}
+		assert.Equal(t, []string{"app.db"}, dirNames(t, dir))
+		assertSameDatabase(t, src, openCopy(t, p, nil))
+	})
+	for _, suffix := range suffixes {
+		t.Run("the database is published while the copy runs: "+suffix, func(t *testing.T) {
+			dir := t.TempDir()
+			p := filepath.Join(dir, "app.db")
+			var ran atomic.Bool
+			testHookBeforePublish = func(string) {
+				if ran.Swap(true) {
+					return
+				}
+				_, err := CopyToLatestFormat(ctx, src, p, nil)
+				require.NoError(t, err)
+			}
+			_, err := CopyToLatestFormat(ctx, src, p+suffix, nil)
+			require.ErrorIs(t, err, ErrDestinationExists)
+			assert.Equal(t, []string{"app.db"}, dirNames(t, dir))
+		})
+	}
+}
+
 // The copy is published by a link, then the staging name goes, and the
 // directory is synced after each.
 func TestCopyToLatestFormat_PublicationOrder(t *testing.T) {

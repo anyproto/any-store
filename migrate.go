@@ -91,7 +91,9 @@ type CopyReport struct {
 //
 // Nothing is replaced. If dstPath, dstPath+"-wal", dstPath+"-wal-shm" or
 // dstPath+".lock" exists, or dstPath is one of those names of an existing
-// file, the call returns ErrDestinationExists and touches nothing. The copy
+// file in any case (p+"-WAL" is p's log on a case-insensitive filesystem,
+// and is refused on every one), the call returns ErrDestinationExists and
+// touches nothing. The copy
 // is built under a private name beside dstPath, checkpointed, verified (each
 // collection's options, document count and index definitions against the
 // source's snapshot, then IntegrityCheck) and closed, and then published at
@@ -483,7 +485,8 @@ func sameIndexDefinition(a, b IndexInfo) bool {
 
 // destinationFree returns ErrDestinationExists if path or a file a database
 // keeps beside it exists, or if path is the name of such a file of an
-// existing one: a copy published as p+"-wal" would be read as p's log.
+// existing one, in any case: a copy published as p+"-wal", or p+"-WAL" on a
+// case-insensitive filesystem, would be read as p's log.
 func destinationFree(path string) error {
 	for _, p := range databaseFiles(path) {
 		if _, err := os.Lstat(p); err == nil {
@@ -493,10 +496,13 @@ func destinationFree(path string) error {
 		}
 	}
 	for _, suffix := range sidecarSuffixes {
-		base, ok := strings.CutSuffix(path, suffix)
-		if !ok || base == "" {
+		// Without regard to case: on a case-insensitive filesystem p-WAL is
+		// p's log. The refusal holds on every filesystem; the base keeps its
+		// own spelling.
+		if len(path) <= len(suffix) || !strings.EqualFold(path[len(path)-len(suffix):], suffix) {
 			continue
 		}
+		base := path[:len(path)-len(suffix)]
 		if _, err := os.Lstat(base); err == nil {
 			return fmt.Errorf("%w: %s is a name the database %s keeps beside it", ErrDestinationExists, path, base)
 		} else if !errors.Is(err, fs.ErrNotExist) {
