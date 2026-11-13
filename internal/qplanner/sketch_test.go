@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"slices"
 	"sync"
 	"testing"
@@ -349,19 +350,32 @@ func sketchWith(size int, counts ...[]uint64) *IndexSketch {
 // The compressed format keeps every counter, whatever its width, and stores
 // per level only the planes its widest count needs.
 func TestIndexSketch_MarshalCompressed(t *testing.T) {
-	for _, tc := range []struct {
+	type roundTrip struct {
 		name   string
 		s      *IndexSketch
 		planes []byte
-	}{
+	}
+	cases := []roundTrip{
 		{"empty", NewIndexSketch(DefaultSketchSize, 2), []byte{0, 0}},
-		{"one byte", sketchWith(8, []uint64{0, 1, 255, 0, 7}), []byte{1}},
-		{"two bytes", sketchWith(8, []uint64{256, 1, 0, 65535}), []byte{2}},
-		{"three bytes", sketchWith(8, []uint64{1 << 16, 0, 0x123456}), []byte{3}},
-		{"eight bytes", sketchWith(8, []uint64{1<<63 | 0x0102030405060708, 3}), []byte{8}},
 		{"width per level", sketchWith(4, []uint64{70000, 0, 2}, nil, []uint64{0, 9}, []uint64{1 << 40}), []byte{3, 0, 1, 6}},
 		{"counted", filledSketch(5000, 2, 0), []byte{2, 1}},
-	} {
+	}
+	// Every width a count can have, at its smallest and its largest value.
+	for w := 1; w <= 8; w++ {
+		least, most := uint64(1)<<(8*(w-1)), uint64(math.MaxUint64)>>(8*(8-w))
+		cases = append(cases, roundTrip{
+			fmt.Sprintf("%d-byte counts", w),
+			sketchWith(8, []uint64{least, 0, most, 3, least | 1}),
+			[]byte{byte(w)},
+		})
+	}
+	// Level totals and the document count take all 64 bits whatever the buckets hold.
+	full := sketchWith(8, []uint64{1, 2}, []uint64{0, 0, math.MaxUint64})
+	full.levelTotals[0], full.levelTotals[1] = math.MaxUint64, math.MaxUint64-1
+	full.docCount.Store(math.MaxUint64)
+	cases = append(cases, roundTrip{"full totals and document count", full, []byte{1, 8}})
+
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			blob := tc.s.MarshalCompressed(nil)
 			assert.Equal(t, sketchMagicS2[:], blob[:4])
