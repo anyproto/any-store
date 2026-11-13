@@ -147,6 +147,26 @@ var (
 	// type of the caller's own that implements the interface.
 	ErrUnsupportedDB = errors.New("any-store: database was not opened by this package")
 
+	// ErrTxInContext is returned by CopyToLatestFormat when its ctx carries a
+	// transaction, read or write: the copy reads its source in a transaction
+	// of its own, and SQLite refuses VACUUM inside a transaction the same
+	// way. Pass a ctx without one.
+	ErrTxInContext = errors.New("any-store: cannot run inside a transaction")
+
+	// ErrDestinationExists is returned (possibly wrapped) by
+	// CopyToLatestFormat when a file is at the destination path, or at one
+	// of the paths a database keeps beside it: path+"-wal", path+"-wal-shm"
+	// and the sentinel path+".lock". The call replaces nothing: a file that
+	// was there is left as it was.
+	ErrDestinationExists = errors.New("any-store: destination exists")
+
+	// ErrPublishUnsupported is returned (wrapped, with the link error) by
+	// CopyToLatestFormat when the finished copy cannot be given the
+	// destination path by a hard link, as on a filesystem without hard links
+	// such as FAT or exFAT. The copy has been removed and nothing is at the
+	// destination path; copy into a directory on another filesystem.
+	ErrPublishUnsupported = errors.New("any-store: cannot publish the copy with a hard link")
+
 	// ErrIncompatibleVersion is returned (wrapped) by Open when the file was written in a format
 	// newer than this release reads. The file is intact and is left unchanged; open it with a
 	// release that knows the format. It does not match ErrCorrupt.

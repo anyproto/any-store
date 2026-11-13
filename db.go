@@ -143,6 +143,17 @@ type DBStats struct {
 // The config parameter can be nil for default settings.
 // Returns a DB instance or an error.
 func Open(ctx context.Context, path string, config *Config) (DB, error) {
+	ds, err := open(ctx, path, config, 0)
+	if err != nil {
+		return nil, err
+	}
+	return ds, nil
+}
+
+// open is Open with the schema format a file it creates gets: 0 for the
+// default, or a format the btree writes (btree.Options.SchemaFormat). An
+// existing file keeps its own.
+func open(ctx context.Context, path string, config *Config, createFormat uint32) (*db, error) {
 	if config == nil {
 		config = &Config{}
 	}
@@ -197,6 +208,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		Codec:                 config.Encryption.Codec,
 		MmapSize:              config.MmapSize,
 		Checksum:              !config.Encryption.Enabled() && !config.InMemory,
+		SchemaFormat:          createFormat,
 	}
 	if cb := config.OnIntegrityError; cb != nil {
 		// Determine the kind discriminator at Open time. The actual codec

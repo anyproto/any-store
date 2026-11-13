@@ -9,6 +9,9 @@ import (
 var (
 	osStat   = os.Stat
 	osRemove = os.Remove
+	// osLink and dirSync publish a finished copy (CopyToLatestFormat).
+	osLink  = os.Link
+	dirSync = syncDir
 )
 
 // File and VFS are always available for type-checking.
