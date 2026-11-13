@@ -107,9 +107,12 @@ After `ErrDestinationExists` the files at and beside the destination are not
 the call's: they were there before it, or another caller published them.
 The error is no reason to remove them. A failure after the link, of the
 directory sync or of the removal of the staging name, comes back with the
-copy published at the destination, and the error says so. A crash at that
-point leaves the complete copy at the destination, maybe with its staging
-name beside it as a second name of the same file.
+copy published at the destination, and the error says so. A destination
+the call published that survives a crash is always the complete copy,
+maybe with its staging name beside it as a second name of the same file.
+Its name is durable only once the directory sync after the link has
+succeeded (on Unix; on Windows it relies on NTFS's metadata journal, as
+below): power lost before that can leave no destination at all.
 
 The CLI has the same copy: `db.migrate("new.db")` in `any-store-cli2` writes
 the copy and prints the report. It never replaces the open file.

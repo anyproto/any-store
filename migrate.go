@@ -119,9 +119,13 @@ type CopyReport struct {
 // they were there before, or another caller put them there, and the error
 // is no reason to remove them. A failure after the link (the directory
 // sync, the removal of the staging name) is returned with the copy
-// published at dstPath, and the error says so; a crash at that point leaves
-// the complete copy at dstPath, maybe with its staging name as a second
-// name of the same file. On an error the report is zero.
+// published at dstPath, and the error says so. Any file at dstPath that
+// the call published, and that survives a crash, is the complete copy,
+// maybe with its staging name beside it as a second name of the same file;
+// but the name is durable only once the directory sync after the link has
+// succeeded (on Unix; on Windows NTFS's metadata journal keeps it), and
+// power lost before that can leave no file at dstPath. On an error the
+// report is zero.
 //
 // The call never renames or removes a file of src.
 func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Config) (report CopyReport, err error) {
