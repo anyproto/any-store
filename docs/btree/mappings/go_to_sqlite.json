@@ -1551,6 +1551,12 @@
     "sqlite": [],
     "note": ""
   },
+  "pager.go:*pager.beginReadHdrBusy": {
+    "sqlite": [
+      "btree.c:btreeBeginTrans"
+    ],
+    "note": "beginReadHdr under the busy state of the begin it is part of (DB.BeginWriteContext's)"
+  },
   "pager.go:*pager.beginWrite": {
     "sqlite": [
       "pager.c:sqlite3PagerBegin"
@@ -2175,6 +2181,12 @@
     "sqlite": [],
     "note": ""
   },
+  "wal.go:*beginBusy.retry": {
+    "sqlite": [
+      "btree.c:btreeInvokeBusyHandler"
+    ],
+    "note": "one begin's busy count, as sqlite3InvokeBusyHandler keeps nBusy (main.c:1770-1780): once the handler declines it is not asked again"
+  },
   "wal.go:*wal.adoptSHMState": {
     "sqlite": [],
     "note": ""
@@ -2193,6 +2205,18 @@
   "wal.go:*wal.beginReadHdr": {
     "sqlite": [],
     "note": ""
+  },
+  "wal.go:*wal.beginReadHdrBusy": {
+    "sqlite": [
+      "btree.c:btreeBeginTrans"
+    ],
+    "note": "the begin's busy loop for SQLITE_BUSY_RECOVERY (btree.c:3730-3737), at the WAL read begin so open's page-1 read is covered too"
+  },
+  "wal.go:*wal.beginReadHdrRetry": {
+    "sqlite": [
+      "wal.c:walBeginReadTransaction"
+    ],
+    "note": "one read begin attempt: walTryBeginRead's WAL_RETRY loop"
   },
   "wal.go:*wal.beginWrite": {
     "sqlite": [
@@ -2261,17 +2285,15 @@
     ],
     "note": ""
   },
-  "wal.go:*wal.ensureHeaderInitialized": {
-    "sqlite": [],
-    "note": ""
-  },
-  "wal.go:*wal.ensureHeaderInitializedInProcess": {
-    "sqlite": [],
-    "note": ""
-  },
   "wal.go:*wal.flushHeader": {
     "sqlite": [],
     "note": "lazy WAL header flush on first write (any-store optimization)"
+  },
+  "wal.go:*wal.indexReadHdr": {
+    "sqlite": [
+      "wal.c:walIndexReadHdr"
+    ],
+    "note": "validated header read; rebuilds the wal-index under the write lock when the header is invalid"
   },
   "wal.go:*wal.initHeaderStateLocked": {
     "sqlite": [],
@@ -2315,10 +2337,6 @@
     ],
     "note": "in-tx frame-reuse checksum-chain rewrite (wal.c:3966-4009), called from writeFrames"
   },
-  "wal.go:*wal.syncFromSHMLocked": {
-    "sqlite": [],
-    "note": ""
-  },
   "wal.go:*wal.truncateFile": {
     "sqlite": [
       "wal.c:walLimitSize"
@@ -2352,8 +2370,10 @@
     "note": ""
   },
   "wal.go:*wal.tryBeginReadMultiProcessHdr": {
-    "sqlite": [],
-    "note": ""
+    "sqlite": [
+      "wal.c:walTryBeginRead"
+    ],
+    "note": "multi-process (mmap shm) arm of tryBeginReadHdr"
   },
   "wal.go:*wal.tryResetWALWithBusy": {
     "sqlite": [
@@ -2419,6 +2439,12 @@
     "sqlite": [],
     "note": "cache-invalidation lookup; no direct SQLite counterpart"
   },
+  "wal.go:*walIndex.liveNBackfill": {
+    "sqlite": [
+      "wal.c:walCheckpoint"
+    ],
+    "note": "the shared pInfo-\u003enBackfill that the reset and completeness tests read (wal.c:2355-2360), not the process-local mirror"
+  },
   "wal.go:*walIndex.lock": {
     "sqlite": [],
     "note": ""
@@ -2429,6 +2455,13 @@
       "wal.c:walIndexTryHdr"
     ],
     "note": ""
+  },
+  "wal.go:*walIndex.readHeaderState": {
+    "sqlite": [
+      "wal.c:walIndexReadHdr",
+      "wal.c:walIndexTryHdr"
+    ],
+    "note": "walIndexTryHdr plus walIndexReadHdr's version gate: a consistent header of another wal-index version is refused, not torn (wal.c:2740-2741)"
   },
   "wal.go:*walIndex.reset": {
     "sqlite": [

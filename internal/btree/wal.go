@@ -225,6 +225,31 @@ func walBusyLock(wi *walIndex, xBusy BusyHandler, slot int, lockType int) error 
 	}
 }
 
+// beginBusy is the busy-handler state of one transaction begin: SQLite's
+// BusyHandler and its nBusy count (sqlite3InvokeBusyHandler,
+// main.c:1770-1780). sqlite3BtreeBeginTrans retries the whole begin from one
+// loop for every SQLITE_BUSY flavour (btree.c:3730-3737), so the count runs
+// across all of the begin's retries, and once the handler has declined it is
+// not asked again: the begin's budget is the handler's, once.
+type beginBusy struct {
+	xBusy BusyHandler
+	n     int
+}
+
+// retry invokes the handler with the begin's count and reports whether to
+// try again.
+func (b *beginBusy) retry() bool {
+	if b == nil || b.xBusy == nil || b.n < 0 {
+		return false
+	}
+	if !b.xBusy(b.n) {
+		b.n = -1
+		return false
+	}
+	b.n++
+	return true
+}
+
 // walHeader represents the WAL file header.
 type walHeader struct {
 	magic      uint32
@@ -376,11 +401,11 @@ func walChecksum(data []byte, s1, s2 uint32) (uint32, uint32) {
 const readMarkNotUsed = uint32(0xFFFFFFFF)
 
 // errWALRetry is an internal sentinel signaling that the caller should retry.
-// Used by (a) tryBeginRead when SHM state changed between metadata read and
-// lock acquisition (beginRead's 5000-attempt loop consumes it), and (b) the
-// ensureHeaderInitialized helper when a peer holds a blocking lock and the
-// operation must be re-attempted. Callers outside beginRead must implement
-// their own retry loop or propagate as BUSY-equivalent.
+// Used by tryBeginRead when SHM state changed between metadata read and lock
+// acquisition, or when the wal-index header is invalid and a lock its repair
+// needs is busy (indexReadHdr); beginReadHdr's retry loop consumes it.
+// Callers outside beginReadHdr must implement their own retry loop or
+// propagate as BUSY-equivalent.
 var errWALRetry = errors.New("btree: WAL retry")
 
 // walIndexHdrSize is the size of one WalIndexHdr in the SHM (48 bytes),
@@ -763,10 +788,21 @@ func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) (uint32, error
 // make recycled frame numbers of the NEW WAL generation pass their old
 // snapshot's maxFrame bound.
 func (wi *walIndex) liveMinFrame() uint32 {
+	return wi.liveNBackfill() + 1
+}
+
+// liveNBackfill returns the current checkpoint frontier: the shared
+// WalCkptInfo.nBackfill in multi-process mode (SQLite reads pInfo->nBackfill
+// from shared memory every time), the process-local counter for heap shm.
+// The process-local wi.nBackfill mirror is refreshed only at some read and
+// write begins, so in multi-process mode it can be left over from an earlier
+// WAL generation and exceed the current log; no decision to reset or
+// truncate the WAL may be taken on it.
+func (wi *walIndex) liveNBackfill() uint32 {
 	if wi.inProcess {
-		return wi.nBackfill.Load() + 1
+		return wi.nBackfill.Load()
 	}
-	return wi.shmNBackfill() + 1
+	return wi.shmNBackfill()
 }
 
 // testInProcessReadSnapshotHook, when non-nil, runs in the in-process read
@@ -954,15 +990,38 @@ func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32, frameCksum,
 // the header is corrupt or the two copies don't match.
 // DRIFT: wal-index szPage neither encoded nor decoded (szPage transform absent) See docs/btree/NOTES.md#drift-90-wal-index-szpage-field-not-encoded-or-decoded
 func (wi *walIndex) readHeader() (WalIndexHdr, bool) {
+	hdr, state := wi.readHeaderState()
+	return hdr, state == walHdrValid
+}
+
+// walHdrState is what a read of the wal-index header found.
+type walHdrState int
+
+const (
+	// walHdrValid: both copies agree, checksum, and carry this build's
+	// wal-index version.
+	walHdrValid walHdrState = iota
+	// walHdrTorn: the copies disagree, are uninitialized, or fail the
+	// checksum (walIndexTryHdr returning non-zero, wal.c:2613-2622). A
+	// writer is between its two copies, or the header needs recovery.
+	walHdrTorn
+	// walHdrBadVersion: a consistent, checksummed header of another
+	// wal-index version. Not damage and never rebuilt: SQLite returns
+	// SQLITE_CANTOPEN for it without running recovery (wal.c:2740-2741).
+	walHdrBadVersion
+)
+
+// readHeaderState is readHeader that tells a torn header from one written
+// with an incompatible wal-index version.
+func (wi *walIndex) readHeaderState() (WalIndexHdr, walHdrState) {
 	region, err := wi.shm.region(0, false)
 	if err != nil {
-		return WalIndexHdr{}, false
+		return WalIndexHdr{}, walHdrTorn
 	}
 
 	if len(region) < walIndexHdrSize*2 {
-		return WalIndexHdr{}, false
+		return WalIndexHdr{}, walHdrTorn
 	}
-
 	// Read copy 1 (offset 0). Plain copy under readHeader's dual-copy +
 	// memcmp protocol, matching walIndexTryHdr (wal.c:2570-2620). The
 	// subsequent memcmp against copy 2 is the torn-read detector; per-word
@@ -987,30 +1046,30 @@ func (wi *walIndex) readHeader() (WalIndexHdr, bool) {
 	hdr1.serialize(buf1[:])
 	hdr2.serialize(buf2[:])
 	if buf1 != buf2 {
-		return WalIndexHdr{}, false
+		return WalIndexHdr{}, walHdrTorn
 	}
 
 	// Verify isInit flag
 	if hdr1.isInit != 1 {
-		return WalIndexHdr{}, false
+		return WalIndexHdr{}, walHdrTorn
 	}
 
 	// Verify checksum: recompute aCksum over bytes 0..39 and compare
 	saved := hdr1.aCksum
 	hdr1.computeCksum()
 	if hdr1.aCksum != saved {
-		return WalIndexHdr{}, false
+		return WalIndexHdr{}, walHdrTorn
 	}
 
 	// Reject a SHM wal-index header written with an incompatible/future
 	// format version. Matches SQLite's walIndexReadHdr gate
-	// (wal.c:2740-2742: iVersion != WALINDEX_MAX_VERSION -> SQLITE_CANTOPEN).
+	// (wal.c:2740-2741: iVersion != WALINDEX_MAX_VERSION -> SQLITE_CANTOPEN).
 	// any-store uses its own walVersion (1000000) instead of 3007000.
 	if hdr1.iVersion != walVersion {
-		return WalIndexHdr{}, false
+		return WalIndexHdr{}, walHdrBadVersion
 	}
 
-	return hdr1, true
+	return hdr1, walHdrValid
 }
 
 // walShmBarrier issues a full memory barrier for cross-process mmap'd memory.
@@ -1454,13 +1513,6 @@ type wal struct {
 	// when the first write transaction commits.
 	headerOnDisk bool
 
-	// inProcessInit gates the in-process lazy init path in
-	// ensureHeaderInitializedInProcess so we only run initHeaderState /
-	// recover once per wal instance. Heap-backed SHM is zero-initialized
-	// per process, so the first call always needs to publish a header;
-	// subsequent calls are no-ops.
-	inProcessInit bool
-
 	// inProcess uses heap-backed shm instead of mmap+fcntl (faster, single-process only)
 	inProcess bool
 
@@ -1626,8 +1678,8 @@ func (w *wal) open() (err error) {
 	//
 	// Lock order write → checkpoint → recover matches SQLite's
 	// walIndexRecover (wal.c:1395-1401 `assert( pWal->writeLock )`) and
-	// any-store's ensureHeaderInitialized slow path — the two open-class
-	// paths cannot deadlock against each other.
+	// indexReadHdr — the two recovery paths cannot deadlock against each
+	// other.
 	//
 	// In-process mode: no SHM coordination needed; w.mu serializes all
 	// writers in the same process and heap SHM has no cross-process races.
@@ -1668,6 +1720,25 @@ func (w *wal) open() (err error) {
 		}
 	}
 
+	// SQLite's version gate (walIndexReadHdr, wal.c:2740-2741): a consistent
+	// wal-index header of another version is a live peer's index, written by
+	// a build this one cannot share it with. The open is refused and the
+	// index left alone; rebuilding it would overwrite the peer's. readHeader
+	// above cannot tell: on a fresh attach region(create=false) maps none of
+	// the peer's index (drift-2026-07-10-3), so region 0 is mapped here, as
+	// walIndexReadHdr maps it through walIndexPage. A consistent header of
+	// this version still goes to recovery below, as on every fresh attach.
+	// A first attacher's shm is the election's 3-byte stump, which maps as
+	// zeros (torn).
+	if !w.inProcess {
+		if _, err := w.index.shm.region(0, true); err != nil {
+			return err
+		}
+		if _, state := w.index.readHeaderState(); state == walHdrBadVersion {
+			return errWalIndexVersion
+		}
+	}
+
 	if info.Size() >= walHeaderSize {
 		return w.recoverLocked()
 	}
@@ -1679,92 +1750,80 @@ func (w *wal) open() (err error) {
 	return nil
 }
 
-// ensureHeaderInitialized is the lazy counterpart to wal.open — it guarantees
-// that w.index has a valid SHM header and that w's process-local state (salts,
-// nFrame, cksum1/2, writerHdr) is synced to it. Safe to call repeatedly; idempotent.
+// indexReadHdr returns the validated wal-index header. When the header is
+// invalid it rebuilds the wal-index from the WAL file first, under the write
+// lock. Port of SQLite's walIndexReadHdr (wal.c:2654-2759):
 //
-// Matches SQLite's walIndexReadHdr (wal.c:2640-2745):
-//   - Non-blocking readHeader first (walIndexTryHdr equivalent).
-//   - On !valid, take WAL_WRITE_LOCK exclusive, retry readHeader.
-//   - If still !valid under WRITE lock, run recover() to reconstruct from the
-//     WAL file. Recovery requires WAL_WRITE_LOCK per wal.c:1399, and additionally
-//     WAL_CKPT_LOCK + WAL_RECOVER_LOCK exclusive to serialize against siblings
-//     that may be trying to initialize concurrently (wal.c:1400-1404).
+//   - Read the header without a lock (walIndexTryHdr). This usually works.
+//   - If it is invalid, a writer may be between its two header copies: take
+//     WAL_WRITE_LOCK (unless the caller holds it) and read again.
+//   - Still invalid under the write lock: no live writer is publishing, so
+//     the header is damaged (a writer died mid-publish). Run recovery.
 //
-// DRIFT: recovery takes WAL_CKPT_LOCK + WAL_RECOVER_LOCK beyond WAL_WRITE_LOCK. See docs/btree/NOTES.md#old-drift-ensureheader-triple-lock-recovery-gate
+// A busy lock returns ErrBusy and repairs nothing; the caller retries or
+// reports busy, as SQLite's callers do with SQLITE_BUSY (walTryBeginRead
+// turns it into WAL_RETRY or SQLITE_BUSY_RECOVERY, wal.c:3084-3108;
+// sqlite3WalCheckpoint returns it). A consistent header of another wal-index
+// version is refused with an ErrWALVersion error and never rebuilt
+// (wal.c:2740-2741).
+// Every lock here is a non-blocking try-lock, so the write → checkpoint →
+// recover order cannot deadlock against checkpointWithMode's checkpoint →
+// write order: the loser sees ErrBusy.
 //
-// ensureHeaderInitialized guarantees the SHM header is published and returns
-// a snapshot of it so callers can stamp it onto their per-tx walHdr. It also
-// calls syncFromSHMLocked to update process-global writer state
-// (w.header.salt*, w.cksum1/2, w.nFrame, w.writerHdr); narrowing that to
-// writer paths only is a remaining per-connection-hdr migration step.
+// haveWriteLock / haveCkptLock say which of the two locks the caller already
+// holds (SQLite: pWal->writeLock and pWal->ckptLock). The caller must not
+// hold w.mu. Multi-process mode only: heap shm has no peers and no torn
+// headers.
 //
-// The returned hdr is the live SHM header value at the moment of observation.
-// On error, the zero hdr is returned and the error signals the retry class.
-func (w *wal) ensureHeaderInitialized() (WalIndexHdr, error) {
-	if w.inProcess || w.inMemory {
-		return w.ensureHeaderInitializedInProcess()
-	}
-
-	// Fast path: a peer (or we) already published a valid header.
-	if hdr, valid := w.index.readHeader(); valid {
-		w.mu.Lock()
-		w.syncFromSHMLocked()
-		w.mu.Unlock()
+// Recovery here runs with peers attached, and with readers of this process
+// in flight. That is safe for the same reasons as in SQLite: the write lock
+// excludes every writer (so the writer-owned fields recoverLocked resets
+// have no user), the checkpoint lock excludes every checkpointer, the hash
+// tables are rebuilt off to the side and copied over identical content for
+// every frame a live snapshot can reach, and a read-mark whose slot a reader
+// holds is left alone (recoverLocked).
+// DRIFT: recovery takes w.mu and resets process-shared writer state (one *wal serves all of a process's transactions) See docs/btree/NOTES.md#drift-2026-11-11-1-attached-wal-index-recovery
+func (w *wal) indexReadHdr(haveWriteLock, haveCkptLock bool) (WalIndexHdr, error) {
+	hdr, state := w.index.readHeaderState()
+	switch state {
+	case walHdrValid:
 		return hdr, nil
+	case walHdrBadVersion:
+		return WalIndexHdr{}, errWalIndexVersion
 	}
 
-	// Slow path: acquire WAL_WRITE_LOCK exclusive, retry, then recover if still bad.
-	if err := w.index.lock(lockWrite, lockExclusive); err != nil {
-		if err == ErrBusy {
-			if e := w.index.lock(lockRecover, lockShared); e == nil {
-				_ = w.index.unlock(lockRecover, lockShared)
-			}
-			if hdr, valid := w.index.readHeader(); valid {
-				w.mu.Lock()
-				w.syncFromSHMLocked()
-				w.mu.Unlock()
-				return hdr, nil
-			}
-			return WalIndexHdr{}, ErrBusyRecovery
+	if !haveWriteLock {
+		if err := w.index.lock(lockWrite, lockExclusive); err != nil {
+			return WalIndexHdr{}, err
 		}
-		return WalIndexHdr{}, err
+		defer func() { _ = w.index.unlock(lockWrite, lockExclusive) }()
 	}
-	defer func() { _ = w.index.unlock(lockWrite, lockExclusive) }()
-
-	// Re-check under WAL_WRITE_LOCK: a peer may have just published.
-	if hdr, valid := w.index.readHeader(); valid {
-		w.mu.Lock()
-		w.syncFromSHMLocked()
-		w.mu.Unlock()
+	hdr, state = w.index.readHeaderState()
+	switch state {
+	case walHdrValid:
 		return hdr, nil
+	case walHdrBadVersion:
+		return WalIndexHdr{}, errWalIndexVersion
 	}
 
-	// Header still bad → run recovery. Acquire CKPT + RECOVER exclusive too.
-	if err := w.index.lock(lockCheckpoint, lockExclusive); err != nil {
-		if err == ErrBusy {
-			return WalIndexHdr{}, ErrBusyRecovery
+	// walIndexRecover's locks (wal.c:1395-1401): everything between the
+	// write lock and the read locks that the caller does not hold yet.
+	if !haveCkptLock {
+		if err := w.index.lock(lockCheckpoint, lockExclusive); err != nil {
+			return WalIndexHdr{}, err
 		}
-		return WalIndexHdr{}, err
+		defer func() { _ = w.index.unlock(lockCheckpoint, lockExclusive) }()
 	}
-	defer func() { _ = w.index.unlock(lockCheckpoint, lockExclusive) }()
 	if err := w.index.lock(lockRecover, lockExclusive); err != nil {
-		if err == ErrBusy {
-			return WalIndexHdr{}, ErrBusyRecovery
-		}
 		return WalIndexHdr{}, err
 	}
 	defer func() { _ = w.index.unlock(lockRecover, lockExclusive) }()
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
-	// Final race check under all three locks.
-	if hdr, valid := w.index.readHeader(); valid {
-		w.syncFromSHMLocked()
-		return hdr, nil
+	if w.file == nil {
+		return WalIndexHdr{}, errors.New("btree: WAL file closed")
 	}
-
 	info, err := w.file.Stat()
 	if err != nil {
 		return WalIndexHdr{}, err
@@ -1774,72 +1833,21 @@ func (w *wal) ensureHeaderInitialized() (WalIndexHdr, error) {
 			return WalIndexHdr{}, err
 		}
 	} else {
+		// No WAL content: nothing is committed beyond the database file.
 		w.initHeaderStateLocked(false)
 	}
-	hdr, _ := w.index.readHeader()
-	return hdr, nil
-}
-
-// ensureHeaderInitializedInProcess is the in-process analog. Heap SHM is
-// zero-initialized per process, so on first call we always run initHeaderState.
-func (w *wal) ensureHeaderInitializedInProcess() (WalIndexHdr, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if !w.inProcessInit {
-		if !w.inMemory && w.file != nil {
-			info, err := w.file.Stat()
-			if err == nil && info.Size() >= walHeaderSize {
-				if err := w.recoverLocked(); err != nil {
-					return WalIndexHdr{}, err
-				}
-				w.inProcessInit = true
-				hdr, _ := w.index.readHeader()
-				return hdr, nil
-			}
-		}
-		w.initHeaderStateLocked(false)
-		w.inProcessInit = true
-	}
-	hdr, _ := w.index.readHeader()
-	return hdr, nil
-}
-
-// syncFromSHMLocked synchronizes process-global state from a valid SHM hdr.
-// After the per-tx walHdr migration (step 4), writer-private fields
-// (w.header.salt*, w.cksum1/2, w.writerHdr) are owned by beginWrite's
-// inline sync under lockWrite — this helper only updates the shared
-// atomics on w.index and w.nFrame that both readers and writers consult
-// for WAL offset + backfill tracking.
-//
-// Caller must hold w.mu and have observed a valid SHM header.
-// DRIFT: headerOnDisk inferred from hdr.mxFrame>0 not fstat (relies on flushHeader-before-frame invariant) See docs/btree/NOTES.md#old-drift-headerondisk-mxframe-inference
-func (w *wal) syncFromSHMLocked() {
 	hdr, valid := w.index.readHeader()
 	if !valid {
-		return
+		return WalIndexHdr{}, fmt.Errorf("%w: wal-index header invalid after recovery", ErrCorrupt)
 	}
-	// w.nFrame is the shared physical append cursor; readers and writers
-	// both look at it. Safe to advance monotonically (the writer in peer
-	// process always writes higher values).
-	if hdr.mxFrame > w.nFrame.Load() {
-		w.nFrame.Store(hdr.mxFrame)
-	}
-	if !w.headerOnDisk && hdr.mxFrame > 0 {
-		w.headerOnDisk = true
-	}
-	// Monotonic updates on shared walIndex atomics. These are safe under
-	// concurrent readers because the writer (single, via the write lock) is the
-	// only source of increments.
-	w.index.maxFrame.Store(hdr.mxFrame)
-	w.index.mxCommitFrame.Store(hdr.mxFrame)
-	for {
-		old := w.index.maxPage.Load()
-		if hdr.nPage <= old || w.index.maxPage.CompareAndSwap(old, hdr.nPage) {
-			break
-		}
-	}
-	w.index.nBackfill.Store(w.index.shmNBackfill())
+	return hdr, nil
 }
+
+// errWalIndexVersion is indexReadHdr's refusal of a wal-index written with
+// another wal-index version: the shared memory belongs to a build this one
+// cannot share it with. Matches ErrWALVersion, the same refusal for the WAL
+// file itself.
+var errWalIndexVersion = fmt.Errorf("%w: wal-index", ErrWALVersion)
 
 // adoptSHMState synchronizes the process-local WAL state (salts, nFrame,
 // checksums, header-on-disk flag) from an already-initialized SHM header.
@@ -1968,12 +1976,11 @@ func (w *wal) writeHeader() error {
 //   - Region 0's memcpy skips the 136-byte header area (htHdrSize), matching
 //     SQLite wal.c:1533: `memcpy(&aShare[nHdr32], &aPrivate[nHdr32], WALINDEX_PGSZ-nHdr)`.
 //
-// Caller must hold w.mu AND lockCheckpoint + lockRecover exclusive (see
-// wal.open and ensureHeaderInitialized). SQLite additionally acquires
-// WAL_ALL_BUT_WRITE..READ_LOCK(0) exclusive during recovery (wal.c:1401);
-// any-store relies on recoverLocked only being invoked from wal.open (before
-// any peer reader/writer has attached) or from ensureHeaderInitialized
-// (which holds lockWrite + lockCheckpoint + lockRecover exclusive).
+// Caller must hold w.mu AND, in multi-process mode, lockWrite +
+// lockCheckpoint + lockRecover exclusive (wal.open and indexReadHdr) — the
+// range SQLite's walIndexRecover holds (the caller's WAL_WRITE_LOCK plus
+// WAL_ALL_BUT_WRITE up to READ_LOCK(0), wal.c:1395-1401). Peers, and readers
+// of this process, may be attached while it runs.
 // DRIFT: recoverLocked sets all read-marks NOT_USED; C pre-seeds slot 1 to mxFrame See docs/btree/NOTES.md#drift-88-wal-recovery-does-not-pre-seed-read-mark-slot-1
 func (w *wal) recoverLocked() error {
 	w.headerOnDisk = true
@@ -2034,9 +2041,18 @@ func (w *wal) recoverLocked() error {
 		s1, s2                             = headerCksum1, headerCksum2
 		offset                             = int64(walHeaderSize)
 	)
+	// The loop is bounded by the file size taken above (SQLite: iLastFrame
+	// from sqlite3OsFileSize, wal.c:1467), so every frame it asks for lies
+	// inside the file and a failed read is an I/O error, not the end of the
+	// log. It aborts recovery with nothing published, as walIndexRecover
+	// keeps the read's rc (wal.c:1502-1503) and writes the header only under
+	// rc==SQLITE_OK (wal.c:1561-1566). Publishing the prefix read so far
+	// would present an earlier commit as the end of the log, and the next
+	// checkpoint would truncate the acknowledged commits behind it. Only a
+	// frame that fails validation (salts, pgno, checksum) ends the scan.
 	for offset+frameSize <= info.Size() {
 		if _, err := w.file.ReadAt(scratch, offset); err != nil {
-			break
+			return fmt.Errorf("btree: WAL recovery: read frame %d: %w", len(parsed)+1, err)
 		}
 		fr.deserialize(scratch[:walFrameSize])
 		if fr.salt1 != w.header.salt1 || fr.salt2 != w.header.salt2 {
@@ -2784,7 +2800,37 @@ func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
 // nBackfill-derived floor would let NEW-generation frames pass the OLD
 // snapshot's maxFrame bound (observed as torn overflow chains in the
 // cross-process reader test).
+//
+// A read begin waits out a peer's recovery (ErrBusyRecovery) through the
+// busy handler, with a count of its own. See beginReadHdrBusy.
 func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
+	busy := beginBusy{xBusy: w.busyHandler}
+	return w.beginReadHdrBusy(&busy)
+}
+
+// beginReadHdrBusy is beginReadHdr under the busy state of the begin it is
+// part of. ErrBusyRecovery (SQLITE_BUSY_RECOVERY: another connection is
+// rebuilding the wal-index, wal.c:3084-3108) goes to the busy handler, which
+// backs off until the recovery is done or the begin's budget is spent;
+// recovery of a large WAL takes longer than the WAL retry loop waits. SQLite
+// invokes the handler from sqlite3BtreeBeginTrans (btree.c:3730-3737); here
+// the loop sits at the WAL read begin, which every begin goes through,
+// including the open-time read of page 1. A nil busy makes one attempt and
+// returns ErrBusyRecovery: DB.BeginWriteContext retries it from its own
+// loop, the one loop of a write begin.
+// DRIFT: the busy loop for a recovery in progress runs at the WAL read begin; C runs it in sqlite3BtreeBeginTrans See docs/btree/NOTES.md#drift-2026-11-11-1-attached-wal-index-recovery
+func (w *wal) beginReadHdrBusy(busy *beginBusy) (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
+	for {
+		hdr, maxFrame, minFrame, slot, err = w.beginReadHdrRetry()
+		if busy == nil || !errors.Is(err, ErrBusyRecovery) || !busy.retry() {
+			return hdr, maxFrame, minFrame, slot, err
+		}
+	}
+}
+
+// beginReadHdrRetry is one read begin attempt with walTryBeginRead's
+// WAL_RETRY loop around it.
+func (w *wal) beginReadHdrRetry() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	// Retry loop matching SQLite's WAL_RETRY protocol (wal.c:3022-3056,
 	// 3391-3393). After 5 retries we begin sleeping; from the 10th retry
 	// onward the delay grows quadratically up to ~10s total before
@@ -3060,17 +3106,30 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 // DRIFT: reader-slot tie-break selects lowest slot; SQLite selects highest on equal marks See docs/btree/NOTES.md#drift-102-reader-slot-tie-break-selects-lowest-not-highest
 func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	// Step 1: Read SHM header into local copy (SQLite: walIndexReadHdr → walIndexTryHdr)
-	hdr, valid := w.index.readHeader()
-	if !valid {
-		// SHM header is invalid — a sibling process may be in walIndexRecover()
-		// (which zeroes SHM in-place) or SHM hasn't been initialized yet.
-		// Matches SQLite wal.c:3089: acquire WAL_RECOVER_LOCK shared as a fence,
-		// blocking until any in-progress exclusive recoverer releases, then
-		// release and retry from the top of the loop.
-		if err := w.index.lock(lockRecover, lockShared); err == nil {
-			_ = w.index.unlock(lockRecover, lockShared)
+	// An invalid header is repaired here, under the write lock, when no one
+	// else can be writing it (indexReadHdr).
+	hdr, err = w.indexReadHdr(false, false)
+	if err != nil {
+		if !errors.Is(err, ErrBusy) {
+			return WalIndexHdr{}, 0, 0, 0, err
 		}
-		return WalIndexHdr{}, 0, 0, 0, errWALRetry
+		// A lock the repair needs is taken: a writer is publishing, or a
+		// sibling is in recovery. SQLite wal.c:3084-3108 probes
+		// WAL_RECOVER_LOCK shared to tell the two apart: if the probe
+		// succeeds no recovery is running, so release it and retry from the
+		// top of the loop (WAL_RETRY); if it is busy a recovery is in
+		// progress and the caller gets SQLITE_BUSY_RECOVERY, which goes to
+		// the busy handler instead of the short retry loop; any other probe
+		// error is returned.
+		probeErr := w.index.lock(lockRecover, lockShared)
+		if probeErr == nil {
+			_ = w.index.unlock(lockRecover, lockShared)
+			return WalIndexHdr{}, 0, 0, 0, errWALRetry
+		}
+		if errors.Is(probeErr, ErrBusy) {
+			return WalIndexHdr{}, 0, 0, 0, ErrBusyRecovery
+		}
+		return WalIndexHdr{}, 0, 0, 0, probeErr
 	}
 	mxFrame := hdr.mxFrame
 
@@ -3199,8 +3258,11 @@ func (w *wal) endRead(slot int) {
 	_ = w.index.unlock(lockRead0+slot, lockShared)
 }
 
-// beginWrite acquires the exclusive write lock.
-// Uses the busy handler for retry/backoff if configured (issue 1.7).
+// beginWrite acquires the exclusive write lock, with one try: BUSY is
+// returned to the caller, as walBeginWriteTransaction returns it
+// (wal.c:3714-3717). A transaction begin retries it from its one busy loop
+// (DB.BeginWriteContext), which releases the read snapshot, backs off on the
+// begin's busy count and starts the begin over.
 //
 // For multi-process mode, performs a BUSY_SNAPSHOT check after acquiring the
 // lock: compares the caller's read snapshot (tx.walHdr, captured at BeginRead
@@ -3226,7 +3288,7 @@ func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, e
 	if walTestHooks && w.forceBusySnapshotForTest.Load() {
 		return false, ErrBusySnapshot
 	}
-	if err := walBusyLock(w.index, w.busyHandler, lockWrite, lockExclusive); err != nil {
+	if err := w.index.lock(lockWrite, lockExclusive); err != nil {
 		return false, err
 	}
 	if w.inProcess || w.inMemory {
@@ -3335,8 +3397,8 @@ func (w *wal) endWrite() {
 // authoritativeMxFrame returns the highest committed WAL frame from the most
 // authoritative source available. In multi-process mode it reads the SHM header
 // (written under lockWrite by any process on commit); in single-process or
-// in-memory mode it uses the in-process atomic. Falls back to the atomic if the
-// SHM read yields a torn/invalid header.
+// in-memory mode it uses the in-process atomic. A torn/invalid SHM header
+// yields mxFrameUnknown, never the process-local count.
 //
 // Callers should prefer this over w.index.mxCommitFrame.LoadLocal() whenever the
 // result influences truncate or WAL-reset decisions: a stale process-local
@@ -3349,30 +3411,19 @@ func (w *wal) authoritativeMxFrame() uint32 {
 		if hdr, valid := w.index.readHeader(); valid {
 			return hdr.mxFrame
 		}
+		return mxFrameUnknown
 	}
 	return w.index.mxCommitFrame.LoadLocal()
 }
 
-// authoritativeMxFrameAndPage returns a CONSISTENT (mxFrame, nPage) pair from a
-// single authoritative snapshot. It pairs authoritativeMxFrame with the
-// committed page count, and MUST be used wherever both values feed the same
-// decision (e.g. the checkpoint full-backfill truncate): in multi-process mode
-// the two values come from a single readHeader() so a peer's PASSIVE-mode commit
-// cannot land between two separate header reads and yield a torn pair (mxFrame
-// from before a grow/shrink, nPage from after) — which would over- or
-// under-truncate the DB file. In single-process or in-memory mode the in-process
-// atomics are authoritative and w.mu serializes checkpoint against every writer,
-// so the pair is trivially consistent. A torn/invalid SHM read falls back to the
-// atomics. Mirrors SQLite's single pWal->hdr snapshot in walCheckpoint
-// (mxSafeFrame=pWal->hdr.mxFrame, mxPage=pWal->hdr.nPage at wal.c:2227-2228).
-func (w *wal) authoritativeMxFrameAndPage() (mxFrame, nPage uint32) {
-	if !w.inProcess && !w.inMemory {
-		if hdr, valid := w.index.readHeader(); valid {
-			return hdr.mxFrame, hdr.nPage
-		}
-	}
-	return w.index.mxCommitFrame.LoadLocal(), w.index.maxPage.Load()
-}
+// mxFrameUnknown is what authoritativeMxFrame reports in multi-process mode
+// when the wal-index header cannot be read (a peer is between its two header
+// copies, or the header is torn). It is larger than any frame number, so
+// every "has the whole log been backfilled" test fails closed: no reset, no
+// truncate, checkpoint incomplete. The process-local count must never stand
+// in here: it misses frames a peer committed, and a reset or truncate decided
+// on it destroys them.
+const mxFrameUnknown = ^uint32(0)
 
 // checkpoint writes WAL frames back to the database file.
 // For InMemory databases, master is used to store checkpointed pages instead of dbFile.
@@ -3409,7 +3460,7 @@ func (w *wal) checkpointPassive(dbFile fileHandle, master *masterStore) error {
 	// committed frames we haven't backfilled. Callers (notably pager.close)
 	// then truncate the WAL and destroy the peer's data. See
 	// authoritativeMxFrame for rationale.
-	nb, mx := w.index.nBackfill.Load(), w.authoritativeMxFrame()
+	nb, mx := w.index.liveNBackfill(), w.authoritativeMxFrame()
 	if debugTrace {
 		trace("ckptPassive: completeness nBackfill=%d authoritativeMxFrame=%d localMxCommit=%d maxFrame=%d",
 			nb, mx, w.index.mxCommitFrame.LoadLocal(), w.index.maxFrame.Load())
@@ -3564,8 +3615,8 @@ func (w *wal) rewriteChecksums(iLast uint32) error {
 	return nil
 }
 
-// mxFrame source (multi-process): `nf` is read via authoritativeMxFrameAndPage,
-// which consults the SHM header under lockCheckpoint. This mirrors SQLite's
+// mxFrame source (multi-process): `nf` comes from the header indexReadHdr
+// returns under lockCheckpoint (repaired first if torn). This mirrors SQLite's
 // walCheckpoint using pWal->hdr.mxFrame. Reading the process-local
 // mxCommitFrame would undercount committed frames written by peer
 // processes, causing a close-time checkpoint to only backfill our own
@@ -3633,6 +3684,22 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 		xBusy = nil
 	}
 
+	// Read the wal-index header, repairing it first if it is invalid. SQLite
+	// does this before anything else in a checkpoint (walIndexReadHdr at
+	// wal.c:4373, then walCheckpoint works from that pWal->hdr): the header
+	// read here is the checkpoint's frontier. If the header is torn and the
+	// write lock cannot be had (PASSIVE, or a downgraded mode), this is
+	// ErrBusy and the checkpoint does nothing.
+	multiProcess := !w.inProcess && !w.inMemory
+	var ckptHdr WalIndexHdr
+	if multiProcess {
+		hdr, err := w.indexReadHdr(hasWriteLock, true)
+		if err != nil {
+			return err
+		}
+		ckptHdr = hdr
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -3641,8 +3708,8 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	// SQLite's walCheckpoint uses pWal->hdr.mxFrame which is only updated
 	// at commit time via walIndexWriteHdr.
 	//
-	// In multi-process mode, read mxFrame from the SHM header via
-	// authoritativeMxFrameAndPage, not the process-local mxCommitFrame. A
+	// In multi-process mode, mxFrame comes from the SHM header read above
+	// (ckptHdr), not the process-local mxCommitFrame. A
 	// sibling process may have committed frames we haven't synced — without
 	// this, our close-time checkpoint would only backfill our own frames, then
 	// truncate the WAL and lose the sibling's data (measured as the
@@ -3665,10 +3732,13 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	// committed DB size and materialize stale pages SQLite never exposes.
 	//
 	// We only proceed past nf==0 below, i.e. a commit frame exists, so nPage is
-	// always >=1. Defensively, if a torn-header fallback ever yields 0 we leave
-	// the backfill unbounded (mxPage==0 disables the filter) — strictly
-	// conservative: that can only fail to prune, never skip a legitimate page.
-	nf, mxPage := w.authoritativeMxFrameAndPage()
+	// always >=1. Defensively, mxPage==0 disables the filter and leaves the
+	// backfill unbounded — strictly conservative: that can only fail to prune,
+	// never skip a legitimate page.
+	nf, mxPage := ckptHdr.mxFrame, ckptHdr.nPage
+	if !multiProcess {
+		nf, mxPage = w.index.mxCommitFrame.LoadLocal(), w.index.maxPage.Load()
+	}
 	if nf == 0 {
 		return nil
 	}
@@ -3684,7 +3754,6 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	// This matches SQLite's walCheckpoint() reader-lock loop (issue 6.3).
 	mxSafeFrame := nf
 
-	multiProcess := !w.inProcess && !w.inMemory
 	for i := 1; i < 5; i++ {
 		var mark uint32
 		if multiProcess {
@@ -3834,8 +3903,8 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 
 		for _, pgno := range pgnos {
 			// Skip orphan frames past the committed DB size (iDbpage>mxPage,
-			// wal.c:2306). mxPage==0 means "unbounded" — see the
-			// authoritativeMxFrameAndPage call above.
+			// wal.c:2306). mxPage==0 means "unbounded" — see where
+			// mxPage is read above.
 			if mxPage != 0 && pgno > mxPage {
 				skippedOrphans++
 				continue
@@ -3908,8 +3977,8 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			// END ENCRYPTION
 			for _, pgno := range pgnos {
 				// Skip orphan frames past the committed DB size (iDbpage>mxPage,
-				// wal.c:2306). mxPage==0 means "unbounded" — see the
-				// authoritativeMxFrameAndPage call above.
+				// wal.c:2306). mxPage==0 means "unbounded" — see where
+				// mxPage is read above.
 				if mxPage != 0 && pgno > mxPage {
 					skippedOrphans++
 					continue
@@ -4005,7 +4074,11 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 // completed a full checkpoint. For non-PASSIVE modes with an incomplete
 // backfill it returns ErrBusy (SQLite walCheckpoint, wal.c:2351-2356).
 func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler) error {
-	backfill := w.index.nBackfill.Load()
+	// The shared nBackfill, as walCheckpoint tests pInfo->nBackfill
+	// (wal.c:2355). This is reached without any backfill having run (nothing
+	// new, or reader slot 0 busy), when the process-local mirror may still
+	// hold a count from an earlier WAL generation: see liveNBackfill.
+	backfill := w.index.liveNBackfill()
 
 	// Use mxCommitFrame (not nFrame) so spilled uncommitted frames don't
 	// prevent WAL reset when all committed frames are checkpointed.

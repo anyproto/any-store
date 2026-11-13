@@ -996,13 +996,21 @@ func (p *pager) beginRead() (maxFrame uint32, slot int, err error) {
 // beginReadHdr is beginRead plus the exact WAL header snapshot used to claim
 // the reader slot. Callers that may escalate to a write transaction should use
 // this so BUSY_SNAPSHOT compares against the same snapshot the read lock used.
+// A read begin, with its own busy state (wal.beginReadHdr).
 func (p *pager) beginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
+	busy := beginBusy{xBusy: p.wal.busyHandler}
+	return p.beginReadHdrBusy(&busy)
+}
+
+// beginReadHdrBusy is beginReadHdr under the busy state of the begin it is
+// part of (wal.beginReadHdrBusy).
+func (p *pager) beginReadHdrBusy(busy *beginBusy) (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	p.mu.RLock()
 	if pagerState(p.state.Load()) == pagerError {
 		p.mu.RUnlock()
 		return WalIndexHdr{}, 0, 0, 0, ErrCorrupt
 	}
-	hdr, maxFrame, minFrame, slot, err = p.wal.beginReadHdr()
+	hdr, maxFrame, minFrame, slot, err = p.wal.beginReadHdrBusy(busy)
 	if err != nil {
 		p.mu.RUnlock()
 		return WalIndexHdr{}, 0, 0, 0, err
@@ -3003,7 +3011,7 @@ func (p *pager) tryCheckpoint() error {
 	// trail a peer's recent commit; comparing nBackfill against a stale local
 	// cursor can return true prematurely and schedule a RESTART that races
 	// the peer's fresh frames. See docs/btree/NOTES.md §"Checkpoint mxFrame source fix".
-	if p.wal.index.nBackfill.Load() >= p.wal.authoritativeMxFrame() {
+	if p.wal.index.liveNBackfill() >= p.wal.authoritativeMxFrame() {
 		if err := p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil); err == nil {
 			// ~ sqlite3BackupRestart (backup.c:701-707) also applies to
 			// auto-checkpoint's best-effort restart.
@@ -3491,7 +3499,20 @@ func (p *pager) close() error {
 				if debugTrace {
 					trace("close: starting passive checkpoint before WAL truncation, dbSize=%d lockedWrite=%v", p.dbSize.Load(), lockedWrite)
 				}
-				cpErr := p.wal.checkpointPassive(p.file, p.master)
+				// A torn wal-index header must be repaired before the
+				// checkpoint reads its frontier. The PASSIVE checkpoint
+				// would take the write lock for that itself, but this
+				// close already holds it, so do it here, as
+				// walIndexReadHdr does for a caller with
+				// pWal->writeLock set (wal.c:2706-2711). On failure the
+				// checkpoint and the truncate are skipped.
+				var cpErr error
+				if lockedWrite {
+					_, cpErr = p.wal.indexReadHdr(true, false)
+				}
+				if cpErr == nil {
+					cpErr = p.wal.checkpointPassive(p.file, p.master)
+				}
 				if cpErr != nil {
 					if debugTrace {
 						trace("close: checkpointPassive incomplete or failed: %v", cpErr)

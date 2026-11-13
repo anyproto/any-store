@@ -1836,49 +1836,44 @@ needed for auto-vacuum and locality hints.
    fields are deleted. See the "Per-connection `walHdr`" section below for the
    current design.
 
-### Lazy `ensureHeaderInitialized` helper (commits 2026-04-18)
+### Lazy `ensureHeaderInitialized` helper (commits 2026-04-18; removed 2026-11-11)
 
-`wal.go:ensureHeaderInitialized` is an experimental lazy counterpart to
-`walIndexReadHdr` (wal.c:2640-2745). Structure matches SQLite:
+`wal.go:ensureHeaderInitialized` was an experimental lazy counterpart to
+`walIndexReadHdr` (wal.c:2654-2759) that only tests called; production code
+used eager SHM init via `wal.open` and never repaired an invalid header
+afterwards. It is replaced by `wal.indexReadHdr`, the production port of
+`walIndexReadHdr`, called from the multi-process read path and from
+`checkpointWithMode`: see
+[drift-2026-11-11-1](#drift-2026-11-11-1-attached-wal-index-recovery).
+`ensureHeaderInitialized`, its in-process variant, the `inProcessInit` flag
+and `syncFromSHMLocked` (its only caller) are deleted; `indexReadHdr` does
+not sync process-global state on the valid-header path, which the reader
+path must not do.
 
-- Fast path: `readHeader()` → if valid, return.
-- Slow path: `walLockExclusive(WAL_WRITE_LOCK)` → retry `readHeader` → if still
-  invalid, recover.
-- Busy-path fence: `walLockShared(WAL_RECOVER_LOCK)` then release, matching
-  wal.c:3089.
-
-Currently the helper is invoked defensively from 3 targeted tests
-(`TestEnsureHeaderInitialized_*`) but NOT from production code. Production
-code continues to use eager SHM init via `wal.open` + `adoptSHMState` /
-`recoverLocked` / `initHeaderStateLocked`. See "SQLite-alignment blocker"
-below for why cold-open was attempted and reverted.
-
-**Drifts from SQLite's `walIndexReadHdr` preserved:**
+**Drifts from SQLite's `walIndexReadHdr`, as they stand for `indexReadHdr`:**
 
 <a id="old-drift-ensureheader-triple-lock-recovery-gate"></a>
-**Severity:** low
+**Severity:** none
 
-1. **Triple-lock recovery gate**: SQLite `walIndexRecover` takes
-   `WAL_ALL_BUT_WRITE..READ_LOCK(0)` exclusive (wal.c:1400-1401). Our
-   `recoverLocked` requires callers to hold `lockCheckpoint + lockRecover`
-   exclusive. The helper takes `lockWrite → lockCheckpoint → lockRecover` under
-   non-blocking `F_SETLK`; under contention with `checkpointWithMode` (which
-   uses `CKPT → WRITE` order) the loser observes `ErrBusy` — no deadlock.
+1. **Recovery lock set.** SQLite `walIndexRecover` holds the caller's
+   `WAL_WRITE_LOCK` and takes `WAL_ALL_BUT_WRITE` up to `READ_LOCK(0)`
+   exclusive, i.e. `WAL_CKPT_LOCK` (unless the caller holds it) and
+   `WAL_RECOVER_LOCK` (wal.c:1395-1401). `indexReadHdr` takes the same set,
+   `lockWrite → lockCheckpoint → lockRecover`, each a non-blocking `F_SETLK`;
+   under contention with `checkpointWithMode` (which uses `CKPT → WRITE`
+   order) the loser observes `ErrBusy` — no deadlock. Not a divergence.
 
-2. **BUSY_RECOVERY signal — resolved 2026-04-22.** The three contended
-   branches in `ensureHeaderInitialized` now return `ErrBusyRecovery`
-   (distinct from the generic `errWALRetry`) when a peer holds the
-   RECOVER / CKPT exclusive locks — matching SQLite's
-   `SQLITE_BUSY_RECOVERY` (`sqlitec/src/wal.c:3063-3090`, probe at
-   `sqlitec/src/os_unix.c:4872-4907`). Upstream `DB.BeginWrite` routes
-   `ErrBusyRecovery` through the configured `BusyHandler` for proper
-   backoff instead of spinning.
+2. **BUSY_RECOVERY signal.** SQLite's `walTryBeginRead` returns
+   `SQLITE_BUSY_RECOVERY` when the `WAL_RECOVER_LOCK` probe is itself busy
+   (`sqlitec/src/wal.c:3084-3108`). `tryBeginReadMultiProcessHdr` returns
+   `ErrBusyRecovery` there, and `pager.beginReadHdr` hands it to the
+   `BusyHandler` for every begin (see drift-2026-11-11-1). Not a divergence.
 
 <a id="old-drift-headerondisk-mxframe-inference"></a>
 **Severity:** none
 
-3. **`headerOnDisk` shortcut in `syncFromSHMLocked`** (`wal.go:1694-1721`):
-   we infer "on-disk WAL header exists" from `hdr.mxFrame > 0` rather than
+3. **`headerOnDisk` shortcut in `syncFromSHMLocked`** (removed 2026-11-11
+   with the function; kept for the history of the anchor): we inferred "on-disk WAL header exists" from `hdr.mxFrame > 0` rather than
    `fstat`-ing, relying on the invariant that `flushHeader` (the lazy
    header-write gate in `writeFrames`, `wal.go:2054-2061`) precedes every
    frame write. This is faithful to SQLite: `sqlite3WalFrames`
@@ -3513,7 +3508,7 @@ A follow-up per-function C-vs-Go audit refresh (2026-06-25). Each drift below wa
 <a id="drift-2026-06-25-25-first-opener-does-not-reset-a-stale-persisted-shm-trusts-checksum-vali"></a>
 ### Drift: First Opener Does Not Reset A Stale Persisted Shm; Trusts Checksum-Valid WAL-Index Header After A Crash Instead Of Forcing WAL Recovery
 - **Category:** missing-feature  -  **Severity:** high  -  **Status:** RESOLVED 2026-07-10 (2026-07 pre-beta review): `newPlatformShm` now runs the complete `unixLockSharedMemory` first-attacher election (`os_unix.c:4860-4913`, 3.52.0) — `F_GETLK` probe of the DMS byte, then: `F_UNLCK` → DMS EXCLUSIVE + **unconditional** `Truncate(3)` + atomic downgrade to SHARED; `F_RDLCK` → join shared (a live process maintains the shm); `F_WRLCK` → BUSY back-off and re-probe, never a shared-join (the `os_unix.c:4864-4871` crash-mid-election race). Bounded 100×10ms in-open retry on contention (see [drift-2026-07-10-2](#drift-2026-07-10-2-dms-busy-retried-in-open-instead-of-surfacing)). Intra-process soundness rests on `openDBs` forbidding same-process double-open by file identity (fcntl record locks are per-(process,inode)), registered in `pager.open` at DB-fd open before any lock, the WAL open or the shm attach (SQLite's `findInodeInfo` point, `os_unix.c:6138`, since 2026-10-15), so a refused open never opens the shm; the shm file must never be open+closed by an attached process (any fd close drops the process's record locks). One mechanism correction to the original entry: the adopt fast paths cited below were in fact unreachable on a *fresh* attach, because `region(create=false)` never maps existing file content — every cold attach already funneled into `recoverLocked` (see [drift-2026-07-10-3](#drift-2026-07-10-3-region-create-false-never-maps-existing-content)); the hazard was latent behind that accident rather than live, and the election now makes the guarantee structural instead of accidental. Regression tests: `TestDMSFirstAttacherTruncatesStaleShm`, `TestDMSNonFirstAttacherDoesNotTruncate`, `TestDMSMidElectionBacksOff`, `TestDMSDowngradeFailureFailsOpen`, `TestStaleShmMxFrameBehind_CommittedTailVisible`, `TestStaleShmMxFrameAhead_UncommittedNotResurrected`, `TestStaleShmGarbageDiscardedOnReopen`, `TestShmStumpCrashBeforeRecoverySelfHeals`, plus the multi-process election tests (`multiprocess_dms_test.go`) and the refused same-process open tests (`double_open_test.go`: the live handle's wal-index header and DMS lock are unchanged, a live reader survives repeated refused opens).
-- **Affected functions:** `shm_mmap.go:newPlatformShm` (`internal/btree/shm_mmap.go:93`, `internal/btree/shm_mmap.go:105`), `wal.go:*wal.ensureHeaderInitialized` (`internal/btree/wal.go:1589`).
+- **Affected functions:** `shm_mmap.go:newPlatformShm` (`internal/btree/shm_mmap.go:93`, `internal/btree/shm_mmap.go:105`), `wal.go:*wal.ensureHeaderInitialized` (`internal/btree/wal.go:1589`; removed 2026-11-11, see `wal.open`'s adopt path).
 
 In SQLite's `unixLockSharedMemory`, the connection that finds the DMS byte unlocked (`F_GETLK` reports `F_UNLCK`, `os_unix.c:4876`) is the first attacher: it takes an EXCLUSIVE DMS lock (`unixShmSystemLock(..., F_WRLCK, ...)`, `os_unix.c:4893`) and then *unconditionally* truncates the `*-shm` file to 3 bytes (`robust_ftruncate(pShmNode->hShm, 3)`, `os_unix.c:4902`) before downgrading to SHARED — and any peer that observes the DMS already held EXCLUSIVE backs off with `SQLITE_BUSY` (`os_unix.c:4906`) so the truncation is never raced. The 3-byte stump is smaller than the wal-index header, so the next `readHeader` necessarily fails validation and `walIndexRecover` rebuilds the index from the authoritative WAL file. The header comment (`os_unix.c:4864-4871`) spells out exactly why the truncate is unconditional: the shm is volatile and may be torn or stale after a power failure or crash, and trusting it can corrupt the database. The Go `newPlatformShm` acquires the DMS lock (`internal/btree/shm_mmap.go:93`) but then only truncates the shm to the 3-byte marker when the file was *freshly created* (`info.Size() == 0`, `internal/btree/shm_mmap.go:105`); if a `*-shm` file persists from a process that died without running `mmapShm.close` (so the file was never unlinked), the new opener sees `Size() > 0`, skips the truncate entirely, and `wal.ensureHeaderInitialized` takes its fast path (`if hdr, valid := w.index.readHeader(); valid`, `internal/btree/wal.go:1589`) — trusting the stale-but-checksum-valid header's `mxFrame`/salts/hash slots instead of recovering from the WAL. The consequence is that Go can resurrect a crashed writer's uncommitted frames, miss the real committed tail, or read against a mismatched salt generation, where SQLite's mandatory first-open truncate-to-3 would have forced a full WAL rebuild.
 
@@ -3814,3 +3809,29 @@ SQLite's ALTER TABLE ... RENAME is an UPDATE of the existing `sqlite_master` row
 - **Affected functions:** `btree.go:leafKeyAt`; callers `btree.go:*Cursor.SeekNear`, `btree.go:*Cursor.currentKeyEqual`.
 
 SQLite's `indexCellCompare` (`btree.c:5952-5982`) compares a record in place only when its size varint is one or two bytes and the whole record fits on the page; a record that extends into overflow pages returns 99, and the already-positioned shortcut of `sqlite3BtreeIndexMoveto` (`btree.c:6060-6081`) falls back to `moveToRoot`. An index record has no separate value, so "the record spills" and "the key spills" coincide there. The Go leaf cell carries `key||value`, and a document cell with a short id and a large body spills while its key is wholly on the page. `leafKeyAt` returns such a key from the page and declines (`errLeafKeySpilled`) only when the key itself continues in the overflow chain, i.e. when `keyLen > nLocal` under the same `maxLocalPayload`/`localPayloadSize` split that every leaf writer uses, so a key it serves is always complete. It also accepts length varints of any width, capped by `maxPayloadAlloc`. The consequence is that the in-page fast path of `SeekNear` and `currentKeyEqual` stays available for `Iterator.Doc()`'s re-seek by id on overflowing documents; a literal port would send every such lookup through `leafFullKey` and the overflow chain. Regression tests: `internal/btree/leafkeyat_overflow_test.go` (`TestLeafKeyAt_SpilledKey` serves the local key of a value-spilling cell and refuses spilled keys; `TestCursor_SeekNearSpilledKeys/local-first-and-last-keys` runs the in-leaf check over spilled cells).
+
+<a id="drift-2026-11-11-1-attached-wal-index-recovery"></a>
+### Drift: Recovery Of A Torn wal-index Header With Peers Attached Runs On The Process-Shared `*wal`
+- **Category:** structural  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.indexReadHdr`, `wal.go:*wal.tryBeginReadMultiProcessHdr`, `wal.go:*wal.checkpointWithMode`, `wal.go:*wal.authoritativeMxFrame`, `pager.go:*pager.close`.
+
+SQLite's `walIndexReadHdr` (`wal.c:2654-2759`) reads the wal-index header without a lock; when it is invalid it takes `WAL_WRITE_LOCK`, reads again, and if the header is still invalid runs `walIndexRecover` (`wal.c:2694-2729`). Every read transaction goes through it (`walTryBeginRead`, `wal.c:3076`), and so does every checkpoint before it copies a frame (`sqlite3WalCheckpoint`, `wal.c:4373`). A header left torn by a writer that died between its two header copies is therefore repaired by the next connection that looks at it.
+
+Until 2026-11-11 the Go port did neither. A reader that found the header invalid only fenced on `lockRecover` and retried, ending in `ErrProtocol` after the retry budget (about 10 s); a write begin went through the same read path. A checkpoint took its frontier from `authoritativeMxFrame` / `authoritativeMxFrameAndPage`, which fell back to the process-local frame count on an invalid header: a surviving process that had not read since a peer's last commits backfilled only through its own stale count, judged the backfill complete, and a RESTART/TRUNCATE (including the close-time checkpoint) then discarded the peer's acknowledged frames.
+
+`wal.indexReadHdr(haveWriteLock, haveCkptLock)` is now the port of `walIndexReadHdr`, called from `tryBeginReadMultiProcessHdr` and at the top of `checkpointWithMode` (whose frontier `nf`/`mxPage` is the header it returns, as `walCheckpoint` works from `pWal->hdr`). A busy lock yields `ErrBusy`: the reader probes `lockRecover` and retries, or reports `ErrBusyRecovery` when the probe is busy (`wal.c:3084-3108`); the checkpoint returns it (`SQLITE_BUSY`). `pager.close` holds the write lock around its close-time checkpoint, so it calls `indexReadHdr(true, false)` itself first (the `pWal->writeLock` branch, `wal.c:2706-2711`); otherwise the PASSIVE checkpoint inside could not take the lock for the repair. `authoritativeMxFrame` no longer substitutes the local count in multi-process mode: an unreadable header reads as `mxFrameUnknown` (larger than any frame), so every "whole log backfilled" test fails closed. `authoritativeMxFrameAndPage` is gone.
+
+What still differs from SQLite, and why:
+
+1. **Process-shared state.** A SQLite `Wal` belongs to one connection, and recovery rewrites that connection's `pWal->hdr`. One Go `*wal` serves every transaction of the process, so `recoverLocked` runs under `w.mu` and resets the writer-owned fields (`nFrame`, `cksum1/2`, salts, the local index atomics). It only does so while `indexReadHdr` holds `lockWrite`, `lockCheckpoint` and `lockRecover` exclusively; the in-process lock table makes that exclusive against this process's own writer and checkpointer as well as against peers, so no user of those fields is active. In-flight readers of the process are unaffected for SQLite's reasons: hash tables are rebuilt privately and copied over identical content for every frame a live snapshot can reach, and a read-mark whose slot is held is left alone.
+2. **No `pChanged`.** After recovery SQLite sets `*pChanged = 1` (`wal.c:2724-2725`), which resets the pager cache (`pager.c:3261-3263`), and a checkpoint that loaded a new header zeroes `pWal->hdr` (`wal.c:4399-4407`). Go's reader caches are keyed by the full header plus `dataVersion`, and the writer compares the live header with `writerHdr` at write begin, so a recovery that publishes a different header invalidates both; one that reproduces the same header leaves caches of the same WAL content in place.
+3. **Where the busy handler runs for `ErrBusyRecovery`.** The mapping itself is SQLite's (`wal.c:3084-3108`): a busy lock with the `WAL_RECOVER_LOCK` probe free is a retry, a busy probe is `ErrBusyRecovery` (`SQLITE_BUSY_RECOVERY`), any other probe error is returned. SQLite invokes the busy handler for it in `sqlite3BtreeBeginTrans`, from the one loop around the whole begin, with one count (`btree.c:3730-3737`; `sqlite3InvokeBusyHandler`, `main.c:1770-1780`, never asks again once the handler has declined). Go has several begin entry points (read, write, backup step, integrity sweep, and open's read of page 1, which is below the pager), so a read begin's loop sits at the WAL read begin, `wal.beginReadHdrBusy`, with the begin's count in a `beginBusy`. `DB.BeginWriteContext` is a write begin's one loop: it makes single read attempts (`beginReadHdrBusy(nil)`), tries the write lock once per attempt (`beginWriteWithSnapshot`, as `walBeginWriteTransaction` does, `wal.c:3714-3717`), and retries `ErrBusyRecovery`, a busy write lock (`ErrBusy`) and, after its tight retries, `ErrBusySnapshot` under one `beginBusy`, each retry from a fresh read snapshot. Until 2026-11-12 there were three counts: the pager's recovery loop and `BeginWriteContext`'s loop each had one, and the inner loop restarted from 0 on every outer retry (with a recovery that did not finish, the default 5 s budget became about 300 s, the process's writer reservation held throughout); and `beginWriteWithSnapshot` waited for the write lock through `walBusyLock` with a count of its own, so a peer that committed just before each timeout made every snapshot retry start a fresh budget (about 60 retries, 5 minutes, at the default). `walBusyLock`'s per-call count (drift-108) is now left only to the checkpoint's, open's and close's lock waits. Tests: `TestTornWalIndexHeader_BusyRecoveryOneBudgetPerBegin`, `_WALReadBeginWaitsOutRecovery`, `TestBeginWrite_PeerCommitsBeforeTimeoutOneBudget`.
+4. **`mxFrameUnknown`.** SQLite needs no such value: after `walIndexReadHdr` it works from its private `pWal->hdr`, and the one live re-read (`wal.c:2322`) is unvalidated. The Go callers outside `checkpointWithMode`'s frontier (`checkpointPassive`, `checkpointPost`, the DB-file truncate guard, `tryCheckpoint`) re-read the shared header and can catch a peer between its two copies; treating that as "more frames may exist" costs at most a skipped reset or truncate.
+
+Three further rules of the same SQLite routines were ported with it (2026-11-11), none of them a divergence any more:
+
+- **A read error during the recovery scan is an error.** `recoverLocked` used to `break` on a failed frame read and publish the prefix it had as the whole log; with recovery now reachable from attached readers and checkpointers, a transient I/O error would have presented an earlier commit as the end of the log and let the next TRUNCATE delete the commits behind it (open-time recovery had the same defect). `walIndexRecover` keeps the read's `rc` (`wal.c:1502-1503`) and publishes only under `rc==SQLITE_OK` (`wal.c:1561-1566`); `recoverLocked` now returns the error with nothing published. Tests (`-tags vfs`): `TestRecoverReadErrorNotEndOfLog_AttachedRecovery`, `_Open`.
+- **Reset decisions read the shared `nBackfill`.** `checkpointPost`, `checkpointPassive`'s completeness result (which gates the close-time WAL truncate) and `tryCheckpoint`'s restart test compared the process-local `walIndex.nBackfill` mirror with the shared frontier. The mirror is refreshed only at some begins, so after a peer's WAL restart it can hold the previous generation's larger count; `checkpointPost` is reached without any backfill when reader slot 0 is busy, and then reset a log none of which had been copied. `walCheckpoint` tests `pInfo->nBackfill` in shared memory (`wal.c:2355`); the three sites now go through `walIndex.liveNBackfill`. Test: `TestCheckpointResetUsesSharedBackfill`.
+- **A wal-index of another version is refused, not rebuilt.** `readHeader` reported a consistent, checksummed header with a foreign `iVersion` as invalid, which `indexReadHdr` would have "repaired" over another build's live index. `walIndexReadHdr` returns `SQLITE_CANTOPEN` for it without recovery (`wal.c:2740-2741`); `readHeaderState` separates the case and `indexReadHdr` returns an error matching `ErrWALVersion`. `wal.open` refuses it the same way, under its recovery locks and before it rebuilds anything: a process attaching to a database a newer build keeps open must not overwrite that build's index. On a fresh attach `region(create=false)` maps none of the peer's index ([drift-2026-07-10-3](#drift-2026-07-10-3-region-create-false-never-maps-existing-content)), so the gate maps region 0 first, as `walIndexReadHdr` does through `walIndexPage`; a consistent header of this version still goes to recovery, as before. Tests: `TestWalIndexFutureVersionRefused`, `TestWalIndexFutureVersionRefusedAtOpen` (two processes).
+
+Regression tests (`internal/btree/walindex_torn_header_test.go`): `TestTornWalIndexHeader_CheckpointKeepsPeerCommits`, `_PassiveCheckpointKeepsPeerCommits`, `_CloseKeepsPeerCommits`, `_ReaderRecovers`, `_WriterRecovers` (two processes: the writer dies between the header copies), `_ReaderRetriesWhileWriteLockBusy`, `_BusyRecoveryWhenRecoverLockHeld`, `_CheckpointBusyWhenWriteLockHeld`.

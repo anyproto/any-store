@@ -1111,15 +1111,20 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	var slot int
 	var readSnap WalIndexHdr
 
-	for attempt := 0; ; attempt++ {
+	// One loop and one busy count for the whole begin, as
+	// sqlite3BtreeBeginTrans (btree.c:3730-3737): a peer's recovery in
+	// progress (ErrBusyRecovery), the write lock held by another connection
+	// (ErrBusy: the lock is tried once per attempt, walBeginWriteTransaction,
+	// wal.c:3714-3717) and a snapshot that moved (ErrBusySnapshot, after its
+	// tight retries) share the handler's budget, which is spent once, not
+	// once per retry. Every retry starts from a fresh read snapshot.
+	busy := beginBusy{xBusy: db.pager.wal.busyHandler}
+	for attempt := 0; ; {
 		var err error
-		readSnap, maxFrame, _, slot, err = db.pager.beginReadHdr()
+		readSnap, maxFrame, _, slot, err = db.pager.beginReadHdrBusy(nil)
 		if err != nil {
-			if errors.Is(err, ErrBusyRecovery) {
-				xBusy := db.pager.wal.busyHandler
-				if xBusy != nil && xBusy(attempt) {
-					continue
-				}
+			if errors.Is(err, ErrBusyRecovery) && busy.retry() {
+				continue
 			}
 			db.mu.RUnlock()
 			db.unlockWriter()
@@ -1136,6 +1141,12 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 			break
 		}
 		db.pager.endRead(slot)
+		if testBeginWriteRetryHook != nil {
+			testBeginWriteRetryHook(err)
+		}
+		if errors.Is(err, ErrBusy) && busy.retry() {
+			continue
+		}
 		if !errors.Is(err, ErrBusySnapshot) {
 			db.mu.RUnlock()
 			db.unlockWriter()
@@ -1146,14 +1157,12 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 		// After a small tight-retry budget, route through the busy handler so
 		// we back off instead of spinning. When busyHandler returns false
 		// (budget exhausted) or is nil, surface ErrBusySnapshot to the caller.
-		if attempt >= busySnapshotInnerRetries {
-			xBusy := db.pager.wal.busyHandler
-			if xBusy == nil || !xBusy(attempt-busySnapshotInnerRetries) {
-				db.mu.RUnlock()
-				db.unlockWriter()
-				return nil, ErrBusySnapshot
-			}
+		if attempt >= busySnapshotInnerRetries && !busy.retry() {
+			db.mu.RUnlock()
+			db.unlockWriter()
+			return nil, ErrBusySnapshot
 		}
+		attempt++
 	}
 
 	// Read the committed page-1 counters for staleness detection from the
@@ -2388,6 +2397,11 @@ var AutoCheckpointThreshold = 10000
 // reader slot and the snapshot bounds are taken, before the page-1 counters
 // are read. Test-only.
 var testReadSlotClaimedHook func()
+
+// testBeginWriteRetryHook, when non-nil, runs inside BeginWriteContext after
+// the write half of an attempt failed and its read snapshot was released,
+// before the begin decides whether to retry. Test-only.
+var testBeginWriteRetryHook func(err error)
 
 // testWriterFinishHook, when non-nil, runs inside Commit/Rollback after the
 // closed flag is set and before the pager operation — the exact spot where a
