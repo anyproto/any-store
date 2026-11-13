@@ -594,7 +594,7 @@ func TestSqlite_Corrupt_8_1_OverflowPointer(t *testing.T) {
 	// Calculate local payload size (unified format)
 	usable := 1024
 	totalPayload := int(keyLen) + int(valLen)
-	nLocal := localPayloadSize(totalPayload, usable)
+	nLocal := localPayloadSize(totalPayload, indexLimits(usable))
 	ovfPtrOff := pos + nLocal // absolute offset of overflow page pointer
 
 	t.Logf("overflow pointer at absolute offset %d (page-relative: %d)", ovfPtrOff, ovfPtrOff-page2Off)

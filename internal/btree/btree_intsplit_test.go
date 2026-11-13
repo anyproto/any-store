@@ -134,7 +134,7 @@ func TestIntSplit_NonPathSplitLeafAndInsert(t *testing.T) {
 		v := fmt.Appendf(nil, "v-%06d", i)
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -178,7 +178,7 @@ func TestIntSplit_NonPathRandomOrderSplits(t *testing.T) {
 		v := fmt.Appendf(nil, "v-%06d", idx)
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -254,7 +254,7 @@ func TestIntSplit_NonPathOverflowKeyInteriorSplit(t *testing.T) {
 		v := []byte("v")
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -275,126 +275,6 @@ func TestIntSplit_NonPathOverflowKeyInteriorSplit(t *testing.T) {
 // Strategy: manually construct a btree where the root is a leaf containing
 // just a couple of cells, then call insertIntoParent with a fake leftPg
 // that doesn't match any child. The loop exits and hits L1941-1945.
-// =============================================================================
-
-func TestIntSplit_InsertIntoParentFallback(t *testing.T) {
-	p := tempPagerSmall(t, 512)
-
-	// Create a root interior page with some children
-	rootPg, err := p.allocatePage()
-	require.NoError(t, err)
-	bt := &btree{pager: p, rootPage: rootPg.pgno, writable: true}
-
-	// Create leaf pages to serve as children
-	leaf1, err := p.allocatePage()
-	require.NoError(t, err)
-	leaf1.header.pageType = pageTypeLeafIdx
-	leaf1.header.cellContentOff = uint16(p.usableSize())
-	leaf1.header.serialize(leaf1.data[:])
-	p.releasePage(leaf1)
-
-	leaf2, err := p.allocatePage()
-	require.NoError(t, err)
-	leaf2.header.pageType = pageTypeLeafIdx
-	leaf2.header.cellContentOff = uint16(p.usableSize())
-	leaf2.header.serialize(leaf2.data[:])
-	p.releasePage(leaf2)
-
-	// Build interior root with leaf1 as leftChild and leaf2 as rightChild
-	cells := []cellData{
-		{leftChild: leaf1.pgno, key: []byte("mmm")},
-	}
-	require.NoError(t, bt.rebuildInteriorPage(rootPg, cells, leaf2.pgno))
-	p.releasePage(rootPg)
-
-	// Create a page that is NOT a child of the root — this will cause
-	// insertIntoParent to fail to find the parent and fall back to splitRoot.
-	fakePg, err := p.allocatePage()
-	require.NoError(t, err)
-	fakePg.header.pageType = pageTypeLeafIdx
-	fakePg.header.cellContentOff = uint16(p.usableSize())
-	fakePg.header.serialize(fakePg.data[:])
-
-	// Allocate another page to serve as the right child after split
-	rightPg, err := p.allocatePage()
-	require.NoError(t, err)
-	rightPg.header.pageType = pageTypeLeafIdx
-	rightPg.header.cellContentOff = uint16(p.usableSize())
-	rightPg.header.serialize(rightPg.data[:])
-	p.releasePage(rightPg)
-
-	// Call insertIntoParent with fakePg — not a child of root.
-	// This should traverse, fail to find the parent, and fallback to splitRoot (L1941-1945).
-	err = bt.insertIntoParent(fakePg, []byte("zzz"), rightPg.pgno)
-	p.releasePage(fakePg)
-	// The fallback splitRoot should succeed
-	require.NoError(t, err)
-}
-
-// =============================================================================
-// Test: insertIntoParent rightChild match (L1929-1933)
-//
-// Sets up a tree where the leaf being split is the rightChild of its parent.
-// The insertIntoParent traversal checks rightChild before descending further.
-// =============================================================================
-
-func TestIntSplit_InsertIntoParentRightChildMatch(t *testing.T) {
-	p := tempPagerSmall(t, 512)
-
-	rootPg, err := p.allocatePage()
-	require.NoError(t, err)
-	bt := &btree{pager: p, rootPage: rootPg.pgno, writable: true}
-
-	// Create leaf pages
-	leaf1, err := p.allocatePage()
-	require.NoError(t, err)
-	leaf1.header.pageType = pageTypeLeafIdx
-	leaf1.header.cellContentOff = uint16(p.usableSize())
-	leaf1.header.serialize(leaf1.data[:])
-	p.releasePage(leaf1)
-
-	leaf2, err := p.allocatePage()
-	require.NoError(t, err)
-	leaf2.header.pageType = pageTypeLeafIdx
-	leaf2.header.cellContentOff = uint16(p.usableSize())
-	leaf2.header.serialize(leaf2.data[:])
-	p.releasePage(leaf2)
-
-	// Build root interior: leaf1 as leftChild of separator "mmm", leaf2 as rightChild
-	cells := []cellData{
-		{leftChild: leaf1.pgno, key: []byte("mmm")},
-	}
-	require.NoError(t, bt.rebuildInteriorPage(rootPg, cells, leaf2.pgno))
-	p.releasePage(rootPg)
-
-	// Create a new page to be the right sibling after split
-	newRight, err := p.allocatePage()
-	require.NoError(t, err)
-	newRight.header.pageType = pageTypeLeafIdx
-	newRight.header.cellContentOff = uint16(p.usableSize())
-	newRight.header.serialize(newRight.data[:])
-	p.releasePage(newRight)
-
-	// Get leaf2 as writable — it is the rightChild of root
-	wpg, gerr := p.getWritablePage(leaf2.pgno)
-	require.NoError(t, gerr)
-
-	// Insert separator where leftPg is the rightChild of the root.
-	// The key "zzz" > "mmm" so searchInterior returns rightChild (leaf2.pgno),
-	// which matches childPgno == leftPg.pgno only if the search returns
-	// the cell's leftChild. But "zzz" > "mmm" => rightChild path.
-	// So it checks pg.header.rightChild == leftPg.pgno => match at L1929.
-	err = bt.insertIntoParent(wpg, []byte("zzz"), newRight.pgno)
-	p.releasePage(wpg)
-	require.NoError(t, err)
-}
-
-// =============================================================================
-// Test: Large scale path-tracked Put triggering deep interior splits
-//
-// Insert 5000 keys in random order with 512-byte pages. This creates a tree
-// with 3+ levels of interior pages and forces multiple interior page splits,
-// including non-root interior splits.
 // =============================================================================
 
 func TestIntSplit_DeepInteriorSplitRandomOrder(t *testing.T) {
@@ -456,7 +336,7 @@ func TestIntSplit_NonPathMultiLevelTraversal(t *testing.T) {
 		v := fmt.Appendf(nil, "v-%04d", i)
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -485,7 +365,7 @@ func TestIntSplit_UpdateLeafCellNilPathSplit(t *testing.T) {
 		v := []byte("s") // small value
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -497,7 +377,7 @@ func TestIntSplit_UpdateLeafCellNilPathSplit(t *testing.T) {
 		copy(v, fmt.Appendf(nil, "bigval-%04d", i))
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -577,7 +457,7 @@ func TestIntSplit_MixedInsertUpdateSplits(t *testing.T) {
 		v := []byte("val")
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -589,7 +469,7 @@ func TestIntSplit_MixedInsertUpdateSplits(t *testing.T) {
 		copy(v, fmt.Appendf(nil, "big-%04d", i))
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -606,7 +486,7 @@ func TestIntSplit_MixedInsertUpdateSplits(t *testing.T) {
 		v := fmt.Appendf(nil, "v-%04d", idx)
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -622,104 +502,3 @@ func TestIntSplit_MixedInsertUpdateSplits(t *testing.T) {
 // only after descending multiple levels. Also tests the fallback path when
 // the search path goes through non-matching children.
 // =============================================================================
-
-func TestIntSplit_InsertIntoParentDeepTraversal(t *testing.T) {
-	p := tempPagerSmall(t, 512)
-
-	// Create a 2-level interior tree manually:
-	// root -> int1 -> leaf1, leaf2
-	//      -> int2 -> leaf3, leaf4 (rightChild of root)
-
-	leaf1, err := p.allocatePage()
-	require.NoError(t, err)
-	leaf1.header.pageType = pageTypeLeafIdx
-	leaf1.header.cellContentOff = uint16(p.usableSize())
-	leaf1.header.serialize(leaf1.data[:])
-	p.releasePage(leaf1)
-
-	leaf2, err := p.allocatePage()
-	require.NoError(t, err)
-	leaf2.header.pageType = pageTypeLeafIdx
-	leaf2.header.cellContentOff = uint16(p.usableSize())
-	leaf2.header.serialize(leaf2.data[:])
-	p.releasePage(leaf2)
-
-	leaf3, err := p.allocatePage()
-	require.NoError(t, err)
-	leaf3.header.pageType = pageTypeLeafIdx
-	leaf3.header.cellContentOff = uint16(p.usableSize())
-	leaf3.header.serialize(leaf3.data[:])
-	p.releasePage(leaf3)
-
-	leaf4, err := p.allocatePage()
-	require.NoError(t, err)
-	leaf4.header.pageType = pageTypeLeafIdx
-	leaf4.header.cellContentOff = uint16(p.usableSize())
-	leaf4.header.serialize(leaf4.data[:])
-	p.releasePage(leaf4)
-
-	// Build int1: leaf1 is leftChild of "ddd", leaf2 is rightChild
-	int1, err := p.allocatePage()
-	require.NoError(t, err)
-	require.NoError(t, (&btree{pager: p, writable: true}).rebuildInteriorPage(int1,
-		[]cellData{{leftChild: leaf1.pgno, key: []byte("ddd")}}, leaf2.pgno))
-	p.releasePage(int1)
-
-	// Build int2: leaf3 is leftChild of "ppp", leaf4 is rightChild
-	int2, err := p.allocatePage()
-	require.NoError(t, err)
-	require.NoError(t, (&btree{pager: p, writable: true}).rebuildInteriorPage(int2,
-		[]cellData{{leftChild: leaf3.pgno, key: []byte("ppp")}}, leaf4.pgno))
-	p.releasePage(int2)
-
-	// Build root: int1 is leftChild of "hhh", int2 is rightChild
-	rootPg, err := p.allocatePage()
-	require.NoError(t, err)
-	bt := &btree{pager: p, rootPage: rootPg.pgno, writable: true}
-	require.NoError(t, bt.rebuildInteriorPage(rootPg,
-		[]cellData{{leftChild: int1.pgno, key: []byte("hhh")}}, int2.pgno))
-	p.releasePage(rootPg)
-
-	// Now call insertIntoParent where leftPg is leaf4 (rightChild of int2,
-	// which is the rightChild of root).
-	// Traversal: root -> search("zzz") > "hhh" -> rightChild(int2)
-	//   -> search("zzz") > "ppp" -> rightChild(leaf4)
-	//   -> leaf4 is not interior, loop exits
-	// But before that, check: childPgno == leaf4.pgno? search returns rightChild=leaf4.pgno.
-	// Actually, searchInterior returns the leftChild of the matching cell or rightChild.
-	// For "zzz" > "hhh", it returns rightChild=int2. childPgno=int2 != leaf4.pgno.
-	// Check rightChild: root.rightChild=int2 != leaf4.pgno. So path=[root.pgno].
-	// Then pg = getPage(int2). searchInterior("zzz") > "ppp" -> rightChild=leaf4.
-	// childPgno=leaf4=leaf4.pgno. Match! path=[root.pgno, int2.pgno], found parent.
-
-	// Actually this hits L1922-1927 (childPgno match). Let me construct a case
-	// that hits L1929 (rightChild match) instead.
-	// For rightChild match: leaf should be the rightChild of its parent.
-	// leaf4 is rightChild of int2, so with key="zzz":
-	// At int2: searchInterior("zzz") > "ppp" returns leaf4 as rightChild.
-	// But wait, searchInterior returns childPgno based on cell search. If key > all cells,
-	// it returns rightChild. So childPgno = leaf4.pgno. That matches at L1922.
-	// For L1929, we need childPgno != leftPg.pgno but rightChild == leftPg.pgno.
-	// This can happen if the key points to a different child but leftPg is actually rightChild.
-
-	// Let me use leaf2 (rightChild of int1) with key "ccc" (< "ddd"):
-	// At root: searchInterior("ccc") < "hhh" -> leftChild=int1. childPgno=int1 != leaf2.
-	// rightChild=int2 != leaf2. path=[root]. pg=getPage(int1).
-	// At int1: searchInterior("ccc") < "ddd" -> leftChild=leaf1. childPgno=leaf1 != leaf2.
-	// rightChild=leaf2 == leaf2. Match at L1929!
-
-	wpg, gerr := p.getWritablePage(leaf2.pgno)
-	require.NoError(t, gerr)
-
-	newRight, err := p.allocatePage()
-	require.NoError(t, err)
-	newRight.header.pageType = pageTypeLeafIdx
-	newRight.header.cellContentOff = uint16(p.usableSize())
-	newRight.header.serialize(newRight.data[:])
-	p.releasePage(newRight)
-
-	// Use key "ccc" which causes traversal to int1 where leaf2 is rightChild
-	err = bt.insertIntoParent(wpg, []byte("ccc"), newRight.pgno)
-	p.releasePage(wpg)
-	require.NoError(t, err)
-}

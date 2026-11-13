@@ -14,8 +14,9 @@ import (
 // nOld+1}, packs each output page as full as it will go (then backs off the
 // last one for balance), reassigns dividers into the parent, and frees/reuses
 // pages. This is what produces SQLite's high, even page fill. any-store's
-// previous splitter used a 2-way split (leafSplitPoint / interiorSplitPoint),
-// which never gathered siblings and left a low-fill tail.
+// previous splitter used a 2-way split, which never gathered siblings and left
+// a low-fill tail; interiorSplitPoint remains for an over-full root interior
+// page and the parent rewrite.
 //
 // The port mirrors SQLite section-for-section; every block cites the btree.c
 // line it is derived from. The ONLY deviations from btree.c are the documented
@@ -100,8 +101,9 @@ type cellArray struct {
 	//                  pointer (SQLite szCell[]); -1 means "not yet computed"
 	//                  (SQLite uses 0 as the sentinel — we use -1 because a
 	//                  legitimate cell can have a tiny but never-negative size).
-	leaf       bool // sibling pages are leaves (leafCorrection = 4 if true)
-	usableSize int  // pager usable page size (pageSize - reserved)
+	leaf       bool          // sibling pages are leaves (leafCorrection = 4 if true)
+	usableSize int           // pager usable page size (pageSize - reserved)
+	leafLim    payloadLimits // local-payload rule of the file's leaf cells
 }
 
 // cachedCellSize returns the in-page byte size of cells[n] (excluding the
@@ -120,7 +122,7 @@ func (b *cellArray) cachedCellSize(n int) int {
 		if c.rawCell != nil {
 			s = len(c.rawCell)
 		} else {
-			s = leafCellSizeWithOverflow(c.key, c.value, b.usableSize)
+			s = leafCellSizeWithOverflow(c.key, c.value, b.leafLim)
 		}
 	} else {
 		s = interiorCellSizeWithOverflow(c.key, b.usableSize)
@@ -311,7 +313,7 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 	// (rewriteParentAfterBalance → insertSepIntoAncestor → balanceNonroot on the
 	// parent) the nested call takes its own entries and the bounded pools fall
 	// back to make() when exhausted.
-	b := &cellArray{leaf: leaf, usableSize: usableSize}
+	b := &cellArray{leaf: leaf, usableSize: usableSize, leafLim: bt.leafLimits()}
 	b.cells = bt.pager.takeCellSlice(0)
 	b.sz = bt.pager.szScratch.take(0)
 	defer func() {
@@ -346,8 +348,10 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 		}
 	}
 
-	poolFail := func(upTo int) {
-		for j := 0; j <= upTo && j < nOld; j++ {
+	// poolFail releases every gathered sibling: all nOld were acquired before
+	// pooling began, whichever one failed (balance_cleanup, btree.c:9002-9010).
+	poolFail := func(int) {
+		for j := 0; j < nOld; j++ {
 			bt.pager.releasePage(apOld[j])
 		}
 		for _, bf := range cellBufs {
@@ -723,8 +727,11 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 	}
 
 	// ---- Step 12 (balance-shallower, btree.c:8942-8967) is NOT done in-line
-	// here. When dispatched from the INSERT path the pooled cell count only grows
-	// (nNew>=nOld), so the parent never empties and Step 12 cannot apply. When
+	// here. When dispatched from the INSERT path under a parent that has cells,
+	// the pooled cell count only grows (nNew>=nOld), so the parent never empties
+	// and Step 12 cannot apply. A root leaf is balanced under a zero-cell root
+	// (splitRootLeafAndInsert); when its child takes every cell that caller does
+	// the collapse after this function returns. When
 	// dispatched from the DELETE/merge path (deleteRebalanceLeaf /
 	// deleteRebalanceInterior, inject.active=false) the parent CAN empty or
 	// under-fill, but that completion is driven AFTER this function returns by
@@ -931,13 +938,17 @@ func (bt *btree) rewriteParentAfterBalance(
 		return bt.rebuildInteriorPage(parentPg, newCells, newRightChild)
 	}
 
-	// Over-full parent: split 2-way and cascade up (deviation 6). On the insert
-	// path nNew<=nOld+1 so the parent gained at most one net cell; a single
-	// 2-way split always suffices to relieve the overflow. The middle cell is
+	// Over-full parent: split 2-way and cascade up (deviation 6). The parent
+	// gained at most nNew-nOld cells, but the new dividers can be much longer
+	// than the ones they replace, so the split index is chosen for both halves
+	// to fit (interiorSplitPointFitting). SQLite inserts the dividers as overflow
+	// cells and balances the parent with balance_nonroot, which can spread it
+	// over more than two pages; a parent that needs three is not handled here
+	// and fails the rebuild below. The middle cell is
 	// promoted; its leftChild becomes the left page's rightChild; the right
 	// page keeps newRightChild. This is the same shape as insertSepIntoInterior's
 	// slow path (btree.go:2039-2075).
-	mid := interiorSplitPoint(newCells, usableSize)
+	mid := interiorSplitPointFitting(newCells, usableSize, hdrOff)
 	leftCells := newCells[:mid]
 	sepKey := bytes.Clone(newCells[mid].key)
 	rightCells := newCells[mid+1:]

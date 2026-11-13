@@ -59,7 +59,7 @@ func TestOldPath_InsertIntoLeaf_HappyPath(t *testing.T) {
 		v := fmt.Appendf(nil, "val-%04d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -77,7 +77,7 @@ func TestOldPath_InsertIntoLeaf_HappyPath(t *testing.T) {
 		v := fmt.Appendf(nil, "upd-%04d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -113,7 +113,7 @@ func TestOldPath_InsertIntoLeaf_DefragPath(t *testing.T) {
 		v := fmt.Appendf(nil, "v%03d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
+		err = bt.Put(k, v)
 		p.releasePage(pg)
 		if err != nil {
 			break // page split occurred, stop filling
@@ -129,7 +129,7 @@ func TestOldPath_InsertIntoLeaf_DefragPath(t *testing.T) {
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
 		// Update with a much shorter value to leave fragments
-		err = bt.insertIntoLeaf(pg, k, []byte("x"))
+		err = bt.Put(k, []byte("x"))
 		p.releasePage(pg)
 		require.NoError(t, err)
 	}
@@ -146,7 +146,7 @@ func TestOldPath_InsertIntoLeaf_DefragPath(t *testing.T) {
 		// Great, we have natural fragmentation. Insert via old path.
 		k := []byte("newkey")
 		v := []byte("newval")
-		err = bt.insertIntoLeaf(pg, k, v)
+		err = bt.Put(k, v)
 		p.releasePage(pg)
 		if err == nil {
 			// Verify the key was inserted
@@ -196,7 +196,7 @@ func TestOldPath_InsertIntoLeaf_DefragManual(t *testing.T) {
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
 
-		cellSize := leafCellSizeWithOverflow(k, v, pageUsable)
+		cellSize := leafCellSizeWithOverflow(k, v, indexLimits(pageUsable))
 		contentStart, cerr := pg.contentAreaOffset(pageUsable)
 		require.NoError(t, cerr)
 		hdrSize := pg.cellPointerOffset() + int(pg.header.cellCount+1)*2
@@ -223,7 +223,7 @@ func TestOldPath_InsertIntoLeaf_DefragManual(t *testing.T) {
 		k := fmt.Appendf(nil, "k%04d", i*10) // update entries at 0, 10, 20
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoLeaf(pg, k, []byte("x"))
+		err = bt.Put(k, []byte("x"))
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -254,7 +254,7 @@ func TestOldPath_InsertIntoLeaf_DefragManual(t *testing.T) {
 	key := []byte("znew")
 	var valSize int
 	for vs := 1; vs < totalFree; vs++ {
-		cs := leafCellSizeWithOverflow(key, make([]byte, vs), pageUsable)
+		cs := leafCellSizeWithOverflow(key, make([]byte, vs), indexLimits(pageUsable))
 		if cs+2 > gapSpace && cs+2 <= totalFree {
 			valSize = vs
 			break
@@ -265,7 +265,7 @@ func TestOldPath_InsertIntoLeaf_DefragManual(t *testing.T) {
 		return
 	}
 
-	newCellSize := leafCellSizeWithOverflow(key, make([]byte, valSize), pageUsable)
+	newCellSize := leafCellSizeWithOverflow(key, make([]byte, valSize), indexLimits(pageUsable))
 	t.Logf("Inserting key with valSize=%d, cellSize=%d (gap=%d, total=%d)", valSize, newCellSize, gapSpace, totalFree)
 
 	newVal := make([]byte, valSize)
@@ -274,7 +274,7 @@ func TestOldPath_InsertIntoLeaf_DefragManual(t *testing.T) {
 	}
 	pg, err = p.getWritablePage(bt.rootPage)
 	require.NoError(t, err)
-	err = bt.insertIntoLeaf(pg, key, newVal)
+	err = bt.Put(key, newVal)
 	p.releasePage(pg)
 	require.NoError(t, err, "defrag insert should succeed")
 
@@ -301,7 +301,7 @@ func TestOldPath_SplitLeafAndInsert(t *testing.T) {
 		v := fmt.Appendf(nil, "val-%06d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 
@@ -354,7 +354,7 @@ func TestOldPath_InsertIntoParent_RightChildMatch(t *testing.T) {
 		v := fmt.Appendf(nil, "v%04d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -384,7 +384,7 @@ func TestOldPath_InsertIntoParent_ReverseOrder(t *testing.T) {
 		v := fmt.Appendf(nil, "v%04d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -424,7 +424,7 @@ func TestOldPath_InsertIntoParent_MixedOrder(t *testing.T) {
 		v = fmt.Appendf(nil, "v%06d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -452,7 +452,7 @@ func TestOldPath_InsertIntoInterior_ViaDeepTree(t *testing.T) {
 		v := fmt.Appendf(nil, "val-%06d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -471,7 +471,7 @@ func TestOldPath_InsertIntoInterior_ViaDeepTree(t *testing.T) {
 		v := fmt.Appendf(nil, "val-%06d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -491,73 +491,6 @@ func TestOldPath_InsertIntoInterior_ViaDeepTree(t *testing.T) {
 // splitLeafAndInsert on a full leaf page.
 // =============================================================================
 
-func TestOldPath_InsertIntoLeaf_SplitLeafAndInsert_Direct(t *testing.T) {
-	// Use a small page size so the leaf fills up quickly
-	p := tempPagerWithPageSize(t, 512)
-	bt := initLeafBtree(t, p)
-
-	// Fill the leaf page until it's full, then call splitLeafAndInsert directly
-	splitDone := false
-	var count int
-	for i := 0; i < 200; i++ {
-		k := fmt.Appendf(nil, "key-%04d", i)
-		v := fmt.Appendf(nil, "val-%04d", i)
-		pg, err := p.getWritablePage(bt.rootPage)
-		require.NoError(t, err)
-
-		idx, found, serr := bt.searchLeaf(pg, k)
-		require.NoError(t, serr)
-		require.False(t, found)
-
-		pageUsable := bt.usablePageSize()
-		cellSize := leafCellSizeWithOverflow(k, v, pageUsable)
-		contentStart, cerr := pg.contentAreaOffset(pageUsable)
-		require.NoError(t, cerr)
-		hdrSize := pg.cellPointerOffset() + int(pg.header.cellCount+1)*2
-		gapSpace := contentStart - hdrSize
-		totalFree := gapSpace + int(pg.header.fragBytes)
-
-		if cellSize+2 > totalFree {
-			// Page is truly full, call splitLeafAndInsert directly
-			err = bt.splitLeafAndInsert(pg, idx, k, v)
-			require.NoError(t, err)
-			p.releasePage(pg)
-			count = i + 1
-			splitDone = true
-			break
-		}
-
-		// Space available, insert normally
-		err = bt.insertLeafCellAt(pg, idx, k, v)
-		require.NoError(t, err)
-		p.releasePage(pg)
-		count = i + 1
-	}
-
-	require.True(t, splitDone, "expected to trigger splitLeafAndInsert")
-
-	// After split, root should be interior (splitRoot modifies root in-place)
-	rpg, err := p.getWritablePage(bt.rootPage)
-	require.NoError(t, err)
-	assert.True(t, rpg.header.isInterior(), "root should be interior after split")
-	p.releasePage(rpg)
-
-	// Verify all inserted keys
-	for i := 0; i < count; i++ {
-		k := fmt.Appendf(nil, "key-%04d", i)
-		v, err := bt.Get(k)
-		require.NoError(t, err, "key %s not found", k)
-		expected := fmt.Appendf(nil, "val-%04d", i)
-		assert.Equal(t, expected, v)
-	}
-}
-
-// =============================================================================
-// TestOldPath_InsertIntoParent_TriggeredByLeafSplit exercises insertIntoParent
-// (L1905-1945) through the full chain: insertIntoPage -> insertIntoLeaf ->
-// splitLeafAndInsert -> insertIntoParent. Uses small pages for frequent splits.
-// =============================================================================
-
 func TestOldPath_InsertIntoParent_TriggeredByLeafSplit(t *testing.T) {
 	p := tempPagerWithPageSize(t, 512)
 	bt := initLeafBtree(t, p)
@@ -571,7 +504,7 @@ func TestOldPath_InsertIntoParent_TriggeredByLeafSplit(t *testing.T) {
 		v := fmt.Appendf(nil, "v%06d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -589,64 +522,6 @@ func TestOldPath_InsertIntoParent_TriggeredByLeafSplit(t *testing.T) {
 // on an interior page after building a multi-level tree.
 // =============================================================================
 
-func TestOldPath_InsertIntoInterior_Direct(t *testing.T) {
-	p := tempPager(t)
-	bt := initLeafBtree(t, p)
-
-	// Build tree with enough entries to get interior root
-	for i := 0; i < 200; i++ {
-		k := fmt.Appendf(nil, "key-%06d", i)
-		v := fmt.Appendf(nil, "val-%06d", i)
-		pg, err := p.getWritablePage(bt.rootPage)
-		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
-		require.NoError(t, err)
-		p.releasePage(pg)
-	}
-
-	// Verify root is interior
-	rpg, err := p.getPage(bt.rootPage)
-	require.NoError(t, err)
-	require.True(t, rpg.header.isInterior())
-	p.releasePage(rpg)
-
-	// Now call insertIntoInterior directly on the root
-	pg, err := p.getWritablePage(bt.rootPage)
-	require.NoError(t, err)
-	err = bt.insertIntoInterior(pg, []byte("key-000050"), []byte("new-value"))
-	require.NoError(t, err)
-	p.releasePage(pg)
-
-	// Verify the update
-	v, err := bt.Get([]byte("key-000050"))
-	require.NoError(t, err)
-	assert.Equal(t, []byte("new-value"), v)
-
-	// Insert a brand new key via insertIntoInterior
-	pg, err = p.getWritablePage(bt.rootPage)
-	require.NoError(t, err)
-	err = bt.insertIntoInterior(pg, []byte("key-999999"), []byte("brand-new"))
-	require.NoError(t, err)
-	p.releasePage(pg)
-
-	v, err = bt.Get([]byte("key-999999"))
-	require.NoError(t, err)
-	assert.Equal(t, []byte("brand-new"), v)
-}
-
-// =============================================================================
-// TestOldPath_InsertIntoParent_RightChildViaAppend inserts keys in strictly
-// ascending order with small pages. Each new key goes to the rightmost leaf,
-// causing it to fill and split. Since the separator key from the split is
-// always greater than existing separators (ascending order), the searchInterior
-// returns rightChild, and childPgno == leftPg.pgno should match at L1922.
-//
-// To trigger the rightChild check at L1929, we need a split where the new
-// separator goes through a non-rightChild path. We can achieve this by first
-// building the tree with ascending keys, then inserting keys that go into the
-// rightmost leaf but with a separator that's less than the parent's last key.
-// =============================================================================
-
 func TestOldPath_InsertIntoParent_RightChildViaAppend(t *testing.T) {
 	p := tempPagerWithPageSize(t, 512)
 	bt := initLeafBtree(t, p)
@@ -659,7 +534,7 @@ func TestOldPath_InsertIntoParent_RightChildViaAppend(t *testing.T) {
 		v := fmt.Appendf(nil, "v%04d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -671,7 +546,7 @@ func TestOldPath_InsertIntoParent_RightChildViaAppend(t *testing.T) {
 		v := fmt.Appendf(nil, "v%04d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -680,7 +555,7 @@ func TestOldPath_InsertIntoParent_RightChildViaAppend(t *testing.T) {
 		v := fmt.Appendf(nil, "v%04d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -751,7 +626,7 @@ func TestOldPath_InsertIntoParent_RightChildBranch(t *testing.T) {
 		binary.BigEndian.PutUint32(v, uint32(idx))
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -780,7 +655,7 @@ func TestOldPath_InsertIntoLeaf_ContentAreaOffsetError(t *testing.T) {
 		v := fmt.Appendf(nil, "val-%04d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoLeaf(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -798,7 +673,7 @@ func TestOldPath_InsertIntoLeaf_ContentAreaOffsetError(t *testing.T) {
 	pg.header.serialize(pg.data[hdrOff:])
 
 	// Now try to insert a new (non-existing) key - should hit contentAreaOffset error
-	err = bt.insertIntoLeaf(pg, []byte("zzz-new"), []byte("val"))
+	err = bt.Put([]byte("zzz-new"), []byte("val"))
 	p.releasePage(pg)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
@@ -818,7 +693,7 @@ func TestOldPath_InsertIntoLeaf_SearchLeafError(t *testing.T) {
 		v := fmt.Appendf(nil, "val-%04d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoLeaf(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -836,7 +711,7 @@ func TestOldPath_InsertIntoLeaf_SearchLeafError(t *testing.T) {
 	}
 
 	// Now searchLeaf should fail because every cell pointer is invalid
-	err = bt.insertIntoLeaf(pg, []byte("key-0002"), []byte("val"))
+	err = bt.Put([]byte("key-0002"), []byte("val"))
 	p.releasePage(pg)
 	assert.Error(t, err)
 }
@@ -845,88 +720,6 @@ func TestOldPath_InsertIntoLeaf_SearchLeafError(t *testing.T) {
 // TestOldPath_InsertIntoInterior_SearchInteriorError exercises the
 // searchInterior error path in insertIntoInterior (L1991-1993) by corrupting
 // an interior page's cell pointer.
-// =============================================================================
-
-func TestOldPath_InsertIntoInterior_SearchInteriorError(t *testing.T) {
-	p := tempPager(t)
-	bt := initLeafBtree(t, p)
-
-	// Build a multi-level tree
-	for i := 0; i < 200; i++ {
-		k := fmt.Appendf(nil, "key-%06d", i)
-		v := fmt.Appendf(nil, "val-%06d", i)
-		pg, err := p.getWritablePage(bt.rootPage)
-		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
-		require.NoError(t, err)
-		p.releasePage(pg)
-	}
-
-	// Verify root is interior
-	rpg, err := p.getPage(bt.rootPage)
-	require.NoError(t, err)
-	require.True(t, rpg.header.isInterior())
-	p.releasePage(rpg)
-
-	// Corrupt a cell pointer in the interior root
-	pg, err := p.getWritablePage(bt.rootPage)
-	require.NoError(t, err)
-	cpOff := pg.cellPointerOffset()
-	// Set first cell pointer to invalid offset
-	binary.BigEndian.PutUint16(pg.data[cpOff:], uint16(len(pg.data)+100))
-
-	// insertIntoInterior should fail at searchInterior
-	err = bt.insertIntoInterior(pg, []byte("key-000050"), []byte("val"))
-	p.releasePage(pg)
-	assert.Error(t, err)
-}
-
-// =============================================================================
-// TestOldPath_InsertIntoInterior_GetWritablePageError exercises the
-// getWritablePage error path in insertIntoInterior (L1996-1998).
-// We trigger this by corrupting the child page number in an interior cell
-// to point to page 0 (which is always invalid).
-// =============================================================================
-
-func TestOldPath_InsertIntoInterior_GetWritablePageError(t *testing.T) {
-	p := tempPager(t)
-	bt := initLeafBtree(t, p)
-
-	// Build a multi-level tree
-	for i := 0; i < 200; i++ {
-		k := fmt.Appendf(nil, "key-%06d", i)
-		v := fmt.Appendf(nil, "val-%06d", i)
-		pg, err := p.getWritablePage(bt.rootPage)
-		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
-		require.NoError(t, err)
-		p.releasePage(pg)
-	}
-
-	// Get the interior root and find the child that would be navigated to
-	pg, err := p.getWritablePage(bt.rootPage)
-	require.NoError(t, err)
-	require.True(t, pg.header.isInterior())
-
-	// Parse the first cell to find its leftChild offset, then corrupt it
-	cpOff := pg.cellPointerOffset()
-	cellOff := int(binary.BigEndian.Uint16(pg.data[cpOff:]))
-
-	// Interior cell format: [4-byte leftChild] [varint keyLen] [key...]
-	// Set leftChild to 0 (invalid page number)
-	binary.BigEndian.PutUint32(pg.data[cellOff:], 0)
-
-	// Insert a key that would navigate to the corrupted child
-	// A key before the first separator would go to leftChild of first cell
-	err = bt.insertIntoInterior(pg, []byte("aaa"), []byte("val"))
-	p.releasePage(pg)
-	assert.Error(t, err, "expected error from getWritablePage with page 0")
-}
-
-// =============================================================================
-// TestOldPath_SplitLeafAndInsert_AllPaths uses many keys with small pages
-// to exhaustively trigger splitLeafAndInsert and its downstream effects
-// (insertIntoParent, splitRoot, etc.) via the old insertIntoPage path.
 // =============================================================================
 
 func TestOldPath_SplitLeafAndInsert_AllPaths(t *testing.T) {
@@ -943,7 +736,7 @@ func TestOldPath_SplitLeafAndInsert_AllPaths(t *testing.T) {
 		v := fmt.Appendf(nil, "v%06d", i)
 		pg, err := p.getWritablePage(bt.rootPage)
 		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
+		err = bt.Put(k, v)
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
@@ -964,110 +757,6 @@ func TestOldPath_SplitLeafAndInsert_AllPaths(t *testing.T) {
 // We trigger this by corrupting the child page's data after navigating to it.
 // =============================================================================
 
-func TestOldPath_InsertIntoInterior_InsertIntoPageError(t *testing.T) {
-	p := tempPager(t)
-	bt := initLeafBtree(t, p)
-
-	// Build a multi-level tree
-	for i := 0; i < 200; i++ {
-		k := fmt.Appendf(nil, "key-%06d", i)
-		v := fmt.Appendf(nil, "val-%06d", i)
-		pg, err := p.getWritablePage(bt.rootPage)
-		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
-		require.NoError(t, err)
-		p.releasePage(pg)
-	}
-
-	// Find the child page that a specific key would navigate to
-	rpg, err := p.getPage(bt.rootPage)
-	require.NoError(t, err)
-	require.True(t, rpg.header.isInterior())
-	childPgno, _, serr := bt.searchInterior(rpg, []byte("key-000050"))
-	require.NoError(t, serr)
-	p.releasePage(rpg)
-
-	// Corrupt ALL cell pointers on the child page
-	cpg, err := p.getWritablePage(childPgno)
-	require.NoError(t, err)
-	cpOff := cpg.cellPointerOffset()
-	badOff := uint16(len(cpg.data) + 100)
-	for i := 0; i < int(cpg.header.cellCount); i++ {
-		binary.BigEndian.PutUint16(cpg.data[cpOff+i*2:], badOff)
-	}
-	p.releasePage(cpg)
-
-	// Now call insertIntoInterior on the root - it should navigate to the
-	// corrupted child and fail at insertIntoPage -> searchLeaf/searchInterior
-	pg, err := p.getWritablePage(bt.rootPage)
-	require.NoError(t, err)
-	err = bt.insertIntoInterior(pg, []byte("key-000050"), []byte("new"))
-	p.releasePage(pg)
-	assert.Error(t, err, "expected error from insertIntoPage on corrupted child")
-}
-
-// =============================================================================
-// TestOldPath_InsertIntoParent_GetPageError exercises the getPage error path
-// in insertIntoParent (L1916-1918) by corrupting the root page number.
-//
-// Strategy: Build a tree, then change bt.rootPage to an invalid page number
-// before calling splitLeafAndInsert (which calls insertIntoParent).
-// =============================================================================
-
-func TestOldPath_InsertIntoParent_GetPageError(t *testing.T) {
-	p := tempPager(t)
-	bt := initLeafBtree(t, p)
-
-	// Build a multi-level tree
-	for i := 0; i < 200; i++ {
-		k := fmt.Appendf(nil, "key-%06d", i)
-		v := fmt.Appendf(nil, "val-%06d", i)
-		pg, err := p.getWritablePage(bt.rootPage)
-		require.NoError(t, err)
-		err = bt.insertIntoPage(pg, k, v)
-		require.NoError(t, err)
-		p.releasePage(pg)
-	}
-
-	// Verify root is interior (so insertIntoParent won't take splitRoot shortcut)
-	rpg, err := p.getPage(bt.rootPage)
-	require.NoError(t, err)
-	require.True(t, rpg.header.isInterior())
-	p.releasePage(rpg)
-
-	// Find a leaf page to split
-	rpg, err = p.getPage(bt.rootPage)
-	require.NoError(t, err)
-	childPgno, _, _ := bt.searchInterior(rpg, []byte("key-000100"))
-	p.releasePage(rpg)
-
-	// Get the child (which should be a leaf) and fill it to cause a split
-	cpg, err := p.getWritablePage(childPgno)
-	require.NoError(t, err)
-
-	// Save the real root page and set root to an invalid page
-	realRoot := bt.rootPage
-	bt.rootPage = 999999 // invalid page
-
-	// Try inserting a key that would require split -> insertIntoParent
-	// The child is not the root, so insertIntoParent tries to getPage(bt.rootPage=999999) and fails
-	if cpg.header.isLeaf() {
-		err = bt.insertIntoLeaf(cpg, []byte("key-forced-split-AAAAAAAAAAAA"), []byte("big-value-to-force-split-BBBBBBBBBBB"))
-		p.releasePage(cpg)
-		// If the leaf was full enough to split, we should get an error from insertIntoParent
-		// If it wasn't full, it may succeed (insertLeafCellAt) without reaching insertIntoParent
-		if err != nil {
-			// Expected: either corrupt or some error from getPage
-			t.Logf("Got expected error: %v", err)
-		}
-	} else {
-		p.releasePage(cpg)
-	}
-
-	// Restore root for cleanup
-	bt.rootPage = realRoot
-}
-
 // TestDelCurCov_DeleteCellPastUsableSize exercises the reserved-region bounds
 // guard in Delete that mirrors SQLite's dropCell (btree.c:7291-7294):
 //
@@ -1083,9 +772,9 @@ func TestDelCurCov_DeleteCellPastUsableSize(t *testing.T) {
 	key := binary.BigEndian.AppendUint32(nil, 1)
 	pg, err := p.getWritablePage(bt.rootPage)
 	require.NoError(t, err)
-	require.NoError(t, bt.insertIntoPage(pg, key, make([]byte, 40)))
+	require.NoError(t, bt.Put(key, make([]byte, 40)))
 	cellOff := int(pg.getCellOffset(0))
-	_, cellSize, perr := parseLeafCellWithSize(pg.data, cellOff, p.usableSize())
+	_, cellSize, perr := parseLeafCellWithSize(pg.data, cellOff, p.leafLimits())
 	require.NoError(t, perr)
 	p.releasePage(pg)
 

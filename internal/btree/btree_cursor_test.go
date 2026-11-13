@@ -994,7 +994,7 @@ func TestDelCurCov_ValueOverflowReadChainError(t *testing.T) {
 					totalPayload := int(kl) + int(vl)
 					maxLocal := maxLocalPayload(pageSize)
 					if totalPayload > maxLocal {
-						nLocal := localPayloadSize(totalPayload, pageSize)
+						nLocal := localPayloadSize(totalPayload, indexLimits(pageSize))
 						overflowPtrOff := cellOff + kn + vn + nLocal
 						if overflowPtrOff+4 <= len(data) {
 							// Set overflow pointer to 0 (invalid)
@@ -1692,7 +1692,7 @@ func TestDelCurCov_DirectDeleteOverflowFastPath(t *testing.T) {
 	require.NoError(t, serr)
 	require.True(t, found)
 	cellOff := int(pg.getCellOffset(idx))
-	cell, _, cerr := parseLeafCellWithSize(pg.data, cellOff, usable)
+	cell, _, cerr := parseLeafCellWithSize(pg.data, cellOff, indexLimits(usable))
 	require.NoError(t, cerr)
 	require.NotZero(t, cell.overflowPg, "expected overflow cell")
 	bt.pager.releasePage(pg)
@@ -1728,7 +1728,7 @@ func TestDelCurCov_DirectCursorValueOverflowKeyLenCorrupt(t *testing.T) {
 	usableSize := bt.usablePageSize()
 	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
 	require.NoError(t, oerr)
-	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), usableSize)
+	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), indexLimits(usableSize))
 	require.NoError(t, cerr)
 	if cell.overflowPg == 0 {
 		t.Skip("cell doesn't have overflow on this page size")
@@ -1764,7 +1764,7 @@ func TestDelCurCov_DirectCursorValueOverflowValLenCorrupt(t *testing.T) {
 	usableSize := bt.usablePageSize()
 	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
 	require.NoError(t, oerr)
-	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), usableSize)
+	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), indexLimits(usableSize))
 	require.NoError(t, cerr)
 	if cell.overflowPg == 0 {
 		t.Skip("cell doesn't have overflow")
@@ -1801,7 +1801,7 @@ func TestDelCurCov_DirectCursorValueOverflowReadChainError(t *testing.T) {
 	usableSize := bt.usablePageSize()
 	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
 	require.NoError(t, oerr)
-	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), usableSize)
+	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), indexLimits(usableSize))
 	require.NoError(t, cerr)
 	if cell.overflowPg == 0 {
 		t.Skip("cell doesn't have overflow")
@@ -1812,7 +1812,7 @@ func TestDelCurCov_DirectCursorValueOverflowReadChainError(t *testing.T) {
 	kl, kn := getVarint(frame.pg.data[cellOff:])
 	vl, vn := getVarint(frame.pg.data[cellOff+kn:])
 	totalPayload := int(kl) + int(vl)
-	nLocal := localPayloadSize(totalPayload, usableSize)
+	nLocal := localPayloadSize(totalPayload, indexLimits(usableSize))
 	overflowPtrOff := cellOff + kn + vn + nLocal
 	// Set overflow pointer to 0 (invalid page)
 	binary.BigEndian.PutUint32(frame.pg.data[overflowPtrOff:], 0)

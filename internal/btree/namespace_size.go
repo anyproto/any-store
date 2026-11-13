@@ -59,7 +59,7 @@ func (bt *btree) walkSize(pgno uint32, depth int, res *NamespaceSize) error {
 				bt.pager.releasePage(pg)
 				return oErr
 			}
-			c, _, pErr := parseLeafCellWithSize(pg.data, int(off), usable)
+			c, _, pErr := parseLeafCellWithSize(pg.data, int(off), bt.leafLimits())
 			if pErr != nil {
 				bt.pager.releasePage(pg)
 				return pErr

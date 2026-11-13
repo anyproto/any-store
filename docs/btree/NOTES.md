@@ -1700,8 +1700,9 @@ inserts funnel an over-full leaf through it (`splitLeafAndInsertWithPath` → `b
 btree.go:2055), and deletes funnel an under-full (>2/3 free) leaf through the same balancer
 with `inject.active=false` (`deleteRebalanceLeaf` → `balanceNonroot`, btree.go:2799;
 `completeMergeUpward` cascades parent under-fullness, gating single-child collapse on root per
-btree.c:8960). The former 2-way `leafSplitPoint` split survives only as the root-leaf fallback
-(`splitRootLeafAndInsert`); `balance_quick` is retained as the rightmost-append fast path
+btree.c:8960). A root leaf goes through `balance_deeper` and then the same balancer
+(`splitRootLeafAndInsert`), and so does an update that grows a cell past its page
+(`updateLeafCell`); no 2-way leaf split remains. `balance_quick` is retained as the rightmost-append fast path
 (below). See `balance.go`'s header for the enumerated index-btree deviations, and
 `any-store-tests:docs/any-store/btree/plans/2026-05-23-balance-nonroot-3sibling.md` /
 `2026-05-23-delete-time-rebalancing.md`. Deferred (optional): first-key divider advance on
@@ -2377,7 +2378,7 @@ risking that the second cursor is left referencing a now-stale/repurposed root p
 
 <a id="drift-35-legacy-superseded-insert-path-functions-undocumented"></a>
 ### Drift: Legacy Superseded Insert Path Functions Undocumented
-- **Category:** changed-logic  -  **Severity:** low
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-10: the cluster (`insertIntoPage`, `insertIntoLeaf`, `insertIntoInterior`, `splitLeafAndInsert`, the non-path `insertIntoParent`) and `leafSplitPoint` are removed; their tests drive `Put`.
 - **Affected functions:** `btree.go:*btree.splitLeafAndInsert` (`btree.go:2362`).
 
 The live insert path is `Put` (`btree.go:1196`) -> `path := pathBuf[:0]` (`btree.go:1216`)
@@ -3549,7 +3550,7 @@ On the non-root general-balance path, Go's `balanceNonroot` gathers the `nOld` c
 
 <a id="drift-2026-06-25-05-updateleafcell-grow-and-overflow-uses-an-inline-2-way-leafsplitpoint-s"></a>
 ### Drift: updateLeafCell Grow-And-Overflow Uses An Inline 2-Way leafSplitPoint Split Not The Faithful balanceNonroot The Insert Path Uses
-- **Category:** changed-logic  -  **Severity:** low
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-10: when the replacement cell does not fit, `updateLeafCell` rebuilds the page without the old cell (`dropCell`, `btree.c:9632`) and hands the new cell to `splitLeafAndInsertWithPath`, the dispatch an insert uses (`balance_quick`, `balanceNonroot`, or `balance_deeper` for a root leaf). A root leaf follows `balance()` too (`btree.c:9134-9151`): `balanceDeeper` moves its cells to a new child and `balanceNonroot` balances that child under the zero-cell root, so the cells are spread over as many pages as they need, and balance-shallower copies the child back when it took them all. Regression tests: `split_release_test.go` (`TestUpdateLeafCell_ReleasesPagesOnRebuildError`, `TestSplitRootLeafAndInsert_ReleasesPagesOnRebuildError`).
 - **Affected functions:** `btree.go:*btree.updateLeafCell` (`internal/btree/btree.go:1432`), `btree.go:leafSplitPoint` (`internal/btree/btree.go:312`), `balance.go:*btree.balanceNonroot` (`internal/btree/balance.go:194`).
 
 When an in-place update grows a value so the replacement cell no longer fits, Go's `updateLeafCell` does not route through the sibling-gathering balancer the insert path uses. After collecting the leaf's cells and confirming they overflow one page (`internal/btree/btree.go:1536`), it performs an inline 2-way median split: `leafSplitPoint(cells, pageUsable)` (`internal/btree/btree.go:1542`) picks a single split index targeting ~2/3 left-fill (`internal/btree/btree.go:312-345`), the page is rebuilt into the original plus one freshly allocated `rightPg`, and the separator is pushed up via `insertIntoParentWithPath` / `insertIntoParent` (`internal/btree/btree.go:1566-1568`). This always manufactures a new page even when an immediate sibling has free room. SQLite's `sqlite3BtreeInsert` treats the grow-an-existing-entry case identically to any other overflow: it `dropCell`s the old cell (`btree.c:9632`), re-inserts the new one, and when the page overflows calls `balance(pCur)` (`btree.c:9665`), whose `balance_nonroot` redistributes cells across up to three siblings (the path any-store itself reproduces in `balanceNonroot`, `internal/btree/balance.go:194`) and only adds a page when the gathered siblings genuinely cannot absorb the cells. The consequence is that value-growing updates produce a different, less-balanced tree shape than both SQLite and any-store's own insert path -- they unconditionally allocate a new page, raising page count and lowering fill factor -- a correctness-preserving but structural/performance divergence.
@@ -3762,3 +3763,17 @@ SQLite never changes its magic. A file from a later release is told apart by the
 Two things differ from SQLite. First, the bounds cannot protect a file from the releases that never checked them, so schema formats 6 and later are written under a second magic, `"any-store v2 fmt"`. It fills all 16 bytes, and those releases compare the whole field, so they refuse the file at the header (as `ErrHeaderCorrupt`) before reading a page of it. The magic changes this once: later formats raise the schema format only. The magic and the schema format must agree (the second magic with a format below 6 is `ErrHeaderCorrupt`), `serialize` writes back the magic the header was read with, so no commit moves a file between the two families, and the copy of page 1 that `pager.open` reads from the WAL must name the same family as the file. Second, a write version above the maximum refuses the open instead of opening read-only: the btree has no read-only open.
 
 The checks live in `dbHeader.deserialize`, whose first caller on the open path is `readInitialHeader`, before the file is locked or its WAL and wal-index are touched; a refused open leaves all three files as they were. A newer format found only in the WAL's copy of page 1 is refused after WAL recovery has run, which may have rewritten the wal-index. Regression tests: `internal/btree/format_gate_test.go` (`TestCheckHeaderFormat`, `TestOpen_RefusedFormatLeavesFilesUntouched`, `TestHeaderSerialize_KeepsMagicFamily`, `TestOpen_FirstMagicStillOpensAndIsRewritten`), `corrupt_open_test.go:TestOpen_NewerFormat`.
+
+<a id="drift-2026-11-10-2-leaf-insert-fit-check-counts-the-cell-pointer-twice"></a>
+### Drift: The Leaf Insert Fit Check Counts The New Cell's Pointer Twice
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.insertIntoLeafWithPath`, `btree.go:*btree.splitRootLeafAndInsert`.
+
+SQLite's `insertCellFast` sends a cell to `balance()` when `sz+2 > pPage->nFree` (`btree.c:7433`): the cell and its two-byte pointer must fit the free space. `insertIntoLeafWithPath` computes the gap as the content start minus the header and the pointer array *including the new cell's slot*, then asks for `cellSize+2` of it, so the pointer is counted twice and a cell that fits with less than two bytes to spare is treated as over-full. On a non-root leaf this only means a balance that redistributes cells that would have fit. On a root leaf the cell arrives at `splitRootLeafAndInsert`, where the child made by `balanceDeeper` then holds every cell on one page; balance-shallower (`btree.c:8942-8967`) copies it back into the root, as SQLite does for a root left with no cells, and the tree keeps its depth. Fixing the check would change which inserts split and is left for a change of its own. Regression tests: `root_leaf_balance_test.go` (`TestRootLeaf_ExactFitCollapsesBack`, `TestRootLeaf_Page1ExactFitCollapsesBack`, `TestRootLeaf_Page1ChildDoesNotFitBack`).
+
+<a id="drift-2026-11-10-3-leaf-payload-limits-come-from-the-pager-not-the-page"></a>
+### Drift: A Leaf Cell's Local-Payload Limits Come From The Pager, Not From The Page
+- **Category:** changed-logic  -  **Severity:** none
+- **Affected functions:** `page.go:payloadLimits`, `page.go:indexLimits`, `page.go:localPayloadSize`, `pager.go:*pager.leafLimits`, `pager.go:*pager.leafLimitsFor`, every leaf-cell parser and writer in `btree.go`.
+
+SQLite's `decodeFlags` copies `maxLocal`/`minLocal` into each `MemPage` from `BtShared`, choosing the index pair or the table-leaf pair by the page's flag byte (`btree.c:2043-2086`), and `btreePayloadToLocal` reads them from the page (`btree.c:1213-1226`). any-store has one leaf page type, so the pair is not chosen per page: leaf code takes a `payloadLimits` from `pager.leafLimits`, and interior code uses `indexLimits`. Both currently return the index pair. `TestLeafCodeTakesLimitsFromPager` fails when production code outside the interior-cell functions calls `maxLocalPayload`, `minLocalPayload` or `indexLimits` directly.

@@ -2926,7 +2926,7 @@ func TestFreeTreePages_CorruptOverflowChain(t *testing.T) {
 	if pg != nil && pg.header.isLeaf() && pg.header.cellCount > 0 {
 		usableSize := db.pager.usableSize()
 		off := pg.getCellOffset(0)
-		cell, cellSize, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+		cell, cellSize, cerr := parseLeafCellWithSize(pg.data, int(off), indexLimits(usableSize))
 		if cerr == nil && cell.overflowPg != 0 {
 			// The overflow pointer is the last 4 bytes of the cell
 			ovfOff := int(off) + cellSize - 4
@@ -2955,7 +2955,7 @@ func TestFreeTreePages_CorruptOverflowChain(t *testing.T) {
 		// Find the first cell with an overflow page and corrupt it
 		for ci := 0; ci < int(pg.header.cellCount); ci++ {
 			off := pg.getCellOffset(ci)
-			cell, cellSize, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, cellSize, cerr := parseLeafCellWithSize(pg.data, int(off), indexLimits(usableSize))
 			if cerr == nil && cell.overflowPg != 0 {
 				ovfOff := int(off) + cellSize - 4
 				if ovfOff+4 <= len(pg.data) {
@@ -2981,7 +2981,7 @@ func TestFreeTreePages_CorruptOverflowChain(t *testing.T) {
 			usableSize := db.pager.usableSize()
 			for ci := 0; ci < int(pg.header.cellCount); ci++ {
 				off := pg.getCellOffset(ci)
-				cell, cellSize, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+				cell, cellSize, cerr := parseLeafCellWithSize(pg.data, int(off), indexLimits(usableSize))
 				if cerr == nil && cell.overflowPg != 0 {
 					ovfOff := int(off) + cellSize - 4
 					if ovfOff+4 <= len(pg.data) {

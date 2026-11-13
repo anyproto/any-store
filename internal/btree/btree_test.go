@@ -1888,7 +1888,7 @@ func TestSearchLeafOverflow_PrefixShortcutInvariant(t *testing.T) {
 	// code does, so test cases target the prefix vs overflow regions precisely.
 	totalPayload := keyLen + len(value)
 	require.Greater(t, totalPayload, maxLocal, "stored key must overflow")
-	nLocal := localPayloadSize(totalPayload, usableSize)
+	nLocal := localPayloadSize(totalPayload, indexLimits(usableSize))
 	localKeyBytes := min(nLocal, keyLen)
 	require.Less(t, localKeyBytes, keyLen,
 		"test requires the key itself to overflow (localKeyBytes < keyLen)")
@@ -1903,7 +1903,7 @@ func TestSearchLeafOverflow_PrefixShortcutInvariant(t *testing.T) {
 	// sequence, the matched index, and whether an exact match was found.
 	search := func(key []byte) (gotEvents []int, idx int, found bool) {
 		events = nil
-		i, f, serr := searchLeafWithOverflow(pg, key, usableSize, p, 0, nil)
+		i, f, serr := searchLeafWithOverflow(pg, key, indexLimits(usableSize), p, 0, nil)
 		require.NoError(t, serr)
 		return events, i, f
 	}
@@ -2004,7 +2004,7 @@ func TestSearchLeafOverflow_StoredKeyExtendsSearchKey(t *testing.T) {
 	storedKey := bytes.Repeat([]byte("p"), maxLocal+80) // overflows
 	require.NoError(t, bt.rebuildLeafPage(pg, []cellData{{key: storedKey, value: []byte("v")}}))
 
-	nLocal := localPayloadSize(len(storedKey)+1, usableSize)
+	nLocal := localPayloadSize(len(storedKey)+1, indexLimits(usableSize))
 	localKeyBytes := min(nLocal, len(storedKey))
 
 	var events []int
@@ -2016,7 +2016,7 @@ func TestSearchLeafOverflow_StoredKeyExtendsSearchKey(t *testing.T) {
 	// equal, so the full read must run and order stored > search.
 	searchKey := bytes.Clone(storedKey[:localKeyBytes+10])
 	events = nil
-	idx, found, serr := searchLeafWithOverflow(pg, searchKey, usableSize, p, 0, nil)
+	idx, found, serr := searchLeafWithOverflow(pg, searchKey, indexLimits(usableSize), p, 0, nil)
 	require.NoError(t, serr)
 	require.Equal(t, []int{searchProbeFullKeyRead}, events,
 		"a true prefix of a longer stored key must be resolved by a full read, not a truncated decision")
@@ -2027,7 +2027,7 @@ func TestSearchLeafOverflow_StoredKeyExtendsSearchKey(t *testing.T) {
 	// Sanity: the full key the search path reconstructs equals the stored key,
 	// confirming the full-read path (not a truncated guess) drives the decision.
 	off := int(pg.data[pg.cellPointerOffset()])<<8 | int(pg.data[pg.cellPointerOffset()+1])
-	full, ferr := leafFullKey(pg.data, off, usableSize, p, 0, nil)
+	full, ferr := leafFullKey(pg.data, off, indexLimits(usableSize), p, 0, nil)
 	require.NoError(t, ferr)
 	require.Equal(t, storedKey, full)
 	require.Equal(t, 1, bytes.Compare(full, searchKey), "stored key must order after its strict prefix")
@@ -2050,7 +2050,7 @@ func TestSearchLeafOverflow_ProbeNilInProduction(t *testing.T) {
 	require.NoError(t, bt.rebuildLeafPage(pg, []cellData{{key: storedKey, value: []byte("v")}}))
 
 	// Exact match still found with the probe nil.
-	idx, found, serr := searchLeafWithOverflow(pg, bytes.Clone(storedKey), usableSize, p, 0, nil)
+	idx, found, serr := searchLeafWithOverflow(pg, bytes.Clone(storedKey), indexLimits(usableSize), p, 0, nil)
 	require.NoError(t, serr)
 	require.True(t, found)
 	require.Equal(t, 0, idx)

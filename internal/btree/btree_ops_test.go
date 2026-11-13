@@ -149,7 +149,7 @@ func TestInsertIntoPageAndInterior(t *testing.T) {
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
 
-		ierr := bt.insertIntoPage(pg, k, v)
+		ierr := bt.Put(k, v)
 		require.NoError(t, ierr)
 		p.releasePage(pg)
 	}
@@ -541,37 +541,6 @@ func TestDeleteCollapsesTreeHeight(t *testing.T) {
 // leafSplitPoint — branches
 // =============================================================================
 
-func TestLeafSplitPointTwoCells(t *testing.T) {
-	cells := []cellData{{key: []byte("a"), value: []byte("v")}, {key: []byte("b"), value: []byte("v")}}
-	assert.Equal(t, 1, leafSplitPoint(cells, 4096))
-}
-
-func TestLeafSplitPointOneCell(t *testing.T) {
-	cells := []cellData{{key: []byte("a"), value: []byte("v")}}
-	assert.Equal(t, 1, leafSplitPoint(cells, 4096))
-}
-
-func TestLeafSplitPointAllFitTarget(t *testing.T) {
-	cells := make([]cellData, 5)
-	for i := range cells {
-		cells[i] = cellData{key: []byte("k"), value: []byte("v")}
-	}
-	assert.Equal(t, len(cells)-1, leafSplitPoint(cells, 65536))
-}
-
-func TestLeafSplitPointSmallPage(t *testing.T) {
-	cells := make([]cellData, 10)
-	for i := range cells {
-		cells[i] = cellData{key: bytes.Repeat([]byte("k"), 50), value: bytes.Repeat([]byte("v"), 50)}
-	}
-	idx := leafSplitPoint(cells, 512)
-	assert.True(t, idx >= 1 && idx < len(cells))
-}
-
-// =============================================================================
-// interiorSplitPoint — branches
-// =============================================================================
-
 func TestInteriorSplitPointTwoCells(t *testing.T) {
 	cells := []cellData{{leftChild: 1, key: []byte("a")}, {leftChild: 2, key: []byte("b")}}
 	assert.Equal(t, 1, interiorSplitPoint(cells, 4096))
@@ -760,7 +729,7 @@ func TestLeafKeyAtMultiByteVarint(t *testing.T) {
 	longKey := bytes.Repeat([]byte("k"), 200)
 	require.NoError(t, bt.rebuildLeafPage(pg, []cellData{{key: longKey, value: []byte("v")}}))
 
-	k, err := leafKeyAt(pg, 0, p.usableSize())
+	k, err := leafKeyAt(pg, 0, p.leafLimits())
 	assert.NoError(t, err)
 	assert.Equal(t, longKey, k)
 
@@ -775,7 +744,7 @@ func TestLeafKeyAtShortKeyLongVal(t *testing.T) {
 
 	require.NoError(t, bt.rebuildLeafPage(pg, []cellData{{key: []byte("abc"), value: bytes.Repeat([]byte("v"), 200)}}))
 
-	k, err := leafKeyAt(pg, 0, p.usableSize())
+	k, err := leafKeyAt(pg, 0, p.leafLimits())
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("abc"), k)
 
@@ -791,7 +760,7 @@ func TestLeafKeyAtCorruptOffset(t *testing.T) {
 	// Corrupt the cell pointer to point beyond page data
 	cpOff := pg.cellPointerOffset()
 	binary.BigEndian.PutUint16(pg.data[cpOff:], uint16(len(pg.data)+10))
-	_, err = leafKeyAt(pg, 0, p.usableSize())
+	_, err = leafKeyAt(pg, 0, p.leafLimits())
 	assert.Error(t, err)
 	p.releasePage(pg)
 }
@@ -1272,13 +1241,13 @@ func TestInsertSepIntoAncestorRootSplit(t *testing.T) {
 // =============================================================================
 
 func TestParseLeafCellCorrupt(t *testing.T) {
-	_, _, err := parseLeafCellWithSize([]byte{}, 0, 0)
+	_, _, err := parseLeafCellWithSize([]byte{}, 0, indexLimits(0))
 	assert.ErrorIs(t, err, ErrCorrupt)
 
-	_, _, err = parseLeafCellWithSize([]byte{0x01}, 5, 0)
+	_, _, err = parseLeafCellWithSize([]byte{0x01}, 5, indexLimits(0))
 	assert.ErrorIs(t, err, ErrCorrupt)
 
-	_, _, err = parseLeafCellWithSize([]byte{0x0a, 0x00}, 0, 0)
+	_, _, err = parseLeafCellWithSize([]byte{0x0a, 0x00}, 0, indexLimits(0))
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -1428,7 +1397,7 @@ func TestRebuildLeafPageWithOverflow(t *testing.T) {
 	require.NoError(t, bt.rebuildLeafPage(pg2, got))
 	// Parse the cell and read the full value via overflow chain
 	off := pg2.getCellOffset(0)
-	c, _, cerr := parseLeafCellWithSize(pg2.data, int(off), p.usableSize())
+	c, _, cerr := parseLeafCellWithSize(pg2.data, int(off), p.leafLimits())
 	require.NoError(t, cerr)
 	assert.Equal(t, []byte("key"), c.key)
 	assert.NotZero(t, c.overflowPg)
@@ -1535,13 +1504,13 @@ func TestWriteLeafCellOverflowLocalVal(t *testing.T) {
 	// totalPayload = 8+500 = 508, which exceeds maxLocalPayload(512) ≈ 102
 	key := []byte("shortkey")
 	value := bytes.Repeat([]byte("V"), 500)
-	nLocal := localPayloadSize(len(key)+len(value), 512)
+	nLocal := localPayloadSize(len(key)+len(value), indexLimits(512))
 
 	buf := make([]byte, nLocal+50)
 	n := writeLeafCellOverflow(buf, key, value, nLocal, 42)
 	assert.True(t, n > 0)
 
-	cell, _, err := parseLeafCellWithSize(buf, 0, 512)
+	cell, _, err := parseLeafCellWithSize(buf, 0, indexLimits(512))
 	assert.NoError(t, err)
 	assert.Equal(t, uint32(42), cell.overflowPg)
 }
@@ -1549,7 +1518,7 @@ func TestWriteLeafCellOverflowLocalVal(t *testing.T) {
 func TestWriteInteriorCellOverflow(t *testing.T) {
 	// fullKeyLen must exceed maxLocalPayload(usableSize) for parseInteriorCell to detect overflow.
 	// maxLocalPayload(512) ≈ 102, so fullKeyLen=500 triggers overflow with usableSize=512.
-	localSize := localPayloadSize(500, 512)
+	localSize := localPayloadSize(500, indexLimits(512))
 	localKey := bytes.Repeat([]byte("K"), localSize)
 	buf := make([]byte, 4+9+localSize+4+100) // leftChild + varint + localKey + overflowPgno + spare
 	n := writeInteriorCellOverflow(buf, 42, 500, localKey, 99)
@@ -1622,7 +1591,7 @@ func TestLeafFullKeyNoOverflow(t *testing.T) {
 	bt.rebuildLeafPage(pg, []cellData{{key: []byte("hello"), value: []byte("world")}})
 
 	off := int(pg.getCellOffset(0))
-	k, err := leafFullKey(pg.data, off, p.usableSize(), p, 0, nil)
+	k, err := leafFullKey(pg.data, off, p.leafLimits(), p, 0, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("hello"), k)
 	p.releasePage(pg)
@@ -1712,7 +1681,7 @@ func TestInsertIntoPageOldPathManyKeys(t *testing.T) {
 		v := fmt.Appendf(nil, "v-%05d", i)
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		ierr := bt.insertIntoPage(pg, k, v)
+		ierr := bt.Put(k, v)
 		require.NoError(t, ierr)
 		p.releasePage(pg)
 	}
@@ -1749,7 +1718,7 @@ func TestInsertIntoPageOldPathUpdate(t *testing.T) {
 		v := fmt.Appendf(nil, "val-%04d", i)
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -1759,7 +1728,7 @@ func TestInsertIntoPageOldPathUpdate(t *testing.T) {
 		v := fmt.Appendf(nil, "new-%04d", i)
 		pg, gerr := p.getWritablePage(bt.rootPage)
 		require.NoError(t, gerr)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -2360,7 +2329,7 @@ func TestInteriorFullKeyOverflow(t *testing.T) {
 func TestParseLeafCellWithSizeValLenError(t *testing.T) {
 	// Key varint OK but valLen varint at end of data
 	data := []byte{0x05, 0x80} // keyLen=5, valLen starts with 0x80 (continuation) but no more data
-	_, _, err := parseLeafCellWithSize(data, 0, 0)
+	_, _, err := parseLeafCellWithSize(data, 0, indexLimits(0))
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -2375,7 +2344,7 @@ func TestParseLeafCellWithSizeTotalPayloadOverflow(t *testing.T) {
 	// These are small values, won't trigger the payload overflow.
 	// To trigger maxPayloadAlloc check, need extremely large varints.
 	// Let's test the negative keyLen path instead
-	_, _, err := parseLeafCellWithSize(data, 0, 0)
+	_, _, err := parseLeafCellWithSize(data, 0, indexLimits(0))
 	// This should succeed because the values are reasonable but key data won't fit
 	if err == nil {
 		// Test still proceeds — the parsed key length is small
@@ -2453,16 +2422,6 @@ func TestInsertSepIntoInteriorFullParent(t *testing.T) {
 // =============================================================================
 // insertIntoLeafWithPath — contentAreaOffset error branch
 // =============================================================================
-
-func TestLeafSplitPointAllBigCells(t *testing.T) {
-	cells := make([]cellData, 5)
-	for i := range cells {
-		cells[i] = cellData{key: bytes.Repeat([]byte("k"), 200), value: bytes.Repeat([]byte("v"), 200)}
-	}
-	// Small page means target is reached very quickly
-	idx := leafSplitPoint(cells, 256)
-	assert.True(t, idx >= 1 && idx < len(cells))
-}
 
 func TestInteriorSplitPointAllBigCells(t *testing.T) {
 	cells := make([]cellData, 5)
@@ -2816,7 +2775,7 @@ func TestLeafKeyAtLargeKeyAndValue(t *testing.T) {
 	bigVal := bytes.Repeat([]byte("V"), 200)
 	require.NoError(t, bt.rebuildLeafPage(pg, []cellData{{key: bigKey, value: bigVal}}))
 
-	k, err := leafKeyAt(pg, 0, p.usableSize())
+	k, err := leafKeyAt(pg, 0, p.leafLimits())
 	assert.NoError(t, err)
 	assert.Equal(t, bigKey, k)
 	p.releasePage(pg)
@@ -3088,11 +3047,11 @@ func TestSearchInteriorWithOverflowCorruptCellPointer(t *testing.T) {
 func TestLeafFullKeyCorruptOffset(t *testing.T) {
 	data := make([]byte, 100)
 	// offset beyond data
-	_, err := leafFullKey(data, 200, 4096, nil, 0, nil)
+	_, err := leafFullKey(data, 200, indexLimits(4096), nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	// keyLen varint error (truncated)
-	_, err = leafFullKey(data, 99, 4096, nil, 0, nil)
+	_, err = leafFullKey(data, 99, indexLimits(4096), nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -3109,19 +3068,6 @@ func TestInteriorFullKeyCorruptOffset(t *testing.T) {
 // =============================================================================
 // leafSplitPoint edge cases
 // =============================================================================
-
-func TestLeafSplitPointHitsTarget(t *testing.T) {
-	// Create cells where cumSize exceeds target exactly at a known index
-	cells := make([]cellData, 10)
-	for i := range cells {
-		cells[i] = cellData{key: bytes.Repeat([]byte("k"), 100), value: bytes.Repeat([]byte("v"), 100)}
-	}
-	// With 4096 page, target = (4096-8)*2/3 = 2725
-	// Each cell ~202+2 varints ≈ 204 bytes + 2 cell ptr = 206
-	// After ~13 cells we'd hit target, but we only have 10
-	idx := leafSplitPoint(cells, 4096)
-	assert.True(t, idx >= 1 && idx < len(cells))
-}
 
 func TestInteriorSplitPointHitsTarget(t *testing.T) {
 	cells := make([]cellData, 10)
@@ -3202,7 +3148,7 @@ func TestSearchLeafWithOverflowCorruptKeyLenVarint(t *testing.T) {
 	pg.data[off+2] = 0xFF
 	pg.data[off+3] = 0xFF
 
-	_, _, serr := searchLeafWithOverflow(pg, []byte("abc"), p.usableSize(), p, 0, nil)
+	_, _, serr := searchLeafWithOverflow(pg, []byte("abc"), p.leafLimits(), p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -3383,12 +3329,12 @@ func TestParseLeafCellWithSizeOverflow(t *testing.T) {
 	// Build a valid overflow cell manually with usableSize=512
 	key := bytes.Repeat([]byte("K"), 200)
 	value := bytes.Repeat([]byte("V"), 300)
-	nLocal := localPayloadSize(len(key)+len(value), 512)
+	nLocal := localPayloadSize(len(key)+len(value), indexLimits(512))
 	buf := make([]byte, nLocal+100) // extra space for varints and overflow ptr
 	n := writeLeafCellOverflow(buf, key, value, nLocal, 42)
 	assert.True(t, n > 0)
 
-	cell, _, err := parseLeafCellWithSize(buf, 0, 512)
+	cell, _, err := parseLeafCellWithSize(buf, 0, indexLimits(512))
 	assert.NoError(t, err)
 	assert.Equal(t, uint32(42), cell.overflowPg)
 }
@@ -3479,7 +3425,7 @@ func TestInsertIntoLeafDefragOldPath(t *testing.T) {
 		require.NoError(t, gerr)
 		k := fmt.Appendf(nil, "key-%04d", i)
 		v := fmt.Appendf(nil, "val-%04d", i)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -3496,7 +3442,7 @@ func TestInsertIntoLeafDefragOldPath(t *testing.T) {
 		require.NoError(t, gerr)
 		k := fmt.Appendf(nil, "key-%04d", i)
 		v := fmt.Appendf(nil, "val-%04d", i)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 }
@@ -3517,7 +3463,7 @@ func TestLeafKeyAtCorruptKeyEndBeyondData(t *testing.T) {
 	off := int(pg.getCellOffset(0))
 	pg.data[off] = 0x7F // keyLen = 127, but only tiny space after varints
 
-	_, err = leafKeyAt(pg, 0, p.usableSize())
+	_, err = leafKeyAt(pg, 0, p.leafLimits())
 	// May or may not error depending on page data layout
 	_ = err
 
@@ -3533,7 +3479,7 @@ func TestLeafKeyAtMultiByteValLen(t *testing.T) {
 	// Short key with value > 127 bytes (multi-byte valLen varint)
 	bt.rebuildLeafPage(pg, []cellData{{key: []byte("abc"), value: bytes.Repeat([]byte("V"), 200)}})
 
-	k, err := leafKeyAt(pg, 0, p.usableSize())
+	k, err := leafKeyAt(pg, 0, p.leafLimits())
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("abc"), k)
 	p.releasePage(pg)
@@ -3620,14 +3566,14 @@ func TestCov_InitBtreeTraceFileError(t *testing.T) {
 func TestCov_ParseLeafCellWithSizeKeyLenVarintError(t *testing.T) {
 	// L128-130: keyLen varint error (continuation bit set, no more data)
 	data := []byte{0x80} // continuation bit only, no more bytes
-	_, _, err := parseLeafCellWithSize(data, 0, 0)
+	_, _, err := parseLeafCellWithSize(data, 0, indexLimits(0))
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
 func TestCov_ParseLeafCellWithSizeAfterKeyLenBeyondData(t *testing.T) {
 	// L133-135: pos >= dataLen after reading keyLen varint
 	data := []byte{0x05} // keyLen=5, but only 1 byte of data total
-	_, _, err := parseLeafCellWithSize(data, 0, 0)
+	_, _, err := parseLeafCellWithSize(data, 0, indexLimits(0))
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -3643,26 +3589,13 @@ func TestCov_ParseLeafCellWithSizeOverflowTruncatedLocalData(t *testing.T) {
 	// totalPayload=400, maxLocal for usableSize=512 is ~102
 	// nLocal = localPayloadSize(400, 512) ~ some small value
 	// but we only have 20 bytes, so pos+nLocal+4 > dataLen
-	_, _, err := parseLeafCellWithSize(buf, 0, 512)
+	_, _, err := parseLeafCellWithSize(buf, 0, indexLimits(512))
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
 // =============================================================================
 // NEW COVERAGE TESTS — leafSplitPoint/interiorSplitPoint edge cases
 // =============================================================================
-
-func TestCov_LeafSplitPointBestIdxClamp(t *testing.T) {
-	// L287-289: bestIdx < 1 clamping
-	// L290-292: bestIdx >= len(cells) clamping
-	// These are hard to trigger normally, but we can check the boundary
-	cells := make([]cellData, 3)
-	for i := range cells {
-		cells[i] = cellData{key: bytes.Repeat([]byte("k"), 10), value: bytes.Repeat([]byte("v"), 10)}
-	}
-	idx := leafSplitPoint(cells, 65536)
-	// With huge page size, all fit on left => bestIdx = len(cells)-1
-	assert.Equal(t, len(cells)-1, idx)
-}
 
 func TestCov_InteriorSplitPointBestIdxClamp(t *testing.T) {
 	// L329-331: bestIdx < 1 clamping
@@ -3786,7 +3719,7 @@ func TestCov_SearchLeafWithOverflowValLenVarintError(t *testing.T) {
 	pg.data[len(pg.data)-2] = 0x80 // valLen multi-byte start, truncated
 	pg.data[len(pg.data)-1] = 0x80 // still continuation
 
-	_, _, serr := searchLeafWithOverflow(pg, []byte("abc"), p.usableSize(), p, 0, nil)
+	_, _, serr := searchLeafWithOverflow(pg, []byte("abc"), p.leafLimits(), p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -3802,7 +3735,7 @@ func TestCov_SearchLeafWithOverflowNoOverflowKeyEndBeyondData(t *testing.T) {
 	off := int(pg.getCellOffset(0))
 	pg.data[off] = 100 // keyLen=100 (1-byte varint), but insufficient space
 
-	_, _, serr := searchLeafWithOverflow(pg, []byte("abc"), p.usableSize(), p, 0, nil)
+	_, _, serr := searchLeafWithOverflow(pg, []byte("abc"), p.leafLimits(), p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -3823,7 +3756,7 @@ func TestCov_SearchLeafWithOverflowKeyLocalEndBeyondData(t *testing.T) {
 	pg.data[off] = 0x84   // multi-byte keyLen
 	pg.data[off+1] = 0x00 // keyLen = 512
 
-	_, _, serr := searchLeafWithOverflow(pg, []byte("short"), p.usableSize(), p, 0, nil)
+	_, _, serr := searchLeafWithOverflow(pg, []byte("short"), p.leafLimits(), p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -3954,12 +3887,12 @@ func TestCov_LeafFullKeyVarintErrors(t *testing.T) {
 	data[8] = 0x80
 	data[9] = 0x80 // 10 continuation bytes = varint decode error
 
-	_, err := leafFullKey(data, 0, 4096, nil, 0, nil)
+	_, err := leafFullKey(data, 0, indexLimits(4096), nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	// L788-790: pos >= dataLen after keyLen
 	data2 := []byte{0x05} // keyLen=5, nothing after
-	_, err = leafFullKey(data2, 0, 4096, nil, 0, nil)
+	_, err = leafFullKey(data2, 0, indexLimits(4096), nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	// L792-794: valLen varint error
@@ -3967,7 +3900,7 @@ func TestCov_LeafFullKeyVarintErrors(t *testing.T) {
 	data3[0] = 0x05 // keyLen=5
 	data3[1] = 0x80 // valLen continuation
 	data3[2] = 0x80 // still continuation, but too truncated
-	_, err = leafFullKey(data3, 0, 4096, nil, 0, nil)
+	_, err = leafFullKey(data3, 0, indexLimits(4096), nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	// L797-799: negative/too-large keyLen
@@ -3980,7 +3913,7 @@ func TestCov_LeafFullKeyVarintErrors(t *testing.T) {
 	data4[3] = 0x80
 	data4[4] = 0x04 // large keyLen
 	data4[5] = 0x01 // valLen=1
-	_, err = leafFullKey(data4, 0, 4096, nil, 0, nil)
+	_, err = leafFullKey(data4, 0, indexLimits(4096), nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	// L800-802: negative/too-large valLen
@@ -3991,7 +3924,7 @@ func TestCov_LeafFullKeyVarintErrors(t *testing.T) {
 	data5[3] = 0x80
 	data5[4] = 0x80
 	data5[5] = 0x04 // large valLen
-	_, err = leafFullKey(data5, 0, 4096, nil, 0, nil)
+	_, err = leafFullKey(data5, 0, indexLimits(4096), nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -4002,7 +3935,7 @@ func TestCov_LeafFullKeyNoOverflowKeyBeyondData(t *testing.T) {
 	data[1] = 0x01 // valLen=1
 	// totalPayload=81, which doesn't exceed maxLocal for usableSize=4096
 	// but pos+80 > 10
-	_, err := leafFullKey(data, 0, 4096, nil, 0, nil)
+	_, err := leafFullKey(data, 0, indexLimits(4096), nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -4015,7 +3948,7 @@ func TestCov_LeafFullKeyOverflowKeyLocalBeyondData(t *testing.T) {
 	// nLocal = localPayloadSize(500, 512)
 	// localKeyBytes = min(nLocal, 100) = nLocal (since nLocal < 100 with 512 page)
 	// pos+localKeyBytes > 20
-	_, err := leafFullKey(data, 0, 512, nil, 0, nil)
+	_, err := leafFullKey(data, 0, indexLimits(512), nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -4027,7 +3960,7 @@ func TestCov_LeafFullKeyOverflowNLocalBeyondData(t *testing.T) {
 	// totalPayload=600, maxLocal(512)~102
 	// localKeyBytes = min(nLocal, 300) = nLocal (since nLocal < 300)
 	// Key overflows, need pos+nLocal+4 > 20
-	_, err := leafFullKey(data, 0, 512, nil, 0, nil)
+	_, err := leafFullKey(data, 0, indexLimits(512), nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -4175,7 +4108,7 @@ func TestCov_InsertIntoLeafViaInsertIntoPage(t *testing.T) {
 		require.NoError(t, gerr)
 		k := fmt.Appendf(nil, "key-%05d", i)
 		v := fmt.Appendf(nil, "val-%05d", i)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -4191,7 +4124,7 @@ func TestCov_InsertIntoLeafViaInsertIntoPage(t *testing.T) {
 		require.NoError(t, gerr)
 		k := fmt.Appendf(nil, "key-%05d", i)
 		v := fmt.Appendf(nil, "val-%05d", i)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -4614,7 +4547,7 @@ func TestCov_LeafKeyAtValOffBeyondData(t *testing.T) {
 	cpOff := pg.cellPointerOffset()
 	binary.BigEndian.PutUint16(pg.data[cpOff:], uint16(len(pg.data)-1))
 
-	_, err = leafKeyAt(pg, 0, p.usableSize())
+	_, err = leafKeyAt(pg, 0, p.leafLimits())
 	assert.Error(t, err)
 	p.releasePage(pg)
 }
@@ -4636,7 +4569,7 @@ func TestCov_LeafKeyAtMultiByteValLenError(t *testing.T) {
 	pg.data[target+1] = 0x80 // multi-byte valLen start (continuation bit set)
 	pg.data[target+2] = 0x80 // still continuation, no terminator - truncated
 
-	_, err = leafKeyAt(pg, 0, p.usableSize())
+	_, err = leafKeyAt(pg, 0, p.leafLimits())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -4660,7 +4593,7 @@ func TestCov_LeafKeyAtMultiByteKeyEndBeyondData(t *testing.T) {
 	pg.data[target+2] = 0x01 // valLen continuation+terminator (value=128)
 	// keyStart = target+3, end = target+3+120 > dataLen
 
-	_, err = leafKeyAt(pg, 0, p.usableSize())
+	_, err = leafKeyAt(pg, 0, p.leafLimits())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -4682,7 +4615,7 @@ func TestCov_LeafKeyAtMultiByteKeyLenPosError(t *testing.T) {
 	pg.data[target+1] = 0x80 // continuation bit set
 	pg.data[target+2] = 0x80 // continuation bit set, no room for terminator
 
-	_, err = leafKeyAt(pg, 0, p.usableSize())
+	_, err = leafKeyAt(pg, 0, p.leafLimits())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -4696,7 +4629,7 @@ func TestCov_LeafKeyAtCellOffsetSafeError(t *testing.T) {
 	bt.rebuildLeafPage(pg, []cellData{{key: []byte("k"), value: []byte("v")}})
 
 	// For 4096-byte page with 8-byte leaf header: need 8 + cellIdx*2 + 2 > 4096 => cellIdx > 2043
-	_, err = leafKeyAt(pg, 9999, p.usableSize())
+	_, err = leafKeyAt(pg, 9999, p.leafLimits())
 	assert.Error(t, err)
 	p.releasePage(pg)
 }
@@ -4713,7 +4646,7 @@ func TestCov_LeafKeyAtPosBeyondDataLen(t *testing.T) {
 	cpOff := pg.cellPointerOffset()
 	binary.BigEndian.PutUint16(pg.data[cpOff:], uint16(len(pg.data)))
 
-	_, err = leafKeyAt(pg, 0, p.usableSize())
+	_, err = leafKeyAt(pg, 0, p.leafLimits())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -4847,7 +4780,7 @@ func TestCov_CollectInteriorCellsOverflowReadError(t *testing.T) {
 	pos := off + 4
 	_, kn := getVarint(pg.data[pos:])
 	pos += kn
-	localSize := localPayloadSize(len(bigKey), p.usableSize())
+	localSize := interiorLocalPayloadSize(len(bigKey), p.usableSize())
 	pos += localSize
 	// Write invalid overflow page number
 	binary.BigEndian.PutUint32(pg.data[pos:], 99999)
@@ -4897,7 +4830,7 @@ func TestCov_CollectLeafCellsOverflowReadError(t *testing.T) {
 	// Corrupt the overflow page number to point to invalid page
 	usableSize := bt.usablePageSize()
 	off := int(pg.getCellOffset(0))
-	cell, _, cerr := parseLeafCellWithSize(pg.data, off, usableSize)
+	cell, _, cerr := parseLeafCellWithSize(pg.data, off, indexLimits(usableSize))
 	require.NoError(t, cerr)
 	if cell.overflowPg != 0 {
 		// Find overflow ptr position and corrupt it
@@ -4907,7 +4840,7 @@ func TestCov_CollectLeafCellsOverflowReadError(t *testing.T) {
 		_, vn := getVarint(pg.data[pos:])
 		pos += vn
 		totalPayload := 1 + 800 // keyLen + valLen
-		nLocal := localPayloadSize(totalPayload, usableSize)
+		nLocal := localPayloadSize(totalPayload, indexLimits(usableSize))
 		pos += nLocal
 		binary.BigEndian.PutUint32(pg.data[pos:], 99999)
 	}
@@ -4951,7 +4884,7 @@ func TestCov_SplitLeafViaOldPath(t *testing.T) {
 		require.NoError(t, gerr)
 		k := fmt.Appendf(nil, "k-%06d", i)
 		v := fmt.Appendf(nil, "v-%06d", i)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -5009,7 +4942,7 @@ func TestCov_InsertIntoInteriorPath(t *testing.T) {
 		require.NoError(t, gerr)
 		k := binary.BigEndian.AppendUint32(nil, uint32(i))
 		v := bytes.Repeat([]byte("x"), 20)
-		require.NoError(t, bt.insertIntoPage(pg, k, v))
+		require.NoError(t, bt.Put(k, v))
 		p.releasePage(pg)
 	}
 
@@ -5112,7 +5045,7 @@ func TestCov_LeafFullKeyTotalPayloadOverflow(t *testing.T) {
 	n += putVarint(data[n:], 600000000) // valLen
 	// totalPayload = 1200000000 > 1073741824
 
-	_, err := leafFullKey(data, 0, 4096, nil, 0, nil)
+	_, err := leafFullKey(data, 0, indexLimits(4096), nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -5871,7 +5804,7 @@ func TestCov_LeafKeyAtMultiByteKeyPosGEDataLen(t *testing.T) {
 	pg.data[target] = 0x80   // continuation
 	pg.data[target+1] = 0x01 // terminator, keyLen=128. pos = target+2 == dataLen
 
-	_, err = leafKeyAt(pg, 0, p.usableSize())
+	_, err = leafKeyAt(pg, 0, p.leafLimits())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -5892,7 +5825,7 @@ func TestCov_LeafKeyAtMultiByteValLenVarintError2(t *testing.T) {
 	pg.data[target+2] = 0x80 // valLen continuation (truncated)
 	pg.data[target+3] = 0x80 // valLen still continuation, no terminator
 
-	_, err = leafKeyAt(pg, 0, p.usableSize())
+	_, err = leafKeyAt(pg, 0, p.leafLimits())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -5913,7 +5846,7 @@ func TestCov_LeafKeyAtMultiByteKeyEndBeyondDataLen2(t *testing.T) {
 	pg.data[target+1] = 0x7f // keyLen terminator (=16256, too large)
 	pg.data[target+2] = 0x01 // valLen = 1 (single byte)
 
-	_, err = leafKeyAt(pg, 0, p.usableSize())
+	_, err = leafKeyAt(pg, 0, p.leafLimits())
 	assert.ErrorIs(t, err, ErrCorrupt)
 	p.releasePage(pg)
 }
