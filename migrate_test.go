@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -919,6 +920,84 @@ func TestCopyToLatestFormat_ConcurrentCopiesToOneDestination(t *testing.T) {
 	assert.Equal(t, 1, refused)
 	assert.Equal(t, []string{"copy.db"}, dirNames(t, dstDir))
 	assertSameDatabase(t, src, openCopy(t, dstPath, nil))
+}
+
+// A file that appears beside the destination while the copy runs fails the
+// publication with ErrDestinationExists: the copy's staging files go, the
+// file stays as it is, and nothing is at the destination.
+func TestCopyToLatestFormat_SidecarAppearsBeforePublication(t *testing.T) {
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1}`)
+	defer func() { testHookBeforePublish = nil }()
+	for _, suffix := range []string{"-wal", "-wal-shm", ".lock"} {
+		t.Run(suffix, func(t *testing.T) {
+			dstPath := filepath.Join(t.TempDir(), "copy.db")
+			testHookBeforePublish = func(string) {
+				require.NoError(t, os.WriteFile(dstPath+suffix, []byte("foreign"), 0o644))
+			}
+			_, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+			require.ErrorIs(t, err, ErrDestinationExists)
+			assert.Equal(t, []string{"copy.db" + suffix}, dirNames(t, filepath.Dir(dstPath)))
+			data, err := os.ReadFile(dstPath + suffix)
+			require.NoError(t, err)
+			assert.Equal(t, "foreign", string(data))
+		})
+	}
+}
+
+// Two copies whose destinations overlap, one at p and one at p+"-wal",
+// where the second would be read as the first one's log: in every order,
+// the copy that comes second fails with ErrDestinationExists and leaves
+// nothing behind.
+func TestCopyToLatestFormat_OverlappingDestinations(t *testing.T) {
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1}`)
+	defer func() { testHookBeforePublish = nil }()
+	// during runs second inside the first one's publication hook, once.
+	nest := func(second string) {
+		var ran atomic.Bool
+		testHookBeforePublish = func(string) {
+			if ran.Swap(true) {
+				return
+			}
+			_, err := CopyToLatestFormat(ctx, src, second, nil)
+			require.NoError(t, err)
+		}
+	}
+
+	t.Run("the log's name is published while the database's copy runs", func(t *testing.T) {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "copy.db")
+		nest(p + "-wal")
+		_, err := CopyToLatestFormat(ctx, src, p, nil)
+		require.ErrorIs(t, err, ErrDestinationExists)
+		assert.Equal(t, []string{"copy.db-wal"}, dirNames(t, dir))
+	})
+	t.Run("the database is published while the log's copy runs", func(t *testing.T) {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "copy.db")
+		nest(p)
+		_, err := CopyToLatestFormat(ctx, src, p+"-wal", nil)
+		require.ErrorIs(t, err, ErrDestinationExists)
+		assert.Equal(t, []string{"copy.db"}, dirNames(t, dir))
+		assertSameDatabase(t, src, openCopy(t, p, nil))
+	})
+	t.Run("the database is there before", func(t *testing.T) {
+		testHookBeforePublish = nil
+		dir := t.TempDir()
+		p := filepath.Join(dir, "copy.db")
+		_, err := CopyToLatestFormat(ctx, src, p, nil)
+		require.NoError(t, err)
+		for _, suffix := range []string{"-wal", "-wal-shm", ".lock"} {
+			_, err = CopyToLatestFormat(ctx, src, p+suffix, nil)
+			require.ErrorIs(t, err, ErrDestinationExists, suffix)
+		}
+		assert.Equal(t, []string{"copy.db"}, dirNames(t, dir))
+	})
 }
 
 // The copy is published by a link, then the staging name goes, and the

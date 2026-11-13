@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -89,13 +90,17 @@ type CopyReport struct {
 // the database's compression setting inherits config's in the copy.
 //
 // Nothing is replaced. If dstPath, dstPath+"-wal", dstPath+"-wal-shm" or
-// dstPath+".lock" exists, the call returns ErrDestinationExists and touches
-// nothing. The copy is built under a private name beside dstPath,
-// checkpointed, verified (each collection's options, document count and
-// index definitions against the source's snapshot, then IntegrityCheck) and
-// closed, and then published at dstPath by a hard link, which fails with
-// ErrDestinationExists if a file appeared there meanwhile: of two calls
-// copying to one dstPath, one publishes. A link that fails otherwise, as on
+// dstPath+".lock" exists, or dstPath is one of those names of an existing
+// file, the call returns ErrDestinationExists and touches nothing. The copy
+// is built under a private name beside dstPath, checkpointed, verified (each
+// collection's options, document count and index definitions against the
+// source's snapshot, then IntegrityCheck) and closed, and then published at
+// dstPath by a hard link. The files beside dstPath are checked again right
+// before the link, and the link fails if dstPath exists, so a file that
+// appeared there while the copy ran also gives ErrDestinationExists: of two
+// calls copying to one dstPath, one publishes. Only for dstPath itself is
+// that atomic; a sidecar created between the last check and the link is not
+// seen. A link that fails otherwise, as on
 // a filesystem without hard links (FAT, exFAT), fails the call with
 // ErrPublishUnsupported; there is no fallback to a rename, which would
 // replace a file published meanwhile. The copy is never returned open; it
@@ -457,7 +462,8 @@ func sameIndexDefinition(a, b IndexInfo) bool {
 }
 
 // destinationFree returns ErrDestinationExists if path or a file a database
-// keeps beside it exists.
+// keeps beside it exists, or if path is the name of such a file of an
+// existing one: a copy published as p+"-wal" would be read as p's log.
 func destinationFree(path string) error {
 	for _, p := range databaseFiles(path) {
 		if _, err := os.Lstat(p); err == nil {
@@ -466,13 +472,32 @@ func destinationFree(path string) error {
 			return fmt.Errorf("any-store: copy to latest format: %w", err)
 		}
 	}
+	for _, suffix := range sidecarSuffixes {
+		base, ok := strings.CutSuffix(path, suffix)
+		if !ok || base == "" {
+			continue
+		}
+		if _, err := os.Lstat(base); err == nil {
+			return fmt.Errorf("%w: %s is a name the database %s keeps beside it", ErrDestinationExists, path, base)
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("any-store: copy to latest format: %w", err)
+		}
+	}
 	return nil
 }
 
-// databaseFiles lists the files of the database at path: the file, its log
-// and the log's index, and the durability sentinel.
+// sidecarSuffixes are the suffixes of the files a database at path keeps
+// beside it: its log, the log's index, and the durability sentinel.
+var sidecarSuffixes = [...]string{"-wal", "-wal-shm", ".lock"}
+
+// databaseFiles lists the files of the database at path: the file and the
+// ones it keeps beside it.
 func databaseFiles(path string) []string {
-	return []string{path, path + "-wal", path + "-wal-shm", path + ".lock"}
+	files := []string{path}
+	for _, suffix := range sidecarSuffixes {
+		files = append(files, path+suffix)
+	}
+	return files
 }
 
 // reserveStaging creates the empty file the copy for dstPath is built in,
@@ -552,7 +577,16 @@ func removeStagingSidecars(stage string) error {
 // no fallback where links fail. Before the link succeeds a failure removes
 // the staging file; once it has, dstPath is never removed, and a failure
 // still fails the call.
+//
+// The files a database keeps beside dstPath are checked again right before
+// the link: one that appeared while the copy ran, put there by anyone or
+// published by another copy, would be read as the copy's log. The link
+// decides atomically only for dstPath itself; a sidecar created between
+// that check and the link is not seen.
 func publishStaging(stage, dstPath string) error {
+	if err := destinationFree(dstPath); err != nil {
+		return discardStaging(err, stage, nil)
+	}
 	if err := osLink(stage, dstPath); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			err = fmt.Errorf("%w: %w", ErrDestinationExists, err)

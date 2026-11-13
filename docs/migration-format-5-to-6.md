@@ -61,12 +61,19 @@ every collection, document and index of `db`:
   collection that inherits the database's compression setting keeps
   inheriting, from `config.DisableCompression`.
 - **Nothing is replaced.** If the destination path, or its `-wal`,
-  `-wal-shm` or `.lock` file, exists, the call returns
+  `-wal-shm` or `.lock` file, exists, or the destination is one of those
+  names of an existing file (`app.db-wal` beside `app.db`), the call returns
   `ErrDestinationExists` and leaves it alone. The copy is built under a
   private name beside the destination (the destination's name, `.tmp-` and
   16 hex digits), checkpointed, verified and closed, and only then given the
-  destination's name by a hard link. Of two calls copying to one path, one
-  publishes and the other gets `ErrDestinationExists`.
+  destination's name by a hard link. Right before the link the destination's
+  `-wal`, `-wal-shm` and `.lock` are checked again, and the link itself fails
+  if the destination exists, so a file that appeared there while the copy
+  ran also gives `ErrDestinationExists`. Of two calls copying to one path,
+  one publishes and the other gets `ErrDestinationExists`. Only for the
+  destination itself is this atomic: a `-wal`, `-wal-shm` or `.lock` created
+  between the last check and the link is not seen, so do not let anything
+  else create files under the destination's name while the copy runs.
 - **Verified.** Before it is published, each collection of the copy is
   checked against the source's snapshot: its options, its document count
   and its index definitions. Then `IntegrityCheck` runs on the copy. A
