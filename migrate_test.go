@@ -1030,7 +1030,10 @@ func TestCopyToLatestFormat_SidecarNameInAnotherCase(t *testing.T) {
 	require.NoError(t, err)
 	insertJSON(t, coll, `{"id":1}`)
 	defer func() { testHookBeforePublish = nil }()
-	suffixes := []string{"-WAL", "-Wal-Shm", "-wAL-sHM", ".LOCK", ".Lock"}
+	// Unicode case equivalents too: U+017F LATIN SMALL LETTER LONG S folds
+	// to s and U+212A KELVIN SIGN to k, and APFS takes them for those.
+	suffixes := []string{"-WAL", "-waL", "-Wal-Shm", "-wAL-sHM", ".LOCK", ".Lock",
+		"-wal-\u017fhm", "-WAL-\u017fHM", ".loc\u212a"}
 
 	t.Run("the database is there before", func(t *testing.T) {
 		testHookBeforePublish = nil

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -503,10 +504,10 @@ func destinationFree(path string) error {
 		// Without regard to case: on a case-insensitive filesystem p-WAL is
 		// p's log. The refusal holds on every filesystem; the base keeps its
 		// own spelling.
-		if len(path) <= len(suffix) || !strings.EqualFold(path[len(path)-len(suffix):], suffix) {
+		base, ok := cutSuffixFold(path, suffix)
+		if !ok || base == "" {
 			continue
 		}
-		base := path[:len(path)-len(suffix)]
 		if _, err := os.Lstat(base); err == nil {
 			return fmt.Errorf("%w: %s is a name the database %s keeps beside it", ErrDestinationExists, path, base)
 		} else if !errors.Is(err, fs.ErrNotExist) {
@@ -514,6 +515,27 @@ func destinationFree(path string) error {
 		}
 	}
 	return nil
+}
+
+// cutSuffixFold is strings.CutSuffix with the suffix matched under Unicode
+// case folding (strings.EqualFold). The end of s is taken by runes, as many
+// as suffix has, not by bytes: a case equivalent may be longer than the
+// letter it folds to, as U+017F LATIN SMALL LETTER LONG S is to s and
+// U+212A KELVIN SIGN to k, and a case-insensitive filesystem takes it for
+// that letter.
+func cutSuffixFold(s, suffix string) (before string, found bool) {
+	end := len(s)
+	for range utf8.RuneCountInString(suffix) {
+		if end == 0 {
+			return s, false
+		}
+		_, size := utf8.DecodeLastRuneInString(s[:end])
+		end -= size
+	}
+	if !strings.EqualFold(s[end:], suffix) {
+		return s, false
+	}
+	return s[:end], true
 }
 
 // sidecarSuffixes are the suffixes of the files a database at path keeps
