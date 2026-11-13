@@ -49,28 +49,26 @@ func TestCopyToLatestFormat_LinkUnsupported(t *testing.T) {
 
 var errInjectedCopyIO = errors.New("injected I/O failure of the copy")
 
-// faultyFile fails its writes once armed, and reports its name to the
-// sync hook.
+// faultyFile is a file of a staged copy, whose writes fail once failWrite
+// is set if it is the copy's log.
 type faultyFile struct {
 	File
-	name   string
-	writes *atomic.Int32
-	failAt int32
+	name      string
+	failWrite *atomic.Bool
 }
 
 func (f *faultyFile) WriteAt(b []byte, off int64) (int, error) {
-	if f.failAt > 0 && f.writes.Add(1) >= f.failAt {
+	if strings.HasSuffix(f.name, "-wal") && f.failWrite.Load() {
 		return 0, errInjectedCopyIO
 	}
 	return f.File.WriteAt(b, off)
 }
 
 // copyFaults installs a VFS that wraps the files of every copy staged
-// beside dstPath: the failAt-th write to a staging log fails, and so do the
-// syncs of a staging database file once failSync is set.
-func copyFaults(t *testing.T, dstPath string, failAt int32, failSync *atomic.Bool) {
+// beside dstPath: once failWrite is set the writes to a staging log fail,
+// and once failSync is set so do the syncs of a staging database file.
+func copyFaults(t *testing.T, dstPath string, failWrite, failSync *atomic.Bool) {
 	t.Helper()
-	var writes atomic.Int32
 	staged := func(name string) bool { return strings.HasPrefix(name, dstPath+".tmp-") }
 	SetVFS(VFS{
 		OpenFile: func(name string, flag int, perm os.FileMode) (File, error) {
@@ -78,11 +76,7 @@ func copyFaults(t *testing.T, dstPath string, failAt int32, failSync *atomic.Boo
 			if err != nil || !staged(name) {
 				return f, err
 			}
-			ff := &faultyFile{File: f, name: name, writes: &writes}
-			if strings.HasSuffix(name, "-wal") {
-				ff.failAt = failAt
-			}
-			return ff, nil
+			return &faultyFile{File: f, name: name, failWrite: failWrite}, nil
 		},
 		Fdatasync: func(f File) error {
 			if ff, ok := f.(*faultyFile); ok && failSync.Load() && !strings.HasSuffix(ff.name, "-wal") {
@@ -95,9 +89,9 @@ func copyFaults(t *testing.T, dstPath string, failAt int32, failSync *atomic.Boo
 }
 
 // An I/O fault of the copy fails the call, which closes the copy and
-// removes every file of it: a write of its log in the middle of the
-// documents, and the sync of its database file at the checkpoint that
-// precedes the verification.
+// removes every file of it: a write of its log while the documents are
+// copied, once a first batch of them has committed, and the sync of its
+// database file at the checkpoint that precedes the verification.
 func TestCopyToLatestFormat_DestinationIOFault(t *testing.T) {
 	src, _ := openSource(t, nil)
 	coll, err := src.CreateCollection(ctx, "docs")
@@ -108,9 +102,18 @@ func TestCopyToLatestFormat_DestinationIOFault(t *testing.T) {
 	}
 	t.Run("log write", func(t *testing.T) {
 		dstPath := filepath.Join(t.TempDir(), "copy.db")
-		copyFaults(t, dstPath, 3, new(atomic.Bool))
+		var failWrite atomic.Bool
+		copyFaults(t, dstPath, &failWrite, new(atomic.Bool))
+		var batches atomic.Int32
+		// The second batch's commit is the first write after the first one.
+		testHookCopiedBatch = func(int) {
+			batches.Add(1)
+			failWrite.Store(true)
+		}
+		defer func() { testHookCopiedBatch = nil }()
 		report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
 		require.ErrorIs(t, err, errInjectedCopyIO)
+		assert.Equal(t, int32(1), batches.Load(), "one batch committed, the next failed")
 		assert.Zero(t, report)
 		ResetVFS()
 		assertNoCopy(t, dstPath)
@@ -118,7 +121,7 @@ func TestCopyToLatestFormat_DestinationIOFault(t *testing.T) {
 	t.Run("database sync", func(t *testing.T) {
 		dstPath := filepath.Join(t.TempDir(), "copy.db")
 		var failSync atomic.Bool
-		copyFaults(t, dstPath, 0, &failSync)
+		copyFaults(t, dstPath, new(atomic.Bool), &failSync)
 		// Armed once the documents are in: the database file is synced
 		// when the copy is created, and next by a checkpoint.
 		testHookCopiedCollection = func(string) { failSync.Store(true) }

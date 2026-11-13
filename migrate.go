@@ -192,11 +192,14 @@ func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Con
 // copyBatch is how many documents one write transaction of a copy inserts.
 const copyBatch = 1000
 
-// Test hooks of CopyToLatestFormat. testHookCopiedCollection runs once a
+// Test hooks of CopyToLatestFormat. testHookCopiedBatch runs each time a
+// full batch of a collection's documents has committed, with the number of
+// its documents copied so far; testHookCopiedCollection runs once a
 // collection's documents are in the copy, with the source's read
 // transaction still open; testHookBeforePublish runs with the copy closed
 // under its staging name, before the link.
 var (
+	testHookCopiedBatch      func(docs int)
 	testHookCopiedCollection func(name string)
 	testHookBeforePublish    func(stage string)
 )
@@ -346,6 +349,9 @@ func copyDocuments(ctx context.Context, tx *btree.ReadTx, ns *btree.Namespace, d
 			err, wtx = wtx.Commit(), nil
 			if err != nil {
 				return fmt.Errorf("any-store: copy to latest format: %w", err)
+			}
+			if testHookCopiedBatch != nil {
+				testHookCopiedBatch(n)
 			}
 		}
 	}
