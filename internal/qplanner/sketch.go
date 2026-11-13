@@ -2,10 +2,13 @@ package qplanner
 
 import (
 	"encoding/binary"
+	"math/bits"
 	"slices"
+	"sync"
 	"sync/atomic"
 
 	"github.com/cespare/xxhash/v2"
+	"github.com/klauspost/compress/s2"
 )
 
 // IndexSketch is a multi-level frequency sketch for cardinality estimation.
@@ -76,8 +79,17 @@ type IndexSketch struct {
 // are detected by its absence, then loaded into the full-key level.
 var sketchMagic = [4]byte{'S', 'K', '0', '2'}
 
-// sketchHeaderLen is the V2 header size: magic(4) + levels(4) + size(4).
+// sketchMagicS2 tags the compressed on-disk format (MarshalCompressed).
+var sketchMagicS2 = [4]byte{'S', 'K', '0', '3'}
+
+// sketchHeaderLen is the V2 header size: magic(4) + levels(4) + size(4). The
+// compressed format has one more byte per level after it.
 const sketchHeaderLen = 12
+
+// maxCompressedBuckets bounds levels*size of a compressed blob: what a header
+// may claim before its block is decoded, and so what MarshalCompressed writes.
+// 128 levels of DefaultSketchSize.
+const maxCompressedBuckets = 1 << 17
 
 // NewIndexSketch creates a sketch with the given per-level bucket count and
 // number of prefix levels. A non-positive size falls back to DefaultSketchSize;
@@ -229,23 +241,204 @@ func (s *IndexSketch) MarshalBinary(dst []byte) []byte {
 	return dst
 }
 
-// UnmarshalBinary deserializes the sketch. A V2 blob (magic-tagged) is loaded
-// directly, adopting its shape; a legacy V1 blob (no magic) is loaded into the
-// full-key level with the shallow levels left empty and flagged for rebuild.
-// The magic alone decides which: a tagged blob that does not parse, down to a
-// cut-off header, leaves the sketch as it was and is never read as legacy
-// buckets.
+// MarshalCompressed serializes the sketch into dst in the compressed format,
+// reusing its capacity when possible.
+//
+// The counters of a level are written as byte planes: byte 0 of every bucket,
+// then byte 1, and so on up to the widest count of the level. The zero high
+// bytes of the counters are not stored, and the low ones lie together for S2:
+// a near-empty sketch takes about 100 bytes and a saturated level 1 to 1.5 KiB,
+// where the V2 format takes 8 KiB per level.
+//
+// Format: [magic 4][levels u32][size u32][planes u8 per level][S2 block]. The
+// block holds, per level, planes[l] planes of size bytes each, then
+// [levelTotals levels*8][docCount 8].
+//
+// A sketch above maxCompressedBuckets is written in the V2 format, which
+// UnmarshalBinary reads wherever it reads this one.
+//
+// Counters may move while it runs, as under MarshalBinary: each is loaded
+// atomically, and a count that outgrows the planes chosen for its level
+// widens them.
+func (s *IndexSketch) MarshalCompressed(dst []byte) []byte {
+	nb := s.Size * s.Levels
+	if nb > maxCompressedBuckets {
+		return s.MarshalBinary(dst)
+	}
+	hdr := sketchHeaderLen + s.Levels
+	dst = slices.Grow(dst[:0], hdr)[:hdr]
+	copy(dst[0:4], sketchMagicS2[:])
+	binary.LittleEndian.PutUint32(dst[4:], uint32(s.Levels))
+	binary.LittleEndian.PutUint32(dst[8:], uint32(s.Size))
+
+	// The block's content is laid out in one scratch buffer and encoded into
+	// another, each sized for what it holds.
+	scratch := getSketchScratch(8*nb + 8*s.Levels + 8)
+	body := *scratch
+	n := 0
+	for l := 0; l < s.Levels; l++ {
+		level := s.Buckets[l*s.Size : (l+1)*s.Size]
+		var all uint64
+		for i := range level {
+			all |= atomic.LoadUint64(&level[i])
+		}
+		planes := packLevel(body[n:], level, byteWidth(all))
+		dst[sketchHeaderLen+l] = byte(planes)
+		n += planes * s.Size
+	}
+	for l := 0; l < s.Levels; l++ {
+		binary.LittleEndian.PutUint64(body[n:], atomic.LoadUint64(&s.levelTotals[l]))
+		n += 8
+	}
+	binary.LittleEndian.PutUint64(body[n:], s.docCount.Load())
+	n += 8
+
+	enc := getSketchScratch(s2.MaxEncodedLen(n))
+	dst = append(dst, s2.Encode(*enc, body[:n])...)
+	putSketchScratch(enc)
+	putSketchScratch(scratch)
+	return dst
+}
+
+// byteWidth returns the number of bytes v needs: 0 for zero.
+func byteWidth(v uint64) int {
+	return (bits.Len64(v) + 7) / 8
+}
+
+// packLevel writes the counters of level into out as byte planes and returns
+// how many it wrote. planes is the width the counters had a moment ago: a
+// counter that has outgrown it since widens the planes, so none is stored cut
+// short. A level that was all zeros stays so, as if marshaled a moment earlier.
+func packLevel(out []byte, level []uint64, planes int) int {
+	for planes > 0 {
+		over := writePlanes(out[:planes*len(level)], level, planes)
+		if over == 0 {
+			break
+		}
+		planes += byteWidth(over)
+	}
+	return planes
+}
+
+// writePlanes writes the low planes bytes of every counter of level into
+// out, plane by plane, and returns the bits the counters have above them:
+// zero unless one is wider than planes bytes. Each counter is loaded once, so
+// its bytes come from one value.
+func writePlanes(out []byte, level []uint64, planes int) (over uint64) {
+	size := len(level)
+	switch planes {
+	case 1:
+		p0 := out[:size]
+		for i := range level {
+			v := atomic.LoadUint64(&level[i])
+			p0[i] = byte(v)
+			over |= v >> 8
+		}
+	case 2:
+		p0, p1 := out[:size], out[size:2*size]
+		for i := range level {
+			v := atomic.LoadUint64(&level[i])
+			p0[i] = byte(v)
+			p1[i] = byte(v >> 8)
+			over |= v >> 16
+		}
+	default:
+		for i := range level {
+			v := atomic.LoadUint64(&level[i])
+			for j := i; j < planes*size; j += size {
+				out[j] = byte(v)
+				v >>= 8
+			}
+			over |= v
+		}
+	}
+	return over
+}
+
+// readPlanes sets the counters of level from src, which holds their low
+// planes bytes plane by plane; the bytes above them are zero.
+func readPlanes(level []uint64, src []byte, planes int) {
+	size := len(level)
+	switch planes {
+	case 0:
+		for i := range level {
+			setCounter(&level[i], 0)
+		}
+	case 1:
+		p0 := src[:size]
+		for i := range level {
+			setCounter(&level[i], uint64(p0[i]))
+		}
+	case 2:
+		p0, p1 := src[:size], src[size:2*size]
+		for i := range level {
+			setCounter(&level[i], uint64(p0[i])|uint64(p1[i])<<8)
+		}
+	default:
+		for i := range level {
+			var v uint64
+			for j := i + (planes-1)*size; j >= 0; j -= size {
+				v = v<<8 | uint64(src[j])
+			}
+			setCounter(&level[i], v)
+		}
+	}
+}
+
+// setCounter stores v unless the counter holds it already: a load costs a
+// fraction of an atomic store, and a reload finds most counters unchanged.
+// The counter has one mutator while a blob is loaded into it.
+func setCounter(p *uint64, v uint64) {
+	if atomic.LoadUint64(p) != v {
+		atomic.StoreUint64(p, v)
+	}
+}
+
+// sketchScratch pools the buffers MarshalCompressed and the compressed load
+// work in: a sketch has no buffer of its own for either. A buffer is as large
+// as a block's content or its encoding, which maxCompressedBuckets bounds.
+var sketchScratch sync.Pool
+
+// getSketchScratch returns a buffer of n bytes.
+func getSketchScratch(n int) *[]byte {
+	p, _ := sketchScratch.Get().(*[]byte)
+	if p == nil {
+		p = new([]byte)
+	}
+	if cap(*p) < n {
+		*p = make([]byte, n)
+	}
+	*p = (*p)[:n]
+	return p
+}
+
+func putSketchScratch(p *[]byte) {
+	sketchScratch.Put(p)
+}
+
+// UnmarshalBinary deserializes the sketch. A V2 or compressed blob
+// (magic-tagged) is loaded directly, adopting its shape; a legacy V1 blob (no
+// magic) is loaded into the full-key level with the shallow levels left empty
+// and flagged for rebuild. The magic alone decides which: a tagged blob that
+// does not parse, down to a cut-off header, leaves the sketch as it was and is
+// never read as legacy buckets.
 //
 // Atomic stores into Buckets/levelTotals/docCount let concurrent readers see
 // consistent values without locking. Reshaping (reallocating the backing slices
-// to match a V2 blob's declared shape) only happens for a not-yet-published
+// to match a tagged blob's declared shape) only happens for a not-yet-published
 // sketch — construction or InspectIndexSketch. A live, published sketch always
 // carries the index's fixed (Size, Levels), so the reshape branch never
 // reallocates a slice a concurrent reader might hold.
 func (s *IndexSketch) UnmarshalBinary(data []byte) {
-	if len(data) >= len(sketchMagic) && [4]byte(data[:4]) == sketchMagic {
-		s.unmarshalV2(data)
-		return
+	if len(data) >= len(sketchMagic) {
+		switch [4]byte(data[:4]) {
+		case sketchMagic:
+			s.unmarshalV2(data)
+			return
+		case sketchMagicS2:
+			s.unmarshalS2(data)
+			return
+		}
 	}
 	s.unmarshalLegacy(data)
 }
@@ -268,13 +461,46 @@ func v2Shape(data []byte) (levels, size int, ok bool) {
 	return int(l), int(sz), true
 }
 
+// s2Shape parses a compressed blob's header: its levels and size, the planes
+// stored per level and the S2 block, with the length the block decodes to.
+// ok is false for a blob without the magic, a corrupt header, or a block that
+// does not declare the length the header implies: none of these loads into a
+// sketch.
+func s2Shape(data []byte) (levels, size int, planes, block []byte, bodyLen int, ok bool) {
+	if len(data) < sketchHeaderLen || [4]byte(data[:4]) != sketchMagicS2 {
+		return 0, 0, nil, nil, 0, false
+	}
+	l := binary.LittleEndian.Uint32(data[4:])
+	sz := binary.LittleEndian.Uint32(data[8:])
+	if l < 1 || sz < 1 || uint64(l)*uint64(sz) > maxCompressedBuckets || len(data) < sketchHeaderLen+int(l) {
+		return 0, 0, nil, nil, 0, false
+	}
+	levels, size = int(l), int(sz)
+	planes = data[sketchHeaderLen : sketchHeaderLen+levels]
+	block = data[sketchHeaderLen+levels:]
+	bodyLen = 8*levels + 8
+	for _, p := range planes {
+		if p > 8 {
+			return 0, 0, nil, nil, 0, false
+		}
+		bodyLen += int(p) * size
+	}
+	if n, err := s2.DecodedLen(block); err != nil || n != bodyLen {
+		return 0, 0, nil, nil, 0, false
+	}
+	return levels, size, planes, block, bodyLen, true
+}
+
 // SameShape reports whether UnmarshalBinary would load data without
-// reshaping the sketch: a V2 blob of its size and levels, or bytes that load
-// into the existing shape or leave it alone (legacy, corrupt, truncated). A
-// published sketch may be reloaded in place only when this holds, since a
-// reshape replaces slices a concurrent reader holds.
+// reshaping the sketch: a V2 or compressed blob of its size and levels, or
+// bytes that load into the existing shape or leave it alone (legacy, corrupt,
+// truncated). A published sketch may be reloaded in place only when this
+// holds, since a reshape replaces slices a concurrent reader holds.
 func (s *IndexSketch) SameShape(data []byte) bool {
 	levels, size, ok := v2Shape(data)
+	if !ok {
+		levels, size, _, _, _, ok = s2Shape(data)
+	}
 	return !ok || (levels == s.Levels && size == s.Size)
 }
 
@@ -300,6 +526,39 @@ func (s *IndexSketch) unmarshalV2(data []byte) {
 	}
 	off += 8 * levels
 	s.docCount.Store(binary.LittleEndian.Uint64(data[off:]))
+	s.needsRebuild.Store(false)
+}
+
+func (s *IndexSketch) unmarshalS2(data []byte) {
+	levels, size, planes, block, bodyLen, ok := s2Shape(data)
+	if !ok {
+		return // corrupt header or block length: preserve current state
+	}
+	// Decoded in full before the first store: a block that fails partway
+	// leaves the counters alone.
+	scratch := getSketchScratch(bodyLen)
+	defer putSketchScratch(scratch)
+	body, err := s2.Decode(*scratch, block)
+	if err != nil {
+		return // corrupt block: preserve current state
+	}
+	if size != s.Size || levels != s.Levels {
+		s.Buckets = make([]uint64, size*levels)
+		s.levelTotals = make([]uint64, levels)
+		s.Size = size
+		s.Levels = levels
+	}
+	off := 0
+	for l, p := range planes {
+		n := int(p) * size
+		readPlanes(s.Buckets[l*size:(l+1)*size], body[off:off+n], int(p))
+		off += n
+	}
+	for l := 0; l < levels; l++ {
+		atomic.StoreUint64(&s.levelTotals[l], binary.LittleEndian.Uint64(body[off+l*8:]))
+	}
+	off += 8 * levels
+	s.docCount.Store(binary.LittleEndian.Uint64(body[off:]))
 	s.needsRebuild.Store(false)
 }
 
