@@ -93,14 +93,21 @@ The call fails with:
 | `ErrPublishUnsupported` | The finished copy could not be linked to the destination path, as on a filesystem without hard links (FAT, exFAT). It wraps the link error. |
 | any other | The copy failed: a collection, index or document could not be copied (the error names it, see [What can differ](#what-can-differ)), the copy did not match the source, or an I/O operation failed. Cancelling `ctx` stops the copy with the context's error. |
 
-On a failure the call closes the copy and removes the files it created. A
-removal that fails is joined to the returned error, naming the file left.
+The call creates the destination only by publishing a complete, verified,
+closed copy. On a failure before that it closes the copy and removes its
+files, which all carry the staging name: `<destination>.tmp-<16 hex digits>`
+and its `-wal`, `-wal-shm` and `.lock`. A removal that fails is joined to
+the returned error, naming the file left. Those staging files are the only
+files a failed call owns, and the only ones a crash before the publication
+leaves: remove them once no copy is running.
 
-A file at the destination after a call that returned an error, or that was
-interrupted, is never a valid copy, even if it opens and passes
-`IntegrityCheck`. Remove it and copy again. A copy interrupted by a crash can
-also leave its staging files (`<destination>.tmp-<16 hex digits>` and their
-`-wal`, `-wal-shm` and `.lock` files); remove them while no copy is running.
+After `ErrDestinationExists` the files at and beside the destination are not
+the call's: they were there before it, or another caller published them.
+The error is no reason to remove them. A failure after the link, of the
+directory sync or of the removal of the staging name, comes back with the
+copy published at the destination, and the error says so. A crash at that
+point leaves the complete copy at the destination, maybe with its staging
+name beside it as a second name of the same file.
 
 The CLI has the same copy: `db.migrate("new.db")` in `any-store-cli2` writes
 the copy and prints the report. It never replaces the open file.
@@ -148,7 +155,11 @@ replaced this way.
 
 The example implements the protocol for one process. It assumes `db` is the
 only handle on `path` and that nothing writes through it until it returns
-(step 1 is the caller's).
+(step 1 is the caller's). On an error, the handle it returns tells the
+caller where things stand: until the source is closed it is `db`, still
+open, and the database goes on as before; once the source is closed it is
+nil, and the caller opens `path` again, which holds the old database before
+the rename and the copy after it.
 
 ```go
 import (
@@ -164,24 +175,22 @@ import (
 
 // replaceWithCopy puts a copy of the database at path, in the latest
 // format, in the file's place, and returns the database opened from it.
-// On an error before the rename, path still holds the old database: open
-// it again. config is the Config the database is opened with.
+// config is the Config the database is opened with. On an error before the
+// source is closed it returns db, still open; after that it returns nil,
+// and path is to be opened again.
 func replaceWithCopy(ctx context.Context, db anystore.DB, path string, config *anystore.Config) (anystore.DB, error) {
 	tmp := path + ".format6"
-	// A copy left by an earlier run is never put in place: make a new one.
-	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
-	}
-	// 2. Copy. The copy is closed when the call returns.
+	// 2. Copy. A file already at tmp is refused with ErrDestinationExists:
+	// it is not this run's, and a copy from an earlier run is stale.
 	if _, err := anystore.CopyToLatestFormat(ctx, db, tmp, config); err != nil {
-		return nil, err
+		return db, err
 	}
 	// 3. Checkpoint the source and check the error: Close drops it.
 	if err := db.Flush(ctx, 0, anystore.FlushModeCheckpointTruncate); err != nil {
 		_ = os.Remove(tmp)
-		return nil, err
+		return db, err
 	}
-	// 4. Close the source.
+	// 4. Close the source. From here on, path has to be opened again.
 	if err := db.Close(); err != nil {
 		_ = os.Remove(tmp)
 		return nil, err
@@ -223,6 +232,12 @@ func syncDir(dir string) error {
 	return d.Sync()
 }
 ```
+
+If a file is at `path + ".format6"` when the example starts, the copy is
+refused with `ErrDestinationExists` and nothing changes. The file may be
+another run's, or a copy an earlier run left; such a copy is stale once
+writes have resumed, and is never to be put in place. Remove it only when
+you know it is yours and no other run is in progress.
 
 With several processes, steps 1, 4 and 7 have to be coordinated across them
 by the application.

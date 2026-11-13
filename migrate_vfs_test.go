@@ -142,16 +142,15 @@ var errCrashed = errors.New("crashed")
 // docs/migration-format-5-to-6.md, the guide's example for one process,
 // with crash(step) after each step: when it returns true the function stops
 // there and leaves every handle and file as a process that died would.
+// On an error before the source is closed it returns db, still open; after
+// that it returns nil, and path is to be opened again.
 func replaceWithCopy(ctx context.Context, db DB, path string, config *Config, crash func(step string) bool) (DB, error) {
 	tmp := path + ".format6"
-	// A copy left by an earlier run is never put in place: make a new one.
-	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
-	}
 	// 1. The caller has stopped every writer.
-	// 2. Copy. The copy is closed when the call returns.
+	// 2. Copy. A file already at tmp is refused with ErrDestinationExists:
+	// it is not this run's, and a copy from an earlier run is stale.
 	if _, err := CopyToLatestFormat(ctx, db, tmp, config); err != nil {
-		return nil, err
+		return db, err
 	}
 	if crash("copied") {
 		return nil, errCrashed
@@ -159,12 +158,12 @@ func replaceWithCopy(ctx context.Context, db DB, path string, config *Config, cr
 	// 3. Checkpoint the source and check the error: Close drops it.
 	if err := db.Flush(ctx, 0, FlushModeCheckpointTruncate); err != nil {
 		_ = os.Remove(tmp)
-		return nil, err
+		return db, err
 	}
 	if crash("checkpointed") {
 		return nil, errCrashed
 	}
-	// 4. Close the source.
+	// 4. Close the source. From here on, path has to be opened again.
 	if err := db.Close(); err != nil {
 		_ = os.Remove(tmp)
 		return nil, err
@@ -290,4 +289,28 @@ func TestReplaceWithCopy_CrashAfterEveryStep(t *testing.T) {
 			assertSameDatabase(t, openCopy(t, reference, nil), reopened)
 		})
 	}
+}
+
+// The guide's example keeps the source open when it fails before closing
+// it, here on a file left at its copy's path by an earlier run: the caller
+// goes on with the handle it gets back, and the file is left alone.
+func TestReplaceWithCopy_EarlyFailureKeepsSource(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.db")
+	src, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, src.Close()) }()
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1}`)
+	require.NoError(t, os.WriteFile(path+".format6", []byte("an earlier run's"), 0o644))
+
+	got, err := replaceWithCopy(ctx, src, path, nil, func(string) bool { return false })
+	require.ErrorIs(t, err, ErrDestinationExists)
+	require.Equal(t, src, got, "the source comes back open")
+	insertJSON(t, coll, `{"id":2}`)
+	assertCollCount(t, coll, 2)
+	data, err := os.ReadFile(path + ".format6")
+	require.NoError(t, err)
+	assert.Equal(t, "an earlier run's", string(data))
 }
