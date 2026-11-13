@@ -1108,7 +1108,7 @@ func (c *collection) buildRangeIndex(tx *btree.WriteTx, s *collSchema, info Inde
 
 	// Persist the sketch
 	skKey := sketchKey(s.name, info.Name)
-	if err = tx.Put(c.db.systemNS, skKey, idx.sketch.MarshalBinary(nil)); err != nil {
+	if err = tx.Put(c.db.systemNS, skKey, c.db.marshalSketch(idx.sketch, nil)); err != nil {
 		return nil, err
 	}
 	// Publish the live sketch as the reader snapshot before the index becomes
@@ -1797,7 +1797,7 @@ func (c *collection) persistSketches(tx *btree.WriteTx, s *collSchema, t *common
 	for _, idx := range s.indexes {
 		if idx.sketchModified {
 			key := sketchKey(s.name, idx.info.Name)
-			idx.sketchBuf = idx.sketch.MarshalBinary(idx.sketchBuf)
+			idx.sketchBuf = c.db.marshalSketch(idx.sketch, idx.sketchBuf)
 			if err := tx.Put(c.db.systemNS, key, idx.sketchBuf); err != nil {
 				return err
 			}

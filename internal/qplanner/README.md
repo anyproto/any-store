@@ -223,6 +223,9 @@ The `IndexSketch` (`sketch.go`) is a frequency sketch using `xxhash/v2` for card
 
 - **Buckets**: `[]uint64` of configurable size (default 1024)
 - **Hashing**: `bucket = xxhash.Sum64(encodedValue) % size`
-- **API**: `Increment`, `Decrement`, `Estimate`, `MarshalBinary`, `UnmarshalBinary`, `Reset`
-- **Storage**: Persisted under `stat_data:<coll>:<index>` in the `_system` namespace
+- **API**: `Increment`, `Decrement`, `Estimate`, `MarshalBinary`, `MarshalCompressed`, `UnmarshalBinary`, `Reset`
+- **Storage**: Persisted under `stat_data:<coll>:<index>` in the `_system` namespace. Two encodings, and `UnmarshalBinary` reads both from any file:
+  - `SK02` (`MarshalBinary`): every counter as 8 bytes, 8 KB per index field. Written to files of schema format 5, which releases before v2.5.0 open: they read any other bytes as legacy bucket counts. Also written, in any file, for a sketch above 131,072 buckets.
+  - `SK03` (`MarshalCompressed`): per level, the counters as byte planes up to the widest count, under an S2 block. About 100 bytes for a near-empty sketch and 1 to 1.5 KB per level for a saturated one, so a row stays on a format 6 leaf up to three saturated levels. Written to files of schema format 6.
+  - The encoding is applied where a row is saved (a commit that changed the sketch, an index build). In memory a sketch is plain counters.
 - **Multi-process sync**: Reloaded when `IsDataStale()` detects changes from another process

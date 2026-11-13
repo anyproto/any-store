@@ -352,7 +352,7 @@ never supported SQLite's formats.
 | Schema format | Magic | Meaning | Written by |
 |---|---|---|---|
 | 5 | `any-store v2\0` (or the older `BTree format 1\0`) | Two-varint leaf cell with unified key/value overflow; index payload limit on every cell | v2.0.0 - v2.4.x |
-| 6 | `any-store v2 fmt` | As 5, with SQLite's table-leaf payload limit on every leaf cell (see [the local-payload drift](#old-drift-index-only-local-payload-no-maxleaf-minleaf)) | v2.5.0 and later |
+| 6 | `any-store v2 fmt` | As 5, with SQLite's table-leaf payload limit on every leaf cell (see [the local-payload drift](#old-drift-index-only-local-payload-no-maxleaf-minleaf)). Above the btree, a save writes the planner's `stat_data` rows compressed in these files (tag `SK03`); format 5 files keep the `SK02` rows that v2.4.x reads | v2.5.0 and later |
 
 A file keeps the format it was created with. Opening a format 5 file with a later release
 reads and writes it under format 5 rules, including namespaces created afterwards. Open
