@@ -175,6 +175,11 @@ func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Con
 	if testHookBeforePublish != nil {
 		testHookBeforePublish(stage)
 	}
+	// Nothing after this point consults ctx: a cancellation that came while
+	// the copy was verified or closed publishes nothing.
+	if err = ctx.Err(); err != nil {
+		return
+	}
 	if err = publishStaging(stage, dstPath); err != nil {
 		// publishStaging removed what it could; whatever is left it named.
 		stage = ""

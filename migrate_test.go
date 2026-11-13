@@ -870,6 +870,25 @@ func TestCopyToLatestFormat_Cancelled(t *testing.T) {
 	assertNoCopy(t, dstPath)
 }
 
+// A cancellation that comes once the copy is verified and closed, before
+// it is published, publishes nothing.
+func TestCopyToLatestFormat_CancelledBeforePublication(t *testing.T) {
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1}`)
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	testHookBeforePublish = func(string) { cancel() }
+	defer func() { testHookBeforePublish = nil }()
+
+	dstPath := filepath.Join(t.TempDir(), "copy.db")
+	report, err := CopyToLatestFormat(cctx, src, dstPath, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Zero(t, report)
+	assertNoCopy(t, dstPath)
+}
+
 // Two calls copying to one destination at once: both build their copies,
 // one publishes, and the other fails with ErrDestinationExists and leaves
 // nothing behind.
