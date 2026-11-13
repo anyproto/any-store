@@ -2348,9 +2348,10 @@
     "sqlite": [
       "wal.c:sqlite3WalFrames",
       "wal.c:walFrames",
-      "wal.c:walWriteOneFrame"
+      "wal.c:walWriteOneFrame",
+      "wal.c:walWriteToLog"
     ],
-    "note": ""
+    "note": "appended frames staged and written in chunks of up to walFrameBatchMax, not two writes per frame (drift-2026-11-11-1)"
   },
   "wal.go:*wal.writeFramesMem": {
     "sqlite": [],

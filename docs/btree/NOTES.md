@@ -3097,6 +3097,15 @@ powersafe logic anywhere. The consequence is that on devices where a torn write 
 corrupt an adjacent partially-written sector, the Go WAL lacks SQLite's defensive sector alignment, so a
 power-loss mid-write could leave the committed region straddling a sector that hardware partially overwrote.
 
+<a id="drift-2026-11-11-1-writeframes-writes-appended-frames-in-chunks-not-two-writes-per-frame"></a>
+### Drift: writeFrames Writes Appended Frames In Chunks, Not Two Writes Per Frame
+- **Category:** performance  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.writeFrames` (`internal/btree/wal.go`, the `frameBatch` staging in the append branch; `walFrameBatchMax`).
+
+C `walFrames` writes every frame through `walWriteOneFrame` (`wal.c:4145`, `wal.c:4180`), which issues two `sqlite3OsWrite` calls per frame: the 24-byte header, then the page (`wal.c:3940-3956`, through `walWriteToLog`, `wal.c:3915-3935`). Go's `writeFrames` stages each appended frame's header and payload contiguously in `w.frameBatch` and writes the staged frames with one `WriteAt` whenever the next frame would not fit in `walFrameBatchMax` (256 KiB) and once after the loop, so a commit of up to 63 frames on 4 KiB pages is one write instead of 2 × frames. Frames reused in place (`wal.c:4124-4140`) are not contiguous with the appends and keep their direct write.
+
+The bytes written and their offsets are the same, so the file and crash recovery are unchanged: appended frames lie past the last commit frame until the commit frame itself lands, recovery stops at the first frame whose checksum fails, and a torn chunk is the same state as a crash partway through the per-frame writes. A failed chunk returns before `nFrame` and the checksums advance, as a failed per-frame write did. Each Go `WriteAt` is a syscall plus runtime overhead, so writing per frame costs relatively more than it does in C; a small commit (a leaf and page 1) goes from four writes to one. `walWriteToLog` also splits a write at `iSyncPoint` for sector padding; Go has no sync point (drift-104), and porting padding would have to split a chunk there too.
+
 <a id="drift-105-journal-size-limit-wal-truncation-feature-unimplemented"></a>
 ### Drift: journal_size_limit WAL Truncation Feature Unimplemented
 - **Category:** new-feature  -  **Severity:** low
