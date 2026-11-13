@@ -93,6 +93,50 @@ func TestDb_OpenCollection(t *testing.T) {
 	})
 }
 
+// A collection whose name, followed by ":", begins another's does not take
+// the other's indexes: the catalog keys of collection "A:b"'s indexes,
+// "idx:A:b:<index>", begin with "idx:A:", the prefix of collection "A"'s.
+func TestGetIndexInfos_NameBeginsAnotherCollection(t *testing.T) {
+	fx := newFixture(t)
+	a, err := fx.CreateCollection(ctx, "A")
+	require.NoError(t, err)
+	ab, err := fx.CreateCollection(ctx, "A:b")
+	require.NoError(t, err)
+	require.NoError(t, ab.EnsureIndex(ctx, IndexInfo{Name: "c", Fields: []string{"x"}}))
+	require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(`{"id":1,"x":1}`)))
+	require.NoError(t, ab.Insert(ctx, anyenc.MustParseJson(`{"id":1,"x":1}`)))
+
+	d := fx.DB.(*db)
+	indexNames := func(coll string) (names []string) {
+		t.Helper()
+		require.NoError(t, d.doReadTx(ctx, func(tx *btree.ReadTx) error {
+			infos, err := d.getIndexInfos(tx, coll)
+			for _, info := range infos {
+				names = append(names, info.Name)
+			}
+			return err
+		}))
+		return names
+	}
+	assert.Empty(t, indexNames("A"))
+	assert.Equal(t, []string{"c"}, indexNames("A:b"))
+
+	// A new handle loads its schema from the catalog.
+	require.NoError(t, a.Close())
+	require.NoError(t, ab.Close())
+	a, err = fx.OpenCollection(ctx, "A")
+	require.NoError(t, err)
+	assert.Empty(t, a.GetIndexes())
+	assertCollCount(t, a, 1)
+	ab, err = fx.OpenCollection(ctx, "A:b")
+	require.NoError(t, err)
+	require.Len(t, ab.GetIndexes(), 1)
+	assert.Equal(t, "c", ab.GetIndexes()[0].Info().Name)
+	n, err := ab.Find(`{"x":1}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+}
+
 func TestDb_GetCollectionNames(t *testing.T) {
 	fx := newFixture(t)
 	var collNames = []string{"c1", "c2", "c3"}
