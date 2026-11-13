@@ -141,6 +141,12 @@ var (
 	ErrBusy = btree.ErrBusy
 
 	ErrDBIsNotOpened = errors.New("any-store: database is not opened")
+
+	// ErrUnsupportedDB is returned by a package function that takes a DB,
+	// such as SchemaFormat, when that DB is not one this package opened: a
+	// type of the caller's own that implements the interface.
+	ErrUnsupportedDB = errors.New("any-store: database was not opened by this package")
+
 	// ErrIncompatibleVersion is returned (wrapped) by Open when the file was written in a format
 	// newer than this release reads. The file is intact and is left unchanged; open it with a
 	// release that knows the format. It does not match ErrCorrupt.
