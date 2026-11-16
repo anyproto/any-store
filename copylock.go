@@ -3,6 +3,8 @@
 package anystore
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 )
 
@@ -108,4 +110,49 @@ func withContentStat(f *os.File) (os.FileInfo, error) {
 		return nil, err
 	}
 	return f.Stat()
+}
+
+// stagingOpenAsDatabase reports whether a database has the file at path
+// open. An open database holds a lock of the operating system on its file
+// from before it reads the file until it closes it (the database file lock,
+// internal/btree/pager.go and dbfile_lock_unix.go, dbfile_lock_windows.go):
+// on Unix a flock, shared when the database is shared between processes and
+// exclusive when it is kept in the process; on Windows, where it is always
+// kept in the process, LockFileEx over the whole file. The exclusive lock
+// without waiting that acquireCopyLock takes, tried here on a descriptor of
+// its own, conflicts with either, in this process as in another. It is
+// released at once, by the close; a file whose lock it gets is reported
+// free.
+//
+// No file is created: a path that names nothing, or something other than a
+// regular file (which no database has open, and whose open could block, as
+// a FIFO's does), is reported free. The file is opened for writing, as the
+// database opens it: flock emulated over NFS takes an exclusive lock only on
+// a descriptor open for writing.
+func stagingOpenAsDatabase(path string) (bool, error) {
+	fi, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !fi.Mode().IsRegular() {
+		return false, nil
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	if err = lockFileExclusive(f); err != nil {
+		if errors.Is(err, ErrBusy) {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
 }

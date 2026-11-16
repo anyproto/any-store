@@ -2,9 +2,11 @@
 
 package anystore
 
-// The lock file of a copy's lock on Unix and Windows (copylock.go).
+// The lock file of a copy's lock on Unix and Windows (copylock.go), and the
+// lock of an open database that a copy tries on its staging file.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,6 +16,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
 // The lock file has content while it is held and goes with its holder; a
@@ -117,4 +121,83 @@ func TestCopyLock_OpenedBeforeItsRemoval(t *testing.T) {
 			assert.Empty(t, dirNames(t, dir))
 		})
 	}
+}
+
+// stagingOpenAsDatabase finds the lock of an open database in both modes of
+// the database file lock: shared between processes, a shared flock (Windows
+// has no such mode and opens it kept in the process), and kept in the
+// process, an exclusive lock. A closed database, a missing name and a
+// directory are free.
+func TestStagingOpenAsDatabase(t *testing.T) {
+	dir := t.TempDir()
+	for _, inProcess := range []bool{false, true} {
+		path := filepath.Join(dir, fmt.Sprintf("inprocess-%v.db", inProcess))
+		d, err := btree.Open(path, btree.Options{InProcess: inProcess})
+		require.NoError(t, err)
+		open, err := stagingOpenAsDatabase(path)
+		require.NoError(t, err)
+		assert.True(t, open, "open, InProcess=%v", inProcess)
+		require.NoError(t, d.Close())
+		open, err = stagingOpenAsDatabase(path)
+		require.NoError(t, err)
+		assert.False(t, open, "closed, InProcess=%v", inProcess)
+	}
+	for _, free := range []string{filepath.Join(dir, "missing"), dir} {
+		open, err := stagingOpenAsDatabase(free)
+		require.NoError(t, err)
+		assert.False(t, open, free)
+	}
+}
+
+// A database open under the staging name, which is not the source, is no
+// killed copy's leftover: the copy tries the lock an open database holds on
+// its file before it removes anything there, and fails with ErrBusy,
+// removing nothing; the database keeps its files and its commits. Once it
+// is closed, it is a file under a reserved name like any other, and the
+// next copy removes it.
+func TestCopyToLatestFormat_StagingOpenAsDatabase(t *testing.T) {
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1}`)
+	dir := t.TempDir()
+	dstPath := filepath.Join(dir, "x")
+	stage := dstPath + ".copy-staging"
+	// The commits stay in the log, which the copy would remove too.
+	conf := &Config{DisableAutoCheckpoint: true}
+	other, err := Open(ctx, stage, conf)
+	require.NoError(t, err)
+	closed := false
+	defer func() {
+		if !closed {
+			_ = other.Close()
+		}
+	}()
+	oc, err := other.CreateCollection(ctx, "other")
+	require.NoError(t, err)
+	insertJSON(t, oc, `{"id":1}`, `{"id":2}`)
+	before := dirNames(t, dir)
+
+	report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+	require.ErrorIs(t, err, ErrBusy)
+	assert.ErrorContains(t, err, "the staging file "+stage+" is open as a database")
+	assert.Zero(t, report)
+	assert.Equal(t, before, dirNames(t, dir), "the copy touches nothing")
+
+	insertJSON(t, oc, `{"id":3}`)
+	closed = true
+	require.NoError(t, other.Close())
+	reopened, err := Open(ctx, stage, conf)
+	require.NoError(t, err)
+	rc, err := reopened.OpenCollection(ctx, "other")
+	require.NoError(t, err)
+	n, err := rc.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 3, n)
+	require.NoError(t, reopened.Close())
+
+	_, err = CopyToLatestFormat(ctx, src, dstPath, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"x"}, dirNames(t, dir))
+	assertSameDatabase(t, src, openCopy(t, dstPath, nil))
 }

@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -110,11 +111,16 @@ type CopyReport struct {
 // Under the lock the copy is built in the staging file
 // dstPath+".copy-staging", in dstPath's own directory, so that publishing
 // it never crosses filesystems. Staging files a killed call left there
-// (that name, and its -wal, -wal-shm and .lock) are removed first: nobody
-// else can be using them while the lock is held. The copy is checkpointed,
-// verified (each collection's options, document count and index
-// definitions against the source's snapshot, then IntegrityCheck) and
-// closed, and then published by renaming the staging file to dstPath. The
+// (that name, and its -wal, -wal-shm and .lock) are removed first: no other
+// copy can be using them while the lock is held. A database open at the
+// staging name is no killed call's: an open database holds a lock of the
+// operating system on its file (a flock on Unix, LockFileEx on Windows),
+// and the call tries that lock, exclusively and without waiting, before it
+// removes anything; if it is held the call returns ErrBusy and removes
+// nothing. js/wasm and wasip1 have no such lock to try. The copy is
+// checkpointed, verified (each collection's options, document count and
+// index definitions against the source's snapshot, then IntegrityCheck)
+// and closed, and then published by renaming the staging file to dstPath. The
 // files at and beside dstPath are checked again right before the rename,
 // so a file that appeared there while the copy ran also gives
 // ErrDestinationExists. The check and the rename are not one step: a file
@@ -125,8 +131,13 @@ type CopyReport struct {
 //
 // The names dstPath+".copy-lock" and dstPath+".copy-staging", with the
 // -wal, -wal-shm and .lock of the latter, are reserved for this call: it
-// creates them and removes them, whatever a file found there holds. Keep
-// nothing of your own under them.
+// creates them and removes them, whatever a file found there holds, but a
+// database open at the staging name. Keep nothing of your own under them.
+// A src whose database file, or a file it keeps beside it, is under one of
+// them is refused, on every platform, before anything is created or
+// removed; the names are compared by path and by file identity, so another
+// spelling of dstPath (relative, through a symbolic link, in another case
+// on a case-insensitive filesystem) is refused too.
 //
 // dstPath is created only by the publication, as a complete, verified,
 // closed copy. On a failure before it the call closes the copy and removes
@@ -170,6 +181,9 @@ func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Con
 		return CopyReport{}, err
 	}
 	if err = notReservedName(dstPath); err != nil {
+		return CopyReport{}, err
+	}
+	if err = sourceOutsideReservedNames(s.btreeDB.Path(), dstPath); err != nil {
 		return CopyReport{}, err
 	}
 	// ~ vacuum.c:236-242: VACUUM INTO refuses an output file that has content.
@@ -625,14 +639,89 @@ func notReservedName(dstPath string) error {
 	return nil
 }
 
+// reservedNames lists the files a copy to dstPath keeps for itself beside
+// it: its lock file, and its staging file with the files a database keeps
+// beside that.
+func reservedNames(dstPath string) []string {
+	return append([]string{dstPath + copyLockSuffix}, databaseFiles(dstPath+copyStagingSuffix)...)
+}
+
+// sourceOutsideReservedNames refuses a copy to dstPath from the source whose
+// database file is at srcPath if a file of the source is under one of the
+// names the copy keeps for itself (reservedNames): the copy would remove it
+// as a killed call's staging file, or lock it as its lock file. The files
+// of the source are its database file and the ones it keeps beside it
+// (databaseFiles). Each is compared with each reserved name as a cleaned
+// absolute path and, where both exist, by file identity (os.SameFile of
+// their stats, which follow symbolic links), so that another spelling of
+// the destination is refused too: a relative one, one through a symbolic
+// link or a hard link, one in another case on a case-insensitive
+// filesystem. A name that exists but cannot be stat'ed fails the call: the
+// copy cannot tell whether it is the source's. An in-memory source, whose
+// srcPath is empty, has no files.
+func sourceOutsideReservedNames(srcPath, dstPath string) error {
+	if srcPath == "" {
+		return nil
+	}
+	stat := func(p string) (os.FileInfo, error) {
+		fi, err := os.Stat(p)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("any-store: copy to latest format: %w", err)
+		}
+		return fi, nil
+	}
+	srcFiles := databaseFiles(srcPath)
+	srcInfos := make([]os.FileInfo, len(srcFiles))
+	for i, p := range srcFiles {
+		var err error
+		if srcInfos[i], err = stat(p); err != nil {
+			return err
+		}
+	}
+	for _, name := range reservedNames(dstPath) {
+		abs, err := filepath.Abs(name)
+		if err != nil {
+			return fmt.Errorf("any-store: copy to latest format: %w", err)
+		}
+		fi, err := stat(name)
+		if err != nil {
+			return err
+		}
+		for i, p := range srcFiles {
+			if p == abs || fi != nil && srcInfos[i] != nil && os.SameFile(fi, srcInfos[i]) {
+				return fmt.Errorf("any-store: copy to latest format: %s, a name the copy keeps for its own files, is the source's file %s", name, p)
+			}
+		}
+	}
+	return nil
+}
+
 // reserveStaging creates the empty file the copy for dstPath is built in,
 // dstPath+copyStagingSuffix, and returns its name. The caller holds
-// dstPath's copy lock, so whatever is under the staging name or beside it
-// was left by a call that died, and is removed first; these are names only
-// this API creates. The file is then created exclusively: everything the
-// copy creates under that name is this call's.
+// dstPath's copy lock, so no other copy uses the staging name, and what is
+// under it or beside it was left by a call that died, and is removed first;
+// these are names only this API creates. The file is then created
+// exclusively: everything the copy creates under that name is this call's.
+//
+// The lock excludes copies, not a database someone opened under the
+// staging name, and that one is no killed call's. An open database holds a
+// lock of the operating system on its file for as long as it is open
+// (stagingOpenAsDatabase), so the staging file is tried for that lock
+// first: one that is held fails the call with ErrBusy, and nothing is
+// removed. The source is refused earlier, on every platform
+// (sourceOutsideReservedNames); this covers another database, where the
+// platform has the lock.
 func reserveStaging(dstPath string) (string, error) {
 	stage := dstPath + copyStagingSuffix
+	switch open, err := stagingOpenAsDatabase(stage); {
+	case err != nil:
+		return "", fmt.Errorf("any-store: copy to latest format: trying the lock of the staging file %s: %w", stage, err)
+	case open:
+		return "", fmt.Errorf("any-store: copy to latest format: the staging file %s is open as a database: %w", stage, ErrBusy)
+	}
 	for _, p := range databaseFiles(stage) {
 		if err := osRemove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return "", fmt.Errorf("any-store: copy to latest format: removing a staging file left by an earlier copy: %w", err)

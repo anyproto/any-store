@@ -1198,6 +1198,72 @@ func TestCopyToLatestFormat_StaleStagingNotRemovable(t *testing.T) {
 	assert.Equal(t, []string{"copy.db.copy-staging-wal"}, dirNames(t, dstDir))
 }
 
+// A source whose database file is under a name a copy keeps for itself
+// beside the destination is refused before anything is created or removed:
+// the copy would remove the file as a killed copy's staging file, with its
+// log and the commits not yet checkpointed out of it, or lock it as its
+// lock file. The names are compared by path and by file identity, so
+// another spelling of the destination is refused too: a relative one, one
+// through a symbolic link to the directory, and, on a case-insensitive
+// filesystem, one in another case. The source keeps every file and every
+// commit, and goes on committing.
+func TestCopyToLatestFormat_SourceUnderReservedName(t *testing.T) {
+	filesOnJS(t)
+	for _, suffix := range []string{".copy-staging", ".copy-staging-wal", ".copy-staging-wal-shm",
+		".copy-staging.lock", ".copy-lock"} {
+		t.Run(suffix, func(t *testing.T) {
+			dir := t.TempDir()
+			srcPath := filepath.Join(dir, "x"+suffix)
+			// The commits stay in the source's log: removing the log would
+			// take them with it.
+			conf := &Config{DisableAutoCheckpoint: true}
+			src, err := Open(ctx, srcPath, conf)
+			require.NoError(t, err)
+			closed := false
+			defer func() {
+				if !closed {
+					_ = src.Close()
+				}
+			}()
+			coll, err := src.CreateCollection(ctx, "docs")
+			require.NoError(t, err)
+			insertJSON(t, coll, `{"id":1}`, `{"id":2}`, `{"id":3}`)
+
+			t.Chdir(dir)
+			spellings := []string{filepath.Join(dir, "x"), "x"}
+			link := filepath.Join(t.TempDir(), "link")
+			if err := os.Symlink(dir, link); err == nil {
+				spellings = append(spellings, filepath.Join(link, "x"))
+			} else {
+				t.Logf("no symbolic link to the directory: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "X"+suffix)); err == nil {
+				// A case-insensitive filesystem.
+				spellings = append(spellings, filepath.Join(dir, "X"))
+			}
+			before := dirNames(t, dir)
+			for _, dstPath := range spellings {
+				report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+				require.ErrorContains(t, err, "a name the copy keeps for its own files, is the source's file", dstPath)
+				assert.NotErrorIs(t, err, ErrDestinationExists)
+				assert.NotErrorIs(t, err, ErrBusy)
+				assert.Zero(t, report)
+				assert.Equal(t, before, dirNames(t, dir), "a copy to %s touches nothing", dstPath)
+			}
+
+			insertJSON(t, coll, `{"id":4}`)
+			closed = true
+			require.NoError(t, src.Close())
+			reopened := openCopy(t, srcPath, conf)
+			c, err := reopened.OpenCollection(ctx, "docs")
+			require.NoError(t, err)
+			n, err := c.Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 4, n)
+		})
+	}
+}
+
 // A lock that cannot be taken for another reason than its being held, and
 // a rename the filesystem refuses, fail the call: the copy's files go and
 // nothing is at the destination.

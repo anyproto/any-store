@@ -93,7 +93,13 @@ every collection, document and index of `db`:
   the latter, belong to the copy: it creates them, and removes whatever it
   finds there. Staging files a killed copy left are removed by the next copy
   to that destination, under its lock. Keep nothing of your own under these
-  names; a destination that ends in one of them is refused.
+  names; a destination that ends in one of them is refused. One thing found
+  there is not removed: a database open at `<destination>.copy-staging`. An
+  open database holds a lock of the operating system on its file (`flock`
+  on Unix, `LockFileEx` on Windows), which the copy tries before it removes
+  anything; if it is held, the call returns `ErrBusy` and removes nothing.
+  js/wasm and wasip1 have no such lock; there only a source under these
+  names is refused, as described below.
 - **Verified.** Before it is published, each collection of the copy is
   checked against the source's snapshot: its options, its document count
   and its index definitions. Then `IntegrityCheck` runs on the copy. A
@@ -101,7 +107,14 @@ every collection, document and index of `db`:
 - **Returned closed.** The copy has no `-wal` or `-wal-shm` file beside it.
   `report` gives the number of collections, documents and indexes copied,
   and how long the call took.
-- **The source's files are never renamed or removed.**
+- **The source's files are never renamed or removed.** A source whose
+  database file, or its `-wal`, `-wal-shm` or `.lock`, is under one of the
+  destination's reserved names (`app.db.copy-staging` copied to `app.db`)
+  is refused before anything is created or removed, on every platform: the
+  copy would take it for a killed copy's staging file. The names are
+  compared by path and by file identity, so another spelling of the
+  destination is refused too: a relative path, one through a symbolic link,
+  one in another case on a case-insensitive filesystem.
 
 The call fails with:
 
@@ -110,7 +123,7 @@ The call fails with:
 | `ErrUnsupportedDB` | `db` was not opened by this package (a type of your own that implements `DB`). Nothing is created. |
 | `ErrTxInContext` | `ctx` carries a read or write transaction. The copy reads in a transaction of its own, as SQLite refuses `VACUUM` inside one. |
 | `ErrDestinationExists` | The destination or one of its sidecars exists, or appeared while the copy ran. |
-| `ErrBusy` | Another call is copying to the same destination right now (on js/wasm and wasip1, to any destination in the process). Nothing was created or removed; try again once that call has returned. |
+| `ErrBusy` | Another call is copying to the same destination right now (on js/wasm and wasip1, to any destination in the process), or a database is open at the destination's staging name, `<destination>.copy-staging`. Nothing was created or removed; try again once that call has returned, or that database is closed. |
 | `ErrCopyPublished` | The copy is complete, verified and published at the destination, and a step after that failed: the sync of the destination's directory, or the removal of a file left under the staging name. It wraps that failure, and the report is filled. Use the copy; to make its name durable, sync its directory. |
 | any other | The copy failed: a collection, index or document could not be copied (the error names it, see [What can differ](#what-can-differ)), the copy did not match the source, or an I/O operation failed. Cancelling `ctx` stops the copy with the context's error. |
 
