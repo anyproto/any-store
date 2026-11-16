@@ -1198,6 +1198,51 @@ func TestCopyToLatestFormat_StaleStagingNotRemovable(t *testing.T) {
 	assert.Equal(t, []string{"copy.db.copy-staging-wal"}, dirNames(t, dstDir))
 }
 
+// A closed source, in memory or on disk, fails the call with ErrDBIsClosed
+// before it creates, writes or removes anything: a staging file a killed
+// copy left stays as it was, no lock file is made, and a destination that
+// exists does not make it ErrDestinationExists.
+func TestCopyToLatestFormat_ClosedSource(t *testing.T) {
+	for _, inMemory := range []bool{false, true} {
+		t.Run(fmt.Sprintf("InMemory=%v", inMemory), func(t *testing.T) {
+			var src DB
+			if inMemory {
+				var err error
+				src, err = Open(ctx, ":memory:", &Config{InMemory: true})
+				require.NoError(t, err)
+			} else {
+				src, _ = openSource(t, nil)
+			}
+			coll, err := src.CreateCollection(ctx, "docs")
+			require.NoError(t, err)
+			insertJSON(t, coll, `{"id":1}`)
+			require.NoError(t, src.Close())
+
+			dir := t.TempDir()
+			dstPath := filepath.Join(dir, "x")
+			stage := dstPath + ".copy-staging"
+			require.NoError(t, os.WriteFile(stage, []byte("left"), 0o644))
+			left, err := os.Lstat(stage)
+			require.NoError(t, err)
+			for _, names := range [][]string{{"x.copy-staging"}, {"x", "x.copy-staging"}} {
+				if len(names) == 2 {
+					require.NoError(t, os.WriteFile(dstPath, []byte("keep"), 0o644))
+				}
+				report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+				require.ErrorIs(t, err, ErrDBIsClosed)
+				assert.Zero(t, report)
+				assert.Equal(t, names, dirNames(t, dir), "the copy touches nothing")
+				now, err := os.Lstat(stage)
+				require.NoError(t, err)
+				assert.True(t, os.SameFile(left, now), "the staging file is the one left there")
+				data, err := os.ReadFile(stage)
+				require.NoError(t, err)
+				assert.Equal(t, "left", string(data))
+			}
+		})
+	}
+}
+
 // A source whose database file is under a name a copy keeps for itself
 // beside the destination is refused before anything is created or removed:
 // the copy would remove the file as a killed copy's staging file, with its

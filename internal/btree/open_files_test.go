@@ -10,7 +10,7 @@ import (
 // OpenFiles names the files by the path Open was given, uncleaned, and
 // identifies them by their descriptors: the database file, the log, and
 // the log's index when that is a file. An in-memory database has none; a
-// closed one returns ErrClosed.
+// closed one, in memory or not, returns ErrClosed.
 func TestOpenFiles(t *testing.T) {
 	dir := t.TempDir()
 	for _, inProcess := range []bool{false, true} {
@@ -64,9 +64,14 @@ func TestOpenFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = mem.Close() }()
 	files, err := mem.OpenFiles()
 	if err != nil || files != (OpenFiles{}) {
 		t.Errorf("in memory: %+v, %v", files, err)
+	}
+	if err := mem.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if files, err := mem.OpenFiles(); !errors.Is(err, ErrClosed) || files != (OpenFiles{}) {
+		t.Errorf("in memory, closed: %+v, %v, want ErrClosed", files, err)
 	}
 }

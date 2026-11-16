@@ -880,9 +880,13 @@ type OpenFiles struct {
 	DB, WAL, SHM os.FileInfo
 }
 
-// OpenFiles returns the files db has open. An in-memory database has none,
-// and returns the zero OpenFiles; a closed one returns ErrClosed.
+// OpenFiles returns the files db has open. A closed database returns
+// ErrClosed, in memory or not; an open in-memory one has none, and returns
+// the zero OpenFiles.
 func (db *DB) OpenFiles() (OpenFiles, error) {
+	if db.closed.Load() {
+		return OpenFiles{}, ErrClosed
+	}
 	if db.opts.InMemory {
 		return OpenFiles{}, nil
 	}
