@@ -100,7 +100,9 @@ type CopyReport struct {
 // (flock on Unix, LockFileEx on Windows), which the system drops if the
 // process dies. A second call for the same dstPath, from this process or
 // another, does not wait: it returns ErrBusy at once and touches nothing.
-// The lock file is removed when the call returns. The other platforms
+// The lock file is removed when the call returns, except after a failure
+// to take the lock, which can leave an unlocked lock file for the next call
+// to reuse. The other platforms
 // (js/wasm, wasip1) have no such lock: there the lock is the process's,
 // one for every dstPath, so one call at a time copies in the process, and
 // no lock file is made.

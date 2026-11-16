@@ -72,10 +72,11 @@ every collection, document and index of `db`:
   system drops the lock if the process dies, so a killed copy never blocks
   the next one. A second call for the same destination, from this process or
   another, does not wait: it returns `ErrBusy` at once and touches nothing.
-  The lock file is removed when the call returns. On js/wasm and wasip1,
-  which have no such lock, the lock is held in the process and covers every
-  destination: one copy at a time runs in the process, and no lock file is
-  made.
+  The lock file is removed when the call returns, except after a failure to
+  take the lock: then an unlocked lock file can stay, and the next call reuses
+  it. On js/wasm and wasip1, which have no such lock, the lock is held in the
+  process and covers every destination: one copy at a time runs in the
+  process, and no lock file is made.
 - **Published by a rename.** The copy is built in the staging file
   `<destination>.copy-staging`, in the destination's own directory,
   checkpointed, verified and closed, and only then renamed to the
@@ -117,8 +118,8 @@ The call creates the destination only by publishing a complete, verified,
 closed copy. On a failure before that it closes the copy and removes its
 staging files. A removal that fails is joined to the returned error, naming
 the file left. The staging files are the only files a failed call owns, and
-the only ones a crash before the publication leaves, beside an empty,
-unlocked lock file. There is nothing to clean up by hand: the next copy to
+the only ones a crash before the publication leaves, beside an unlocked
+lock file of one byte. There is nothing to clean up by hand: the next copy to
 that destination removes them. If no copy will follow, remove the reserved
 names once no copy is running.
 
