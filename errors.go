@@ -87,6 +87,14 @@ var (
 	// first, then create it with the new definition.
 	ErrIndexMismatch = errors.New("any-store: index exists with a different definition")
 
+	// ErrNamespaceExists is returned when a collection or index name derives
+	// a storage name that another collection's index already has. Collection
+	// names may contain ":", so collection "A"'s index "b:c" and collection
+	// "A:b"'s index "c" derive the same catalog key: creating the second of
+	// the two, with CreateIndex or EnsureIndex and whatever its definition,
+	// returns it (wrapped), and nothing is created.
+	ErrNamespaceExists = btree.ErrNamespaceExists
+
 	// ErrTxIsReadOnly is returned when a write operation is attempted in a read-only transaction.
 	ErrTxIsReadOnly = errors.New("any-store: transaction is read-only")
 

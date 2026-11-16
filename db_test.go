@@ -160,10 +160,10 @@ func TestRegisterIndex_KeyOfAnotherCollectionsIndex(t *testing.T) {
 		t.Helper()
 		for _, info := range []IndexInfo{same, other} {
 			err := a.EnsureIndex(ctx, info)
-			require.ErrorIs(t, err, btree.ErrNamespaceExists)
+			require.ErrorIs(t, err, ErrNamespaceExists)
 			assert.NotErrorIs(t, err, ErrIndexExists)
 			assert.Contains(t, err.Error(), `"idx:A:b:c" holds index "c" of another collection`)
-			require.ErrorIs(t, a.CreateIndex(ctx, info), btree.ErrNamespaceExists)
+			require.ErrorIs(t, a.CreateIndex(ctx, info), ErrNamespaceExists)
 		}
 		assert.Empty(t, a.GetIndexes(), "A has no index")
 		// No unique index on A: equal values of x go in.

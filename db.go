@@ -473,7 +473,7 @@ func indexKeyPrefix(collName string) string {
 // stand for two pairs: collection "A:b" index "c" and collection "A" index
 // "b:c" both derive idx:A:b:c and ix:A:b:c. Creating the second of the two
 // finds the first one's catalog record, which stores the first one's index
-// name: registerIndex refuses it with btree.ErrNamespaceExists, for
+// name: registerIndex refuses it with ErrNamespaceExists, for
 // CreateIndex and EnsureIndex alike and whatever the definition, since the
 // record's index is the other collection's. The scan of collection "A"'s
 // prefix "idx:A:" also meets the records of "A:b"; getIndexInfos takes a
@@ -2051,7 +2051,7 @@ func fulltextDefMatches(fv *anyenc.Value, p *FulltextParams) bool {
 // collection's: the key is also the one of a collection whose name continues
 // collName past a ":" (see validateCollectionName), and getIndexInfos gives
 // the record to that collection alone. It is refused with
-// btree.ErrNamespaceExists whatever its definition: taking an identical one
+// ErrNamespaceExists whatever its definition: taking an identical one
 // for this collection's index would let EnsureIndex report an index the
 // collection does not have.
 func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) error {
