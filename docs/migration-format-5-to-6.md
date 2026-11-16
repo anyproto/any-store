@@ -72,9 +72,14 @@ every collection, document and index of `db`:
   system drops the lock if the process dies, so a killed copy never blocks
   the next one. A second call for the same destination, from this process or
   another, does not wait: it returns `ErrBusy` at once and touches nothing.
-  The lock file is removed when the call returns, except after a failure to
-  take the lock: then an unlocked lock file can stay, and the next call reuses
-  it. On js/wasm and wasip1, which have no such lock, the lock is held in the
+  A destination that names a file a database keeps beside it (`app.db-wal`,
+  `app.db-wal-shm` or `app.db.lock`, in any case) is read as `app.db`'s file
+  once `app.db` exists, so a copy to it holds `app.db.copy-lock` too: a copy
+  to `app.db` and a copy to one of those names do not run at once either,
+  and the one that comes second returns `ErrBusy`. The lock files are
+  removed when the call returns, except after a failure to take a lock:
+  then an unlocked lock file can stay, and the next call reuses it. On
+  js/wasm and wasip1, which have no such lock, the lock is held in the
   process and covers every destination: one copy at a time runs in the
   process, and no lock file is made.
 - **Published by a rename.** The copy is built in the staging file
@@ -85,21 +90,26 @@ every collection, document and index of `db`:
   without hard links. Right before the rename the destination and its
   `-wal`, `-wal-shm` and `.lock` are checked again, so a file that appeared
   there while the copy ran also gives `ErrDestinationExists`. The check and
-  the rename are not one step: a file that something else creates at the
-  destination between them is replaced, so do not let anything else create
-  files under the destination's name while the copy runs.
+  the rename are not one step, and the locks exclude only other copies: a
+  file that something else creates at the destination between them is
+  replaced, and a `-wal`, `-wal-shm` or `.lock` that it creates beside the
+  destination then is not seen, and is read as the copy's own once the copy
+  is opened. So do not let anything else create files under the
+  destination's name while the copy runs.
 - **Reserved names.** `<destination>.copy-lock` and
   `<destination>.copy-staging`, with the `-wal`, `-wal-shm` and `.lock` of
-  the latter, belong to the copy: it creates them, and removes whatever it
-  finds there. Staging files a killed copy left are removed by the next copy
-  to that destination, under its lock. Keep nothing of your own under these
-  names; a destination that ends in one of them is refused. One thing found
-  there is not removed: a database open at `<destination>.copy-staging`. An
-  open database holds a lock of the operating system on its file (`flock`
-  on Unix, `LockFileEx` on Windows), which the copy tries before it removes
-  anything; if it is held, the call returns `ErrBusy` and removes nothing.
-  js/wasm and wasip1 have no such lock; there only a source under these
-  names is refused, as described below.
+  the latter, belong to the copy, and so, for a destination `app.db-wal`,
+  `app.db-wal-shm` or `app.db.lock`, does `app.db.copy-lock`: it creates
+  them, and removes whatever it finds there. Staging files a killed copy
+  left are removed by the next copy to that destination, under its lock.
+  Keep nothing of your own under these names; a destination that ends in
+  one of them is refused. One thing found there is not removed: a database
+  open at `<destination>.copy-staging`. An open database holds a lock of
+  the operating system on its file (`flock` on Unix, `LockFileEx` on
+  Windows), which the copy tries before it removes anything; if it is held,
+  the call returns `ErrBusy` and removes nothing. js/wasm and wasip1 have
+  no such lock; there only a source under these names is refused, as
+  described below.
 - **Verified.** Before it is published, each collection of the copy is
   checked against the source's snapshot: its options, its document count
   and its index definitions. Then `IntegrityCheck` runs on the copy. A
@@ -123,7 +133,7 @@ The call fails with:
 | `ErrUnsupportedDB` | `db` was not opened by this package (a type of your own that implements `DB`). Nothing is created. |
 | `ErrTxInContext` | `ctx` carries a read or write transaction. The copy reads in a transaction of its own, as SQLite refuses `VACUUM` inside one. |
 | `ErrDestinationExists` | The destination or one of its sidecars exists, or appeared while the copy ran. |
-| `ErrBusy` | Another call is copying to the same destination right now (on js/wasm and wasip1, to any destination in the process), or a database is open at the destination's staging name, `<destination>.copy-staging`. Nothing was created or removed; try again once that call has returned, or that database is closed. |
+| `ErrBusy` | Another call is copying to the same destination right now, or to a name one of the two would keep beside the other (`app.db` and `app.db-wal`, either way round; on js/wasm and wasip1, to any destination in the process), or a database is open at the destination's staging name, `<destination>.copy-staging`. Nothing was created or removed; try again once that call has returned, or that database is closed. |
 | `ErrCopyPublished` | The copy is complete, verified and published at the destination, and a step after that failed: the sync of the destination's directory, or the removal of a file left under the staging name. It wraps that failure, and the report is filled. Use the copy; to make its name durable, sync its directory. |
 | any other | The copy failed: a collection, index or document could not be copied (the error names it, see [What can differ](#what-can-differ)), the copy did not match the source, or an I/O operation failed. Cancelling `ctx` stops the copy with the context's error. |
 

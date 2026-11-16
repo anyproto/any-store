@@ -1202,15 +1202,26 @@ func TestCopyToLatestFormat_StaleStagingNotRemovable(t *testing.T) {
 // beside the destination is refused before anything is created or removed:
 // the copy would remove the file as a killed copy's staging file, with its
 // log and the commits not yet checkpointed out of it, or lock it as its
-// lock file. The names are compared by path and by file identity, so
-// another spelling of the destination is refused too: a relative one, one
-// through a symbolic link to the directory, and, on a case-insensitive
-// filesystem, one in another case. The source keeps every file and every
-// commit, and goes on committing.
+// lock file. A copy to x+"-wal", x+"-wal-shm" or x+".lock" holds x's copy
+// lock too, so a source at x+".copy-lock" is refused for those as well. The
+// names are compared by path and by file identity, so another spelling of
+// the destination is refused too: a relative one, one through a symbolic
+// link to the directory, and, on a case-insensitive filesystem, one in
+// another case. The source keeps every file and every commit, and goes on
+// committing.
 func TestCopyToLatestFormat_SourceUnderReservedName(t *testing.T) {
 	filesOnJS(t)
-	for _, suffix := range []string{".copy-staging", ".copy-staging-wal", ".copy-staging-wal-shm",
-		".copy-staging.lock", ".copy-lock"} {
+	for _, tc := range []struct {
+		suffix string
+		dsts   []string
+	}{
+		{".copy-staging", []string{"x"}},
+		{".copy-staging-wal", []string{"x"}},
+		{".copy-staging-wal-shm", []string{"x"}},
+		{".copy-staging.lock", []string{"x"}},
+		{".copy-lock", []string{"x", "x-wal", "x-wal-shm", "x.lock"}},
+	} {
+		suffix := tc.suffix
 		t.Run(suffix, func(t *testing.T) {
 			dir := t.TempDir()
 			srcPath := filepath.Join(dir, "x"+suffix)
@@ -1230,16 +1241,22 @@ func TestCopyToLatestFormat_SourceUnderReservedName(t *testing.T) {
 			insertJSON(t, coll, `{"id":1}`, `{"id":2}`, `{"id":3}`)
 
 			t.Chdir(dir)
-			spellings := []string{filepath.Join(dir, "x"), "x"}
 			link := filepath.Join(t.TempDir(), "link")
-			if err := os.Symlink(dir, link); err == nil {
-				spellings = append(spellings, filepath.Join(link, "x"))
-			} else {
-				t.Logf("no symbolic link to the directory: %v", err)
+			linked := os.Symlink(dir, link) == nil
+			if !linked {
+				t.Log("no symbolic link to the directory")
 			}
-			if _, err := os.Stat(filepath.Join(dir, "X"+suffix)); err == nil {
-				// A case-insensitive filesystem.
-				spellings = append(spellings, filepath.Join(dir, "X"))
+			_, err = os.Stat(filepath.Join(dir, "X"+suffix))
+			caseless := err == nil
+			var spellings []string
+			for _, dst := range tc.dsts {
+				spellings = append(spellings, filepath.Join(dir, dst), dst)
+				if linked {
+					spellings = append(spellings, filepath.Join(link, dst))
+				}
+				if caseless {
+					spellings = append(spellings, filepath.Join(dir, "X"+dst[1:]))
+				}
 			}
 			before := dirNames(t, dir)
 			for _, dstPath := range spellings {
@@ -1338,47 +1355,109 @@ func TestCopyToLatestFormat_SidecarAppearsBeforePublication(t *testing.T) {
 	}
 }
 
-// Two copies whose destinations overlap, one at p and one at p+"-wal",
-// where the second would be read as the first one's log: in every order,
-// the copy that comes second fails with ErrDestinationExists and leaves
-// nothing behind.
+// Two copies whose destinations overlap, one at p and one at a name the
+// database at p keeps beside it (p+"-wal", p+"-wal-shm", p+".lock", in any
+// case): published both, the open of p would take the other copy for its
+// log, its log's index or its sentinel, and truncate or replace it. Their
+// copy locks are different files, so a copy to such a name holds p's copy
+// lock too, and the two exclude each other however they interleave. A
+// chain needs no more: p+"-wal-wal" is p+"-wal"'s log, and meets it at
+// p+"-wal"'s lock.
+//
+// The interleaving forced here is the one that two separate locks let
+// through: the second copy starts while the first is copying, under its
+// locks, and the first goes on to its rename only once the second has
+// returned or has come to its own rename, past every check of the
+// destination. Exactly one publishes, in either start order: the second
+// returns ErrBusy while the first waits for it, so at once, and touches
+// nothing.
 func TestCopyToLatestFormat_OverlappingDestinations(t *testing.T) {
 	src, _ := openSource(t, nil)
 	coll, err := src.CreateCollection(ctx, "docs")
 	require.NoError(t, err)
 	insertJSON(t, coll, `{"id":1}`)
-	defer func() { testHookBeforePublish = nil }()
-	// during runs second inside the first one's publication hook, once.
-	nest := func(second string) {
-		var ran atomic.Bool
-		testHookBeforePublish = func(string) {
-			if ran.Swap(true) {
-				return
+	prevRename := osRename
+	defer func() {
+		testHookCopiedCollection = nil
+		osRename = prevRename
+	}()
+
+	// Each pair is a database's name and a name it keeps beside it, as
+	// suffixes of p.
+	for _, pair := range [][2]string{{"", "-wal"}, {"", "-wal-shm"}, {"", ".lock"}, {"", "-WAL"}, {"-wal", "-wal-wal"}} {
+		for _, sidecarFirst := range []bool{false, true} {
+			first, second := "p"+pair[0], "p"+pair[1]
+			if sidecarFirst {
+				first, second = second, first
 			}
-			_, err := CopyToLatestFormat(ctx, src, second, nil)
-			require.NoError(t, err)
+			t.Run(first+" then "+second, func(t *testing.T) {
+				dir := t.TempDir()
+				p := filepath.Join(dir, "copy.db")
+				base := p + pair[0]
+				first, second := base, p+pair[1]
+				if sidecarFirst {
+					first, second = second, first
+				}
+				other := map[string]string{first: second, second: first}
+				// renaming[d] is closed when the copy to d comes to its
+				// rename, returned[d] when the call for d returns.
+				renaming := map[string]chan struct{}{first: make(chan struct{}), second: make(chan struct{})}
+				returned := map[string]chan struct{}{first: make(chan struct{}), second: make(chan struct{})}
+				osRename = func(oldpath, newpath string) error {
+					close(renaming[newpath])
+					select {
+					case <-renaming[other[newpath]]:
+					case <-returned[other[newpath]]:
+					case <-time.After(time.Minute):
+						t.Errorf("the copy to %s neither renames nor returns", other[newpath])
+					}
+					return prevRename(oldpath, newpath)
+				}
+				errs := map[string]chan error{first: make(chan error, 1), second: make(chan error, 1)}
+				run := func(dst string) {
+					_, err := CopyToLatestFormat(ctx, src, dst, nil)
+					close(returned[dst])
+					errs[dst] <- err
+				}
+				var started atomic.Bool
+				testHookCopiedCollection = func(string) {
+					if started.Swap(true) {
+						return
+					}
+					// The first copy is copying: the second starts.
+					before := dirNames(t, dir)
+					go run(second)
+					select {
+					case <-returned[second]:
+						assert.Equal(t, before, dirNames(t, dir), "the copy to %s touches nothing", second)
+					case <-renaming[second]:
+						t.Errorf("the copy to %s is past every check while the copy to %s runs", second, first)
+					case <-time.After(time.Minute):
+						t.Errorf("the copy to %s waits", second)
+					}
+				}
+				go run(first)
+				for _, dst := range []string{first, second} {
+					select {
+					case err := <-errs[dst]:
+						if dst == first {
+							assert.NoError(t, err, "the copy to %s publishes", dst)
+						} else {
+							assert.ErrorIs(t, err, ErrBusy, "the copy to %s is refused", dst)
+							assert.ErrorContains(t, err, "another copy holds the copy lock of "+base)
+						}
+					case <-time.After(2 * time.Minute):
+						t.Fatalf("the copy to %s does not end", dst)
+					}
+				}
+				assert.Equal(t, []string{filepath.Base(first)}, dirNames(t, dir))
+				assertSameDatabase(t, src, openCopy(t, first, nil))
+			})
 		}
 	}
-
-	t.Run("the log's name is published while the database's copy runs", func(t *testing.T) {
-		dir := t.TempDir()
-		p := filepath.Join(dir, "copy.db")
-		nest(p + "-wal")
-		_, err := CopyToLatestFormat(ctx, src, p, nil)
-		require.ErrorIs(t, err, ErrDestinationExists)
-		assert.Equal(t, []string{"copy.db-wal"}, dirNames(t, dir))
-	})
-	t.Run("the database is published while the log's copy runs", func(t *testing.T) {
-		dir := t.TempDir()
-		p := filepath.Join(dir, "copy.db")
-		nest(p)
-		_, err := CopyToLatestFormat(ctx, src, p+"-wal", nil)
-		require.ErrorIs(t, err, ErrDestinationExists)
-		assert.Equal(t, []string{"copy.db"}, dirNames(t, dir))
-		assertSameDatabase(t, src, openCopy(t, p, nil))
-	})
 	t.Run("the database is there before", func(t *testing.T) {
-		testHookBeforePublish = nil
+		osRename = prevRename
+		testHookCopiedCollection = nil
 		dir := t.TempDir()
 		p := filepath.Join(dir, "copy.db")
 		_, err := CopyToLatestFormat(ctx, src, p, nil)
@@ -1391,11 +1470,43 @@ func TestCopyToLatestFormat_OverlappingDestinations(t *testing.T) {
 	})
 }
 
+// The copy locks a copy holds: its destination's, after that of the
+// database the destination would be a file of, matched in any case; one
+// level, as a database reads only the files beside its own name. Where one
+// lock serves the process, it is taken once.
+func TestCopyLockNames(t *testing.T) {
+	want := func(names ...string) []string {
+		if !copyLockPerName {
+			return names[len(names)-1:]
+		}
+		return names
+	}
+	for _, tc := range []struct {
+		dst  string
+		want []string
+	}{
+		{"p", want("p")},
+		{"p-wal", want("p", "p-wal")},
+		{"p-wal-shm", want("p", "p-wal-shm")},
+		{"p.lock", want("p", "p.lock")},
+		{"p-WAL", want("p", "p-WAL")},
+		{"p.loc\u212a", want("p", "p.loc\u212a")},
+		{"p-wal-wal", want("p-wal", "p-wal-wal")},
+		{"p-wal.lock", want("p-wal", "p-wal.lock")},
+		{"p-shm", want("p-shm")},
+		{"-wal", want("-wal")},
+	} {
+		assert.Equal(t, tc.want, copyLockNames(tc.dst), tc.dst)
+	}
+}
+
 // The names a database keeps beside it are refused as destinations whatever
 // their case: on a case-insensitive filesystem app.db-WAL is app.db's log,
 // and the open of app.db would take a copy published there for its log and
 // truncate it. The refusal holds on every filesystem, at the start and at
-// the check before the rename.
+// the check before the rename. While such a copy runs it holds app.db's
+// copy lock, matched in any case too, so a copy to app.db is refused with
+// ErrBusy; a file that something else puts there is found by the check.
 func TestCopyToLatestFormat_SidecarNameInAnotherCase(t *testing.T) {
 	src, _ := openSource(t, nil)
 	coll, err := src.CreateCollection(ctx, "docs")
@@ -1421,7 +1532,7 @@ func TestCopyToLatestFormat_SidecarNameInAnotherCase(t *testing.T) {
 		assertSameDatabase(t, src, openCopy(t, p, nil))
 	})
 	for _, suffix := range suffixes {
-		t.Run("the database is published while the copy runs: "+suffix, func(t *testing.T) {
+		t.Run("the database appears while the copy runs: "+suffix, func(t *testing.T) {
 			dir := t.TempDir()
 			p := filepath.Join(dir, "app.db")
 			var ran atomic.Bool
@@ -1430,11 +1541,15 @@ func TestCopyToLatestFormat_SidecarNameInAnotherCase(t *testing.T) {
 					return
 				}
 				_, err := CopyToLatestFormat(ctx, src, p, nil)
-				require.NoError(t, err)
+				assert.ErrorIs(t, err, ErrBusy)
+				require.NoError(t, os.WriteFile(p, []byte("foreign"), 0o644))
 			}
 			_, err := CopyToLatestFormat(ctx, src, p+suffix, nil)
 			require.ErrorIs(t, err, ErrDestinationExists)
 			assert.Equal(t, []string{"app.db"}, dirNames(t, dir))
+			data, err := os.ReadFile(p)
+			require.NoError(t, err)
+			assert.Equal(t, "foreign", string(data))
 		})
 	}
 }

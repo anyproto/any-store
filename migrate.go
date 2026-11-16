@@ -101,9 +101,13 @@ type CopyReport struct {
 // (flock on Unix, LockFileEx on Windows), which the system drops if the
 // process dies. A second call for the same dstPath, from this process or
 // another, does not wait: it returns ErrBusy at once and touches nothing.
-// The lock file is removed when the call returns, except after a failure
-// to take the lock, which can leave an unlocked lock file for the next call
-// to reuse. The other platforms
+// A dstPath that names a file a database at p keeps beside it (p+"-wal",
+// p+"-wal-shm" or p+".lock", in any case) is read as p's file once p
+// exists, so a call for it holds p+".copy-lock" too, taken first: a copy
+// to p and a copy to one of those names do not run at once either, and the
+// one that comes second returns ErrBusy. The lock files are removed when
+// the call returns, except after a failure to take a lock, which can leave
+// an unlocked lock file for the next call to reuse. The other platforms
 // (js/wasm, wasip1) have no such lock: there the lock is the process's,
 // one for every dstPath, so one call at a time copies in the process, and
 // no lock file is made.
@@ -120,19 +124,22 @@ type CopyReport struct {
 // nothing. js/wasm and wasip1 have no such lock to try. The copy is
 // checkpointed, verified (each collection's options, document count and
 // index definitions against the source's snapshot, then IntegrityCheck)
-// and closed, and then published by renaming the staging file to dstPath. The
-// files at and beside dstPath are checked again right before the rename,
-// so a file that appeared there while the copy ran also gives
-// ErrDestinationExists. The check and the rename are not one step: a file
-// that something other than this call creates at dstPath between them is
-// replaced, so let nothing else create files under dstPath's name while
-// the copy runs. The copy is never returned open; it has no -wal or
-// -wal-shm beside it.
+// and closed, and then published by renaming the staging file to dstPath.
+// The files at and beside dstPath are checked again right before the
+// rename, so a file that appeared there while the copy ran also gives
+// ErrDestinationExists. The check and the rename are not one step, and the
+// locks exclude only other copies: a file that something else creates at
+// dstPath between them is replaced, and a -wal, -wal-shm or .lock that it
+// creates beside dstPath then is not seen, and is read as the copy's own
+// once the copy is opened. So let nothing else create files under dstPath's
+// name while the copy runs. The copy is never returned open; it has no
+// -wal or -wal-shm beside it.
 //
 // The names dstPath+".copy-lock" and dstPath+".copy-staging", with the
-// -wal, -wal-shm and .lock of the latter, are reserved for this call: it
-// creates them and removes them, whatever a file found there holds, but a
-// database open at the staging name. Keep nothing of your own under them.
+// -wal, -wal-shm and .lock of the latter, are reserved for this call, and
+// so, for a dstPath that is p's -wal, -wal-shm or .lock, is p+".copy-lock":
+// it creates them and removes them, whatever a file found there holds, but
+// a database open at the staging name. Keep nothing of your own under them.
 // A src whose database file, or a file it keeps beside it, is under one of
 // them is refused, on every platform, before anything is created or
 // removed; the names are compared by path and by file identity, so another
@@ -192,16 +199,15 @@ func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Con
 	if err = destinationFree(dstPath); err != nil {
 		return CopyReport{}, err
 	}
-	unlock, err := lockCopy(dstPath + copyLockSuffix)
+	unlock, err := lockDestination(dstPath)
 	if err != nil {
-		if errors.Is(err, ErrBusy) {
-			return CopyReport{}, fmt.Errorf("any-store: copy to latest format: another copy holds the copy lock of %s: %w", dstPath, err)
-		}
-		return CopyReport{}, fmt.Errorf("any-store: copy to latest format: locking the destination: %w", err)
+		return CopyReport{}, err
 	}
 	// Runs last, after the staging files are gone.
 	defer unlock()
-	// From here to the return no other call copies to dstPath.
+	// From here to the return no other call copies to dstPath, to a name a
+	// database at dstPath keeps beside it, or to the name whose database
+	// keeps dstPath beside it.
 	if err = destinationFree(dstPath); err != nil {
 		return CopyReport{}, err
 	}
@@ -557,14 +563,7 @@ func destinationFree(path string) error {
 			return fmt.Errorf("any-store: copy to latest format: %w", err)
 		}
 	}
-	for _, suffix := range sidecarSuffixes {
-		// Without regard to case: on a case-insensitive filesystem p-WAL is
-		// p's log. The refusal holds on every filesystem; the base keeps its
-		// own spelling.
-		base, ok := cutSuffixFold(path, suffix)
-		if !ok || base == "" {
-			continue
-		}
+	for _, base := range sidecarBases(path) {
 		if _, err := os.Lstat(base); err == nil {
 			return fmt.Errorf("%w: %s is a name the database %s keeps beside it", ErrDestinationExists, path, base)
 		} else if !errors.Is(err, fs.ErrNotExist) {
@@ -598,6 +597,24 @@ func cutSuffixFold(s, suffix string) (before string, found bool) {
 // sidecarSuffixes are the suffixes of the files a database at path keeps
 // beside it: its log, the log's index, and the durability sentinel.
 var sidecarSuffixes = [...]string{"-wal", "-wal-shm", ".lock"}
+
+// sidecarBases lists the names whose database would keep a file at path:
+// path without a sidecar suffix it ends in, matched without regard to case,
+// as on a case-insensitive filesystem p-WAL is p's log (the match holds on
+// every filesystem; the base keeps path's own spelling). A path is the
+// sidecar of at most one name, as no suffix ends another, and of that name
+// only: a database reads the files beside its own name and no others, so
+// p+"-wal-wal" is p+"-wal"'s log and none of p's. A path that is a suffix
+// alone has no base.
+func sidecarBases(path string) []string {
+	var bases []string
+	for _, suffix := range sidecarSuffixes {
+		if base, ok := cutSuffixFold(path, suffix); ok && base != "" {
+			bases = append(bases, base)
+		}
+	}
+	return bases
+}
 
 // databaseFiles lists the files of the database at path: the file and the
 // ones it keeps beside it.
@@ -640,10 +657,65 @@ func notReservedName(dstPath string) error {
 }
 
 // reservedNames lists the files a copy to dstPath keeps for itself beside
-// it: its lock file, and its staging file with the files a database keeps
-// beside that.
+// it: its lock files (copyLockNames, here on every platform), and its
+// staging file with the files a database keeps beside that.
 func reservedNames(dstPath string) []string {
-	return append([]string{dstPath + copyLockSuffix}, databaseFiles(dstPath+copyStagingSuffix)...)
+	var names []string
+	for _, base := range sidecarBases(dstPath) {
+		names = append(names, base+copyLockSuffix)
+	}
+	names = append(names, dstPath+copyLockSuffix)
+	return append(names, databaseFiles(dstPath+copyStagingSuffix)...)
+}
+
+// copyLockNames lists the names whose copy locks a copy to dstPath holds,
+// in the order it takes them: the database dstPath would be a file of
+// (sidecarBases), then dstPath. A copy to p and a copy to p+"-wal" have
+// locks of their own in different files, p+".copy-lock" and
+// p+"-wal.copy-lock": with those alone both could pass the check before
+// the rename (destinationFree) before either renamed, and both publish. So
+// the copy to p+"-wal" holds p's lock too, and the two run one at a time.
+// One level is enough: two destinations meet only when one is the other's
+// sidecar (sidecarBases), and both then hold the lock of the shorter; p
+// and p+"-wal-wal" do not meet, and need no common lock. Where one lock
+// serves the process (copyLockPerName false) it is taken once, and covers
+// every destination.
+func copyLockNames(dstPath string) []string {
+	var names []string
+	if copyLockPerName {
+		names = sidecarBases(dstPath)
+	}
+	return append(names, dstPath)
+}
+
+// lockDestination takes the copy locks of a copy to dstPath
+// (copyLockNames), each without waiting, and returns the function that
+// releases them, in the reverse order. A lock another holder has releases
+// the ones taken and returns ErrBusy at once, naming the lock; as nobody
+// waits, the order of the locks cannot deadlock.
+func lockDestination(dstPath string) (unlock func(), err error) {
+	var releases []func()
+	unlock = func() {
+		for i := len(releases) - 1; i >= 0; i-- {
+			releases[i]()
+		}
+	}
+	for _, name := range copyLockNames(dstPath) {
+		release, err := lockCopy(name + copyLockSuffix)
+		if err != nil {
+			unlock()
+			switch {
+			case !errors.Is(err, ErrBusy):
+				return nil, fmt.Errorf("any-store: copy to latest format: locking the destination: %w", err)
+			case name == dstPath:
+				return nil, fmt.Errorf("any-store: copy to latest format: another copy holds the copy lock of %s: %w", dstPath, err)
+			default:
+				return nil, fmt.Errorf("any-store: copy to latest format: another copy holds the copy lock of %s, and %s is a name the database there keeps beside it: %w", name, dstPath, err)
+			}
+		}
+		releases = append(releases, release)
+	}
+	return unlock, nil
 }
 
 // sourceOutsideReservedNames refuses a copy to dstPath from the source whose
@@ -788,9 +860,11 @@ func removeStagingSidecars(stage string) error {
 // A rename replaces what is at dstPath, so the files at and beside dstPath
 // are checked again right before it: one that appeared while the copy ran
 // fails the call, and one beside dstPath would be read as the copy's log.
-// The caller holds dstPath's copy lock, so no other copy publishes there
-// meanwhile; a file anyone else creates at dstPath between the check and
-// the rename is replaced.
+// The caller holds the copy locks of dstPath and of the database dstPath
+// would be a file of (lockDestination), so meanwhile no other copy
+// publishes at dstPath, beside it, or at the name it is beside. A file
+// anything else creates at dstPath between the check and the rename is
+// replaced, and one it creates beside dstPath then is not seen.
 //
 // Before the rename succeeds a failure removes the staging file, and
 // published is false. Once it has, published is true and dstPath is never

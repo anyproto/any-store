@@ -21,6 +21,11 @@ import "sync/atomic"
 // either.
 var copyLockHeld atomic.Bool
 
+// copyLockPerName: one lock serves every name, so a copy takes it once
+// (copyLockNames); a second acquireCopyLock by the same call would be
+// refused.
+const copyLockPerName = false
+
 // acquireCopyLock takes the process's lock of a copy; a lock already held,
 // for this destination or another, returns ErrBusy at once.
 func acquireCopyLock(string) (release func(), err error) {

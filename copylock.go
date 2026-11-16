@@ -156,3 +156,7 @@ func stagingOpenAsDatabase(path string) (bool, error) {
 	}
 	return false, nil
 }
+
+// copyLockPerName: each name has a copy lock of its own, its lock file, so
+// a copy can hold the locks of several names (copyLockNames).
+const copyLockPerName = true
