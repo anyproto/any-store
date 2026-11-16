@@ -2,14 +2,12 @@ package anystore
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
 	"maps"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -94,39 +92,53 @@ type CopyReport struct {
 // dstPath+".lock" exists, or dstPath is one of those names of an existing
 // file in any case (p+"-WAL" is p's log on a case-insensitive filesystem,
 // and is refused on every one), the call returns ErrDestinationExists and
-// touches nothing. The copy
-// is built under a private name beside dstPath, checkpointed, verified (each
-// collection's options, document count and index definitions against the
-// source's snapshot, then IntegrityCheck) and closed, and then published at
-// dstPath by a hard link. The files beside dstPath are checked again right
-// before the link, and the link fails if dstPath exists, so a file that
-// appeared there while the copy ran also gives ErrDestinationExists: of two
-// calls copying to one dstPath, one publishes. Only for dstPath itself is
-// that atomic; a sidecar created between the last check and the link is not
-// seen. A link that fails otherwise, as on
-// a filesystem without hard links (FAT, exFAT), fails the call with
-// ErrPublishUnsupported; there is no fallback to a rename, which would
-// replace a file published meanwhile. The copy is never returned open; it
-// has no -wal or -wal-shm beside it.
+// touches nothing. A dstPath that ends in one of the names this call keeps
+// for itself, listed below, is refused too.
+//
+// One call at a time copies to a dstPath. For the whole call it holds an
+// exclusive lock of the operating system on the file dstPath+".copy-lock"
+// (flock on Unix, LockFileEx on Windows), which the system drops if the
+// process dies. A second call for the same dstPath, from this process or
+// another, does not wait: it returns ErrBusy at once and touches nothing.
+// The lock file is removed when the call returns.
+//
+// Under the lock the copy is built in the staging file
+// dstPath+".copy-staging", in dstPath's own directory, so that publishing
+// it never crosses filesystems. Staging files a killed call left there
+// (that name, and its -wal, -wal-shm and .lock) are removed first: nobody
+// else can be using them while the lock is held. The copy is checkpointed,
+// verified (each collection's options, document count and index
+// definitions against the source's snapshot, then IntegrityCheck) and
+// closed, and then published by renaming the staging file to dstPath. The
+// files at and beside dstPath are checked again right before the rename,
+// so a file that appeared there while the copy ran also gives
+// ErrDestinationExists. The check and the rename are not one step: a file
+// that something other than this call creates at dstPath between them is
+// replaced, so let nothing else create files under dstPath's name while
+// the copy runs. The copy is never returned open; it has no -wal or
+// -wal-shm beside it.
+//
+// The names dstPath+".copy-lock" and dstPath+".copy-staging", with the
+// -wal, -wal-shm and .lock of the latter, are reserved for this call: it
+// creates them and removes them, whatever a file found there holds. Keep
+// nothing of your own under them.
 //
 // dstPath is created only by the publication, as a complete, verified,
 // closed copy. On a failure before it the call closes the copy and removes
-// its files, all under the staging name: dstPath+".tmp-" and 16 hex digits,
-// with the -wal, -wal-shm and .lock of that name. A removal that fails is
-// joined to the error, with the file's name. Those staging files are the
-// only ones a failed call owns, and the only ones a crash before the
-// publication leaves; remove them once no copy runs. After
+// its staging files. A removal that fails is joined to the error, with the
+// file's name. The staging files are the only ones a failed call owns, and
+// the only ones a crash before the publication leaves, beside an empty,
+// unlocked lock file; the next call for dstPath removes them. After
 // ErrDestinationExists the files at and beside dstPath are not this call's:
-// they were there before, or another caller put them there, and the error
-// is no reason to remove them. A failure after the link (the directory
-// sync, the removal of the staging name) is returned with the copy
+// they were there before, or someone else put them there, and the error
+// is no reason to remove them. A failure after the rename (the directory
+// sync, the removal of a staging leftover) is returned with the copy
 // published at dstPath, and the error says so. Any file at dstPath that
-// the call published, and that survives a crash, is the complete copy,
-// maybe with its staging name beside it as a second name of the same file;
-// but the name is durable only once the directory sync after the link has
+// the call published, and that survives a crash, is the complete copy; but
+// the name is durable only once the directory sync after the rename has
 // succeeded (on Unix; on Windows NTFS's metadata journal keeps it), and
-// power lost before that can leave no file at dstPath. On an error the
-// report is zero.
+// power lost before that can leave the copy under its staging name, which
+// the next call removes. On an error the report is zero.
 //
 // The call never renames or removes a file of src.
 func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Config) (report CopyReport, err error) {
@@ -150,7 +162,25 @@ func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Con
 	if err = ctx.Err(); err != nil {
 		return CopyReport{}, err
 	}
+	if err = notReservedName(dstPath); err != nil {
+		return CopyReport{}, err
+	}
 	// ~ vacuum.c:236-242: VACUUM INTO refuses an output file that has content.
+	// Checked before the lock too, so that a destination that exists gets no
+	// lock file put beside it.
+	if err = destinationFree(dstPath); err != nil {
+		return CopyReport{}, err
+	}
+	unlock, err := lockCopy(dstPath + copyLockSuffix)
+	if err != nil {
+		if errors.Is(err, ErrBusy) {
+			return CopyReport{}, fmt.Errorf("any-store: copy to latest format: another copy to %s is running: %w", dstPath, err)
+		}
+		return CopyReport{}, fmt.Errorf("any-store: copy to latest format: locking the destination: %w", err)
+	}
+	// Runs last, after the staging files are gone.
+	defer unlock()
+	// From here to the return no other call copies to dstPath.
 	if err = destinationFree(dstPath); err != nil {
 		return CopyReport{}, err
 	}
@@ -213,7 +243,7 @@ const copyBatch = 1000
 // its documents copied so far; testHookCopiedCollection runs once a
 // collection's documents are in the copy, with the source's read
 // transaction still open; testHookBeforePublish runs with the copy closed
-// under its staging name, before the link.
+// under its staging name, before the rename.
 var (
 	testHookCopiedBatch      func(docs int)
 	testHookCopiedCollection func(name string)
@@ -552,38 +582,61 @@ func databaseFiles(path string) []string {
 	return files
 }
 
-// reserveStaging creates the empty file the copy for dstPath is built in,
-// under a name no other caller knows: dstPath, ".tmp-" and a random suffix,
-// created exclusively, with none of the files a database keeps beside it
-// existing. Everything the copy creates under that name is this call's.
-func reserveStaging(dstPath string) (string, error) {
-	var taken error
-	for range 4 {
-		var suffix [8]byte
-		_, _ = rand.Read(suffix[:]) // crypto/rand never fails on supported platforms
-		stage := dstPath + ".tmp-" + hex.EncodeToString(suffix[:])
-		// Files left under this name are not this call's to remove.
-		if taken = destinationFree(stage); taken != nil {
-			continue
+// The names CopyToLatestFormat keeps for itself beside dstPath. Neither is
+// a name a database keeps beside dstPath or beside the staging file
+// (sidecarSuffixes): the lock file in particular is not a ".lock", which is
+// a database's durability sentinel. A destination that ends in one of them,
+// or in a sidecar of the staging name, is refused (notReservedName), so the
+// call never publishes a database under a name that another call would
+// lock, or would remove as a killed call's staging file.
+const (
+	// copyLockSuffix names the file whose lock a copy holds for the whole
+	// call (acquireCopyLock).
+	copyLockSuffix = ".copy-lock"
+	// copyStagingSuffix names the file the copy is built in. One fixed name
+	// rather than a random one: under the lock one call at a time uses it,
+	// and what a killed call left is found by its name alone, with no
+	// search of the directory for names that look like this call's.
+	copyStagingSuffix = ".copy-staging"
+)
+
+// notReservedName refuses a destination that ends, in any case, in one of
+// the names a copy keeps for itself beside its destination.
+func notReservedName(dstPath string) error {
+	reserved := append([]string{copyLockSuffix}, databaseFiles(copyStagingSuffix)...)
+	for _, suffix := range reserved {
+		if _, ok := cutSuffixFold(dstPath, suffix); ok {
+			return fmt.Errorf("any-store: copy to latest format: the destination %s ends in %q, a name the copy keeps for its own files", dstPath, suffix)
 		}
-		f, err := osOpenFile(stage, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
-		if errors.Is(err, fs.ErrExist) {
-			taken = err
-			continue
-		}
-		if err != nil {
-			return "", fmt.Errorf("any-store: copy to latest format: %w", err)
-		}
-		if err = f.Close(); err != nil {
-			err = fmt.Errorf("any-store: copy to latest format: %w", err)
-			if rerr := osRemove(stage); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
-				err = errors.Join(err, fmt.Errorf("any-store: left on disk: %s: %w", stage, rerr))
-			}
-			return "", err
-		}
-		return stage, nil
 	}
-	return "", fmt.Errorf("any-store: copy to latest format: no free staging name beside %s: %w", dstPath, taken)
+	return nil
+}
+
+// reserveStaging creates the empty file the copy for dstPath is built in,
+// dstPath+copyStagingSuffix, and returns its name. The caller holds
+// dstPath's copy lock, so whatever is under the staging name or beside it
+// was left by a call that died, and is removed first; these are names only
+// this API creates. The file is then created exclusively: everything the
+// copy creates under that name is this call's.
+func reserveStaging(dstPath string) (string, error) {
+	stage := dstPath + copyStagingSuffix
+	for _, p := range databaseFiles(stage) {
+		if err := osRemove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("any-store: copy to latest format: removing a staging file left by an earlier copy: %w", err)
+		}
+	}
+	f, err := osOpenFile(stage, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
+	if err != nil {
+		return "", fmt.Errorf("any-store: copy to latest format: %w", err)
+	}
+	if err = f.Close(); err != nil {
+		err = fmt.Errorf("any-store: copy to latest format: %w", err)
+		if rerr := osRemove(stage); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+			err = errors.Join(err, fmt.Errorf("any-store: left on disk: %s: %w", stage, rerr))
+		}
+		return "", err
+	}
+	return stage, nil
 }
 
 // discardStaging cleans up after a copy that failed before publication: it
@@ -624,31 +677,27 @@ func removeStagingSidecars(stage string) error {
 	return nil
 }
 
-// publishStaging gives the closed copy the name dstPath without replacing
-// anything: a hard link, which fails if dstPath exists, then the removal of
-// the staging name. The directory is synced after each (syncDir). A rename
-// would replace a file published at dstPath meanwhile, by another call or
-// anyone else; a check before it would not close that window, so there is
-// no fallback where links fail. Before the link succeeds a failure removes
-// the staging file; once it has, dstPath is never removed, and a failure
-// still fails the call.
+// publishStaging gives the closed copy the name dstPath: a rename of the
+// staging file, which is in dstPath's directory, so the rename never
+// crosses filesystems and needs nothing a filesystem or a platform may
+// lack (hard links are refused to applications on Android, and FAT has
+// none). The directory is synced after it (syncDir).
 //
-// The files a database keeps beside dstPath are checked again right before
-// the link: one that appeared while the copy ran, put there by anyone or
-// published by another copy, would be read as the copy's log. The link
-// decides atomically only for dstPath itself; a sidecar created between
-// that check and the link is not seen.
+// A rename replaces what is at dstPath, so the files at and beside dstPath
+// are checked again right before it: one that appeared while the copy ran
+// fails the call, and one beside dstPath would be read as the copy's log.
+// The caller holds dstPath's copy lock, so no other copy publishes there
+// meanwhile; a file anyone else creates at dstPath between the check and
+// the rename is replaced.
+//
+// Before the rename succeeds a failure removes the staging file; once it
+// has, dstPath is never removed, and a failure still fails the call.
 func publishStaging(stage, dstPath string) error {
 	if err := destinationFree(dstPath); err != nil {
 		return discardStaging(err, stage, nil)
 	}
-	if err := osLink(stage, dstPath); err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			err = fmt.Errorf("%w: %w", ErrDestinationExists, err)
-		} else {
-			err = fmt.Errorf("%w: %w", ErrPublishUnsupported, err)
-		}
-		return discardStaging(err, stage, nil)
+	if err := osRename(stage, dstPath); err != nil {
+		return discardStaging(fmt.Errorf("any-store: copy to latest format: publishing the copy: %w", err), stage, nil)
 	}
 	// The copy is published: what fails from here on says so.
 	published := fmt.Sprintf("any-store: copy to latest format: the copy is published at %s, but", dstPath)
@@ -656,10 +705,12 @@ func publishStaging(stage, dstPath string) error {
 	if err := dirSync(dstPath); err != nil {
 		errs = append(errs, fmt.Errorf("%s syncing its directory failed: %w", published, err))
 	}
-	if err := osRemove(stage); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		errs = append(errs, fmt.Errorf("%s its staging name is left on disk: %s: %w", published, stage, err))
-	} else if err := dirSync(stage); err != nil {
-		errs = append(errs, fmt.Errorf("%s syncing the directory of %s failed: %w", published, filepath.Dir(stage), err))
+	// The closed copy's sidecars went before the rename; nothing should be
+	// left under the staging name.
+	for _, p := range databaseFiles(stage)[1:] {
+		if err := osRemove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("%s a staging file is left on disk: %s: %w", published, p, err))
+		}
 	}
 	return errors.Join(errs...)
 }

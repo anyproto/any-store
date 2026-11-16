@@ -802,6 +802,18 @@ func TestCopyToLatestFormat_Refusals(t *testing.T) {
 			assert.Equal(t, "keep", string(data))
 		})
 	}
+	// The names a copy keeps for its lock and its staging files, in any
+	// case: a database published under one would be locked, or removed as
+	// a killed copy's leftover, by a copy to the name before the suffix.
+	for _, suffix := range []string{".copy-lock", ".copy-staging", ".copy-staging-wal", ".copy-staging-wal-shm",
+		".copy-staging.lock", ".COPY-LOCK", ".Copy-Staging", ".copy-\u017ftaging-WAL"} {
+		t.Run("the destination is a reserved name: "+suffix, func(t *testing.T) {
+			dstPath := filepath.Join(t.TempDir(), "copy.db")
+			_, err := CopyToLatestFormat(ctx, src, dstPath+suffix, nil)
+			require.ErrorContains(t, err, "a name the copy keeps for its own files")
+			assertNoCopy(t, dstPath)
+		})
+	}
 	t.Run("the destination is the source", func(t *testing.T) {
 		_, err := CopyToLatestFormat(ctx, src, src.(*db).btreeDB.Path(), nil)
 		require.ErrorIs(t, err, ErrDestinationExists)
@@ -889,9 +901,10 @@ func TestCopyToLatestFormat_CancelledBeforePublication(t *testing.T) {
 	assertNoCopy(t, dstPath)
 }
 
-// Two calls copying to one destination at once: both build their copies,
-// one publishes, and the other fails with ErrDestinationExists and leaves
-// nothing behind.
+// Two calls copying to one destination at once: the first holds the
+// destination's lock for the whole call, so the second fails at once with
+// ErrBusy, whenever it comes, and creates and removes nothing; the first
+// publishes.
 func TestCopyToLatestFormat_ConcurrentCopiesToOneDestination(t *testing.T) {
 	src, _ := openSource(t, nil)
 	coll, err := src.CreateCollection(ctx, "docs")
@@ -900,34 +913,76 @@ func TestCopyToLatestFormat_ConcurrentCopiesToOneDestination(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"n":%d}`, i, i))))
 	}
-
-	// Both calls reach publication before either links.
-	var arrived sync.WaitGroup
-	arrived.Add(2)
-	testHookBeforePublish = func(string) {
-		arrived.Done()
-		arrived.Wait()
-	}
-	defer func() { testHookBeforePublish = nil }()
-
 	dstDir := t.TempDir()
 	dstPath := filepath.Join(dstDir, "copy.db")
-	errs := make(chan error, 2)
-	for range 2 {
+
+	// The second call runs while the first is copying, and again when the
+	// first is about to publish.
+	second := func(string) {
+		before := dirNames(t, dstDir)
+		done := make(chan error, 1)
 		go func() {
+			_, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			assert.ErrorIs(t, err, ErrBusy)
+			assert.NotErrorIs(t, err, ErrDestinationExists)
+		case <-time.After(time.Minute):
+			t.Error("the second copy waits")
+		}
+		assert.Equal(t, before, dirNames(t, dstDir), "the second copy touches nothing")
+		assert.Contains(t, before, "copy.db.copy-staging")
+		assert.Contains(t, before, "copy.db.copy-lock")
+	}
+	var attempts int
+	testHookCopiedCollection = func(name string) { attempts++; second(name) }
+	testHookBeforePublish = func(stage string) { attempts++; second(stage) }
+	defer func() { testHookCopiedCollection, testHookBeforePublish = nil, nil }()
+
+	_, err = CopyToLatestFormat(ctx, src, dstPath, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 2, attempts)
+	assert.Equal(t, []string{"copy.db"}, dirNames(t, dstDir))
+	assertSameDatabase(t, src, openCopy(t, dstPath, nil))
+
+	// The lock went with the call: the destination is what refuses now.
+	_, err = CopyToLatestFormat(ctx, src, dstPath, nil)
+	require.ErrorIs(t, err, ErrDestinationExists)
+}
+
+// Unlimited free concurrency on one destination: of many calls started
+// together exactly one publishes, each of the others fails with ErrBusy or,
+// once the copy is there, ErrDestinationExists, and nothing but the copy is
+// left.
+func TestCopyToLatestFormat_ManyCopiesToOneDestination(t *testing.T) {
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1}`, `{"id":2}`)
+	dstDir := t.TempDir()
+	dstPath := filepath.Join(dstDir, "copy.db")
+
+	const callers = 8
+	errs := make(chan error, callers)
+	start := make(chan struct{})
+	for range callers {
+		go func() {
+			<-start
 			_, err := CopyToLatestFormat(ctx, src, dstPath, nil)
 			errs <- err
 		}()
 	}
-	var published, refused int
-	for range 2 {
+	close(start)
+	var published int
+	for range callers {
 		select {
 		case err := <-errs:
 			switch {
 			case err == nil:
 				published++
-			case errors.Is(err, ErrDestinationExists):
-				refused++
+			case errors.Is(err, ErrBusy), errors.Is(err, ErrDestinationExists):
 			default:
 				t.Errorf("unexpected error: %v", err)
 			}
@@ -936,22 +991,207 @@ func TestCopyToLatestFormat_ConcurrentCopiesToOneDestination(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, published)
-	assert.Equal(t, 1, refused)
 	assert.Equal(t, []string{"copy.db"}, dirNames(t, dstDir))
 	assertSameDatabase(t, src, openCopy(t, dstPath, nil))
 }
 
-// A file that appears beside the destination while the copy runs fails the
-// publication with ErrDestinationExists: the copy's staging files go, the
-// file stays as it is, and nothing is at the destination.
+// A lock another holder has on the destination fails the call at once with
+// ErrBusy: nothing is created and nothing removed, not even the staging
+// files a killed copy left, which could be the holder's.
+func TestCopyToLatestFormat_LockHeld(t *testing.T) {
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1}`)
+	dstDir := t.TempDir()
+	dstPath := filepath.Join(dstDir, "copy.db")
+	release, err := acquireCopyLock(dstPath + ".copy-lock")
+	require.NoError(t, err)
+	staged := []string{"copy.db.copy-lock", "copy.db.copy-staging", "copy.db.copy-staging-wal"}
+	for _, name := range staged[1:] {
+		require.NoError(t, os.WriteFile(filepath.Join(dstDir, name), []byte("the holder's"), 0o644))
+	}
+
+	report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+	require.ErrorIs(t, err, ErrBusy)
+	assert.Contains(t, err.Error(), "another copy to "+dstPath+" is running")
+	assert.Zero(t, report)
+	assert.Equal(t, staged, dirNames(t, dstDir))
+	for _, name := range staged[1:] {
+		data, err := os.ReadFile(filepath.Join(dstDir, name))
+		require.NoError(t, err)
+		assert.Equal(t, "the holder's", string(data))
+	}
+
+	// Once the holder is gone the call goes through, over what it left.
+	release()
+	_, err = CopyToLatestFormat(ctx, src, dstPath, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"copy.db"}, dirNames(t, dstDir))
+	assertSameDatabase(t, src, openCopy(t, dstPath, nil))
+}
+
+// The lock of a copy: one holder at a time, a second is refused at once
+// with ErrBusy, and the lock file goes with its holder.
+func TestCopyLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "copy.db.copy-lock")
+	release, err := acquireCopyLock(path)
+	require.NoError(t, err)
+	_, err = acquireCopyLock(path)
+	require.ErrorIs(t, err, ErrBusy)
+	release()
+	assert.Empty(t, dirNames(t, filepath.Dir(path)))
+	// A lock file nobody holds, as a killed process leaves it, locks nothing.
+	require.NoError(t, os.WriteFile(path, nil, 0o644))
+	release, err = acquireCopyLock(path)
+	require.NoError(t, err)
+	release()
+	assert.Empty(t, dirNames(t, filepath.Dir(path)))
+
+	// Holders that come and go, each removing the lock file as it leaves:
+	// never two at once.
+	var holders, entered atomic.Int32
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 300 {
+				release, err := acquireCopyLock(path)
+				if err != nil {
+					if !errors.Is(err, ErrBusy) {
+						t.Errorf("unexpected error: %v", err)
+					}
+					continue
+				}
+				if holders.Add(1) != 1 {
+					t.Error("two holders of one lock")
+				}
+				entered.Add(1)
+				holders.Add(-1)
+				release()
+			}
+		}()
+	}
+	wg.Wait()
+	assert.NotZero(t, entered.Load())
+	assert.Empty(t, dirNames(t, filepath.Dir(path)))
+}
+
+// The staging files a killed copy left beside the destination, with no lock
+// held, are removed by the next copy to it, which succeeds; a leftover lock
+// file is taken over. Nothing else in the directory is touched.
+func TestCopyToLatestFormat_StaleStagingRemoved(t *testing.T) {
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1}`, `{"id":2}`)
+	dstDir := t.TempDir()
+	dstPath := filepath.Join(dstDir, "copy.db")
+	for _, name := range []string{"copy.db.copy-lock", "copy.db.copy-staging", "copy.db.copy-staging-wal",
+		"copy.db.copy-staging-wal-shm", "copy.db.copy-staging.lock"} {
+		require.NoError(t, os.WriteFile(filepath.Join(dstDir, name), []byte("left by a killed copy"), 0o644))
+	}
+	// Not names of a copy to copy.db: they stay.
+	foreign := []string{"copy.db.copy-staging2", "copy.db.tmp-0123456789abcdef", "other.db.copy-staging"}
+	for _, name := range foreign {
+		require.NoError(t, os.WriteFile(filepath.Join(dstDir, name), []byte("foreign"), 0o644))
+	}
+
+	report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 2, report.Documents)
+	assert.Equal(t, append([]string{"copy.db"}, foreign...), dirNames(t, dstDir))
+	for _, name := range foreign {
+		data, err := os.ReadFile(filepath.Join(dstDir, name))
+		require.NoError(t, err)
+		assert.Equal(t, "foreign", string(data))
+	}
+	assertSameDatabase(t, src, openCopy(t, dstPath, nil))
+}
+
+// A staging file of a killed copy that cannot be removed fails the call
+// before anything is copied, naming the file.
+func TestCopyToLatestFormat_StaleStagingNotRemovable(t *testing.T) {
+	src, _ := openSource(t, nil)
+	dstDir := t.TempDir()
+	dstPath := filepath.Join(dstDir, "copy.db")
+	require.NoError(t, os.WriteFile(dstPath+".copy-staging-wal", []byte("left"), 0o644))
+	errRemove := errors.New("cannot remove")
+	prevRemove := osRemove
+	osRemove = func(name string) error {
+		if name == dstPath+".copy-staging-wal" {
+			return &os.PathError{Op: "remove", Path: name, Err: errRemove}
+		}
+		return prevRemove(name)
+	}
+	defer func() { osRemove = prevRemove }()
+
+	_, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+	require.ErrorIs(t, err, errRemove)
+	assert.Contains(t, err.Error(), dstPath+".copy-staging-wal")
+	assert.Equal(t, []string{"copy.db.copy-staging-wal"}, dirNames(t, dstDir))
+}
+
+// A lock that cannot be taken for another reason than its being held, and
+// a rename the filesystem refuses, fail the call: the copy's files go and
+// nothing is at the destination.
+func TestCopyToLatestFormat_LockAndRenameFaults(t *testing.T) {
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1}`)
+	errFault := errors.New("refused")
+
+	t.Run("lock", func(t *testing.T) {
+		prevLock := lockCopy
+		lockCopy = func(string) (func(), error) { return nil, errFault }
+		defer func() { lockCopy = prevLock }()
+		dstPath := filepath.Join(t.TempDir(), "copy.db")
+		report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+		require.ErrorIs(t, err, errFault)
+		assert.NotErrorIs(t, err, ErrBusy)
+		assert.Zero(t, report)
+		assertNoCopy(t, dstPath)
+	})
+	t.Run("rename", func(t *testing.T) {
+		prevRename := osRename
+		var renames int
+		osRename = func(oldpath, newpath string) error {
+			renames++
+			return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: errFault}
+		}
+		defer func() { osRename = prevRename }()
+		dstPath := filepath.Join(t.TempDir(), "copy.db")
+		report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+		require.ErrorIs(t, err, errFault)
+		assert.Contains(t, err.Error(), "publishing the copy")
+		assert.Equal(t, 1, renames)
+		assert.Zero(t, report)
+		assertNoCopy(t, dstPath)
+	})
+}
+
+// A file that appears at the destination or beside it while the copy runs,
+// after the checks at the start, fails the publication with
+// ErrDestinationExists at the check before the rename: the copy's staging
+// files go and the file stays as it is, the one at the destination not
+// replaced by the rename.
 func TestCopyToLatestFormat_SidecarAppearsBeforePublication(t *testing.T) {
 	src, _ := openSource(t, nil)
 	coll, err := src.CreateCollection(ctx, "docs")
 	require.NoError(t, err)
 	insertJSON(t, coll, `{"id":1}`)
 	defer func() { testHookBeforePublish = nil }()
-	for _, suffix := range []string{"-wal", "-wal-shm", ".lock"} {
-		t.Run(suffix, func(t *testing.T) {
+	prevRename := osRename
+	var renames int
+	osRename = func(oldpath, newpath string) error {
+		renames++
+		return prevRename(oldpath, newpath)
+	}
+	defer func() { osRename = prevRename }()
+	for _, suffix := range []string{"", "-wal", "-wal-shm", ".lock"} {
+		t.Run("appears: "+suffix, func(t *testing.T) {
 			dstPath := filepath.Join(t.TempDir(), "copy.db")
 			testHookBeforePublish = func(string) {
 				require.NoError(t, os.WriteFile(dstPath+suffix, []byte("foreign"), 0o644))
@@ -962,6 +1202,7 @@ func TestCopyToLatestFormat_SidecarAppearsBeforePublication(t *testing.T) {
 			data, err := os.ReadFile(dstPath + suffix)
 			require.NoError(t, err)
 			assert.Equal(t, "foreign", string(data))
+			assert.Zero(t, renames)
 		})
 	}
 }
@@ -1023,7 +1264,7 @@ func TestCopyToLatestFormat_OverlappingDestinations(t *testing.T) {
 // their case: on a case-insensitive filesystem app.db-WAL is app.db's log,
 // and the open of app.db would take a copy published there for its log and
 // truncate it. The refusal holds on every filesystem, at the start and at
-// the check before the link.
+// the check before the rename.
 func TestCopyToLatestFormat_SidecarNameInAnotherCase(t *testing.T) {
 	src, _ := openSource(t, nil)
 	coll, err := src.CreateCollection(ctx, "docs")
@@ -1067,8 +1308,10 @@ func TestCopyToLatestFormat_SidecarNameInAnotherCase(t *testing.T) {
 	}
 }
 
-// The copy is published by a link, then the staging name goes, and the
-// directory is synced after each.
+// The copy is published by one rename of the staging file, in the
+// destination's directory, and the directory is synced after it; before the
+// rename only what an earlier copy may have left and the closed copy's
+// sidecars are removed.
 func TestCopyToLatestFormat_PublicationOrder(t *testing.T) {
 	src, _ := openSource(t, nil)
 	_, err := src.CreateCollection(ctx, "docs")
@@ -1077,10 +1320,10 @@ func TestCopyToLatestFormat_PublicationOrder(t *testing.T) {
 	var calls []string
 	var stage string
 	testHookBeforePublish = func(s string) { stage = s }
-	prevLink, prevRemove, prevSync := osLink, osRemove, dirSync
-	osLink = func(oldname, newname string) error {
-		calls = append(calls, "link "+filepath.Base(oldname)+" "+filepath.Base(newname))
-		return prevLink(oldname, newname)
+	prevRename, prevRemove, prevSync := osRename, osRemove, dirSync
+	osRename = func(oldpath, newpath string) error {
+		calls = append(calls, "rename "+filepath.Base(oldpath)+" "+filepath.Base(newpath))
+		return prevRename(oldpath, newpath)
 	}
 	osRemove = func(name string) error {
 		calls = append(calls, "remove "+filepath.Base(name))
@@ -1092,29 +1335,38 @@ func TestCopyToLatestFormat_PublicationOrder(t *testing.T) {
 	}
 	defer func() {
 		testHookBeforePublish = nil
-		osLink, osRemove, dirSync = prevLink, prevRemove, prevSync
+		osRename, osRemove, dirSync = prevRename, prevRemove, prevSync
 	}()
 
 	dstDir := t.TempDir()
 	dstPath := filepath.Join(dstDir, "copy.db")
 	_, err = CopyToLatestFormat(ctx, src, dstPath, nil)
 	require.NoError(t, err)
-	require.NotEmpty(t, stage)
-	base, dir := filepath.Base(stage), filepath.Base(dstDir)
-	require.GreaterOrEqual(t, len(calls), 4)
-	assert.Equal(t, []string{
-		"link " + base + " copy.db",
-		"sync " + dir,
-		"remove " + base,
-		"sync " + dir,
-	}, calls[len(calls)-4:])
-	for _, c := range calls[:len(calls)-4] {
-		assert.True(t, strings.HasPrefix(c, "remove "+base+"-") || strings.HasPrefix(c, "remove "+base+"."), "before the link only the closed copy's sidecars go: %s", c)
+	assert.Equal(t, dstPath+".copy-staging", stage)
+	assert.Equal(t, filepath.Dir(dstPath), filepath.Dir(stage), "the rename stays in one directory")
+	dir := filepath.Base(dstDir)
+	var published int
+	for i, c := range calls {
+		if c == "rename copy.db.copy-staging copy.db" {
+			published = i
+		}
+	}
+	require.NotZero(t, published)
+	require.Greater(t, len(calls), published+1)
+	assert.Equal(t, "sync "+dir, calls[published+1])
+	for i, c := range calls {
+		if i == published || i == published+1 {
+			continue
+		}
+		assert.True(t, strings.HasPrefix(c, "remove copy.db.copy-staging"), "only staging files are removed: %s", c)
+		if i > published {
+			assert.NotEqual(t, "remove copy.db.copy-staging", c, "the published file is not removed under its old name")
+		}
 	}
 	assert.Equal(t, []string{"copy.db"}, dirNames(t, dstDir))
 }
 
-// A failure after the link comes back saying the copy is published: the
+// A failure after the rename comes back saying the copy is published: the
 // complete copy stays at the destination, and the staging name goes.
 func TestCopyToLatestFormat_FailureAfterPublication(t *testing.T) {
 	src, _ := openSource(t, nil)
@@ -1159,7 +1411,8 @@ func TestCopyToLatestFormat_CleanupFailureIsReported(t *testing.T) {
 	var left string
 	prevRemove := osRemove
 	osRemove = func(name string) error {
-		if strings.Contains(name, ".tmp-") && strings.HasSuffix(name, "-wal") {
+		// Only the copy's own log: nothing is there when the call starts.
+		if _, err := os.Lstat(name); err == nil && strings.HasSuffix(name, ".copy-staging-wal") {
 			left = name
 			return errRemove
 		}
@@ -1199,7 +1452,7 @@ func TestCopyToLatestFormat_StagingFileNotClosed(t *testing.T) {
 		t.Run(fmt.Sprintf("removable=%v", removable), func(t *testing.T) {
 			var stage string
 			osRemove = func(name string) error {
-				if strings.Contains(name, ".tmp-") && !removable {
+				if _, err := os.Lstat(name); err == nil && strings.HasSuffix(name, ".copy-staging") && !removable {
 					stage = name
 					return errRemove
 				}

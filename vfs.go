@@ -9,10 +9,12 @@ import (
 var (
 	osStat   = os.Stat
 	osRemove = os.Remove
-	// osOpenFile creates the staging file of a copy, and osLink and dirSync
-	// publish the finished copy (CopyToLatestFormat).
+	// CopyToLatestFormat: lockCopy takes the lock a copy holds for the whole
+	// call, osOpenFile creates its staging file, and osRename and dirSync
+	// publish the finished copy.
+	lockCopy   = acquireCopyLock
 	osOpenFile = os.OpenFile
-	osLink     = os.Link
+	osRename   = os.Rename
 	dirSync    = syncDir
 )
 

@@ -138,6 +138,10 @@ var (
 	// it with errors.Is: the busy errors of the storage layer that are not
 	// this value wrap it by the time they leave Backup. What a Backup that
 	// returned it has done is described at DB.Backup.
+	//
+	// CopyToLatestFormat returns it (wrapped) at once, without waiting, when
+	// another call is copying to the same destination: that call holds the
+	// destination's copy lock. Nothing has been created or removed.
 	ErrBusy = btree.ErrBusy
 
 	ErrDBIsNotOpened = errors.New("any-store: database is not opened")
@@ -159,13 +163,6 @@ var (
 	// and the sentinel path+".lock". The call replaces nothing: a file that
 	// was there is left as it was.
 	ErrDestinationExists = errors.New("any-store: destination exists")
-
-	// ErrPublishUnsupported is returned (wrapped, with the link error) by
-	// CopyToLatestFormat when the finished copy cannot be given the
-	// destination path by a hard link, as on a filesystem without hard links
-	// such as FAT or exFAT. The copy has been removed and nothing is at the
-	// destination path; copy into a directory on another filesystem.
-	ErrPublishUnsupported = errors.New("any-store: cannot publish the copy with a hard link")
 
 	// ErrIncompatibleVersion is returned (wrapped) by Open when the file was written in a format
 	// newer than this release reads. The file is intact and is left unchanged; open it with a

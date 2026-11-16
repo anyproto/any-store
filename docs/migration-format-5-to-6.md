@@ -65,17 +65,31 @@ every collection, document and index of `db`:
   names of an existing file (`app.db-wal` beside `app.db`, in any case:
   `app.db-WAL` is `app.db`'s log on a case-insensitive filesystem, and is
   refused on every filesystem), the call returns
-  `ErrDestinationExists` and leaves it alone. The copy is built under a
-  private name beside the destination (the destination's name, `.tmp-` and
-  16 hex digits), checkpointed, verified and closed, and only then given the
-  destination's name by a hard link. Right before the link the destination's
-  `-wal`, `-wal-shm` and `.lock` are checked again, and the link itself fails
-  if the destination exists, so a file that appeared there while the copy
-  ran also gives `ErrDestinationExists`. Of two calls copying to one path,
-  one publishes and the other gets `ErrDestinationExists`. Only for the
-  destination itself is this atomic: a `-wal`, `-wal-shm` or `.lock` created
-  between the last check and the link is not seen, so do not let anything
-  else create files under the destination's name while the copy runs.
+  `ErrDestinationExists` and leaves it alone.
+- **One copy at a time to a destination.** For the whole call the copy holds
+  an exclusive lock of the operating system on the file
+  `<destination>.copy-lock` (`flock` on Unix, `LockFileEx` on Windows). The
+  system drops the lock if the process dies, so a killed copy never blocks
+  the next one. A second call for the same destination, from this process or
+  another, does not wait: it returns `ErrBusy` at once and touches nothing.
+  The lock file is removed when the call returns.
+- **Published by a rename.** The copy is built in the staging file
+  `<destination>.copy-staging`, in the destination's own directory,
+  checkpointed, verified and closed, and only then renamed to the
+  destination. The rename stays within one directory, so it works wherever
+  the destination can be written, including filesystems and platforms
+  without hard links. Right before the rename the destination and its
+  `-wal`, `-wal-shm` and `.lock` are checked again, so a file that appeared
+  there while the copy ran also gives `ErrDestinationExists`. The check and
+  the rename are not one step: a file that something else creates at the
+  destination between them is replaced, so do not let anything else create
+  files under the destination's name while the copy runs.
+- **Reserved names.** `<destination>.copy-lock` and
+  `<destination>.copy-staging`, with the `-wal`, `-wal-shm` and `.lock` of
+  the latter, belong to the copy: it creates them, and removes whatever it
+  finds there. Staging files a killed copy left are removed by the next copy
+  to that destination, under its lock. Keep nothing of your own under these
+  names; a destination that ends in one of them is refused.
 - **Verified.** Before it is published, each collection of the copy is
   checked against the source's snapshot: its options, its document count
   and its index definitions. Then `IntegrityCheck` runs on the copy. A
@@ -92,27 +106,28 @@ The call fails with:
 | `ErrUnsupportedDB` | `db` was not opened by this package (a type of your own that implements `DB`). Nothing is created. |
 | `ErrTxInContext` | `ctx` carries a read or write transaction. The copy reads in a transaction of its own, as SQLite refuses `VACUUM` inside one. |
 | `ErrDestinationExists` | The destination or one of its sidecars exists, or appeared while the copy ran. |
-| `ErrPublishUnsupported` | The finished copy could not be linked to the destination path, as on a filesystem without hard links (FAT, exFAT). It wraps the link error. |
+| `ErrBusy` | Another call is copying to the same destination right now. Nothing was created or removed; try again once that call has returned. |
 | any other | The copy failed: a collection, index or document could not be copied (the error names it, see [What can differ](#what-can-differ)), the copy did not match the source, or an I/O operation failed. Cancelling `ctx` stops the copy with the context's error. |
 
 The call creates the destination only by publishing a complete, verified,
 closed copy. On a failure before that it closes the copy and removes its
-files, which all carry the staging name: `<destination>.tmp-<16 hex digits>`
-and its `-wal`, `-wal-shm` and `.lock`. A removal that fails is joined to
-the returned error, naming the file left. Those staging files are the only
-files a failed call owns, and the only ones a crash before the publication
-leaves: remove them once no copy is running.
+staging files. A removal that fails is joined to the returned error, naming
+the file left. The staging files are the only files a failed call owns, and
+the only ones a crash before the publication leaves, beside an empty,
+unlocked lock file. There is nothing to clean up by hand: the next copy to
+that destination removes them. If no copy will follow, remove the reserved
+names once no copy is running.
 
 After `ErrDestinationExists` the files at and beside the destination are not
-the call's: they were there before it, or another caller published them.
-The error is no reason to remove them. A failure after the link, of the
-directory sync or of the removal of the staging name, comes back with the
+the call's: they were there before it, or someone else put them there.
+The error is no reason to remove them. A failure after the rename, of the
+directory sync or of the removal of a staging leftover, comes back with the
 copy published at the destination, and the error says so. A destination
-the call published that survives a crash is always the complete copy,
-maybe with its staging name beside it as a second name of the same file.
-Its name is durable only once the directory sync after the link has
+the call published that survives a crash is always the complete copy.
+Its name is durable only once the directory sync after the rename has
 succeeded (on Unix; on Windows it relies on NTFS's metadata journal, as
-below): power lost before that can leave no destination at all.
+below): power lost before that can leave no destination at all, with the
+copy still under its staging name, which the next copy removes.
 
 The CLI has the same copy: `db.migrate("new.db")` in `any-store-cli2` writes
 the copy and prints the report. It never replaces the open file.
@@ -153,10 +168,6 @@ after it deletes a file; on Windows there is no directory sync, as in
 SQLite's Windows layer, and the name changes rely on NTFS's metadata
 journal. `CopyToLatestFormat` syncs the destination's directory by the same
 rule when it publishes.
-
-On a filesystem without hard links the copy cannot be published
-(`ErrPublishUnsupported`), so a database on such a filesystem cannot be
-replaced this way.
 
 The example implements the protocol for one process. It assumes `db` is the
 only handle on `path` and that nothing writes through it until it returns

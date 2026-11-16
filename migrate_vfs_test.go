@@ -2,9 +2,9 @@
 
 package anystore
 
-// CopyToLatestFormat under faults of the file system: a link the volume
-// refuses, a write or a sync of the copy that fails, and a process that
-// dies after any step of the guide's replacement protocol.
+// CopyToLatestFormat under faults of the file system: a write or a sync of
+// the copy that fails, and a process that dies after any step of the
+// guide's replacement protocol.
 
 import (
 	"context"
@@ -16,7 +16,6 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -24,28 +23,6 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 )
-
-// A volume without hard links (FAT, exFAT) refuses the link: the call
-// returns ErrPublishUnsupported with the link error, removes its copy and
-// leaves nothing at the destination.
-func TestCopyToLatestFormat_LinkUnsupported(t *testing.T) {
-	src, _ := openSource(t, nil)
-	coll, err := src.CreateCollection(ctx, "docs")
-	require.NoError(t, err)
-	insertJSON(t, coll, `{"id":1}`)
-	prevLink := osLink
-	osLink = func(oldname, newname string) error {
-		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: syscall.EPERM}
-	}
-	defer func() { osLink = prevLink }()
-
-	dstPath := filepath.Join(t.TempDir(), "copy.db")
-	report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
-	require.ErrorIs(t, err, ErrPublishUnsupported)
-	require.ErrorIs(t, err, syscall.EPERM)
-	assert.Zero(t, report)
-	assertNoCopy(t, dstPath)
-}
 
 var errInjectedCopyIO = errors.New("injected I/O failure of the copy")
 
@@ -69,7 +46,7 @@ func (f *faultyFile) WriteAt(b []byte, off int64) (int, error) {
 // and once failSync is set so do the syncs of a staging database file.
 func copyFaults(t *testing.T, dstPath string, failWrite, failSync *atomic.Bool) {
 	t.Helper()
-	staged := func(name string) bool { return strings.HasPrefix(name, dstPath+".tmp-") }
+	staged := func(name string) bool { return strings.HasPrefix(name, dstPath+".copy-staging") }
 	SetVFS(VFS{
 		OpenFile: func(name string, flag int, perm os.FileMode) (File, error) {
 			f, err := os.OpenFile(name, flag, perm)
