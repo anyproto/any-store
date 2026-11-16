@@ -124,9 +124,14 @@ every collection, document and index of `db`:
   of those names fails the call with an error, and the copy neither opens,
   writes nor removes it: it can be another name of a file that a database of
   this process has open, such as its `-wal-shm`, and closing a descriptor of
-  a file drops every POSIX record lock the process holds on it. js/wasm and
-  wasip1 have no such lock and make no lock file; there only a source under
-  these names is refused, as described below.
+  a file drops every POSIX record lock the process holds on it. The copy
+  assumes that nothing else links files to its reserved names: a reserved
+  name that is itself a symbolic link, a non-regular file or a hard link is
+  refused, but a regular file there that something else reaches through a
+  link of its own, such as another database's `-wal-shm` made a symbolic
+  link to it, is not detected. js/wasm and wasip1 have no such lock and make
+  no lock file; there only a source under these names is refused, as
+  described below.
 - **Verified.** Before it is published, each collection of the copy is
   checked against the source's snapshot: its options, its document count
   and its index definitions. Then `IntegrityCheck` runs on the copy. A
