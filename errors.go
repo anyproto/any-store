@@ -148,8 +148,13 @@ var (
 	// returned it has done is described at DB.Backup.
 	//
 	// CopyToLatestFormat returns it (wrapped) at once, without waiting, when
-	// another call is copying to the same destination: that call holds the
-	// destination's copy lock. Nothing has been created or removed.
+	// another call holds a copy lock it needs, as a call copying to the same
+	// destination does, or to a name one of the two keeps beside the other
+	// (on js/wasm and wasip1, any call in the process), and when a database
+	// is open at the destination's staging name. No file but the copy's lock
+	// files has been created, written or removed: a lock the call took
+	// before it failed it released, removing the lock file, which may be one
+	// that a killed call left there unlocked.
 	ErrBusy = btree.ErrBusy
 
 	ErrDBIsNotOpened = errors.New("any-store: database is not opened")

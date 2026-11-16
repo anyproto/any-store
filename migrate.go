@@ -99,17 +99,21 @@ type CopyReport struct {
 // exclusive lock of the operating system on the file dstPath+".copy-lock"
 // (flock on Unix, LockFileEx on Windows), which the system drops if the
 // process dies. A second call for the same dstPath, from this process or
-// another, does not wait: it returns ErrBusy at once and touches nothing.
-// A dstPath that names a file a database at p keeps beside it (p+"-wal",
-// p+"-wal-shm" or p+".lock", in any case) is read as p's file once p
-// exists, so a call for it holds p+".copy-lock" too, taken first: a copy
-// to p and a copy to one of those names do not run at once either, and the
-// one that comes second returns ErrBusy. The lock files are removed when
-// the call returns, except after a failure to take a lock, which can leave
-// an unlocked lock file for the next call to reuse. The other platforms
-// (js/wasm, wasip1) have no such lock: there the lock is the process's,
-// one for every dstPath, so one call at a time copies in the process, and
-// no lock file is made.
+// another, does not wait: it returns ErrBusy at once, and touches no file
+// but the copy's lock files. A dstPath that names a file a database at p
+// keeps beside it (p+"-wal", p+"-wal-shm" or p+".lock", in any case) is
+// read as p's file once p exists, so a call for it holds p+".copy-lock"
+// too, taken first: a copy to p and a copy to one of those names do not
+// run at once either, and the one that comes second returns ErrBusy. The
+// lock files are removed when the call returns, except after a failure to
+// take a lock, which can leave an unlocked lock file for the next call to
+// reuse. So a call that returns ErrBusy has created, written or removed no
+// file but lock files: a lock it took before it failed on the next one, or
+// before it found a database open at the staging name (below), it released,
+// removing its file, which may be one that a killed call left there
+// unlocked. The other platforms (js/wasm, wasip1) have no such lock: there
+// the lock is the process's, one for every dstPath, so one call at a time
+// copies in the process, and no lock file is made.
 //
 // Under the lock the copy is built in the staging file
 // dstPath+".copy-staging", in dstPath's own directory, so that publishing
@@ -120,13 +124,14 @@ type CopyReport struct {
 // operating system on its file (a flock on Unix, LockFileEx on Windows),
 // and the call tries that lock, exclusively and without waiting, before it
 // removes anything; if it is held the call returns ErrBusy and removes
-// nothing. To try it the call opens the staging file, and it opens only a
-// regular file with one link, which is what a copy leaves there. A
-// symbolic link, a file with other links (on Unix; Windows does not report
-// the count) or anything but a regular file there can be another name of a
-// file a database of this process has open, and closing a descriptor of
-// that file would drop every record lock the process holds on it: such a
-// file fails the call with an error, and is neither opened nor removed.
+// nothing under the staging name. To try it the call opens the staging
+// file, and it opens only a regular file with one link, which is what a
+// copy leaves there. A symbolic link, a file with other links (on Unix;
+// Windows does not report the count) or anything but a regular file there
+// can be another name of a file a database of this process has open, and
+// closing a descriptor of that file would drop every record lock the
+// process holds on it: such a file fails the call with an error, and is
+// neither opened nor removed.
 // js/wasm and wasip1 have no such lock to try, and open nothing. The copy
 // is checkpointed, verified (each collection's options, document count and
 // index definitions against the source's snapshot, then IntegrityCheck)
@@ -821,12 +826,13 @@ var errStagingAlias = errors.New("a copy makes only a regular file with one link
 // staging name, and that one is no killed call's. An open database holds a
 // lock of the operating system on its file for as long as it is open
 // (stagingOpenAsDatabase), so the staging file is tried for that lock
-// first: one that is held fails the call with ErrBusy, and nothing is
-// removed. A staging file that a copy does not leave (a symbolic link, a
-// file with other links, anything but a regular file) is neither tried nor
-// removed: it fails the call with errStagingAlias. The source is refused
-// earlier, on every platform (sourceOutsideReservedNames); this covers
-// another database, where the platform has the lock.
+// first: one that is held fails the call with ErrBusy, and nothing under
+// the staging name is removed. A staging file that a copy does not leave
+// (a symbolic link, a file with other links, anything but a regular file)
+// is neither tried nor removed: it fails the call with errStagingAlias.
+// The source is refused earlier, on every platform
+// (sourceOutsideReservedNames); this covers another database, where the
+// platform has the lock.
 func reserveStaging(dstPath string) (string, error) {
 	stage := dstPath + copyStagingSuffix
 	switch open, err := stagingOpenAsDatabase(stage); {
