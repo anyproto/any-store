@@ -167,7 +167,7 @@ func TestSearchCorrupt_SearchLeafWithOverflow_KeyFitsLocallyEndBeyondData(t *tes
 	pg.data[newOff] = byte(keyLen) // keyLen (1-byte varint)
 	putVarint(pg.data[newOff+1:], uint64(valLen))
 
-	_, _, serr := searchLeafWithOverflow(pg, shortKey, usableSize, p, 0, nil)
+	_, _, serr := searchLeafWithOverflow(pg, shortKey, indexLimits(usableSize), p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -194,7 +194,7 @@ func TestSearchCorrupt_SearchLeafWithOverflow_LeafFullKeyError(t *testing.T) {
 	// pos+nLocal+4 > dataLen (L831 in leafFullKey).
 	// nLocal = localPayloadSize(totalPayload, usableSize).
 	totalPayload := len(bigKey) + len(val)
-	nLocal := localPayloadSize(totalPayload, usableSize)
+	nLocal := localPayloadSize(totalPayload, indexLimits(usableSize))
 	localKeyBytes := min(nLocal, len(bigKey))
 
 	// varints: varint(bigKeyLen) = 2 bytes, varint(1) = 1 byte. payloadStart = newOff+3.
@@ -233,7 +233,7 @@ func TestSearchCorrupt_SearchLeafWithOverflow_LeafFullKeyError(t *testing.T) {
 	}
 
 	// Search with same key prefix - prefix comparison should be 0, triggering leafFullKey.
-	_, _, serr := searchLeafWithOverflow(pg, bigKey, usableSize, p, 0, nil)
+	_, _, serr := searchLeafWithOverflow(pg, bigKey, indexLimits(usableSize), p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -260,7 +260,7 @@ func TestSearchCorrupt_LeafFullKey_KeyLenVarintError(t *testing.T) {
 		pg.data[off+i] = 0xFF
 	}
 
-	_, fkerr := leafFullKey(pg.data, off, usableSize, p, 0, nil)
+	_, fkerr := leafFullKey(pg.data, off, indexLimits(usableSize), p, 0, nil)
 	assert.ErrorIs(t, fkerr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -298,7 +298,7 @@ func TestSearchCorrupt_LeafFullKey_OverflowKeyFitsLocallyBeyondData(t *testing.T
 	pg.data[off] = byte(keyLen) // keyLen (1-byte varint since keyLen < 128)
 	putVarint(pg.data[off+1:], uint64(valLen))
 
-	_, fkerr := leafFullKey(pg.data, off, usableSize, p, 0, nil)
+	_, fkerr := leafFullKey(pg.data, off, indexLimits(usableSize), p, 0, nil)
 	assert.ErrorIs(t, fkerr, ErrCorrupt)
 	p.releasePage(pg)
 }

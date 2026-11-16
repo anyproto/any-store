@@ -79,7 +79,7 @@ func TestSnapshotHeaderCounters_ImmuneToWALRestart(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, rtx.walSlot,
 		"precondition: reader must hold a slot-0 snapshot (empty WAL range)")
-	baseFCC := rtx.DiskFileChangeCounter()
+	baseFCC := rtx.diskFileChangeCounter
 	baseSC := rtx.DiskSchemaCookie()
 
 	// Restart the WAL under the held reader (the reset waits only on slots

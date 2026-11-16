@@ -5,9 +5,12 @@ package btree
 // Database header (first 100 bytes of page 1):
 //
 //	Offset  Size  Description
-//	0       16    Magic string "any-store v2\000" (zero-padded to 16;
-//	              "BTree format 1\000" still accepted, see dbMagicV1), or
-//	              "any-store v2 fmt" for schema formats 6 and later (dbMagicFmt)
+//	0       16    Magic string "any-store v2 fmt" (dbMagicFmt), written with
+//	              schema formats 6 and later. Schema format 5 files carry
+//	              "any-store v2\000" (zero-padded to 16); the older
+//	              "BTree format 1\000" (dbMagicV1) is accepted and rewritten
+//	              as it by the next commit. A file never moves between the
+//	              two families.
 //	16      2     Page size in bytes
 //	18      1     File format write version (2=WAL; above maxWriteVersion refused)
 //	19      1     File format read version (2=WAL; above maxReadVersion refused)
@@ -113,8 +116,20 @@ const (
 	// reads and writes. firstVersionedSchemaFormat is the first one written
 	// under dbMagicFmt.
 	minSchemaFormat            = 5
-	maxSchemaFormat            = 5
+	maxSchemaFormat            = 6
 	firstVersionedSchemaFormat = 6
+
+	// schemaFormatTableLeaf is the schema format from which every leaf cell of
+	// a file uses SQLite's table-leaf payload limit (tableLeafLimits). Files of
+	// schema format 5 keep the index rule on their leaves.
+	schemaFormatTableLeaf = 6
+
+	// schemaFormatPage1OnChange is the schema format from which a commit
+	// writes page 1 only when it has to (pager.commit): its header changed,
+	// its content is dirty, or the commit has no other page to carry its
+	// commit mark. Files of schema format 5 keep page 1 in every commit,
+	// with the change counter that releases up to v2.4.x watch.
+	schemaFormatPage1OnChange = 6
 
 	// maxReadVersion and maxWriteVersion are the highest header version bytes
 	// (offsets 19 and 18) this binary accepts, as in lockBtree (btree.c:3322-3327).
@@ -148,21 +163,63 @@ func overflowPageUsable(usableSize int) int {
 	return usableSize - 4
 }
 
+// payloadLimits is the local-payload rule of a cell: how many payload bytes
+// stay on the page before the rest moves to an overflow chain. It is the
+// any-store form of MemPage.maxLocal / minLocal, which decodeFlags sets per
+// page from BtShared (btree.c:2043-2086). The zero value means "no overflow
+// detection" to the cell parsers.
+type payloadLimits struct {
+	usable   int // usable page size (pageSize - reserved)
+	maxLocal int // largest payload stored wholly on the page
+	minLocal int // local part kept by a cell whose payload overflows
+}
+
+// indexLimits returns SQLite's index-btree rule (BtShared.maxLocal / minLocal).
+// Interior cells always use it. Leaf cells take their rule from the pager
+// (pager.leafLimits), never from here: see TestLeafCodeTakesLimitsFromPager.
+func indexLimits(usableSize int) payloadLimits {
+	return payloadLimits{usable: usableSize, maxLocal: maxLocalPayload(usableSize), minLocal: minLocalPayload(usableSize)}
+}
+
+// DRIFT: the table-leaf rule applies to every leaf of a schema format 6 file, index trees included, and is chosen per file, not per page. See docs/btree/NOTES.md#old-drift-index-only-local-payload-no-maxleaf-minleaf
+// tableLeafLimits returns SQLite's table-leaf rule (BtShared.maxLeaf / minLeaf,
+// btree.c:3439-3440): a leaf cell keeps up to usableSize-35 payload bytes on
+// the page. SQLite applies it to table leaves only, because an index entry is
+// moved whole into an interior page when its leaf splits and four of them
+// must fit there. any-store never moves a leaf entry up — the parent gets a
+// key-only copy under the index rule — so every leaf of a file can use it.
+func tableLeafLimits(usableSize int) payloadLimits {
+	return payloadLimits{usable: usableSize, maxLocal: usableSize - 35, minLocal: minLocalPayload(usableSize)}
+}
+
+// leafLimitsOf returns the leaf-cell rule of a file of the given schema
+// format: the table-leaf rule from schemaFormatTableLeaf on, the index rule
+// before it.
+func leafLimitsOf(schemaFormat uint32, usableSize int) payloadLimits {
+	if schemaFormat >= schemaFormatTableLeaf {
+		return tableLeafLimits(usableSize)
+	}
+	return indexLimits(usableSize)
+}
+
+// interiorLocalPayloadSize is localPayloadSize under the index rule, which
+// every interior cell uses.
+func interiorLocalPayloadSize(keyLen, usableSize int) int {
+	return localPayloadSize(keyLen, indexLimits(usableSize))
+}
+
 // localPayloadSize computes how many bytes of payload are stored locally
-// when total payload exceeds maxLocal. Uses SQLite's surplus algorithm.
-// DRIFT: Go has only index maxLocal/minLocal; SQLite's table maxLeaf/minLeaf pair absent (no table See docs/btree/NOTES.md#old-drift-index-only-local-payload-no-maxleaf-minleaf
-func localPayloadSize(totalPayload, usableSize int) int {
-	maxLocal := maxLocalPayload(usableSize)
-	if totalPayload <= maxLocal {
+// when total payload exceeds lim.maxLocal. Port of btreePayloadToLocal
+// (btree.c:1213-1226).
+func localPayloadSize(totalPayload int, lim payloadLimits) int {
+	if totalPayload <= lim.maxLocal {
 		return totalPayload
 	}
-	minLocal := minLocalPayload(usableSize)
-	ovflUsable := overflowPageUsable(usableSize)
-	surplus := minLocal + (totalPayload-minLocal)%ovflUsable
-	if surplus <= maxLocal {
+	surplus := lim.minLocal + (totalPayload-lim.minLocal)%overflowPageUsable(lim.usable)
+	if surplus <= lim.maxLocal {
 		return surplus
 	}
-	return minLocal
+	return lim.minLocal
 }
 
 // Leaf cell format (schema format 5+):
@@ -170,11 +227,12 @@ func localPayloadSize(totalPayload, usableSize int) int {
 //   [varint(keyLen)] [varint(valLen)] [payload...] [4-byte overflow_ptr?]
 //
 // The payload is the concatenation (key || value), treated as a single blob
-// for overflow purposes. When totalPayload = keyLen + valLen exceeds
-// maxLocalPayload(usableSize), only nLocal = localPayloadSize(totalPayload,
-// usableSize) bytes of payload are stored on-page, and the remainder is
-// written to an overflow chain. The overflow pointer (4 bytes) is appended
-// after the local payload.
+// for overflow purposes. When totalPayload = keyLen + valLen exceeds the
+// file's leaf limit (pager.leafLimits: usableSize-35 from schema format 6,
+// the index limit in schema format 5), only nLocal = localPayloadSize(
+// totalPayload, limits) bytes of payload are stored on-page, and the
+// remainder is written to an overflow chain. The overflow pointer (4 bytes)
+// is appended after the local payload.
 //
 // This matches SQLite's index btree format where the entire cell payload can
 // overflow. The key difference from SQLite is that we use two varints
@@ -213,7 +271,7 @@ type dbHeader struct {
 }
 
 // serialize writes the database header to the first 100 bytes of buf.
-// DRIFT: DB header: 'any-store v2' magic (legacy 'BTree format 1' still read), version=1, KDF salt at 72-87, auto/incr-vacuum fields z See docs/btree/NOTES.md#old-drift-db-file-header-magic-version-salt-vacuum
+// DRIFT: DB header: own magics ('any-store v2 fmt', or 'any-store v2' for schema format 5), library version field = 1, KDF salt at 72-87, auto/incr-vacuum fields zero. See docs/btree/NOTES.md#old-drift-db-file-header-magic-version-salt-vacuum
 func (h *dbHeader) serialize(buf []byte) {
 	if h.versioned {
 		copy(buf[0:16], dbMagicFmt)
@@ -353,6 +411,10 @@ func checkHeaderFormat(versioned bool, readVersion, writeVersion uint8, schemaFo
 			return fmt.Errorf("%w: schema format %d under the versioned magic", ErrHeaderCorrupt, schemaFormat)
 		}
 		return nil
+	}
+	if schemaFormat >= firstVersionedSchemaFormat {
+		// The zero-padded magics are only ever written with schema format 5.
+		return fmt.Errorf("%w: schema format %d without the versioned magic", ErrHeaderCorrupt, schemaFormat)
 	}
 	// Schema format 5 introduced unified leaf cell overflow (key+value as a
 	// single payload blob). Older formats stored the key fully on-page and

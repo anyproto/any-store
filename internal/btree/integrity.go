@@ -34,11 +34,12 @@ type integrityChecker struct {
 	pager       *pager
 	cache       *pcache // private reader cache (avoids racing with writerCache)
 	walMaxFrame uint32
-	nPages      uint32   // total database pages
-	pageRef     []byte   // bit-packed: 1 bit per page
-	usableSize  int      // pageSize - reservedSpace
-	maxErrors   int      // stop after this many errors
-	errors      []string // accumulated error messages
+	nPages      uint32        // total database pages
+	pageRef     []byte        // bit-packed: 1 bit per page
+	usableSize  int           // pageSize - reservedSpace
+	leafLim     payloadLimits // leaf-cell rule of the snapshot's schema format
+	maxErrors   int           // stop after this many errors
+	errors      []string      // accumulated error messages
 
 	// Context for error messages
 	treeName string // current tree name (e.g., "master" or namespace name)
@@ -289,6 +290,8 @@ func (ic *integrityChecker) keyInBounds(key, lower, upper []byte, context string
 // strict cell ordering check this enforces
 //
 //	max(subtree[child i]) < D_i <= min(subtree[child i+1]).
+//
+// DRIFT: child depths are compared with the first child's, not with the previous one's. See docs/btree/NOTES.md#drift-2026-06-25-11-checktreepage-anchors-child-depth-comparison-on-the-first-child-and-ne
 func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLeafCell func(key, value []byte)) int {
 	if ic.tooManyErrors() {
 		return 0
@@ -316,6 +319,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 
 	nCells := int(pg.header.cellCount)
 	isLeaf := pg.header.isLeaf()
+	leafLim := ic.leafLim
 
 	// prevDivider tracks the divider key to the LEFT of the next child to be
 	// recursed into (the inclusive lower bound for that child). It starts at
@@ -354,8 +358,13 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 		cellOff := int(pg.getCellOffset(i))
 
 		// Validate cell pointer is within the cell content area
-		if cellOff < contentOffset || cellOff > ic.usableSize-4 {
-			ic.report("%s cell %d: offset %d out of range %d..%d", context, i, cellOff, contentOffset, ic.usableSize-4)
+		// SQLite bounds the offset by usableSize-4 (btree.c:10954), its minimum
+		// cell size. any-store's leaf cells have no such floor (a one-byte key
+		// with an empty value takes three bytes), so only the page end bounds
+		// the offset here; the cell's own extent is checked below.
+		// DRIFT: cell offsets up to usableSize-1 are accepted, because leaf cells smaller than four bytes exist. See docs/btree/NOTES.md#drift-26-leaf-cell-size-missing-four-byte-minimum-clamp
+		if cellOff < contentOffset || cellOff >= ic.usableSize {
+			ic.report("%s cell %d: offset %d out of range %d..%d", context, i, cellOff, contentOffset, ic.usableSize-1)
 			doCoverageCheck = false
 			continue
 		}
@@ -363,7 +372,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 		// Parse cell and compute its size
 		var cellSize int
 		if isLeaf {
-			cell, sz, cerr := parseLeafCellWithSize(pg.data, cellOff, ic.usableSize)
+			cell, sz, cerr := parseLeafCellWithSize(pg.data, cellOff, leafLim)
 			if cerr != nil {
 				ic.report("%s cell %d: corrupt cell data", context, i)
 				doCoverageCheck = false
@@ -381,7 +390,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 			// Key ordering check — need full key for overflow cells
 			var fullKey []byte
 			if cell.overflowPg != 0 {
-				fk, fkerr := leafFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, ic.cache)
+				fk, fkerr := leafFullKey(pg.data, cellOff, leafLim, ic.pager, ic.walMaxFrame, ic.cache)
 				if fkerr != nil {
 					ic.report("%s cell %d: corrupt leaf key", context, i)
 				} else {
@@ -409,7 +418,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 					valLen, _, verr2 := getVarintSafe(pg.data[pos:])
 					if verr2 == nil {
 						totalPayload := int(keyLen) + int(valLen)
-						nLocal := localPayloadSize(totalPayload, ic.usableSize)
+						nLocal := localPayloadSize(totalPayload, leafLim)
 						overflowBytes := totalPayload - nLocal
 						ovflUsable := overflowPageUsable(ic.usableSize)
 						nOverflow := (overflowBytes + ovflUsable - 1) / ovflUsable
@@ -437,7 +446,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 				}
 				hookVal := cell.value
 				if cell.overflowPg != 0 {
-					fv, fverr := leafFullValue(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, ic.cache)
+					fv, fverr := leafFullValue(pg.data, cellOff, leafLim, ic.pager, ic.walMaxFrame, ic.cache)
 					if fverr != nil {
 						// Surface the error class (I/O vs geometry) beside the
 						// hook's generic corrupt-value report, mirroring the
@@ -486,7 +495,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 				pos := cellOff + 4
 				keyLen, _, verr := getVarintSafe(pg.data[pos:])
 				if verr == nil {
-					localSz := localPayloadSize(int(keyLen), ic.usableSize)
+					localSz := interiorLocalPayloadSize(int(keyLen), ic.usableSize)
 					overflowBytes := int(keyLen) - localSz
 					ovflUsable := overflowPageUsable(ic.usableSize)
 					nOverflow := (overflowBytes + ovflUsable - 1) / ovflUsable
@@ -562,19 +571,29 @@ func (db *DB) IntegrityCheck() error {
 	return db.IntegrityCheckN(100)
 }
 
+// testIntegritySnapshotHook runs in IntegrityCheckN once its read
+// transaction is open and page 1 has been read. Nil outside tests.
+var testIntegritySnapshotHook func()
+
 // IntegrityCheckN is like IntegrityCheck but stops after maxErrors issues.
 // Pass 0 for unlimited.
 func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// Start a read transaction
-	maxFrame, slot, err := db.pager.beginRead()
+	walHdr, maxFrame, minFrame, slot, err := db.pager.beginReadHdr()
 	if err != nil {
 		return err
 	}
 	defer db.pager.endRead(slot)
 
 	// Use a private reader cache to avoid racing with the writer's cache.
+	// Its WAL floor is the snapshot's, as for every reader cache: on slot 0
+	// (minFrame = maxFrame+1) the check reads nothing from the WAL
+	// (walFindFrame, wal.c:3538-3541). A WAL restart needs only slots 1-4,
+	// so it can run under the check, and the live floor would let the next
+	// generation's frames, numbered from 1 again, into this snapshot.
 	cache := newPcache(int(db.pager.pageSize), 200, true)
 	cache.useSlab = db.pager.useSlab
+	cache.minFrame = minFrame
 	defer cache.destroy()
 
 	// Read page 1 to get the current header
@@ -588,37 +607,41 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 		return err
 	}
 	db.pager.releasePage(pg1)
+	if testIntegritySnapshotHook != nil {
+		testIntegritySnapshotHook()
+	}
 
+	// The pager's count for this snapshot, the one every reader of it uses
+	// (effectiveReaderDbSize: the wal-index header's committed size, else
+	// the file's). The process-local committed position must not be used: in
+	// a process that has not begun a write since a peer grew the database it
+	// is stale, and the peer's pages, still only in the WAL, were reported as
+	// invalid page numbers. Nor may pager.dbSize, the writer's live count: a
+	// write transaction open in this process that has truncated the database
+	// would cap the check below pages the committed snapshot still owns.
+	maxPossible, err := db.pager.effectiveReaderDbSize(walHdr)
+	if err != nil {
+		return err
+	}
+	// The page count by lockBtree's rule (btree.c:3294-3298), which is the
+	// btreePagecount the integrity check walks (btree.c:11163-11168): page
+	// 1's size when it is non-zero and the change counter matches
+	// VersionValidFor, the pager's count otherwise. An untrusted 0 is not an
+	// empty database.
 	nPages := hdr.DatabaseSize
+	if nPages == 0 || hdr.VersionValidFor != hdr.FileChangeCount {
+		nPages = maxPossible
+	}
 	if nPages == 0 {
 		return nil
 	}
 
-	// Cap nPages against the actual database size to protect against corrupted
-	// headers claiming billions of pages. This matches SQLite's approach where
-	// btreePagecount() uses the actual file/WAL size, not the header field.
-	//
-	// Use max(filePages, walIndex.maxPage) because pages allocated in the WAL
-	// may have page numbers beyond the current physical DB file size (they get
-	// written to the DB file during checkpoint).
-	pageSize := db.pager.pageSize
-	if pageSize > 0 {
-		var maxPossible uint32
-		if db.pager.file != nil {
-			fi, statErr := db.pager.file.Stat()
-			if statErr == nil {
-				maxPossible = uint32(fi.Size() / int64(pageSize))
-			}
-		}
-		// WAL's maxPage tracks the committed database size including
-		// pages that only exist in the WAL (not yet checkpointed).
-		walMaxPage := db.pager.wal.index.maxPage.Load()
-		if walMaxPage > maxPossible {
-			maxPossible = walMaxPage
-		}
-		if maxPossible > 0 && nPages > maxPossible {
-			nPages = maxPossible
-		}
+	// Cap nPages against the snapshot's database size to protect against
+	// corrupted headers claiming billions of pages: SQLite fails lockBtree on
+	// a trusted size above the pager's count (btree.c:3401-3408); the check
+	// here goes on with the pages that exist.
+	if maxPossible > 0 && nPages > maxPossible {
+		nPages = maxPossible
 	}
 
 	// Bound reader page/overflow reads against this snapshot's (capped) page
@@ -632,6 +655,7 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 		pageRef:     make([]byte, nPages/8+1),
 		nPages:      nPages,
 		usableSize:  int(db.pager.pageSize) - int(hdr.ReservedSpace),
+		leafLim:     leafLimitsOf(hdr.SchemaFormat, int(db.pager.pageSize)-int(hdr.ReservedSpace)),
 		maxErrors:   maxErrors,
 	}
 

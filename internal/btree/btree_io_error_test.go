@@ -521,7 +521,7 @@ func TestIO_ReadOverflowChain_MaxIteration(t *testing.T) {
 		n := int(pg.header.cellCount)
 		for i := 0; i < n; i++ {
 			off := pg.getCellOffset(i)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), indexLimits(usableSize))
 			if cerr == nil && cell.overflowPg != 0 {
 				// Found an overflow cell - make it circular
 				ovfPg, ovfErr := db.pager.getWritablePage(cell.overflowPg)
@@ -588,7 +588,7 @@ func TestIO_FreeOverflowChain_BoundsError(t *testing.T) {
 	n := int(pg.header.cellCount)
 	for i := 0; i < n; i++ {
 		off := pg.getCellOffset(i)
-		cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+		cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), indexLimits(usableSize))
 		if cerr == nil && cell.overflowPg != 0 {
 			overflowPg = cell.overflowPg
 			break
@@ -892,7 +892,7 @@ func TestIO_ReadOverflowChain_OutOfBoundsPage(t *testing.T) {
 	n := int(pg.header.cellCount)
 	for i := 0; i < n; i++ {
 		off := pg.getCellOffset(i)
-		cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+		cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), indexLimits(usableSize))
 		if cerr == nil && cell.overflowPg != 0 {
 			ovfPg, ovfErr := db.pager.getWritablePage(cell.overflowPg)
 			if ovfErr == nil {
@@ -923,6 +923,7 @@ func TestIO_ReadOverflowChain_OutOfBoundsPage(t *testing.T) {
 // Mirrors C accessPayload's post-loop completeness check (btree.c:5327-5330:
 // `if( rc==SQLITE_OK && amt>0 ) return SQLITE_CORRUPT_PAGE(pPage)`).
 func TestIO_ReadOverflowChain_PrematureTerminator(t *testing.T) {
+	useLegacyFormat(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
@@ -958,7 +959,7 @@ func TestIO_ReadOverflowChain_PrematureTerminator(t *testing.T) {
 	n := int(pg.header.cellCount)
 	for i := 0; i < n; i++ {
 		off := pg.getCellOffset(i)
-		cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+		cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), indexLimits(usableSize))
 		if cerr == nil && cell.overflowPg != 0 {
 			ovfPg, ovfErr := db.pager.getWritablePage(cell.overflowPg)
 			if ovfErr == nil {

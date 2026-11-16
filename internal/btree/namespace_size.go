@@ -40,6 +40,8 @@ func (tx *ReadTx) NamespaceSize(ns *Namespace) (NamespaceSize, error) {
 
 // walkSize recursively accumulates page and payload counts for the subtree
 // rooted at pgno. depth guards against circular page references.
+// DRIFT: no visited-page set. See docs/btree/NOTES.md#drift-2026-06-25-18-walksize-has-no-visited-page-set-so-a-corrupt-dag-cycle-triggers-expon
+// DRIFT: child page numbers are followed without a bounds check. See docs/btree/NOTES.md#drift-2026-06-25-17-walksize-descends-child-right-child-page-numbers-without-the-bounds-gu
 func (bt *btree) walkSize(pgno uint32, depth int, res *NamespaceSize) error {
 	if depth > btCursorMaxDepth {
 		return ErrCorrupt
@@ -59,7 +61,7 @@ func (bt *btree) walkSize(pgno uint32, depth int, res *NamespaceSize) error {
 				bt.pager.releasePage(pg)
 				return oErr
 			}
-			c, _, pErr := parseLeafCellWithSize(pg.data, int(off), usable)
+			c, _, pErr := parseLeafCellWithSize(pg.data, int(off), bt.leafLimits())
 			if pErr != nil {
 				bt.pager.releasePage(pg)
 				return pErr

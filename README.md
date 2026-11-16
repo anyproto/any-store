@@ -97,7 +97,9 @@ if err := tx.Commit(); err != nil { // or tx.Rollback()
 
 Any operation run with `tx.Context()` joins the transaction. Read transactions (`db.ReadTx`) pin a consistent snapshot; writers never block readers. One write transaction is active at a time — across all processes.
 
-A transaction begins with a context, as does an operation run without one, which opens its own. The wait for this process's writer lock, or for a reader slot once `Config.ReadConcurrency` of them are held, ends with the context's error when the context ends first; a context that has ended already begins nothing; a context that never ends waits until the database closes (`ErrDBIsClosed`). The wait behind another process's writer is the busy handler's: it ends with the busy error after the busy timeout, not with the context. `Commit` and `Rollback` do not consult the context. `TxFromContext` returns the transaction a context carries.
+A transaction begins with a context, as does an operation run without one, which opens its own. The wait for this process's writer lock, or for a reader slot once `Config.ReadConcurrency` of them are held, ends with the context's error when the context ends first; a context that has ended already begins nothing; a context that never ends waits until the database closes (`ErrDBIsClosed`). The wait behind another process's writer is the busy handler's: it ends with the busy error (`ErrBusy`) after the busy timeout, not with the context. `Commit` and `Rollback` do not consult the context. `TxFromContext` returns the transaction a context carries.
+
+`db.Backup` is the exception to the waits: it does not wait for this process's writer lock or for a reader slot. The copy advances between this process's write transactions; if one stays open, or no reader slot is free, for the busy timeout, `Backup` returns an error that matches `ErrBusy` (`errors.Is`) and can be called again. With a context that carries a write transaction of the same database it returns that error at once: it would be waiting for its caller. It looks at its context between the batches of the copy, not inside one. The destination file is never removed. If `Backup` fails before the copy is committed, a destination that existed keeps its content and a new one is an empty database; the copy is committed in one step at the end, and an error after that leaves the completed copy. A batch of the copy begins its transactions with the ordinary waits behind another process, so `Backup` can return later than the busy timeout after it last copied. Two backups in opposite directions between the same two databases are busy for each other until one has ended.
 
 An operation run with a context that has ended begins nothing, inside a transaction as well; the transaction stays open for `Commit` and `Rollback`. A find, count, update or delete that is running polls its context once per page of its scan and ends with the context's error: an iterator's `Next` returns false and `Err` reports it. An `Update` or `Delete` rolls its writes back: its own transaction, or its savepoint inside the caller's transaction, which stays open (SQLite rolls back the whole transaction for an interrupted write statement). When the scan is an index's, the polled pages are the index's: the document fetches for one index leaf are the longest it runs past its context. The in-memory sort step of a sorted query and the search of a `$text` or `$knn` plan run to completion before the first `Next` and do not poll the context.
 
@@ -229,6 +231,21 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 Whole-file page-level AEAD; bring-your-own key management via `EncryptionConfig.Codec`.
 
 An independent Go implementation following design conventions from [SQLCipher](https://www.zetetic.net/sqlcipher/) (BSD-3-Clause) — reserved-tail page overhead, the page-1 plaintext-prefix rule, PBKDF2-HMAC-SHA256 key derivation. No SQLCipher code is included; the cryptography is Go-native and uses AEAD rather than SQLCipher's encrypt-then-MAC construction. Not SQLCipher-compatible on disk. See [NOTICE.md](NOTICE.md).
+
+## File format versions
+
+A database file keeps the on-disk format it was created with.
+
+| Format | Created by | Opened by |
+| ------ | ---------- | --------- |
+| 5 | v2.0.0 – v2.4.x | every v2 release |
+| 6 | v2.5.0 and later | v2.5.0 and later |
+
+Format 6 keeps a document or index entry of up to about one page (4,045 bytes on the default page size) on its b-tree leaf; format 5 moves anything over 997 bytes to a page of its own. A format 5 file opened by v2.5.0 or later stays format 5 and is read and written as before.
+
+Opening a format 6 file with v2.4.4 fails with `ErrIncompatibleVersion` and leaves the file unchanged. Releases before v2.4.4 refuse it as a corrupt file and do not read it either: do not go back past v2.4.4 once a release that creates format 6 files has run.
+
+`Backup` writes a copy in the source's format: a backup of a format 5 database is a format 5 file.
 
 ## Documentation
 

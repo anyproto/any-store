@@ -255,13 +255,17 @@ const (
 	FlushModeCheckpointFull FlushMode = "CHECKPOINT_FULL"
 
 	// FlushModeCheckpointRestart is like Full but after checkpointing also
-	// waits until all readers are reading from the database file only, then
-	// resets the WAL so new writes start from the beginning. Blocks new
-	// writers while pending, but does not impede readers.
+	// waits until all readers are reading from the database file only, so
+	// that the next write transaction starts the WAL over from its
+	// beginning. The checkpoint itself leaves the WAL as it is: its size
+	// does not change, and the file is reused, not shrunk. Blocks new
+	// writers while pending, but does not impede readers. Returns a busy
+	// error if a reader still uses the WAL when the busy timeout ends.
 	FlushModeCheckpointRestart FlushMode = "CHECKPOINT_RESTART"
 
-	// FlushModeCheckpointTruncate is like Restart but also truncates the WAL
-	// file to zero bytes.
+	// FlushModeCheckpointTruncate is like Restart but also resets the WAL
+	// and truncates its file to zero bytes. It is the only mode that gives
+	// the WAL's disk space back.
 	FlushModeCheckpointTruncate FlushMode = "CHECKPOINT_TRUNCATE"
 )
 

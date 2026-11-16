@@ -234,6 +234,7 @@ func TestCorruptCov_SearchLeafVarintCorruption(t *testing.T) {
 // When leaf has overflow cells, key reading from overflow pages can fail
 
 func TestCorruptCov_LeafFullKeyBoundsCheck(t *testing.T) {
+	useLegacyFormat(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 	db, err := testOpen(t, path, Options{PageSize: 512})
@@ -277,7 +278,7 @@ func TestCorruptCov_LeafFullKeyBoundsCheck(t *testing.T) {
 					kl, kn := getVarint(data[cellOff:])
 					if kl > 100 && kn > 0 {
 						// This is an overflow cell - corrupt the overflow page pointer
-						nLocal := localPayloadSize(int(kl), pageSize)
+						nLocal := localPayloadSize(int(kl), indexLimits(pageSize))
 						overflowPtrOff := cellOff + kn + nLocal
 						if overflowPtrOff+4 <= len(data) {
 							// Point to page 0 (invalid)

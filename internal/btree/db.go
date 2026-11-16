@@ -121,6 +121,12 @@ type Options struct {
 
 	PageSize uint32 // Page size in bytes (default: 4096)
 
+	// SchemaFormat is the on-disk format of a database file this Open
+	// creates: 0 for the current one, or 5 for the format of releases before
+	// v2.5.0. An existing file keeps its own format whatever is asked. Used by
+	// a backup, whose destination must have its source's format.
+	SchemaFormat uint32
+
 	// DisableAutoCheckpoint disables auto-checkpoint entirely (manual Checkpoint() only).
 	DisableAutoCheckpoint bool
 
@@ -343,6 +349,18 @@ type DB struct {
 	writerLocksDone atomic.Bool // CAS guard: writer lock cleanup (endRead+RUnlock+Unlock) runs exactly once
 	closeOnce       sync.Once   // guards closing closeCh
 
+	// writerRegistered says that the holder of the write lock is a write
+	// transaction whose teardown (releaseWriterLocks) is valid: it holds its
+	// reader slot, db.mu and the pager's write state. The lock is also held,
+	// without any of that, by a BeginWrite still on its way and by a
+	// Backup.Step. writerRegMu orders the registration against Close: a
+	// BeginWrite that finds the database closing there backs out, and a Close
+	// that finds no registered transaction waits for the holder instead of
+	// tearing down a transaction that is not one. (SQLite serializes close
+	// with everything else through the connection mutex, main.c:1263.)
+	writerRegMu      sync.Mutex
+	writerRegistered bool
+
 	// Namespace root pages are stored in a master table on page 1.
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
 	masterBT *btree
@@ -455,15 +473,38 @@ func (db *DB) releaseWriterLocks(pager *pager, slot int, pre, post func()) bool 
 	}
 	defer db.unlockWriter()
 	defer db.mu.RUnlock()
+	defer db.unregisterWriter()
 	if pre != nil {
 		pre()
 	}
+	// Whatever way the transaction ended, the backups do not go on with
+	// pages it sent them and did not commit, or without pages it committed
+	// and did not send (pager.backupOwed). Before the write lock goes: no
+	// Step runs until then.
+	pager.dischargeBackups()
 	pager.endRead(slot)
 	if post != nil {
 		post()
 	}
 	return true
 }
+
+// unregisterWriter ends the registration of the write transaction whose
+// locks releaseWriterLocks is releasing.
+func (db *DB) unregisterWriter() {
+	db.writerRegMu.Lock()
+	db.writerRegistered = false
+	db.writerRegMu.Unlock()
+}
+
+// Test hooks of the Close / BeginWrite handshake: testWriterRegisterHook runs
+// in BeginWrite once it holds everything a write transaction holds, before
+// it registers; testCloseWriterCheckedHook in Close once it found the write
+// lock held and looked for a registered transaction.
+var (
+	testWriterRegisterHook     func()
+	testCloseWriterCheckedHook func(registered bool)
+)
 
 // lockWriter takes the write lock: one writer at a time in this process (the
 // writer lock across processes is the WAL's, taken in pager.beginWrite). A
@@ -585,7 +626,11 @@ func Open(path string, opts Options) (*DB, error) {
 		}
 	}
 
+	if opts.SchemaFormat != 0 && (opts.SchemaFormat < minSchemaFormat || opts.SchemaFormat > maxSchemaFormat) {
+		return nil, fmt.Errorf("btree: cannot create a database of schema format %d", opts.SchemaFormat)
+	}
 	p := newPager(path, opts.PageSize, opts.CacheSize, !opts.InMemory)
+	p.createFormat = opts.SchemaFormat
 	p.useSlab = opts.UsePageSlab
 	p.writerCache.useSlab = opts.UsePageSlab
 	p.inProcess = opts.InProcess
@@ -701,6 +746,9 @@ func Open(path string, opts Options) (*DB, error) {
 		writeSem:        make(chan struct{}, 1),
 		closeCh:         make(chan struct{}),
 	}
+	// No write transaction: its teardown has nothing to run on (Close).
+	db.writerLocksDone.Store(true)
+	p.testOwner = db
 
 	// A reader that pins a commit while it is still on its way out of
 	// pager.commit finds its counters remembered: the pager has them in its
@@ -746,22 +794,34 @@ func (db *DB) Close() error {
 	db.closeOnce.Do(func() { close(db.closeCh) })
 
 	if !db.tryLockWriter() {
-		// A writer holds the write lock. Force-rollback the abandoned/in-flight tx.
-		// writerOpMu serializes with commit/rollback so we don't interleave
-		// with a concurrent Commit or Rollback call.
-		// Use rollbackForClose which skips writerCache operations to avoid
-		// racing with the writer's B-tree ops (pcache has no mutex).
-		db.pager.writerOpMu.Lock()
-		if pagerState(db.pager.state.Load()) == pagerWriter {
-			db.pager.rollbackForClose()
+		// The write lock is held: by a write transaction, by a BeginWrite
+		// that has not got that far, or by a Backup.Step. Only a registered
+		// write transaction is rescued; the other two end by themselves (a
+		// BeginWrite sees closing when it comes to register).
+		db.writerRegMu.Lock()
+		registered := db.writerRegistered
+		db.writerRegMu.Unlock()
+		if testCloseWriterCheckedHook != nil {
+			testCloseWriterCheckedHook(registered)
 		}
-		db.pager.writerOpMu.Unlock()
+		if registered {
+			// Force-rollback the abandoned/in-flight tx.
+			// writerOpMu serializes with commit/rollback so we don't interleave
+			// with a concurrent Commit or Rollback call.
+			// Use rollbackForClose which skips writerCache operations to avoid
+			// racing with the writer's B-tree ops (pcache has no mutex).
+			db.pager.writerOpMu.Lock()
+			if pagerState(db.pager.state.Load()) == pagerWriter {
+				db.pager.rollbackForClose()
+			}
+			db.pager.writerOpMu.Unlock()
 
-		// Exactly-once writer lock cleanup (endRead + RUnlock + Unlock) via
-		// the shared teardown: a writer goroutine completing concurrently
-		// could race with Close, and the writerLocksDone CAS inside
-		// releaseWriterLocks prevents the double-release.
-		db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil)
+			// Exactly-once writer lock cleanup (endRead + RUnlock + Unlock) via
+			// the shared teardown: a writer goroutine completing concurrently
+			// could race with Close, and the writerLocksDone CAS inside
+			// releaseWriterLocks prevents the double-release.
+			db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil)
+		}
 		// A plain send, not lockWriter: closeCh is closed already, and this
 		// wait is for the holder to leave.
 		db.writeSem <- struct{}{}
@@ -844,6 +904,13 @@ func (db *DB) Options() Options {
 	return db.opts
 }
 
+// SchemaFormat returns the on-disk format of the open file (5 or 6; 0 for a
+// file whose header never recorded one, which is read as 5). A file keeps the
+// format it was created with.
+func (db *DB) SchemaFormat() uint32 {
+	return db.pager.schemaFormat.Load()
+}
+
 // beginRead starts a read-only transaction.
 // When readCounters is false, disk counters are initialized from local counters
 // without reading page-1 metadata, which is useful for hot point-lookups.
@@ -912,7 +979,7 @@ func (db *DB) beginRead(ctx context.Context, readCounters, wait bool) (*ReadTx, 
 	// validity key, the memo key and tx.walHdr below.
 	snapHdr := hdr
 	if hdr.isInit == 0 {
-		snapHdr = db.pager.wal.index.synthHdr(maxFrame)
+		snapHdr = db.pager.wal.index.synthHdr(maxFrame, hdr.nPage)
 	}
 
 	localFCC := db.localFileChangeCounter.Load()
@@ -969,10 +1036,18 @@ func (db *DB) beginRead(ctx context.Context, readCounters, wait bool) (*ReadTx, 
 	// Allocate reader cache from pool for per-connection page caching.
 	// Persistent cache: keep cached pages only if the DB snapshot hasn't
 	// changed (curDV and snapHdr, above).
-	// Snapshot DB page count for this reader (hdr.nPage, fallback p.dbSize).
-	// Carried on the cache so reader bound checks accept pages a peer
-	// allocated after open. Set in lockstep with walHdr.
-	snapDbSize := db.pager.effectiveReaderDbSize(hdr)
+	// Snapshot DB page count for this reader: the size its snapshot's last
+	// commit recorded (effectiveReaderDbSize), never the writer's live
+	// p.dbSize. Carried on the cache so reader bound checks accept pages a
+	// peer allocated after open and pages above a truncation that an open
+	// write transaction has not committed. Set in lockstep with walHdr.
+	snapDbSize, err := db.pager.effectiveReaderDbSize(hdr)
+	if err != nil {
+		db.pager.endRead(slot)
+		db.mu.RUnlock()
+		<-db.readerSem
+		return nil, err
+	}
 	var cache *pcache
 	select {
 	case cache = <-db.readerCaches:
@@ -1017,8 +1092,6 @@ func (db *DB) beginRead(ctx context.Context, readCounters, wait bool) (*ReadTx, 
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
 	tx.diskSchemaCookie = sc
-	tx.localFileChangeCounter = localFCC
-	tx.localSchemaCookie = localSC
 	tx.snapFileChangeCounter = snapFCC
 	tx.snapSchemaCookie = snapSC
 	return tx, nil
@@ -1102,15 +1175,20 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	var slot int
 	var readSnap WalIndexHdr
 
-	for attempt := 0; ; attempt++ {
+	// One loop and one busy count for the whole begin, as
+	// sqlite3BtreeBeginTrans (btree.c:3730-3737): a peer's recovery in
+	// progress (ErrBusyRecovery), the write lock held by another connection
+	// (ErrBusy: the lock is tried once per attempt, walBeginWriteTransaction,
+	// wal.c:3714-3717) and a snapshot that moved (ErrBusySnapshot, after its
+	// tight retries) share the handler's budget, which is spent once, not
+	// once per retry. Every retry starts from a fresh read snapshot.
+	busy := beginBusy{xBusy: db.pager.wal.busyHandler}
+	for attempt := 0; ; {
 		var err error
-		readSnap, maxFrame, _, slot, err = db.pager.beginReadHdr()
+		readSnap, maxFrame, _, slot, err = db.pager.beginReadHdrBusy(nil)
 		if err != nil {
-			if errors.Is(err, ErrBusyRecovery) {
-				xBusy := db.pager.wal.busyHandler
-				if xBusy != nil && xBusy(attempt) {
-					continue
-				}
+			if errors.Is(err, ErrBusyRecovery) && busy.retry() {
+				continue
 			}
 			db.mu.RUnlock()
 			db.unlockWriter()
@@ -1127,6 +1205,12 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 			break
 		}
 		db.pager.endRead(slot)
+		if testBeginWriteRetryHook != nil {
+			testBeginWriteRetryHook(err)
+		}
+		if errors.Is(err, ErrBusy) && busy.retry() {
+			continue
+		}
 		if !errors.Is(err, ErrBusySnapshot) {
 			db.mu.RUnlock()
 			db.unlockWriter()
@@ -1137,14 +1221,12 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 		// After a small tight-retry budget, route through the busy handler so
 		// we back off instead of spinning. When busyHandler returns false
 		// (budget exhausted) or is nil, surface ErrBusySnapshot to the caller.
-		if attempt >= busySnapshotInnerRetries {
-			xBusy := db.pager.wal.busyHandler
-			if xBusy == nil || !xBusy(attempt-busySnapshotInnerRetries) {
-				db.mu.RUnlock()
-				db.unlockWriter()
-				return nil, ErrBusySnapshot
-			}
+		if attempt >= busySnapshotInnerRetries && !busy.retry() {
+			db.mu.RUnlock()
+			db.unlockWriter()
+			return nil, ErrBusySnapshot
 		}
+		attempt++
 	}
 
 	// Read the committed page-1 counters for staleness detection from the
@@ -1158,13 +1240,27 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	// equals what this process last wrote, so the on-disk counters are
 	// unchanged and p.header still matches. SQLite likewise keeps the header
 	// in the in-memory page-1 PgHdr and does not re-read it from the WAL per
-	// statement. The staleness signal (diskFileChangeCounter vs
-	// localFileChangeCounter, consumed by checkStale → IsDataStale) is
-	// therefore preserved on the identical invalidation edge.
+	// statement.
 	fcc, sc := db.pager.committedCounters()
 
-	// Reset the cleanup guard for this write transaction.
+	// Register the write transaction and reset its cleanup guard, unless
+	// the database started closing while this begin was on its way: Close
+	// then waits for the lock and rescues nothing (writerRegistered).
+	if testWriterRegisterHook != nil {
+		testWriterRegisterHook()
+	}
+	db.writerRegMu.Lock()
+	if db.closing.Load() {
+		db.writerRegMu.Unlock()
+		_ = db.pager.rollback()
+		db.pager.endRead(slot)
+		db.mu.RUnlock()
+		db.unlockWriter()
+		return nil, ErrClosed
+	}
+	db.writerRegistered = true
 	db.writerLocksDone.Store(false)
+	db.writerRegMu.Unlock()
 
 	tx := db.getWriteTx()
 	tx.ReadTx.db = db
@@ -1179,7 +1275,8 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	if readSnap.isInit != 0 {
 		tx.ReadTx.walHdr = readSnap
 	} else {
-		tx.ReadTx.walHdr = db.pager.wal.index.synthHdr(maxFrame)
+		_, nPage := db.pager.wal.index.mxCommitFrame.LoadPos()
+		tx.ReadTx.walHdr = db.pager.wal.index.synthHdr(maxFrame, nPage)
 	}
 	tx.ReadTx.walSlot = slot
 	tx.ReadTx.writable = true
@@ -1189,8 +1286,6 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	// the latest state, so the snapshot-bounded pair equals the disk pair.
 	tx.ReadTx.snapFileChangeCounter = fcc
 	tx.ReadTx.snapSchemaCookie = sc
-	tx.ReadTx.localFileChangeCounter = db.localFileChangeCounter.Load()
-	tx.ReadTx.localSchemaCookie = db.localSchemaCookie.Load()
 	tx.dataChanged = false   // pool reuse safety
 	tx.schemaChanged = false // pool reuse safety
 	tx.onCommitted = nil
@@ -1240,45 +1335,25 @@ func (db *DB) Checkpoint(mode CheckpointMode) error {
 	return db.pager.checkpointWithMode(mode)
 }
 
-// UpdateLocalCounters sets the local counter cache: the page-1 counters the
-// in-memory state is known to reflect. Commit sets them to the committed
-// values; a caller that rebuilt its in-memory state from a snapshot records
-// that snapshot with AdvanceLocalCounters. This raw store exists for tests,
-// which also wind the cache back to model a peer's commit.
-func (db *DB) UpdateLocalCounters(fileChangeCounter, schemaCookie uint32) {
-	db.localFileChangeCounter.Store(fileChangeCounter)
-	db.localSchemaCookie.Store(schemaCookie)
+// LocalSchemaCookie returns the schema cookie of this process's last commit,
+// or of the database as it was opened if it has not committed.
+func (db *DB) LocalSchemaCookie() uint32 {
+	return db.localSchemaCookie.Load()
 }
 
-// AdvanceLocalCounters records that the in-memory state reflects the given
-// counters, never moving either one back: a commit that landed meanwhile
-// already recorded newer values, and the state it published must not be
-// reported stale again by the next transaction.
-func (db *DB) AdvanceLocalCounters(fileChangeCounter, schemaCookie uint32) {
-	advanceCounter(&db.localFileChangeCounter, fileChangeCounter)
-	advanceCounter(&db.localSchemaCookie, schemaCookie)
-}
-
-// LocalCounters returns the local counter cache.
-func (db *DB) LocalCounters() (fileChangeCounter, schemaCookie uint32) {
-	return db.localFileChangeCounter.Load(), db.localSchemaCookie.Load()
-}
-
-// advanceCounter stores v unless c already holds v or a later value; the
-// counters increment per commit and are compared modulo 2^32.
-func advanceCounter(c *atomic.Uint32, v uint32) {
+// ForgetSeenHeader makes the next transaction begin find the committed state
+// as another process's: the change state forgets the wal-index header it
+// holds, so the begin's snapshot is news and the change epoch moves
+// (ReadTx.ChangeEpoch). For tests, which model a peer's commit with it; no
+// effect on an in-process or in-memory database.
+func (db *DB) ForgetSeenHeader() {
+	w := db.pager.wal
 	for {
-		old := c.Load()
-		if int32(v-old) <= 0 || c.CompareAndSwap(old, v) {
+		cur := w.chg.Load()
+		if cur == nil || w.chg.CompareAndSwap(cur, &walChange{epoch: cur.epoch, pending: cur.pending}) {
 			return
 		}
 	}
-}
-
-// counterReached reports whether have has reached target, comparing
-// modulo 2^32 like advanceCounter.
-func counterReached(have, target uint32) bool {
-	return int32(have-target) >= 0
 }
 
 // CreateNamespace creates a new namespace. Must be called within a write transaction.
@@ -1519,11 +1594,11 @@ func (db *DB) freeTreePagesDepth(pgno uint32, depth int) error {
 		}
 	} else {
 		// Leaf page: free any overflow chains
-		usableSize := db.pager.usableSize()
+		lim := db.pager.leafLimits()
 		n := int(pg.header.cellCount)
 		for i := range n {
 			off := pg.getCellOffset(i)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
 			if cerr != nil {
 				db.pager.releasePage(pg)
 				return cerr
@@ -1558,9 +1633,13 @@ func (db *DB) GetNamespace(name string) (*Namespace, error) {
 	}
 	defer db.pager.endRead(slot)
 
+	dbSize, err := db.pager.effectiveReaderDbSize(hdr)
+	if err != nil {
+		return nil, err
+	}
 	cache := newPcache(int(db.pager.pageSize), 200, true)
 	cache.useSlab = db.pager.useSlab
-	cache.dbSize = db.pager.effectiveReaderDbSize(hdr)
+	cache.dbSize = dbSize
 	cache.minFrame = minFrame
 	defer cache.destroy()
 
@@ -1597,9 +1676,10 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 	}
 
 	usableSize := bt.usablePageSize()
+	lim := bt.leafLimits()
 	for {
 		if pg.header.isLeaf() {
-			idx, found, serr := searchLeafWithOverflow(pg, nameKey, usableSize, bt.pager, bt.walMaxFrame, bt.cache)
+			idx, found, serr := searchLeafWithOverflow(pg, nameKey, lim, bt.pager, bt.walMaxFrame, bt.cache)
 			if serr != nil {
 				bt.pager.releasePage(pg)
 				return nil, serr
@@ -1609,7 +1689,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 				return nil, ErrNamespaceNotFound
 			}
 			off := pg.getCellOffset(idx)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
 			if cerr != nil {
 				bt.pager.releasePage(pg)
 				return nil, cerr
@@ -1619,7 +1699,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 			// chain, so reassemble it the way accessPayload does.
 			value := cell.value
 			if cell.overflowPg != 0 {
-				value, cerr = leafFullValue(pg.data, int(off), usableSize, bt.pager, bt.walMaxFrame, bt.cache)
+				value, cerr = leafFullValue(pg.data, int(off), lim, bt.pager, bt.walMaxFrame, bt.cache)
 				if cerr != nil {
 					bt.pager.releasePage(pg)
 					return nil, cerr
@@ -1660,9 +1740,13 @@ func (db *DB) ListNamespaces() ([]string, error) {
 	}
 	defer db.pager.endRead(slot)
 
+	dbSize, err := db.pager.effectiveReaderDbSize(hdr)
+	if err != nil {
+		return nil, err
+	}
 	cache := newPcache(int(db.pager.pageSize), 200, true)
 	cache.useSlab = db.pager.useSlab
-	cache.dbSize = db.pager.effectiveReaderDbSize(hdr)
+	cache.dbSize = dbSize
 	cache.minFrame = minFrame
 	defer cache.destroy()
 
@@ -1717,10 +1801,8 @@ type ReadTx struct {
 	walHdr WalIndexHdr
 
 	// Disk counters from page 1 at transaction start (for staleness detection).
-	diskFileChangeCounter  uint32
-	diskSchemaCookie       uint32
-	localFileChangeCounter uint32 // snapshot of DB's local value
-	localSchemaCookie      uint32 // snapshot of DB's local value
+	diskFileChangeCounter uint32
+	diskSchemaCookie      uint32
 	// Snapshot-bounded page-1 counters, baked at begin: what THIS tx's tree
 	// reads can actually see. Equal to the disk pair unless the begin-time
 	// read was raised past the snapshot (begin racing a commit, or a pinned
@@ -1786,9 +1868,10 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 
 	// Search without starting a new read tx (we're already in one)
 	usableSize := tx.pager.usableSize()
+	lim := tx.pager.leafLimits()
 	for {
 		if pg.header.isLeaf() {
-			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, tx.pager, tx.walHdr.mxFrame, tx.cache)
+			idx, found, serr := searchLeafWithOverflow(pg, key, lim, tx.pager, tx.walHdr.mxFrame, tx.cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
 				return buf, serr
@@ -1798,7 +1881,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				return buf, ErrKeyNotFound
 			}
 			off := pg.getCellOffset(idx)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
 			if cerr != nil {
 				tx.pager.releasePage(pg)
 				return buf, cerr
@@ -1819,7 +1902,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				}
 
 				totalPayload := int(keyLen) + int(valLen)
-				nLocal := localPayloadSize(totalPayload, usableSize)
+				nLocal := localPayloadSize(totalPayload, lim)
 				localKeyBytes := min(nLocal, int(keyLen))
 				localValBytes := nLocal - localKeyBytes
 				keyOverflow := int(keyLen) - localKeyBytes
@@ -1889,10 +1972,11 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 	}
 
 	usableSize := tx.pager.usableSize()
+	lim := tx.pager.leafLimits()
 	for {
 		if pg.header.isLeaf() {
 			_, found, serr := searchLeafWithOverflow(
-				pg, key, usableSize, tx.pager, tx.walHdr.mxFrame, tx.cache,
+				pg, key, lim, tx.pager, tx.walHdr.mxFrame, tx.cache,
 			)
 			tx.pager.releasePage(pg)
 			if serr != nil {
@@ -1936,6 +2020,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 	}
 
 	usableSize := tx.pager.usableSize()
+	lim := tx.pager.leafLimits()
 	cache := tx.cache // nil for writers, per-connection pcache for readers
 	rightmost := true // tracks if we're on the rightmost path through the tree
 
@@ -1948,7 +2033,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 
 	for {
 		if pg.header.isLeaf() {
-			idx, _, serr := searchLeafWithOverflow(pg, prefix, usableSize, tx.pager, tx.walHdr.mxFrame, cache)
+			idx, _, serr := searchLeafWithOverflow(pg, prefix, lim, tx.pager, tx.walHdr.mxFrame, cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
 				return buf, serr
@@ -1966,7 +2051,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 				return tx.leftmostKeyAfter(fallbackPgno, fallbackIdx, buf)
 			}
 			off := pg.getCellOffset(idx)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
 			if cerr != nil {
 				tx.pager.releasePage(pg)
 				return buf, cerr
@@ -1974,7 +2059,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 			if cell.overflowPg != 0 {
 				// leafFullKey returns a slice into pg.data when the key is
 				// local: copy before the release.
-				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walHdr.mxFrame, cache)
+				fullKey, kerr := leafFullKey(pg.data, int(off), lim, tx.pager, tx.walHdr.mxFrame, cache)
 				if kerr != nil {
 					tx.pager.releasePage(pg)
 					return buf, kerr
@@ -2036,7 +2121,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 	tx.pager.releasePage(pg)
 
 	// Descend to the leftmost key of this subtree.
-	usableSize := tx.pager.usableSize()
+	lim := tx.pager.leafLimits()
 	cache := tx.cache // nil for writers, per-connection pcache for readers
 	pg, err = tx.txDescendChild(nextPgno)
 	if err != nil {
@@ -2049,7 +2134,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 				return buf, ErrKeyNotFound
 			}
 			off := pg.getCellOffset(0)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
 			if cerr != nil {
 				tx.pager.releasePage(pg)
 				return buf, cerr
@@ -2057,7 +2142,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 			if cell.overflowPg != 0 {
 				// leafFullKey returns a slice into pg.data when the key is
 				// local: copy before the release.
-				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walHdr.mxFrame, cache)
+				fullKey, kerr := leafFullKey(pg.data, int(off), lim, tx.pager, tx.walHdr.mxFrame, cache)
 				if kerr != nil {
 					tx.pager.releasePage(pg)
 					return buf, kerr
@@ -2141,20 +2226,35 @@ func (tx *ReadTx) CountContext(ctx context.Context, ns *Namespace) (int, error) 
 }
 
 // DatabaseSize returns the number of pages in the database, including page 1
-// (the header page), as of this transaction's snapshot.
-// ~ sqlite3BtreeLastPage / sqlite3PagerPagecount (btree.c:2371, pager.c:3925):
-// SQLite returns the per-connection pPager->dbSize, which is set from the
-// reader's captured WAL-index header (sqlite3WalDbsize == pWal->hdr.nPage,
-// pager.c:5448). Here it is the per-reader snapshot bound carried on the
-// reader cache (tx.cache.dbSize, set at BeginRead from effectiveReaderDbSize),
-// so the count is consistent with the same snapshot used for page reads —
-// not the live global writer counter that DB.DatabaseSize exposes.
+// (the header page), as of this transaction's snapshot: sqlite3BtreeLastPage
+// (btree.c:2364-2369), the btree's nPage. lockBtree takes that from page 1
+// when page 1's size is non-zero and its change counter matches
+// VersionValidFor, and from the pager's count otherwise (btree.c:3294-3298);
+// lockBtreePageCount applies the rule to the snapshot's page 1. The pager's
+// count (sqlite3WalDbsize, or the database file's size when the WAL has no
+// commit) is the bound page reads use (tx.cache.dbSize, from
+// effectiveReaderDbSize). It can be larger: a file may hold pages past the
+// logical size, which are no part of the database, and a backup that copied
+// them would leave pages nothing uses in its destination.
 //
-// For a write transaction (embedded ReadTx, cache==nil), readerDbSizeBound
-// falls back to p.dbSize, which is the writer's live page count and matches
-// sqlite3BtreeLastPage's pBt->nPage for the writing connection.
-func (tx *ReadTx) DatabaseSize() uint32 {
-	return tx.pager.readerDbSizeBound(tx.cache)
+// For a write transaction (embedded ReadTx, cache==nil) it is p.dbSize, the
+// writer's live page count, which beginWrite derived by the same rule and
+// which matches sqlite3BtreeLastPage's pBt->nPage for the writing connection.
+func (tx *ReadTx) DatabaseSize() (uint32, error) {
+	if tx.cache == nil {
+		return tx.pager.dbSize.Load(), nil
+	}
+	pg, err := tx.pager.getPageReader(1, tx.walMaxFrame, tx.cache)
+	if err != nil {
+		return 0, err
+	}
+	var h dbHeader
+	err = h.deserialize(pg.data[:dbHeaderSize])
+	tx.pager.releasePage(pg)
+	if err != nil {
+		return 0, err
+	}
+	return lockBtreePageCount(&h, tx.pager.readerDbSizeBound(tx.cache))
 }
 
 // GetNamespace returns a Namespace handle for the given name, respecting the
@@ -2189,48 +2289,36 @@ func (tx *ReadTx) IsWriteTx() bool {
 	return tx.writable
 }
 
-// LocalCaughtUp reports whether the local counter cache has reached the
-// counters this tx read from disk at begin: the state the cache stands for
-// already covers everything the tx can see. With the cache moving only
-// forward, a stale verdict can then only have come from a commit of this
-// process that landed during the begin and recorded its counters since.
-func (tx *ReadTx) LocalCaughtUp() bool {
-	fcc, sc := tx.db.LocalCounters()
-	return counterReached(fcc, tx.diskFileChangeCounter) && counterReached(sc, tx.diskSchemaCookie)
-}
-
-// IsDataStale returns true if the on-disk FileChangeCount differs from the
-// locally cached value, indicating another process has committed data changes
-// since this DB last committed or synced counters.
-func (tx *ReadTx) IsDataStale() bool {
-	return tx.diskFileChangeCounter != tx.localFileChangeCounter
-}
-
-// IsSchemaStale returns true if the on-disk SchemaCookie differs from the
-// locally cached value, indicating another process has committed schema changes.
-func (tx *ReadTx) IsSchemaStale() bool {
-	return tx.diskSchemaCookie != tx.localSchemaCookie
-}
-
-// DiskFileChangeCounter returns the FileChangeCount read from page 1 at
-// the start of this transaction.
-func (tx *ReadTx) DiskFileChangeCounter() uint32 {
-	return tx.diskFileChangeCounter
-}
-
 // DiskSchemaCookie returns the SchemaCookie read from page 1 at the start
 // of this transaction.
 func (tx *ReadTx) DiskSchemaCookie() uint32 {
 	return tx.diskSchemaCookie
 }
 
+// ChangeEpoch returns the invalidation epoch of this process, and whether
+// this transaction's snapshot is exact for it: it holds every change of
+// another process the epoch counts and none it does not count.
+//
+// The epoch moves when a transaction of this process, of any kind, begins at
+// a wal-index header the process neither wrote nor had seen (another
+// process's commit or WAL reset), and when the process rebuilds the wal-index
+// (pager_reset's iDataVersion++, pager.c:1772-1773, with own commits
+// cancelled as btree.c:4417 does). State derived from the database content
+// and kept across transactions is valid for an epoch: it is loaded through a
+// transaction that is exact for the epoch, and loaded again when the epoch
+// has moved.
+//
+// In-process and in-memory databases have no other process: the epoch stays
+// 0 and every snapshot is exact.
+func (tx *ReadTx) ChangeEpoch() (epoch uint64, exact bool) {
+	return tx.pager.wal.changeEpoch(&tx.walHdr)
+}
+
 // SnapshotHeaderCounters returns the page-1 FileChangeCount and SchemaCookie
 // as of THIS tx's snapshot — baked at begin from the tx's captured
 // [minFrame, maxFrame] window, both sides fixed for the tx's life
-// (SQLite's pWal->minFrame/mxFrame). Unlike
-// DiskFileChangeCounter/DiskSchemaCookie — whose begin-time read is raised to
-// the newest committed frame so staleness detection notices peer commits —
-// these values never exceed what the tx's tree reads can actually see: a
+// (SQLite's pWal->minFrame/mxFrame). Unlike DiskSchemaCookie, whose
+// begin-time read is raised to the newest committed frame, these values never exceed what the tx's tree reads can actually see: a
 // begin that raced a commit, or a reader slot pinned to an older snapshot,
 // reports the older counters here. They are exact on a fast begin too. Judgments about snapshot contents (e.g.
 // whether a catalog key committed at cookie C must be visible) require this
@@ -2259,11 +2347,6 @@ func (tx *ReadTx) SetAux(v any) {
 // without the error plumbing — for per-query visibility checks.
 func (tx *ReadTx) SnapshotSchemaCookie() uint32 {
 	return tx.snapSchemaCookie
-}
-
-// SnapshotFileChangeCounter is the change-counter half, same contract.
-func (tx *ReadTx) SnapshotFileChangeCounter() uint32 {
-	return tx.snapFileChangeCounter
 }
 
 // Rollback ends the read transaction (for ReadTx, this is the same as commit).
@@ -2379,6 +2462,11 @@ var AutoCheckpointThreshold = 10000
 // reader slot and the snapshot bounds are taken, before the page-1 counters
 // are read. Test-only.
 var testReadSlotClaimedHook func()
+
+// testBeginWriteRetryHook, when non-nil, runs inside BeginWriteContext after
+// the write half of an attempt failed and its read snapshot was released,
+// before the begin decides whether to retry. Test-only.
+var testBeginWriteRetryHook func(err error)
 
 // testWriterFinishHook, when non-nil, runs inside Commit/Rollback after the
 // closed flag is set and before the pager operation — the exact spot where a

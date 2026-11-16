@@ -18,13 +18,16 @@ func TestCheckHeaderFormat(t *testing.T) {
 		schemaFormat uint32
 		want         error
 	}{
-		{name: "current", read: 2, write: 2, schemaFormat: maxSchemaFormat},
+		{name: "current", versioned: true, read: 2, write: 2, schemaFormat: maxSchemaFormat},
 		{name: "format never recorded", read: 2, write: 2, schemaFormat: 0},
 		{name: "version bytes below the maximum", read: 1, write: 1, schemaFormat: 5},
 		{name: "old format", read: 2, write: 2, schemaFormat: 4, want: ErrOldFormat},
 		{name: "newer read version", read: 3, write: 2, schemaFormat: 5, want: ErrNewerFormat},
 		{name: "newer write version", read: 2, write: 3, schemaFormat: 5, want: ErrNewerFormat},
-		{name: "newer format under the old magic", read: 2, write: 2, schemaFormat: maxSchemaFormat + 1, want: ErrNewerFormat},
+		{name: "format 5", read: 2, write: 2, schemaFormat: 5},
+		{name: "format 6", versioned: true, read: 2, write: 2, schemaFormat: 6},
+		{name: "format 6 under a zero-padded magic", read: 2, write: 2, schemaFormat: 6, want: ErrHeaderCorrupt},
+		{name: "newer format under a zero-padded magic", read: 2, write: 2, schemaFormat: maxSchemaFormat + 1, want: ErrNewerFormat},
 		{name: "newer format under the versioned magic", versioned: true, read: 2, write: 2, schemaFormat: maxSchemaFormat + 1, want: ErrNewerFormat},
 		{name: "versioned magic with format 5", versioned: true, read: 2, write: 2, schemaFormat: 5, want: ErrHeaderCorrupt},
 		{name: "versioned magic with an old format", versioned: true, read: 2, write: 2, schemaFormat: 3, want: ErrHeaderCorrupt},
@@ -115,6 +118,7 @@ func gateFixture(t *testing.T) (db, wal, shm []byte) {
 }
 
 func TestOpen_RefusedFormatLeavesFilesUntouched(t *testing.T) {
+	useLegacyFormat(t)
 	dbBytes, walBytes, shmBytes := gateFixture(t)
 
 	for _, tc := range []struct {
@@ -133,15 +137,20 @@ func TestOpen_RefusedFormatLeavesFilesUntouched(t *testing.T) {
 			want: ErrNewerFormat,
 		},
 		{
-			name: "schema format 6 under the old magic",
+			name: "schema format 6 under a zero-padded magic",
 			edit: func(hdr []byte) { binary.BigEndian.PutUint32(hdr[44:48], 6) },
+			want: ErrHeaderCorrupt,
+		},
+		{
+			name: "a newer schema format under a zero-padded magic",
+			edit: func(hdr []byte) { binary.BigEndian.PutUint32(hdr[44:48], maxSchemaFormat+1) },
 			want: ErrNewerFormat,
 		},
 		{
-			name: "a format-6 file",
+			name: "a file of a newer schema format",
 			edit: func(hdr []byte) {
 				copy(hdr[:16], dbMagicFmt)
-				binary.BigEndian.PutUint32(hdr[44:48], 6)
+				binary.BigEndian.PutUint32(hdr[44:48], maxSchemaFormat+1)
 			},
 			want: ErrNewerFormat,
 		},
@@ -183,6 +192,7 @@ func TestOpen_RefusedFormatLeavesFilesUntouched(t *testing.T) {
 }
 
 func TestOpen_FirstMagicStillOpensAndIsRewritten(t *testing.T) {
+	useLegacyFormat(t)
 	// given
 	path := filepath.Join(t.TempDir(), "t.db")
 	db, err := testOpen(t, path, DefaultOptions())

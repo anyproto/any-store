@@ -415,7 +415,9 @@ func TestBeginRead_InProcessRetriesInsideRestart(t *testing.T) {
 				}
 			}
 			defer func() { testResetMidHook = nil; testReadSlotClaimedHook = nil }()
-			if err := db.Checkpoint(CheckpointRestart); err != nil {
+			// TRUNCATE: the checkpoint that resets the log itself. (A RESTART
+			// checkpoint leaves that to the next writer.)
+			if err := db.Checkpoint(CheckpointTruncate); err != nil {
 				t.Fatal(err)
 			}
 			<-done
