@@ -1380,6 +1380,17 @@ Additionally, the following Go-specific mechanisms have no SQLite analogue:
   force-rollback. SQLite does not allow `sqlite3_close()` during active
   transactions (returns `SQLITE_BUSY`); Go's DB.Close performs a force-rollback,
   requiring this mutex to prevent it from racing with a concurrent commit.
+- `pagerStress` spills only in `pagerWriter` without `closeInvalidated`.
+  SQLite's has no such test: its pages are dirty only inside a write
+  transaction (`pager_write` asserts a writer state, `pager.c:6056-6059`),
+  and its connection mutex keeps a close from running under a statement
+  (`vdbeapi.c:923`, `main.c:1263`). The Close force-rollback
+  (`rollbackForClose`) rewinds the log to the transaction's base frame and
+  releases the WAL write lock under a writer that may still be fetching
+  pages, so its spill would land where the next writer, in this process or
+  another, appends. Regression tests:
+  `TestCloseRescue_AbandonedWriterDoesNotSpill`,
+  `TestCloseRescue_SpillSparesPeerWriterFrames`.
 - `db.writerLocksDone`: atomic CAS guard ensuring Close/Commit/Rollback lock
   cleanup runs exactly once despite concurrent goroutines
 - In-memory WAL `memFrames` truncation on rollback (no SQLite equivalent since

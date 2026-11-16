@@ -152,3 +152,86 @@ func multiProcessChild(t *testing.T, dbPath string) {
 	t.Logf("child: nFrame=%d after commit", db.pager.wal.nFrame.Load())
 	require.NoError(t, db.Close())
 }
+
+// closeRescuePeerRows is how many rows the peer process commits, keys after
+// the parent's.
+const closeRescuePeerRows = 50
+
+// A writer that DB.Close rescued must not spill into a log another process
+// now writes. Close rewinds the log to the transaction's base frame and
+// releases the WAL write lock; a peer then appends its commit from that
+// frame on, and a spill by the abandoned writer would land on the peer's
+// frames.
+func TestCloseRescue_SpillSparesPeerWriterFrames(t *testing.T) {
+	opts := Options{
+		CacheSize:             closeRescueCache,
+		InProcess:             false,
+		DisableAutoCheckpoint: true,
+	}
+	if path := os.Getenv("TEST_CLOSE_RESCUE_PEER_DB"); path != "" {
+		// === PEER PROCESS === one commit, then close.
+		db, err := testOpen(t, path, opts)
+		require.NoError(t, err)
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := tx.GetNamespace("t")
+		require.NoError(t, err)
+		for i := 1; i <= closeRescuePeerRows; i++ {
+			require.NoError(t, tx.Put(ns, closeRescueKey(closeRescueRows+i), make([]byte, closeRescueValSize)))
+		}
+		require.NoError(t, tx.Commit())
+		require.NoError(t, db.Close())
+		return
+	}
+
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := testOpen(t, path, opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	createNS(t, db, "t")
+	putN(t, db, "t", closeRescueRows, closeRescueValSize)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.GetNamespace("t")
+	require.NoError(t, err)
+	p := db.pager
+	base := p.wal.nFrame.Load()
+	fillWriterCacheDirty(t, p)
+	rescueAsClose(db)
+
+	cmd := exec.Command(os.Args[0],
+		"-test.run=^TestCloseRescue_SpillSparesPeerWriterFrames$",
+		"-test.v",
+		"-test.timeout=60s",
+	)
+	cmd.Env = append(os.Environ(), "TEST_CLOSE_RESCUE_PEER_DB="+path)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	require.NoError(t, cmd.Run(), "peer process failed")
+
+	frameSize := int64(walFrameSize) + int64(p.pageSize)
+	peerFrom := int64(walHeaderSize) + int64(base)*frameSize
+	walBefore, err := os.ReadFile(path + "-wal")
+	require.NoError(t, err)
+	require.Greater(t, int64(len(walBefore)), peerFrom, "the peer's commit is not in the log after the base frame")
+
+	// The abandoned writer reads on; every miss meets a cache full of dirty
+	// pages.
+	for i := 1; i <= closeRescueRows; i++ {
+		_, err := tx.Get(ns, closeRescueKey(i))
+		require.NoError(t, err)
+	}
+
+	walAfter, err := os.ReadFile(path + "-wal")
+	require.NoError(t, err)
+	require.Equal(t, len(walBefore), len(walAfter))
+	require.True(t, string(walBefore[peerFrom:]) == string(walAfter[peerFrom:]), "the peer's frames were overwritten")
+	require.ErrorIs(t, tx.Put(ns, closeRescueKey(1), []byte("x")), ErrClosed)
+
+	require.NoError(t, db.Close())
+	db, err = testOpen(t, path, opts)
+	require.NoError(t, err)
+	require.Equal(t, closeRescueRows+closeRescuePeerRows, countKeys(t, db, "t"))
+	require.NoError(t, db.IntegrityCheck())
+}

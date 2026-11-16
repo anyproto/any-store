@@ -2649,11 +2649,33 @@ func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
 // Modeled after SQLite's pagerStress() (pager.c:4609-4681).
 // DRIFT: pagerStress guards pgno==1; C relies on page-1 staying pinned (never a victim) See docs/btree/NOTES.md#old-drift-pagerstress-page1-exclusion
 func (p *pager) pagerStress(pg *page) error {
+	st := pagerState(p.state.Load())
+
 	// Defense-in-depth: do not spill in error state (SQLite pager.c:4632).
 	// SQLite marks this path NEVER() — it should be unreachable because
 	// pcache.create is not called in error state — but the guard prevents
 	// writing to a potentially corrupt WAL if the invariant is violated.
-	if pagerState(p.state.Load()) == pagerError {
+	if st == pagerError {
+		return nil
+	}
+
+	// Spill only for the write transaction that holds the WAL write lock.
+	// SQLite's pagerStress has no such test because it never needs one: a
+	// page is dirty only inside a write transaction (pager_write asserts a
+	// writer state, pager.c:6056-6059), walFrames asserts the write lock
+	// (wal.c:4049), and the connection mutex (sqlite3_step, vdbeapi.c:923;
+	// sqlite3Close, main.c:1263) keeps a close from ending the transaction
+	// while a statement still fetches pages. DB.Close does end it so:
+	// rollbackForClose rewinds the log to the transaction's base frame and
+	// releases the write lock, leaving the dirty cache to a writer that may
+	// still be inside an operation and meets writeStateErr only at the next
+	// boundary. A spill from that writer would land where the next writer,
+	// in this process or another, appends. rollbackForClose leaves the state
+	// pagerOpen, which the state test catches; closeInvalidated, loaded
+	// after the state and set before it is demoted, also stops a spill that
+	// saw the state just before. The refused page stays dirty and the cache
+	// grows past its limit, as under doNotSpill.
+	if st != pagerWriter || p.closeInvalidated.Load() {
 		return nil
 	}
 
