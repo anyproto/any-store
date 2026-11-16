@@ -1380,17 +1380,8 @@ Additionally, the following Go-specific mechanisms have no SQLite analogue:
   force-rollback. SQLite does not allow `sqlite3_close()` during active
   transactions (returns `SQLITE_BUSY`); Go's DB.Close performs a force-rollback,
   requiring this mutex to prevent it from racing with a concurrent commit.
-- `pagerStress` spills only in `pagerWriter` without `closeInvalidated`.
-  SQLite's has no such test: its pages are dirty only inside a write
-  transaction (`pager_write` asserts a writer state, `pager.c:6056-6059`),
-  and its connection mutex keeps a close from running under a statement
-  (`vdbeapi.c:923`, `main.c:1263`). The Close force-rollback
-  (`rollbackForClose`) rewinds the log to the transaction's base frame and
-  releases the WAL write lock under a writer that may still be fetching
-  pages, so its spill would land where the next writer, in this process or
-  another, appends. Regression tests:
-  `TestCloseRescue_AbandonedWriterDoesNotSpill`,
-  `TestCloseRescue_SpillSparesPeerWriterFrames`.
+- `pagerStress` spills only in `pagerWriter` without `closeInvalidated`
+  (drift-2026-11-16-2 below).
 - `db.writerLocksDone`: atomic CAS guard ensuring Close/Commit/Rollback lock
   cleanup runs exactly once despite concurrent goroutines
 - In-memory WAL `memFrames` truncation on rollback (no SQLite equivalent since
@@ -3378,6 +3369,15 @@ SQLite's `isFatalError` keeps exactly `SQLITE_BUSY` and `SQLITE_LOCKED` out of a
 `Step` takes a ctx, and looks at it once before it takes anything. A Step of more than `backupCtxPages` (256) pages now also looks at it every 256 pages, and when it has ended stops copying and returns the ctx's error. The pages copied stay copied and the Step's tail runs as for a Step of that many pages (`nRemaining`, `nPagecount`, the attach for updates), so a later Step on the same `Backup` goes on; the error is not sticky, like the other "not now" results (`backupBusy`). The reason is the public `Backup`: after `backupRestartLimit` restarts it copies the rest with `Step(ctx, -1)`, which holds this process's write lock on the source for the whole copy, and a cancelled ctx must still end it in bounded time.
 
 `Restarts` has no C counterpart either: `sqlite3BackupRestart` only sets `iNext = 1` (`backup.c:701-707`). The count (restarts that threw copied pages away) changes nothing in the copy; the public `Backup` reads it to decide when to stop stepping in batches. The rollback rule that causes the restarts is SQLite's and is unchanged (`pagerUndoCallback`, `pagerRollbackWal`, `pager.c:3112-3168`). Regression tests: `TestBackupPublic_FinishesUnderRollbacks` (root package), `TestBackup_RestartsCounted`, `TestBackup_LongStepEndsWithItsCtx`.
+
+<a id="drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer"></a>
+### Drift: pagerStress Spills Only For The Live Writer
+- **Category:** added-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.pagerStress`.
+
+SQLite's `pagerStress` (`pager.c:4609-4680`) has no test of the pager's state: its pages are dirty only inside a write transaction (`pager_write` asserts a writer state, `pager.c:6056-6059`), `walFrames` asserts the write lock (`wal.c:4049`), and its connection mutex keeps a close from running under a statement (`sqlite3_step`, `vdbeapi.c:923`; `sqlite3Close`, `main.c:1263`).
+
+`DB.Close` does end a transaction under a running operation: `rollbackForClose` rewinds the log to the transaction's base frame, releases the WAL write lock and leaves the dirty cache to the writer's goroutine, which meets `ErrClosed` only at its next operation boundary. A spill from that goroutine would land where the next writer, in this process or another, appends. `pagerStress` therefore spills only in `pagerWriter` with `closeInvalidated` unset; the state is loaded before the flag, the reverse of `rollbackForClose`'s stores. A refused spill leaves the page dirty and the cache grows past its limit, as under `doNotSpill`. Regression tests: `TestCloseRescue_AbandonedWriterDoesNotSpill`, `TestCloseRescue_SpillSparesPeerWriterFrames`.
 
 <a id="drift-102-reader-slot-tie-break-selects-lowest-not-highest"></a>
 ### Drift: Reader Slot Tie Break Selects Lowest Not Highest

@@ -2648,6 +2648,7 @@ func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
 // Only the writer's cache has xStress set; reader caches have no stress callback.
 // Modeled after SQLite's pagerStress() (pager.c:4609-4681).
 // DRIFT: pagerStress guards pgno==1; C relies on page-1 staying pinned (never a victim) See docs/btree/NOTES.md#old-drift-pagerstress-page1-exclusion
+// DRIFT: pagerStress spills only for pagerWriter without closeInvalidated; C needs no test, since a close cannot end its transaction under a statement See docs/btree/NOTES.md#drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer
 func (p *pager) pagerStress(pg *page) error {
 	st := pagerState(p.state.Load())
 
