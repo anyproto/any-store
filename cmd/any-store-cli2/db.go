@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -457,6 +458,18 @@ func (c *Conn) Migrate(cmd Cmd) (result string, err error) {
 		return "", err
 	}
 	report, err := anystore.CopyToLatestFormat(mainCtx.Ctx(), c.db, cmd.Path, nil)
+	return migrateResult(from, report, err)
+}
+
+// migrateResult is what db.migrate prints for a copy's report and error. A
+// copy that is published while a step after its publication failed
+// (anystore.ErrCopyPublished) is there and complete: its report is printed,
+// with the failure as a warning.
+func migrateResult(from int, report anystore.CopyReport, err error) (string, error) {
+	var warning error
+	if errors.Is(err, anystore.ErrCopyPublished) {
+		warning, err = err, nil
+	}
 	if err != nil {
 		return "", err
 	}
@@ -466,6 +479,9 @@ func (c *Conn) Migrate(cmd Cmd) (result string, err error) {
 	fmt.Fprintf(&buf, "Documents:\t%d\n", report.Documents)
 	fmt.Fprintf(&buf, "Indexes:\t%d\n", report.Indexes)
 	fmt.Fprintf(&buf, "Duration:\t%s", report.Duration.Round(time.Millisecond))
+	if warning != nil {
+		fmt.Fprintf(&buf, "\nWarning:\t%s", warning)
+	}
 	return buf.String(), nil
 }
 

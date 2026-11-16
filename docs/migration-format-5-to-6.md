@@ -107,6 +107,7 @@ The call fails with:
 | `ErrTxInContext` | `ctx` carries a read or write transaction. The copy reads in a transaction of its own, as SQLite refuses `VACUUM` inside one. |
 | `ErrDestinationExists` | The destination or one of its sidecars exists, or appeared while the copy ran. |
 | `ErrBusy` | Another call is copying to the same destination right now. Nothing was created or removed; try again once that call has returned. |
+| `ErrCopyPublished` | The copy is complete, verified and published at the destination, and a step after that failed: the sync of the destination's directory, or the removal of a file left under the staging name. It wraps that failure, and the report is filled. Use the copy; to make its name durable, sync its directory. |
 | any other | The copy failed: a collection, index or document could not be copied (the error names it, see [What can differ](#what-can-differ)), the copy did not match the source, or an I/O operation failed. Cancelling `ctx` stops the copy with the context's error. |
 
 The call creates the destination only by publishing a complete, verified,
@@ -121,8 +122,11 @@ names once no copy is running.
 After `ErrDestinationExists` the files at and beside the destination are not
 the call's: they were there before it, or someone else put them there.
 The error is no reason to remove them. A failure after the rename, of the
-directory sync or of the removal of a staging leftover, comes back with the
-copy published at the destination, and the error says so. A destination
+directory sync or of the removal of a staging leftover, comes back as
+`ErrCopyPublished` wrapping what failed, with the filled report: the copy
+is published at the destination, and running the copy again would only meet
+`ErrDestinationExists`. Every other error comes with a zero report and
+nothing at the destination that the call put there. A destination
 the call published that survives a crash is always the complete copy.
 Its name is durable only once the directory sync after the rename has
 succeeded (on Unix; on Windows it relies on NTFS's metadata journal, as
@@ -144,7 +148,11 @@ with the old file. Do it in this order:
    starts and until the new file is open. Open no new handle on the database
    in the meantime.
 2. **Copy** with `CopyToLatestFormat`, into the same directory, which must
-   succeed. It returns with the copy closed.
+   succeed. It returns with the copy closed. `ErrCopyPublished` counts as
+   success here: the copy is complete, and step 5 syncs the directory again,
+   checked, before anything relies on the copy's name. Before copying,
+   remove a copy that an earlier run of this protocol left at the same
+   name: it may be older than the database.
 3. **Checkpoint the source** with `FlushModeCheckpointTruncate` and check the
    error. `Close` swallows a checkpoint error, so it cannot be relied on.
 4. **Close every handle on the source, in every process**, idle and
@@ -196,9 +204,16 @@ import (
 // and path is to be opened again.
 func replaceWithCopy(ctx context.Context, db anystore.DB, path string, config *anystore.Config) (anystore.DB, error) {
 	tmp := path + ".format6"
-	// 2. Copy. A file already at tmp is refused with ErrDestinationExists:
-	// it is not this run's, and a copy from an earlier run is stale.
-	if _, err := anystore.CopyToLatestFormat(ctx, db, tmp, config); err != nil {
+	// 1. The caller has stopped every writer, and this is the only run.
+	// So a file at tmp is a copy an earlier run left when it failed or was
+	// killed. It can be older than the database: never put it in place.
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return db, err
+	}
+	// 2. Copy. With ErrCopyPublished the copy is complete at tmp and only a
+	// step after it failed, the directory sync at worst: go on, step 5 syncs
+	// the same directory before anything relies on it, and checks the error.
+	if _, err := anystore.CopyToLatestFormat(ctx, db, tmp, config); err != nil && !errors.Is(err, anystore.ErrCopyPublished) {
 		return db, err
 	}
 	// 3. Checkpoint the source and check the error: Close drops it.
@@ -249,11 +264,16 @@ func syncDir(dir string) error {
 }
 ```
 
-If a file is at `path + ".format6"` when the example starts, the copy is
-refused with `ErrDestinationExists` and nothing changes. The file may be
-another run's, or a copy an earlier run left; such a copy is stale once
-writes have resumed, and is never to be put in place. Remove it only when
-you know it is yours and no other run is in progress.
+A run of the example that fails or is killed can leave its copy at
+`path + ".format6"`. That copy is stale once writes have resumed, and is
+never to be put in place, so the example removes a file at that name before
+it copies. This is safe only under the protocol: writes are stopped and one
+run is in progress, so the name is the example's own. If something else of
+yours may use the name, pick another. The staging files of a copy that was
+killed need no such step: `CopyToLatestFormat` removes them itself, under
+its lock, the next time it copies to that name. A file beside the name that
+is not a copy's (`path + ".format6-wal"`, say) still refuses the copy with
+`ErrDestinationExists`, and the example returns `db`, open.
 
 With several processes, steps 1, 4 and 7 have to be coordinated across them
 by the application.

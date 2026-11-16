@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -59,6 +61,27 @@ func Test_Migrate(t *testing.T) {
 	n, err := coll.Find(`{"n":{"$gte":2}}`).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 2, n)
+}
+
+// Test_MigrateResult: a copy that is published with a failure after its
+// publication prints its report and the failure as a warning; any other
+// error is the command's error.
+func Test_MigrateResult(t *testing.T) {
+	report := anystore.CopyReport{Collections: 1, Documents: 3, Indexes: 1}
+	result, err := migrateResult(5, report, nil)
+	require.NoError(t, err)
+	assert.Contains(t, result, "Documents:\t3\n")
+	assert.NotContains(t, result, "Warning")
+
+	failure := fmt.Errorf("%w: %w", anystore.ErrCopyPublished, errors.New("cannot sync"))
+	result, err = migrateResult(5, report, failure)
+	require.NoError(t, err)
+	assert.Contains(t, result, "Documents:\t3\n")
+	assert.Contains(t, result, "\nWarning:\t"+failure.Error())
+
+	result, err = migrateResult(5, anystore.CopyReport{}, anystore.ErrDestinationExists)
+	require.ErrorIs(t, err, anystore.ErrDestinationExists)
+	assert.Empty(t, result)
 }
 
 // Test_HelpMigrate: the command has its help entry.

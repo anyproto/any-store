@@ -1366,25 +1366,70 @@ func TestCopyToLatestFormat_PublicationOrder(t *testing.T) {
 	assert.Equal(t, []string{"copy.db"}, dirNames(t, dstDir))
 }
 
-// A failure after the rename comes back saying the copy is published: the
-// complete copy stays at the destination, and the staging name goes.
+// A failure after the rename comes back as ErrCopyPublished with what
+// failed and with the filled report: the complete copy stays at the
+// destination. A failure before the rename is never ErrCopyPublished.
 func TestCopyToLatestFormat_FailureAfterPublication(t *testing.T) {
 	src, _ := openSource(t, nil)
 	coll, err := src.CreateCollection(ctx, "docs")
 	require.NoError(t, err)
-	insertJSON(t, coll, `{"id":1}`)
-	errSync := errors.New("cannot sync")
-	prevSync := dirSync
-	dirSync = func(string) error { return errSync }
-	defer func() { dirSync = prevSync }()
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Fields: []string{"n"}}))
+	insertJSON(t, coll, `{"id":1,"n":1}`, `{"id":2,"n":2}`)
+	errFault := errors.New("injected fault")
+	want := func(report CopyReport) CopyReport {
+		return CopyReport{Collections: 1, Documents: 2, Indexes: 1, Duration: report.Duration}
+	}
 
-	dstDir := t.TempDir()
-	dstPath := filepath.Join(dstDir, "copy.db")
-	_, err = CopyToLatestFormat(ctx, src, dstPath, nil)
-	require.ErrorIs(t, err, errSync)
-	assert.Contains(t, err.Error(), "the copy is published at "+dstPath)
-	assert.Equal(t, []string{"copy.db"}, dirNames(t, dstDir))
-	assertSameDatabase(t, src, openCopy(t, dstPath, nil))
+	t.Run("directory sync", func(t *testing.T) {
+		prevSync := dirSync
+		dirSync = func(string) error { return errFault }
+		defer func() { dirSync = prevSync }()
+		dstDir := t.TempDir()
+		dstPath := filepath.Join(dstDir, "copy.db")
+		report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+		require.ErrorIs(t, err, ErrCopyPublished)
+		require.ErrorIs(t, err, errFault)
+		assert.Contains(t, err.Error(), "the copy is published at "+dstPath)
+		assert.Equal(t, want(report), report)
+		assert.NotZero(t, report.Duration)
+		assert.Equal(t, []string{"copy.db"}, dirNames(t, dstDir))
+		assertSameDatabase(t, src, openCopy(t, dstPath, nil))
+	})
+	t.Run("staging leftover", func(t *testing.T) {
+		prevRename, prevRemove := osRename, osRemove
+		var renamed bool
+		osRename = func(oldpath, newpath string) error {
+			renamed = true
+			return prevRename(oldpath, newpath)
+		}
+		osRemove = func(name string) error {
+			if renamed && strings.HasSuffix(name, ".copy-staging-wal") {
+				return &os.PathError{Op: "remove", Path: name, Err: errFault}
+			}
+			return prevRemove(name)
+		}
+		defer func() { osRename, osRemove = prevRename, prevRemove }()
+		dstDir := t.TempDir()
+		dstPath := filepath.Join(dstDir, "copy.db")
+		report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+		require.ErrorIs(t, err, ErrCopyPublished)
+		require.ErrorIs(t, err, errFault)
+		assert.Contains(t, err.Error(), "a staging file is left on disk: "+dstPath+".copy-staging-wal")
+		assert.Equal(t, want(report), report)
+		assert.Equal(t, []string{"copy.db"}, dirNames(t, dstDir))
+		assertSameDatabase(t, src, openCopy(t, dstPath, nil))
+	})
+	t.Run("before the rename", func(t *testing.T) {
+		prevRename := osRename
+		osRename = func(string, string) error { return errFault }
+		defer func() { osRename = prevRename }()
+		dstPath := filepath.Join(t.TempDir(), "copy.db")
+		report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+		require.ErrorIs(t, err, errFault)
+		assert.NotErrorIs(t, err, ErrCopyPublished)
+		assert.Zero(t, report)
+		assertNoCopy(t, dstPath)
+	})
 }
 
 // syncDir runs on Unix, where it fsyncs the directory, and does nothing

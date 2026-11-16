@@ -164,6 +164,17 @@ var (
 	// was there is left as it was.
 	ErrDestinationExists = errors.New("any-store: destination exists")
 
+	// ErrCopyPublished is returned by CopyToLatestFormat, always wrapped
+	// together with the error of the step that failed, when the copy is
+	// complete, verified and published at the destination path, and a step
+	// after the publication failed: the sync of the destination's directory
+	// (on Unix), without which the destination's name may not survive a
+	// power loss, or the removal of a file left under the staging name. The
+	// CopyReport returned with it is filled. The destination is the copy and
+	// can be used; do not remove it or run the copy again because of this
+	// error. To make its name durable, sync its directory.
+	ErrCopyPublished = errors.New("any-store: the copy is published, but a step after its publication failed")
+
 	// ErrIncompatibleVersion is returned (wrapped) by Open when the file was written in a format
 	// newer than this release reads. The file is intact and is left unchanged; open it with a
 	// release that knows the format. It does not match ErrCorrupt.

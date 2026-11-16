@@ -132,13 +132,15 @@ type CopyReport struct {
 // ErrDestinationExists the files at and beside dstPath are not this call's:
 // they were there before, or someone else put them there, and the error
 // is no reason to remove them. A failure after the rename (the directory
-// sync, the removal of a staging leftover) is returned with the copy
-// published at dstPath, and the error says so. Any file at dstPath that
+// sync, the removal of a staging leftover) leaves the copy published at
+// dstPath: the call returns the filled report and an error that wraps
+// ErrCopyPublished with the failure. Any file at dstPath that
 // the call published, and that survives a crash, is the complete copy; but
 // the name is durable only once the directory sync after the rename has
 // succeeded (on Unix; on Windows NTFS's metadata journal keeps it), and
 // power lost before that can leave the copy under its staging name, which
-// the next call removes. On an error the report is zero.
+// the next call removes. On every error but ErrCopyPublished the report is
+// zero.
 //
 // The call never renames or removes a file of src.
 func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Config) (report CopyReport, err error) {
@@ -188,9 +190,12 @@ func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Con
 	if err != nil {
 		return CopyReport{}, err
 	}
-	var dst *db
+	var (
+		dst       *db
+		published bool
+	)
 	defer func() {
-		if err != nil {
+		if err != nil && !published {
 			report = CopyReport{}
 			if stage != "" {
 				err = discardStaging(err, stage, dst)
@@ -226,13 +231,16 @@ func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Con
 	if err = ctx.Err(); err != nil {
 		return
 	}
-	if err = publishStaging(stage, dstPath); err != nil {
-		// publishStaging removed what it could; whatever is left it named.
-		stage = ""
+	published, err = publishStaging(stage, dstPath)
+	// publishStaging removed what it could; whatever is left it named.
+	stage = ""
+	if !published {
 		return
 	}
+	// The copy is at dstPath: the report is the caller's whether or not a
+	// step after the rename failed (ErrCopyPublished).
 	report.Duration = time.Since(start)
-	return report, nil
+	return report, err
 }
 
 // copyBatch is how many documents one write transaction of a copy inserts.
@@ -690,27 +698,32 @@ func removeStagingSidecars(stage string) error {
 // meanwhile; a file anyone else creates at dstPath between the check and
 // the rename is replaced.
 //
-// Before the rename succeeds a failure removes the staging file; once it
-// has, dstPath is never removed, and a failure still fails the call.
-func publishStaging(stage, dstPath string) error {
+// Before the rename succeeds a failure removes the staging file, and
+// published is false. Once it has, published is true and dstPath is never
+// removed; a failure from there on still fails the call, as
+// ErrCopyPublished wrapped with what failed.
+func publishStaging(stage, dstPath string) (published bool, err error) {
 	if err := destinationFree(dstPath); err != nil {
-		return discardStaging(err, stage, nil)
+		return false, discardStaging(err, stage, nil)
 	}
 	if err := osRename(stage, dstPath); err != nil {
-		return discardStaging(fmt.Errorf("any-store: copy to latest format: publishing the copy: %w", err), stage, nil)
+		return false, discardStaging(fmt.Errorf("any-store: copy to latest format: publishing the copy: %w", err), stage, nil)
 	}
 	// The copy is published: what fails from here on says so.
-	published := fmt.Sprintf("any-store: copy to latest format: the copy is published at %s, but", dstPath)
+	at := fmt.Sprintf("any-store: copy to latest format: the copy is published at %s, but", dstPath)
 	var errs []error
 	if err := dirSync(dstPath); err != nil {
-		errs = append(errs, fmt.Errorf("%s syncing its directory failed: %w", published, err))
+		errs = append(errs, fmt.Errorf("%s syncing its directory failed: %w", at, err))
 	}
 	// The closed copy's sidecars went before the rename; nothing should be
 	// left under the staging name.
 	for _, p := range databaseFiles(stage)[1:] {
 		if err := osRemove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			errs = append(errs, fmt.Errorf("%s a staging file is left on disk: %s: %w", published, p, err))
+			errs = append(errs, fmt.Errorf("%s a staging file is left on disk: %s: %w", at, p, err))
 		}
 	}
-	return errors.Join(errs...)
+	if len(errs) != 0 {
+		return true, fmt.Errorf("%w: %w", ErrCopyPublished, errors.Join(errs...))
+	}
+	return true, nil
 }
