@@ -123,13 +123,95 @@ func TestCopyLock_OpenedBeforeItsRemoval(t *testing.T) {
 	}
 }
 
+// A lock file's name that holds what a copy does not leave there, a
+// directory, a symbolic link or, where the link count is known, a file with
+// two links, is refused with errReservedNameAlias: it is neither opened,
+// written nor removed. Each can be another name of a file something has
+// open, and the byte an empty lock file gets would go to that file.
+func TestCopyLock_RefusesAlias(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	require.NoError(t, os.WriteFile(target, nil, 0o644))
+	sub := filepath.Join(dir, "dir.copy-lock")
+	require.NoError(t, os.Mkdir(sub, 0o755))
+	refused := []string{sub}
+	if link := filepath.Join(dir, "symlink.copy-lock"); os.Symlink(target, link) == nil {
+		refused = append(refused, link)
+	} else {
+		t.Log("no symbolic link")
+	}
+	hard := filepath.Join(dir, "hardlink.copy-lock")
+	require.NoError(t, os.Link(target, hard))
+	if fi, err := os.Lstat(hard); err == nil {
+		if _, ok := linkCount(fi); ok {
+			refused = append(refused, hard)
+		}
+	}
+	before := dirNames(t, dir)
+	for _, name := range refused {
+		release, err := acquireCopyLock(name)
+		if err == nil {
+			release()
+		}
+		assert.ErrorIs(t, err, errReservedNameAlias, name)
+		assert.ErrorContains(t, err, "the lock file "+name)
+	}
+	assert.Equal(t, before, dirNames(t, dir), "nothing is removed")
+	fi, err := os.Stat(target)
+	require.NoError(t, err)
+	assert.Zero(t, fi.Size(), "nothing is written through a link")
+}
+
+// A lock file that another copy creates, removes or replaces with a lock
+// file of its own between the Lstat and the open, as a copy coming or
+// leaving does, is looked at again, and the lock is taken: what was opened
+// is a regular file with one link, and a change of the name is no reason to
+// fail. (On Windows os.Lstat reads a regular file's identity only when it is
+// compared, by its path, so a file replaced before the open passes for the
+// one the Lstat saw, and is locked at once.)
+func TestCopyLock_NameChangesUnderTheOpen(t *testing.T) {
+	for _, change := range []string{"created", "removed", "replaced"} {
+		t.Run(change, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "copy.db.copy-lock")
+			if change != "created" {
+				require.NoError(t, os.WriteFile(path, []byte("left"), 0o644))
+			}
+			lstats := 0
+			testHookReservedLstat = func(p string) {
+				if lstats++; lstats != 1 {
+					return
+				}
+				switch change {
+				case "created":
+					require.NoError(t, os.WriteFile(p, []byte("other"), 0o644))
+				case "removed":
+					require.NoError(t, os.Remove(p))
+				default:
+					require.NoError(t, os.Remove(p))
+					require.NoError(t, os.WriteFile(p, []byte("other"), 0o644))
+				}
+			}
+			defer func() { testHookReservedLstat = nil }()
+
+			release, err := acquireCopyLock(path)
+			require.NoError(t, err)
+			if change != "replaced" || runtime.GOOS != "windows" {
+				assert.Equal(t, 2, lstats, "the name is looked at again")
+			}
+			release()
+			assert.Empty(t, dirNames(t, dir))
+		})
+	}
+}
+
 // stagingOpenAsDatabase finds the lock of an open database in both modes of
 // the database file lock: shared between processes, a shared flock (Windows
 // has no such mode and opens it kept in the process), and kept in the
 // process, an exclusive lock. A closed database and a missing name are
 // free. A directory, a symbolic link and, where the link count is known, a
-// file with two links are refused with errStagingAlias, unopened: each can
-// be another name of a file something has open.
+// file with two links are refused with errReservedNameAlias, unopened: each
+// can be another name of a file something has open.
 func TestStagingOpenAsDatabase(t *testing.T) {
 	dir := t.TempDir()
 	for _, inProcess := range []bool{false, true} {
@@ -169,7 +251,7 @@ func TestStagingOpenAsDatabase(t *testing.T) {
 	}
 	for _, name := range refused {
 		_, err = stagingOpenAsDatabase(name)
-		assert.ErrorIs(t, err, errStagingAlias, name)
+		assert.ErrorIs(t, err, errReservedNameAlias, name)
 		assert.ErrorContains(t, err, "the staging file "+name)
 	}
 }

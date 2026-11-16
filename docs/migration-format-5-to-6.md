@@ -103,21 +103,22 @@ every collection, document and index of `db`:
   them, and removes whatever it finds there. Staging files a killed copy
   left are removed by the next copy to that destination, under its lock.
   Keep nothing of your own under these names; a destination that ends in one
-  of them is refused. Two things found at `<destination>.copy-staging` are
-  not removed: an open database, and anything a copy does not leave there.
-  An open database holds a lock of the operating system on its file (`flock`
-  on Unix, `LockFileEx` on Windows), which the copy tries before it removes
-  anything; if it is held, the call returns `ErrBusy` and removes nothing
-  under the staging name. To try it the copy opens
-  `<destination>.copy-staging`, and it does so only for a regular file with
-  one link, which is what a copy leaves there. A symbolic link, a file with
-  other hard links (on Unix; Windows does not report the count) or anything
-  but a regular file at that name fails the call with an error, and the copy
-  neither opens nor removes it: it can be another name of a file that a
-  database of this process has open, such as its `-wal-shm`, and closing a
-  descriptor of a file drops every POSIX record lock the process holds on
-  it. js/wasm and wasip1 have no such lock; there only a source under these
-  names is refused, as described below.
+  of them is refused. Two things are not removed. One is an open database at
+  `<destination>.copy-staging`: an open database holds a lock of the
+  operating system on its file (`flock` on Unix, `LockFileEx` on Windows),
+  which the copy tries before it removes anything; if it is held, the call
+  returns `ErrBusy` and removes nothing under the staging name. The other is
+  anything a copy does not leave at a lock file's name or at the staging
+  name. The copy opens a lock file, and `<destination>.copy-staging` to try
+  its lock, only if it is a regular file with one link, which is what a copy
+  leaves there. A symbolic link, a file with other hard links (on Unix;
+  Windows does not report the count) or anything but a regular file at one
+  of those names fails the call with an error, and the copy neither opens,
+  writes nor removes it: it can be another name of a file that a database of
+  this process has open, such as its `-wal-shm`, and closing a descriptor of
+  a file drops every POSIX record lock the process holds on it. js/wasm and
+  wasip1 have no such lock and make no lock file; there only a source under
+  these names is refused, as described below.
 - **Verified.** Before it is published, each collection of the copy is
   checked against the source's snapshot: its options, its document count
   and its index definitions. Then `IntegrityCheck` runs on the copy. A

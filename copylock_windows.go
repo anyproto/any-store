@@ -44,13 +44,15 @@ func releaseCopyLock(f *os.File, path string) {
 // syncLockFile flushes the byte withContentStat wrote.
 func syncLockFile(f *os.File) error { return f.Sync() }
 
-// stagingOpenFlags: Windows has no flag for an open that does not follow a
-// symbolic link. One put at the staging name after its Lstat is opened,
-// and then refused as another file than the Lstat saw
-// (stagingOpenAsDatabase); its open and close drop no lock of another
-// handle.
-const stagingOpenFlags = 0
+// reservedOpenFlags: Windows has no flag for an open that does not follow
+// a symbolic link. One put at a lock file's or the staging file's name after
+// its Lstat is opened, and then refused as another file than the Lstat saw
+// (openReserved and its callers), before it is locked or written; a name
+// that named nothing is created exclusively, which a symbolic link put
+// there fails. The open and close drop no lock of another handle: a
+// LockFileEx lock belongs to the handle that took it.
+const reservedOpenFlags = 0
 
 // linkCount does not report the number of links on Windows: os.FileInfo
-// does not carry it there (stagingOpenAsDatabase).
+// does not carry it there (openReserved).
 func linkCount(os.FileInfo) (uint64, bool) { return 0, false }
