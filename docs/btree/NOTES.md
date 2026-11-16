@@ -3223,6 +3223,17 @@ SQLite's `isFatalError` keeps exactly `SQLITE_BUSY` and `SQLITE_LOCKED` out of a
 
 `Step` treats `ErrBusy`, `ErrBusySnapshot`, `ErrBusyRecovery`, `ErrReadersBusy` and the ctx's own error alike: returned, not kept. (Any other error stays sticky even if the ctx has ended meanwhile.) `Finish` returns the last Step's busy error when the backup is neither done nor failed, as `sqlite3_backup_finish` returns the `p->rc` the step left (`backup.c:558`, `603`). A begin that failed its admission holds no transaction and has copied nothing, so a later Step on the same `Backup` continues correctly, and another process rebuilding the wal-index is an ordinary event of multi-process use, not a reason to abandon a copy. `ErrProtocol` stays fatal, as `SQLITE_PROTOCOL` is. Test: `TestBackupChange_StepBusy`; the recovery case is exercised by `TestBackupChange_StepRunsRecovery`, where the Step's own begin does the rebuild.
 
+<a id="drift-2026-11-16-1-a-long-backup-step-ends-early-when-its-ctx-ends"></a>
+### Drift: A Long Backup Step Ends Early When Its ctx Ends
+- **Category:** added-logic  -  **Severity:** low
+- **Affected functions:** `backup.go:*Backup.Step`, `backup.go:*Backup.Restarts`, `backup.go:*Backup.restartLocked`.
+
+`sqlite3_backup_step` copies `nPage` pages, or every remaining page when `nPage` is negative, in one loop with no way out but an error (`backup.c:390-401`); the caller bounds a call by the `nPage` it passes.
+
+`Step` takes a ctx, and looks at it once before it takes anything. A Step of more than `backupCtxPages` (256) pages now also looks at it every 256 pages, and when it has ended stops copying and returns the ctx's error. The pages copied stay copied and the Step's tail runs as for a Step of that many pages (`nRemaining`, `nPagecount`, the attach for updates), so a later Step on the same `Backup` goes on; the error is not sticky, like the other "not now" results (`backupBusy`). The reason is the public `Backup`: after `backupRestartLimit` restarts it copies the rest with `Step(ctx, -1)`, which holds this process's write lock on the source for the whole copy, and a cancelled ctx must still end it in bounded time.
+
+`Restarts` has no C counterpart either: `sqlite3BackupRestart` only sets `iNext = 1` (`backup.c:701-707`). The count (restarts that threw copied pages away) changes nothing in the copy; the public `Backup` reads it to decide when to stop stepping in batches. The rollback rule that causes the restarts is SQLite's and is unchanged (`pagerUndoCallback`, `pagerRollbackWal`, `pager.c:3112-3168`). Regression tests: `TestBackupPublic_FinishesUnderRollbacks` (root package), `TestBackup_RestartsCounted`, `TestBackup_LongStepEndsWithItsCtx`.
+
 <a id="drift-102-reader-slot-tie-break-selects-lowest-not-highest"></a>
 ### Drift: Reader Slot Tie Break Selects Lowest Not Highest
 - **Category:** changed-logic  -  **Severity:** low

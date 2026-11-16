@@ -23,6 +23,14 @@ func SetBackupBusyTimeout(d time.Duration) (restore func()) {
 // destination (nil before the open, the destination after); nil removes it.
 func SetBackupOpenHook(f func(dst *btree.DB)) { testBackupOpenHook = f }
 
+// BackupRestartLimit is how many restarts of its copy Backup takes before
+// it copies the rest in one Step.
+const BackupRestartLimit = backupRestartLimit
+
+// SetBackupSteppedHook installs the hook that runs after each of Backup's
+// Steps that copied and left pages to copy; nil removes it.
+func SetBackupSteppedHook(f func()) { testBackupSteppedHook = f }
+
 // SetBackupBusyWaitHook installs the hook that runs each time Backup is
 // about to wait before retrying a busy Step; nil removes it.
 func SetBackupBusyWaitHook(f func()) { testBackupBusyWaitHook = f }

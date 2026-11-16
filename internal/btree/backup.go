@@ -70,6 +70,11 @@ type Backup struct {
 	exact   bool
 	stepped bool
 
+	// nRestart counts the times the copy was sent back to page 1 with pages
+	// already copied (restart, and the Step that found the source changed):
+	// the work thrown away. See Restarts.
+	nRestart uint32
+
 	// busy is the busy error of the last Step, nil if that Step was not
 	// busy: see stepBusy.
 	busy error
@@ -231,6 +236,10 @@ var testBackupSampledHook func()
 // or wholly after the Step (backup.c:323-324, 668). It takes that lock, and
 // its reader slot, without waiting: the caller may be the one holding them.
 //
+// A Step of many pages looks at ctx every backupCtxPages pages and, once it
+// has ended, returns its error with the pages copied so far kept: the Step
+// then counts as a shorter one, and a later Step goes on from there.
+//
 // ~ sqlite3_backup_step (backup.c:314–566).
 // DRIFT: backup empty-source (nSrcPage==0 -> NewDb) path missing; truncateTo(0) errors See docs/btree/NOTES.md#drift-41-backup-empty-source-finalization-path-missing
 func (b *Backup) Step(ctx context.Context, nPage int) error {
@@ -305,7 +314,7 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 		testBackupSampledHook()
 	}
 	if b.stepped && (!exact || !b.exact || epoch != b.epoch) {
-		b.iNext = 1
+		b.restartLocked()
 	}
 	b.epoch, b.exact, b.stepped = epoch, exact, true
 
@@ -318,7 +327,16 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 	srcPgsz := b.src.PageSize()
 
 	// Main copy loop. ~ backup.c:390–401.
+	// DRIFT: a Step of more than backupCtxPages pages ends early, with the ctx's error, once the ctx has ended; C's loop has no way out See docs/btree/NOTES.md#drift-2026-11-16-1-a-long-backup-step-ends-early-when-its-ctx-ends
+	var ctxErr error
 	for ii := 0; (nPage < 0 || ii < nPage) && b.iNext <= nSrcPage; ii++ {
+		if ii != 0 && ii%backupCtxPages == 0 {
+			// What was copied stays copied, as after a Step of ii pages:
+			// the statistics and the attach below run before the return.
+			if ctxErr = ctx.Err(); ctxErr != nil {
+				break
+			}
+		}
 		iSrcPg := b.iNext
 
 		srcPg, err := b.src.pager.getPageReader(iSrcPg, rtx.walMaxFrame, rtx.cache)
@@ -363,7 +381,26 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 		b.src.pager.attachBackup(b)
 		b.isAttached = true
 	}
-	return nil
+	return ctxErr // nil unless the ctx ended inside the loop; not sticky (backupBusy)
+}
+
+// backupCtxPages is how many pages a Step copies between two looks at its
+// ctx. A Step that copies everything left in one call (nPage < 0) holds the
+// source's write lock of this process for the whole copy; a ctx that ends
+// meanwhile must still end it.
+const backupCtxPages = 256
+
+// Restarts returns how many times the copy has been sent back to page 1
+// with pages already copied: by a rollback or a WAL reset of this process
+// (restart), or by a Step that found the source changed by something other
+// than this process's commits. A caller that steps in batches uses it to
+// tell that its batches are not getting through (see the public Backup).
+// SQLite keeps no such count; sqlite3BackupRestart only resets iNext
+// (backup.c:701-707).
+func (b *Backup) Restarts() uint32 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.nRestart
 }
 
 // Remaining returns the number of pages still to be backed up as of
@@ -488,6 +525,15 @@ func (b *Backup) restart() {
 	defer b.mu.Unlock()
 	if b.finished {
 		return // see update
+	}
+	b.restartLocked()
+}
+
+// restartLocked is restart's body: p->iNext = 1 (backup.c:705), counted when
+// it throws copied pages away. Caller holds b.mu.
+func (b *Backup) restartLocked() {
+	if b.iNext > 1 {
+		b.nRestart++
 	}
 	b.iNext = 1
 }
