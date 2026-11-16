@@ -180,8 +180,11 @@ var (
 	// The check is made again under the locks and right before the copy is
 	// published, and a file that appeared by then refuses the call after it
 	// created its lock files, or built the copy under its staging name, and
-	// removed them again: no file but the copy's own lock and staging files
-	// has been created, written or removed.
+	// removed them again. Apart from the read bookkeeping in the source's
+	// wal-index (its -wal-shm), which the copy's read of the source changes
+	// as any reader's does, no file but the copy's own lock and staging
+	// files has been created, written or removed; the source's files are
+	// never renamed, removed or otherwise written.
 	ErrDestinationExists = errors.New("any-store: destination exists")
 
 	// ErrCopyPublished is returned by CopyToLatestFormat, always wrapped

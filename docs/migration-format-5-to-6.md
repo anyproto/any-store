@@ -69,8 +69,11 @@ every collection, document and index of `db`:
   takes its locks, it touches nothing. The check is made again under the
   locks and right before the rename (below), and a file that appeared
   meanwhile is found then, after the copy created its lock files, or built
-  the whole copy under its staging name, and it removes them again: no file
-  but the copy's own lock and staging files is created, written or removed.
+  the whole copy under its staging name, and it removes them again. Apart
+  from the read bookkeeping in the source's `-wal-shm`, which the copy's
+  read of the source changes as any reader's does, no file but the copy's
+  own lock and staging files is created, written or removed; the source's
+  files are never renamed, removed or otherwise written.
 - **One copy at a time to a destination.** For the whole call the copy holds
   an exclusive lock of the operating system on the file
   `<destination>.copy-lock` (`flock` on Unix, `LockFileEx` on Windows). The
@@ -151,7 +154,7 @@ The call fails with:
 | ----- | ---- |
 | `ErrUnsupportedDB` | `db` was not opened by this package (a type of your own that implements `DB`). Nothing is created. |
 | `ErrTxInContext` | `ctx` carries a read or write transaction. The copy reads in a transaction of its own, as SQLite refuses `VACUUM` inside one. |
-| `ErrDestinationExists` | The destination or one of its sidecars exists, or appeared while the copy ran. No file was created, written or removed but the copy's own lock and staging files: a file that was there before the call refuses it before it creates anything, and one that appeared while it ran refuses it after it made its lock files or its copy, which it removed again, with any a killed copy had left under those names. |
+| `ErrDestinationExists` | The destination or one of its sidecars exists, or appeared while the copy ran. No file was created, written or removed but the copy's own lock and staging files, apart from the read bookkeeping in the source's `-wal-shm`, which the copy's read of the source changes as any reader's does: a file that was there before the call refuses it before it creates anything, and one that appeared while it ran refuses it after it made its lock files or its copy, which it removed again, with any a killed copy had left under those names. The source's files are never renamed, removed or otherwise written. |
 | `ErrBusy` | Another call is copying to the same destination right now, or to a name one of the two would keep beside the other (`app.db` and `app.db-wal`, either way round; on js/wasm and wasip1, to any destination in the process), or a database is open at the destination's staging name, `<destination>.copy-staging`. No file was created, written or removed but the copy's lock files (`<destination>.copy-lock`, and `app.db.copy-lock` for a destination `app.db-wal`): a lock the call took before it failed was released and its file removed, which may be one a killed copy left there. Try again once that call has returned, or that database is closed. |
 | `ErrCopyPublished` | The copy is complete, verified and published at the destination, and a step after that failed: the sync of the destination's directory, or the removal of a file left under the staging name. It wraps that failure, and the report is filled. Use the copy; to make its name durable, sync its directory. |
 | any other | The copy failed: a collection, index or document could not be copied (the error names it, see [What can differ](#what-can-differ)), the copy did not match the source, or an I/O operation failed. Cancelling `ctx` stops the copy with the context's error. |

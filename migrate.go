@@ -97,11 +97,13 @@ type CopyReport struct {
 // again under the locks and right before the publication (below), and a
 // file found then, one that appeared meanwhile, returns
 // ErrDestinationExists after the call created its lock files, or built the
-// whole copy under its staging name, and removed them again: no file but
-// the copy's own lock and staging files is created, written or removed,
-// and those removed can include ones a killed call left there. A dstPath
-// that ends in one of the names this call keeps for itself, listed below,
-// is refused too.
+// whole copy under its staging name, and removed them again. Apart from the
+// read bookkeeping in src's wal-index (its -wal-shm), which the call's read
+// of src changes as any reader of src does, no file but the copy's own lock
+// and staging files is created, written or removed, and those removed can
+// include ones a killed call left there; src's files are never renamed,
+// removed or otherwise written. A dstPath that ends in one of the names
+// this call keeps for itself, listed below, is refused too.
 //
 // One call at a time copies to a dstPath. For the whole call it holds an
 // exclusive lock of the operating system on the file dstPath+".copy-lock"
