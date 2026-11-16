@@ -92,8 +92,16 @@ type CopyReport struct {
 // dstPath+".lock" exists, or dstPath is one of those names of an existing
 // file in any case (p+"-WAL" is p's log on a case-insensitive filesystem,
 // and is refused on every one), the call returns ErrDestinationExists and
-// touches nothing. A dstPath that ends in one of the names this call keeps
-// for itself, listed below, is refused too.
+// leaves that file as it is. Found by the first check, before the call
+// takes its locks, it returns having touched nothing. The check is made
+// again under the locks and right before the publication (below), and a
+// file found then, one that appeared meanwhile, returns
+// ErrDestinationExists after the call created its lock files, or built the
+// whole copy under its staging name, and removed them again: no file but
+// the copy's own lock and staging files is created, written or removed,
+// and those removed can include ones a killed call left there. A dstPath
+// that ends in one of the names this call keeps for itself, listed below,
+// is refused too.
 //
 // One call at a time copies to a dstPath. For the whole call it holds an
 // exclusive lock of the operating system on the file dstPath+".copy-lock"
