@@ -85,10 +85,16 @@ func TestIntegrityCheckIgnoresOpenWriterTruncation(t *testing.T) {
 		name   string
 		opts   Options
 		reopen bool // close and reopen first: the WAL then holds no commit
+		// restart: the writer starts the log over before it truncates. The
+		// restart moves the commit cursor to 0 and must keep the committed
+		// size with it, as walRestartHdr keeps hdr.nPage (wal.c:2146-2160).
+		restart bool
 	}{
 		{name: "in-process", opts: Options{PageSize: 4096, InProcess: true, DisableAutoCheckpoint: true}},
 		{name: "in-process reopened", opts: Options{PageSize: 4096, InProcess: true, DisableAutoCheckpoint: true}, reopen: true},
+		{name: "in-process restarted log", opts: Options{PageSize: 4096, InProcess: true, DisableAutoCheckpoint: true}, restart: true},
 		{name: "in-memory", opts: Options{PageSize: 4096, InMemory: true}},
+		{name: "in-memory restarted log", opts: Options{PageSize: 4096, InMemory: true, DisableAutoCheckpoint: true}, restart: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -103,11 +109,23 @@ func TestIntegrityCheckIgnoresOpenWriterTruncation(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, uint32(0), db.pager.wal.index.mxCommitFrame.LoadLocal(), "setup: no commit in the WAL")
 			}
+			if tc.restart {
+				// The whole log in the database file: the next writer's
+				// first frames start it over (restartLogLocked).
+				require.NoError(t, db.Checkpoint(CheckpointPassive))
+			}
 			committed := db.pager.dbSize.Load()
 			require.Greater(t, committed, uint32(16), "setup: a database of many pages")
 
 			wtx, err := db.BeginWrite()
 			require.NoError(t, err)
+			if tc.restart {
+				restarts := db.pager.wal.index.restarts.Load()
+				restartPutTx(t, wtx, 0, 1, 2) // one row, same size
+				restartSpillAll(t, db)
+				require.NotEqual(t, restarts, db.pager.wal.index.restarts.Load(), "setup: the writer started the log over")
+				require.Zero(t, db.pager.wal.index.mxCommitFrame.LoadLocal(), "setup: no commit in the new log")
+			}
 			require.NoError(t, db.pager.truncateTo(committed/4))
 			require.Equal(t, committed/4, db.pager.dbSize.Load(), "setup: the writer's count is the truncated one")
 
