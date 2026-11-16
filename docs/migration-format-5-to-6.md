@@ -121,10 +121,15 @@ every collection, document and index of `db`:
   database file, or its `-wal`, `-wal-shm` or `.lock`, is under one of the
   destination's reserved names (`app.db.copy-staging` copied to `app.db`)
   is refused before anything is created or removed, on every platform: the
-  copy would take it for a killed copy's staging file. The names are
-  compared by path and by file identity, so another spelling of the
-  destination is refused too: a relative path, one through a symbolic link,
-  one in another case on a case-insensitive filesystem.
+  copy would take it for a killed copy's staging file. The files are
+  compared by identity: what each reserved name names, with the files the
+  source has open (its database file, its log, and its `-wal-shm` where
+  that is a file) and with its `.lock`. So every spelling of the
+  destination is refused: a relative path, one through a symbolic link,
+  one in another case on a case-insensitive filesystem. So is a source
+  opened under a path that names another file than the one it opened: a
+  `..` after a symbolic link to a directory goes up from the link's
+  target, as the system resolves it, not from the link.
 
 The call fails with:
 

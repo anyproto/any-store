@@ -4586,6 +4586,28 @@ func (w *wal) doResetWAL(truncate bool) error {
 	return nil
 }
 
+// fileInfos returns the FileInfo, from fstat, of the open log file and of
+// the log's index file; index is nil when the index is in memory
+// (DB.OpenFiles).
+func (w *wal) fileInfos() (log, index os.FileInfo, err error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.file == nil {
+		return nil, nil, ErrClosed
+	}
+	if log, err = w.file.Stat(); err != nil {
+		return nil, nil, err
+	}
+	if w.index != nil {
+		if f, ok := w.index.shm.(shmFile); ok {
+			if index, err = f.fileInfo(); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	return log, index, nil
+}
+
 // truncateFile truncates the WAL file to zero bytes under the WAL mutex.
 // DRIFT: journal_size_limit/mxWalSize WAL truncation unimplemented (truncateOnCommit/walLimitSize) See docs/btree/NOTES.md#drift-105-journal-size-limit-wal-truncation-feature-unimplemented
 func (w *wal) truncateFile() {

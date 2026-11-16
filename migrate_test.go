@@ -1204,11 +1204,10 @@ func TestCopyToLatestFormat_StaleStagingNotRemovable(t *testing.T) {
 // log and the commits not yet checkpointed out of it, or lock it as its
 // lock file. A copy to x+"-wal", x+"-wal-shm" or x+".lock" holds x's copy
 // lock too, so a source at x+".copy-lock" is refused for those as well. The
-// names are compared by path and by file identity, so another spelling of
-// the destination is refused too: a relative one, one through a symbolic
-// link to the directory, and, on a case-insensitive filesystem, one in
-// another case. The source keeps every file and every commit, and goes on
-// committing.
+// files are compared by identity, so another spelling of the destination is
+// refused too: a relative one, one through a symbolic link to the
+// directory, and, on a case-insensitive filesystem, one in another case.
+// The source keeps every file and every commit, and goes on committing.
 func TestCopyToLatestFormat_SourceUnderReservedName(t *testing.T) {
 	filesOnJS(t)
 	for _, tc := range []struct {
@@ -1272,6 +1271,96 @@ func TestCopyToLatestFormat_SourceUnderReservedName(t *testing.T) {
 			closed = true
 			require.NoError(t, src.Close())
 			reopened := openCopy(t, srcPath, conf)
+			c, err := reopened.OpenCollection(ctx, "docs")
+			require.NoError(t, err)
+			n, err := c.Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 4, n)
+		})
+	}
+}
+
+// A source opened as d/link/../x.copy-staging, with d/link a symbolic link
+// to r/sub, is the file r/x.copy-staging: the system resolves the link
+// before the "..". Its path, which the btree cleans lexically, is
+// d/x.copy-staging, which names nothing. A copy to r/x is refused by the
+// files the source has open, not by that path: it fails, every file of the
+// source stays as it was, and the source reopens with its commits. Where
+// the system takes ".." lexically (Windows), the spelling names d/x.copy-staging,
+// and the case does not arise.
+func TestCopyToLatestFormat_SourceThroughLinkAndDotDot(t *testing.T) {
+	filesOnJS(t)
+	sep := string(filepath.Separator)
+	for _, tc := range []struct {
+		suffix string
+		dsts   []string
+	}{
+		{".copy-staging", []string{"x"}},
+		{".copy-staging-wal", []string{"x"}},
+		{".copy-staging-wal-shm", []string{"x"}},
+		{".copy-staging.lock", []string{"x"}},
+		{".copy-lock", []string{"x", "x-wal"}},
+	} {
+		suffix := tc.suffix
+		t.Run(suffix, func(t *testing.T) {
+			top := t.TempDir()
+			d, r := filepath.Join(top, "d"), filepath.Join(top, "r")
+			require.NoError(t, os.MkdirAll(filepath.Join(r, "sub"), 0o755))
+			require.NoError(t, os.Mkdir(d, 0o755))
+			link := filepath.Join(d, "link")
+			if err := os.Symlink(filepath.Join(r, "sub"), link); err != nil {
+				t.Skipf("no symbolic link to a directory: %v", err)
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(r, "probe"), nil, 0o644))
+			if _, err := os.Stat(link + sep + ".." + sep + "probe"); err != nil {
+				t.Skipf("the system does not resolve the link before \"..\": %v", err)
+			}
+			require.NoError(t, os.Remove(filepath.Join(r, "probe")))
+
+			// The commits stay in the source's log: removing the log, or
+			// the file beside it, would take them with it.
+			conf := &Config{DisableAutoCheckpoint: true}
+			spelled := link + sep + ".." + sep + "x" + suffix
+			src, err := Open(ctx, spelled, conf)
+			require.NoError(t, err)
+			closed := false
+			defer func() {
+				if !closed {
+					_ = src.Close()
+				}
+			}()
+			require.Equal(t, filepath.Join(d, "x"+suffix), src.(*db).btreeDB.Path())
+			coll, err := src.CreateCollection(ctx, "docs")
+			require.NoError(t, err)
+			insertJSON(t, coll, `{"id":1}`, `{"id":2}`, `{"id":3}`)
+
+			names := dirNames(t, r)
+			require.Contains(t, names, "x"+suffix)
+			before := make(map[string]os.FileInfo, len(names))
+			for _, name := range names {
+				fi, err := os.Lstat(filepath.Join(r, name))
+				require.NoError(t, err)
+				before[name] = fi
+			}
+			for _, dst := range tc.dsts {
+				dstPath := filepath.Join(r, dst)
+				report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+				require.ErrorContains(t, err, "a name the copy keeps for its own files, is the source's file", dstPath)
+				assert.Zero(t, report)
+				assert.Equal(t, names, dirNames(t, r), "a copy to %s touches nothing", dstPath)
+				assert.Equal(t, []string{"link"}, dirNames(t, d))
+				for name, fi := range before {
+					now, err := os.Lstat(filepath.Join(r, name))
+					if assert.NoError(t, err, name) {
+						assert.True(t, os.SameFile(fi, now), "%s is the file it was", name)
+					}
+				}
+			}
+
+			insertJSON(t, coll, `{"id":4}`)
+			closed = true
+			require.NoError(t, src.Close())
+			reopened := openCopy(t, filepath.Join(r, "x"+suffix), conf)
 			c, err := reopened.OpenCollection(ctx, "docs")
 			require.NoError(t, err)
 			n, err := c.Count(ctx)

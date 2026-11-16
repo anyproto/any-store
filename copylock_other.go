@@ -37,6 +37,6 @@ func acquireCopyLock(string) (release func(), err error) {
 
 // stagingOpenAsDatabase reports no database open at path: an open database
 // holds no lock here that another handle could see. The source of a copy
-// is refused by name and identity before it gets here
+// is refused by the identities of its files before it gets here
 // (sourceOutsideReservedNames).
 func stagingOpenAsDatabase(string) (bool, error) { return false, nil }

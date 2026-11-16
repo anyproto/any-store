@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"maps"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -142,9 +141,14 @@ type CopyReport struct {
 // a database open at the staging name. Keep nothing of your own under them.
 // A src whose database file, or a file it keeps beside it, is under one of
 // them is refused, on every platform, before anything is created or
-// removed; the names are compared by path and by file identity, so another
+// removed. The files are compared by identity: each reserved name's file
+// with the files src has open, as their descriptors identify them, and
+// with its .lock as the spelling src was opened by names it. So every
 // spelling of dstPath (relative, through a symbolic link, in another case
-// on a case-insensitive filesystem) is refused too.
+// on a case-insensitive filesystem) is refused, and so is a src whose path
+// names another file than the one it has open (a ".." after a symbolic
+// link, which the system resolves before going up). A closed src returns
+// ErrDBIsClosed.
 //
 // dstPath is created only by the publication, as a complete, verified,
 // closed copy. On a failure before it the call closes the copy and removes
@@ -190,7 +194,7 @@ func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Con
 	if err = notReservedName(dstPath); err != nil {
 		return CopyReport{}, err
 	}
-	if err = sourceOutsideReservedNames(s.btreeDB.Path(), dstPath); err != nil {
+	if err = sourceOutsideReservedNames(s.btreeDB, dstPath); err != nil {
 		return CopyReport{}, err
 	}
 	// ~ vacuum.c:236-242: VACUUM INTO refuses an output file that has content.
@@ -718,21 +722,43 @@ func lockDestination(dstPath string) (unlock func(), err error) {
 	return unlock, nil
 }
 
-// sourceOutsideReservedNames refuses a copy to dstPath from the source whose
-// database file is at srcPath if a file of the source is under one of the
-// names the copy keeps for itself (reservedNames): the copy would remove it
-// as a killed call's staging file, or lock it as its lock file. The files
-// of the source are its database file and the ones it keeps beside it
-// (databaseFiles). Each is compared with each reserved name as a cleaned
-// absolute path and, where both exist, by file identity (os.SameFile of
-// their stats, which follow symbolic links), so that another spelling of
-// the destination is refused too: a relative one, one through a symbolic
-// link or a hard link, one in another case on a case-insensitive
-// filesystem. A name that exists but cannot be stat'ed fails the call: the
-// copy cannot tell whether it is the source's. An in-memory source, whose
-// srcPath is empty, has no files.
-func sourceOutsideReservedNames(srcPath, dstPath string) error {
-	if srcPath == "" {
+// sourceOutsideReservedNames refuses a copy to dstPath from the source src
+// if a file of the source is under one of the names the copy keeps for
+// itself (reservedNames): the copy would remove it as a killed call's
+// staging file, or lock it as its lock file. The files of the source are
+// its database file and the ones it keeps beside it (databaseFiles), and
+// they are compared by identity (os.SameFile) with what each reserved name
+// names (os.Stat, which follows symbolic links), so that every spelling of
+// the destination is refused: a relative one, one through a symbolic link
+// or a hard link, one in another case on a case-insensitive filesystem.
+//
+// The source's files are the ones it reads and writes, not the ones its
+// path names: the identities of the files it has open, from fstat of their
+// descriptors (btree.DB.OpenFiles), its database file and log always, and
+// the log's index where that is a file. A path can name another file:
+// btree.DB.Path is cleaned lexically, and a ".." after a symbolic link to a
+// directory takes it to the link's parent, where the system resolves the
+// link first and goes up from its target. The durability sentinel (.lock),
+// which no process holds open, and the log's index where it is in memory
+// are stat'ed under the spelling the source was opened by, which the system
+// resolves as it did at the open.
+//
+// A file of the source that does not exist yet has no identity, and is not
+// compared by name either: a name a database keeps beside its file is
+// under a reserved name only if the database file is under the staging
+// name itself (the reserved names that end in a sidecar suffix are the
+// staging name's sidecars, and the .copy-lock ones end in none), and the
+// database file always exists, open, so its identity refuses the copy.
+//
+// A name that exists but cannot be stat'ed fails the call: the copy cannot
+// tell whether it is the source's. An in-memory source has no files. A
+// closed source returns ErrDBIsClosed.
+func sourceOutsideReservedNames(src *btree.DB, dstPath string) error {
+	open, err := src.OpenFiles()
+	if err != nil {
+		return fmt.Errorf("any-store: copy to latest format: the source: %w", err)
+	}
+	if open.Path == "" {
 		return nil
 	}
 	stat := func(p string) (os.FileInfo, error) {
@@ -745,25 +771,26 @@ func sourceOutsideReservedNames(srcPath, dstPath string) error {
 		}
 		return fi, nil
 	}
-	srcFiles := databaseFiles(srcPath)
-	srcInfos := make([]os.FileInfo, len(srcFiles))
+	// In the order of databaseFiles: the file, -wal, -wal-shm, .lock.
+	srcFiles := databaseFiles(open.Path)
+	srcInfos := []os.FileInfo{open.DB, open.WAL, open.SHM, nil}
 	for i, p := range srcFiles {
-		var err error
-		if srcInfos[i], err = stat(p); err != nil {
-			return err
+		if srcInfos[i] == nil {
+			if srcInfos[i], err = stat(p); err != nil {
+				return err
+			}
 		}
 	}
 	for _, name := range reservedNames(dstPath) {
-		abs, err := filepath.Abs(name)
-		if err != nil {
-			return fmt.Errorf("any-store: copy to latest format: %w", err)
-		}
 		fi, err := stat(name)
 		if err != nil {
 			return err
 		}
+		if fi == nil {
+			continue
+		}
 		for i, p := range srcFiles {
-			if p == abs || fi != nil && srcInfos[i] != nil && os.SameFile(fi, srcInfos[i]) {
+			if srcInfos[i] != nil && os.SameFile(fi, srcInfos[i]) {
 				return fmt.Errorf("any-store: copy to latest format: %s, a name the copy keeps for its own files, is the source's file %s", name, p)
 			}
 		}
