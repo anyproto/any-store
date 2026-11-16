@@ -1028,9 +1028,11 @@ func (db *DB) beginRead(ctx context.Context, readCounters, wait bool) (*ReadTx, 
 	// Allocate reader cache from pool for per-connection page caching.
 	// Persistent cache: keep cached pages only if the DB snapshot hasn't
 	// changed (curDV and snapHdr, above).
-	// Snapshot DB page count for this reader (hdr.nPage, fallback p.dbSize).
-	// Carried on the cache so reader bound checks accept pages a peer
-	// allocated after open. Set in lockstep with walHdr.
+	// Snapshot DB page count for this reader: the size its snapshot's last
+	// commit recorded (effectiveReaderDbSize), never the writer's live
+	// p.dbSize. Carried on the cache so reader bound checks accept pages a
+	// peer allocated after open and pages above a truncation that an open
+	// write transaction has not committed. Set in lockstep with walHdr.
 	snapDbSize, err := db.pager.effectiveReaderDbSize(hdr)
 	if err != nil {
 		db.pager.endRead(slot)

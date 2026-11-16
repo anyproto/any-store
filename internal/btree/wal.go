@@ -820,10 +820,26 @@ var (
 )
 
 // synthHdr is the header of a snapshot in the in-process and in-memory
-// modes, which keep no WAL-index header: the frame ceiling and the restart
-// count (iChange, unused otherwise), no salts (WalIndexHdr.synthesized).
+// modes, which keep no WAL-index header: the frame ceiling, the database
+// size of the commit that ends on it (nPage, as in a real header:
+// sqlite3WalDbsize, wal.c:3669-3674) and the restart count (iChange, unused
+// otherwise), no salts (WalIndexHdr.synthesized). The size is the last
+// commit's: the callers are the commit that has just published mxFrame, and
+// the writer, whose snapshot is the last commit.
 func (wi *walIndex) synthHdr(mxFrame uint32) WalIndexHdr {
-	return WalIndexHdr{isInit: 1, mxFrame: mxFrame, iChange: wi.restarts.Load()}
+	_, nPage := wi.mxCommitFrame.LoadCommit()
+	return WalIndexHdr{isInit: 1, mxFrame: mxFrame, nPage: nPage, iChange: wi.restarts.Load()}
+}
+
+// storeCommit publishes a commit to this process's readers: the frame it
+// ends on with the database size it recorded. A commit that passes no size
+// (dbSize 0) keeps the recorded one.
+func (wi *walIndex) storeCommit(mxFrame, dbSize uint32) {
+	if dbSize == 0 {
+		wi.mxCommitFrame.Store(mxFrame)
+		return
+	}
+	wi.mxCommitFrame.StoreCommit(mxFrame, dbSize)
 }
 
 // get returns the frame containing the latest version of pgno within
@@ -2387,7 +2403,7 @@ func (w *wal) recoverLocked() error {
 		w.cksum1 = lastCommitCksum1
 		w.cksum2 = lastCommitCksum2
 		w.index.maxFrame.Store(lastCommitFrame)
-		w.index.mxCommitFrame.Store(lastCommitFrame)
+		w.index.mxCommitFrame.StoreCommit(lastCommitFrame, lastCommitDbSize)
 		w.index.maxPage.Store(lastCommitDbSize)
 		// SQLite wal.c:1598: nBackfillAttempted = mxFrame after recovery.
 		w.index.nBackfillAttempted.Store(lastCommitFrame)
@@ -2671,8 +2687,10 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		// see committed frames once they are durable on disk. This matches
 		// SQLite where walIndexWriteHdr (which publishes mxFrame) is called
 		// after fdatasync.
+		// The database size goes with it, as one word: an in-process read
+		// begin takes the pair as its snapshot (commitFrameCounter).
 		mxCommit := w.index.maxFrame.Load()
-		w.index.mxCommitFrame.Store(mxCommit)
+		w.index.storeCommit(mxCommit, dbSize)
 		if w.inProcess && w.onPublish != nil {
 			w.onPublish(w.index.synthHdr(mxCommit))
 		}
@@ -2828,8 +2846,9 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 
 	if commit {
 		// Advance mxCommitFrame so readers can see the committed frames.
+		// The database size goes with them, as one word (commitFrameCounter).
 		mxCommit := w.index.maxFrame.Load()
-		w.index.mxCommitFrame.Store(mxCommit)
+		w.index.storeCommit(mxCommit, dbSize)
 		if dbSize > 0 {
 			w.index.maxPage.Store(dbSize)
 		}
@@ -3182,14 +3201,19 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 	if testInProcessReadSnapshotHook != nil {
 		testInProcessReadSnapshotHook()
 	}
-	mxFrame := w.index.mxCommitFrame.LoadLocal()
+	// The snapshot's frame ceiling and its database size, one load: the
+	// size is the one its last commit recorded (pWal->hdr.nPage of the
+	// snapshot, sqlite3WalDbsize, wal.c:3669-3674), never the writer's live
+	// count, which an open write transaction grows and shrinks.
+	mxFrame, nPage := w.index.mxCommitFrame.LoadCommit()
 	nBackfill := w.index.nBackfill.Load()
 	if testInProcessFramesReadHook != nil {
 		testInProcessFramesReadHook()
 	}
-	hdr = WalIndexHdr{isInit: 1, mxFrame: mxFrame, iChange: restarts}
+	hdr = WalIndexHdr{isInit: 1, mxFrame: mxFrame, nPage: nPage, iChange: restarts}
 	revalidate := func() bool {
-		return w.index.mxCommitFrame.LoadLocal() == mxFrame && w.index.nBackfill.Load() == nBackfill &&
+		f, n := w.index.mxCommitFrame.LoadCommit()
+		return f == mxFrame && n == nPage && w.index.nBackfill.Load() == nBackfill &&
 			w.index.restarts.Load() == restarts
 	}
 
