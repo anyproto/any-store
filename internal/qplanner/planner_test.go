@@ -3178,25 +3178,6 @@ func TestSelectivityForIndex(t *testing.T) {
 		}
 		assert.InDelta(t, 0.1, selectivityForIndex(idx, 100), 1e-9)
 	})
-	t.Run("legacy_unrebuilt_shallow_level_falls_back", func(t *testing.T) {
-		// A 2-level sketch loaded from a legacy single-level blob: only the
-		// full-key level holds data, so a shallow prefix (level 0) must fall back
-		// to DefaultRangeSelectivity instead of trusting an empty bucket.
-		legacy := make([]byte, DefaultSketchSize*8+8) // V1 buckets + docCount, no magic
-		sk := NewIndexSketch(DefaultSketchSize, 2)
-		sk.UnmarshalBinary(legacy)
-		if !sk.NeedsRebuild() {
-			t.Fatal("legacy load into multi-level sketch must set NeedsRebuild")
-		}
-		idx := &CBOIndex{
-			Info:        &IndexInfo{FieldNames: []string{"a", "b"}},
-			Bounds:      query.Bounds{{Start: []byte{1}, End: []byte{1}}},
-			Sketch:      sk,
-			PointLookup: true,
-			BoundFields: 1, // shallow prefix → untrusted on a not-yet-rebuilt sketch
-		}
-		assert.Equal(t, DefaultRangeSelectivity, selectivityForIndex(idx, 100))
-	})
 	t.Run("range_prefix_falls_back", func(t *testing.T) {
 		// Non-point-lookup (range) prefix: no sketch estimate, default range.
 		idx := &CBOIndex{

@@ -241,7 +241,7 @@ A database file keeps the on-disk format it was created with.
 | 5 | v2.0.0 – v2.4.x | every v2 release |
 | 6 | v2.5.0 and later | v2.5.0 and later |
 
-Format 6 keeps a document or index entry of up to about one page (4,045 bytes on the default page size) on its b-tree leaf; format 5 moves anything over 997 bytes to a page of its own. A format 5 file opened by v2.5.0 or later stays format 5 and is read and written as before.
+Format 6 keeps a document or index entry of up to about one page (4,045 bytes on the default page size) on its b-tree leaf; format 5 moves anything over 997 bytes to a page of its own. Format 6 also stores the planner's statistics compressed: a row per index that takes about 100 bytes for a small collection, where format 5 keeps 8 KB per indexed field. A format 5 file opened by v2.5.0 or later stays format 5 and is read and written as before.
 
 Opening a format 6 file with v2.4.4 fails with `ErrIncompatibleVersion` and leaves the file unchanged. Releases before v2.4.4 refuse it as a corrupt file and do not read it either: do not go back past v2.4.4 once a release that creates format 6 files has run.
 

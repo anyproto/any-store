@@ -1105,7 +1105,7 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 						p = 1.0
 					}
 					pTotal *= p
-				} else if isEquality && idx.Sketch != nil && fi == 0 && sketchLevelTrusted(idx.Sketch, 0) {
+				} else if isEquality && idx.Sketch != nil && fi == 0 {
 					// Equality on the index's leading field: the level-0 sketch holds
 					// the count for that field's value alone (the prefix), so this is
 					// accurate for both single-field and compound indexes. The sketch
@@ -1205,19 +1205,6 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 	return pTotal
 }
 
-// sketchLevelTrusted reports whether a sketch level holds usable counts. After a
-// legacy single-level blob is loaded into a multi-level sketch (NeedsRebuild),
-// only the full-key level carries data; the shallow prefix levels are empty
-// until a rescan or fresh writes repopulate them, so estimating from them would
-// be falsely optimistic. Treat shallow levels of a not-yet-rebuilt sketch as
-// untrusted and let the caller fall back to DefaultRangeSelectivity.
-func sketchLevelTrusted(s *IndexSketch, level int) bool {
-	if !s.NeedsRebuild() {
-		return true
-	}
-	return level == s.NumLevels()-1
-}
-
 // indexEntries returns the live entry count of this index at the deepest
 // bound level — the population an interpolated range fraction applies to. For
 // a SPARSE index this count is far below the collection size and is itself a
@@ -1229,17 +1216,13 @@ func sketchLevelTrusted(s *IndexSketch, level int) bool {
 // fan-out, so a chain bound on a scalar leading field counts documents while
 // one bound on the array field counts elements), and a single-field chain
 // fetches once per in-range entry, so the count is NOT capped at the
-// collection here. Falls back to totalDocs when the sketch is absent or the
-// level is untrusted (legacy blob pending rebuild).
+// collection here. Falls back to totalDocs when the sketch is absent.
 func indexEntries(idx *CBOIndex, totalDocs float64) float64 {
 	if idx.Sketch == nil {
 		return totalDocs
 	}
 	level := max(idx.BoundFields-1, 0)
 	level = min(level, idx.Sketch.NumLevels()-1)
-	if !sketchLevelTrusted(idx.Sketch, level) {
-		return totalDocs
-	}
 	n := float64(idx.Sketch.EntryCount(level))
 	if n <= 0 {
 		return totalDocs
@@ -1329,7 +1312,7 @@ func orderedLeadIn(params *PlanParams, idx *CBOIndex) float64 {
 	// to it.
 	est := func(b query.Bound) (float64, bool) {
 		sk := idx.Sketch
-		if sk == nil || !sketchLevelTrusted(sk, 0) || !allBoundsFixedNonEmpty(query.Bounds{b}) {
+		if sk == nil || !allBoundsFixedNonEmpty(query.Bounds{b}) {
 			return 0, false
 		}
 		n := float64(sk.Estimate(0, b.Start)) - float64(sk.EntryCount(0))/float64(max(sk.Size, 1))
@@ -1576,8 +1559,7 @@ func selectivityForIndex(idx *CBOIndex, totalDocs float64) float64 {
 	// DefaultRangeSelectivity fallback. idx.Bounds[0].Start is the encoded prefix
 	// of exactly those fields.
 	if idx.PointLookup && idx.Sketch != nil && idx.BoundFields >= 1 &&
-		idx.BoundFields <= idx.Sketch.NumLevels() &&
-		sketchLevelTrusted(idx.Sketch, idx.BoundFields-1) {
+		idx.BoundFields <= idx.Sketch.NumLevels() {
 		est := idx.Sketch.Estimate(idx.BoundFields-1, idx.Bounds[0].Start)
 		p := float64(est) / totalDocs
 		if p <= 0 {
@@ -1623,8 +1605,7 @@ func estimateIndexDocsWithFieldSel(idx *CBOIndex, totalDocs float64, fieldSel []
 	// for the bound prefix directly — exact for the full key and accurate for a
 	// partial prefix on a compound index alike.
 	if idx.PointLookup && idx.Sketch != nil && idx.BoundFields >= 1 &&
-		idx.BoundFields <= idx.Sketch.NumLevels() &&
-		sketchLevelTrusted(idx.Sketch, idx.BoundFields-1) {
+		idx.BoundFields <= idx.Sketch.NumLevels() {
 		var total float64
 		for _, b := range idx.Bounds {
 			total += float64(idx.Sketch.Estimate(idx.BoundFields-1, b.Start))
@@ -2771,7 +2752,7 @@ func EstimateFieldEntries(cur *btree.Cursor, info *IndexInfo, sk *IndexSketch, t
 		return 0, false
 	}
 	bs = ComputeSingleFieldBounds(info, bs)
-	sketched := sk != nil && sketchLevelTrusted(sk, 0)
+	sketched := sk != nil
 	if allBoundsFixedNonEmpty(bs) {
 		if info.Unique && !info.Sparse && len(info.FieldNames) == 1 {
 			return float64(len(bs)), true

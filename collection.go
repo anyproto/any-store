@@ -1108,7 +1108,7 @@ func (c *collection) buildRangeIndex(tx *btree.WriteTx, s *collSchema, info Inde
 
 	// Persist the sketch
 	skKey := sketchKey(s.name, info.Name)
-	if err = tx.Put(c.db.systemNS, skKey, idx.sketch.MarshalBinary(nil)); err != nil {
+	if err = tx.Put(c.db.systemNS, skKey, c.db.marshalSketch(idx.sketch, nil)); err != nil {
 		return nil, err
 	}
 	// Publish the live sketch as the reader snapshot before the index becomes
@@ -1758,13 +1758,18 @@ func (c *collection) reloadSketch(tx *btree.ReadTx, collName string, idx *index,
 	// republishes live concurrently (settleSketches takes no c.mu) is
 	// overtaken by this snapshot's bytes, as a fresh object would be. Bytes
 	// of another shape (a snapshot older than this handle's definition) go
-	// into a fresh object: a published one is never reshaped.
+	// into a fresh object: a published one is never reshaped. Bytes that do
+	// not decode publish nothing: the fresh object would be an empty sketch
+	// in place of the counts readers have.
 	pub := idx.loadPubSketch()
+	into := pub
 	if pub == nil || pub == idx.sketch || !pub.SameShape(data) {
-		pub = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
+		into = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
 	}
-	pub.UnmarshalBinary(data)
-	idx.storePubSketch(pub)
+	if !into.UnmarshalBinary(data) && pub != nil {
+		return
+	}
+	idx.storePubSketch(into)
 }
 
 // indexInfoEqual reports whether two IndexInfo values describe the same index
@@ -1797,7 +1802,7 @@ func (c *collection) persistSketches(tx *btree.WriteTx, s *collSchema, t *common
 	for _, idx := range s.indexes {
 		if idx.sketchModified {
 			key := sketchKey(s.name, idx.info.Name)
-			idx.sketchBuf = idx.sketch.MarshalBinary(idx.sketchBuf)
+			idx.sketchBuf = c.db.marshalSketch(idx.sketch, idx.sketchBuf)
 			if err := tx.Put(c.db.systemNS, key, idx.sketchBuf); err != nil {
 				return err
 			}
