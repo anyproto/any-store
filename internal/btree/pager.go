@@ -91,8 +91,9 @@ type pager struct {
 	dbSize      atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
 	state       atomic.Int32  // pagerState
 
-	// noWalCommitSize memoizes the database file's size for readers whose
-	// snapshot header carries no committed size. See effectiveReaderDbSize.
+	// noWalCommitSize memoizes the database file's size for multi-process
+	// readers whose snapshot header carries no committed size. See
+	// effectiveReaderDbSize.
 	noWalCommitSize atomic.Pointer[noWalCommitSize]
 
 	// balanceQuickDispatchCount counts dispatches into splitLeafRightmostAppend.
@@ -771,8 +772,9 @@ func (p *pager) readPage1AtOpen() error {
 	}
 
 	// sqlite3WalDbsize: the snapshot header's nPage. Heap shm publishes no
-	// header on commit (the snapshot header is synthesized), so there the
-	// size is the wal's own record of the last commit.
+	// header on commit, so there the size is the wal's own record of the
+	// last commit; the synthesized header's nPage is not used here, open
+	// being what seeds it for a WAL with no commit (seedCommittedSize).
 	walNPage := hdr.nPage
 	if p.inProcess || p.inMemory {
 		walNPage = 0
@@ -790,7 +792,21 @@ func (p *pager) readPage1AtOpen() error {
 	}
 	p.header = header
 	p.dbSize.Store(nPage)
+	p.seedCommittedSize(nPage)
 	return nil
+}
+
+// seedCommittedSize records the database size settled at open as the size of
+// the last commit, for the read begins of the in-process and in-memory
+// modes, whose snapshot header takes its nPage from that record
+// (tryBeginReadInProcessHdr). A WAL with commits has recorded the same size
+// at recovery; one with none has recorded nothing, and the size is page 1's
+// and the file's. A multi-process reader has the shared header and the file
+// (effectiveReaderDbSize) and does not read the record.
+func (p *pager) seedCommittedSize(nPage uint32) {
+	if p.inProcess || p.inMemory {
+		p.wal.index.mxCommitFrame.StoreSize(nPage)
+	}
 }
 
 // testOpenAfterWALOpenHook runs in open between the WAL attach and the
@@ -952,6 +968,7 @@ func (p *pager) initNewDB() error {
 	if err := p.wal.open(); err != nil {
 		return err
 	}
+	p.seedCommittedSize(p.dbSize.Load())
 
 	p.state.Store(int32(pagerOpen))
 	return nil
@@ -2061,15 +2078,23 @@ func (p *pager) getHasContent(pgno uint32) bool {
 //     open of a checkpointed database), and the size is the database file's,
 //     rounded up, as pagerPagecount takes it from sqlite3OsFileSize.
 //
-// In-process mode has no file fallback: its writers publish no wal-index
-// header (the snapshot header is synthesized without a size), no other
-// process can change the database, and p.dbSize is the authoritative
-// same-process counter.
+// The in-process and in-memory modes publish no wal-index header; their
+// snapshot header is synthesized at the read begin with the same field: the
+// size recorded by the last commit at or below the snapshot's frame, loaded
+// in one word with that frame (commitFrameCounter), and seeded at open for a
+// WAL with no commit (seedCommittedSize). So they take the first branch too
+// and need no file fallback.
 //
-// Multi-process readers must never bound-check against p.dbSize: that atomic
-// is the writer's allocation counter, refreshed only on the write path
-// (beginWrite -> refreshHeaderFromPage1), so a process that has not written
-// since a peer grew the database would reject the peer's pages as corrupt.
+// No reader may bound-check against p.dbSize. That atomic is the writer's
+// allocation counter: it moves inside an open write transaction (allocation
+// grows it, truncateTo shrinks it at once, rollback puts it back), so a
+// reader of the committed snapshot bounded by it would see the pages above
+// an uncommitted truncation as out of range; and in a multi-process file it
+// is refreshed only on the write path (beginWrite -> refreshHeaderFromPage1),
+// so a process that has not written since a peer grew the database would
+// reject the peer's pages as corrupt. The last return is for a header with no
+// size outside the multi-process mode, which no read begin of an open
+// database produces; p.dbSize is all there is to answer with.
 //
 // A failed file-size query is the read begin's error, as pagerPagecount
 // returns it (pager.c:3299-3303); there is no fallback to p.dbSize.
@@ -2793,6 +2818,10 @@ func (p *pager) pagerError() {
 	// writeHeader (wal.go), so a writeHeader failure leaves mxCommitFrame
 	// ahead of the rolled-back WAL state. At beginWrite() time,
 	// mxCommitFrame == nFrame == savedWalFrame, so restore to that value.
+	// The database size recorded with it stays: only the in-process and
+	// in-memory modes read it, and there nothing can fail once a commit has
+	// stored the pair, so the cursor is already savedWalFrame and the size
+	// the last commit's.
 	p.wal.index.mxCommitFrame.Store(p.savedWalFrame.Load())
 
 	// Truncate in-memory WAL frames to match restored nFrame.

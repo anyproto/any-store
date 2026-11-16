@@ -611,11 +611,14 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// corrupted headers claiming billions of pages. This matches SQLite's
 	// approach where btreePagecount() is the pager's count, not the header
 	// field. The count is the one every reader of this snapshot uses
-	// (effectiveReaderDbSize: the wal-index header's committed size, else
-	// the file's). The process-local walIndex.maxPage must not be the cap:
-	// in a process that has not begun a write since a peer grew the
-	// database it is stale, and the peer's pages, still only in the WAL,
-	// were reported as invalid page numbers.
+	// (effectiveReaderDbSize: the snapshot header's committed size, else
+	// the file's; pagerPagecount, pager.c:3279-3306). Neither process-local
+	// count may be the cap. walIndex.maxPage is stale in a process that has
+	// not begun a write since a peer grew the database, and the peer's
+	// pages, still only in the WAL, were reported as invalid page numbers.
+	// pager.dbSize is the writer's live count: a write transaction open in
+	// this process that has truncated the database would cap the check
+	// below pages the committed snapshot still owns.
 	maxPossible, err := db.pager.effectiveReaderDbSize(walHdr)
 	if err != nil {
 		return err
