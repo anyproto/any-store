@@ -188,8 +188,12 @@ func TestCopyLock_NameChangesUnderTheOpen(t *testing.T) {
 				case "removed":
 					require.NoError(t, os.Remove(p))
 				default:
-					require.NoError(t, os.Remove(p))
-					require.NoError(t, os.WriteFile(p, []byte("other"), 0o644))
+					// Made while the original still exists, so it cannot
+					// get the original's identity, as a file created after
+					// the original's removal can on a filesystem that
+					// reuses the freed inode at once.
+					require.NoError(t, os.WriteFile(p+".new", []byte("other"), 0o644))
+					require.NoError(t, os.Rename(p+".new", p))
 				}
 			}
 			defer func() { testHookReservedLstat = nil }()
