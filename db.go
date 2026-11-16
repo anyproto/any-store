@@ -472,11 +472,12 @@ func indexKeyPrefix(collName string) string {
 // single record) so families can't cross-collide. Within a family one key can
 // stand for two pairs: collection "A:b" index "c" and collection "A" index
 // "b:c" both derive idx:A:b:c and ix:A:b:c. Creating the second of the two
-// finds the first one's catalog record: ErrIndexMismatch for another
-// definition, ErrIndexExists for the same one, which EnsureIndex takes for
-// the index it asked for. The scan of collection "A"'s prefix "idx:A:" also
-// meets the records of "A:b"; getIndexInfos takes a record only under the
-// key its own name derives. Rejecting ":" would also strand pre-validation
+// finds the first one's catalog record, which stores the first one's index
+// name: registerIndex refuses it with btree.ErrNamespaceExists, for
+// CreateIndex and EnsureIndex alike and whatever the definition, since the
+// record's index is the other collection's. The scan of collection "A"'s
+// prefix "idx:A:" also meets the records of "A:b"; getIndexInfos takes a
+// record only under the key its own name derives. Rejecting ":" would also strand pre-validation
 // files whose collection names legally contain it.
 // maxNameLen caps collection and index names. Derived namespace names embed
 // both plus a family prefix/suffix (widest: fts "ftx:"+coll+":"+index+":vocab",
@@ -2045,10 +2046,25 @@ func fulltextDefMatches(fv *anyenc.Value, p *FulltextParams) bool {
 // (fields / unique / sparse) returns ErrIndexMismatch — a redefinition is never
 // applied silently. This mirrors SQLite, where CREATE INDEX never mutates an
 // existing object's definition in place; the caller must DROP then CREATE.
+//
+// A record under the key that stores another index name is not this
+// collection's: the key is also the one of a collection whose name continues
+// collName past a ":" (see validateCollectionName), and getIndexInfos gives
+// the record to that collection alone. It is refused with
+// btree.ErrNamespaceExists whatever its definition: taking an identical one
+// for this collection's index would let EnsureIndex report an index the
+// collection does not have.
 func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) error {
 	key := indexKey(collName, info.Name)
 	// Check if already exists
 	if existing, err := tx.Get(db.systemNS, key); err == nil {
+		var p anyenc.Parser
+		if v, perr := p.Parse(existing); perr == nil {
+			if stored := v.GetString("name"); stored != info.Name {
+				return fmt.Errorf("any-store: collection %q: index %q: the catalog key %q holds index %q of another collection: %w",
+					collName, info.Name, key, stored, btree.ErrNamespaceExists)
+			}
+		}
 		if indexDefMatches(existing, info) {
 			return ErrIndexExists
 		}

@@ -137,6 +137,64 @@ func TestGetIndexInfos_NameBeginsAnotherCollection(t *testing.T) {
 	assert.Equal(t, 1, n)
 }
 
+// Collection "A" asking for index "b:c" derives the catalog key of
+// collection "A:b"'s index "c". The record there is not "A"'s, so neither
+// EnsureIndex nor CreateIndex takes it for the index asked for, the same
+// definition or not: both fail with ErrNamespaceExists, "A" gets no index,
+// and "A:b" keeps its own.
+func TestRegisterIndex_KeyOfAnotherCollectionsIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	fx, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, fx.Close()) }()
+	a, err := fx.CreateCollection(ctx, "A")
+	require.NoError(t, err)
+	ab, err := fx.CreateCollection(ctx, "A:b")
+	require.NoError(t, err)
+	require.NoError(t, ab.EnsureIndex(ctx, IndexInfo{Name: "c", Fields: []string{"x"}, Unique: true}))
+	require.NoError(t, ab.Insert(ctx, anyenc.MustParseJson(`{"id":1,"x":1}`)))
+
+	same := IndexInfo{Name: "b:c", Fields: []string{"x"}, Unique: true}
+	other := IndexInfo{Name: "b:c", Fields: []string{"y"}}
+	check := func(t *testing.T, a, ab Collection) {
+		t.Helper()
+		for _, info := range []IndexInfo{same, other} {
+			err := a.EnsureIndex(ctx, info)
+			require.ErrorIs(t, err, btree.ErrNamespaceExists)
+			assert.NotErrorIs(t, err, ErrIndexExists)
+			assert.Contains(t, err.Error(), `"idx:A:b:c" holds index "c" of another collection`)
+			require.ErrorIs(t, a.CreateIndex(ctx, info), btree.ErrNamespaceExists)
+		}
+		assert.Empty(t, a.GetIndexes(), "A has no index")
+		// No unique index on A: equal values of x go in.
+		for _, id := range []int{1, 2} {
+			require.NoError(t, a.UpsertOne(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"x":1}`, id))))
+		}
+		assertCollCount(t, a, 2)
+		// A:b's index is as it was, and still unique.
+		require.Len(t, ab.GetIndexes(), 1)
+		assert.Equal(t, "c", ab.GetIndexes()[0].Info().Name)
+		require.NoError(t, ab.EnsureIndex(ctx, IndexInfo{Name: "c", Fields: []string{"x"}, Unique: true}))
+		require.ErrorIs(t, ab.Insert(ctx, anyenc.MustParseJson(`{"id":2,"x":1}`)), ErrUniqueConstraint)
+		n, err := ab.Find(`{"x":1}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+		assertCollCount(t, ab, 1)
+	}
+	check(t, a, ab)
+
+	// The same from the file.
+	require.NoError(t, fx.Close())
+	fx, err = Open(ctx, path, nil)
+	require.NoError(t, err)
+	a, err = fx.OpenCollection(ctx, "A")
+	require.NoError(t, err)
+	ab, err = fx.OpenCollection(ctx, "A:b")
+	require.NoError(t, err)
+	check(t, a, ab)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
 func TestDb_GetCollectionNames(t *testing.T) {
 	fx := newFixture(t)
 	var collNames = []string{"c1", "c2", "c3"}
