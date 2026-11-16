@@ -2648,7 +2648,7 @@ func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
 // Only the writer's cache has xStress set; reader caches have no stress callback.
 // Modeled after SQLite's pagerStress() (pager.c:4609-4681).
 // DRIFT: pagerStress guards pgno==1; C relies on page-1 staying pinned (never a victim) See docs/btree/NOTES.md#old-drift-pagerstress-page1-exclusion
-// DRIFT: pagerStress spills only for pagerWriter without closeInvalidated; C needs no test, since a close cannot end its transaction under a statement See docs/btree/NOTES.md#drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer
+// DRIFT: pagerStress spills only for pagerWriter without closeInvalidated, and writeFrames re-checks under the WAL mutex; C needs no test, since a close cannot end its transaction under a statement See docs/btree/NOTES.md#drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer
 func (p *pager) pagerStress(pg *page) error {
 	st := pagerState(p.state.Load())
 
@@ -2671,13 +2671,22 @@ func (p *pager) pagerStress(pg *page) error {
 	// releases the write lock, leaving the dirty cache to a writer that may
 	// still be inside an operation and meets writeStateErr only at the next
 	// boundary. A spill from that writer would land where the next writer,
-	// in this process or another, appends. rollbackForClose leaves the state
-	// pagerOpen, which the state test catches; closeInvalidated, loaded
-	// after the state and set before it is demoted, also stops a spill that
-	// saw the state just before. The refused page stays dirty and the cache
-	// grows past its limit, as under doNotSpill.
+	// in this process or another, appends. The guard has two steps. This
+	// one refuses a spill that starts after the rescue: rollbackForClose
+	// leaves the state pagerOpen, and sets closeInvalidated, which is loaded
+	// after the state, before it demotes it. A spill that passed this test
+	// just before the rescue is stopped by the second: writeFrames tests
+	// writeEndedByClose under the WAL mutex before it writes, and the rescue
+	// sets it, rewinds the log and releases the write lock under that
+	// mutex, so the spill writes either entirely before the rewind, which
+	// drops its frame, or nothing (errWriteEndedByClose below). A refused
+	// page stays dirty and the cache grows past its limit, as under
+	// doNotSpill.
 	if st != pagerWriter || p.closeInvalidated.Load() {
 		return nil
+	}
+	if testStressGuardPassedHook != nil {
+		testStressGuardPassedHook()
 	}
 
 	// Do not spill if OFF or ROLLBACK flags are set (SQLite pager.c:4636-4641).
@@ -2705,6 +2714,12 @@ func (p *pager) pagerStress(pg *page) error {
 
 	// Write the page to WAL without commit (SQLite pager.c:4649).
 	if err := p.wal.writeFrames([]*page{pg}, false, 0); err != nil {
+		if errors.Is(err, errWriteEndedByClose) {
+			// Close ended the transaction after the guard above: nothing
+			// was written, and the transaction is not this goroutine's to
+			// clean up. A refused spill.
+			return nil
+		}
 		// Transition to error state on WAL write failure, matching SQLite's
 		// return pager_error(pPager, rc) at pager.c:4680. Without this the
 		// error is silently dropped by pcache.create() (which has no error
@@ -2735,6 +2750,10 @@ func (p *pager) pagerStress(pg *page) error {
 // testAfterSpillHook, when non-nil, runs once pagerStress has written a
 // spilled page to the WAL. Test-only.
 var testAfterSpillHook func()
+
+// testStressGuardPassedHook, when non-nil, runs in pagerStress once a spill
+// has passed the writer-state guard, before anything is written. Test-only.
+var testStressGuardPassedHook func()
 
 // commit writes all dirty pages to WAL and commits the transaction.
 // hasChanges reports whether the write transaction has anything to commit:
@@ -3078,7 +3097,9 @@ func (p *pager) rollbackLocked() error {
 // is deliberately left untouched because the writer goroutine may still be
 // in a B-tree operation accessing those structures, and pcache has no mutex.
 // Since the database is closing, that state will be GC'd.
-// Caller must hold writerOpMu.
+// Caller must hold writerOpMu; it takes the WAL mutex inside it, the order
+// a commit's writeFrames takes them in.
+// DRIFT: ends the write transaction under the WAL mutex and marks the WAL (writeEndedByClose) for a writer still running; C cannot close under a statement See docs/btree/NOTES.md#drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer
 func (p *pager) rollbackForClose() {
 	st := pagerState(p.state.Load())
 	if st != pagerWriter && st != pagerError {
@@ -3091,16 +3112,23 @@ func (p *pager) rollbackForClose() {
 	// ErrClosed rather than ErrReadOnly.
 	p.closeInvalidated.Store(true)
 
-	// Roll back spilled frames in the WAL index.
-	// index.rollbackToFrame and nFrame are safe (own locking / atomic).
-	baseFrame := p.walBaseFrame()
-	p.wal.index.rollbackToFrame(baseFrame)
-	p.wal.nFrame.Store(baseFrame)
+	// The WAL side runs under the WAL mutex, which a spill holds from its
+	// test of writeEndedByClose in writeFrames to its last write: a spill
+	// that passed pagerStress's guard before closeInvalidated was set has
+	// either written its frame by now, and the rewind below drops it, or
+	// will find writeEndedByClose set and write nothing. The base frame is
+	// read under the mutex too: a spill's restart of the log moves it.
+	w := p.wal
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.writeEndedByClose = true
 
-	if p.wal.inMemory {
-		p.wal.mu.Lock()
-		p.wal.memFrames = p.wal.memFrames[:baseFrame]
-		p.wal.mu.Unlock()
+	// Roll back spilled frames in the WAL index.
+	baseFrame := p.walBaseFrame()
+	w.index.rollbackToFrame(baseFrame)
+	w.nFrame.Store(baseFrame)
+	if w.inMemory {
+		w.memFrames = w.memFrames[:baseFrame]
 	}
 
 	// Skip hasContent, header, savepoints, and WAL
@@ -3109,7 +3137,7 @@ func (p *pager) rollbackForClose() {
 	// here would be a data race. None of it matters after Close().
 
 	p.state.Store(int32(pagerOpen))
-	p.wal.endWrite()
+	w.endWrite()
 }
 
 // pagerError transitions the pager to the error state. It ensures the WAL

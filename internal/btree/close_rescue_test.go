@@ -107,3 +107,77 @@ func TestCloseRescue_AbandonedWriterDoesNotSpill(t *testing.T) {
 	require.Equal(t, closeRescueRows, countKeys(t, db, "t"))
 	require.NoError(t, db.IntegrityCheck())
 }
+
+// A spill that has passed pagerStress's guard when Close rescues the
+// transaction writes nothing. The hook runs the rescue at that point, after
+// the guard and before the log write: writeFrames tests under the WAL mutex
+// what the rescue sets there before it rewinds the log, so the page stays
+// dirty and no frame lands past the base. (An InMemory database never
+// spills: its writer cache is not purgeable.)
+func TestCloseRescue_SpillPastGuardWritesNothing(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		opts Options
+	}{
+		{"shared wal-index", Options{}},
+		{"InProcess", Options{InProcess: true}},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			opts := mode.opts
+			opts.CacheSize = closeRescueCache
+			opts.DisableAutoCheckpoint = true
+			path := filepath.Join(t.TempDir(), "test.db")
+			db, err := testOpen(t, path, opts)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = db.Close() })
+			createNS(t, db, "t")
+			putN(t, db, "t", closeRescueRows, closeRescueValSize)
+
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			ns, err := tx.GetNamespace("t")
+			require.NoError(t, err)
+			p := db.pager
+			base := p.wal.nFrame.Load()
+			fillWriterCacheDirty(t, p)
+			walSize := func() int64 {
+				info, err := os.Stat(path + "-wal")
+				require.NoError(t, err)
+				return info.Size()
+			}
+			sizeAtBase := walSize()
+
+			var spills, rescues atomic.Int32
+			testAfterSpillHook = func() { spills.Add(1) }
+			testStressGuardPassedHook = func() {
+				if rescues.Add(1) == 1 {
+					rescueAsClose(db)
+				}
+			}
+			t.Cleanup(func() {
+				testAfterSpillHook = nil
+				testStressGuardPassedHook = nil
+			})
+
+			// The first miss on the full cache calls pagerStress, and the
+			// rescue runs once the spill has passed the guard. Every later
+			// miss is refused at the guard.
+			for i := 1; i <= closeRescueRows; i++ {
+				_, err := tx.Get(ns, closeRescueKey(i))
+				require.NoError(t, err)
+			}
+			require.Equal(t, int32(1), rescues.Load(), "no spill passed the guard")
+			require.Zero(t, spills.Load(), "a page was spilled after Close ended the transaction")
+			require.Equal(t, base, p.wal.nFrame.Load())
+			require.Equal(t, base, p.wal.index.maxFrame.Load())
+			require.Equal(t, sizeAtBase, walSize())
+			require.ErrorIs(t, tx.Put(ns, closeRescueKey(1), []byte("x")), ErrClosed)
+
+			require.NoError(t, db.Close())
+			db, err = testOpen(t, path, Options{InProcess: opts.InProcess})
+			require.NoError(t, err)
+			require.Equal(t, closeRescueRows, countKeys(t, db, "t"))
+			require.NoError(t, db.IntegrityCheck())
+		})
+	}
+}
