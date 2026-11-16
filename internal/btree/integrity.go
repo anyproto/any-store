@@ -616,7 +616,9 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// the file's). The process-local committed position must not be used: in
 	// a process that has not begun a write since a peer grew the database it
 	// is stale, and the peer's pages, still only in the WAL, were reported as
-	// invalid page numbers.
+	// invalid page numbers. Nor may pager.dbSize, the writer's live count: a
+	// write transaction open in this process that has truncated the database
+	// would cap the check below pages the committed snapshot still owns.
 	maxPossible, err := db.pager.effectiveReaderDbSize(walHdr)
 	if err != nil {
 		return err

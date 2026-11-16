@@ -1211,18 +1211,44 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 	// inside its begins, as any transaction begin does, so the time until
 	// Backup gives up is this timeout plus the waits of the last Step's
 	// begins, not the timeout alone.
+	//
+	// Batches alone do not bound the copy. Between two Steps the source is
+	// free, and whatever changes it other than a commit of this process
+	// sends the copy back to page 1: a rollback of this process that undid
+	// anything (sqlite3BackupRestart from pagerUndoCallback and
+	// pagerRollbackWal, pager.c:3139, 3147-3168), a commit by another
+	// process (pager_reset, pager.c:1774). A Step that copies after such a
+	// restart returns nil like any other and starts the clock again, so a
+	// process that keeps rolling back (every write that fails after touching
+	// a page does) would keep the copy from ever reaching the last page.
+	// Once the copy has been restarted backupRestartLimit times, the rest
+	// goes in one Step, the way sqlite3_backup_step(p, -1) copies every
+	// remaining page in one call (backup.c:390). That Step holds this
+	// process's write lock on the source from start to end (btree
+	// Backup.Step), so no write transaction of this process, and no
+	// rollback, runs inside it: the writers wait for it instead, and a
+	// restart that landed before it only makes it start at page 1. It ends
+	// with the copy done, or busy, which is retried as above, or with the
+	// ctx's error if the ctx ends while it copies.
 	const batch = 256
 	lastCopied := time.Now()
 	for busy := 0; ; {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
-		serr := b.Step(ctx, batch)
+		nPage := batch
+		if b.Restarts() >= backupRestartLimit {
+			nPage = -1
+		}
+		serr := b.Step(ctx, nPage)
 		if errors.Is(serr, btree.ErrBackupDone) {
 			break
 		}
 		if serr == nil {
 			lastCopied, busy = time.Now(), 0
+			if testBackupSteppedHook != nil {
+				testBackupSteppedHook()
+			}
 			continue
 		}
 		if !isBusyErr(serr) || time.Since(lastCopied) >= backupBusyTimeout {
@@ -1253,13 +1279,26 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 // Test hooks of Backup. testBackupOpenHook runs twice: with nil right before
 // the destination is opened, and with the destination once it is open.
 // testBackupBusyWaitHook runs each time Backup is about to wait before it
-// retries a busy Step. testBackupCopiedHook runs once the copy is committed,
-// before the bookkeeping on it.
+// retries a busy Step. testBackupSteppedHook runs after each Step that copied
+// and left pages to copy, with nothing of the source held.
+// testBackupCopiedHook runs once the copy is committed, before the
+// bookkeeping on it.
 var (
 	testBackupOpenHook     func(dst *btree.DB)
 	testBackupBusyWaitHook func()
+	testBackupSteppedHook  func()
 	testBackupCopiedHook   func()
 )
+
+// backupRestartLimit is how many times Backup lets its copy be restarted
+// before it copies the rest in one Step (see the loop). Batches are the
+// polite way to copy, with writers of this process running in between, and
+// a restart or two is what an occasional failed write or a peer's commit
+// costs; a copy restarted this many times is not converging, and each
+// further attempt throws away up to the whole database's worth of copying.
+// A small fixed number: the one Step costs the writers of this process one
+// wait of a full copy, no more than the batches had already spent.
+const backupRestartLimit = 3
 
 // backupBusyTimeout is how long Backup retries busy Steps after the last one
 // that copied: the busy timeout of a transaction begin. A variable for tests.

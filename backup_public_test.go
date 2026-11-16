@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -405,4 +406,77 @@ func TestBackupPublic_CloseDuringBusyWait(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Backup did not return after Close")
 	}
+}
+
+// Backup finishes while the same process keeps rolling back write
+// transactions. Every rollback that undid something restarts the copy
+// (sqlite3BackupRestart from pagerUndoCallback, pager.c:3139), and a copy
+// made only of batches never reaches the last page when a rollback lands
+// between every two of them. After BackupRestartLimit restarts Backup copies
+// the rest in one Step, as sqlite3_backup_step(p, -1) does (backup.c:390),
+// which no write transaction of this process interleaves.
+//
+// The rollbacks are not timed: one runs after every Step that left pages to
+// copy, which is the schedule a writer failing every few milliseconds
+// settles into against a source that takes longer than that to copy.
+func TestBackupPublic_FinishesUnderRollbacks(t *testing.T) {
+	ctx := context.Background()
+	src, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "src.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = src.Close() })
+	coll, err := src.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+
+	// A source several batches of 256 pages long. The padding is random so
+	// that it does not compress away.
+	const docs = 1000
+	rnd := rand.New(rand.NewSource(1))
+	pad := make([]byte, 1500)
+	wtx, err := src.WriteTx(ctx)
+	require.NoError(t, err)
+	for i := 0; i < docs; i++ {
+		_, _ = rnd.Read(pad)
+		require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%x"}`, i, pad))))
+	}
+	require.NoError(t, wtx.Commit())
+
+	// The failure signal is a count, not a clock: without the bound Backup is
+	// still restarting after BackupRestartLimit rollbacks, so the hook
+	// cancels it on the next one. The fixed loop never gets there.
+	bctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// The write that fails after touching pages: insert, roll back.
+	rollbacks := 0
+	var hookErr error
+	anystore.SetBackupSteppedHook(func() {
+		if rollbacks >= anystore.BackupRestartLimit {
+			cancel()
+			return
+		}
+		tx, err := src.WriteTx(ctx)
+		if err != nil {
+			hookErr = err
+			return
+		}
+		if err := coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":"rolled back"}`)); err != nil {
+			hookErr = err
+		}
+		if err := tx.Rollback(); err != nil {
+			hookErr = err
+		}
+		rollbacks++
+	})
+	t.Cleanup(func() { anystore.SetBackupSteppedHook(nil) })
+
+	dst := filepath.Join(t.TempDir(), "dst.db")
+	err = src.Backup(bctx, dst)
+	require.NoError(t, hookErr)
+	require.NoError(t, err, "Backup must finish while this process rolls transactions back (%d rollbacks)", rollbacks)
+	require.Equal(t, anystore.BackupRestartLimit, rollbacks, "batches until the limit, then one Step for the rest")
+
+	st, err := os.Stat(dst)
+	require.NoError(t, err)
+	require.Greater(t, st.Size(), int64(3*256*4096), "setup: the copy is several batches long")
+	requireBackupOf(t, dst, docs)
 }

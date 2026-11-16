@@ -17,6 +17,10 @@
     ],
     "note": ""
   },
+  "backup.go:*Backup.Restarts": {
+    "sqlite": [],
+    "note": "no C counterpart: how many restarts threw copied pages away; read by the public Backup to stop stepping in batches"
+  },
   "backup.go:*Backup.Step": {
     "sqlite": [
       "backup.c:sqlite3_backup_step"
@@ -42,6 +46,12 @@
       "backup.c:sqlite3BackupRestart"
     ],
     "note": "called by the source pager when a write transaction that sent the backup pages ends without committing them all (rollback, error cleanup, unwind); no-op on a finished backup"
+  },
+  "backup.go:*Backup.restartLocked": {
+    "sqlite": [
+      "backup.c:sqlite3BackupRestart"
+    ],
+    "note": "p->iNext = 1 (backup.c:705), counted when pages had been copied; body of restart and of the Step that finds the source changed"
   },
   "backup.go:*Backup.stepBusy": {
     "sqlite": [

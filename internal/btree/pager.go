@@ -101,8 +101,9 @@ type pager struct {
 	dbSize       atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
 	state        atomic.Int32  // pagerState
 
-	// noWalCommitSize memoizes the database file's size for readers whose
-	// snapshot header carries no committed size. See effectiveReaderDbSize.
+	// noWalCommitSize memoizes the database file's size for multi-process
+	// readers whose snapshot header carries no committed size. See
+	// effectiveReaderDbSize.
 	noWalCommitSize atomic.Pointer[noWalCommitSize]
 
 	// balanceQuickDispatchCount counts dispatches into splitLeafRightmostAppend.

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -913,4 +914,112 @@ func TestBackup_ReleasesSourcePages(t *testing.T) {
 	free := len(globalPageSlab.freeList)
 	globalPageSlab.mu.Unlock()
 	require.Equal(t, slabPages, free, "slab pages not returned after the backup")
+}
+
+// TestBackup_RestartsCounted: Restarts counts the restarts that threw copied
+// pages away, and a rollback that undid something is one
+// (sqlite3BackupRestart from pagerUndoCallback, pager.c:3139).
+func TestBackup_RestartsCounted(t *testing.T) {
+	src, dst := backupPair(t)
+	ns, _ := src.GetNamespace("data")
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	fat := make([]byte, 300)
+	for i := 0; i < 200; i++ {
+		require.NoError(t, stx.Put(ns, fmt.Appendf(nil, "k-%04d", i), fat))
+	}
+	require.NoError(t, stx.Commit())
+	require.Greater(t, src.DatabaseSize(), uint32(4))
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	defer func() { _ = b.Finish() }()
+	rollback := func() {
+		wtx, err := src.BeginWrite()
+		require.NoError(t, err)
+		require.NoError(t, wtx.Put(ns, []byte("rolled-back"), fat))
+		require.NoError(t, wtx.Rollback())
+	}
+
+	require.NoError(t, b.Step(context.Background(), 2))
+	require.Equal(t, uint32(0), b.Restarts())
+	rollback()
+	require.Equal(t, uint32(1), b.Restarts(), "a rollback that undid a page restarts the copy")
+	rollback()
+	require.Equal(t, uint32(1), b.Restarts(), "nothing copied since the last restart: nothing thrown away")
+	require.NoError(t, b.Step(context.Background(), 2))
+	rollback()
+	require.Equal(t, uint32(2), b.Restarts())
+
+	// A Step for everything left is not restarted from inside this process.
+	require.ErrorIs(t, b.Step(context.Background(), -1), ErrBackupDone)
+	require.Equal(t, uint32(2), b.Restarts())
+}
+
+// endingCtx is a ctx that has ended once ended is set.
+type endingCtx struct {
+	context.Context
+	ended atomic.Bool
+}
+
+func (c *endingCtx) Err() error {
+	if c.ended.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+
+// TestBackup_LongStepEndsWithItsCtx: a Step for everything left looks at its
+// ctx every backupCtxPages pages. When the ctx has ended it returns the
+// ctx's error, keeps what it copied and stays attached for updates, so a
+// later Step completes a correct copy.
+func TestBackup_LongStepEndsWithItsCtx(t *testing.T) {
+	src, dst := backupPair(t)
+	ns, _ := src.GetNamespace("data")
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	fat := make([]byte, 3000)
+	for i := 0; i < 800; i++ {
+		require.NoError(t, stx.Put(ns, fmt.Appendf(nil, "k-%04d", i), fat))
+	}
+	require.NoError(t, stx.Commit())
+	nSrc := src.DatabaseSize()
+	require.Greater(t, nSrc, uint32(2*backupCtxPages))
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+
+	// The ctx ends inside the Step, once its snapshot is taken.
+	ctx := &endingCtx{Context: context.Background()}
+	testBackupSampledHook = func() { ctx.ended.Store(true) }
+	defer func() { testBackupSampledHook = nil }()
+	require.ErrorIs(t, b.Step(ctx, -1), context.Canceled)
+	testBackupSampledHook = nil
+	require.Equal(t, nSrc-backupCtxPages, b.Remaining(), "the pages copied before the ctx ended are kept")
+	require.Equal(t, nSrc, b.PageCount())
+
+	// A commit on a page already copied reaches the copy: the Step that
+	// ended early attached the backup.
+	updated := []byte("updated-online")
+	stx2, err := src.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, stx2.Put(ns, []byte("k-0000"), updated))
+	require.NoError(t, stx2.Commit())
+
+	// The ctx's error was not sticky.
+	require.ErrorIs(t, b.Step(context.Background(), -1), ErrBackupDone)
+	require.NoError(t, b.Finish())
+
+	require.NoError(t, dst.IntegrityCheck())
+	rtx, err := dst.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns2, err := rtx.GetNamespace("data")
+	require.NoError(t, err)
+	got, err := rtx.Get(ns2, []byte("k-0000"))
+	require.NoError(t, err)
+	require.Equal(t, string(updated), string(got))
+	got, err = rtx.Get(ns2, []byte("k-0799"))
+	require.NoError(t, err)
+	require.Len(t, got, len(fat))
 }
