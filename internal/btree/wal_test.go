@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -2777,4 +2778,126 @@ func TestOpenPage1WALReadErrorFailsOpen(t *testing.T) {
 	db2 := openDBNoCleanup(t, path)
 	assert.Equal(t, 1, countKeys(t, db2, "t1"))
 	require.NoError(t, db2.Close())
+}
+
+// errInjectedInTxRange is the failure testInTxRangeErrHook injects.
+var errInjectedInTxRange = errors.New("injected getInTxRange failure")
+
+// putRowsAsync commits rows [from, to) of namespace t, 200-byte values, in a
+// write transaction of its own goroutine, and returns the commit's result.
+func putRowsAsync(db *DB, from, to int) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		tx, err := db.BeginWrite()
+		if err != nil {
+			done <- err
+			return
+		}
+		ns, err := tx.GetNamespace("t")
+		for i := from; err == nil && i < to; i++ {
+			err = tx.Put(ns, binary.BigEndian.AppendUint32(nil, uint32(i)), make([]byte, 200))
+		}
+		if err != nil {
+			_ = tx.Rollback()
+			done <- err
+			return
+		}
+		done <- tx.Commit()
+	}()
+	return done
+}
+
+// waitCommit returns the result of a putRowsAsync, failing the test if it
+// does not come.
+func waitCommit(t *testing.T, done <-chan error, what string) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s did not return: the WAL mutex is held", what)
+		return nil
+	}
+}
+
+// A commit whose frame write fails looking up the transaction's frames
+// (getInTxRange) returns the error with the WAL's mutex free, so the next
+// transaction runs. The InMemory frame write returned that error with the
+// mutex held: the failed commit's own cleanup, and every transaction after
+// it, waited on the mutex for good.
+func TestCommit_InTxRangeErrorReleasesWALMutex(t *testing.T) {
+	for _, inMemory := range []bool{true, false} {
+		t.Run(fmt.Sprintf("InMemory=%v", inMemory), func(t *testing.T) {
+			opts := DefaultOptions()
+			opts.InMemory = inMemory
+			db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), opts)
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				// A failed run can leave a commit stuck with the writer's
+				// locks, and Close would wait on it.
+				if !t.Failed() {
+					_ = db.Close()
+				}
+			})
+			createNS(t, db, "t")
+			require.NoError(t, waitCommit(t, putRowsAsync(db, 0, 100), "the first commit"))
+
+			// Every page of a commit but the last is looked up in the
+			// transaction's frames, so a commit of many pages meets the
+			// failure.
+			testInTxRangeErrHook = func() error { return errInjectedInTxRange }
+			t.Cleanup(func() { testInTxRangeErrHook = nil })
+			err = waitCommit(t, putRowsAsync(db, 100, 200), "the failing commit")
+			require.ErrorIs(t, err, errInjectedInTxRange)
+			testInTxRangeErrHook = nil
+
+			require.NoError(t, waitCommit(t, putRowsAsync(db, 200, 300), "the next commit"))
+			require.Equal(t, 200, countKeys(t, db, "t"))
+			require.NoError(t, db.IntegrityCheck())
+		})
+	}
+}
+
+// A failed InMemory frame write also drops the frames it appended before the
+// failure, as the file path's are overwritten by the next append: the next
+// write appends from the same frame, and that frame reads back as its page.
+func TestWriteFramesMem_InTxRangeErrorDropsAppendedFrames(t *testing.T) {
+	w := newWal(filepath.Join(t.TempDir(), "test.db-wal"), 4096)
+	w.inMemory = true
+	require.NoError(t, w.open())
+	defer w.close(false)
+	_, err := w.beginWrite()
+	require.NoError(t, err)
+	defer w.endWrite()
+
+	pageOf := func(pgno uint32, fill byte) *page {
+		data := make([]byte, 4096)
+		for i := range data {
+			data[i] = fill
+		}
+		return &page{pgno: pgno, data: data}
+	}
+	require.NoError(t, w.writeFrames([]*page{pageOf(2, 0)}, true, 2))
+	nf := w.nFrame.Load()
+
+	// A spill of two pages: the first is appended, the lookup for the
+	// second fails.
+	calls := 0
+	testInTxRangeErrHook = func() error {
+		calls++
+		if calls == 2 {
+			return errInjectedInTxRange
+		}
+		return nil
+	}
+	t.Cleanup(func() { testInTxRangeErrHook = nil })
+	require.ErrorIs(t, w.writeFrames([]*page{pageOf(3, 'a'), pageOf(4, 'b')}, false, 0), errInjectedInTxRange)
+	testInTxRangeErrHook = nil
+	require.Equal(t, nf, w.nFrame.Load())
+
+	require.NoError(t, w.writeFrames([]*page{pageOf(5, 'c')}, false, 0))
+	require.Equal(t, nf+1, w.nFrame.Load())
+	buf := make([]byte, 4096)
+	require.NoError(t, w.readFrame(nf+1, buf, nil, nil))
+	require.Equal(t, byte('c'), buf[0], "frame %d reads back a page of the failed write", nf+1)
 }

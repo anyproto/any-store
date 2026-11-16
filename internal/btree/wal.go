@@ -762,6 +762,11 @@ func (wi *walIndex) shmCleanupFromFrame(target, maxFrame uint32) {
 // In-process mode walks pageMap; multi-process mode consults the SHM
 // hash via shmHashGet.
 func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) (uint32, error) {
+	if f := testInTxRangeErrHook; f != nil {
+		if err := f(); err != nil {
+			return 0, err
+		}
+	}
 	if wi.inProcess {
 		wi.mu.RLock()
 		frames := wi.pageMap[pgno]
@@ -775,6 +780,12 @@ func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) (uint32, error
 	}
 	return wi.shmHashGet(pgno, maxFrame, minFrame)
 }
+
+// testInTxRangeErrHook, when non-nil, makes getInTxRange fail with the error
+// it returns, as an over-probed hash chain of the shared wal-index fails it.
+// The in-process index, which InMemory databases use, has no such failure.
+// Test-only.
+var testInTxRangeErrHook func() error
 
 // liveMinFrame returns the CURRENT checkpoint frontier bound (nBackfill+1)
 // for WAL lookups. Valid only for callers that cannot race a WAL restart:
@@ -1601,6 +1612,15 @@ type wal struct {
 	// on recovery, on endWrite, and on savepoint rollback past the
 	// overwrite. Mirrors SQLite's Wal.iReCksum (wal.c:533).
 	iReCksum uint32
+
+	// writeEndedByClose is set, under mu, by DB.Close's rescue of a write
+	// transaction in flight (pager.rollbackForClose), in the same critical
+	// section as the rewind of the log and the release of the write lock.
+	// writeFrames tests it under mu before it writes anything, so a spill
+	// that passed pagerStress's guard before the rescue writes either all
+	// of its frame before the rewind, which drops it, or nothing. Never
+	// cleared: the database is closing.
+	writeEndedByClose bool
 
 	// frameBatch stages writeFrames' appended frames (header + payload,
 	// contiguous as they lie in the file) so they go out in one WriteAt per
@@ -2463,11 +2483,16 @@ func (w *wal) recoverLocked() error {
 // per write.
 const walFrameBatchMax = 256 << 10
 
+// errWriteEndedByClose is writeFrames' refusal to write for a write
+// transaction that DB.Close has ended (wal.writeEndedByClose).
+var errWriteEndedByClose = fmt.Errorf("%w: write transaction ended by Close", ErrClosed)
+
 // writeFrames appends frames to the WAL. If commit is true, the last frame
 // is marked as a commit frame with the given dbSize.
 // Appended frames are staged in w.frameBatch and written in chunks of up to
 // walFrameBatchMax bytes; frames reused in place are written directly.
 // DRIFT: appended frames written in chunked WriteAt calls, not two writes per frame (walWriteOneFrame) See docs/btree/NOTES.md#drift-2026-11-11-10-writeframes-writes-appended-frames-in-chunks-not-two-writes-per-frame
+// DRIFT: refuses to write once Close has ended the write transaction (writeEndedByClose); C asserts the write lock (wal.c:4049) See docs/btree/NOTES.md#drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer
 // DRIFT: padToSectorBoundary commit-frame sector padding not ported See docs/btree/NOTES.md#drift-104-padtosectorboundary-sector-padding-of-commit-frames-not-port
 // DRIFT: journal_size_limit/mxWalSize WAL truncation unimplemented (truncateOnCommit/walLimitSize) See docs/btree/NOTES.md#drift-105-journal-size-limit-wal-truncation-feature-unimplemented
 // DRIFT: in-process mode skips SHM hdr write on commit; BeginRead/Write synthesize a minimal walHdr See docs/btree/NOTES.md#old-drift-inprocess-skips-shm-hdr-on-commit
@@ -2482,12 +2507,26 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		return w.writeFramesMem(pages, commit, dbSize)
 	}
 
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// walFrames asserts that its caller holds the write lock (wal.c:4049).
+	// A spill's caller may have lost it since it checked: DB.Close's rescue
+	// (rollbackForClose) ends the transaction under a writer still inside an
+	// operation, and pagerStress's test of the writer state can come just
+	// before it. The rescue sets writeEndedByClose, rewinds the log and
+	// releases the write lock under w.mu, so testing the flag here, before
+	// anything is written, leaves no frame of this call past the rewound
+	// base. A commit cannot get here so: it holds writerOpMu, which the
+	// rescue takes, and tests the writer state under it. writeFramesMem
+	// needs no test: an InMemory writer cache is not purgeable and never
+	// spills, so only a commit reaches it.
+	if w.writeEndedByClose {
+		return errWriteEndedByClose
+	}
 	if w.file == nil {
 		return errors.New("btree: WAL file closed")
 	}
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	// See if these frames can go to the start of the log (wal.c:4067-4072).
 	if err := w.restartLogLocked(); err != nil {
@@ -2797,6 +2836,7 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	w.mu.Lock()
 
 	nf := w.nFrame.Load()
+	nMem := len(w.memFrames)
 	startFrame := nf + 1
 	pageSz := int(w.pageSize)
 
@@ -2827,6 +2867,12 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 		if !(commit && isLast) && iFirst > 0 {
 			iWrite, err := w.index.getInTxRange(p.pgno, nf+nAppended, iFirst)
 			if err != nil {
+				// Return as the file path does: nFrame not advanced and
+				// w.mu released. The frames this call appended go too; the
+				// file path's are overwritten by the next append, but here
+				// the next append would come after them.
+				w.memFrames = w.memFrames[:nMem]
+				w.mu.Unlock()
 				return err
 			}
 			if iWrite > 0 {
@@ -3711,7 +3757,10 @@ func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, e
 	return stateChanged, nil
 }
 
-// endWrite releases the exclusive write lock.
+// endWrite releases the exclusive write lock. It takes no lock of its own:
+// the writer calls it from its own goroutine, and rollbackForClose, which
+// ends the transaction from Close's, calls it holding w.mu, so its store to
+// iReCksum is ordered with an abandoned writer's writeFrames.
 // DRIFT: journal_size_limit/mxWalSize WAL truncation unimplemented (truncateOnCommit/walLimitSize) See docs/btree/NOTES.md#drift-105-journal-size-limit-wal-truncation-feature-unimplemented
 func (w *wal) endWrite() {
 	// Tx boundary: any pending in-tx frame rewrite is moot. Either
