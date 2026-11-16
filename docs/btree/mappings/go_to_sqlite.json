@@ -1274,11 +1274,23 @@
     "sqlite": [],
     "note": ""
   },
+  "mxframe.go:*commitFrameCounter.LoadCommit": {
+    "sqlite": [],
+    "note": "the commit frame with the database size its commit recorded, one load: WalIndexHdr.mxFrame and nPage (wal.c:328-329) for the modes with no wal-index header"
+  },
   "mxframe.go:*commitFrameCounter.LoadLocal": {
     "sqlite": [],
     "note": ""
   },
   "mxframe.go:*commitFrameCounter.Store": {
+    "sqlite": [],
+    "note": ""
+  },
+  "mxframe.go:*commitFrameCounter.StoreCommit": {
+    "sqlite": [],
+    "note": ""
+  },
+  "mxframe.go:*commitFrameCounter.StoreSize": {
     "sqlite": [],
     "note": ""
   },
@@ -1708,13 +1720,20 @@
   "pager.go:*pager.open": {
     "sqlite": [
       "btree.c:lockBtree",
+      "pager.c:pagerPagecount",
       "pager.c:sqlite3PagerOpen"
     ],
-    "note": ""
+    "note": "page 1 and the page count are read at one snapshot in readPage1AtOpen"
   },
   "pager.go:*pager.pagerError": {
     "sqlite": [
       "pager.c:pager_error"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.pagerPageCount": {
+    "sqlite": [
+      "pager.c:pagerPagecount"
     ],
     "note": ""
   },
@@ -1753,6 +1772,14 @@
     ],
     "note": ""
   },
+  "pager.go:*pager.readPage1AtOpen": {
+    "sqlite": [
+      "btree.c:lockBtree",
+      "pager.c:pagerBeginReadTransaction",
+      "pager.c:pagerPagecount"
+    ],
+    "note": "open-time page-1 read and page count under one WAL read transaction"
+  },
   "pager.go:*pager.readRawPage": {
     "sqlite": [],
     "note": ""
@@ -1784,8 +1811,11 @@
     "note": ""
   },
   "pager.go:*pager.refreshHeaderFromPage1": {
-    "sqlite": [],
-    "note": ""
+    "sqlite": [
+      "btree.c:lockBtree",
+      "pager.c:readDbPage"
+    ],
+    "note": "page-1 re-read at write begin after a peer's change: one source, whole page, lockBtree's page-count rule"
   },
   "pager.go:*pager.releasePage": {
     "sqlite": [
@@ -1836,6 +1866,10 @@
       "wal.c:sqlite3WalSavepoint"
     ],
     "note": ""
+  },
+  "pager.go:*pager.seedCommittedSize": {
+    "sqlite": [],
+    "note": "open records the settled database size as the last commit size for in-process and in-memory read begins (the nPage of their synthesized header)"
   },
   "pager.go:*pager.setHasContent": {
     "sqlite": [
@@ -1894,6 +1928,12 @@
       "btree.c:fillInCell"
     ],
     "note": ""
+  },
+  "pager.go:lockBtreePageCount": {
+    "sqlite": [
+      "btree.c:lockBtree"
+    ],
+    "note": "the page-count rule only (offset 28 vs the pager's count); a non-zero 24/92 mismatch is rejected, see drift-2026-11-11-2"
   },
   "pager.go:newPager": {
     "sqlite": [
@@ -2554,6 +2594,10 @@
     "note": ""
   },
   "wal.go:*walIndex.shmWriteReadMark": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.storeCommit": {
     "sqlite": [],
     "note": ""
   },
