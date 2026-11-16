@@ -9,6 +9,13 @@ import (
 var (
 	osStat   = os.Stat
 	osRemove = os.Remove
+	// CopyToLatestFormat: lockCopy takes the lock a copy holds for the whole
+	// call, osOpenFile creates its staging file, and osRename and dirSync
+	// publish the finished copy.
+	lockCopy   = acquireCopyLock
+	osOpenFile = os.OpenFile
+	osRename   = os.Rename
+	dirSync    = syncDir
 )
 
 // File and VFS are always available for type-checking.

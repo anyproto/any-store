@@ -32,6 +32,12 @@ func Test_Js(t *testing.T) {
 			Path: "backupPath",
 		})
 	})
+	t.Run("migrate", func(t *testing.T) {
+		assertCmd(t, `db.migrate("newPath")`, Cmd{
+			Cmd:  "migrate",
+			Path: "newPath",
+		})
+	})
 	t.Run("count", func(t *testing.T) {
 		assertCmd(t, `db.coll.count()`, Cmd{
 			Cmd:        "count",

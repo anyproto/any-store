@@ -14,6 +14,7 @@ package btree
 
 import (
 	"fmt"
+	"os"
 	"sync"
 )
 
@@ -147,6 +148,12 @@ type shm interface {
 	// status via the DB-file exclusive lock upgrade (see pager.close) —
 	// shm no longer does its own DMS-based check.
 	close(isLastClient bool) error
+}
+
+// shmFile is a shm backed by a file of its own (mmapShm): fileInfo returns
+// the FileInfo, from fstat, of that file while it is open.
+type shmFile interface {
+	fileInfo() (os.FileInfo, error)
 }
 
 // Lock types for shm.lock/unlock.

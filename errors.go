@@ -87,6 +87,14 @@ var (
 	// first, then create it with the new definition.
 	ErrIndexMismatch = errors.New("any-store: index exists with a different definition")
 
+	// ErrNamespaceExists is returned when a collection or index name derives
+	// a storage name that another collection's index already has. Collection
+	// names may contain ":", so collection "A"'s index "b:c" and collection
+	// "A:b"'s index "c" derive the same catalog key: creating the second of
+	// the two, with CreateIndex or EnsureIndex and whatever its definition,
+	// returns it (wrapped), and nothing is created.
+	ErrNamespaceExists = btree.ErrNamespaceExists
+
 	// ErrTxIsReadOnly is returned when a write operation is attempted in a read-only transaction.
 	ErrTxIsReadOnly = errors.New("any-store: transaction is read-only")
 
@@ -138,9 +146,58 @@ var (
 	// it with errors.Is: the busy errors of the storage layer that are not
 	// this value wrap it by the time they leave Backup. What a Backup that
 	// returned it has done is described at DB.Backup.
+	//
+	// CopyToLatestFormat returns it (wrapped) at once, without waiting, when
+	// another call holds a copy lock it needs, as a call copying to the same
+	// destination does, or to a name one of the two keeps beside the other
+	// (on js/wasm and wasip1, any call in the process), and when a database
+	// is open at the destination's staging name. No file but the copy's lock
+	// files has been created, written or removed: a lock the call took
+	// before it failed it released, removing the lock file, which may be one
+	// that a killed call left there unlocked.
 	ErrBusy = btree.ErrBusy
 
 	ErrDBIsNotOpened = errors.New("any-store: database is not opened")
+
+	// ErrUnsupportedDB is returned by a package function that takes a DB,
+	// such as SchemaFormat, when that DB is not one this package opened: a
+	// type of the caller's own that implements the interface.
+	ErrUnsupportedDB = errors.New("any-store: database was not opened by this package")
+
+	// ErrTxInContext is returned by CopyToLatestFormat when its ctx carries a
+	// transaction, read or write: the copy reads its source in a transaction
+	// of its own, and SQLite refuses VACUUM inside a transaction the same
+	// way. Pass a ctx without one.
+	ErrTxInContext = errors.New("any-store: cannot run inside a transaction")
+
+	// ErrDestinationExists is returned (possibly wrapped) by
+	// CopyToLatestFormat when a file is at the destination path, or at one
+	// of the paths a database keeps beside it: path+"-wal", path+"-wal-shm"
+	// and the sentinel path+".lock"; or when the destination is one of
+	// those paths of a file that exists. The call replaces nothing: a file
+	// that was there is left as it was. One found before the call takes its
+	// copy locks refuses it before it creates anything.
+	// The check is made again under the locks and right before the copy is
+	// published, and a file that appeared by then refuses the call after it
+	// created its lock files, or built the copy under its staging name, and
+	// removed them again. Apart from the read bookkeeping in the source's
+	// wal-index (its -wal-shm), which the copy's read of the source changes
+	// as any reader's does, no file but the copy's own lock and staging
+	// files has been created, written or removed; the source's files are
+	// never renamed, removed or otherwise written.
+	ErrDestinationExists = errors.New("any-store: destination exists")
+
+	// ErrCopyPublished is returned by CopyToLatestFormat, always wrapped
+	// together with the error of the step that failed, when the copy is
+	// complete, verified and published at the destination path, and a step
+	// after the publication failed: the sync of the destination's directory
+	// (on Unix), without which the destination's name may not survive a
+	// power loss, or the removal of a file left under the staging name. The
+	// CopyReport returned with it is filled. The destination is the copy and
+	// can be used; do not remove it or run the copy again because of this
+	// error. To make its name durable, sync its directory.
+	ErrCopyPublished = errors.New("any-store: the copy is published, but a step after its publication failed")
+
 	// ErrIncompatibleVersion is returned (wrapped) by Open when the file was written in a format
 	// newer than this release reads. The file is intact and is left unchanged; open it with a
 	// release that knows the format. It does not match ErrCorrupt.

@@ -862,6 +862,52 @@ func (db *DB) Path() string {
 	return db.path
 }
 
+// OpenFiles is what DB.OpenFiles reports: the files a database has open,
+// identified by their descriptors, and the spelling they were opened by.
+type OpenFiles struct {
+	// Path is the database's path as Open was given it, neither made
+	// absolute nor cleaned: the spelling the database file and the files
+	// beside it (Path+"-wal", Path+"-wal-shm") were opened by, which the
+	// system resolves as it did then. Path() is its lexically cleaned
+	// absolute form, which names another file when a ".." in it follows a
+	// symbolic link to a directory: the system resolves the link first.
+	Path string
+	// DB, WAL and SHM are the FileInfo, from fstat of its descriptor, of
+	// the database file, its log and the log's index: the files the
+	// database reads and writes, whatever names they have now. SHM is nil
+	// when the log's index is in memory (InProcess, and every platform
+	// without mmap shared memory).
+	DB, WAL, SHM os.FileInfo
+}
+
+// OpenFiles returns the files db has open. A closed database returns
+// ErrClosed, in memory or not; an open in-memory one has none, and returns
+// the zero OpenFiles.
+func (db *DB) OpenFiles() (OpenFiles, error) {
+	if db.closed.Load() {
+		return OpenFiles{}, ErrClosed
+	}
+	if db.opts.InMemory {
+		return OpenFiles{}, nil
+	}
+	p := db.pager
+	// pager.close holds p.mu while it closes the descriptors.
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if db.closed.Load() || p.file == nil || p.wal == nil {
+		return OpenFiles{}, ErrClosed
+	}
+	files := OpenFiles{Path: p.path}
+	var err error
+	if files.DB, err = p.file.Stat(); err != nil {
+		return OpenFiles{}, err
+	}
+	if files.WAL, files.SHM, err = p.wal.fileInfos(); err != nil {
+		return OpenFiles{}, err
+	}
+	return files, nil
+}
+
 // PageSize returns the fixed page size in bytes for this database.
 // ~ sqlite3BtreeGetPageSize (btree.c). Unlike SQLite, our page size is
 // immutable after Open — set from Options.PageSize or read from the header.

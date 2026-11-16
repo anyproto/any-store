@@ -247,6 +247,8 @@ Opening a format 6 file with v2.4.4 fails with `ErrIncompatibleVersion` and leav
 
 `Backup` writes a copy in the source's format: a backup of a format 5 database is a format 5 file.
 
+`SchemaFormat` reports the format of an open database, and `CopyToLatestFormat` copies a database into a new file in the latest format. Moving a format 5 database onto format 6 is optional; [docs/migration-format-5-to-6.md](docs/migration-format-5-to-6.md) describes when to do it, what can differ in the copy, and how to put the copy in the old file's place.
+
 ## Documentation
 
 * **API reference** — [pkg.go.dev/github.com/anyproto/any-store/v2](https://pkg.go.dev/github.com/anyproto/any-store/v2)

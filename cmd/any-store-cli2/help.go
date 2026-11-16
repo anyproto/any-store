@@ -66,6 +66,7 @@ Database
   show stats                                database statistics
   db.createCollection("name")               a collection must exist before inserting into it
   db.backup("copy.db")   db.quickCheck()
+  db.migrate("new.db")                      copy into a new file in the latest on-disk format
 
 Collection: db.<collection>
   .insert(doc, ...)                         "id" is the primary key

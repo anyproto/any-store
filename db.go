@@ -143,6 +143,17 @@ type DBStats struct {
 // The config parameter can be nil for default settings.
 // Returns a DB instance or an error.
 func Open(ctx context.Context, path string, config *Config) (DB, error) {
+	ds, err := open(ctx, path, config, 0)
+	if err != nil {
+		return nil, err
+	}
+	return ds, nil
+}
+
+// open is Open with the schema format a file it creates gets: 0 for the
+// default, or a format the btree writes (btree.Options.SchemaFormat). An
+// existing file keeps its own.
+func open(ctx context.Context, path string, config *Config, createFormat uint32) (*db, error) {
 	if config == nil {
 		config = &Config{}
 	}
@@ -197,6 +208,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		Codec:                 config.Encryption.Codec,
 		MmapSize:              config.MmapSize,
 		Checksum:              !config.Encryption.Enabled() && !config.InMemory,
+		SchemaFormat:          createFormat,
 	}
 	if cb := config.OnIntegrityError; cb != nil {
 		// Determine the kind discriminator at Open time. The actual codec
@@ -457,11 +469,16 @@ func indexKeyPrefix(collName string) string {
 //
 // ":" inside a name is allowed: every catalog key family is prefixed
 // ("coll:", "collcfg:", "idx:", "stat_data:", "idx_mk:"; "idx_format" is a
-// single record) so families can't cross-collide, and the residual within-family ambiguity (collection "A:b"
-// index "c" vs collection "A" index "b:c" both deriving ix:A:b:c) fails loudly
-// with ErrNamespaceExists at index-create or rename time — it can never
-// corrupt silently. Rejecting ":" would also strand pre-validation files whose
-// collection names legally contain it.
+// single record) so families can't cross-collide. Within a family one key can
+// stand for two pairs: collection "A:b" index "c" and collection "A" index
+// "b:c" both derive idx:A:b:c and ix:A:b:c. Creating the second of the two
+// finds the first one's catalog record, which stores the first one's index
+// name: registerIndex refuses it with ErrNamespaceExists, for
+// CreateIndex and EnsureIndex alike and whatever the definition, since the
+// record's index is the other collection's. The scan of collection "A"'s
+// prefix "idx:A:" also meets the records of "A:b"; getIndexInfos takes a
+// record only under the key its own name derives. Rejecting ":" would also strand pre-validation
+// files whose collection names legally contain it.
 // maxNameLen caps collection and index names. Derived namespace names embed
 // both plus a family prefix/suffix (widest: fts "ftx:"+coll+":"+index+":vocab",
 // +11 bytes), and a master-table cell must keep its 4-byte root value within
@@ -1837,7 +1854,11 @@ func (db *db) clearFtsDirty() {
 	db.ftsDirty = db.ftsDirty[:0]
 }
 
-// getIndexInfos reads all index metadata for a collection from the system namespace
+// getIndexInfos reads all index metadata for a collection from the system
+// namespace. The scan of the key prefix "idx:<coll>:" also meets the records
+// of a collection whose name begins with "<coll>:" — "idx:A:b:c" is index "c"
+// of collection "A:b", and index "b:c" of "A" would have the same key — so a
+// record is the collection's only when its key is the one its name derives.
 func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, error) {
 	prefix := indexKeyPrefix(collName)
 	cursor := tx.NewCursor(db.systemNS)
@@ -1872,6 +1893,13 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 			Sparse: v.GetBool("sparse"),
 			Unique: v.GetBool("unique"),
 			Kind:   IndexKind(v.GetInt("kind")),
+		}
+		if string(key[len(prefix):]) != info.Name {
+			// Another collection's index (see above).
+			if err := cursor.Next(); err != nil {
+				return nil, err
+			}
+			continue
 		}
 		if info.Kind == IndexKindFulltext {
 			info.Fulltext = &FulltextParams{}
@@ -2057,10 +2085,25 @@ func fulltextDefMatches(fv *anyenc.Value, p *FulltextParams) bool {
 // (fields / unique / sparse) returns ErrIndexMismatch — a redefinition is never
 // applied silently. This mirrors SQLite, where CREATE INDEX never mutates an
 // existing object's definition in place; the caller must DROP then CREATE.
+//
+// A record under the key that stores another index name is not this
+// collection's: the key is also the one of a collection whose name continues
+// collName past a ":" (see validateCollectionName), and getIndexInfos gives
+// the record to that collection alone. It is refused with
+// ErrNamespaceExists whatever its definition: taking an identical one
+// for this collection's index would let EnsureIndex report an index the
+// collection does not have.
 func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) error {
 	key := indexKey(collName, info.Name)
 	// Check if already exists
 	if existing, err := tx.Get(db.systemNS, key); err == nil {
+		var p anyenc.Parser
+		if v, perr := p.Parse(existing); perr == nil {
+			if stored := v.GetString("name"); stored != info.Name {
+				return fmt.Errorf("any-store: collection %q: index %q: the catalog key %q holds index %q of another collection: %w",
+					collName, info.Name, key, stored, btree.ErrNamespaceExists)
+			}
+		}
 		if indexDefMatches(existing, info) {
 			return ErrIndexExists
 		}

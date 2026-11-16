@@ -66,6 +66,17 @@ DB.prototype.backup = function (path) {
     }
 }
 
+DB.prototype.migrate = function (path) {
+    return {
+        result: function () {
+            return JSON.stringify({
+                cmd: 'migrate',
+                path: path,
+            })
+        }
+    }
+}
+
 function Query(name) {
     this.collection = name;
     this.cmd = "find";

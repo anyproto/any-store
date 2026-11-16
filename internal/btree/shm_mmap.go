@@ -460,6 +460,16 @@ func (s *mmapShm) fcntlLock(lockType int, offset int64) error {
 	return nil
 }
 
+// fileInfo returns the FileInfo of the shm file (shmFile).
+func (s *mmapShm) fileInfo() (os.FileInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.file == nil {
+		return nil, ErrClosed
+	}
+	return s.file.Stat()
+}
+
 func (s *mmapShm) close(isLastClient bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
