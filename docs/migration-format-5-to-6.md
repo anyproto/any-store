@@ -72,7 +72,10 @@ every collection, document and index of `db`:
   system drops the lock if the process dies, so a killed copy never blocks
   the next one. A second call for the same destination, from this process or
   another, does not wait: it returns `ErrBusy` at once and touches nothing.
-  The lock file is removed when the call returns.
+  The lock file is removed when the call returns. On js/wasm and wasip1,
+  which have no such lock, the lock is held in the process and covers every
+  destination: one copy at a time runs in the process, and no lock file is
+  made.
 - **Published by a rename.** The copy is built in the staging file
   `<destination>.copy-staging`, in the destination's own directory,
   checkpointed, verified and closed, and only then renamed to the
@@ -106,7 +109,7 @@ The call fails with:
 | `ErrUnsupportedDB` | `db` was not opened by this package (a type of your own that implements `DB`). Nothing is created. |
 | `ErrTxInContext` | `ctx` carries a read or write transaction. The copy reads in a transaction of its own, as SQLite refuses `VACUUM` inside one. |
 | `ErrDestinationExists` | The destination or one of its sidecars exists, or appeared while the copy ran. |
-| `ErrBusy` | Another call is copying to the same destination right now. Nothing was created or removed; try again once that call has returned. |
+| `ErrBusy` | Another call is copying to the same destination right now (on js/wasm and wasip1, to any destination in the process). Nothing was created or removed; try again once that call has returned. |
 | `ErrCopyPublished` | The copy is complete, verified and published at the destination, and a step after that failed: the sync of the destination's directory, or the removal of a file left under the staging name. It wraps that failure, and the report is filled. Use the copy; to make its name durable, sync its directory. |
 | any other | The copy failed: a collection, index or document could not be copied (the error names it, see [What can differ](#what-can-differ)), the copy did not match the source, or an I/O operation failed. Cancelling `ctx` stops the copy with the context's error. |
 

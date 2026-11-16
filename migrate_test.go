@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -995,6 +996,73 @@ func TestCopyToLatestFormat_ManyCopiesToOneDestination(t *testing.T) {
 	assertSameDatabase(t, src, openCopy(t, dstPath, nil))
 }
 
+// Spellings of one destination are one destination: while a copy to it
+// runs, a copy to another spelling of it, absolute or relative, is refused
+// with ErrBusy and touches nothing, so it removes none of the first copy's
+// staging files; the first publishes. On Unix and Windows the spellings
+// meet at the lock file, one file whatever names it; on the other
+// platforms the copy lock is the process's (copylock_other.go).
+func TestCopyToLatestFormat_DestinationSpellings(t *testing.T) {
+	filesOnJS(t)
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1}`, `{"id":2}`)
+	dstDir := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(dstDir, "sub"), 0o755))
+	dstPath := filepath.Join(dstDir, "copy.db")
+	t.Chdir(dstDir)
+	sep := string(filepath.Separator)
+	spellings := []string{
+		dstDir + sep + "." + sep + "copy.db",
+		dstDir + sep + "sub" + sep + ".." + sep + "copy.db",
+		"copy.db",
+		"." + sep + "copy.db",
+	}
+
+	var tried int
+	testHookCopiedCollection = func(string) {
+		before := dirNames(t, dstDir)
+		assert.Contains(t, before, "copy.db.copy-staging")
+		for _, spelling := range spellings {
+			tried++
+			_, err := CopyToLatestFormat(ctx, src, spelling, nil)
+			assert.ErrorIs(t, err, ErrBusy, spelling)
+			assert.Equal(t, before, dirNames(t, dstDir), "a copy to %s touches nothing", spelling)
+		}
+	}
+	defer func() { testHookCopiedCollection = nil }()
+
+	_, err = CopyToLatestFormat(ctx, src, dstPath, nil)
+	require.NoError(t, err)
+	assert.Equal(t, len(spellings), tried)
+	assert.Equal(t, []string{"copy.db", "sub"}, dirNames(t, dstDir))
+	assertSameDatabase(t, src, openCopy(t, dstPath, nil))
+}
+
+// filesOnJS backs the databases of a test with the os package under
+// js/wasm, where the btree has no file backend of its own unless SetVFS
+// gives it one (internal/btree/osfuncs_vfs_js.go), and Node's file system
+// serves os. Elsewhere it does nothing.
+func filesOnJS(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "js" {
+		return
+	}
+	SetVFS(VFS{
+		OpenFile: func(name string, flag int, perm os.FileMode) (File, error) {
+			f, err := os.OpenFile(name, flag, perm)
+			if err != nil {
+				return nil, err
+			}
+			return f, nil
+		},
+		Remove:    os.Remove,
+		Fdatasync: func(f File) error { return f.Sync() },
+	})
+	t.Cleanup(ResetVFS)
+}
+
 // A lock another holder has on the destination fails the call at once with
 // ErrBusy: nothing is created and nothing removed, not even the staging
 // files a killed copy left, which could be the holder's.
@@ -1014,7 +1082,7 @@ func TestCopyToLatestFormat_LockHeld(t *testing.T) {
 
 	report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
 	require.ErrorIs(t, err, ErrBusy)
-	assert.Contains(t, err.Error(), "another copy to "+dstPath+" is running")
+	assert.Contains(t, err.Error(), "another copy holds the copy lock of "+dstPath)
 	assert.Zero(t, report)
 	assert.Equal(t, staged, dirNames(t, dstDir))
 	for _, name := range staged[1:] {

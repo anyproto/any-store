@@ -100,7 +100,10 @@ type CopyReport struct {
 // (flock on Unix, LockFileEx on Windows), which the system drops if the
 // process dies. A second call for the same dstPath, from this process or
 // another, does not wait: it returns ErrBusy at once and touches nothing.
-// The lock file is removed when the call returns.
+// The lock file is removed when the call returns. The other platforms
+// (js/wasm, wasip1) have no such lock: there the lock is the process's,
+// one for every dstPath, so one call at a time copies in the process, and
+// no lock file is made.
 //
 // Under the lock the copy is built in the staging file
 // dstPath+".copy-staging", in dstPath's own directory, so that publishing
@@ -176,7 +179,7 @@ func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Con
 	unlock, err := lockCopy(dstPath + copyLockSuffix)
 	if err != nil {
 		if errors.Is(err, ErrBusy) {
-			return CopyReport{}, fmt.Errorf("any-store: copy to latest format: another copy to %s is running: %w", dstPath, err)
+			return CopyReport{}, fmt.Errorf("any-store: copy to latest format: another copy holds the copy lock of %s: %w", dstPath, err)
 		}
 		return CopyReport{}, fmt.Errorf("any-store: copy to latest format: locking the destination: %w", err)
 	}
