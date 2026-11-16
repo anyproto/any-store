@@ -1203,6 +1203,7 @@ func TestCopyToLatestFormat_StaleStagingNotRemovable(t *testing.T) {
 // copy left stays as it was, no lock file is made, and a destination that
 // exists does not make it ErrDestinationExists.
 func TestCopyToLatestFormat_ClosedSource(t *testing.T) {
+	filesOnJS(t)
 	for _, inMemory := range []bool{false, true} {
 		t.Run(fmt.Sprintf("InMemory=%v", inMemory), func(t *testing.T) {
 			var src DB
