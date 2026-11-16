@@ -1031,8 +1031,10 @@ func TestCopyToLatestFormat_LockHeld(t *testing.T) {
 	assertSameDatabase(t, src, openCopy(t, dstPath, nil))
 }
 
-// The lock of a copy: one holder at a time, a second is refused at once
-// with ErrBusy, and the lock file goes with its holder.
+// The lock of a copy, on every platform: one holder at a time, a second is
+// refused at once with ErrBusy, and a released lock is free for the next.
+// What the lock leaves on disk depends on the platform: copylock_test.go
+// for Unix and Windows, copylock_other_test.go for the others.
 func TestCopyLock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "copy.db.copy-lock")
 	release, err := acquireCopyLock(path)
@@ -1040,16 +1042,12 @@ func TestCopyLock(t *testing.T) {
 	_, err = acquireCopyLock(path)
 	require.ErrorIs(t, err, ErrBusy)
 	release()
-	assert.Empty(t, dirNames(t, filepath.Dir(path)))
-	// A lock file nobody holds, as a killed process leaves it, locks nothing.
-	require.NoError(t, os.WriteFile(path, nil, 0o644))
 	release, err = acquireCopyLock(path)
 	require.NoError(t, err)
 	release()
-	assert.Empty(t, dirNames(t, filepath.Dir(path)))
 
-	// Holders that come and go, each removing the lock file as it leaves:
-	// never two at once.
+	// Holders that come and go, each removing the lock file, where there is
+	// one, as it leaves: never two at once.
 	var holders, entered atomic.Int32
 	var wg sync.WaitGroup
 	for range 8 {
@@ -1075,7 +1073,6 @@ func TestCopyLock(t *testing.T) {
 	}
 	wg.Wait()
 	assert.NotZero(t, entered.Load())
-	assert.Empty(t, dirNames(t, filepath.Dir(path)))
 }
 
 // The staging files a killed copy left beside the destination, with no lock

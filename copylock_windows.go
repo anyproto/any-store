@@ -40,3 +40,6 @@ func releaseCopyLock(f *os.File, path string) {
 	_ = f.Close()
 	_ = os.Remove(path)
 }
+
+// syncLockFile flushes the byte withContentStat wrote.
+func syncLockFile(f *os.File) error { return f.Sync() }

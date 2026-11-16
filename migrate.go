@@ -127,8 +127,8 @@ type CopyReport struct {
 // closed copy. On a failure before it the call closes the copy and removes
 // its staging files. A removal that fails is joined to the error, with the
 // file's name. The staging files are the only ones a failed call owns, and
-// the only ones a crash before the publication leaves, beside an empty,
-// unlocked lock file; the next call for dstPath removes them. After
+// the only ones a crash before the publication leaves, beside an unlocked
+// lock file; the next call for dstPath removes them. After
 // ErrDestinationExists the files at and beside dstPath are not this call's:
 // they were there before, or someone else put them there, and the error
 // is no reason to remove them. A failure after the rename (the directory

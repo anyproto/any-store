@@ -35,3 +35,21 @@ func releaseCopyLock(f *os.File, path string) {
 	_ = os.Remove(path)
 	_ = f.Close()
 }
+
+// syncLockFile syncs the byte withContentStat wrote with fsync(2), as
+// findInodeInfo does (os_unix.c:1569 at version-3.52.0), not with
+// f.Sync, which is F_FULLFSYNC on macOS: the sync is there for the volume to
+// give the file its identity, not to make the byte durable.
+func syncLockFile(f *os.File) error {
+	for {
+		err := syscall.Fsync(int(f.Fd()))
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, syscall.EINTR):
+			continue
+		default:
+			return &os.PathError{Op: "fsync", Path: f.Name(), Err: err}
+		}
+	}
+}
