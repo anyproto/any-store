@@ -120,8 +120,15 @@ type CopyReport struct {
 // operating system on its file (a flock on Unix, LockFileEx on Windows),
 // and the call tries that lock, exclusively and without waiting, before it
 // removes anything; if it is held the call returns ErrBusy and removes
-// nothing. js/wasm and wasip1 have no such lock to try. The copy is
-// checkpointed, verified (each collection's options, document count and
+// nothing. To try it the call opens the staging file, and it opens only a
+// regular file with one link, which is what a copy leaves there. A
+// symbolic link, a file with other links (on Unix; Windows does not report
+// the count) or anything but a regular file there can be another name of a
+// file a database of this process has open, and closing a descriptor of
+// that file would drop every record lock the process holds on it: such a
+// file fails the call with an error, and is neither opened nor removed.
+// js/wasm and wasip1 have no such lock to try, and open nothing. The copy
+// is checkpointed, verified (each collection's options, document count and
 // index definitions against the source's snapshot, then IntegrityCheck)
 // and closed, and then published by renaming the staging file to dstPath.
 // The files at and beside dstPath are checked again right before the
@@ -138,7 +145,8 @@ type CopyReport struct {
 // -wal, -wal-shm and .lock of the latter, are reserved for this call, and
 // so, for a dstPath that is p's -wal, -wal-shm or .lock, is p+".copy-lock":
 // it creates them and removes them, whatever a file found there holds, but
-// a database open at the staging name. Keep nothing of your own under them.
+// a database open at the staging name and, at that name, anything a copy
+// does not leave there. Keep nothing of your own under them.
 // A src whose database file, or a file it keeps beside it, is under one of
 // them is refused, on every platform, before anything is created or
 // removed. The files are compared by identity: each reserved name's file
@@ -798,6 +806,10 @@ func sourceOutsideReservedNames(src *btree.DB, dstPath string) error {
 	return nil
 }
 
+// errStagingAlias is what stagingOpenAsDatabase refuses to open: something
+// under the staging name that a copy does not make there.
+var errStagingAlias = errors.New("a copy makes only a regular file with one link under that name, and opens or removes nothing else there")
+
 // reserveStaging creates the empty file the copy for dstPath is built in,
 // dstPath+copyStagingSuffix, and returns its name. The caller holds
 // dstPath's copy lock, so no other copy uses the staging name, and what is
@@ -810,12 +822,16 @@ func sourceOutsideReservedNames(src *btree.DB, dstPath string) error {
 // lock of the operating system on its file for as long as it is open
 // (stagingOpenAsDatabase), so the staging file is tried for that lock
 // first: one that is held fails the call with ErrBusy, and nothing is
-// removed. The source is refused earlier, on every platform
-// (sourceOutsideReservedNames); this covers another database, where the
-// platform has the lock.
+// removed. A staging file that a copy does not leave (a symbolic link, a
+// file with other links, anything but a regular file) is neither tried nor
+// removed: it fails the call with errStagingAlias. The source is refused
+// earlier, on every platform (sourceOutsideReservedNames); this covers
+// another database, where the platform has the lock.
 func reserveStaging(dstPath string) (string, error) {
 	stage := dstPath + copyStagingSuffix
 	switch open, err := stagingOpenAsDatabase(stage); {
+	case errors.Is(err, errStagingAlias):
+		return "", fmt.Errorf("any-store: copy to latest format: %w", err)
 	case err != nil:
 		return "", fmt.Errorf("any-store: copy to latest format: trying the lock of the staging file %s: %w", stage, err)
 	case open:

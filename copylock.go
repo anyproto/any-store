@@ -4,6 +4,7 @@ package anystore
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 )
@@ -15,10 +16,13 @@ const copyLockAttempts = 16
 // Test seams of acquireCopyLock: testHookCopyLockOpened runs once the lock
 // file is open, before it is locked; copyLockSameFile compares the locked
 // file with the one the path names, and is a variable so that a test can
-// model a volume that gives every empty file one identity.
+// model a volume that gives every empty file one identity. And of
+// stagingOpenAsDatabase: testHookStagingLstat runs between the Lstat of the
+// staging file and its open.
 var (
 	testHookCopyLockOpened func()
 	copyLockSameFile       = os.SameFile
+	testHookStagingLstat   func(path string)
 )
 
 // acquireCopyLock takes the lock of a copy (CopyToLatestFormat): an
@@ -122,25 +126,47 @@ func withContentStat(f *os.File) (os.FileInfo, error) {
 // without waiting that acquireCopyLock takes, tried here on a descriptor of
 // its own, conflicts with either, in this process as in another. It is
 // released at once, by the close; a file whose lock it gets is reported
-// free.
+// free. A path that names nothing is reported free; no file is created. The
+// file is opened for writing, as the database opens it: flock emulated over
+// NFS takes an exclusive lock only on a descriptor open for writing.
 //
-// No file is created: a path that names nothing, or something other than a
-// regular file (which no database has open, and whose open could block, as
-// a FIFO's does), is reported free. The file is opened for writing, as the
-// database opens it: flock emulated over NFS takes an exclusive lock only on
-// a descriptor open for writing.
+// The file is opened only if it is what a copy leaves at the staging name, a
+// regular file with one link, which cannot be another name of a file that
+// something else has open. A symbolic link, a file with more than one link,
+// and anything but a regular file fail the call (errStagingAlias), and are
+// not removed. The reason is the POSIX record lock: closing a descriptor
+// drops every record lock the process holds on the file, whichever
+// descriptor took it (os_unix.c:1246-1254 at version-3.52.0), and a
+// database's -wal-shm carries its record locks. The probe's close of another
+// name of the -wal-shm of a database open in this process would drop that
+// database's locks, and a peer process would then be granted what the
+// database holds. So the name is Lstat'ed first; the open does not follow a
+// symbolic link where the platform can refuse one (stagingOpenFlags), so
+// that one put there after the Lstat fails the open; and the open file is
+// fstat'ed, and must be the file the Lstat saw, with one link, before its
+// lock is tried. A window is left and accepted: a link made to the file, or
+// the name moved onto another file, between the Lstat and the close. Only
+// something that races the copy on a name kept for it does that.
+//
+// On Windows the link count is not checked: os.FileInfo does not carry it
+// there, and the hazard it guards against does not exist, as a LockFileEx
+// lock belongs to the handle that took it and no other handle's close
+// drops it.
 func stagingOpenAsDatabase(path string) (bool, error) {
-	fi, err := os.Stat(path)
+	fi, err := os.Lstat(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	if !fi.Mode().IsRegular() {
-		return false, nil
+	if err = stagingOwnFile(path, fi); err != nil {
+		return false, err
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if testHookStagingLstat != nil {
+		testHookStagingLstat(path)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|stagingOpenFlags, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil
 	}
@@ -148,6 +174,16 @@ func stagingOpenAsDatabase(path string) (bool, error) {
 		return false, err
 	}
 	defer func() { _ = f.Close() }()
+	opened, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	if !os.SameFile(fi, opened) {
+		return false, fmt.Errorf("the staging file %s was replaced while the copy looked at it: %w", path, errStagingAlias)
+	}
+	if err = stagingOwnFile(path, opened); err != nil {
+		return false, err
+	}
 	if err = lockFileExclusive(f); err != nil {
 		if errors.Is(err, ErrBusy) {
 			return true, nil
@@ -155,6 +191,21 @@ func stagingOpenAsDatabase(path string) (bool, error) {
 		return false, err
 	}
 	return false, nil
+}
+
+// stagingOwnFile refuses a file a copy could not have made at the staging
+// name: a symbolic link, anything but a regular file, a file with more than
+// one link (where the platform reports the count, linkCount).
+func stagingOwnFile(path string, fi os.FileInfo) error {
+	switch n, ok := linkCount(fi); {
+	case fi.Mode()&fs.ModeSymlink != 0:
+		return fmt.Errorf("the staging file %s is a symbolic link: %w", path, errStagingAlias)
+	case !fi.Mode().IsRegular():
+		return fmt.Errorf("the staging file %s is not a regular file (%v): %w", path, fi.Mode().Type(), errStagingAlias)
+	case ok && n != 1:
+		return fmt.Errorf("the staging file %s has %d links: %w", path, n, errStagingAlias)
+	}
+	return nil
 }
 
 // copyLockPerName: each name has a copy lock of its own, its lock file, so

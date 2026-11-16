@@ -53,3 +53,17 @@ func syncLockFile(f *os.File) error {
 		}
 	}
 }
+
+// stagingOpenFlags: the probe of the staging file does not follow a
+// symbolic link (stagingOpenAsDatabase), and does not wait in the open for a
+// FIFO or a device put there after its Lstat.
+const stagingOpenFlags = syscall.O_NOFOLLOW | syscall.O_NONBLOCK
+
+// linkCount returns the number of links of the file fi describes.
+func linkCount(fi os.FileInfo) (uint64, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return uint64(st.Nlink), true
+}

@@ -126,8 +126,10 @@ func TestCopyLock_OpenedBeforeItsRemoval(t *testing.T) {
 // stagingOpenAsDatabase finds the lock of an open database in both modes of
 // the database file lock: shared between processes, a shared flock (Windows
 // has no such mode and opens it kept in the process), and kept in the
-// process, an exclusive lock. A closed database, a missing name and a
-// directory are free.
+// process, an exclusive lock. A closed database and a missing name are
+// free. A directory, a symbolic link and, where the link count is known, a
+// file with two links are refused with errStagingAlias, unopened: each can
+// be another name of a file something has open.
 func TestStagingOpenAsDatabase(t *testing.T) {
 	dir := t.TempDir()
 	for _, inProcess := range []bool{false, true} {
@@ -142,10 +144,33 @@ func TestStagingOpenAsDatabase(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, open, "closed, InProcess=%v", inProcess)
 	}
-	for _, free := range []string{filepath.Join(dir, "missing"), dir} {
-		open, err := stagingOpenAsDatabase(free)
-		require.NoError(t, err)
-		assert.False(t, open, free)
+	open, err := stagingOpenAsDatabase(filepath.Join(dir, "missing"))
+	require.NoError(t, err)
+	assert.False(t, open)
+
+	target := filepath.Join(dir, "target")
+	require.NoError(t, os.WriteFile(target, []byte("target"), 0o644))
+	refused := []string{dir}
+	if link := filepath.Join(dir, "symlink"); os.Symlink(target, link) == nil {
+		refused = append(refused, link)
+	} else {
+		t.Log("no symbolic link")
+	}
+	hard := filepath.Join(dir, "hardlink")
+	require.NoError(t, os.Link(target, hard))
+	if fi, err := os.Lstat(hard); err == nil {
+		if _, ok := linkCount(fi); ok {
+			refused = append(refused, hard)
+		} else {
+			open, err = stagingOpenAsDatabase(hard)
+			require.NoError(t, err, "no link count on %s", runtime.GOOS)
+			assert.False(t, open)
+		}
+	}
+	for _, name := range refused {
+		_, err = stagingOpenAsDatabase(name)
+		assert.ErrorIs(t, err, errStagingAlias, name)
+		assert.ErrorContains(t, err, "the staging file "+name)
 	}
 }
 
