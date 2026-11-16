@@ -762,6 +762,11 @@ func (wi *walIndex) shmCleanupFromFrame(target, maxFrame uint32) {
 // In-process mode walks pageMap; multi-process mode consults the SHM
 // hash via shmHashGet.
 func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) (uint32, error) {
+	if f := testInTxRangeErrHook; f != nil {
+		if err := f(); err != nil {
+			return 0, err
+		}
+	}
 	if wi.inProcess {
 		wi.mu.RLock()
 		frames := wi.pageMap[pgno]
@@ -775,6 +780,12 @@ func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) (uint32, error
 	}
 	return wi.shmHashGet(pgno, maxFrame, minFrame)
 }
+
+// testInTxRangeErrHook, when non-nil, makes getInTxRange fail with the error
+// it returns, as an over-probed hash chain of the shared wal-index fails it.
+// The in-process index, which InMemory databases use, has no such failure.
+// Test-only.
+var testInTxRangeErrHook func() error
 
 // liveMinFrame returns the CURRENT checkpoint frontier bound (nBackfill+1)
 // for WAL lookups. Valid only for callers that cannot race a WAL restart:
@@ -2797,6 +2808,7 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	w.mu.Lock()
 
 	nf := w.nFrame.Load()
+	nMem := len(w.memFrames)
 	startFrame := nf + 1
 	pageSz := int(w.pageSize)
 
@@ -2827,6 +2839,12 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 		if !(commit && isLast) && iFirst > 0 {
 			iWrite, err := w.index.getInTxRange(p.pgno, nf+nAppended, iFirst)
 			if err != nil {
+				// Return as the file path does: nFrame not advanced and
+				// w.mu released. The frames this call appended go too; the
+				// file path's are overwritten by the next append, but here
+				// the next append would come after them.
+				w.memFrames = w.memFrames[:nMem]
+				w.mu.Unlock()
 				return err
 			}
 			if iWrite > 0 {
