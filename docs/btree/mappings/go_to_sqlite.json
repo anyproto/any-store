@@ -764,14 +764,6 @@
     ],
     "note": ""
   },
-  "db.go:*DB.BeginReadFast": {
-    "sqlite": [
-      "btree.c:btreeBeginTrans",
-      "btree.c:sqlite3BtreeBeginTrans",
-      "pager.c:pagerBeginReadTransaction"
-    ],
-    "note": "fast path skips page-1 counter read"
-  },
   "db.go:*DB.BeginWrite": {
     "sqlite": [
       "btree.c:btreeBeginTrans",

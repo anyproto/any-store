@@ -926,7 +926,7 @@ func TestCommit_SchemaChanged(t *testing.T) {
 	require.NoError(t, rtx.Rollback())
 }
 
-func TestBeginReadFast(t *testing.T) {
+func TestBeginRead_OwnCommitCounters(t *testing.T) {
 	db := tempDB(t)
 
 	tx, err := db.BeginWrite()
@@ -936,7 +936,7 @@ func TestBeginReadFast(t *testing.T) {
 	require.NoError(t, tx.Put(ns, []byte("k"), []byte("v")))
 	require.NoError(t, tx.Commit())
 
-	rtx, err := db.BeginReadFast()
+	rtx, err := db.BeginRead()
 	require.NoError(t, err)
 	assert.False(t, rtx.writable)
 	// The counters are the snapshot's: here those of the handle's own commit.
@@ -952,10 +952,10 @@ func TestBeginReadFast(t *testing.T) {
 	require.NoError(t, rtx.Rollback())
 }
 
-// A fast begin reports the counters of its own snapshot: not the local
+// A read begin reports the counters of its own snapshot: not the local
 // cache, which lags a peer's commit, and for a reader that began before a
 // commit not that commit's.
-func TestBeginReadFast_SnapshotCountersAreTheSnapshots(t *testing.T) {
+func TestBeginRead_SnapshotCountersAreTheSnapshots(t *testing.T) {
 	for _, inProcess := range []bool{false, true} {
 		t.Run(fmt.Sprintf("inProcess=%v", inProcess), func(t *testing.T) {
 			opts := DefaultOptions()
@@ -963,12 +963,12 @@ func TestBeginReadFast_SnapshotCountersAreTheSnapshots(t *testing.T) {
 			db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), opts)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = db.Close() })
-			testFastBeginSnapshotCounters(t, db)
+			testBeginSnapshotCounters(t, db)
 		})
 	}
 }
 
-func testFastBeginSnapshotCounters(t *testing.T, db *DB) {
+func testBeginSnapshotCounters(t *testing.T, db *DB) {
 	commit := func(schema bool) (fcc, sc uint32) {
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
@@ -986,7 +986,7 @@ func testFastBeginSnapshotCounters(t *testing.T, db *DB) {
 		return db.localFileChangeCounter.Load(), db.localSchemaCookie.Load()
 	}
 	snapshot := func() (fcc, sc uint32) {
-		rtx, err := db.BeginReadFast()
+		rtx, err := db.BeginRead()
 		require.NoError(t, err)
 		fcc, sc, err = rtx.SnapshotHeaderCounters()
 		require.NoError(t, err)
@@ -1012,7 +1012,7 @@ func testFastBeginSnapshotCounters(t *testing.T, db *DB) {
 
 	// A reader that pinned its snapshot before a commit keeps that
 	// snapshot's counters; one that begins after gets the new ones.
-	older, err := db.BeginReadFast()
+	older, err := db.BeginRead()
 	require.NoError(t, err)
 	fcc2, sc2 := commit(true)
 	require.NotEqual(t, sc, sc2)

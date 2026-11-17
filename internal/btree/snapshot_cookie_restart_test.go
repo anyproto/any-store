@@ -184,7 +184,7 @@ func TestBeginRead_InProcessFastPathRetriesAcrossRestart(t *testing.T) {
 				t.Fatalf("snapshot lacks the commit at cookie %d, want %d", cookie, cookieBefore)
 			}
 			// The readers of the commit: the content under its key.
-			fast, err := db.BeginReadFast()
+			fast, err := db.BeginRead()
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -443,11 +443,11 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 }
 
 // findIdOwnTx is the point lookup of a caller without a transaction: one
-// fast read tx around the fetch of the key in buf.SmallBuf. A function of
+// btree read tx around the fetch of the key in buf.SmallBuf. A function of
 // its own to keep its return count low: past returns x defers = 15 the
 // compiler stops open-coding defers, which costs this path about 3%.
 func (c *collection) findIdOwnTx(ctx context.Context, p *anyenc.Parser, buf *syncpool.DocBuffer) (doc Doc, err error) {
-	tx, err := c.db.btreeDB.BeginReadFastContext(ctx)
+	tx, err := c.db.btreeDB.BeginReadContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -456,7 +456,7 @@ func (c *collection) findIdOwnTx(ctx context.Context, p *anyenc.Parser, buf *syn
 			err = rbErr
 		}
 	}()
-	// The fast begin skips checkStale; the schema check it needs is this.
+	// A btree-level begin runs no checkStale; the schema check it needs is this.
 	c.db.observeCookie(tx)
 	s, err := c.resolve(tx)
 	if err != nil {

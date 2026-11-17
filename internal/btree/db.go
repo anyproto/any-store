@@ -1135,17 +1135,6 @@ func (db *DB) TryBeginRead() (*ReadTx, error) {
 	return db.beginRead(context.Background(), false)
 }
 
-// BeginReadFast is BeginRead: every read begin is the one that reads no
-// page 1 at a remembered snapshot.
-func (db *DB) BeginReadFast() (*ReadTx, error) {
-	return db.beginRead(context.Background(), true)
-}
-
-// BeginReadFastContext is BeginReadFast with BeginReadContext's wait.
-func (db *DB) BeginReadFastContext(ctx context.Context) (*ReadTx, error) {
-	return db.beginRead(ctx, true)
-}
-
 // BeginWrite starts a read-write transaction. Only one write transaction
 // can be active at a time (single-writer semantics). Waits until the
 // existing write transaction completes or the DB closes.
