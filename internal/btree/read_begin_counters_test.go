@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -328,7 +330,10 @@ func TestReadBeginCounters_CheckCatchesAWrongMemo(t *testing.T) {
 
 // Readers begin while a writer commits schema changes and restarts the
 // WAL: each reader's cookie names the newest namespace its snapshot holds,
-// and (the test-build check) is the one on its snapshot's page 1.
+// and (the test-build check) is the one on its snapshot's page 1. The writer
+// lets every reader in before its first commit and waits for further reads
+// after each one, so the readers run through every phase whatever the
+// scheduler does.
 func TestReadBeginCounters_ConcurrentWithCommitsAndRestarts(t *testing.T) {
 	counterModes(t, func(t *testing.T, db *DB) {
 		counterDDL(t, db, "seed")
@@ -340,10 +345,32 @@ func TestReadBeginCounters_ConcurrentWithCommitsAndRestarts(t *testing.T) {
 		errs := make(chan error, 1<<16)
 		var wg sync.WaitGroup
 		var gate sync.RWMutex
-		for r := 0; r < 4; r++ {
+		const readers = 4
+		var reads atomic.Int64
+		// waitReads waits until n reads have completed. It gives up when a
+		// reader has failed (the errors fail the test) or after a deadline.
+		waitReads := func(n int64) bool {
+			deadline := time.Now().Add(30 * time.Second)
+			for reads.Load() < n {
+				if len(errs) > 0 || time.Now().After(deadline) {
+					return false
+				}
+				time.Sleep(50 * time.Microsecond)
+			}
+			return true
+		}
+		var started sync.WaitGroup
+		started.Add(readers)
+		for r := 0; r < readers; r++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				first := true
+				defer func() {
+					if first {
+						started.Done()
+					}
+				}()
 				for {
 					select {
 					case <-stop:
@@ -372,11 +399,20 @@ func TestReadBeginCounters_ConcurrentWithCommitsAndRestarts(t *testing.T) {
 						errs <- err
 						return
 					}
+					reads.Add(1)
+					if first {
+						first = false
+						started.Done()
+					}
 				}
 			}()
 		}
-		for i := 1; i <= commits; i++ {
+		started.Wait()
+		starved := false
+		for i := 1; i <= commits && !starved; i++ {
 			counterDDL(t, db, name(base+uint32(i)))
+			// At least one read per reader after this commit before the next.
+			starved = !waitReads(reads.Load() + readers)
 			switch i % 6 {
 			case 2:
 				_ = db.Checkpoint(CheckpointPassive)
@@ -394,6 +430,7 @@ func TestReadBeginCounters_ConcurrentWithCommitsAndRestarts(t *testing.T) {
 		for err := range errs {
 			require.NoError(t, err)
 		}
+		require.False(t, starved, "the readers stopped completing reads (%d reads)", reads.Load())
 		counterNow(t, db, base+commits, []string{name(base + commits)}, nil)
 	})
 }
