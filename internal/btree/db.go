@@ -365,12 +365,11 @@ type DB struct {
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
 	masterBT *btree
 
-	// The page-1 counters of this handle's last commit, or of the file as
-	// it was opened: LocalSchemaCookie, a backup's capture of the
-	// destination's schema. No transaction takes its counters from them.
-	// Written by Commit (under the write lock + mu.RLock).
-	localFileChangeCounter atomic.Uint32
-	localSchemaCookie      atomic.Uint32
+	// The schema cookie of this handle's last commit, or of the file as it
+	// was opened: LocalSchemaCookie, a backup's capture of the destination's
+	// schema. No transaction takes its counters from it. Written by Commit
+	// (under the write lock + mu.RLock).
+	localSchemaCookie atomic.Uint32
 
 	// dataVersion is a monotonically increasing counter incremented on every
 	// write commit. Used by persistent reader caches to detect staleness:
@@ -770,13 +769,12 @@ func Open(path string, opts Options) (*DB, error) {
 		p.close()
 		return nil, err
 	}
-	fcc, sc, err := p.readHeaderCounters(maxFrame)
+	_, sc, err := p.readHeaderCounters(maxFrame)
 	p.endRead(slot)
 	if err != nil {
 		p.close()
 		return nil, err
 	}
-	db.localFileChangeCounter.Store(fcc)
 	db.localSchemaCookie.Store(sc)
 
 	if canonicalPath != "" {
@@ -2531,14 +2529,14 @@ func (tx *WriteTx) Commit() error {
 	db.commitHook = nil
 	completed = true
 	if err == nil {
-		db.localFileChangeCounter.Store(newFCC)
 		db.localSchemaCookie.Store(newSC)
 		// Increment dataVersion so persistent reader caches detect staleness.
 		// Unlike walMaxFrame, this counter never wraps after checkpoint restart.
 		dv := db.dataVersion.Add(1)
-		// A synthesized header identifies the snapshot only together with
-		// the dataVersion, which just moved: the entry made as the commit
-		// became visible (wal.onPublish) is stored again under the new one.
+		// The memo keeps a synthesized header with the dataVersion (a
+		// backstop, see snapCountersMemo), which just moved: the entry made
+		// as the commit became visible (wal.onPublish) is stored again under
+		// the new one.
 		if db.hasPublished {
 			db.snapCounters.put(dv, &db.published, newFCC, newSC)
 		}

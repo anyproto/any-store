@@ -16,9 +16,11 @@ import (
 //
 // The key is what identifies a snapshot to this process (see DB.beginRead):
 // the WAL-index header, which is unique per commit when it comes from the
-// shared memory — change counter, frame checksum and salts — and for the
-// header synthesized in-process, which is a frame number only, the
-// dataVersion with it.
+// shared memory — change counter, frame checksum and salts. The header
+// synthesized in the in-process and in-memory modes (frame number, page
+// count, restart count) identifies a snapshot as well: within a restart
+// generation the published frame number only rises and a published frame is
+// never rewritten. The dataVersion kept with it is a backstop.
 //
 // Readers take no lock: every field is an atomic, framed by a sequence
 // number that is odd while a writer is inside and changes with every write.

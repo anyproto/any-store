@@ -2504,7 +2504,7 @@ func (p *pager) committedCounters() (fileChangeCount, schemaCookie uint32) {
 // at the newest committed state: the frame bound is raised from walMaxFrame
 // to the live wal-index header's (frames written by other processes
 // included) and the floor is the live one. For a caller that holds no
-// snapshot to stay within: Open, which seeds the handle's local counters.
+// snapshot to stay within: Open, which seeds the handle's schema cookie.
 // A transaction never uses it — its counters are its snapshot's
 // (readHeaderCountersAt).
 //

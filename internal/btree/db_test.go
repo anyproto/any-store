@@ -896,6 +896,7 @@ func TestCommit_DataChanged(t *testing.T) {
 	require.NoError(t, tx.Put(ns, []byte("k"), []byte("v")))
 	tx.MarkDataChanged()
 	require.NoError(t, tx.Commit())
+	committedFCC, _ := db.pager.committedCounters()
 
 	// The commit is the handle's own: the next transaction reads the new
 	// counter and finds no change.
@@ -905,7 +906,7 @@ func TestCommit_DataChanged(t *testing.T) {
 	require.NoError(t, err)
 	epoch, exact := rtx.ChangeEpoch()
 	require.NoError(t, rtx.Rollback())
-	assert.Equal(t, db.localFileChangeCounter.Load(), fcc)
+	assert.Equal(t, committedFCC, fcc)
 	assert.Zero(t, epoch)
 	assert.True(t, exact)
 }
@@ -935,13 +936,15 @@ func TestBeginRead_OwnCommitCounters(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Put(ns, []byte("k"), []byte("v")))
 	require.NoError(t, tx.Commit())
+	committedFCC, committedSC := db.pager.committedCounters()
 
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)
 	assert.False(t, rtx.writable)
 	// The counters are the snapshot's: here those of the handle's own commit.
-	assert.Equal(t, db.localFileChangeCounter.Load(), rtx.snapFileChangeCounter)
-	assert.Equal(t, db.localSchemaCookie.Load(), rtx.snapSchemaCookie)
+	assert.Equal(t, committedFCC, rtx.snapFileChangeCounter)
+	assert.Equal(t, committedSC, rtx.snapSchemaCookie)
+	assert.Equal(t, db.LocalSchemaCookie(), rtx.snapSchemaCookie)
 	assert.Equal(t, rtx.SnapshotSchemaCookie(), rtx.DiskSchemaCookie())
 
 	ns2, err := rtx.GetNamespace("fast")
@@ -983,7 +986,7 @@ func testBeginSnapshotCounters(t *testing.T, db *DB) {
 			tx.MarkSchemaChanged()
 		}
 		require.NoError(t, tx.Commit())
-		return db.localFileChangeCounter.Load(), db.localSchemaCookie.Load()
+		return db.pager.committedCounters()
 	}
 	snapshot := func() (fcc, sc uint32) {
 		rtx, err := db.BeginRead()
@@ -998,16 +1001,14 @@ func testBeginSnapshotCounters(t *testing.T, db *DB) {
 	gotFCC, gotSC := snapshot()
 	assert.Equal(t, [2]uint32{fcc, sc}, [2]uint32{gotFCC, gotSC}, "after an own commit")
 
-	// A peer's commit: the local cache lags, and nothing here remembers the
+	// A peer's commit: the local cookie lags, and nothing here remembers the
 	// snapshot's counters.
-	db.localFileChangeCounter.Store(fcc - 1)
 	db.localSchemaCookie.Store(sc - 1)
 	db.snapCounters.put(0, &WalIndexHdr{aSalt: [2]uint32{1, 1}}, 0, 0)
 	gotFCC, gotSC = snapshot()
 	assert.Equal(t, [2]uint32{fcc, sc}, [2]uint32{gotFCC, gotSC}, "read from page 1, not the lagging cache")
 	gotFCC, gotSC = snapshot()
 	assert.Equal(t, [2]uint32{fcc, sc}, [2]uint32{gotFCC, gotSC}, "remembered")
-	db.localFileChangeCounter.Store(fcc)
 	db.localSchemaCookie.Store(sc)
 
 	// A reader that pinned its snapshot before a commit keeps that
