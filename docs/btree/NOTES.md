@@ -2579,8 +2579,24 @@ test builds (`SetCheckPage1ForTest`) every begin the memo serves is checked agai
 page-1 read within the snapshot's bounds (`checkSnapshotCounters`), so every suite holds
 the memo to page 1.
 
-`readHeaderCounters`, which raises the frame bound to the live header, is left for `Open`,
-where there is no snapshot to stay within.
+The memo is not SQLite's cache in three ways, none of which changes which counters a
+snapshot gets:
+- **Lifetime.** It has one entry for the process, replaced by whichever begin or commit
+  stores last; it is not cleared on a failed begin or a wal-index recovery, where SQLite
+  resets the cache (`pager.c:3261`; `*pChanged = 1` after `walIndexRecover`,
+  `wal.c:2724-2725`), because its key already tells those snapshots apart. "Once per
+  snapshot" is the common case, not a bound: a delayed begin at an older snapshot replaces
+  the entry, and the next begin at the newer one reads page 1 again.
+- **Scope.** It is shared by every reader of the process; SQLite's cache belongs to one
+  connection.
+- **Error timing.** A begin at the remembered snapshot reads nothing, so an unreadable
+  page 1 fails the first page read that needs it, not the begin. SQLite fails the begin in
+  `lockBtree` only when page 1 is not in its cache, which it may evict between
+  transactions.
+
+`readHeaderCounters`, which raises the frame bound to the live header, is left for `Open`.
+`Open` holds a reader slot for that read (`db.go`, after `wal.onPublish` is set), but what
+it reads seeds the process-local counters, not a transaction's snapshot pair.
 
 <a id="drift-46-public-multi-process-staleness-api-diverges-from-sqlite-auto"></a>
 ### Drift: Public Multi Process Staleness API Diverges From SQLite Auto Tracking
@@ -2589,14 +2605,16 @@ where there is no snapshot to stay within.
   `db.go:1903-1915`, `db.go:1798-1821`, `db.go:1017-1024`), `pager.go`
   (`internal/btree/pager.go:2308-2319`).
 
-any-store's page-1 counters are caller-driven where SQLite's are automatic. SQLite
-increments the page-1 File Change Counter (offset 24) inside the pager on every commit
-(`pager_incr_changecounter`, `pager.c:6317`, `pager.c:6295-6304`) and the Schema Cookie
-(offset 40) when the schema changes. any-store makes the bumps opt-in:
-`WriteTx.MarkDataChanged()`/`MarkSchemaChanged()` set `tx.dataChanged`/`tx.schemaChanged`,
-`Commit` forwards them to `pager.commit`, and `pager.commit` moves the cookie only when
-`schemaChanged` is set (the change counter: see
-[drift-77](#drift-77-filechangecount-bumped-conditionally-not-unconditionally)). A caller
+any-store's schema cookie is caller-driven where SQLite's is automatic. SQLite moves the
+Schema Cookie (offset 40) as the statement that changes the schema executes
+(`OP_SetCookie`, `vdbe.c:4249`). any-store makes the bump opt-in:
+`WriteTx.MarkSchemaChanged()` sets `tx.schemaChanged`, `Commit` forwards it to
+`pager.commit`, and `pager.commit` moves the cookie only when it is set. (The File Change
+Counter, offset 24, has its own rule per schema format: see
+[drift-77](#drift-77-filechangecount-bumped-conditionally-not-unconditionally). In WAL mode
+SQLite writes it only into a page 1 the commit writes anyway, `pager_write_changecounter`
+from `pagerWalFrames`, `pager.c:3218`; the every-commit `pager_incr_changecounter`,
+`pager.c:6317`, is the rollback-journal path.) A caller
 that changes the schema and forgets `MarkSchemaChanged` leaves the cookie as it was, and
 no other connection learns of the change from it.
 
