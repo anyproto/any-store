@@ -305,7 +305,7 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 	// DRIFT: SQLite conditionally opens a tx only if none exists, to
 	// support explicit sqlite3_backup_step-inside-a-user-tx patterns.
 	// any-store doesn't expose that; we always open+close our own.
-	rtx, err := b.src.beginRead(ctx, false, false)
+	rtx, err := b.src.beginRead(ctx, false)
 	if err != nil {
 		if errors.Is(err, ErrReadersBusy) {
 			return b.stepBusy(ErrBusy)

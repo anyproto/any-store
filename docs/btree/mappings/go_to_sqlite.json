@@ -1537,6 +1537,10 @@
     "sqlite": [],
     "note": "test-build check, in the place of SQLite assert()s: the header a write transaction begins with is the committed page 1's"
   },
+  "page1_check.go:*pager.checkSnapshotCounters": {
+    "sqlite": [],
+    "note": "test-build check, in the place of SQLite assert()s: the counters a read begin took from the memo are those of page 1 within the snapshot's frame bounds"
+  },
   "page1_check.go:*pager.committedPage1": {
     "sqlite": [],
     "note": "test-build check helper: page 1 read past the writer cache"
@@ -1880,7 +1884,7 @@
   },
   "pager.go:*pager.readHeaderCounters": {
     "sqlite": [],
-    "note": "any-store cross-process header read bypassing cache/index"
+    "note": "page-1 counters at the newest committed state, for Open; a transaction has its snapshot's (readHeaderCountersAt, the counters memo)"
   },
   "pager.go:*pager.readOverflowAt": {
     "sqlite": [

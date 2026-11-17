@@ -2538,34 +2538,49 @@ silently absorbed -- which can break callers (or wrappers) that rely on SQLite's
 finish semantics.
 
 <a id="drift-45-beginreadfast-skips-page-1-staleness-counter-reads"></a>
-### Drift: BeginReadFast Skips Page 1 Staleness Counter Reads
-- **Category:** new-feature  -  **Severity:** medium
-- **Affected functions:** `db.go:*DB.BeginRead` (`db.go:840-842`),
-  `db.go:*DB.BeginReadFast` (`internal/btree/db.go:847-849`, `db.go:754-767`, `db.go:831-834`,
-  `db.go:1801-1821`), `db.go` (`internal/btree/db.go:727`, `db.go:840-849`).
+### Drift: Read Begin Takes The Page 1 Counters From A Memo
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `db.go:*DB.beginRead`, `snapcounters.go:*snapCountersMemo`,
+  `pager.go:*pager.readHeaderCountersAt`, `page1_check.go:*pager.checkSnapshotCounters`.
 
-Go parameterizes its read-transaction opener as `beginRead(readCounters bool)` (`db.go:727`)
-and adds a public `BeginReadFast()` that passes `readCounters=false` (`db.go:847-849`); on
-that fast path `pager.readHeaderCounters` is skipped and the transaction's
-`diskFileChangeCounter`/`diskSchemaCookie` are seeded from the process-local cached counters
-(`db.go:754-767`, `db.go:831-834`) rather than from on-disk page-1 metadata. Snapshot
-isolation for actual data reads is preserved -- the path still fixes the WAL `maxFrame`/reader
-slot and clears the per-connection reader cache on change-counter mismatch, matching SQLite's
-`pagerBeginReadTransaction` reset behavior -- so the divergence is purely in the staleness
-reporting layer, which has no SQLite analogue to begin with. The consequence is that on a
-fast read `IsDataStale`/`IsSchemaStale` always return false and
-`DiskFileChangeCounter`/`DiskSchemaCookie` return possibly-stale local values
-(`db.go:1801-1821`); this is an undocumented new API whose semantics a caller must understand
-to avoid mistaking a fast read's "not stale" for a verified cross-process check.
+(The anchor keeps the name of the entry it replaces: until 2026-11-17 there were two read
+begins, one that read page 1 at every begin with the frame bound raised to the newest
+committed frame and a `BeginReadFast` that did not. There is one now.)
 
-The snapshot-bounded pair (`SnapshotHeaderCounters`) is exact on the fast path all the same:
-`snapCountersMemo` (`snapcounters.go`) remembers the counters of one snapshot, keyed by its
-WAL-index header (with `dataVersion` for the header synthesized in-process). A commit of this
-process stores its own as it becomes visible (`wal.onPublish`), a begin that had to read page 1
-stores what it read, and a fast begin that pins another snapshot reads page 1 at its own bounds
-once. SQLite reads the schema cookie of the statement's own transaction from the cached page 1
-in `OP_Transaction` (`vdbe.c:4128`, `btree.c:3784-3787`); the memo is how the fast path gets
-that value without the page read.
+A read transaction carries the page-1 `FileChangeCount` and `SchemaCookie` of its snapshot
+(`ReadTx.SnapshotHeaderCounters`, `SnapshotSchemaCookie`). SQLite has the cookie from the
+transaction's own page 1: `sqlite3BtreeBeginTrans` runs `lockBtree` while `pBt->pPage1==0`
+(`btree.c:3707`), `unlockBtreeIfUnused` drops the page when the transaction ends
+(`btree.c:3489-3499`), and the cookie is `get4byte(&pBt->pPage1->aData[40])`
+(`btree.c:3786`, consumed by `OP_Transaction`, `vdbe.c:4128`). `lockBtree` gets page 1
+through the pager cache, and in WAL mode that cache outlives the transaction:
+`pagerBeginReadTransaction` resets it only when `sqlite3WalBeginReadTransaction` reports a
+change (`pager.c:3246-3267`), which is a `memcmp` of the whole wal-index header
+(`walIndexTryHdr`, `wal.c:2624-2626`). The one per-transaction read of the counters from
+the file (`dbFileVers`, `pager.c:5410`) is inside `if( !pagerUseWal(pPager) && ... )`
+(`pager.c:5266`): rollback-journal mode only. So a WAL read begin reads page 1 from the
+WAL or the database file once per snapshot, and nothing past the snapshot.
+
+The Go port has the same rule with a different holder. A reader's page cache is one of a
+pool, not the connection's, so the two counters are kept apart from it in
+`snapCountersMemo` (`snapcounters.go`): one entry, keyed by what identifies a snapshot to
+this process — the wal-index header (change counter, frame checksum, salts), and for the
+header synthesized in the in-process and in-memory modes (frame number, page count,
+restart count) the `dataVersion` with it. This is the key the reader caches are kept or
+cleared by. `beginRead` takes the pair from the memo at the remembered snapshot and
+otherwise reads page 1 strictly within the snapshot's `[minFrame, maxFrame]`
+(`readHeaderCountersAt`) and remembers it. A commit of this process stores its own pair as
+it becomes visible (`wal.onPublish`), so the first reader of a commit reads nothing either.
+
+What the memo must never do is serve one snapshot's counters to another. The key is
+SQLite's; the two places where the synthesized header needed more than a frame number are
+in the key (the restart count, a seqlock around a restart's zeroing; `dataVersion`). In
+test builds (`SetCheckPage1ForTest`) every begin the memo serves is checked against a
+page-1 read within the snapshot's bounds (`checkSnapshotCounters`), so every suite holds
+the memo to page 1.
+
+`readHeaderCounters`, which raises the frame bound to the live header, is left for `Open`,
+where there is no snapshot to stay within.
 
 <a id="drift-46-public-multi-process-staleness-api-diverges-from-sqlite-auto"></a>
 ### Drift: Public Multi Process Staleness API Diverges From SQLite Auto Tracking
@@ -2574,50 +2589,41 @@ that value without the page read.
   `db.go:1903-1915`, `db.go:1798-1821`, `db.go:1017-1024`), `pager.go`
   (`internal/btree/pager.go:2308-2319`).
 
-any-store exposes a caller-driven multi-process staleness protocol with no analogue in stock
-SQLite. SQLite *automatically* increments the page-1 File Change Counter (offset 24) and
-Schema Cookie (offset 40) inside the pager on every commit / schema change
-(`pager_incr_changecounter`, `pager.c:6317`, `pager.c:6295-6304`). any-store instead
-makes counter bumping opt-in: `WriteTx.MarkDataChanged()`/`MarkSchemaChanged()`
-(`db.go:1868-1878`) merely set `tx.dataChanged`/`tx.schemaChanged` flags (`db.go:1855-1856`);
-`Commit` forwards those flags to `pager.commit` (`db.go:1903-1915`), and `pager.commit` only
-increments the on-disk counters when those flags are set (`pager.go:2308-2319`), with
-`UpdateLocalCounters` (`db.go:1017-1024`) and the `IsDataStale`/`IsSchemaStale`/
-`DiskFileChangeCounter`/`DiskSchemaCookie` accessors (`db.go:1798-1821`) forming the rest of
-the surface. The consequence is a fundamentally different contract from SQLite's automatic
-tracking: a caller who forgets to call `MarkDataChanged`/`MarkSchemaChanged` will leave the
-cross-process change counters unbumped, so other connections' staleness checks silently fail
-to observe the change.
+any-store's page-1 counters are caller-driven where SQLite's are automatic. SQLite
+increments the page-1 File Change Counter (offset 24) inside the pager on every commit
+(`pager_incr_changecounter`, `pager.c:6317`, `pager.c:6295-6304`) and the Schema Cookie
+(offset 40) when the schema changes. any-store makes the bumps opt-in:
+`WriteTx.MarkDataChanged()`/`MarkSchemaChanged()` set `tx.dataChanged`/`tx.schemaChanged`,
+`Commit` forwards them to `pager.commit`, and `pager.commit` moves the cookie only when
+`schemaChanged` is set (the change counter: see
+[drift-77](#drift-77-filechangecount-bumped-conditionally-not-unconditionally)). A caller
+that changes the schema and forgets `MarkSchemaChanged` leaves the cookie as it was, and
+no other connection learns of the change from it.
 
-A second divergence inside this surface: the begin-time counters behind
-`DiskFileChangeCounter`/`DiskSchemaCookie` are read with the frame bound RAISED to the newest
-committed frame (`pager.readHeaderCounters`), so a begin racing a commit — or a reader slot
-pinned behind — reports counters its own snapshot cannot see. SQLite has no such raise:
+Nothing else of the surface this entry used to describe remains. The staleness accessors
+(`IsDataStale`, `IsSchemaStale`, `DiskFileChangeCounter`, `LocalCaughtUp`,
+`AdvanceLocalCounters`, `UpdateLocalCounters`) were removed when change detection moved to
+the wal-index header (`ReadTx.ChangeEpoch`,
+[the change state](#drift-2026-11-13-1-the-change-state-is-one-value-under-compare-and-swap)), and the
+begin-time page-1 read whose frame bound was RAISED to the newest committed frame — so
+that a begin racing a commit, or a reader slot pinned behind, reported counters its own
+snapshot could not see — is gone too (2026-11-17). SQLite has no such raise:
 `sqlite3BtreeBeginTrans` returns the cookie from the transaction's own page 1
-(`sqlitec/src/btree.c:3785-3786`), and the `SQLITE_SCHEMA` reload consumes the cookie read
-through that same transaction (`sqlitec/src/prepare.c:288,293`) — detection, reload, and
-consumption are all snapshot-bounded. The raise is kept for cross-process staleness
-detection, but judgments about snapshot contents must use the snapshot-bounded pair —
-`ReadTx.SnapshotHeaderCounters`/`SnapshotSchemaCookie`, baked at begin from the tx's captured
-`[minFrame, maxFrame]` window (a second bounded page-1 read is paid only when the detection
-read was actually raised) — which restores the SQLite-aligned semantics. Consumers: the
-staleness pass (reconcile + counter consumption — consuming the raised counters would mark
-peer DDL as reconciled that the reconcile snapshot never contained, silently detaching later
-write transactions from a peer-created index) and the index-visibility fast paths
-(`visibleIndexes`, range/fts `visibleTo`, `vectorIndex.forTx` — judging with the raised
-cookie admits an index whose namespace the snapshot cannot resolve, returning silently wrong
-query results).
+(`btree.c:3786`), and the `SQLITE_SCHEMA` reload consumes the cookie read through that
+same transaction (`prepare.c:288,293`) — detection, reload and consumption are all
+snapshot-bounded. A transaction here has one pair, its snapshot's:
+`ReadTx.SnapshotHeaderCounters`/`SnapshotSchemaCookie`, fixed at begin for the captured
+`[minFrame, maxFrame]` window ([drift-45](#drift-45-beginreadfast-skips-page-1-staleness-counter-reads)
+for where a read begin has it from); `DiskSchemaCookie` is the same value under the name
+the write paths use. The consumers judge snapshot contents with it: the schema-cookie
+observation at a begin (consuming a cookie the snapshot does not contain would mark another
+process's DDL as seen that the snapshot never held) and the index-visibility checks
+(admitting an index whose namespace the snapshot cannot resolve returns wrong results).
 
-The rest of the surface follows SQLite's behavior with a different mechanism: the local
-counter cache records the counters the caller's in-memory state reflects and moves only
-forward (`AdvanceLocalCounters`; `UpdateLocalCounters` stays a raw store for tests), and
-`ReadTx.LocalCaughtUp` lets a caller whose begin-time verdict is stale skip its reload once
-the cache has reached the counters the tx read from disk, which only a commit of this
-process can bring about. In SQLite a connection's own DDL updates the cookie its schema was
-loaded from (`OP_SetCookie`, `vdbe.c`) as it executes, so `OP_Transaction` never reloads a
-schema change of the connection's own, and nothing winds the cached cookie back; here the
-cache is updated at commit and advanced by readers from their snapshot, with the same two
-outcomes.
+The handle also keeps the counters of its own last commit (`localSchemaCookie`,
+`LocalSchemaCookie()`; of the file as opened before it commits). No transaction takes its
+counters from them: they serve a backup's capture of the destination's schema
+(`backup.go`, `iDestSchema`).
 
 <a id="drift-47-checkpoint-omits-open-transaction-guard"></a>
 ### Drift: Checkpoint Omits Open Transaction Guard

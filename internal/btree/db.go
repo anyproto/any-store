@@ -365,10 +365,10 @@ type DB struct {
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
 	masterBT *btree
 
-	// Local counter cache for multi-process staleness detection.
-	// Accessed atomically: written by Commit (under the write lock + mu.RLock)
-	// and read by BeginRead/BeginWrite (under mu.RLock). Since both
-	// paths hold mu.RLock (not exclusive), atomics are required.
+	// The page-1 counters of this handle's last commit, or of the file as
+	// it was opened: LocalSchemaCookie, a backup's capture of the
+	// destination's schema. No transaction takes its counters from them.
+	// Written by Commit (under the write lock + mu.RLock).
 	localFileChangeCounter atomic.Uint32
 	localSchemaCookie      atomic.Uint32
 
@@ -958,12 +958,11 @@ func (db *DB) SchemaFormat() uint32 {
 }
 
 // beginRead starts a read-only transaction.
-// When readCounters is false, disk counters are initialized from local counters
-// without reading page-1 metadata, which is useful for hot point-lookups.
+// DRIFT: a read begin has its snapshot's page-1 counters from a memo keyed by the wal-index header; SQLite has them from the page 1 its pager cache keeps under the same key See docs/btree/NOTES.md#drift-45-beginreadfast-skips-page-1-staleness-counter-reads
 // When wait is false, a held-up reader slot is ErrReadersBusy, not a wait.
 // A wait ends with a slot, with ctx (its Err) or with Close (ErrClosed). ctx
 // is checked before the wait, so a ctx that has ended takes no slot.
-func (db *DB) beginRead(ctx context.Context, readCounters, wait bool) (*ReadTx, error) {
+func (db *DB) beginRead(ctx context.Context, wait bool) (*ReadTx, error) {
 	if db.closing.Load() {
 		return nil, ErrClosed
 	}
@@ -1028,55 +1027,31 @@ func (db *DB) beginRead(ctx context.Context, readCounters, wait bool) (*ReadTx, 
 		snapHdr = db.pager.wal.index.synthHdr(maxFrame, hdr.nPage)
 	}
 
-	localFCC := db.localFileChangeCounter.Load()
-	localSC := db.localSchemaCookie.Load()
-	fcc := localFCC
-	sc := localSC
-	snapFCC, snapSC := localFCC, localSC
-	if !readCounters {
-		// The disk pair stays the seeded local one (no staleness detection on
-		// this path); the snapshot pair is exact all the same — from the
-		// memo, or read at the snapshot's own bounds.
-		var ok bool
-		if snapFCC, snapSC, ok = db.snapCounters.get(curDV, &snapHdr); !ok {
-			snapFCC, snapSC, err = db.pager.readHeaderCountersAt(maxFrame, minFrame)
-			if err != nil {
-				db.pager.endRead(slot)
-				db.mu.RUnlock()
-				<-db.readerSem
-				return nil, err
-			}
+	// The page-1 counters of the snapshot. SQLite takes the schema cookie
+	// from the transaction's page 1 (btree.c:3786), which lockBtree fetches
+	// through the pager cache, and in WAL mode that cache outlives the
+	// transaction unless the wal-index header changed (walIndexTryHdr's
+	// memcmp, wal.c:2624-2626; pager_reset, pager.c:3246-3267): page 1 is
+	// read from the WAL or the file once per snapshot, not once per
+	// transaction. The memo is that cached page 1, cut down to the two
+	// counters and keyed by the same header: a begin at the remembered
+	// snapshot reads nothing, a begin at any other reads page 1 within the
+	// snapshot's own bounds and remembers it. Nothing is read past the
+	// snapshot.
+	snapFCC, snapSC, ok := db.snapCounters.get(curDV, &snapHdr)
+	if !ok {
+		snapFCC, snapSC, err = db.pager.readHeaderCountersAt(maxFrame, minFrame)
+		if err == nil {
 			db.snapCounters.put(curDV, &snapHdr, snapFCC, snapSC)
 		}
+	} else if checkPage1Invariant.Load() {
+		err = db.pager.checkSnapshotCounters(maxFrame, minFrame, snapFCC, snapSC)
 	}
-	if readCounters {
-		// Read on-disk counters for staleness detection (raised to the
-		// newest committed frame so peer commits are noticed).
-		var effMax, floor uint32
-		fcc, sc, effMax, floor, err = db.pager.readHeaderCountersRaised(maxFrame)
-		if err != nil {
-			db.pager.endRead(slot)
-			db.mu.RUnlock()
-			<-db.readerSem
-			return nil, err
-		}
-		// Snapshot-bounded pair: identical to the raised read unless its
-		// bounds differ from the snapshot's (rare: begin racing a commit, a
-		// pinned reader slot, a checkpoint or restart in between) — only
-		// then pay a second bounded read. The floor matters as much as the
-		// ceiling: after a restart the new generation's frames sit below
-		// the snapshot's maxFrame, and only its own floor excludes them.
-		snapFCC, snapSC = fcc, sc
-		if effMax != maxFrame || floor != minFrame {
-			snapFCC, snapSC, err = db.pager.readHeaderCountersAt(maxFrame, minFrame)
-			if err != nil {
-				db.pager.endRead(slot)
-				db.mu.RUnlock()
-				<-db.readerSem
-				return nil, err
-			}
-		}
-		db.snapCounters.put(curDV, &snapHdr, snapFCC, snapSC)
+	if err != nil {
+		db.pager.endRead(slot)
+		db.mu.RUnlock()
+		<-db.readerSem
+		return nil, err
 	}
 
 	// Allocate reader cache from pool for per-connection page caching.
@@ -1136,8 +1111,6 @@ func (db *DB) beginRead(ctx context.Context, readCounters, wait bool) (*ReadTx, 
 	tx.walMaxFrame = maxFrame
 	tx.walHdr = snapHdr
 	tx.walSlot = slot
-	tx.diskFileChangeCounter = fcc
-	tx.diskSchemaCookie = sc
 	tx.snapFileChangeCounter = snapFCC
 	tx.snapSchemaCookie = snapSC
 	return tx, nil
@@ -1145,36 +1118,32 @@ func (db *DB) beginRead(ctx context.Context, readCounters, wait bool) (*ReadTx, 
 
 // BeginRead starts a read-only transaction. Its wait for a reader slot ends
 // with the slot or with Close; BeginReadContext's also ends with a ctx.
-// DRIFT: BeginReadFast skips page-1 counter read; staleness APIs return stale/false See docs/btree/NOTES.md#drift-45-beginreadfast-skips-page-1-staleness-counter-reads
 func (db *DB) BeginRead() (*ReadTx, error) {
-	return db.beginRead(context.Background(), true, true)
+	return db.beginRead(context.Background(), true)
 }
 
 // BeginReadContext is BeginRead whose wait for a reader slot also ends with
 // ctx: ctx.Err() when ctx ends first, at once when ctx has ended already.
 func (db *DB) BeginReadContext(ctx context.Context) (*ReadTx, error) {
-	return db.beginRead(ctx, true, true)
+	return db.beginRead(ctx, true)
 }
 
 // TryBeginRead is BeginRead that does not wait for a reader slot:
 // ErrReadersBusy when every one is held. For a caller that may hold one
 // itself.
 func (db *DB) TryBeginRead() (*ReadTx, error) {
-	return db.beginRead(context.Background(), true, false)
+	return db.beginRead(context.Background(), false)
 }
 
-// BeginReadFast starts a read-only transaction without the raised page-1
-// counter read. It preserves snapshot isolation for data access and reports
-// the snapshot's own counters exactly (SnapshotHeaderCounters), but skips
-// staleness detection: the disk counters are the seeded local ones.
-// DRIFT: BeginReadFast skips the raised page-1 counter read; staleness APIs return stale/false See docs/btree/NOTES.md#drift-45-beginreadfast-skips-page-1-staleness-counter-reads
+// BeginReadFast is BeginRead: every read begin is the one that reads no
+// page 1 at a remembered snapshot.
 func (db *DB) BeginReadFast() (*ReadTx, error) {
-	return db.beginRead(context.Background(), false, true)
+	return db.beginRead(context.Background(), true)
 }
 
 // BeginReadFastContext is BeginReadFast with BeginReadContext's wait.
 func (db *DB) BeginReadFastContext(ctx context.Context) (*ReadTx, error) {
-	return db.beginRead(ctx, false, true)
+	return db.beginRead(ctx, true)
 }
 
 // BeginWrite starts a read-write transaction. Only one write transaction
@@ -1326,10 +1295,8 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 	}
 	tx.ReadTx.walSlot = slot
 	tx.ReadTx.writable = true
-	tx.ReadTx.diskFileChangeCounter = fcc
-	tx.ReadTx.diskSchemaCookie = sc
-	// The write lock excludes concurrent commits: the writer's snapshot IS
-	// the latest state, so the snapshot-bounded pair equals the disk pair.
+	// The write lock excludes concurrent commits: the writer's snapshot is
+	// the latest state, and its counters are the refreshed header's.
 	tx.ReadTx.snapFileChangeCounter = fcc
 	tx.ReadTx.snapSchemaCookie = sc
 	tx.dataChanged = false   // pool reuse safety
@@ -1846,16 +1813,11 @@ type ReadTx struct {
 	// Populated in parallel with walMaxFrame.
 	walHdr WalIndexHdr
 
-	// Disk counters from page 1 at transaction start (for staleness detection).
-	diskFileChangeCounter uint32
-	diskSchemaCookie      uint32
-	// Snapshot-bounded page-1 counters, baked at begin: what THIS tx's tree
-	// reads can actually see. Equal to the disk pair unless the begin-time
-	// read was raised past the snapshot (begin racing a commit, or a pinned
-	// reader slot) — the disk pair serves staleness DETECTION, this pair
-	// serves judgments about snapshot CONTENTS (visibility bounds, staleness
-	// consumption). On a counterless fast begin both pairs are the seeded
-	// local values (see BeginReadFast's contract).
+	// The page-1 counters of the transaction's snapshot, fixed at begin:
+	// FileChangeCount and SchemaCookie as the page 1 its tree reads resolve
+	// holds them. A read transaction has them from the counters memo or a
+	// page-1 read within its own frame bounds (beginRead), a write
+	// transaction from the header it refreshed from page 1 (BeginWrite).
 	snapFileChangeCounter uint32
 	snapSchemaCookie      uint32
 	closed                bool
@@ -2335,10 +2297,11 @@ func (tx *ReadTx) IsWriteTx() bool {
 	return tx.writable
 }
 
-// DiskSchemaCookie returns the SchemaCookie read from page 1 at the start
-// of this transaction.
+// DiskSchemaCookie returns the SchemaCookie of page 1 as of this
+// transaction's snapshot: SnapshotSchemaCookie under the name the write
+// paths use for "the committed cookie this transaction started from".
 func (tx *ReadTx) DiskSchemaCookie() uint32 {
-	return tx.diskSchemaCookie
+	return tx.snapSchemaCookie
 }
 
 // ChangeEpoch returns the invalidation epoch of this process, and whether
@@ -2361,14 +2324,13 @@ func (tx *ReadTx) ChangeEpoch() (epoch uint64, exact bool) {
 }
 
 // SnapshotHeaderCounters returns the page-1 FileChangeCount and SchemaCookie
-// as of THIS tx's snapshot — baked at begin from the tx's captured
+// as of THIS tx's snapshot — fixed at begin for the tx's captured
 // [minFrame, maxFrame] window, both sides fixed for the tx's life
-// (SQLite's pWal->minFrame/mxFrame). Unlike DiskSchemaCookie, whose
-// begin-time read is raised to the newest committed frame, these values never exceed what the tx's tree reads can actually see: a
-// begin that raced a commit, or a reader slot pinned to an older snapshot,
-// reports the older counters here. They are exact on a fast begin too. Judgments about snapshot contents (e.g.
-// whether a catalog key committed at cookie C must be visible) require this
-// bound, not the raised one. Field reads: no I/O, safe on hot paths.
+// (SQLite's pWal->minFrame/mxFrame). They never exceed what the tx's tree
+// reads can actually see: a begin that raced a commit, or a reader slot
+// pinned to an older snapshot, reports the older counters here. This is the
+// cookie sqlite3BtreeBeginTrans returns from the transaction's own page 1
+// (btree.c:3786). Field reads: no I/O, safe on hot paths.
 func (tx *ReadTx) SnapshotHeaderCounters() (fileChangeCount, schemaCookie uint32, err error) {
 	if tx.closed {
 		return 0, 0, ErrTxClosed

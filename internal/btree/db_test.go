@@ -939,9 +939,10 @@ func TestBeginReadFast(t *testing.T) {
 	rtx, err := db.BeginReadFast()
 	require.NoError(t, err)
 	assert.False(t, rtx.writable)
-	// Fast read skips on-disk counter fetch and uses local counters.
-	assert.Equal(t, db.localFileChangeCounter.Load(), rtx.diskFileChangeCounter)
-	assert.Equal(t, db.localSchemaCookie.Load(), rtx.diskSchemaCookie)
+	// The counters are the snapshot's: here those of the handle's own commit.
+	assert.Equal(t, db.localFileChangeCounter.Load(), rtx.snapFileChangeCounter)
+	assert.Equal(t, db.localSchemaCookie.Load(), rtx.snapSchemaCookie)
+	assert.Equal(t, rtx.SnapshotSchemaCookie(), rtx.DiskSchemaCookie())
 
 	ns2, err := rtx.GetNamespace("fast")
 	require.NoError(t, err)

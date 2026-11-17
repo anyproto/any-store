@@ -453,11 +453,11 @@ func TestReadFrameNoBenignFailuresUnderTruncateStress(t *testing.T) {
 }
 
 // TestReadHeaderCountersWALErrorPropagates pins the same propagation contract
-// on the page-1 header-counter read that BeginRead's staleness detection uses
-// (readHeaderCounters → readWalFrameData, which shares the fault hook): a WAL
-// read failure must fail BeginRead instead of silently serving the stale
-// DB-file FileChangeCount/SchemaCookie, which would defeat cross-process
-// staleness detection and backup restart detection.
+// on the page-1 header-counter read of a BeginRead that pins a snapshot whose
+// counters are not remembered (readHeaderCountersAt → readWalFrameData, which
+// shares the fault hook): a WAL read failure must fail BeginRead instead of
+// silently serving the older DB-file FileChangeCount/SchemaCookie as the
+// snapshot's.
 func TestReadHeaderCountersWALErrorPropagates(t *testing.T) {
 	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
 
@@ -482,6 +482,9 @@ func TestReadHeaderCountersWALErrorPropagates(t *testing.T) {
 		return nil
 	})
 
+	// The snapshot of the commit is remembered, and a begin at it reads no
+	// page 1; another snapshot remembered in its place makes this begin read.
+	db.snapCounters.put(0, &WalIndexHdr{aSalt: [2]uint32{1, 1}}, 0, 0)
 	_, err = db.BeginRead()
 	require.ErrorIs(t, err, sentinel,
 		"BeginRead must fail when the page-1 counter read fails, not serve stale counters")

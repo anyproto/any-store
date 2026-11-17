@@ -2500,12 +2500,13 @@ func (p *pager) committedCounters() (fileChangeCount, schemaCookie uint32) {
 	return p.header.FileChangeCount, p.header.SchemaCookie
 }
 
-// readHeaderCounters reads the FileChangeCount and SchemaCookie from page 1.
-// It checks the SHM header to discover the true WAL state (including frames
-// written by other processes), then uses shmHashGet + direct WAL file read to
-// get the latest page 1 data. Falls back to the database file if page 1 is
-// not in the WAL. This bypasses both the page cache and the in-process WAL
-// index to ensure cross-process visibility.
+// readHeaderCounters reads the FileChangeCount and SchemaCookie from page 1
+// at the newest committed state: the frame bound is raised from walMaxFrame
+// to the live wal-index header's (frames written by other processes
+// included) and the floor is the live one. For a caller that holds no
+// snapshot to stay within: Open, which seeds the handle's local counters.
+// A transaction never uses it — its counters are its snapshot's
+// (readHeaderCountersAt).
 //
 // For inProcess mode (heap SHM), the in-process Go map (walIndex.get) is used
 // instead of shmHashGet to avoid data races on the raw SHM byte regions.
@@ -2513,25 +2514,10 @@ func (p *pager) committedCounters() (fileChangeCount, schemaCookie uint32) {
 // cross-process readers), but in single-process mode the Go map with its
 // RWMutex provides safe concurrent access.
 func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaCookie uint32, err error) {
-	fileChangeCount, schemaCookie, _, _, err = p.readHeaderCountersRaised(walMaxFrame)
-	return
-}
-
-// readHeaderCountersRaised is readHeaderCounters plus the frame bounds it
-// actually used: the effective ceiling and the live floor. beginRead
-// consults them: when both equal the snapshot's own bounds, the returned
-// counters are also the snapshot counters — no second read needed for the
-// snapshot-bounded pair. Either can differ: the ceiling when the WAL grew
-// since the snapshot was taken, the floor when a checkpoint moved it — or a
-// restart put it back below the snapshot's, under which the frames of the
-// new WAL generation sit at numbers the snapshot's window spans.
-func (p *pager) readHeaderCountersRaised(walMaxFrame uint32) (fileChangeCount, schemaCookie, effectiveMaxFrame, floor uint32, err error) {
-	// Determine the effective max frame by checking the SHM header,
-	// which reflects writes from ALL processes sharing this database.
 	// For inProcess mode, the SHM header is not updated by writers
 	// (writeFrames skips writeHeader when inProcess=true), so we use
 	// the in-process walIndex.maxFrame directly.
-	effectiveMaxFrame = walMaxFrame
+	effectiveMaxFrame := walMaxFrame
 	if p.inProcess {
 		// Use mxCommitFrame (not maxFrame) so spilled uncommitted frames are invisible to readers.
 		if mf := p.wal.index.mxCommitFrame.LoadLocal(); mf > effectiveMaxFrame {
@@ -2540,24 +2526,28 @@ func (p *pager) readHeaderCountersRaised(walMaxFrame uint32) (fileChangeCount, s
 	} else if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
 		effectiveMaxFrame = hdr.mxFrame
 	}
-	floor = p.wal.index.liveMinFrame()
-	fileChangeCount, schemaCookie, err = p.readHeaderCountersAt(effectiveMaxFrame, floor)
-	return
+	return p.readHeaderCountersAt(effectiveMaxFrame, p.wal.index.liveMinFrame())
 }
 
-// readHeaderCountersAt is readHeaderCounters WITHOUT the raise to the latest
-// committed frame: it reads page 1 strictly within [minFrame, maxFrame], so
-// a reader tx passing its begin-captured bounds gets the counters its
-// snapshot actually contains. Both sides matter: the max side excludes
-// commits past the snapshot; the min side must be the snapshot's captured
-// floor, NOT liveMinFrame (see its doc) — a WAL restart racing a slot-0
-// reader recycles new-generation frame numbers below the old maxFrame, and
-// a live floor would admit them, serving post-restart counters.
-// readHeaderCounters raises the max bound (and may use the live floor: its
-// callers hold no snapshot to protect) to discover the true WAL state for
-// STALENESS DETECTION — those counters may exceed what a snapshot can see,
-// and must not be used to judge snapshot contents.
+// readHeaderCountersAt reads the FileChangeCount and SchemaCookie of page 1
+// strictly within [minFrame, maxFrame]: from page 1's newest WAL frame in
+// that window, else from the database file. A read transaction passing its
+// begin-captured bounds gets the counters its snapshot actually contains,
+// as SQLite reads the cookie from the transaction's own page 1
+// (btree.c:3786). Both sides matter: the max side excludes commits past the
+// snapshot; the min side must be the snapshot's captured floor, NOT
+// liveMinFrame (see its doc) — a WAL restart racing a slot-0 reader
+// recycles new-generation frame numbers below the old maxFrame, and a live
+// floor would admit them, serving post-restart counters.
 func (p *pager) readHeaderCountersAt(effectiveMaxFrame, minFrame uint32) (fileChangeCount, schemaCookie uint32, err error) {
+	return p.headerCountersAt(effectiveMaxFrame, minFrame, true)
+}
+
+// headerCountersAt is readHeaderCountersAt; faultHook false reads the WAL
+// frame past the test-only fault hook, for the test-build check of the
+// counters memo (checkSnapshotCounters), which must not use up a fault a
+// test aimed at the code under test.
+func (p *pager) headerCountersAt(effectiveMaxFrame, minFrame uint32, faultHook bool) (fileChangeCount, schemaCookie uint32, err error) {
 	// Look up page 1's latest frame.
 	// walIndex.get() merges the local page map with SHM, preferring newer SHM
 	// frames. After an external state change, beginWrite rebuilds the local page
@@ -2580,7 +2570,13 @@ func (p *pager) readHeaderCountersAt(effectiveMaxFrame, minFrame uint32) (fileCh
 			// detection. Same contract as the page getters (drift-6
 			// resolution): the caller holds a reader slot, so the frame
 			// cannot have been legitimately reset away.
-			if err := p.readWalFrameData(frame, buf[:]); err != nil {
+			var err error
+			if faultHook {
+				err = p.readWalFrameData(frame, buf[:])
+			} else {
+				err = p.readWalFrameDataRaw(frame, buf[:])
+			}
+			if err != nil {
 				return 0, 0, fmt.Errorf("btree: read page-1 header counters (WAL frame %d): %w", frame, err)
 			}
 			return binary.BigEndian.Uint32(buf[24:28]), binary.BigEndian.Uint32(buf[40:44]), nil
@@ -2621,6 +2617,11 @@ func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
 			return err
 		}
 	}
+	return p.readWalFrameDataRaw(frame, buf)
+}
+
+// readWalFrameDataRaw is readWalFrameData without the fault hook.
+func (p *pager) readWalFrameDataRaw(frame uint32, buf []byte) error {
 	// Use the immutable inMemory flag instead of checking the mutable memFrames
 	// slice header to avoid a data race with writeFramesMem's append.
 	if p.wal.inMemory {

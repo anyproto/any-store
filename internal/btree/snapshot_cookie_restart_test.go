@@ -82,8 +82,18 @@ func TestBeginRead_SnapshotCookieAfterRestart(t *testing.T) {
 	if _, err = rtx.GetNamespace("b"); err == nil {
 		t.Fatal("the snapshot has the namespace the other connection created after it")
 	}
-	if rtx.DiskSchemaCookie() != cookieBefore+1 {
-		t.Fatalf("disk cookie %d, want %d: the raised read did not notice the other connection's commit", rtx.DiskSchemaCookie(), cookieBefore+1)
+	// One pair per read transaction: nothing is read past the snapshot.
+	if rtx.DiskSchemaCookie() != cookieBefore {
+		t.Fatalf("disk cookie %d, want the snapshot's %d", rtx.DiskSchemaCookie(), cookieBefore)
+	}
+	// The next begin pins the other connection's commit and reports it.
+	next, err := db1.BeginRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Rollback()
+	if c := next.SnapshotSchemaCookie(); c != cookieBefore+1 {
+		t.Fatalf("the next reader's cookie %d, want %d", c, cookieBefore+1)
 	}
 }
 

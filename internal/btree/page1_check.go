@@ -6,13 +6,15 @@ import (
 	"sync/atomic"
 )
 
-// checkPage1Invariant turns on two checks of the pager's header against the
-// committed page 1, in the manner of SQLite's assert()s: off in release
+// checkPage1Invariant turns on three checks of what is kept in memory
+// against the committed page 1, in the manner of SQLite's assert()s: off in release
 // builds, on for the btree test suite (its TestMain), in both schema formats.
-// They hold the contract a schema format 6 commit relies on when it leaves
-// page 1 out (commitNeedsPage1): the header a write transaction works from is
-// the committed page 1's, and every commit leaves page 1 serializing the
-// header it committed.
+// The first two hold the contract a schema format 6 commit relies on when it
+// leaves page 1 out (commitNeedsPage1): the header a write transaction works
+// from is the committed page 1's, and every commit leaves page 1 serializing
+// the header it committed. The third holds the contract of the counters memo
+// (snapCountersMemo): a read transaction that takes its counters from the
+// memo has the ones its snapshot's page 1 holds.
 //
 //   - At write begin, after the refresh: the committed page 1, read past the
 //     writer cache, decodes to p.header field for field; p.dbSize is what
@@ -24,6 +26,9 @@ import (
 //     commit wrote page 1 its change counter and VersionValidFor are equal
 //     (0 included: the counter is a u32 and dbFileVers+1 wraps, as SQLite's
 //     does, pager.c:3089).
+//   - At a read begin the memo served: page 1 read within the snapshot's own
+//     frame bounds, from its WAL frame or the database file, carries the
+//     FileChangeCount and SchemaCookie the memo gave.
 //
 // A page 1 that cannot be read or decoded past the cache is left to the code
 // that reads it; tests that damage page 1 on purpose rely on that. A broken
@@ -54,7 +59,7 @@ func (p *pager) committedPage1() (dbHeader, bool) {
 	return h, true
 }
 
-// errPage1Invariant is the error of a broken check at write begin.
+// errPage1Invariant is the error of a broken check at a begin.
 var errPage1Invariant = errors.New("btree: page-1 invariant broken")
 
 func (p *pager) checkPage1AtBegin() error {
@@ -92,4 +97,20 @@ func (p *pager) assertPage1AfterCommit(wrotePage1 bool) {
 	if wrotePage1 && h.VersionValidFor != h.FileChangeCount {
 		panic(fmt.Sprintf("btree: page 1 after commit: VersionValidFor %d, FileChangeCount %d", h.VersionValidFor, h.FileChangeCount))
 	}
+}
+
+// checkSnapshotCounters is the check at a read begin whose counters came
+// from the counters memo: a page-1 read within the snapshot's bounds gives
+// the same pair. The read goes past the WAL frame fault hook, and one that
+// fails is no verdict.
+func (p *pager) checkSnapshotCounters(maxFrame, minFrame, fcc, sc uint32) error {
+	gotFCC, gotSC, err := p.headerCountersAt(maxFrame, minFrame, false)
+	if err != nil {
+		return nil
+	}
+	if gotFCC != fcc || gotSC != sc {
+		return fmt.Errorf("%w at read begin: the counters memo gave FileChangeCount %d, SchemaCookie %d; page 1 within frames [%d, %d] has %d, %d",
+			errPage1Invariant, fcc, sc, minFrame, maxFrame, gotFCC, gotSC)
+	}
+	return nil
 }
