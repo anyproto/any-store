@@ -357,7 +357,7 @@ func TestBackupChange_StepAtAnOlderSnapshotThanTheEpoch(t *testing.T) {
 		wg.Add(1)
 		go func() { // another transaction of this process counts the commit
 			defer wg.Done()
-			rtx, err := f.src.beginRead(context.Background(), false, true)
+			rtx, err := f.src.beginRead(context.Background(), true)
 			if err == nil {
 				_ = rtx.Rollback()
 			}
@@ -486,7 +486,7 @@ func TestBackupChange_StepDuringAPendingPublication(t *testing.T) {
 		wg.Add(1)
 		go func() { // another begin of this process rebuilds the wal-index
 			defer wg.Done()
-			rtx, err := f.src.beginRead(context.Background(), false, true)
+			rtx, err := f.src.beginRead(context.Background(), true)
 			if err == nil {
 				_ = rtx.Rollback()
 			}
@@ -666,7 +666,7 @@ func TestChangeEpoch_RacingBeginsCountOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			rtx, err := db.beginRead(context.Background(), false, true)
+			rtx, err := db.beginRead(context.Background(), true)
 			if err == nil {
 				_ = rtx.Rollback()
 			}

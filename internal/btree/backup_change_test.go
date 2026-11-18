@@ -195,7 +195,7 @@ func TestBackupChange_StepBusy(t *testing.T) {
 		// Every reader slot held.
 		var held []*ReadTx
 		for {
-			rtx, err := f.src.beginRead(context.Background(), false, false)
+			rtx, err := f.src.beginRead(context.Background(), false)
 			if err != nil {
 				require.ErrorIs(t, err, ErrReadersBusy)
 				break

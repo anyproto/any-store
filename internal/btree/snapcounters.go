@@ -9,13 +9,18 @@ import (
 // SchemaCookie) of one snapshot, so that a read transaction pinning the same
 // snapshot learns them without reading page 1. A commit of this process
 // stores the snapshot it produces as it becomes visible; a read begin that
-// had to read the counters stores what it read.
+// had to read the counters stores what it read. It stands where SQLite's
+// pager cache keeps page 1 from one WAL read transaction to the next until
+// the wal-index header changes (pager.c:3246-3267); in test builds every
+// begin it serves is checked against page 1 (checkSnapshotCounters).
 //
 // The key is what identifies a snapshot to this process (see DB.beginRead):
 // the WAL-index header, which is unique per commit when it comes from the
-// shared memory — change counter, frame checksum and salts — and for the
-// header synthesized in-process, which is a frame number only, the
-// dataVersion with it.
+// shared memory — change counter, frame checksum and salts. The header
+// synthesized in the in-process and in-memory modes (frame number, page
+// count, restart count) identifies a snapshot as well: within a restart
+// generation the published frame number only rises and a published frame is
+// never rewritten. The dataVersion kept with it is a backstop.
 //
 // Readers take no lock: every field is an atomic, framed by a sequence
 // number that is odd while a writer is inside and changes with every write.

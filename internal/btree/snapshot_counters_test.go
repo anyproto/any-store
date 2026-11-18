@@ -10,9 +10,9 @@ import (
 
 // SnapshotHeaderCounters must be bounded by the reader's own snapshot on the
 // MAX side: a commit that lands after the reader began is invisible to it,
-// while the raised detection read (pager.readHeaderCounters) sees it. A
-// regression that routes the snapshot read through the raised path returns
-// the post-commit cookie here.
+// while a read raised to the newest committed frame (pager.readHeaderCounters,
+// which Open uses) sees it. A regression that routes the snapshot read
+// through the raised path returns the post-commit cookie here.
 func TestSnapshotHeaderCounters_BoundedByReaderSnapshot(t *testing.T) {
 	db := tempDB(t)
 
@@ -41,8 +41,9 @@ func TestSnapshotHeaderCounters_BoundedByReaderSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, baseSC, sc, "snapshot counters must not see a post-begin commit")
 
-	// The raised detection read at the same frame bound DOES see it — the
-	// divergence the snapshot-bounded accessor exists for.
+	// The raised read at the same frame bound DOES see it, and the reader
+	// has one pair: the name the write paths use gives the snapshot's too.
+	assert.Equal(t, baseSC, rtx.DiskSchemaCookie())
 	_, raisedSC, err := db.pager.readHeaderCounters(rtx.WalMaxFrame())
 	require.NoError(t, err)
 	assert.Equal(t, baseSC+1, raisedSC, "raised read should see the newer commit")
@@ -79,7 +80,7 @@ func TestSnapshotHeaderCounters_ImmuneToWALRestart(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, rtx.walSlot,
 		"precondition: reader must hold a slot-0 snapshot (empty WAL range)")
-	baseFCC := rtx.diskFileChangeCounter
+	baseFCC := rtx.snapFileChangeCounter
 	baseSC := rtx.DiskSchemaCookie()
 
 	// Restart the WAL under the held reader (the reset waits only on slots

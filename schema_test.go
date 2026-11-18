@@ -284,8 +284,9 @@ func TestResolve_NoRangeFromTwoChecks(t *testing.T) {
 	assert.Equal(t, 10, n)
 }
 
-// A fast read begin learns of another process's schema change like any
-// other: the point lookup does not go through a handle that change retired.
+// The read transaction of a point lookup learns of another process's schema
+// change like any other: the lookup does not go through a handle that
+// change retired.
 func TestFindId_NoticesPeerSchemaChange(t *testing.T) {
 	skipIfInMemory(t, "staleness counters model cross-process commits; not applicable in-memory")
 	fx := newFixture(t)
@@ -878,7 +879,7 @@ func TestTxSchemaOf_RawTxMemo(t *testing.T) {
 	require.NoError(t, err)
 	c := coll.(*collection)
 
-	tx, err := dbi.btreeDB.BeginReadFast()
+	tx, err := dbi.btreeDB.BeginRead()
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback() }()
 	assert.Nil(t, memoGet(tx, c))

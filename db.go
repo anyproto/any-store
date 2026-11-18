@@ -619,7 +619,7 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 //	  after one (btree.ReadTx.ChangeEpoch), and each handle reloads its
 //	  sketches when a transaction next plans with them or writes through it
 //	  and the count has moved (collection.refreshSketches). Nothing is done
-//	  for it here: a transaction that never comes this way (a fast read, a
+//	  for it here: a transaction that never comes this way (a point lookup, a
 //	  backup step, an integrity sweep) counts the commit just the same.
 //	  A stale sketch only affects which index the planner CHOOSES, never
 //	  query RESULTS (the any-store analog of sqlite_stat1).

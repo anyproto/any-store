@@ -141,8 +141,6 @@ func TestBeginReadContext_DeadlineWhenSlotsHeld(t *testing.T) {
 	defer cancel()
 	_, err = db.BeginReadContext(ctx)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
-	_, err = db.BeginReadFastContext(ctx)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
 
 	waitCtx, cancelWait := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -172,8 +170,6 @@ func TestBeginReadContext_PreCancelledTakesNoSlot(t *testing.T) {
 	cancel()
 	for i := 0; i < 1000; i++ {
 		_, err := db.BeginReadContext(ctx)
-		require.ErrorIs(t, err, context.Canceled)
-		_, err = db.BeginReadFastContext(ctx)
 		require.ErrorIs(t, err, context.Canceled)
 	}
 	require.Equal(t, 0, len(db.readerSem))
