@@ -2693,6 +2693,13 @@
     "sqlite": [],
     "note": ""
   },
+  "wal.go:*walIndex.mapSegmentForLookup": {
+    "sqlite": [
+      "wal.c:walHashGet",
+      "wal.c:walIndexPage"
+    ],
+    "note": ""
+  },
   "wal.go:*walIndex.prepareHeader": {
     "sqlite": [
       "wal.c:walIndexWriteHdr"

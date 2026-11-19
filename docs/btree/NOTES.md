@@ -3131,6 +3131,15 @@ wrong, where C's cannot:
   it read hash tables a log restart may be clearing. `shmHashGet`, `get` and `getInTxRange` return `(0, nil)`
   for `minFrame > maxFrame`. Tests: `TestWalIndexLookup_EmptyWindowMapsNothing`,
   `TestWalIndexMapError_CheckpointedReaderReads`.
+- **A lookup does not extend the wal-index file.** `shmHashGet` mapped with `region(seg, true)`, which
+  extends a short file with zeros and maps them: a segment missing from the file read as "no page here"
+  instead of failing. C passes `pWal->writeLock` as the extend flag (`wal.c:784-786`), `unixShmMap` leaves the
+  region unmapped for a reader (`os_unix.c:5163-5164`), and `walHashGet` makes that an error
+  (`wal.c:1185-1187`). `shmHashGet` now takes what is mapped (`region(seg, false)`) and otherwise goes through
+  `mapSegmentForLookup`, which fails with `errShmSegmentMissing` when the file does not reach the segment's
+  end and maps the segment otherwise. A writer's lookups do not extend either, where C's would (its extend
+  flag is set): a segment of a frame in the window was made by the writer of that frame. Test:
+  `TestWalIndexLookup_MissingSegmentFails`.
 - **Bounds before page number; atomic slots.** The probe tested `aPgno` before the frame bounds and read and
   wrote the 16-bit slots as plain bytes, so a reader goroutine read page numbers and slots of entries above
   its snapshot while the writer of the same process changed them (an append, a rollback's
@@ -4132,7 +4141,7 @@ any-store's shm fcntl wrapper allowlists only a transient errno set — `EACCES,
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `shm_mmap.go:*mmapShm.region` (`internal/btree/shm_mmap.go:115-125`).
 
-`mmapShm.region` returns an already-mapped region (`shm_mmap.go:120-121`) but, when `create=false` and the region is not yet mapped in this process, returns an error (`shm_mmap.go:124-125`) instead of mapping an existing on-disk region or returning `(nil, OK)` for a region past EOF. SQLite's `unixShmMap` (`os_unix.c:5159-5230`) maps any region already present in the shm file even when not extending, and returns `(NULL, SQLITE_OK)` for a not-yet-allocated region. The hot WAL read path works around this by always passing `create=true` (`wal.go:1171`), so impact is confined to best-effort callers (`shmClearHash`, `shmCleanupFromFrame`, `shmReadCkptInfo`). The consequence is that a peer process's freshly-extended region is unreachable to a `create=false` caller, and the mapping/return semantics diverge from the ported function.
+`mmapShm.region` returns an already-mapped region (`shm_mmap.go:120-121`) but, when `create=false` and the region is not yet mapped in this process, returns an error (`shm_mmap.go:124-125`) instead of mapping an existing on-disk region or returning `(nil, OK)` for a region past EOF. SQLite's `unixShmMap` (`os_unix.c:5159-5230`) maps any region already present in the shm file even when not extending, and returns `(NULL, SQLITE_OK)` for a not-yet-allocated region. The WAL lookup works around this without extending the file: it checks the file's size and only then maps with `create=true` (`mapSegmentForLookup`, 2026-11-19; until then it passed `create=true` outright, which also extended a short file); the remaining impact is on best-effort callers (`shmClearHash`, `shmCleanupFromFrame`, `shmReadCkptInfo`). The consequence is that a peer process's freshly-extended region is unreachable to a `create=false` caller, and the mapping/return semantics diverge from the ported function.
 
 <a id="drift-2026-06-25-28-recoverlocked-truncates-the-wal-and-discards-committed-frames-on-a-cor"></a>
 ### Drift: recoverLocked truncates the WAL and discards committed frames on a corrupt/incompatible WAL header instead of preserving it / returning CANTOPEN
