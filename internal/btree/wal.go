@@ -621,13 +621,17 @@ func (wi *walIndex) set(pgno, frame uint32) error {
 		wi.pageMap[pgno] = append(frames, frame)
 		wi.mu.Unlock()
 	}
-	if frame > wi.maxFrame.Load() {
+	// mxFrame is the last frame of the log before this append: pWal->hdr.mxFrame
+	// while walFrames runs its walIndexAppend loop (it is advanced after the
+	// loop, wal.c:4243).
+	mxFrame := wi.maxFrame.Load()
+	if frame > mxFrame {
 		wi.maxFrame.Store(frame)
 	}
 	// Propagate an ErrCorrupt (full/over-probed hash segment) so a single-frame
 	// write aborts like C's walFrames loop (wal.c:4229) instead of silently
 	// dropping the mapping.
-	return wi.shmHashWrite(pgno, frame)
+	return wi.shmHashWrite(pgno, frame, mxFrame)
 }
 
 // setBatch records multiple page->frame mappings under a single lock and
@@ -647,14 +651,18 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) erro
 		}
 		wi.mu.Unlock()
 	}
-	if f := startFrame + uint32(len(pages)) - 1; f > wi.maxFrame.Load() {
+	// mxFrame is the last frame of the log before this batch, for every frame
+	// of the batch: pWal->hdr.mxFrame stays put while walFrames runs its
+	// walIndexAppend loop and is advanced after it (wal.c:4243).
+	mxFrame := wi.maxFrame.Load()
+	if f := startFrame + uint32(len(pages)) - 1; f > mxFrame {
 		wi.maxFrame.Store(f)
 	}
 	// Propagate the first ErrCorrupt (full/over-probed hash segment) so the
 	// commit aborts like C's walFrames loop (wal.c:4229 stops the loop, skips
 	// walIndexWriteHdr, returns rc) instead of silently dropping the mapping.
 	for i, p := range pages {
-		if err := wi.shmHashWrite(p.pgno, startFrame+uint32(i)); err != nil {
+		if err := wi.shmHashWrite(p.pgno, startFrame+uint32(i), mxFrame); err != nil {
 			return err
 		}
 	}
@@ -737,19 +745,30 @@ func (wi *walIndex) shmCleanupFromFrame(target, maxFrame uint32) {
 			clear(region[htHashArrayOff : htHashArrayOff+htNSlot*2])
 			continue
 		}
-		// SQLite's walCleanupHash: selectively zero slots whose indexed frame
-		// is beyond iLimit, then memset the tail of aPgno.
-		iLimit := uint16(target - iZero) // target's idx within this segment, 1-based
-		for h := 0; h < htNSlot; h++ {
-			slotOff := htHashArrayOff + h*2
-			v := binary.LittleEndian.Uint16(region[slotOff:])
-			if v > iLimit {
-				binary.LittleEndian.PutUint16(region[slotOff:], 0)
-			}
+		shmCleanupHashSegment(region, seg, target)
+	}
+}
+
+// shmCleanupHashSegment is SQLite's walCleanupHash (wal.c:1233-1288) on the
+// hash table that holds frame mxFrame, mapped as region: it zeroes every
+// aHash slot whose frame is above mxFrame (`if( sLoc.aHash[i]>iLimit )
+// sLoc.aHash[i] = 0`, wal.c:1258-1262) and the aPgno entries of those frames
+// (`memset(&sLoc.aPgno[iLimit], 0, nByte)`, wal.c:1267-1269). The slots of
+// frames up to mxFrame keep their places, so their probe chains still end at
+// the first empty slot after them. seg must be mxFrame's segment
+// (htFrameSegIdx) and the caller holds the write lock.
+func shmCleanupHashSegment(region []byte, seg int, mxFrame uint32) {
+	pgnoBase, nEntry, iZero := htSegmentInfo(seg)
+	iLimit := uint16(mxFrame - iZero) // mxFrame's 1-based index in this segment
+	for h := 0; h < htNSlot; h++ {
+		slotOff := htHashArrayOff + h*2
+		v := binary.LittleEndian.Uint16(region[slotOff:])
+		if v > iLimit {
+			binary.LittleEndian.PutUint16(region[slotOff:], 0)
 		}
-		for i := int(iLimit); i < nEntry; i++ {
-			binary.LittleEndian.PutUint32(region[pgnoBase+i*4:], 0)
-		}
+	}
+	for i := int(iLimit); i < nEntry; i++ {
+		binary.LittleEndian.PutUint32(region[pgnoBase+i*4:], 0)
 	}
 }
 
@@ -1224,7 +1243,11 @@ func htSegmentInfo(seg int) (pgnoBase int, nEntry int, iZero uint32) {
 // stored aPgno[idx]. That is harmless: the transaction aborts and the frame
 // is never published via mxFrame/mxCommitFrame, so no reader can reach it,
 // and shmCleanupFromFrame/reset scrubs the slot on rollback.
-func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
+//
+// mxFrame is the last frame of the log before the append that frame belongs
+// to (pWal->hdr.mxFrame in walIndexAppend): the frames above it are not part
+// of the log, whatever the hash table says about them.
+func (wi *walIndex) shmHashWrite(pgno, frame, mxFrame uint32) error {
 	seg, idx := htFrameSegIdx(frame)
 
 	region, err := wi.shm.region(seg, true)
@@ -1247,8 +1270,24 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
 		clear(region[pgnoBase:])
 	}
 
-	// Write pgno to aPgno[idx] first (SQLite wal.c:1337). u32-aligned.
+	// A frame slot that is already set is left over from a writer that died
+	// inside a transaction, after it had written dirty pages to the WAL to
+	// free memory: nothing rolled its frames back, so their entries are still
+	// in the hash table, above the log's last frame. They are removed before
+	// the new entry goes in (wal.c:1321-1330 `if( sLoc.aPgno[idx-1] ){
+	// walCleanupHash(pWal); }`). Left in place they sit in their pages' probe
+	// chains ahead of the entries appended now: enough of them overflow the
+	// bounded probe below (a false ErrCorrupt), and a later rollback that
+	// zeroes one of them (shmCleanupFromFrame) cuts the chain in front of a
+	// committed entry, which shmHashGet then no longer finds.
 	pgnoOff := htPgnoOffset(seg, idx)
+	if atomic.LoadUint32((*uint32)(unsafe.Pointer(&region[pgnoOff]))) != 0 {
+		if err := wi.shmCleanupHash(mxFrame, seg, region); err != nil {
+			return err
+		}
+	}
+
+	// Write pgno to aPgno[idx] first (SQLite wal.c:1337). u32-aligned.
 	atomic.StoreUint32((*uint32)(unsafe.Pointer(&region[pgnoOff])), pgno)
 
 	// Release barrier between aPgno and the hash slot publish, matching
@@ -1283,6 +1322,30 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
 		}
 		h = (h + 1) & (htNSlot - 1)
 	}
+	return nil
+}
+
+// shmCleanupHash is walCleanupHash (wal.c:1233-1288) as walIndexAppend calls
+// it: it removes from the hash table that holds frame mxFrame every entry of
+// a frame above mxFrame. With no frame in the log there is nothing to keep
+// and nothing is done (`if( pWal->hdr.mxFrame==0 ) return;`, wal.c:1245): the
+// first frame of a segment has zeroed the segment already. seg and region are
+// the segment being appended to, which is mxFrame's segment whenever a slot
+// in it is found set (an append into a later segment starts at its first
+// entry, which zeroes it); any other segment is mapped here, as walHashGet
+// does (wal.c:1254).
+func (wi *walIndex) shmCleanupHash(mxFrame uint32, seg int, region []byte) error {
+	if mxFrame == 0 {
+		return nil
+	}
+	mxSeg, _ := htFrameSegIdx(mxFrame)
+	if mxSeg != seg {
+		var err error
+		if region, err = wi.shm.region(mxSeg, true); err != nil {
+			return err
+		}
+	}
+	shmCleanupHashSegment(region, mxSeg, mxFrame)
 	return nil
 }
 

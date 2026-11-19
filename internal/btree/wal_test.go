@@ -2140,7 +2140,7 @@ func TestShmHashWrite_CollisionLimit_Corrupt(t *testing.T) {
 	binary.LittleEndian.PutUint16(region[hashSlotOff((h0+1)&(htNSlot-1)):], 9)
 	binary.LittleEndian.PutUint16(region[hashSlotOff((h0+2)&(htNSlot-1)):], 11)
 
-	err = wi.shmHashWrite(pgno, frame)
+	err = wi.shmHashWrite(pgno, frame, frame-1)
 	require.ErrorIs(t, err, ErrCorrupt,
 		"shmHashWrite must return ErrCorrupt when the probe walks past nCollide=idx+1 occupied slots")
 }
@@ -2201,7 +2201,7 @@ func TestShmHashWrite_FirstFrameLazilyClearsSegment(t *testing.T) {
 	// Writing frame 1 (the segment's first entry of the new generation) must
 	// succeed — not ErrCorrupt — because the segment is zeroed first.
 	const pgno = uint32(777)
-	require.NoError(t, wi.shmHashWrite(pgno, 1),
+	require.NoError(t, wi.shmHashWrite(pgno, 1, 0),
 		"first frame of a segment must lazily clear stale entries, not trip the collision bound")
 
 	// The new entry is findable, and the junk is gone: a lookup for one of
@@ -2282,7 +2282,7 @@ func mustShmHashGet(t *testing.T, wi *walIndex, pgno, maxFrame, minFrame uint32)
 
 func mustShmHashWrite(t *testing.T, wi *walIndex, pgno, frame uint32) {
 	t.Helper()
-	if err := wi.shmHashWrite(pgno, frame); err != nil {
+	if err := wi.shmHashWrite(pgno, frame, frame-1); err != nil {
 		t.Fatalf("shmHashWrite(%d, %d): unexpected error: %v", pgno, frame, err)
 	}
 }
