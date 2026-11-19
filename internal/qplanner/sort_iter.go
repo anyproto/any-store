@@ -3,7 +3,9 @@ package qplanner
 import (
 	"bytes"
 	"cmp"
+	"errors"
 	"fmt"
+	"math"
 	"slices"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -62,13 +64,30 @@ type SortIter struct {
 // consecutive unhandled documents.
 const sortRawFallbackMax = 8
 
+// sortEntry locates one row's packed sort key + docId in the arena. The
+// lengths are 32-bit: a sort key is the whole marshaled field value (a long
+// string, or an object or array sorted whole), so it has no bound below the
+// arena's own, and a narrower length would wrap and slice the docId out of
+// the wrong bytes. The struct stays 12 bytes — the entries are what the sort
+// swaps — by keeping the multiKey flag in the top bit of the docId length.
 type sortEntry struct {
-	off      uint32   // offset into arena
-	keyLen   uint16   // total length (sort key + docId suffix)
-	docLen   uint16   // docId length (trailing portion)
-	multiKey uint8    // 1 = upstream marked this entry multiKey; 0 = unique. Forwarded as-is on emit so consumer-side DocDedup can skip the seen-set for unique streams.
-	_        [3]uint8 // explicit padding so the struct size stays predictable across archs
+	off    uint32 // offset into arena
+	keyLen uint32 // total length (sort key + docId suffix)
+	// docMK is the docId length (the trailing portion of the key) in the low
+	// 31 bits and the multiKey flag in the top bit: set = upstream marked this
+	// entry multiKey; clear = unique. The flag is forwarded as-is on emit so
+	// consumer-side DocDedup can skip the seen-set for unique streams.
+	docMK uint32
 }
+
+const sortEntryMultiKey = 1 << 31
+
+func (e sortEntry) docLen() uint32 { return e.docMK &^ sortEntryMultiKey }
+func (e sortEntry) multiKey() bool { return e.docMK&sortEntryMultiKey != 0 }
+
+// errSortTooLarge is returned when the packed sort keys of one sort do not
+// fit the 32-bit offsets of its entries.
+var errSortTooLarge = errors.New("any-store: the sort keys of one in-memory sort exceed 4 GiB")
 
 func (it *SortIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	if !it.inited {
@@ -84,7 +103,7 @@ func (it *SortIter) Next() (key []byte, docId []byte, multiKey bool, err error) 
 
 	e := it.entries[it.idx]
 	it.idx++
-	docId = it.arena[e.off+uint32(e.keyLen)-uint32(e.docLen) : e.off+uint32(e.keyLen)]
+	docId = it.arena[e.off+e.keyLen-e.docLen() : e.off+e.keyLen]
 
 	// Clear DocParsed so planIterator.Doc() does a lazy fetch by docId.
 	// collectAndSort() leaves DocParsed pointing at the last collected doc,
@@ -94,7 +113,7 @@ func (it *SortIter) Next() (key []byte, docId []byte, multiKey bool, err error) 
 		it.Plan.DocRaw = nil
 	}
 
-	return docId, docId, e.multiKey == 1, nil
+	return docId, docId, e.multiKey(), nil
 }
 
 // growArena ensures the arena has at least need bytes of free capacity,
@@ -151,8 +170,8 @@ func (it *SortIter) appendSortKey(dst []byte, doc *anyenc.Value, raw []byte) ([]
 
 func (it *SortIter) collectAndSort() error {
 	cmpEntry := func(a, b sortEntry) int {
-		ak := it.arena[a.off : a.off+uint32(a.keyLen)]
-		bk := it.arena[b.off : b.off+uint32(b.keyLen)]
+		ak := it.arena[a.off : a.off+a.keyLen]
+		bk := it.arena[b.off : b.off+b.keyLen]
 		return bytes.Compare(ak, bk)
 	}
 
@@ -193,9 +212,11 @@ func (it *SortIter) collectAndSort() error {
 			}
 		}
 
-		var mkByte uint8
+		// docId length + multiKey flag, as sortEntry.docMK packs them. A docId
+		// is a b-tree key and far below 2 GiB, so the flag bit is free.
+		docMK := uint32(len(docId))
 		if mk {
-			mkByte = 1
+			docMK |= sortEntryMultiKey
 		}
 
 		if it.TopK <= 0 {
@@ -206,10 +227,11 @@ func (it *SortIter) collectAndSort() error {
 				return err
 			}
 			it.arena = append(it.arena, docId...)
-			keyLen := uint16(len(it.arena) - int(off))
-			it.entries = append(it.entries, sortEntry{
-				off: off, keyLen: keyLen, docLen: uint16(len(docId)), multiKey: mkByte,
-			})
+			if uint64(len(it.arena)) > math.MaxUint32 {
+				return errSortTooLarge
+			}
+			keyLen := uint32(len(it.arena) - int(off))
+			it.entries = append(it.entries, sortEntry{off: off, keyLen: keyLen, docMK: docMK})
 			continue
 		}
 
@@ -226,18 +248,19 @@ func (it *SortIter) collectAndSort() error {
 			return err
 		}
 		it.arena = append(it.arena, docId...)
-		candLen := uint16(len(it.arena) - int(base))
+		if uint64(len(it.arena)) > math.MaxUint32 {
+			return errSortTooLarge
+		}
+		candLen := uint32(len(it.arena) - int(base))
 		candKey := it.arena[base:] // view of the candidate at the tail
 
 		switch {
 		case len(it.entries) < it.TopK:
 			// Heap not yet full: admit unconditionally, keeping the tail bytes.
-			it.entries = append(it.entries, sortEntry{
-				off: base, keyLen: candLen, docLen: uint16(len(docId)), multiKey: mkByte,
-			})
+			it.entries = append(it.entries, sortEntry{off: base, keyLen: candLen, docMK: docMK})
 			it.liveBytes += int(candLen)
 			it.heapUp(len(it.entries) - 1)
-		case bytes.Compare(candKey, it.arena[it.entries[0].off:it.entries[0].off+uint32(it.entries[0].keyLen)]) < 0:
+		case bytes.Compare(candKey, it.arena[it.entries[0].off:it.entries[0].off+it.entries[0].keyLen]) < 0:
 			// Candidate is smaller than the current heap max (the root): the root
 			// loses. If the root's vacated slot is exactly the candidate's size,
 			// overwrite it in place and drop the tail copy (reuse, no growth);
@@ -250,13 +273,11 @@ func (it *SortIter) collectAndSort() error {
 			it.liveBytes += int(candLen) - int(root.keyLen)
 			off := base
 			if root.keyLen == candLen {
-				copy(it.arena[root.off:root.off+uint32(candLen)], candKey)
+				copy(it.arena[root.off:root.off+candLen], candKey)
 				it.arena = it.arena[:base] // uncommit tail; reuse root's slot
 				off = root.off
 			}
-			it.entries[0] = sortEntry{
-				off: off, keyLen: candLen, docLen: uint16(len(docId)), multiKey: mkByte,
-			}
+			it.entries[0] = sortEntry{off: off, keyLen: candLen, docMK: docMK}
 			it.heapDown(0)
 			it.maybeCompact()
 		default:
@@ -300,9 +321,9 @@ func (it *SortIter) maybeCompact() {
 	dst := uint32(0)
 	for _, i := range it.order {
 		e := &it.entries[i]
-		copy(it.arena[dst:dst+uint32(e.keyLen)], it.arena[e.off:e.off+uint32(e.keyLen)])
+		copy(it.arena[dst:dst+e.keyLen], it.arena[e.off:e.off+e.keyLen])
 		e.off = dst
-		dst += uint32(e.keyLen)
+		dst += e.keyLen
 	}
 	it.arena = it.arena[:dst]
 }
@@ -343,8 +364,8 @@ func (it *SortIter) heapDown(i int) {
 // heapLess returns true if entries[i] < entries[j] (for max-heap, parent should be largest).
 func (it *SortIter) heapLess(i, j int) bool {
 	a, b := it.entries[i], it.entries[j]
-	ak := it.arena[a.off : a.off+uint32(a.keyLen)]
-	bk := it.arena[b.off : b.off+uint32(b.keyLen)]
+	ak := it.arena[a.off : a.off+a.keyLen]
+	bk := it.arena[b.off : b.off+b.keyLen]
 	return bytes.Compare(ak, bk) < 0
 }
 

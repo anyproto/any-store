@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -492,4 +493,16 @@ func TestSortIter_PreservesMultiKeyAcrossSort(t *testing.T) {
 	}
 	assert.Equal(t, []string{"p1", "p2"}, deduped,
 		"after sort+dedup, each doc appears once in ascending sort order")
+}
+
+// The entries are what the sort swaps and what a TopK heap holds: widening
+// the lengths to 32 bits must not grow the entry.
+func TestSortEntry_Is12Bytes(t *testing.T) {
+	assert.Equal(t, uintptr(12), unsafe.Sizeof(sortEntry{}))
+	e := sortEntry{docMK: 70000 | sortEntryMultiKey}
+	assert.Equal(t, uint32(70000), e.docLen())
+	assert.True(t, e.multiKey())
+	e = sortEntry{docMK: 70000}
+	assert.Equal(t, uint32(70000), e.docLen())
+	assert.False(t, e.multiKey())
 }

@@ -909,3 +909,85 @@ func TestVerbCoherence_Knn(t *testing.T) {
 		})
 	}
 }
+
+// A sort key has no length limit: it is the whole marshaled value of the sort
+// field. An in-memory sort — full, or the bounded TopK of a Limit — must
+// return each row's own document id whatever the key's length, including the
+// lengths around 64 KiB where a 16-bit length would wrap.
+
+func longSortKeyIds(t *testing.T, q anystore.Query) []string {
+	it, err := q.Iter(ctx)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, it.Close()) }()
+	var ids []string
+	for it.Next() {
+		doc, err := it.Doc()
+		require.NoError(t, err)
+		ids = append(ids, string(doc.Value().GetStringBytes("id")))
+	}
+	require.NoError(t, it.Err())
+	return ids
+}
+
+func TestSort_KeyLongerThan64KiB(t *testing.T) {
+	// 65530: key + id is exactly 64 KiB. 70000: past it. 200000: several times.
+	for _, n := range []int{65530, 65536, 70000, 200000} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "long_sort_key")
+			require.NoError(t, err)
+			insertJSON(t, coll,
+				fmt.Sprintf(`{"id":"doc1","body":"%s"}`, strings.Repeat("a", n)),
+				`{"id":"doc2","body":"b"}`,
+				`{"id":"doc3","body":"c"}`,
+				fmt.Sprintf(`{"id":"doc4","body":"%sz"}`, strings.Repeat("a", n)),
+			)
+
+			explain, err := coll.Find(nil).Sort("body").Explain(ctx)
+			require.NoError(t, err)
+			require.Contains(t, explain.Sql, "-> Sort")
+			assert.Equal(t, []string{"doc1", "doc4", "doc2", "doc3"},
+				longSortKeyIds(t, coll.Find(nil).Sort("body")), "full sort")
+			assert.Equal(t, []string{"doc3", "doc2", "doc4", "doc1"},
+				longSortKeyIds(t, coll.Find(nil).Sort("-body")), "full sort, descending")
+
+			explain, err = coll.Find(nil).Sort("body").Limit(1).Explain(ctx)
+			require.NoError(t, err)
+			require.Contains(t, explain.Sql, "TopK(1)")
+			assert.Equal(t, []string{"doc1"},
+				longSortKeyIds(t, coll.Find(nil).Sort("body").Limit(1)), "TopK(1)")
+			assert.Equal(t, []string{"doc1", "doc4", "doc2"},
+				longSortKeyIds(t, coll.Find(nil).Sort("body").Limit(3)), "TopK(3)")
+			// The two long keys enter the heap first and are evicted: the
+			// heap and its arena reuse handle long entries leaving, too.
+			assert.Equal(t, []string{"doc3", "doc2"},
+				longSortKeyIds(t, coll.Find(nil).Sort("-body").Limit(2)), "TopK(2), descending")
+
+			res, err := coll.Find(nil).Sort("body").Limit(2).Delete(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 2, res.Modified)
+			assert.Equal(t, []string{"doc2", "doc3"}, longSortKeyIds(t, coll.Find(nil).Sort("id")))
+		})
+	}
+}
+
+// The sorted, limited Delete removes the document its filter matched. The
+// long sort key begins with the bytes of another document's encoded id — what
+// a wrapped key length would have sliced out as the row's id.
+func TestSort_LongKeyLimitDelete_RemovesMatchedDoc(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "long_sort_key_delete")
+	require.NoError(t, err)
+	a := &anyenc.Arena{}
+	big := a.NewObject()
+	big.Set("id", a.NewString("doc1"))
+	big.Set("kind", a.NewString("big"))
+	big.Set("body", a.NewString("doc2\x00"+strings.Repeat("a", 65528)))
+	require.NoError(t, coll.Insert(ctx, big))
+	insertJSON(t, coll, `{"id":"doc2","kind":"small","body":"b"}`)
+
+	res, err := coll.Find(`{"kind":"big"}`).Sort("body").Limit(10).Delete(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.Modified)
+	assert.Equal(t, []string{"doc2"}, longSortKeyIds(t, coll.Find(nil)))
+}
