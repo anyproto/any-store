@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -113,19 +114,20 @@ func TestWalIndexDeadWriter_CommittedEntryStaysReachable(t *testing.T) {
 	})
 }
 
-// The same through the pager, the dead writer's entries planted as a kill
-// leaves them: the committed row is read back, also by the writer that next
-// changes its page, and after recovery.
-func TestWalIndexDeadWriter_PlantedSlots(t *testing.T) {
+// plantDeadWriter returns a database in which a writer rewrote rows
+// [from,200) with fill 9, wrote every dirty page to the WAL and died: its
+// frames are in the WAL file and their entries in the wal-index, as a kill
+// leaves them.
+func plantDeadWriter(t *testing.T, from int) (*DB, string) {
+	t.Helper()
 	db, path := openRestartDB(t, restartModes[0]) // shared memory
 	restartPut(t, db, 0, 200, 1)
 	wi := db.pager.wal.index
 	committed := wi.mxCommitFrame.LoadLocal()
 
-	// The writer that dies: it rewrites every row and writes every page out.
 	wtx, err := db.BeginWrite()
 	require.NoError(t, err)
-	restartPutTx(t, wtx, 0, 200, 9)
+	restartPutTx(t, wtx, from, 200, 9)
 	restartSpillAll(t, db)
 	require.Greater(t, db.pager.wal.nFrame.Load(), committed+2, "setup: the transaction wrote frames")
 	region, err := wi.shm.region(0, true)
@@ -133,8 +135,46 @@ func TestWalIndexDeadWriter_PlantedSlots(t *testing.T) {
 	left := append([]byte(nil), region[htPgnoOff0:]...)
 	require.NoError(t, wtx.Rollback())
 	copy(region[htPgnoOff0:], left) // no rollback happened
+	return db, path
+}
 
+// The same through the pager, the dead writer's entries planted as a kill
+// leaves them: the committed row is read back, also by the writer that next
+// changes its page, and after recovery.
+func TestWalIndexDeadWriter_PlantedSlots(t *testing.T) {
+	db, path := plantDeadWriter(t, 0)
 	deadWriterSurvivor(t, db, path)
+}
+
+// The next writer's first commit has several pages, the later ones pages the
+// dead writer wrote: by the time it comes to one of those, the frame the dead
+// writer gave that page is a frame of this commit, still being written, with
+// another page in it. Nothing of this commit is in the wal-index before its
+// frames are written, so no page of it can be written over a frame the index
+// names (walFrames looks up to pWal->hdr.mxFrame, wal.c:3525, which it
+// advances after it has indexed the batch, wal.c:4243).
+func TestWalIndexDeadWriter_PlantedSlots_MultiPageCommit(t *testing.T) {
+	db, path := plantDeadWriter(t, deadWriterMultiPageFrom)
+	deadWriterSurvivorMultiPage(t, db, path)
+}
+
+// coldReaders empties the reader caches: the next read transaction reads
+// every page through the wal-index.
+func coldReaders(db *DB) {
+	for n := len(db.readerCaches); n > 0; n-- {
+		c := <-db.readerCaches
+		c.clear()
+		db.readerCaches <- c
+	}
+}
+
+// deadWriterCheck checks rows from a cold reader of db and from a crash copy
+// of the files, whose WAL is recovered from its bytes.
+func deadWriterCheck(t *testing.T, db *DB, path, name string, check func(db *DB)) {
+	t.Helper()
+	coldReaders(db)
+	check(db)
+	restartRecoverCopy(t, path, name, restartModes[0], check)
 }
 
 // deadWriterSurvivor is what the surviving process does once the writer that
@@ -143,31 +183,65 @@ func TestWalIndexDeadWriter_PlantedSlots(t *testing.T) {
 func deadWriterSurvivor(t *testing.T, db *DB, path string) {
 	t.Helper()
 	restartPut(t, db, 5, 6, 2) // a page the dead writer wrote
-	restartCheck(t, db, 5, 6, 2)
+	deadWriterCheck(t, db, path, "after-commit", func(db *DB) { restartCheck(t, db, 5, 6, 2) })
 
 	wtx, err := db.BeginWrite() // a frame is written and rolled back
 	require.NoError(t, err)
 	restartPutTx(t, wtx, 150, 151, 3)
 	restartSpillAll(t, db)
 	require.NoError(t, wtx.Rollback())
-	restartCheck(t, db, 5, 6, 2)
+	deadWriterCheck(t, db, path, "after-rollback", func(db *DB) { restartCheck(t, db, 5, 6, 2) })
 
 	restartPut(t, db, 6, 7, 4) // the same leaf: the writer reads the page
-	restartCheck(t, db, 5, 6, 2)
-	restartCheck(t, db, 6, 7, 4)
+	check := func(db *DB) {
+		restartCheck(t, db, 0, 5, 1)
+		restartCheck(t, db, 5, 6, 2)
+		restartCheck(t, db, 6, 7, 4)
+		restartCheck(t, db, 7, 200, 1)
+	}
+	deadWriterCheck(t, db, path, "after-writer", check)
 
 	require.NoError(t, db.Close())
 	db2, err := testOpen(t, path, restartModes[0].opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
-	restartCheck(t, db2, 0, 5, 1)
-	restartCheck(t, db2, 5, 6, 2)
-	restartCheck(t, db2, 6, 7, 4)
-	restartCheck(t, db2, 7, 200, 1)
+	check(db2)
 	require.NoError(t, db2.IntegrityCheck())
 }
 
-const deadWriterEnvPath = "ANYSTORE_DEAD_WRITER_DB"
+// deadWriterSurvivorMultiPage is a survivor whose first commit rewrites every
+// row in one batch of frames. A commit writes its pages last-changed first:
+// the pages of rows [0,deadWriterMultiPageFrom) come first, and behind them
+// the pages the dead writer wrote, each of them at a frame number the dead
+// writer used for an earlier one.
+func deadWriterSurvivorMultiPage(t *testing.T, db *DB, path string) {
+	t.Helper()
+	before := db.pager.wal.index.mxCommitFrame.LoadLocal()
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	restartPutTx(t, wtx, deadWriterMultiPageFrom, 200, 2)
+	restartPutTx(t, wtx, 0, deadWriterMultiPageFrom, 2)
+	require.NoError(t, wtx.Commit())
+	require.Greater(t, db.pager.wal.index.mxCommitFrame.LoadLocal(), before+3, "setup: a commit of several pages")
+	check := func(db *DB) { restartCheck(t, db, 0, 200, 2) }
+	deadWriterCheck(t, db, path, "after-commit", check)
+
+	require.NoError(t, db.Close())
+	db2, err := testOpen(t, path, restartModes[0].opts)
+	require.NoError(t, err)
+	defer func() { _ = db2.Close() }()
+	check(db2)
+	require.NoError(t, db2.IntegrityCheck())
+}
+
+const (
+	deadWriterEnvPath = "ANYSTORE_DEAD_WRITER_DB"
+	deadWriterEnvFrom = "ANYSTORE_DEAD_WRITER_FROM"
+
+	// deadWriterMultiPageFrom is the first row the dead writer rewrote in
+	// the multi-page flow (deadWriterSurvivorMultiPage).
+	deadWriterMultiPageFrom = 100
+)
 
 // deadWriterChild is the writer that gets killed: it rewrites every row,
 // writes every dirty page to the WAL, reports it and waits.
@@ -180,9 +254,14 @@ func deadWriterChild(t *testing.T) bool {
 	require.NoError(t, err)
 	wtx, err := db.BeginWrite()
 	require.NoError(t, err)
-	restartPutTx(t, wtx, 0, 200, 9)
+	from, err := strconv.Atoi(os.Getenv(deadWriterEnvFrom))
+	require.NoError(t, err)
+	restartPutTx(t, wtx, from, 200, 9)
 	restartSpillAll(t, db)
-	require.NoError(t, os.WriteFile(path+".spilled", binary.BigEndian.AppendUint32(nil, db.pager.wal.nFrame.Load()), 0o644))
+	// Published by rename: the parent kills this process as soon as it sees
+	// the name, and reads the frame count from it.
+	require.NoError(t, os.WriteFile(path+".spilled.tmp", binary.BigEndian.AppendUint32(nil, db.pager.wal.nFrame.Load()), 0o644))
+	require.NoError(t, os.Rename(path+".spilled.tmp", path+".spilled"))
 	for {
 		time.Sleep(time.Hour) // killed by the parent
 	}
@@ -194,12 +273,17 @@ func TestWalIndexDeadWriter_KilledProcess(t *testing.T) {
 	if deadWriterChild(t) {
 		return
 	}
+	t.Run("one-page-commit", func(t *testing.T) { killedWriter(t, 0, deadWriterSurvivor) })
+	t.Run("multi-page-commit", func(t *testing.T) { killedWriter(t, deadWriterMultiPageFrom, deadWriterSurvivorMultiPage) })
+}
+
+func killedWriter(t *testing.T, from int, survivor func(t *testing.T, db *DB, path string)) {
 	db, path := openRestartDB(t, restartModes[0])
 	restartPut(t, db, 0, 200, 1)
 	committed := db.pager.wal.index.mxCommitFrame.LoadLocal()
 
 	cmd := exec.Command(os.Args[0], "-test.run=^TestWalIndexDeadWriter_KilledProcess$", "-test.v", "-test.timeout=60s")
-	cmd.Env = append(os.Environ(), deadWriterEnvPath+"="+path)
+	cmd.Env = append(os.Environ(), deadWriterEnvPath+"="+path, deadWriterEnvFrom+"="+strconv.Itoa(from))
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	require.NoError(t, cmd.Start())
 	killed := false
@@ -230,5 +314,5 @@ func TestWalIndexDeadWriter_KilledProcess(t *testing.T) {
 	_, idx := htFrameSegIdx(spilled)
 	require.NotZero(t, binary.LittleEndian.Uint32(region[htPgnoOffset(0, idx):]), "setup: the peer's entries are in the wal-index")
 
-	deadWriterSurvivor(t, db, path)
+	survivor(t, db, path)
 }
