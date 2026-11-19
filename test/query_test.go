@@ -234,3 +234,140 @@ func testFile(t *testing.T, filename string) {
 	}
 
 }
+
+// emptyLogicalColl holds five documents {id:i, a:i}, i = 1..5, and a
+// full-text index, so a $text filter is a valid source next to the logical
+// operators under test.
+func emptyLogicalColl(t *testing.T) anystore.Collection {
+	_, coll := ftsTestColl(t, "body")
+	for i := 1; i <= 5; i++ {
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"body":"hello world"}`, i, i))))
+	}
+	return coll
+}
+
+// An empty object matches every document wherever a filter is expected: as
+// the whole filter and as an element of $and, $or or $nor. Every verb gives
+// the same answer, and none panics.
+func TestQuery_EmptyObjectInLogicalOperator(t *testing.T) {
+	for _, tc := range []struct {
+		filter string
+		want   int
+	}{
+		{`{}`, 5},
+		{`{"$or":[{},{"a":1}]}`, 5},
+		{`{"$and":[{},{"a":1}]}`, 1},
+		{`{"$nor":[{}]}`, 0},
+		{`{"$nor":[{},{"a":1}]}`, 0},
+		{`{"$or":[{}]}`, 5},
+		{`{"$and":[{}]}`, 5},
+		{`{"$or":[{"$and":[{}]},{"a":5}]}`, 5},
+		{`{"$text":{"$search":"hello"},"$and":[{}]}`, 5},
+	} {
+		t.Run(tc.filter, func(t *testing.T) {
+			coll := emptyLogicalColl(t)
+
+			n, err := coll.Find(tc.filter).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, n, "Count")
+
+			assert.Len(t, writeOrderIterIds(t, coll.Find(tc.filter)), tc.want, "Iter")
+
+			n, err = coll.Aggregate(fmt.Sprintf(`[{"$match":%s}]`, tc.filter)).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, n, "Aggregate $match")
+
+			res, err := coll.Find(tc.filter).Update(ctx, `{"$set":{"touched":true}}`)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, res.Modified, "Update")
+			assertQueryCount(t, coll.Find(`{"touched":true}`), tc.want)
+
+			res, err = coll.Find(tc.filter).Delete(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, res.Modified, "Delete")
+			assertQueryCount(t, coll.Find(nil), 5-tc.want)
+		})
+	}
+}
+
+// A Go-built query.And with no children is a filter, not JSON: it never meets
+// the parser's empty-array rule and matches every document, alone or nested.
+// Callers build one when no field of their own filter is set.
+func TestQuery_GoEmptyAndMatchesAll(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		filter query.Filter
+		want   int
+	}{
+		{"And{}", query.And{}, 5},
+		{"And{And{}}", query.And{query.And{}}, 5},
+		{"And{And{}, a=1}", query.And{query.And{}, query.MustParseCondition(`{"a":1}`)}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coll := emptyLogicalColl(t)
+
+			n, err := coll.Find(tc.filter).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, n, "Count")
+
+			assert.Len(t, writeOrderIterIds(t, coll.Find(tc.filter)), tc.want, "Iter")
+
+			res, err := coll.Find(tc.filter).Update(ctx, `{"$set":{"touched":true}}`)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, res.Modified, "Update")
+			assertQueryCount(t, coll.Find(`{"touched":true}`), tc.want)
+
+			res, err = coll.Find(tc.filter).Delete(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, res.Modified, "Delete")
+			assertQueryCount(t, coll.Find(nil), 5-tc.want)
+		})
+	}
+}
+
+// An empty array under $and, $or or $nor is a parse error from every verb,
+// at every level and next to any other key. No verb treats it as "no filter":
+// a Delete or Update with it changes nothing.
+func TestQuery_EmptyLogicalArrayIsParseError(t *testing.T) {
+	for _, filter := range []string{
+		`{"$or":[]}`,
+		`{"$and":[]}`,
+		`{"$nor":[]}`,
+		`{"$and":[],"a":1}`,
+		`{"$or":[],"a":1}`,
+		`{"$nor":[],"a":1}`,
+		`{"$or":[{"$and":[]},{"a":5}]}`,
+		`{"$text":{"$search":"hello"},"$and":[]}`,
+	} {
+		t.Run(filter, func(t *testing.T) {
+			coll := emptyLogicalColl(t)
+			requireParseError := func(verb string, err error) {
+				t.Helper()
+				var pe *query.ParseError
+				require.ErrorAs(t, err, &pe, verb)
+				assert.Contains(t, pe.Reason, "must be a non-empty array", verb)
+			}
+
+			_, err := coll.Find(filter).Count(ctx)
+			requireParseError("Count", err)
+
+			_, err = coll.Find(filter).Iter(ctx)
+			requireParseError("Iter", err)
+
+			_, err = coll.Find(filter).Explain(ctx)
+			requireParseError("Explain", err)
+
+			_, err = coll.Aggregate(fmt.Sprintf(`[{"$match":%s}]`, filter)).Count(ctx)
+			requireParseError("Aggregate $match", err)
+
+			_, err = coll.Find(filter).Update(ctx, `{"$set":{"touched":true}}`)
+			requireParseError("Update", err)
+			assertQueryCount(t, coll.Find(`{"touched":true}`), 0)
+
+			_, err = coll.Find(filter).Delete(ctx)
+			requireParseError("Delete", err)
+			assertQueryCount(t, coll.Find(nil), 5)
+		})
+	}
+}

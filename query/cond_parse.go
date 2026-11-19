@@ -88,11 +88,24 @@ func ParseCondition(cond any) (Filter, error) {
 	return parseAnd(v)
 }
 
+// errEmptyLogicalArray is the rejection for {"$and": []}, {"$or": []} and
+// {"$nor": []} (MongoDB's rule: the operand must be a non-empty array). An
+// empty disjunction is false and an empty conjunction is true, so letting the
+// shape through would make a filter built from an empty list match nothing or
+// everything depending on the operator — and a Delete with it empty the
+// collection. A caller that means "every document" writes {}.
+func errEmptyLogicalArray(op string) error {
+	return &ParseError{Op: op, Reason: op + " must be a non-empty array"}
+}
+
 func parseAndArray(v *anyenc.Value) (f Filter, err error) {
 	if v.Type() != anyenc.TypeArray {
 		return nil, &ParseError{Op: "$and", Reason: "$and must be an array"}
 	}
 	arr, _ := v.Array()
+	if len(arr) == 0 {
+		return nil, errEmptyLogicalArray("$and")
+	}
 	var fs And
 	if len(arr) > 1 {
 		fs = make(And, 0, len(arr))
@@ -116,6 +129,9 @@ func parseOrArray(v *anyenc.Value) (f Filter, err error) {
 		return nil, &ParseError{Op: "$or", Reason: "$or must be an array"}
 	}
 	arr, _ := v.Array()
+	if len(arr) == 0 {
+		return nil, errEmptyLogicalArray("$or")
+	}
 	var fs Or
 	if len(arr) > 1 {
 		fs = make(Or, 0, len(arr))
@@ -139,6 +155,9 @@ func parseNorArray(v *anyenc.Value) (f Filter, err error) {
 		return nil, &ParseError{Op: "$nor", Reason: "$nor must be an array"}
 	}
 	arr, _ := v.Array()
+	if len(arr) == 0 {
+		return nil, errEmptyLogicalArray("$nor")
+	}
 	fs := make(Nor, 0, len(arr))
 	for i, el := range arr {
 		if f, err = parseAnd(el); err != nil {
@@ -236,6 +255,13 @@ func parseAnd(val *anyenc.Value) (res Filter, err error) {
 	}
 	if fs != nil {
 		return fs, nil
+	}
+	if f == nil {
+		// The empty object {} is the condition every document satisfies
+		// (MongoDB's rule), as the whole filter and as an element of
+		// $and/$or/$nor. It must be a real filter, never nil: the logical
+		// operators evaluate every element they hold.
+		return All{}, nil
 	}
 	return f, nil
 }

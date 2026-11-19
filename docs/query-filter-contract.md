@@ -178,6 +178,20 @@ build per query and carry no such guarantee.
     rejection, never a literal-equality pull — a swallowed error would make
     the same bytes mean different pulls across library versions in a
     multi-process deployment.
+    The empty shapes of the logical operators follow MongoDB. An empty
+    object `{}` is the condition every document satisfies, as the whole
+    filter and as an element of `$and`/`$or`/`$nor`: `{"$or":[{},{"a":1}]}`
+    matches everything, `{"$nor":[{}]}` nothing. An empty ARRAY under
+    `$and`, `$or` or `$nor` is a rejection at every level, alone or next to
+    another key (`Reason`: `"$or must be a non-empty array"`). An empty
+    disjunction is false and an empty conjunction true, so accepting the
+    shape would make a filter built from an empty list match nothing or
+    everything depending on the operator, and a `Delete` with it could empty
+    the collection; a caller that means "every document" passes `{}` or a
+    nil filter. Pinned by `TestParseCondition_EmptyObjectMatchesAll` and
+    `TestParseCondition_EmptyLogicalArrayRejected` (query/cond_parse_test.go)
+    and, through every verb, by `TestQuery_EmptyObjectInLogicalOperator` and
+    `TestQuery_EmptyLogicalArrayIsParseError` (test/query_test.go).
     Each vocabulary is data: `query.Operators()`, `query.ModifierOperators()`,
     `anystore.AggregateStages()` and `anystore.AggregateAccumulators()`
     return exactly what the parsers recognize, so callers advertising a

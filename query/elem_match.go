@@ -191,12 +191,10 @@ func parseElemMatch(v *anyenc.Value) (Filter, error) {
 		}
 		return ElemMatch{Cond: cond, ValueForm: true}, nil
 	}
+	// {"$elemMatch": {}} parses to All: any object element.
 	cond, err := parseAnd(v)
 	if err != nil {
 		return nil, err
-	}
-	if cond == nil {
-		cond = All{} // {"$elemMatch": {}}: any object element
 	}
 	if ContainsSourceFilter(cond) {
 		return nil, &ParseError{Op: "$elemMatch", Reason: "$text and $knn are not allowed under $elemMatch"}
