@@ -644,6 +644,18 @@
     ],
     "note": ""
   },
+  "codec.go:*aeadScratch.drawNonce": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec.go:*noCopy.Lock": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec.go:*noCopy.Unlock": {
+    "sqlite": [],
+    "note": ""
+  },
   "codec.go:*noncePool.Draw": {
     "sqlite": [],
     "note": ""

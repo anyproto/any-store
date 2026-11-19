@@ -49,7 +49,7 @@ For every page in the file:
 
 ### Page-1 header gap (limitation)
 
-`encryptPageWithCodec` (`codec.go:98-127`) preserves the first 100
+`encryptPageWithCodec` (`codec.go:194-212`) preserves the first 100
 bytes of page 1 (the SQLite-format DB header) as a plaintext prefix
 and only passes `src[100:]` to the codec. So:
 
