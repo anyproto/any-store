@@ -651,19 +651,24 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) erro
 		}
 		wi.mu.Unlock()
 	}
-	// mxFrame is the last frame of the log before this batch, for every frame
-	// of the batch: pWal->hdr.mxFrame stays put while walFrames runs its
-	// walIndexAppend loop and is advanced after it (wal.c:4243).
-	mxFrame := wi.maxFrame.Load()
-	if f := startFrame + uint32(len(pages)) - 1; f > mxFrame {
+	// last is the last frame whose index entry is this log's: the last frame
+	// before the batch, then each frame of the batch once it is indexed. It
+	// is the limit of the dead-writer cleanup in shmHashWrite.
+	// DRIFT: the cleanup limit follows the batch; C's is pWal->hdr.mxFrame for the whole batch See docs/btree/NOTES.md#drift-2026-11-19-dead-writer-cleanup-limit-follows-the-batch
+	last := wi.maxFrame.Load()
+	if f := startFrame + uint32(len(pages)) - 1; f > last {
 		wi.maxFrame.Store(f)
 	}
 	// Propagate the first ErrCorrupt (full/over-probed hash segment) so the
 	// commit aborts like C's walFrames loop (wal.c:4229 stops the loop, skips
 	// walIndexWriteHdr, returns rc) instead of silently dropping the mapping.
 	for i, p := range pages {
-		if err := wi.shmHashWrite(p.pgno, startFrame+uint32(i), mxFrame); err != nil {
+		frame := startFrame + uint32(i)
+		if err := wi.shmHashWrite(p.pgno, frame, last); err != nil {
 			return err
+		}
+		if frame > last {
+			last = frame
 		}
 	}
 	return nil
@@ -1244,9 +1249,12 @@ func htSegmentInfo(seg int) (pgnoBase int, nEntry int, iZero uint32) {
 // is never published via mxFrame/mxCommitFrame, so no reader can reach it,
 // and shmCleanupFromFrame/reset scrubs the slot on rollback.
 //
-// mxFrame is the last frame of the log before the append that frame belongs
-// to (pWal->hdr.mxFrame in walIndexAppend): the frames above it are not part
-// of the log, whatever the hash table says about them.
+// mxFrame is the last frame whose entry is this log's: the entries of the
+// frames above it are not, whatever the hash table says about them. For the
+// first frame of a batch it is the last frame of the log before the batch,
+// pWal->hdr.mxFrame in walIndexAppend; for the following ones the frame
+// indexed just before (setBatch), where C keeps pWal->hdr.mxFrame for the
+// whole batch.
 func (wi *walIndex) shmHashWrite(pgno, frame, mxFrame uint32) error {
 	seg, idx := htFrameSegIdx(frame)
 
@@ -2645,7 +2653,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	// that died. Writing the page into that frame and leaving it out of the
 	// appended set would lose it: the staged batch writes another page over
 	// the same frame. In C iFirst stays 0 until the transaction has written
-	// frames (pWal->hdr differs from the live header, wal.c:4062-4065); here
+	// frames (pWal->hdr differs from the live header, wal.c:4062-4064); here
 	// the first call of a transaction has iFirst == nf+1, an empty window.
 	iFirst := w.index.mxCommitFrame.LoadLocal() + 1
 	canReuse := iFirst <= nf && !DiagDisableReuse.Load()
