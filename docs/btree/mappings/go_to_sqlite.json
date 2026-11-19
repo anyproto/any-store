@@ -2824,6 +2824,22 @@
     ],
     "note": ""
   },
+  "wal.go:htSlotLoad": {
+    "sqlite": [
+      "wal.c:walFindFrame"
+    ],
+    "note": "AtomicLoad of a hash slot"
+  },
+  "wal.go:htSlotStore": {
+    "sqlite": [
+      "wal.c:walIndexAppend"
+    ],
+    "note": "AtomicStore of a hash slot"
+  },
+  "wal.go:htSlotWord": {
+    "sqlite": [],
+    "note": ""
+  },
   "wal.go:newWal": {
     "sqlite": [],
     "note": ""

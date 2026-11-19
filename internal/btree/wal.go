@@ -765,16 +765,27 @@ func (wi *walIndex) shmCleanupFromFrame(target, maxFrame uint32) {
 func shmCleanupHashSegment(region []byte, seg int, mxFrame uint32) {
 	pgnoBase, nEntry, iZero := htSegmentInfo(seg)
 	iLimit := uint16(mxFrame - iZero) // mxFrame's 1-based index in this segment
-	for h := 0; h < htNSlot; h++ {
-		slotOff := htHashArrayOff + h*2
-		v := binary.LittleEndian.Uint16(region[slotOff:])
-		if v > iLimit {
-			binary.LittleEndian.PutUint16(region[slotOff:], 0)
+	// The slots, two to a word, are stored like htSlotStore's: readers of
+	// this process and of others probe the table meanwhile. They never use
+	// what is removed here, which is above every snapshot, and the entries
+	// they do use keep their places. The page numbers removed are never
+	// read by a reader (shmHashGet tests the bounds first) and are cleared
+	// as C's memset clears them.
+	for h := 0; h < htNSlot; h += 2 {
+		p, _ := htSlotWord(region, h)
+		w := atomic.LoadUint32(p)
+		nw := w
+		if uint16(w) > iLimit {
+			nw &^= 0xffff
+		}
+		if uint16(w>>16) > iLimit {
+			nw &^= 0xffff0000
+		}
+		if nw != w {
+			atomic.StoreUint32(p, nw)
 		}
 	}
-	for i := int(iLimit); i < nEntry; i++ {
-		binary.LittleEndian.PutUint32(region[pgnoBase+i*4:], 0)
-	}
+	clear(region[pgnoBase+int(iLimit)*4 : pgnoBase+nEntry*4])
 }
 
 // getInTxRange returns the frame for pgno within [minFrame, maxFrame],
@@ -1310,9 +1321,10 @@ func (wi *walIndex) shmHashWrite(pgno, frame, mxFrame uint32) error {
 		walShmBarrier()
 	}
 
-	// Insert into hash table (linear probing). aHash entries are u16; we
-	// publish via a plain store here because writes are serialized under
-	// lockWrite and the preceding barrier ordered aPgno before us.
+	// Insert into hash table (linear probing). aHash entries are u16,
+	// published with htSlotStore (C: AtomicStore, wal.c:1338): writes are
+	// serialized under lockWrite, readers probe meanwhile, and the preceding
+	// barrier ordered aPgno before the slot.
 	//
 	// Bound the probe like C's walIndexAppend (wal.c:1333-1336). C uses
 	// `nCollide = idx` where its idx is 1-based (`iFrame - sLoc.iZero`); Go's
@@ -1323,9 +1335,8 @@ func (wi *walIndex) shmHashWrite(pgno, frame, mxFrame uint32) error {
 	nCollide := idx + 1
 	h := int(pgno*htHash1) & (htNSlot - 1)
 	for range htNSlot {
-		slotOff := htHashArrayOff + h*2
-		if binary.LittleEndian.Uint16(region[slotOff:]) == 0 {
-			binary.LittleEndian.PutUint16(region[slotOff:], uint16(idx+1))
+		if htSlotLoad(region, h) == 0 {
+			htSlotStore(region, h, uint16(idx+1))
 			return nil
 		}
 		if nCollide--; nCollide < 0 {
@@ -1432,20 +1443,25 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 		nCollide := htNSlot
 		var bestFrame uint32
 		for range htNSlot {
-			slotOff := htHashArrayOff + h*2
-			entry := binary.LittleEndian.Uint16(region[slotOff:])
+			entry := htSlotLoad(region, h)
 			if entry == 0 {
 				break // end of probe chain (genuine miss)
 			}
-			idx := int(entry) - 1
-			if idx < nEntry {
-				storedPgno := binary.LittleEndian.Uint32(region[pgnoBase+idx*4:])
-				if storedPgno == pgno {
-					frame := iZero + uint32(idx) + 1
-					if frame <= maxFrame && frame >= minFrame && frame > bestFrame {
-						bestFrame = frame
-					}
-				}
+			// The frame is tested against the snapshot's bounds before
+			// its page number is read, in C's order (wal.c:3585 `if(
+			// iFrame<=iLast && iFrame>=pWal->minFrame &&
+			// sLoc.aPgno[iH-1]==pgno )`): the entries above maxFrame are
+			// the writer's to change (an append in progress, a rollback,
+			// the removal of a dead writer's entries), and their page
+			// numbers are not read at all. Those of the window were
+			// written before the snapshot was published and do not
+			// change while it is in use, so they are read plainly, as C
+			// reads them.
+			frame := iZero + uint32(entry)
+			if frame <= maxFrame && frame >= minFrame && int(entry) <= nEntry &&
+				binary.LittleEndian.Uint32(region[pgnoBase+(int(entry)-1)*4:]) == pgno &&
+				frame > bestFrame {
+				bestFrame = frame
 			}
 			// Bound the probe AFTER the match check, like C (wal.c:3589-3592):
 			// walking past nCollide occupied slots = full/corrupt chain.
@@ -1464,6 +1480,34 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 	}
 
 	return 0, nil
+}
+
+// htSlotWord returns the 32-bit word that holds hash slot h and the slot's
+// bit offset in it. Go has no 16-bit atomics, so the slots, which are
+// 16-bit, are loaded and stored through the aligned word that holds two of
+// them (aHash starts at a multiple of 4 in a region whose start is aligned).
+// Slots are little-endian, as everywhere in this file: the even slot is the
+// word's low half on the little-endian machines the shared wal-index is
+// built for.
+func htSlotWord(region []byte, h int) (*uint32, uint) {
+	return (*uint32)(unsafe.Pointer(&region[htHashArrayOff+(h&^1)*2])), uint(h&1) * 16
+}
+
+// htSlotLoad reads hash slot h, as walFindFrame does with AtomicLoad
+// (wal.c:3583): a reader probes the table while the writer appends to it.
+func htSlotLoad(region []byte, h int) uint16 {
+	p, shift := htSlotWord(region, h)
+	return uint16(atomic.LoadUint32(p) >> shift)
+}
+
+// htSlotStore writes hash slot h, as walIndexAppend does with AtomicStore
+// (wal.c:1338). The caller holds the write lock: no one else stores into the
+// table, so rewriting the neighbouring slot with the value just loaded
+// changes nothing a reader can see.
+func htSlotStore(region []byte, h int, v uint16) {
+	p, shift := htSlotWord(region, h)
+	w := atomic.LoadUint32(p)
+	atomic.StoreUint32(p, w&^(0xffff<<shift)|uint32(v)<<shift)
 }
 
 // shmClearHash zeros out all hash table data in shm regions.
