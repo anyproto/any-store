@@ -457,7 +457,10 @@ intentional.
    **Order (2026-11-19).** The upgrade is the first step of the close, as
    `sqlite3OsLock(pWal->pDbFd, SQLITE_LOCK_EXCLUSIVE)` is in `sqlite3WalClose`
    (`wal.c:2522-2523`); the PASSIVE checkpoint (`wal.c:2528-2530`) and the
-   truncate (`wal.c:2531-2549`) run only under it, and a close that does not
+   truncate (`wal.c:2531-2550`: the WAL is deleted unless it is persistent, `wal.c:2536-2540`, and a
+   persistent one is truncated to zero only with a non-negative size limit, `else if( pWal->mxWalSize>=0 )`,
+   `wal.c:2541-2548`; here the WAL is always truncated and never deleted,
+   [drift-55](#drift-55-wal-file-truncated-but-never-unlinked-on-last-client-close)) run only under it, and a close that does not
    get the lock runs neither. `pager.close` used to checkpoint first, then
    upgrade, then truncate on the checkpoint's result — with the write lock
    or, when a peer's transaction outlasted the busy timeout, without it. A
@@ -1354,15 +1357,15 @@ comments in source):
 4. **Batched wal-index update** (`wal.go:setBatch`) — **Severity:** medium.
    SQLite updates the wal-index
    inline in `walFrames()` — the write loop tags each page `PGHDR_WAL_APPEND`
-   (set on append `wal.c:4149`, cleared on in-place reuse `wal.c:4137`), then a
-   second loop replays the flag via `walIndexAppend()` (`wal.c:4212-4221`);
+   (set on append `wal.c:4163`, cleared on in-place reuse `wal.c:4151`), then a
+   second loop replays the flag via `walIndexAppend()` (`wal.c:4225-4229`);
    rollback uses `walCleanupHash()` (`wal.c:1233`). We mirror this with one
    post-loop `setBatch` (`wal.go:603`, called at `wal.go:2218`) per
    `writeFrames` call (a single `wi.mu` acquisition for the in-process `pageMap`,
    then eager `shmHashWrite` — *not* deferred), plus a `walCleanupHash` analog on
    rollback. `shmHashWrite` also runs `walCleanupHash` (`shmCleanupHash`) before
    it writes a frame whose `aPgno` entry is already set, as `walIndexAppend`
-   does (`wal.c:1321-1330`): the entry is left over from a writer that died
+   does (`wal.c:1327-1330`): the entry is left over from a writer that died
    after it had spilled pages, and with it the rest of that writer's entries
    above the log's last frame. The limit of that cleanup follows the batch
    ([drift-2026-11-19](#drift-2026-11-19-dead-writer-cleanup-limit-follows-the-batch)).
@@ -3104,7 +3107,7 @@ SQLite's per-read `szPage` decode (low impact because Go derives page size elsew
 - **Affected functions:** `wal.go:*walIndex.shmHashGet`.
 
 C's `walFindFrame` aborts the entire frame lookup on any hash-segment map failure:
-`rc = walHashGet(pWal, iHash, &sLoc); if( rc!=SQLITE_OK ) return rc;` (`wal.c:3562-3565`), so an SHM
+`rc = walHashGet(pWal, iHash, &sLoc); if( rc!=SQLITE_OK ){ return rc; }` (`wal.c:3576-3579`), so an SHM
 map/extend error (`walHashGet` -> `walIndexPage` -> `sqlite3OsShmMap`) reaches the reader:
 `readDbPage` returns it (`pager.c:3032-3033`) and `getPageNormal` drops the page and fails the get
 (`pager_acquire_err`, `pager.c:5629`). Go's `shmHashGet` did `if err != nil { continue }`: it skipped

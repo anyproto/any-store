@@ -4011,11 +4011,17 @@ func (p *pager) close() error {
 						cpErr = p.wal.checkpointPassive(p.file, p.master)
 					}
 					// The WAL is truncated only after a checkpoint that
-					// completed (wal.c:2531 `if( rc==SQLITE_OK )`, then
-					// walLimitSize(pWal, 0) at wal.c:2548 for a persistent
-					// WAL), and, with a shared wal-index, only with the
-					// write lock: a close that could not take it does not
-					// know the log is not being written.
+					// completed (wal.c:2531 `if( rc==SQLITE_OK )`). What C
+					// does then depends on the persistent-WAL setting: it
+					// deletes the file unless the WAL is persistent
+					// (wal.c:2536-2540), and truncates a persistent one to
+					// zero only under a non-negative size limit (`else if(
+					// pWal->mxWalSize>=0 )`, wal.c:2541-2548), leaving it as
+					// it is otherwise. Here it is always truncated, never
+					// deleted (drift-55). With a shared wal-index the
+					// truncate also needs the write lock: a close that could
+					// not take it does not know the log is not being
+					// written.
 					if cpErr == nil && (lockedWrite || p.inProcess) {
 						if debugTrace {
 							trace("close: TRUNCATING WAL (cpErr=nil isLastClient=true) nBackfill=%d mxFrame=%d",
