@@ -497,3 +497,43 @@ func TestIntegrity_OverlappingSweepsKeepVerificationOn(t *testing.T) {
 	_, err = coll.FindId(ctx, sweepDocID(sweepDamagedDoc))
 	require.ErrorIs(t, err, ErrPageIntegrity, "a read of the damaged page after both sweeps")
 }
+
+// TestIntegrity_InMemoryHasNoIntegrityMode: an in-memory database stores
+// its pages as they are, with no codec, whatever Config.Encryption says
+// (EncryptionConfig: "InMemory databases ignore Encryption"). There is no
+// page tag to verify: the mode is IntegrityNone and a sweep scans nothing,
+// where it used to try the cipher's tag on plain pages and list every one.
+func TestIntegrity_InMemoryHasNoIntegrityMode(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		cfg  Config
+	}{
+		{name: "plain", cfg: Config{InMemory: true}},
+		{name: "passphrase", cfg: Config{InMemory: true, Encryption: EncryptionConfig{Passphrase: []byte("p"), KDFIterations: 1000}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var fired atomic.Uint32
+			cfg := tc.cfg
+			cfg.OnIntegrityError = func(IntegrityError) { fired.Add(1) }
+			db, err := Open(ctx, ":memory:", &cfg)
+			require.NoError(t, err)
+			defer func() { _ = db.Close() }()
+			coll, err := db.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			for i := 0; i < 200; i++ {
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"%s","pad":"%s"}`, sweepDocID(i), sweepDocPad(i)))))
+			}
+			require.NoError(t, db.Flush(ctx, 0, FlushModeCheckpointFull))
+
+			require.Equal(t, IntegrityNone, db.IntegrityMode())
+			rep, err := db.VerifyIntegrity(ctx)
+			require.NoError(t, err)
+			require.Equal(t, IntegrityNone, rep.Mode)
+			require.Zero(t, rep.Pages)
+			require.Empty(t, rep.Errors)
+			require.Zero(t, fired.Load())
+		})
+	}
+}
