@@ -12,6 +12,7 @@ package btree
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -315,4 +316,74 @@ func killedWriter(t *testing.T, from int, survivor func(t *testing.T, db *DB, pa
 	require.NotZero(t, binary.LittleEndian.Uint32(region[htPgnoOffset(0, idx):]), "setup: the peer's entries are in the wal-index")
 
 	survivor(t, db, path)
+}
+
+// A writer died while it rolled its frames back: the hash slots of frames 2
+// and 3 are cleared, and of their two page numbers only the first. The next
+// writer indexes frame 2 without finding anything in its way, finds frame
+// 3's page number set and cleans up. What it removes is what the dead writer
+// left, above the frames it has indexed itself: frame 2 is its own.
+func TestWalIndexDeadWriter_PartlyClearedTail(t *testing.T) {
+	deadWriterIndexes(t, func(t *testing.T, wi *walIndex) {
+		const a, b = uint32(3), uint32(4)
+		require.NoError(t, wi.set(5, 1)) // the log: one committed frame
+		region, err := wi.shm.region(0, true)
+		require.NoError(t, err)
+		binary.LittleEndian.PutUint32(region[htPgnoOffset(0, 2):], 77) // frame 3's page number
+
+		require.NoError(t, wi.setBatch([]*page{{pgno: a}, {pgno: b}}, 2, true))
+		frame, err := wi.shmHashGet(a, 3, 1)
+		require.NoError(t, err)
+		require.Equal(t, uint32(2), frame, "the batch's first frame is in the index")
+		frame, err = wi.shmHashGet(b, 3, 1)
+		require.NoError(t, err)
+		require.Equal(t, uint32(3), frame)
+	})
+}
+
+// A reader of the same process looks a committed page up while the writer
+// removes a dead writer's entries and while it rolls back: the reader's
+// result does not change, and its accesses to the hash table do not race the
+// writer's (run with -race; the heap index is the one the detector sees).
+func TestWalIndexDeadWriter_CleanupUnderReader(t *testing.T) {
+	deadWriterIndexes(t, func(t *testing.T, wi *walIndex) {
+		const h0, nDead, rounds = 2000, 40, 300
+		committed := pgnoWithHash(t, h0)
+		require.NoError(t, wi.set(committed, 1))
+
+		stop := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			for {
+				select {
+				case <-stop:
+					done <- nil
+					return
+				default:
+				}
+				// The committed page, and one whose chain runs through
+				// the dead writer's slots.
+				for _, c := range []struct{ pgno, want uint32 }{{committed, 1}, {committed + htNSlot, 0}} {
+					frame, err := wi.shmHashGet(c.pgno, 1, 1)
+					if err == nil && frame != c.want {
+						err = fmt.Errorf("page %d: frame %d, want %d", c.pgno, frame, c.want)
+					}
+					if err != nil {
+						done <- err
+						return
+					}
+				}
+			}
+		}()
+		for i := 0; i < rounds; i++ {
+			for k := 0; k < nDead; k++ { // a writer writes frames 2.. and dies
+				require.NoError(t, wi.set(pgnoWithHash(t, h0+k), uint32(2+k)))
+			}
+			wi.maxFrame.Store(1)
+			require.NoError(t, wi.set(pgnoWithHash(t, h0), 2)) // the next writer cleans up
+			wi.rollbackToFrame(1)                              // and rolls back
+		}
+		close(stop)
+		require.NoError(t, <-done)
+	})
 }

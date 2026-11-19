@@ -1364,10 +1364,10 @@ comments in source):
    it writes a frame whose `aPgno` entry is already set, as `walIndexAppend`
    does (`wal.c:1321-1330`): the entry is left over from a writer that died
    after it had spilled pages, and with it the rest of that writer's entries
-   above the log's last frame. `setBatch` passes the last frame before the
-   batch, which is `pWal->hdr.mxFrame` during the `walIndexAppend` loop
-   (advanced after it, `wal.c:4243`). Tests: `TestWalIndexDeadWriter_*`
-   (`wal_index_dead_writer_test.go`). **Invariant: the appended set handed to `setBatch` MUST be recorded
+   above the log's last frame. The limit of that cleanup follows the batch
+   ([drift-2026-11-19](#drift-2026-11-19-dead-writer-cleanup-limit-follows-the-batch)).
+   Tests: `TestWalIndexDeadWriter_*` (`wal_index_dead_writer_test.go`).
+   **Invariant: the appended set handed to `setBatch` MUST be recorded
    inline in the write loop (the `appended` slice ≡ `PGHDR_WAL_APPEND`), never
    re-derived.** Re-deriving the reuse predicate after the loop dropped the
    force-appended commit frame and silently corrupted recovery — see the
@@ -3150,6 +3150,29 @@ segment 0, `htNPage=4096` otherwise), and `shmHashGet` uses it as a defensive in
 consequence is a behavioral divergence in how the `aPgno` index is constrained: Go adds an explicit
 `idx < nEntry` upper-bound check that C lacks, so an index C would read unconditionally Go instead
 rejects/skips — a different (and stricter) handling of out-of-range hash entries.
+
+<a id="drift-2026-11-19-dead-writer-cleanup-limit-follows-the-batch"></a>
+### Drift: Dead-Writer Cleanup Limit Follows The Batch
+- **Category:** changed-logic  -  **Severity:** low (strictly keeps more; closes a window C has)
+- **Affected functions:** `wal.go:*walIndex.setBatch`, `wal.go:*walIndex.shmHashWrite`, `wal.go:*walIndex.shmCleanupHash`.
+
+`walIndexAppend` runs `walCleanupHash` when the frame's `aPgno` entry is already set (`wal.c:1327-1328`), and
+`walCleanupHash` removes every entry above `pWal->hdr.mxFrame` (`wal.c:1258-1271`). `walFrames` advances
+`pWal->hdr.mxFrame` after its `walIndexAppend` loop (`wal.c:4243`), so for every frame of a batch the limit is
+the last frame before the batch. That is right when the leftover is a dead writer's spill: its entries start at
+the first frame after the log's end, the batch's first frame finds its `aPgno` set, and the cleanup runs before
+the batch has indexed anything. It is wrong for a writer that died inside a rollback's cleanup, which clears
+the hash slots and then the page numbers in ascending order (`walCleanupHash`'s `memset`, `wal.c:1271`; here
+`shmCleanupHashSegment`): with the page numbers of the first frames cleared and the later ones not, the batch
+indexes its first frames, finds a later `aPgno` set, and cleans back to the limit — removing the entries it has
+just written. The commit succeeds and those pages read as they were before it. By reading, C behaves the same
+in that state (the limit is `pWal->hdr.mxFrame`, the batch's own entries are above it, and the `assert(
+!sLoc.aPgno[idx-1] )` at `wal.c:1329` holds); the state needs a process killed inside one `memset`.
+
+Go passes `shmHashWrite` the last frame whose entry is to be kept: the last frame before the batch for the
+batch's first frame, then each frame as it is indexed (`setBatch`). The cleanup therefore never removes an
+entry of the batch, and removes the same entries as C's whenever it runs at the batch's first frame. Test:
+`TestWalIndexDeadWriter_PartlyClearedTail`.
 
 <a id="drift-95-shmcleanupfromframe-zeros-all-segments-above-target"></a>
 ### Drift: shmCleanupFromFrame Zeros All Segments Above Target
