@@ -1100,6 +1100,10 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 					return err
 				}
 			}
+		} else {
+			// A read failure, not an empty catalog: a prefix nothing
+			// matches leaves the cursor invalid with a nil error.
+			return err
 		}
 		if err := cursor.Seek([]byte("idx:")); err == nil {
 			for cursor.Valid() {
@@ -1115,6 +1119,10 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 					return err
 				}
 			}
+		} else {
+			// A read failure, not an empty catalog: a prefix nothing
+			// matches leaves the cursor invalid with a nil error.
+			return err
 		}
 		return nil
 	})
@@ -2113,6 +2121,8 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 			return fmt.Errorf("%w: %w", ErrIndexMismatch, ErrVectorIndexUnsupported)
 		}
 		return ErrIndexMismatch
+	} else if !errors.Is(err, btree.ErrKeyNotFound) {
+		return err
 	}
 	var a anyenc.Arena
 	obj := a.NewObject()
@@ -2467,7 +2477,7 @@ func (db *db) listCollectionNames(tx *btree.ReadTx) ([]string, error) {
 	defer cursor.Close()
 	prefix := []byte("coll:")
 	if err := cursor.Seek(prefix); err != nil {
-		return nil, nil
+		return nil, err
 	}
 	var names []string
 	for cursor.Valid() {
