@@ -1125,6 +1125,10 @@
     "sqlite": [],
     "note": ""
   },
+  "dbfile_lock_other.go:unlockDBFile": {
+    "sqlite": [],
+    "note": "no-op: no cross-process file lock on this target"
+  },
   "dbfile_lock_unix.go:acquireSharedDBLock": {
     "sqlite": [],
     "note": ""
@@ -1140,6 +1144,16 @@
   "dbfile_lock_unix.go:tryUpgradeDBLockExclusive": {
     "sqlite": [],
     "note": ""
+  },
+  "dbfile_lock_unix.go:unlockDBFile": {
+    "sqlite": [
+      "os_unix.c:flockUnlock"
+    ],
+    "note": "drops the flock after a refused upgrade to exclusive (lockDBForCreate)"
+  },
+  "dbfile_lock_windows.go:unlockDBFile": {
+    "sqlite": [],
+    "note": "no-op: the multi-process lock protocol never runs on Windows"
   },
   "debug_trace.go:trace": {
     "sqlite": [],
@@ -1699,6 +1713,20 @@
     ],
     "note": "the pager's count for a write begin, the one its readers use"
   },
+  "pager.go:*pager.createIfEmpty": {
+    "sqlite": [
+      "btree.c:newDatabase",
+      "btree.c:sqlite3BtreeSetVersion",
+      "pager.c:pagerOpenWalIfPresent"
+    ],
+    "note": "a file of zero pages becomes a one-page database under the exclusive DB-file lock; a WAL beside it is deleted first"
+  },
+  "pager.go:*pager.createPage1": {
+    "sqlite": [
+      "btree.c:newDatabase"
+    ],
+    "note": "written and synced in place, with no rollback journal"
+  },
   "pager.go:*pager.decryptPage": {
     "sqlite": [],
     "note": ""
@@ -1816,7 +1844,7 @@
     "sqlite": [
       "btree.c:newDatabase"
     ],
-    "note": "any-store initializes empty page 1 at pager open; SQLite defers to btree layer"
+    "note": "in-memory databases only; a database in a file is created by createIfEmpty"
   },
   "pager.go:*pager.installCodec": {
     "sqlite": [],
@@ -1833,6 +1861,24 @@
       "btree.c:decodeFlags"
     ],
     "note": "the file's leaf rule for a given usable size"
+  },
+  "pager.go:*pager.lockDBForCreate": {
+    "sqlite": [
+      "pager.c:sqlite3PagerExclusiveLock"
+    ],
+    "note": "flock upgrade with drop-and-retry between several creators, up to BusyTimeout"
+  },
+  "pager.go:*pager.lockDBShared": {
+    "sqlite": [
+      "pager.c:pager_wait_on_lock"
+    ],
+    "note": "shared DB-file flock, retried for a second against an exclusive holder"
+  },
+  "pager.go:*pager.newPage1": {
+    "sqlite": [
+      "btree.c:newDatabase"
+    ],
+    "note": "header and empty leaf image of page 1"
   },
   "pager.go:*pager.notePage1Read": {
     "sqlite": [
@@ -1994,6 +2040,10 @@
       "wal.c:sqlite3WalSavepoint"
     ],
     "note": ""
+  },
+  "pager.go:*pager.setCodec": {
+    "sqlite": [],
+    "note": "replaces the codec chosen before the DB-file lock was held"
   },
   "pager.go:*pager.setHasContent": {
     "sqlite": [

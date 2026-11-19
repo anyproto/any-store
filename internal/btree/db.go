@@ -638,22 +638,27 @@ func Open(path string, opts Options) (*DB, error) {
 	p.mmapSize = opts.MmapSize
 
 	// BEGIN ENCRYPTION
-	// Build and install codec before p.open(). For an existing file we read
-	// the header first to discover the salt; for a new file we generate a
-	// fresh salt. InMemory databases skip encryption entirely (encryption.md §7).
+	// The codec goes with the file's header: a passphrase key is derived
+	// from the header's salt, and the checksum mode is read from it. For an
+	// existing file the header is read to discover them; for a new file a
+	// fresh salt is drawn. InMemory databases skip encryption entirely
+	// (encryption.md §7).
 	//
 	// The encryption marker on disk is a non-zero Salt field (bytes 72-87
 	// of page 1). ReservedSpace alone is NOT the marker, because the same
 	// byte is used by SQLite-compat tests that exercise reserve-related
 	// code paths on plaintext databases.
 	//
-	// Note: there is a TOCTOU window between readInitialHeader (which
-	// opens/reads/closes the file) and p.open() (which reopens and locks).
-	// An external process swapping the file in that window would surface
-	// as a decrypt error on the first page read — not silent corruption.
-	// The openDBs registration in p.open() refuses a same-process double-open.
-	// A future hardening could hold a shared lock across readInitialHeader
-	// and p.open().
+	// The codec is settled twice. Here, before p.open() and with no lock,
+	// from a first look at the file: a wrong key option or an unreadable
+	// header is refused before anything is created or attached, and a key
+	// derivation is usually done before any lock is held. Then by p.open(),
+	// with the DB-file lock held, on the header it read under that lock.
+	// Between the two another process may create the database, or win its
+	// creation from this open; the second call then builds the codec again,
+	// from the salt that is in the file. It does nothing when the first
+	// look still holds, which is every open of a database that already
+	// existed.
 	wantEncryption := opts.Key != nil || opts.Codec != nil
 	var zeroSalt [SaltLen]byte
 	// Resolve effective codec mode. Encryption is opt-in (errors if it
@@ -661,48 +666,69 @@ func Open(path string, opts Options) (*DB, error) {
 	// ReservedSpace marker on existing DBs and honored from Options.Checksum
 	// on new DBs — file state is authoritative on reopen, so users can't
 	// accidentally upgrade or downgrade a live database via config drift.
-	useCksum := false
 	if !opts.InMemory {
+		// What the installed codec was built for.
+		var settled struct {
+			done   bool
+			exists bool
+			salt   [SaltLen]byte
+			cksum  bool
+		}
+		p.settleCodec = func(hdr *dbHeader) error {
+			fileExists := hdr != nil
+			useCksum := opts.Checksum
+			if fileExists {
+				fileEncrypted := hdr.Salt != zeroSalt
+				// Checksum-mode marker: zero salt + ReservedSpace == cksumOverhead (16).
+				// Any other non-zero ReservedSpace is left to higher-level
+				// integrity validation (e.g. tests synthesizing off-page cells).
+				fileCksum := !fileEncrypted && hdr.ReservedSpace == cksumOverhead
+				switch {
+				case fileEncrypted && !wantEncryption:
+					return fmt.Errorf("btree: database file is encrypted, Options.Key or Options.Codec required")
+				case !fileEncrypted && wantEncryption:
+					return fmt.Errorf("btree: database file is not encrypted, remove Options.Key/Codec")
+				}
+				useCksum = fileCksum
+			}
+			if settled.done && settled.exists == fileExists && settled.cksum == useCksum &&
+				(!fileExists || settled.salt == hdr.Salt) {
+				// A new file keeps the salt drawn for it.
+				return nil
+			}
+			var salt [SaltLen]byte
+			var codec Codec
+			if wantEncryption || useCksum {
+				if fileExists {
+					salt = hdr.Salt
+				} else if wantEncryption {
+					if _, err := rand.Read(salt[:]); err != nil {
+						return fmt.Errorf("btree: generate salt: %w", err)
+					}
+				}
+				var cerr error
+				codec, cerr = buildCodec(opts, salt[:], useCksum)
+				if cerr != nil {
+					return cerr
+				}
+				if sink, ok := codec.(OnErrorSink); ok && opts.OnIntegrityError != nil {
+					sink.SetOnError(opts.OnIntegrityError)
+				}
+			}
+			p.setCodec(codec, salt)
+			settled.done, settled.exists, settled.salt, settled.cksum = true, fileExists, salt, useCksum
+			return nil
+		}
 		existingHeader, herr := readInitialHeader(path)
-		fileExists := herr == nil
 		if herr != nil && !errors.Is(herr, os.ErrNotExist) && !errors.Is(herr, errEmptyFile) {
 			return nil, fmt.Errorf("btree: read header: %w", herr)
 		}
-		if fileExists {
-			fileEncrypted := existingHeader.Salt != zeroSalt
-			// Checksum-mode marker: zero salt + ReservedSpace == cksumOverhead (16).
-			// Any other non-zero ReservedSpace is left to higher-level
-			// integrity validation (e.g. tests synthesizing off-page cells).
-			fileCksum := !fileEncrypted && existingHeader.ReservedSpace == cksumOverhead
-			switch {
-			case fileEncrypted && !wantEncryption:
-				return nil, fmt.Errorf("btree: database file is encrypted, Options.Key or Options.Codec required")
-			case !fileEncrypted && wantEncryption:
-				return nil, fmt.Errorf("btree: database file is not encrypted, remove Options.Key/Codec")
-			}
-			useCksum = fileCksum
-		} else {
-			useCksum = opts.Checksum
+		var first *dbHeader
+		if herr == nil {
+			first = &existingHeader
 		}
-		wantCodec := wantEncryption || useCksum
-		if wantCodec {
-			var salt [SaltLen]byte
-			if fileExists {
-				salt = existingHeader.Salt
-			} else if wantEncryption {
-				if _, err := rand.Read(salt[:]); err != nil {
-					return nil, fmt.Errorf("btree: generate salt: %w", err)
-				}
-			}
-			codec, cerr := buildCodec(opts, salt[:], useCksum)
-			if cerr != nil {
-				return nil, cerr
-			}
-			if sink, ok := codec.(OnErrorSink); ok && opts.OnIntegrityError != nil {
-				sink.SetOnError(opts.OnIntegrityError)
-			}
-			p.header.Salt = salt
-			p.installCodec(codec)
+		if err := p.settleCodec(first); err != nil {
+			return nil, err
 		}
 	} else if opts.InMemory && (wantEncryption || opts.Checksum) {
 		// InMemory: build codec from zero salt; no on-disk marker.
