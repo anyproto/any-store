@@ -2114,8 +2114,10 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		assert.EqualValues(t, 1, on.DocCount)
 	})
 
-	// reloadSketch has nothing to rebase to and keeps the flag: the collection
-	// stays listed until a commit writes the row.
+	// reloadLiveSketch has nothing to rebase to and keeps the flag: the collection
+	// stays listed until a commit writes the row. That is the commit of a
+	// transaction that used the collection: one that wrote elsewhere stores
+	// no sketch of a transaction before it.
 	t.Run("sketches: no committed row keeps the collection listed", func(t *testing.T) {
 		fx := newFixture(t)
 		dbi := fx.DB.(*db)
@@ -2137,9 +2139,18 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		assert.True(t, idx.sketchModified)
 		require.NoError(t, b.Insert(tx.Context(), doc(1)))
 		require.NoError(t, tx.Commit())
+		assert.True(t, idx.sketchModified)
+		_, err = dbi.InspectIndexSketch(ctx, "a", "a")
+		require.ErrorIs(t, err, ErrIndexNotFound, "a commit that did not use the collection stores no row for it")
+
+		tx, err = fx.WriteTx(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"a"}, names(dbi.sketchDirty), "still listed")
+		require.NoError(t, a.Insert(tx.Context(), doc(2)))
+		require.NoError(t, tx.Commit())
 		assert.False(t, idx.sketchModified)
 		_, err = dbi.InspectIndexSketch(ctx, "a", "a")
-		require.NoError(t, err, "the commit persisted the row")
+		require.NoError(t, err, "the commit of a transaction that used the collection persisted the row")
 
 		require.NoError(t, b.Insert(ctx, doc(2)))
 		assert.Equal(t, []string{"b"}, names(dbi.sketchDirty))

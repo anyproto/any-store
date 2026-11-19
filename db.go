@@ -1739,10 +1739,17 @@ func (db *db) forgetLocked(c *collection) {
 // lists them on t for the settle (commonTx.settleSketches). Called once per
 // write transaction commit to batch sketch persistence. It removes nothing
 // from the list: the next write-tx begin does (resetUncommittedSketches).
+//
+// Only the collections whose live sketches are this transaction's
+// (collection.sketchTx) are written. One the transaction never used has
+// none of its deltas: what is flagged there is left over from a transaction
+// that did not commit, on counts no writer loaded since, and storing it
+// would put them over a row another process may have written meanwhile. It
+// stays listed for a begin to rebase.
 func (db *db) persistAllDirtySketches(tx *btree.WriteTx, t *commonTx) error {
 	gen := db.epoch.Load().gen
 	for _, c := range db.sketchDirty {
-		if c.closed.Load() {
+		if c.closed.Load() || c.sketchTx != t.sketchTx {
 			continue
 		}
 		var s *collSchema
