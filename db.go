@@ -107,6 +107,24 @@ type DB interface {
 
 	// Close closes the database connection.
 	// Returns an error if there is an issue closing the connection.
+	//
+	// Close waits, with no timeout, for every read transaction and every
+	// iterator of this DB to end: each ReadTx must be committed and each
+	// Iterator closed before Close can return. One that is never ended
+	// makes Close block forever, and Close called by the goroutine that
+	// still holds one deadlocks on itself (a `defer it.Close()` that runs
+	// after `db.Close()`, or a return out of an iteration loop into it).
+	// While Close waits the database is already closing: operations fail
+	// with ErrDBIsClosed, on an open transaction too, which is left only to
+	// be ended.
+	//
+	// Close does not wait for a write transaction. One that is open, or in
+	// the middle of an operation on another goroutine, is rolled back: what
+	// it wrote is discarded, the operation and every later one on it fail
+	// with ErrDBIsClosed, its Commit fails with ErrDBIsClosed and its
+	// Rollback returns nil.
+	//
+	// A second Close returns ErrDBIsClosed.
 	Close() error
 
 	// IntegrityMode reports the page-level integrity mode of this database

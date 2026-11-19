@@ -332,6 +332,103 @@ func TestDb_Close(t *testing.T) {
 		}
 	})
 
+	// closeAsync runs Close on its own goroutine; waitClosed reports whether
+	// it returned within d.
+	closeAsync := func(fx *fixture) chan error {
+		done := make(chan error, 1)
+		go func() { done <- fx.DB.Close() }()
+		return done
+	}
+	waitClosed := func(done chan error, d time.Duration) (error, bool) {
+		select {
+		case err := <-done:
+			return err, true
+		case <-time.After(d):
+			return nil, false
+		}
+	}
+	newColl := func(t *testing.T) (*fixture, Collection) {
+		fx := newFixture(t, &Config{})
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1}`), anyenc.MustParseJson(`{"id":2}`)))
+		return fx, coll
+	}
+
+	// The documented contract: Close waits for every read transaction and
+	// iterator to end, with no timeout, and returns once the last has.
+	t.Run("waits for an open iterator", func(t *testing.T) {
+		for _, advanced := range []bool{true, false} {
+			fx, coll := newColl(t)
+			it, err := coll.Find(nil).Iter(ctx)
+			require.NoError(t, err)
+			if advanced {
+				require.True(t, it.Next())
+			}
+
+			done := closeAsync(fx)
+			_, closed := waitClosed(done, 300*time.Millisecond)
+			require.False(t, closed, "Close returned with an iterator open (advanced=%v)", advanced)
+
+			require.NoError(t, it.Close())
+			err, closed = waitClosed(done, 10*time.Second)
+			require.True(t, closed, "Close did not return after the iterator closed (advanced=%v)", advanced)
+			require.NoError(t, err)
+		}
+	})
+
+	t.Run("waits for an open read transaction", func(t *testing.T) {
+		fx, coll := newColl(t)
+		rtx, err := fx.ReadTx(ctx)
+		require.NoError(t, err)
+		_, err = coll.FindId(rtx.Context(), 1)
+		require.NoError(t, err)
+
+		done := closeAsync(fx)
+		_, closed := waitClosed(done, 300*time.Millisecond)
+		require.False(t, closed, "Close returned with a read transaction open")
+
+		// A closing database runs nothing more, on an open transaction
+		// either: the transaction is left only to be ended.
+		_, err = coll.FindId(rtx.Context(), 2)
+		require.ErrorIs(t, err, ErrDBIsClosed)
+
+		require.NoError(t, rtx.Commit())
+		err, closed = waitClosed(done, 10*time.Second)
+		require.True(t, closed, "Close did not return after the read transaction ended")
+		require.NoError(t, err)
+	})
+
+	// An open write transaction does not hold Close back: Close rolls it
+	// back. Its writes are gone, and what is done with it afterwards fails
+	// with ErrDBIsClosed instead of blocking.
+	t.Run("rolls back an open write transaction", func(t *testing.T) {
+		fx, coll := newColl(t)
+		wtx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":3}`)))
+
+		err, closed := waitClosed(closeAsync(fx), 10*time.Second)
+		require.True(t, closed, "Close did not return with a write transaction open")
+		require.NoError(t, err)
+
+		require.ErrorIs(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":4}`)), ErrDBIsClosed)
+		require.ErrorIs(t, wtx.Commit(), ErrDBIsClosed)
+		require.NoError(t, wtx.Rollback())
+
+		if fx.tmpDir == "" {
+			return // InMemory: nothing to reopen
+		}
+		db, err := Open(ctx, filepath.Join(fx.tmpDir, "any-store-test.db"), nil)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, db.Close()) }()
+		c, err := db.Collection(ctx, "test")
+		require.NoError(t, err)
+		n, err := c.Count(ctx)
+		require.NoError(t, err)
+		require.Equal(t, 2, n)
+	})
 }
 
 func newFixture(t testing.TB, c ...*Config) *fixture {

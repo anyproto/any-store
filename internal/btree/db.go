@@ -784,6 +784,19 @@ func Open(path string, opts Options) (*DB, error) {
 }
 
 // Close closes the database.
+//
+// Close waits for every read transaction of this handle to end
+// (db.mu.Lock against the RLock each ReadTx holds), with no timeout and no
+// error: a ReadTx that is never rolled back blocks Close forever, and Close
+// called on the goroutine that holds one deadlocks. SQLite's sqlite3_close
+// refuses instead (SQLITE_BUSY, "unable to close due to unfinalized
+// statements", main.c sqlite3Close) and sqlite3_close_v2 defers the close;
+// neither blocks.
+//
+// A registered write transaction is not waited for: Close rolls it back and
+// releases its locks (see the force-rollback entry in docs/btree/NOTES.md).
+//
+// A second Close returns ErrClosed.
 func (db *DB) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
 		return ErrClosed

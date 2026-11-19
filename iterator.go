@@ -36,6 +36,12 @@ import (
 // CompactVectorIndex of the collection fail with ErrIterOpen until the
 // iterator is closed, advanced or not: they free the trees it reads.
 //
+// An Iterator must be closed. Until its Close it holds its read transaction
+// open — its own, when the query ran with a context that carries no
+// transaction — and DB.Close waits for that with no timeout: an iterator
+// that is never closed makes DB.Close block forever. Close is safe to defer
+// and to call twice.
+//
 // An Iterator belongs to one goroutine at a time. Opened with the context
 // of a transaction, its methods are calls on the transaction (see
 // commonTx), and once the transaction has ended Next and Doc fail with
@@ -63,7 +69,10 @@ type Iterator interface {
 	// Err returns any error encountered during the lifetime of the iterator.
 	Err() error
 
-	// Close closes the iterator and releases any associated resources.
+	// Close closes the iterator and releases any associated resources: the
+	// read transaction the iterator opened for itself, if it did. It must be
+	// called, also after Next has returned false or Err an error; see
+	// Iterator.
 	Close() error
 }
 

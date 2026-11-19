@@ -1385,6 +1385,12 @@ Additionally, the following Go-specific mechanisms have no SQLite analogue:
   below).
 - `db.writerLocksDone`: atomic CAS guard ensuring Close/Commit/Rollback lock
   cleanup runs exactly once despite concurrent goroutines
+- `DB.Close` waits for open read transactions (`db.mu.Lock` against the
+  `RLock` each `ReadTx` holds), with no timeout: a reader that is never ended
+  blocks it forever. `sqlite3Close` returns `SQLITE_BUSY` ("unable to close
+  due to unfinalized statements", `main.c`) and `sqlite3_close_v2` defers the
+  close; neither blocks. The wait is the documented contract of `DB.Close`
+  (godoc, README "Transactions"), pinned by `TestDb_Close` in the root package.
 - In-memory WAL `memFrames` truncation on rollback (no SQLite equivalent since
   SQLite's in-memory WAL is a separate VFS shim)
 
