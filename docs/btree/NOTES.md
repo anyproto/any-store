@@ -3131,6 +3131,23 @@ wrong, where C's cannot:
   it read hash tables a log restart may be clearing. `shmHashGet`, `get` and `getInTxRange` return `(0, nil)`
   for `minFrame > maxFrame`. Tests: `TestWalIndexLookup_EmptyWindowMapsNothing`,
   `TestWalIndexMapError_CheckpointedReaderReads`.
+- **Bounds before page number; atomic slots.** The probe tested `aPgno` before the frame bounds and read and
+  wrote the 16-bit slots as plain bytes, so a reader goroutine read page numbers and slots of entries above
+  its snapshot while the writer of the same process changed them (an append, a rollback's
+  `shmCleanupFromFrame`, the removal of a dead writer's entries). C loads the slot with `AtomicLoad`
+  (`wal.c:3583`), tests `iFrame<=iLast && iFrame>=pWal->minFrame` before `sLoc.aPgno[iH-1]==pgno`
+  (`wal.c:3585`) and stores the slot with `AtomicStore` (`wal.c:1338`). The probe now has C's order, and
+  every access to a slot of a table that readers probe goes through `htSlotLoad`/`htSlotStore`: Go has no
+  16-bit atomics, so the aligned 32-bit word that holds two slots is loaded and stored; a store rewrites the
+  neighbouring slot with the value it has just loaded, which is safe because only the holder of the write
+  lock stores. `shmCleanupHashSegment` clears its slots the same way, where C's `walCleanupHash` stores
+  plainly (`wal.c:1260-1264`): a plain store that a reader loads concurrently is a data race in Go. The page
+  numbers stay plain, as in C (the read after the bounds, the cleanup's `memset`, `wal.c:1271`): a reader
+  reads only those of its window, written before its snapshot was published and not changed while it is in
+  use. The whole-segment clears (a segment's first frame, the segments past a rollback target,
+  `shmClearHash`) stay plain: no snapshot reaches those segments. Test:
+  `TestWalIndexDeadWriter_CleanupUnderReader` under `-race` (the detector sees the heap index only; it does
+  not track the mmap'd one).
 
 <a id="drift-93-wal-hash-probe-full-chain-corruption-signal-dropped"></a>
 ### **Resolved (stale, 2026-06-25)** — shmHashGet now bounds the per-segment probe and propagates full-chain corruption as ErrCorrupt, matching C's walFindFrame (write path shmHashWrite likewise returns ErrCorrupt); cited wal.go:1081 is stale. Drift: WAL Hash Probe Full Chain Corruption Signal Dropped
