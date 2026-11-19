@@ -454,6 +454,28 @@ intentional.
    exclusive — serializing shm unlink against new opens exactly as SQLite
    does in `wal.c:2487-2551` (`sqlite3WalClose`).
 
+   **Order (2026-11-19).** The upgrade is the first step of the close, as
+   `sqlite3OsLock(pWal->pDbFd, SQLITE_LOCK_EXCLUSIVE)` is in `sqlite3WalClose`
+   (`wal.c:2522-2523`); the PASSIVE checkpoint (`wal.c:2528-2530`) and the
+   truncate (`wal.c:2531-2549`) run only under it, and a close that does not
+   get the lock runs neither. `pager.close` used to checkpoint first, then
+   upgrade, then truncate on the checkpoint's result — with the write lock
+   or, when a peer's transaction outlasted the busy timeout, without it. A
+   peer that committed after the checkpoint's last look at the log and whose
+   process ended before the upgrade (no Close, so no checkpoint of its own)
+   had its commit truncated away. Under the lock no other process is
+   attached, so nothing can be committed between the checkpoint and the
+   truncate. Consequences of SQLite's order: a close that is not the last no
+   longer checkpoints (the processes still attached do), it no longer waits
+   for a busy write lock, and the last close holds the file exclusively for
+   the length of its checkpoint, during which an opener retries its shared
+   lock (`pager.open`, 100 × 10 ms, then an error) where SQLite's opener
+   goes through its busy handler. Under the lock the close still takes
+   `WAL_WRITE_LOCK` (free by then) where SQLite switches to exclusive
+   locking mode (`wal.c:2525-2527`), and truncates only if it got it. Tests:
+   `TestCloseNotLastClient_LeavesWAL`,
+   `TestCloseLastClient_KeepsCommitBeforeLock` (`-tags vfs`, two processes).
+
    See `internal/btree/dbfile_lock_unix.go` for the flock wrappers. The
    inode-verify retry loop in `newPlatformShm` is gone — a single-shot
    `osOpenFile` + `F_RDLCK(DMS)` now suffices.
@@ -3930,7 +3952,7 @@ For file-backed databases that run in forced in-process mode (heap-backed WAL-in
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `dbfile_lock_unix.go:tryUpgradeDBLockExclusive` (`internal/btree/dbfile_lock_unix.go:55-65`), `dbfile_lock_unix.go:flockNB` (`internal/btree/dbfile_lock_unix.go:74-85`), `pager.go:*pager.close` (`internal/btree/pager.go:3277-3284`).
 
-To prove "last client" at close, the Go pager upgrades its lifetime DB-file lock from shared to exclusive by issuing a single `syscall.Flock(fd, LOCK_EX|LOCK_NB)` through `flockNB` (`internal/btree/dbfile_lock_unix.go:78`), with `tryUpgradeDBLockExclusive` mapping `ErrBusy` to `(false, nil)` (`internal/btree/dbfile_lock_unix.go:60-61`). Per BSD `flock(2)` semantics a shared→exclusive conversion on one open file description is not atomic: the kernel first drops the existing `LOCK_SH` and only then tries to install `LOCK_EX`, so when the exclusive grant cannot be satisfied immediately the `LOCK_NB` attempt fails *after* the shared lock has already been released. The caller therefore observes `(false, nil)` and treats itself as a non-last client (`internal/btree/pager.go:3277-3284`), unaware that its DB-file SHARED lock is now gone. SQLite's flock VFS sidesteps this entirely: in `flockLock` every lock at or above `SHARED_LOCK` is physically an exclusive `flock` (`os_unix.c:2682-2685`), so once any lock is held an upgrade just bumps the in-memory level and returns `SQLITE_OK` without re-issuing `robust_flock` (`os_unix.c:2696-2701`), and `flockCheckReservedLock` documents that the connection's lock is already exclusive (`os_unix.c:2643-2656`); the held lock is never momentarily dropped, and SQLite's real DB-file close protocol additionally uses atomic fcntl byte-range conversions that do not release the prior lock on failure. The consequence is that a non-last client whose upgrade fails returns `isLastClient=false` but has silently dropped its lifetime DB-file shared lock, opening a window (until its fd closes) in which a peer process's concurrent `tryUpgradeDBLockExclusive` sees no contention, wrongly declares itself last client, and truncates the WAL / unlinks the shm while this client is still attached — re-opening the early-truncation / orphan-inode race the DB-file lock protocol exists to prevent.
+To prove "last client" at close, the Go pager upgrades its lifetime DB-file lock from shared to exclusive by issuing a single `syscall.Flock(fd, LOCK_EX|LOCK_NB)` through `flockNB` (`internal/btree/dbfile_lock_unix.go:78`), with `tryUpgradeDBLockExclusive` mapping `ErrBusy` to `(false, nil)` (`internal/btree/dbfile_lock_unix.go:60-61`). Per BSD `flock(2)` semantics a shared→exclusive conversion on one open file description is not atomic: the kernel first drops the existing `LOCK_SH` and only then tries to install `LOCK_EX`, so when the exclusive grant cannot be satisfied immediately the `LOCK_NB` attempt fails *after* the shared lock has already been released. The caller therefore observes `(false, nil)` and treats itself as a non-last client (`internal/btree/pager.go:3277-3284`), unaware that its DB-file SHARED lock is now gone. SQLite's flock VFS sidesteps this entirely: in `flockLock` every lock at or above `SHARED_LOCK` is physically an exclusive `flock` (`os_unix.c:2682-2685`), so once any lock is held an upgrade just bumps the in-memory level and returns `SQLITE_OK` without re-issuing `robust_flock` (`os_unix.c:2696-2701`), and `flockCheckReservedLock` documents that the connection's lock is already exclusive (`os_unix.c:2643-2656`); the held lock is never momentarily dropped, and SQLite's real DB-file close protocol additionally uses atomic fcntl byte-range conversions that do not release the prior lock on failure. The consequence is that a non-last client whose upgrade fails returns `isLastClient=false` but has silently dropped its lifetime DB-file shared lock, opening a window (until its fd closes) in which a peer process's concurrent `tryUpgradeDBLockExclusive` sees no contention, wrongly declares itself last client, and truncates the WAL / unlinks the shm while this client is still attached — re-opening the early-truncation / orphan-inode race the DB-file lock protocol exists to prevent. Since 2026-11-19 the upgrade is the first step of `pager.close` (§SHM open/close protocol drift, item 1): a closer whose upgrade fails runs no checkpoint and no truncate, and only closes its descriptors after it, so the unlocked window is no longer than it was; the conversion itself is unchanged.
 
 <a id="drift-2026-06-25-09-downgradedblocktoshared-can-leave-the-db-file-fully-unlocked-or-spurio"></a>
 ### Drift: downgradeDBLockToShared Can Leave The DB File Fully Unlocked Or Spuriously Return ErrBusy
