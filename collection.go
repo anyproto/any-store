@@ -1745,13 +1745,21 @@ func (c *collection) readSketchRow(tx *btree.ReadTx, key, buf []byte) ([]byte, e
 // epoch equals it.
 const sketchEpochNone = ^uint64(0)
 
+// sketchEpochRolledBack is the sketchSeen of a handle after a write
+// transaction that wrote to its sketches rolled back
+// (db.unpublishDirtySketches): no epoch equals it either, so a reader loads,
+// and the next write transaction's begin, which rebases the live sketches
+// and publishes them, takes it away again (resetUncommittedSketches).
+const sketchEpochRolledBack = ^uint64(0) - 1
+
 // refreshSketches brings the sketches of the version s, resolved for tx, up
 // to what is stored. Called where sketches are used: a reader's plan, and
 // every operation of a writer on the collection, the first of which loads.
 //
 // A reader loads the published sketches (reloadPubSketch) if another process
 // committed since they were last loaded: the change epoch moved
-// (btree.ReadTx.ChangeEpoch). What it loads is stamped with the epoch
+// (btree.ReadTx.ChangeEpoch), or a rollback unset the stamp
+// (db.unpublishDirtySketches). What it loads is stamped with the epoch
 // (sketchSeen), so it has to hold every change the epoch counts: a reader
 // loads only if its snapshot is exact for the epoch. One at an older
 // snapshot would publish older sketches as current, over newer ones, and

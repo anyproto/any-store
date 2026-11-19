@@ -673,6 +673,12 @@ func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
 					flagged = flagged || idx.sketchModified
 				}
 			}
+			// The published sketches are the live ones again, as current
+			// as those: unless a reader loaded since the rollback, they
+			// take the live stamp, and a reader of this transaction's time
+			// does not load copies that would hide its writes from its own
+			// plans.
+			c.sketchSeen.CompareAndSwap(sketchEpochRolledBack, c.sketchLive.Load())
 			c.mu.Unlock()
 		} else if s != nil && !c.closed.Load() {
 			for _, idx := range s.indexes {
@@ -1725,6 +1731,20 @@ func (db *db) evictLocked(c *collection) {
 		}
 	}
 	db.forgetLocked(c)
+}
+
+// unpublishDirtySketches is the rollback's part for the sketches: the live
+// ones the transaction wrote to are published (the transaction plans with
+// its own writes), and hold its deltas until the next write transaction's
+// begin rebases them (resetUncommittedSketches). The readers' stamp of each
+// listed collection is unset, so the next reader that uses one loads the
+// stored rows into sketches of its own (collection.refreshSketches) instead
+// of reporting counts of a transaction that never committed. Writer state:
+// before the rollback releases the write lock.
+func (db *db) unpublishDirtySketches() {
+	for _, c := range db.sketchDirty {
+		c.sketchSeen.Store(sketchEpochRolledBack)
+	}
 }
 
 // forgetLocked takes c out of byIdentity. The caller holds db.mu.

@@ -522,6 +522,7 @@ func (w writeTx) unwind() error {
 	w.commonTx.tripIters()
 	w.db.resetAllFtsPending(w.readTx)
 	w.db.discardLog(&w.commonTx.schema, 0)
+	w.db.unpublishDirtySketches()
 	return w.writeTx.Rollback()
 }
 
