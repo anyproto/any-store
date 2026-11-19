@@ -212,3 +212,55 @@ func TestVerifyIntegrity_AEAD_DetectsCorruption(t *testing.T) {
 		t.Fatalf("want IntegrityAEADAuthFail on page 2; got %+v", rep.Errors)
 	}
 }
+
+// TestVerifyIntegrity_DamagedPage1Listed: the sweep takes its page count
+// from page 1's header, which is stored outside the codec. Damage to the
+// rest of page 1 is a page error of the report, not the sweep's error.
+func TestVerifyIntegrity_DamagedPage1Listed(t *testing.T) {
+	cksum := DefaultOptions()
+	cksum.Checksum = true
+	cksum.InProcess = true
+	aead := DefaultOptions()
+	aead.Key = []byte("p")
+	aead.KDFIterations = 1000
+	aead.InProcess = true
+	cases := []struct {
+		name string
+		opts Options
+		kind IntegrityErrorKind
+	}{
+		{name: "checksum", opts: cksum, kind: IntegrityChecksumMismatch},
+		{name: "aead", opts: aead, kind: IntegrityAEADAuthFail},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "db")
+			setupSweepDB(t, path, tc.opts)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pages := len(data) / int(tc.opts.PageSize)
+			data[dbHeaderSize+100] ^= 0x01
+			if err := os.WriteFile(path, data, 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			db, err := Open(path, tc.opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			rep, err := db.VerifyIntegrity(context.Background())
+			if err != nil {
+				t.Fatalf("VerifyIntegrity: %v", err)
+			}
+			if rep.Pages != pages {
+				t.Fatalf("Pages = %d, want %d", rep.Pages, pages)
+			}
+			if len(rep.Errors) != 1 || rep.Errors[0].PageNo != 1 || rep.Errors[0].Kind != tc.kind {
+				t.Fatalf("want one error of kind %v on page 1, got %+v", tc.kind, rep.Errors)
+			}
+		})
+	}
+}

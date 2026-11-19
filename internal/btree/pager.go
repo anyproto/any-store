@@ -1677,15 +1677,22 @@ func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
 // returns the raw stored bytes. Returns a fresh page-sized buffer; caller
 // owns it.
 //
+// The WAL lookup runs within the reader's frame window, as getPageReader's
+// does: up to walMaxFrame, from the floor its cache carries (readerMinFrame;
+// the live checkpoint frontier for a nil cache, which only a caller that
+// cannot race a WAL restart may pass). The live frontier under a read
+// transaction would let the frames of a WAL generation begun after its
+// snapshot, numbered from 1 again, into a slot-0 snapshot.
+//
 // Caller must hold a read lock (read transaction or equivalent) — same
 // concurrency contract as getPage.
-func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
+func (p *pager) readRawPage(pgno, walMaxFrame uint32, cache *pcache) ([]byte, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
 	buf := make([]byte, p.pageSize)
 	if walMaxFrame > 0 && p.wal != nil {
-		frame, err := p.wal.index.get(pgno, walMaxFrame, p.wal.index.liveMinFrame())
+		frame, err := p.wal.index.get(pgno, walMaxFrame, p.readerMinFrame(cache))
 		if err != nil {
 			// ErrCorrupt from a full/over-probed SHM hash chain: fail the read
 			// (C walFindFrame SQLITE_CORRUPT_BKPT, wal.c:3593) rather than
@@ -1716,6 +1723,35 @@ func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
 		return buf, nil
 	}
 	return nil, fmt.Errorf("btree: readRawPage: no backing storage for page %d", pgno)
+}
+
+// readRawPage1Header is readRawPage for page 1's header alone: the first
+// len(buf) bytes of page 1 (dbHeaderSize of them are outside the codec),
+// from its newest WAL frame in the reader's window, else from the database
+// file. For a page 1 that cannot be read whole.
+func (p *pager) readRawPage1Header(walMaxFrame uint32, cache *pcache, buf []byte) error {
+	if walMaxFrame > 0 && p.wal != nil {
+		frame, err := p.wal.index.get(1, walMaxFrame, p.readerMinFrame(cache))
+		if err != nil {
+			return err
+		}
+		if frame > 0 {
+			if err := p.readWalFrameData(frame, buf); err != nil {
+				return fmt.Errorf("btree: readRawPage1Header (WAL frame %d): %w", frame, err)
+			}
+			return nil
+		}
+	}
+	if p.file != nil {
+		if _, err := p.file.ReadAt(buf, 0); err != nil {
+			return fmt.Errorf("btree: readRawPage1Header: %w", err)
+		}
+		return nil
+	}
+	if p.master != nil && p.master.readPageInto(1, buf) {
+		return nil
+	}
+	return errors.New("btree: readRawPage1Header: no backing storage for page 1")
 }
 
 // END ENCRYPTION
