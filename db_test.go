@@ -1616,7 +1616,9 @@ func TestCheckStale_ConsumesOnlySnapshotCounters(t *testing.T) {
 // commit republished the live sketch and recorded the counters. A peer's
 // commit (the local counters left behind) still reloads, into a reader-owned
 // sketch that is allocated once and reused by later reloads of the same
-// shape; the live sketch is never touched.
+// shape; a reader never touches the live sketch. The live sketch is the next
+// write transaction's to load: it takes the peer's row before its own
+// deltas, however many readers loaded that row before it.
 func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 	skipIfInMemory(t, "models another process's commit; not applicable in-memory")
 	fx := newFixture(t)
@@ -1680,7 +1682,7 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 
 	// The bytes on disk change under a peer, in either stored encoding: the
 	// reload decodes them into the same reader-owned object, and the live
-	// sketch keeps its count.
+	// sketch keeps its count while only readers pass.
 	docs, liveDocs := uint64(40), uint64(2)
 	for _, enc := range []struct {
 		name    string
@@ -1736,12 +1738,35 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 		assert.Equal(t, docs, idx.loadPubSketch().GetDocCount(), enc.name)
 		assert.Same(t, live, idx.sketch, enc.name)
 
+		// A row of the index's shape again, loaded by a reader: into a
+		// fresh object, the published one having another shape. The live
+		// sketch still holds what this process last committed.
+		reshaped := idx.loadPubSketch()
+		peerWrites(1)
+		assert.NotSame(t, reshaped, idx.loadPubSketch(), enc.name)
+		assert.Equal(t, 1, idx.loadPubSketch().Levels, enc.name)
+		assert.Equal(t, docs, idx.loadPubSketch().GetDocCount(), enc.name)
+		assert.Same(t, live, idx.sketch, enc.name)
+		assert.Equal(t, liveDocs, live.GetDocCount(), "%s: readers alone leave the live sketch", enc.name)
+
+		// A write of this process: the readers before it loaded the peer's
+		// row into the published sketch only, so the writer loads it into
+		// the live one, in place, and its delta goes on top. The row it
+		// stores holds the peer's counts and its own, and the published
+		// sketch is the live one again.
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"own-%s","a":7}`, enc.name))))
+		liveDocs = docs + 1
+		assert.Same(t, live, idx.sketch, enc.name)
+		assert.Equal(t, liveDocs, live.GetDocCount(), "%s: the peer's row and the own delta", enc.name)
+		assert.Equal(t, 1, live.Levels, enc.name)
+		stored, err := dbi.InspectIndexSketch(ctx, "c", idx.info.Name)
+		require.NoError(t, err)
+		assert.Equal(t, liveDocs, stored.DocCount, "%s: the stored row", enc.name)
+		require.Same(t, live, idx.loadPubSketch(), enc.name)
+
 		// After a commit of this process the published sketch is the live
 		// one, and a reload decodes into a fresh object. A row that does not
 		// decode must not publish that object, empty, over the live counts.
-		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"own-%s","a":7}`, enc.name))))
-		liveDocs++
-		require.Same(t, live, idx.loadPubSketch(), enc.name)
 		settled, err := dbi.btreeDB.BeginRead()
 		require.NoError(t, err)
 		e0 = epochOf(settled)
