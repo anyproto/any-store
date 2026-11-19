@@ -358,6 +358,13 @@ type pager struct {
 	// Heap-allocated as part of the pager struct; passed by pointer so
 	// the crypto/cipher.AEAD interface calls don't force per-call escape.
 	codecAEAD aeadScratch
+	// settleCodec, when set, installs the codec that goes with the database
+	// header given, or with a file that has no database yet (nil). open
+	// calls it with the DB-file lock held, on the header it read under that
+	// lock, and before it asks for the exclusive lock to create a database;
+	// a call that finds the codec already built for the same file state
+	// does nothing. Set by Open for a file-backed database.
+	settleCodec func(hdr *dbHeader) error
 	// END ENCRYPTION
 }
 
@@ -686,6 +693,21 @@ func (p *pager) open() (err error) {
 		return err
 	}
 
+	// BEGIN ENCRYPTION
+	// The codec is settled on this header, read under the DB-file lock: the
+	// salt the key is derived from and the checksum marker are the file's.
+	// Open's first look at the file was unlocked; another process may have
+	// created the database since, or this open may have lost the creation
+	// to one. The header itself stays as read.
+	if p.settleCodec != nil {
+		hdr := p.header
+		if err := p.settleCodec(&hdr); err != nil {
+			return err
+		}
+		p.header = hdr
+	}
+	// END ENCRYPTION
+
 	// The change-counter sentinel and the page count are judged further
 	// down, on the page 1 the open snapshot reads (the WAL's when it holds a
 	// newer one), not on this first read of the file.
@@ -889,6 +911,19 @@ func (p *pager) installCodec(c Codec) {
 	p.codecScratch = make([]byte, p.pageSize)
 }
 
+// setCodec replaces whatever codec is installed with c (nil: none) for a
+// file that carries salt in its header. Like installCodec it runs before any
+// page I/O; unlike it, it can take back an earlier choice, which Open makes
+// before the DB-file lock is held and settles again under it.
+func (p *pager) setCodec(c Codec, salt [SaltLen]byte) {
+	p.codec = nil
+	p.codecScratch = nil
+	p.header.Salt = salt
+	p.header.ReservedSpace = 0
+	p.usableSize_ = int(p.pageSize)
+	p.installCodec(c)
+}
+
 // encryptPage transforms plaintext page bytes for writing to disk or WAL.
 // When no codec is installed, returns src unchanged (pass-through). When
 // a codec is installed, encrypts into scratch and returns the ciphertext
@@ -971,6 +1006,15 @@ func (p *pager) lockDBShared(f fileHandle) error {
 // attacher's election, which truncates a stale one (newPlatformShm).
 // DRIFT: page 1 of a new database is written and synced in place under the exclusive DB-file lock, with no rollback journal. See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
 func (p *pager) createIfEmpty(f fileHandle) (created bool, err error) {
+	// BEGIN ENCRYPTION
+	// The codec of a new file, before the exclusive lock is asked for: a key
+	// derivation, when one is needed here, is not done under it.
+	if p.settleCodec != nil {
+		if err := p.settleCodec(nil); err != nil {
+			return false, err
+		}
+	}
+	// END ENCRYPTION
 	if !p.inProcess {
 		won, err := p.lockDBForCreate(f)
 		if err != nil || !won {
