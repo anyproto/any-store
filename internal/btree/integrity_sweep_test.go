@@ -153,7 +153,7 @@ func TestVerifyIntegrity_Cksum_DetectsCorruption(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	// Sweep — VerifyIntegrity disables verify-on-read internally, so this
+	// Sweep — VerifyIntegrity reads pages raw, past the codec, so this
 	// must succeed and accumulate the error.
 	rep, err := db.VerifyIntegrity(context.Background())
 	if err != nil {

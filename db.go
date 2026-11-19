@@ -115,9 +115,9 @@ type DB interface {
 
 	// VerifyIntegrity walks every page and verifies its per-page integrity
 	// tag (XXH3-128 trailer for cksum mode, AEAD auth tag for encrypted mode).
-	// Plain DBs return IntegrityNone with zero pages scanned. Mismatches are
-	// returned in IntegrityReport.Errors; the function only errors on I/O or
-	// context cancellation. See IntegrityConfig.
+	// Plain DBs return IntegrityNone with zero pages scanned. Mismatches and
+	// pages that cannot be read are returned in IntegrityReport.Errors; the
+	// function errors when the sweep cannot start or is cancelled.
 	VerifyIntegrity(ctx context.Context) (IntegrityReport, error)
 }
 

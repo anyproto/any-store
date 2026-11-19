@@ -22,7 +22,8 @@ import (
 type IntegrityErrorKind int
 
 const (
-	// IntegrityKindUnknown is reserved.
+	// IntegrityKindUnknown: the page could not be read and so was not
+	// verified (VerifyIntegrity only).
 	IntegrityKindUnknown IntegrityErrorKind = IntegrityErrorKind(btree.IntegrityKindUnknown)
 	// IntegrityChecksumMismatch indicates an XXH3-128 trailer mismatch
 	// (cksum mode).
@@ -85,8 +86,14 @@ func StampPageChecksumForTest(page []byte) {
 // against a cksumvfs-protected SQLite database, and works on AEAD-encrypted
 // databases too.
 //
-// Returns an error only on I/O failures or context cancellation. Per-page
-// integrity mismatches are returned in Report.Errors.
+// A page that fails verification is listed in Report.Errors, and so is a
+// page that cannot be read (Kind IntegrityKindUnknown, the read's error in
+// Inner); the sweep goes on to the next page. The returned error is a sweep
+// that could not start or count the pages (the read transaction, page 1),
+// or a cancelled context.
+//
+// Reads and writes that run beside the sweep verify the pages they read as
+// at any other time.
 func (db *db) VerifyIntegrity(ctx context.Context) (IntegrityReport, error) {
 	res, err := db.btreeDB.VerifyIntegrity(ctx)
 	if err != nil {
