@@ -149,7 +149,8 @@ type Collection interface {
 // transaction alone (see resolveSlow).
 func newCollection(db *db, name string, tx *btree.ReadTx) (*collection, *collSchema, error) {
 	c := &collection{db: db, openName: name}
-	// The sketches are about to be read through tx. They are current for the
+	// The sketches are about to be read through tx, the live one and the
+	// published one alike (loadSketchAtOpen). They are current for the
 	// change epoch only if tx's snapshot is exact for it; a transaction at
 	// an older snapshot (the open may run inside one that began before
 	// another process's commit was counted) loads older sketches, which the
@@ -157,8 +158,10 @@ func newCollection(db *db, name string, tx *btree.ReadTx) (*collection, *collSch
 	// latest there is: nothing of another process commits under it.
 	if epoch, exact := tx.ChangeEpoch(); exact || tx.IsWriteTx() {
 		c.sketchSeen.Store(epoch)
+		c.sketchLive.Store(epoch)
 	} else {
 		c.sketchSeen.Store(sketchEpochNone)
+		c.sketchLive.Store(sketchEpochNone)
 	}
 	s, err := c.loadSchema(tx, name, nil)
 	if err != nil {
@@ -216,9 +219,15 @@ type collection struct {
 	// allocating a fresh read buffer per index.
 	sketchReadBuf []byte
 
-	// sketchSeen is the change epoch (btree.ReadTx.ChangeEpoch) the sketches of this handle were last
-	// brought up to (refreshSketches).
+	// sketchSeen is the change epoch (btree.ReadTx.ChangeEpoch) the
+	// published sketches of this handle were last brought up to, by a reader
+	// or by a writer (refreshSketches).
 	sketchSeen atomic.Uint64
+	// sketchLive is the same for the live sketches, which only a write
+	// transaction loads again: a reader that brought the published ones up
+	// to an epoch leaves it behind, and the next write transaction loads the
+	// live ones before it writes.
+	sketchLive atomic.Uint64
 
 	// pinned counts the entries of the open write transaction's schema log
 	// that reference this handle (txSchema.log): its creation, each schema
@@ -1678,8 +1687,9 @@ func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, collName string, idx *in
 	idx.storePubSketch(idx.sketch)
 }
 
-// sketchEpochNone is the sketchSeen of a handle whose sketches were loaded
-// at a snapshot that was not exact for any epoch: no epoch equals it.
+// sketchEpochNone is the sketchSeen and sketchLive of a handle whose
+// sketches were loaded at a snapshot that was not exact for any epoch: no
+// epoch equals it.
 const sketchEpochNone = ^uint64(0)
 
 // refreshSketches reloads the sketches of the version s, resolved for tx, if
@@ -1693,24 +1703,43 @@ const sketchEpochNone = ^uint64(0)
 // epoch: one at an older snapshot would publish older sketches as current,
 // over newer ones, and nothing would reload them until the next commit of
 // another process. A writer's snapshot is the latest there is.
+//
+// There are two stamps, because a reader loads less than a writer does. A
+// reader brings up the published sketches only (reloadSketch) and stamps
+// sketchSeen. The live ones are a write transaction's to load, and
+// sketchLive is the epoch it last did so for: a writer goes by that stamp
+// alone, so the readers that came before it do not stand in for its own
+// load. Without it the writer would put its deltas on the counts from before
+// the other process's commit and store them over that process's row
+// (persistSketches). The epoch does not move on this process's own commits,
+// so they cause no load, and a transaction loads at most once: before its
+// first write to the collection, nothing after it.
 func (c *collection) refreshSketches(tx *btree.ReadTx, s *collSchema) {
 	epoch, exact := tx.ChangeEpoch()
-	if c.sketchSeen.Load() == epoch {
+	writable := tx.IsWriteTx()
+	stamp := &c.sketchSeen
+	if writable {
+		stamp = &c.sketchLive
+	}
+	if stamp.Load() == epoch {
 		return
 	}
-	writable := tx.IsWriteTx()
 	if !writable && !exact {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.sketchSeen.Load() == epoch {
+	if stamp.Load() == epoch {
 		return
 	}
 	for _, idx := range s.indexes {
 		c.reloadSketch(tx, s.name, idx, writable)
 	}
+	// The writer's load republished the live sketches: both are current.
 	c.sketchSeen.Store(epoch)
+	if writable {
+		c.sketchLive.Store(epoch)
+	}
 }
 
 // reloadSketch refreshes one already-published index's sketch from the _system
@@ -1721,9 +1750,11 @@ func (c *collection) refreshSketches(tx *btree.ReadTx, s *collSchema) {
 //	WRITE tx (writable): the calling goroutine holds the btree write lock and is the
 //	  SOLE mutator of idx.sketch, so it reloads IN PLACE into the live object (0
 //	  alloc) — catching up to a peer's committed counts BEFORE applying its own
-//	  deltas (a reader that consumed the peer's commit first leaves live
-//	  behind until the next stale verdict: advisory, see IndexSketch) — then
-//	  republishes live so readers see the peer's state immediately.
+//	  deltas, whether or not a reader loaded the same bytes into the
+//	  published sketch first (collection.sketchLive): the deltas are
+//	  persisted on top of what is loaded here, so a load skipped is the
+//	  peer's counts lost from the stored row — then republishes live so
+//	  readers see the peer's state immediately.
 //
 //	READ tx (!writable): a concurrent in-process writer may be incrementing
 //	  idx.sketch right now, so we NEVER touch it. The disk bytes are decoded
