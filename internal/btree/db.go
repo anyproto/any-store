@@ -1922,6 +1922,10 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				valOverflow := int(valLen) - localValBytes
 
 				// Grow buf to hold the full value — no intermediate allocations.
+				if !payloadInFile(tx.pager, tx.cache, totalPayload) {
+					tx.pager.releasePage(pg)
+					return buf, ErrCorrupt
+				}
 				start := len(buf)
 				buf = slices.Grow(buf, int(valLen))[:start+int(valLen)]
 				fullVal := buf[start:]

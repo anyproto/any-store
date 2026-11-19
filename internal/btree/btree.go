@@ -202,7 +202,7 @@ func parseLeafCellWithSize(data []byte, offset int, lim payloadLimits) (cellData
 	}
 	pos += n
 
-	if !payloadFits(int(keyLen), int(valLen)) {
+	if !payloadFits(keyLen, valLen) {
 		return c, 0, ErrCorrupt
 	}
 	totalPayload := int(keyLen) + int(valLen)
@@ -280,7 +280,7 @@ func parseInteriorCell(data []byte, offset int, usableSize ...int) (cellData, in
 	}
 	pos += n
 
-	if !payloadFits(int(keyLen), 0) {
+	if !payloadFits(keyLen, 0) {
 		return c, 0, ErrCorrupt
 	}
 
@@ -669,8 +669,12 @@ func searchLeafWithOverflow(pg *page, key []byte, lim payloadLimits, p *pager, w
 		}
 		payloadStart := pos + vn
 
-		// The same bounds as parseLeafCellWithSize, before the lengths are
-		// added or used as slice bounds.
+		// Each length singly, before the two are added or used as slice
+		// bounds. That is looser than payloadFits, the bound of the parsers:
+		// a cell whose lengths pass singly and not together (one a release
+		// without the write-side limit could store) is compared like any
+		// other when a search for a neighbouring key probes it, and the
+		// neighbours stay readable. A match on it is refused below.
 		if keyLen > uint64(payloadLimit) || valLen > uint64(payloadLimit) {
 			return 0, false, ErrCorrupt
 		}
@@ -728,6 +732,12 @@ func searchLeafWithOverflow(pg *page, key []byte, lim payloadLimits, p *pager, w
 
 		cmp := bytes.Compare(cellKey, key)
 		if cmp == 0 {
+			// The cell found is one a read will parse: report it only if
+			// the parsers accept it, so that Has does not answer true for
+			// a record Get calls corrupt.
+			if !payloadFits(keyLen, valLen) {
+				return 0, false, ErrCorrupt
+			}
 			return mid, true, nil
 		}
 		if cmp < 0 {
@@ -939,7 +949,7 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	}
 	pos += n
 
-	if !payloadFits(int(keyLen), int(valLen)) {
+	if !payloadFits(keyLen, valLen) {
 		return nil, ErrCorrupt
 	}
 
@@ -967,7 +977,7 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	}
 
 	// Key overflows: allocate and reconstruct
-	if pos+nLocal+4 > dataLen {
+	if pos+nLocal+4 > dataLen || !payloadInFile(p, cache, totalPayload) {
 		return nil, ErrCorrupt
 	}
 	fullKey := make([]byte, int(keyLen))
@@ -1015,7 +1025,7 @@ func leafFullValue(data []byte, offset int, lim payloadLimits, p *pager, walMaxF
 	}
 	pos += n
 
-	if !payloadFits(int(keyLen), int(valLen)) {
+	if !payloadFits(keyLen, valLen) {
 		return nil, ErrCorrupt
 	}
 
@@ -1045,6 +1055,9 @@ func leafFullValue(data []byte, offset int, lim payloadLimits, p *pager, walMaxF
 		return data[pos+localKeyBytes : pos+localKeyBytes+int(valLen)], nil
 	}
 
+	if !payloadInFile(p, cache, totalPayload) {
+		return nil, ErrCorrupt
+	}
 	fullVal := make([]byte, int(valLen))
 	copy(fullVal, data[pos+localKeyBytes:pos+nLocal])
 	overflowPg := binary.BigEndian.Uint32(data[pos+nLocal : pos+nLocal+4])
@@ -1073,7 +1086,7 @@ func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFr
 	keyStart := offset + 4 + n
 	maxLocal := maxLocalPayload(usableSize)
 
-	if !payloadFits(int(keyLen), 0) {
+	if !payloadFits(keyLen, 0) {
 		return nil, ErrCorrupt
 	}
 
@@ -1086,7 +1099,7 @@ func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFr
 
 	// Overflow: read local portion + overflow chain
 	localSize := interiorLocalPayloadSize(int(keyLen), usableSize)
-	if keyStart+localSize+4 > dataLen {
+	if keyStart+localSize+4 > dataLen || !payloadInFile(p, cache, int(keyLen)) {
 		return nil, ErrCorrupt
 	}
 	fullKey := make([]byte, int(keyLen))
@@ -1245,6 +1258,10 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 				keyOverflow := int(keyLen) - localKeyBytes
 				overflowSize := totalPayload - nLocal
 
+				if !payloadInFile(bt.pager, bt.cache, totalPayload) {
+					bt.pager.releasePage(pg)
+					return buf, ErrCorrupt
+				}
 				start := len(buf)
 				buf = append(buf, make([]byte, int(valLen))...)
 				fullVal := buf[start:]
@@ -1334,7 +1351,7 @@ const maxKeySize = maxPayloadAlloc
 // be written, ErrKeyTooLarge when the key alone is over the record size limit
 // and ErrValueTooLarge when the key and the value together are.
 func recordSizeErr(keyLen, valLen int) error {
-	if payloadFits(keyLen, valLen) {
+	if payloadFits(uint64(keyLen), uint64(valLen)) {
 		return nil
 	}
 	if keyLen > payloadLimit {
@@ -1792,6 +1809,9 @@ func (bt *btree) cellFullKey(c *cellData) ([]byte, error) {
 	localKeyBytes := min(nLocal, int(keyLen))
 	keyOverflow := int(keyLen) - localKeyBytes
 
+	if !payloadInFile(bt.pager, bt.cache, totalPayload) {
+		return nil, ErrCorrupt
+	}
 	fullKey := make([]byte, int(keyLen))
 	copy(fullKey, c.key[:localKeyBytes])
 	overflowBuf := make([]byte, keyOverflow)
@@ -1870,6 +1890,10 @@ func (bt *btree) collectInteriorCellsKeepBuf(pg *page) ([]cellData, []byte, erro
 			keyLen, kn := getVarint(pg.data[pos:])
 			pos += kn
 			localSize := interiorLocalPayloadSize(int(keyLen), usable)
+			if !payloadInFile(bt.pager, bt.cache, int(keyLen)) {
+				bt.pager.recycleCellBuf(buf)
+				return nil, nil, ErrCorrupt
+			}
 			fullKey := make([]byte, int(keyLen))
 			copy(fullKey, pg.data[pos:pos+localSize])
 			overflowPg := binary.BigEndian.Uint32(pg.data[pos+localSize : pos+localSize+4])
@@ -4022,7 +4046,7 @@ func leafKeyAt(pg *page, idx int, lim payloadLimits) ([]byte, error) {
 		valLen = int(vl)
 		pos += n
 	}
-	if !payloadFits(keyLen, valLen) {
+	if !payloadFits(uint64(keyLen), uint64(valLen)) {
 		return nil, ErrCorrupt
 	}
 	totalPayload := keyLen + valLen
@@ -4248,6 +4272,9 @@ func (c *Cursor) Value() ([]byte, error) {
 		valOverflow := int(valLen) - localValBytes
 
 		// Allocate full value buffer and copy local portion
+		if !payloadInFile(c.bt.pager, c.bt.cache, totalPayload) {
+			return nil, ErrCorrupt
+		}
 		fullVal := make([]byte, int(valLen))
 		if localValBytes > 0 {
 			copy(fullVal, cell.value)
@@ -4318,6 +4345,9 @@ func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
 		valOverflow := int(valLen) - localValBytes
 
 		// Grow buf to hold the full value
+		if !payloadInFile(c.bt.pager, c.bt.cache, totalPayload) {
+			return buf, ErrCorrupt
+		}
 		start := len(buf)
 		buf = slices.Grow(buf, int(valLen))[:start+int(valLen)]
 		fullVal := buf[start:]
