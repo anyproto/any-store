@@ -1803,7 +1803,7 @@
       "pager.c:getPageNormal",
       "pager.c:sqlite3PagerGetData"
     ],
-    "note": ""
+    "note": "a cache miss in pagerError returns pager.errCode (getPageError's rule, for misses only)"
   },
   "pager.go:*pager.getWritablePage": {
     "sqlite": [
@@ -1856,7 +1856,7 @@
     "sqlite": [
       "pager.c:pager_error"
     ],
-    "note": ""
+    "note": "a failed commit's: pager_error with pager_unlock's cleanup at once. A failed spill only records the error (pagerStress, pager.errCode) and rollbackLocked cleans up"
   },
   "pager.go:*pager.pagerPageCount": {
     "sqlite": [
@@ -1868,7 +1868,7 @@
     "sqlite": [
       "pager.c:pagerStress"
     ],
-    "note": ""
+    "note": "a failed write stores pager.errCode and sets pagerError, pager_error's part (pager.c:1947-1960), inline"
   },
   "pager.go:*pager.readDBPage": {
     "sqlite": [],
@@ -2096,7 +2096,7 @@
       "pcache1.c:pcache1FetchNoMutex",
       "pcache1.c:pcache1FetchStage2"
     ],
-    "note": "initial 'already cached?' probe via hashFind (pcache1FetchNoMutex); on allocate, hashInsert links into apHash (was pc.pages[pgno]=p). nPage replaces len(pages)."
+    "note": "initial 'already cached?' probe via hashFind (pcache1FetchNoMutex); on allocate, hashInsert links into apHash (was pc.pages[pgno]=p). nPage replaces len(pages). Returns the xStress error without creating the page (sqlite3PcacheFetchStress)."
   },
   "pcache.go:*pcache.destroy": {
     "sqlite": [
