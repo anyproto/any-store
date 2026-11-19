@@ -3689,13 +3689,20 @@ func TestPagerInitNewDB_WriteError(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// --- pager.go:261-263 initNewDB() WAL open error ---
+// --- open(): WAL open error on a database that has its page 1 ---
 func TestPagerInitNewDB_WALOpenError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	// Create a directory where the WAL file should be.
+	// A database of one page, as its creation leaves it, and a directory
+	// where its WAL file should be. (Beside an empty file the open would
+	// delete a WAL first; an empty directory goes the same way.)
+	created := newPager(path, 4096, 100, true)
+	created.inProcess = true
+	require.NoError(t, created.open())
+	require.NoError(t, created.close())
 	walPath := path + "-wal"
+	_ = os.Remove(walPath)
 	require.NoError(t, os.MkdirAll(walPath, 0755))
 	t.Cleanup(func() { os.RemoveAll(walPath) })
 

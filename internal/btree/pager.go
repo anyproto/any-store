@@ -963,6 +963,12 @@ func (p *pager) lockDBShared(f fileHandle) error {
 // that ends under the EXCLUSIVE lock (OP_JournalMode, vdbe.c:8061-8066, to
 // sqlite3BtreeSetVersion, btree.c:11489, and newDatabase, btree.c:3506), and
 // never opens a WAL on a file of zero pages.
+//
+// A WAL found beside the empty file belongs to a database that is gone: it is
+// deleted before page 1 is written, as pagerOpenWalIfPresent deletes it when
+// the database has no pages (pager.c:3355-3356). Recovery would otherwise
+// apply its frames to the new database. The wal-index is left to the first
+// attacher's election, which truncates a stale one (newPlatformShm).
 // DRIFT: page 1 of a new database is written and synced in place under the exclusive DB-file lock, with no rollback journal. See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
 func (p *pager) createIfEmpty(f fileHandle) (created bool, err error) {
 	if !p.inProcess {
@@ -970,6 +976,9 @@ func (p *pager) createIfEmpty(f fileHandle) (created bool, err error) {
 		if err != nil || !won {
 			return false, err
 		}
+	}
+	if err := osRemove(p.path + "-wal"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("btree: delete the WAL beside an empty database file: %w", err)
 	}
 	if err := p.createPage1(); err != nil {
 		return false, err
