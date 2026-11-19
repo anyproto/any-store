@@ -522,6 +522,10 @@ func (p *pager) open() (err error) {
 		return p.initNewDB()
 	}
 
+	if h := testOpenStageHook; h != nil {
+		h(p, "before-lock")
+	}
+
 	f, err := osOpenFile(p.path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		return err
@@ -891,6 +895,13 @@ func (p *pager) readPage1AtOpen() error {
 // window. Nil outside tests.
 var testOpenAfterWALOpenHook func(p *pager)
 
+// testOpenStageHook runs at named points of a file-backed open, so a test
+// can hold one process there while another runs: "before-lock" (nothing
+// opened or locked yet; Open has made its first, unlocked read of the header)
+// and "before-page1-write" (this open is about to write page 1 of a new
+// database). Nil outside tests.
+var testOpenStageHook func(p *pager, stage string)
+
 // BEGIN ENCRYPTION
 
 // installCodec attaches a page codec to the pager. Must be called before
@@ -1169,6 +1180,9 @@ func (p *pager) createPage1() error {
 		buf = ct
 	}
 	// END ENCRYPTION
+	if h := testOpenStageHook; h != nil {
+		h(p, "before-page1-write")
+	}
 	if _, err := p.file.WriteAt(buf, 0); err != nil {
 		return err
 	}
