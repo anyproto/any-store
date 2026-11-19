@@ -220,6 +220,10 @@ func cyclicTreeDB(t *testing.T, nsName string) (DB, Collection) {
 	off = firstChildOff(secondPg)
 	binary.BigEndian.PutUint32(secondPg[off:off+4], root)
 	StampPageChecksumForTest(secondPg)
+	// The page must pass its checksum: a page that fails it is refused when
+	// it is read, before its child pointer is followed, and that error
+	// matches ErrCorrupt too.
+	require.True(t, VerifyPageChecksum(secondPg), "the patched page does not pass its checksum")
 	_, err = f.WriteAt(secondPg, int64(second-1)*pageSize)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
@@ -233,24 +237,26 @@ func cyclicTreeDB(t *testing.T, nsName string) (DB, Collection) {
 
 func cyclicTreeID(i int) string { return fmt.Sprintf("id-%06d-%s", i, strings.Repeat("x", 90)) }
 
+func cyclicTreeK(i int) string { return fmt.Sprintf("k-%06d-%s", i, strings.Repeat("y", 90)) }
+
 func cyclicTreeDoc(i int) *anyenc.Value {
-	return anyenc.MustParseJson(fmt.Sprintf(`{"id":%q,"k":"k-%06d-%s","b":%q}`,
-		cyclicTreeID(i), i, strings.Repeat("y", 90), strings.Repeat("b", 300)))
+	return anyenc.MustParseJson(fmt.Sprintf(`{"id":%q,"k":%q,"b":%q}`,
+		cyclicTreeID(i), cyclicTreeK(i), strings.Repeat("b", 300)))
 }
 
 // endsWithin runs fn on its own goroutine and returns its error. When fn has
-// not returned in 3s it panics, which ends the test binary: a descent that
-// follows the cycle cannot be stopped, keeps its transaction's locks, and may
-// grow memory with every turn, so nothing can run beside it.
-func endsWithin(t *testing.T, what string, fn func() error) error {
+// not returned in the given time it panics, which ends the test binary: a
+// descent that follows the cycle cannot be stopped, keeps its transaction's
+// locks, and may grow memory with every turn, so nothing can run beside it.
+func endsWithin(t *testing.T, d time.Duration, what string, fn func() error) error {
 	t.Helper()
 	done := make(chan error, 1)
 	go func() { done <- fn() }()
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(3 * time.Second):
-		panic(fmt.Sprintf("%s: %s did not return within 3s", t.Name(), what))
+	case <-time.After(d):
+		panic(fmt.Sprintf("%s: %s did not return within %v", t.Name(), what, d))
 	}
 }
 
@@ -264,21 +270,40 @@ func TestErrCorrupt_TreeWithACycleOfInteriorPages(t *testing.T) {
 	type op struct {
 		name string
 		run  func(ctx context.Context, coll Collection) error
+		// rolledBack checks that the failed write left nothing behind.
+		rolledBack func(t *testing.T, coll Collection)
 	}
-	findId := op{"FindId", func(ctx context.Context, coll Collection) error {
+	// Where the data tree is sound, document 1 is still what was inserted.
+	firstDocUnchanged := func(t *testing.T, coll Collection) {
+		t.Helper()
+		doc, err := coll.FindId(ctx, cyclicTreeID(1))
+		require.NoError(t, err)
+		require.Equal(t, cyclicTreeK(1), string(doc.Value().GetStringBytes("k")))
+	}
+	findId := op{name: "FindId", run: func(ctx context.Context, coll Collection) error {
 		_, err := coll.FindId(ctx, cyclicTreeID(1))
 		return err
 	}}
-	insert := op{"Insert", func(ctx context.Context, coll Collection) error {
+	insert := op{name: "Insert", run: func(ctx context.Context, coll Collection) error {
 		return coll.Insert(ctx, cyclicTreeDoc(0))
 	}}
-	updateId := op{"UpdateId", func(ctx context.Context, coll Collection) error {
+	updateId := op{name: "UpdateId", run: func(ctx context.Context, coll Collection) error {
 		_, err := coll.UpdateId(ctx, cyclicTreeID(1), query.MustParseModifier(`{"$set":{"k":"zzz"}}`))
 		return err
 	}}
-	deleteId := op{"DeleteId", func(ctx context.Context, coll Collection) error {
+	deleteId := op{name: "DeleteId", run: func(ctx context.Context, coll Collection) error {
 		return coll.DeleteId(ctx, cyclicTreeID(1))
 	}}
+	// With the cycle in the index tree the data tree takes the write first
+	// and the index write then fails: the document write must not stay.
+	insertIdx, updateIdx, deleteIdx := insert, updateId, deleteId
+	insertIdx.rolledBack = func(t *testing.T, coll Collection) {
+		t.Helper()
+		_, err := coll.FindId(ctx, cyclicTreeID(0))
+		require.ErrorIs(t, err, ErrDocNotFound)
+	}
+	updateIdx.rolledBack = firstDocUnchanged
+	deleteIdx.rolledBack = firstDocUnchanged
 	for _, tc := range []struct {
 		name   string
 		nsName string
@@ -287,21 +312,26 @@ func TestErrCorrupt_TreeWithACycleOfInteriorPages(t *testing.T) {
 		{"data tree", "c", []op{findId, insert, updateId, deleteId}},
 		// The data tree is sound here, so FindId answers; the writes reach
 		// the index tree with the entry they add or remove.
-		{"index tree", indexNsName("c", "k"), []op{insert, updateId, deleteId}},
+		{"index tree", indexNsName("c", "k"), []op{insertIdx, updateIdx, deleteIdx}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, coll := cyclicTreeDB(t, tc.nsName)
 			for _, o := range tc.ops {
 				opCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-				err := endsWithin(t, o.name, func() error { return o.run(opCtx, coll) })
+				err := endsWithin(t, 3*time.Second, o.name, func() error { return o.run(opCtx, coll) })
 				cancel()
 				require.ErrorIs(t, err, ErrCorrupt, o.name)
+				// The depth bound, not a page that fails its checksum.
+				require.NotErrorIs(t, err, ErrPageIntegrity, o.name)
+				if o.rolledBack != nil {
+					o.rolledBack(t, coll)
+				}
 			}
-			// The failed writes rolled back: the sound part still reads.
 			doc, err := coll.FindId(ctx, cyclicTreeID(6000))
 			require.NoError(t, err)
 			require.Equal(t, cyclicTreeID(6000), string(doc.Value().GetStringBytes("id")))
-			require.NoError(t, endsWithin(t, "Close", db.Close))
+			// Close checkpoints the WAL: disk I/O, with a bound of its own.
+			require.NoError(t, endsWithin(t, 2*time.Minute, "Close", db.Close))
 		})
 	}
 }
