@@ -332,12 +332,14 @@ type index struct {
 
 	// sketch is the WRITER-OWNED live selectivity sketch. It is mutated in place
 	// ONLY by the single writer (putEntries/deleteEntries, a savepoint's
-	// restoreImages, the writer's reloadSketch, serialized by the btree
+	// restoreImages, the writer's reloadLiveSketch, serialized by the btree
 	// write lock and the cross-process WAL write lock) and marshaled by
 	// persistSketches. No reader ever swaps or mutates it, so a concurrent
-	// read-tx reload can never lose the writer's accumulated increments. Inside a
-	// write tx it is also the planner's view (reflects this tx's own uncommitted
-	// inserts).
+	// read-tx reload can never lose the writer's accumulated increments. The
+	// writer replaces the object, under c.mu, only when the stored row has
+	// another shape (reloadLiveSketch). It is published while a write tx
+	// uses it, so it is also that tx's planner's view (reflects the tx's own
+	// uncommitted inserts), unless a reader loaded a copy of its own since.
 	sketch *qplanner.IndexSketch
 
 	// sketchPub is the READER-VISIBLE published sketch — the per-index
@@ -426,12 +428,14 @@ func (idx *index) markSketchModified() {
 
 // sketchWrite precedes the sketch mutations of one entry write (putEntries,
 // deleteEntries): inside a savepoint it journals the live sketch, so the
-// savepoint's rollback restores it, then flags it modified. A write
+// savepoint's rollback restores it, then flags it modified, and the live
+// sketches are the transaction's (collection.sketchTx). A write
 // transaction of the db carries itself in the btree transaction's Aux
 // slot; a bare btree transaction journals nothing.
 func (idx *index) sketchWrite(tx *btree.WriteTx) {
 	if t, _ := tx.Aux().(*commonTx); t != nil {
 		t.journalSketch(idx)
+		idx.c.sketchTx = t.sketchTx
 	}
 	idx.markSketchModified()
 }

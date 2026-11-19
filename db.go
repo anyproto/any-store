@@ -550,6 +550,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	tx.readTx = &btWtx.ReadTx
 	tx.writeTx = btWtx
 	tx.modified.Store(false)
+	tx.sketchTx = version
 	btWtx.SetAux(tx)
 
 	db.checkStale(&btWtx.ReadTx)
@@ -662,10 +663,13 @@ func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
 			c.mu.Lock()
 			for _, idx := range s.indexes {
 				if idx.sketchModified {
-					// reloadSketch (writable) rebases live to the committed bytes and
+					// reloadLiveSketch rebases live to the committed bytes and
 					// clears sketchModified; if there are no committed bytes yet
 					// (brand-new pre-commit index) it preserves the built sketch.
-					c.reloadSketch(tx, s.name, idx, true)
+					// A read that fails leaves the index flagged: the first
+					// use of the collection loads it again, and may fail the
+					// operation for it (refreshLiveSketches).
+					_ = c.reloadLiveSketch(tx, s.name, idx)
 					flagged = flagged || idx.sketchModified
 				}
 			}

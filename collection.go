@@ -150,18 +150,31 @@ type Collection interface {
 func newCollection(db *db, name string, tx *btree.ReadTx) (*collection, *collSchema, error) {
 	c := &collection{db: db, openName: name}
 	// The sketches are about to be read through tx, the live one and the
-	// published one alike (loadSketchAtOpen). They are current for the
-	// change epoch only if tx's snapshot is exact for it; a transaction at
-	// an older snapshot (the open may run inside one that began before
-	// another process's commit was counted) loads older sketches, which the
-	// first use then loads again. A write transaction's snapshot is the
-	// latest there is: nothing of another process commits under it.
-	if epoch, exact := tx.ChangeEpoch(); exact || tx.IsWriteTx() {
+	// published one alike (loadSketchAtOpen). The published ones are current
+	// for the change epoch only if tx's snapshot is exact for it; a
+	// transaction at an older snapshot (the open may run inside one that
+	// began before another process's commit was counted) loads older
+	// sketches, which the first use then loads again. A write transaction's
+	// snapshot is the latest there is: nothing commits under it.
+	//
+	// The live ones are current only if a write transaction loaded them. A
+	// reader's snapshot can miss a commit of this process, which moves no
+	// epoch: one that lands between this load and the handle's registration
+	// (through a handle closed since), or, in memory, any commit after the
+	// reader began, where every snapshot passes for exact. So a handle a
+	// reader opened leaves the live stamp unset, and its first write
+	// transaction loads the stored rows.
+	epoch, exact := tx.ChangeEpoch()
+	c.sketchSeen.Store(sketchEpochNone)
+	c.sketchLive.Store(sketchEpochNone)
+	if tx.IsWriteTx() {
 		c.sketchSeen.Store(epoch)
 		c.sketchLive.Store(epoch)
-	} else {
-		c.sketchSeen.Store(sketchEpochNone)
-		c.sketchLive.Store(sketchEpochNone)
+		if t, _ := tx.Aux().(*commonTx); t != nil {
+			c.sketchTx = t.sketchTx
+		}
+	} else if exact {
+		c.sketchSeen.Store(epoch)
 	}
 	s, err := c.loadSchema(tx, name, nil)
 	if err != nil {
@@ -214,7 +227,7 @@ type collection struct {
 	primaryKey string
 
 	// sketchReadBuf is reused scratch for decoding persisted sketch bytes during
-	// the advisory reload (reloadSketch). Only touched under c.mu, so a single
+	// a reload (reloadLiveSketch, reloadPubSketch). Only touched under c.mu, so a single
 	// per-collection buffer is safe and keeps the stale-reload path from
 	// allocating a fresh read buffer per index.
 	sketchReadBuf []byte
@@ -224,10 +237,18 @@ type collection struct {
 	// or by a writer (refreshSketches).
 	sketchSeen atomic.Uint64
 	// sketchLive is the same for the live sketches, which only a write
-	// transaction loads again: a reader that brought the published ones up
-	// to an epoch leaves it behind, and the next write transaction loads the
-	// live ones before it writes.
+	// transaction loads: a reader that brought the published ones up to an
+	// epoch leaves it behind, a handle a reader opened has it unset, and the
+	// next write transaction loads the live ones before it writes.
 	sketchLive atomic.Uint64
+	// sketchTx is the write transaction (commonTx.sketchTx) the live
+	// sketches belong to: the last one that brought them up for itself
+	// (refreshSketches), opened the handle, or wrote to them
+	// (index.sketchWrite). That transaction loads nothing over them again,
+	// and its commit stores them (db.persistAllDirtySketches); to any other
+	// transaction, what is flagged on them is left over from a transaction
+	// that did not commit. Writer state, under the btree write lock.
+	sketchTx uint64
 
 	// pinned counts the entries of the open write transaction's schema log
 	// that reference this handle (txSchema.log): its creation, each schema
@@ -1674,17 +1695,49 @@ func (c *collection) buildIndex(tx *btree.WriteTx, s *collSchema, idx *index) er
 // Called from the loader and createIndex — in both the index is not yet in a
 // published set, so filling live in place and publishing it is unobservable
 // to readers (no copy-on-write ceremony needed).
-func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, collName string, idx *index) {
+//
+// A row that is not there leaves the sketch empty. A read that fails is not
+// a load: a write transaction gets the error, as its deltas would go on an
+// empty sketch and be stored over the row; a reader goes on with the empty
+// sketch and unsets the handle's stamps, so the next use loads the row
+// (refreshSketches).
+func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, collName string, idx *index) error {
 	if idx.sketch == nil {
 		idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
 	}
 	key := sketchKey(collName, idx.info.Name)
-	if data, err := tx.AppendValue(c.db.systemNS, key, nil); err == nil {
+	data, err := c.readSketchRow(tx, key, nil)
+	switch {
+	case err == nil:
 		idx.sketch.UnmarshalBinary(data)
+	case errors.Is(err, btree.ErrKeyNotFound):
+	case tx.IsWriteTx():
+		return err
+	default:
+		c.sketchSeen.Store(sketchEpochNone)
+		c.sketchLive.Store(sketchEpochNone)
 	}
 	// Publish the live object as the initial reader snapshot. The index is not
 	// yet visible to readers, so no reader can be holding the previous value.
 	idx.storePubSketch(idx.sketch)
+	return nil
+}
+
+// testHookSketchRead, when set, runs before every read of a stored sketch
+// row (an open, a reload) and fails the read with the error it returns.
+// Tests only.
+var testHookSketchRead func(key []byte) error
+
+// readSketchRow reads the stored sketch row under key through tx, appended
+// to buf: btree.ErrKeyNotFound for no row, any other error for a read that
+// failed.
+func (c *collection) readSketchRow(tx *btree.ReadTx, key, buf []byte) ([]byte, error) {
+	if testHookSketchRead != nil {
+		if err := testHookSketchRead(key); err != nil {
+			return nil, err
+		}
+	}
+	return tx.AppendValue(c.db.systemNS, key, buf)
 }
 
 // sketchEpochNone is the sketchSeen and sketchLive of a handle whose
@@ -1692,98 +1745,177 @@ func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, collName string, idx *in
 // epoch equals it.
 const sketchEpochNone = ^uint64(0)
 
-// refreshSketches reloads the sketches of the version s, resolved for tx, if
-// another process committed since they were last loaded: the change epoch
-// moved (btree.ReadTx.ChangeEpoch). Called where sketches are used: a
-// reader's plan, and a writer's first operation on the collection, before
-// its own deltas go on top.
+// refreshSketches brings the sketches of the version s, resolved for tx, up
+// to what is stored. Called where sketches are used: a reader's plan, and
+// every operation of a writer on the collection, the first of which loads.
 //
-// What is loaded is stamped with the epoch, so it has to hold every change
-// the epoch counts. A reader loads only if its snapshot is exact for the
-// epoch: one at an older snapshot would publish older sketches as current,
-// over newer ones, and nothing would reload them until the next commit of
-// another process. A writer's snapshot is the latest there is.
+// A reader loads the published sketches (reloadPubSketch) if another process
+// committed since they were last loaded: the change epoch moved
+// (btree.ReadTx.ChangeEpoch). What it loads is stamped with the epoch
+// (sketchSeen), so it has to hold every change the epoch counts: a reader
+// loads only if its snapshot is exact for the epoch. One at an older
+// snapshot would publish older sketches as current, over newer ones, and
+// nothing would reload them until the next commit of another process. A read
+// that fails stamps nothing, and the next reader loads again; the plan goes
+// on with what is published, which decides no result.
 //
-// There are two stamps, because a reader loads less than a writer does. A
-// reader brings up the published sketches only (reloadSketch) and stamps
-// sketchSeen. The live ones are a write transaction's to load, and
-// sketchLive is the epoch it last did so for: a writer goes by that stamp
-// alone, so the readers that came before it do not stand in for its own
-// load. Without it the writer would put its deltas on the counts from before
-// the other process's commit and store them over that process's row
-// (persistSketches). The epoch does not move on this process's own commits,
-// so they cause no load, and a transaction loads at most once: before its
-// first write to the collection, nothing after it.
-func (c *collection) refreshSketches(tx *btree.ReadTx, s *collSchema) {
+// A writer has the live sketches to load (refreshLiveSketches), and may
+// return the error of a read that failed.
+func (c *collection) refreshSketches(tx *btree.ReadTx, s *collSchema) error {
+	if tx.IsWriteTx() {
+		return c.refreshLiveSketches(tx, s)
+	}
 	epoch, exact := tx.ChangeEpoch()
-	writable := tx.IsWriteTx()
-	stamp := &c.sketchSeen
-	if writable {
-		stamp = &c.sketchLive
-	}
-	if stamp.Load() == epoch {
-		return
-	}
-	if !writable && !exact {
-		return
+	if c.sketchSeen.Load() == epoch || !exact {
+		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if stamp.Load() == epoch {
-		return
+	if c.sketchSeen.Load() == epoch {
+		return nil
 	}
+	loaded := true
 	for _, idx := range s.indexes {
-		c.reloadSketch(tx, s.name, idx, writable)
+		loaded = c.reloadPubSketch(tx, s.name, idx) && loaded
 	}
-	// The writer's load republished the live sketches: both are current.
-	c.sketchSeen.Store(epoch)
-	if writable {
-		c.sketchLive.Store(epoch)
+	if loaded {
+		c.sketchSeen.Store(epoch)
 	}
+	return nil
 }
 
-// reloadSketch refreshes one already-published index's sketch from the _system
-// namespace (refreshSketches, and the rebase of resetUncommittedSketches).
-// It is the sqlite_stat1 reload analog and is advisory/fail-soft: a missing key
-// or decode error leaves current state intact and never aborts the transaction.
+// refreshLiveSketches is refreshSketches for a write transaction: the live
+// sketches are loaded from the stored rows before the transaction's first
+// delta goes on them, since the commit stores them over those rows
+// (persistSketches). A load skipped is the other process's counts lost from
+// the file.
 //
-//	WRITE tx (writable): the calling goroutine holds the btree write lock and is the
-//	  SOLE mutator of idx.sketch, so it reloads IN PLACE into the live object (0
-//	  alloc) — catching up to a peer's committed counts BEFORE applying its own
-//	  deltas, whether or not a reader loaded the same bytes into the
-//	  published sketch first (collection.sketchLive): the deltas are
-//	  persisted on top of what is loaded here, so a load skipped is the
-//	  peer's counts lost from the stored row — then republishes live so
-//	  readers see the peer's state immediately.
+// The live sketches have a stamp of their own, sketchLive: the epoch a write
+// transaction last loaded them for. The readers' stamp does not stand in for
+// it: a reader that planned first after another process's commit loaded the
+// published sketches only. The epoch does not move on this process's own
+// commits, so they cause no load.
 //
-//	READ tx (!writable): a concurrent in-process writer may be incrementing
-//	  idx.sketch right now, so we NEVER touch it. The disk bytes are decoded
-//	  into the reader-owned published sketch — in place, as the writer path
-//	  does with its own: every field is read and written atomically and a
-//	  planner tolerates a mix of two reloads (plan-time only, see IndexSketch)
-//	  — and a fresh one is allocated only while the published sketch IS the
-//	  live object (initially, and again after each commit republishes it).
-//	  The writer's live object is untouched; its in-flight increments can
-//	  never be lost.
-func (c *collection) reloadSketch(tx *btree.ReadTx, collName string, idx *index, writable bool) {
+// The transaction decides once per collection, at its first use of it, and
+// then the sketches are its own (sketchTx) to the end. The epoch can move
+// under an open write transaction: nothing commits under it, but a reader of
+// this process that took its snapshot at an older commit may only now count
+// it (wal.noteSnapshot). A load at that point would put the stored row over
+// the transaction's deltas.
+//
+// At that first use, what is flagged on a live sketch is left over from a
+// transaction that did not commit and that the begin could not rebase
+// (resetUncommittedSketches: the handle was unverified, or the read
+// failed): it is loaded again here whatever the stamp says.
+//
+// A read that fails returns its error and stamps nothing: the operation
+// fails before it writes, and the next one loads again.
+func (c *collection) refreshLiveSketches(tx *btree.ReadTx, s *collSchema) error {
+	t, _ := tx.Aux().(*commonTx)
+	if t != nil && c.sketchTx == t.sketchTx {
+		return nil
+	}
+	epoch, _ := tx.ChangeEpoch()
+	stale := c.sketchLive.Load() != epoch
+	load := stale
+	if !load && t != nil {
+		for _, idx := range s.indexes {
+			load = load || idx.sketchModified
+		}
+	}
+	if load {
+		if err := c.loadLiveSketches(tx, s, epoch, stale); err != nil {
+			return err
+		}
+	}
+	if t != nil {
+		c.sketchTx = t.sketchTx
+	}
+	return nil
+}
+
+// loadLiveSketches is the load of refreshLiveSketches: every index of s if
+// the live sketches are stale for epoch, the flagged ones otherwise.
+func (c *collection) loadLiveSketches(tx *btree.ReadTx, s *collSchema, epoch uint64, stale bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, idx := range s.indexes {
+		if !stale && !idx.sketchModified {
+			continue
+		}
+		if err := c.reloadLiveSketch(tx, s.name, idx); err != nil {
+			return err
+		}
+	}
+	if stale {
+		// The load republished the live sketches: both are current.
+		c.sketchSeen.Store(epoch)
+		c.sketchLive.Store(epoch)
+	}
+	return nil
+}
+
+// reloadLiveSketch loads one index's live sketch from its stored row, for a
+// write transaction (refreshLiveSketches, and the rebase of
+// resetUncommittedSketches), and publishes it. The caller holds the btree
+// write lock, so it is the sole mutator of idx.sketch, and c.mu.
+//
+// The row is decoded in place (no allocation), unless it has another shape
+// than the live sketch: the live object is published, a planner may hold it,
+// and a reshape replaces the slices it reads (IndexSketch.UnmarshalBinary).
+// Such a row goes into a fresh object, which becomes the live one once it
+// decoded.
+//
+// No row, or bytes that do not decode, leave the live sketch as it is (a
+// sketch built in this transaction has no row yet). A read that failed is
+// returned: nothing was loaded.
+func (c *collection) reloadLiveSketch(tx *btree.ReadTx, collName string, idx *index) error {
 	key := sketchKey(collName, idx.info.Name)
-	data, err := tx.AppendValue(c.db.systemNS, key, c.sketchReadBuf[:0])
+	data, err := c.readSketchRow(tx, key, c.sketchReadBuf[:0])
 	if err != nil {
-		return // no persisted bytes: preserve current state (advisory)
+		if errors.Is(err, btree.ErrKeyNotFound) {
+			return nil
+		}
+		return err
 	}
 	c.sketchReadBuf = data
-	if writable {
-		if idx.sketch == nil {
-			idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
-		}
-		idx.sketch.UnmarshalBinary(data) // in-place into live (sole mutator)
-		idx.storePubSketch(idx.sketch)   // republish live for readers
-		// Live now equals the committed on-disk state, so any prior
-		// uncommitted (e.g. rolled-back) deltas are discarded — clear the dirty
-		// flag so they are not re-persisted on the next commit.
-		idx.sketchModified = false
-		return
+	if idx.sketch == nil {
+		idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
 	}
+	if idx.sketch.SameShape(data) {
+		idx.sketch.UnmarshalBinary(data)
+	} else if fresh := qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths)); fresh.UnmarshalBinary(data) {
+		idx.sketch = fresh
+	}
+	idx.storePubSketch(idx.sketch) // republish live for readers
+	// Live now equals the committed on-disk state, so any prior
+	// uncommitted (e.g. rolled-back) deltas are discarded — clear the dirty
+	// flag so they are not re-persisted on the next commit.
+	idx.sketchModified = false
+	return nil
+}
+
+// reloadPubSketch loads one index's published sketch from its stored row,
+// for a reader (refreshSketches), and reports whether the row was read: no
+// row counts, a read that failed does not. The sqlite_stat1 reload analog,
+// advisory and fail-soft: a missing row or a decode error leaves what is
+// published. The caller holds c.mu.
+//
+// A concurrent in-process writer may be incrementing idx.sketch right now,
+// so it is NEVER touched. The disk bytes are decoded into the reader-owned
+// published sketch — in place: every field is read and written atomically
+// and a planner tolerates a mix of two reloads (plan-time only, see
+// IndexSketch) — and a fresh one is allocated only while the published
+// sketch IS the live object (initially, and again after each commit
+// republishes it). The writer's live object is untouched; its in-flight
+// increments can never be lost.
+func (c *collection) reloadPubSketch(tx *btree.ReadTx, collName string, idx *index) bool {
+	key := sketchKey(collName, idx.info.Name)
+	data, err := c.readSketchRow(tx, key, c.sketchReadBuf[:0])
+	if err != nil {
+		return errors.Is(err, btree.ErrKeyNotFound)
+	}
+	c.sketchReadBuf = data
 	// idx.sketch is only replaced under c.mu (held here) or before the index
 	// is published, so the identity check is race-free; a commit that
 	// republishes live concurrently (settleSketches takes no c.mu) is
@@ -1798,9 +1930,10 @@ func (c *collection) reloadSketch(tx *btree.ReadTx, collName string, idx *index,
 		into = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
 	}
 	if !into.UnmarshalBinary(data) && pub != nil {
-		return
+		return true
 	}
 	idx.storePubSketch(into)
+	return true
 }
 
 // indexInfoEqual reports whether two IndexInfo values describe the same index
@@ -1825,7 +1958,8 @@ func indexInfoEqual(a, b IndexInfo) bool {
 // and lists them on the transaction for the settle that follows the commit
 // (commonTx.settleSketches: the republish as the reader snapshot and the
 // flag clear, once the commit is visible). Last-writer-wins (no
-// cross-process merge — the sketch is advisory, like sqlite_stat1). Runs
+// cross-process merge — the sketch is advisory, like sqlite_stat1; the
+// writer loaded the row before its deltas, refreshLiveSketches). Runs
 // inside Commit before pager.commit, so the bytes are atomic with the
 // file-change counter / schema cookie. s is the writer's version
 // (collection.inTx).

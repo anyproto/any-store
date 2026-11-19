@@ -201,7 +201,9 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 			return rErr
 		}
 		stats.Name = s.name
-		c.refreshSketches(tx, s)
+		if rErr = c.refreshSketches(tx, s); rErr != nil {
+			return rErr
+		}
 		indexes, vindexes, ftsindexes := s.indexes, s.vindexes, s.ftsIndexes
 
 		// Documents: scan the collection B-tree summing stored and
