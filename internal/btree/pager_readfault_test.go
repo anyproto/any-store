@@ -155,6 +155,8 @@ func TestReadRawPageWALErrorPropagates(t *testing.T) {
 	opts := DefaultOptions()
 	opts.Checksum = true
 	opts.DisableAutoCheckpoint = true
+	var mismatches atomic.Int32
+	opts.OnIntegrityError = func(uint32, error) { mismatches.Add(1) }
 	db, err := testOpen(t, filepath.Join(dir, "test.db"), opts)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -204,6 +206,9 @@ func TestReadRawPageWALErrorPropagates(t *testing.T) {
 	require.Equal(t, targetPgno, res.Errors[0].PageNo)
 	require.Equal(t, IntegrityKindUnknown, res.Errors[0].Kind)
 	require.ErrorIs(t, res.Errors[0].Inner, sentinel)
+	// The checksum of a page that could not be read was never compared:
+	// the codec's hook, which reports checksum mismatches, stays silent.
+	require.Zero(t, mismatches.Load(), "no checksum-mismatch notification for a read error")
 }
 
 // TestWALDecryptFailurePropagatesFromReadFrame pins the highest-severity case

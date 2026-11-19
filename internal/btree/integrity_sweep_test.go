@@ -153,7 +153,7 @@ func TestVerifyIntegrity_Cksum_DetectsCorruption(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	// Sweep — VerifyIntegrity disables verify-on-read internally, so this
+	// Sweep — VerifyIntegrity reads pages raw, past the codec, so this
 	// must succeed and accumulate the error.
 	rep, err := db.VerifyIntegrity(context.Background())
 	if err != nil {
@@ -260,6 +260,54 @@ func TestVerifyIntegrity_DamagedPage1Listed(t *testing.T) {
 			}
 			if len(rep.Errors) != 1 || rep.Errors[0].PageNo != 1 || rep.Errors[0].Kind != tc.kind {
 				t.Fatalf("want one error of kind %v on page 1, got %+v", tc.kind, rep.Errors)
+			}
+		})
+	}
+}
+
+// TestVerifyIntegrity_InMemoryHasNoMode: the in-memory store and the
+// in-memory WAL hold pages as the b-tree wrote them, with no codec
+// (wal.writeFramesMem), even when the options name one. The integrity mode
+// is that of the stored pages: none.
+func TestVerifyIntegrity_InMemoryHasNoMode(t *testing.T) {
+	cksum := Options{PageSize: 4096, InMemory: true, Checksum: true}
+	aead := Options{PageSize: 4096, InMemory: true, Key: []byte("p"), KDFIterations: 1000}
+	for name, opts := range map[string]Options{"checksum": cksum, "aead": aead} {
+		t.Run(name, func(t *testing.T) {
+			resetPageBufferPool()
+			db, err := Open("", opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			wtx, err := db.BeginWrite()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ns, err := wtx.CreateNamespace("x")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 200; i++ {
+				if err := wtx.Put(ns, []byte{byte(i)}, bytes.Repeat([]byte{byte(i)}, 300)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := wtx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Checkpoint(CheckpointFull); err != nil {
+				t.Fatal(err)
+			}
+			if m := db.IntegrityMode(); m != IntegrityNone {
+				t.Fatalf("IntegrityMode = %v, want IntegrityNone", m)
+			}
+			rep, err := db.VerifyIntegrity(context.Background())
+			if err != nil {
+				t.Fatalf("VerifyIntegrity: %v", err)
+			}
+			if rep.Mode != IntegrityNone || rep.Pages != 0 || len(rep.Errors) != 0 {
+				t.Fatalf("want no mode, no pages, no errors; got mode %v, %d pages, %d errors", rep.Mode, rep.Pages, len(rep.Errors))
 			}
 		})
 	}
