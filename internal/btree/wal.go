@@ -2634,7 +2634,21 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	// last-committed state at tx begin. Within a tx, spills don't
 	// update mxCommitFrame (commit=false skips the Store), so iFirst
 	// stays stable across spills.
+	//
+	// The lookup's ceiling is nf, the last frame in the wal-index when this
+	// call began, for every page of the call: walFindFrame searches up to
+	// pWal->hdr.mxFrame (`u32 iLast = pWal->hdr.mxFrame;`, wal.c:3525), and
+	// walFrames advances that only after it has indexed the whole batch
+	// (wal.c:4243). The frames this call appends are not in the index yet
+	// (setBatch runs after the loop), so an entry the index has for one of
+	// their numbers is not this transaction's: it is left over from a writer
+	// that died. Writing the page into that frame and leaving it out of the
+	// appended set would lose it: the staged batch writes another page over
+	// the same frame. In C iFirst stays 0 until the transaction has written
+	// frames (pWal->hdr differs from the live header, wal.c:4062-4065); here
+	// the first call of a transaction has iFirst == nf+1, an empty window.
 	iFirst := w.index.mxCommitFrame.LoadLocal() + 1
+	canReuse := iFirst <= nf && !DiagDisableReuse.Load()
 
 	// Track appended frames separately from the input slice index.
 	// Reused pages don't advance the append cursor nor the checksum
@@ -2668,8 +2682,8 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		// Reuse check — mirrors SQLite wal.c:4124-4140. Only allowed
 		// for non-last-of-commit pages; the last commit frame must
 		// be a fresh append carrying the dbSize commit marker.
-		if !(commit && isLast) && iFirst > 0 && !DiagDisableReuse.Load() {
-			iWrite, err := w.index.getInTxRange(p.pgno, nf+nAppended, iFirst)
+		if !(commit && isLast) && canReuse {
+			iWrite, err := w.index.getInTxRange(p.pgno, nf, iFirst)
 			if err != nil {
 				return err
 			}
@@ -2910,8 +2924,10 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	pageSz := int(w.pageSize)
 
 	// iFirst — first frame written by the current tx. Same logic as
-	// disk-mode writeFrames; reuse only allowed for frames in this tx.
+	// disk-mode writeFrames; reuse only allowed for frames in this tx,
+	// looked up among the frames indexed before this call (ceiling nf).
 	iFirst := w.index.mxCommitFrame.LoadLocal() + 1
+	canReuse := iFirst <= nf
 
 	// Ensure arena has enough space for all pages in this batch (worst
 	// case: no reuse). We may over-reserve when reuse fires; that's fine
@@ -2933,8 +2949,8 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 		isLast := i == len(pages)-1
 
 		// Reuse check — same semantics as disk-mode writeFrames.
-		if !(commit && isLast) && iFirst > 0 {
-			iWrite, err := w.index.getInTxRange(p.pgno, nf+nAppended, iFirst)
+		if !(commit && isLast) && canReuse {
+			iWrite, err := w.index.getInTxRange(p.pgno, nf, iFirst)
 			if err != nil {
 				// Return as the file path does: nFrame not advanced and
 				// w.mu released. The frames this call appended go too; the
