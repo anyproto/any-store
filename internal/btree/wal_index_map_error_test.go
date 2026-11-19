@@ -139,6 +139,60 @@ func TestWalIndexMapError_LookupsFail(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// A snapshot that is entirely in the database file has an empty frame window
+// (minFrame above maxFrame, what a reader on slot 0 gets): its lookups touch
+// no segment, so one that cannot be mapped does not fail them. walFindFrame
+// returns before its loop for such a reader (wal.c:3538-3541 `if( iLast==0
+// || (pWal->readLock==0 && pWal->bShmUnreliable==0) ){ *piRead = 0; return
+// SQLITE_OK; }`).
+func TestWalIndexLookup_EmptyWindowMapsNothing(t *testing.T) {
+	db, failSegment, _ := mapErrorDB(t)
+	wi := db.pager.wal.index
+	mx := wi.mxCommitFrame.LoadLocal()
+	seg, idx := htFrameSegIdx(mx)
+	require.Equal(t, 1, seg)
+	require.Less(t, idx, htNPage-1, "setup: frame mx+1 is in the same segment")
+	failSegment()
+
+	frame, err := wi.get(2, mx, mx+1)
+	require.NoError(t, err)
+	require.Zero(t, frame)
+	frame, err = wi.getInTxRange(2, mx, mx+1)
+	require.NoError(t, err)
+	require.Zero(t, frame)
+	frame, err = wi.shmHashGet(2, mx, mx+1)
+	require.NoError(t, err)
+	require.Zero(t, frame)
+
+	heap, err := newWalIndex("", true)
+	require.NoError(t, err)
+	defer func() { _ = heap.close(false) }()
+	require.NoError(t, heap.set(2, 1))
+	for _, get := range []func(pgno, maxFrame, minFrame uint32) (uint32, error){heap.get, heap.getInTxRange, heap.shmHashGet} {
+		frame, err = get(2, 1, 2)
+		require.NoError(t, err)
+		require.Zero(t, frame)
+		frame, err = get(2, 1, 1)
+		require.NoError(t, err)
+		require.Equal(t, uint32(1), frame)
+	}
+}
+
+// The same through a read transaction: once the log is backfilled, a reader
+// takes slot 0 and reads every page, page 1 included, from the database
+// file, with a segment of the log that cannot be mapped.
+func TestWalIndexMapError_CheckpointedReaderReads(t *testing.T) {
+	db, failSegment, restore := mapErrorDB(t)
+	require.NoError(t, db.Checkpoint(CheckpointRestart))
+	wi := db.pager.wal.index
+	require.Equal(t, wi.mxCommitFrame.LoadLocal(), wi.liveNBackfill(), "setup: the log is backfilled")
+	coldReaders(db)
+	failSegment()
+	defer restore()
+	restartCheck(t, db, 0, 1, 2)
+	restartCheck(t, db, 1, 2, 1)
+}
+
 // BenchmarkShmHashGet is the shared-memory page lookup over two segments: a
 // page found in the newest segment, one found in the oldest, one in neither.
 func BenchmarkShmHashGet(b *testing.B) {

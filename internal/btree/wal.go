@@ -791,6 +791,9 @@ func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) (uint32, error
 			return 0, err
 		}
 	}
+	if minFrame > maxFrame {
+		return 0, nil // an empty window, see shmHashGet
+	}
 	if wi.inProcess {
 		wi.mu.RLock()
 		frames := wi.pageMap[pgno]
@@ -889,6 +892,9 @@ func (wi *walIndex) synthHdr(mxFrame, nPage uint32) WalIndexHdr {
 // DRIFT: WAL hash-probe full-chain (nCollide) CORRUPT signal dropped in get/shmHashGet See docs/btree/NOTES.md#drift-93-wal-hash-probe-full-chain-corruption-signal-dropped
 // DRIFT: in-process WAL lookup via Go map (O(1)) vs SQLite hash scan; cross-process still uses SHM See docs/btree/NOTES.md#old-drift-pagemap-same-process-lookup
 func (wi *walIndex) get(pgno, maxFrame, minFrame uint32) (uint32, error) {
+	if minFrame > maxFrame {
+		return 0, nil // an empty window, see shmHashGet
+	}
 	if wi.inProcess {
 		// In-process: no SHM to consult; pageMap is the sole source of truth.
 		wi.mu.RLock()
@@ -1381,7 +1387,14 @@ func (wi *walIndex) shmCleanupHash(mxFrame uint32, seg int, region []byte) error
 // that would mask the corruption). A segment that cannot be mapped fails the
 // lookup with the mapping error, for the same reason.
 func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) {
-	if maxFrame == 0 {
+	// No frame, or an empty window: a snapshot that is entirely in the
+	// database file (a reader on slot 0 has minFrame == maxFrame+1). No
+	// segment is mapped or read for it, as walFindFrame returns before its
+	// loop (wal.c:3538-3541 `if( iLast==0 || (pWal->readLock==0 &&
+	// pWal->bShmUnreliable==0) ){ *piRead = 0; return SQLITE_OK; }`): a
+	// segment it cannot map is none of its business, and the hash tables of
+	// a log that is being started over are read by nobody.
+	if maxFrame == 0 || minFrame > maxFrame {
 		return 0, nil
 	}
 
