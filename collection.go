@@ -529,9 +529,13 @@ func (c *collection) insertItem(tx *btree.WriteTx, s *collSchema, buf *syncpool.
 		buf.DocBuf, buf.ScratchBuf = it.Value().MarshalCompressed(buf.DocBuf[:0], buf.ScratchBuf)
 	}
 
-	// Check if key already exists
+	// Check if key already exists. A check that failed is not "no such
+	// document": the Put below would replace one that is there and leave
+	// the index entries of its old values behind.
 	if _, err := tx.Get(s.ns, buf.SmallBuf); err == nil {
 		return ErrDocExists
+	} else if err != btree.ErrKeyNotFound && !errors.Is(err, btree.ErrKeyNotFound) {
+		return err
 	}
 
 	if err = tx.Put(s.ns, buf.SmallBuf, buf.DocBuf); err != nil {
@@ -1327,8 +1331,9 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 			txErr = nil
 		}
 		// Delete sketch data
-		skKey := sketchKey(s.name, indexName)
-		_ = tx.Delete(c.db.systemNS, skKey) // ignore if not found
+		if txErr = c.db.deleteOptionalRecord(tx, sketchKey(s.name, indexName)); txErr != nil {
+			return
+		}
 		// Delete the multikey flag (keyed by the immutable namespace name —
 		// resolve it from the live index object, since nsName computed from
 		// the CURRENT collection name is wrong after a rename): drop+recreate
@@ -1336,7 +1341,9 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 		next.indexes = make([]*index, 0, len(s.indexes))
 		for _, idx := range s.indexes {
 			if idx.info.Name == indexName {
-				_ = tx.Delete(c.db.systemNS, multikeyKey(idx.ns.Name()))
+				if txErr = c.db.deleteOptionalRecord(tx, multikeyKey(idx.ns.Name())); txErr != nil {
+					return
+				}
 				continue
 			}
 			next.indexes = append(next.indexes, idx)

@@ -3,6 +3,7 @@ package qplanner
 import (
 	"fmt"
 
+	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/query"
 )
 
@@ -74,7 +75,12 @@ func (it *CoverIter) Next() (key []byte, docId []byte, multiKey bool, err error)
 		var kerr error
 		it.keyBuf, kerr = it.Source.AppendSeekKey(seekStart, it.keyBuf[:0])
 		if kerr != nil {
-			continue // key not found
+			if kerr == btree.ErrKeyNotFound {
+				continue // no key at or after the bound
+			}
+			// A seek that failed says nothing about the key: the error is
+			// the query's, as in FetchIter and FilterIter.
+			return nil, nil, false, kerr
 		}
 		if !HasExactFieldPrefix(it.keyBuf, b.Start, lastInverted) {
 			continue
