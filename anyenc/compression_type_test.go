@@ -1,10 +1,13 @@
 package anyenc
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
+	"github.com/klauspost/compress/s2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fastjson"
@@ -249,4 +252,78 @@ func BenchmarkParseCompressed(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, _ = p.Parse(dst)
 	}
+}
+
+// A compressed object is written only when it can be read back: the decoder
+// refuses a compressed object whose plain size is over decompressedLimit, so
+// an object over it is stored plain, and the encoder is not called with a
+// size it reports as too large for a block, where it panics.
+
+func compressibleObject(t *testing.T, plainSize int) *Value {
+	t.Helper()
+	a := &Arena{}
+	obj := a.NewObject()
+	obj.Set("id", a.NewString("doc"))
+	obj.Set("s", a.NewString(""))
+	base := len(obj.MarshalTo(nil))
+	require.Greater(t, plainSize, base)
+	obj.Set("s", a.NewString(strings.Repeat("a", plainSize-base)))
+	require.Len(t, obj.MarshalTo(nil), plainSize)
+	return obj
+}
+
+func TestMarshalCompressed_PlainWhenOverDecoderLimit(t *testing.T) {
+	const limit = 4000
+	prev := decompressedLimit
+	decompressedLimit = limit
+	defer func() { decompressedLimit = prev }()
+
+	// Exactly at the limit: compressed, and both decoders read it.
+	at := compressibleObject(t, limit)
+	enc, _ := at.MarshalCompressed(nil, nil)
+	require.Equal(t, byte(TypeCompressedObjectS2), enc[0])
+	require.Less(t, len(enc), limit/2)
+	got, err := Parse(enc)
+	require.NoError(t, err)
+	require.Equal(t, at.MarshalTo(nil), got.MarshalTo(nil))
+	_, err = (&Parser{}).DecodedDoc(enc)
+	require.NoError(t, err)
+
+	// One byte over: the compressed form would be refused by the decoder,
+	// so the plain form is what is written, and it reads back.
+	over := compressibleObject(t, limit+1)
+	enc, _ = over.MarshalCompressed([]byte("prefix"), nil)
+	require.Equal(t, "prefix", string(enc[:6]))
+	enc = enc[6:]
+	require.Equal(t, byte(TypeObject), enc[0], "an object over the decoder's limit was stored compressed")
+	require.Equal(t, over.MarshalTo(nil), enc)
+	got, err = Parse(enc)
+	require.NoError(t, err)
+	require.Equal(t, over.MarshalTo(nil), got.MarshalTo(nil))
+
+	// What the check prevents: the same object compressed anyway is one no
+	// decoder accepts.
+	plain := over.MarshalTo(nil)
+	forced := append([]byte{byte(TypeCompressedObjectS2), 0, 0, 0, 0}, s2.Encode(nil, plain)...)
+	binary.BigEndian.PutUint32(forced[1:], uint32(len(forced)-5))
+	_, err = Parse(forced)
+	require.Error(t, err)
+}
+
+func TestMarshalCompressed_PlainWhenEncoderRefusesSize(t *testing.T) {
+	// s2.MaxEncodedLen answers -1 for an input over its block limit (4 GiB
+	// on a 64-bit build), and s2.Encode panics on such an input.
+	prev := s2MaxEncodedLen
+	s2MaxEncodedLen = func(int) int { return -1 }
+	defer func() { s2MaxEncodedLen = prev }()
+
+	obj := compressibleObject(t, 4000)
+	var enc []byte
+	require.NotPanics(t, func() { enc, _ = obj.MarshalCompressed(nil, nil) })
+	require.Equal(t, byte(TypeObject), enc[0], "the encoder was called with a size it refuses")
+	require.Equal(t, obj.MarshalTo(nil), enc)
+
+	// The real function answers so for a size past the block limit; Encode
+	// begins with the same call and panics on a negative answer.
+	require.Negative(t, s2.MaxEncodedLen(math.MaxInt))
 }
