@@ -107,8 +107,8 @@ func (p *Parser) DecodedDoc(doc []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("compressed object: s2 header: %w", err)
 	}
-	if dLen > maxDecompressedSize {
-		return nil, fmt.Errorf("compressed object: decoded size %d exceeds limit %d", dLen, maxDecompressedSize)
+	if dLen > decompressedLimit {
+		return nil, fmt.Errorf("compressed object: decoded size %d exceeds limit %d", dLen, decompressedLimit)
 	}
 	p.c.decompBuf, err = s2.Decode(p.c.decompBuf[:cap(p.c.decompBuf)], compressed)
 	if err != nil {
