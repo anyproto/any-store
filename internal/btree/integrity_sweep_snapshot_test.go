@@ -15,41 +15,46 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const sweepPeerEnv = "BTREE_TEST_SWEEP_PEER"
+// The child's database path and its operations travel in two variables: a
+// path may hold any separator a single value would be split on.
+const (
+	sweepPeerPathEnv = "BTREE_TEST_SWEEP_PEER_PATH"
+	sweepPeerOpsEnv  = "BTREE_TEST_SWEEP_PEER_OPS"
+)
 
 var sweepPeerOpts = Options{PageSize: 4096, Checksum: true, DisableAutoCheckpoint: true}
 
 // runSweepPeer runs TestVerifyIntegritySweep_PeerChild on path in another
 // process, with ops separated by ";":
 //
-//	grow       commit rows 1000..3000 of namespace t1 in one transaction
-//	ckpt       TRUNCATE checkpoint
-//	exit       exit without closing the database, which would checkpoint
-//	flip:P     flip one byte of page P in the database file, with no
-//	           handle open on the database
+//	grow        commit rows 1000..3000 of namespace t1 in one transaction
+//	ckpt        TRUNCATE checkpoint
+//	exit        exit without closing the database, which would checkpoint
+//	flip:OFF    flip the byte at offset OFF of the database file, with no
+//	            handle open on the database
+//	flipwal:OFF the same in the WAL file
 //
-// The parent never opens the database file a second time itself: closing
+// The parent never opens the database's files a second time itself: closing
 // any descriptor of a file drops the process's fcntl locks on it.
 func runSweepPeer(t *testing.T, path, ops string) {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestVerifyIntegritySweep_PeerChild$", "-test.timeout=60s")
-	cmd.Env = append(os.Environ(), sweepPeerEnv+"="+path+"|"+ops)
+	cmd.Env = append(os.Environ(), sweepPeerPathEnv+"="+path, sweepPeerOpsEnv+"="+ops)
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "child: %s", out)
 }
 
 // TestVerifyIntegritySweep_PeerChild is the child of runSweepPeer.
 func TestVerifyIntegritySweep_PeerChild(t *testing.T) {
-	arg := os.Getenv(sweepPeerEnv)
-	if arg == "" {
+	path := os.Getenv(sweepPeerPathEnv)
+	if path == "" {
 		t.Skip("child process only")
 	}
-	parts := strings.SplitN(arg, "|", 2)
-	path := parts[0]
 	var db *DB
-	for _, op := range strings.Split(parts[1], ";") {
+	for _, op := range strings.Split(os.Getenv(sweepPeerOpsEnv), ";") {
 		f := strings.Split(op, ":")
-		if f[0] != "flip" && db == nil {
+		flip := f[0] == "flip" || f[0] == "flipwal"
+		if !flip && db == nil {
 			var err error
 			db, err = Open(path, sweepPeerOpts)
 			require.NoError(t, err)
@@ -61,13 +66,16 @@ func TestVerifyIntegritySweep_PeerChild(t *testing.T) {
 			require.NoError(t, db.Checkpoint(CheckpointTruncate))
 		case "exit":
 			os.Exit(0)
-		case "flip":
-			require.Nil(t, db, "flip runs with no handle on the database")
-			pgno, err := strconv.Atoi(f[1])
+		case "flip", "flipwal":
+			require.Nil(t, db, "a flip runs with no handle on the database")
+			off, err := strconv.ParseInt(f[1], 10, 64)
 			require.NoError(t, err)
-			file, err := os.OpenFile(path, os.O_RDWR, 0)
+			name := path
+			if f[0] == "flipwal" {
+				name += "-wal"
+			}
+			file, err := os.OpenFile(name, os.O_RDWR, 0)
 			require.NoError(t, err)
-			off := int64(pgno-1)*int64(sweepPeerOpts.PageSize) + 500
 			var b [1]byte
 			_, err = file.ReadAt(b[:], off)
 			require.NoError(t, err)
@@ -84,12 +92,30 @@ func TestVerifyIntegritySweep_PeerChild(t *testing.T) {
 	}
 }
 
+// sweepSnapshot returns the page count of a read transaction begun now and,
+// for pgno != 0, the WAL frame that transaction reads pgno from (0: the
+// database file). The transaction ends with the call, whatever fails.
+func sweepSnapshot(t *testing.T, db *DB, pgno uint32) (nPages, frame uint32) {
+	t.Helper()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	nPages, err = rtx.DatabaseSize()
+	require.NoError(t, err)
+	if pgno != 0 {
+		frame, err = db.pager.wal.index.get(pgno, rtx.walMaxFrame, db.pager.readerMinFrame(rtx.cache))
+		require.NoError(t, err)
+	}
+	return nPages, frame
+}
+
 // TestVerifyIntegritySweepsPagesAPeerAdded: the sweep covers the pages of
 // the snapshot it reads, as a read transaction counts them (pagerPagecount,
 // pager.c:3279-3306: the size the WAL's last commit recorded, else the
 // file's), not the pages this process knew when it last wrote or opened. A
 // process that has only read since a peer grew the database must verify the
-// peer's pages too, and find the damaged one among them.
+// peer's pages too, in the database file and in the WAL, and find the
+// damaged one among them.
 func TestVerifyIntegritySweepsPagesAPeerAdded(t *testing.T) {
 	cases := []struct {
 		name string
@@ -98,6 +124,7 @@ func TestVerifyIntegritySweepsPagesAPeerAdded(t *testing.T) {
 		{name: "checkpointed", ckpt: true},
 		{name: "in the WAL"},
 	}
+	pageSize := int64(sweepPeerOpts.PageSize)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			path := t.TempDir() + "/test.db"
@@ -123,32 +150,28 @@ func TestVerifyIntegritySweepsPagesAPeerAdded(t *testing.T) {
 			}
 			runSweepPeer(t, path, ops)
 
-			rtx, err := db.BeginRead()
-			require.NoError(t, err)
-			snap, err := rtx.DatabaseSize()
-			require.NoError(t, err)
-			require.NoError(t, rtx.Rollback())
+			snap, _ := sweepSnapshot(t, db, 0)
 			require.Greater(t, snap, before+100, "setup: the peer grew the database")
 			info, err := os.Stat(path)
 			require.NoError(t, err)
-			filePages := uint32(info.Size() / int64(sweepPeerOpts.PageSize))
+			filePages := uint32(info.Size() / pageSize)
 
-			var damaged uint32
+			// One byte of a page the peer added, where the snapshot reads it.
+			damaged := before + (snap-before)/2
 			if tc.ckpt {
 				require.Equal(t, snap, filePages, "setup: the peer's pages are in the database file")
-				damaged = before + (snap-before)/2
-				runSweepPeer(t, path, "flip:"+strconv.Itoa(int(damaged)))
+				runSweepPeer(t, path, "flip:"+strconv.FormatInt(int64(damaged-1)*pageSize+500, 10))
 			} else {
 				require.Equal(t, before, filePages, "setup: the peer's pages are only in the WAL")
+				_, frame := sweepSnapshot(t, db, damaged)
+				require.NotZero(t, frame, "setup: the page is read from a WAL frame")
+				off := int64(walHeaderSize) + int64(frame-1)*(int64(walFrameSize)+pageSize) + int64(walFrameSize) + 500
+				runSweepPeer(t, path, "flipwal:"+strconv.FormatInt(off, 10))
 			}
 
 			res, err = db.VerifyIntegrity(ctx)
 			require.NoError(t, err)
 			require.Equal(t, int(snap), res.Pages, "the sweep covers the snapshot's pages")
-			if !tc.ckpt {
-				require.Empty(t, res.Errors)
-				return
-			}
 			require.Len(t, res.Errors, 1)
 			require.Equal(t, damaged, res.Errors[0].PageNo)
 			require.Equal(t, IntegrityChecksumMismatch, res.Errors[0].Kind)
@@ -276,4 +299,110 @@ func TestReadRawPageSlot0IgnoresNewWALGeneration(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, bytes.Equal(snapshot[pgno], raw), "page %d is not the snapshot's", pgno)
 	}
+}
+
+// sweepCountDB is a checksum database of many pages whose handle stays
+// open, and its page count.
+func sweepCountDB(t *testing.T, opts Options) (*DB, uint32) {
+	t.Helper()
+	db, err := testOpen(t, t.TempDir()+"/test.db", opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	dmsPutRange(t, db, "t1", 0, 2000)
+	n := db.pager.dbSize.Load()
+	require.Greater(t, n, uint32(150), "setup: a database of many pages")
+	return db, n
+}
+
+// sweepPatchFile writes b into the database file at off through the pager's
+// own descriptor: no second descriptor of the file is opened and closed.
+func sweepPatchFile(t *testing.T, db *DB, off int64, b []byte) {
+	t.Helper()
+	_, err := db.pager.file.WriteAt(b, off)
+	require.NoError(t, err)
+}
+
+// TestVerifyIntegritySweepDamagedPageCount: page 1's header is outside both
+// codecs, so nothing tags its page count, and a smaller count with the
+// change counters intact is a well-formed header (lockBtree accepts it,
+// btree.c:3294-3298: a file may hold pages past the logical size). Where the
+// snapshot's WAL commit recorded the database's size, that is a second count
+// the sweep has: it lists page 1 for the disagreement and sweeps the pages
+// the commit recorded.
+func TestVerifyIntegritySweepDamagedPageCount(t *testing.T) {
+	cases := []struct {
+		name string
+		opts Options
+	}{
+		{name: "multi-process", opts: sweepPeerOpts},
+		{name: "in-process", opts: Options{PageSize: 4096, Checksum: true, DisableAutoCheckpoint: true, InProcess: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, n := sweepCountDB(t, tc.opts)
+			// Everything in the database file; the WAL's commit is still
+			// the snapshot's.
+			require.NoError(t, db.Checkpoint(CheckpointFull))
+			ctx := context.Background()
+			res, err := db.VerifyIntegrity(ctx)
+			require.NoError(t, err)
+			require.Equal(t, int(n), res.Pages)
+			require.Empty(t, res.Errors)
+
+			// One bit of the count, and a byte of a page past the new count.
+			small := n &^ 128
+			require.Less(t, small, n)
+			sweepPatchFile(t, db, 28, binary.BigEndian.AppendUint32(nil, small))
+			damaged := small + 10
+			off := int64(damaged-1)*int64(tc.opts.PageSize) + 500
+			sweepPatchFile(t, db, off, []byte{0xA5, 0x5A, 0xA5, 0x5A})
+
+			res, err = db.VerifyIntegrity(ctx)
+			require.NoError(t, err)
+			require.Equal(t, int(n), res.Pages, "the sweep covers the pages the WAL's commit recorded")
+			require.Len(t, res.Errors, 2)
+			require.Equal(t, uint32(1), res.Errors[0].PageNo)
+			require.Equal(t, IntegrityKindUnknown, res.Errors[0].Kind)
+			require.ErrorIs(t, res.Errors[0].Inner, ErrHeaderCorrupt)
+			require.Equal(t, damaged, res.Errors[1].PageNo)
+			require.Equal(t, IntegrityChecksumMismatch, res.Errors[1].Kind)
+		})
+	}
+}
+
+// TestVerifyIntegritySweepLogicalSizeBelowFile: with no commit in the WAL
+// the pager's count is the file's length, and a file may be longer than the
+// database (lockBtree, btree.c:3294-3298). The sweep covers the pages page 1
+// counts, as sqlite_dbpage and the integrity check do; the pages past them
+// are no part of the database. A page count damaged downwards is not told
+// apart from this, here or in SQLite.
+func TestVerifyIntegritySweepLogicalSizeBelowFile(t *testing.T) {
+	path := t.TempDir() + "/test.db"
+	db, err := testOpen(t, path, sweepPeerOpts)
+	require.NoError(t, err)
+	dmsPutRange(t, db, "t1", 0, 2000)
+	n := db.pager.dbSize.Load()
+	require.NoError(t, db.Checkpoint(CheckpointTruncate))
+	require.NoError(t, db.Close())
+
+	// Three pages past the database's end, with no valid tag.
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	require.NoError(t, err)
+	_, err = file.Write(bytes.Repeat([]byte{0xEE}, 3*int(sweepPeerOpts.PageSize)))
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	db, err = testOpen(t, path, sweepPeerOpts)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	bound := db.pager.readerDbSizeBound(rtx.cache)
+	require.NoError(t, rtx.Rollback())
+	require.Equal(t, n+3, bound, "setup: the pager's count is the file's length")
+
+	res, err := db.VerifyIntegrity(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int(n), res.Pages)
+	require.Empty(t, res.Errors)
 }

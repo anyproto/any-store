@@ -1725,6 +1725,35 @@ func (p *pager) readRawPage(pgno, walMaxFrame uint32, cache *pcache) ([]byte, er
 	return nil, fmt.Errorf("btree: readRawPage: no backing storage for page %d", pgno)
 }
 
+// readRawPage1Header is readRawPage for page 1's header alone: the first
+// len(buf) bytes of page 1 (dbHeaderSize of them are outside the codec),
+// from its newest WAL frame in the reader's window, else from the database
+// file. For a page 1 that cannot be read whole.
+func (p *pager) readRawPage1Header(walMaxFrame uint32, cache *pcache, buf []byte) error {
+	if walMaxFrame > 0 && p.wal != nil {
+		frame, err := p.wal.index.get(1, walMaxFrame, p.readerMinFrame(cache))
+		if err != nil {
+			return err
+		}
+		if frame > 0 {
+			if err := p.readWalFrameData(frame, buf); err != nil {
+				return fmt.Errorf("btree: readRawPage1Header (WAL frame %d): %w", frame, err)
+			}
+			return nil
+		}
+	}
+	if p.file != nil {
+		if _, err := p.file.ReadAt(buf, 0); err != nil {
+			return fmt.Errorf("btree: readRawPage1Header: %w", err)
+		}
+		return nil
+	}
+	if p.master != nil && p.master.readPageInto(1, buf) {
+		return nil
+	}
+	return errors.New("btree: readRawPage1Header: no backing storage for page 1")
+}
+
 // END ENCRYPTION
 
 // writeStateErr returns the error for a write operation attempted while the
