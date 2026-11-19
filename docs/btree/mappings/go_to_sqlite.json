@@ -1249,6 +1249,13 @@
     "sqlite": [],
     "note": ""
   },
+  "integrity_sweep.go:*DB.sweepPageCount": {
+    "sqlite": [
+      "btree.c:lockBtree",
+      "pager.c:sqlite3PagerPagecount"
+    ],
+    "note": "the page count the codec sweep covers: lockBtree's rule on the raw page-1 header, cross-checked against the size a WAL commit recorded"
+  },
   "integrity_sweep.go:verifyAEADPage": {
     "sqlite": [],
     "note": ""
@@ -1910,6 +1917,10 @@
   "pager.go:*pager.readRawPage": {
     "sqlite": [],
     "note": ""
+  },
+  "pager.go:*pager.readRawPage1Header": {
+    "sqlite": [],
+    "note": "page 1's header alone, for a page 1 the codec sweep cannot read whole"
   },
   "pager.go:*pager.readTempPage": {
     "sqlite": [
