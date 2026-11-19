@@ -15,8 +15,15 @@ import (
 
 // Codec is the pluggable page-encryption interface. When a non-nil Codec is
 // installed on the pager, every file/WAL I/O site routes through it.
-// Implementations must be safe for concurrent use: the pager shares one Codec
-// across the writer and all readers.
+// Implementations must be safe for concurrent use, Encrypt included: the
+// pager shares one Codec across the writer and all readers, and one Codec
+// object can serve several databases at once (Options.Codec is installed
+// as given, so two databases opened with it, or a database and its Backup
+// destination, which opens with the source's Options, encrypt through it
+// from their own writers at the same time). A codec therefore keeps no
+// per-call mutable state of its own: whatever an Encrypt or Decrypt call
+// needs to write, the nonce source included, lives in the caller's
+// aeadScratch.
 //
 // Overhead() bytes are reserved at the end of every page for the codec's
 // per-page metadata (IV/nonce, authentication tag, padding). The btree cell
@@ -36,8 +43,9 @@ type Codec interface {
 	// in dst, returning a slice of dst with the same length as src.
 	// The last Overhead() bytes of dst contain the nonce+tag+padding.
 	// pgno is bound into the authentication tag as associated data.
-	// s is a caller-owned scratch holding the nonce/AAD buffers; it must
-	// not be nil. See aeadScratch for concurrency rules.
+	// s is a caller-owned scratch holding the nonce/AAD buffers and the
+	// nonce pool the nonce is drawn from; it must not be nil. See
+	// aeadScratch for concurrency rules.
 	Encrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error)
 
 	// Decrypt is the inverse of Encrypt. On tag verification failure it
@@ -53,13 +61,49 @@ type Codec interface {
 // cipher: XChaCha20-Poly1305 uses a 24-byte nonce; AAD is always 4 bytes
 // but the field is padded to 16 for alignment / future use.
 //
-// Not safe for concurrent use: each caller (single-writer or per-reader-tx
-// pcache) owns one instance. Modeled after SQLCipher's reuse of
-// codec_ctx->iv and the EVP_CIPHER_CTX scratch.
+// It also owns the nonce source, the noncePool Encrypt draws random nonces
+// from. The pool cannot live in the codec: one codec object can be shared
+// by several databases, each encrypting from its own writer (see Codec),
+// and an unlocked pool drawn from by two of them hands out the same nonce
+// twice under one key. Here it follows the rule the buffers above follow:
+// one owner, one goroutine at a time. SQLCipher keeps no shared nonce state
+// either: every connection builds its own codec_ctx from the key
+// (sqlcipher_codec_ctx_init), and sqlcipher_page_cipher writes reserve_sz
+// fresh random bytes into each page it encrypts, straight from the
+// provider's random function (for OpenSSL the process-wide RAND_bytes,
+// which SQLCipher calls under its own global SQLCIPHER_MUTEX_PROVIDER_RAND).
+// The pool here is an unlocked batch in front of crypto/rand, so it takes
+// its caller's ownership instead of a lock. It is allocated on the first
+// Encrypt, so a scratch that only ever decrypts (every reader's) never
+// carries one.
+//
+// Not safe for concurrent use: each caller (the pager's writer side, the
+// WAL's frame writer, each per-reader-tx pcache) owns one instance, the way
+// each SQLCipher connection owns its codec_ctx and the page buffer in it.
+// Must not be copied: a copy made after the first Encrypt would share the
+// pool with the original (go vet's copylocks check reports copies).
 type aeadScratch struct {
-	aad   [16]byte
-	nonce [24]byte
+	_      noCopy
+	aad    [16]byte
+	nonce  [24]byte
+	nonces *noncePool // nil until the first drawNonce
 }
+
+// drawNonce fills out with fresh random bytes from s's own nonce pool,
+// allocating the pool on the first call.
+func (s *aeadScratch) drawNonce(out []byte) error {
+	if s.nonces == nil {
+		s.nonces = newNoncePool()
+	}
+	return s.nonces.Draw(out)
+}
+
+// noCopy makes go vet's copylocks check report copies of a struct that
+// holds it, as sync.noCopy does in the standard library. It has no state.
+type noCopy struct{}
+
+func (*noCopy) Lock()   {}
+func (*noCopy) Unlock() {}
 
 // ErrPageIntegrity is the umbrella sentinel returned (wrapped) by every
 // codec when a page fails its on-disk integrity check. Both modes report
@@ -194,11 +238,10 @@ const noncePoolSize = 4096
 
 // noncePool batches crypto/rand.Read syscalls behind a userspace buffer.
 //
-// NOT safe for concurrent use. any-store's Codec is only invoked for
-// nonce-drawing Encrypt calls by the writer goroutine (write-lock-serialized
-// at the DB level); readers never call Encrypt. If a future refactor
-// lets multiple goroutines share a codec for encryption, wrap Draw in
-// external synchronization or add a lock here.
+// NOT safe for concurrent use, and it takes no lock: each pool belongs to
+// one aeadScratch, whose owner encrypts from one goroutine at a time (the
+// pager's and the WAL's under the database's write lock). A pool must never
+// be reachable from a codec, which is shared (see aeadScratch).
 type noncePool struct {
 	buf [noncePoolSize]byte
 	off int // position to read from; starts == len(buf) so first call triggers a refill

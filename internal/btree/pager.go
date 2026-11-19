@@ -353,9 +353,11 @@ type pager struct {
 	// because multiple read transactions may run concurrently.
 	// Modeled after SQLCipher's codec_ctx->buffer (crypto_impl.c).
 	codecScratch []byte
-	// codecAEAD holds the nonce/AAD scratch for writer-side codec calls.
-	// Heap-allocated as part of the pager struct; passed by pointer so
-	// the crypto/cipher.AEAD interface calls don't force per-call escape.
+	// codecAEAD holds the nonce/AAD scratch for writer-side codec calls,
+	// and the nonce pool initNewDB's page-1 encrypt draws from: this
+	// pager's own, never shared with another database that has the same
+	// codec. Heap-allocated as part of the pager struct; passed by pointer
+	// so the crypto/cipher.AEAD interface calls don't force per-call escape.
 	codecAEAD aeadScratch
 	// END ENCRYPTION
 }

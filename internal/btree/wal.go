@@ -1647,9 +1647,11 @@ type wal struct {
 	// ciphertext. Allocated lazily on first use. Writes are
 	// single-writer-serialized, so one buffer is safe.
 	codecScratch []byte
-	// codecAEAD is the nonce/AAD scratch for writeFrame's codec call.
-	// Embedded by value so nonce/aad slices live on the wal's heap
-	// allocation rather than escaping per-call.
+	// codecAEAD is the nonce/AAD scratch for writeFrame's codec call, and
+	// the nonce pool its encrypts draw from: this WAL's own, never shared
+	// with another database that has the same codec. Embedded by value so
+	// nonce/aad slices live on the wal's heap allocation rather than
+	// escaping per-call.
 	codecAEAD aeadScratch
 	// END ENCRYPTION
 }
