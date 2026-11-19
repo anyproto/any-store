@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"os"
 	"os/exec"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -114,5 +115,55 @@ func TestCloseNotLastClient_LeavesWAL(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 	restartCheck(t, db2, 0, 60, 1)
+	require.NoError(t, db2.IntegrityCheck())
+}
+
+// A close that is not the last does not wait for another process's write
+// transaction: sqlite3WalClose takes nothing before the exclusive lock on the
+// database file (wal.c:2522-2523), and without that lock it neither
+// checkpoints nor truncates, so it never asks for the write lock and never
+// calls its busy handler.
+func TestCloseNotLastClient_PeerWriterNoBusyWait(t *testing.T) {
+	if closeOrderChild(t) {
+		return
+	}
+	db, path := openRestartDB(t, restartModes[0])
+	restartPut(t, db, 0, 60, 1)
+
+	peer := startCloseOrderPeer(t, "TestCloseNotLastClient_PeerWriterNoBusyWait", path, "commit-on-signal")
+	waited := false
+	defer func() {
+		if !waited {
+			_ = peer.Process.Kill()
+			_ = peer.Wait()
+		}
+	}()
+	closeOrderWaitFile(t, path+".holding")
+
+	var busyCalls atomic.Int32
+	db.pager.wal.busyHandler = func(int) bool {
+		busyCalls.Add(1)
+		return false
+	}
+	before, err := os.Stat(path + "-wal")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	require.Zero(t, busyCalls.Load(), "the close waited on the peer's write lock")
+	after, err := os.Stat(path + "-wal")
+	require.NoError(t, err)
+	require.Equal(t, before.Size(), after.Size(), "the WAL is the peer's too")
+
+	// The peer commits after the close and ends without one of its own.
+	require.NoError(t, os.WriteFile(path+".commit", nil, 0o644))
+	require.NoError(t, peer.Wait())
+	waited = true
+	_, err = os.Stat(path + ".committed")
+	require.NoError(t, err, "setup: the peer committed")
+
+	db2, err := testOpen(t, path, restartModes[0].opts)
+	require.NoError(t, err)
+	defer func() { _ = db2.Close() }()
+	restartCheck(t, db2, 0, 60, 1)
+	restartCheck(t, db2, 100, 110, 7)
 	require.NoError(t, db2.IntegrityCheck())
 }
