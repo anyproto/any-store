@@ -28,6 +28,14 @@ var (
 	// destination with Options.SchemaFormat set to the source's SchemaFormat.
 	ErrBackupFormatMismatch = errors.New("btree: backup source and destination must have the same schema format")
 
+	// ErrBackupCodecMismatch — the destination's pages are not laid out like
+	// the source's: another reserved space at the end of each page, or
+	// another kind of page codec (none, checksum, encryption). A handle's
+	// codec and usable size are fixed when it is opened, so a destination
+	// that exists as such a file cannot receive the source's pages. Create
+	// the destination with the source's BackupDestinationOptions.
+	ErrBackupCodecMismatch = errors.New("btree: backup source and destination must have the same reserved space and kind of page codec (plain, checksum or encrypted)")
+
 	// ErrBackupDstBusy — ~ checkReadTransaction (backup.c:124–130)
 	// ("destination database is in use"). Raised when dst already has an
 	// open read/write transaction at BackupInit time.
@@ -137,11 +145,50 @@ func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 		return nil, ErrBackupFormatMismatch
 	}
 
+	// SQLite's destination takes the reserved space, like every other
+	// header field, from the copied page 1: the next lockBtree reads byte
+	// 20 (btree.c:3384, 3417) and nothing else in the handle depends on it.
+	// Here the usable size and the codec that owns the reserved bytes are
+	// fixed at Open. A destination with fewer reserved bytes than the
+	// source's pages have would let its codec write a trailer over cell
+	// content; one with more would be read by the wrong layout after the
+	// header is reloaded. Refused before a page is written.
+	// DRIFT: the destination must already have the source's reserved space and kind of codec; SQLite's adopts them with page 1. See docs/btree/NOTES.md#drift-2026-11-19-2-a-backup-destination-has-the-geometry-of-the-source-file
+	if dst.pager.usableSize() != src.pager.usableSize() || dst.IntegrityMode() != src.IntegrityMode() {
+		return nil, ErrBackupCodecMismatch
+	}
+
 	return &Backup{
 		dst:   dst,
 		src:   src,
 		iNext: 1, // ~ backup.c:188
 	}, nil
+}
+
+// BackupDestinationOptions returns the Options to open the destination of a
+// backup of db with: the handle's own (its key or codec among them), with the
+// page geometry taken from the open file and not from what the handle asked
+// for. A file keeps the page size, the checksum mode and the schema format it
+// was created with whatever Options say (Open), so Options().Checksum is true
+// on a plain file opened with defaults, and a destination created from it
+// would stamp a checksum trailer over the last bytes of pages that reserve no
+// room for one. The destination is always a file.
+//
+// ~ setDestPgsz (backup.c:112-116), which gives the destination the source's
+// page size before it is first locked; VACUUM INTO passes the reserved bytes
+// along with it (vacuum.c:233, 281, sqlite3BtreeGetRequestedReserve). An
+// existing destination keeps its own geometry and BackupInit refuses it if
+// that differs.
+func (db *DB) BackupDestinationOptions() Options {
+	opts := db.opts
+	opts.InMemory = false
+	opts.PageSize = db.pager.pageSize
+	opts.Checksum = db.IntegrityMode() == IntegrityChecksum
+	// A file whose header never recorded a format is read as format 5.
+	if opts.SchemaFormat = db.SchemaFormat(); opts.SchemaFormat == 0 {
+		opts.SchemaFormat = 5
+	}
+	return opts
 }
 
 // onePage copies page iSrcPg from the source into the destination.
