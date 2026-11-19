@@ -96,14 +96,21 @@ func (db *DB) CksumCodec() *cksumCodec {
 // and the pager cache keeps it only while the snapshot is unchanged
 // (pager.c:3261-3264).
 //
-// The sweep reads every page raw, past the codec, and checks it itself: the
-// read begin reads only page 1's header, which is outside the codec. It
-// therefore changes nothing in how the handle's other transactions read.
-// Verification of the pages they read stays on while it runs
-// (cksumCodec.SetVerify is the handle's one switch, shared by the writer
-// and every reader).
+// The sweep reads every page raw, with its own read (readRawPage), and its
+// read begin reads only page 1's header, which is outside the codec. A
+// checksum page it hashes itself, never through the codec; an AEAD page it
+// hands to the codec's Decrypt, which is the only way to check the tag. It
+// changes nothing in how the handle's other transactions read: the
+// checksum codec's verify-on-read flag (cksumCodec.SetVerify, the handle's
+// one switch, shared by the writer and every reader) is left as it is
+// configured, on by default and off in a handle opened to read past damage.
 //
-// Returns IntegrityNone with zero pages scanned for plain DBs.
+// The codec's OnError hook fires once for each page whose tag fails: for a
+// checksum page the sweep fires it, for an AEAD page Decrypt does. A page
+// that could not be read fires nothing.
+//
+// Returns IntegrityNone with zero pages scanned for plain DBs and for
+// in-memory DBs, whose pages are stored without a codec.
 func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 	mode := db.IntegrityMode()
 	res := SweepResult{Mode: mode}
