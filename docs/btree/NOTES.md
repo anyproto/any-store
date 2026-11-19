@@ -2056,15 +2056,8 @@ a fresh destination DB at `path` with matching options.
 - No `nBackup` counter on source -- nothing for it to block (no
   VACUUM, immutable page size).
 
-**GAP -- KDF-salt poisoning when backing up an encrypted DB.** `onePage` copies page 1
-verbatim (patching only the DatabaseSize field at offset 28), so the destination inherits
-the **source's** 16-byte KDF salt (header bytes 72-87, `codec_kdf.go`). For raw-key codecs
-this is harmless, but a KDF-derived (passphrase) destination will, on reopen, re-derive its
-key from (dst passphrase, **src** salt) — the wrong key, leaving it permanently
-undecryptable. SQLCipher rejects the cross-codec case at `sqlite3_backup_init`
-(`backup.c:156-175`); any-store does not. Recorded in
-`docs/btree/mappings/sqlcipher_codec.json` (`backup.c:156-175`). Fix options: reject the
-cross-codec case at `BackupInit`, or refresh dst's salt on page 1 after copy.
+The KDF salt of an encrypted destination is its own, not the source's: see
+[drift-2026-11-19-1](#drift-2026-11-19-1-a-backup-destination-keeps-its-own-kdf-salt).
 
 ---
 
@@ -3392,6 +3385,21 @@ SQLite's `isFatalError` keeps exactly `SQLITE_BUSY` and `SQLITE_LOCKED` out of a
 
 `Restarts` has no C counterpart either: `sqlite3BackupRestart` only sets `iNext = 1` (`backup.c:701-707`). The count (restarts that threw copied pages away) changes nothing in the copy; the public `Backup` reads it to decide when to stop stepping in batches. The rollback rule that causes the restarts is SQLite's and is unchanged (`pagerUndoCallback`, `pagerRollbackWal`, `pager.c:3112-3168`). Regression tests: `TestBackupPublic_FinishesUnderRollbacks` (root package), `TestBackup_RestartsCounted`, `TestBackup_LongStepEndsWithItsCtx`.
 
+<a id="drift-2026-11-19-1-a-backup-destination-keeps-its-own-kdf-salt"></a>
+### Drift: A Backup Destination Keeps Its Own KDF Salt
+- **Category:** added-logic  -  **Severity:** none (was critical: until 2026-11-19 the source's salt was copied and the backup of a passphrase database could not be opened)
+- **Affected functions:** `backup.go:*Backup.onePage`, `backup.go:*Backup.Step`, `backup.go:*Backup.finalize`.
+
+`backupOnePage` copies a page whole (`memcpy(zOut, zIn, nCopy)`, `backup.c:269`) and patches one field of page 1, the page count (`backup.c:271-273`). SQLite's header has no field that belongs to the file rather than to the database in it.
+
+any-store's has one: the KDF salt at header bytes 72-87 (`dbHeader.Salt`), which is also the marker of an encrypted file. `Open` keys the destination's codec with it (`buildCodec`: PBKDF2 of the passphrase and the salt, unless the key is 32 raw bytes or the codec is the caller's), drawn at random for a new file and read from the header of an existing one, and that codec seals every page the backup writes. Until 2026-11-19 the copy of page 1 carried the source's salt into the destination's header (`finalize` reloads the in-memory header from the copied bytes, and the commit writes it back): the next open derived the key from the passphrase and the source's salt and failed AEAD authentication on page 1. Every backup of a database opened with a passphrase was lost that way, and a backup written over an older, readable one destroyed it. A raw 32-byte key and a caller's codec do not use the salt, so those backups opened. A backup of an in-memory encrypted database, whose header has a zero salt, made a file whose header says it is not encrypted.
+
+`onePage` now writes the destination's salt (read when the first `Step` locks the destination) over bytes 72-87 of every copy of page 1: the first, an update and a restart alike. `finalize` then reloads that salt with the rest of the header. This is SQLCipher's rule, reached by its own route: its codec writes the writing context's `kdf_salt` over the first 16 bytes of page 1 each time it encrypts that page (`sqlcipher.c:3303-3312`, SQLCipher v4.14.0), whatever the page image holds, so a destination there cannot end up with the source's salt.
+
+Why not the other way round (create the destination with the source's salt, so the two files share a key): an existing destination has a salt already and would have to be re-keyed under an open handle and a live WAL; and one key would then seal two files' worth of pages with random nonces, where the nonce collision bound is per key. With a salt of its own a passphrase destination has a key of its own. A raw 32-byte key or a caller's codec is the same key in both files, as before; the built-in codecs draw random nonces, so that is a matter of how many pages one key seals and not of a repeated counter.
+
+Regression tests: `backup_codec_test.go` (`TestBackup_DestinationKeepsItsSalt`, `TestBackup_InMemorySourceIntoEncryptedFile`), root `backup_roundtrip_test.go`.
+
 <a id="drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer"></a>
 ### Drift: pagerStress Spills Only For The Live Writer
 - **Category:** added-logic  -  **Severity:** low
@@ -4162,7 +4170,7 @@ Balance-shallower copies the only child back into a root with no cells when `pPa
 - **Category:** changed-logic  -  **Severity:** none
 - **Affected functions:** `backup.go:*Backup.finalize`.
 
-`sqlite3_backup` copies page 1 like any other page and then patches fields in the destination's page image (the schema cookie through `sqlite3BtreeUpdateMeta`, the version bytes through `sqlite3BtreeSetVersion`; `backup.c:420-431`); there is no header kept apart from the page. any-store's pager keeps a parsed `dbHeader` and writes it over page 1 at every commit, so `finalize` deserialises the copied page 1 into the destination's header, bumps the schema cookie there, and lets the commit serialise it back. The header that reaches disk is the source's, field for field, except for the cookie and the page count; a field `dbHeader` does not model would not survive, and there is none today. The magic family and schema format are the source's as well, which is why the destination must already have them (see [the backup format entry](#drift-2026-11-11-8-backup-refuses-a-destination-of-another-schema-format)).
+`sqlite3_backup` copies page 1 like any other page and then patches fields in the destination's page image (the schema cookie through `sqlite3BtreeUpdateMeta`, the version bytes through `sqlite3BtreeSetVersion`; `backup.c:420-431`); there is no header kept apart from the page. any-store's pager keeps a parsed `dbHeader` and writes it over page 1 at every commit, so `finalize` deserialises the copied page 1 into the destination's header, bumps the schema cookie there, and lets the commit serialise it back. The header that reaches disk is the source's, field for field, except for the cookie, the page count and the KDF salt, which stays the destination's ([drift-2026-11-19-1](#drift-2026-11-19-1-a-backup-destination-keeps-its-own-kdf-salt)); a field `dbHeader` does not model would not survive, and there is none today. The magic family and schema format are the source's as well, which is why the destination must already have them (see [the backup format entry](#drift-2026-11-11-8-backup-refuses-a-destination-of-another-schema-format)).
 
 <a id="drift-2026-11-11-1-attached-wal-index-recovery"></a>
 ### Drift: Recovery Of A Torn wal-index Header With Peers Attached Runs On The Process-Shared `*wal`
