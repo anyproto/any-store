@@ -794,7 +794,15 @@ func Open(path string, opts Options) (*DB, error) {
 // neither blocks.
 //
 // A registered write transaction is not waited for: Close rolls it back and
-// releases its locks (see the force-rollback entry in docs/btree/NOTES.md).
+// releases its locks. What Close does wait for is the one call of that
+// transaction that is in flight (writerGate): a Put, a cursor move. That
+// call completes; every later call of the transaction returns ErrClosed and
+// touches nothing, its Commit returns ErrClosed and its Rollback nil. Close
+// must therefore not be called from inside a call of the write transaction
+// on that call's goroutine, which only a hook the call runs can do
+// (Options.OnIntegrityError): it would wait for itself. Between two calls
+// of its transaction the writer's goroutine may call Close.
+// See docs/btree/NOTES.md#drift-2026-11-19-1-close-waits-for-the-writers-call-in-flight.
 //
 // A second Close returns ErrClosed.
 func (db *DB) Close() error {
@@ -816,11 +824,17 @@ func (db *DB) Close() error {
 			testCloseWriterCheckedHook(registered)
 		}
 		if registered {
-			// Force-rollback the abandoned/in-flight tx.
+			// The transaction's goroutine may be inside a b-tree operation,
+			// which holds no lock: wait for that one call to return, and
+			// refuse every later call of the transaction, before anything
+			// it uses is taken from under it (writerGate). A Commit or a
+			// Rollback is not such a call; writerOpMu below waits for it.
+			db.pager.wgate.close()
+			// Force-rollback the abandoned tx.
 			// writerOpMu serializes with commit/rollback so we don't interleave
 			// with a concurrent Commit or Rollback call.
-			// Use rollbackForClose which skips writerCache operations to avoid
-			// racing with the writer's B-tree ops (pcache has no mutex).
+			// rollbackForClose leaves the writer cache alone; pager.close
+			// frees it.
 			db.pager.writerOpMu.Lock()
 			if pagerState(db.pager.state.Load()) == pagerWriter {
 				db.pager.rollbackForClose()
@@ -1374,6 +1388,10 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := db.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer db.pager.wgate.leave()
 
 	// Check if namespace already exists using proper tree traversal
 	// (page 1 may be an interior node after splits).
@@ -1417,6 +1435,10 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := db.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer db.pager.wgate.leave()
 
 	// Look up the namespace's root page using proper tree traversal
 	// (page 1 may be an interior node after splits).
@@ -1461,6 +1483,10 @@ func (db *DB) RenameNamespace(tx *WriteTx, oldName, newName string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := db.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer db.pager.wgate.leave()
 
 	// Resolve the old namespace via the writer path (sees dirty pages from
 	// the current write tx; page 1 may be an interior node after splits).
@@ -1869,6 +1895,12 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 	if tx.closed {
 		return buf, ErrTxClosed
 	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return buf, err
+		}
+		defer tx.pager.wgate.leave()
+	}
 	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
 		return buf, err
@@ -1974,6 +2006,12 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 	if tx.closed {
 		return false, ErrTxClosed
 	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return false, err
+		}
+		defer tx.pager.wgate.leave()
+	}
 	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
 		return false, err
@@ -2021,6 +2059,12 @@ func (tx *ReadTx) SeekKey(ns *Namespace, prefix []byte) ([]byte, error) {
 func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byte, error) {
 	if tx.closed {
 		return buf, ErrTxClosed
+	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return buf, err
+		}
+		defer tx.pager.wgate.leave()
 	}
 	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
@@ -2229,6 +2273,12 @@ func (tx *ReadTx) CountContext(ctx context.Context, ns *Namespace) (int, error) 
 	if tx.closed {
 		return 0, ErrTxClosed
 	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return 0, err
+		}
+		defer tx.pager.wgate.leave()
+	}
 	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
 	return bt.CountContext(ctx)
 }
@@ -2280,6 +2330,12 @@ func (tx *ReadTx) DatabaseSize() (uint32, error) {
 func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
+	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return nil, err
+		}
+		defer tx.pager.wgate.leave()
 	}
 	if tx.writable {
 		return tx.db.getNamespaceLocked(name)
@@ -2415,6 +2471,10 @@ func (tx *WriteTx) GetNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return nil, err
+	}
+	defer tx.pager.wgate.leave()
 	return tx.db.getNamespaceLocked(name)
 }
 
@@ -2441,6 +2501,10 @@ func (tx *WriteTx) MarkSchemaChanged() {
 // A commit without changes is empty: FileChangeCount and SchemaCookie stay
 // as they are whatever MarkDataChanged and MarkSchemaChanged said.
 func (tx *WriteTx) HasChanges() bool {
+	if tx.pager.wgate.enter() != nil {
+		return false // ended by DB.Close: rolled back
+	}
+	defer tx.pager.wgate.leave()
 	return tx.pager.hasChanges()
 }
 
@@ -2449,6 +2513,10 @@ func (tx *WriteTx) Put(ns *Namespace, key, value []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	return bt.Put(key, value)
 }
@@ -2458,6 +2526,10 @@ func (tx *WriteTx) Delete(ns *Namespace, key []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	return bt.Delete(key)
 }
@@ -2603,6 +2675,10 @@ func (tx *WriteTx) Savepoint() (int, error) {
 	if tx.closed {
 		return 0, ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return 0, err
+	}
+	defer tx.pager.wgate.leave()
 	return tx.pager.savepoint()
 }
 
@@ -2617,6 +2693,10 @@ func (tx *WriteTx) RollbackToSavepoint(id int) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	if _, err := tx.pager.saveAllCursors(0); err != nil {
 		return err
 	}
@@ -2628,6 +2708,10 @@ func (tx *WriteTx) ReleaseSavepoint(id int) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	return tx.pager.releaseSavepoint(id)
 }
 
@@ -2636,6 +2720,10 @@ func (tx *WriteTx) CreateNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return nil, err
+	}
+	defer tx.pager.wgate.leave()
 	if err := tx.db.CreateNamespace(tx, name); err != nil {
 		return nil, err
 	}
@@ -2647,6 +2735,10 @@ func (tx *WriteTx) DeleteNamespace(name string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	return tx.db.DeleteNamespace(tx, name)
 }
 
@@ -2657,5 +2749,9 @@ func (tx *WriteTx) RenameNamespace(oldName, newName string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	return tx.db.RenameNamespace(tx, oldName, newName)
 }

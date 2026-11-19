@@ -2,6 +2,7 @@ package test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -947,4 +948,174 @@ func TestWriteTx_SavepointRefusedInModifier(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 3, cnt)
 	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// Close during a running write: Close rolls back the write transaction it
+// finds, also one whose goroutine is in the middle of an operation. That
+// goroutine must come out with ErrDBIsClosed — not with a panic on a page
+// buffer Close took from under it, and not with a corruption error for a
+// healthy file — and a second database in the process must be untouched.
+func TestDb_CloseDuringWrite(t *testing.T) {
+	big := func(i, n int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":"k-%07d","pad":"%s"}`, i,
+			strings.Repeat(fmt.Sprintf("%016x", uint64(i)*0x9E3779B97F4A7C15), n/16+1)[:n]))
+	}
+	for _, mode := range []struct {
+		name     string
+		inMemory bool
+		iters    int
+	}{
+		// An in-memory database closes without a checkpoint, so the teardown
+		// follows the rescue at once: the mode that panicked most.
+		{"in-memory", true, 300},
+		{"file", false, 60},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			if testing.Short() {
+				mode.iters /= 10
+			}
+			dir := t.TempDir()
+			// B: a second open database, written while A is closed under load.
+			bdb, err := anystore.Open(ctx, filepath.Join(dir, "b.db"), nil)
+			require.NoError(t, err)
+			defer func() { _ = bdb.Close() }()
+			bcoll, err := bdb.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			var (
+				mu       sync.Mutex
+				outcomes = map[string]int{}
+				bWant    = map[string]string{}
+				bNext    int
+			)
+			note := func(k string) { mu.Lock(); outcomes[k]++; mu.Unlock() }
+
+			for it := 0; it < mode.iters; it++ {
+				adb, err := anystore.Open(ctx, filepath.Join(dir, fmt.Sprintf("a%d.db", it)), &anystore.Config{InMemory: mode.inMemory})
+				require.NoError(t, err)
+				acoll, err := adb.CreateCollection(ctx, "c")
+				require.NoError(t, err)
+				var wg sync.WaitGroup
+				stop := make(chan struct{})
+				for g := 0; g < 2; g++ {
+					wg.Add(1)
+					go func(g int) {
+						defer wg.Done()
+						defer func() {
+							if r := recover(); r != nil {
+								note(fmt.Sprintf("PANIC: %.120v", r))
+							}
+						}()
+						for k := 0; ; k++ {
+							docs := make([]*anyenc.Value, 50)
+							for j := range docs {
+								docs[j] = big(g*10_000_000+k*50+j, 1500)
+							}
+							if err := acoll.Insert(ctx, docs...); err != nil {
+								if errors.Is(err, anystore.ErrDBIsClosed) {
+									note("ErrDBIsClosed")
+								} else {
+									note(fmt.Sprintf("other error: %.120v", err))
+								}
+								return
+							}
+						}
+					}(g)
+				}
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for {
+						select {
+						case <-stop:
+							return
+						default:
+						}
+						mu.Lock()
+						i := bNext
+						bNext++
+						mu.Unlock()
+						d := big(i, 1200)
+						if err := bcoll.Insert(ctx, d); err != nil {
+							note(fmt.Sprintf("B insert: %.120v", err))
+							return
+						}
+						mu.Lock()
+						bWant[fmt.Sprintf("k-%07d", i)] = d.String()
+						mu.Unlock()
+					}
+				}()
+				time.Sleep(time.Duration(1+it%8) * time.Millisecond)
+				require.NoError(t, adb.Close())
+				close(stop)
+				wg.Wait()
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			for k, n := range outcomes {
+				if k != "ErrDBIsClosed" {
+					t.Errorf("%d x writer outcome: %s", n, k)
+				}
+			}
+			require.Equal(t, 2*mode.iters, outcomes["ErrDBIsClosed"], "every writer ends with ErrDBIsClosed")
+
+			require.NoError(t, bdb.IntegrityCheck(ctx))
+			for id, want := range bWant {
+				d, err := bcoll.FindId(ctx, id)
+				require.NoError(t, err, id)
+				require.Equal(t, want, d.Value().String(), id)
+			}
+		})
+	}
+}
+
+// closeModifier closes the database from inside a write: user code that an
+// operation runs between two steps of its storage work.
+type closeModifier struct {
+	db     anystore.DB
+	closed error
+}
+
+func (m *closeModifier) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+	m.closed = m.db.Close()
+	v.Set("touched", a.NewNumberInt(1))
+	return v, true, nil
+}
+
+// Close called by the write transaction's own goroutine, from a
+// query.Modifier in the middle of an update, returns: it waits for the
+// transaction's storage call in flight, and a modifier runs between two of
+// them. The update it interrupted fails with ErrDBIsClosed and writes nothing.
+func TestDb_CloseFromModifier(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.db")
+	db, err := anystore.Open(ctx, path, nil)
+	require.NoError(t, err)
+	coll, err := db.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	for i := 0; i < 10; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i))))
+	}
+
+	mod := &closeModifier{db: db}
+	done := make(chan error, 1)
+	go func() {
+		_, err := coll.Find(nil).Update(ctx, mod)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, mod.closed)
+		require.ErrorIs(t, err, anystore.ErrDBIsClosed)
+	case <-time.After(20 * time.Second):
+		t.Fatal("Close called from a modifier did not return")
+	}
+
+	db, err = anystore.Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	coll, err = db.Collection(ctx, "c")
+	require.NoError(t, err)
+	assertQueryCount(t, coll.Find(`{"touched":1}`), 0)
+	assertQueryCount(t, coll.Find(nil), 10)
 }

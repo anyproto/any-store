@@ -120,9 +120,12 @@ type DB interface {
 	//
 	// Close does not wait for a write transaction. One that is open, or in
 	// the middle of an operation on another goroutine, is rolled back: what
-	// it wrote is discarded, the operation and every later one on it fail
-	// with ErrDBIsClosed, its Commit fails with ErrDBIsClosed and its
-	// Rollback returns nil.
+	// it wrote is discarded, an operation that was running ends with
+	// ErrDBIsClosed unless it was already past its last step, every later
+	// one fails with ErrDBIsClosed, its Commit fails with ErrDBIsClosed and
+	// its Rollback returns nil. Close waits only for the step of storage
+	// work that operation is in, which is short; it must not be called from
+	// Config.OnIntegrityError, which runs inside such a step.
 	//
 	// A second Close returns ErrDBIsClosed.
 	Close() error

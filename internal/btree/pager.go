@@ -82,7 +82,11 @@ type pager struct {
 	// that DB.Close can safely force-rollback an abandoned transaction
 	// without racing with a concurrent commit. Per-connection pcache has
 	// no mutex, so this pager-level lock is the serialization point.
-	writerOpMu  sync.Mutex
+	writerOpMu sync.Mutex
+	// wgate counts the write transaction's calls in flight, so that DB.Close
+	// can wait for the one running before it ends the transaction and tears
+	// the pager down. See writerGate.
+	wgate       writerGate
 	master      *masterStore // InMemory "disk" — holds checkpointed page data
 	header      dbHeader
 	pageSize    uint32
@@ -404,6 +408,7 @@ func newPager(path string, pageSize uint32, cacheSize int, purgeable bool) *page
 		keyScratch:       scratchPool[[]byte]{clearOnPut: true},
 	}
 	p.writerCache.xStress = p.pagerStress
+	p.wgate = newWriterGate()
 	return p
 }
 
@@ -3094,10 +3099,12 @@ func (p *pager) rollbackLocked() error {
 
 // rollbackForClose is a variant of rollbackLocked for use by DB.Close().
 // It only performs WAL-level rollback and lock release — all writer-owned
-// state (hasContent, header, savepoints, WAL checksums)
-// is deliberately left untouched because the writer goroutine may still be
-// in a B-tree operation accessing those structures, and pcache has no mutex.
-// Since the database is closing, that state will be GC'd.
+// state (the cache, hasContent, header, savepoints, WAL checksums) is left
+// untouched. DB.Close calls it with the writer gate closed and no call of
+// the transaction in flight (writerGate), so nothing reads that state
+// concurrently any more; it is left alone all the same, because the
+// database is closing and pager.close disposes of it, and because the tests
+// of the spill guard run this from inside an operation.
 // Caller must hold writerOpMu; it takes the WAL mutex inside it, the order
 // a commit's writeFrames takes them in.
 // DRIFT: ends the write transaction under the WAL mutex and marks the WAL (writeEndedByClose) for a writer still running; C cannot close under a statement See docs/btree/NOTES.md#drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer
@@ -4036,7 +4043,17 @@ func (p *pager) close() error {
 		_ = p.wal.close(isLastClient)
 	}
 
-	p.writerCache.destroy()
+	// A write transaction that DB.Close ended under its goroutine makes no
+	// further call into the pager (writerGate), but that goroutine can still
+	// hold a key or a value an earlier call returned, and those are slices
+	// of the cache's pages. Returned to the process-wide pool, the pages
+	// would be another database's while it reads them; left alone, they go
+	// with the pager when the last reference does. Slab pages go back
+	// regardless: the slab is the process's fixed budget, and a slot that is
+	// not returned is lost to it.
+	if !p.wgate.closed() || p.useSlab {
+		p.writerCache.destroy()
+	}
 
 	// Tear down the mmap reader before closing the file so the fd
 	// remains valid during munmap. Matches SQLite's unixUnmapfile

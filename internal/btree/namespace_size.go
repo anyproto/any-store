@@ -24,6 +24,12 @@ func (tx *ReadTx) NamespaceSize(ns *Namespace) (NamespaceSize, error) {
 	if tx.closed {
 		return NamespaceSize{}, ErrTxClosed
 	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return NamespaceSize{}, err
+		}
+		defer tx.pager.wgate.leave()
+	}
 	bt := &btree{
 		pager:       tx.pager,
 		cache:       tx.cache,
