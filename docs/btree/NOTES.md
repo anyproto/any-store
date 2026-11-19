@@ -3077,18 +3077,25 @@ write nor reconstructs it on read; the field carries no usable page-size informa
 SQLite's per-read `szPage` decode (low impact because Go derives page size elsewhere).
 
 <a id="drift-92-shmhashget-skips-segment-on-map-io-error"></a>
-### Drift: shmHashGet Skips Segment On Map IO Error
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `wal.go:*walIndex.shmHashGet` (`internal/btree/wal.go:1152`; the skip-on-error path is `wal.go:1171-1174`).
+### **Resolved (2026-11-19)** — Drift: shmHashGet Skips Segment On Map IO Error
+- **Category:** changed-logic  -  **Severity:** was recorded low; the effect was a silent stale read
+- **Affected functions:** `wal.go:*walIndex.shmHashGet`.
 
-C's `walFindFrame` (`wal.c:3505`) aborts the entire frame lookup on any hash-segment map failure:
-`rc = walHashGet(pWal, iHash, &sLoc); if(rc!=SQLITE_OK){ return rc; }` (`wal.c:3562-3565`), so an SHM
-map/extend IO error (`walHashGet` -> `walIndexPage` -> `sqlite3OsShmMap`) propagates up to the reader. Go's
-`shmHashGet` instead does `region, err := wi.shm.region(seg, true); if err != nil { continue }`
-(`wal.go:1171-1174`), silently skipping that hash segment and continuing the scan. The consequence is that a
-genuine SHM mapping/IO error is swallowed rather than reported: the lookup proceeds over the remaining
-segments and may return a stale or missing-frame result where SQLite would have failed the read with the
-underlying error.
+C's `walFindFrame` aborts the entire frame lookup on any hash-segment map failure:
+`rc = walHashGet(pWal, iHash, &sLoc); if( rc!=SQLITE_OK ) return rc;` (`wal.c:3562-3565`), so an SHM
+map/extend error (`walHashGet` -> `walIndexPage` -> `sqlite3OsShmMap`) reaches the reader:
+`readDbPage` returns it (`pager.c:3032-3033`) and `getPageNormal` drops the page and fails the get
+(`pager_acquire_err`, `pager.c:5629`). Go's `shmHashGet` did `if err != nil { continue }`: it skipped
+the segment and went on to the older ones, so the lookup answered with an older frame or with "not in
+the WAL", and the caller read the page from before a commit: a reader returned the old value with no
+error, and a writer that changed such a page committed the earlier commit away. `shmHashGet` now
+returns the mapping error (wrapped, `errors.Is` still matches it). Every caller already failed its
+read on a lookup error (the over-probed-chain `ErrCorrupt`, drift-93): `walIndex.get` → `getPageWriter`
+(the page is discarded from the writer cache, as `pager_acquire_err` drops it), `readTempPage`,
+`getPageReader`, `readRawPage`, `headerCountersAt`, the page 1 read of `open`; `getInTxRange` →
+`writeFrames`/`writeFramesMem`; `getLatest`. The in-process index looks pages up in `pageMap` and maps
+nothing. Tests: `TestWalIndexMapError_ReaderFails`, `_WriterFails`, `_LookupsFail`
+(`wal_index_map_error_test.go`).
 
 <a id="drift-93-wal-hash-probe-full-chain-corruption-signal-dropped"></a>
 ### **Resolved (stale, 2026-06-25)** — shmHashGet now bounds the per-segment probe and propagates full-chain corruption as ErrCorrupt, matching C's walFindFrame (write path shmHashWrite likewise returns ErrCorrupt); cited wal.go:1081 is stale. Drift: WAL Hash Probe Full Chain Corruption Signal Dropped
