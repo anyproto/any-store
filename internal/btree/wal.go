@@ -1370,8 +1370,8 @@ func (wi *walIndex) shmCleanupHash(mxFrame uint32, seg int, region []byte) error
 // caller legitimately read the page from the DB file; only an over-probed
 // non-empty chain is corruption — the read FAILS instead of silently
 // returning 0 and reading a pre-commit page from the DB file (a stale read
-// that would mask the corruption).
-// DRIFT: shmHashGet silently skips segment on SHM map/IO error vs C abort See docs/btree/NOTES.md#drift-92-shmhashget-skips-segment-on-map-io-error
+// that would mask the corruption). A segment that cannot be mapped fails the
+// lookup with the mapping error, for the same reason.
 func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) {
 	if maxFrame == 0 {
 		return 0, nil
@@ -1391,9 +1391,15 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 		// row-loss: hdr.mxFrame advertised frames in a segment we hadn't
 		// mapped, shmHashGet returned 0, and the read path fell through to
 		// the DB file which still held the pre-commit page.
+		//
+		// A segment that cannot be mapped fails the lookup, as walFindFrame
+		// returns walHashGet's error (wal.c:3562-3565 `rc = walHashGet(pWal,
+		// iHash, &sLoc); if( rc!=SQLITE_OK ) return rc;`). Going on to the
+		// older segments, or reporting the page as not in the WAL, would
+		// hand the caller the page from before a commit.
 		region, err := wi.shm.region(seg, true)
 		if err != nil {
-			continue
+			return 0, fmt.Errorf("btree: wal-index segment %d: %w", seg, err)
 		}
 
 		pgnoBase, nEntry, iZero := htSegmentInfo(seg)
