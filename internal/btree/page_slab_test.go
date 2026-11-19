@@ -412,3 +412,72 @@ func TestPageSlab_DoublePutAtFullListIsDropped(t *testing.T) {
 		t.Fatal("double Put placed a slab buffer in the pool")
 	}
 }
+
+// The slab serves only requests for its own slot size (pcache1Alloc's
+// per-request guard): any other size comes from the default allocator at the
+// requested size and leaves the slab untouched, and freeing it does not put
+// it on the slab's free list.
+func TestAllocPageBuffer_SlabServesOnlyItsOwnPageSize(t *testing.T) {
+	globalPageSlab.Reset()
+	globalPageSlab.Init(8192, 4)
+	defer globalPageSlab.Reset()
+	resetPageBufferPool()
+	defer resetPageBufferPool()
+
+	buf := allocPageBuffer(4096, true)
+	if len(buf) != 4096 {
+		t.Fatalf("a 4096 request with an 8192 slab got %d bytes", len(buf))
+	}
+	if globalPageSlab.within(buf) {
+		t.Fatal("a request the slab does not serve got a slab slot")
+	}
+	globalPageSlab.mu.Lock()
+	free, overflow := len(globalPageSlab.freeList), globalPageSlab.nOverflow
+	globalPageSlab.mu.Unlock()
+	if free != 4 || overflow != 0 {
+		t.Fatalf("slab touched by a request it does not serve: free=%d overflow=%d", free, overflow)
+	}
+	freePageBuffer(buf, true)
+	globalPageSlab.mu.Lock()
+	free = len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+	if free != 4 {
+		t.Fatalf("a foreign buffer reached the free list: free=%d", free)
+	}
+	if globalPageSlab.UnderPressure() {
+		t.Fatal("an unused slab reports pressure")
+	}
+
+	// The slab's own size is served from it.
+	own := allocPageBuffer(8192, true)
+	if len(own) != 8192 || !globalPageSlab.within(own) {
+		t.Fatalf("an 8192 request did not get a slab slot (len %d)", len(own))
+	}
+	freePageBuffer(own, true)
+}
+
+// A slab with no pages or no page size is initialized and empty, as
+// sqlite3PCacheBufferSetup's n==0 branch leaves it: nothing is allocated for
+// it, no request is served from it, and it never reports pressure.
+func TestPageSlab_InitWithoutPagesIsEmpty(t *testing.T) {
+	for _, args := range [][2]int{{4096, 0}, {4096, -1}, {0, 16}, {-4096, 16}, {0, 0}} {
+		var s pageSlab
+		s.Init(args[0], args[1]) // a negative size must not panic in make
+		if !s.initialized.Load() {
+			t.Fatalf("Init(%d, %d): not initialized", args[0], args[1])
+		}
+		if len(s.slab) != 0 || len(s.freeList) != 0 || s.nSlab != 0 {
+			t.Fatalf("Init(%d, %d): slab=%d free=%d nSlab=%d, want an empty slab",
+				args[0], args[1], len(s.slab), len(s.freeList), s.nSlab)
+		}
+		for _, ps := range []int{512, 4096, 65536} {
+			if s.serves(ps) {
+				t.Fatalf("Init(%d, %d): serves page size %d", args[0], args[1], ps)
+			}
+		}
+		if s.UnderPressure() {
+			t.Fatalf("Init(%d, %d): an empty slab reports pressure", args[0], args[1])
+		}
+		s.Reset()
+	}
+}

@@ -76,9 +76,19 @@ func resetPageBufferPool() {
 }
 
 // allocPageBuffer returns a page-sized buffer. useSlab is a local bool
-// resolved once at pcache/pager creation time — no global reads on hot path.
+// resolved once at pcache/pager creation time.
+//
+// The slab serves a request only when the request is for the slab's own slot
+// size; any other size takes the default allocator, at the requested size.
+// Matches the per-request guard of pcache1Alloc (pcache1.c:344,
+// `if( nByte<=pcache1.szSlot )`, else sqlite3Malloc(nByte)): a slab configured
+// for another page size, or with no slots, is never the source of a
+// wrong-sized page — the database works without it. Go asks for equality where
+// C asks for "fits": a page buffer's length is its page size, and a larger slot
+// would have to be cut down on Get and restored on Put.
+// DRIFT: the slab serves a request of exactly its slot size, C one that fits See docs/btree/NOTES.md#drift-2026-06-25-22-slab-get-has-no-per-request-size-guard-and-its-initialized-pagesize-va
 func allocPageBuffer(pageSize int, useSlab bool) []byte {
-	if useSlab {
+	if useSlab && globalPageSlab.serves(pageSize) {
 		return globalPageSlab.Get()
 	}
 	if buf, ok := pageBufferPool.Get().([]byte); ok {
@@ -87,7 +97,10 @@ func allocPageBuffer(pageSize int, useSlab bool) []byte {
 	return make([]byte, pageSize)
 }
 
-// freePageBuffer returns a buffer to the slab or sync.Pool.
+// freePageBuffer returns a buffer to the slab or sync.Pool. In slab mode a
+// buffer that did not come out of the slab (an overflow buffer, or every
+// buffer when the slab does not serve this page size) goes to the sync.Pool:
+// pageSlab.Put keeps only slices of its own backing array.
 //
 // BEGIN ENCRYPTION
 // Note: pageBufferPool stores []byte directly, which causes a 24-byte eface
@@ -108,9 +121,20 @@ func freePageBuffer(buf []byte, useSlab bool) {
 	pageBufferPool.Put(buf)
 }
 
+// serves reports whether the slab hands out buffers of pageSize bytes. False
+// for an empty slab (pageSize 0). s.pageSize is immutable once the slab is
+// initialized, which btree.Open checks before any pager has useSlab set.
+func (s *pageSlab) serves(pageSize int) bool {
+	return s.pageSize != 0 && pageSize == s.pageSize
+}
+
 // Init allocates one nPages*pageSize buffer and fills the free list with its
-// page slices. If already initialized, this is a no-op.
-// Matches sqlite3PCacheBufferSetup (pcache1.c:271-291).
+// page slices. If already initialized, this is a no-op: the first call's
+// arguments stay, whatever a later call passes.
+// Matches sqlite3PCacheBufferSetup (pcache1.c:271-291), including its two
+// "no buffer" branches (pcache1.c:274-275, `if( n==0 ) sz = 0;`): a slab with
+// no pages or no page size is an initialized slab with no slots, and every
+// allocation takes the default allocator.
 // DRIFT: pageSlab.Init/ConfigPageCache idempotent & no-disable vs C re-configurable setup See docs/btree/NOTES.md#drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl
 func (s *pageSlab) Init(pageSize, nPages int) {
 	if s.initialized.Load() {
@@ -120,6 +144,9 @@ func (s *pageSlab) Init(pageSize, nPages int) {
 	defer s.mu.Unlock()
 	if s.initialized.Load() {
 		return
+	}
+	if pageSize <= 0 || nPages <= 0 {
+		pageSize, nPages = 0, 0
 	}
 	s.pageSize = pageSize
 	s.nSlab = nPages
@@ -247,6 +274,12 @@ func (s *pageSlab) Reset() {
 // ConfigPageCache initializes the global page slab with the given page size
 // and number of pages. This mirrors sqlite3_config(SQLITE_CONFIG_PAGECACHE).
 // Must be called before opening any databases.
+//
+// pageSize must be the page size of the databases that opt in. A database of
+// another page size, and every database when pageSize or nPages is not
+// positive, opens and runs on the default allocator as if it had not opted in
+// (pcache1Alloc's fallback, see allocPageBuffer). The first call configures
+// the slab for the life of the process; later calls are no-ops.
 //
 // By default (without calling this and setting UsePageSlab), page buffers are
 // allocated via sync.Pool (like SQLite's default malloc mode). Calling this

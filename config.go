@@ -11,7 +11,17 @@ import (
 
 // InitPageBuffer pre-allocates a global pool of nPages page-sized buffers.
 // Must be called before opening any databases that use UseGlobalPageBuffer.
-// Mirrors sqlite3_config(SQLITE_CONFIG_PAGECACHE). Call once at process startup.
+// Mirrors sqlite3_config(SQLITE_CONFIG_PAGECACHE). Call once at process
+// startup: the first call configures the pool for the life of the process and
+// a later call, with the same or other arguments, does nothing.
+//
+// pageSize must be the database page size, 4096. It does not select a page
+// size. A pool of any other size is allocated as asked and never used: as in
+// SQLite, a buffer is taken from the pool only when the pool's buffers are the
+// size the database needs, and a database with UseGlobalPageBuffer otherwise
+// opens and runs on the default allocator, without the pool's memory bound.
+// The same holds for every database when pageSize or nPages is zero or
+// negative, which allocates nothing.
 //
 // Example: InitPageBuffer(4096, 5000) pre-allocates ~20MB of page buffers.
 func InitPageBuffer(pageSize, nPages int) {
