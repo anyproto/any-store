@@ -54,53 +54,45 @@ func mapErrorDB(t *testing.T) (db *DB, failSegment, restore func()) {
 	return db, failSegment, restore
 }
 
+// The reader's transaction and namespace are open before the segment fails,
+// and the leaf of row 0 is not in its cache: the failure is the Get's.
 func TestWalIndexMapError_ReaderFails(t *testing.T) {
 	db, failSegment, restore := mapErrorDB(t)
+	coldReaders(db)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	ns, err := rtx.GetNamespace("t1")
+	require.NoError(t, err)
 	failSegment()
-	err := func() error {
-		rtx, err := db.BeginRead()
-		if err != nil {
-			return err
-		}
-		defer func() { _ = rtx.Rollback() }()
-		ns, err := rtx.GetNamespace("t1")
-		if err != nil {
-			return err
-		}
-		_, err = rtx.Get(ns, binary.BigEndian.AppendUint32(nil, 0))
-		return err
-	}()
+	_, err = rtx.Get(ns, binary.BigEndian.AppendUint32(nil, 0))
 	require.ErrorIs(t, err, errSegmentMap)
 
 	restore()
+	require.NoError(t, rtx.Rollback())
 	restartCheck(t, db, 0, 1, 2)
 	restartCheck(t, db, 1, 2, 1)
 	require.NoError(t, db.IntegrityCheck())
 }
 
 // The writer reads the leaf of rows 0 and 1 to change row 1. With the page
-// from before row 0's commit it would write that commit away.
+// from before row 0's commit it would write that commit away. The
+// transaction and namespace are open before the segment fails, and the leaf
+// is not in the writer's cache: the failure is the Put's page read (the
+// transaction never gets as far as writing a frame, which maps the segment
+// too, in shmHashWrite).
 func TestWalIndexMapError_WriterFails(t *testing.T) {
 	db, failSegment, restore := mapErrorDB(t)
 	db.pager.writerCache.clear() // the writer has to read its pages
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.GetNamespace("t1")
+	require.NoError(t, err)
 	failSegment()
-	// The failure is the page read's: the transaction never gets as far as
-	// writing a frame (which maps the segment too, in shmHashWrite).
-	err := func() error {
-		wtx, err := db.BeginWrite()
-		if err != nil {
-			return err
-		}
-		defer func() { _ = wtx.Rollback() }()
-		ns, err := wtx.GetNamespace("t1")
-		if err != nil {
-			return err
-		}
-		return wtx.Put(ns, binary.BigEndian.AppendUint32(nil, 1), bytes.Repeat([]byte{3}, 300))
-	}()
+	err = wtx.Put(ns, binary.BigEndian.AppendUint32(nil, 1), bytes.Repeat([]byte{3}, 300))
 	require.ErrorIs(t, err, errSegmentMap)
 
 	restore()
+	require.NoError(t, wtx.Rollback())
 	restartCheck(t, db, 0, 1, 2)
 	restartCheck(t, db, 1, 2, 1)
 	restartPut(t, db, 1, 2, 3) // the writer goes on
