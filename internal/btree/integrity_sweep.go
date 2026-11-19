@@ -53,9 +53,9 @@ func (db *DB) IntegrityMode() IntegrityMode {
 	return IntegrityAEAD
 }
 
-// CksumCodec returns the active *cksumCodec if one is installed, else nil.
-// Used by anystore wrappers to expose the runtime PRAGMA-equivalent toggle
-// (SetVerifyOnRead). No-op for AEAD codecs.
+// CksumCodec returns the active *cksumCodec if one is installed, else nil
+// (plain and AEAD databases). The anystore wrapper turns verify-on-read off
+// through it for Config.ContinueOnIntegrityError.
 func (db *DB) CksumCodec() *cksumCodec {
 	if c, ok := db.pager.codec.(*cksumCodec); ok {
 		return c
@@ -64,19 +64,23 @@ func (db *DB) CksumCodec() *cksumCodec {
 }
 
 // VerifyIntegrity walks every page of the snapshot its read transaction
-// holds (1..ReadTx.DatabaseSize) and verifies the per-page integrity tag. For checksum-mode DBs this re-hashes
-// the trailer and compares it; for AEAD-mode DBs it attempts a decrypt
-// (the AEAD tag IS the integrity tag).
+// holds (1..ReadTx.DatabaseSize) and verifies the per-page integrity tag.
+// For checksum-mode DBs this re-hashes the trailer and compares it; for
+// AEAD-mode DBs it attempts a decrypt (the AEAD tag IS the integrity tag).
 //
-// Read-only operation that opens its own internal read transaction.
-// Mismatches are collected into Result.Errors; non-integrity errors
-// (file I/O, cancelled context) are returned as the function's error.
+// Read-only operation that opens its own internal read transaction. A page
+// that fails verification is listed in Result.Errors, and so is a page that
+// cannot be read (Kind IntegrityKindUnknown, the read's error in Inner); the
+// sweep goes on to the next page. The function's error is a read
+// transaction that cannot begin, a page 1 that cannot be read or whose
+// header gives no page count, and a cancelled context.
 //
-// On checksum DBs the sweep temporarily clears the verify-on-read flag so
-// the read path doesn't abort on the first mismatch — the original flag
-// is restored on return. On AEAD DBs there is no toggle (disabling AEAD
-// verification would be a vulnerability); per-page Decrypt errors are
-// caught and routed into the result instead of bubbling up.
+// The sweep reads every page raw, past the codec, and checks it itself: the
+// read begin reads only page 1's header, which is outside the codec. It
+// therefore changes nothing in how the handle's other transactions read.
+// Verification of the pages they read stays on while it runs
+// (cksumCodec.SetVerify is the handle's one switch, shared by the writer
+// and every reader).
 //
 // Returns IntegrityNone with zero pages scanned for plain DBs.
 func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
@@ -84,12 +88,6 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 	res := SweepResult{Mode: mode}
 	if mode == IntegrityNone {
 		return res, nil
-	}
-
-	if c := db.CksumCodec(); c != nil {
-		prev := c.VerifyOn()
-		c.SetVerify(false)
-		defer c.SetVerify(prev)
 	}
 
 	tx, err := db.BeginReadContext(ctx)
