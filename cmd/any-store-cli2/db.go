@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,7 +13,6 @@ import (
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
-	_ "net/http/pprof"
 )
 
 func openConn(path string) (err error) {
@@ -32,10 +30,6 @@ func openConn(path string) (err error) {
 		return
 	}
 	return
-}
-
-func init() {
-	go http.ListenAndServe(":6060", nil)
 }
 
 var conn *Conn
