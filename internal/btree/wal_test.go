@@ -2870,7 +2870,7 @@ func TestCommit_InTxRangeErrorReleasesWALMutex(t *testing.T) {
 
 // The first frame write of a transaction looks nothing up: no frame of the
 // transaction is in the wal-index yet (walFrames' iFirst is 0 until then,
-// wal.c:4062-4065, 4124).
+// wal.c:4062-4064, 4138).
 func TestCommit_FirstFrameWriteLooksNothingUp(t *testing.T) {
 	for _, inMemory := range []bool{true, false} {
 		t.Run(fmt.Sprintf("InMemory=%v", inMemory), func(t *testing.T) {

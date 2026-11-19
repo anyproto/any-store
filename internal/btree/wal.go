@@ -757,8 +757,8 @@ func (wi *walIndex) shmCleanupFromFrame(target, maxFrame uint32) {
 // shmCleanupHashSegment is SQLite's walCleanupHash (wal.c:1233-1288) on the
 // hash table that holds frame mxFrame, mapped as region: it zeroes every
 // aHash slot whose frame is above mxFrame (`if( sLoc.aHash[i]>iLimit )
-// sLoc.aHash[i] = 0`, wal.c:1258-1262) and the aPgno entries of those frames
-// (`memset(&sLoc.aPgno[iLimit], 0, nByte)`, wal.c:1267-1269). The slots of
+// sLoc.aHash[i] = 0`, wal.c:1260-1264) and the aPgno entries of those frames
+// (`memset(&sLoc.aPgno[iLimit], 0, nByte)`, wal.c:1271). The slots of
 // frames up to mxFrame keep their places, so their probe chains still end at
 // the first empty slot after them. seg must be mxFrame's segment
 // (htFrameSegIdx) and the caller holds the write lock.
@@ -1264,8 +1264,8 @@ func (wi *walIndex) shmHashWrite(pgno, frame, mxFrame uint32) error {
 	}
 
 	// Lazily zero the segment's aPgno+aHash area when writing its FIRST
-	// entry, matching SQLite walIndexAppend (wal.c:1324-1330
-	// `if( idx==1 ){ memset((void*)&aPgno[1], 0, nByte); }`). A WAL reset
+	// entry, matching SQLite walIndexAppend (wal.c:1315-1319
+	// `if( idx==1 ){ ... memset((void*)sLoc.aPgno, 0, nByte); }`). A WAL reset
 	// (shmClearHash) only clears the segments the resetting connection has
 	// mapped; a WAL that previously grew further left stale entries from
 	// the prior generation in the higher segments, and those occupied slots
@@ -1282,7 +1282,7 @@ func (wi *walIndex) shmHashWrite(pgno, frame, mxFrame uint32) error {
 	// inside a transaction, after it had written dirty pages to the WAL to
 	// free memory: nothing rolled its frames back, so their entries are still
 	// in the hash table, above the log's last frame. They are removed before
-	// the new entry goes in (wal.c:1321-1330 `if( sLoc.aPgno[idx-1] ){
+	// the new entry goes in (wal.c:1327-1330 `if( sLoc.aPgno[idx-1] ){
 	// walCleanupHash(pWal); }`). Left in place they sit in their pages' probe
 	// chains ahead of the entries appended now: enough of them overflow the
 	// bounded probe below (a false ErrCorrupt), and a later rollback that
@@ -1336,12 +1336,12 @@ func (wi *walIndex) shmHashWrite(pgno, frame, mxFrame uint32) error {
 // shmCleanupHash is walCleanupHash (wal.c:1233-1288) as walIndexAppend calls
 // it: it removes from the hash table that holds frame mxFrame every entry of
 // a frame above mxFrame. With no frame in the log there is nothing to keep
-// and nothing is done (`if( pWal->hdr.mxFrame==0 ) return;`, wal.c:1245): the
+// and nothing is done (`if( pWal->hdr.mxFrame==0 ) return;`, wal.c:1244): the
 // first frame of a segment has zeroed the segment already. seg and region are
 // the segment being appended to, which is mxFrame's segment whenever a slot
 // in it is found set (an append into a later segment starts at its first
 // entry, which zeroes it); any other segment is mapped here, as walHashGet
-// does (wal.c:1254).
+// does (wal.c:1252).
 func (wi *walIndex) shmCleanupHash(mxFrame uint32, seg int, region []byte) error {
 	if mxFrame == 0 {
 		return nil
@@ -1364,13 +1364,13 @@ func (wi *walIndex) shmCleanupHash(mxFrame uint32, seg int, region []byte) error
 // [minFrame, maxFrame]. This is the cross-process fallback when pageMap
 // doesn't contain the page — another process may have written WAL frames.
 //
-// Matches SQLite's walFindFrame (wal.c:3554-3581): only scan hash segments
+// Matches SQLite's walFindFrame (wal.c:3519-3618): only scan hash segments
 // that could contain frames in [minFrame, maxFrame], searching backwards
 // from the newest segment. This avoids scanning already-checkpointed
 // segments, which is critical for performance on large WALs.
 // Returns ErrCorrupt when a probe chain walks past nCollide occupied slots
 // without hitting an empty slot, mirroring walFindFrame's bounded probe
-// (wal.c:3580 `nCollide = HASHTABLE_NSLOT`, wal.c:3592-3595
+// (wal.c:3580 `nCollide = HASHTABLE_NSLOT`, wal.c:3589-3592
 // `if((nCollide--)==0){ *piRead = 0; return SQLITE_CORRUPT_BKPT; }`). nCollide
 // is reset per segment (C resets inside the iHash loop, wal.c:3580) so a
 // multi-segment scan bounds each hash table independently, not cumulatively.
@@ -1386,13 +1386,14 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 	}
 
 	lastSeg, _ := htFrameSegIdx(maxFrame)
-	// Match SQLite wal.c:3554 — skip segments before minFrame.
+	// Skip the segments before minFrame's (wal.c:3568 `iMinHash =
+	// walFramePage(pWal->minFrame);`).
 	minSeg, _ := htFrameSegIdx(minFrame)
 
 	for seg := lastSeg; seg >= minSeg; seg-- {
 		// Map segment on demand (create=true). A peer writer may have just
 		// extended SHM with a new segment containing frames <= maxFrame that
-		// this reader hasn't yet mapped. SQLite's walFindFrame (wal.c:3562)
+		// this reader hasn't yet mapped. SQLite's walFindFrame (wal.c:3576)
 		// always calls walHashGet → walIndexPage → sqlite3OsShmMap, which
 		// maps/extends the wal-index page — it never silently skips a
 		// segment. Skipping here was the root cause of cross-process
@@ -1401,9 +1402,9 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 		// the DB file which still held the pre-commit page.
 		//
 		// A segment that cannot be mapped fails the lookup, as walFindFrame
-		// returns walHashGet's error (wal.c:3562-3565 `rc = walHashGet(pWal,
-		// iHash, &sLoc); if( rc!=SQLITE_OK ) return rc;`). Going on to the
-		// older segments, or reporting the page as not in the WAL, would
+		// returns walHashGet's error (wal.c:3576-3579 `rc = walHashGet(pWal,
+		// iHash, &sLoc); if( rc!=SQLITE_OK ){ return rc; }`). Going on to
+		// the older segments, or reporting the page as not in the WAL, would
 		// hand the caller the page from before a commit.
 		region, err := wi.shm.region(seg, true)
 		if err != nil {
@@ -1433,7 +1434,7 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 					}
 				}
 			}
-			// Bound the probe AFTER the match check, like C (wal.c:3592-3595):
+			// Bound the probe AFTER the match check, like C (wal.c:3589-3592):
 			// walking past nCollide occupied slots = full/corrupt chain.
 			if nCollide--; nCollide == 0 {
 				if debugTrace {

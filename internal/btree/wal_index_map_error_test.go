@@ -3,8 +3,8 @@
 package btree
 
 // A wal-index segment that cannot be mapped fails the page lookup, and with
-// it the page read: walFindFrame returns walHashGet's error (wal.c:3562-3565
-// `rc = walHashGet(pWal, iHash, &sLoc); if( rc!=SQLITE_OK ) return rc;`).
+// it the page read: walFindFrame returns walHashGet's error (wal.c:3576-3579
+// `rc = walHashGet(pWal, iHash, &sLoc); if( rc!=SQLITE_OK ){ return rc; }`).
 // Taking the segment for one that does not hold the page would send the read
 // to an older frame or to the database file: the page from before a commit.
 

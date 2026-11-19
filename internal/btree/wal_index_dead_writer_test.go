@@ -7,7 +7,7 @@ package btree
 // wal-index hash table: nothing rolls them back. They are above the log's
 // last frame, so no reader uses them, but they occupy slots in their pages'
 // probe chains. The next writer removes them before it adds an entry of its
-// own (walIndexAppend, wal.c:1321-1330: `if( sLoc.aPgno[idx-1] ){
+// own (walIndexAppend, wal.c:1327-1330: `if( sLoc.aPgno[idx-1] ){
 // walCleanupHash(pWal); }`).
 
 import (
