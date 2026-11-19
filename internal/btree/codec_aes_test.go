@@ -148,10 +148,14 @@ func benchCodecEncrypt(b *testing.B, c Codec) {
 	const pageSize = 4096
 	src := make([]byte, pageSize)
 	dst := make([]byte, pageSize)
+	// One scratch for the whole run, as the pager and the WAL each keep
+	// one for their lifetime.
+	var s aeadScratch
 	b.SetBytes(pageSize)
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := c.Encrypt(dst, src, uint32(i+1), &aeadScratch{}); err != nil {
+		if _, err := c.Encrypt(dst, src, uint32(i+1), &s); err != nil {
 			b.Fatal(err)
 		}
 	}
