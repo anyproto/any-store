@@ -417,3 +417,141 @@ func TestChangeEpoch_ConsumersDuringAPendingPublication(t *testing.T) {
 	require.NotNil(t, c2)
 	require.Equal(t, uint64(51), sketchDocCount(t, c2), "an open at the replaced header stamped nothing")
 }
+
+// A write of this process goes on top of the sketch row another process
+// committed, whatever this process did between that commit and the write. A
+// reader that plans first loads the row into the published sketch only; the
+// writer still has to load it into the live one, or its commit stores the
+// counts from before the other process's commit over that row, for good.
+//
+// 50 documents, one more from the peer, then the steps of each case: the
+// stored row, the published sketch and the sketch a fresh open loads all
+// count every document.
+func TestChangeEpoch_WriterLoadsThePeersRowAfterAReader(t *testing.T) {
+	if changePeer(t) {
+		return
+	}
+	ctx := context.Background()
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":3}`, id))
+	}
+	find := func(t *testing.T, ctx context.Context, coll Collection) {
+		t.Helper()
+		_, err := coll.Find(`{"a":1}`).Count(ctx)
+		require.NoError(t, err)
+	}
+	cases := []struct {
+		name string
+		// late: the handle is opened after the peer's commit.
+		late bool
+		// steps returns the number of documents it committed.
+		steps func(t *testing.T, d DB, coll Collection) int
+	}{
+		{name: "write", steps: func(t *testing.T, d DB, coll Collection) int {
+			require.NoError(t, coll.Insert(ctx, doc(100)))
+			return 1
+		}},
+		{name: "find, write", steps: func(t *testing.T, d DB, coll Collection) int {
+			find(t, ctx, coll)
+			require.NoError(t, coll.Insert(ctx, doc(100)))
+			return 1
+		}},
+		{name: "stats, write", steps: func(t *testing.T, d DB, coll Collection) int {
+			require.Equal(t, uint64(51), sketchDocCount(t, coll))
+			require.NoError(t, coll.Insert(ctx, doc(100)))
+			return 1
+		}},
+		{name: "two readers, write", steps: func(t *testing.T, d DB, coll Collection) int {
+			find(t, ctx, coll)
+			require.Equal(t, uint64(51), sketchDocCount(t, coll))
+			require.NoError(t, coll.Insert(ctx, doc(100)))
+			return 1
+		}},
+		{name: "handle opened after the commit, find, write", late: true, steps: func(t *testing.T, d DB, coll Collection) int {
+			find(t, ctx, coll)
+			require.NoError(t, coll.Insert(ctx, doc(100)))
+			return 1
+		}},
+		{name: "write, stats, write", steps: func(t *testing.T, d DB, coll Collection) int {
+			require.NoError(t, coll.Insert(ctx, doc(100)))
+			require.Equal(t, uint64(52), sketchDocCount(t, coll))
+			require.NoError(t, coll.Insert(ctx, doc(101)))
+			return 2
+		}},
+		{name: "find, a write tx that plans between its writes", steps: func(t *testing.T, d DB, coll Collection) int {
+			find(t, ctx, coll)
+			wtx, err := d.WriteTx(ctx)
+			require.NoError(t, err)
+			require.NoError(t, coll.Insert(wtx.Context(), doc(100)))
+			find(t, wtx.Context(), coll)
+			require.NoError(t, coll.Insert(wtx.Context(), doc(101)))
+			require.NoError(t, wtx.Commit())
+			return 2
+		}},
+		{name: "find, a write tx rolled back, write", steps: func(t *testing.T, d DB, coll Collection) int {
+			find(t, ctx, coll)
+			wtx, err := d.WriteTx(ctx)
+			require.NoError(t, err)
+			require.NoError(t, coll.Insert(wtx.Context(), doc(100), doc(101)))
+			require.NoError(t, wtx.Rollback())
+			require.NoError(t, coll.Insert(ctx, doc(100)))
+			return 1
+		}},
+		{name: "find, a statement rolled back in the write tx", steps: func(t *testing.T, d DB, coll Collection) int {
+			find(t, ctx, coll)
+			wtx, err := d.WriteTx(ctx)
+			require.NoError(t, err)
+			// The first use of the collection in the transaction is inside
+			// the statement's savepoint, and the statement fails on its
+			// last document.
+			require.Error(t, coll.Insert(wtx.Context(), doc(100), doc(101), doc(1)))
+			require.NoError(t, coll.Insert(wtx.Context(), doc(100)))
+			require.NoError(t, wtx.Commit())
+			return 1
+		}},
+		{name: "find, write, own writes after", steps: func(t *testing.T, d DB, coll Collection) int {
+			find(t, ctx, coll)
+			for i := 0; i < 5; i++ {
+				require.NoError(t, coll.Insert(ctx, doc(100+i)))
+				find(t, ctx, coll)
+			}
+			return 5
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, path := openSketchDB(t)
+			var coll Collection
+			var err error
+			if !tc.late {
+				coll, err = d.OpenCollection(ctx, "c")
+				require.NoError(t, err)
+				require.Equal(t, uint64(50), sketchDocCount(t, coll))
+			}
+			runChangePeer(t, path)
+			if tc.late {
+				coll, err = d.OpenCollection(ctx, "c")
+				require.NoError(t, err)
+			}
+
+			want := uint64(51 + tc.steps(t, d, coll))
+
+			n, err := coll.Count(ctx)
+			require.NoError(t, err)
+			require.Equal(t, int(want), n, "setup: the documents")
+			idxName := coll.GetIndexes()[0].Info().Name
+			stored, err := d.(IndexSketchInspector).InspectIndexSketch(ctx, "c", idxName)
+			require.NoError(t, err)
+			require.Equal(t, want, stored.DocCount, "the stored row holds the peer's counts and this process's")
+			require.Equal(t, want, sketchDocCount(t, coll), "the published sketch")
+
+			require.NoError(t, d.Close())
+			d2, err := Open(ctx, path, nil)
+			require.NoError(t, err)
+			defer func() { _ = d2.Close() }()
+			coll2, err := d2.OpenCollection(ctx, "c")
+			require.NoError(t, err)
+			require.Equal(t, want, sketchDocCount(t, coll2), "the sketch a fresh open loads")
+		})
+	}
+}
