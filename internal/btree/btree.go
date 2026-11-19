@@ -198,13 +198,10 @@ func parseLeafCellWithSize(data []byte, offset int, lim payloadLimits) (cellData
 	}
 	pos += n
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc || int(valLen) < 0 || int(valLen) > maxPayloadAlloc {
+	if !payloadFits(int(keyLen), int(valLen)) {
 		return c, 0, ErrCorrupt
 	}
 	totalPayload := int(keyLen) + int(valLen)
-	if totalPayload < 0 || totalPayload > maxPayloadAlloc {
-		return c, 0, ErrCorrupt
-	}
 	maxLocal := 0
 	if lim.usable > 0 {
 		maxLocal = lim.maxLocal
@@ -279,7 +276,7 @@ func parseInteriorCell(data []byte, offset int, usableSize ...int) (cellData, in
 	}
 	pos += n
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
+	if !payloadFits(int(keyLen), 0) {
 		return c, 0, ErrCorrupt
 	}
 
@@ -670,7 +667,7 @@ func searchLeafWithOverflow(pg *page, key []byte, lim payloadLimits, p *pager, w
 
 		// The same bounds as parseLeafCellWithSize, before the lengths are
 		// added or used as slice bounds.
-		if keyLen > maxPayloadAlloc || valLen > maxPayloadAlloc {
+		if keyLen > uint64(payloadLimit) || valLen > uint64(payloadLimit) {
 			return 0, false, ErrCorrupt
 		}
 		totalPayload := int(keyLen) + int(valLen)
@@ -938,17 +935,11 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	}
 	pos += n
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
-		return nil, ErrCorrupt
-	}
-	if int(valLen) < 0 || int(valLen) > maxPayloadAlloc {
+	if !payloadFits(int(keyLen), int(valLen)) {
 		return nil, ErrCorrupt
 	}
 
 	totalPayload := int(keyLen) + int(valLen)
-	if totalPayload < 0 || totalPayload > maxPayloadAlloc {
-		return nil, ErrCorrupt
-	}
 	maxLocal := lim.maxLocal
 
 	if totalPayload <= maxLocal {
@@ -1020,17 +1011,11 @@ func leafFullValue(data []byte, offset int, lim payloadLimits, p *pager, walMaxF
 	}
 	pos += n
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
-		return nil, ErrCorrupt
-	}
-	if int(valLen) < 0 || int(valLen) > maxPayloadAlloc {
+	if !payloadFits(int(keyLen), int(valLen)) {
 		return nil, ErrCorrupt
 	}
 
 	totalPayload := int(keyLen) + int(valLen)
-	if totalPayload < 0 || totalPayload > maxPayloadAlloc {
-		return nil, ErrCorrupt
-	}
 	maxLocal := lim.maxLocal
 
 	if totalPayload <= maxLocal {
@@ -1084,7 +1069,7 @@ func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFr
 	keyStart := offset + 4 + n
 	maxLocal := maxLocalPayload(usableSize)
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
+	if !payloadFits(int(keyLen), 0) {
 		return nil, ErrCorrupt
 	}
 
@@ -1336,18 +1321,32 @@ func (bt *btree) Has(key []byte) (bool, error) {
 	return true, nil
 }
 
-// maxKeySize returns the maximum key size. Since both leaf and interior cells
-// support overflow (matching SQLite's index btrees), the key can be very large.
-// We limit it to prevent absurd allocations. SQLite limits index keys to about
-// 1/4 of SQLITE_MAX_LENGTH. We use a generous 1GB limit.
-const maxKeySize = 1 << 30 // 1GB
+// maxKeySize is the maximum key size. Both leaf and interior cells support
+// overflow (matching SQLite's index btrees), so a key may be as large as a
+// whole record: the record size limit, with an empty value.
+const maxKeySize = maxPayloadAlloc
 
-// Put inserts or updates a key-value pair in the B-tree.
-func (bt *btree) Put(key, value []byte) error {
-	// Validate key size. Both leaf and interior cells support overflow,
-	// so this is just a sanity limit to prevent absurd allocations.
-	if len(key) > maxKeySize {
+// recordSizeErr is the write side of payloadFits: nil for a record that may
+// be written, ErrKeyTooLarge when the key alone is over the record size limit
+// and ErrValueTooLarge when the key and the value together are.
+func recordSizeErr(keyLen, valLen int) error {
+	if payloadFits(keyLen, valLen) {
+		return nil
+	}
+	if keyLen > payloadLimit {
 		return ErrKeyTooLarge
+	}
+	return ErrValueTooLarge
+}
+
+// Put inserts or updates a key-value pair in the B-tree. A record over the
+// record size limit is refused with ErrKeyTooLarge or ErrValueTooLarge and
+// nothing is written.
+func (bt *btree) Put(key, value []byte) error {
+	// A record the cell parsers would reject is refused here, before a
+	// page is touched: see payloadFits.
+	if err := recordSizeErr(len(key), len(value)); err != nil {
+		return err
 	}
 
 	// The cursors open on this tree are saved before a page of it changes
@@ -3980,7 +3979,7 @@ func leafKeyAt(pg *page, idx int, lim payloadLimits) ([]byte, error) {
 		pos++
 	} else {
 		kl, n, kerr := getVarintSafe(data[pos:])
-		if kerr != nil || kl > maxPayloadAlloc {
+		if kerr != nil || kl > uint64(payloadLimit) {
 			return nil, ErrCorrupt
 		}
 		keyLen = int(kl)
@@ -3994,16 +3993,16 @@ func leafKeyAt(pg *page, idx int, lim payloadLimits) ([]byte, error) {
 		pos++
 	} else {
 		vl, n, verr := getVarintSafe(data[pos:])
-		if verr != nil || vl > maxPayloadAlloc {
+		if verr != nil || vl > uint64(payloadLimit) {
 			return nil, ErrCorrupt
 		}
 		valLen = int(vl)
 		pos += n
 	}
-	totalPayload := keyLen + valLen
-	if totalPayload > maxPayloadAlloc {
+	if !payloadFits(keyLen, valLen) {
 		return nil, ErrCorrupt
 	}
+	totalPayload := keyLen + valLen
 	if totalPayload > lim.maxLocal {
 		nLocal := localPayloadSize(totalPayload, lim)
 		if pos+nLocal+overflowPtrSize > dataLen {
