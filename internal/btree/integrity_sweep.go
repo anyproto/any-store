@@ -153,9 +153,13 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 		if e != nil {
 			res.Errors = append(res.Errors, *e)
 		}
-		if mode == IntegrityChecksum && (raw == nil || e != nil) {
+		if e != nil && e.Kind == IntegrityChecksumMismatch {
 			// Fire the codec's OnError hook so subscribers see sweep
-			// mismatches the same way they see read-path mismatches.
+			// mismatches the same way they see read-path mismatches. Only
+			// for a checksum that was compared and differed, as cksumvfs
+			// compares only after a read that succeeded (cksmRead): a page
+			// that could not be read is listed and notifies nobody. The
+			// AEAD codecs fire the hook themselves, from Decrypt.
 			if c := db.CksumCodec(); c != nil {
 				c.fire(pgno, errCksumMismatch)
 			}
