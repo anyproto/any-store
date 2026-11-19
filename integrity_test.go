@@ -7,8 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -126,43 +128,51 @@ func TestIntegrity_AEAD_VerifyIntegrity_AllGood(t *testing.T) {
 // TestIntegrity_ContinueOnIntegrityError_Cksum verifies that the flag
 // suppresses the read-path ErrPageIntegrity but still fires the callback.
 // Models the forensic-dump use case: read past corruption, log every hit.
+// A sweep leaves the setting as configured: the read after it still returns
+// the damaged document.
 func TestIntegrity_ContinueOnIntegrityError_Cksum(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "db")
-	writeAndCloseIntegrityDB(t, path, &Config{})
-
-	pageSize := int64(4096)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data[pageSize+200] ^= 0x01
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		t.Fatal(err)
-	}
+	ctx := context.Background()
+	path, damaged := damagedSweepDB(t)
 
 	var fired atomic.Uint32
+	var lastPgno atomic.Uint32
 	cfg := &Config{
 		ContinueOnIntegrityError: true,
-		OnIntegrityError:         func(IntegrityError) { fired.Add(1) },
+		OnIntegrityError: func(e IntegrityError) {
+			fired.Add(1)
+			lastPgno.Store(e.PageNo)
+		},
 	}
-	db, err := Open(context.Background(), path, cfg)
-	if err != nil {
-		t.Fatalf("Open with ContinueOnIntegrityError=true should succeed even with corrupt page: %v", err)
-	}
-	defer db.Close()
+	db, err := Open(ctx, path, cfg)
+	require.NoError(t, err, "Open with ContinueOnIntegrityError=true succeeds with a corrupt page")
+	defer func() { _ = db.Close() }()
+	coll, err := db.OpenCollection(ctx, "c")
+	require.NoError(t, err)
 
-	// Sweep — lists the mismatch; callback fires.
-	rep, err := db.VerifyIntegrity(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	forensicRead := func(when string) {
+		t.Helper()
+		doc, err := coll.FindId(ctx, sweepDocID(sweepDamagedDoc))
+		require.NoError(t, err, "a forensic read %s", when)
+		pad := string(doc.Value().GetStringBytes("pad"))
+		want := []byte(sweepDocPad(sweepDamagedDoc))
+		require.Len(t, pad, len(want))
+		require.NotEqual(t, string(want), pad, "the read returns the damaged bytes")
 	}
-	if len(rep.Errors) == 0 {
-		t.Fatal("expected at least one mismatch in report")
-	}
-	if fired.Load() == 0 {
-		t.Fatal("OnIntegrityError did not fire")
-	}
+	// The callback fires when the damaged page is read from the file; a
+	// later read of it can come from the reader's page cache and fire
+	// nothing, so the count is taken from the open to the first read.
+	forensicRead("before the sweep")
+	require.NotZero(t, fired.Load(), "reading the damaged page fires the callback")
+	require.Equal(t, damaged, lastPgno.Load())
+
+	// The sweep lists the mismatch and fires the callback once for it.
+	fired.Store(0)
+	rep, err := db.VerifyIntegrity(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []IntegrityError{{PageNo: damaged, Kind: IntegrityChecksumMismatch}}, rep.Errors)
+	require.Equal(t, uint32(1), fired.Load(), "one callback for one damaged page")
+
+	forensicRead("after the sweep")
 }
 
 // TestIntegrity_OnIntegrityError_Cksum_FiresOnSweep verifies that a
@@ -199,11 +209,12 @@ func TestIntegrity_OnIntegrityError_Cksum_FiresOnSweep(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	fired.Store(0)
 	if _, err := db.VerifyIntegrity(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if fired.Load() == 0 {
-		t.Fatal("OnIntegrityError did not fire on cksum mismatch")
+	if n := fired.Load(); n != 1 {
+		t.Fatalf("OnIntegrityError fired %d times for one damaged page in one sweep, want 1", n)
 	}
 	if lastPgno.Load() != 2 {
 		t.Fatalf("lastPgno = %d, want 2", lastPgno.Load())
@@ -248,11 +259,12 @@ func TestIntegrity_OnIntegrityError_AEAD_FiresOnSweep(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	fired.Store(0)
 	if _, err := db.VerifyIntegrity(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if fired.Load() == 0 {
-		t.Fatal("OnIntegrityError did not fire on AEAD failure")
+	if n := fired.Load(); n != 1 {
+		t.Fatalf("OnIntegrityError fired %d times for one damaged page in one sweep, want 1", n)
 	}
 	if IntegrityErrorKind(lastKind.Load()) != IntegrityAEADAuthFail {
 		t.Fatalf("lastKind = %v, want IntegrityAEADAuthFail", lastKind.Load())
@@ -366,11 +378,19 @@ func damagedSweepDB(t *testing.T) (path string, pgno uint32) {
 	path = filepath.Join(t.TempDir(), "db")
 	db, err := Open(ctx, path, &Config{DisableCompression: true})
 	require.NoError(t, err)
+	// A setup step that fails must not leave the database open.
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			_ = db.Close()
+		}
+	})
 	coll, err := db.CreateCollection(ctx, "c")
 	require.NoError(t, err)
 	for i := 0; i < 400; i++ {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"%s","pad":"%s"}`, sweepDocID(i), sweepDocPad(i)))))
 	}
+	closed = true
 	require.NoError(t, db.Close())
 
 	data, err := os.ReadFile(path)
@@ -457,6 +477,8 @@ func TestIntegrity_OverlappingSweepsKeepVerificationOn(t *testing.T) {
 
 	parked := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
 	release := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	var released [2]sync.Once
+	releaseSweep := func(i int) { released[i].Do(func() { close(release[i]) }) }
 	var calls atomic.Int32
 	db, err := Open(ctx, path, &Config{OnIntegrityError: func(IntegrityError) {
 		if n := calls.Add(1); n <= 2 {
@@ -465,7 +487,13 @@ func TestIntegrity_OverlappingSweepsKeepVerificationOn(t *testing.T) {
 		}
 	}})
 	require.NoError(t, err)
-	defer func() { _ = db.Close() }()
+	// Whatever fails, the parked callbacks are released before the close,
+	// which waits for the sweeps' read transactions.
+	defer func() {
+		releaseSweep(0)
+		releaseSweep(1)
+		_ = db.Close()
+	}()
 	coll, err := db.OpenCollection(ctx, "c")
 	require.NoError(t, err)
 
@@ -481,14 +509,37 @@ func TestIntegrity_OverlappingSweepsKeepVerificationOn(t *testing.T) {
 		}()
 		return ch
 	}
+	// A sweep that returns before it reaches the damaged page (an error, a
+	// callback that no longer fires) fails the test instead of hanging it.
+	deadline := time.After(time.Minute)
+	awaitParked := func(i int, done chan result) {
+		t.Helper()
+		select {
+		case <-parked[i]:
+		case res := <-done:
+			t.Fatalf("sweep %d returned before its callback: err=%v, %d errors", i, res.err, len(res.rep.Errors))
+		case <-deadline:
+			t.Fatalf("sweep %d neither parked nor returned", i)
+		}
+	}
+	awaitResult := func(i int, done chan result) result {
+		t.Helper()
+		select {
+		case res := <-done:
+			return res
+		case <-deadline:
+			t.Fatalf("sweep %d did not return", i)
+			return result{}
+		}
+	}
 	a := sweep()
-	<-parked[0]
+	awaitParked(0, a)
 	b := sweep()
-	<-parked[1]
-	close(release[0])
-	resA := <-a
-	close(release[1])
-	resB := <-b
+	awaitParked(1, b)
+	releaseSweep(0)
+	resA := awaitResult(0, a)
+	releaseSweep(1)
+	resB := awaitResult(1, b)
 	for _, res := range []result{resA, resB} {
 		require.NoError(t, res.err)
 		require.Equal(t, []IntegrityError{{PageNo: damaged, Kind: IntegrityChecksumMismatch}}, res.rep.Errors)
