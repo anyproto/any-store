@@ -2757,7 +2757,8 @@ transaction and its locks, and must instead abort and re-begin.
 ### Drift: New DB Page 1 Written Directly To File Bypassing WAL
 - **Category:** changed-logic  -  **Severity:** low  -  **Status:** NARROWED 2026-11-21: creation runs under the exclusive DB-file lock and inside a rollback journal committed by its delete, a WAL beside a database of zero pages is deleted, and the codec is settled on the header read under the lock. What remains is listed below.
 - **Affected functions:** `pager.go:*pager.open`, `pager.go:*pager.createIfEmpty`,
-  `pager.go:*pager.lockDBForCreate`, `pager.go:*pager.createPage1`, `pager.go:*pager.newPage1`,
+  `pager.go:*pager.lockDBForCreate`, `pager.go:*pager.lockDBShared`,
+  `pager.go:*pager.downgradeDBLock`, `pager.go:*pager.createPage1`, `pager.go:*pager.newPage1`,
   `creation_journal.go` (all of it), `syncdir_unix.go` (all of it), `wal.go:*wal.syncFile`,
   `db.go:Open` (the `settleCodec` closure and the first look at the header).
 
@@ -2864,19 +2865,39 @@ if this open is the one that writes page 1.
    SQLite runs it at every acquisition of the SHARED lock (`pager.c:5281-5282`).
 3. *The lock is a flock.* SQLite goes SHARED → RESERVED → EXCLUSIVE with fcntl byte ranges, and
    two connections cannot both hold RESERVED. A flock has no such step: several creators all
-   hold the shared lock at first and none can upgrade. A refused creator drops its lock, sleeps
-   1-3 ms holding nothing, asks whether the creation is still pending and requests the lock again;
-   a creation that stays pending with the file locked by another process for `BusyTimeout` is
-   `ErrBusy`. The same loop serves the playback of a hot journal, for which SQLite asks for
+   hold the shared lock at first and none can upgrade. A refused creator drops its lock, waits
+   holding nothing, asks whether the creation is still pending and requests the lock again. The
+   same loop serves the playback of a hot journal, for which SQLite asks for
    EXCLUSIVE once and returns busy (`pager.c:5308`). The exclusive lock becomes shared
    again before the WAL is opened, so a kernel that lets go of a flock inside a conversion (see
    the two flock entries below) leaves this handle unlocked only while it is attached to
    nothing.
-4. *The WAL is deleted under the exclusive lock*, where SQLite deletes it under SHARED and
+4. *The waits for the DB-file lock.* SQLite waits for its SHARED lock in `pager_wait_on_lock`
+   (`pager.c:3946-3962`, from `sqlite3PagerSharedLock`, `pager.c:5272`): `pagerLockDb` is
+   repeated while it returns `SQLITE_BUSY` and the busy handler agrees, and the result is
+   `SQLITE_BUSY` when the handler gives up. The handler's count is the connection's `nBusy`
+   (`sqlite3InvokeBusyHandler`, `main.c:1770-1780`), set to zero when a statement starts
+   (`vdbe.c:901`), and the default handler sleeps along `delays[]` until the total reaches the
+   timeout (`sqliteDefaultBusyCallback`, `main.c:1718-1747`). `pager.lockDBShared` is that
+   loop: the shared request is repeated through `DefaultBusyTimeout(BusyTimeout)` (the same
+   delay table, 5 s), and exhaustion is an error that matches `ErrBusy`. One count
+   (`beginBusy`) runs across all of an open's waits on the DB-file lock, a creation's waits in
+   `lockDBForCreate` included, so the open waits for that lock for `BusyTimeout` once. Three
+   things differ. `wal.open`'s later wait for the WAL write lock counts by itself
+   ([drift-108](#drift-108-busy-handler-retry-count-resets-per-call)), so an `Open` can wait
+   for `BusyTimeout` twice. The exclusive → shared conversion after a creation
+   (`downgradeDBLock`) has a count of its own, because SQLite's downgrade cannot fail and a
+   flock's can. And a multi-process open cannot tell a process that holds the file in
+   in-process mode (exclusive for the handle's life) from a peer inside its close or its
+   creation: it waits the whole `BusyTimeout` and fails with `ErrBusy`. The in-process open
+   itself asks for its exclusive lock once and is refused at once with `ErrInProcessLocked`,
+   whoever holds the file; mixing the two modes on one file from mmap-shm platforms is the only
+   way to meet the long wait.
+5. *The WAL is deleted under the exclusive lock*, where SQLite deletes it under SHARED and
    relies on an empty database not being in WAL mode (`pager.c:3330-3337`). The wal-index file
    is not deleted, as in SQLite: the first attacher's election truncates a stale one
    (`newPlatformShm`).
-5. *In-process mode* holds the exclusive DB-file lock for the handle's whole life (Windows,
+6. *In-process mode* holds the exclusive DB-file lock for the handle's whole life (Windows,
    linux/386 and any other target without mmap shm), so the same sequence runs with no lock
    change. On wasm the lock functions are no-ops: nothing serializes two runtimes that share one
    storage (two WASI instances over one directory, two browser tabs over one IndexedDB store),
@@ -2910,6 +2931,9 @@ Tests (`multiprocess_create_test.go`, two processes, one held at a named point o
 `testOpenStageHook`): `TestMultiProcessCreateRaceOneDatabase` (a creator held before its page-1
 write while a second process opens the path; plain and passphrase),
 `TestMultiProcessCreateManyAtOnce` (six processes released together),
+`TestOpenWaitsForCreatorHoldingDBLock`, `TestOpenWaitsForLastCloserHoldingDBLock` (vfs tag) and
+`TestOpenAgainstInProcessHolder` (`multiprocess_dblock_wait*_test.go`: the wait for a holder of
+the exclusive lock, and the refusal of an in-process open),
 `TestMultiProcessCreateLoserKeyFromWinnersSalt` (an open that saw no file and then finds another
 process's encrypted database), `TestOpen_PassphraseKeyDerivedOncePerOpen`
 (`encryption_integration_test.go`: one key derivation by an open that creates an encrypted
@@ -4057,7 +4081,7 @@ C `unixShmMap` with `isWrite==0` still maps *existing* regions of the shm file �
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `pager.go:*pager.open` (registration and the create/existing decision), `pager.go:*pager.rekeyRegistry`, `pager.go:*pager.createIfEmpty`, `db.go:registryKey`, `db.go:unstableOpenMu`, `inode_unstable_darwin.go`.
 
-SQLite's `findInodeInfo` keys its per-process inode registry on an fstat of the just-opened fd, under the process-wide `unixBigLock`; on macOS msdos volumes, where a zero-size file reports a wrong inode (ticket #3260; a FAT32 image on macOS 2026-10-15 reported 2^64−13 for an empty file and 13 after its first byte), it first writes one byte and fsyncs so the fstat sees a real inode (`os_unix.c:1553-1576`, 3.52.0) — safe there because 'S' is the first byte of every SQLite header and `unixFileSize` reports a size of 1 as 0. any-store's header does not start with that byte and a 1-byte file would not read as empty to `readInitialHeader`, the create/existing decision or another process, so on such a volume (darwin, `fstatfs` type `msdos` or `exfat`) an empty file is keyed by its absolute path instead, and `rekeyRegistry` moves the entry to the inode once the file has content: in `pager.open` after the create/existing decision, when the file holds a page 1 that this open (`createIfEmpty`, written and fdatasynced) or another process wrote — before any WAL open. Every open on such a volume takes `unstableOpenMu` for its key stat and store, and a path-keyed handle keeps it until its re-key, so the move from path to inode is atomic to the other openers in the process: two spellings of one empty file, or a joiner and its creator, meet on the mutex, the later one stats after the earlier one is keyed by inode and is refused at registration, and only one handle ever runs `createIfEmpty` on the file. The mutex is held across the DB-file flock retry (up to 1 s against a closing peer) and across a creation's wait for the exclusive lock, which SQLite's lock never is: latency only, for other opens on such volumes in this process. Wherever a (dev,ino) identity exists on a stable volume the key is the inode from the first stat, as in SQLite, and the mutex is never taken; Windows and wasm, and a VFS handle whose FileInfo carries no identity, key by path throughout, as before. Two processes creating one empty file at once are serialized by the exclusive DB-file lock ([drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal)). Regression tests (`openregistry_vfs_test.go`, vfs tag, a VFS that reports one inode for every empty file with `emptyFileInodeUnstable` forced on): `TestOpen_RegistryFollowsInodeOfNewFile`, `TestOpen_OpensOnUnstableVolumeSerializeOnCreate`, `TestOpen_JoinerDuringCreatorFdatasyncWaits`, `TestOpen_PathKeyedOpenJoinsContentByInode`, `TestOpen_TwoSpellingsSettleBeforeWAL`.
+SQLite's `findInodeInfo` keys its per-process inode registry on an fstat of the just-opened fd, under the process-wide `unixBigLock`; on macOS msdos volumes, where a zero-size file reports a wrong inode (ticket #3260; a FAT32 image on macOS 2026-10-15 reported 2^64−13 for an empty file and 13 after its first byte), it first writes one byte and fsyncs so the fstat sees a real inode (`os_unix.c:1553-1576`, 3.52.0) — safe there because 'S' is the first byte of every SQLite header and `unixFileSize` reports a size of 1 as 0. any-store's header does not start with that byte and a 1-byte file would not read as empty to `readInitialHeader`, the create/existing decision or another process, so on such a volume (darwin, `fstatfs` type `msdos` or `exfat`) an empty file is keyed by its absolute path instead, and `rekeyRegistry` moves the entry to the inode once the file has content: in `pager.open` after the create/existing decision, when the file holds a page 1 that this open (`createIfEmpty`, written and fdatasynced) or another process wrote — before any WAL open. Every open on such a volume takes `unstableOpenMu` for its key stat and store, and a path-keyed handle keeps it until its re-key, so the move from path to inode is atomic to the other openers in the process: two spellings of one empty file, or a joiner and its creator, meet on the mutex, the later one stats after the earlier one is keyed by inode and is refused at registration, and only one handle ever runs `createIfEmpty` on the file. The mutex is held across the open's wait for the DB-file lock (the busy handler's, up to `BusyTimeout` against a closing or creating peer), which SQLite's lock never is: latency only, for other opens on such volumes in this process. Wherever a (dev,ino) identity exists on a stable volume the key is the inode from the first stat, as in SQLite, and the mutex is never taken; Windows and wasm, and a VFS handle whose FileInfo carries no identity, key by path throughout, as before. Two processes creating one empty file at once are serialized by the exclusive DB-file lock ([drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal)). Regression tests (`openregistry_vfs_test.go`, vfs tag, a VFS that reports one inode for every empty file with `emptyFileInodeUnstable` forced on): `TestOpen_RegistryFollowsInodeOfNewFile`, `TestOpen_OpensOnUnstableVolumeSerializeOnCreate`, `TestOpen_JoinerDuringCreatorFdatasyncWaits`, `TestOpen_PathKeyedOpenJoinsContentByInode`, `TestOpen_TwoSpellingsSettleBeforeWAL`.
 
 <a id="drift-2026-06-25-01-transient-busy-locked-equivalent-errors-are-made-sticky-in-b-rc-so-a-b"></a>
 ### Drift: Transient BUSY/LOCKED-Equivalent Errors Are Made Sticky In b.rc So A Backup Cannot Be Retried Or Resumed
@@ -4160,7 +4184,7 @@ The second caller, `pager.lockDBForCreate` (the creation of a new database, [dri
 
 To convert an exclusive DB-file lock back to shared, the Go code calls `downgradeDBLockToShared`, which simply issues `flockNB(fd, syscall.LOCK_SH)` (`internal/btree/dbfile_lock_unix.go:67-70`); that wrapper performs a real `syscall.Flock(fd, LOCK_SH|LOCK_NB)` and maps `EWOULDBLOCK`/`EAGAIN` to `ErrBusy` (`internal/btree/dbfile_lock_unix.go:74-85`). On BSD `flock` a lock-mode conversion is not atomic — the kernel first drops the existing exclusive lock and then tries to acquire the shared one — so with `LOCK_NB` set the re-acquire can fail if another process grabs a lock in the window, leaving the file with no lock at all while the call returns `ErrBusy`. SQLite's `flockUnlock` deliberately avoids any syscall for an exclusive→shared down-conversion: it observes that an exclusive lock already subsumes shared access and merely updates the in-memory state, `pFile->eFileLock = SHARED_LOCK; return SQLITE_OK;` (`os_unix.c:2747-2751`), reserving an actual `robust_flock(LOCK_UN)` only for the full `NO_LOCK` release path (`os_unix.c:2734-2763`), so its downgrade can never fail and never relinquishes the kernel lock.
 
-The consequence is that a caller invoking downgrade after a successful exclusive upgrade may end up with the DB file silently unlocked (losing the mutual exclusion that serializes last-client-unlink against new openers) while receiving an unexpected `ErrBusy` from an operation that semantically cannot be busy; this is currently latent because no caller invokes `downgradeDBLockToShared` today, but the hazard is inherited by any future use of this cross-platform lock API (also stubbed in `dbfile_lock_windows.go`). The two exclusive→shared conversions in the open path do not use it: after a new database's page 1 is written (`createIfEmpty`), and when an open gets the exclusive lock and finds that another process has created the database (`lockDBForCreate`), both [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal). They go through `pager.lockDBShared`, which repeats the shared request while it is refused, and they run before the WAL is opened, so a lock dropped inside the conversion leaves the handle unlocked only while it is attached to nothing.
+The consequence is that a caller invoking downgrade after a successful exclusive upgrade may end up with the DB file silently unlocked (losing the mutual exclusion that serializes last-client-unlink against new openers) while receiving an unexpected `ErrBusy` from an operation that semantically cannot be busy; this is currently latent because no caller invokes `downgradeDBLockToShared` today, but the hazard is inherited by any future use of this cross-platform lock API (also stubbed in `dbfile_lock_windows.go`). The two exclusive→shared conversions in the open path do not use it: after a new database's page 1 is written (`createIfEmpty`), and when an open gets the exclusive lock and finds that another process has created the database (`lockDBForCreate`), both [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal). They go through `pager.downgradeDBLock`, which repeats the shared request through the busy handler while it is refused, and they run before the WAL is opened, so a lock dropped inside the conversion leaves the handle unlocked only while it is attached to nothing.
 
 <a id="drift-2026-06-25-10-flocknb-does-not-retry-on-eintr-no-robust-flock-equivalent"></a>
 ### Drift: flockNB Does Not Retry On EINTR (No robust_flock Equivalent)
