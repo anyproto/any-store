@@ -2,9 +2,12 @@ package anystore
 
 import (
 	"context"
+	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -175,6 +178,190 @@ func TestEncryption_BringYourOwnCodec(t *testing.T) {
 	got, err := coll2.FindId(context.Background(), "k")
 	require.NoError(t, err)
 	assert.Equal(t, `{"id":"k","v":"hello"}`, got.Value().String())
+}
+
+// sharedCodecDoc is the document number i of a shared-codec test, padded so
+// that a few of them fill a page.
+func sharedCodecDoc(prefix string, i int) *anyenc.Value {
+	return anyenc.MustParseJson(fmt.Sprintf(`{"id":"%s-%d","pad":"%0300d"}`, prefix, i, i))
+}
+
+// requireSharedCodecDocs reads every document of collection "c" in the
+// database at path, which must hold the ids prefix-0..prefix-(n-1) and,
+// only when moreOK, other documents besides.
+func requireSharedCodecDocs(t *testing.T, path string, cfg *Config, prefix string, n int, moreOK bool) {
+	t.Helper()
+	ctx := context.Background()
+	db, err := Open(ctx, path, cfg)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	coll, err := db.OpenCollection(ctx, "c")
+	require.NoError(t, err)
+	for i := 0; i < n; i++ {
+		got, err := coll.FindId(ctx, fmt.Sprintf("%s-%d", prefix, i))
+		require.NoError(t, err)
+		require.Equal(t, sharedCodecDoc(prefix, i).String(), got.Value().String())
+	}
+	count, err := coll.Count(ctx)
+	require.NoError(t, err)
+	if !moreOK {
+		require.Equal(t, n, count)
+		return
+	}
+	// The other documents decrypt too: walk the whole collection.
+	iter, err := coll.Find(nil).Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	walked := 0
+	for iter.Next() {
+		_, err := iter.Doc()
+		require.NoError(t, err)
+		walked++
+	}
+	require.NoError(t, iter.Err())
+	require.Equal(t, count, walked)
+	require.GreaterOrEqual(t, count, n)
+}
+
+// One codec object in Config.Encryption.Codec serving two databases that
+// write at the same time. Each database encrypts its pages through it from
+// its own writer, so the codec must not keep per-encrypt state of its own
+// (a shared nonce source repeats nonces under one key). Run it with -race.
+func TestEncryption_SharedCodecTwoDatabases(t *testing.T) {
+	ctx := context.Background()
+	key := make([]byte, 32)
+	_, err := rand.Read(key)
+	require.NoError(t, err)
+	codec, err := NewAESCodec(key)
+	require.NoError(t, err)
+	cfg := &Config{Encryption: EncryptionConfig{Codec: codec}}
+
+	dir := t.TempDir()
+	paths := []string{filepath.Join(dir, "a.db"), filepath.Join(dir, "b.db")}
+	prefixes := []string{"a", "b"}
+	const docs = 300
+
+	colls := make([]Collection, len(paths))
+	dbs := make([]DB, len(paths))
+	for i, path := range paths {
+		db, err := Open(ctx, path, cfg)
+		require.NoError(t, err)
+		dbs[i] = db
+		colls[i], err = db.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+	}
+
+	start := make(chan struct{})
+	errs := make([]error, len(paths))
+	var wg sync.WaitGroup
+	for i := range dbs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			// One commit per document: every commit encrypts its frames.
+			for j := 0; j < docs; j++ {
+				if err := colls[i].Insert(ctx, sharedCodecDoc(prefixes[i], j)); err != nil {
+					errs[i] = err
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	for i, db := range dbs {
+		require.NoError(t, errs[i])
+		require.NoError(t, db.Close())
+	}
+
+	for i, path := range paths {
+		requireSharedCodecDocs(t, path, cfg, prefixes[i], docs, false)
+	}
+}
+
+// A database with a caller-supplied codec backed up while it is written to.
+// Backup opens the destination with the source's options, so the
+// destination's writer encrypts through the same codec object as the
+// source's writer, at the same time. Run it with -race.
+//
+// The config is a raw-key AES codec with the default page size and no
+// checksum mode: the destination then has the source's page geometry and
+// needs no KDF salt, so the copy is readable with the same codec.
+func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
+	ctx := context.Background()
+	key := make([]byte, 32)
+	_, err := rand.Read(key)
+	require.NoError(t, err)
+	codec, err := NewAESCodec(key)
+	require.NoError(t, err)
+	cfg := &Config{Encryption: EncryptionConfig{Codec: codec}}
+
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "src.db")
+	dstPath := filepath.Join(dir, "dst.db")
+
+	db, err := Open(ctx, srcPath, cfg)
+	require.NoError(t, err)
+	coll, err := db.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	// Enough pages that the copy takes several Steps and its commit writes
+	// many frames.
+	const pre = 3000
+	batch := make([]*anyenc.Value, 0, 500)
+	for i := 0; i < pre; i++ {
+		batch = append(batch, sharedCodecDoc("pre", i))
+		if len(batch) == cap(batch) {
+			require.NoError(t, coll.Insert(ctx, batch...))
+			batch = batch[:0]
+		}
+	}
+
+	// The writer commits one document at a time for the whole backup.
+	stop := make(chan struct{})
+	running := make(chan struct{})
+	writerDone := make(chan struct{})
+	var writerErr error
+	go func() {
+		defer close(writerDone)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := coll.Insert(ctx, sharedCodecDoc("w", i)); err != nil {
+				writerErr = err
+				return
+			}
+			if i == 10 {
+				close(running)
+			}
+		}
+	}()
+	select {
+	case <-running:
+	case <-writerDone:
+		require.NoError(t, writerErr)
+	}
+
+	// A writer that commits in a tight loop can keep every Step of a Backup
+	// busy until the busy timeout ends it with ErrBusy; that happens on a
+	// loaded machine with or without a shared codec. The test is about the
+	// race between the two writers, so a busy Backup is run again.
+	var backupErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if backupErr = db.Backup(ctx, dstPath); !errors.Is(backupErr, ErrBusy) {
+			break
+		}
+	}
+	close(stop)
+	<-writerDone
+	require.NoError(t, writerErr)
+	require.NoError(t, backupErr)
+	require.NoError(t, db.Close())
+
+	requireSharedCodecDocs(t, dstPath, cfg, "pre", pre, true)
 }
 
 func BenchmarkAnystore_Insert_Plain(b *testing.B) {
