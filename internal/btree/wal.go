@@ -1415,24 +1415,22 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 	minSeg, _ := htFrameSegIdx(minFrame)
 
 	for seg := lastSeg; seg >= minSeg; seg-- {
-		// Map segment on demand (create=true). A peer writer may have just
-		// extended SHM with a new segment containing frames <= maxFrame that
-		// this reader hasn't yet mapped. SQLite's walFindFrame (wal.c:3576)
-		// always calls walHashGet → walIndexPage → sqlite3OsShmMap, which
-		// maps/extends the wal-index page — it never silently skips a
-		// segment. Skipping here was the root cause of cross-process
-		// row-loss: hdr.mxFrame advertised frames in a segment we hadn't
-		// mapped, shmHashGet returned 0, and the read path fell through to
-		// the DB file which still held the pre-commit page.
+		// A segment this process has not mapped yet is mapped on demand: a
+		// peer writer may have extended the wal-index with a segment that
+		// holds frames <= maxFrame. walFindFrame always goes through
+		// walHashGet → walIndexPage → sqlite3OsShmMap; it never skips a
+		// segment.
 		//
 		// A segment that cannot be mapped fails the lookup, as walFindFrame
 		// returns walHashGet's error (wal.c:3576-3579 `rc = walHashGet(pWal,
 		// iHash, &sLoc); if( rc!=SQLITE_OK ){ return rc; }`). Going on to
 		// the older segments, or reporting the page as not in the WAL, would
 		// hand the caller the page from before a commit.
-		region, err := wi.shm.region(seg, true)
+		region, err := wi.shm.region(seg, false)
 		if err != nil {
-			return 0, fmt.Errorf("btree: wal-index segment %d: %w", seg, err)
+			if region, err = wi.mapSegmentForLookup(seg); err != nil {
+				return 0, fmt.Errorf("btree: wal-index segment %d: %w", seg, err)
+			}
 		}
 
 		pgnoBase, nEntry, iZero := htSegmentInfo(seg)
@@ -1481,6 +1479,38 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 
 	return 0, nil
 }
+
+// mapSegmentForLookup maps a wal-index segment this process has not mapped
+// yet, for a lookup. A lookup never extends the wal-index file: the segment
+// of a frame in the caller's window was created by the writer of that frame
+// before it published it, so one that is not in the file is damage, and a
+// freshly allocated segment of zeros would answer "not in the WAL" for every
+// page. A reader's walIndexPage passes pWal->writeLock as the extend flag
+// (wal.c:784-786), unixShmMap leaves a region past the end of the file
+// unmapped for it (os_unix.c:5163-5164 `if( !bExtend ){ goto shmpage_out;
+// }`), and walHashGet makes the missing page an error (wal.c:1185-1187).
+//
+// shm.region(seg, false) cannot serve here: it returns only what this process
+// has mapped already (docs/btree/NOTES.md, region(create=false)). The file's
+// size is checked instead, for a shm that has a file; segments are appended
+// whole, so a file that reaches the segment's end holds it. The heap shms
+// have no file and no other process: their segments are this process's own.
+func (wi *walIndex) mapSegmentForLookup(seg int) ([]byte, error) {
+	if f, ok := wi.shm.(shmFile); ok {
+		info, err := f.fileInfo()
+		if err != nil {
+			return nil, err
+		}
+		if need := int64(seg+1) * shmRegionSize; info.Size() < need {
+			return nil, fmt.Errorf("%w: the wal-index file has %d bytes, the segment ends at %d", errShmSegmentMissing, info.Size(), need)
+		}
+	}
+	return wi.shm.region(seg, true)
+}
+
+// errShmSegmentMissing is the failure of a lookup whose wal-index segment is
+// not in the wal-index file.
+var errShmSegmentMissing = errors.New("btree: wal-index segment missing")
 
 // htSlotWord returns the 32-bit word that holds hash slot h and the slot's
 // bit offset in it. Go has no 16-bit atomics, so the slots, which are

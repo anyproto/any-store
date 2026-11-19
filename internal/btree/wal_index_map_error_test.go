@@ -12,7 +12,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -191,6 +193,60 @@ func TestWalIndexMapError_CheckpointedReaderReads(t *testing.T) {
 	defer restore()
 	restartCheck(t, db, 0, 1, 2)
 	restartCheck(t, db, 1, 2, 1)
+}
+
+// A lookup maps a segment that is in the wal-index file and fails on one that
+// is not: it never extends the file. A reader's walIndexPage passes
+// pWal->writeLock as the extend flag (wal.c:784-786), unixShmMap leaves a
+// region beyond the end of the file unmapped for it (os_unix.c:5163-5164 `if(
+// !bExtend ){ goto shmpage_out; }`) and walHashGet turns the missing page
+// into an error (wal.c:1185-1187). A segment made of zeros would answer "not
+// in the WAL" for every page.
+func TestWalIndexLookup_MissingSegmentFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.shm")
+	writer, err := newWalIndex(path, false)
+	require.NoError(t, err)
+	defer func() { _ = writer.close(false) }()
+	const nFrames = htNPageOne + 10
+	for f := uint32(1); f <= nFrames; f++ {
+		require.NoError(t, writer.set(f+1, f))
+	}
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, int64(2*shmRegionSize), info.Size(), "setup: the writer made two segments")
+
+	// The readers attach as other processes do: they find the file in use
+	// (the probe of the DMS byte reports a shared lock) and leave it as it
+	// is. In one process the election would truncate it (newPlatformShm).
+	stubDMSFcntl(t, func(_ func(uintptr, int, *syscall.Flock_t) syscall.Errno, _ uintptr, cmd int, flock *syscall.Flock_t) (syscall.Errno, bool) {
+		if cmd == syscall.F_GETLK {
+			flock.Type = syscall.F_RDLCK
+			return 0, true
+		}
+		return 0, false
+	})
+	attach := func() *walIndex {
+		wi, err := newWalIndex(path, false)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wi.close(false) })
+		return wi
+	}
+
+	// A reader that has mapped nothing maps the second segment, which is in
+	// the file, and finds the frame.
+	frame, err := attach().shmHashGet(nFrames+1, nFrames, 1)
+	require.NoError(t, err)
+	require.Equal(t, uint32(nFrames), frame)
+
+	// The file loses its second segment. A reader that has not mapped it
+	// fails the lookup and leaves the file as it is.
+	reader := attach()
+	require.NoError(t, os.Truncate(path, shmRegionSize))
+	frame, err = reader.shmHashGet(nFrames+1, nFrames, 1)
+	require.ErrorIs(t, err, errShmSegmentMissing, "the lookup answered frame %d from a segment that is not in the file", frame)
+	info, err = os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, int64(shmRegionSize), info.Size(), "the lookup extended the wal-index file")
 }
 
 // BenchmarkShmHashGet is the shared-memory page lookup over two segments: a
