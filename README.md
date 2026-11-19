@@ -82,7 +82,7 @@ func main() {
 
 The full end-to-end example lives in [`example/`](example) and the [API docs](https://pkg.go.dev/github.com/anyproto/any-store/v2).
 
-> **Document size.** A document's encoded id and stored body together are limited to 1 GiB (`1<<30` bytes); a write over the limit fails with `ErrValueTooLarge` (`ErrKeyTooLarge` when the id alone is over it) and stores nothing.
+> **Document size.** Each key/value pair a write stores is limited to 1 GiB (`1<<30` bytes): a document's encoded id with its stored body, and each index entry's key with its one-byte value. A write over the limit stores nothing and fails with `ErrValueTooLarge`, or with `ErrKeyTooLarge` when a key alone is over it; the two are separate errors, check for both.
 
 > **Choosing document ids.** Unlike SQLite there is no hidden rowid — the document id is the btree key. Increment-like ids (`anyenc.NewObjectID()`, timestamps, sequences) keep inserts append-ordered and reads cache-friendly; fully random ids (e.g. UUIDv4) scatter them. In practice this only matters for very hot write/read paths or huge collections.
 

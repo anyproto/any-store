@@ -811,7 +811,7 @@ The Go implementation has:
 | Aspect | SQLite | Go |
 |--------|--------|-----|
 | Max local payload | `BT_MAX_LOCAL = 65501` | `payloadLimits.maxLocal` computed from usableSize: the index limit for interior cells, the file's leaf limit (`pager.leafLimits`) for leaf cells |
-| Max total payload | Validated against `nPage * usableSize` | `maxPayloadAlloc = 1 << 30` |
+| Max total payload | Validated against `nPage * pageSize` (`sqlite3BtreeMaxRecordSize`) | `maxPayloadAlloc = 1 << 30` in the parsers and for writes; `payloadInFile` (`nPage * pageSize`) before a reader allocates |
 | Approach | Per-access bounds checking with macros | Per-access bounds checking with error returns |
 | Overflow protection | Trust chain structure | `maxIter` + bounds checks |
 | Max tree depth | `BTCURSOR_MAX_DEPTH = 20` | `btCursorMaxDepth` (same value) |
@@ -828,26 +828,50 @@ The cap is also the write-side limit (2026-11-19). `Put` took any value and any 
 then rejected as `ErrCorrupt` by every parse of its cell (`parseLeafCellWithSize`,
 `leafFullKey`, `leafFullValue`, `leafKeyAt`); a value alone over the cap also failed the
 binary-search probes of its leaf (`searchLeafWithOverflow`), which made the neighbouring
-keys unreadable. Both sides now apply one rule, `payloadFits` (`page.go`): neither length
-negative, key length plus value length at most `maxPayloadAlloc` (`1<<30`). The parsers
+keys unreadable. Both sides now apply one rule, `payloadFits` (`page.go`): key length plus
+value length at most `maxPayloadAlloc` (`1<<30`), tested on the 64-bit lengths a cell
+declares before they are converted to `int` (on a 32-bit build a declared length of
+`1<<32+1` converts to 1, and the five parsers that converted first accepted it). The parsers
 answer `ErrCorrupt` for a cell that fails it; `Put` answers `ErrKeyTooLarge` (the key alone
 is over) or `ErrValueTooLarge` before it touches a page, and `CreateNamespace` /
 `RenameNamespace` apply it to the master-table record (the name and a 4-byte root) before
-they allocate the root or delete the old name. `searchLeafWithOverflow` and
-`leafCellPayloadLen` (`walkSize`) test the two lengths singly and not their sum, as before:
-looser than `payloadFits`, never stricter, so nothing `Put` accepts fails there. The
-overflow-chain readers have no cap of their own (their `maxIter` follows from the length
-asked for), and the 9-byte varint holds any length under the cap.
+they allocate the root or delete the old name. Only `Put` brings a new record into a tree;
+the page rebuilds, a `Delete` that defragments its leaf among them, write back cells they
+have parsed. `searchLeafWithOverflow` tests the two lengths singly when it probes a cell
+and their sum only for the cell it reports as found: a cell over the limit by its sum (a
+release without the write-side limit could store one) does not hide its neighbours, and
+`Has` does not answer true for a record `Get` rejects. `leafCellPayloadLen` (`walkSize`)
+tests them singly, as before. Both are looser than `payloadFits`, never stricter, so
+nothing `Put` accepts fails there. The overflow-chain readers have no cap of their own
+(their `maxIter` follows from the length asked for), and the 9-byte varint holds any length
+under the cap.
 
-SQLite draws this line above the b-tree: `SQLITE_MAX_LENGTH` is 1,000,000,000
-(`sqliteLimit.h:24`), `OP_MakeRecord` fails with `SQLITE_TOOBIG` when
-`nByte+nZero>db->aLimit[SQLITE_LIMIT_LENGTH]` (`vdbe.c:3697`, `too_big:` at `vdbe.c:9298`),
-and `sqlite3BtreeInsert` only asserts its lengths (`btree.c:9485`, `9540`); on the read side
-`sqlite3VdbeMemFromBtree` returns `SQLITE_CORRUPT_BKPT` for an amount past
-`sqlite3BtreeMaxRecordSize` (`vdbemem.c:1428-1429`). The value differs (2^30 here, 10^9
+The fixed cap alone let a damaged cell in a small file declare just under 1 GiB and have a
+reader allocate that much before the overflow chain turned out short. SQLite's precise
+bound is ported for that (2026-11-19): `sqlite3VdbeMemFromBtree` returns
+`SQLITE_CORRUPT_BKPT` when `amt+offset > sqlite3BtreeMaxRecordSize(pCur)` before it resizes
+the Mem (`vdbemem.c:1428-1429`), and that size is `pageSize * nPage` (`btree.c:4981-4985`).
+`payloadInFile` (`page.go`) is the same test with the page count of the reader's snapshot
+(`readerDbSizeBound`: the read transaction's, or the live count for the writer). It runs
+before every allocation sized by a declared length: `btree.AppendValue`,
+`ReadTx.AppendValue`, `Cursor.Value`, `Cursor.AppendValue`, `leafFullKey`, `leafFullValue`,
+`interiorFullKey`, `cellFullKey` and `collectInteriorCellsKeepBuf`. It is applied where the
+bytes are asked for, as in SQLite, not in the cell parsers, which have no pager. The 1 GiB
+cap stays as the limit of what is written and as the bound where the two differ (a file
+over 1 GiB).
+
+SQLite draws the write-side line above the b-tree: `SQLITE_MAX_LENGTH` is 1,000,000,000
+(`sqliteLimit.h:24`) and is tested where a value or a record is built. In `OP_MakeRecord`
+the test is `nByte+nZero>db->aLimit[SQLITE_LIMIT_LENGTH]` (`vdbe.c:3697`, `too_big:` at
+`vdbe.c:9298`), and it runs when the output register must grow to hold the record: it is in
+the `else` of `if( nByte+nZero<=pOut->szMalloc )` (`vdbe.c:3690`). `sqlite3BtreeInsert`
+only asserts its lengths (`btree.c:9485`, `9540`). The value differs (2^30 here, 10^9
 there) and so does the layer, the b-tree being the lowest one every writer here passes
-through. Tests: `TestPayloadLimit_RealConstants`, `TestPayloadLimit_PutRefusesWhatReadRejects`,
-`TestPayloadLimit_NamespaceName`.
+through. Tests: `TestPayloadLimit_RealConstants`,
+`TestPayloadLimit_LengthsCheckedBeforeNarrowing`,
+`TestPayloadLimit_PutRefusesWhatReadRejects`, `TestPayloadLimit_NamespaceName`,
+`TestPayloadLimit_DeclaredLengthOverFileSize`,
+`TestPayloadLimit_OverflowRecordWithinFileSize`.
 
 <a id="old-drift-additive-maxiter-circular-chain-guard"></a>
 **Severity:** low

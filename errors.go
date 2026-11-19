@@ -233,16 +233,30 @@ var (
 	// file does not hold. Recovery itself repairs a bad WAL header and drops torn frames silently.
 	ErrWALCorrupt = btree.ErrWALCorrupt
 
-	// ErrValueTooLarge is returned (wrapped) by a write whose record is over the record size
-	// limit of 1 GiB (1<<30 bytes). For a document the record is its encoded id and its stored
-	// body together, the body compressed unless compression is off or does not shrink it; for an
-	// index entry it is the entry's key. Nothing is written and the write's transaction scope is
-	// rolled back like after any other failed write. Without this check the record would be
-	// stored and every later read of it would report ErrCorrupt.
+	// ErrValueTooLarge is returned (wrapped) by a write of a record over the record size limit:
+	// a stored key and its value together may take 1 GiB (1<<30 bytes). The limit applies to each
+	// key/value pair a write stores, not to the document as a whole:
+	//
+	//   - the document itself: its encoded id as the key and its body as the value, the body
+	//     compressed unless compression is off, does not shrink it, or its plain encoding is over
+	//     1 GiB (it is then stored, and measured, plain);
+	//   - each index entry: the encoded indexed values followed by the id as the key, and a
+	//     one-byte value. An index key of exactly 1 GiB is therefore over the limit by that byte
+	//     and reported with this error, not with ErrKeyTooLarge.
+	//
+	// Nothing of the record is written, and the operation is rolled back like after any other
+	// failed write. Without the limit the record would be stored and every later read of it
+	// would report ErrCorrupt.
+	//
+	// ErrKeyTooLarge is a separate error, not a kind of this one: a caller that handles records
+	// over the limit checks for both.
 	ErrValueTooLarge = btree.ErrValueTooLarge
 
-	// ErrKeyTooLarge is ErrValueTooLarge for a record whose key alone, a document's encoded id
-	// or an index entry's key, is over the limit.
+	// ErrKeyTooLarge is returned (wrapped) by a write of a record whose key alone is over 1 GiB:
+	// a document's encoded id, or an index entry's key. Which of the two errors an oversized
+	// document gets depends on the pair that fails first: an update that grows an indexed field
+	// past the limit writes the index entry before the document and returns this error even when
+	// the id is short. It does not match ErrValueTooLarge; see there.
 	ErrKeyTooLarge = btree.ErrKeyTooLarge
 
 	// ErrPageBufferNotInitialized is returned when UseGlobalPageBuffer is set
