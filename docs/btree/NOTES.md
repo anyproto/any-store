@@ -454,6 +454,31 @@ intentional.
    exclusive — serializing shm unlink against new opens exactly as SQLite
    does in `wal.c:2487-2551` (`sqlite3WalClose`).
 
+   **Order (2026-11-19).** The upgrade is the first step of the close, as
+   `sqlite3OsLock(pWal->pDbFd, SQLITE_LOCK_EXCLUSIVE)` is in `sqlite3WalClose`
+   (`wal.c:2522-2523`); the PASSIVE checkpoint (`wal.c:2528-2530`) and the
+   truncate (`wal.c:2531-2550`: the WAL is deleted unless it is persistent, `wal.c:2536-2540`, and a
+   persistent one is truncated to zero only with a non-negative size limit, `else if( pWal->mxWalSize>=0 )`,
+   `wal.c:2541-2548`; here the WAL is always truncated and never deleted,
+   [drift-55](#drift-55-wal-file-truncated-but-never-unlinked-on-last-client-close)) run only under it, and a close that does not
+   get the lock runs neither. `pager.close` used to checkpoint first, then
+   upgrade, then truncate on the checkpoint's result — with the write lock
+   or, when a peer's transaction outlasted the busy timeout, without it. A
+   peer that committed after the checkpoint's last look at the log and whose
+   process ended before the upgrade (no Close, so no checkpoint of its own)
+   had its commit truncated away. Under the lock no other process is
+   attached, so nothing can be committed between the checkpoint and the
+   truncate. Consequences of SQLite's order: a close that is not the last no
+   longer checkpoints (the processes still attached do), it no longer waits
+   for a busy write lock, and the last close holds the file exclusively for
+   the length of its checkpoint, during which an opener retries its shared
+   lock (`pager.open`, 100 × 10 ms, then an error) where SQLite's opener
+   goes through its busy handler. Under the lock the close still takes
+   `WAL_WRITE_LOCK` (free by then) where SQLite switches to exclusive
+   locking mode (`wal.c:2525-2527`), and truncates only if it got it. Tests:
+   `TestCloseNotLastClient_LeavesWAL`,
+   `TestCloseLastClient_KeepsCommitBeforeLock` (`-tags vfs`, two processes).
+
    See `internal/btree/dbfile_lock_unix.go` for the flock wrappers. The
    inode-verify retry loop in `newPlatformShm` is gone — a single-shot
    `osOpenFile` + `F_RDLCK(DMS)` now suffices.
@@ -1332,13 +1357,20 @@ comments in source):
 4. **Batched wal-index update** (`wal.go:setBatch`) — **Severity:** medium.
    SQLite updates the wal-index
    inline in `walFrames()` — the write loop tags each page `PGHDR_WAL_APPEND`
-   (set on append `wal.c:4149`, cleared on in-place reuse `wal.c:4137`), then a
-   second loop replays the flag via `walIndexAppend()` (`wal.c:4212-4221`);
+   (set on append `wal.c:4163`, cleared on in-place reuse `wal.c:4151`), then a
+   second loop replays the flag via `walIndexAppend()` (`wal.c:4225-4229`);
    rollback uses `walCleanupHash()` (`wal.c:1233`). We mirror this with one
    post-loop `setBatch` (`wal.go:603`, called at `wal.go:2218`) per
    `writeFrames` call (a single `wi.mu` acquisition for the in-process `pageMap`,
    then eager `shmHashWrite` — *not* deferred), plus a `walCleanupHash` analog on
-   rollback. **Invariant: the appended set handed to `setBatch` MUST be recorded
+   rollback. `shmHashWrite` also runs `walCleanupHash` (`shmCleanupHash`) before
+   it writes a frame whose `aPgno` entry is already set, as `walIndexAppend`
+   does (`wal.c:1327-1330`): the entry is left over from a writer that died
+   after it had spilled pages, and with it the rest of that writer's entries
+   above the log's last frame. The limit of that cleanup follows the batch
+   ([drift-2026-11-19](#drift-2026-11-19-dead-writer-cleanup-limit-follows-the-batch)).
+   Tests: `TestWalIndexDeadWriter_*` (`wal_index_dead_writer_test.go`).
+   **Invariant: the appended set handed to `setBatch` MUST be recorded
    inline in the write loop (the `appended` slice ≡ `PGHDR_WAL_APPEND`), never
    re-derived.** Re-deriving the reuse predicate after the loop dropped the
    force-appended commit frame and silently corrupted recovery — see the
@@ -3070,18 +3102,61 @@ write nor reconstructs it on read; the field carries no usable page-size informa
 SQLite's per-read `szPage` decode (low impact because Go derives page size elsewhere).
 
 <a id="drift-92-shmhashget-skips-segment-on-map-io-error"></a>
-### Drift: shmHashGet Skips Segment On Map IO Error
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `wal.go:*walIndex.shmHashGet` (`internal/btree/wal.go:1152`; the skip-on-error path is `wal.go:1171-1174`).
+### **Resolved (2026-11-19)** — Drift: shmHashGet Skips Segment On Map IO Error
+- **Category:** changed-logic  -  **Severity:** was recorded low; the effect was a silent stale read
+- **Affected functions:** `wal.go:*walIndex.shmHashGet`.
 
-C's `walFindFrame` (`wal.c:3505`) aborts the entire frame lookup on any hash-segment map failure:
-`rc = walHashGet(pWal, iHash, &sLoc); if(rc!=SQLITE_OK){ return rc; }` (`wal.c:3562-3565`), so an SHM
-map/extend IO error (`walHashGet` -> `walIndexPage` -> `sqlite3OsShmMap`) propagates up to the reader. Go's
-`shmHashGet` instead does `region, err := wi.shm.region(seg, true); if err != nil { continue }`
-(`wal.go:1171-1174`), silently skipping that hash segment and continuing the scan. The consequence is that a
-genuine SHM mapping/IO error is swallowed rather than reported: the lookup proceeds over the remaining
-segments and may return a stale or missing-frame result where SQLite would have failed the read with the
-underlying error.
+C's `walFindFrame` aborts the entire frame lookup on any hash-segment map failure:
+`rc = walHashGet(pWal, iHash, &sLoc); if( rc!=SQLITE_OK ){ return rc; }` (`wal.c:3576-3579`), so an SHM
+map/extend error (`walHashGet` -> `walIndexPage` -> `sqlite3OsShmMap`) reaches the reader:
+`readDbPage` returns it (`pager.c:3032-3033`) and `getPageNormal` drops the page and fails the get
+(`pager_acquire_err`, `pager.c:5629`). Go's `shmHashGet` did `if err != nil { continue }`: it skipped
+the segment and went on to the older ones, so the lookup answered with an older frame or with "not in
+the WAL", and the caller read the page from before a commit: a reader returned the old value with no
+error, and a writer that changed such a page committed the earlier commit away. `shmHashGet` now
+returns the mapping error (wrapped, `errors.Is` still matches it). Every caller already failed its
+read on a lookup error (the over-probed-chain `ErrCorrupt`, drift-93): `walIndex.get` → `getPageWriter`
+(the page is discarded from the writer cache, as `pager_acquire_err` drops it), `readTempPage`,
+`getPageReader`, `readRawPage`, `headerCountersAt`, the page 1 read of `open`; `getInTxRange` →
+`writeFrames`/`writeFramesMem`; `getLatest`. The in-process index looks pages up in `pageMap` and maps
+nothing. Tests: `TestWalIndexMapError_ReaderFails`, `_WriterFails`, `_LookupsFail`
+(`wal_index_map_error_test.go`).
+
+More of `walFindFrame`'s rules came with it (2026-11-19), since a lookup that can fail must not fail, or be
+wrong, where C's cannot:
+
+- **An empty window touches no segment.** A snapshot that is entirely in the database file (a reader on slot
+  0: `minFrame == maxFrame+1`) returned before the loop in C (`wal.c:3538-3541`). `shmHashGet` mapped and
+  probed the segment of `maxFrame` for it, so a segment it could not map failed a read that needs no WAL, and
+  it read hash tables a log restart may be clearing. `shmHashGet`, `get` and `getInTxRange` return `(0, nil)`
+  for `minFrame > maxFrame`. Tests: `TestWalIndexLookup_EmptyWindowMapsNothing`,
+  `TestWalIndexMapError_CheckpointedReaderReads`.
+- **A lookup does not extend the wal-index file.** `shmHashGet` mapped with `region(seg, true)`, which
+  extends a short file with zeros and maps them: a segment missing from the file read as "no page here"
+  instead of failing. C passes `pWal->writeLock` as the extend flag (`wal.c:784-786`), `unixShmMap` leaves the
+  region unmapped for a reader (`os_unix.c:5163-5164`), and `walHashGet` makes that an error
+  (`wal.c:1185-1187`). `shmHashGet` now takes what is mapped (`region(seg, false)`) and otherwise goes through
+  `mapSegmentForLookup`, which fails with `errShmSegmentMissing` when the file does not reach the segment's
+  end and maps the segment otherwise. A writer's lookups do not extend either, where C's would (its extend
+  flag is set): a segment of a frame in the window was made by the writer of that frame. Test:
+  `TestWalIndexLookup_MissingSegmentFails`.
+- **Bounds before page number; atomic slots.** The probe tested `aPgno` before the frame bounds and read and
+  wrote the 16-bit slots as plain bytes, so a reader goroutine read page numbers and slots of entries above
+  its snapshot while the writer of the same process changed them (an append, a rollback's
+  `shmCleanupFromFrame`, the removal of a dead writer's entries). C loads the slot with `AtomicLoad`
+  (`wal.c:3583`), tests `iFrame<=iLast && iFrame>=pWal->minFrame` before `sLoc.aPgno[iH-1]==pgno`
+  (`wal.c:3585`) and stores the slot with `AtomicStore` (`wal.c:1338`). The probe now has C's order, and
+  every access to a slot of a table that readers probe goes through `htSlotLoad`/`htSlotStore`: Go has no
+  16-bit atomics, so the aligned 32-bit word that holds two slots is loaded and stored; a store rewrites the
+  neighbouring slot with the value it has just loaded, which is safe because only the holder of the write
+  lock stores. `shmCleanupHashSegment` clears its slots the same way, where C's `walCleanupHash` stores
+  plainly (`wal.c:1260-1264`): a plain store that a reader loads concurrently is a data race in Go. The page
+  numbers stay plain, as in C (the read after the bounds, the cleanup's `memset`, `wal.c:1271`): a reader
+  reads only those of its window, written before its snapshot was published and not changed while it is in
+  use. The whole-segment clears (a segment's first frame, the segments past a rollback target,
+  `shmClearHash`) stay plain: no snapshot reaches those segments. Test:
+  `TestWalIndexDeadWriter_CleanupUnderReader` under `-race` (the detector sees the heap index only; it does
+  not track the mmap'd one).
 
 <a id="drift-93-wal-hash-probe-full-chain-corruption-signal-dropped"></a>
 ### **Resolved (stale, 2026-06-25)** — shmHashGet now bounds the per-segment probe and propagates full-chain corruption as ErrCorrupt, matching C's walFindFrame (write path shmHashWrite likewise returns ErrCorrupt); cited wal.go:1081 is stale. Drift: WAL Hash Probe Full Chain Corruption Signal Dropped
@@ -3114,6 +3189,29 @@ segment 0, `htNPage=4096` otherwise), and `shmHashGet` uses it as a defensive in
 consequence is a behavioral divergence in how the `aPgno` index is constrained: Go adds an explicit
 `idx < nEntry` upper-bound check that C lacks, so an index C would read unconditionally Go instead
 rejects/skips — a different (and stricter) handling of out-of-range hash entries.
+
+<a id="drift-2026-11-19-dead-writer-cleanup-limit-follows-the-batch"></a>
+### Drift: Dead-Writer Cleanup Limit Follows The Batch
+- **Category:** changed-logic  -  **Severity:** low (strictly keeps more; closes a window C has)
+- **Affected functions:** `wal.go:*walIndex.setBatch`, `wal.go:*walIndex.shmHashWrite`, `wal.go:*walIndex.shmCleanupHash`.
+
+`walIndexAppend` runs `walCleanupHash` when the frame's `aPgno` entry is already set (`wal.c:1327-1328`), and
+`walCleanupHash` removes every entry above `pWal->hdr.mxFrame` (`wal.c:1258-1271`). `walFrames` advances
+`pWal->hdr.mxFrame` after its `walIndexAppend` loop (`wal.c:4243`), so for every frame of a batch the limit is
+the last frame before the batch. That is right when the leftover is a dead writer's spill: its entries start at
+the first frame after the log's end, the batch's first frame finds its `aPgno` set, and the cleanup runs before
+the batch has indexed anything. It is wrong for a writer that died inside a rollback's cleanup, which clears
+the hash slots and then the page numbers in ascending order (`walCleanupHash`'s `memset`, `wal.c:1271`; here
+`shmCleanupHashSegment`): with the page numbers of the first frames cleared and the later ones not, the batch
+indexes its first frames, finds a later `aPgno` set, and cleans back to the limit — removing the entries it has
+just written. The commit succeeds and those pages read as they were before it. By reading, C behaves the same
+in that state (the limit is `pWal->hdr.mxFrame`, the batch's own entries are above it, and the `assert(
+!sLoc.aPgno[idx-1] )` at `wal.c:1329` holds); the state needs a process killed inside one `memset`.
+
+Go passes `shmHashWrite` the last frame whose entry is to be kept: the last frame before the batch for the
+batch's first frame, then each frame as it is indexed (`setBatch`). The cleanup therefore never removes an
+entry of the batch, and removes the same entries as C's whenever it runs at the batch's first frame. Test:
+`TestWalIndexDeadWriter_PartlyClearedTail`.
 
 <a id="drift-95-shmcleanupfromframe-zeros-all-segments-above-target"></a>
 ### Drift: shmCleanupFromFrame Zeros All Segments Above Target
@@ -3916,7 +4014,7 @@ For file-backed databases that run in forced in-process mode (heap-backed WAL-in
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `dbfile_lock_unix.go:tryUpgradeDBLockExclusive` (`internal/btree/dbfile_lock_unix.go:55-65`), `dbfile_lock_unix.go:flockNB` (`internal/btree/dbfile_lock_unix.go:74-85`), `pager.go:*pager.close` (`internal/btree/pager.go:3277-3284`).
 
-To prove "last client" at close, the Go pager upgrades its lifetime DB-file lock from shared to exclusive by issuing a single `syscall.Flock(fd, LOCK_EX|LOCK_NB)` through `flockNB` (`internal/btree/dbfile_lock_unix.go:78`), with `tryUpgradeDBLockExclusive` mapping `ErrBusy` to `(false, nil)` (`internal/btree/dbfile_lock_unix.go:60-61`). Per BSD `flock(2)` semantics a shared→exclusive conversion on one open file description is not atomic: the kernel first drops the existing `LOCK_SH` and only then tries to install `LOCK_EX`, so when the exclusive grant cannot be satisfied immediately the `LOCK_NB` attempt fails *after* the shared lock has already been released. The caller therefore observes `(false, nil)` and treats itself as a non-last client (`internal/btree/pager.go:3277-3284`), unaware that its DB-file SHARED lock is now gone. SQLite's flock VFS sidesteps this entirely: in `flockLock` every lock at or above `SHARED_LOCK` is physically an exclusive `flock` (`os_unix.c:2682-2685`), so once any lock is held an upgrade just bumps the in-memory level and returns `SQLITE_OK` without re-issuing `robust_flock` (`os_unix.c:2696-2701`), and `flockCheckReservedLock` documents that the connection's lock is already exclusive (`os_unix.c:2643-2656`); the held lock is never momentarily dropped, and SQLite's real DB-file close protocol additionally uses atomic fcntl byte-range conversions that do not release the prior lock on failure. The consequence is that a non-last client whose upgrade fails returns `isLastClient=false` but has silently dropped its lifetime DB-file shared lock, opening a window (until its fd closes) in which a peer process's concurrent `tryUpgradeDBLockExclusive` sees no contention, wrongly declares itself last client, and truncates the WAL / unlinks the shm while this client is still attached — re-opening the early-truncation / orphan-inode race the DB-file lock protocol exists to prevent.
+To prove "last client" at close, the Go pager upgrades its lifetime DB-file lock from shared to exclusive by issuing a single `syscall.Flock(fd, LOCK_EX|LOCK_NB)` through `flockNB` (`internal/btree/dbfile_lock_unix.go:78`), with `tryUpgradeDBLockExclusive` mapping `ErrBusy` to `(false, nil)` (`internal/btree/dbfile_lock_unix.go:60-61`). Per BSD `flock(2)` semantics a shared→exclusive conversion on one open file description is not atomic: the kernel first drops the existing `LOCK_SH` and only then tries to install `LOCK_EX`, so when the exclusive grant cannot be satisfied immediately the `LOCK_NB` attempt fails *after* the shared lock has already been released. The caller therefore observes `(false, nil)` and treats itself as a non-last client (`internal/btree/pager.go:3277-3284`), unaware that its DB-file SHARED lock is now gone. SQLite's flock VFS sidesteps this entirely: in `flockLock` every lock at or above `SHARED_LOCK` is physically an exclusive `flock` (`os_unix.c:2682-2685`), so once any lock is held an upgrade just bumps the in-memory level and returns `SQLITE_OK` without re-issuing `robust_flock` (`os_unix.c:2696-2701`), and `flockCheckReservedLock` documents that the connection's lock is already exclusive (`os_unix.c:2643-2656`); the held lock is never momentarily dropped, and SQLite's real DB-file close protocol additionally uses atomic fcntl byte-range conversions that do not release the prior lock on failure. The consequence is that a non-last client whose upgrade fails returns `isLastClient=false` but has silently dropped its lifetime DB-file shared lock, opening a window (until its fd closes) in which a peer process's concurrent `tryUpgradeDBLockExclusive` sees no contention, wrongly declares itself last client, and truncates the WAL / unlinks the shm while this client is still attached — re-opening the early-truncation / orphan-inode race the DB-file lock protocol exists to prevent. Since 2026-11-19 the upgrade is the first step of `pager.close` (§SHM open/close protocol drift, item 1): a closer whose upgrade fails runs no checkpoint and no truncate, and only closes its descriptors after it, so the unlocked window is no longer than it was; the conversion itself is unchanged.
 
 <a id="drift-2026-06-25-09-downgradedblocktoshared-can-leave-the-db-file-fully-unlocked-or-spurio"></a>
 ### Drift: downgradeDBLockToShared Can Leave The DB File Fully Unlocked Or Spuriously Return ErrBusy
@@ -4043,7 +4141,7 @@ any-store's shm fcntl wrapper allowlists only a transient errno set — `EACCES,
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `shm_mmap.go:*mmapShm.region` (`internal/btree/shm_mmap.go:115-125`).
 
-`mmapShm.region` returns an already-mapped region (`shm_mmap.go:120-121`) but, when `create=false` and the region is not yet mapped in this process, returns an error (`shm_mmap.go:124-125`) instead of mapping an existing on-disk region or returning `(nil, OK)` for a region past EOF. SQLite's `unixShmMap` (`os_unix.c:5159-5230`) maps any region already present in the shm file even when not extending, and returns `(NULL, SQLITE_OK)` for a not-yet-allocated region. The hot WAL read path works around this by always passing `create=true` (`wal.go:1171`), so impact is confined to best-effort callers (`shmClearHash`, `shmCleanupFromFrame`, `shmReadCkptInfo`). The consequence is that a peer process's freshly-extended region is unreachable to a `create=false` caller, and the mapping/return semantics diverge from the ported function.
+`mmapShm.region` returns an already-mapped region (`shm_mmap.go:120-121`) but, when `create=false` and the region is not yet mapped in this process, returns an error (`shm_mmap.go:124-125`) instead of mapping an existing on-disk region or returning `(nil, OK)` for a region past EOF. SQLite's `unixShmMap` (`os_unix.c:5159-5230`) maps any region already present in the shm file even when not extending, and returns `(NULL, SQLITE_OK)` for a not-yet-allocated region. The WAL lookup works around this without extending the file: it checks the file's size and only then maps with `create=true` (`mapSegmentForLookup`, 2026-11-19; until then it passed `create=true` outright, which also extended a short file); the remaining impact is on best-effort callers (`shmClearHash`, `shmCleanupFromFrame`, `shmReadCkptInfo`). The consequence is that a peer process's freshly-extended region is unreachable to a `create=false` caller, and the mapping/return semantics diverge from the ported function.
 
 <a id="drift-2026-06-25-28-recoverlocked-truncates-the-wal-and-discards-committed-frames-on-a-cor"></a>
 ### Drift: recoverLocked truncates the WAL and discards committed frames on a corrupt/incompatible WAL header instead of preserving it / returning CANTOPEN

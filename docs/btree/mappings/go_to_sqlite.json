@@ -2693,6 +2693,13 @@
     "sqlite": [],
     "note": ""
   },
+  "wal.go:*walIndex.mapSegmentForLookup": {
+    "sqlite": [
+      "wal.c:walHashGet",
+      "wal.c:walIndexPage"
+    ],
+    "note": ""
+  },
   "wal.go:*walIndex.prepareHeader": {
     "sqlite": [
       "wal.c:walIndexWriteHdr"
@@ -2739,6 +2746,12 @@
   },
   "wal.go:*walIndex.shmCleanupFromFrame": {
     "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.shmCleanupHash": {
+    "sqlite": [
+      "wal.c:walCleanupHash"
+    ],
     "note": ""
   },
   "wal.go:*walIndex.shmClearHash": {
@@ -2818,12 +2831,34 @@
     ],
     "note": ""
   },
+  "wal.go:htSlotLoad": {
+    "sqlite": [
+      "wal.c:walFindFrame"
+    ],
+    "note": "AtomicLoad of a hash slot"
+  },
+  "wal.go:htSlotStore": {
+    "sqlite": [
+      "wal.c:walIndexAppend"
+    ],
+    "note": "AtomicStore of a hash slot"
+  },
+  "wal.go:htSlotWord": {
+    "sqlite": [],
+    "note": ""
+  },
   "wal.go:newWal": {
     "sqlite": [],
     "note": ""
   },
   "wal.go:newWalIndex": {
     "sqlite": [],
+    "note": ""
+  },
+  "wal.go:shmCleanupHashSegment": {
+    "sqlite": [
+      "wal.c:walCleanupHash"
+    ],
     "note": ""
   },
   "wal.go:walBusyLock": {
