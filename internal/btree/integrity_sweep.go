@@ -41,10 +41,12 @@ type SweepResult struct {
 	Errors []SweepError
 }
 
-// IntegrityMode returns the codec mode currently installed on the DB.
-// Plain DBs (no codec) report IntegrityNone.
+// IntegrityMode returns the integrity mode of the pages the DB stores.
+// Plain DBs (no codec) report IntegrityNone, and so does every in-memory
+// DB: its store and its WAL hold pages as the b-tree wrote them, past any
+// codec the options named (wal.writeFramesMem), so no page carries a tag.
 func (db *DB) IntegrityMode() IntegrityMode {
-	if db.pager.codec == nil {
+	if db.pager.codec == nil || db.pager.inMemory {
 		return IntegrityNone
 	}
 	if _, ok := db.pager.codec.(*cksumCodec); ok {
