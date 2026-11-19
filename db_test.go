@@ -1706,12 +1706,17 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 			stalePass()
 			return row
 		}
-		peerWrites(1)
+		// own is the shape of the live sketch (the index has one field; the
+		// first pass's writer leaves the live sketch with two levels, see
+		// below), other is the shape it does not have.
+		own := live.Levels
+		other := 3 - own
+		peerWrites(own)
 		pub = idx.loadPubSketch()
 		require.NotSame(t, live, pub, enc.name)
 		require.Equal(t, docs, pub.GetDocCount(), enc.name)
 
-		peerWrites(1)
+		peerWrites(own)
 		assert.Same(t, pub, idx.loadPubSketch(), "%s: the reader-owned sketch is reused", enc.name)
 		assert.Equal(t, docs, pub.GetDocCount(), enc.name)
 		assert.Equal(t, liveDocs, live.GetDocCount(), enc.name)
@@ -1731,34 +1736,50 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 
 		// Bytes of another shape never reshape the published object: they are
 		// decoded into a fresh one.
-		peerWrites(2)
+		peerWrites(other)
 		assert.NotSame(t, pub, idx.loadPubSketch(), enc.name)
-		assert.Equal(t, 1, pub.Levels, enc.name)
-		assert.Equal(t, 2, idx.loadPubSketch().Levels, enc.name)
-		assert.Equal(t, docs, idx.loadPubSketch().GetDocCount(), enc.name)
-		assert.Same(t, live, idx.sketch, enc.name)
-
-		// A row of the index's shape again, loaded by a reader: into a
-		// fresh object, the published one having another shape. The live
-		// sketch still holds what this process last committed.
-		reshaped := idx.loadPubSketch()
-		peerWrites(1)
-		assert.NotSame(t, reshaped, idx.loadPubSketch(), enc.name)
-		assert.Equal(t, 1, idx.loadPubSketch().Levels, enc.name)
+		assert.Equal(t, own, pub.Levels, enc.name)
+		assert.Equal(t, other, idx.loadPubSketch().Levels, enc.name)
 		assert.Equal(t, docs, idx.loadPubSketch().GetDocCount(), enc.name)
 		assert.Same(t, live, idx.sketch, enc.name)
 		assert.Equal(t, liveDocs, live.GetDocCount(), "%s: readers alone leave the live sketch", enc.name)
 
 		// A write of this process: the readers before it loaded the peer's
 		// row into the published sketch only, so the writer loads it into
-		// the live one, in place, and its delta goes on top. The row it
-		// stores holds the peer's counts and its own, and the published
-		// sketch is the live one again.
-		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"own-%s","a":7}`, enc.name))))
+		// the live one and its delta goes on top. The row has another
+		// shape than the live object, which was published and may still be
+		// in a planner's hands: it is left as it is, and a fresh object
+		// becomes the live one. The reader below holds the old object
+		// across the load (a data race if the load reshaped it). The row
+		// the writer stores holds the peer's counts and its own, and the
+		// published sketch is the live one again.
+		held, stop, stopped := live, make(chan struct{}), make(chan struct{})
+		heldCounters := held.Snapshot(nil)
+		go func() {
+			defer close(stopped)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = held.Estimate(held.NumLevels()-1, []byte{1})
+					_ = held.EntryCount(0)
+					_ = held.Distribution(0)
+				}
+			}
+		}()
+		insertErr := coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"own-%s","a":7}`, enc.name)))
+		close(stop)
+		<-stopped
+		require.NoError(t, insertErr)
+		live = idx.sketch
+		// Compared as a bool: a failed NotSame prints both sketches.
+		require.True(t, held != live, "%s: a row of another shape is not decoded into the published object", enc.name)
+		assert.Equal(t, own, held.Levels, enc.name)
+		assert.True(t, slices.Equal(heldCounters, held.Snapshot(nil)), "%s: the object a reader may hold is as it was", enc.name)
 		liveDocs = docs + 1
-		assert.Same(t, live, idx.sketch, enc.name)
+		assert.Equal(t, other, live.Levels, enc.name)
 		assert.Equal(t, liveDocs, live.GetDocCount(), "%s: the peer's row and the own delta", enc.name)
-		assert.Equal(t, 1, live.Levels, enc.name)
 		stored, err := dbi.InspectIndexSketch(ctx, "c", idx.info.Name)
 		require.NoError(t, err)
 		assert.Equal(t, liveDocs, stored.DocCount, "%s: the stored row", enc.name)

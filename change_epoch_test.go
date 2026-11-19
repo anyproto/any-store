@@ -14,6 +14,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,11 +28,14 @@ import (
 const (
 	changePeerEnv     = "ANYSTORE_TEST_CHANGE_PEER_DB"
 	changePeerHoldEnv = "ANYSTORE_TEST_CHANGE_PEER_HOLD"
+	changePeerBulkEnv = "ANYSTORE_TEST_CHANGE_PEER_BULK"
 )
 
 // changePeer is the other process: one insert into the indexed collection.
 // With changePeerHoldEnv set it instead holds a write transaction on the
 // database until the file named there appears, after creating <file>.held.
+// With changePeerBulkEnv set it instead inserts 100 documents into c and
+// creates a collection: a schema change beside the writes.
 func changePeer(t *testing.T) bool {
 	path := os.Getenv(changePeerEnv)
 	if path == "" {
@@ -53,6 +58,20 @@ func changePeer(t *testing.T) bool {
 		require.NoError(t, db.Close())
 		return true
 	}
+	if os.Getenv(changePeerBulkEnv) != "" {
+		c, err := db.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		wtx, err := db.WriteTx(ctx)
+		require.NoError(t, err)
+		for i := 0; i < 100; i++ {
+			require.NoError(t, c.Insert(wtx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":7}`, 1000+i))))
+		}
+		require.NoError(t, wtx.Commit())
+		_, err = db.CreateCollection(ctx, "made-by-the-peer")
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+		return true
+	}
 	for _, name := range []string{"c", "c2"} {
 		c, err := db.OpenCollection(ctx, name)
 		if name == "c2" && err != nil {
@@ -65,14 +84,14 @@ func changePeer(t *testing.T) bool {
 	return true
 }
 
-func runChangePeer(t *testing.T, path string) {
+func runChangePeer(t *testing.T, path string, env ...string) {
 	t.Helper()
 	name := t.Name()
 	if i := bytes.IndexByte([]byte(name), '/'); i >= 0 {
 		name = name[:i]
 	}
 	cmd := exec.Command(os.Args[0], "-test.run=^"+name+"$", "-test.timeout=60s")
-	cmd.Env = append(os.Environ(), changePeerEnv+"="+path)
+	cmd.Env = append(append(os.Environ(), changePeerEnv+"="+path), env...)
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "peer failed:\n%s", out)
 }
@@ -96,6 +115,14 @@ func openSketchDB(t *testing.T) (DB, string) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	return db, path
+}
+
+// storedSketch is the stored row of c's one index, decoded.
+func storedSketch(t *testing.T, d DB, coll Collection) IndexSketchInfo {
+	t.Helper()
+	info, err := d.(IndexSketchInspector).InspectIndexSketch(context.Background(), "c", coll.GetIndexes()[0].Info().Name)
+	require.NoError(t, err)
+	return info
 }
 
 func sketchDocCount(t *testing.T, coll Collection) uint64 {
@@ -504,7 +531,7 @@ func TestChangeEpoch_WriterLoadsThePeersRowAfterAReader(t *testing.T) {
 			// The first use of the collection in the transaction is inside
 			// the statement's savepoint, and the statement fails on its
 			// last document.
-			require.Error(t, coll.Insert(wtx.Context(), doc(100), doc(101), doc(1)))
+			require.ErrorIs(t, coll.Insert(wtx.Context(), doc(100), doc(101), doc(1)), ErrDocExists)
 			require.NoError(t, coll.Insert(wtx.Context(), doc(100)))
 			require.NoError(t, wtx.Commit())
 			return 1
@@ -523,6 +550,11 @@ func TestChangeEpoch_WriterLoadsThePeersRowAfterAReader(t *testing.T) {
 			d, path := openSketchDB(t)
 			var coll Collection
 			var err error
+			// The row before the peer's commit: the peer's document has a
+			// value of the indexed field none of these has, in a bucket
+			// that is empty here.
+			before, err := d.(IndexSketchInspector).InspectIndexSketch(ctx, "c", "a")
+			require.NoError(t, err)
 			if !tc.late {
 				coll, err = d.OpenCollection(ctx, "c")
 				require.NoError(t, err)
@@ -539,11 +571,25 @@ func TestChangeEpoch_WriterLoadsThePeersRowAfterAReader(t *testing.T) {
 			n, err := coll.Count(ctx)
 			require.NoError(t, err)
 			require.Equal(t, int(want), n, "setup: the documents")
-			idxName := coll.GetIndexes()[0].Info().Name
-			stored, err := d.(IndexSketchInspector).InspectIndexSketch(ctx, "c", idxName)
-			require.NoError(t, err)
+			stored := storedSketch(t, d, coll)
 			require.Equal(t, want, stored.DocCount, "the stored row holds the peer's counts and this process's")
 			require.Equal(t, want, sketchDocCount(t, coll), "the published sketch")
+			// The counts by value, not the total alone: the peer's value has
+			// its bucket, and every count that was added is the peer's one
+			// or this process's.
+			require.Len(t, stored.Buckets, len(before.Buckets))
+			peers, added := 0, uint64(0)
+			for i, n := range stored.Buckets {
+				require.GreaterOrEqual(t, n, before.Buckets[i])
+				added += n - before.Buckets[i]
+				if before.Buckets[i] == 0 && n == 1 {
+					peers++
+				}
+			}
+			require.Equal(t, 1, peers, "the bucket of the peer's value")
+			require.Equal(t, want-50, added, "the peer's entry and this process's")
+			pub := coll.(*collection).loadIndexes()[0].loadPubSketch()
+			require.True(t, slices.Equal(stored.Buckets, pub.Snapshot(nil)[:len(stored.Buckets)]), "the published sketch has the stored row's counts by value")
 
 			require.NoError(t, d.Close())
 			d2, err := Open(ctx, path, nil)
@@ -552,6 +598,308 @@ func TestChangeEpoch_WriterLoadsThePeersRowAfterAReader(t *testing.T) {
 			coll2, err := d2.OpenCollection(ctx, "c")
 			require.NoError(t, err)
 			require.Equal(t, want, sketchDocCount(t, coll2), "the sketch a fresh open loads")
+			pub2 := coll2.(*collection).loadIndexes()[0].loadPubSketch()
+			require.True(t, slices.Equal(stored.Buckets, pub2.Snapshot(nil)[:len(stored.Buckets)]), "a fresh open loads the stored row's counts by value")
 		})
 	}
+}
+
+// The change epoch can move while a write transaction is open: a reader of
+// this process that took its snapshot at an older commit of the peer and is
+// only now counting it. Nothing committed under the writer, and it loaded
+// the peer's row before its first write to the collection: it does not load
+// the row again over its own deltas.
+func TestChangeEpoch_EpochMovesUnderAWriteTx(t *testing.T) {
+	if changePeer(t) {
+		return
+	}
+	ctx := context.Background()
+	d, path := openSketchDB(t)
+	bt := d.(*db).btreeDB
+	coll, err := d.OpenCollection(ctx, "c")
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), sketchDocCount(t, coll))
+	epoch := func() uint64 {
+		rtx, err := bt.BeginRead()
+		require.NoError(t, err)
+		e, _ := rtx.ChangeEpoch()
+		require.NoError(t, rtx.Rollback())
+		return e
+	}
+
+	runChangePeer(t, path) // the peer's first commit
+	// A reader takes its snapshot there and stops before it counts it.
+	entered, release := make(chan struct{}), make(chan struct{})
+	var first atomic.Bool
+	btree.SetTestChangeSwapHook(func() {
+		if first.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+	})
+	defer btree.SetTestChangeSwapHook(nil)
+	delayed := make(chan error, 1)
+	go func() {
+		rtx, err := bt.BeginRead()
+		if err == nil {
+			err = rtx.Rollback()
+		}
+		delayed <- err
+	}()
+	<-entered
+	runChangePeer(t, path) // the peer's second commit
+
+	wtx, err := d.WriteTx(ctx) // counts the second commit
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":100,"a":3}`)))
+	e1 := epoch()
+	close(release)
+	require.NoError(t, <-delayed)
+	require.Equal(t, e1+1, epoch(), "setup: the delayed reader moved the epoch under the write transaction")
+	// The next uses of the collection in the transaction: a plan and a write.
+	_, err = coll.Find(`{"a":1}`).Count(wtx.Context())
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":101,"a":3}`)))
+	require.NoError(t, wtx.Commit())
+
+	n, err := coll.Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 54, n, "setup: the documents")
+	require.Equal(t, uint64(54), storedSketch(t, d, coll).DocCount, "both of the transaction's documents are in the stored row")
+	require.Equal(t, uint64(54), sketchDocCount(t, coll))
+}
+
+// A read of the stored row that fails is not a load. A writer that cannot
+// load the row fails the operation before it writes: its deltas would go on
+// counts that miss the peer's, and be stored over the peer's row. A reader
+// plans with what is published and loads on its next use. A handle opened
+// while the read fails is not one whose sketches are current.
+func TestChangeEpoch_SketchRowReadFails(t *testing.T) {
+	if changePeer(t) {
+		return
+	}
+	ctx := context.Background()
+	injected := errors.New("injected: sketch row read")
+	failOnce := func(t *testing.T) *int {
+		failed := new(int)
+		testHookSketchRead = func([]byte) error {
+			if *failed == 0 {
+				*failed++
+				return injected
+			}
+			return nil
+		}
+		t.Cleanup(func() { testHookSketchRead = nil })
+		return failed
+	}
+
+	t.Run("writer", func(t *testing.T) {
+		d, path := openSketchDB(t)
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		runChangePeer(t, path)
+		require.Equal(t, uint64(51), sketchDocCount(t, coll)) // a reader loaded the row
+
+		failed := failOnce(t)
+		err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":100,"a":3}`))
+		require.Equal(t, 1, *failed, "setup: the writer read the row")
+		require.ErrorIs(t, err, injected, "the write fails before it puts its deltas on unloaded counts")
+		require.Equal(t, uint64(51), storedSketch(t, d, coll).DocCount)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":100,"a":3}`)), "the next write loads the row")
+		require.Equal(t, uint64(52), storedSketch(t, d, coll).DocCount)
+		require.Equal(t, uint64(52), sketchDocCount(t, coll))
+	})
+
+	t.Run("reader", func(t *testing.T) {
+		d, path := openSketchDB(t)
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		require.Equal(t, uint64(50), sketchDocCount(t, coll))
+		runChangePeer(t, path)
+
+		failed := failOnce(t)
+		require.Equal(t, uint64(50), sketchDocCount(t, coll), "the published sketch as it was")
+		require.Equal(t, 1, *failed, "setup: the reader read the row")
+		require.Equal(t, uint64(51), sketchDocCount(t, coll), "the next reader loads the row")
+	})
+
+	t.Run("open through a reader", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		failed := failOnce(t)
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		require.Equal(t, 1, *failed, "setup: the open read the row")
+		require.Equal(t, uint64(50), sketchDocCount(t, coll), "the first use loads the row")
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":100,"a":3}`)))
+		require.Equal(t, uint64(51), storedSketch(t, d, coll).DocCount)
+	})
+
+	t.Run("open through a writer", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		failed := failOnce(t)
+		_, err = d.OpenCollection(wtx.Context(), "c")
+		require.Equal(t, 1, *failed, "setup: the open read the row")
+		require.ErrorIs(t, err, injected)
+		coll, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":100,"a":3}`)))
+		require.NoError(t, wtx.Commit())
+		require.Equal(t, uint64(51), storedSketch(t, d, coll).DocCount)
+	})
+}
+
+// A handle loaded through a read transaction has live sketches no writer
+// has verified: the snapshot they were read at may miss a commit of this
+// process, which moves no epoch. The first write through the handle loads
+// the stored row.
+func TestSketch_HandleOpenedThroughAReaderIsLoadedByItsFirstWriter(t *testing.T) {
+	ctx := context.Background()
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":3}`, id))
+	}
+
+	// A commit of this process between the load of the handle and its
+	// registration, through a handle that is closed again.
+	t.Run("commit between load and registration", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		hooked := false
+		testHookBeforeRegister = func(name string) {
+			if name != "c" || hooked {
+				return
+			}
+			hooked = true
+			h, err := d.OpenCollection(ctx, "c")
+			require.NoError(t, err)
+			require.NoError(t, h.Insert(ctx, doc(100)))
+			require.NoError(t, h.Close())
+		}
+		t.Cleanup(func() { testHookBeforeRegister = nil })
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		require.True(t, hooked)
+		testHookBeforeRegister = nil
+
+		require.NoError(t, coll.Insert(ctx, doc(101)))
+		n, err := coll.Count(ctx)
+		require.NoError(t, err)
+		require.Equal(t, 52, n, "setup: the documents")
+		require.Equal(t, uint64(52), storedSketch(t, d, coll).DocCount)
+		require.Equal(t, uint64(52), sketchDocCount(t, coll))
+	})
+
+	// In memory there is no other process and every snapshot passes for
+	// current: a handle opened through a read transaction older than a
+	// commit of this process.
+	t.Run("in memory, through an old read tx", func(t *testing.T) {
+		d, err := Open(ctx, ":memory:", &Config{InMemory: true})
+		require.NoError(t, err)
+		defer func() { _ = d.Close() }()
+		coll, err := d.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		for i := 0; i < 50; i++ {
+			require.NoError(t, coll.Insert(ctx, doc(i)))
+		}
+		old, err := d.ReadTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, doc(100)))
+		require.NoError(t, coll.Close())
+
+		coll, err = d.OpenCollection(old.Context(), "c") // loads at 50 documents
+		require.NoError(t, err)
+		require.NoError(t, old.Commit())
+		require.NoError(t, coll.Insert(ctx, doc(101)))
+		n, err := coll.Count(ctx)
+		require.NoError(t, err)
+		require.Equal(t, 52, n, "setup: the documents")
+		require.Equal(t, uint64(52), storedSketch(t, d, coll).DocCount)
+		require.Equal(t, uint64(52), sketchDocCount(t, coll))
+	})
+}
+
+// Stats right after a write transaction rolled back: the documents and the
+// sketch agree. The live sketch keeps the aborted counts until the next
+// write transaction begins; readers load the stored row instead.
+func TestSketch_StatsAfterARollback(t *testing.T) {
+	if changePeer(t) {
+		return
+	}
+	ctx := context.Background()
+	for _, peer := range []bool{true, false} {
+		name := "own commits only"
+		if peer {
+			name = "after a peer's commit and a reader"
+		}
+		t.Run(name, func(t *testing.T) {
+			d, path := openSketchDB(t)
+			coll, err := d.OpenCollection(ctx, "c")
+			require.NoError(t, err)
+			want := uint64(51)
+			if peer {
+				runChangePeer(t, path)
+			} else {
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":99,"a":3}`)))
+			}
+			require.Equal(t, want, sketchDocCount(t, coll))
+
+			wtx, err := d.WriteTx(ctx)
+			require.NoError(t, err)
+			require.NoError(t, coll.Insert(wtx.Context(),
+				anyenc.MustParseJson(`{"id":100,"a":3}`), anyenc.MustParseJson(`{"id":101,"a":3}`)))
+			// Inside the transaction a plan sees its writes.
+			ex, err := coll.Find(`{"a":3}`).Explain(wtx.Context())
+			require.NoError(t, err)
+			require.Contains(t, ex.Plan, "est_rows", "setup: a planned query")
+			inTx := coll.(*collection).loadIndexes()[0].loadPubSketch().GetDocCount()
+			require.Equal(t, want+2, inTx, "the transaction plans with its own writes")
+			require.NoError(t, wtx.Rollback())
+
+			st, err := coll.Stats(ctx)
+			require.NoError(t, err)
+			require.Equal(t, int(want), st.DocCount)
+			require.Equal(t, want, st.Indexes[0].SketchDocCount, "no count of the rolled-back transaction")
+
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":100,"a":3}`)))
+			require.Equal(t, want+1, storedSketch(t, d, coll).DocCount)
+			require.Equal(t, want+1, sketchDocCount(t, coll))
+		})
+	}
+}
+
+// A sketch left dirty by a rolled-back transaction is not this
+// transaction's to store. Another process changed the schema, so the begin
+// could not rebase the collection (its handle is unverified); a reader
+// verifies it while the write transaction is open; the transaction writes
+// elsewhere and commits. The stored row of the collection stays the peer's.
+func TestSketch_CommitStoresNoSketchOfAnEarlierTx(t *testing.T) {
+	if changePeer(t) {
+		return
+	}
+	ctx := context.Background()
+	d, path := openSketchDB(t)
+	coll, err := d.OpenCollection(ctx, "c")
+	require.NoError(t, err)
+	other, err := d.CreateCollection(ctx, "other")
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), sketchDocCount(t, coll))
+
+	wtx, err := d.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":100,"a":3}`)))
+	require.NoError(t, wtx.Rollback()) // c's live sketch: 51, dirty
+
+	runChangePeer(t, path, changePeerBulkEnv+"=1") // 100 documents into c, and a schema change
+
+	wtx, err = d.WriteTx(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(150), sketchDocCount(t, coll), "a reader verifies the handle and loads the peer's row")
+	require.NoError(t, other.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":1}`)))
+	require.NoError(t, wtx.Commit())
+
+	require.Equal(t, uint64(150), storedSketch(t, d, coll).DocCount, "the peer's row")
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":100,"a":3}`)))
+	require.Equal(t, uint64(151), storedSketch(t, d, coll).DocCount)
+	require.Equal(t, uint64(151), sketchDocCount(t, coll))
 }
