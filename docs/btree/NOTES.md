@@ -1338,7 +1338,14 @@ comments in source):
    post-loop `setBatch` (`wal.go:603`, called at `wal.go:2218`) per
    `writeFrames` call (a single `wi.mu` acquisition for the in-process `pageMap`,
    then eager `shmHashWrite` — *not* deferred), plus a `walCleanupHash` analog on
-   rollback. **Invariant: the appended set handed to `setBatch` MUST be recorded
+   rollback. `shmHashWrite` also runs `walCleanupHash` (`shmCleanupHash`) before
+   it writes a frame whose `aPgno` entry is already set, as `walIndexAppend`
+   does (`wal.c:1321-1330`): the entry is left over from a writer that died
+   after it had spilled pages, and with it the rest of that writer's entries
+   above the log's last frame. `setBatch` passes the last frame before the
+   batch, which is `pWal->hdr.mxFrame` during the `walIndexAppend` loop
+   (advanced after it, `wal.c:4243`). Tests: `TestWalIndexDeadWriter_*`
+   (`wal_index_dead_writer_test.go`). **Invariant: the appended set handed to `setBatch` MUST be recorded
    inline in the write loop (the `appended` slice ≡ `PGHDR_WAL_APPEND`), never
    re-derived.** Re-deriving the reuse predicate after the loop dropped the
    force-appended commit frame and silently corrupted recovery — see the

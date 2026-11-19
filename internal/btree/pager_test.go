@@ -3447,7 +3447,7 @@ func TestShmHashWrite_RegionError(t *testing.T) {
 	// TestWalIndex_ShmHashWrite_RegionError.
 	idx.close(false)
 
-	err = idx.shmHashWrite(1, 1)
+	err = idx.shmHashWrite(1, 1, 0)
 	require.NoError(t, err)
 }
 
@@ -5861,7 +5861,7 @@ func TestWalIndex_ShmHashWrite_RegionError(t *testing.T) {
 	// region error to its caller (previously it returned void/silently). This
 	// mirrors C's walIndexAppend returning the walHashGet failure rc
 	// (wal.c:1299-1304), letting writeFrames/writeFramesMem abort the commit.
-	err := w.index.shmHashWrite(1, 4097)
+	err := w.index.shmHashWrite(1, 4097, 4096)
 	require.ErrorIs(t, err, os.ErrClosed)
 }
 

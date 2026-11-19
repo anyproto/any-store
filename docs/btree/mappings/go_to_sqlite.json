@@ -2741,6 +2741,12 @@
     "sqlite": [],
     "note": ""
   },
+  "wal.go:*walIndex.shmCleanupHash": {
+    "sqlite": [
+      "wal.c:walCleanupHash"
+    ],
+    "note": ""
+  },
   "wal.go:*walIndex.shmClearHash": {
     "sqlite": [],
     "note": ""
@@ -2824,6 +2830,12 @@
   },
   "wal.go:newWalIndex": {
     "sqlite": [],
+    "note": ""
+  },
+  "wal.go:shmCleanupHashSegment": {
+    "sqlite": [
+      "wal.c:walCleanupHash"
+    ],
     "note": ""
   },
   "wal.go:walBusyLock": {
