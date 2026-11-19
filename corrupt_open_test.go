@@ -1,15 +1,20 @@
 package anystore
 
 import (
+	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 )
 
 // writeDB makes a closed database with enough documents to span many pages and returns its path.
@@ -166,4 +171,137 @@ func TestOpen_NewerFormat(t *testing.T) {
 	after, err := os.ReadFile(path)
 	require.NoError(t, err)
 	assert.Equal(t, data, after, "a refused open must leave the file as it was")
+}
+
+// cyclicTreeDB makes a database with a collection "c" and an index on "k",
+// both trees three levels deep, closes it, and rewrites one child pointer of
+// the named tree in the file: the first child of the root's first child now
+// leads back to the root. Every page stays well formed and carries a valid
+// checksum; only the shape is wrong. It returns the reopened database.
+func cyclicTreeDB(t *testing.T, nsName string) (DB, Collection) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "cycle.db")
+	db, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	coll, err := db.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "k", Fields: []string{"k"}}))
+	docs := make([]*anyenc.Value, 0, 6000)
+	for i := 1; i <= 6000; i++ {
+		docs = append(docs, cyclicTreeDoc(i))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+	require.NoError(t, db.Flush(ctx, 0, FlushModeCheckpointFull))
+	bdb := BtreeOf(db)
+	pageSize := int64(bdb.PageSize())
+	ns, err := bdb.GetNamespace(nsName)
+	require.NoError(t, err)
+	root := ns.RootPage()
+	require.NoError(t, db.Close())
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	readPage := func(pgno uint32) []byte {
+		b := make([]byte, pageSize)
+		_, err := f.ReadAt(b, int64(pgno-1)*pageSize)
+		require.NoError(t, err)
+		return b
+	}
+	// An interior page (type 2) keeps its cell pointers from byte 12; a
+	// cell starts with its left child.
+	firstChildOff := func(pg []byte) uint16 {
+		require.Equal(t, byte(2), pg[0], "not an interior page: the tree is too shallow")
+		return binary.BigEndian.Uint16(pg[12:14])
+	}
+	rootPg := readPage(root)
+	off := firstChildOff(rootPg)
+	second := binary.BigEndian.Uint32(rootPg[off : off+4])
+	secondPg := readPage(second)
+	off = firstChildOff(secondPg)
+	binary.BigEndian.PutUint32(secondPg[off:off+4], root)
+	StampPageChecksumForTest(secondPg)
+	_, err = f.WriteAt(secondPg, int64(second-1)*pageSize)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	db, err = Open(ctx, path, nil)
+	require.NoError(t, err)
+	coll, err = db.Collection(ctx, "c")
+	require.NoError(t, err)
+	return db, coll
+}
+
+func cyclicTreeID(i int) string { return fmt.Sprintf("id-%06d-%s", i, strings.Repeat("x", 90)) }
+
+func cyclicTreeDoc(i int) *anyenc.Value {
+	return anyenc.MustParseJson(fmt.Sprintf(`{"id":%q,"k":"k-%06d-%s","b":%q}`,
+		cyclicTreeID(i), i, strings.Repeat("y", 90), strings.Repeat("b", 300)))
+}
+
+// endsWithin runs fn on its own goroutine and returns its error. When fn has
+// not returned in 3s it panics, which ends the test binary: a descent that
+// follows the cycle cannot be stopped, keeps its transaction's locks, and may
+// grow memory with every turn, so nothing can run beside it.
+func endsWithin(t *testing.T, what string, fn func() error) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(3 * time.Second):
+		panic(fmt.Sprintf("%s: %s did not return within 3s", t.Name(), what))
+	}
+}
+
+// A tree whose interior pages form a cycle is deeper than any tree can be:
+// the operation that descends it reports ErrCorrupt, and neither spins nor
+// keeps a lock.
+func TestErrCorrupt_TreeWithACycleOfInteriorPages(t *testing.T) {
+	// Document 1 has the smallest id and the smallest k: its descent takes
+	// the first child at each level, into the cycle. Document 0 would sort
+	// before it.
+	type op struct {
+		name string
+		run  func(ctx context.Context, coll Collection) error
+	}
+	findId := op{"FindId", func(ctx context.Context, coll Collection) error {
+		_, err := coll.FindId(ctx, cyclicTreeID(1))
+		return err
+	}}
+	insert := op{"Insert", func(ctx context.Context, coll Collection) error {
+		return coll.Insert(ctx, cyclicTreeDoc(0))
+	}}
+	updateId := op{"UpdateId", func(ctx context.Context, coll Collection) error {
+		_, err := coll.UpdateId(ctx, cyclicTreeID(1), query.MustParseModifier(`{"$set":{"k":"zzz"}}`))
+		return err
+	}}
+	deleteId := op{"DeleteId", func(ctx context.Context, coll Collection) error {
+		return coll.DeleteId(ctx, cyclicTreeID(1))
+	}}
+	for _, tc := range []struct {
+		name   string
+		nsName string
+		ops    []op
+	}{
+		{"data tree", "c", []op{findId, insert, updateId, deleteId}},
+		// The data tree is sound here, so FindId answers; the writes reach
+		// the index tree with the entry they add or remove.
+		{"index tree", indexNsName("c", "k"), []op{insert, updateId, deleteId}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, coll := cyclicTreeDB(t, tc.nsName)
+			for _, o := range tc.ops {
+				opCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				err := endsWithin(t, o.name, func() error { return o.run(opCtx, coll) })
+				cancel()
+				require.ErrorIs(t, err, ErrCorrupt, o.name)
+			}
+			// The failed writes rolled back: the sound part still reads.
+			doc, err := coll.FindId(ctx, cyclicTreeID(6000))
+			require.NoError(t, err)
+			require.Equal(t, cyclicTreeID(6000), string(doc.Value().GetStringBytes("id")))
+			require.NoError(t, endsWithin(t, "Close", db.Close))
+		})
+	}
 }
