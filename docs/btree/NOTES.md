@@ -823,6 +823,32 @@ The Go implementation has:
 the specific cap values differ. SQLite's `nCell/usableSize > nPage` check is more
 precise (validates against actual database size), while Go uses a fixed 1 GB cap.
 
+The cap is also the write-side limit (2026-11-19). `Put` took any value and any key up to
+1 GiB, so a record whose key and value together passed `maxPayloadAlloc` was written and
+then rejected as `ErrCorrupt` by every parse of its cell (`parseLeafCellWithSize`,
+`leafFullKey`, `leafFullValue`, `leafKeyAt`); a value alone over the cap also failed the
+binary-search probes of its leaf (`searchLeafWithOverflow`), which made the neighbouring
+keys unreadable. Both sides now apply one rule, `payloadFits` (`page.go`): neither length
+negative, key length plus value length at most `maxPayloadAlloc` (`1<<30`). The parsers
+answer `ErrCorrupt` for a cell that fails it; `Put` answers `ErrKeyTooLarge` (the key alone
+is over) or `ErrValueTooLarge` before it touches a page, and `CreateNamespace` /
+`RenameNamespace` apply it to the master-table record (the name and a 4-byte root) before
+they allocate the root or delete the old name. `searchLeafWithOverflow` and
+`leafCellPayloadLen` (`walkSize`) test the two lengths singly and not their sum, as before:
+looser than `payloadFits`, never stricter, so nothing `Put` accepts fails there. The
+overflow-chain readers have no cap of their own (their `maxIter` follows from the length
+asked for), and the 9-byte varint holds any length under the cap.
+
+SQLite draws this line above the b-tree: `SQLITE_MAX_LENGTH` is 1,000,000,000
+(`sqliteLimit.h:24`), `OP_MakeRecord` fails with `SQLITE_TOOBIG` when
+`nByte+nZero>db->aLimit[SQLITE_LIMIT_LENGTH]` (`vdbe.c:3697`, `too_big:` at `vdbe.c:9298`),
+and `sqlite3BtreeInsert` only asserts its lengths (`btree.c:9485`, `9540`); on the read side
+`sqlite3VdbeMemFromBtree` returns `SQLITE_CORRUPT_BKPT` for an amount past
+`sqlite3BtreeMaxRecordSize` (`vdbemem.c:1428-1429`). The value differs (2^30 here, 10^9
+there) and so does the layer, the b-tree being the lowest one every writer here passes
+through. Tests: `TestPayloadLimit_RealConstants`, `TestPayloadLimit_PutRefusesWhatReadRejects`,
+`TestPayloadLimit_NamespaceName`.
+
 <a id="old-drift-additive-maxiter-circular-chain-guard"></a>
 **Severity:** low
 
