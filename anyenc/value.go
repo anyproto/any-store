@@ -387,8 +387,14 @@ func (v *Value) estimateSize(limit int) int {
 	}
 }
 
+// s2MaxEncodedLen is s2.MaxEncodedLen, a variable so that a test can stand in
+// for an input past the encoder's block limit.
+var s2MaxEncodedLen = s2.MaxEncodedLen
+
 // MarshalCompressed marshals the value with S2 compression (objects only).
 // For non-object values or objects smaller than CompressMinSize, falls back to MarshalTo.
+// So it does for an object whose plain encoding is over 1 GiB, the largest
+// the decoders expand, and for one that compression does not shrink.
 // scratch is a reusable buffer for intermediate marshal; returns updated scratch for reuse.
 func (v *Value) MarshalCompressed(dst, scratch []byte) ([]byte, []byte) {
 	if v == nil || v.t != TypeObject || !v.IsSizeBigger(CompressMinSize) {
@@ -396,12 +402,21 @@ func (v *Value) MarshalCompressed(dst, scratch []byte) ([]byte, []byte) {
 	}
 	// Marshal object into scratch
 	scratch = v.MarshalTo(scratch[:0])
+	// Keep plain what could not be read back compressed, or not compressed
+	// at all: the decoders refuse a compressed object whose plain size is
+	// over decompressedLimit, and the encoder panics on an input past its
+	// block limit, for which MaxEncodedLen answers a negative size. The
+	// plain form of such an object is too large for a record; the store's
+	// write reports that, with the size it has here.
+	maxComp := s2MaxEncodedLen(len(scratch))
+	if len(scratch) > decompressedLimit || maxComp < 0 {
+		return append(dst, scratch...), scratch
+	}
 	headerStart := len(dst)
 	dst = append(dst, byte(TypeCompressedObjectS2))
 	dst = append(dst, 0, 0, 0, 0) // placeholder for compressed length
 	hdrLen := len(dst) - headerStart
 	// Ensure dst has enough capacity for s2 output
-	maxComp := s2.MaxEncodedLen(len(scratch))
 	if needed := len(dst) + maxComp; cap(dst) < needed {
 		newDst := make([]byte, len(dst), needed)
 		copy(newDst, dst)
