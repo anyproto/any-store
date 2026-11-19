@@ -1,6 +1,7 @@
 package query
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -619,4 +620,34 @@ func TestPullConditionIsTypeBracketed(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, modified)
 	assert.Equal(t, `{"tags":["a",3,true,null]}`, res.String())
+}
+
+// A modifier whose path indexes past the end of an array pads it with nulls,
+// up to MongoDB's limit of 1,500,000 padding elements; past it the modifier
+// returns an error and the document is not changed.
+func TestModifier_ArrayPaddingIsBounded(t *testing.T) {
+	const limit = 1_500_000
+	a := &anyenc.Arena{}
+	for _, tc := range []struct {
+		name, modFmt string
+	}{
+		{"$set", `{"$set":{"arr.%d":1}}`},
+		{"$inc", `{"$inc":{"arr.%d":1}}`},
+		{"$set through an intermediate segment", `{"$set":{"arr.%d.x":1}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// arr has two elements: index 2+limit needs exactly limit nulls.
+			doc := anyenc.MustParseJson(`{"arr":[1,2]}`)
+			res, modified, err := MustParseModifier(fmt.Sprintf(tc.modFmt, 2+limit)).Modify(a, doc)
+			require.NoError(t, err)
+			assert.True(t, modified)
+			assert.Len(t, res.GetArray("arr"), 2+limit+1)
+
+			doc = anyenc.MustParseJson(`{"arr":[1,2]}`)
+			_, modified, err = MustParseModifier(fmt.Sprintf(tc.modFmt, 2+limit+1)).Modify(a, doc)
+			require.ErrorContains(t, err, "can't backfill array to larger than 1500000 elements")
+			assert.False(t, modified)
+			assert.Equal(t, `{"arr":[1,2]}`, doc.String())
+		})
+	}
 }

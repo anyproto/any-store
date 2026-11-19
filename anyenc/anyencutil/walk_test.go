@@ -1,6 +1,9 @@
 package anyencutil
 
 import (
+	"math"
+	"runtime"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -91,5 +94,78 @@ func TestWalk(t *testing.T) {
 			}
 
 		}
+	})
+}
+
+// A numeric segment past the end of an array pads it with nulls. The padding
+// is bounded: one path segment must not ask for an allocation proportional to
+// a number the caller wrote.
+func TestWalk_ArrayPaddingIsBounded(t *testing.T) {
+	a := &anyenc.Arena{}
+	set := func(v *anyenc.Value, path ...string) error {
+		return Walk(a, v, path, true, func(_, _ *anyenc.Value) (*anyenc.Value, error) {
+			return a.NewTrue(), nil
+		})
+	}
+	// allocated reports the bytes fn allocated.
+	allocated := func(fn func()) uint64 {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		fn()
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+	const arrLen = 2
+	atCap := strconv.Itoa(arrLen + maxArrayPadding)
+	overCap := strconv.Itoa(arrLen + maxArrayPadding + 1)
+
+	t.Run("padding of exactly the limit succeeds", func(t *testing.T) {
+		v := anyenc.MustParseJson(`{"arr":[1,2]}`)
+		require.NoError(t, set(v, "arr", atCap))
+		arr := v.GetArray("arr")
+		require.Len(t, arr, arrLen+maxArrayPadding+1)
+		assert.Equal(t, anyenc.TypeNull, arr[arrLen].Type())
+		assert.Equal(t, anyenc.TypeTrue, arr[len(arr)-1].Type())
+	})
+	t.Run("intermediate segment at the limit succeeds", func(t *testing.T) {
+		v := anyenc.MustParseJson(`{"arr":[1,2]}`)
+		require.NoError(t, set(v, "arr", atCap, "x"))
+		arr := v.GetArray("arr")
+		require.Len(t, arr, arrLen+maxArrayPadding+1)
+		assert.Equal(t, `{"x":true}`, arr[len(arr)-1].String())
+	})
+	for _, tc := range []struct {
+		name string
+		path []string
+	}{
+		{"one over the limit", []string{"arr", overCap}},
+		{"intermediate segment one over the limit", []string{"arr", overCap, "x"}},
+		{"far over the limit", []string{"arr", "4000000000"}},
+		{"intermediate segment far over the limit", []string{"arr", "4000000000", "x"}},
+		{"largest int", []string{"arr", strconv.Itoa(math.MaxInt)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := anyenc.MustParseJson(`{"arr":[1,2]}`)
+			var err error
+			n := allocated(func() { err = set(v, tc.path...) })
+			require.ErrorContains(t, err, "can't backfill array to larger than 1500000 elements")
+			assert.Equal(t, `{"arr":[1,2]}`, v.String(), "a refused path leaves the document as it was")
+			assert.Less(t, n, uint64(64<<10), "a refused path allocates nothing proportional to its index")
+		})
+	}
+	t.Run("an index that is not a non-negative int is refused", func(t *testing.T) {
+		for _, seg := range []string{"-1", "99999999999999999999999999", "x"} {
+			v := anyenc.MustParseJson(`{"arr":[1,2]}`)
+			require.ErrorContains(t, set(v, "arr", seg), "cannot create field", seg)
+			require.ErrorContains(t, set(v, "arr", seg, "x"), "cannot create field", seg)
+			assert.Equal(t, `{"arr":[1,2]}`, v.String())
+		}
+	})
+	t.Run("an existing element far into a long array is not padding", func(t *testing.T) {
+		v := anyenc.MustParseJson(`{"arr":[1,2,3]}`)
+		require.NoError(t, set(v, "arr", "2"))
+		require.NoError(t, set(v, "arr", "3"))
+		assert.Equal(t, `{"arr":[1,2,true,true]}`, v.String())
 	})
 }

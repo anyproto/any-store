@@ -2615,3 +2615,38 @@ func TestDrop_RefusedUnderOpenIterator(t *testing.T) {
 	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
+
+// An update whose path indexes far past the end of an array is refused with
+// an error: the array is not padded, the document is not changed, and the
+// database stays usable.
+func TestCollection_Update_ArrayPaddingIsBounded(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"arr":[1,2]}`)))
+
+	for _, mod := range []string{
+		`{"$set":{"arr.1500003":1}}`,
+		`{"$inc":{"arr.1500003":1}}`,
+		`{"$set":{"arr.1500003.x":1}}`,
+		`{"$set":{"arr.4000000000":1}}`,
+		`{"$set":{"arr.9223372036854775807.x":1}}`,
+	} {
+		_, err = coll.UpdateId(ctx, 1, query.MustParseModifier(mod))
+		require.ErrorContains(t, err, "can't backfill array to larger than 1500000 elements", mod)
+
+		_, err = coll.Find(`{"id":1}`).Update(ctx, mod)
+		require.ErrorContains(t, err, "can't backfill array to larger than 1500000 elements", mod)
+	}
+
+	doc, err := coll.FindId(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, `{"id":1,"arr":[1,2]}`, doc.Value().String())
+
+	// A small pad is ordinary.
+	_, err = coll.UpdateId(ctx, 1, query.MustParseModifier(`{"$set":{"arr.4":5}}`))
+	require.NoError(t, err)
+	doc, err = coll.FindId(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, `{"id":1,"arr":[1,2,null,null,5]}`, doc.Value().String())
+}
