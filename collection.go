@@ -1331,8 +1331,9 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 			txErr = nil
 		}
 		// Delete sketch data
-		skKey := sketchKey(s.name, indexName)
-		_ = tx.Delete(c.db.systemNS, skKey) // ignore if not found
+		if txErr = c.db.deleteOptionalRecord(tx, sketchKey(s.name, indexName)); txErr != nil {
+			return
+		}
 		// Delete the multikey flag (keyed by the immutable namespace name —
 		// resolve it from the live index object, since nsName computed from
 		// the CURRENT collection name is wrong after a rename): drop+recreate
@@ -1340,7 +1341,9 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 		next.indexes = make([]*index, 0, len(s.indexes))
 		for _, idx := range s.indexes {
 			if idx.info.Name == indexName {
-				_ = tx.Delete(c.db.systemNS, multikeyKey(idx.ns.Name()))
+				if txErr = c.db.deleteOptionalRecord(tx, multikeyKey(idx.ns.Name())); txErr != nil {
+					return
+				}
 				continue
 			}
 			next.indexes = append(next.indexes, idx)
