@@ -2,6 +2,8 @@ package vector
 
 import (
 	"encoding/binary"
+	"fmt"
+	"math"
 	"unsafe"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -87,18 +89,23 @@ func (p *PagedHNSW) Gets() int { return p.gets }
 
 // vecOf reads node id's vector from the btree into the reusable scratch and
 // returns it as []float32 (zero-copy when the read fits scratch's capacity).
-func (p *PagedHNSW) vecOf(rtx *btree.ReadTx, id uint32, keyBuf []byte) []float32 {
+// A read that fails, or a record of another length, is an error: the scratch
+// still holds the vector read before it.
+func (p *PagedHNSW) vecOf(rtx *btree.ReadTx, id uint32, keyBuf []byte) ([]float32, error) {
 	binary.BigEndian.PutUint64(keyBuf, uint64(id))
 	p.gets++
 	b, err := rtx.AppendValue(p.vecNS, keyBuf, p.scratchB[:0])
-	if err != nil || len(b) != p.dim*4 {
-		return p.scratchF // (shouldn't happen in the prototype)
+	if err != nil {
+		return nil, fmt.Errorf("vector: paged: vector of node %d: %w", id, err)
+	}
+	if len(b) != p.dim*4 {
+		return nil, fmt.Errorf("vector: paged: vector of node %d: bad record len %d", id, len(b))
 	}
 	if &b[0] == &p.scratchB[0] {
-		return p.scratchF // landed in scratch, no realloc
+		return p.scratchF, nil // landed in scratch, no realloc
 	}
 	// fell back to a fresh buffer: reinterpret it
-	return unsafe.Slice((*float32)(unsafe.Pointer(&b[0])), p.dim)
+	return unsafe.Slice((*float32)(unsafe.Pointer(&b[0])), p.dim), nil
 }
 
 // Search runs the HNSW query reading vectors from the btree. It opens one read
@@ -116,17 +123,33 @@ func (p *PagedHNSW) Search(query []float32, k int) ([]SearchResult, error) {
 	defer rtx.Rollback()
 
 	var keyBuf [8]byte
+	// readErr is the first vector read that failed. The traversal goes on
+	// with that node at the largest distance, and its result is dropped.
+	var readErr error
 	dist := func(id uint32) float32 {
-		return p.dist(query, p.vecOf(rtx, id, keyBuf[:]))
+		v, err := p.vecOf(rtx, id, keyBuf[:])
+		if err != nil {
+			if readErr == nil {
+				readErr = err
+			}
+			return math.MaxFloat32
+		}
+		return p.dist(query, v)
 	}
 
 	// descend the upper layers greedily (ef=1)
 	ep := g.entryID
-	for lc := g.topLayer; lc > 0; lc-- {
+	for lc := g.topLayer; lc > 0 && readErr == nil; lc-- {
 		ep = p.greedyClosest(g, ep, lc, dist)
+	}
+	if readErr != nil {
+		return nil, readErr
 	}
 	ef := max(g.EfSearch, k)
 	found := p.searchLayer(g, ep, ef, 0, dist)
+	if readErr != nil {
+		return nil, readErr
+	}
 	k = min(k, len(found))
 	out := make([]SearchResult, k)
 	for i := 0; i < k; i++ {
@@ -231,8 +254,11 @@ func (p *PagedHNSW) SearchHybrid(query []float32, k int) ([]SearchResult, error)
 	out := make([]SearchResult, 0, len(routed))
 	for _, r := range routed {
 		id := g.keyToID[r.Key]
-		d := p.dist(query, p.vecOf(rtx, id, keyBuf[:]))
-		out = append(out, SearchResult{Key: r.Key, Distance: d})
+		v, err := p.vecOf(rtx, id, keyBuf[:])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, SearchResult{Key: r.Key, Distance: p.dist(query, v)})
 	}
 	sortResultsByDist(out)
 	if k < len(out) {

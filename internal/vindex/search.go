@@ -314,7 +314,11 @@ func (s *searcher) readVec(label uint32) ([]float32, error) {
 	}
 	s.keyBuf = labelKey(s.keyBuf, label)
 	if s.ix.quant != QuantNone {
-		s.qbuf, _ = s.rtx.AppendValue(s.ix.vvec, s.keyBuf, s.qbuf[:0])
+		var err error
+		// A read that failed is the caller's error, not a record of length 0.
+		if s.qbuf, err = s.rtx.AppendValue(s.ix.vvec, s.keyBuf, s.qbuf[:0]); err != nil {
+			return nil, err
+		}
 		if v, ok := decodeVecInto(s.qbuf, s.ix.dim, s.ix.quant, s.vf); ok {
 			return v, nil
 		}
@@ -360,7 +364,11 @@ func (s *searcher) vec2Of(label uint32) ([]float32, error) {
 func (s *searcher) readVec2(label uint32) ([]float32, error) {
 	s.keyBuf = labelKey(s.keyBuf, label)
 	if s.ix.quant != QuantNone {
-		s.qbuf2, _ = s.rtx.AppendValue(s.ix.vvec, s.keyBuf, s.qbuf2[:0])
+		var err error
+		// A read that failed is the caller's error, not a record of length 0.
+		if s.qbuf2, err = s.rtx.AppendValue(s.ix.vvec, s.keyBuf, s.qbuf2[:0]); err != nil {
+			return nil, err
+		}
 		if v, ok := decodeVecInto(s.qbuf2, s.ix.dim, s.ix.quant, s.vf2); ok {
 			return v, nil
 		}
