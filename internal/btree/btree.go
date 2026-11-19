@@ -85,6 +85,10 @@ type btree struct {
 	rootPage    uint32
 	walMaxFrame uint32 // WAL snapshot for this operation (0 = use pager default)
 	writable    bool   // true if this btree is used by a write transaction
+	// pathLen is the number of interior pages on the path of the Put or
+	// Delete in progress, the root included: the tree has pathLen+1 levels
+	// there. splitRoot reads it to refuse a level no descent would reach.
+	pathLen int
 }
 
 // getPage returns a page using this btree's walMaxFrame for snapshot isolation.
@@ -1403,6 +1407,8 @@ func (bt *btree) Put(key, value []byte) error {
 		}
 	}
 
+	bt.pathLen = len(path)
+
 	// pg is now the target leaf page — get it writable
 	leafPgno := pg.pgno
 	bt.pager.releasePage(pg)
@@ -2521,7 +2527,19 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 // page, then converts the root into an interior page pointing to the new child
 // and the right sibling. Handles both leaf and interior roots correctly.
 // DRIFT: splitRoot omits SQLite's anotherValidCursor() guard before deepening root See docs/btree/NOTES.md#drift-34-splitroot-missing-anothervalidcursor-corruption-guard
+// DRIFT: a root whose tree already has btCursorMaxDepth levels is not deepened. See docs/btree/NOTES.md#drift-2026-11-19-1-the-root-is-not-deepened-past-the-cursor-s-depth
 func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) error {
+	// A level more than btCursorMaxDepth is one no descent reaches: the
+	// write would report success and its tree would read as corrupt from
+	// then on. balance_deeper has no such test (btree.c:9034, called from
+	// balance at btree.c:9143 with no look at the depth): SQLite deepens
+	// the root and returns SQLITE_CORRUPT from moveToChild on the next
+	// seek. The pages below were already rewritten by this split; the
+	// transaction has to be rolled back, as after any failed Put.
+	if bt.pathLen >= btCursorMaxDepth-1 {
+		return ErrCorrupt
+	}
+	bt.pathLen++
 	// Allocate a new page for the old root's content
 	newLeftPg, err := bt.pager.allocatePage()
 	if err != nil {
@@ -2623,6 +2641,8 @@ func (bt *btree) Delete(key []byte) error {
 			return err
 		}
 	}
+
+	bt.pathLen = len(path)
 
 	// Phase 2: Get leaf as writable and delete
 	leafPgno := pg.pgno
@@ -3529,9 +3549,12 @@ func (bt *btree) countPage(ctx context.Context, pgno uint32, depth int) (int, er
 // at btree.c:6227): with iPage the number of child pointers followed from the
 // root, a further step is refused once iPage >= BTCURSOR_MAX_DEPTH-1. A chain
 // of btCursorMaxDepth pages, root and leaf included, is the deepest one read.
-// Every descent applies it, the cursor's and the cursor-free ones (Put,
-// Delete, the point lookups, the namespace lookup): SQLite has one way down a
-// tree, the cursor, so its insert and delete are bounded by the same line.
+// It is applied by cursor navigation, the point lookups, the namespace
+// lookup and the descents of Put and Delete. SQLite's seeks, inserts and
+// deletes all go down through a cursor, so that one line bounds them. The
+// walks over a whole tree are not held to it: countPage, walkSize and keyRank
+// stop one level later, freeTreePages at its own bound, as SQLite's
+// clearDatabasePage recurses without a cursor (btree.c:10225).
 const btCursorMaxDepth = 20
 
 // Cursor provides ordered iteration over a B-tree.
