@@ -529,9 +529,13 @@ func (c *collection) insertItem(tx *btree.WriteTx, s *collSchema, buf *syncpool.
 		buf.DocBuf, buf.ScratchBuf = it.Value().MarshalCompressed(buf.DocBuf[:0], buf.ScratchBuf)
 	}
 
-	// Check if key already exists
+	// Check if key already exists. A check that failed is not "no such
+	// document": the Put below would replace one that is there and leave
+	// the index entries of its old values behind.
 	if _, err := tx.Get(s.ns, buf.SmallBuf); err == nil {
 		return ErrDocExists
+	} else if err != btree.ErrKeyNotFound && !errors.Is(err, btree.ErrKeyNotFound) {
+		return err
 	}
 
 	if err = tx.Put(s.ns, buf.SmallBuf, buf.DocBuf); err != nil {

@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -32,6 +34,7 @@ type readFaults struct {
 	armed  atomic.Bool
 	reads  atomic.Int64
 	fired  atomic.Bool
+	stack  atomic.Pointer[string] // of the read that failed
 }
 
 type readFaultFile struct {
@@ -43,10 +46,19 @@ func (f *readFaultFile) ReadAt(b []byte, off int64) (int, error) {
 	if rf := f.rf; rf.armed.Load() {
 		if rf.reads.Add(1)-1 == rf.failAt {
 			rf.fired.Store(true)
+			stack := string(debug.Stack())
+			rf.stack.Store(&stack)
 			return 0, errInjectedRead
 		}
 	}
 	return f.File.ReadAt(b, off)
+}
+
+// firedIn reports that the read that failed was made by fn, a function
+// name as a stack trace prints it ("(*index).markMultiKey").
+func (rf *readFaults) firedIn(fn string) bool {
+	stack := rf.stack.Load()
+	return stack != nil && strings.Contains(*stack, fn)
 }
 
 // during runs op with the fault armed.
