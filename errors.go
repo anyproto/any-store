@@ -233,6 +233,18 @@ var (
 	// file does not hold. Recovery itself repairs a bad WAL header and drops torn frames silently.
 	ErrWALCorrupt = btree.ErrWALCorrupt
 
+	// ErrValueTooLarge is returned (wrapped) by a write whose record is over the record size
+	// limit of 1 GiB (1<<30 bytes). For a document the record is its encoded id and its stored
+	// body together, the body compressed unless compression is off or does not shrink it; for an
+	// index entry it is the entry's key. Nothing is written and the write's transaction scope is
+	// rolled back like after any other failed write. Without this check the record would be
+	// stored and every later read of it would report ErrCorrupt.
+	ErrValueTooLarge = btree.ErrValueTooLarge
+
+	// ErrKeyTooLarge is ErrValueTooLarge for a record whose key alone, a document's encoded id
+	// or an index entry's key, is over the limit.
+	ErrKeyTooLarge = btree.ErrKeyTooLarge
+
 	// ErrPageBufferNotInitialized is returned when UseGlobalPageBuffer is set
 	// but InitPageBuffer was not called before opening the database.
 	ErrPageBufferNotInitialized = errors.New("any-store: global page buffer not initialized (call InitPageBuffer first)")
