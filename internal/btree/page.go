@@ -151,20 +151,39 @@ const (
 var payloadLimit = maxPayloadAlloc
 
 // payloadFits reports whether a record with a key of keyLen bytes and a
-// value of valLen bytes is within the record size limit: neither length
-// negative and their sum at most payloadLimit. It is the one rule of both
-// sides. The cell parsers answer ErrCorrupt for a cell that fails it, so Put
-// refuses such a record before it writes anything: a record that could be
-// written and not read back would make its own file corrupt.
+// value of valLen bytes is within the record size limit: their sum is at
+// most payloadLimit. It is the one rule of both sides. The cell parsers
+// answer ErrCorrupt for a cell that fails it, so Put refuses such a record
+// before it writes anything: a record that could be written and not read
+// back would make its own file corrupt.
 //
-// SQLite draws the same line above the b-tree: a record over
-// SQLITE_LIMIT_LENGTH (SQLITE_MAX_LENGTH, 1,000,000,000, sqliteLimit.h:24) is
-// SQLITE_TOOBIG in OP_MakeRecord (vdbe.c:3697) and never reaches
-// sqlite3BtreeInsert.
-func payloadFits(keyLen, valLen int) bool {
-	// The sum is not formed: on a 32-bit int two lengths at the limit
-	// overflow it.
-	return keyLen >= 0 && valLen >= 0 && valLen <= payloadLimit && keyLen <= payloadLimit-valLen
+// The lengths are the 64-bit values a cell declares, tested before they are
+// narrowed: on a 32-bit int a declared length of 1<<32+1 converts to 1. A
+// pair that passes fits an int of either width, and so does its sum.
+//
+// SQLite draws the same line above the b-tree: SQLITE_LIMIT_LENGTH
+// (SQLITE_MAX_LENGTH, 1,000,000,000, sqliteLimit.h:24) is tested where a
+// value or a record is built, and a record over it is SQLITE_TOOBIG before
+// sqlite3BtreeInsert sees it. In OP_MakeRecord the test runs when the output
+// register must grow to hold the record (vdbe.c:3690-3699).
+func payloadFits(keyLen, valLen uint64) bool {
+	limit := uint64(payloadLimit)
+	// The sum is not formed: two 64-bit lengths can wrap it.
+	return valLen <= limit && keyLen <= limit-valLen
+}
+
+// payloadInFile reports whether a payload of total bytes can be stored in the
+// database as the reader sees it: no more than its page count times the page
+// size. A reader that is about to allocate from a length a cell declares
+// tests it first, so that a few damaged bytes in a small file cannot ask for
+// a gigabyte before the overflow chain is found short. ~
+// sqlite3VdbeMemFromBtree, which returns SQLITE_CORRUPT_BKPT when
+// amt+offset > sqlite3BtreeMaxRecordSize, before it resizes the Mem
+// (vdbemem.c:1428-1429), that size being pageSize*nPage (btree.c:4981-4985).
+// The page count is the snapshot's for a reader (cache) and the live one for
+// the writer, as readerDbSizeBound resolves it.
+func payloadInFile(p *pager, cache *pcache, total int) bool {
+	return total >= 0 && uint64(total) <= uint64(p.readerDbSizeBound(cache))*uint64(p.pageSize)
 }
 
 // maxLocalPayload returns the max payload stored locally before overflow.
