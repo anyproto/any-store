@@ -63,8 +63,8 @@ func (db *DB) CksumCodec() *cksumCodec {
 	return nil
 }
 
-// VerifyIntegrity walks every page in the database (1..DatabaseSize) and
-// verifies the per-page integrity tag. For checksum-mode DBs this re-hashes
+// VerifyIntegrity walks every page of the snapshot its read transaction
+// holds (1..ReadTx.DatabaseSize) and verifies the per-page integrity tag. For checksum-mode DBs this re-hashes
 // the trailer and compares it; for AEAD-mode DBs it attempts a decrypt
 // (the AEAD tag IS the integrity tag).
 //
@@ -98,8 +98,28 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 	}
 	defer tx.Rollback()
 
-	total := db.pager.header.DatabaseSize
+	// The sweep covers the pages of the snapshot it reads, by the rule a read
+	// transaction counts them (ReadTx.DatabaseSize, lockBtree's): page 1's
+	// size checked against the pager's count for this snapshot. The pager's
+	// in-memory header is the writer's, refreshed only at open, at a write
+	// begin and by a commit: it lags a peer process's growth and runs ahead
+	// of every snapshot while a commit is under way.
+	// Page 1 is read raw, as every page of the sweep is; its header is stored
+	// outside the codec. Decoding it would return a damaged page 1 as the
+	// sweep's error instead of listing it.
 	maxFrame := tx.walMaxFrame
+	raw1, err := db.pager.readRawPage(1, maxFrame)
+	if err != nil {
+		return res, err
+	}
+	var snapHdr dbHeader
+	if err := snapHdr.deserialize(raw1[:dbHeaderSize]); err != nil {
+		return res, err
+	}
+	total, err := lockBtreePageCount(&snapHdr, db.pager.readerDbSizeBound(tx.cache))
+	if err != nil {
+		return res, err
+	}
 	for pgno := uint32(1); pgno <= total; pgno++ {
 		if err := ctx.Err(); err != nil {
 			return res, err
