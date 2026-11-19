@@ -2118,11 +2118,6 @@
       },
       {
         "file": "backup.c",
-        "func": "setDestPgsz",
-        "reason": "negotiates destination page size; any-store enforces equal page size at BackupInit instead."
-      },
-      {
-        "file": "backup.c",
         "func": "sqlite3BackupUpdate",
         "reason": "connection-wide dispatcher invoked when a source page changes mid-backup, walking every Backup on the source; any-store has the per-object backupUpdate (cited by backup.go Backup.update) but no multi-object dispatch."
       },

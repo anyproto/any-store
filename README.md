@@ -195,7 +195,7 @@ db.Flush(ctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive)
 
 ## Integrity
 
-Every non-encrypted database carries an XXH3-128 page-trailer checksum (16 bytes/page) by default — corruption is caught on read. There is no opt-out; the cost is <1% on writes and effectively zero on reads. Encrypted databases derive integrity from the cipher's AEAD tag instead. File state is authoritative on reopen — existing plain databases stay plain, existing checksum databases auto-install the codec regardless of caller config.
+Every non-encrypted database carries an XXH3-128 page-trailer checksum (16 bytes/page) by default — corruption is caught on read. There is no opt-out; the cost is <1% on writes and effectively zero on reads. Encrypted databases derive integrity from the cipher's AEAD tag instead. File state is authoritative on reopen — existing plain databases stay plain, existing checksum databases auto-install the codec regardless of caller config. An in-memory database has no checksums, and its `Backup` is a plain file; `Backup` copies a database as the kind of file it is, and returns an error, leaving the destination as it was, when the file at the destination path is a database of another kind (plain, checksummed, encrypted).
 
 Conceptually mirrors SQLite's [`cksumvfs`](https://sqlite.org/cksumvfs.html), generalized to also surface AEAD failures via the same API.
 
@@ -229,6 +229,8 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 ```
 
 Whole-file page-level AEAD; bring-your-own key management via `EncryptionConfig.Codec`.
+
+`Backup` of an encrypted database writes an encrypted copy that opens with the same passphrase, key or codec. The copy has a salt of its own, so with a passphrase its derived key differs from the source's.
 
 An independent Go implementation following design conventions from [SQLCipher](https://www.zetetic.net/sqlcipher/) (BSD-3-Clause) — reserved-tail page overhead, the page-1 plaintext-prefix rule, PBKDF2-HMAC-SHA256 key derivation. No SQLCipher code is included; the cryptography is Go-native and uses AEAD rather than SQLCipher's encrypt-then-MAC construction. Not SQLCipher-compatible on disk. See [NOTICE.md](NOTICE.md).
 

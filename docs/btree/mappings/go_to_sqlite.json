@@ -39,7 +39,7 @@
     "sqlite": [
       "backup.c:backupOnePage"
     ],
-    "note": "page-size always equal (enforced at BackupInit) so the backup.c:251–276 loop collapses to one iteration"
+    "note": "page-size always equal (enforced at BackupInit) so the backup.c:251–276 loop collapses to one iteration; page 1 keeps the destination's KDF salt (drift-2026-11-19-1)"
   },
   "backup.go:*Backup.restart": {
     "sqlite": [
@@ -65,11 +65,17 @@
     ],
     "note": "re-copies an already-copied page the source logged, at a commit or a spill; no-op on a done or finished backup"
   },
+  "backup.go:*DB.BackupDestinationOptions": {
+    "sqlite": [
+      "backup.c:setDestPgsz"
+    ],
+    "note": "the Options a backup's destination is created with: the handle's, with page size, checksum mode and schema format read from the open source file (drift-2026-11-19-2); SQLite sets the destination's page size here and takes the reserved bytes from the copied page 1"
+  },
   "backup.go:*DB.BackupInit": {
     "sqlite": [
       "backup.c:sqlite3_backup_init"
     ],
-    "note": "minus the handle/name resolution (DRIFT #2 in any-store-tests:docs/any-store/btree/plans/2026-04-22-sqlite-backup-port.md): takes (dst, src *btree.DB) directly"
+    "note": "minus the handle/name resolution (DRIFT #2 in any-store-tests:docs/any-store/btree/plans/2026-04-22-sqlite-backup-port.md): takes (dst, src *btree.DB) directly; refuses a destination of another page size, schema format, reserved space or kind of codec (drift-2026-11-11-8, drift-2026-11-19-2)"
   },
   "backup.go:backupBusy": {
     "sqlite": [

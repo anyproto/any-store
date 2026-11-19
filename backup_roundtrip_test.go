@@ -4,7 +4,7 @@ package anystore_test
 // and holds the same documents. One round trip per kind of database (plain,
 // checksummed, encrypted by passphrase, by raw key, by a caller's codec), per
 // kind of source (file, in-memory) and per state of the destination (absent,
-// a database of the same kind).
+// a database of the same kind, a database of another kind).
 
 import (
 	"bytes"
@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -73,6 +74,15 @@ var roundTripKinds = []roundTripKind{
 	{"caller-codec", codecConfig, codecConfig, anystore.IntegrityAEAD},
 	{"in-memory", inMemory(defaultConfig), defaultConfig, anystore.IntegrityNone},
 	{"in-memory-passphrase", inMemory(passphraseConfig("correct horse", "")), passphraseConfig("correct horse", ""), anystore.IntegrityAEAD},
+	{"in-memory-raw-key-32", inMemory(passphraseConfig("0123456789abcdef0123456789abcdef", "")), passphraseConfig("0123456789abcdef0123456789abcdef", ""), anystore.IntegrityAEAD},
+}
+
+// Kinds that are only destinations: the source's kind in everything the file
+// header shows (encrypted, 32 reserved bytes), and not readable with the
+// source's credentials.
+var roundTripForeignKinds = []roundTripKind{
+	{"another-passphrase", passphraseConfig("battery staple", ""), passphraseConfig("battery staple", ""), anystore.IntegrityAEAD},
+	{"passphrase-chacha", passphraseConfig("correct horse", anystore.CipherChaCha20Poly1305), passphraseConfig("correct horse", anystore.CipherChaCha20Poly1305), anystore.IntegrityAEAD},
 }
 
 // fillRoundTrip puts n documents of a few sizes (some past one page) and an
@@ -160,6 +170,18 @@ func TestBackupRoundTrip(t *testing.T) {
 
 			// then
 			requireCopy(t, copyPath, kind.reopen(t), kind.mode, want)
+
+			// and a backup of the copy is a copy too: the restored database
+			// is backed up like any other
+			restored, err := anystore.Open(ctx, copyPath, kind.reopen(t))
+			require.NoError(t, err)
+			for id, js := range fillRoundTrip(t, restored, 300, 20) {
+				want[id] = js
+			}
+			againPath := filepath.Join(dir, "again.db")
+			require.NoError(t, restored.Backup(ctx, againPath))
+			require.NoError(t, restored.Close())
+			requireCopy(t, againPath, kind.reopen(t), kind.mode, want)
 		})
 	}
 }
@@ -199,6 +221,83 @@ func TestBackupRoundTrip_OverExistingOfSameKind(t *testing.T) {
 
 			// then
 			requireCopy(t, dstPath, kind.reopen(t), kind.mode, want)
+		})
+	}
+}
+
+// A backup over a database of another kind (other reserved space, other page
+// codec), or of the same kind under other credentials, is refused before a
+// page of the destination is written: the destination opens afterwards as it
+// did before.
+func TestBackupRoundTrip_OverExistingOfAnotherKind(t *testing.T) {
+	ctx := context.Background()
+	kindByName := func(name string) roundTripKind {
+		for _, k := range append(roundTripKinds[:len(roundTripKinds):len(roundTripKinds)], roundTripForeignKinds...) {
+			if k.name == name {
+				return k
+			}
+		}
+		t.Fatalf("no kind %q", name)
+		return roundTripKind{}
+	}
+	plainFile := func(t *testing.T, path string) map[string]string {
+		mem, err := anystore.Open(ctx, "", &anystore.Config{InMemory: true})
+		require.NoError(t, err)
+		want := fillRoundTrip(t, mem, 7000, 100)
+		require.NoError(t, mem.Backup(ctx, path))
+		require.NoError(t, mem.Close())
+		return want
+	}
+	for _, tc := range []struct{ src, dst string }{
+		{"in-memory", "checksummed"},
+		{"checksummed", "plain"},
+		{"checksummed", "passphrase"},
+		{"passphrase", "checksummed"},
+		{"passphrase", "plain"},
+		{"passphrase", "passphrase-xchacha"},
+		{"in-memory", "passphrase"},
+		{"passphrase", "another-passphrase"},
+		{"passphrase", "passphrase-chacha"},
+		{"in-memory-raw-key-32", "passphrase"},
+	} {
+		t.Run(tc.src+"-over-"+tc.dst, func(t *testing.T) {
+			// given
+			dir := t.TempDir()
+			dstPath := filepath.Join(dir, "dst.db")
+			var (
+				dstWant   map[string]string
+				dstReopen = defaultConfig
+				dstMode   = anystore.IntegrityNone
+			)
+			if tc.dst == "plain" {
+				dstWant = plainFile(t, dstPath)
+			} else {
+				dstKind := kindByName(tc.dst)
+				dstReopen, dstMode = dstKind.reopen, dstKind.mode
+				dst, err := anystore.Open(ctx, dstPath, dstKind.open(t))
+				require.NoError(t, err)
+				dstWant = fillRoundTrip(t, dst, 7000, 100)
+				require.NoError(t, dst.Close())
+			}
+			before, err := os.ReadFile(dstPath)
+			require.NoError(t, err)
+
+			srcKind := kindByName(tc.src)
+			src, err := anystore.Open(ctx, filepath.Join(dir, "src.db"), srcKind.open(t))
+			require.NoError(t, err)
+			defer func() { require.NoError(t, src.Close()) }()
+			fillRoundTrip(t, src, 0, 300)
+
+			// when
+			err = src.Backup(ctx, dstPath)
+
+			// then
+			require.Error(t, err)
+			t.Logf("Backup: %v", err)
+			after, err := os.ReadFile(dstPath)
+			require.NoError(t, err)
+			assert.True(t, bytes.Equal(before, after), "the destination file is untouched")
+			requireCopy(t, dstPath, dstReopen(t), dstMode, dstWant)
 		})
 	}
 }

@@ -2040,7 +2040,9 @@ the source. See
 "Backups".
 
 Anystore-level `(*db).Backup(ctx, path)` drives the engine by opening
-a fresh destination DB at `path` with matching options.
+the destination at `path` with `(*DB).BackupDestinationOptions()`: the
+source handle's options with the page geometry of the source file as it is
+(see [drift-2026-11-19-2](#drift-2026-11-19-2-a-backup-destination-has-the-geometry-of-the-source-file)).
 
 <a id="old-drift-backup-intentional-simplifications"></a>
 **Key intentional simplifications** (full list in the plan document):
@@ -2051,6 +2053,8 @@ a fresh destination DB at `path` with matching options.
   `SQLITE_READONLY` for WAL+size-mismatch is our `ErrBackupPageSizeMismatch`
   at init. The cross-size packing path at `backup.c:449-528` is
   therefore unreachable.
+- Always the same reserved space and kind of page codec: `ErrBackupCodecMismatch`
+  at init ([drift-2026-11-19-2](#drift-2026-11-19-2-a-backup-destination-has-the-geometry-of-the-source-file)).
 - No `PENDING_BYTE_PAGE` handling -- any-store has no 1GB lock byte.
 - No attached-db name resolution (`findDatabase`, backup.c:82) -- one b-tree per DB.
 - No `nBackup` counter on source -- nothing for it to block (no
@@ -3399,6 +3403,22 @@ any-store's has one: the KDF salt at header bytes 72-87 (`dbHeader.Salt`), which
 Why not the other way round (create the destination with the source's salt, so the two files share a key): an existing destination has a salt already and would have to be re-keyed under an open handle and a live WAL; and one key would then seal two files' worth of pages with random nonces, where the nonce collision bound is per key. With a salt of its own a passphrase destination has a key of its own. A raw 32-byte key or a caller's codec is the same key in both files, as before; the built-in codecs draw random nonces, so that is a matter of how many pages one key seals and not of a repeated counter.
 
 Regression tests: `backup_codec_test.go` (`TestBackup_DestinationKeepsItsSalt`, `TestBackup_InMemorySourceIntoEncryptedFile`), root `backup_roundtrip_test.go`.
+
+<a id="drift-2026-11-19-2-a-backup-destination-has-the-geometry-of-the-source-file"></a>
+### Drift: A Backup Destination Must Already Have The Reserved Space And Codec Kind Of The Source File
+- **Category:** changed-logic  -  **Severity:** low (was important: until 2026-11-19 a backup of a plain file opened with default options damaged every page of the copy)
+- **Affected functions:** `backup.go:*DB.BackupInit`, `backup.go:*DB.BackupDestinationOptions`, root `db.go:*db.Backup`.
+
+**SQLite.** Before the destination is first locked, `sqlite3_backup_step` gives it the source's page size: `setDestPgsz` calls `sqlite3BtreeSetPageSize(p->pDest, sqlite3BtreeGetPageSize(p->pSrc), 0, 0)` (`backup.c:112-116`, `361`). It passes no reserved size. The reserved bytes reach the destination with page 1, like every other header field: `backupOnePage` copies the page whole (`backup.c:269`), and the next `lockBtree` on the destination computes `usableSize = pageSize - page1[20]` (`btree.c:3384`, `3417`). Nothing in a connection is bound to the old value, so a destination of any reserved size becomes one of the source's. Where SQLite creates the destination itself it passes the reserve explicitly: VACUUM gives the new file `sqlite3BtreeGetRequestedReserve(pMain)` (`vacuum.c:233`, `281`). SQLite 3.52.0 has no codec in the pager; the checks on reserved bytes and codec presence in `backupOnePage` are SQLCipher's (`backup.c:261-299` in SQLCipher v4.14.0: align the destination's reserve to the source's with `sqlite3PagerSetPagesize`, `SQLITE_READONLY` if that fails), as is the refusal of a backup between a keyed and a plaintext database (`backup.c:156-175` there).
+
+**any-store.** The usable size and the codec that owns the reserved bytes belong to the open handle: `Open` installs the codec and fixes `usableSize_` before the first read, from the file's header for an existing file (zero salt and 16 reserved bytes mean checksums, a non-zero salt means encryption) and from `Options` only for a new one. Two things follow.
+
+1. *The destination must be created like the source file, not like the source handle.* `Options.Checksum` is what the handle asked for; a plain file opened with it stays plain, and `Options()` still says `Checksum`. The root package's `Backup` built its destination from `Options()`, so the backup of such a file went into a checksummed destination: the pages were copied whole with content up to their last byte, and at commit the destination's codec wrote a 16-byte XXH3 trailer over the end of each, which is cell content. `finalize` then took `ReservedSpace = 0` from the copied page 1, and the file reopened as a plain database with damaged cells. `Backup` returned nil. The one public way to a plain file is the backup of an in-memory database (the root package gives an in-memory database no checksums); reopening that backup with defaults and backing it up again hit this. `BackupDestinationOptions` now derives the page size, the checksum mode and the schema format from the open file, and `Backup` uses it. This is what `setDestPgsz` and the copied page 1 achieve in SQLite, done at the one moment any-store can do it.
+2. *An existing destination of another geometry is refused.* `BackupInit` returns `ErrBackupCodecMismatch` when the two handles differ in usable size or in kind of codec (none, checksum, encryption), before anything is written; the destination keeps its content. SQLite would overwrite it. Doing that here means replacing the codec and the usable size of an open pager, under its WAL and under any other handle on the file, which is the same obstacle as for the schema format ([drift-2026-11-11-8](#drift-2026-11-11-8-backup-refuses-a-destination-of-another-schema-format)). Before this check an in-memory backup over a file a default `Open` had made returned an error after it had written, and left that file unopenable. Two encrypted files of one reserved size pass the check whatever their ciphers and keys: the destination seals the pages with its own key and keeps its own salt ([drift-2026-11-19-1](#drift-2026-11-19-1-a-backup-destination-keeps-its-own-kdf-salt)). A destination that cannot be read with the source handle's credentials fails earlier, at its open or at the first `Step`'s write begin, also before a page is written.
+
+The backup of an in-memory database is still a plain file, as before; what changed is that a plain file's backup is plain too.
+
+Regression tests: `backup_codec_test.go` (`TestBackupDestinationOptions_FollowTheFile`, `TestBackupDestinationOptions_InMemorySource`, `TestBackupInit_RefusesAnotherCodec`, `TestBackup_BetweenCiphersOfOneReserve`), root `backup_roundtrip_test.go` (`TestBackupRoundTrip`, `TestBackupRoundTrip_OverExistingOfAnotherKind`).
 
 <a id="drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer"></a>
 ### Drift: pagerStress Spills Only For The Live Writer
