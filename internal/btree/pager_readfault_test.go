@@ -188,7 +188,7 @@ func TestReadRawPageWALErrorPropagates(t *testing.T) {
 	})
 
 	// Direct: readRawPage must propagate, not fall back to the disk copy.
-	_, err = db.pager.readRawPage(targetPgno, walMaxFrame)
+	_, err = db.pager.readRawPage(targetPgno, walMaxFrame, rtx.cache)
 	require.ErrorIs(t, err, sentinel, "readRawPage readFrameRaw failure must propagate")
 	require.Contains(t, err.Error(), "WAL frame")
 	require.NoError(t, rtx.Rollback())

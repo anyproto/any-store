@@ -3,7 +3,9 @@
 package btree
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"os"
 	"os/exec"
 	"strconv"
@@ -216,5 +218,62 @@ func TestVerifyIntegritySweepBesideGrowingCommit(t *testing.T) {
 			require.Equal(t, int(writerN), res.Pages)
 			require.Empty(t, res.Errors)
 		})
+	}
+}
+
+// TestReadRawPageSlot0IgnoresNewWALGeneration: the sweep's page read looks a
+// page up in the WAL within its read transaction's frame window, floor
+// included, as every reader does (pWal->minFrame, walFindFrame,
+// wal.c:3538-3541). A snapshot of a fully checkpointed WAL holds read slot
+// 0 and reads nothing from the WAL; a WAL restart needs only slots 1-4, so
+// it can run under that snapshot, and the next writer's frames are numbered
+// from 1 again, below the snapshot's mxFrame. The read must keep returning
+// the snapshot's pages, from the database file.
+func TestReadRawPageSlot0IgnoresNewWALGeneration(t *testing.T) {
+	db, err := testOpen(t, t.TempDir()+"/test.db", restartNPageOpts)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	const rows = 200
+	for i := 0; i < rows; i += 5 {
+		dmsPutRange(t, db, "t1", i, i+5)
+	}
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+	hdr, valid := db.pager.wal.index.readHeader()
+	require.True(t, valid)
+	require.Equal(t, hdr.mxFrame, db.pager.wal.index.shmNBackfill(), "setup: the WAL is fully backfilled")
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	require.Equal(t, rtx.walMaxFrame+1, rtx.cache.minFrame, "setup: the snapshot reads nothing from the WAL")
+	nPages, err := rtx.DatabaseSize()
+	require.NoError(t, err)
+	snapshot := make([][]byte, nPages+1)
+	for pgno := uint32(1); pgno <= nPages; pgno++ {
+		snapshot[pgno], err = db.pager.readRawPage(pgno, rtx.walMaxFrame, rtx.cache)
+		require.NoError(t, err)
+	}
+
+	// Under the snapshot: the log starts over, and a commit that empties
+	// the tree rewrites its pages in frames 1..k of the new generation.
+	require.NoError(t, db.Checkpoint(CheckpointRestart))
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.GetNamespace("t1")
+	require.NoError(t, err)
+	for i := 0; i < rows; i++ {
+		require.NoError(t, wtx.Delete(ns, binary.BigEndian.AppendUint32(nil, uint32(i))))
+	}
+	require.NoError(t, wtx.Commit())
+	after, valid := db.pager.wal.index.readHeader()
+	require.True(t, valid)
+	require.NotZero(t, after.mxFrame)
+	require.Less(t, after.mxFrame, hdr.mxFrame, "setup: the new frames are numbered below the snapshot's mxFrame")
+
+	for pgno := uint32(1); pgno <= nPages; pgno++ {
+		raw, err := db.pager.readRawPage(pgno, rtx.walMaxFrame, rtx.cache)
+		require.NoError(t, err)
+		require.True(t, bytes.Equal(snapshot[pgno], raw), "page %d is not the snapshot's", pgno)
 	}
 }

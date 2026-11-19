@@ -1677,15 +1677,22 @@ func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
 // returns the raw stored bytes. Returns a fresh page-sized buffer; caller
 // owns it.
 //
+// The WAL lookup runs within the reader's frame window, as getPageReader's
+// does: up to walMaxFrame, from the floor its cache carries (readerMinFrame;
+// the live checkpoint frontier for a nil cache, which only a caller that
+// cannot race a WAL restart may pass). The live frontier under a read
+// transaction would let the frames of a WAL generation begun after its
+// snapshot, numbered from 1 again, into a slot-0 snapshot.
+//
 // Caller must hold a read lock (read transaction or equivalent) — same
 // concurrency contract as getPage.
-func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
+func (p *pager) readRawPage(pgno, walMaxFrame uint32, cache *pcache) ([]byte, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
 	buf := make([]byte, p.pageSize)
 	if walMaxFrame > 0 && p.wal != nil {
-		frame, err := p.wal.index.get(pgno, walMaxFrame, p.wal.index.liveMinFrame())
+		frame, err := p.wal.index.get(pgno, walMaxFrame, p.readerMinFrame(cache))
 		if err != nil {
 			// ErrCorrupt from a full/over-probed SHM hash chain: fail the read
 			// (C walFindFrame SQLITE_CORRUPT_BKPT, wal.c:3593) rather than

@@ -108,7 +108,7 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 	// outside the codec. Decoding it would return a damaged page 1 as the
 	// sweep's error instead of listing it.
 	maxFrame := tx.walMaxFrame
-	raw1, err := db.pager.readRawPage(1, maxFrame)
+	raw1, err := db.pager.readRawPage(1, maxFrame, tx.cache)
 	if err != nil {
 		return res, err
 	}
@@ -126,7 +126,7 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 		}
 		switch mode {
 		case IntegrityChecksum:
-			if e := verifyCksumPage(db.pager, pgno, maxFrame); e != nil {
+			if e := verifyCksumPage(db.pager, pgno, maxFrame, tx.cache); e != nil {
 				// Fire the codec's OnError hook so subscribers see sweep
 				// mismatches the same way they see read-path mismatches.
 				if c := db.CksumCodec(); c != nil {
@@ -135,7 +135,7 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 				res.Errors = append(res.Errors, *e)
 			}
 		case IntegrityAEAD:
-			if e := verifyAEADPage(db.pager, pgno, maxFrame); e != nil {
+			if e := verifyAEADPage(db.pager, pgno, maxFrame, tx.cache); e != nil {
 				res.Errors = append(res.Errors, *e)
 			}
 		}
@@ -147,9 +147,10 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 // verifyCksumPage reads pgno's raw on-disk bytes and re-hashes the body to
 // compare against the trailer. Mirrors the codec's Encrypt/Decrypt range:
 // pages 2+ hash [0..end-16], page 1 hashes [dbHeaderSize..end-16] because
-// encryptPageWithCodec preserves the page-1 plaintext prefix.
-func verifyCksumPage(p *pager, pgno, walMaxFrame uint32) *SweepError {
-	raw, err := p.readRawPage(pgno, walMaxFrame)
+// encryptPageWithCodec preserves the page-1 plaintext prefix. cache is the
+// read transaction's, for the floor of its WAL frame window (readRawPage).
+func verifyCksumPage(p *pager, pgno, walMaxFrame uint32, cache *pcache) *SweepError {
+	raw, err := p.readRawPage(pgno, walMaxFrame, cache)
 	if err != nil {
 		return &SweepError{PageNo: pgno, Inner: err}
 	}
@@ -174,8 +175,8 @@ func verifyCksumPage(p *pager, pgno, walMaxFrame uint32) *SweepError {
 // verifyAEADPage attempts a full decrypt of pgno's raw bytes through the
 // installed codec. AEAD's auth tag is the integrity check — a successful
 // Decrypt means the page is authentic. The plaintext output is discarded.
-func verifyAEADPage(p *pager, pgno, walMaxFrame uint32) *SweepError {
-	raw, err := p.readRawPage(pgno, walMaxFrame)
+func verifyAEADPage(p *pager, pgno, walMaxFrame uint32, cache *pcache) *SweepError {
+	raw, err := p.readRawPage(pgno, walMaxFrame, cache)
 	if err != nil {
 		return &SweepError{PageNo: pgno, Inner: err}
 	}
