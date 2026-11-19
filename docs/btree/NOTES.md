@@ -889,18 +889,30 @@ input. Auto-vacuum and PENDING_BYTE checks are absent because those features don
 (`verifyCksumPage` / `verifyAEADPage`) that re-hashes (cksum codec) or AEAD-decrypts every
 page to detect ciphertext tampering or bit-rot. No SQLite analogue: stock SQLite has no
 page-level MAC, and this is the codec layer's own consistency check. Any-store-specific.
-It reads every page raw, past the codec (`readRawPage`), and compares the tag itself, so it
-needs nothing from the codec's read path and leaves it as it is: the sweep once cleared the
-checksum codec's verify-on-read flag for its duration and restored the saved value on
-return. The flag is the handle's one switch (`cksumCodec.verify`, the
-`PRAGMA checksum_verification` of cksumvfs, where it is per connection), shared by the
-writer and every reader, so for that time every other read returned a damaged page as
-good, a write to such a page committed it with a fresh checksum, and two overlapping
-sweeps left the flag off (the second saved the first's `false`). Nothing in the sweep
-ever went through `Decrypt`: the read begin reads page 1's header only, which is outside
-the codec, and the page count is taken from the raw page 1. The flag is now set only at
-open, for `Config.ContinueOnIntegrityError`. The codec's OnError hook is fired by the
-sweep itself for the pages it lists (drift-2026-06-25-13).
+It reads every page raw, with its own read (`readRawPage`), not the codec's read path. A
+checksum page it hashes itself (`verifyCksumPage`) and never passes to `cksumCodec.Decrypt`;
+an AEAD page it passes to the codec's `Decrypt` (`verifyAEADPage` →
+`decryptPageWithCodec`), the only way to check that tag. Its read begin reads page 1's
+header only, which is outside the codec, and its page count comes from the raw page 1. So
+the checksum sweep needs nothing from the codec's verify-on-read flag and leaves it as
+configured: on by default, off in a handle opened with `Config.ContinueOnIntegrityError`,
+the one place that sets it. The sweep once cleared that flag for its duration and restored
+the saved value on return. The flag is the handle's one switch (`cksumCodec.verify`),
+shared by the writer and every reader, so for that time every other read returned a
+damaged page as good, a write to such a page committed it with a fresh checksum, and two
+overlapping sweeps left the flag off (the second saved the first's `false`). cksumvfs keeps
+its `PRAGMA checksum_verification` per open database file and its WAL partner
+(`sqlite3_file_control` on the named database, `pragma.c:495`; `p->verifyCksm` and
+`p->pPartner->verifyCksm`, `cksumvfs.c:563-565`): two databases attached to one connection
+have two settings.
+The codec's OnError hook fires once for each page whose tag fails: for a checksum page the
+sweep fires it, only after a comparison that differed (drift-2026-06-25-13, resolved); for
+an AEAD page the codec's `Decrypt` fires it. A page the sweep could not read is listed
+(`IntegrityKindUnknown`) and fires nothing, in either mode.
+An in-memory database has no integrity mode (`IntegrityMode` returns `IntegrityNone`, the
+sweep scans nothing): its store and WAL hold pages as the b-tree wrote them, past any
+codec the options named (`wal.writeFramesMem`), so no page carries a tag. The sweep used
+to try the configured codec on those pages and list every one.
 The pages it covers are those of its read transaction's snapshot, counted as SQLite counts
 them for `sqlite_dbpage` and the integrity check (see
 [the resolved drift](#drift-2026-06-25-12-verifyintegrity-bounds-the-sweep-with-the-live-writer-header-pager-hea)).
@@ -3975,10 +3987,10 @@ When walking an interior page, Go's `checkTreePage` anchors the expected subtree
 
 <a id="drift-2026-06-25-13-checksum-sweep-fires-the-onerror-errcksummismatch-hook-even-for-plain-"></a>
 ### Drift: Checksum Sweep Fires The OnError(errCksumMismatch) Hook Even For Plain File-I/O Read Errors
-- **Category:** error-handling  -  **Severity:** low
+- **Category:** error-handling  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-19: the sweep fires the hook only for a page whose checksum was compared and differed (`Kind == IntegrityChecksumMismatch`); a page it could not read is listed and fires nothing (`TestReadRawPageWALErrorPropagates`). What remains is in the report, not the hook: for a frame above this process's `nFrame`, `wal.readFrameRaw` returns `ErrWALCorrupt` in place of the read's own error (drift-2026-07-10-1), so `SweepError.Inner` does not carry the cause there.
 - **Affected functions:** `integrity_sweep.go:*DB.VerifyIntegrity`, `integrity_sweep.go:verifyCksumPage`.
 
-In `VerifyIntegrity`'s checksum branch, any non-nil `SweepError` returned by `verifyCksumPage` triggers the codec's OnError hook with a hard-coded `errCksumMismatch`, regardless of which failure produced it. But `verifyCksumPage` returns two distinct error shapes: a genuine trailer mismatch carries `Kind: IntegrityChecksumMismatch` (its `want != got` compare mirrors `cksumCodec.Decrypt`), while a failed raw-page read returns `&SweepError{PageNo: pgno, Inner: err}` with `Kind` left at the zero value `IntegrityKindUnknown`. The sweep loop never inspects the kind before calling `c.fire`, so a transient file-I/O read fault is reported through the same `errCksumMismatch` notification as an actual corrupt page.
+In `VerifyIntegrity`'s checksum branch, any non-nil `SweepError` returned by `verifyCksumPage` triggered the codec's OnError hook with a hard-coded `errCksumMismatch`, regardless of which failure produced it. But `verifyCksumPage` returns two distinct error shapes: a genuine trailer mismatch carries `Kind: IntegrityChecksumMismatch` (its `want != got` compare mirrors `cksumCodec.Decrypt`), while a failed raw-page read returns `&SweepError{PageNo: pgno, Inner: err}` with `Kind` left at the zero value `IntegrityKindUnknown`. The sweep loop did not inspect the kind before calling `c.fire`, so a transient file-I/O read fault was reported through the same `errCksumMismatch` notification as an actual corrupt page.
 
 SQLite's cksumvfs keeps the two cases strictly separate: `cksmRead` computes and compares the trailer only when the underlying `xRead` succeeded (`rc==SQLITE_OK`), surfacing a real trailer mismatch as `SQLITE_IOERR_DATA` (`cksumvfs.c:451`, `cksumvfs.c:455`), whereas a plain read failure propagates the original `xRead` error code (e.g. `SQLITE_IOERR_READ`) and never reaches the checksum comparison at all — C never relabels an I/O fault as a data/checksum fault. The consequence is that subscribers wired to the codec OnError hook (anystore corruption handlers) receive a checksum-mismatch event for a transient read error during a sweep, potentially marking a healthy database corrupt or kicking off recovery; severity is low because the collected `SweepError` itself still carries the correct kind and inner error, so only the side-channel OnError notification is misclassified.
 
@@ -3986,11 +3998,11 @@ SQLite's cksumvfs keeps the two cases strictly separate: `cksmRead` computes and
 ### Drift: Page-1 DB Header Bytes 0..99 Excluded From Both Checksum And AEAD Integrity Coverage
 
 - **Category:** missing-feature  -  **Severity:** low
-- **Affected functions:** `integrity_sweep.go:verifyCksumPage`, `integrity_sweep.go:verifyAEADPage`, `codec.go:encryptPageWithCodec` (`internal/btree/codec.go:149`).
+- **Affected functions:** `integrity_sweep.go:verifyCksumPage`, `integrity_sweep.go:verifyAEADPage`, `codec.go:encryptPageWithCodec`.
 
-For page 1 the Go integrity sweep starts its hash at `dbHeaderSize` rather than 0: `verifyCksumPage` sets `start = dbHeaderSize` when `pgno == 1` and hashes only `raw[start:bodyEnd]`, so the first 100 bytes of page 1 never enter the XXH3-128. That exclusion is structural, baked into the codec write path: `encryptPageWithCodec` copies the first `dbHeaderSize` bytes as a plaintext prefix and only encrypts/authenticates the remainder (`internal/btree/codec.go:153-158`), and the cksumCodec documents that "the page-1 DB header is therefore NOT covered by the per-page checksum" (`internal/btree/codec_cksum.go:26-31`). For the AEAD codec, `verifyAEADPage` decrypts only that same post-prefix slice, so the header bytes carry no authentication tag and the SQLite-format invariants there are instead checked only by `dbHeader.deserialize` at open time.
+For page 1 the Go integrity sweep starts its hash at `dbHeaderSize` rather than 0: `verifyCksumPage` sets `start = dbHeaderSize` when `pgno == 1` and hashes only `raw[start:bodyEnd]`, so the first 100 bytes of page 1 never enter the XXH3-128. That exclusion is structural, baked into the codec write path: `encryptPageWithCodec` copies the first `dbHeaderSize` bytes as a plaintext prefix and only encrypts/authenticates the remainder, and the cksumCodec documents that "the page-1 DB header is therefore NOT covered by the per-page checksum" (`internal/btree/codec_cksum.go:26-31`). For the AEAD codec, `verifyAEADPage` decrypts only that same post-prefix slice, so the header bytes carry no authentication tag. What is checked of them is their format, not their integrity: `dbHeader.deserialize` at open, at every write begin, and in every sweep, which decodes its snapshot's header (`sweepPageCount`) and applies `lockBtreePageCount`. A header that stops being valid after open (a payload-fraction byte, the magic) is found by the next sweep: listed against page 1 when a WAL commit gives the page count, the sweep's `ErrHeaderCorrupt` otherwise. A header `DatabaseSize` of 0 is not an error: the pager's count stands in. A page count that differs from the one the snapshot's WAL commit recorded is listed (drift-2026-06-25-12); any other field changed to another valid value passes.
 
-SQLite's cksumvfs, by contrast, checksums the entire page including page 1's 100-byte database header: the read path computes `cksmCompute((u8*)zBuf, iAmt-8, cksum)` starting at offset 0 of the page buffer (`cksumvfs.c:450`), and the `verify_checksum()` SQL function does the same with `cksmCompute(data, nByte-8, cksum)` over the whole blob (`cksumvfs.c:353`); `cksmCompute` walks from `a[0]` to `a[nByte]` with no header carve-out (`cksumvfs.c:299`). The consequence is that bit-rot or tampering confined to the page-1 header — e.g. a flipped DatabaseSize or freelist-trunk pointer that still parses as structurally valid — passes `VerifyIntegrity` clean, whereas an equivalent SQLite cksumvfs database would flag it; for the AEAD codec this is an authentication gap on file-structure metadata.
+SQLite's cksumvfs, by contrast, checksums the entire page including page 1's 100-byte database header: the read path computes `cksmCompute((u8*)zBuf, iAmt-8, cksum)` starting at offset 0 of the page buffer (`cksumvfs.c:450`), and the `verify_checksum()` SQL function does the same with `cksmCompute(data, nByte-8, cksum)` over the whole blob (`cksumvfs.c:353`); `cksmCompute` walks from `a[0]` to `a[nByte]` with no header carve-out (`cksumvfs.c:299`). The consequence is that bit-rot or tampering confined to the page-1 header — e.g. a flipped freelist-trunk pointer or schema cookie that still parses as structurally valid, or a `DatabaseSize` lowered in a snapshot with no WAL commit — passes `VerifyIntegrity` clean, whereas an equivalent SQLite cksumvfs database would flag it; for the AEAD codec this is an authentication gap on file-structure metadata.
 
 <a id="drift-2026-06-25-15-remap-grows-mapping-to-a-single-page-end-and-always-full-unmaps-re-mma"></a>
 ### Drift: Remap Always Unmaps And Re-mmaps The Whole Region Instead Of Extending In Place
