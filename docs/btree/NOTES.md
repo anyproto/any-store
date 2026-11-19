@@ -3122,6 +3122,16 @@ read on a lookup error (the over-probed-chain `ErrCorrupt`, drift-93): `walIndex
 nothing. Tests: `TestWalIndexMapError_ReaderFails`, `_WriterFails`, `_LookupsFail`
 (`wal_index_map_error_test.go`).
 
+More of `walFindFrame`'s rules came with it (2026-11-19), since a lookup that can fail must not fail, or be
+wrong, where C's cannot:
+
+- **An empty window touches no segment.** A snapshot that is entirely in the database file (a reader on slot
+  0: `minFrame == maxFrame+1`) returned before the loop in C (`wal.c:3538-3541`). `shmHashGet` mapped and
+  probed the segment of `maxFrame` for it, so a segment it could not map failed a read that needs no WAL, and
+  it read hash tables a log restart may be clearing. `shmHashGet`, `get` and `getInTxRange` return `(0, nil)`
+  for `minFrame > maxFrame`. Tests: `TestWalIndexLookup_EmptyWindowMapsNothing`,
+  `TestWalIndexMapError_CheckpointedReaderReads`.
+
 <a id="drift-93-wal-hash-probe-full-chain-corruption-signal-dropped"></a>
 ### **Resolved (stale, 2026-06-25)** — shmHashGet now bounds the per-segment probe and propagates full-chain corruption as ErrCorrupt, matching C's walFindFrame (write path shmHashWrite likewise returns ErrCorrupt); cited wal.go:1081 is stale. Drift: WAL Hash Probe Full Chain Corruption Signal Dropped
 - **Category:** changed-logic  -  **Severity:** low
