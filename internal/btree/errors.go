@@ -55,10 +55,13 @@ var (
 	// ErrInvalidPage indicates a page number is out of range or invalid.
 	ErrInvalidPage = errors.New("btree: invalid page number")
 
-	// ErrKeyTooLarge indicates the key exceeds the maximum allowed size.
+	// ErrKeyTooLarge is returned by Put for a key longer than the record
+	// size limit (1 GiB). Nothing is written.
 	ErrKeyTooLarge = errors.New("btree: key too large")
 
-	// ErrValueTooLarge indicates the value exceeds maximum allowed size.
+	// ErrValueTooLarge is returned by Put when the key fits the record size
+	// limit (1 GiB) and the key and the value together do not. Nothing is
+	// written.
 	ErrValueTooLarge = errors.New("btree: value too large")
 
 	// ErrWALCorrupt indicates the WAL index points at a frame the file does not hold.

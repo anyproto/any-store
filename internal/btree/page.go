@@ -139,11 +139,33 @@ const (
 	// overflowPtrSize is the size of the overflow page pointer at the end
 	// of a leaf cell that has overflowed.
 	overflowPtrSize = 4
-	// maxPayloadAlloc is the maximum allocation size for key/value payloads
-	// read from disk. Protects against OOM from corrupted varints that decode
-	// to absurdly large values. 1 GB is generous for any real workload.
+	// maxPayloadAlloc is the largest record, key and value together, in
+	// bytes: 1 GiB. A cell read from disk that declares more is corruption
+	// (the cap protects against a corrupted varint that decodes to an
+	// absurd allocation), and Put refuses to write more; see payloadFits.
 	maxPayloadAlloc = 1 << 30
 )
+
+// payloadLimit is maxPayloadAlloc. It is a variable only so that a test can
+// lower it: what is written and what is read are held to the one value.
+var payloadLimit = maxPayloadAlloc
+
+// payloadFits reports whether a record with a key of keyLen bytes and a
+// value of valLen bytes is within the record size limit: neither length
+// negative and their sum at most payloadLimit. It is the one rule of both
+// sides. The cell parsers answer ErrCorrupt for a cell that fails it, so Put
+// refuses such a record before it writes anything: a record that could be
+// written and not read back would make its own file corrupt.
+//
+// SQLite draws the same line above the b-tree: a record over
+// SQLITE_LIMIT_LENGTH (SQLITE_MAX_LENGTH, 1,000,000,000, sqliteLimit.h:24) is
+// SQLITE_TOOBIG in OP_MakeRecord (vdbe.c:3697) and never reaches
+// sqlite3BtreeInsert.
+func payloadFits(keyLen, valLen int) bool {
+	// The sum is not formed: on a 32-bit int two lengths at the limit
+	// overflow it.
+	return keyLen >= 0 && valLen >= 0 && valLen <= payloadLimit && keyLen <= payloadLimit-valLen
+}
 
 // maxLocalPayload returns the max payload stored locally before overflow.
 // Matches SQLite's formula for index B-trees.

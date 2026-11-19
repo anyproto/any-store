@@ -1372,6 +1372,12 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	if !errors.Is(err, ErrNamespaceNotFound) {
 		return err
 	}
+	// The master-table record is the name and the 4-byte root page number.
+	// Put would refuse one over the record size limit; refuse it before the
+	// root page is allocated.
+	if err = recordSizeErr(len(name), 4); err != nil {
+		return err
+	}
 
 	// Allocate a new page for the namespace's B-tree root
 	rootPg, err := db.pager.allocatePage()
@@ -1465,6 +1471,12 @@ func (db *DB) RenameNamespace(tx *WriteTx, oldName, newName string) error {
 		return ErrNamespaceExists
 	}
 	if !errors.Is(err, ErrNamespaceNotFound) {
+		return err
+	}
+
+	// The Put below would refuse a name over the record size limit; refuse
+	// it before the old name is deleted.
+	if err = recordSizeErr(len(newName), 4); err != nil {
 		return err
 	}
 
