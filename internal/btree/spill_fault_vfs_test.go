@@ -1,4 +1,4 @@
-//go:build vfs
+//go:build vfs && !js
 
 package btree
 
@@ -20,7 +20,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,12 +29,14 @@ var errInjectedSpillIO = errors.New("injected WAL write failure")
 
 // spillFaultFile is the log of a database whose writes fail from the
 // failAt-th one on: that one alone, or all of them while sticky is set (a
-// full disk).
+// full disk). A torn failure writes the first half of its bytes before it
+// fails.
 type spillFaultFile struct {
 	File
 	writes atomic.Int64
 	failAt atomic.Int64 // 0: never
 	sticky atomic.Bool
+	torn   atomic.Bool
 	fired  atomic.Int64
 }
 
@@ -43,14 +44,19 @@ func (f *spillFaultFile) WriteAt(b []byte, off int64) (int, error) {
 	n := f.writes.Add(1)
 	if at := f.failAt.Load(); at != 0 && (n == at || (n > at && f.sticky.Load())) {
 		f.fired.Add(1)
+		if f.torn.Load() {
+			w, _ := f.File.WriteAt(b[:len(b)/2], off)
+			return w, errInjectedSpillIO
+		}
 		return 0, errInjectedSpillIO
 	}
 	return f.File.WriteAt(b, off)
 }
 
-func (f *spillFaultFile) arm(nthFromNow int64, sticky bool) {
+func (f *spillFaultFile) arm(nthFromNow int64, sticky, torn bool) {
 	f.fired.Store(0)
 	f.sticky.Store(sticky)
+	f.torn.Store(torn)
 	f.failAt.Store(f.writes.Load() + nthFromNow)
 }
 
@@ -71,12 +77,13 @@ func spillValue(rng *rand.Rand, n int) []byte {
 // spillFaultDB is a database with a committed baseline in namespace "a" and
 // the model of what is committed.
 type spillFaultDB struct {
-	db    *DB
-	ns    *Namespace
-	path  string
-	file  *spillFaultFile
-	model map[int][]byte
-	big   []int // baseline keys whose values are on overflow chains
+	db     *DB
+	ns     *Namespace
+	path   string
+	file   *spillFaultFile
+	model  map[int][]byte
+	big    []int // baseline keys whose values are on overflow chains
+	copies int   // crash copies taken
 }
 
 func openSpillFaultDB(t *testing.T, cacheSize, baseKeys int) *spillFaultDB {
@@ -153,22 +160,32 @@ func (s *spillFaultDB) apply(tx *WriteTx, op spillOp) error {
 	return tx.Put(s.ns, spillKey(op.key), op.val)
 }
 
-// verify is the integrity check and a read of every committed key. It
-// reports failures without ending the test: it runs on guarded's goroutine.
+// verify is the integrity check and a read of every committed key.
 func (s *spillFaultDB) verify(t *testing.T, what string) bool {
 	t.Helper()
-	if !assert.NoError(t, s.db.IntegrityCheck(), "%s: integrity check", what) {
+	return verifySpillModel(t, s.db, s.model, what)
+}
+
+// verifySpillModel checks that db's namespace "a" holds exactly model. It
+// reports failures without ending the test.
+func verifySpillModel(t *testing.T, db *DB, model map[int][]byte, what string) bool {
+	t.Helper()
+	if !assert.NoError(t, db.IntegrityCheck(), "%s: integrity check", what) {
 		return false
 	}
-	rtx, err := s.db.BeginRead()
+	rtx, err := db.BeginRead()
 	if !assert.NoError(t, err, what) {
 		return false
 	}
 	defer rtx.Rollback()
-	n, err := rtx.Count(s.ns)
-	ok := assert.NoError(t, err, what) && assert.Equal(t, len(s.model), n, "%s: key count", what)
-	for k, want := range s.model {
-		got, err := rtx.Get(s.ns, spillKey(k))
+	ns, err := rtx.GetNamespace("a")
+	if !assert.NoError(t, err, what) {
+		return false
+	}
+	n, err := rtx.Count(ns)
+	ok := assert.NoError(t, err, what) && assert.Equal(t, len(model), n, "%s: key count", what)
+	for k, want := range model {
+		got, err := rtx.Get(ns, spillKey(k))
 		if !assert.NoError(t, err, "%s: key %d", what, k) {
 			return false
 		}
@@ -180,120 +197,98 @@ func (s *spillFaultDB) verify(t *testing.T, what string) bool {
 	return ok
 }
 
-// guarded runs f with a deadline and turns a panic into a failure. It
-// reports whether f returned: after a timeout f's goroutine may still hold
-// the database.
-func guarded(t *testing.T, what string, f func()) bool {
+// verifyCrashCopy opens a copy of the database and its log as they are now,
+// as a crash would leave them, and checks that it holds what is committed.
+// The copy's log is recovered from its bytes: an orderly Close checkpoints
+// and truncates it first, and a log whose frames chain from the wrong
+// checksums, or that ends in a torn frame the recovery takes for one, would
+// go unnoticed.
+func (s *spillFaultDB) verifyCrashCopy(t *testing.T, what string) {
 	t.Helper()
-	done := make(chan string, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				done <- fmt.Sprintf("panic: %v\n%s", r, debug.Stack())
-				return
-			}
-			done <- ""
-		}()
-		f()
-	}()
-	select {
-	case msg := <-done:
-		if msg != "" {
-			t.Errorf("%s: %s", what, msg)
+	s.copies++
+	path := restartCopyFiles(t, s.path, fmt.Sprintf("crash-%d", s.copies))
+	db, err := testOpen(t, path, Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err, what)
+	defer func() { require.NoError(t, db.Close(), what) }()
+	verifySpillModel(t, db, s.model, what)
+}
+
+// guarded runs f and turns a panic into a failure, so that what a wrong
+// outcome leaves behind is still checked. A hang is go test's -timeout,
+// which prints every goroutine.
+func guarded(t *testing.T, what string, f func()) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%s: panic: %v\n%s", what, r, debug.Stack())
 		}
-		return true
-	case <-time.After(60 * time.Second):
-		t.Errorf("%s: no progress in 60s (livelock)", what)
-		return false
-	}
+	}()
+	f()
 }
 
 type spillFaultCase struct {
 	nth        int64 // the write of the log that fails, counted from the transaction's begin
 	sticky     bool
+	torn       bool // the failing write writes half its bytes
 	savepoints bool // each operation in a savepoint, rolled back when it fails
 	commit     bool // the failed transaction ends with Commit instead of Rollback
 }
 
-// runSpillFault runs one transaction under the fault and everything that
-// must hold after it. It reports whether the fault fired inside an
-// operation (a spill) rather than at the commit. Every check is made, a
-// failed one included: what a wrong outcome leaves behind is the point.
-func (s *spillFaultDB) runSpillFault(t *testing.T, c spillFaultCase, ops []spillOp) (inOp bool) {
+// runSpillFault runs one transaction with the fault at c.nth, which falls
+// on a spill of one of its operations, and everything that must hold after
+// it. Every check is made, a failed one included: what a wrong outcome
+// leaves behind is the point.
+func (s *spillFaultDB) runSpillFault(t *testing.T, c spillFaultCase, ops []spillOp) {
 	t.Helper()
 	p := s.db.pager
-	returned := guarded(t, "failed transaction", func() {
+	guarded(t, "failed transaction", func() {
 		tx, err := s.db.BeginWrite()
-		if !assert.NoError(t, err) {
-			return
-		}
+		require.NoError(t, err)
 		ended := false
 		defer func() {
 			if !ended {
 				_ = tx.Rollback()
 			}
 		}()
-		s.file.arm(c.nth, c.sticky)
-		pending := map[int][]byte{}
-		deleted := map[int]bool{}
-		var opErr error
+		s.file.arm(c.nth, c.sticky, c.torn)
+		failed := -1
 		for i, op := range ops {
 			sp := -1
 			if c.savepoints {
-				if sp, err = tx.Savepoint(); !assert.NoError(t, err) {
-					return
-				}
+				sp, err = tx.Savepoint()
+				require.NoError(t, err)
 			}
-			if opErr = s.apply(tx, op); opErr != nil {
-				assert.ErrorIs(t, opErr, errInjectedSpillIO, "operation %d fails with the I/O error", i)
-				assert.NotErrorIs(t, opErr, ErrCorrupt, "operation %d", i)
+			fired := s.file.fired.Load()
+			opErr := s.apply(tx, op)
+			if s.file.fired.Load() == fired {
+				require.NoError(t, opErr, "operation %d, before the fault", i)
 				if c.savepoints {
-					// The transaction is in the error state: its savepoint
-					// cannot be played back, only the whole of it.
-					assert.ErrorIs(t, tx.RollbackToSavepoint(sp), errInjectedSpillIO)
+					require.NoError(t, tx.ReleaseSavepoint(sp))
 				}
-				break
+				continue
 			}
+			// The operation whose spill met the fault fails with its error.
+			require.ErrorIs(t, opErr, errInjectedSpillIO, "operation %d meets the fault", i)
+			assert.NotErrorIs(t, opErr, ErrCorrupt, "operation %d", i)
 			if c.savepoints {
-				if !assert.NoError(t, tx.ReleaseSavepoint(sp)) {
-					return
-				}
+				// The transaction is in the error state: its savepoint
+				// cannot be played back, only the whole of it.
+				assert.ErrorIs(t, tx.RollbackToSavepoint(sp), errInjectedSpillIO)
 			}
-			if op.del {
-				deleted[op.key] = true
-				delete(pending, op.key)
-			} else {
-				pending[op.key] = op.val
-				delete(deleted, op.key)
-			}
+			failed = i
+			break
 		}
-		if opErr == nil {
-			// The fault point is past the last spill: the commit meets it.
-			ended = true
-			err := tx.Commit()
-			if s.file.fired.Load() != 0 {
-				assert.ErrorIs(t, err, errInjectedSpillIO)
-				return
-			}
-			if assert.NoError(t, err) {
-				for k := range deleted {
-					delete(s.model, k)
-				}
-				for k, v := range pending {
-					s.model[k] = v
-				}
-			}
-			return
-		}
-		inOp = true
+		require.GreaterOrEqual(t, failed, 0, "the fault fired inside an operation")
 		assert.Equal(t, int32(pagerError), p.state.Load(), "the transaction is in the error state")
-		// Every later write reports the error, and nothing more is written.
-		fired := s.file.fired.Load()
-		assert.ErrorIs(t, tx.Put(s.ns, spillKey(1<<40), []byte("after the error")), errInjectedSpillIO)
+
+		// Every later operation reports the error, and nothing more is
+		// written to the log: not by them, not by the end of the
+		// transaction.
+		writes := s.file.writes.Load()
+		assert.ErrorIs(t, tx.Put(s.ns, spillKey(1<<30), []byte("after the error")), errInjectedSpillIO)
 		assert.ErrorIs(t, tx.Delete(s.ns, spillKey(0)), errInjectedSpillIO)
 		_, err = tx.Savepoint()
 		assert.ErrorIs(t, err, errInjectedSpillIO)
-		assert.Equal(t, fired, s.file.fired.Load(), "no write of the log in the error state")
 		// A read of the failed transaction reports the error too, a
 		// committed key never "not found": a balance the spill stopped
 		// half-way left the cached pages of the tree incomplete.
@@ -316,30 +311,25 @@ func (s *spillFaultDB) runSpillFault(t *testing.T, c spillFaultCase, ops []spill
 		} else {
 			assert.NoError(t, tx.Rollback())
 		}
+		assert.Equal(t, writes, s.file.writes.Load(), "a write of the log in the error state or at its end")
 	})
 	s.file.disarm()
-	if !returned {
-		s.db = nil // its goroutine is stuck in it
-		return inOp
-	}
 	assert.Equal(t, int32(pagerOpen), p.state.Load())
 	assert.Zero(t, p.writerCache.nDirty, "no dirty page outlives the transaction")
 	assert.Nil(t, p.errCode)
 
-	returned = guarded(t, "after the failed transaction", func() {
+	guarded(t, "after the failed transaction", func() {
 		s.verify(t, "after the failed transaction")
+		s.verifyCrashCopy(t, "crash copy after the failed transaction")
 		// An empty transaction commits nothing.
 		frames := p.wal.nFrame.Load()
 		tx, err := s.db.BeginWrite()
-		if !assert.NoError(t, err) {
-			return
-		}
+		require.NoError(t, err)
 		assert.NoError(t, tx.Commit())
 		assert.Equal(t, frames, p.wal.nFrame.Load(), "an empty commit writes no frame")
 		// A normal one commits.
-		if tx, err = s.db.BeginWrite(); !assert.NoError(t, err) {
-			return
-		}
+		tx, err = s.db.BeginWrite()
+		require.NoError(t, err)
 		rng := rand.New(rand.NewSource(c.nth))
 		for i := 0; i < 40; i++ {
 			k := 1_000_000 + i
@@ -352,12 +342,9 @@ func (s *spillFaultDB) runSpillFault(t *testing.T, c spillFaultCase, ops []spill
 		}
 		assert.NoError(t, tx.Commit())
 		s.verify(t, "after the next transaction")
+		s.verifyCrashCopy(t, "crash copy after the next transaction")
 		s.reopen(t)
 	})
-	if !returned {
-		s.db = nil
-	}
-	return inOp
 }
 
 // reopen closes the database and opens it again without the fault file.
@@ -384,14 +371,25 @@ func (s *spillFaultDB) reopen(t *testing.T) {
 }
 
 // spillWrites is the number of writes of the log the operations make before
-// the commit: the spills.
-func (s *spillFaultDB) spillWrites(t *testing.T, ops []spillOp) int64 {
+// the commit, each in a savepoint of its own or not: the spills. It is
+// counted on a database of its own, as fresh as the one each fault point
+// gets.
+func spillWrites(t *testing.T, cacheSize, baseKeys int, seed int64, nOps int, savepoints bool) int64 {
 	t.Helper()
+	s := openSpillFaultDB(t, cacheSize, baseKeys)
 	tx, err := s.db.BeginWrite()
 	require.NoError(t, err)
 	before := s.file.writes.Load()
-	for _, op := range ops {
+	for _, op := range s.spillOps(seed, nOps, baseKeys) {
+		sp := -1
+		if savepoints {
+			sp, err = tx.Savepoint()
+			require.NoError(t, err)
+		}
 		require.NoError(t, s.apply(tx, op))
+		if savepoints {
+			require.NoError(t, tx.ReleaseSavepoint(sp))
+		}
 	}
 	n := s.file.writes.Load() - before
 	require.NoError(t, tx.Rollback())
@@ -400,7 +398,8 @@ func (s *spillFaultDB) spillWrites(t *testing.T, ops []spillOp) int64 {
 }
 
 // The fault point swept across a transaction that spills from a 32-page
-// cache, a database for each point.
+// cache, a database for each point. The writes are counted for each mode,
+// so that every point falls on a spill.
 func TestSpillFault_Sweep(t *testing.T) {
 	const (
 		baseKeys = 150
@@ -414,26 +413,22 @@ func TestSpillFault_Sweep(t *testing.T) {
 		{"rollback", spillFaultCase{}},
 		{"commit", spillFaultCase{commit: true}},
 		{"sticky", spillFaultCase{sticky: true}},
+		{"torn", spillFaultCase{torn: true}},
 		{"savepoints", spillFaultCase{savepoints: true}},
-		{"savepoints-commit-sticky", spillFaultCase{savepoints: true, commit: true, sticky: true}},
+		{"savepoints-commit-sticky-torn", spillFaultCase{savepoints: true, commit: true, sticky: true, torn: true}},
 	}
-	s := openSpillFaultDB(t, 32, baseKeys)
-	total := s.spillWrites(t, s.spillOps(seed, nOps, baseKeys))
-	require.Greater(t, total, int64(100), "the transaction spills")
 	for _, m := range modes {
 		t.Run(m.name, func(t *testing.T) {
-			var inOp int
+			total := spillWrites(t, 32, baseKeys, seed, nOps, m.c.savepoints)
+			require.Greater(t, total, int64(100), "the transaction spills")
 			for nth := int64(1); nth <= total; nth += total / 12 {
 				t.Run(fmt.Sprintf("write=%d", nth), func(t *testing.T) {
 					s := openSpillFaultDB(t, 32, baseKeys)
 					c := m.c
 					c.nth = nth
-					if s.runSpillFault(t, c, s.spillOps(seed, nOps, baseKeys)) {
-						inOp++
-					}
+					s.runSpillFault(t, c, s.spillOps(seed, nOps, baseKeys))
 				})
 			}
-			require.Greater(t, inOp, 8, "the fault fired inside an operation")
 		})
 	}
 }
@@ -447,15 +442,20 @@ func TestSpillFault_DefaultCache(t *testing.T) {
 	const (
 		baseKeys = 300
 		nOps     = 80000
+		seed     = 3
 	)
-	s := openSpillFaultDB(t, 0, baseKeys)
-	require.Equal(t, defaultCacheSize, s.db.pager.writerCache.maxPages)
-	total := s.spillWrites(t, s.spillOps(3, nOps, baseKeys))
-	require.Greater(t, total, int64(100), "the transaction spills")
-	for i, nth := range []int64{1, total / 3, total - 1} {
+	totals := map[bool]int64{}
+	for i, c := range []spillFaultCase{{commit: true}, {sticky: true, torn: true}, {savepoints: true}} {
+		total, ok := totals[c.savepoints]
+		if !ok {
+			total = spillWrites(t, 0, baseKeys, seed, nOps, c.savepoints)
+			require.Greater(t, total, int64(100), "the transaction spills")
+			totals[c.savepoints] = total
+		}
+		c.nth = []int64{1, total / 3, total - 1}[i]
 		s := openSpillFaultDB(t, 0, baseKeys)
-		c := spillFaultCase{nth: nth, sticky: i == 1, savepoints: i == 2, commit: i == 0}
-		require.True(t, s.runSpillFault(t, c, s.spillOps(3, nOps, baseKeys)), "the fault fired inside an operation")
+		require.Equal(t, defaultCacheSize, s.db.pager.writerCache.maxPages)
+		s.runSpillFault(t, c, s.spillOps(seed, nOps, baseKeys))
 	}
 }
 
@@ -560,7 +560,7 @@ func TestSpillFault_RootSplitStoppedHalfWay(t *testing.T) {
 			// Every page the split allocates now spills one.
 			fillWriterCacheDirty(t, p)
 
-			f.arm(nth, false)
+			f.arm(nth, false, false)
 			err = tx.Put(ns, closeRescueKey(fit+1), make([]byte, valSize))
 			if f.fired.Load() == 0 {
 				require.NoError(t, err)
@@ -626,7 +626,7 @@ func TestSpillFault_RollbackTripsCursors(t *testing.T) {
 			require.True(t, c.Valid())
 			require.NotEmpty(t, c.stack)
 
-			s.file.arm(1, false)
+			s.file.arm(1, false, false)
 			var opErr error
 			for _, op := range s.spillOps(7, 400, baseKeys) {
 				if opErr = s.apply(tx, op); opErr != nil {
@@ -683,7 +683,7 @@ func TestSpillFault_RenameReadBack(t *testing.T) {
 			tx, err := db.BeginWrite()
 			require.NoError(t, err)
 			defer func() { _ = tx.Rollback() }()
-			f.arm(nth, false)
+			f.arm(nth, false, false)
 			err = tx.RenameNamespace("old", newName)
 			require.Equal(t, int64(1), f.fired.Load(), "the fault fired")
 			require.ErrorIs(t, err, errInjectedSpillIO)
