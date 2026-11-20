@@ -660,14 +660,6 @@
     "sqlite": [],
     "note": ""
   },
-  "codec.go:*onErrorField.SetOnError": {
-    "sqlite": [],
-    "note": ""
-  },
-  "codec.go:*onErrorField.fire": {
-    "sqlite": [],
-    "note": ""
-  },
   "codec.go:decryptPageWithCodec": {
     "sqlite": [],
     "note": ""
@@ -683,6 +675,10 @@
   "codec.go:encryptWith": {
     "sqlite": [],
     "note": ""
+  },
+  "codec.go:integrityHook.fire": {
+    "sqlite": [],
+    "note": "No SQLite counterpart. The database's integrity hook, passed with every Decrypt, is SQLCipher's per-connection failure report: sqlite3Codec records a decrypt failure on the codec_ctx its pager passed to the call (sqlcipher_codec_ctx_set_error)."
   },
   "codec.go:newNoncePool": {
     "sqlite": [],

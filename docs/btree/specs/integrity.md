@@ -49,7 +49,7 @@ For every page in the file:
 
 ### Page-1 header gap (limitation)
 
-`encryptPageWithCodec` (`codec.go:194-212`) preserves the first 100
+`encryptPageWithCodec` (`codec.go:183-201`) preserves the first 100
 bytes of page 1 (the SQLite-format DB header) as a plaintext prefix
 and only passes `src[100:]` to the codec. So:
 
@@ -119,8 +119,8 @@ ignores it because disabling AEAD verification would return attacker-
 controlled plaintext.
 
 Direct btree callers can subscribe to per-page failures via
-`btree.Options.OnIntegrityError` (a uniform hook fired by all codecs
-that implement `OnErrorSink`).
+`btree.Options.OnIntegrityError` (one hook for every codec, and for this
+database's failures only).
 
 ## Why `SetVerifyOnRead(false)` is rejected on AEAD
 
@@ -130,20 +130,27 @@ page anyway and inspect it. Disabling AEAD verification would return
 the only thing standing between the user and a chosen-ciphertext
 attack). We refuse and return `ErrAEADIntegrityVerifyMandatory`.
 
-## How the unified `OnError` works
+## How `OnIntegrityError` works
 
-Every `Codec` that implements page integrity also embeds
-`onErrorField` (`codec.go`). Three codecs do today:
+The hook belongs to the database, not to the codec: one codec object
+can serve several databases (`Options.Codec` is installed as given),
+so a hook stored in the codec would go to whichever database set it
+last. `installCodec` stores `Options.OnIntegrityError` on the pager
+(`pager.onIntegrityError`), which copies it to its WAL, and every
+`Decrypt` the pager or the WAL makes passes it in (`codec.go`,
+`integrityHook`). The codec reports to the hook of the call:
 
 - `cksumCodec.Decrypt` fires on XXH3 mismatch (regardless of
   verify-on-read state — the toggle suppresses only the error return).
 - `aesCodec.Decrypt` and `chachaCodec.Decrypt` fire on
-  `cipher.AEAD.Open` failure before returning `ErrCodecTamper`.
+  `cipher.AEAD.Open` failure before returning `ErrPageIntegrity`.
 
-`Options.OnIntegrityError` is wired onto whichever codec is installed
-at `Open` time. The `VerifyIntegrity` sweep also fires the cksum
-codec's hook on detected mismatches so subscribers see one signal
-regardless of code path.
+The `VerifyIntegrity` sweep also fires the pager's hook on detected
+checksum mismatches so subscribers see one signal regardless of code
+path. SQLCipher reports a page it cannot decrypt to the connection the
+call came from the same way: each pager passes its own `codec_ctx` to
+every codec call, and `sqlite3Codec` records the failure there and on
+that pager (`sqlcipher_codec_ctx_set_error` → `sqlite3pager_error`).
 
 ## Verification flow
 
@@ -152,13 +159,13 @@ regardless of code path.
 1. Reports `IntegrityNone` with zero pages scanned for plain DBs.
 2. For checksum mode: `pager.readRawPage(pgno)` (codec-bypass) +
    `xxh3.Hash128` recomputation + trailer compare. Detected
-   mismatches accumulate into `Report.Errors` and fire the codec's
-   `OnError`.
+   mismatches accumulate into `Report.Errors` and fire the database's
+   `OnIntegrityError`.
 3. For AEAD mode: `pager.readRawPage(pgno)` +
    `decryptPageWithCodec(...)`. The codec's auth tag does the work;
    any tag failure yields a `SweepError{Kind: IntegrityAEADAuthFail}`
-   (the AEAD codec's own `OnError` fires first as a side effect of
-   `Decrypt`).
+   (`Decrypt` fires the database's `OnIntegrityError` first, which the
+   sweep passes in as the read path does).
 
 The sweep is read-only; uses an internal read transaction.
 
