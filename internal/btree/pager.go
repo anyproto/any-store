@@ -1124,8 +1124,11 @@ func (p *pager) beginReadHdrBusy(busy *beginBusy) (hdr WalIndexHdr, maxFrame, mi
 	p.mu.RLock()
 	// The writer's state is not tested: pagerError is the state of the open
 	// write transaction, which a read begin sees no more of than it does of
-	// pagerWriter. SQLite's error state belongs to the failing connection's
-	// own Pager (pager.c:1947-1960), and no other connection meets it.
+	// pagerWriter. The snapshot is bounded by the committed frame, and a
+	// spill, failed or not, never publishes its frames as a commit. In
+	// SQLite a connection with a private cache has its own Pager
+	// (pager.c:1947-1960 sets its errCode), and no other connection meets
+	// its error state (shared caches: docs/btree/NOTES.md#drift-2026-11-19-1-the-error-state-of-a-failed-spill).
 	// The change state before the snapshot is taken: see wal.noteSnapshot.
 	// ~ pagerBeginReadTransaction (pager.c:3246-3267): every begin of every
 	// kind passes here, so none can take a snapshot holding another
