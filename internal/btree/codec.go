@@ -20,16 +20,16 @@ import (
 // as given, so two databases opened with it, or a database and its Backup
 // destination, which opens with the source's Options, encrypt through it
 // from their own writers at the same time). A codec therefore keeps no
-// per-call mutable state and nothing a database sets: whatever an Encrypt
-// or Decrypt call needs to write, the nonce source included, lives in the
-// caller's aeadScratch, and Decrypt reports an integrity failure to the
-// hook its caller passes in, the calling database's own
-// Options.OnIntegrityError. SQLCipher reports a page it cannot decrypt to
-// the connection the call came from: each pager passes its own codec_ctx
-// to every codec call (pPager->xCodec(pPager->pCodec, ...)), and
+// per-call mutable state and nothing a database sets (the one exception,
+// cksumCodec's verify flag, is in a codec that is never shared): whatever
+// an Encrypt or Decrypt call needs to write, the nonce source included,
+// lives in the caller's aeadScratch, and Decrypt reports an integrity
+// failure to the hook its caller passes in, the calling database's own
+// Options.OnIntegrityError. SQLCipher, too, reports a page it cannot
+// decrypt to the connection the call came from: each pager passes its own
+// codec_ctx to every codec call (pPager->xCodec(pPager->pCodec, ...)), and
 // sqlite3Codec records the failure on that ctx and its pager
-// (sqlcipher_codec_ctx_set_error → sqlite3pager_error). Here the pager and
-// the WAL pass their database's hook with every Decrypt the same way.
+// (sqlcipher_codec_ctx_set_error → sqlite3pager_error).
 //
 // Overhead() bytes are reserved at the end of every page for the codec's
 // per-page metadata (IV/nonce, authentication tag, padding). The btree cell
