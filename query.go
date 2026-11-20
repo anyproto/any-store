@@ -887,11 +887,14 @@ func countPlanRoot(plan *qplanner.Plan) (int, error) {
 // by one contiguous arena: one allocation curve, and the ids stay valid after
 // plan.Close — bulk writes must release the plan's cursors before mutating,
 // and iterators reuse their docId buffers between rows.
+//
+// The offsets are ints: the ids of one bulk write have no bound below the
+// buffer's own, and a 32-bit offset would wrap past 4 GiB.
 func collectDistinctIDs(root qplanner.Iterator) ([][]byte, error) {
-	var idBuf []byte       // contiguous buffer for all ids
-	var idOffsets []uint32 // start offset of each id in idBuf
+	var idBuf []byte    // contiguous buffer for all ids
+	var idOffsets []int // start offset of each id in idBuf
 	if err := qplanner.ForEachDistinct(root, func(docId []byte) error {
-		idOffsets = append(idOffsets, uint32(len(idBuf)))
+		idOffsets = append(idOffsets, len(idBuf))
 		idBuf = append(idBuf, docId...)
 		return nil
 	}); err != nil {
@@ -901,7 +904,7 @@ func collectDistinctIDs(root qplanner.Iterator) ([][]byte, error) {
 	for i, off := range idOffsets {
 		end := len(idBuf)
 		if i+1 < len(idOffsets) {
-			end = int(idOffsets[i+1])
+			end = idOffsets[i+1]
 		}
 		ids[i] = idBuf[off:end]
 	}
