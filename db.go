@@ -852,6 +852,10 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 // its registration. Tests only.
 var testHookBeforeRegister func(name string)
 
+// testHookRegistered, when set, runs right after a new handle entered the
+// registry, where any transaction can find it. Tests only.
+var testHookRegistered func(name string)
+
 // errHandleGone tells openCollection that the handle it found registered is
 // not live any more.
 var errHandleGone = errors.New("any-store: registered handle is gone")
@@ -917,11 +921,21 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 			db.forgetLocked(existing.(*collection))
 		}
 		c.since = db.sinceNow()
+		// The version is settled before the handle can be found. The
+		// handle's sketch stamps speak for the index objects of this
+		// version (newCollection): were the handle registered first,
+		// another transaction could install a head it loaded at an older
+		// snapshot, and a write transaction that opened the handle would
+		// put its deltas on sketches it never loaded. Nothing else has
+		// the handle yet, so its lock is free under db.mu.
+		c.adopt(tx, schema)
 		db.openedCollections[collectionName] = c
 		db.byIdentity[c.identity] = c
 		db.mu.Unlock()
+		if testHookRegistered != nil {
+			testHookRegistered(collectionName)
+		}
 		opened = c
-		c.adopt(tx, schema)
 		return nil
 	})
 	if err != nil {
