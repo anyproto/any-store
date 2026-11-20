@@ -1,6 +1,7 @@
 package qplanner
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 
@@ -135,6 +136,11 @@ func (it *FtsProbeIter) siftDown(i int) {
 	}
 }
 
+// errRankedTooLarge is returned when the document ids a ranked result keeps
+// (the rank form of FtsProbeIter, VectorScoreIter) do not fit the 32-bit
+// offsets of its entries. The arena is packed before this is decided.
+var errRankedTooLarge = errors.New("any-store: the document ids of one ranked result exceed 4 GiB")
+
 // compact rewrites arena to hold only the kept entries' id bytes.
 func (it *FtsProbeIter) compact() {
 	fresh := make([]byte, 0, it.keptBytes)
@@ -205,11 +211,24 @@ func (it *FtsProbeIter) init() error {
 				root = &it.entries[0]
 			}
 			it.keptBytes += len(docId) - int(root.ln)
+			if !fitsSortArena(len(it.arena) + len(docId)) {
+				// Past the 32-bit offsets: pack the kept ids, the evicted
+				// one's bytes now dead, before appending.
+				root.ln = 0
+				it.compact()
+				root = &it.entries[0]
+				if !fitsSortArena(len(it.arena) + len(docId)) {
+					return errRankedTooLarge
+				}
+			}
 			off := uint32(len(it.arena))
 			it.arena = append(it.arena, docId...)
 			it.entries[0] = probeEntry{off: off, ln: uint32(len(docId)), intId: intId, score: score}
 			it.siftDown(0)
 			continue
+		}
+		if !fitsSortArena(len(it.arena) + len(docId)) {
+			return errRankedTooLarge
 		}
 		off := uint32(len(it.arena))
 		it.arena = append(it.arena, docId...)
