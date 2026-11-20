@@ -179,7 +179,7 @@ func setSortArenaLimit(t *testing.T, n int) {
 // The $sort stage applies its 32-bit arena limit as qplanner.SortIter does:
 // to the rows it keeps, when it keeps them. A top-K loser is no error, a
 // winner whose tail does not fit is kept after packing, and only rows that do
-// not fit even packed are an error, which releases the arena.
+// not fit even packed are an error. Close releases the arena.
 func TestSortStage_ArenaLimitAppliesOnAdmission(t *testing.T) {
 	spec := MustParsePipeline(`[{"$sort": {"v": 1}}]`)[0].(SortSpec)
 	rowLen := func(j string, topK bool) int {
@@ -212,7 +212,7 @@ func TestSortStage_ArenaLimitAppliesOnAdmission(t *testing.T) {
 		setSortArenaLimit(t, 4*e)
 		_, err, st := runSortStage(t, 4, append(slices.Clone(kept), winner)...)
 		require.ErrorIs(t, err, errSortTooLarge)
-		assert.Nil(t, st.arena, "a failed sort releases its arena")
+		assert.Nil(t, st.arena, "Close releases the arena")
 	})
 	t.Run("full sort at and past the limit", func(t *testing.T) {
 		full := 0
@@ -226,7 +226,7 @@ func TestSortStage_ArenaLimitAppliesOnAdmission(t *testing.T) {
 		setSortArenaLimit(t, full-1)
 		_, err, st := runSortStage(t, 0, kept...)
 		require.ErrorIs(t, err, errSortTooLarge)
-		assert.Nil(t, st.arena, "a failed sort releases its arena")
+		assert.Nil(t, st.arena, "Close releases the arena")
 	})
 }
 
@@ -236,4 +236,37 @@ func TestSortStage_NeedsCompactDoesNotOverflow(t *testing.T) {
 	assert.False(t, sortNeedsCompact(math.MaxInt/2+1+1<<20, math.MaxInt/2+1))
 	assert.True(t, sortNeedsCompact(3<<16, 1<<16))
 	assert.False(t, sortNeedsCompact(2<<16, 1<<16))
+}
+
+// An error from the source leaves the rows collected so far in place, and the
+// next Next resumes collecting: a $facet feed pauses the chain with
+// errFacetPause after every row it feeds.
+func TestSortStage_ResumesAfterSourceError(t *testing.T) {
+	spec := MustParsePipeline(`[{"$sort": {"v": 1}}]`)[0].(SortSpec)
+	for _, topK := range []int{0, 2} {
+		feed := &facetFeed{}
+		st := &SortStage{Src: feed, Spec: spec, TopK: topK}
+		ctx := newTestCtx()
+		for _, row := range []string{`{"id":"a","v":3}`, `{"id":"b","v":1}`, `{"id":"c","v":2}`} {
+			feed.row = anyenc.MustParseJson(row)
+			_, err := st.Next(ctx)
+			require.ErrorIs(t, err, errFacetPause)
+		}
+		feed.done = true
+		var ids []string
+		for {
+			v, err := st.Next(ctx)
+			require.NoError(t, err)
+			if v == nil {
+				break
+			}
+			ids = append(ids, v.GetString("id"))
+		}
+		want := []string{"b", "c", "a"}
+		if topK > 0 {
+			want = want[:topK]
+		}
+		assert.Equal(t, want, ids, "TopK %d", topK)
+		st.Close()
+	}
 }

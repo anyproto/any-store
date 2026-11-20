@@ -32,7 +32,7 @@ import (
 // keeps must fit sortArenaLimit bytes. As in qplanner.SortIter, the limit
 // applies to a row when it is kept, after slot reuse and compaction, never to
 // a top-K candidate that loses; rows past it are errSortTooLarge. MemoryLimit
-// bounds the arena first unless it is disabled.
+// bounds the arena first unless it is disabled. Close releases the arena.
 type SortStage struct {
 	Src  Stage
 	Spec SortSpec
@@ -72,14 +72,13 @@ func fitsSortArena(n int) bool { return uint64(n) <= sortArenaLimit }
 
 func (s *SortStage) Next(ctx *Ctx) (*anyenc.Value, error) {
 	if !s.built {
-		// Built before collecting: after an error the stage is spent, and a
-		// later Next ends the stream instead of sorting what the source has
-		// left.
-		s.built = true
+		// An error leaves the collected rows in place: a $facet feed pauses
+		// the chain with errFacetPause after every row, and the next Next
+		// resumes collecting where it stopped. Close releases them.
 		if err := s.collectAndSort(ctx); err != nil {
-			s.release()
 			return nil, err
 		}
+		s.built = true
 	}
 	if s.idx >= len(s.entries) {
 		return nil, nil
@@ -311,8 +310,9 @@ func (s *SortStage) heapDown(i int) {
 	}
 }
 
-// release drops the arena and the entries: after an error, or once the stage
-// is closed, nothing reads them.
+// release drops the arena and the entries once the stage is closed: nothing
+// reads them after that, and a caller that keeps the closed pipeline must not
+// keep a sort's memory alive with it.
 func (s *SortStage) release() {
 	s.arena, s.entries, s.order = nil, nil, nil
 	s.liveBytes, s.idx = 0, 0
