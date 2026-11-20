@@ -48,6 +48,8 @@ func TestFilterOkRawParity(t *testing.T) {
 		`{"$or":[{"tags.0":"x"},{"a":50}]}`, // partially lazy Or
 		`{"missing.path.deep":{"$exists":false}}`,
 		`{"n":null}`,
+		`{"tags":{"$all":[]}}`, // matches nothing
+		`{"$and":[{},{"tags":{"$all":[]}}]}`,
 	}
 
 	parser := &anyenc.Parser{}

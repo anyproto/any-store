@@ -371,3 +371,57 @@ func TestQuery_EmptyLogicalArrayIsParseError(t *testing.T) {
 		})
 	}
 }
+
+// {"$all": []} matches no document (MongoDB's rule), alone and in a compound
+// filter, with and without an index on the field: next to the match-all {} a
+// conjunction of no equalities would have let a Delete empty the collection.
+func TestQuery_AllWithEmptyArrayMatchesNothing(t *testing.T) {
+	for _, index := range []string{"", "tags", "sparse tags"} {
+		for _, filter := range []string{
+			`{"tags":{"$all":[]}}`,
+			`{"$and":[{},{"tags":{"$all":[]}}]}`,
+			`{"$and":[{"a":{"$gte":1}},{"tags":{"$all":[]}}]}`,
+			`{"$or":[{"tags":{"$all":[]}},{"a":1}]}`,
+		} {
+			t.Run(index+"/"+filter, func(t *testing.T) {
+				fx := newFixture(t)
+				coll, err := fx.CreateCollection(ctx, "all_empty")
+				require.NoError(t, err)
+				switch index {
+				case "tags":
+					require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}}))
+				case "sparse tags":
+					require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}, Sparse: true}))
+				}
+				insertJSON(t, coll,
+					`{"id":1,"a":1,"tags":["x","y"]}`,
+					`{"id":2,"a":2,"tags":[]}`,
+					`{"id":3,"a":3,"tags":"x"}`,
+					`{"id":4,"a":4}`,
+				)
+				want := 0
+				if strings.Contains(filter, `"$or"`) {
+					want = 1 // the {"a":1} branch
+				}
+
+				n, err := coll.Find(filter).Count(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, want, n, "Count")
+				assert.Len(t, writeOrderIterIds(t, coll.Find(filter)), want, "Iter")
+				n, err = coll.Aggregate(fmt.Sprintf(`[{"$match":%s}]`, filter)).Count(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, want, n, "Aggregate $match")
+
+				res, err := coll.Find(filter).Update(ctx, `{"$set":{"touched":true}}`)
+				require.NoError(t, err)
+				assert.Equal(t, want, res.Modified, "Update")
+				assertQueryCount(t, coll.Find(`{"touched":true}`), want)
+
+				res, err = coll.Find(filter).Delete(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, want, res.Modified, "Delete")
+				assertQueryCount(t, coll.Find(nil), 4-want)
+			})
+		}
+	}
+}

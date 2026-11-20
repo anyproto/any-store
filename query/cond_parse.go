@@ -931,6 +931,14 @@ func makeArrComp(op Operator, v *anyenc.Value) (Filter, error) {
 		return Nor(makeEqArray(v)), nil
 	case opAll:
 		vals, _ := v.Array()
+		if len(vals) == 0 {
+			// {"$all": []} matches no document (MongoDB's rule). The
+			// conjunction of no equalities would be true for every document,
+			// one without the field too, so it compiles to the empty $in:
+			// false for every value, and the isUnsatisfiable short-circuit of
+			// the query layer.
+			return NewInValue(), nil
+		}
 		if f, ok, err := parseAllElemMatch(vals); err != nil || ok {
 			return f, err
 		}

@@ -278,3 +278,31 @@ func TestParseCondition_EmptyLogicalArrayRejected(t *testing.T) {
 		})
 	}
 }
+
+// {"$all": []} matches no document (MongoDB's rule): not one whose array is
+// empty, not one without the field. A conjunction of no equalities would be
+// true everywhere, and next to the match-all {} it would let a Delete empty
+// the collection.
+func TestParseCondition_AllWithEmptyArrayMatchesNothing(t *testing.T) {
+	docs := []string{`{"tags":[1,2]}`, `{"tags":[]}`, `{"tags":null}`, `{"tags":1}`, `{}`}
+	for _, tc := range []struct {
+		filter string
+		want   bool
+	}{
+		{`{"tags":{"$all":[]}}`, false},
+		{`{"$and":[{},{"tags":{"$all":[]}}]}`, false},
+		{`{"$or":[{},{"tags":{"$all":[]}}]}`, true},
+		{`{"$nor":[{"tags":{"$all":[]}}]}`, true},
+		{`{"tags":{"$not":{"$all":[]}}}`, true},
+		{`{"o":{"$elemMatch":{"tags":{"$all":[]}}}}`, false},
+	} {
+		t.Run(tc.filter, func(t *testing.T) {
+			f, err := ParseCondition(tc.filter)
+			require.NoError(t, err)
+			for _, d := range docs {
+				doc := anyenc.MustParseJson(d)
+				assert.Equal(t, tc.want, f.Ok(doc, &syncpool.DocBuffer{}), d)
+			}
+		})
+	}
+}
