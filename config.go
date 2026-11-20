@@ -16,12 +16,15 @@ import (
 // a later call, with the same or other arguments, does nothing.
 //
 // pageSize must be the database page size, 4096. It does not select a page
-// size. A pool of any other size is allocated as asked and never used: as in
-// SQLite, a buffer is taken from the pool only when the pool's buffers are the
-// size the database needs, and a database with UseGlobalPageBuffer otherwise
-// opens and runs on the default allocator, without the pool's memory bound.
-// The same holds for every database when pageSize or nPages is zero or
-// negative, which allocates nothing.
+// size. A pool of any other size is allocated as asked and never used: a
+// database with UseGlobalPageBuffer takes buffers from the pool only when they
+// are exactly its page size, and otherwise opens and runs on the default
+// allocator, without the pool's memory bound. (SQLite's page cache uses any
+// slot large enough for a page and its header; the buffers of this pool are
+// the pages themselves.) A pageSize below 512 or an nPages below 1 allocates
+// nothing and leaves every database on the default allocator, as SQLite
+// ignores such a configuration; so does an nPages*pageSize too large for an
+// int.
 //
 // Example: InitPageBuffer(4096, 5000) pre-allocates ~20MB of page buffers.
 func InitPageBuffer(pageSize, nPages int) {
