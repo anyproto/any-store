@@ -2258,8 +2258,12 @@ func (tx *ReadTx) newCursor(ns *Namespace) *Cursor {
 	// The page stack lives in the cursor (BtCursor.apPage/aiIdx, btreeInt.h);
 	// without it every descent regrows the stack from nil.
 	c.stack = c.stackBuf[:0]
-	if tx.writable && !tx.closed {
+	// Joining the writer's list is a call of the write transaction: a
+	// cursor made after DB.Close ended the transaction stays off the list,
+	// which Close has disposed of, and every use of it is refused.
+	if tx.writable && !tx.closed && tx.pager.wgate.enter() == nil {
 		tx.pager.linkCursor(c)
+		tx.pager.wgate.leave()
 	}
 	return c
 }
@@ -2303,6 +2307,11 @@ func (tx *ReadTx) CountContext(ctx context.Context, ns *Namespace) (int, error) 
 // which matches sqlite3BtreeLastPage's pBt->nPage for the writing connection.
 func (tx *ReadTx) DatabaseSize() (uint32, error) {
 	if tx.cache == nil {
+		// Once DB.Close has ended the transaction the count is one of a
+		// transaction that was rolled back.
+		if tx.pager.wgate.closed() {
+			return 0, ErrClosed
+		}
 		return tx.pager.dbSize.Load(), nil
 	}
 	pg, err := tx.pager.getPageReader(1, tx.walMaxFrame, tx.cache)

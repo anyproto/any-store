@@ -637,3 +637,176 @@ func TestClose_WaitsForBackupWritingDestination(t *testing.T) {
 		require.ErrorIs(t, b.Finish(), ErrClosed)
 	})
 }
+
+// slabFree reports whether buf's slab slot is on the slab's free list.
+func slabFree(buf []byte) bool {
+	globalPageSlab.mu.Lock()
+	defer globalPageSlab.mu.Unlock()
+	for _, f := range globalPageSlab.freeList {
+		if &f[0] == &buf[0] {
+			return true
+		}
+	}
+	return false
+}
+
+// A key or a value a cursor returned is a slice of the leaf the cursor pins,
+// valid until the cursor's next move. Close ends the write transaction
+// between two calls of it, with such a slice in its goroutine's hands: the
+// leaf's buffer stays out of the allocator until the cursor moves or is
+// closed, and everything else in the writer cache goes back at once.
+func TestClose_KeepsBackTheLeavesCursorsLent(t *testing.T) {
+	const slabPages = 512
+	for _, mode := range []struct {
+		name string
+		slab bool
+	}{
+		{"slab", true},
+		{"pool", false},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			opts := Options{CacheSize: 64}
+			if mode.slab {
+				globalPageSlab.Reset()
+				globalPageSlab.Init(4096, slabPages)
+				defer globalPageSlab.Reset()
+				opts.UsePageSlab = true
+			}
+			dir := t.TempDir()
+			db, err := testOpen(t, filepath.Join(dir, "a.db"), opts)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = db.Close() })
+			createNS(t, db, "t")
+			putN(t, db, "t", 200, 500)
+
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			ns, err := tx.GetNamespace("t")
+			require.NoError(t, err)
+			// Two cursors on one leaf, a third on another.
+			c1, c2, c3 := tx.NewCursor(ns), tx.NewCursor(ns), tx.NewCursor(ns)
+			require.NoError(t, c1.First())
+			require.NoError(t, c2.First())
+			require.NoError(t, c3.Last())
+			key, err := c1.Key()
+			require.NoError(t, err)
+			val, err := c3.Value()
+			require.NoError(t, err)
+			wantKey, wantVal := bytes.Clone(key), bytes.Clone(val)
+			firstLeaf := c1.stack[len(c1.stack)-1].pg
+			lastLeaf := c3.stack[len(c3.stack)-1].pg
+			require.Same(t, firstLeaf, c2.stack[len(c2.stack)-1].pg)
+			require.NotSame(t, firstLeaf, lastLeaf)
+			firstBuf, lastBuf := firstLeaf.data, lastLeaf.data
+			// Unpinned pages are in the cache too.
+			require.Greater(t, db.pager.writerCache.nPage, 2)
+
+			p := db.pager
+			require.NoError(t, db.Close())
+
+			if mode.slab {
+				require.Len(t, p.lent, 2)
+				require.False(t, slabFree(firstBuf), "a lent leaf went back to the slab")
+				require.False(t, slabFree(lastBuf), "a lent leaf went back to the slab")
+				globalPageSlab.mu.Lock()
+				free := len(globalPageSlab.freeList)
+				globalPageSlab.mu.Unlock()
+				require.Equal(t, slabPages-2, free, "only the lent leaves stay out of the slab")
+			} else {
+				require.Nil(t, p.lent)
+			}
+			// The closed pager keeps nothing of the cache and no cursor.
+			require.Zero(t, p.writerCache.nPage)
+			require.Empty(t, p.writerCache.pFree)
+			require.Nil(t, p.cursors)
+			require.False(t, c1.linked)
+
+			// Another database takes every buffer the allocator will give
+			// and writes it: the lent slices keep their content.
+			other, err := testOpen(t, filepath.Join(dir, "b.db"), Options{CacheSize: slabPages * 2, UsePageSlab: mode.slab})
+			require.NoError(t, err)
+			createNS(t, other, "t")
+			otx, err := other.BeginWrite()
+			require.NoError(t, err)
+			ons, err := otx.GetNamespace("t")
+			require.NoError(t, err)
+			for i := 0; i < 2000; i++ {
+				require.NoError(t, otx.Put(ons, closeRescueKey(i), bytes.Repeat([]byte{0x5A}, 1500)))
+			}
+			require.Equal(t, wantKey, key, "the key a cursor lent was overwritten")
+			require.Equal(t, wantVal, val, "the value a cursor lent was overwritten")
+			require.NoError(t, otx.Rollback())
+			require.NoError(t, other.Close())
+
+			// A read does not end the loan; a move or a Close does, and the
+			// last cursor on a leaf returns its slot.
+			_, err = c1.Value()
+			require.ErrorIs(t, err, ErrClosed)
+			require.Equal(t, wantKey, key)
+			require.ErrorIs(t, c1.Next(), ErrClosed)
+			require.False(t, c1.Valid())
+			if mode.slab {
+				require.False(t, slabFree(firstBuf), "the leaf went back with a cursor still on it")
+			}
+			c2.Close()
+			c3.Close()
+			c1.Close()
+			if mode.slab {
+				require.Empty(t, p.lent)
+				require.True(t, slabFree(firstBuf))
+				require.True(t, slabFree(lastBuf))
+				globalPageSlab.mu.Lock()
+				free := len(globalPageSlab.freeList)
+				globalPageSlab.mu.Unlock()
+				require.Equal(t, slabPages, free, "a slot was lost")
+			}
+
+			// Cursors made after the close stay off the pager's list, used
+			// and closed or not.
+			for i := 0; i < 3; i++ {
+				late := tx.NewCursor(ns)
+				require.False(t, late.linked)
+				require.ErrorIs(t, late.First(), ErrClosed)
+				late.Close()
+			}
+			require.Nil(t, p.cursors)
+			_, err = tx.DatabaseSize()
+			require.ErrorIs(t, err, ErrClosed)
+			require.NoError(t, tx.Rollback())
+		})
+	}
+}
+
+// A move that Close refused before it disposed of the cache ends the
+// cursor's pin there: Close keeps nothing back for it.
+func TestClose_CursorAbandonedBeforeCacheDisposal(t *testing.T) {
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 256)
+	defer globalPageSlab.Reset()
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "a.db"), Options{UsePageSlab: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	createNS(t, db, "t")
+	putN(t, db, "t", 50, 500)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.GetNamespace("t")
+	require.NoError(t, err)
+	cur := tx.NewCursor(ns)
+	require.NoError(t, cur.First())
+
+	drained, release := holdCloseAtDrain(t)
+	closed := make(chan error, 1)
+	p := db.pager
+	go func() { closed <- db.Close() }()
+	<-drained
+	require.ErrorIs(t, cur.Next(), ErrClosed)
+	release()
+	require.NoError(t, <-closed)
+	require.Empty(t, p.lent)
+	globalPageSlab.mu.Lock()
+	free := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+	require.Equal(t, 256, free, "a slot was lost")
+	cur.Close()
+}

@@ -86,7 +86,12 @@ type pager struct {
 	// wgate counts the write transaction's calls in flight, so that DB.Close
 	// can wait for the one running before it ends the transaction and tears
 	// the pager down. See writerGate.
-	wgate       writerGate
+	wgate writerGate
+	// lentMu guards what is left of a write transaction that DB.Close ended
+	// under its goroutine: the stacks of its cursors and lent, the page
+	// buffers those cursors had lent out. See destroyEndedWriterCache.
+	lentMu sync.Mutex
+	lent   map[*page]lentPage
 	master      *masterStore // InMemory "disk" — holds checkpointed page data
 	header      dbHeader
 	pageSize    uint32
@@ -4043,15 +4048,9 @@ func (p *pager) close() error {
 		_ = p.wal.close(isLastClient)
 	}
 
-	// A write transaction that DB.Close ended under its goroutine makes no
-	// further call into the pager (writerGate), but that goroutine can still
-	// hold a key or a value an earlier call returned, and those are slices
-	// of the cache's pages. Returned to the process-wide pool, the pages
-	// would be another database's while it reads them; left alone, they go
-	// with the pager when the last reference does. Slab pages go back
-	// regardless: the slab is the process's fixed budget, and a slot that is
-	// not returned is lost to it.
-	if !p.wgate.closed() || p.useSlab {
+	if p.wgate.closed() {
+		p.destroyEndedWriterCache()
+	} else {
 		p.writerCache.destroy()
 	}
 
@@ -4091,6 +4090,80 @@ var testBeforeRegistryDeleteHook func(p *pager)
 type createdRoot struct {
 	root uint32
 	seq  uint64
+}
+
+// lentPage is a page buffer that a cursor of an ended write transaction
+// still pins: n cursors pin it.
+type lentPage struct {
+	data []byte
+	n    int
+}
+
+// destroyEndedWriterCache is the disposal of the writer cache of a write
+// transaction that DB.Close ended under its goroutine (writerGate). That
+// goroutine makes no further call into the pager, but it can still be
+// reading a key or a value an earlier call returned, and those are slices of
+// the leaf a cursor pins (Cursor.Key, Cursor.Value). Such a buffer is lent:
+// returned to the pool or to the slab now, it would be another database's
+// while its borrower reads it.
+//
+// So the leaves the transaction's cursors pin are taken out of the cache
+// first, and the rest of the cache is destroyed as any other. A lent buffer
+// of the default allocator is dropped: it goes when its borrower lets go of
+// it. One of the slab is kept in lent until the cursor that pins it is
+// moved or closed (Cursor.abandon), which is where the slice it handed out
+// stops being valid: the slab is the process's fixed budget, and a slot
+// that is not returned is lost to it. A cursor that is never used again
+// keeps its slot.
+//
+// The cursors are taken off the pager's list: they stay their owner's, and
+// the closed pager keeps none of them reachable.
+//
+// SQLite has no counterpart: sqlite3_close refuses while a statement, and
+// with it a cursor, is open (main.c sqlite3Close, connectionIsBusy).
+// DRIFT: the leaves that cursors of a transaction ended by Close pin outlive the page cache; C cannot close under an open cursor See docs/btree/NOTES.md#drift-2026-11-19-1-close-waits-for-the-writers-call-in-flight
+func (p *pager) destroyEndedWriterCache() {
+	p.lentMu.Lock()
+	defer p.lentMu.Unlock()
+	var lent map[*page]lentPage
+	for c := p.cursors; c != nil; c = c.nextCursor {
+		for i := range c.stack {
+			pg := c.stack[i].pg
+			if pg == nil {
+				continue
+			}
+			if lent == nil {
+				lent = make(map[*page]lentPage)
+			}
+			l := lent[pg]
+			if l.n == 0 {
+				l.data, pg.data = pg.data, nil
+			}
+			l.n++
+			lent[pg] = l
+		}
+	}
+	p.writerCache.destroy()
+	p.resetCursors()
+	if p.useSlab {
+		p.lent = lent
+	}
+}
+
+// returnLent ends a cursor's pin of pg, a page of a write transaction that
+// DB.Close ended: the last pin of a lent slab buffer returns it. Caller
+// holds lentMu.
+func (p *pager) returnLent(pg *page) {
+	l, ok := p.lent[pg]
+	if !ok {
+		return
+	}
+	if l.n--; l.n > 0 {
+		p.lent[pg] = l
+		return
+	}
+	delete(p.lent, pg)
+	freePageBuffer(l.data, p.useSlab)
 }
 
 // linkCursor adds a writer's cursor to the list the writes save
