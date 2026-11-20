@@ -3629,6 +3629,23 @@ func (c *Cursor) enterGate() error {
 	return err
 }
 
+// readsPinnedLeaf reports whether a Key or a Value of this write
+// transaction's cursor can run outside the writer gate: the cursor is on the
+// writer's list and stands on an entry, so what the call reads is the leaf
+// the cursor pins, and Close has not ended the transaction. Such a call
+// makes no call into the pager unless the entry has an overflow chain, for
+// which it goes back through the gate. Close can come while it runs, and
+// finds no call in flight; that is safe because the pager keeps back the
+// leaf of every cursor on the list when it disposes of the cache
+// (destroyEndedWriterCache), for the slices earlier calls returned, and
+// writes neither that page nor the cursor. The call then completes on the
+// leaf as the transaction left it, as a call in flight does. A cursor that
+// is saved, tripped, off the list or of an ended transaction takes the
+// gate, which restores it or refuses it.
+func (c *Cursor) readsPinnedLeaf() bool {
+	return c.linked && c.state == cursorValid && !c.bt.pager.wgate.closed()
+}
+
 // leaveGate counts the call that enterGate counted in out again.
 func (c *Cursor) leaveGate() {
 	c.gated = false
@@ -3642,7 +3659,9 @@ func (c *Cursor) leaveGate() {
 // operation must not leave the call counted, and so the cursor's methods
 // themselves have none: a read transaction's cursor, which never comes
 // here, runs them as it would without the gate. Next, Key and Value, the
-// calls of a scan, have their own; the others share one per signature.
+// calls of a scan, have their own; the others share one per signature. Key
+// and Value come here only when they have more to do than read the pinned
+// leaf (readsPinnedLeaf).
 
 func (c *Cursor) gatedMove(move func(*Cursor) error) error {
 	if err := c.enterGate(); err != nil {
@@ -4290,7 +4309,7 @@ func (c *Cursor) currentKeyEqual(key []byte) (bool, error) {
 // transaction to the tree (which saves the cursor), or Close().
 // For overflow cells where the key spills, a new slice is allocated.
 func (c *Cursor) Key() ([]byte, error) {
-	if c.bt.writable && !c.gated {
+	if c.bt.writable && !c.gated && !c.readsPinnedLeaf() {
 		return c.gatedKey()
 	}
 	if err := c.restored(); err != nil {
@@ -4314,6 +4333,11 @@ func (c *Cursor) Key() ([]byte, error) {
 		return nil, cerr
 	}
 	if cell.overflowPg != 0 {
+		// The overflow chain is read through the pager: a call of the
+		// write transaction (readsPinnedLeaf).
+		if c.bt.writable && !c.gated {
+			return c.gatedKey()
+		}
 		// Key may be partial — use leafFullKey to reconstruct
 		return leafFullKey(frame.pg.data, int(off), lim, c.bt.pager, c.bt.walMaxFrame, c.bt.cache)
 	}
@@ -4326,7 +4350,7 @@ func (c *Cursor) Key() ([]byte, error) {
 // transaction to the tree (which saves the cursor), or Close().
 // For overflow values, a new slice is allocated and returned.
 func (c *Cursor) Value() ([]byte, error) {
-	if c.bt.writable && !c.gated {
+	if c.bt.writable && !c.gated && !c.readsPinnedLeaf() {
 		return c.gatedValue()
 	}
 	if err := c.restored(); err != nil {
@@ -4352,6 +4376,11 @@ func (c *Cursor) Value() ([]byte, error) {
 	}
 
 	if cell.overflowPg != 0 {
+		// The overflow chain is read through the pager: a call of the
+		// write transaction (readsPinnedLeaf).
+		if c.bt.writable && !c.gated {
+			return c.gatedValue()
+		}
 		// Unified payload format: read keyLen, valLen from header varints,
 		// compute nLocal, then reconstruct the full value.
 		pos := int(off)

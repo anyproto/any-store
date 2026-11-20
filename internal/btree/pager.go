@@ -4107,18 +4107,21 @@ type lentPage struct {
 // transaction that DB.Close ended under its goroutine (writerGate). That
 // goroutine makes no further call into the pager, but it can still be
 // reading a key or a value an earlier call returned, and those are slices of
-// the leaf a cursor pins (Cursor.Key, Cursor.Value). Such a buffer is lent:
-// returned to the pool or to the slab now, it would be another database's
-// while its borrower reads it.
+// the leaf a cursor pins (Cursor.Key, Cursor.Value); a Key or a Value of a
+// cursor that stands on its leaf can also be running, outside the gate
+// (Cursor.readsPinnedLeaf). Such a leaf is lent: its buffer returned to the
+// pool or to the slab now would be another database's while its borrower
+// reads it.
 //
 // So the leaves the transaction's cursors pin are taken out of the cache
-// first, and the rest of the cache is destroyed as any other. A lent buffer
-// of the default allocator is dropped: it goes when its borrower lets go of
-// it. One of the slab is kept in lent until the cursor that pins it is
-// moved or closed (Cursor.abandon), which is where the slice it handed out
-// stops being valid: the slab is the process's fixed budget, and a slot
-// that is not returned is lost to it. A cursor that is never used again
-// keeps its slot.
+// first, untouched: neither the page nor the cursor that pins it is written
+// here, only the cache's and the list's links. The rest of the cache is
+// destroyed as any other. A lent buffer of the default allocator stays with
+// its page and goes when the cursor does. One of the slab is noted in lent
+// until the cursor that pins it is moved or closed (Cursor.abandon), which
+// is where the slice it handed out stops being valid: the slab is the
+// process's fixed budget, and a slot that is not returned is lost to it. A
+// cursor that is never used again keeps its slot.
 //
 // The cursors are taken off the pager's list: they stay their owner's, and
 // the closed pager keeps none of them reachable.
@@ -4130,7 +4133,7 @@ func (p *pager) destroyEndedWriterCache() {
 	p.lentMu.Lock()
 	defer p.lentMu.Unlock()
 	var lent map[*page]lentPage
-	for c := p.cursors; c != nil; c = c.nextCursor {
+	for c := p.cursors; c != nil; {
 		for i := range c.stack {
 			pg := c.stack[i].pg
 			if pg == nil {
@@ -4141,14 +4144,22 @@ func (p *pager) destroyEndedWriterCache() {
 			}
 			l := lent[pg]
 			if l.n == 0 {
-				l.data, pg.data = pg.data, nil
+				l.data = pg.data
+				if pg.inCache && pg.cache == p.writerCache {
+					p.writerCache.hashRemove(pg)
+				}
 			}
 			l.n++
 			lent[pg] = l
 		}
+		// The link is the list's; linked is the cursor's own flag, which a
+		// Key running outside the gate reads.
+		next := c.nextCursor
+		c.nextCursor = nil
+		c = next
 	}
+	p.cursors = nil
 	p.writerCache.destroy()
-	p.resetCursors()
 	if p.useSlab {
 		p.lent = lent
 	}

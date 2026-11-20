@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -727,7 +728,9 @@ func TestClose_KeepsBackTheLeavesCursorsLent(t *testing.T) {
 			require.Zero(t, p.writerCache.nPage)
 			require.Empty(t, p.writerCache.pFree)
 			require.Nil(t, p.cursors)
-			require.False(t, c1.linked)
+			require.Nil(t, c1.nextCursor)
+			require.Nil(t, c2.nextCursor)
+			require.Nil(t, c3.nextCursor)
 
 			// Another database takes every buffer the allocator will give
 			// and writes it: the lent slices keep their content.
@@ -817,4 +820,103 @@ func TestClose_CursorAbandonedBeforeCacheDisposal(t *testing.T) {
 	globalPageSlab.mu.Unlock()
 	require.Equal(t, 256, free, "a slot was lost")
 	cur.Close()
+}
+
+// Key and Value of a cursor that stands on its leaf read that leaf and
+// nothing else, so they run outside the gate, and Close does not wait for
+// them. Close comes while a goroutine does nothing but read the entry: the
+// reads see the entry or ErrClosed, never another page's bytes, and under
+// the race detector nothing Close does conflicts with them.
+func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		slab bool
+	}{
+		{"slab", true},
+		{"pool", false},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			opts := Options{CacheSize: 64, InMemory: true}
+			if mode.slab {
+				globalPageSlab.Reset()
+				globalPageSlab.Init(4096, 512)
+				defer globalPageSlab.Reset()
+				opts.UsePageSlab = true
+			}
+			iters := 200
+			if testing.Short() {
+				iters = 20
+			}
+			for it := 0; it < iters; it++ {
+				db, err := testOpen(t, "", opts)
+				require.NoError(t, err)
+				createNS(t, db, "t")
+				putN(t, db, "t", 50, 300)
+				tx, err := db.BeginWrite()
+				require.NoError(t, err)
+				ns, err := tx.GetNamespace("t")
+				require.NoError(t, err)
+				cur := tx.NewCursor(ns)
+				require.NoError(t, cur.First())
+				wantKey, err := cur.Key()
+				require.NoError(t, err)
+				wantKey = bytes.Clone(wantKey)
+				wantVal, err := cur.Value()
+				require.NoError(t, err)
+				wantVal = bytes.Clone(wantVal)
+				// The reads are not calls in flight.
+				require.Zero(t, db.pager.wgate.n.Load())
+
+				var (
+					wg      sync.WaitGroup
+					started = make(chan struct{})
+					bad     atomic.Value
+					reads   int
+				)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for i := 0; ; i++ {
+						if i == 100 {
+							close(started)
+						}
+						k, kerr := cur.Key()
+						v, verr := cur.Value()
+						if kerr != nil || verr != nil {
+							if !errors.Is(kerr, ErrClosed) && kerr != nil || !errors.Is(verr, ErrClosed) && verr != nil {
+								bad.Store(fmt.Sprintf("Key: %v, Value: %v", kerr, verr))
+							}
+							if i < 100 {
+								close(started)
+							}
+							break
+						}
+						if !bytes.Equal(k, wantKey) || !bytes.Equal(v, wantVal) {
+							bad.Store("a read returned another entry's bytes")
+							break
+						}
+						reads++
+					}
+					// A slice in hand stays the entry until the cursor moves.
+					k, kerr := cur.Key()
+					if kerr == nil && !bytes.Equal(k, wantKey) {
+						bad.Store("a read after Close returned another entry's bytes")
+					}
+					cur.Close()
+				}()
+				<-started
+				require.NoError(t, db.Close())
+				// Another database takes what the first gave back.
+				other, err := testOpen(t, "", opts)
+				require.NoError(t, err)
+				createNS(t, other, "t")
+				putN(t, other, "t", 50, 300)
+				require.NoError(t, other.Close())
+				wg.Wait()
+				require.Nil(t, bad.Load())
+				require.NotZero(t, reads)
+				require.NoError(t, tx.Rollback())
+			}
+		})
+	}
 }
