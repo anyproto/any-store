@@ -3430,7 +3430,7 @@ Here, since 2026-11-19: `pcache.create` returns the spill's error and creates no
 
 A failed commit keeps [the eager cleanup](#old-drift-pagererror-eager-cleanup).
 
-Regression tests: `TestCreate_FailedSpillFailsTheCreate`, `TestBeginRead_PagerErrorState`, `TestCloseRescue_ErrorState`; with `-tags vfs`, `TestSpillFault_Sweep`, `TestSpillFault_DefaultCache`, `TestSpillFault_SavepointRollbackAfterSpill`, `TestSpillFault_RootSplitStoppedHalfWay`, `TestSpillFault_RollbackTripsCursors`, `TestSpillFault_RenameReadBack` (`internal/btree/spill_fault_vfs_test.go`) and `TestSpillFault_WriteTx` (`test/`).
+Regression tests: `TestCreate_FailedSpillFailsTheCreate`, `TestBeginRead_PagerErrorState`, `TestCloseRescue_ErrorState`; with `-tags vfs`, `TestSpillFault_Sweep`, `TestSpillFault_DefaultCache`, `TestSpillFault_SavepointRollbackAfterSpill`, `TestSpillFault_RootSplitStoppedHalfWay`, `TestSpillFault_RollbackTripsCursors`, `TestSpillFault_RenameReadBack`, `TestSpillFault_CloseInErrorState` (`internal/btree/spill_fault_vfs_test.go`) and `TestSpillFault_WriteTx` (`test/`).
 
 <a id="drift-102-reader-slot-tie-break-selects-lowest-not-highest"></a>
 ### Drift: Reader Slot Tie Break Selects Lowest Not Highest
