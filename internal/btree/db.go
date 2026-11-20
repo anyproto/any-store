@@ -198,9 +198,11 @@ type Options struct {
 	// concurrent use.
 	Codec Codec
 
-	// OnIntegrityError, if non-nil, is fired by the installed codec
-	// (cksum or AEAD) on every per-page integrity failure. Same hook
-	// for both modes. Runs on the I/O goroutine; must not block.
+	// OnIntegrityError, if non-nil, is called on every per-page integrity
+	// failure of this database (cksum or AEAD; same hook for both modes)
+	// and of no other: the pager keeps it and passes it to the codec with
+	// each decrypt, so two databases sharing one Codec each get their own
+	// failures. Runs on the I/O goroutine; must not block.
 	OnIntegrityError func(pgno uint32, inner error)
 	// END ENCRYPTION
 }
@@ -698,11 +700,8 @@ func Open(path string, opts Options) (*DB, error) {
 			if cerr != nil {
 				return nil, cerr
 			}
-			if sink, ok := codec.(OnErrorSink); ok && opts.OnIntegrityError != nil {
-				sink.SetOnError(opts.OnIntegrityError)
-			}
 			p.header.Salt = salt
-			p.installCodec(codec)
+			p.installCodec(codec, opts.OnIntegrityError)
 		}
 	} else if opts.InMemory && (wantEncryption || opts.Checksum) {
 		// InMemory: build codec from zero salt; no on-disk marker.
@@ -711,10 +710,7 @@ func Open(path string, opts Options) (*DB, error) {
 		if cerr != nil {
 			return nil, cerr
 		}
-		if sink, ok := codec.(OnErrorSink); ok && opts.OnIntegrityError != nil {
-			sink.SetOnError(opts.OnIntegrityError)
-		}
-		p.installCodec(codec)
+		p.installCodec(codec, opts.OnIntegrityError)
 	}
 	// END ENCRYPTION
 

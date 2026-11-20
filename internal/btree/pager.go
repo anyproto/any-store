@@ -344,6 +344,12 @@ type pager struct {
 	// decrypts them after reads. Installed once at Open and immutable
 	// thereafter. Safe for concurrent use across the writer and readers.
 	codec Codec
+	// onIntegrityError is this database's Options.OnIntegrityError, set
+	// with the codec in installCodec and immutable thereafter. Every
+	// decrypt this pager makes (and its WAL's, which gets a copy) passes it
+	// to the codec, which may serve other databases too and keeps no hook
+	// of its own; the integrity sweep calls it directly.
+	onIntegrityError integrityHook
 	// codecScratch is a reusable page-sized scratch buffer used on the
 	// writer side (initNewDB, getPageWriter, wal.writeFrame) to hold
 	// ciphertext while the source plaintext stays live in the pcache.
@@ -353,9 +359,11 @@ type pager struct {
 	// because multiple read transactions may run concurrently.
 	// Modeled after SQLCipher's codec_ctx->buffer (crypto_impl.c).
 	codecScratch []byte
-	// codecAEAD holds the nonce/AAD scratch for writer-side codec calls.
-	// Heap-allocated as part of the pager struct; passed by pointer so
-	// the crypto/cipher.AEAD interface calls don't force per-call escape.
+	// codecAEAD holds the nonce/AAD scratch for writer-side codec calls,
+	// and the nonce pool initNewDB's page-1 encrypt draws from: this
+	// pager's own, never shared with another database that has the same
+	// codec. Heap-allocated as part of the pager struct; passed by pointer
+	// so the crypto/cipher.AEAD interface calls don't force per-call escape.
 	codecAEAD aeadScratch
 	// END ENCRYPTION
 }
@@ -749,8 +757,10 @@ func (p *pager) open() (err error) {
 	p.wal.busyHandler = DefaultBusyTimeout(BusyTimeout)
 	// BEGIN ENCRYPTION
 	// Propagate codec to the WAL so frame writes/reads use the same
-	// cipher as the DB file.
+	// cipher as the DB file, and the integrity hook so its decrypt
+	// failures reach this database's callback.
 	p.wal.codec = p.codec
+	p.wal.onIntegrityError = p.onIntegrityError
 	// END ENCRYPTION
 	if err := p.wal.open(); err != nil {
 		return err
@@ -879,11 +889,12 @@ var testOpenAfterWALOpenHook func(p *pager)
 // any I/O. Sets the on-disk ReservedSpace header byte and the in-memory
 // usableSize_ so the btree cell code respects the codec's per-page
 // overhead. Calling with nil is a no-op (unencrypted mode).
-func (p *pager) installCodec(c Codec) {
+func (p *pager) installCodec(c Codec, onError integrityHook) {
 	if c == nil {
 		return
 	}
 	p.codec = c
+	p.onIntegrityError = onError
 	p.header.ReservedSpace = uint8(c.Overhead())
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 	// Pre-allocate one writer-side scratch buffer. Reused by all writer
@@ -916,7 +927,7 @@ func (p *pager) encryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
 // scratch. Reader-path callers must NOT go through this; they should
 // call decryptPageWithCodec directly with their own *aeadScratch.
 func (p *pager) decryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
-	return decryptPageWithCodec(p.codec, scratch, src, pgno, &p.codecAEAD)
+	return decryptPageWithCodec(p.codec, scratch, src, pgno, &p.codecAEAD, p.onIntegrityError)
 }
 
 // END ENCRYPTION
@@ -1041,8 +1052,10 @@ func (p *pager) initNewDB() error {
 	p.wal.busyHandler = DefaultBusyTimeout(BusyTimeout)
 	// BEGIN ENCRYPTION
 	// Propagate codec to the WAL so frame writes/reads use the same
-	// cipher as the DB file.
+	// cipher as the DB file, and the integrity hook so its decrypt
+	// failures reach this database's callback.
 	p.wal.codec = p.codec
+	p.wal.onIntegrityError = p.onIntegrityError
 	// END ENCRYPTION
 	if err := p.wal.open(); err != nil {
 		return err
@@ -1478,7 +1491,7 @@ func (p *pager) readTempPage(pgno, walMaxFrame, walMinFrame, dbSizeBound uint32,
 				if aeadS == nil {
 					aeadS = new(aeadScratch)
 				}
-				plain, derr := decryptPageWithCodec(p.codec, scratch, pg.data, pgno, aeadS)
+				plain, derr := decryptPageWithCodec(p.codec, scratch, pg.data, pgno, aeadS, p.onIntegrityError)
 				if derr != nil {
 					if ownScratch {
 						freePageBuffer(scratch, false)
@@ -1608,7 +1621,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 				if cache.codecScratch == nil {
 					cache.codecScratch = make([]byte, p.pageSize)
 				}
-				plain, derr := decryptPageWithCodec(p.codec, cache.codecScratch, pg.data, pgno, &cache.codecAEAD)
+				plain, derr := decryptPageWithCodec(p.codec, cache.codecScratch, pg.data, pgno, &cache.codecAEAD, p.onIntegrityError)
 				if derr != nil {
 					cache.discard(pg.pgno)
 					return nil, fmt.Errorf("btree: page %d: %w", pgno, derr)
