@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -994,7 +995,16 @@ func TestDb_CloseDuringWrite(t *testing.T) {
 				require.NoError(t, err)
 				acoll, err := adb.CreateCollection(ctx, "c")
 				require.NoError(t, err)
-				var wg sync.WaitGroup
+				var (
+					wg sync.WaitGroup
+					// written counts the inserts of A that succeeded: Close
+					// comes only once each writer is past its first, with
+					// the next one under way or about to be.
+					written [2]atomic.Int32
+					// bAfter counts B's inserts since A's Close returned:
+					// the ones that take the buffers A gave back.
+					bAfter atomic.Int32
+				)
 				stop := make(chan struct{})
 				for g := 0; g < 2; g++ {
 					wg.Add(1)
@@ -1005,22 +1015,41 @@ func TestDb_CloseDuringWrite(t *testing.T) {
 								note(fmt.Sprintf("PANIC: %.120v", r))
 							}
 						}()
-						for k := 0; ; k++ {
+						// The first batches are built ahead, so that the writer
+						// spends the time before Close in Insert.
+						batch := func(k int) []*anyenc.Value {
 							docs := make([]*anyenc.Value, 50)
 							for j := range docs {
 								docs[j] = big(g*10_000_000+k*50+j, 1500)
 							}
-							if err := acoll.Insert(ctx, docs...); err != nil {
-								if errors.Is(err, anystore.ErrDBIsClosed) {
-									note("ErrDBIsClosed")
-								} else {
-									note(fmt.Sprintf("other error: %.120v", err))
-								}
-								return
+							return docs
+						}
+						var ahead [6][]*anyenc.Value
+						for k := range ahead {
+							ahead[k] = batch(k)
+						}
+						for k := 0; ; k++ {
+							var docs []*anyenc.Value
+							if k < len(ahead) {
+								docs = ahead[k]
+							} else {
+								docs = batch(k)
 							}
+							err := acoll.Insert(ctx, docs...)
+							if err == nil {
+								written[g].Add(1)
+								continue
+							}
+							if errors.Is(err, anystore.ErrDBIsClosed) {
+								note("ErrDBIsClosed")
+							} else {
+								note(fmt.Sprintf("other error: %.120v", err))
+							}
+							return
 						}
 					}(g)
 				}
+				var aClosed atomic.Bool
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
@@ -1042,10 +1071,19 @@ func TestDb_CloseDuringWrite(t *testing.T) {
 						mu.Lock()
 						bWant[fmt.Sprintf("k-%07d", i)] = d.String()
 						mu.Unlock()
+						if aClosed.Load() {
+							bAfter.Add(1)
+						}
 					}
 				}()
-				time.Sleep(time.Duration(1+it%8) * time.Millisecond)
+				require.Eventually(t, func() bool {
+					return written[0].Load() > 0 && written[1].Load() > 0
+				}, 30*time.Second, 100*time.Microsecond, "the writers of A did not start")
+				time.Sleep(time.Duration(it%8) * 250 * time.Microsecond)
 				require.NoError(t, adb.Close())
+				aClosed.Store(true)
+				require.Eventually(t, func() bool { return bAfter.Load() >= 8 },
+					30*time.Second, 100*time.Microsecond, "B did not write after A closed")
 				close(stop)
 				wg.Wait()
 			}

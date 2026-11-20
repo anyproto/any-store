@@ -360,11 +360,18 @@ func TestClose_DuringRunningWriter(t *testing.T) {
 					cur := tx.NewCursor(ns)
 					defer cur.Close()
 					val := bytes.Repeat([]byte{0xAB}, 700)
-					// failed reports an error other than a key the loop's own
-					// deletes removed.
+					// failed reports an error; missing lets through a key the
+					// loop's own deletes removed, for the calls that look one
+					// up.
 					failed := func(err error) bool {
 						opErr = err
-						return err != nil && !errors.Is(err, ErrKeyNotFound)
+						return err != nil
+					}
+					missing := func(err error) error {
+						if errors.Is(err, ErrKeyNotFound) {
+							return nil
+						}
+						return err
 					}
 					for i := 0; ; i++ {
 						if i == 20 {
@@ -373,16 +380,16 @@ func TestClose_DuringRunningWriter(t *testing.T) {
 						if failed(tx.Put(ns, closeRescueKey(i), val)) {
 							return
 						}
-						if _, err := tx.Get(ns, closeRescueKey(i/2)); failed(err) {
+						if _, err := tx.Get(ns, closeRescueKey(i/2)); failed(missing(err)) {
 							return
 						}
 						if failed(cur.Seek(closeRescueKey(i / 3))) {
 							return
 						}
-						if _, err := cur.Key(); failed(err) {
+						if _, err := cur.Key(); failed(missing(err)) {
 							return
 						}
-						if i%64 == 0 && failed(tx.Delete(ns, closeRescueKey(i/4))) {
+						if i%64 == 0 && failed(missing(tx.Delete(ns, closeRescueKey(i/4)))) {
 							return
 						}
 					}
