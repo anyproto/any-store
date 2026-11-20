@@ -293,6 +293,15 @@ func (s *spillFaultDB) runSpillFault(t *testing.T, c spillFaultCase, ops []spill
 		_, err = tx.Savepoint()
 		assert.ErrorIs(t, err, errInjectedSpillIO)
 		assert.Equal(t, fired, s.file.fired.Load(), "no write of the log in the error state")
+		// A read of the failed transaction reports the error too, a
+		// committed key never "not found": a balance the spill stopped
+		// half-way left the cached pages of the tree incomplete.
+		for k := range s.model {
+			_, err := tx.Get(s.ns, spillKey(k))
+			if !assert.ErrorIs(t, err, errInjectedSpillIO, "read of committed key %d in the failed transaction", k) {
+				break
+			}
+		}
 		// A read transaction begins and reads what is committed meanwhile.
 		if rtx, err := s.db.BeginRead(); assert.NoError(t, err, "a read beside the failed transaction") {
 			got, err := rtx.Get(s.ns, spillKey(1))
@@ -485,4 +494,105 @@ func TestSpillFault_SavepointRollbackAfterSpill(t *testing.T) {
 	require.NoError(t, tx.Commit())
 	require.True(t, s.verify(t, "after the commit"))
 	s.reopen(t)
+}
+
+// A failed spill can stop the split of a tree's root half-way:
+// balanceDeeper has moved the root's cells to a new child and left the
+// root an interior page with no cell, and the fetch that fails is the one
+// for the sibling the balance allocates next. That root stays in the
+// writer cache. The next read or write of the tree meets the spill's
+// error, not the zero-cell root, which only page 1 may be and which a
+// descent reports as corruption.
+func TestSpillFault_RootSplitStoppedHalfWay(t *testing.T) {
+	const valSize = 400
+	open := func(t *testing.T, keys int) (*DB, *spillFaultFile) {
+		path := filepath.Join(t.TempDir(), "split.db")
+		db, err := testOpen(t, path, Options{PageSize: 4096, CacheSize: closeRescueCache, DisableAutoCheckpoint: true})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = db.Close() })
+		createNS(t, db, "a")
+		putN(t, db, "a", closeRescueRows, closeRescueValSize)
+		createNS(t, db, "b")
+		if keys > 0 {
+			putN(t, db, "b", keys, valSize)
+		}
+		f := &spillFaultFile{File: db.pager.wal.file}
+		db.pager.wal.file = f
+		return db, f
+	}
+	rootIsInterior := func(t *testing.T, tx *WriteTx, ns *Namespace) bool {
+		pg, err := tx.pager.getPage(ns.rootPage)
+		require.NoError(t, err)
+		defer tx.pager.releasePage(pg)
+		return pg.header.isInterior()
+	}
+
+	// The number of keys "b"'s leaf root holds: the next one splits it.
+	db, _ := open(t, 0)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.GetNamespace("b")
+	require.NoError(t, err)
+	fit := 0
+	for !rootIsInterior(t, tx, ns) {
+		fit++
+		require.NoError(t, tx.Put(ns, closeRescueKey(fit), make([]byte, valSize)))
+	}
+	fit--
+	require.NoError(t, tx.Rollback())
+	require.Greater(t, fit, 2)
+
+	// The fault swept across the writes of the split, until one is past
+	// its last.
+	halfWay := 0
+	for nth, fired := int64(1), true; fired; nth++ {
+		fired = false
+		t.Run(fmt.Sprintf("write=%d", nth), func(t *testing.T) {
+			db, f := open(t, fit)
+			p := db.pager
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			defer func() { _ = tx.Rollback() }()
+			ns, err := tx.GetNamespace("b")
+			require.NoError(t, err)
+			require.False(t, rootIsInterior(t, tx, ns))
+			// Every page the split allocates now spills one.
+			fillWriterCacheDirty(t, p)
+
+			f.arm(nth, false)
+			err = tx.Put(ns, closeRescueKey(fit+1), make([]byte, valSize))
+			if f.fired.Load() == 0 {
+				require.NoError(t, err)
+				return
+			}
+			fired = true
+			require.ErrorIs(t, err, errInjectedSpillIO)
+			if root := p.writerCache.hashFind(ns.rootPage); root != nil &&
+				root.header.isInterior() && root.header.cellCount == 0 {
+				halfWay++
+			}
+
+			for i, op := range []func() error{
+				func() error { return tx.Put(ns, closeRescueKey(fit+2), []byte("x")) },
+				func() error { return tx.Put(ns, closeRescueKey(1), []byte("x")) },
+				func() error { return tx.Delete(ns, closeRescueKey(2)) },
+				func() error { _, err := tx.Get(ns, closeRescueKey(3)); return err },
+				func() error {
+					c := tx.NewCursor(ns)
+					defer c.Close()
+					return c.First()
+				},
+			} {
+				err := op()
+				assert.ErrorIs(t, err, errInjectedSpillIO, "operation %d after the failed split", i)
+				assert.NotErrorIs(t, err, ErrCorrupt, "operation %d after the failed split", i)
+			}
+
+			require.NoError(t, tx.Rollback())
+			f.disarm()
+			require.Equal(t, fit, countKeys(t, db, "b"))
+			require.NoError(t, db.IntegrityCheck())
+		})
+	}
+	require.Greater(t, halfWay, 0, "no fault stopped the split with a zero-cell root")
 }

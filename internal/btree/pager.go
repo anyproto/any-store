@@ -276,9 +276,9 @@ type pager struct {
 	spillBuf   [1]*page // pagerStress's argument to dispatchBackupUpdate
 
 	// errCode is the error that put the open write transaction in
-	// pagerError (Pager.errCode, pager.c:1947-1960): every write operation
-	// and the commit return it until the rollback, which clears it. Owned
-	// by the writer's goroutine, like the cache.
+	// pagerError (Pager.errCode, pager.c:1947-1960): every page fetch, every
+	// write operation and the commit return it until the rollback, which
+	// clears it. Owned by the writer's goroutine, like the cache.
 	errCode error
 
 	// testOwner is the DB this pager belongs to, for the test seam's hooks.
@@ -1268,10 +1268,19 @@ func (p *pager) getPage(pgno uint32) (*page, error) {
 // getPageWriter returns a page using the writer's cache, reading from
 // WAL or disk on cache miss. Used by the writer goroutine only.
 // DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
-// DRIFT: in the error state only a cache miss returns the error; C's getPageError fails every fetch See docs/btree/NOTES.md#drift-2026-11-19-1-the-error-state-of-a-failed-spill
 func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
+	}
+
+	// The error state fails every fetch with its error (getPageError,
+	// pager.c:5710-5722), a cached page as much as one to be read: the log
+	// may end in a torn frame of this transaction, and a balance the failed
+	// spill stopped half-way leaves cached pages that hold part of the tree
+	// or none of it. errCode is the writer's own, as the cache is: a plain
+	// load.
+	if p.errCode != nil {
+		return nil, p.writeStateErr()
 	}
 
 	// Check writer cache first. SQLite returns cached pages directly without
@@ -1280,14 +1289,6 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 	// for the writer's snapshot. Cache is cleared on checkpoint/WAL restart.
 	if pg := p.writerCache.fetch(pgno); pg != nil {
 		return pg, nil
-	}
-
-	// Cache miss. In the error state nothing more is read: the log may end
-	// in a torn frame of this transaction, and the fetch reports the error
-	// (getPageError, pager.c:5710-5722). A page already in the cache is
-	// still served above; see the pagerError drift.
-	if pagerState(p.state.Load()) == pagerError {
-		return nil, p.writeStateErr()
 	}
 
 	// Create a new cached page (hard create). A failed spill fails the
@@ -2765,7 +2766,7 @@ func (p *pager) pagerStress(pg *page) error {
 		// b-tree operation that asked for a page is still running and holds
 		// pointers into the cache, so the cache stays as it is, this page
 		// still dirty; the fetch fails with the error (pcache.create), every
-		// later write and the commit return it (writeStateErr), and the
+		// later fetch, write and the commit return it (writeStateErr), and the
 		// rollback discards the cache and rewinds the log (rollbackLocked),
 		// as pager_unlock does once no page is referenced
 		// (pager.c:1853-1864, 1904-1917). A transaction Close has ended
