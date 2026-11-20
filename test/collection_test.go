@@ -3,6 +3,7 @@ package test
 import (
 	"context"
 	"fmt"
+	"math"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -2625,18 +2626,19 @@ func TestCollection_Update_ArrayPaddingIsBounded(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"arr":[1,2]}`)))
 
+	// Every index here is a valid int on 32-bit platforms too.
 	for _, mod := range []string{
 		`{"$set":{"arr.1500003":1}}`,
 		`{"$inc":{"arr.1500003":1}}`,
 		`{"$set":{"arr.1500003.x":1}}`,
-		`{"$set":{"arr.4000000000":1}}`,
-		`{"$set":{"arr.9223372036854775807.x":1}}`,
+		fmt.Sprintf(`{"$set":{"arr.%d":1}}`, math.MaxInt32),
+		fmt.Sprintf(`{"$set":{"arr.%d.x":1}}`, math.MaxInt),
 	} {
 		_, err = coll.UpdateId(ctx, 1, query.MustParseModifier(mod))
-		require.ErrorContains(t, err, "can't backfill array to larger than 1500000 elements", mod)
+		require.ErrorContains(t, err, "can't backfill more than 1500000 elements", mod)
 
 		_, err = coll.Find(`{"id":1}`).Update(ctx, mod)
-		require.ErrorContains(t, err, "can't backfill array to larger than 1500000 elements", mod)
+		require.ErrorContains(t, err, "can't backfill more than 1500000 elements", mod)
 	}
 
 	doc, err := coll.FindId(ctx, 1)

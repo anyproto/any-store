@@ -7,24 +7,33 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 )
 
-// maxArrayPadding is the largest number of null elements a numeric path
+// MaxArrayPadding is the largest number of null elements a numeric path
 // segment may add to an array to reach its index: {"$set": {"arr.N": v}} on
-// an array of length L appends N-L nulls before v. The limit and the error are
-// MongoDB's (kMaxPaddingAllowed), and stop one path segment from asking for an
-// allocation proportional to a number the caller wrote.
-const maxArrayPadding = 1_500_000
+// an array of length L appends N-L nulls before v. The limit and the error
+// are MongoDB's (kMaxPaddingAllowed, maybePadTo in update/path_support.cpp),
+// and stop one path segment from asking for an allocation proportional to a
+// number the caller wrote. A segment naming an index at most MaxArrayPadding
+// is never refused by it.
+const MaxArrayPadding = 1_500_000
+
+// paddingExceeds reports whether setting index idx of an array of length n
+// needs more than MaxArrayPadding nulls. idx and n are non-negative, so the
+// difference cannot overflow.
+func paddingExceeds(idx, n int) bool {
+	return idx-n > MaxArrayPadding
+}
 
 // setArrayItem stores value at the index the path segment names, padding arr
 // with nulls up to it. It refuses, before anything is allocated, a segment
-// that is not a non-negative index or that needs more than maxArrayPadding
+// that is not a non-negative index or that needs more than MaxArrayPadding
 // nulls.
 func setArrayItem(arr *anyenc.Value, path string, value *anyenc.Value) error {
 	idx, err := strconv.Atoi(path) // an index that overflows int is an error here
 	if err != nil || idx < 0 {
 		return fmt.Errorf("cannot create field '%s' in element %s", path, arr.String())
 	}
-	if elems, _ := arr.Array(); idx-len(elems) > maxArrayPadding {
-		return fmt.Errorf("cannot create field '%s': can't backfill array to larger than %d elements", path, maxArrayPadding)
+	if elems, _ := arr.Array(); paddingExceeds(idx, len(elems)) {
+		return fmt.Errorf("cannot create field '%s': can't backfill more than %d elements", path, MaxArrayPadding)
 	}
 	arr.SetArrayItem(idx, value)
 	return nil
@@ -34,7 +43,7 @@ func setArrayItem(arr *anyenc.Value, path string, value *anyenc.Value) error {
 // If create == true path will be created.
 //
 // A numeric segment into an array sets that element, padding the array with
-// nulls when the index is past its end; padding by more than maxArrayPadding
+// nulls when the index is past its end; padding by more than MaxArrayPadding
 // elements is an error and leaves the array as it was.
 func Walk(a *anyenc.Arena, v *anyenc.Value, fieldPath []string, create bool, finalize func(prevValue *anyenc.Value, value *anyenc.Value) (res *anyenc.Value, err error)) (err error) {
 	prevField := v

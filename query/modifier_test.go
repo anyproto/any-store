@@ -645,7 +645,7 @@ func TestModifier_ArrayPaddingIsBounded(t *testing.T) {
 
 			doc = anyenc.MustParseJson(`{"arr":[1,2]}`)
 			_, modified, err = MustParseModifier(fmt.Sprintf(tc.modFmt, 2+limit+1)).Modify(a, doc)
-			require.ErrorContains(t, err, "can't backfill array to larger than 1500000 elements")
+			require.ErrorContains(t, err, "can't backfill more than 1500000 elements")
 			assert.False(t, modified)
 			assert.Equal(t, `{"arr":[1,2]}`, doc.String())
 		})

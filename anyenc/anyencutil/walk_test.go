@@ -2,7 +2,6 @@ package anyencutil
 
 import (
 	"math"
-	"runtime"
 	"strconv"
 	"testing"
 
@@ -99,7 +98,9 @@ func TestWalk(t *testing.T) {
 
 // A numeric segment past the end of an array pads it with nulls. The padding
 // is bounded: one path segment must not ask for an allocation proportional to
-// a number the caller wrote.
+// a number the caller wrote. A refused segment leaves the array as it was, its
+// backing storage too; with the largest int as the index, an implementation
+// that allocated toward it would not return at all.
 func TestWalk_ArrayPaddingIsBounded(t *testing.T) {
 	a := &anyenc.Arena{}
 	set := func(v *anyenc.Value, path ...string) error {
@@ -107,24 +108,17 @@ func TestWalk_ArrayPaddingIsBounded(t *testing.T) {
 			return a.NewTrue(), nil
 		})
 	}
-	// allocated reports the bytes fn allocated.
-	allocated := func(fn func()) uint64 {
-		var before, after runtime.MemStats
-		runtime.GC()
-		runtime.ReadMemStats(&before)
-		fn()
-		runtime.ReadMemStats(&after)
-		return after.TotalAlloc - before.TotalAlloc
-	}
 	const arrLen = 2
-	atCap := strconv.Itoa(arrLen + maxArrayPadding)
-	overCap := strconv.Itoa(arrLen + maxArrayPadding + 1)
+	atCap := strconv.Itoa(arrLen + MaxArrayPadding)
+	overCap := strconv.Itoa(arrLen + MaxArrayPadding + 1)
 
+	// long is {"arr":[1,2,null…,true]}: the array the at-limit set builds.
+	var long *anyenc.Value
 	t.Run("padding of exactly the limit succeeds", func(t *testing.T) {
-		v := anyenc.MustParseJson(`{"arr":[1,2]}`)
-		require.NoError(t, set(v, "arr", atCap))
-		arr := v.GetArray("arr")
-		require.Len(t, arr, arrLen+maxArrayPadding+1)
+		long = anyenc.MustParseJson(`{"arr":[1,2]}`)
+		require.NoError(t, set(long, "arr", atCap))
+		arr := long.GetArray("arr")
+		require.Len(t, arr, arrLen+MaxArrayPadding+1)
 		assert.Equal(t, anyenc.TypeNull, arr[arrLen].Type())
 		assert.Equal(t, anyenc.TypeTrue, arr[len(arr)-1].Type())
 	})
@@ -132,7 +126,7 @@ func TestWalk_ArrayPaddingIsBounded(t *testing.T) {
 		v := anyenc.MustParseJson(`{"arr":[1,2]}`)
 		require.NoError(t, set(v, "arr", atCap, "x"))
 		arr := v.GetArray("arr")
-		require.Len(t, arr, arrLen+maxArrayPadding+1)
+		require.Len(t, arr, arrLen+MaxArrayPadding+1)
 		assert.Equal(t, `{"x":true}`, arr[len(arr)-1].String())
 	})
 	for _, tc := range []struct {
@@ -141,20 +135,23 @@ func TestWalk_ArrayPaddingIsBounded(t *testing.T) {
 	}{
 		{"one over the limit", []string{"arr", overCap}},
 		{"intermediate segment one over the limit", []string{"arr", overCap, "x"}},
-		{"far over the limit", []string{"arr", "4000000000"}},
-		{"intermediate segment far over the limit", []string{"arr", "4000000000", "x"}},
+		{"far over the limit", []string{"arr", strconv.Itoa(math.MaxInt32)}},
+		{"intermediate segment far over the limit", []string{"arr", strconv.Itoa(math.MaxInt32), "x"}},
 		{"largest int", []string{"arr", strconv.Itoa(math.MaxInt)}},
+		{"intermediate segment at the largest int", []string{"arr", strconv.Itoa(math.MaxInt), "x"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v := anyenc.MustParseJson(`{"arr":[1,2]}`)
-			var err error
-			n := allocated(func() { err = set(v, tc.path...) })
-			require.ErrorContains(t, err, "can't backfill array to larger than 1500000 elements")
+			before, _ := v.Get("arr").Array()
+			err := set(v, tc.path...)
+			require.ErrorContains(t, err, "can't backfill more than 1500000 elements")
 			assert.Equal(t, `{"arr":[1,2]}`, v.String(), "a refused path leaves the document as it was")
-			assert.Less(t, n, uint64(64<<10), "a refused path allocates nothing proportional to its index")
+			after, _ := v.Get("arr").Array()
+			assert.Equal(t, cap(before), cap(after), "a refused path does not grow the array")
 		})
 	}
 	t.Run("an index that is not a non-negative int is refused", func(t *testing.T) {
+		// The decimal overflows int on every platform.
 		for _, seg := range []string{"-1", "99999999999999999999999999", "x"} {
 			v := anyenc.MustParseJson(`{"arr":[1,2]}`)
 			require.ErrorContains(t, set(v, "arr", seg), "cannot create field", seg)
@@ -163,9 +160,38 @@ func TestWalk_ArrayPaddingIsBounded(t *testing.T) {
 		}
 	})
 	t.Run("an existing element far into a long array is not padding", func(t *testing.T) {
-		v := anyenc.MustParseJson(`{"arr":[1,2,3]}`)
-		require.NoError(t, set(v, "arr", "2"))
-		require.NoError(t, set(v, "arr", "3"))
-		assert.Equal(t, `{"arr":[1,2,true,true]}`, v.String())
+		require.NotNil(t, long, "needs the at-limit subtest")
+		n := len(long.GetArray("arr"))
+		require.Greater(t, n-1, MaxArrayPadding)
+		v := anyenc.MustParseJson(`false`)
+		require.NoError(t, Walk(a, long, []string{"arr", strconv.Itoa(n - 1)}, true,
+			func(_, _ *anyenc.Value) (*anyenc.Value, error) { return v, nil }))
+		arr := long.GetArray("arr")
+		require.Len(t, arr, n, "overwriting an element keeps the length")
+		assert.Equal(t, anyenc.TypeFalse, arr[n-1].Type())
+		// Appending right after the end pads nothing.
+		require.NoError(t, set(long, "arr", strconv.Itoa(n)))
+		assert.Len(t, long.GetArray("arr"), n+1)
 	})
+}
+
+// The padding a segment needs is its index minus the array's length; the
+// check is exact at the limit and cannot overflow for any index.
+func TestPaddingExceeds(t *testing.T) {
+	for _, tc := range []struct {
+		idx, n int
+		want   bool
+	}{
+		{0, 0, false},
+		{5, 10, false},
+		{MaxArrayPadding, 0, false},
+		{MaxArrayPadding + 1, 0, true},
+		{MaxArrayPadding + 7, 7, false},
+		{MaxArrayPadding + 8, 7, true},
+		{math.MaxInt, 0, true},
+		{math.MaxInt, math.MaxInt - MaxArrayPadding, false},
+		{math.MaxInt, math.MaxInt - MaxArrayPadding - 1, true},
+	} {
+		assert.Equal(t, tc.want, paddingExceeds(tc.idx, tc.n), "idx %d, len %d", tc.idx, tc.n)
+	}
 }
