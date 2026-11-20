@@ -808,10 +808,11 @@ func (db *DB) Close() error {
 			// with a concurrent Commit or Rollback call.
 			// Use rollbackForClose which skips writerCache operations to avoid
 			// racing with the writer's B-tree ops (pcache has no mutex).
+			// It ends a transaction in pagerWriter or in pagerError (a failed
+			// spill, which holds the WAL write lock until its rollback) and
+			// leaves any other state alone.
 			db.pager.writerOpMu.Lock()
-			if pagerState(db.pager.state.Load()) == pagerWriter {
-				db.pager.rollbackForClose()
-			}
+			db.pager.rollbackForClose()
 			db.pager.writerOpMu.Unlock()
 
 			// Exactly-once writer lock cleanup (endRead + RUnlock + Unlock) via
