@@ -1468,7 +1468,7 @@ func statsDocCounts(t *testing.T, ctx context.Context, coll Collection) (docs in
 func failSketchReadOnce(t *testing.T) (failed *int, injected error) {
 	failed = new(int)
 	injected = errors.New("injected: sketch row read")
-	testHookSketchRead = func([]byte) error {
+	testHookSketchRead = func(string) error {
 		if *failed == 0 {
 			*failed++
 			return injected
@@ -1681,7 +1681,7 @@ func TestSketch_ReaderBehindThePublishedEpochLoadsNothing(t *testing.T) {
 	c.sketchSeen.Store(epoch + 1) // published for a newer epoch while this reader waited
 
 	reads := 0
-	testHookSketchRead = func([]byte) error { reads++; return nil }
+	testHookSketchRead = func(string) error { reads++; return nil }
 	defer func() { testHookSketchRead = nil }()
 	require.NoError(t, c.refreshSketches(rtx, c.cur()))
 	require.Zero(t, reads, "the reader loaded a row")

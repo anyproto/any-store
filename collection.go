@@ -1727,15 +1727,16 @@ func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, collName string, idx *in
 
 // testHookSketchRead, when set, runs before every read of a stored sketch
 // row (an open, a reload) and fails the read with the error it returns.
-// Tests only.
-var testHookSketchRead func(key []byte) error
+// Tests only. It takes the key as a string: a key handed to it as it is
+// would escape to the heap in every read, hook or no hook.
+var testHookSketchRead func(key string) error
 
 // readSketchRow reads the stored sketch row under key through tx, appended
 // to buf: btree.ErrKeyNotFound for no row, any other error for a read that
 // failed.
 func (c *collection) readSketchRow(tx *btree.ReadTx, key, buf []byte) ([]byte, error) {
 	if testHookSketchRead != nil {
-		if err := testHookSketchRead(key); err != nil {
+		if err := testHookSketchRead(string(key)); err != nil {
 			return nil, err
 		}
 	}
