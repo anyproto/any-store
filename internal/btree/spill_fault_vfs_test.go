@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -268,7 +269,7 @@ func (s *spillFaultDB) runSpillFault(t *testing.T, c spillFaultCase, ops []spill
 				continue
 			}
 			// The operation whose spill met the fault fails with its error.
-			require.ErrorIs(t, opErr, errInjectedSpillIO, "operation %d meets the fault", i)
+			assert.ErrorIs(t, opErr, errInjectedSpillIO, "operation %d meets the fault", i)
 			assert.NotErrorIs(t, opErr, ErrCorrupt, "operation %d", i)
 			if c.savepoints {
 				// The transaction is in the error state: its savepoint
@@ -694,4 +695,45 @@ func TestSpillFault_RenameReadBack(t *testing.T) {
 			require.NoError(t, db.IntegrityCheck())
 		})
 	}
+}
+
+// Close with a transaction that earlier spills and then a failed one left
+// in the error state: Close ends it at once, its spilled frames go with
+// it, and the abandoned writer's next write reports ErrClosed.
+func TestSpillFault_CloseInErrorState(t *testing.T) {
+	const (
+		baseKeys = 150
+		nOps     = 400
+		seed     = 7
+	)
+	total := spillWrites(t, 32, baseKeys, seed, nOps, false)
+	s := openSpillFaultDB(t, 32, baseKeys)
+	p := s.db.pager
+	tx, err := s.db.BeginWrite()
+	require.NoError(t, err)
+	base := p.wal.nFrame.Load()
+	s.file.arm(total/2, false, false)
+	var opErr error
+	for _, op := range s.spillOps(seed, nOps, baseKeys) {
+		if opErr = s.apply(tx, op); opErr != nil {
+			break
+		}
+	}
+	require.ErrorIs(t, opErr, errInjectedSpillIO)
+	require.Greater(t, p.wal.nFrame.Load(), base, "no spill succeeded before the failed one")
+	require.Equal(t, int32(pagerError), p.state.Load())
+
+	db := s.db
+	s.db = nil
+	start := time.Now()
+	require.NoError(t, db.Close())
+	require.Less(t, time.Since(start), time.Second, "Close waited on the write lock of the transaction it ends")
+	require.ErrorIs(t, tx.Put(s.ns, spillKey(1<<30), []byte("x")), ErrClosed)
+	_ = tx.Rollback()
+
+	s.file.disarm()
+	db, err = testOpen(t, s.path, Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	require.True(t, verifySpillModel(t, db, s.model, "after Close and reopen"))
 }

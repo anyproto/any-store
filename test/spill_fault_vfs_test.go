@@ -272,7 +272,7 @@ func TestSpillFault_WriteTx(t *testing.T) {
 						}
 						// The operation whose spill met the fault fails with
 						// its error.
-						require.ErrorIs(t, opErr, errInjectedSpillIO, "operation %d meets the fault", j)
+						assert.ErrorIs(t, opErr, errInjectedSpillIO, "operation %d meets the fault", j)
 						assert.NotErrorIs(t, opErr, anystore.ErrCorrupt, "operation %d", j)
 						failed = j
 						break
