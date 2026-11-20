@@ -36,6 +36,13 @@ import (
 // CompactVectorIndex of the collection fail with ErrIterOpen until the
 // iterator is closed, advanced or not: they free the trees it reads.
 //
+// An Iterator must be closed. Opened with a context that carries no
+// transaction, it holds a read transaction of its own until its Close, and
+// DB.Close waits for that with no timeout: such an iterator, never closed,
+// makes DB.Close block forever. Opened inside a transaction it holds none:
+// DB.Close waits for a ReadTx until its Commit and does not wait for a
+// WriteTx (see DB.Close). Close is safe to defer and to call twice.
+//
 // An Iterator belongs to one goroutine at a time. Opened with the context
 // of a transaction, its methods are calls on the transaction (see
 // commonTx), and once the transaction has ended Next and Doc fail with
@@ -63,7 +70,10 @@ type Iterator interface {
 	// Err returns any error encountered during the lifetime of the iterator.
 	Err() error
 
-	// Close closes the iterator and releases any associated resources.
+	// Close closes the iterator and releases any associated resources: the
+	// read transaction the iterator opened for itself, if it did. It must be
+	// called, also after Next has returned false or Err an error; see
+	// Iterator.
 	Close() error
 }
 
@@ -111,6 +121,14 @@ func (pi *planIterator) Next() bool {
 		defer pi.shared.exit()
 		if err := pi.trippedErr(); err != nil {
 			pi.err = err
+			return false
+		}
+		// A write transaction that DB.Close rolled back under its owner
+		// still looks open to its handle. The plan may have rows in memory
+		// (a sort, a vector or text search) that no storage call stands
+		// behind any more.
+		if pi.data.Tx.EndedByClose() {
+			pi.err = ErrDBIsClosed
 			return false
 		}
 		pi.mark = pi.shared.savepointMark()
@@ -185,6 +203,10 @@ func (pi *planIterator) Doc() (Doc, error) {
 			}
 			if pi.shared.Done() {
 				return nil, ErrTxIsUsed
+			}
+			// Rolled back by DB.Close: see Next.
+			if pi.data.Tx.EndedByClose() {
+				return nil, ErrDBIsClosed
 			}
 		}
 		if perf {

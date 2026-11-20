@@ -3544,7 +3544,10 @@ type Cursor struct {
 	skipNext int8
 	// nextCursor links the writer's open cursors (BtCursor.pNext,
 	// pager.cursors); linked says the cursor is on the list.
-	linked     bool
+	linked bool
+	// gated says a call on this cursor of a write transaction is in flight
+	// and counted at the writer gate (enterGate).
+	gated      bool
 	nextCursor *Cursor
 	// faultErr is what every use of a cursorFault reports; faultSeq is the
 	// schema event that tripped it (pager.schemaSeq), 0 for a failed move
@@ -3576,6 +3579,14 @@ type cursorFrame struct {
 
 // Close releases all pinned pages and invalidates the cursor.
 func (c *Cursor) Close() {
+	if c.bt.writable {
+		if c.bt.pager.wgate.enter() != nil {
+			c.abandon()
+			c.clearSaved()
+			return
+		}
+		defer c.bt.pager.wgate.leave()
+	}
 	c.releasePages()
 	c.clearSaved()
 	c.state = cursorInvalid
@@ -3600,6 +3611,163 @@ func (c *Cursor) releasePages() {
 	// truncate keeps the pre-allocated stackBuf backing array, so no allocation
 	// churn is introduced.
 	c.stack = c.stack[:0]
+}
+
+// enterGate counts a call on a write transaction's cursor in at the writer
+// gate, and marks the cursor so (gated): the calls the cursor makes on
+// itself while the call runs — SeekExact is a SeekNear, which is a Seek;
+// CountUntil reads a key and steps for every entry — are part of it and do
+// not come here again. Paired with leaveGate, deferred, in the gated
+// functions below. A move that DB.Close refused there ends the cursor's pin
+// of its leaf (abandon): the key or value the cursor handed out is valid
+// until its next move, which this was.
+func (c *Cursor) enterGate() error {
+	err := c.bt.pager.wgate.enter()
+	if err == nil {
+		c.gated = true
+	}
+	return err
+}
+
+// readsPinnedLeaf reports whether a Key or a Value of this write
+// transaction's cursor can run outside the writer gate: the cursor is on the
+// writer's list and stands on an entry, so what the call reads is the leaf
+// the cursor pins, and Close has not ended the transaction. Such a call
+// makes no call into the pager unless the entry has an overflow chain, for
+// which it goes back through the gate. Close can come while it runs, and
+// finds no call in flight; that is safe because the pager keeps back the
+// leaf of every cursor on the list when it disposes of the cache
+// (destroyEndedWriterCache), for the slices earlier calls returned, and
+// writes neither that page nor the cursor. The call then completes on the
+// leaf as the transaction left it, as a call in flight does. A cursor that
+// is saved, tripped, off the list or of an ended transaction takes the
+// gate, which restores it or refuses it.
+func (c *Cursor) readsPinnedLeaf() bool {
+	return c.linked && c.state == cursorValid && !c.bt.pager.wgate.closed()
+}
+
+// leaveGate counts the call that enterGate counted in out again.
+func (c *Cursor) leaveGate() {
+	c.gated = false
+	c.bt.pager.wgate.leave()
+}
+
+// The gated functions run a call on a write transaction's cursor inside the
+// writer gate: they count it in, mark the cursor gated and make the call
+// again, which then takes its ordinary path, as every call the cursor makes
+// on itself meanwhile does. The gate's defer lives here, a panic in a b-tree
+// operation must not leave the call counted, and so the cursor's methods
+// themselves have none: a read transaction's cursor, which never comes
+// here, runs them as it would without the gate. Next, Key and Value, the
+// calls of a scan, have their own; the others share one per signature. Key
+// and Value come here only when they have more to do than read the pinned
+// leaf (readsPinnedLeaf).
+
+func (c *Cursor) gatedMove(move func(*Cursor) error) error {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return err
+	}
+	defer c.leaveGate()
+	return move(c)
+}
+
+func (c *Cursor) gatedNext() error {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return err
+	}
+	defer c.leaveGate()
+	return c.Next()
+}
+
+func (c *Cursor) gatedSeek(seek func(*Cursor, []byte) error, key []byte) error {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return err
+	}
+	defer c.leaveGate()
+	return seek(c, key)
+}
+
+func (c *Cursor) gatedSkip(skip func(*Cursor, int) error, n int) error {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return err
+	}
+	defer c.leaveGate()
+	return skip(c, n)
+}
+
+func (c *Cursor) gatedKey() ([]byte, error) {
+	if err := c.enterGate(); err != nil {
+		return nil, err
+	}
+	defer c.leaveGate()
+	return c.Key()
+}
+
+func (c *Cursor) gatedValue() ([]byte, error) {
+	if err := c.enterGate(); err != nil {
+		return nil, err
+	}
+	defer c.leaveGate()
+	return c.Value()
+}
+
+func (c *Cursor) gatedAppendValue(buf []byte) ([]byte, error) {
+	if err := c.enterGate(); err != nil {
+		return buf, err
+	}
+	defer c.leaveGate()
+	return c.AppendValue(buf)
+}
+
+func (c *Cursor) gatedAppendValueByKey(key, buf []byte) ([]byte, error) {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return buf, err
+	}
+	defer c.leaveGate()
+	return c.AppendValueByKey(key, buf)
+}
+
+func (c *Cursor) gatedCountUntil(endKey []byte, endInclusive bool) (int, error) {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return 0, err
+	}
+	defer c.leaveGate()
+	return c.CountUntil(endKey, endInclusive)
+}
+
+func (c *Cursor) gatedRangeFraction(low, high []byte) (float64, error) {
+	if err := c.enterGate(); err != nil {
+		return 0, err
+	}
+	defer c.leaveGate()
+	return c.RangeFraction(low, high)
+}
+
+// abandon is what a move or a Close does to the cursor of a write
+// transaction that DB.Close ended: the cursor lets go of its pages without
+// releasing them to the cache, which is not this goroutine's any more, and
+// stands nowhere. A page whose buffer the pager kept back for this cursor
+// gives it back (pager.destroyEndedWriterCache). lentMu, not the gate, is
+// what excludes DB.Close here: it reads the stacks of the transaction's
+// cursors as it disposes of the cache.
+func (c *Cursor) abandon() {
+	p := c.bt.pager
+	p.lentMu.Lock()
+	for i := range c.stack {
+		if pg := c.stack[i].pg; pg != nil {
+			p.returnLent(pg)
+			c.stack[i].pg = nil
+		}
+	}
+	c.stack = c.stack[:0]
+	p.lentMu.Unlock()
+	c.state = cursorInvalid
 }
 
 // clearSaved drops a saved position (sqlite3BtreeClearCursor, btree.c:848):
@@ -3727,6 +3895,9 @@ func (c *Cursor) restored() error {
 
 // First positions the cursor at the first (smallest) key.
 func (c *Cursor) First() error {
+	if c.bt.writable && !c.gated {
+		return c.gatedMove((*Cursor).First)
+	}
 	if c.state == cursorFault {
 		return c.faultErr
 	}
@@ -3804,6 +3975,9 @@ func (c *Cursor) first() error {
 
 // Last positions the cursor at the last (largest) key.
 func (c *Cursor) Last() error {
+	if c.bt.writable && !c.gated {
+		return c.gatedMove((*Cursor).Last)
+	}
 	if c.state == cursorFault {
 		return c.faultErr
 	}
@@ -3861,6 +4035,9 @@ func (c *Cursor) last() error {
 
 // Seek positions the cursor at the first key >= the given key.
 func (c *Cursor) Seek(key []byte) error {
+	if c.bt.writable && !c.gated {
+		return c.gatedSeek((*Cursor).Seek, key)
+	}
 	if c.state == cursorFault {
 		return c.faultErr
 	}
@@ -3999,6 +4176,9 @@ func leafKeyAt(pg *page, idx int, lim payloadLimits) ([]byte, error) {
 // It optimises for the case where the target key falls within the currently
 // pinned leaf page, avoiding a full root-to-leaf traversal.
 func (c *Cursor) SeekNear(key []byte) error {
+	if c.bt.writable && !c.gated {
+		return c.gatedSeek((*Cursor).SeekNear, key)
+	}
 	// Fast path: check if key falls within the pinned leaf page. A saved or
 	// tripped cursor pins none and takes the full seek.
 	if c.state == cursorValid && len(c.stack) > 0 {
@@ -4040,6 +4220,9 @@ func (c *Cursor) SeekNear(key []byte) error {
 // SeekExact positions the cursor at the entry matching key exactly.
 // Returns ErrKeyNotFound if the key does not exist.
 func (c *Cursor) SeekExact(key []byte) error {
+	if c.bt.writable && !c.gated {
+		return c.gatedSeek((*Cursor).SeekExact, key)
+	}
 	if err := c.SeekNear(key); err != nil {
 		return err
 	}
@@ -4061,6 +4244,9 @@ func (c *Cursor) SeekExact(key []byte) error {
 // allowing cursor-based callers to avoid extra key/value parsing work.
 // DRIFT: an API with no SQLite counterpart. See docs/btree/NOTES.md#drift-115-cursor-skip-and-appendvaluebykey-new-apis-beyond-sqlite-surf
 func (c *Cursor) AppendValueByKey(key []byte, buf []byte) ([]byte, error) {
+	if c.bt.writable && !c.gated {
+		return c.gatedAppendValueByKey(key, buf)
+	}
 	if err := c.SeekNear(key); err != nil {
 		return buf, err
 	}
@@ -4123,6 +4309,9 @@ func (c *Cursor) currentKeyEqual(key []byte) (bool, error) {
 // transaction to the tree (which saves the cursor), or Close().
 // For overflow cells where the key spills, a new slice is allocated.
 func (c *Cursor) Key() ([]byte, error) {
+	if c.bt.writable && !c.gated && !c.readsPinnedLeaf() {
+		return c.gatedKey()
+	}
 	if err := c.restored(); err != nil {
 		return nil, err
 	}
@@ -4144,6 +4333,11 @@ func (c *Cursor) Key() ([]byte, error) {
 		return nil, cerr
 	}
 	if cell.overflowPg != 0 {
+		// The overflow chain is read through the pager: a call of the
+		// write transaction (readsPinnedLeaf).
+		if c.bt.writable && !c.gated {
+			return c.gatedKey()
+		}
 		// Key may be partial — use leafFullKey to reconstruct
 		return leafFullKey(frame.pg.data, int(off), lim, c.bt.pager, c.bt.walMaxFrame, c.bt.cache)
 	}
@@ -4156,6 +4350,9 @@ func (c *Cursor) Key() ([]byte, error) {
 // transaction to the tree (which saves the cursor), or Close().
 // For overflow values, a new slice is allocated and returned.
 func (c *Cursor) Value() ([]byte, error) {
+	if c.bt.writable && !c.gated && !c.readsPinnedLeaf() {
+		return c.gatedValue()
+	}
 	if err := c.restored(); err != nil {
 		return nil, err
 	}
@@ -4179,6 +4376,11 @@ func (c *Cursor) Value() ([]byte, error) {
 	}
 
 	if cell.overflowPg != 0 {
+		// The overflow chain is read through the pager: a call of the
+		// write transaction (readsPinnedLeaf).
+		if c.bt.writable && !c.gated {
+			return c.gatedValue()
+		}
 		// Unified payload format: read keyLen, valLen from header varints,
 		// compute nLocal, then reconstruct the full value.
 		pos := int(off)
@@ -4228,6 +4430,9 @@ func (c *Cursor) Value() ([]byte, error) {
 // For overflow values, reads directly into buf with no intermediate allocation,
 // matching SQLite's accessPayload() offset approach.
 func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
+	if c.bt.writable && !c.gated {
+		return c.gatedAppendValue(buf)
+	}
 	if err := c.restored(); err != nil {
 		return buf, err
 	}
@@ -4303,6 +4508,9 @@ func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
 // past a leaf's last entry) continues from them.
 // DRIFT: B+tree (leaf-only keys) drops interior-cell positions that SQLite B-tree visits See docs/btree/NOTES.md#drift-14-b-plus-tree-traversal-drops-interior-cell-keys-versus-sqlite
 func (c *Cursor) Next() error {
+	if c.bt.writable && !c.gated {
+		return c.gatedNext()
+	}
 	if c.state != cursorValid {
 		if err := c.restored(); err != nil {
 			return err
@@ -4416,6 +4624,9 @@ func (c *Cursor) Next() error {
 // index; on an interior page we descend into the previous child's rightmost
 // leaf.
 func (c *Cursor) Previous() error {
+	if c.bt.writable && !c.gated {
+		return c.gatedMove((*Cursor).Previous)
+	}
 	if c.state != cursorValid {
 		if err := c.restored(); err != nil {
 			return err
@@ -4534,6 +4745,9 @@ func (c *Cursor) Previous() error {
 // A restored cursor that landed after its saved key has taken the first
 // step already.
 func (c *Cursor) Skip(n int) error {
+	if c.bt.writable && !c.gated {
+		return c.gatedSkip((*Cursor).Skip, n)
+	}
 	if n <= 0 {
 		return nil
 	}
@@ -4576,6 +4790,9 @@ func (c *Cursor) Skip(n int) error {
 // SkipBackward moves the cursor backward by n positions.
 // Mirror of Skip for reverse traversal.
 func (c *Cursor) SkipBackward(n int) error {
+	if c.bt.writable && !c.gated {
+		return c.gatedSkip((*Cursor).SkipBackward, n)
+	}
 	if n <= 0 {
 		return nil
 	}
@@ -4625,6 +4842,9 @@ func (c *Cursor) Valid() bool {
 // The cursor must be positioned at or after the start of the range.
 // After this call, the cursor is positioned past the end key (or invalid).
 func (c *Cursor) CountUntil(endKey []byte, endInclusive bool) (int, error) {
+	if c.bt.writable && !c.gated {
+		return c.gatedCountUntil(endKey, endInclusive)
+	}
 	count := 0
 	lim := c.bt.leafLimits()
 
@@ -4779,6 +4999,9 @@ func (c *Cursor) keyRank(key []byte) (float64, error) {
 // to [0,1]; bound inclusivity is ignored (an at-most-one-entry rounding the cost
 // model does not care about). It does not move the cursor.
 func (c *Cursor) RangeFraction(low, high []byte) (float64, error) {
+	if c.bt.writable && !c.gated {
+		return c.gatedRangeFraction(low, high)
+	}
 	var lo, hi float64 = 0, 1
 	if len(low) > 0 {
 		r, err := c.keyRank(low)
