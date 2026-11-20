@@ -628,7 +628,9 @@ func (c *collection) resolveAs(tx *btree.ReadTx, name string) (*collSchema, erro
 				// after DROP TABLE in the same SQLite transaction.
 				return nil, ErrCollectionClosed
 			}
-			c.refreshSketches(tx, e.s)
+			if err := c.refreshSketches(tx, e.s); err != nil {
+				return nil, err
+			}
 			return e.s, nil
 		}
 	}
@@ -641,14 +643,18 @@ func (c *collection) resolveAs(tx *btree.ReadTx, name string) (*collSchema, erro
 	if s := c.head.Load(); s != nil {
 		if s.current(e, tx.SnapshotSchemaCookie(), writer) {
 			if writer {
-				c.refreshSketches(tx, s)
+				if err := c.refreshSketches(tx, s); err != nil {
+					return nil, err
+				}
 			}
 			return s, nil
 		}
 	}
 	s, err := c.resolveSlow(tx, name)
 	if err == nil && writer {
-		c.refreshSketches(tx, s)
+		if err = c.refreshSketches(tx, s); err != nil {
+			return nil, err
+		}
 	}
 	return s, err
 }
@@ -870,7 +876,9 @@ func (c *collection) loadRangeIndex(tx *btree.ReadTx, name string, info IndexInf
 	}
 	idx.format = format
 	idx.outdated = indexFormatOutdated(format, info)
-	c.loadSketchAtOpen(tx, name, idx)
+	if err = c.loadSketchAtOpen(tx, name, idx); err != nil {
+		return nil, err
+	}
 	return idx, nil
 }
 

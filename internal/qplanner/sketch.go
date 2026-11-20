@@ -46,9 +46,10 @@ import (
 // (Snapshot, Restore), and the deltas of a tx that rolled back or whose
 // commit failed survive until the next write tx begins
 // (db.resetUncommittedSketches). A peer process's commits arrive only via the
-// advisory reload in db.checkStale, which is fail-soft: a decode error keeps
-// the stale copy. A plan-time read tolerates all of this — a wrong cost means a
-// slower query, and execution still runs against the snapshot. An answer-time
+// reload at the next use (collection.refreshSketches), which is fail-soft for
+// a reader: a decode error keeps the stale copy. A plan-time read tolerates
+// all of this — a wrong cost means a slower query, and execution still runs
+// against the snapshot. An answer-time
 // read does not: a wrong estimate of zero is a wrong answer.
 //
 // Making an answer-time read safe requires storing sketches in the btree under

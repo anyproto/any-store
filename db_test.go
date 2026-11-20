@@ -1616,7 +1616,9 @@ func TestCheckStale_ConsumesOnlySnapshotCounters(t *testing.T) {
 // commit republished the live sketch and recorded the counters. A peer's
 // commit (the local counters left behind) still reloads, into a reader-owned
 // sketch that is allocated once and reused by later reloads of the same
-// shape; the live sketch is never touched.
+// shape; a reader never touches the live sketch. The live sketch is the next
+// write transaction's to load: it takes the peer's row before its own
+// deltas, however many readers loaded that row before it.
 func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 	skipIfInMemory(t, "models another process's commit; not applicable in-memory")
 	fx := newFixture(t)
@@ -1680,7 +1682,7 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 
 	// The bytes on disk change under a peer, in either stored encoding: the
 	// reload decodes them into the same reader-owned object, and the live
-	// sketch keeps its count.
+	// sketch keeps its count while only readers pass.
 	docs, liveDocs := uint64(40), uint64(2)
 	for _, enc := range []struct {
 		name    string
@@ -1704,12 +1706,17 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 			stalePass()
 			return row
 		}
-		peerWrites(1)
+		// own is the shape of the live sketch (the index has one field; the
+		// first pass's writer leaves the live sketch with two levels, see
+		// below), other is the shape it does not have.
+		own := live.Levels
+		other := 3 - own
+		peerWrites(own)
 		pub = idx.loadPubSketch()
 		require.NotSame(t, live, pub, enc.name)
 		require.Equal(t, docs, pub.GetDocCount(), enc.name)
 
-		peerWrites(1)
+		peerWrites(own)
 		assert.Same(t, pub, idx.loadPubSketch(), "%s: the reader-owned sketch is reused", enc.name)
 		assert.Equal(t, docs, pub.GetDocCount(), enc.name)
 		assert.Equal(t, liveDocs, live.GetDocCount(), enc.name)
@@ -1729,19 +1736,58 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 
 		// Bytes of another shape never reshape the published object: they are
 		// decoded into a fresh one.
-		peerWrites(2)
+		peerWrites(other)
 		assert.NotSame(t, pub, idx.loadPubSketch(), enc.name)
-		assert.Equal(t, 1, pub.Levels, enc.name)
-		assert.Equal(t, 2, idx.loadPubSketch().Levels, enc.name)
+		assert.Equal(t, own, pub.Levels, enc.name)
+		assert.Equal(t, other, idx.loadPubSketch().Levels, enc.name)
 		assert.Equal(t, docs, idx.loadPubSketch().GetDocCount(), enc.name)
 		assert.Same(t, live, idx.sketch, enc.name)
+		assert.Equal(t, liveDocs, live.GetDocCount(), "%s: readers alone leave the live sketch", enc.name)
+
+		// A write of this process: the readers before it loaded the peer's
+		// row into the published sketch only, so the writer loads it into
+		// the live one and its delta goes on top. The row has another
+		// shape than the live object, which was published and may still be
+		// in a planner's hands: it is left as it is, and a fresh object
+		// becomes the live one. The reader below holds the old object
+		// across the load (a data race if the load reshaped it). The row
+		// the writer stores holds the peer's counts and its own, and the
+		// published sketch is the live one again.
+		held, stop, stopped := live, make(chan struct{}), make(chan struct{})
+		heldCounters := held.Snapshot(nil)
+		go func() {
+			defer close(stopped)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = held.Estimate(held.NumLevels()-1, []byte{1})
+					_ = held.EntryCount(0)
+					_ = held.Distribution(0)
+				}
+			}
+		}()
+		insertErr := coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"own-%s","a":7}`, enc.name)))
+		close(stop)
+		<-stopped
+		require.NoError(t, insertErr)
+		live = idx.sketch
+		// Compared as a bool: a failed NotSame prints both sketches.
+		require.True(t, held != live, "%s: a row of another shape is not decoded into the published object", enc.name)
+		assert.Equal(t, own, held.Levels, enc.name)
+		assert.True(t, slices.Equal(heldCounters, held.Snapshot(nil)), "%s: the object a reader may hold is as it was", enc.name)
+		liveDocs = docs + 1
+		assert.Equal(t, other, live.Levels, enc.name)
+		assert.Equal(t, liveDocs, live.GetDocCount(), "%s: the peer's row and the own delta", enc.name)
+		stored, err := dbi.InspectIndexSketch(ctx, "c", idx.info.Name)
+		require.NoError(t, err)
+		assert.Equal(t, liveDocs, stored.DocCount, "%s: the stored row", enc.name)
+		require.Same(t, live, idx.loadPubSketch(), enc.name)
 
 		// After a commit of this process the published sketch is the live
 		// one, and a reload decodes into a fresh object. A row that does not
 		// decode must not publish that object, empty, over the live counts.
-		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"own-%s","a":7}`, enc.name))))
-		liveDocs++
-		require.Same(t, live, idx.loadPubSketch(), enc.name)
 		settled, err := dbi.btreeDB.BeginRead()
 		require.NoError(t, err)
 		e0 = epochOf(settled)
@@ -2089,9 +2135,10 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		assert.EqualValues(t, 1, on.DocCount)
 	})
 
-	// reloadSketch has nothing to rebase to and keeps the flag: the collection
-	// stays listed until a commit writes the row.
-	t.Run("sketches: no committed row keeps the collection listed", func(t *testing.T) {
+	// No stored row is no statistics: the rebase empties the live sketch,
+	// which is then as the file has it, and the collection leaves the list.
+	// Nothing of the rolled-back transaction is stored by a later commit.
+	t.Run("sketches: no committed row is rebased to an empty sketch", func(t *testing.T) {
 		fx := newFixture(t)
 		dbi := fx.DB.(*db)
 		a, b := create(t, fx, "a", rangeIdx), create(t, fx, "b", rangeIdx)
@@ -2105,16 +2152,24 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, a.Insert(tx.Context(), doc(2)))
 		require.NoError(t, tx.Rollback())
+		assert.Equal(t, []string{"a"}, names(dbi.sketchDirty))
+		assert.EqualValues(t, 2, idx.sketch.GetDocCount())
 
 		tx, err = fx.WriteTx(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, []string{"a"}, names(dbi.sketchDirty))
-		assert.True(t, idx.sketchModified)
+		assert.Empty(t, names(dbi.sketchDirty))
+		assert.False(t, idx.sketchModified)
+		assert.Zero(t, idx.sketch.GetDocCount())
 		require.NoError(t, b.Insert(tx.Context(), doc(1)))
 		require.NoError(t, tx.Commit())
-		assert.False(t, idx.sketchModified)
 		_, err = dbi.InspectIndexSketch(ctx, "a", "a")
-		require.NoError(t, err, "the commit persisted the row")
+		require.ErrorIs(t, err, ErrIndexNotFound, "a commit that did not use the collection stores no row for it")
+
+		require.NoError(t, a.Insert(ctx, doc(2)))
+		assert.False(t, idx.sketchModified)
+		on, err := dbi.InspectIndexSketch(ctx, "a", "a")
+		require.NoError(t, err, "the commit of a transaction that wrote to the collection stored the row")
+		assert.EqualValues(t, 1, on.DocCount, "the document counted since the index had no statistics")
 
 		require.NoError(t, b.Insert(ctx, doc(2)))
 		assert.Equal(t, []string{"b"}, names(dbi.sketchDirty))
@@ -2310,6 +2365,190 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 0, n, "postings of the rolled-back tx must not surface")
 	})
+}
+
+// A handle a write transaction opens has its version installed before any
+// other transaction can find the handle. The handle's sketch stamps speak
+// for the sketches the writer loaded; a reader at an older snapshot that
+// found the handle first would install the ones it loads, and the writer
+// would put its count on them and store a row that misses a commit.
+func TestOpenCollection_VersionIsInstalledBeforeTheHandleIsFound(t *testing.T) {
+	d, _ := openSketchDB(t)
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":3}`, id))
+	}
+	old, err := d.ReadTx(ctx) // at 50 documents
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = old.Commit() })
+	h, err := d.OpenCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, h.Insert(ctx, doc(100)))
+	require.NoError(t, h.Close()) // 51 documents, no handle
+
+	wtx, err := d.WriteTx(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wtx.Rollback() })
+	hooked := false
+	testHookRegistered = func(name string) {
+		if name != "c" || hooked {
+			return
+		}
+		hooked = true
+		o, err := d.OpenCollection(old.Context(), "c")
+		require.NoError(t, err)
+		n, err := o.Find(`{"a":3}`).Count(old.Context())
+		require.NoError(t, err)
+		require.Equal(t, 10, n, "setup: the older reader used the handle at its snapshot")
+	}
+	defer func() { testHookRegistered = nil }()
+	coll, err := d.OpenCollection(wtx.Context(), "c")
+	require.NoError(t, err)
+	require.True(t, hooked, "setup: the write transaction made the handle")
+	require.NoError(t, coll.Insert(wtx.Context(), doc(101)))
+	require.NoError(t, wtx.Commit())
+	require.NoError(t, old.Commit())
+
+	n, err := coll.Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 52, n, "setup: the documents")
+	require.Equal(t, uint64(52), storedSketch(t, d, coll).DocCount)
+	require.Equal(t, uint64(52), sketchDocCount(t, coll))
+}
+
+// A handle closed between a write and the commit: the documents commit, and
+// so do their counts. A handle that is closed because its collection is gone
+// for the transaction stores nothing.
+func TestWriteTx_HandleClosedBeforeCommitStoresItsSketches(t *testing.T) {
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":3}`, id))
+	}
+	reopened := func(t *testing.T, d DB, want int) {
+		t.Helper()
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		require.Equal(t, uint64(want), storedSketch(t, d, coll).DocCount, "the stored row")
+		docs, sketch := statsDocCounts(t, ctx, coll)
+		require.Equal(t, want, docs, "setup: the documents")
+		require.Equal(t, uint64(want), sketch)
+		require.Equal(t, uint64(want), sketchDocCount(t, coll), "the sketch the next handle loads")
+		require.NoError(t, coll.Insert(ctx, doc(900)))
+		require.Equal(t, uint64(want+1), storedSketch(t, d, coll).DocCount, "the next write counts on")
+	}
+
+	t.Run("commit", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		require.NoError(t, coll.Insert(wtx.Context(), doc(100), doc(101)))
+		require.NoError(t, coll.Close())
+		require.NoError(t, wtx.Commit())
+		reopened(t, d, 52)
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		require.NoError(t, coll.Insert(wtx.Context(), doc(100), doc(101)))
+		require.NoError(t, coll.Close())
+		require.NoError(t, wtx.Rollback())
+		reopened(t, d, 50)
+	})
+
+	// The collection was made inside a savepoint that rolled back: its
+	// handle is closed, and no row is stored for a collection that does not
+	// exist, for one of that name to load later.
+	t.Run("a collection whose creation rolled back", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		sp, err := d.WriteTx(wtx.Context())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = sp.Rollback() })
+		made, err := d.CreateCollection(sp.Context(), "made")
+		require.NoError(t, err)
+		require.NoError(t, made.EnsureIndex(sp.Context(), IndexInfo{Fields: []string{"a"}}))
+		require.NoError(t, made.Insert(sp.Context(), doc(1)))
+		require.NoError(t, sp.Rollback())
+		c, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, c.Insert(wtx.Context(), doc(100)))
+		require.NoError(t, wtx.Commit())
+		_, err = d.(*db).InspectIndexSketch(ctx, "made", "a")
+		require.ErrorIs(t, err, ErrIndexNotFound)
+		require.Equal(t, uint64(51), storedSketch(t, d, c).DocCount)
+	})
+}
+
+// BenchmarkSketch_FindThenWriteAfterAPeersCommit is the cycle of a process
+// that shares its file: another process commits, this one plans a query and
+// then writes. The reader loads the stored sketch rows into the published
+// sketches and the writer into the live ones, every time.
+func BenchmarkSketch_FindThenWriteAfterAPeersCommit(b *testing.B) {
+	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
+		b.Skip("models another process's commit; not applicable in-memory")
+	}
+	fx := newFixture(b)
+	dbi := fx.DB.(*db)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(b, err)
+	require.NoError(b, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	for i := 0; i < 200; i++ {
+		require.NoError(b, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%5))))
+	}
+	docs := [2]*anyenc.Value{anyenc.MustParseJson(`{"id":1,"a":1}`), anyenc.MustParseJson(`{"id":1,"a":2}`)}
+	q := coll.Find(`{"a":3}`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dbi.btreeDB.ForgetSeenHeader() // the newest commit is another process's
+		if _, err := q.Count(ctx); err != nil {
+			b.Fatal(err)
+		}
+		if err := coll.UpdateOne(ctx, docs[i&1]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkSketch_RollbackThenFind is a write transaction that rolls back,
+// then a query: the counts the transaction left on the live sketches of two
+// indexes are there when the query plans, and the next transaction's begin
+// rebases them.
+func BenchmarkSketch_RollbackThenFind(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(b, err)
+	require.NoError(b, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}, IndexInfo{Fields: []string{"b"}}))
+	for i := 0; i < 200; i++ {
+		require.NoError(b, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%5, i%7))))
+	}
+	doc := anyenc.MustParseJson(`{"id":1000,"a":3,"b":3}`)
+	q := coll.Find(`{"a":3}`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		wtx, err := fx.WriteTx(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err = coll.Insert(wtx.Context(), doc); err != nil {
+			b.Fatal(err)
+		}
+		if err = wtx.Rollback(); err != nil {
+			b.Fatal(err)
+		}
+		if _, err = q.Count(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 // BenchmarkWriteTx_OpenCollections writes to one collection of a db holding n

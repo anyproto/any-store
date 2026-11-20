@@ -550,6 +550,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	tx.readTx = &btWtx.ReadTx
 	tx.writeTx = btWtx
 	tx.modified.Store(false)
+	tx.sketchTx = version
 	btWtx.SetAux(tx)
 
 	db.checkStale(&btWtx.ReadTx)
@@ -647,9 +648,9 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 // sketches it wrote itself (savepointTx.images).
 //
 // Only db.sketchDirty is visited, and this is where a collection leaves it:
-// once closed, or once none of its indexes is flagged. An index with no
-// committed bytes keeps its flag through the rebase and stays listed for the
-// next commit to persist.
+// once closed, or once none of its indexes is flagged. An index whose row
+// could not be read keeps its flag through the rebase, and the collection
+// stays listed.
 func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
 	kept := db.sketchDirty[:0]
 	gen := db.epoch.Load().gen
@@ -662,10 +663,13 @@ func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
 			c.mu.Lock()
 			for _, idx := range s.indexes {
 				if idx.sketchModified {
-					// reloadSketch (writable) rebases live to the committed bytes and
-					// clears sketchModified; if there are no committed bytes yet
-					// (brand-new pre-commit index) it preserves the built sketch.
-					c.reloadSketch(tx, s.name, idx, true)
+					// reloadLiveSketch rebases live to the committed bytes, or
+					// to an empty sketch if there are none, and clears
+					// sketchModified.
+					// A read that fails leaves the index flagged: the first
+					// use of the collection loads it again, and may fail the
+					// operation for it (refreshLiveSketches).
+					_ = c.reloadLiveSketch(tx, s.name, idx)
 					flagged = flagged || idx.sketchModified
 				}
 			}
@@ -848,6 +852,10 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 // its registration. Tests only.
 var testHookBeforeRegister func(name string)
 
+// testHookRegistered, when set, runs right after a new handle entered the
+// registry, where any transaction can find it. Tests only.
+var testHookRegistered func(name string)
+
 // errHandleGone tells openCollection that the handle it found registered is
 // not live any more.
 var errHandleGone = errors.New("any-store: registered handle is gone")
@@ -913,11 +921,21 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 			db.forgetLocked(existing.(*collection))
 		}
 		c.since = db.sinceNow()
+		// The version is settled before the handle can be found. The
+		// handle's sketch stamps speak for the index objects of this
+		// version (newCollection): were the handle registered first,
+		// another transaction could install a head it loaded at an older
+		// snapshot, and a write transaction that opened the handle would
+		// put its deltas on sketches it never loaded. Nothing else has
+		// the handle yet, so its lock is free under db.mu.
+		c.adopt(tx, schema)
 		db.openedCollections[collectionName] = c
 		db.byIdentity[c.identity] = c
 		db.mu.Unlock()
+		if testHookRegistered != nil {
+			testHookRegistered(collectionName)
+		}
 		opened = c
-		c.adopt(tx, schema)
 		return nil
 	})
 	if err != nil {
@@ -1735,10 +1753,23 @@ func (db *db) forgetLocked(c *collection) {
 // lists them on t for the settle (commonTx.settleSketches). Called once per
 // write transaction commit to batch sketch persistence. It removes nothing
 // from the list: the next write-tx begin does (resetUncommittedSketches).
+//
+// Only the collections whose live sketches are this transaction's
+// (collection.sketchTx) are written. One the transaction never used has
+// none of its deltas: what is flagged there is left over from a transaction
+// that did not commit, on counts no writer loaded since, and storing it
+// would put them over a row another process may have written meanwhile. It
+// stays listed for a begin to rebase.
+//
+// A handle closed since the transaction wrote through it is written like
+// an open one: its documents commit, and so do their counts. The handles
+// that have no collection to store for are told apart below: one the
+// transaction dropped by its log, one whose creation a savepoint rolled
+// back by having no version at all.
 func (db *db) persistAllDirtySketches(tx *btree.WriteTx, t *commonTx) error {
 	gen := db.epoch.Load().gen
 	for _, c := range db.sketchDirty {
-		if c.closed.Load() {
+		if c.sketchTx != t.sketchTx {
 			continue
 		}
 		var s *collSchema
