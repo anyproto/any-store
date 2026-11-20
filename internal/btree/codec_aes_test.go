@@ -161,6 +161,48 @@ func benchCodecEncrypt(b *testing.B, c Codec) {
 	}
 }
 
+// Micro-benchmark: single Decrypt call of a valid page, with an integrity
+// hook passed as a database with OnIntegrityError passes one.
+// Run with: go test -bench BenchmarkCodec_Decrypt -run '^$' -benchtime=3s
+func BenchmarkCodec_Decrypt_AES256GCM(b *testing.B) {
+	benchCodecDecrypt(b, mustAES(b))
+}
+
+func BenchmarkCodec_Decrypt_ChaCha20Poly1305(b *testing.B) {
+	benchCodecDecrypt(b, mustChaCha(b))
+}
+
+func BenchmarkCodec_Decrypt_XChaCha20Poly1305(b *testing.B) {
+	benchCodecDecrypt(b, mustXChaCha(b))
+}
+
+func benchCodecDecrypt(b *testing.B, c Codec) {
+	b.Helper()
+	const pageSize, pgno = 4096, 7
+	src := make([]byte, pageSize)
+	ct := make([]byte, pageSize)
+	var w aeadScratch
+	if _, err := c.Encrypt(ct, src, pgno, &w); err != nil {
+		b.Fatal(err)
+	}
+	dst := make([]byte, pageSize)
+	// One scratch for the whole run, as each reader cache keeps one.
+	var s aeadScratch
+	var failures int
+	onError := integrityHook(func(uint32, error) { failures++ })
+	b.SetBytes(pageSize)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := c.Decrypt(dst, ct, pgno, &s, onError); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if failures != 0 {
+		b.Fatalf("onError fired %d times on valid pages", failures)
+	}
+}
+
 func mustAES(b *testing.B) Codec {
 	b.Helper()
 	c, err := NewAESCodec(make([]byte, 32))
