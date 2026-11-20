@@ -21,7 +21,8 @@ const aesTagLen = 16
 // aesCodec implements Codec using AES-256-GCM. It holds only the immutable
 // cipher.AEAD, which is safe for concurrent use, so one instance can serve
 // the writer and readers of one database and several databases at once.
-// The nonce source is the caller's (aeadScratch).
+// The nonce source is the caller's (aeadScratch), and so is the hook an
+// authentication failure is reported to (Decrypt's onError).
 //
 // Per-page layout (pageSize = 4096, bodyLen = 4064):
 //
@@ -34,7 +35,6 @@ const aesTagLen = 16
 // block size), which is the SQLCipher convention for reserve areas.
 type aesCodec struct {
 	aead cipher.AEAD
-	onErrorField
 }
 
 // NewAESCodec constructs the default codec. key must be exactly 32 bytes
@@ -102,8 +102,8 @@ func (c *aesCodec) Encrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte
 
 // Decrypt is the inverse of Encrypt. Returns errAEADAuthFail (wrapping
 // ErrPageIntegrity) on any authentication failure (wrong key, corruption,
-// or pgno mismatch). dst must not alias src.
-func (c *aesCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error) {
+// or pgno mismatch), after reporting it to onError. dst must not alias src.
+func (c *aesCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch, onError integrityHook) ([]byte, error) {
 	if len(dst) < len(src) {
 		return nil, fmt.Errorf("btree: aesCodec.Decrypt: dst too small (%d < %d)", len(dst), len(src))
 	}
@@ -124,7 +124,7 @@ func (c *aesCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte
 	// dst and src are separate buffers — no aliasing.
 	pt, err := c.aead.Open(dst[:0], nonce, ctAndTag, aad)
 	if err != nil {
-		c.fire(pgno, err)
+		onError.fire(pgno, err)
 		return nil, errAEADAuthFail
 	}
 	if len(pt) != bodyLen {

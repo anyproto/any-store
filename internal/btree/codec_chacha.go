@@ -17,7 +17,8 @@ import (
 //
 // Like aesCodec it holds only immutable cipher state, safe for concurrent
 // use, so one instance can serve several databases at once; the nonce
-// source is the caller's (aeadScratch).
+// source is the caller's (aeadScratch), and so is the hook an
+// authentication failure is reported to (Decrypt's onError).
 type chachaCodec struct {
 	aead interface {
 		Seal(dst, nonce, plaintext, additionalData []byte) []byte
@@ -27,7 +28,6 @@ type chachaCodec struct {
 	}
 	nonceLen int
 	overhead int
-	onErrorField
 }
 
 const (
@@ -101,7 +101,7 @@ func (c *chachaCodec) Encrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]b
 	return dst[:len(src)], nil
 }
 
-func (c *chachaCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error) {
+func (c *chachaCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch, onError integrityHook) ([]byte, error) {
 	if len(dst) < len(src) {
 		return nil, fmt.Errorf("btree: chachaCodec.Decrypt: dst too small (%d < %d)", len(dst), len(src))
 	}
@@ -119,7 +119,7 @@ func (c *chachaCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]b
 
 	pt, err := c.aead.Open(dst[:0], nonce, ctAndTag, aad)
 	if err != nil {
-		c.fire(pgno, err)
+		onError.fire(pgno, err)
 		return nil, errAEADAuthFail
 	}
 	if len(pt) != bodyLen {

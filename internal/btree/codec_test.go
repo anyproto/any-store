@@ -112,7 +112,7 @@ func TestCodec_NoncePoolOwnedByScratch(t *testing.T) {
 			t.Fatalf("%T: Encrypt left the writer's scratch without a nonce pool", c)
 		}
 		for i := 0; i < 3; i++ {
-			if _, err := c.Decrypt(pt, ct, 3, &r); err != nil {
+			if _, err := c.Decrypt(pt, ct, 3, &r, nil); err != nil {
 				t.Fatalf("%T: Decrypt: %v", c, err)
 			}
 		}
@@ -171,7 +171,7 @@ func TestCodec_DecryptPlainNil(t *testing.T) {
 	var c Codec
 	src := []byte("hello world")
 	dst := make([]byte, 0, len(src))
-	out, err := decryptWith(c, dst, src, 42, &aeadScratch{})
+	out, err := decryptWith(c, dst, src, 42, &aeadScratch{}, nil)
 	if err != nil {
 		t.Fatalf("decryptWith(nil) error: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestPager_InstallCodec_ReservedSpace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.installCodec(c)
+	p.installCodec(c, nil)
 	if p.header.ReservedSpace != uint8(c.Overhead()) {
 		t.Fatalf("ReservedSpace = %d, want %d", p.header.ReservedSpace, c.Overhead())
 	}
@@ -207,7 +207,7 @@ func TestPager_InstallCodec_ReservedSpace(t *testing.T) {
 func TestPager_InstallCodec_NilIsNoop(t *testing.T) {
 	p := &pager{pageSize: 4096}
 	p.usableSize_ = int(p.pageSize)
-	p.installCodec(nil)
+	p.installCodec(nil, nil)
 	if p.codec != nil {
 		t.Fatalf("nil install set codec")
 	}

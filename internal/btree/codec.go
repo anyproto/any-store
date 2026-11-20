@@ -10,7 +10,6 @@ package btree
 import (
 	"crypto/rand"
 	"fmt"
-	"sync/atomic"
 )
 
 // Codec is the pluggable page-encryption interface. When a non-nil Codec is
@@ -21,9 +20,16 @@ import (
 // as given, so two databases opened with it, or a database and its Backup
 // destination, which opens with the source's Options, encrypt through it
 // from their own writers at the same time). A codec therefore keeps no
-// per-call mutable state of its own: whatever an Encrypt or Decrypt call
-// needs to write, the nonce source included, lives in the caller's
-// aeadScratch.
+// per-call mutable state and nothing a database sets: whatever an Encrypt
+// or Decrypt call needs to write, the nonce source included, lives in the
+// caller's aeadScratch, and Decrypt reports an integrity failure to the
+// hook its caller passes in, the calling database's own
+// Options.OnIntegrityError. SQLCipher reports a page it cannot decrypt to
+// the connection the call came from: each pager passes its own codec_ctx
+// to every codec call (pPager->xCodec(pPager->pCodec, ...)), and
+// sqlite3Codec records the failure on that ctx and its pager
+// (sqlcipher_codec_ctx_set_error → sqlite3pager_error). Here the pager and
+// the WAL pass their database's hook with every Decrypt the same way.
 //
 // Overhead() bytes are reserved at the end of every page for the codec's
 // per-page metadata (IV/nonce, authentication tag, padding). The btree cell
@@ -51,7 +57,22 @@ type Codec interface {
 	// Decrypt is the inverse of Encrypt. On tag verification failure it
 	// returns an error that wraps ErrPageIntegrity (without modifying dst
 	// past any intermediate state). Callers must not use dst on error.
-	Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error)
+	// Every integrity failure it detects, including one it does not return
+	// (cksumCodec with verification off), goes to onError with pgno and the
+	// failure's detail; a nil onError reports nothing.
+	Decrypt(dst, src []byte, pgno uint32, s *aeadScratch, onError integrityHook) ([]byte, error)
+}
+
+// integrityHook is the database's Options.OnIntegrityError as its pager and
+// WAL hold it, passed to every Decrypt they make. It is per database: a
+// codec never stores one, because a codec can serve several databases.
+type integrityHook func(pgno uint32, inner error)
+
+// fire calls h, if there is one.
+func (h integrityHook) fire(pgno uint32, inner error) {
+	if h != nil {
+		h(pgno, inner)
+	}
 }
 
 // aeadScratch is a caller-owned, per-call scratch for codec Encrypt/Decrypt.
@@ -129,38 +150,6 @@ var (
 	errAEADAuthFail  = fmt.Errorf("%w: AEAD authentication failed", ErrPageIntegrity)
 )
 
-// OnErrorSink is implemented by codecs that support a per-page mismatch
-// callback. cksumCodec, aesCodec, and chachaCodec all implement it.
-// The callback fires whenever a page integrity check fails (XXH3-128
-// mismatch for cksum, AEAD auth fail for aes/chacha) and runs on the
-// I/O goroutine; it must not block.
-type OnErrorSink interface {
-	SetOnError(func(pgno uint32, inner error))
-}
-
-// onErrorField is the shared atomic-pointer field used by all codecs that
-// implement OnErrorSink. Embed it; do not duplicate the storage. Safe for
-// concurrent reads from any goroutine; SetOnError swaps atomically.
-type onErrorField struct {
-	cb atomic.Pointer[func(uint32, error)]
-}
-
-// SetOnError installs the callback. Pass nil to clear.
-func (f *onErrorField) SetOnError(fn func(pgno uint32, inner error)) {
-	if fn == nil {
-		f.cb.Store(nil)
-		return
-	}
-	f.cb.Store(&fn)
-}
-
-// fire invokes the callback if installed. No-op when none is set.
-func (f *onErrorField) fire(pgno uint32, inner error) {
-	if p := f.cb.Load(); p != nil {
-		(*p)(pgno, inner)
-	}
-}
-
 // overheadOrZero returns c.Overhead() or 0 if c is nil. Used by the pager
 // to compute ReservedSpace without branching at every call site.
 func overheadOrZero(c Codec) int {
@@ -184,11 +173,11 @@ func encryptWith(c Codec, dst, src []byte, pgno uint32, s *aeadScratch) ([]byte,
 
 // decryptWith is the corresponding decrypt-path helper. Same pass-through
 // semantics on nil codec.
-func decryptWith(c Codec, dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error) {
+func decryptWith(c Codec, dst, src []byte, pgno uint32, s *aeadScratch, onError integrityHook) ([]byte, error) {
 	if c == nil {
 		return src, nil
 	}
-	return c.Decrypt(dst, src, pgno, s)
+	return c.Decrypt(dst, src, pgno, s, onError)
 }
 
 // encryptPageWithCodec is a package-level variant of pager.encryptPage that
@@ -211,8 +200,9 @@ func encryptPageWithCodec(c Codec, dst, src []byte, pgno uint32, s *aeadScratch)
 	return dst[:len(src)], nil
 }
 
-// decryptPageWithCodec is the decrypt-path counterpart.
-func decryptPageWithCodec(c Codec, dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error) {
+// decryptPageWithCodec is the decrypt-path counterpart. onError is the
+// calling database's integrity hook (see Codec.Decrypt).
+func decryptPageWithCodec(c Codec, dst, src []byte, pgno uint32, s *aeadScratch, onError integrityHook) ([]byte, error) {
 	if c == nil {
 		return src, nil
 	}
@@ -221,7 +211,7 @@ func decryptPageWithCodec(c Codec, dst, src []byte, pgno uint32, s *aeadScratch)
 		plainPrefix = dbHeaderSize
 	}
 	copy(dst[:plainPrefix], src[:plainPrefix])
-	if _, err := c.Decrypt(dst[plainPrefix:], src[plainPrefix:], pgno, s); err != nil {
+	if _, err := c.Decrypt(dst[plainPrefix:], src[plainPrefix:], pgno, s, onError); err != nil {
 		return nil, err
 	}
 	return dst[:len(src)], nil

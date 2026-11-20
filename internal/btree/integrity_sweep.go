@@ -107,11 +107,11 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 		switch mode {
 		case IntegrityChecksum:
 			if e := verifyCksumPage(db.pager, pgno, maxFrame); e != nil {
-				// Fire the codec's OnError hook so subscribers see sweep
-				// mismatches the same way they see read-path mismatches.
-				if c := db.CksumCodec(); c != nil {
-					c.fire(pgno, errCksumMismatch)
-				}
+				// Fire the database's integrity hook (the pager's, which its
+				// reads pass to the codec; the codec keeps none) so
+				// subscribers see sweep mismatches the same way they see
+				// read-path mismatches.
+				db.pager.onIntegrityError.fire(pgno, errCksumMismatch)
 				res.Errors = append(res.Errors, *e)
 			}
 		case IntegrityAEAD:
@@ -161,7 +161,7 @@ func verifyAEADPage(p *pager, pgno, walMaxFrame uint32) *SweepError {
 	}
 	var s aeadScratch
 	dst := make([]byte, len(raw))
-	if _, derr := decryptPageWithCodec(p.codec, dst, raw, pgno, &s); derr != nil {
+	if _, derr := decryptPageWithCodec(p.codec, dst, raw, pgno, &s, p.onIntegrityError); derr != nil {
 		return &SweepError{PageNo: pgno, Kind: IntegrityAEADAuthFail, Inner: derr}
 	}
 	return nil
