@@ -284,6 +284,10 @@
     "sqlite": [],
     "note": "any-store: counts the call enterGate counted in out again (drift-2026-11-19-1)"
   },
+  "btree.go:*Cursor.readsPinnedLeaf": {
+    "sqlite": [],
+    "note": "any-store: whether Key or Value of a write transaction's cursor reads only the leaf the cursor pins and so runs outside the writer gate (drift-2026-11-19-1)"
+  },
   "btree.go:*Cursor.releasePages": {
     "sqlite": [
       "btree.c:btreeReleaseAllCursorPages"

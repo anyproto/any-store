@@ -34,7 +34,9 @@ import "sync/atomic"
 //
 // Only the write transaction pays: two atomic adds per call, on a word no
 // other goroutine writes until Close. A read transaction never comes here;
-// Close waits for readers on db.mu.
+// Close waits for readers on db.mu. One kind of call of the write
+// transaction stays outside: a cursor's Key or Value that reads nothing but
+// the leaf the cursor pins (Cursor.readsPinnedLeaf).
 type writerGate struct {
 	// n is the number of calls in flight, with writerGateClosed set once
 	// Close has closed the gate.
