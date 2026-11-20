@@ -308,15 +308,6 @@ func TestBackupRoundTrip_WhileWriting(t *testing.T) {
 	ctx := context.Background()
 	for _, kind := range roundTripKinds {
 		t.Run(kind.name, func(t *testing.T) {
-			if kind.name == "caller-codec" {
-				// Backup hands the caller's codec object to the destination,
-				// so the source's writer and the backup's commit encrypt with
-				// one object at once, and the built-in codecs' nonce pool is
-				// not safe for that (the race detector reports it). A defect
-				// of its own, not of the copy: this kind joins the test when
-				// it is fixed.
-				t.Skip("a caller's codec is shared by the source and the destination")
-			}
 			// given
 			dir := t.TempDir()
 			src, err := anystore.Open(ctx, filepath.Join(dir, "src.db"), kind.open(t))
