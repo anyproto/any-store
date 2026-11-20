@@ -2,6 +2,7 @@ package btree
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -557,4 +558,82 @@ func TestClose_CommitAfterFailedSpillAndClose(t *testing.T) {
 
 	require.NoError(t, db.Close())
 	require.ErrorIs(t, tx.Commit(), ErrClosed)
+}
+
+// A backup's destination holds a write transaction that the backup writes
+// through, in Step and in the updates the source's commits send it: both
+// are calls of that transaction, which a Close of the destination waits
+// for. The Close comes while the backup holds a destination page it has
+// fetched and not yet written.
+func TestClose_WaitsForBackupWritingDestination(t *testing.T) {
+	seed := func(t *testing.T, src *DB) *Namespace {
+		ns, err := src.GetNamespace("data")
+		require.NoError(t, err)
+		stx, err := src.BeginWrite()
+		require.NoError(t, err)
+		for i := 0; i < 200; i++ {
+			require.NoError(t, stx.Put(ns, closeRescueKey(i), make([]byte, 300)))
+		}
+		require.NoError(t, stx.Commit())
+		require.NoError(t, src.Checkpoint(CheckpointFull))
+		return ns
+	}
+	// closeAtFetch closes dst from inside the next onePage.
+	closeAtFetch := func(t *testing.T, dst *DB) (closed func() chan error) {
+		var ch chan error
+		testBackupPageFetchedHook = func() {
+			testBackupPageFetchedHook = nil
+			ch = closeFromCall(t, dst)
+		}
+		t.Cleanup(func() { testBackupPageFetchedHook = nil })
+		return func() chan error { return ch }
+	}
+
+	t.Run("Step", func(t *testing.T) {
+		src, dst := backupPair(t)
+		seed(t, src)
+		b, err := dst.BackupInit(src)
+		require.NoError(t, err)
+		closed := closeAtFetch(t, dst)
+		// The Step in flight runs to its end on the pages it holds.
+		require.ErrorIs(t, b.Step(context.Background(), -1), ErrBackupDone)
+		require.NotNil(t, closed(), "the hook did not fire")
+		require.NoError(t, <-closed())
+		// The copy is not committed: the destination was closed under it.
+		require.ErrorIs(t, b.Finish(), ErrClosed)
+	})
+
+	t.Run("update", func(t *testing.T) {
+		src, dst := backupPair(t)
+		ns := seed(t, src)
+		b, err := dst.BackupInit(src)
+		require.NoError(t, err)
+		require.NoError(t, b.Step(context.Background(), int(src.DatabaseSize()-1)))
+
+		closed := closeAtFetch(t, dst)
+		stx, err := src.BeginWrite()
+		require.NoError(t, err)
+		require.NoError(t, stx.Put(ns, closeRescueKey(0), []byte("updated")))
+		require.NoError(t, stx.Commit())
+		require.NotNil(t, closed(), "the commit sent the backup no page")
+		require.NoError(t, <-closed())
+
+		require.ErrorIs(t, b.Step(context.Background(), -1), ErrClosed)
+		require.ErrorIs(t, b.Finish(), ErrClosed)
+	})
+
+	t.Run("update after the destination closed", func(t *testing.T) {
+		src, dst := backupPair(t)
+		ns := seed(t, src)
+		b, err := dst.BackupInit(src)
+		require.NoError(t, err)
+		require.NoError(t, b.Step(context.Background(), int(src.DatabaseSize()-1)))
+		require.NoError(t, dst.Close())
+
+		stx, err := src.BeginWrite()
+		require.NoError(t, err)
+		require.NoError(t, stx.Put(ns, closeRescueKey(0), []byte("updated")))
+		require.NoError(t, stx.Commit())
+		require.ErrorIs(t, b.Finish(), ErrClosed)
+	})
 }
