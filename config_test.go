@@ -8,6 +8,7 @@ package anystore
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,7 +21,12 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 )
 
-const pageBufferChildEnv = "ANYSTORE_TEST_PAGE_BUFFER_CHILD"
+const (
+	// pageBufferChildEnv carries "pageSize,nPages,id" to the child.
+	pageBufferChildEnv = "ANYSTORE_TEST_PAGE_BUFFER_CHILD"
+	// pageBufferPathEnv carries the database path, which may hold a comma.
+	pageBufferPathEnv = "ANYSTORE_TEST_PAGE_BUFFER_PATH"
+)
 
 // A page buffer pool of the wrong page size, or with no pages, must never
 // hand a database a wrong-sized page: a healthy database opened with
@@ -30,11 +36,14 @@ const pageBufferChildEnv = "ANYSTORE_TEST_PAGE_BUFFER_CHILD"
 func TestInitPageBuffer_MisSizedPoolIsNotUsed(t *testing.T) {
 	ctx := context.Background()
 	if spec := os.Getenv(pageBufferChildEnv); spec != "" {
-		pageBufferChild(t, ctx, spec)
+		pageBufferChild(t, ctx, spec, os.Getenv(pageBufferPathEnv))
 		return
 	}
 
-	path := filepath.Join(t.TempDir(), "h.db")
+	// A comma in the path must reach the child intact.
+	dir := filepath.Join(t.TempDir(), "a,b")
+	require.NoError(t, os.Mkdir(dir, 0o755))
+	path := filepath.Join(dir, "h.db")
 	db, err := Open(ctx, path, nil)
 	require.NoError(t, err)
 	coll, err := db.CreateCollection(ctx, "c")
@@ -44,29 +53,33 @@ func TestInitPageBuffer_MisSizedPoolIsNotUsed(t *testing.T) {
 	}
 	require.NoError(t, db.Close())
 
-	for i, args := range [][2]int{
+	configs := [][2]int{
 		{4096, 64}, // the one configuration that uses the pool
 		{1024, 64},
 		{2048, 64},
 		{8192, 64},
 		{65536, 4},
 		{1000, 64}, // not a page size at all
+		{256, 64},  // below SQLite's 512
 		{0, 64},
 		{-4096, 64},
 		{4096, 0},
 		{4096, -5},
 		{0, 0},
-	} {
+		{math.MaxInt, 2}, // the pool's size overflows an int
+	}
+	for i, args := range configs {
 		t.Run(fmt.Sprintf("%d_%d", args[0], args[1]), func(t *testing.T) {
-			spec := fmt.Sprintf("%d,%d,%s,%d", args[0], args[1], path, 1000+i)
+			spec := fmt.Sprintf("%d,%d,%d", args[0], args[1], 1000+i)
 			cmd := exec.Command(os.Args[0], "-test.run=^TestInitPageBuffer_MisSizedPoolIsNotUsed$", "-test.timeout=60s")
-			cmd.Env = append(os.Environ(), pageBufferChildEnv+"="+spec)
+			cmd.Env = append(os.Environ(), pageBufferChildEnv+"="+spec, pageBufferPathEnv+"="+path)
 			out, err := cmd.CombinedOutput()
 			require.NoError(t, err, "child failed:\n%s", out)
 		})
 	}
 
-	// Every child added one document and left the file healthy.
+	// Every child added one document in each of its two passes and left the
+	// file healthy.
 	db, err = Open(ctx, path, nil)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, db.Close()) }()
@@ -75,24 +88,39 @@ func TestInitPageBuffer_MisSizedPoolIsNotUsed(t *testing.T) {
 	require.NoError(t, err)
 	n, err := coll.Count(ctx)
 	require.NoError(t, err)
-	require.Equal(t, 200+11, n)
+	require.Equal(t, 200+2*len(configs), n)
 }
 
-// pageBufferChild configures the pool as spec says ("pageSize,nPages,path,id")
-// and uses the database at path, and a new one, through it.
-func pageBufferChild(t *testing.T, ctx context.Context, spec string) {
-	parts := strings.SplitN(spec, ",", 4)
-	pageSize, _ := strconv.Atoi(parts[0])
-	nPages, _ := strconv.Atoi(parts[1])
-	path := parts[2]
-	id, _ := strconv.Atoi(parts[3])
+// pageBufferChild configures the pool as spec says ("pageSize,nPages,id")
+// and uses the database at path, and a new one, through it. The databases
+// are opened right after that first call, so a first call the wrapper
+// ignored fails the open (ErrPageSlabNotInitialized) instead of being made
+// good by a later call; the later calls, with other arguments, come after
+// and must change nothing.
+func pageBufferChild(t *testing.T, ctx context.Context, spec, path string) {
+	parts := strings.Split(spec, ",")
+	require.Len(t, parts, 3, spec)
+	pageSize, err := strconv.Atoi(parts[0])
+	require.NoError(t, err)
+	nPages, err := strconv.Atoi(parts[1])
+	require.NoError(t, err)
+	id, err := strconv.Atoi(parts[2])
+	require.NoError(t, err)
+	require.NotEmpty(t, path)
 
 	InitPageBuffer(pageSize, nPages)
+	pageBufferChildUse(t, ctx, path, id, 0)
+
 	// The first call wins: a second one with other arguments changes nothing
 	// and does not fail.
 	InitPageBuffer(8192, 3)
 	InitPageBuffer(4096, 128)
+	pageBufferChildUse(t, ctx, path, id, 1)
+}
 
+// pageBufferChildUse adds one document to the database at path and fills a
+// new one, both with UseGlobalPageBuffer; round tells the two passes apart.
+func pageBufferChildUse(t *testing.T, ctx context.Context, path string, id, round int) {
 	conf := &Config{UseGlobalPageBuffer: true}
 	db, err := Open(ctx, path, conf)
 	require.NoError(t, err)
@@ -101,12 +129,12 @@ func pageBufferChild(t *testing.T, ctx context.Context, spec string) {
 	n, err := coll.Find(`{"id":{"$lt":200}}`).Count(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 200, n)
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, id))))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, id*10+round))))
 	require.NoError(t, db.QuickCheck(ctx))
 	require.NoError(t, db.Close())
 
 	// A database created under the same configuration.
-	fresh, err := Open(ctx, filepath.Join(filepath.Dir(path), fmt.Sprintf("fresh-%d.db", id)), conf)
+	fresh, err := Open(ctx, filepath.Join(filepath.Dir(path), fmt.Sprintf("fresh-%d-%d.db", id, round)), conf)
 	require.NoError(t, err)
 	fc, err := fresh.CreateCollection(ctx, "c")
 	require.NoError(t, err)
