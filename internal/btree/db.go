@@ -630,8 +630,14 @@ func Open(path string, opts Options) (*DB, error) {
 	}
 	p := newPager(path, opts.PageSize, opts.CacheSize, !opts.InMemory)
 	p.createFormat = opts.SchemaFormat
-	p.useSlab = opts.UsePageSlab
-	p.writerCache.useSlab = opts.UsePageSlab
+	// The slab is used only when it serves this database's page size: a
+	// mismatched or empty slab leaves the database as if it had not opted
+	// in, with its caches' bulk allocation and without the slab's lock on
+	// every buffer return. The page size cannot change after this point: the
+	// file's header page size must match the buffer pool's (pager open).
+	useSlab := opts.UsePageSlab && globalPageSlab.serves(int(opts.PageSize))
+	p.useSlab = useSlab
+	p.writerCache.useSlab = useSlab
 	p.inProcess = opts.InProcess
 	p.noCommitSync = opts.NoCommitSync
 	p.inMemory = opts.InMemory
