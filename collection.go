@@ -234,7 +234,9 @@ type collection struct {
 
 	// sketchSeen is the change epoch (btree.ReadTx.ChangeEpoch) the
 	// published sketches of this handle were last brought up to, by a reader
-	// or by a writer (refreshSketches).
+	// or by a writer (refreshSketches). It only moves forward: epochs are
+	// counted up, and a reader that sampled an older one loads nothing over
+	// what a newer one published.
 	sketchSeen atomic.Uint64
 	// sketchLive is the same for the live sketches, which only a write
 	// transaction loads: a reader that brought the published ones up to an
@@ -1745,6 +1747,13 @@ func (c *collection) readSketchRow(tx *btree.ReadTx, key, buf []byte) ([]byte, e
 // epoch equals it.
 const sketchEpochNone = ^uint64(0)
 
+// sketchBehind reports that sketches stamped seen have to be loaded for
+// epoch: they were loaded at no epoch, or at an earlier one. Epochs only
+// count up (btree walChange.epoch).
+func sketchBehind(seen, epoch uint64) bool {
+	return seen == sketchEpochNone || seen < epoch
+}
+
 // refreshSketches brings the sketches of the version s, resolved for tx, up
 // to what is stored. Called where sketches are used: a reader's plan, and
 // every operation of a writer on the collection, the first of which loads.
@@ -1755,9 +1764,12 @@ const sketchEpochNone = ^uint64(0)
 // (sketchSeen), so it has to hold every change the epoch counts: a reader
 // loads only if its snapshot is exact for the epoch. One at an older
 // snapshot would publish older sketches as current, over newer ones, and
-// nothing would reload them until the next commit of another process. A read
-// that fails stamps nothing, and the next reader loads again; the plan goes
-// on with what is published, which decides no result.
+// nothing would reload them until the next commit of another process. For
+// the same reason a reader loads nothing once the stamp is at or past the
+// epoch it sampled: a later reader, or a writer, published newer sketches
+// while this one waited. A read that fails stamps nothing, and the next
+// reader loads again; the plan goes on with what is published, which decides
+// no result.
 //
 // A writer has the live sketches to load (refreshLiveSketches), and may
 // return the error of a read that failed.
@@ -1766,12 +1778,12 @@ func (c *collection) refreshSketches(tx *btree.ReadTx, s *collSchema) error {
 		return c.refreshLiveSketches(tx, s)
 	}
 	epoch, exact := tx.ChangeEpoch()
-	if c.sketchSeen.Load() == epoch || !exact {
+	if !exact || !sketchBehind(c.sketchSeen.Load(), epoch) {
 		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.sketchSeen.Load() == epoch {
+	if !sketchBehind(c.sketchSeen.Load(), epoch) {
 		return nil
 	}
 	loaded := true
