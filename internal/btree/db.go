@@ -807,7 +807,9 @@ func Open(path string, opts Options) (*DB, error) {
 // touches nothing, its Commit returns ErrClosed and its Rollback nil. The
 // wait has no bound of its own: a call is as long as its work, a Count or
 // the drop of a namespace walks a whole tree, and a Step copies as many
-// pages as it was asked to.
+// pages as it was asked to. A cursor's Key or Value that only reads the
+// leaf the cursor pins is not waited for: it runs outside the gate, on a
+// page the teardown keeps back (Cursor.readsPinnedLeaf).
 //
 // Close must therefore not be called from inside a call of the write
 // transaction on that call's goroutine: it would wait for itself. That is
