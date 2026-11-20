@@ -1878,26 +1878,36 @@ func (c *collection) loadLiveSketches(tx *btree.ReadTx, s *collSchema, epoch uin
 // Such a row goes into a fresh object, which becomes the live one once it
 // decoded.
 //
-// No row, or bytes that do not decode, leave the live sketch as it is (a
-// sketch built in this transaction has no row yet). A read that failed is
-// returned: nothing was loaded.
+// No row, or bytes that do not decode, are no statistics: the live sketch is
+// emptied, as an open leaves it (loadSketchAtOpen). What it held is not the
+// stored state — counts no writer verified, or the deltas of a transaction
+// that did not commit — and the transaction's deltas would be stored on top
+// of it. This is sqlite3AnalysisLoad's order: the statistics in memory are
+// cleared first, then the stored ones are read (analyze.c). The row an index
+// built in this transaction has is read like any other: the build stored it.
+// A read that failed is returned: nothing was loaded.
 func (c *collection) reloadLiveSketch(tx *btree.ReadTx, collName string, idx *index) error {
 	key := sketchKey(collName, idx.info.Name)
 	data, err := c.readSketchRow(tx, key, c.sketchReadBuf[:0])
-	if err != nil {
-		if errors.Is(err, btree.ErrKeyNotFound) {
-			return nil
-		}
+	found := err == nil
+	if found {
+		c.sketchReadBuf = data
+	} else if !errors.Is(err, btree.ErrKeyNotFound) {
 		return err
 	}
-	c.sketchReadBuf = data
 	if idx.sketch == nil {
 		idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
 	}
-	if idx.sketch.SameShape(data) {
-		idx.sketch.UnmarshalBinary(data)
-	} else if fresh := qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths)); fresh.UnmarshalBinary(data) {
-		idx.sketch = fresh
+	decoded := false
+	if found {
+		if idx.sketch.SameShape(data) {
+			decoded = idx.sketch.UnmarshalBinary(data)
+		} else if fresh := qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths)); fresh.UnmarshalBinary(data) {
+			idx.sketch, decoded = fresh, true
+		}
+	}
+	if !decoded {
+		idx.sketch.Reset()
 	}
 	idx.storePubSketch(idx.sketch) // republish live for readers
 	// Live now equals the committed on-disk state, so any prior

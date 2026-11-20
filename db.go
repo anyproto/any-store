@@ -648,9 +648,9 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 // sketches it wrote itself (savepointTx.images).
 //
 // Only db.sketchDirty is visited, and this is where a collection leaves it:
-// once closed, or once none of its indexes is flagged. An index with no
-// committed bytes keeps its flag through the rebase and stays listed for the
-// next commit to persist.
+// once closed, or once none of its indexes is flagged. An index whose row
+// could not be read keeps its flag through the rebase, and the collection
+// stays listed.
 func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
 	kept := db.sketchDirty[:0]
 	gen := db.epoch.Load().gen
@@ -663,9 +663,9 @@ func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
 			c.mu.Lock()
 			for _, idx := range s.indexes {
 				if idx.sketchModified {
-					// reloadLiveSketch rebases live to the committed bytes and
-					// clears sketchModified; if there are no committed bytes yet
-					// (brand-new pre-commit index) it preserves the built sketch.
+					// reloadLiveSketch rebases live to the committed bytes, or
+					// to an empty sketch if there are none, and clears
+					// sketchModified.
 					// A read that fails leaves the index flagged: the first
 					// use of the collection loads it again, and may fail the
 					// operation for it (refreshLiveSketches).
