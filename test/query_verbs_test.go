@@ -930,25 +930,29 @@ func longSortKeyIds(t *testing.T, q anystore.Query) []string {
 }
 
 func TestSort_KeyLongerThan64KiB(t *testing.T) {
-	// 65530: key + id is exactly 64 KiB. 70000: past it. 200000: several times.
-	for _, n := range []int{65530, 65536, 70000, 200000} {
+	// The packed entry is the body plus 2 bytes of string encoding and the
+	// 6-byte encoded id: 65528 makes it exactly 64 KiB, 65529 one byte past.
+	// 70000 and 200000 are past it by more.
+	for _, n := range []int{65528, 65529, 70000, 200000} {
 		t.Run(fmt.Sprint(n), func(t *testing.T) {
 			fx := newFixture(t)
 			coll, err := fx.CreateCollection(ctx, "long_sort_key")
 			require.NoError(t, err)
+			// The long keys come first in primary-key order, so a TopK scan
+			// admits both before the short keys arrive.
 			insertJSON(t, coll,
 				fmt.Sprintf(`{"id":"doc1","body":"%s"}`, strings.Repeat("a", n)),
-				`{"id":"doc2","body":"b"}`,
-				`{"id":"doc3","body":"c"}`,
-				fmt.Sprintf(`{"id":"doc4","body":"%sz"}`, strings.Repeat("a", n)),
+				fmt.Sprintf(`{"id":"doc2","body":"%sz"}`, strings.Repeat("a", n)),
+				`{"id":"doc3","body":"b"}`,
+				`{"id":"doc4","body":"c"}`,
 			)
 
 			explain, err := coll.Find(nil).Sort("body").Explain(ctx)
 			require.NoError(t, err)
 			require.Contains(t, explain.Sql, "-> Sort")
-			assert.Equal(t, []string{"doc1", "doc4", "doc2", "doc3"},
+			assert.Equal(t, []string{"doc1", "doc2", "doc3", "doc4"},
 				longSortKeyIds(t, coll.Find(nil).Sort("body")), "full sort")
-			assert.Equal(t, []string{"doc3", "doc2", "doc4", "doc1"},
+			assert.Equal(t, []string{"doc4", "doc3", "doc2", "doc1"},
 				longSortKeyIds(t, coll.Find(nil).Sort("-body")), "full sort, descending")
 
 			explain, err = coll.Find(nil).Sort("body").Limit(1).Explain(ctx)
@@ -956,19 +960,48 @@ func TestSort_KeyLongerThan64KiB(t *testing.T) {
 			require.Contains(t, explain.Sql, "TopK(1)")
 			assert.Equal(t, []string{"doc1"},
 				longSortKeyIds(t, coll.Find(nil).Sort("body").Limit(1)), "TopK(1)")
-			assert.Equal(t, []string{"doc1", "doc4", "doc2"},
+			assert.Equal(t, []string{"doc1", "doc2", "doc3"},
 				longSortKeyIds(t, coll.Find(nil).Sort("body").Limit(3)), "TopK(3)")
-			// The two long keys enter the heap first and are evicted: the
-			// heap and its arena reuse handle long entries leaving, too.
-			assert.Equal(t, []string{"doc3", "doc2"},
+			// Both long keys enter the heap, doc3 evicts one and doc4 the
+			// other: the heap and its arena reuse handle long entries
+			// leaving, too.
+			assert.Equal(t, []string{"doc4", "doc3"},
 				longSortKeyIds(t, coll.Find(nil).Sort("-body").Limit(2)), "TopK(2), descending")
 
 			res, err := coll.Find(nil).Sort("body").Limit(2).Delete(ctx)
 			require.NoError(t, err)
 			assert.Equal(t, 2, res.Modified)
-			assert.Equal(t, []string{"doc2", "doc3"}, longSortKeyIds(t, coll.Find(nil).Sort("id")))
+			assert.Equal(t, []string{"doc3", "doc4"}, longSortKeyIds(t, coll.Find(nil).Sort("id")))
 		})
 	}
+}
+
+// A document id has no 64 KiB bound either: an in-memory sort, full or TopK,
+// carries an id past it to Doc() and to a sorted, limited Delete.
+func TestSort_IdLongerThan64KiB(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "long_sort_id")
+	require.NoError(t, err)
+	long := func(c string) string { return strings.Repeat(c, 70000) }
+	insertJSON(t, coll,
+		fmt.Sprintf(`{"id":"%s","v":3}`, long("a")),
+		fmt.Sprintf(`{"id":"%s","v":1}`, long("b")),
+		fmt.Sprintf(`{"id":"%s","v":2}`, long("c")),
+	)
+	assert.Equal(t, []string{long("b"), long("c"), long("a")},
+		longSortKeyIds(t, coll.Find(nil).Sort("v")), "full sort")
+	explain, err := coll.Find(nil).Sort("v").Limit(2).Explain(ctx)
+	require.NoError(t, err)
+	require.Contains(t, explain.Sql, "TopK(2)")
+	assert.Equal(t, []string{long("b"), long("c")},
+		longSortKeyIds(t, coll.Find(nil).Sort("v").Limit(2)), "TopK(2)")
+	assert.Equal(t, []string{long("a"), long("c")},
+		longSortKeyIds(t, coll.Find(nil).Sort("-v").Limit(2)), "TopK(2), descending")
+
+	res, err := coll.Find(nil).Sort("v").Limit(1).Delete(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.Modified)
+	assert.Equal(t, []string{long("a"), long("c")}, longSortKeyIds(t, coll.Find(nil).Sort("id")))
 }
 
 // The sorted, limited Delete removes the document its filter matched. The
