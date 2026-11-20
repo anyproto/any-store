@@ -2652,3 +2652,41 @@ func TestCollection_Update_ArrayPaddingIsBounded(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, `{"id":1,"arr":[1,2,null,null,5]}`, doc.Value().String())
 }
+
+// A bulk write that fails part way rolls back every document it changed and
+// reports no matched or modified document: the counts describe what the
+// call wrote, and it wrote nothing.
+func TestQuery_FailedBulkWriteReportsNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name, mod string
+	}{
+		// id 1: "arr" is an object, the numeric key is an ordinary field;
+		// id 2: "arr" is an array, and the index is past the padding limit.
+		{"padding refused on the second document", `{"$set":{"arr.1500001":1}}`},
+		// id 2: "n" is a string.
+		{"$inc on a string in the second document", `{"$inc":{"n":1}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			require.NoError(t, coll.Insert(ctx,
+				anyenc.MustParseJson(`{"id":1,"arr":{},"n":1}`),
+				anyenc.MustParseJson(`{"id":2,"arr":[],"n":"s"}`),
+			))
+
+			res, err := coll.Find(nil).Sort("id").Update(ctx, tc.mod)
+			require.Error(t, err)
+			assert.Equal(t, anystore.ModifyResult{}, res)
+
+			for id, want := range map[int]string{
+				1: `{"id":1,"arr":{},"n":1}`,
+				2: `{"id":2,"arr":[],"n":"s"}`,
+			} {
+				doc, err := coll.FindId(ctx, id)
+				require.NoError(t, err)
+				assert.Equal(t, want, doc.Value().String())
+			}
+		})
+	}
+}
