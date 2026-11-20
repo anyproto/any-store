@@ -19,10 +19,11 @@ import (
 // reducing sort from O(N log N) to O(N log K) and memory from O(N) to O(K) entries.
 //
 // Arena bounding: a row's packed sort-key + docId is built in the arena's spare
-// tail capacity and kept ONLY when the row enters/stays in the top-K heap
-// (matching SQLite's pushOntoSorter in select.c, which inserts a record into the
-// sorter AFTER the LIMIT eviction so "loser" rows are never materialized;
-// vdbesort.c notes the sorter holds <= LIMIT+OFFSET records). A losing row
+// tail capacity and kept ONLY when the row enters/stays in the top-K heap, as
+// SQLite's pushOntoSorter decides before it inserts a record: "inserted into
+// the sorter if either (a) there are currently less than LIMIT+OFFSET items or
+// (b) the new record is smaller than the largest record currently in the
+// sorter", and otherwise the row is skipped (select.c:833-846). A losing row
 // simply truncates the tail back — zero retained bytes, zero allocation. When a
 // smaller row evicts the heap root and the root's vacated slot is exactly the
 // new row's size, the row overwrites that slot in place (reuse, no growth);
@@ -30,7 +31,12 @@ import (
 // reclaimed by a compaction guard that rebuilds the arena from the live entries
 // when fragmentation grows large. This keeps the arena's high-water mark O(K)
 // without any per-eviction memmove. With TopK <= 0 (full sort) every row is
-// materialized, as before.
+// materialized.
+//
+// The entries address the arena with 32-bit offsets, so what the sort keeps
+// must fit sortArenaLimit bytes; the limit applies to a row when it is kept,
+// after slot reuse and compaction, never to a candidate that loses. A sort
+// whose kept rows pass it returns errSortTooLarge.
 type SortIter struct {
 	Source  Iterator
 	Data    *CursorSource
@@ -85,14 +91,25 @@ const sortEntryMultiKey = 1 << 31
 func (e sortEntry) docLen() uint32 { return e.docMK &^ sortEntryMultiKey }
 func (e sortEntry) multiKey() bool { return e.docMK&sortEntryMultiKey != 0 }
 
-// errSortTooLarge is returned when the packed sort keys of one sort do not
-// fit the 32-bit offsets of its entries.
+// errSortTooLarge is returned when the packed sort keys of the rows one sort
+// keeps do not fit the 32-bit offsets of its entries.
 var errSortTooLarge = errors.New("any-store: the sort keys of one in-memory sort exceed 4 GiB")
+
+// sortArenaLimit is the most arena bytes a sort keeps: the end of every kept
+// entry must be a uint32. A variable so tests can reach it without
+// allocating 4 GiB. On a 32-bit platform memory runs out before a slice
+// reaches it.
+var sortArenaLimit uint64 = math.MaxUint32
+
+// fitsSortArena reports whether an arena of n bytes can be addressed by the
+// entries.
+func fitsSortArena(n int) bool { return uint64(n) <= sortArenaLimit }
 
 func (it *SortIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	if !it.inited {
 		it.inited = true
 		if err := it.collectAndSort(); err != nil {
+			it.release()
 			return nil, nil, false, err
 		}
 	}
@@ -220,18 +237,18 @@ func (it *SortIter) collectAndSort() error {
 		}
 
 		if it.TopK <= 0 {
-			// Full sort: materialize every row (behavior unchanged).
+			// Full sort: materialize every row.
 			it.growArena(256)
-			off := uint32(len(it.arena))
+			off := len(it.arena)
 			if it.arena, err = it.appendSortKey(it.arena, doc, raw); err != nil {
 				return err
 			}
 			it.arena = append(it.arena, docId...)
-			if uint64(len(it.arena)) > math.MaxUint32 {
+			if !fitsSortArena(len(it.arena)) {
 				return errSortTooLarge
 			}
-			keyLen := uint32(len(it.arena) - int(off))
-			it.entries = append(it.entries, sortEntry{off: off, keyLen: keyLen, docMK: docMK})
+			keyLen := uint32(len(it.arena) - off)
+			it.entries = append(it.entries, sortEntry{off: uint32(off), keyLen: keyLen, docMK: docMK})
 			continue
 		}
 
@@ -239,26 +256,29 @@ func (it *SortIter) collectAndSort() error {
 		// candidate's packed key + docId at the arena TAIL (in spare capacity)
 		// WITHOUT committing it, so we can decide membership before deciding to
 		// keep the bytes. A "loser" row truncates the tail back and costs no
-		// retained memory and no allocation — mirroring SQLite's pushOntoSorter,
-		// which only inserts a record into the sorter AFTER it survives the LIMIT
-		// eviction (select.c), so the sorter holds <= LIMIT+OFFSET records.
-		base := uint32(len(it.arena))
+		// retained memory and no allocation, as SQLite's pushOntoSorter skips a
+		// row that would not stay among LIMIT+OFFSET records (select.c:833-846).
+		// The candidate's offset and length are native ints until it is kept:
+		// a loser past sortArenaLimit is no error.
+		base := len(it.arena)
 		it.growArena(256)
 		if it.arena, err = it.appendSortKey(it.arena, doc, raw); err != nil {
 			return err
 		}
 		it.arena = append(it.arena, docId...)
-		if uint64(len(it.arena)) > math.MaxUint32 {
-			return errSortTooLarge
-		}
-		candLen := uint32(len(it.arena) - int(base))
+		candLen := len(it.arena) - base
 		candKey := it.arena[base:] // view of the candidate at the tail
 
 		switch {
 		case len(it.entries) < it.TopK:
 			// Heap not yet full: admit unconditionally, keeping the tail bytes.
-			it.entries = append(it.entries, sortEntry{off: base, keyLen: candLen, docMK: docMK})
-			it.liveBytes += int(candLen)
+			// Nothing has been evicted yet, so the arena holds only live
+			// entries: past the limit, the kept rows do not fit.
+			if !fitsSortArena(len(it.arena)) {
+				return errSortTooLarge
+			}
+			it.entries = append(it.entries, sortEntry{off: uint32(base), keyLen: uint32(candLen), docMK: docMK})
+			it.liveBytes += candLen
 			it.heapUp(len(it.entries) - 1)
 		case bytes.Compare(candKey, it.arena[it.entries[0].off:it.entries[0].off+it.entries[0].keyLen]) < 0:
 			// Candidate is smaller than the current heap max (the root): the root
@@ -270,14 +290,23 @@ func (it *SortIter) collectAndSort() error {
 			// deliberately do NOT memmove-compact the arena on every eviction —
 			// that would be O(N*K) copy churn.
 			root := it.entries[0]
-			it.liveBytes += int(candLen) - int(root.keyLen)
-			off := base
-			if root.keyLen == candLen {
-				copy(it.arena[root.off:root.off+candLen], candKey)
+			it.liveBytes += candLen - int(root.keyLen)
+			var off int
+			switch {
+			case int(root.keyLen) == candLen:
+				copy(it.arena[root.off:int(root.off)+candLen], candKey)
 				it.arena = it.arena[:base] // uncommit tail; reuse root's slot
-				off = root.off
+				off = int(root.off)
+			case fitsSortArena(len(it.arena)):
+				off = base
+			default:
+				// The tail is past the limit: pack the live entries, the
+				// root's bytes now dead, and move the candidate after them.
+				if off, err = it.admitAfterCompact(base, candLen); err != nil {
+					return err
+				}
 			}
-			it.entries[0] = sortEntry{off: off, keyLen: candLen, docMK: docMK}
+			it.entries[0] = sortEntry{off: uint32(off), keyLen: uint32(candLen), docMK: docMK}
 			it.heapDown(0)
 			it.maybeCompact()
 		default:
@@ -307,10 +336,24 @@ func (it *SortIter) collectAndSort() error {
 // clobbered before it is copied. it.entries stays in heap order; only each
 // entry's .off field is rewritten, so the heap invariant is preserved.
 func (it *SortIter) maybeCompact() {
-	const minWaste = 64 << 10 // don't bother compacting tiny arenas
-	if len(it.arena) <= it.liveBytes*2 || len(it.arena)-it.liveBytes < minWaste {
-		return
+	if sortNeedsCompact(len(it.arena), it.liveBytes) {
+		it.compact()
 	}
+}
+
+// sortNeedsCompact reports whether an arena of arenaLen bytes holding
+// liveBytes of live entries has more dead bytes than live ones, and enough of
+// them to be worth a pass. Written without liveBytes*2, which overflows a
+// 32-bit int from 1 GiB of live keys on.
+func sortNeedsCompact(arenaLen, liveBytes int) bool {
+	const minWaste = 64 << 10 // don't bother compacting tiny arenas
+	waste := arenaLen - liveBytes
+	return waste > liveBytes && waste >= minWaste
+}
+
+// compact packs the live entries toward offset 0 (see maybeCompact) and
+// returns the packed length; the arena is cut to it.
+func (it *SortIter) compact() int {
 	it.order = it.order[:0]
 	for i := range it.entries {
 		it.order = append(it.order, i)
@@ -326,6 +369,24 @@ func (it *SortIter) maybeCompact() {
 		dst += e.keyLen
 	}
 	it.arena = it.arena[:dst]
+	return int(dst)
+}
+
+// admitAfterCompact keeps the candidate built at arena[base:base+candLen]
+// when the arena's tail is past sortArenaLimit: it packs the live entries,
+// with the evicted root (entries[0], about to be overwritten) counted as
+// dead, and moves the candidate after them. Every live entry lies below base,
+// so packing never reaches the candidate's bytes. Returns the candidate's
+// new offset, or errSortTooLarge when the kept rows do not fit even packed.
+func (it *SortIter) admitAfterCompact(base, candLen int) (int, error) {
+	cand := it.arena[base : base+candLen]
+	it.entries[0].keyLen = 0 // the evicted root's bytes are dead
+	dst := it.compact()
+	if !fitsSortArena(dst + candLen) {
+		return 0, errSortTooLarge
+	}
+	it.arena = append(it.arena, cand...) // within capacity; copy handles the overlap
+	return dst, nil
 }
 
 // heapUp restores the max-heap property by moving entries[i] up.
@@ -369,11 +430,20 @@ func (it *SortIter) heapLess(i, j int) bool {
 	return bytes.Compare(ak, bk) < 0
 }
 
-// Close releases resources by closing the source iterator.
+// release drops the arena and the entries: after an error, or once the
+// iterator is closed, nothing reads them, and a caller that keeps the closed
+// iterator must not keep a sort's memory alive with it.
+func (it *SortIter) release() {
+	it.arena, it.entries, it.order = nil, nil, nil
+	it.liveBytes, it.idx = 0, 0
+}
+
+// Close closes the source iterator and releases the sort's memory.
 func (it *SortIter) Close() {
 	if it.Source != nil {
 		it.Source.Close()
 	}
+	it.release()
 }
 
 func (it *SortIter) String() string {

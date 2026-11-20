@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"testing"
 	"unsafe"
@@ -505,4 +506,149 @@ func TestSortEntry_Is12Bytes(t *testing.T) {
 	e = sortEntry{docMK: 70000}
 	assert.Equal(t, uint32(70000), e.docLen())
 	assert.False(t, e.multiKey())
+}
+
+// setSortArenaLimit lowers the arena limit for one test, so its boundary is
+// reached with a few short keys.
+func setSortArenaLimit(t *testing.T, n int) {
+	old := sortArenaLimit
+	sortArenaLimit = uint64(n)
+	t.Cleanup(func() { sortArenaLimit = old })
+}
+
+// limitRow is one input row of the arena-limit tests: sort field "v" and an
+// encoded docId.
+type limitRow struct {
+	doc   *anyenc.Value
+	docId []byte
+}
+
+func mkLimitRow(a *anyenc.Arena, v, id string) limitRow {
+	o := a.NewObject()
+	o.Set("v", a.NewString(v))
+	return limitRow{doc: o, docId: anyenc.AppendAnyValue(nil, id)}
+}
+
+// packedLen is the arena bytes a row takes when kept.
+func packedLen(t *testing.T, srt query.Sort, r limitRow) int {
+	return len(sortKeyOf(t, srt, r.doc, r.docId))
+}
+
+// sortRows runs rows through a SortIter and returns the emitted ids, the
+// error of the first Next, and the iterator (closed).
+func sortRows(t *testing.T, srt query.Sort, topK int, rows []limitRow) ([]string, error, *SortIter) {
+	t.Helper()
+	plan := &Plan{}
+	hits := make([]fakeHit, len(rows))
+	for i, r := range rows {
+		hits[i] = fakeHit{key: r.docId, docId: r.docId, doc: r.doc}
+	}
+	it := &SortIter{Source: &fakeIter{plan: plan, hits: hits}, Sorter: srt, Plan: plan, TopK: topK}
+	defer it.Close()
+	var ids []string
+	for {
+		_, docId, _, err := it.Next()
+		if err != nil {
+			return ids, err, it
+		}
+		if docId == nil {
+			return ids, nil, it
+		}
+		ids = append(ids, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+}
+
+// The arena limit applies to the rows a sort keeps, when it keeps them: a
+// TopK candidate that loses is no error however far past the limit it was
+// built, a winner whose tail does not fit is kept after packing the live
+// entries, and only rows that do not fit even packed are an error
+// (pushOntoSorter decides before it inserts, select.c:833-846).
+func TestSortIter_ArenaLimitAppliesOnAdmission(t *testing.T) {
+	srt := query.MustParseSort("v")
+	a := &anyenc.Arena{}
+	// Four kept rows of one length, "b…".
+	kept := []limitRow{
+		mkLimitRow(a, "b1", "id-1"), mkLimitRow(a, "b2", "id-2"),
+		mkLimitRow(a, "b3", "id-3"), mkLimitRow(a, "b4", "id-4"),
+	}
+	e := packedLen(t, srt, kept[0])
+	for _, r := range kept {
+		require.Equal(t, e, packedLen(t, srt, r))
+	}
+	loser := mkLimitRow(a, "c-loses-to-every-kept-row", "id-9")
+	winner := mkLimitRow(a, "a0", "id-0x") // one byte longer than a kept row
+	require.Equal(t, e+1, packedLen(t, srt, winner))
+
+	t.Run("a loser past the limit", func(t *testing.T) {
+		setSortArenaLimit(t, 4*e)
+		ids, err, _ := sortRows(t, srt, 4, append(slices.Clone(kept), loser))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"id-1", "id-2", "id-3", "id-4"}, ids)
+	})
+	t.Run("a winner whose tail is past the limit", func(t *testing.T) {
+		// Live after the eviction: 3e + (e+1). The tail would end at 5e+1.
+		setSortArenaLimit(t, 4*e+1)
+		ids, err, _ := sortRows(t, srt, 4, append(slices.Clone(kept), winner, loser))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"id-0x", "id-1", "id-2", "id-3"}, ids)
+	})
+	t.Run("a winner that does not fit even packed", func(t *testing.T) {
+		setSortArenaLimit(t, 4*e)
+		_, err, it := sortRows(t, srt, 4, append(slices.Clone(kept), winner))
+		require.ErrorIs(t, err, errSortTooLarge)
+		assert.Nil(t, it.arena, "a failed sort releases its arena")
+	})
+	t.Run("kept rows past the limit", func(t *testing.T) {
+		setSortArenaLimit(t, 4*e-1)
+		_, err, _ := sortRows(t, srt, 4, kept)
+		require.ErrorIs(t, err, errSortTooLarge)
+	})
+	t.Run("full sort at and past the limit", func(t *testing.T) {
+		setSortArenaLimit(t, 4*e)
+		ids, err, _ := sortRows(t, srt, 0, kept)
+		require.NoError(t, err)
+		assert.Len(t, ids, 4)
+		setSortArenaLimit(t, 4*e-1)
+		_, err, it := sortRows(t, srt, 0, kept)
+		require.ErrorIs(t, err, errSortTooLarge)
+		assert.Nil(t, it.arena, "a failed sort releases its arena")
+		assert.Nil(t, it.entries)
+	})
+}
+
+// Close releases the sort's memory: a caller that keeps a closed iterator
+// does not keep its arena.
+func TestSortIter_CloseReleasesArena(t *testing.T) {
+	srt := query.MustParseSort("v")
+	a := &anyenc.Arena{}
+	for _, topK := range []int{0, 2} {
+		_, err, it := sortRows(t, srt, topK, []limitRow{
+			mkLimitRow(a, "x", "1"), mkLimitRow(a, "y", "2"), mkLimitRow(a, "z", "3"),
+		})
+		require.NoError(t, err)
+		assert.Nil(t, it.arena, "TopK %d", topK)
+		assert.Nil(t, it.entries, "TopK %d", topK)
+	}
+}
+
+// The compaction guard compares dead bytes with live ones without doubling
+// either: liveBytes*2 overflows an int from half its range on, which on a
+// 32-bit platform is 1 GiB of live keys, and the overflowed guard compacts on
+// every eviction.
+func TestSortNeedsCompact(t *testing.T) {
+	const minWaste = 64 << 10
+	for _, tc := range []struct {
+		arena, live int
+		want        bool
+	}{
+		{0, 0, false},
+		{3 * minWaste, minWaste, true},
+		{2 * minWaste, minWaste, false}, // waste == live
+		{minWaste + 10, 10, true},
+		{minWaste - 1 + 5, 5, false}, // waste below minWaste
+		{math.MaxInt/2 + 1 + 1<<20, math.MaxInt/2 + 1, false},
+		{math.MaxInt, math.MaxInt / 4, true},
+	} {
+		assert.Equal(t, tc.want, sortNeedsCompact(tc.arena, tc.live), "arena %d, live %d", tc.arena, tc.live)
+	}
 }
