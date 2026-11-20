@@ -2511,10 +2511,12 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	defer w.mu.Unlock()
 
 	// walFrames asserts that its caller holds the write lock (wal.c:4049).
-	// A spill's caller may have lost it since it checked: DB.Close's rescue
-	// (rollbackForClose) ends the transaction under a writer still inside an
-	// operation, and pagerStress's test of the writer state can come just
-	// before it. The rescue sets writeEndedByClose, rewinds the log and
+	// A spill's caller may have lost it since it checked: rollbackForClose
+	// ends the transaction, and when it runs under a writer still inside an
+	// operation (DB.Close runs it only once the writer gate is empty; the
+	// tests of this guard run it from inside a spill), pagerStress's test
+	// of the writer state can come just before it. The rescue sets
+	// writeEndedByClose, rewinds the log and
 	// releases the write lock under w.mu, so testing the flag here, before
 	// anything is written, leaves no frame of this call past the rewound
 	// base. A commit cannot get here so: it holds writerOpMu, which the

@@ -2677,12 +2677,15 @@ func (p *pager) pagerStress(pg *page) error {
 	// writer state, pager.c:6056-6059), walFrames asserts the write lock
 	// (wal.c:4049), and the connection mutex (sqlite3_step, vdbeapi.c:923;
 	// sqlite3Close, main.c:1263) keeps a close from ending the transaction
-	// while a statement still fetches pages. DB.Close does end it so:
-	// rollbackForClose rewinds the log to the transaction's base frame and
-	// releases the write lock, leaving the dirty cache to a writer that may
-	// still be inside an operation and meets writeStateErr only at the next
-	// boundary. A spill from that writer would land where the next writer,
-	// in this process or another, appends. The guard has two steps. This
+	// while a statement still fetches pages. rollbackForClose does end it
+	// so: it rewinds the log to the transaction's base frame and releases
+	// the write lock without touching the dirty cache. DB.Close runs it
+	// only once the writer gate is closed and empty (writerGate), and no
+	// call of the transaction, so no spill, follows it; the guard is the
+	// pager's own, for a rescue that runs under an operation, as the tests
+	// of the guard run it. A spill after such a rescue would land where
+	// the next writer, in this process or another, appends. The guard has
+	// two steps. This
 	// one refuses a spill that starts after the rescue: rollbackForClose
 	// leaves the state pagerOpen, and sets closeInvalidated, which is loaded
 	// after the state, before it demotes it. A spill that passed this test
@@ -3108,8 +3111,9 @@ func (p *pager) rollbackLocked() error {
 // untouched. DB.Close calls it with the writer gate closed and no call of
 // the transaction in flight (writerGate), so nothing reads that state
 // concurrently any more; it is left alone all the same, because the
-// database is closing and pager.close disposes of it, and because the tests
-// of the spill guard run this from inside an operation.
+// database is closing and pager.close disposes of it
+// (destroyEndedWriterCache), and because the tests of the spill guard run
+// this from inside an operation.
 // Caller must hold writerOpMu; it takes the WAL mutex inside it, the order
 // a commit's writeFrames takes them in.
 // DRIFT: ends the write transaction under the WAL mutex and marks the WAL (writeEndedByClose) for a writer still running; C cannot close under a statement See docs/btree/NOTES.md#drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer

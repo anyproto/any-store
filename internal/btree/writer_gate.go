@@ -14,15 +14,23 @@ import "sync/atomic"
 // gate and waits for the count to reach zero. From then on a call of that
 // transaction is refused at the door with ErrClosed and touches nothing.
 //
+// Commit and Rollback are such calls, and so are a backup's writes to its
+// destination (Backup.Step, Backup.update). Closing the gate is therefore
+// the one decision that ends the transaction: a call that Close refused is
+// never followed by a Commit that publishes what the calls before it wrote.
+// A Commit or a Rollback in flight is waited for to its end, the release of
+// the transaction's locks and the unwind of a panic included.
+//
 // SQLite needs none of this: sqlite3_step holds the connection mutex, which
 // sqlite3_close takes (vdbeapi.c sqlite3_step, main.c sqlite3Close), and
 // sqlite3Close then refuses with SQLITE_BUSY while a statement is active.
 // DRIFT: Close ends a write transaction under its goroutine, after waiting for the call in flight; C refuses the close See docs/btree/NOTES.md#drift-2026-11-19-1-close-waits-for-the-writers-call-in-flight
 //
 // The count is of calls, not of transactions, and nests: a gated call may
-// make another (a cursor that saves its position reads its key). Only the
-// outermost call is refused once the gate is closed; a call that was let in
-// before runs to its end, calls it makes included.
+// make another (a write saves the transaction's cursors, and each reads its
+// key). Only the outermost call is refused once the gate is closed; a call
+// that was let in before runs to its end, calls it makes included. A cursor
+// counts the calls it makes on itself as one (Cursor.enterGate).
 //
 // Only the write transaction pays: two atomic adds per call, on a word no
 // other goroutine writes until Close. A read transaction never comes here;

@@ -789,19 +789,32 @@ func Open(path string, opts Options) (*DB, error) {
 // (db.mu.Lock against the RLock each ReadTx holds), with no timeout and no
 // error: a ReadTx that is never rolled back blocks Close forever, and Close
 // called on the goroutine that holds one deadlocks. SQLite's sqlite3_close
-// refuses instead (SQLITE_BUSY, "unable to close due to unfinalized
-// statements", main.c sqlite3Close) and sqlite3_close_v2 defers the close;
-// neither blocks.
+// and sqlite3_close_v2 wait for the connection mutex, so for a step running
+// on another thread (main.c:1263, vdbeapi.c:923), and no longer: with a
+// statement unfinalized or a backup unfinished sqlite3_close then returns
+// SQLITE_BUSY (main.c:1283) and sqlite3_close_v2 leaves a zombie that is
+// closed with the last of them (main.c:1307, 1371). Neither waits for a
+// statement to be finalized.
 //
 // A registered write transaction is not waited for: Close rolls it back and
-// releases its locks. What Close does wait for is the one call of that
-// transaction that is in flight (writerGate): a Put, a cursor move. That
-// call completes; every later call of the transaction returns ErrClosed and
-// touches nothing, its Commit returns ErrClosed and its Rollback nil. Close
-// must therefore not be called from inside a call of the write transaction
-// on that call's goroutine, which only a hook the call runs can do
-// (Options.OnIntegrityError): it would wait for itself. Between two calls
-// of its transaction the writer's goroutine may call Close.
+// releases its locks, as sqlite3Close rolls back a transaction left open
+// with no statement running (sqlite3RollbackAll, main.c:1386). What Close
+// does wait for is the one call of that transaction that is in flight
+// (writerGate): a Put, a cursor move, a Commit, a Rollback, a Backup.Step
+// into this database. That call completes, a Commit included: a
+// transaction whose Commit was in flight when Close came is committed.
+// Every call of the transaction that comes later returns ErrClosed and
+// touches nothing, its Commit returns ErrClosed and its Rollback nil. The
+// wait has no bound of its own: a call is as long as its work, a Count or
+// the drop of a namespace walks a whole tree, and a Step copies as many
+// pages as it was asked to.
+//
+// Close must therefore not be called from inside a call of the write
+// transaction on that call's goroutine: it would wait for itself. That is
+// any code a call runs synchronously: Options.OnIntegrityError, a method of
+// the VFS a page read goes through, the Err of a caller's context, which a
+// count polls. Between two calls of its transaction the writer's goroutine
+// may call Close.
 // See docs/btree/NOTES.md#drift-2026-11-19-1-close-waits-for-the-writers-call-in-flight.
 //
 // A second Close returns ErrClosed.

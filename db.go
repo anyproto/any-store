@@ -108,24 +108,37 @@ type DB interface {
 	// Close closes the database connection.
 	// Returns an error if there is an issue closing the connection.
 	//
-	// Close waits, with no timeout, for every read transaction and every
-	// iterator of this DB to end: each ReadTx must be committed and each
-	// Iterator closed before Close can return. One that is never ended
+	// Close waits, with no timeout, for every read transaction of this DB
+	// to end. A ReadTx ends with its Commit. An Iterator opened with a
+	// context that carries no transaction holds a read transaction of its
+	// own until its Close; one opened inside a transaction holds none, and
+	// ends with that transaction. A read transaction that is never ended
 	// makes Close block forever, and Close called by the goroutine that
 	// still holds one deadlocks on itself (a `defer it.Close()` that runs
 	// after `db.Close()`, or a return out of an iteration loop into it).
-	// While Close waits the database is already closing: operations fail
-	// with ErrDBIsClosed, on an open transaction too, which is left only to
-	// be ended.
+	// While Close waits the database is already closing: an operation on a
+	// collection fails with ErrDBIsClosed, inside an open transaction too.
+	// What is already open goes on until it is ended: an iterator's Next
+	// and Doc, and the calls on the DB itself through an open read
+	// transaction.
 	//
-	// Close does not wait for a write transaction. One that is open, or in
-	// the middle of an operation on another goroutine, is rolled back: what
-	// it wrote is discarded, an operation that was running ends with
-	// ErrDBIsClosed unless it was already past its last step, every later
-	// one fails with ErrDBIsClosed, its Commit fails with ErrDBIsClosed and
-	// its Rollback returns nil. Close waits only for the step of storage
-	// work that operation is in, which is short; it must not be called from
-	// Config.OnIntegrityError, which runs inside such a step.
+	// Close does not wait for a write transaction to end. It waits for the
+	// one step of storage work the transaction is in, however long that
+	// step is (a count walks its whole tree), and then rolls the
+	// transaction back: what it wrote is discarded, an operation that was
+	// running ends with ErrDBIsClosed unless it was already past its last
+	// step, every later one fails with ErrDBIsClosed and so does an
+	// iterator opened in the transaction, its Commit fails with
+	// ErrDBIsClosed and its Rollback returns nil; the Rollback of a
+	// WriteTx opened inside it returns ErrDBIsClosed. A Commit that was
+	// already running when Close came is that step: it completes, and the
+	// transaction is committed. Only the Commit's own result says which.
+	//
+	// Close must not be called from code that runs inside a step of storage
+	// work, on the goroutine doing that step: it would wait for itself.
+	// That is Config.OnIntegrityError, the methods of a custom VFS, and the
+	// methods of a context passed to an operation. A query.Modifier runs
+	// between two steps and may call it.
 	//
 	// A second Close returns ErrDBIsClosed.
 	Close() error
