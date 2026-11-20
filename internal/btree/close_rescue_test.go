@@ -19,9 +19,7 @@ import (
 // the tests here pin the pager's own guard against a spill in that state.
 func rescueAsClose(db *DB) {
 	db.pager.writerOpMu.Lock()
-	if pagerState(db.pager.state.Load()) == pagerWriter {
-		db.pager.rollbackForClose()
-	}
+	db.pager.rollbackForClose()
 	db.pager.writerOpMu.Unlock()
 }
 

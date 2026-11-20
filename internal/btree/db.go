@@ -824,27 +824,30 @@ func (db *DB) Close() error {
 			testCloseWriterCheckedHook(registered)
 		}
 		if registered {
-			// The transaction's goroutine may be inside a b-tree operation,
-			// which holds no lock: wait for that one call to return, and
-			// refuse every later call of the transaction, before anything
-			// it uses is taken from under it (writerGate). A Commit or a
-			// Rollback is not such a call; writerOpMu below waits for it.
+			// The transaction's goroutine may be inside a call: a b-tree
+			// operation, which holds no lock, or its Commit or Rollback.
+			// Wait for that one call to return, and refuse every later call
+			// of the transaction, its Commit included, before anything it
+			// uses is taken from under it (writerGate). Closing the gate is
+			// the one decision: from here the transaction neither changes
+			// nor commits anything, so what it holds is rolled back.
 			db.pager.wgate.close()
-			// Force-rollback the abandoned tx.
-			// writerOpMu serializes with commit/rollback so we don't interleave
-			// with a concurrent Commit or Rollback call.
-			// rollbackForClose leaves the writer cache alone; pager.close
-			// frees it.
-			db.pager.writerOpMu.Lock()
-			if pagerState(db.pager.state.Load()) == pagerWriter {
-				db.pager.rollbackForClose()
+			if testWriterGateDrainedHook != nil {
+				testWriterGateDrainedHook()
 			}
+			// Force-rollback the abandoned tx. A Commit or a Rollback that
+			// was in flight has ended it already, and released its locks:
+			// rollbackForClose and releaseWriterLocks then find nothing to
+			// do. writerOpMu is rollbackForClose's contract; nothing
+			// contends for it once the gate is empty.
+			db.pager.writerOpMu.Lock()
+			db.pager.rollbackForClose()
 			db.pager.writerOpMu.Unlock()
 
 			// Exactly-once writer lock cleanup (endRead + RUnlock + Unlock) via
-			// the shared teardown: a writer goroutine completing concurrently
-			// could race with Close, and the writerLocksDone CAS inside
-			// releaseWriterLocks prevents the double-release.
+			// the shared teardown: the writerLocksDone CAS inside
+			// releaseWriterLocks makes it a no-op after a Commit or a
+			// Rollback that ended the transaction while Close waited.
 			db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil)
 		}
 		// A plain send, not lockWriter: closeCh is closed already, and this
@@ -2568,6 +2571,19 @@ func (tx *WriteTx) Commit() error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	// A Commit is a call of the transaction like any other (writerGate):
+	// DB.Close waits for one in flight, through the release of the locks
+	// and the unwind of a panic, and refuses one that comes after it closed
+	// the gate. The refused transaction is Close's to roll back and to
+	// release; this handle only ends.
+	gate := &tx.pager.wgate
+	if err := gate.enter(); err != nil {
+		tx.closed = true
+		tx.aux = nil
+		tx.onCommitted = nil
+		return err
+	}
+	defer gate.leave()
 	tx.closed = true
 	tx.aux = nil
 	// Captured for the defer: on the normal path tx is returned to the pool
@@ -2642,6 +2658,16 @@ func (tx *WriteTx) Rollback() error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	// As in Commit: a Rollback that DB.Close refused has nothing to do,
+	// Close rolls the transaction back and releases its locks.
+	gate := &tx.pager.wgate
+	if gate.enter() != nil {
+		tx.closed = true
+		tx.aux = nil
+		tx.onCommitted = nil
+		return nil
+	}
+	defer gate.leave()
 	tx.closed = true
 	tx.aux = nil
 	tx.onCommitted = nil

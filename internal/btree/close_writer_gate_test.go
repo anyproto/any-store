@@ -18,21 +18,44 @@ import (
 // of the transaction is refused with ErrClosed before it touches a page.
 
 // closeFromCall starts db.Close on its own goroutine from inside a call of
-// the write transaction and returns once Close stands at the gate. The
-// returned channel yields Close's result.
+// the write transaction and returns once Close has closed the gate, found
+// the call in flight and is about to wait for it. The returned channel
+// yields Close's result.
 func closeFromCall(t *testing.T, db *DB) chan error {
 	t.Helper()
-	atGate := make(chan struct{})
-	testWriterGateClosingHook = func() { close(atGate) }
+	waiting := make(chan struct{})
+	testWriterGateWaitingHook = func() { close(waiting) }
 	done := make(chan error, 1)
 	go func() { done <- db.Close() }()
 	select {
-	case <-atGate:
+	case <-waiting:
+	case err := <-done:
+		t.Fatalf("Close returned (%v) with a call of the write transaction in flight", err)
 	case <-time.After(10 * time.Second):
-		t.Fatal("Close did not reach the writer gate")
+		t.Fatal("Close did not reach the wait at the writer gate")
 	}
-	testWriterGateClosingHook = nil
+	testWriterGateWaitingHook = nil
 	return done
+}
+
+// holdCloseAtDrain makes db.Close stop once it has closed the writer gate
+// and found it empty, before the forced rollback. It returns a channel that
+// is closed when Close stands there, and the function that lets it go on.
+func holdCloseAtDrain(t *testing.T) (drained chan struct{}, release func()) {
+	t.Helper()
+	drained = make(chan struct{})
+	hold := make(chan struct{})
+	testWriterGateDrainedHook = func() {
+		close(drained)
+		<-hold
+	}
+	var once sync.Once
+	release = func() { once.Do(func() { close(hold) }) }
+	t.Cleanup(func() {
+		release()
+		testWriterGateDrainedHook = nil
+	})
+	return drained, release
 }
 
 func TestClose_WaitsForWriterCallInFlight(t *testing.T) {
@@ -97,11 +120,13 @@ func TestClose_WaitsForWriterCallInFlight(t *testing.T) {
 					return
 				}
 				fired = true
+				// closeFromCall returns with Close in the gate's wait, which
+				// only this call's return ends.
 				closed = closeFromCall(t, db)
 				select {
 				case <-closed:
 					returned = true
-				case <-time.After(200 * time.Millisecond):
+				default:
 				}
 			})
 
@@ -371,4 +396,165 @@ func TestClose_DuringRunningWriter(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Closing the gate is the one decision that ends the write transaction:
+// once a call of it has been refused, its Commit is refused too. Close is
+// held between the gate and the forced rollback, where the pager is still
+// in the writer state; a statement of the layer above that failed there has
+// its savepoint rollback refused, and a parent Commit that got through
+// would publish the half of the statement that was written.
+func TestClose_CommitRefusedOnceGateClosed(t *testing.T) {
+	for _, end := range []string{"Commit", "Rollback"} {
+		t.Run(end, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "a.db")
+			db, err := testOpen(t, path, Options{DisableAutoCheckpoint: true})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = db.Close() })
+			createNS(t, db, "t")
+			putN(t, db, "t", 10, 100)
+
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			ns, err := tx.GetNamespace("t")
+			require.NoError(t, err)
+			// The statement: a savepoint, and the first half of its writes.
+			sp, err := tx.Savepoint()
+			require.NoError(t, err)
+			require.NoError(t, tx.Delete(ns, closeRescueKey(1)))
+
+			drained, release := holdCloseAtDrain(t)
+			closed := make(chan error, 1)
+			go func() { closed <- db.Close() }()
+			select {
+			case <-drained:
+			case <-time.After(10 * time.Second):
+				t.Fatal("Close did not reach the forced rollback")
+			}
+			require.Equal(t, pagerWriter, pagerState(db.pager.state.Load()))
+
+			// The statement fails and cannot be undone...
+			require.ErrorIs(t, tx.Put(ns, closeRescueKey(1), []byte("x")), ErrClosed)
+			require.ErrorIs(t, tx.RollbackToSavepoint(sp), ErrClosed)
+			// ...so the transaction cannot be committed either.
+			if end == "Commit" {
+				require.ErrorIs(t, tx.Commit(), ErrClosed)
+			} else {
+				require.NoError(t, tx.Rollback())
+			}
+			require.ErrorIs(t, tx.Commit(), ErrTxClosed)
+
+			release()
+			require.NoError(t, <-closed)
+
+			db, err = testOpen(t, path, Options{})
+			require.NoError(t, err)
+			defer func() { require.NoError(t, db.Close()) }()
+			require.Equal(t, 10, countKeys(t, db, "t"), "the refused transaction's delete was committed")
+			require.NoError(t, db.IntegrityCheck())
+		})
+	}
+}
+
+// The call in flight leaves and its goroutine goes straight on to Commit:
+// the gate was closed while the call ran, so the Commit is refused, whoever
+// comes first to writerOpMu.
+func TestClose_CommitRightAfterCallInFlight(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.db")
+	db, err := testOpen(t, path, Options{DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	createNS(t, db, "t")
+	putN(t, db, "t", closeRescueRows, closeRescueValSize)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.GetNamespace("t")
+	require.NoError(t, err)
+
+	// Close is held after the gate so that the Commit below is the first
+	// to writerOpMu.
+	_, release := holdCloseAtDrain(t)
+	var (
+		fired  bool
+		closed chan error
+	)
+	setRebuildPageFaultHook(func(*page) error {
+		if !fired {
+			fired = true
+			closed = closeFromCall(t, db)
+		}
+		return nil
+	})
+	t.Cleanup(func() { setRebuildPageFaultHook(nil) })
+	for i := closeRescueRows + 1; i <= closeRescueRows+200 && !fired; i++ {
+		require.NoError(t, tx.Put(ns, closeRescueKey(i), bytes.Repeat([]byte{0xEE}, 1500)))
+	}
+	require.True(t, fired, "the hook did not fire")
+	require.ErrorIs(t, tx.Commit(), ErrClosed)
+	release()
+	require.NoError(t, <-closed)
+
+	db, err = testOpen(t, path, Options{})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	require.Equal(t, closeRescueRows, countKeys(t, db, "t"), "a Commit after the gate closed was published")
+	require.NoError(t, db.IntegrityCheck())
+}
+
+// Close waits for a Commit in flight to its end, the unwind of a panic
+// included. The panic strikes after the commit is published, with the pager
+// still in the writer state and writerOpMu released by the unwinding: a
+// forced rollback there would rewind a commit other connections have seen.
+func TestClose_WaitsForCommitThatPanicsAfterPublish(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.db")
+	db, err := testOpen(t, path, Options{DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	createNS(t, db, "t")
+	putN(t, db, "t", 10, 100)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.GetNamespace("t")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, closeRescueKey(100), []byte("committed")))
+
+	var closed chan error
+	testCommitPostPublishHook = func() {
+		testCommitPostPublishHook = nil
+		closed = closeFromCall(t, db)
+		panic("after publish")
+	}
+	t.Cleanup(func() { testCommitPostPublishHook = nil })
+	func() {
+		defer func() { require.Equal(t, "after publish", recover()) }()
+		_ = tx.Commit()
+	}()
+	require.NoError(t, <-closed)
+
+	db, err = testOpen(t, path, Options{})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	require.Equal(t, 11, countKeys(t, db, "t"), "the published commit was rewound")
+	require.NoError(t, db.IntegrityCheck())
+}
+
+// A failed spill ends the transaction's hold on the pager before Close
+// comes. The Commit after Close still reports the close: the gate refuses
+// it, whatever state the pager was left in.
+func TestClose_CommitAfterFailedSpillAndClose(t *testing.T) {
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "a.db"), Options{})
+	require.NoError(t, err)
+	createNS(t, db, "t")
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.GetNamespace("t")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, closeRescueKey(1), []byte("x")))
+	// What pagerStress does when its write to the log fails.
+	db.pager.pagerError()
+
+	require.NoError(t, db.Close())
+	require.ErrorIs(t, tx.Commit(), ErrClosed)
 }

@@ -80,6 +80,9 @@ func (g *writerGate) close() {
 			break
 		}
 	}
+	if testWriterGateWaitingHook != nil {
+		testWriterGateWaitingHook()
+	}
 	<-g.idle
 }
 
@@ -88,7 +91,16 @@ func (g *writerGate) closed() bool {
 	return g.n.Load()&writerGateClosed != 0
 }
 
-// testWriterGateClosingHook, when non-nil, runs in DB.Close as it is about
-// to close the gate: the last point at which a call of the write transaction
-// can still get in. Test-only.
-var testWriterGateClosingHook func()
+// Test hooks of the gate's close, test-only:
+//   - testWriterGateClosingHook runs in DB.Close as it is about to close the
+//     gate: the last point at which a call of the write transaction can
+//     still get in;
+//   - testWriterGateWaitingHook runs once the gate is closed with a call in
+//     flight, before the wait for it;
+//   - testWriterGateDrainedHook runs in DB.Close once the gate is closed and
+//     empty, before the forced rollback.
+var (
+	testWriterGateClosingHook func()
+	testWriterGateWaitingHook func()
+	testWriterGateDrainedHook func()
+)
