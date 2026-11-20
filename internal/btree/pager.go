@@ -2865,6 +2865,7 @@ var (
 	testCommitPostPublishHook func()
 )
 
+// DRIFT: the commit of a transaction in the error state returns the error and rolls the transaction back; C's sqlite3PagerCommitPhaseOne returns it and leaves the transaction to the VDBE's rollback See docs/btree/NOTES.md#drift-2026-11-19-1-the-error-state-of-a-failed-spill
 func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC uint32, err error) {
 	p.writerOpMu.Lock()
 	defer p.writerOpMu.Unlock()
@@ -3308,6 +3309,7 @@ func (p *pager) freeSavepointPageBuffers(from, to int) {
 
 // savepoint creates a new savepoint and returns its ID.
 // Page copies are saved lazily in getWritablePage when pages are actually modified.
+// DRIFT: opening a savepoint in the error state returns the error; C's sqlite3PagerOpenSavepoint does not test errCode See docs/btree/NOTES.md#drift-2026-11-19-1-the-error-state-of-a-failed-spill
 func (p *pager) savepoint() (int, error) {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return 0, p.writeStateErr()

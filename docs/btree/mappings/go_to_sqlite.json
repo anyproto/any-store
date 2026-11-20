@@ -784,7 +784,7 @@
       "btree.c:sqlite3BtreeClose",
       "pager.c:sqlite3PagerClose"
     ],
-    "note": ""
+    "note": "a write transaction still registered, in pagerWriter or pagerError, is ended first (rollbackForClose)"
   },
   "db.go:*DB.CreateNamespace": {
     "sqlite": [
@@ -1678,7 +1678,7 @@
       "pager.c:sqlite3PagerCommitPhaseTwo",
       "pager.c:pager_write_changecounter"
     ],
-    "note": "the schema-cookie bump before the page-1 decision is the sqlite3BtreeUpdateMeta equivalent; in schema format 6 the change counter is dbFileVers+1 once page 1 is fetched"
+    "note": "the schema-cookie bump before the page-1 decision is the sqlite3BtreeUpdateMeta equivalent; in schema format 6 the change counter is dbFileVers+1 once page 1 is fetched. In pagerError it returns pager.errCode and rolls the transaction back"
   },
   "pager.go:*pager.commitNeedsPage1": {
     "sqlite": [
@@ -1803,7 +1803,7 @@
       "pager.c:getPageNormal",
       "pager.c:sqlite3PagerGetData"
     ],
-    "note": "a cache miss in pagerError returns pager.errCode (getPageError's rule, for misses only)"
+    "note": "every fetch in pagerError returns pager.errCode, a cached page's too (getPageError's rule, tested inline)"
   },
   "pager.go:*pager.getWritablePage": {
     "sqlite": [
@@ -1975,7 +1975,7 @@
       "pager.c:pager_end_transaction",
       "pager.c:sqlite3PagerRollback"
     ],
-    "note": ""
+    "note": "in pagerError it first trips the cursors with pager.errCode (sqlite3BtreeRollback's tripCode), then cleans up and clears the error (pager_unlock's part)"
   },
   "pager.go:*pager.rollbackToSavepoint": {
     "sqlite": [

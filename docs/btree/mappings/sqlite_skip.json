@@ -635,7 +635,7 @@
       {
         "file": "pager.c",
         "func": "getPageError",
-        "reason": "stub getter installed after a fatal pager error; any-store has no getter switch: getPageWriter returns pager.errCode on a cache miss in pagerError, and the write operations test the state."
+        "reason": "stub getter installed after a fatal pager error; any-store has no getter switch: getPageWriter tests pager.errCode before every fetch and returns it, and the write operations test the state."
       },
       {
         "file": "pager.c",
