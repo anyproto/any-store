@@ -39,6 +39,96 @@ func (mRoot ModifierChain) Modify(a *anyenc.Arena, v *anyenc.Value) (result *any
 	return
 }
 
+// paddingStaged is a parsed modifier with a path segment that names an array
+// index past anyencutil.MaxArrayPadding. On an array that segment is refused,
+// and the operations run in order on the caller's document: a refusal in the
+// middle would leave the operations before it applied, and a $rename whose
+// destination is refused has already removed its source. Modify therefore
+// runs the modifier on a copy of the document first, with its operands parsed
+// afresh from src (an operation can change a value an earlier one stored, and
+// the copy must not reach the operands the real run stores), and changes the
+// caller's document only after that trial succeeds. A modifier without such a
+// segment is never refused by the padding limit and runs directly.
+type paddingStaged struct {
+	ModifierChain
+	src []byte // the modifier document, encoded
+}
+
+func (m paddingStaged) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	if v != nil {
+		if err = m.trial(v); err != nil {
+			return nil, false, err
+		}
+	}
+	return m.ModifierChain.Modify(a, v)
+}
+
+// trial runs a fresh parse of the modifier on a copy of v and returns its
+// error. The real run applies the same operations to the same content, so it
+// fails exactly when the trial does.
+func (m paddingStaged) trial(v *anyenc.Value) error {
+	var mp, dp anyenc.Parser
+	mv, err := mp.Parse(m.src)
+	if err != nil {
+		return err
+	}
+	fresh, err := parseModRoot(mv)
+	if err != nil {
+		return err
+	}
+	doc, err := dp.Parse(v.MarshalTo(nil))
+	if err != nil {
+		return err
+	}
+	_, _, err = fresh.Modify(&anyenc.Arena{}, doc)
+	return err
+}
+
+// mayExceedPadding reports whether a path of the chain has a segment naming
+// an array index the padding limit can refuse: past
+// anyencutil.MaxArrayPadding, or too large for an int. A segment naming a
+// smaller index needs at most MaxArrayPadding nulls whatever the array.
+func mayExceedPadding(chain ModifierChain) bool {
+	for _, m := range chain {
+		var paths [][]string
+		switch mt := m.(type) {
+		case modifierSet:
+			paths = [][]string{mt.fieldPath}
+		case modifierUnset:
+			paths = [][]string{mt.fieldPath}
+		case modifierInc:
+			paths = [][]string{mt.fieldPath}
+		case modifierRename:
+			paths = [][]string{mt.fieldPath, mt.val}
+		case modifierPop:
+			paths = [][]string{mt.fieldPath}
+		case modifierPush:
+			paths = [][]string{mt.fieldPath}
+		case modifierPull:
+			paths = [][]string{mt.fieldPath}
+		case modifierPullAll:
+			paths = [][]string{mt.fieldPath}
+		case modifierAddToSet:
+			paths = [][]string{mt.fieldPath}
+		case ModifierChain:
+			if mayExceedPadding(mt) {
+				return true
+			}
+		}
+		for _, path := range paths {
+			for _, seg := range path {
+				// ParseIndexSegment reports an index too large for an int as
+				// n = -1, a negative one too; only the latter starts with '-'.
+				n, ok := anyenc.ParseIndexSegment(seg)
+				if ok && seg[0] != '-' && (n < 0 || n > anyencutil.MaxArrayPadding) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 type modifierSet struct {
 	fieldPath []string
 	val       *anyenc.Value
