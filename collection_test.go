@@ -1411,3 +1411,216 @@ func TestCollection_DropRefusedUnderIterator(t *testing.T) {
 		require.NoError(t, fx.IntegrityCheck(ctx))
 	})
 }
+
+// openSketchDB makes a database with an indexed collection of 50 documents
+// and returns it reopened, so that no collection handle is open.
+func openSketchDB(t *testing.T) (DB, string) {
+	t.Helper()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "p.db")
+	db, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	coll, err := db.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	for i := 0; i < 50; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%5))))
+	}
+	require.NoError(t, db.Close())
+	db, err = Open(ctx, path, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	return db, path
+}
+
+// storedSketch is the stored row of c's one index, decoded.
+func storedSketch(t *testing.T, d DB, coll Collection) IndexSketchInfo {
+	t.Helper()
+	info, err := d.(IndexSketchInspector).InspectIndexSketch(context.Background(), "c", coll.GetIndexes()[0].Info().Name)
+	require.NoError(t, err)
+	return info
+}
+
+// sketchDocCount is the document count of the published sketch of coll's
+// one index, the one plans are made with, after a reader planned with the
+// collection.
+func sketchDocCount(t *testing.T, coll Collection) uint64 {
+	t.Helper()
+	_, err := coll.Find(`{"a":1}`).Count(context.Background())
+	require.NoError(t, err)
+	idxs := coll.(*collection).loadIndexes()
+	require.Len(t, idxs, 1)
+	return idxs[0].loadPubSketch().GetDocCount()
+}
+
+// statsDocCounts is what Stats reports through ctx: the documents, and the
+// document count of the sketch of coll's one index.
+func statsDocCounts(t *testing.T, ctx context.Context, coll Collection) (docs int, sketch uint64) {
+	t.Helper()
+	st, err := coll.Stats(ctx)
+	require.NoError(t, err)
+	require.Len(t, st.Indexes, 1)
+	return st.DocCount, st.Indexes[0].SketchDocCount
+}
+
+// failSketchReadOnce makes the next read of a stored sketch row fail with
+// the error it returns, and counts the reads that failed.
+func failSketchReadOnce(t *testing.T) (failed *int, injected error) {
+	failed = new(int)
+	injected = errors.New("injected: sketch row read")
+	testHookSketchRead = func([]byte) error {
+		if *failed == 0 {
+			*failed++
+			return injected
+		}
+		return nil
+	}
+	t.Cleanup(func() { testHookSketchRead = nil })
+	return failed, injected
+}
+
+// A handle loaded through a read transaction has live sketches no writer
+// has verified: the snapshot they were read at may miss a commit of this
+// process, which moves no epoch. The first write through the handle loads
+// the stored row.
+func TestSketch_HandleOpenedThroughAReaderIsLoadedByItsFirstWriter(t *testing.T) {
+	ctx := context.Background()
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":3}`, id))
+	}
+
+	// A commit of this process between the load of the handle and its
+	// registration, through a handle that is closed again.
+	t.Run("commit between load and registration", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		hooked := false
+		testHookBeforeRegister = func(name string) {
+			if name != "c" || hooked {
+				return
+			}
+			hooked = true
+			h, err := d.OpenCollection(ctx, "c")
+			require.NoError(t, err)
+			require.NoError(t, h.Insert(ctx, doc(100)))
+			require.NoError(t, h.Close())
+		}
+		t.Cleanup(func() { testHookBeforeRegister = nil })
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		require.True(t, hooked)
+		testHookBeforeRegister = nil
+
+		require.NoError(t, coll.Insert(ctx, doc(101)))
+		n, err := coll.Count(ctx)
+		require.NoError(t, err)
+		require.Equal(t, 52, n, "setup: the documents")
+		require.Equal(t, uint64(52), storedSketch(t, d, coll).DocCount)
+		require.Equal(t, uint64(52), sketchDocCount(t, coll))
+	})
+
+	// In memory there is no other process and every snapshot passes for
+	// current: a handle opened through a read transaction older than a
+	// commit of this process.
+	t.Run("in memory, through an old read tx", func(t *testing.T) {
+		d, err := Open(ctx, ":memory:", &Config{InMemory: true})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = d.Close() })
+		coll, err := d.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		for i := 0; i < 50; i++ {
+			require.NoError(t, coll.Insert(ctx, doc(i)))
+		}
+		old, err := d.ReadTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = old.Commit() })
+		require.NoError(t, coll.Insert(ctx, doc(100)))
+		require.NoError(t, coll.Close())
+
+		coll, err = d.OpenCollection(old.Context(), "c") // loads at 50 documents
+		require.NoError(t, err)
+		require.NoError(t, old.Commit())
+		require.NoError(t, coll.Insert(ctx, doc(101)))
+		n, err := coll.Count(ctx)
+		require.NoError(t, err)
+		require.Equal(t, 52, n, "setup: the documents")
+		require.Equal(t, uint64(52), storedSketch(t, d, coll).DocCount)
+		require.Equal(t, uint64(52), sketchDocCount(t, coll))
+	})
+}
+
+// An open that cannot read a stored sketch row has not loaded it. Through a
+// reader the open goes on, with an empty sketch that nothing takes for the
+// stored one: the first write through the handle loads the row before its
+// own count goes on it, so the row it stores still counts every document,
+// and so does the one a later open of the file loads. Through a write
+// transaction the open fails.
+func TestSketch_RowReadFailsAtOpen(t *testing.T) {
+	ctx := context.Background()
+	verbs := []struct {
+		name  string
+		write func(coll Collection) error
+		want  uint64
+	}{
+		{"insert", func(coll Collection) error {
+			return coll.Insert(ctx, anyenc.MustParseJson(`{"id":100,"a":3}`))
+		}, 51},
+		{"update", func(coll Collection) error {
+			return coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":1,"a":9}`))
+		}, 50},
+		{"upsert", func(coll Collection) error {
+			return coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":100,"a":3}`))
+		}, 51},
+		{"delete", func(coll Collection) error {
+			return coll.DeleteId(ctx, 1)
+		}, 49},
+	}
+	for _, v := range verbs {
+		t.Run("through a reader, "+v.name, func(t *testing.T) {
+			d, path := openSketchDB(t)
+			failed, _ := failSketchReadOnce(t)
+			coll, err := d.OpenCollection(ctx, "c")
+			require.NoError(t, err)
+			require.Equal(t, 1, *failed, "setup: the open read the row")
+
+			require.NoError(t, v.write(coll))
+			require.Equal(t, v.want, storedSketch(t, d, coll).DocCount, "the stored row")
+			require.Equal(t, v.want, sketchDocCount(t, coll), "the published sketch")
+
+			require.NoError(t, d.Close())
+			d2, err := Open(ctx, path, nil)
+			require.NoError(t, err)
+			defer func() { _ = d2.Close() }()
+			coll2, err := d2.OpenCollection(ctx, "c")
+			require.NoError(t, err)
+			docs, sketch := statsDocCounts(t, ctx, coll2)
+			require.Equal(t, int(v.want), docs, "setup: the documents")
+			require.Equal(t, v.want, sketch, "the row a later open loads")
+		})
+	}
+
+	t.Run("through a reader, then a reader", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		failed, _ := failSketchReadOnce(t)
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		require.Equal(t, 1, *failed, "setup: the open read the row")
+		require.Equal(t, uint64(50), sketchDocCount(t, coll), "the first plan loads the row")
+	})
+
+	t.Run("through a writer", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		failed, injected := failSketchReadOnce(t)
+		_, err = d.OpenCollection(wtx.Context(), "c")
+		require.Equal(t, 1, *failed, "setup: the open read the row")
+		require.ErrorIs(t, err, injected)
+		coll, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":100,"a":3}`)))
+		require.NoError(t, wtx.Commit())
+		require.Equal(t, uint64(51), storedSketch(t, d, coll).DocCount)
+	})
+}
