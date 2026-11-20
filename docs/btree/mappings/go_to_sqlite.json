@@ -240,9 +240,45 @@
     "sqlite": [],
     "note": "any-store: counts a cursor call of the write transaction in at the writer gate, once for the calls it makes on itself; C holds the connection mutex for the step, vdbeapi.c sqlite3_step (drift-2026-11-19-1)"
   },
-  "btree.go:*Cursor.enterMove": {
+  "btree.go:*Cursor.gatedAppendValue": {
     "sqlite": [],
-    "note": "any-store: enterGate for a call that moves the cursor; a refused move ends the cursor's pin (drift-2026-11-19-1)"
+    "note": "any-store: AppendValue of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+  },
+  "btree.go:*Cursor.gatedAppendValueByKey": {
+    "sqlite": [],
+    "note": "any-store: AppendValueByKey of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+  },
+  "btree.go:*Cursor.gatedCountUntil": {
+    "sqlite": [],
+    "note": "any-store: CountUntil of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+  },
+  "btree.go:*Cursor.gatedKey": {
+    "sqlite": [],
+    "note": "any-store: Key of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+  },
+  "btree.go:*Cursor.gatedMove": {
+    "sqlite": [],
+    "note": "any-store: First, Last and Previous of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+  },
+  "btree.go:*Cursor.gatedNext": {
+    "sqlite": [],
+    "note": "any-store: Next of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+  },
+  "btree.go:*Cursor.gatedRangeFraction": {
+    "sqlite": [],
+    "note": "any-store: RangeFraction of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+  },
+  "btree.go:*Cursor.gatedSeek": {
+    "sqlite": [],
+    "note": "any-store: Seek, SeekNear and SeekExact of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+  },
+  "btree.go:*Cursor.gatedSkip": {
+    "sqlite": [],
+    "note": "any-store: Skip and SkipBackward of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+  },
+  "btree.go:*Cursor.gatedValue": {
+    "sqlite": [],
+    "note": "any-store: Value of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
   },
   "btree.go:*Cursor.leaveGate": {
     "sqlite": [],

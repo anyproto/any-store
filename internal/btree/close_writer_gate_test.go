@@ -548,9 +548,11 @@ func TestClose_WaitsForCommitThatPanicsAfterPublish(t *testing.T) {
 	require.NoError(t, db.IntegrityCheck())
 }
 
-// A failed spill ends the transaction's hold on the pager before Close
-// comes. The Commit after Close still reports the close: the gate refuses
-// it, whatever state the pager was left in.
+// A write error can end the transaction's hold on the pager before Close
+// comes: the pager's error cleanup leaves it open, with nothing for the
+// rescue to roll back and no closeInvalidated set. The Commit after Close
+// still reports the close: the gate refuses it, whatever state the pager
+// was left in.
 func TestClose_CommitAfterFailedSpillAndClose(t *testing.T) {
 	db, err := testOpen(t, filepath.Join(t.TempDir(), "a.db"), Options{})
 	require.NoError(t, err)
@@ -560,7 +562,6 @@ func TestClose_CommitAfterFailedSpillAndClose(t *testing.T) {
 	ns, err := tx.GetNamespace("t")
 	require.NoError(t, err)
 	require.NoError(t, tx.Put(ns, closeRescueKey(1), []byte("x")))
-	// What pagerStress does when its write to the log fails.
 	db.pager.pagerError()
 
 	require.NoError(t, db.Close())
