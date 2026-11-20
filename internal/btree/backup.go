@@ -28,6 +28,14 @@ var (
 	// destination with Options.SchemaFormat set to the source's SchemaFormat.
 	ErrBackupFormatMismatch = errors.New("btree: backup source and destination must have the same schema format")
 
+	// ErrBackupCodecMismatch — the destination's pages are not laid out like
+	// the source's: another reserved space at the end of each page, or
+	// another kind of page codec (none, checksum, encryption). A handle's
+	// codec and usable size are fixed when it is opened, so a destination
+	// that exists as such a file cannot receive the source's pages. Create
+	// the destination with the source's BackupDestinationOptions.
+	ErrBackupCodecMismatch = errors.New("btree: backup source and destination must have the same reserved space and kind of page codec (plain, checksum or encrypted)")
+
 	// ErrBackupDstBusy — ~ checkReadTransaction (backup.c:124–130)
 	// ("destination database is in use"). Raised when dst already has an
 	// open read/write transaction at BackupInit time.
@@ -43,6 +51,9 @@ var (
 	ErrBackupDone = errors.New("btree: backup done")
 )
 
+// dbHeaderSaltOff is the offset of dbHeader.Salt in page 1 (dbHeader.serialize).
+const dbHeaderSaltOff = 72
+
 // Backup tracks the state of an online-copy operation from src to dst.
 // ~ struct sqlite3_backup (backup.c:21–41). Fields renamed to Go idioms;
 // C names kept in comments.
@@ -56,6 +67,10 @@ type Backup struct {
 	dstWriteTx *WriteTx
 
 	src *DB // ~ pSrc (backup.c:29)
+
+	// dstSalt is the destination's KDF salt (header bytes 72-87), read once
+	// the destination is locked. Every copy of page 1 keeps it: see onePage.
+	dstSalt [SaltLen]byte
 
 	// rc is sticky: once a fatal error occurs, every subsequent call
 	// short-circuits with it. ~ backup.c:31 + isFatalError (backup.c:217–219).
@@ -130,11 +145,50 @@ func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 		return nil, ErrBackupFormatMismatch
 	}
 
+	// SQLite's destination takes the reserved space, like every other
+	// header field, from the copied page 1: the next lockBtree reads byte
+	// 20 (btree.c:3384, 3417) and nothing else in the handle depends on it.
+	// Here the usable size and the codec that owns the reserved bytes are
+	// fixed at Open. A destination with fewer reserved bytes than the
+	// source's pages have would let its codec write a trailer over cell
+	// content; one with more would be read by the wrong layout after the
+	// header is reloaded. Refused before a page is written.
+	// DRIFT: the destination must already have the source's reserved space and kind of codec; SQLite's adopts them with page 1. See docs/btree/NOTES.md#drift-2026-11-19-2-a-backup-destination-has-the-geometry-of-the-source-file
+	if dst.pager.usableSize() != src.pager.usableSize() || dst.IntegrityMode() != src.IntegrityMode() {
+		return nil, ErrBackupCodecMismatch
+	}
+
 	return &Backup{
 		dst:   dst,
 		src:   src,
 		iNext: 1, // ~ backup.c:188
 	}, nil
+}
+
+// BackupDestinationOptions returns the Options to open the destination of a
+// backup of db with: the handle's own (its key or codec among them), with the
+// page geometry taken from the open file and not from what the handle asked
+// for. A file keeps the page size, the checksum mode and the schema format it
+// was created with whatever Options say (Open), so Options().Checksum is true
+// on a plain file opened with defaults, and a destination created from it
+// would stamp a checksum trailer over the last bytes of pages that reserve no
+// room for one. The destination is always a file.
+//
+// ~ setDestPgsz (backup.c:112-116), which gives the destination the source's
+// page size before it is first locked; VACUUM INTO passes the reserved bytes
+// along with it (vacuum.c:233, 281, sqlite3BtreeGetRequestedReserve). An
+// existing destination keeps its own geometry and BackupInit refuses it if
+// that differs.
+func (db *DB) BackupDestinationOptions() Options {
+	opts := db.opts
+	opts.InMemory = false
+	opts.PageSize = db.pager.pageSize
+	opts.Checksum = db.IntegrityMode() == IntegrityChecksum
+	// A file whose header never recorded a format is read as format 5.
+	if opts.SchemaFormat = db.SchemaFormat(); opts.SchemaFormat == 0 {
+		opts.SchemaFormat = 5
+	}
+	return opts
 }
 
 // onePage copies page iSrcPg from the source into the destination.
@@ -172,6 +226,20 @@ func (b *Backup) onePage(iSrcPg uint32, srcData []byte, bUpdate bool, snapPageCo
 	// field so dst's header reflects the source's page count.
 	if iSrcPg == 1 && !bUpdate {
 		putUint32BE(dstPg.data[28:32], snapPageCount)
+	}
+
+	// The KDF salt is the one header field that is the destination's own, on
+	// the first copy of page 1 and on every later one (an update, a
+	// restart): the destination's codec was keyed with it when the
+	// destination was opened, and seals every page this backup writes. With
+	// the source's salt in the header the next open would derive another key
+	// than the one the pages are sealed with. finalize reloads the in-memory
+	// header from these bytes, so the commit writes the same salt back.
+	// SQLite has no such field. Two plain or checksummed files both have a
+	// zero salt here.
+	// DRIFT: page 1 is not copied whole: the destination keeps its KDF salt. See docs/btree/NOTES.md#drift-2026-11-19-1-a-backup-destination-keeps-its-own-kdf-salt
+	if iSrcPg == 1 {
+		copy(dstPg.data[dbHeaderSaltOff:dbHeaderSaltOff+SaltLen], b.dstSalt[:])
 	}
 
 	// ~ backup.c:270: invalidate the btree parse-cache on the dst page.
@@ -291,6 +359,9 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 		}
 		b.dstWriteTx = wtx
 		b.iDstSchema = b.dst.localSchemaCookie.Load() // ~ iDestSchema capture
+		// The write begin has just read the header from the destination's
+		// page 1 (refreshHeaderFromPage1).
+		b.dstSalt = b.dst.pager.header.Salt
 		b.dstLocked = true
 	}
 
@@ -462,8 +533,9 @@ func (b *Backup) finalize(nSrcPage uint32) error {
 	// unconditionally re-serializes p.header over page 1 at commit
 	// (pager.go:1946); without this reload that serialize would revert every
 	// page-1 header field (freelist trunk pointers, page size, text encoding,
-	// user/application metadata, salt, file-change/version counters, ...) to
-	// the destination's own stale values. SQLite has no such re-serialize, so
+	// user/application metadata, file-change/version counters, ...) to
+	// the destination's own stale values. The salt is the exception: it is
+	// the destination's own in the copied bytes already (onePage). SQLite has no such re-serialize, so
 	// the verbatim-copied source fields survive there (only offset 28/40 and
 	// the WAL version bytes are patched). This mirrors the established
 	// savepoint page-1 restore at pager.go:2274.
