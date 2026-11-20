@@ -30,11 +30,11 @@ func TestPcacheGhostPage_ReleaseAfterRemovalWhilePinned(t *testing.T) {
 		pc := newPcache(4096, 100, true)
 
 		// Pin two pages so we can verify accounting on the survivor too.
-		keep := pc.create(1, 2)
+		keep := testCreate(pc, 1, 2)
 		pc.release(keep) // page 1 is clean+unpinned → on LRU
 		require.Equal(t, 1, pc.nRecyclable)
 
-		pinned := pc.create(2, 2) // page 2 stays pinned
+		pinned := testCreate(pc, 2, 2) // page 2 stays pinned
 		require.Equal(t, 1, pinned.pinCount)
 		require.True(t, pinned.inCache)
 		require.Equal(t, 2, pc.nPage)
@@ -69,9 +69,9 @@ func TestPcacheGhostPage_ReleaseAfterRemovalWhilePinned(t *testing.T) {
 
 		// Pages 1..3 unpinned (on LRU), page 4 pinned.
 		for i := uint32(1); i <= 3; i++ {
-			pc.release(pc.create(i, 2))
+			pc.release(testCreate(pc, i, 2))
 		}
-		pinned := pc.create(4, 2)
+		pinned := testCreate(pc, 4, 2)
 		require.Equal(t, 4, pc.nPage)
 		require.Equal(t, 3, pc.nRecyclable)
 
@@ -113,7 +113,7 @@ func TestPcacheGhostPage_ReleaseAfterRemovalWhilePinned(t *testing.T) {
 
 		pc := newPcache(4096, 100, true) // non-slab → initBulk populates pFree with isBulkLocal pages
 
-		pinned := pc.create(1, 2)
+		pinned := testCreate(pc, 1, 2)
 		require.True(t, pinned.isBulkLocal, "non-slab create draws from the bulk-local pool")
 
 		pc.discard(1) // returns pinned to pFree (bulk-local)
@@ -152,14 +152,14 @@ func TestPcacheGhostPage_ReleaseAfterRemovalWhilePinned(t *testing.T) {
 
 		// Three dirty pages; release them so they sit unpinned-but-dirty, oldest
 		// at the dirty tail. Keep one (page 1) pinned and dirty.
-		p1 := pc.create(1, 2)
+		p1 := testCreate(pc, 1, 2)
 		pc.makeDirty(p1) // page 1 dirty, stays pinned
 
-		p2 := pc.create(2, 2)
+		p2 := testCreate(pc, 2, 2)
 		pc.makeDirty(p2)
 		pc.release(p2) // dirty, unpinned
 
-		p3 := pc.create(3, 2)
+		p3 := testCreate(pc, 3, 2)
 		pc.makeDirty(p3)
 		pc.release(p3) // dirty, unpinned
 		require.Equal(t, 3, pc.nPage)
@@ -168,7 +168,7 @@ func TestPcacheGhostPage_ReleaseAfterRemovalWhilePinned(t *testing.T) {
 		// Cache is at capacity with all-dirty pages and zero recyclable. Creating a
 		// 4th page must invoke xStress (spill the oldest unpinned dirty page) and
 		// then evict it. The pinned dirty page 1 must be left alone.
-		p4 := pc.create(4, 2)
+		p4 := testCreate(pc, 4, 2)
 		require.NotNil(t, p4)
 		require.NotNil(t, spilled, "stress callback should have fired")
 		assert.NotEqual(t, uint32(1), spilled.pgno, "the pinned page must not be chosen as spill victim")
