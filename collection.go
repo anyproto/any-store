@@ -1830,7 +1830,7 @@ func (c *collection) refreshLiveSketches(tx *btree.ReadTx, s *collSchema) error 
 	epoch, _ := tx.ChangeEpoch()
 	stale := c.sketchLive.Load() != epoch
 	load := stale
-	if !load && t != nil {
+	if !load && t != nil && c.sketchDirty {
 		for _, idx := range s.indexes {
 			load = load || idx.sketchModified
 		}
@@ -1924,12 +1924,14 @@ func (c *collection) reloadLiveSketch(tx *btree.ReadTx, collName string, idx *in
 // published. The caller holds c.mu.
 //
 // A concurrent in-process writer may be incrementing idx.sketch right now,
-// so it is NEVER touched. The disk bytes are decoded into the reader-owned
-// published sketch — in place: every field is read and written atomically
-// and a planner tolerates a mix of two reloads (plan-time only, see
-// IndexSketch) — and a fresh one is allocated only while the published
-// sketch IS the live object (initially, and again after each commit
-// republishes it). The writer's live object is untouched; its in-flight
+// so it is NEVER touched. The disk bytes are decoded into a reader-owned
+// sketch, in place: every field is read and written atomically and a planner
+// tolerates a mix of two reloads (plan-time only, see IndexSketch). That is
+// the published sketch, or, while the published sketch IS the live object
+// (initially, and again after each writer's load and each commit republish
+// it), the copy the readers decoded into last (index.sketchCopy). One is
+// allocated only for the first such load of the index, and for a row of
+// another shape. The writer's live object is untouched; its in-flight
 // increments can never be lost.
 func (c *collection) reloadPubSketch(tx *btree.ReadTx, collName string, idx *index) bool {
 	key := sketchKey(collName, idx.info.Name)
@@ -1943,17 +1945,20 @@ func (c *collection) reloadPubSketch(tx *btree.ReadTx, collName string, idx *ind
 	// republishes live concurrently (settleSketches takes no c.mu) is
 	// overtaken by this snapshot's bytes, as a fresh object would be. Bytes
 	// of another shape (a snapshot older than this handle's definition) go
-	// into a fresh object: a published one is never reshaped. Bytes that do
-	// not decode publish nothing: the fresh object would be an empty sketch
-	// in place of the counts readers have.
+	// into an object of their own: a published one is never reshaped. Bytes
+	// that do not decode publish nothing: the object would be an empty
+	// sketch, or an older load, in place of the counts readers have.
 	pub := idx.loadPubSketch()
 	into := pub
 	if pub == nil || pub == idx.sketch || !pub.SameShape(data) {
-		into = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
+		if into = idx.sketchCopy; into == nil || into == idx.sketch || !into.SameShape(data) {
+			into = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
+		}
 	}
 	if !into.UnmarshalBinary(data) && pub != nil {
 		return true
 	}
+	idx.sketchCopy = into
 	idx.storePubSketch(into)
 	return true
 }

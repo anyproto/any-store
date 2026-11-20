@@ -343,13 +343,20 @@ type index struct {
 	sketch *qplanner.IndexSketch
 
 	// sketchPub is the READER-VISIBLE published sketch — the per-index
-	// analog of the collection's index set. The query/Stats path reads it lock-free via
+	// analog of the collection's index set. The query path reads it lock-free via
 	// loadPubSketch(); the advisory staleness tier decodes the disk bytes into
-	// it on a stale READ (in place while it is a reader-owned object, a fresh
-	// one while it is the live sketch — never into live); the writer
+	// it on a stale READ (in place while it is a reader-owned object, into
+	// sketchCopy while it is the live sketch — never into live); the writer
 	// republishes its live object into it at commit (a pointer Store, no
 	// clone). Non-nil once the index is published to readers.
 	sketchPub atomic.Pointer[qplanner.IndexSketch]
+	// sketchCopy is the reader-owned sketch the readers last decoded a
+	// stored row into (collection.reloadPubSketch), kept while the live
+	// sketch is the published one so that the next reader's load decodes
+	// into it again instead of allocating. Nil until a reader loads after
+	// another process's commit: one more sketch per index, and only in a
+	// process that shares the file. Under c.mu.
+	sketchCopy *qplanner.IndexSketch
 
 	sketchBuf []byte
 	// sketchImaged is the version of the savepoint whose scope holds the
