@@ -3618,22 +3618,13 @@ func (c *Cursor) releasePages() {
 // itself while the call runs — SeekExact is a SeekNear, which is a Seek;
 // CountUntil reads a key and steps for every entry — are part of it and do
 // not come here again. Paired with leaveGate, deferred, in the gated
-// functions below.
+// functions below. A move that DB.Close refused there ends the cursor's pin
+// of its leaf (abandon): the key or value the cursor handed out is valid
+// until its next move, which this was.
 func (c *Cursor) enterGate() error {
 	err := c.bt.pager.wgate.enter()
 	if err == nil {
 		c.gated = true
-	}
-	return err
-}
-
-// enterMove is enterGate for a call that moves the cursor. A move that
-// DB.Close refused ends the cursor's pin of its leaf (abandon): the key or
-// value the cursor handed out is valid until its next move, which this was.
-func (c *Cursor) enterMove() error {
-	err := c.enterGate()
-	if err != nil {
-		c.abandon()
 	}
 	return err
 }
@@ -3654,7 +3645,8 @@ func (c *Cursor) leaveGate() {
 // calls of a scan, have their own; the others share one per signature.
 
 func (c *Cursor) gatedMove(move func(*Cursor) error) error {
-	if err := c.enterMove(); err != nil {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
 		return err
 	}
 	defer c.leaveGate()
@@ -3662,7 +3654,8 @@ func (c *Cursor) gatedMove(move func(*Cursor) error) error {
 }
 
 func (c *Cursor) gatedNext() error {
-	if err := c.enterMove(); err != nil {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
 		return err
 	}
 	defer c.leaveGate()
@@ -3670,7 +3663,8 @@ func (c *Cursor) gatedNext() error {
 }
 
 func (c *Cursor) gatedSeek(seek func(*Cursor, []byte) error, key []byte) error {
-	if err := c.enterMove(); err != nil {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
 		return err
 	}
 	defer c.leaveGate()
@@ -3678,7 +3672,8 @@ func (c *Cursor) gatedSeek(seek func(*Cursor, []byte) error, key []byte) error {
 }
 
 func (c *Cursor) gatedSkip(skip func(*Cursor, int) error, n int) error {
-	if err := c.enterMove(); err != nil {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
 		return err
 	}
 	defer c.leaveGate()
@@ -3710,7 +3705,8 @@ func (c *Cursor) gatedAppendValue(buf []byte) ([]byte, error) {
 }
 
 func (c *Cursor) gatedAppendValueByKey(key, buf []byte) ([]byte, error) {
-	if err := c.enterMove(); err != nil {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
 		return buf, err
 	}
 	defer c.leaveGate()
@@ -3718,7 +3714,8 @@ func (c *Cursor) gatedAppendValueByKey(key, buf []byte) ([]byte, error) {
 }
 
 func (c *Cursor) gatedCountUntil(endKey []byte, endInclusive bool) (int, error) {
-	if err := c.enterMove(); err != nil {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
 		return 0, err
 	}
 	defer c.leaveGate()
