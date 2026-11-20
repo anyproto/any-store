@@ -306,3 +306,41 @@ func TestParseCondition_AllWithEmptyArrayMatchesNothing(t *testing.T) {
 		})
 	}
 }
+
+// A filter that matches every document renders as {}: the parsed empty
+// object (All) and a Go-built And with no conditions, alone or nested. The
+// rendering is what Explain shows, and it parses back to a filter that
+// matches the same documents: the parser rejects null and {"$and":[]}.
+func TestFilterString_MatchAllRoundTrips(t *testing.T) {
+	docs := []string{`{"a":1,"b":[{"c":1}]}`, `{"a":2,"b":[]}`, `{}`}
+	for _, tc := range []struct {
+		name   string
+		filter Filter
+		want   string
+	}{
+		{"{}", MustParseCondition(`{}`), `{}`},
+		{"$and of {}", MustParseCondition(`{"$and":[{},{"a":1}]}`), ``},
+		{"$or of {}", MustParseCondition(`{"$or":[{},{"a":1}]}`), ``},
+		{"$nor of {}", MustParseCondition(`{"$nor":[{}]}`), `{"$nor":[{}]}`},
+		{"$elemMatch {}", MustParseCondition(`{"b":{"$elemMatch":{}}}`), `{"b": {"$elemMatch": {}}}`},
+		{"And{}", And{}, `{}`},
+		{"And{And{}}", And{And{}}, `{"$and":[{}]}`},
+		{"And{And{}, a=1}", And{And{}, MustParseCondition(`{"a":1}`)}, ``},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := tc.filter.String()
+			if tc.want != "" {
+				assert.Equal(t, tc.want, s)
+			}
+			back, err := ParseCondition(s)
+			require.NoError(t, err, s)
+			again, err := ParseCondition(back.String())
+			require.NoError(t, err, back.String())
+			assert.Equal(t, back.String(), again.String(), "the rendering of a parsed filter is a fixed point")
+			for _, d := range docs {
+				doc := anyenc.MustParseJson(d)
+				assert.Equal(t, tc.filter.Ok(doc, &syncpool.DocBuffer{}), back.Ok(doc, &syncpool.DocBuffer{}), "%s on %s", s, d)
+			}
+		})
+	}
+}

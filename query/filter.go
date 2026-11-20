@@ -593,12 +593,18 @@ func (e And) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
+// String renders the conjunction. An And with no conditions matches every
+// document and renders as {}, the filter that parses back to that: the parser
+// rejects {"$and":[]}.
 func (e And) String() string {
 	var subS []string
 	for _, f := range e {
 		if f != nil {
 			subS = append(subS, f.String())
 		}
+	}
+	if len(subS) == 0 {
+		return "{}"
 	}
 	return fmt.Sprintf(`{"$and":[%s]}`, strings.Join(subS, ", "))
 }
@@ -860,8 +866,10 @@ func (a All) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
+// String renders the match-all condition as the empty object, the filter that
+// parses back to it.
 func (a All) String() string {
-	return "null"
+	return "{}"
 }
 
 // Text is the {"$text":{"$search":"..."}} full-text predicate. Matching and
