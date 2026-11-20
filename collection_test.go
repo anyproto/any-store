@@ -1624,3 +1624,117 @@ func TestSketch_RowReadFailsAtOpen(t *testing.T) {
 		require.Equal(t, uint64(51), storedSketch(t, d, coll).DocCount)
 	})
 }
+
+// An index with no stored row, or with one that does not decode, has no
+// statistics: that is what an open loads, and what a write transaction
+// rebases a sketch to that a rolled-back transaction wrote to. The counts of
+// the transaction that rolled back are not stored by the next one.
+func TestSketch_RebaseWithoutAStoredRow(t *testing.T) {
+	ctx := context.Background()
+	for _, row := range []string{"no row", "a row that does not decode"} {
+		t.Run(row, func(t *testing.T) {
+			d, _ := openSketchDB(t)
+			dbi := d.(*db)
+			coll, err := d.OpenCollection(ctx, "c")
+			require.NoError(t, err)
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":90,"a":3}`))) // a writer's handle: live at 51
+			require.NoError(t, dbi.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+				if row == "no row" {
+					return tx.Delete(dbi.systemNS, sketchKey("c", "a"))
+				}
+				return tx.Put(dbi.systemNS, sketchKey("c", "a"), []byte("not a sketch"))
+			}))
+			idx := coll.(*collection).loadIndexes()[0]
+
+			wtx, err := d.WriteTx(ctx)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = wtx.Rollback() })
+			require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":100,"a":3}`)))
+			require.NoError(t, wtx.Rollback())
+			require.True(t, idx.sketchModified, "setup: the rolled-back count is on the live sketch")
+
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":100,"a":3}`)))
+			require.Equal(t, uint64(1), storedSketch(t, d, coll).DocCount,
+				"the one document counted since the index had no statistics, and nothing of the rolled-back transaction")
+			require.Equal(t, uint64(1), idx.sketch.GetDocCount())
+			require.Equal(t, uint64(1), sketchDocCount(t, coll))
+		})
+	}
+}
+
+// A reader that sampled the change epoch and then waited loads nothing once
+// a later reader, or a writer, has brought the published sketches up to a
+// newer epoch: its older rows would replace the newer ones, stamped with the
+// older epoch.
+func TestSketch_ReaderBehindThePublishedEpochLoadsNothing(t *testing.T) {
+	d, _ := openSketchDB(t)
+	coll, err := d.OpenCollection(ctx, "c")
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), sketchDocCount(t, coll))
+	c := coll.(*collection)
+
+	rtx, err := d.(*db).btreeDB.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	epoch, exact := rtx.ChangeEpoch()
+	require.True(t, exact, "setup: the reader may load")
+	c.sketchSeen.Store(epoch + 1) // published for a newer epoch while this reader waited
+
+	reads := 0
+	testHookSketchRead = func([]byte) error { reads++; return nil }
+	defer func() { testHookSketchRead = nil }()
+	require.NoError(t, c.refreshSketches(rtx, c.cur()))
+	require.Zero(t, reads, "the reader loaded a row")
+	require.Equal(t, epoch+1, c.sketchSeen.Load(), "the stamp went back")
+
+	// At no epoch, and at an older one, it loads.
+	for _, seen := range []uint64{sketchEpochNone, epoch - 1} {
+		if seen == epoch-1 && epoch == 0 {
+			continue
+		}
+		c.sketchSeen.Store(seen)
+		reads = 0
+		require.NoError(t, c.refreshSketches(rtx, c.cur()))
+		require.Equal(t, 1, reads)
+		require.Equal(t, epoch, c.sketchSeen.Load())
+	}
+}
+
+// While the live sketch is the published one, a reader's load decodes into
+// a sketch of the readers' own. There is one per index: a writer's load and
+// every commit publish the live sketch again, and the next reader's load
+// decodes into the copy the readers had, not into a new one.
+func TestSketch_ReadersLoadIntoOneCopy(t *testing.T) {
+	d, _ := openSketchDB(t)
+	coll, err := d.OpenCollection(ctx, "c")
+	require.NoError(t, err)
+	c := coll.(*collection)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":100,"a":3}`)))
+	idx := c.loadIndexes()[0]
+	live := idx.sketch
+	require.Same(t, live, idx.loadPubSketch(), "setup: the commit published the live sketch")
+
+	// A reader's load, as after another process's commit.
+	load := func() {
+		t.Helper()
+		rtx, err := d.(*db).btreeDB.BeginRead()
+		require.NoError(t, err)
+		c.sketchSeen.Store(sketchEpochNone)
+		require.NoError(t, c.refreshSketches(rtx, c.cur()))
+		require.NoError(t, rtx.Rollback())
+	}
+	load()
+	readers := idx.loadPubSketch()
+	require.True(t, readers != live, "a reader never decodes into the live sketch")
+	require.Equal(t, uint64(51), readers.GetDocCount())
+	load()
+	require.True(t, idx.loadPubSketch() == readers, "a reader-owned published sketch is decoded into in place")
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":101,"a":3}`)))
+	require.Same(t, live, idx.sketch)
+	require.True(t, idx.loadPubSketch() == live, "setup: the commit published the live sketch again")
+	load()
+	require.True(t, idx.loadPubSketch() == readers, "the next load decodes into the readers' copy")
+	require.Equal(t, uint64(52), readers.GetDocCount())
+	require.Equal(t, uint64(52), live.GetDocCount())
+}
