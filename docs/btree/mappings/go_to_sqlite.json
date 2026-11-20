@@ -1573,6 +1573,12 @@
     ],
     "note": ""
   },
+  "page_slab.go:*pageSlab.serves": {
+    "sqlite": [
+      "pcache1.c:pcache1Alloc"
+    ],
+    "note": "the nByte<=szSlot guard; Go requires equality (DRIFT)"
+  },
   "page_slab.go:ConfigPageCache": {
     "sqlite": [
       "pcache1.c:sqlite3PCacheBufferSetup"
@@ -1580,8 +1586,10 @@
     "note": ""
   },
   "page_slab.go:allocPageBuffer": {
-    "sqlite": [],
-    "note": "Go dispatcher between slab and sync.Pool allocators"
+    "sqlite": [
+      "pcache1.c:pcache1Alloc"
+    ],
+    "note": "Go dispatcher between slab and sync.Pool allocators; the slab only for its own slot size, as pcache1Alloc falls back to sqlite3Malloc"
   },
   "page_slab.go:freePageBuffer": {
     "sqlite": [],
@@ -1594,6 +1602,12 @@
   "page_slab.go:resetPageBufferPool": {
     "sqlite": [],
     "note": "test-only sync.Pool reset"
+  },
+  "page_slab.go:slabUsable": {
+    "sqlite": [
+      "malloc.c:sqlite3MallocInit"
+    ],
+    "note": "szPage<512 || nPage<=0 clears the configuration; Go adds the int overflow of the slab size"
   },
   "pager.go:*masterStore.readPageInto": {
     "sqlite": [],

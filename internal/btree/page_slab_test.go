@@ -1,6 +1,8 @@
 package btree
 
 import (
+	"math"
+	"path/filepath"
 	"sync"
 	"testing"
 )
@@ -410,5 +412,124 @@ func TestPageSlab_DoublePutAtFullListIsDropped(t *testing.T) {
 	}
 	if got, _ := pageBufferPool.Get().([]byte); got != nil && s.within(got) {
 		t.Fatal("double Put placed a slab buffer in the pool")
+	}
+}
+
+// The slab serves only requests for its own slot size (pcache1Alloc's
+// per-request guard): any other size comes from the default allocator at the
+// requested size and leaves the slab untouched, and freeing it does not put
+// it on the slab's free list.
+func TestAllocPageBuffer_SlabServesOnlyItsOwnPageSize(t *testing.T) {
+	globalPageSlab.Reset()
+	globalPageSlab.Init(8192, 4)
+	defer globalPageSlab.Reset()
+	resetPageBufferPool()
+	defer resetPageBufferPool()
+
+	buf := allocPageBuffer(4096, true)
+	if len(buf) != 4096 {
+		t.Fatalf("a 4096 request with an 8192 slab got %d bytes", len(buf))
+	}
+	if globalPageSlab.within(buf) {
+		t.Fatal("a request the slab does not serve got a slab slot")
+	}
+	globalPageSlab.mu.Lock()
+	free, overflow := len(globalPageSlab.freeList), globalPageSlab.nOverflow
+	globalPageSlab.mu.Unlock()
+	if free != 4 || overflow != 0 {
+		t.Fatalf("slab touched by a request it does not serve: free=%d overflow=%d", free, overflow)
+	}
+	freePageBuffer(buf, true)
+	globalPageSlab.mu.Lock()
+	free = len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+	if free != 4 {
+		t.Fatalf("a foreign buffer reached the free list: free=%d", free)
+	}
+	if globalPageSlab.UnderPressure() {
+		t.Fatal("an unused slab reports pressure")
+	}
+
+	// The slab's own size is served from it.
+	own := allocPageBuffer(8192, true)
+	if len(own) != 8192 || !globalPageSlab.within(own) {
+		t.Fatalf("an 8192 request did not get a slab slot (len %d)", len(own))
+	}
+	freePageBuffer(own, true)
+}
+
+// A slab with no pages, or with slots below MinPageSize, is initialized and
+// empty, as SQLite leaves a configuration sqlite3MallocInit cleared
+// (`szPage<512 || nPage<=0`, malloc.c:165-168): nothing is allocated for it,
+// no request is served from it, and it never reports pressure. So is one
+// whose byte size overflows an int, which make would refuse with a panic.
+func TestPageSlab_InitWithoutPagesIsEmpty(t *testing.T) {
+	for _, args := range [][2]int{
+		{4096, 0}, {4096, -1}, {0, 16}, {-4096, 16}, {0, 0},
+		{256, 16}, {MinPageSize - 1, 16},
+		{math.MaxInt, 2}, {4096, math.MaxInt/4096 + 1}, {MaxPageSize, math.MaxInt},
+	} {
+		var s pageSlab
+		s.Init(args[0], args[1]) // a negative or overflowing size must not panic in make
+		if !s.initialized.Load() {
+			t.Fatalf("Init(%d, %d): not initialized", args[0], args[1])
+		}
+		if len(s.slab) != 0 || len(s.freeList) != 0 || s.nSlab != 0 {
+			t.Fatalf("Init(%d, %d): slab=%d free=%d nSlab=%d, want an empty slab",
+				args[0], args[1], len(s.slab), len(s.freeList), s.nSlab)
+		}
+		for _, ps := range []int{512, 4096, 65536} {
+			if s.serves(ps) {
+				t.Fatalf("Init(%d, %d): serves page size %d", args[0], args[1], ps)
+			}
+		}
+		if s.UnderPressure() {
+			t.Fatalf("Init(%d, %d): an empty slab reports pressure", args[0], args[1])
+		}
+		s.Reset()
+	}
+}
+
+// The smallest slab SQLite accepts, MinPageSize slots, is allocated.
+func TestPageSlab_InitAtMinPageSize(t *testing.T) {
+	var s pageSlab
+	defer s.Reset()
+	s.Init(MinPageSize, 4)
+	if !s.serves(MinPageSize) || len(s.freeList) != 4 {
+		t.Fatalf("Init(%d, 4): serves=%v free=%d", MinPageSize, s.serves(MinPageSize), len(s.freeList))
+	}
+}
+
+// Open resolves whether a database uses the slab: only when it opted in and
+// the slab serves its page size. A database the slab does not serve runs as
+// if it had not opted in, its caches with their bulk allocation and none of
+// its buffer returns through the slab's lock.
+func TestOpen_UsesSlabOnlyWhenItServesThePageSize(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		pageSize, pages int
+		want            bool
+	}{
+		{"matching", int(DefaultPageSize), 64, true},
+		{"other page size", 2 * int(DefaultPageSize), 64, false},
+		{"no pages", int(DefaultPageSize), 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			globalPageSlab.Reset()
+			globalPageSlab.Init(tc.pageSize, tc.pages)
+			t.Cleanup(globalPageSlab.Reset)
+
+			opts := DefaultOptions()
+			opts.UsePageSlab = true
+			db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close() }()
+			if db.pager.useSlab != tc.want || db.pager.writerCache.useSlab != tc.want {
+				t.Fatalf("pager useSlab=%v, writer cache useSlab=%v, want %v",
+					db.pager.useSlab, db.pager.writerCache.useSlab, tc.want)
+			}
+		})
 	}
 }

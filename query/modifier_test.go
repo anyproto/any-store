@@ -1,6 +1,7 @@
 package query
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -619,4 +620,97 @@ func TestPullConditionIsTypeBracketed(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, modified)
 	assert.Equal(t, `{"tags":["a",3,true,null]}`, res.String())
+}
+
+// A modifier whose path indexes past the end of an array pads it with nulls,
+// up to MongoDB's limit of 1,500,000 padding elements; past it the modifier
+// returns an error and the document is not changed.
+func TestModifier_ArrayPaddingIsBounded(t *testing.T) {
+	const limit = 1_500_000
+	a := &anyenc.Arena{}
+	for _, tc := range []struct {
+		name, modFmt string
+	}{
+		{"$set", `{"$set":{"arr.%d":1}}`},
+		{"$inc", `{"$inc":{"arr.%d":1}}`},
+		{"$set through an intermediate segment", `{"$set":{"arr.%d.x":1}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// arr has two elements: index 2+limit needs exactly limit nulls.
+			doc := anyenc.MustParseJson(`{"arr":[1,2]}`)
+			res, modified, err := MustParseModifier(fmt.Sprintf(tc.modFmt, 2+limit)).Modify(a, doc)
+			require.NoError(t, err)
+			assert.True(t, modified)
+			assert.Len(t, res.GetArray("arr"), 2+limit+1)
+
+			doc = anyenc.MustParseJson(`{"arr":[1,2]}`)
+			_, modified, err = MustParseModifier(fmt.Sprintf(tc.modFmt, 2+limit+1)).Modify(a, doc)
+			require.ErrorContains(t, err, "can't backfill more than 1500000 elements")
+			assert.False(t, modified)
+			assert.Equal(t, `{"arr":[1,2]}`, doc.String())
+		})
+	}
+}
+
+// A modifier refused by the padding limit leaves the document it was given
+// as it was, whichever of its operations is refused: a $rename whose
+// destination is refused keeps its source, and the operations before the
+// refused one in a chain are not applied either.
+func TestModifier_PaddingRefusalLeavesDocumentUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name, doc, mod string
+	}{
+		{"$rename destination", `{"x":7,"arr":[]}`, `{"$rename":{"x":"arr.1500001"}}`},
+		{"$rename destination, nested", `{"x":7,"o":{"arr":[]}}`, `{"$rename":{"x":"o.arr.1500001.y"}}`},
+		{"$set fields after a change", `{"arr":[1,2]}`, `{"$set":{"a":1,"arr.1500003":1}}`},
+		{"operators after a change", `{"n":1,"arr":[1,2]}`, `{"$inc":{"n":1},"$unset":{"x":""},"$set":{"arr.1500003":1}}`},
+		{"$unset before a refusal", `{"x":1,"arr":[1,2]}`, `{"$unset":{"x":""},"$addToSet":{"arr.1500003":1}}`},
+		{"an index too large for an int", `{"a":0,"arr":[1,2]}`, `{"$set":{"a":1,"arr.99999999999999999999":1}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := anyenc.MustParseJson(tc.doc)
+			res, modified, err := MustParseModifier(tc.mod).Modify(&anyenc.Arena{}, doc)
+			require.Error(t, err)
+			assert.Nil(t, res)
+			assert.False(t, modified)
+			assert.Equal(t, anyenc.MustParseJson(tc.doc).String(), doc.String())
+		})
+	}
+}
+
+// A modifier that could be refused but is not runs once, on the document it
+// was given, as any other modifier does: the result is that document, and an
+// operation that changes a value an earlier one stored sees it once.
+func TestModifier_PaddingStagedAppliesOnce(t *testing.T) {
+	doc := anyenc.MustParseJson(`{"x":7,"arr":[1,2]}`)
+	mod := MustParseModifier(`{"$set":{"o":{"n":1},"arr.1500002":true},"$inc":{"o.n":1},"$rename":{"x":"y"}}`)
+	res, modified, err := mod.Modify(&anyenc.Arena{}, doc)
+	require.NoError(t, err)
+	assert.True(t, modified)
+	assert.Same(t, doc, res, "the modifier changes the document it is given")
+	assert.Equal(t, 2, doc.GetInt("o", "n"))
+	assert.Equal(t, 7, doc.GetInt("y"))
+	assert.Nil(t, doc.Get("x"))
+	arr := doc.GetArray("arr")
+	require.Len(t, arr, 1_500_003)
+	assert.Equal(t, anyenc.TypeTrue, arr[len(arr)-1].Type())
+}
+
+// Only a modifier with a segment past the padding limit, or too large for an
+// int, takes the staged path; every other modifier runs as the plain chain.
+func TestParseModifier_StagesOnlyPathsPastThePaddingLimit(t *testing.T) {
+	for mod, staged := range map[string]bool{
+		`{"$set":{"a":1,"b.c":2}}`:                                false,
+		`{"$set":{"arr.1500000":1}}`:                              false,
+		`{"$set":{"arr.+5":1,"arr.-1":1,"arr.x":1}}`:              false,
+		`{"$unset":{"arr.1500000.x":""}}`:                         false,
+		`{"$set":{"arr.1500001":1}}`:                              true,
+		`{"$inc":{"o.arr.2147483647.n":1}}`:                       true,
+		`{"$rename":{"x":"arr.1500001"}}`:                         true,
+		`{"$rename":{"arr.1500001":"x"}}`:                         true,
+		`{"$set":{"a":1},"$push":{"arr.99999999999999999999":1}}`: true,
+	} {
+		_, isStaged := MustParseModifier(mod).(paddingStaged)
+		assert.Equal(t, staged, isStaged, mod)
+	}
 }

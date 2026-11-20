@@ -1267,3 +1267,20 @@ func TestCutSink(t *testing.T) {
 		assert.Len(t, rest, 0)
 	})
 }
+
+// An empty $match object, or a filter part that is only {} next to $expr, is
+// "no filter": the spec carries a nil Filter, so the stage pushes no
+// predicate down and checks none per document.
+func TestParseMatch_EmptyObjectIsNoFilter(t *testing.T) {
+	for _, spec := range []string{
+		`{}`,
+		`{"$and":[{}]}`,
+		`{"$and":[{},{"$expr":{"$gt":["$a",1]}}]}`,
+	} {
+		t.Run(spec, func(t *testing.T) {
+			p := MustParsePipeline(`[{"$match":` + spec + `}]`)
+			require.Len(t, p, 1)
+			assert.Nil(t, p[0].(MatchSpec).Filter)
+		})
+	}
+}

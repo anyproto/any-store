@@ -49,6 +49,10 @@ func MustParseModifier(modifier any) Modifier {
 
 // ParseModifier parses an update modifier document. Rejections are reported
 // as *ParseError with Source "modifier"; see ParseError.
+//
+// A modifier refused by the array padding limit (anyencutil.MaxArrayPadding)
+// returns the error from Modify and leaves the document it was given as it
+// was, whichever of its operations is refused.
 func ParseModifier(modifier any) (Modifier, error) {
 	if m, ok := modifier.(Modifier); ok {
 		return m, nil
@@ -61,6 +65,9 @@ func ParseModifier(modifier any) (Modifier, error) {
 	m, err := parseModRoot(v)
 	if err != nil {
 		return nil, withSource(err, "modifier")
+	}
+	if chain, ok := m.(ModifierChain); ok && mayExceedPadding(chain) {
+		return paddingStaged{ModifierChain: chain, src: v.MarshalTo(nil)}, nil
 	}
 	return m, nil
 }

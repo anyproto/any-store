@@ -2775,25 +2775,32 @@ would never produce.
 <a id="drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl"></a>
 ### Drift: pageSlab And ConfigPageCache Idempotent Versus Reconfigurable Setup
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `page_slab.go:*pageSlab.Init` (`internal/btree/page_slab.go:115-146`),
-  `page_slab.go:ConfigPageCache`
-  (`internal/btree/page_slab.go:115-146 (guard at 116,121); wrapper page_slab.go:259-261`),
-  `page_slab.go:ConfigPageCache`
-  (`internal/btree/page_slab.go:124-143 (nReserve/slab/freeList for nPages==0); Put logic page_slab.go:192-202`).
+- **Affected functions:** `page_slab.go:*pageSlab.Init`, `page_slab.go:slabUsable`,
+  `page_slab.go:ConfigPageCache`.
 
-C's `sqlite3PCacheBufferSetup` (`pcache1.c:271-291`) is fully reconfigurable: on every call while
-initialized it unconditionally overwrites the entire global slab config (`szSlot`,
-`nSlot`/`nFreeSlot`, `nReserve`, `pStart`, `pFree`, `bUnderPressure`, `pEnd`) and rebuilds the free
-list, and it has two explicit disable branches up front -- `if(pBuf==0) sz=n=0;` and `if(n==0)
-sz=0;` (`pcache1.c:274-275`) -- so passing `n==0` drives `szSlot` to 0 and effectively turns the
-static page cache OFF, routing all allocations to `sqlite3Malloc`. Go's `pageSlab.Init` (the
-worker behind `ConfigPageCache`) is permanently first-call-wins idempotent: a double-checked
-`s.initialized.Load()` guard (`page_slab.go:116,121`) makes every subsequent `Init` a silent no-op
-("If already initialized, this is a no-op."), so re-configuration with different parameters is
-ignored, and there is no disable path -- `nPages==0` still sets `initialized=true` and is treated
-as an initialized but empty slab rather than a disabled cache. The consequences are that the page
-cache cannot be reconfigured after first setup and cannot be turned off via a zero-size config the
-way SQLite allows; both diverge from SQLite's reconfigurable, disable-capable setup semantics.
+SQLite configures its page-cache buffer in two steps. `sqlite3_config(SQLITE_CONFIG_PAGECACHE,
+pMem, sz, N)` records the three arguments (`main.c:524-532`); it is refused with
+`SQLITE_MISUSE` once the library is initialized (`main.c:434-440`), so a configuration changes
+only between `sqlite3_shutdown`, which clears the init flags (`main.c:380-395`), and the next
+`sqlite3_initialize`. Initialization then checks it: `sqlite3MallocInit` clears a configuration
+it cannot use, `if( sqlite3GlobalConfig.pPage==0 || sqlite3GlobalConfig.szPage<512 ||
+sqlite3GlobalConfig.nPage<=0 )` setting `pPage = 0; szPage = 0;` (`malloc.c:165-168`), and
+`sqlite3PCacheBufferSetup` (`pcache1.c:271-291`) builds the slot list, where `if( pBuf==0 ) sz =
+n = 0;` and `if( n==0 ) sz = 0;` (`pcache1.c:274-275`) leave a cleared one with no slots, so every
+allocation goes to `sqlite3Malloc`.
+
+Go's `pageSlab.Init` (behind `ConfigPageCache` and `anystore.InitPageBuffer`) keeps SQLite's rule
+for which arguments give slots: `slabUsable` requires `pageSize >= MinPageSize` (512) and
+`nPages > 0`, the `malloc.c:165-168` check. Go adds one condition of its own, because it allocates
+the slab where C is handed one: `nPages*pageSize` must fit an int. Any other arguments leave an
+initialized slab with no slots and slot size 0, which serves no request (`pageSlab.serves`), and
+`btree.Open` resolves `useSlab` to false for every database.
+
+What diverges is the lifecycle. Go has no shutdown, and `Init` is first-call-wins: a
+double-checked `s.initialized` guard makes every later call a no-op, so the slab is configured once
+for the life of the process and cannot be resized, turned off or turned on later, as a SQLite
+process can across `sqlite3_shutdown`. Pinned by `TestPageSlab_InitIdempotent`,
+`TestPageSlab_InitWithoutPagesIsEmpty` and `TestPageSlab_InitAtMinPageSize`.
 
 <a id="drift-69-underpressure-drops-heap-nearly-full-fallback"></a>
 ### Drift: UnderPressure Drops Heap Nearly Full Fallback
@@ -4018,11 +4025,17 @@ The consequence is that a database whose read-version byte is greater than 2 (a 
 <a id="drift-2026-06-25-22-slab-get-has-no-per-request-size-guard-and-its-initialized-pagesize-va"></a>
 ### Drift: Slab Get Has No Per-Request Size Guard And Its Initialized PageSize Validator Is Dead Code
 - **Category:** missing-feature  -  **Severity:** low
-- **Affected functions:** `page_slab.go:pageSlab.Get` (`internal/btree/page_slab.go:151-175`), `db.go:Open` (`internal/btree/db.go:418-420`).
+- **Affected functions:** `page_slab.go:allocPageBuffer`, `page_slab.go:*pageSlab.serves`, `db.go:Open`.
 
-Go's `pageSlab.Get()` (`internal/btree/page_slab.go:151-175`) takes no size argument: it pops the last buffer off `freeList`, or on exhaustion takes a buffer from `pageBufferPool` or returns `make([]byte, s.pageSize)` — always the slab's own configured `pageSize` (`internal/btree/page_slab.go:169,174`). `allocPageBuffer(pageSize, useSlab)` (`internal/btree/page_slab.go:80-88`) honors the caller's requested `pageSize` only on the non-slab `sync.Pool`/`make` branch and discards it entirely when `useSlab` is true, calling `globalPageSlab.Get()` with no size check. The one validator that could have caught a mismatch, `pageSlab.Initialized(pageSize)`, compared the requested size against `s.pageSize` but had no non-test callers and has been removed. The only size-related enforcement at open is the all-or-nothing `UsePageSlab && !globalPageSlab.initialized.Load()` guard in `Open` (`internal/btree/db.go:418-420`), which checks that the slab is initialized but never that its page size matches the DB being opened.
+**Resolved (2026-11-19)**: the per-request guard is ported. `pcache1Alloc(nByte)` (`pcache1.c:341-374`) serves a request from the buffer only under `if( nByte<=pcache1.szSlot )` (`pcache1.c:344`) and otherwise calls `sqlite3Malloc(nByte)` (`pcache1.c:361`). `allocPageBuffer(pageSize, useSlab)` takes a buffer from the slab only when `globalPageSlab.serves(pageSize)`, and otherwise takes the default allocator (`pageBufferPool`, then `make`) at the requested size. `freePageBuffer` needs no guard: `pageSlab.Put` keeps only slices of the slab's backing array and passes everything else to the pool. A slab configured for one page size is never the source of a page for a database of another. Pinned by `TestAllocPageBuffer_SlabServesOnlyItsOwnPageSize` and, through the public API in one process per configuration, by `TestInitPageBuffer_MisSizedPoolIsNotUsed`.
 
-SQLite's `pcache1Alloc(nByte)` (`pcache1.c:341-374`) instead guards every request with `if( nByte<=pcache1.szSlot )` (`pcache1.c:344`): only requests that fit the slot size are served from the slab, and anything larger falls through to `sqlite3Malloc(nByte)` (`pcache1.c:361`) at the correct size. The consequence is that if a process configures the slab for one page size and then opens a DB with a different page size (an existing file whose header page size differs, or a second DB), the pager receives buffers sized for the slab's page rather than its own — a too-small buffer triggers index-out-of-range panics on page read/write while a too-large one wastes memory — with no per-request size guard and no graceful heap fallback at the correct size as SQLite provides.
+What remains different:
+
+- **Equality, not "fits".** The C request is the whole allocation, `pCache->szAlloc = szPage + szExtra + ROUND8(sizeof(PgHdr1))` (`pcache1.c:787`, passed at 449), and a slot is addressed by pointer, so any slot at least that large serves it and a slot of exactly the page size does not. A Go page buffer is a slice whose length is the page size: the slab serves a page size equal to its slot size, and serving a larger slot would mean cutting it down on `Get` and restoring its full extent on `Put`. A slab with larger slots than the page size is unused in Go and used in C.
+- **Resolved per database.** `btree.Open` sets `useSlab` only when the database opted in and the slab serves its page size; the page size cannot change after that, since the file's must match the process's buffer pool. A database the slab does not serve runs as one that did not opt in: its caches make their initial bulk allocation and return buffers without the slab's lock. In C a configured buffer turns the bulk allocation off for every cache (`pcache1Init` sets `nInitPage` only when `pPage==0`, `pcache1.c:730-737`), whether its slots fit or not. In a Go process every database has one page size, so a slab that does not serve it serves none.
+- **No overflow counter.** The pool-overflow status counters C updates on the fallback (`SQLITE_STATUS_PAGECACHE_OVERFLOW`, `pcache1.c:365-369`) have no counterpart: `nOverflow` counts only exhaustion of a slab that does serve the size.
+
+Pinned by `TestOpen_UsesSlabOnlyWhenItServesThePageSize`.
 
 <a id="drift-2026-06-25-24-truncate-always-full-scans-all-hash-buckets-sqlite-uses-imaxkey-to-sca"></a>
 ### Drift: Truncate Always Full-Scans All Hash Buckets; SQLite Uses iMaxKey To Scan Only Affected Slots

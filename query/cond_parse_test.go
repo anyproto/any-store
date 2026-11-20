@@ -6,6 +6,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fastjson"
+
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 type parserCase struct {
@@ -206,4 +209,138 @@ func BenchmarkParseCondition(b *testing.B) {
 	b.Run("middle", func(b *testing.B) {
 		bench(b, `{"a": {"$in": [1, 2], "$nin": [3,4], "$all": [5,6]}}`)
 	})
+}
+
+// An empty object is the condition every document satisfies — as the whole
+// filter and as an element of $and/$or/$nor — and is always a real filter:
+// the logical operators evaluate every element they hold, so a nil element
+// would be a nil-interface call at evaluation.
+func TestParseCondition_EmptyObjectMatchesAll(t *testing.T) {
+	doc := anyenc.MustParseJson(`{"a":2,"b":[1,2]}`)
+	for _, tc := range []struct {
+		filter string
+		want   bool
+	}{
+		{`{}`, true},
+		{`{"$and":[{}]}`, true},
+		{`{"$or":[{}]}`, true},
+		{`{"$nor":[{}]}`, false},
+		{`{"$or":[{},{"a":1}]}`, true},
+		{`{"$and":[{},{"a":1}]}`, false},
+		{`{"$and":[{},{"a":2}]}`, true},
+		{`{"$nor":[{},{"a":1}]}`, false},
+		{`{"$or":[{"$and":[{}]},{"a":5}]}`, true},
+		{`{"$and":[{"$or":[{}]}],"a":2}`, true},
+		{`{"b":{"$elemMatch":{}}}`, false}, // object form: no object element
+	} {
+		t.Run(tc.filter, func(t *testing.T) {
+			f, err := ParseCondition(tc.filter)
+			require.NoError(t, err)
+			require.NotNil(t, f)
+			assert.Equal(t, tc.want, f.Ok(doc, &syncpool.DocBuffer{}))
+			assert.NotPanics(t, func() { _ = f.String() })
+			assert.NotPanics(t, func() { _ = f.IndexBounds("a", nil) })
+		})
+	}
+}
+
+// An empty array under $and, $or or $nor is rejected at every level, alone or
+// beside another key: an empty disjunction is false and an empty conjunction
+// true, so a filter built from an empty list would match nothing or everything
+// depending on the operator.
+func TestParseCondition_EmptyLogicalArrayRejected(t *testing.T) {
+	for _, tc := range []struct {
+		filter, wantPath, wantOp string
+	}{
+		{`{"$or":[]}`, "$or", "$or"},
+		{`{"$and":[]}`, "$and", "$and"},
+		{`{"$nor":[]}`, "$nor", "$nor"},
+		{`{"$and":[],"a":1}`, "$and", "$and"},
+		{`{"$or":[],"a":1}`, "$or", "$or"},
+		{`{"$nor":[],"a":1}`, "$nor", "$nor"},
+		{`{"a":1,"$or":[]}`, "$or", "$or"},
+		{`{"$or":[{"$and":[]},{"a":5}]}`, "$or.0.$and", "$and"},
+		{`{"$and":[{"a":1},{"$or":[]}]}`, "$and.1.$or", "$or"},
+		{`{"$nor":[{"$nor":[]}]}`, "$nor.0.$nor", "$nor"},
+		{`{"$text":{"$search":"hello"},"$and":[]}`, "$and", "$and"},
+		{`{"a":{"$elemMatch":{"$or":[]}}}`, "a.$elemMatch.$or", "$or"},
+		{`{"a":{"$all":[{"$elemMatch":{"$and":[]}}]}}`, "a.$all.0.$elemMatch.$and", "$and"},
+	} {
+		t.Run(tc.filter, func(t *testing.T) {
+			f, err := ParseCondition(tc.filter)
+			require.Error(t, err)
+			assert.Nil(t, f)
+			var pe *ParseError
+			require.ErrorAs(t, err, &pe)
+			assert.Equal(t, tc.wantPath, pe.Path)
+			assert.Equal(t, tc.wantOp, pe.Op)
+			assert.Equal(t, tc.wantOp+" must be a non-empty array", pe.Reason)
+		})
+	}
+}
+
+// {"$all": []} matches no document (MongoDB's rule): not one whose array is
+// empty, not one without the field. A conjunction of no equalities would be
+// true everywhere, and next to the match-all {} it would let a Delete empty
+// the collection.
+func TestParseCondition_AllWithEmptyArrayMatchesNothing(t *testing.T) {
+	docs := []string{`{"tags":[1,2]}`, `{"tags":[]}`, `{"tags":null}`, `{"tags":1}`, `{}`}
+	for _, tc := range []struct {
+		filter string
+		want   bool
+	}{
+		{`{"tags":{"$all":[]}}`, false},
+		{`{"$and":[{},{"tags":{"$all":[]}}]}`, false},
+		{`{"$or":[{},{"tags":{"$all":[]}}]}`, true},
+		{`{"$nor":[{"tags":{"$all":[]}}]}`, true},
+		{`{"tags":{"$not":{"$all":[]}}}`, true},
+		{`{"o":{"$elemMatch":{"tags":{"$all":[]}}}}`, false},
+	} {
+		t.Run(tc.filter, func(t *testing.T) {
+			f, err := ParseCondition(tc.filter)
+			require.NoError(t, err)
+			for _, d := range docs {
+				doc := anyenc.MustParseJson(d)
+				assert.Equal(t, tc.want, f.Ok(doc, &syncpool.DocBuffer{}), d)
+			}
+		})
+	}
+}
+
+// A filter that matches every document renders as {}: the parsed empty
+// object (All) and a Go-built And with no conditions, alone or nested. The
+// rendering is what Explain shows, and it parses back to a filter that
+// matches the same documents: the parser rejects null and {"$and":[]}.
+func TestFilterString_MatchAllRoundTrips(t *testing.T) {
+	docs := []string{`{"a":1,"b":[{"c":1}]}`, `{"a":2,"b":[]}`, `{}`}
+	for _, tc := range []struct {
+		name   string
+		filter Filter
+		want   string
+	}{
+		{"{}", MustParseCondition(`{}`), `{}`},
+		{"$and of {}", MustParseCondition(`{"$and":[{},{"a":1}]}`), ``},
+		{"$or of {}", MustParseCondition(`{"$or":[{},{"a":1}]}`), ``},
+		{"$nor of {}", MustParseCondition(`{"$nor":[{}]}`), `{"$nor":[{}]}`},
+		{"$elemMatch {}", MustParseCondition(`{"b":{"$elemMatch":{}}}`), `{"b": {"$elemMatch": {}}}`},
+		{"And{}", And{}, `{}`},
+		{"And{And{}}", And{And{}}, `{"$and":[{}]}`},
+		{"And{And{}, a=1}", And{And{}, MustParseCondition(`{"a":1}`)}, ``},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := tc.filter.String()
+			if tc.want != "" {
+				assert.Equal(t, tc.want, s)
+			}
+			back, err := ParseCondition(s)
+			require.NoError(t, err, s)
+			again, err := ParseCondition(back.String())
+			require.NoError(t, err, back.String())
+			assert.Equal(t, back.String(), again.String(), "the rendering of a parsed filter is a fixed point")
+			for _, d := range docs {
+				doc := anyenc.MustParseJson(d)
+				assert.Equal(t, tc.filter.Ok(doc, &syncpool.DocBuffer{}), back.Ok(doc, &syncpool.DocBuffer{}), "%s on %s", s, d)
+			}
+		})
+	}
 }
