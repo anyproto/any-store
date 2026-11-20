@@ -685,17 +685,18 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(wtx WriteTx, btWt
 			_ = tx.Rollback()
 			panic(r)
 		}
-		// A write that does not commit reports nothing matched or modified,
-		// as UpdateId does: the counts describe what the call wrote.
+		// A write that does not commit modified nothing: Modified counts the
+		// documents the call wrote. Matched still reports the documents it
+		// matched before the failure.
 		if err != nil {
 			_ = tx.Rollback()
-			result = ModifyResult{}
+			result.Modified = 0
 			return
 		}
 		if err = tx.Commit(); err == nil {
 			committed = true
 		} else {
-			result = ModifyResult{}
+			result.Modified = 0
 		}
 	}()
 

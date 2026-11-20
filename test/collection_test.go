@@ -2654,9 +2654,10 @@ func TestCollection_Update_ArrayPaddingIsBounded(t *testing.T) {
 }
 
 // A bulk write that fails part way rolls back every document it changed and
-// reports no matched or modified document: the counts describe what the
-// call wrote, and it wrote nothing.
-func TestQuery_FailedBulkWriteReportsNothing(t *testing.T) {
+// reports no modified document: it wrote nothing. Matched reports what it
+// matched before the failure, as TestIndex_Maintenance_FindUpdateUniqueConstraintEnforced
+// pins.
+func TestQuery_FailedBulkWriteReportsNothingModified(t *testing.T) {
 	for _, tc := range []struct {
 		name, mod string
 	}{
@@ -2677,7 +2678,7 @@ func TestQuery_FailedBulkWriteReportsNothing(t *testing.T) {
 
 			res, err := coll.Find(nil).Sort("id").Update(ctx, tc.mod)
 			require.Error(t, err)
-			assert.Equal(t, anystore.ModifyResult{}, res)
+			assert.Equal(t, 0, res.Modified)
 
 			for id, want := range map[int]string{
 				1: `{"id":1,"arr":{},"n":1}`,
