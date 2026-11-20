@@ -90,8 +90,8 @@ type pager struct {
 	// lentMu guards what is left of a write transaction that DB.Close ended
 	// under its goroutine: the stacks of its cursors and lent, the page
 	// buffers those cursors had lent out. See destroyEndedWriterCache.
-	lentMu sync.Mutex
-	lent   map[*page]lentPage
+	lentMu      sync.Mutex
+	lent        map[*page]lentPage
 	master      *masterStore // InMemory "disk" — holds checkpointed page data
 	header      dbHeader
 	pageSize    uint32

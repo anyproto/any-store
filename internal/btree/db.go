@@ -855,6 +855,9 @@ func (db *DB) Close() error {
 		db.writeSem <- struct{}{}
 	}
 	db.unlockWriter()
+	if testCloseWaitingReadersHook != nil {
+		testCloseWaitingReadersHook()
+	}
 	// Wait for all active readers to finish
 	db.mu.Lock()
 	db.mu.Unlock()
@@ -870,6 +873,11 @@ func (db *DB) Close() error {
 drained:
 	return db.pager.close()
 }
+
+// testCloseWaitingReadersHook, when non-nil, runs in Close once the write
+// transaction is dealt with, before the wait for the read transactions.
+// Test-only.
+var testCloseWaitingReadersHook func()
 
 // SetClosing marks the database as closing, causing new transactions to fail.
 // Also unblocks the goroutines waiting for a reader slot or the write lock.
@@ -2325,6 +2333,17 @@ func (tx *ReadTx) DatabaseSize() (uint32, error) {
 		return 0, err
 	}
 	return lockBtreePageCount(&h, tx.pager.readerDbSizeBound(tx.cache))
+}
+
+// EndedByClose reports whether DB.Close has ended this write transaction
+// under its owner (writerGate): it is rolled back, and what its owner still
+// holds of it — a document read earlier, the rows of a sort — is of a
+// transaction that never committed. False for a read transaction, which
+// Close waits for. Every storage call of an ended transaction reports
+// ErrClosed by itself; this is for the callers that have no such call to
+// make.
+func (tx *ReadTx) EndedByClose() bool {
+	return tx.writable && tx.pager.wgate.closed()
 }
 
 // GetNamespace returns a Namespace handle for the given name, respecting the

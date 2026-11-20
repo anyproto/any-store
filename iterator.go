@@ -122,6 +122,14 @@ func (pi *planIterator) Next() bool {
 			pi.err = err
 			return false
 		}
+		// A write transaction that DB.Close rolled back under its owner
+		// still looks open to its handle. The plan may have rows in memory
+		// (a sort, a vector or text search) that no storage call stands
+		// behind any more.
+		if pi.data.Tx.EndedByClose() {
+			pi.err = ErrDBIsClosed
+			return false
+		}
 		pi.mark = pi.shared.savepointMark()
 	}
 	for {
@@ -194,6 +202,10 @@ func (pi *planIterator) Doc() (Doc, error) {
 			}
 			if pi.shared.Done() {
 				return nil, ErrTxIsUsed
+			}
+			// Rolled back by DB.Close: see Next.
+			if pi.data.Tx.EndedByClose() {
+				return nil, ErrDBIsClosed
 			}
 		}
 		if perf {
