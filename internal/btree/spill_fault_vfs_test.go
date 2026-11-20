@@ -17,6 +17,7 @@ import (
 	"math/rand"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -644,6 +645,53 @@ func TestSpillFault_RollbackTripsCursors(t *testing.T) {
 			require.ErrorIs(t, c.Next(), errInjectedSpillIO, "the cursor was not ended with the transaction's error")
 			c.Close()
 			require.True(t, s.verify(t, "after the failed transaction"))
+		})
+	}
+}
+
+// A rename reads its new catalog entry back. With a name whose overflow
+// chain is longer than the writer cache, that read needs pages the cache
+// has no room for, and the spill that makes room can fail: the rename
+// reports the spill's error, as every other step of it does, and not
+// corruption.
+func TestSpillFault_RenameReadBack(t *testing.T) {
+	newName := strings.Repeat("n", 3*closeRescueCache*4096)
+	open := func(t *testing.T) (*DB, *spillFaultFile) {
+		path := filepath.Join(t.TempDir(), "rename.db")
+		db, err := testOpen(t, path, Options{PageSize: 4096, CacheSize: closeRescueCache, DisableAutoCheckpoint: true})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = db.Close() })
+		createNS(t, db, "old")
+		putN(t, db, "old", 10, 100)
+		f := &spillFaultFile{File: db.pager.wal.file}
+		db.pager.wal.file = f
+		return db, f
+	}
+
+	db, f := open(t)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	before := f.writes.Load()
+	require.NoError(t, tx.RenameNamespace("old", newName))
+	total := f.writes.Load() - before
+	require.NoError(t, tx.Rollback())
+	require.Greater(t, total, int64(closeRescueCache), "the rename spills")
+
+	for nth := int64(1); nth <= total; nth++ {
+		t.Run(fmt.Sprintf("write=%d", nth), func(t *testing.T) {
+			db, f := open(t)
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			defer func() { _ = tx.Rollback() }()
+			f.arm(nth, false)
+			err = tx.RenameNamespace("old", newName)
+			require.Equal(t, int64(1), f.fired.Load(), "the fault fired")
+			require.ErrorIs(t, err, errInjectedSpillIO)
+			require.NotErrorIs(t, err, ErrCorrupt)
+			require.NoError(t, tx.Rollback())
+			f.disarm()
+			require.Equal(t, 10, countKeys(t, db, "old"))
+			require.NoError(t, db.IntegrityCheck())
 		})
 	}
 }
