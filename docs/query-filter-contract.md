@@ -192,6 +192,15 @@ build per query and carry no such guarantee.
     `TestParseCondition_EmptyLogicalArrayRejected` (query/cond_parse_test.go)
     and, through every verb, by `TestQuery_EmptyObjectInLogicalOperator` and
     `TestQuery_EmptyLogicalArrayIsParseError` (test/query_test.go).
+    `{"$all":[]}` is accepted and matches no document, as in MongoDB: not
+    one whose array is empty, not one without the field. It is the empty
+    `$in`, so a conjunct of it makes the whole filter match nothing (the
+    query layer answers without reading, as for `{"$in":[]}`), and its
+    index bounds are empty: it narrows no seek, and the residual filter
+    rejects every row. Pinned by
+    `TestParseCondition_AllWithEmptyArrayMatchesNothing` and, through every
+    verb and with an index on the field, by
+    `TestQuery_AllWithEmptyArrayMatchesNothing`.
     Each vocabulary is data: `query.Operators()`, `query.ModifierOperators()`,
     `anystore.AggregateStages()` and `anystore.AggregateAccumulators()`
     return exactly what the parsers recognize, so callers advertising a
