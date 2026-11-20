@@ -3084,6 +3084,18 @@ func (p *pager) rollbackLocked() error {
 		return nil
 	}
 
+	// The cursors of a transaction in the error state are ended with its
+	// error before the cache goes, as a failed commit's are (pagerError):
+	// SQLite rolls such a transaction back with a trip code
+	// (sqlite3VdbeHalt → sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK) →
+	// sqlite3BtreeRollback, btree.c:4532-4536). A cursor left open pins
+	// pages of the cache, and its Close would otherwise unpin them in the
+	// next transaction's hands. The error state fails every fetch, so a
+	// cursor whose key would need one is tripped without its position.
+	if st == pagerError {
+		p.tripCursors(0, p.writeStateErr(), 0)
+	}
+
 	// A rollback that undoes anything restarts the backups: pagerRollbackWal
 	// runs pagerUndoCallback for every logged and every dirty page, and it
 	// ends in sqlite3BackupRestart (pager.c:3147-3166, 3139). A spilled

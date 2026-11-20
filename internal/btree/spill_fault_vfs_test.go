@@ -596,3 +596,54 @@ func TestSpillFault_RootSplitStoppedHalfWay(t *testing.T) {
 	}
 	require.Greater(t, halfWay, 0, "no fault stopped the split with a zero-cell root")
 }
+
+// The cursors of a transaction in the error state are ended by its
+// rollback, before the cache they pin is discarded: a cursor left open on
+// another tree would otherwise keep pointers into the discarded cache and
+// unpin, at its Close, pages the next transaction holds. The commit of
+// such a transaction rolls it back the same way.
+func TestSpillFault_RollbackTripsCursors(t *testing.T) {
+	const baseKeys = 150
+	for _, end := range []string{"rollback", "commit"} {
+		t.Run(end, func(t *testing.T) {
+			s := openSpillFaultDB(t, 32, baseKeys)
+			tx, err := s.db.BeginWrite()
+			require.NoError(t, err)
+			nsB, err := tx.CreateNamespace("b")
+			require.NoError(t, err)
+			for i := 0; i < 20; i++ {
+				require.NoError(t, tx.Put(nsB, spillKey(i), []byte("b")))
+			}
+			require.NoError(t, tx.Commit())
+
+			tx, err = s.db.BeginWrite()
+			require.NoError(t, err)
+			defer func() { _ = tx.Rollback() }()
+			c := tx.NewCursor(nsB)
+			defer c.Close()
+			require.NoError(t, c.First())
+			require.True(t, c.Valid())
+			require.NotEmpty(t, c.stack)
+
+			s.file.arm(1, false)
+			var opErr error
+			for _, op := range s.spillOps(7, 400, baseKeys) {
+				if opErr = s.apply(tx, op); opErr != nil {
+					break
+				}
+			}
+			require.ErrorIs(t, opErr, errInjectedSpillIO)
+			if end == "rollback" {
+				require.NoError(t, tx.Rollback())
+			} else {
+				require.ErrorIs(t, tx.Commit(), errInjectedSpillIO)
+			}
+			s.file.disarm()
+
+			require.Empty(t, c.stack, "the cursor holds pages of the discarded cache")
+			require.ErrorIs(t, c.Next(), errInjectedSpillIO, "the cursor was not ended with the transaction's error")
+			c.Close()
+			require.True(t, s.verify(t, "after the failed transaction"))
+		})
+	}
+}
