@@ -2755,8 +2755,10 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	// the same frame. In C iFirst stays 0 until the transaction has written
 	// frames (pWal->hdr differs from the live header, wal.c:4062-4064); here
 	// the first call of a transaction has iFirst == nf+1, an empty window.
+	// iFirst == 0 is the wrapped sum of a committed frame 0xffffffff: C's
+	// `if( iFirst && ...` (wal.c:4138) reuses nothing then, and so does this.
 	iFirst := w.index.mxCommitFrame.LoadLocal() + 1
-	canReuse := iFirst <= nf && !DiagDisableReuse.Load()
+	canReuse := iFirst != 0 && iFirst <= nf && !DiagDisableReuse.Load()
 
 	// Track appended frames separately from the input slice index.
 	// Reused pages don't advance the append cursor nor the checksum
@@ -3035,7 +3037,7 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	// disk-mode writeFrames; reuse only allowed for frames in this tx,
 	// looked up among the frames indexed before this call (ceiling nf).
 	iFirst := w.index.mxCommitFrame.LoadLocal() + 1
-	canReuse := iFirst <= nf
+	canReuse := iFirst != 0 && iFirst <= nf
 
 	// Ensure arena has enough space for all pages in this batch (worst
 	// case: no reuse). We may over-reserve when reuse fires; that's fine
