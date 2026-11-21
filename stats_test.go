@@ -80,9 +80,9 @@ func TestCollection_Stats(t *testing.T) {
 		assert.Equal(t, 1.0, st.CompressionRatio)
 	})
 
-	// Stats reads each index's live in-memory sketch while writers may be
-	// mutating it. Run Stats concurrently with inserts under -race to pin
-	// that the sketch reads (Distribution/GetDocCount) stay race-free.
+	// Stats in a read transaction decodes each index's stored row into a
+	// sketch of its own while writers commit. Run Stats concurrently with
+	// inserts under -race to pin that it shares nothing with them.
 	t.Run("concurrent with writes", func(t *testing.T) {
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "test")

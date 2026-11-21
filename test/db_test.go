@@ -604,10 +604,9 @@ func TestIteratorDeleteDuringIterationStaysConsistent(t *testing.T) {
 //
 // Guarantees asserted here:
 //   - NO ACCUMULATION: after M rolled-back txs Stats, which reports the stored
-//     sketch, still counts N. The planner's sketch in memory holds at most the
-//     most recent rolled-back tx's deltas (N + K, cleaned up at the next write
-//     tx begin), NOT N + (1+M)*K; that is asserted beside the code
-//     (TestWriteTx_DirtyLists).
+//     sketch, still counts N. The planner's sketch in memory is not looked
+//     at here: the rebase of one rolled-back tx's deltas at the next write tx
+//     begin is asserted beside the code (TestWriteTx_DirtyLists).
 //   - NO DISK POLLUTION: a clean commit after the rollbacks persists the true
 //     count (N+1), not the accumulated drift.
 //   - The real Count() is exact (== N) throughout (the sketch is advisory).

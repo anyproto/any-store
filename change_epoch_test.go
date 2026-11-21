@@ -96,8 +96,9 @@ func runChangePeer(t *testing.T, path string, env ...string) {
 
 // The sketches of an open collection follow another process's commit,
 // whatever kind of transaction of this process is the first to begin after
-// it: one that reloads sketches, or one that never looks at them (a fast
-// read by id, a btree-level read, a backup, an integrity check).
+// it, and none of these looks at the published sketches: Stats, which reads
+// the stored row for itself, a fast read by id, a btree-level read, a write
+// transaction that does nothing, a backup, an integrity check.
 func TestChangeEpoch_PeerCommitReloadsSketches(t *testing.T) {
 	if changePeer(t) {
 		return
@@ -114,6 +115,8 @@ func TestChangeEpoch_PeerCommitReloadsSketches(t *testing.T) {
 
 			switch first {
 			case "stats":
+				_, err := coll.Stats(ctx)
+				require.NoError(t, err)
 			case "find-id":
 				_, err := coll.FindId(ctx, 1)
 				require.NoError(t, err)

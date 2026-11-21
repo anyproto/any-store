@@ -1593,9 +1593,11 @@ func TestSketch_RowReadFailsAtOpen(t *testing.T) {
 			defer func() { _ = d2.Close() }()
 			coll2, err := d2.OpenCollection(ctx, "c")
 			require.NoError(t, err)
+			require.Equal(t, v.want, coll2.(*collection).loadIndexes()[0].loadPubSketch().GetDocCount(),
+				"the sketch a later open loads")
 			docs, sketch := statsDocCounts(t, ctx, coll2)
 			require.Equal(t, int(v.want), docs, "setup: the documents")
-			require.Equal(t, v.want, sketch, "the row a later open loads")
+			require.Equal(t, v.want, sketch, "the stored row, as Stats reads it")
 		})
 	}
 
@@ -1673,25 +1675,42 @@ func TestSketch_ReaderBehindThePublishedEpochLoadsNothing(t *testing.T) {
 	require.Equal(t, uint64(50), sketchDocCount(t, coll))
 	c := coll.(*collection)
 
+	// The committed state is another process's to the next begin: the
+	// epoch moves, so there is an older one to be stamped with.
+	d.(*db).btreeDB.ForgetSeenHeader()
 	rtx, err := d.(*db).btreeDB.BeginRead()
 	require.NoError(t, err)
 	defer func() { _ = rtx.Rollback() }()
 	epoch, exact := rtx.ChangeEpoch()
 	require.True(t, exact, "setup: the reader may load")
-	c.sketchSeen.Store(epoch + 1) // published for a newer epoch while this reader waited
+	require.NotZero(t, epoch, "setup: an older epoch exists")
 
 	reads := 0
 	testHookSketchRead = func(string) error { reads++; return nil }
 	defer func() { testHookSketchRead = nil }()
+
+	// Published for a newer epoch before the reader looks.
+	c.sketchSeen.Store(epoch + 1)
 	require.NoError(t, c.refreshSketches(rtx, c.cur()))
 	require.Zero(t, reads, "the reader loaded a row")
 	require.Equal(t, epoch+1, c.sketchSeen.Load(), "the stamp went back")
 
+	// Published for a newer epoch while the reader waited for the handle's
+	// lock: it found the sketches behind, and checks again once it has the
+	// lock.
+	for _, seen := range []uint64{sketchEpochNone, epoch - 1} {
+		c.sketchSeen.Store(seen)
+		waited := 0
+		testHookSketchReaderWaits = func() { waited++; c.sketchSeen.Store(epoch + 1) }
+		require.NoError(t, c.refreshSketches(rtx, c.cur()))
+		testHookSketchReaderWaits = nil
+		require.Equal(t, 1, waited, "setup: the reader found the sketches behind")
+		require.Zero(t, reads, "the reader loaded a row")
+		require.Equal(t, epoch+1, c.sketchSeen.Load(), "the stamp went back")
+	}
+
 	// At no epoch, and at an older one, it loads.
 	for _, seen := range []uint64{sketchEpochNone, epoch - 1} {
-		if seen == epoch-1 && epoch == 0 {
-			continue
-		}
 		c.sketchSeen.Store(seen)
 		reads = 0
 		require.NoError(t, c.refreshSketches(rtx, c.cur()))

@@ -1738,6 +1738,11 @@ func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, collName string, idx *in
 // would escape to the heap in every read, hook or no hook.
 var testHookSketchRead func(key string) error
 
+// testHookSketchReaderWaits, when set, runs in a reader that found the
+// published sketches behind its epoch, before it takes the handle's lock to
+// load them (refreshSketches). Tests only.
+var testHookSketchReaderWaits func()
+
 // readSketchRow reads the stored sketch row under key through tx, appended
 // to buf: btree.ErrKeyNotFound for no row, any other error for a read that
 // failed.
@@ -1788,6 +1793,9 @@ func (c *collection) refreshSketches(tx *btree.ReadTx, s *collSchema) error {
 	epoch, exact := tx.ChangeEpoch()
 	if !exact || !sketchBehind(c.sketchSeen.Load(), epoch) {
 		return nil
+	}
+	if testHookSketchReaderWaits != nil {
+		testHookSketchReaderWaits()
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
