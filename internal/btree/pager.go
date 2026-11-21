@@ -4243,8 +4243,10 @@ func (p *pager) tripCursors(root uint32, err error, seq uint64) {
 // that ends in an error halts: the call that met the failed spill, and
 // each later one, whether a fetch failed, the state test of a savepoint
 // call did, or a cursor the halt faulted reported its fault. A cursor
-// opened since the failure is ended by the next of them. A transaction
-// DB.Close ended is left as Close left it.
+// opened since the failure is ended by the next of them. Commit is the
+// exception: it rolls the transaction back, and the rollback ends the
+// cursors (rollbackLocked, pagerError). A transaction DB.Close ended is
+// left as Close left it.
 // Writer's goroutine only.
 // DRIFT: every cursor is faulted and no read cursor is saved, and the error state outlives the halt See docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill
 func (p *pager) halt() {
