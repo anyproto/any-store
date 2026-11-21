@@ -134,11 +134,11 @@ type Collection interface {
 	WriteTx(ctx context.Context) (WriteTx, error)
 
 	// Close releases the handle: later operations through it fail with
-	// ErrCollectionClosed. A handle the open write transaction used, or
-	// got from an open of a collection nothing had open, is released once
-	// that use commits or rolls back — with the transaction, or with a
-	// savepoint that encloses its first use or that open — and stays open
-	// if the collection is opened again before that.
+	// ErrCollectionClosed. If the open write transaction has used the
+	// handle (an open by the transaction counts), the release waits until
+	// that transaction ends, or until a savepoint that encloses that first
+	// use rolls back. An open of the collection before then keeps the
+	// handle open.
 	Close() error
 }
 
@@ -1624,7 +1624,7 @@ func (c *collection) Close() error {
 
 // close evicts the handle from the registry and fails its later operations.
 // While the open write transaction's schema log references the handle (see
-// pinned) the close waits until that transaction commits or rolls back, and
+// pinned) the close waits for the last reference to go (db.unpinLocked), and
 // the handle stays usable until then — unless force: the database is
 // closing and no transaction will end.
 func (c *collection) close(force bool) error {
