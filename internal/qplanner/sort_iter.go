@@ -259,11 +259,13 @@ func (it *SortIter) collectAndSort() error {
 		// entry, though a loser longer than the spare capacity grows the
 		// arena's backing array, and that capacity stays until the arena is
 		// released. SQLite's pushOntoSorter also keeps no record of a row that
-		// would not stay among LIMIT+OFFSET records (select.c:833-846), and
+		// would not stay among LIMIT+OFFSET records (select.c:833-846). When
+		// the loop's order satisfies no prefix of the ORDER BY (nOBSat==0), it
 		// compares the row's key registers with the largest kept entry before
-		// it builds a record at all (OP_IdxLE before makeSorterRecord,
-		// select.c:851-858). The candidate's offset and length are native ints
-		// until it is kept: a loser past sortArenaLimit is no error.
+		// it builds a record at all (OP_IdxLE at select.c:852, makeSorterRecord
+		// at :857-858); when it satisfies a prefix, the record is built first
+		// (:789-797). The candidate's offset and length are native ints until
+		// it is kept: a loser past sortArenaLimit is no error.
 		base := len(it.arena)
 		it.growArena(256)
 		if it.arena, err = it.appendSortKey(it.arena, doc, raw); err != nil {
