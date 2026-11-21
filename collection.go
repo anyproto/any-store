@@ -1781,8 +1781,9 @@ func sketchBehind(seen, epoch uint64) bool {
 // the same reason a reader loads nothing once the stamp is at or past the
 // epoch it sampled: a later reader, or a writer, published newer sketches
 // while this one waited. A read that fails stamps nothing, and the next
-// reader loads again; the plan goes on with what is published, which decides
-// no result.
+// reader loads again; the plan goes on with what is published. That is an
+// estimate: it picks the plan, and for $knn the driver, approximate or
+// exact (qplanner knn_plan.go), never the rows a plan returns.
 //
 // A writer has the live sketches to load (refreshLiveSketches), and may
 // return the error of a read that failed.
@@ -1971,7 +1972,14 @@ func (c *collection) reloadPubSketch(tx *btree.ReadTx, collName string, idx *ind
 	// idx.sketch is only replaced under c.mu (held here) or before the index
 	// is published, so the identity check is race-free; a commit that
 	// republishes live concurrently (settleSketches takes no c.mu) is
-	// overtaken by this snapshot's bytes, as a fresh object would be. Bytes
+	// overtaken by this snapshot's bytes, as a fresh object would be: a
+	// reader that read its row before that commit then publishes the
+	// pre-commit counts and stamps the epoch, and plans miss the commit's
+	// counts until the next write transaction loads or republishes. The
+	// stored row is right. SQLite's statistics go stale the same way
+	// between connections: ANALYZE changes no schema cookie (analyze.c has
+	// no sqlite3ChangeCookie), so another connection keeps what it loaded
+	// until it reloads the schema (sqlite3InitOne, prepare.c). Bytes
 	// of another shape (a snapshot older than this handle's definition) go
 	// into an object of their own: a published one is never reshaped. Bytes
 	// that do not decode publish nothing: the object would be an empty

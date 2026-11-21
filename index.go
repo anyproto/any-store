@@ -353,9 +353,11 @@ type index struct {
 	// sketchCopy is the reader-owned sketch the readers last decoded a
 	// stored row into (collection.reloadPubSketch), kept while the live
 	// sketch is the published one so that the next reader's load decodes
-	// into it again instead of allocating. Nil until a reader loads after
-	// another process's commit: one more sketch per index, and only in a
-	// process that shares the file. Under c.mu.
+	// into it again instead of allocating. Nil until a reader loads a
+	// stored row: after another process's commit, after an open that could
+	// not read the row, or for a handle opened through a read transaction
+	// whose snapshot was not exact for the change epoch. One more sketch
+	// per index. Under c.mu.
 	sketchCopy *qplanner.IndexSketch
 
 	sketchBuf []byte

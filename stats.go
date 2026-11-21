@@ -395,11 +395,12 @@ func uncompressedDocLen(val []byte) (int, error) {
 //
 // The published sketch is not it: that one is the planner's, shared by
 // transactions at different snapshots and not snapshot-isolated (see
-// qplanner.IndexSketch), while Stats reports figures that agree with the
-// documents its transaction counts. So a read transaction reports the stored
-// row as its snapshot has it, decoded into a sketch of its own: an empty one
-// for no row or for bytes that do not decode, which is what an open loads
-// (loadSketchAtOpen), and the error for a read that failed. A write
+// qplanner.IndexSketch), while Stats reports the sketch of the same
+// snapshot as the documents its transaction counts. So a read transaction
+// reports the stored row as its snapshot has it, decoded into a sketch of
+// its own: an empty one for no row or for bytes that do not decode, which is
+// what an open loads (loadSketchAtOpen) and need not agree with the
+// documents, and the error for a read that failed. A write
 // transaction reports the live sketch, which resolve brought up to the
 // stored row at its first use of the collection (refreshLiveSketches) and
 // which holds its own uncommitted changes since.
