@@ -1040,16 +1040,10 @@ func (p *pager) initNewDB() error {
 	// The change counter initNewDB wrote is page 1's as this pager knows it.
 	p.dbFileVers.Store(p.header.FileChangeCount)
 	// A new database is one page, page 1, before its first commit
-	// (newDatabase sets nPage = 1, btree.c:3540-3541). An in-memory database
-	// has no file for its readers to take that size from, so until a commit
-	// records another, every snapshot carries it as the committed size. The
-	// other modes' readers take it from the file, where page 1 was written
-	// above.
-	if p.inMemory {
-		if f, n := p.wal.index.mxCommitFrame.LoadPos(); n == 0 {
-			p.wal.index.mxCommitFrame.StorePos(f, 1)
-		}
-	}
+	// (newDatabase sets nPage = 1, btree.c:3540-3541). No commit has
+	// recorded a size, so the committed position keeps none: its readers
+	// take the size page 1 was written to above, the file's or, in memory,
+	// the master store's (effectiveReaderDbSize).
 
 	p.state.Store(int32(pagerOpen))
 	return nil
@@ -2308,10 +2302,12 @@ func (p *pager) getHasContent(pgno uint32) bool {
 // (walIndex.mxCommitFrame), which only a published commit moves. As in
 // SQLite's header, it is 0 until a commit records one (walIndexRecover
 // zeroes the header and sets nPage from a commit frame, wal.c:1408, 1512)
-// and a WAL reset keeps it, so a non-zero size is always a commit's. An
-// in-process reader without one takes the file's, as above; an in-memory
-// database has no file, and its creation stores the new database's one
-// page as the committed size.
+// and a WAL reset keeps it, so a non-zero size is always a commit's, in
+// every mode. An in-process reader without one takes the file's, as above.
+// An in-memory database has no file: its master store, which stands for
+// one, holds only what creation wrote until a commit is checkpointed into
+// it, and before the first commit the database is that one page, page 1
+// (newDatabase sets nPage = 1, btree.c:3540-3541). Its readers take 1.
 //
 // No reader bound-checks against p.dbSize: that atomic is the writer's
 // allocation counter. An open write transaction moves it (a backup's shrink,
@@ -2351,7 +2347,8 @@ func (p *pager) effectiveReaderDbSize(hdr WalIndexHdr) (uint32, error) {
 		return n, nil
 	}
 	if p.inMemory {
-		return 0, errors.New("btree: internal error: an in-memory snapshot without a committed size")
+		// No commit yet: the new database's one page.
+		return 1, nil
 	}
 	return p.dbSize.Load(), nil
 }
