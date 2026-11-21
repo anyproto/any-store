@@ -264,6 +264,26 @@ func localPayloadSize(totalPayload int, lim payloadLimits) int {
 	return lim.minLocal
 }
 
+// spilledLocalSize is localPayloadSize for a leaf cell that declares a key
+// of keyLen bytes and a value of valLen bytes whose sum is over lim.maxLocal,
+// computed without forming that sum. A reader that reads only the key does
+// not bound the value's length (see leafFullKey), and two 64-bit lengths can
+// wrap a sum; btreePayloadToLocal's (nPayload-minLocal) % (usable-4) is taken
+// term by term instead. For lengths whose sum fits an int the result is
+// localPayloadSize's. SQLite has one payload length per cell, which its cell
+// parsers read into a u32 (btreeParseCellPtr, btree.c:1280-1287), so it has
+// no sum to wrap.
+func spilledLocalSize(keyLen, valLen uint64, lim payloadLimits) int {
+	m := uint64(overflowPageUsable(lim.usable))
+	minLocal := uint64(lim.minLocal)
+	// The sum is over maxLocal, so over minLocal: the difference is positive.
+	surplus := minLocal + (keyLen%m+valLen%m+m-minLocal%m)%m
+	if surplus <= uint64(lim.maxLocal) {
+		return int(surplus)
+	}
+	return lim.minLocal
+}
+
 // Leaf cell format (schema format 5+):
 //
 //   [varint(keyLen)] [varint(valLen)] [payload...] [4-byte overflow_ptr?]

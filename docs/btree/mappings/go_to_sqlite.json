@@ -1509,6 +1509,12 @@
     ],
     "note": "putVarint64 is the static encoder; sqlite3PutVarint the public wrapper (util.c)"
   },
+  "page.go:spilledLocalSize": {
+    "sqlite": [
+      "btree.c:btreePayloadToLocal"
+    ],
+    "note": "a key length and a value length, taken modulo usable-4 term by term, for a payload over maxLocal"
+  },
   "page.go:tableLeafLimits": {
     "sqlite": [
       "btree.c:lockBtree"

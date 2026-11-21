@@ -665,29 +665,31 @@ func searchLeafWithOverflow(pg *page, key []byte, lim payloadLimits, p *pager, w
 		}
 		payloadStart := pos + vn
 
-		// Each length singly, before the two are added or used as slice
-		// bounds. That is looser than payloadFits, the bound of the parsers:
-		// a cell whose lengths pass singly and not together (one a release
-		// without the write-side limit could store) is compared like any
-		// other when a search for a neighbouring key probes it, and the
-		// neighbours stay readable. leafFullKey, which rebuilds a spilled
-		// key for the compare, tests the same way and holds only the key to
-		// the file size. A match on it is refused below.
-		if keyLen > uint64(payloadLimit) || valLen > uint64(payloadLimit) {
+		// A probe reads the cell's key and nothing else, so only the key's
+		// length is bounded here. The value's length, whatever it declares,
+		// only places the key's local part, and is used without adding it
+		// to the key's: a damaged length can wrap the sum. A cell with a
+		// damaged value length is therefore compared like any other when a
+		// search for a neighbouring key probes it, and the neighbours stay
+		// readable as long as the key's layout is intact. leafFullKey, which
+		// rebuilds a spilled key for the compare, tests the same way and
+		// holds only the key to the file size. SQLite's index probe sizes
+		// what it reads from the key alone (btree.c:6159-6168). A match is
+		// tested below.
+		if keyLen > uint64(payloadLimit) {
 			return 0, false, ErrCorrupt
 		}
-		totalPayload := int(keyLen) + int(valLen)
 		var cellKey []byte
-		if totalPayload <= maxLocal {
+		if valLen <= uint64(maxLocal) && keyLen <= uint64(maxLocal)-valLen {
 			// Fast path: no overflow, key fully on-page
 			end := payloadStart + int(keyLen)
-			if int(keyLen) < 0 || end > dataLen {
+			if end > dataLen {
 				return 0, false, ErrCorrupt
 			}
 			cellKey = data[payloadStart:end]
 		} else {
 			// Overflow cell — may need to read full key
-			nLocal := localPayloadSize(totalPayload, lim)
+			nLocal := spilledLocalSize(keyLen, valLen, lim)
 			localKeyBytes := min(nLocal, int(keyLen))
 			if localKeyBytes == int(keyLen) {
 				// Key fits fully in local portion
@@ -730,9 +732,11 @@ func searchLeafWithOverflow(pg *page, key []byte, lim payloadLimits, p *pager, w
 
 		cmp := bytes.Compare(cellKey, key)
 		if cmp == 0 {
-			// The cell found is one a read will parse: report it only if
-			// its lengths are within the record size limit, which every
-			// parse of it requires. The value is not tested against the
+			// The cell found is the one a Get goes on to parse whole:
+			// report it only if its key and value together are within the
+			// record size limit, which that parse requires. The test is
+			// the search's, so every exact match is held to it, Has and an
+			// exact seek included. The value is not tested against the
 			// file here; that runs where the value is read, so Has can
 			// answer true for a record whose Get is ErrCorrupt by that
 			// bound. SQLite's table seek skips a cell's payload size and
@@ -952,21 +956,22 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	pos += n
 
 	// The key is what this reads, so the key is what is bounded: its length
-	// here, singly as searchLeafWithOverflow tests it, and its bytes against
-	// the file below. The value's length only places the local part; its
+	// here, as searchLeafWithOverflow tests it, and its bytes against the
+	// file below. The value's length, whatever it declares, only places the
+	// local part, and is not added to the key's (spilledLocalSize): its
 	// bounds are tested where a value is read. SQLite's index probe sizes
 	// the key it rebuilds the same way (btree.c:6159-6168), and
 	// sqlite3VdbeMemFromBtree tests the range it reads (vdbemem.c:1428).
 	// A damaged value length therefore does not hide the cell's neighbours
-	// from a search that has to compare this key.
-	if keyLen > uint64(payloadLimit) || valLen > uint64(payloadLimit) {
+	// from a search that has to compare this key, as long as the key's
+	// layout is intact: the declared lengths give the local part the size
+	// the cell was written with.
+	if keyLen > uint64(payloadLimit) {
 		return nil, ErrCorrupt
 	}
 
-	totalPayload := int(keyLen) + int(valLen)
-	maxLocal := lim.maxLocal
-
-	if totalPayload <= maxLocal {
+	maxLocal := uint64(lim.maxLocal)
+	if valLen <= maxLocal && keyLen <= maxLocal-valLen {
 		// No overflow: key is fully on-page
 		if pos+int(keyLen) > dataLen {
 			return nil, ErrCorrupt
@@ -975,7 +980,7 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	}
 
 	// Overflow cell
-	nLocal := localPayloadSize(totalPayload, lim)
+	nLocal := spilledLocalSize(keyLen, valLen, lim)
 	localKeyBytes := min(nLocal, int(keyLen))
 
 	if localKeyBytes == int(keyLen) {
