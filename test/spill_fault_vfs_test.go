@@ -112,6 +112,68 @@ func copySpillDB(t *testing.T, path, name string) string {
 	return dst
 }
 
+// A read whose spill fails ends the transaction's scans as well: an
+// iterator open on another collection stops at its next step with the
+// read's error, as SQLite's statement halt ends the connection's cursors,
+// and does not go on through the documents of the page it stands on.
+func TestSpillFault_FailedReadEndsIterators(t *testing.T) {
+	faults := &spillFaults{}
+	anystore.SetVFS(anystore.VFS{OpenFile: func(name string, flag int, perm os.FileMode) (anystore.File, error) {
+		f, err := os.OpenFile(name, flag, perm)
+		if err != nil || !strings.HasSuffix(name, "-wal") {
+			return f, err
+		}
+		return &spillFaultFile{File: f, f: faults}, nil
+	}})
+	t.Cleanup(anystore.ResetVFS)
+
+	path := filepath.Join(t.TempDir(), "iter.db")
+	conf := &anystore.Config{CacheSize: 30, DisableAutoCheckpoint: true, DisableCompression: true}
+	db, err := anystore.Open(ctx, path, conf)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	a, err := db.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	b, err := db.CreateCollection(ctx, "b")
+	require.NoError(t, err)
+	rng := rand.New(rand.NewSource(1))
+	const nA = 300
+	for i := 0; i < nA; i++ {
+		require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(spillDoc(rng, i, 1000))))
+	}
+	for i := 0; i < 20; i++ {
+		require.NoError(t, b.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i))))
+	}
+
+	tx, err := db.WriteTx(ctx)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	iter, err := b.Find(nil).Iter(tx.Context())
+	require.NoError(t, err)
+	defer func() { _ = iter.Close() }()
+	require.True(t, iter.Next(), "the scan of b stands on its first document")
+	// Each insert of a large document fills the transaction's cache with
+	// dirty pages, and the read after it of a document the cache does not
+	// hold has to spill one once no clean page is left: the log's write
+	// fails under that read.
+	var readErr error
+	for i := 0; i < nA && faults.fired.Load() == 0; i++ {
+		require.NoError(t, a.Insert(tx.Context(), anyenc.MustParseJson(spillDoc(rng, nA+i, 12000))))
+		faults.arm(1, false, false)
+		_, readErr = a.FindId(tx.Context(), i)
+		if faults.fired.Load() == 0 {
+			require.NoError(t, readErr)
+			faults.disarm()
+		}
+	}
+	require.Equal(t, int64(1), faults.fired.Load(), "a read met the fault")
+	require.ErrorIs(t, readErr, errInjectedSpillIO)
+
+	assert.False(t, iter.Next(), "the scan of b goes on after the failed read")
+	assert.ErrorIs(t, iter.Err(), errInjectedSpillIO)
+	faults.disarm()
+}
+
 func TestSpillFault_WriteTx(t *testing.T) {
 	const baseDocs = 150
 	for _, cacheSize := range []int{30, 0} {
