@@ -291,7 +291,7 @@ type logEntry struct {
 	kind logKind
 	// prevLast is the handle's mark (collection.logLast) before the entry:
 	// what a rollback that discards the entry gives back (discardLog).
-	prevLast int32
+	prevLast int
 }
 
 type logKind uint8
@@ -407,7 +407,7 @@ func (t *txSchema) add(db *db, e logEntry) {
 	db.mu.Lock()
 	e.c.pinned++
 	db.mu.Unlock()
-	e.prevLast = int32(e.c.logLast)
+	e.prevLast = e.c.logLast
 	t.changes = append(t.changes, len(t.log))
 	t.log = append(t.log, e)
 	e.c.logLast = len(t.log)
@@ -464,7 +464,7 @@ func (c *collection) logPin(t *txSchema) error {
 // caller raised under db.mu: logPin, and the open that registers a handle
 // the write transaction loaded (db.openCollectionOnce).
 func (t *txSchema) pin(c *collection) {
-	t.log = append(t.log, logEntry{c: c, kind: logPin, prevLast: int32(c.logLast)})
+	t.log = append(t.log, logEntry{c: c, kind: logPin, prevLast: c.logLast})
 	c.logLast = len(t.log)
 }
 
@@ -553,7 +553,7 @@ func (db *db) discardLog(t *txSchema, from int) {
 		}
 		// From the end: a handle with several entries in the scope ends
 		// with the mark it had before the first of them.
-		e.c.logLast = int(e.prevLast)
+		e.c.logLast = e.prevLast
 		switch e.kind {
 		case logCreate:
 			e.c.closed.Store(true)
