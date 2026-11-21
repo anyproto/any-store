@@ -3,6 +3,7 @@
 package btree
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"sync/atomic"
@@ -25,11 +26,14 @@ func (f *page1ReadCountFile) ReadAt(b []byte, off int64) (int, error) {
 	return f.File.ReadAt(b, off)
 }
 
-// TestVerifyIntegritySweepPage1BodyUnreadable: the sweep takes its page
-// count from page 1's header. When the page cannot be read whole but its
-// header can, the sweep lists page 1 with the read's error and goes on with
-// the pages the header counts, as it does for any other page it cannot
-// read. A sweep that reads page 1 reads it once.
+// TestVerifyIntegritySweepPage1BodyUnreadable: when page 1 cannot be read
+// whole but its header can, the sweep lists page 1 with the read's error and
+// goes on, as it does for any other page it cannot read. With a WAL commit
+// in the snapshot it sweeps the pages the commit recorded. With none, the
+// pager's count is the file's length, and the sweep reads the header alone
+// for the page count (readRawPage1Header): the file here is longer than the
+// database, so only the header's count gives the database's pages. A sweep
+// that reads page 1 reads it once.
 func TestVerifyIntegritySweepPage1BodyUnreadable(t *testing.T) {
 	cases := []struct {
 		name string
@@ -60,9 +64,21 @@ func TestVerifyIntegritySweepPage1BodyUnreadable(t *testing.T) {
 			require.NoError(t, db.Checkpoint(tc.ckpt))
 			if tc.ckpt == CheckpointTruncate {
 				require.NoError(t, db.Close())
+				// Three pages past the database's end, with no valid tag:
+				// the file's length is no longer the database's size.
+				file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+				require.NoError(t, err)
+				_, err = file.Write(bytes.Repeat([]byte{0xEE}, 3*int(sweepPeerOpts.PageSize)))
+				require.NoError(t, err)
+				require.NoError(t, file.Close())
 				db, err = testOpen(t, path, sweepPeerOpts)
 				require.NoError(t, err)
 				defer func() { _ = db.Close() }()
+				rtx, err := db.BeginRead()
+				require.NoError(t, err)
+				bound := db.pager.readerDbSizeBound(rtx.cache)
+				require.NoError(t, rtx.Rollback())
+				require.Equal(t, n+3, bound, "setup: the pager's count is the file's length")
 			}
 
 			ctx := context.Background()
