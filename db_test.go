@@ -2738,8 +2738,8 @@ func TestOpenCollection_HandleClosedAtEveryAttempt(t *testing.T) {
 }
 
 // A lookup by name in the write transaction's schema log goes by its schema
-// changes, whatever handles the transaction uses besides, and follows a
-// savepoint that rolls a change back.
+// changes, whatever handles the transaction uses besides: it looks at no pin.
+// It follows a savepoint that rolls a change back.
 func TestWriteTx_NameLookupAmongPinnedHandles(t *testing.T) {
 	fx := newFixture(t)
 	for i := range 8 {
@@ -2757,10 +2757,19 @@ func TestWriteTx_NameLookupAmongPinnedHandles(t *testing.T) {
 			require.NoError(t, c.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":1}`)))
 		}
 	}
+	// visits returns the log entries byName looks at for name.
+	visits := func(name string) int {
+		v := &visitCounts{}
+		testVisits = v
+		defer func() { testVisits = nil }()
+		log.byName(name)
+		return v.byName
+	}
 	use(0, 3)
 	require.Len(t, log.log, 3, "setup: one pin per handle used")
 	require.Empty(t, log.changes, "a pin is not a schema change")
 	require.Nil(t, log.byName("p0"), "a used handle is found in the registry, not in the log")
+	require.Zero(t, visits("p0"), "a log of pins")
 
 	kept, err := fx.CreateCollection(wtx.Context(), "kept")
 	require.NoError(t, err)
@@ -2784,6 +2793,8 @@ func TestWriteTx_NameLookupAmongPinnedHandles(t *testing.T) {
 	_, err = fx.OpenCollection(wtx.Context(), "undone")
 	require.ErrorIs(t, err, ErrCollectionNotFound)
 	use(6, 8)
+	require.Len(t, log.log, 9, "setup: eight pins and the creation")
+	require.Equal(t, 1, visits("kept"), "the one schema change among the pins")
 	again, err := fx.OpenCollection(wtx.Context(), "kept")
 	require.NoError(t, err)
 	if again != kept {

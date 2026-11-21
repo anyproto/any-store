@@ -266,6 +266,8 @@ type txSchema struct {
 var testVisits *visitCounts
 
 type visitCounts struct {
+	// byName counts the log entries byName looks at.
+	byName int
 	// discard counts the log entries discardLog walks.
 	discard int
 	// evict counts the registry entries db.evictLocked looks at.
@@ -388,6 +390,9 @@ func (t *txSchema) byName(name string) *logEntry {
 	for j := len(t.changes) - 1; j >= 0; j-- {
 		i := t.changes[j]
 		e := &t.log[i]
+		if testVisits != nil {
+			testVisits.byName++
+		}
 		if e.s.name != name || e.c.logLast != i+1 {
 			continue
 		}
