@@ -122,19 +122,24 @@ func PersistPaged(g *FlatHNSW, db *btree.DB, name string, metric Metric) error {
 // PagedExists reports whether a persisted paged index named name is present.
 // Absent is a namespace or a meta record that is not there; a read that
 // fails is returned, and says nothing about the index.
+//
+// The namespace is looked up before a read transaction begins, so a name
+// with no namespace takes no reader slot (btree.Options.MaxReaders): a
+// caller that holds the slots itself gets its answer. The meta record is
+// then read in a transaction of its own, which waits for a slot.
 func PagedExists(db *btree.DB, name string) (bool, error) {
-	rtx, err := db.BeginRead()
-	if err != nil {
-		return false, err
-	}
-	defer rtx.Rollback()
-	ns, err := rtx.GetNamespace(name + ":pmeta")
+	ns, err := db.GetNamespace(name + ":pmeta")
 	if err != nil {
 		if errors.Is(err, btree.ErrNamespaceNotFound) {
 			return false, nil
 		}
 		return false, err
 	}
+	rtx, err := db.BeginRead()
+	if err != nil {
+		return false, err
+	}
+	defer rtx.Rollback()
 	if _, err = rtx.Get(ns, []byte(btreeMetaKey)); err != nil {
 		if errors.Is(err, btree.ErrKeyNotFound) {
 			return false, nil

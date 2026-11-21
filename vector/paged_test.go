@@ -92,6 +92,36 @@ func TestPersistReloadParity(t *testing.T) {
 	}
 }
 
+// PagedExists for a name that has no index takes no reader slot: a caller
+// that holds the only one gets the answer instead of waiting for itself.
+func TestPagedExists_AbsentTakesNoReaderSlot(t *testing.T) {
+	db, err := btree.Open(filepath.Join(t.TempDir(), "p.db"), btree.Options{MaxReaders: 1})
+	require.NoError(t, err)
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	_, err = db.TryBeginRead()
+	require.ErrorIs(t, err, btree.ErrReadersBusy, "setup: the one reader slot is taken")
+
+	type result struct {
+		exists bool
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		exists, err := PagedExists(db, "none")
+		done <- result{exists, err}
+	}()
+	select {
+	case r := <-done:
+		require.NoError(t, r.err)
+		require.False(t, r.exists)
+	case <-time.After(10 * time.Second):
+		t.Fatal("PagedExists waits for a reader slot to look up a name with no index")
+	}
+}
+
 // TestPagedVsMemory measures the latency and RAM trade of paging vectors from
 // the btree (Option B) vs the in-memory arena (Option A), warm cache.
 func TestPagedVsMemory(t *testing.T) {
