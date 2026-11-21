@@ -3699,7 +3699,15 @@ func (c *Cursor) gatedSkip(skip func(*Cursor, int) error, n int) error {
 	return skip(c, n)
 }
 
+// testGatedKeyValueHook, when non-nil, runs as a write transaction's Key or
+// Value takes the writer gate instead of reading the pinned leaf alone
+// (readsPinnedLeaf), with the cursor that makes the call. Test-only.
+var testGatedKeyValueHook func(c *Cursor)
+
 func (c *Cursor) gatedKey() ([]byte, error) {
+	if testGatedKeyValueHook != nil {
+		testGatedKeyValueHook(c)
+	}
 	if err := c.enterGate(); err != nil {
 		return nil, err
 	}
@@ -3708,6 +3716,9 @@ func (c *Cursor) gatedKey() ([]byte, error) {
 }
 
 func (c *Cursor) gatedValue() ([]byte, error) {
+	if testGatedKeyValueHook != nil {
+		testGatedKeyValueHook(c)
+	}
 	if err := c.enterGate(); err != nil {
 		return nil, err
 	}

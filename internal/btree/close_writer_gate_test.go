@@ -955,7 +955,10 @@ func TestClose_CursorAbandonedBeforeCacheDisposal(t *testing.T) {
 // nothing else, so they run outside the gate, and Close does not wait for
 // them. Close comes while a goroutine does nothing but read the entry: the
 // reads see the entry or ErrClosed, never another page's bytes, and under
-// the race detector nothing Close does conflicts with them.
+// the race detector nothing Close does conflicts with them. A hook on the
+// gated path (testGatedKeyValueHook) checks that the reads made while the
+// gate is open are the ones outside it: only a read that finds the gate
+// closed may take it, and is refused there.
 func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
 	for _, mode := range []struct {
 		name string
@@ -976,6 +979,7 @@ func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
 			if testing.Short() {
 				iters = 20
 			}
+			t.Cleanup(func() { testGatedKeyValueHook = nil })
 			for it := 0; it < iters; it++ {
 				db, err := testOpen(t, "", opts)
 				require.NoError(t, err)
@@ -987,14 +991,18 @@ func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
 				require.NoError(t, err)
 				cur := tx.NewCursor(ns)
 				require.NoError(t, cur.First())
+				var gatedOpen atomic.Int32
+				testGatedKeyValueHook = func(c *Cursor) {
+					if c == cur && !db.pager.wgate.closed() {
+						gatedOpen.Add(1)
+					}
+				}
 				wantKey, err := cur.Key()
 				require.NoError(t, err)
 				wantKey = bytes.Clone(wantKey)
 				wantVal, err := cur.Value()
 				require.NoError(t, err)
 				wantVal = bytes.Clone(wantVal)
-				// Key and Value take the path outside the gate.
-				require.True(t, cur.readsPinnedLeaf())
 
 				var (
 					wg      sync.WaitGroup
@@ -1043,8 +1051,10 @@ func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
 				putN(t, other, "t", 50, 300)
 				require.NoError(t, other.Close())
 				wg.Wait()
+				testGatedKeyValueHook = nil
 				require.Nil(t, bad.Load())
 				require.NotZero(t, reads)
+				require.Zero(t, gatedOpen.Load(), "a Key or a Value of the cursor on its leaf took the writer gate while it was open")
 				require.NoError(t, tx.Rollback())
 			}
 		})
