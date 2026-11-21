@@ -1,4 +1,4 @@
-//go:build vfs && !js
+//go:build vfs && (linux || darwin) && (amd64 || arm64)
 
 package btree
 
