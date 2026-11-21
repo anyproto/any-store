@@ -548,8 +548,10 @@ func (b *Backup) update(iPage uint32, data []byte) {
 
 	// A write to the destination's write transaction, made on the source
 	// writer's goroutine: a call of that transaction, as in Step
-	// (backupUpdate takes the destination's mutex, backup.c:676). After a
-	// Close of the destination the backup has failed.
+	// (backupUpdate takes the destination's mutex, backup.c:676). One that
+	// comes after a Close of the destination is refused and fails the
+	// backup, as a Step then does; a Finish with neither between returns
+	// what an unfinished backup's finish returns (backup.c:603).
 	if err := b.dst.pager.wgate.enter(); err != nil {
 		b.rc = err
 		return

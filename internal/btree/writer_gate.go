@@ -22,10 +22,14 @@ import "sync/atomic"
 // panic included: it leaves the gate once it has released everything but
 // the write lock, and Close then waits for the write lock.
 //
-// SQLite needs none of this: sqlite3_step holds the connection mutex, which
-// sqlite3_close takes (vdbeapi.c sqlite3_step, main.c sqlite3Close), and
-// sqlite3Close then refuses with SQLITE_BUSY while a statement is active.
-// DRIFT: Close ends a write transaction under its goroutine, after waiting for the call in flight; C refuses the close See docs/btree/NOTES.md#drift-2026-11-19-1-close-waits-for-the-writers-call-in-flight
+// SQLite needs none of this. In serialized mode, the default build,
+// sqlite3_step holds the connection mutex, which sqlite3_close takes
+// (vdbeapi.c:923, main.c:1263); sqlite3_close then refuses with SQLITE_BUSY
+// while a statement is unfinalized, and sqlite3_close_v2 leaves the close to
+// the last finalize (main.c:1283, 1371). In multi-thread mode the connection
+// has no mutex, and a close during another thread's step is the
+// application's error.
+// DRIFT: Close ends a write transaction under its goroutine, after waiting for the call in flight; C refuses or defers the close See docs/btree/NOTES.md#drift-2026-11-19-1-close-waits-for-the-writers-call-in-flight
 //
 // The count is of calls, not of transactions, and nests: a gated call may
 // make another (a write saves the transaction's cursors, and each reads its

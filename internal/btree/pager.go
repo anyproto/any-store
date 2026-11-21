@@ -4137,8 +4137,11 @@ type lentPage struct {
 // The cursors are taken off the pager's list: they stay their owner's, and
 // the closed pager keeps none of them reachable.
 //
-// SQLite has no counterpart: sqlite3_close refuses while a statement, and
-// with it a cursor, is open (main.c sqlite3Close, connectionIsBusy).
+// SQLite has no counterpart: no close ends a transaction under an open
+// statement, and with it a cursor. sqlite3_close refuses while one is
+// unfinalized, sqlite3_close_v2 leaves the close to its finalize (main.c:1283,
+// 1371), and sqlite3BtreeClose asserts that no cursor of the handle is open
+// (btree.c:2924-2935).
 // DRIFT: the leaves that cursors of a transaction ended by Close pin outlive the page cache; C cannot close under an open cursor See docs/btree/NOTES.md#drift-2026-11-19-1-close-waits-for-the-writers-call-in-flight
 func (p *pager) destroyEndedWriterCache() {
 	p.lentMu.Lock()

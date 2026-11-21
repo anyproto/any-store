@@ -807,13 +807,17 @@ func Open(path string, opts Options) (*DB, error) {
 // Close waits for every read transaction of this handle to end
 // (db.mu.Lock against the RLock each ReadTx holds), with no timeout and no
 // error: a ReadTx that is never rolled back blocks Close forever, and Close
-// called on the goroutine that holds one deadlocks. SQLite's sqlite3_close
-// and sqlite3_close_v2 wait for the connection mutex, so for a step running
-// on another thread (main.c:1263, vdbeapi.c:923), and no longer: with a
-// statement unfinalized or a backup unfinished sqlite3_close then returns
-// SQLITE_BUSY (main.c:1283) and sqlite3_close_v2 leaves a zombie that is
-// closed with the last of them (main.c:1307, 1371). Neither waits for a
-// statement to be finalized.
+// called on the goroutine that holds one deadlocks. In serialized mode, the
+// default build, SQLite's sqlite3_close and sqlite3_close_v2 wait for the
+// connection mutex, so for a step running on another thread (main.c:1263,
+// vdbeapi.c:923), and, but for the shared b-tree mutexes of a shared cache
+// (disconnectAllVtab, main.c:1213), no longer: with a statement unfinalized,
+// or a backup that reads from the connection unfinished (backup.c:204),
+// sqlite3_close then returns SQLITE_BUSY (main.c:1283) and sqlite3_close_v2
+// leaves a zombie that is closed with the last of them (main.c:1307, 1371).
+// Neither waits for a statement to be finalized. In multi-thread mode the
+// connection has no mutex (main.c:3388-3393), and a close during another
+// thread's step is the application's error.
 //
 // A registered write transaction is not waited for: Close rolls it back and
 // releases its locks, as sqlite3Close rolls back a transaction left open
