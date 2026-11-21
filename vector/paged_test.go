@@ -92,9 +92,10 @@ func TestPersistReloadParity(t *testing.T) {
 	}
 }
 
-// PagedExists for a name that has no index takes no reader slot: a caller
-// that holds the only one gets the answer instead of waiting for itself.
-func TestPagedExists_AbsentTakesNoReaderSlot(t *testing.T) {
+// PagedExists for a name with no :pmeta namespace takes no reader slot: a
+// caller that holds the only one gets the answer instead of waiting for
+// itself.
+func TestPagedExists_MissingNamespaceTakesNoReaderSlot(t *testing.T) {
 	db, err := btree.Open(filepath.Join(t.TempDir(), "p.db"), btree.Options{MaxReaders: 1})
 	require.NoError(t, err)
 	defer db.Close()
@@ -118,7 +119,7 @@ func TestPagedExists_AbsentTakesNoReaderSlot(t *testing.T) {
 		require.NoError(t, r.err)
 		require.False(t, r.exists)
 	case <-time.After(10 * time.Second):
-		t.Fatal("PagedExists waits for a reader slot to look up a name with no index")
+		t.Fatal("PagedExists waits for a reader slot to look up a name with no :pmeta namespace")
 	}
 }
 
