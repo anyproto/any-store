@@ -511,6 +511,97 @@ func TestClose_CommitRightAfterCallInFlight(t *testing.T) {
 	require.NoError(t, db.IntegrityCheck())
 }
 
+// The gate counts calls, not transactions. Writer A's Commit or Rollback
+// leaves it before the write lock passes on, as SQLite's COMMIT releases the
+// write lock inside the step that holds the connection mutex, and the next
+// BEGIN is another step that takes it (vdbe.c:4042, pager.c:2142,
+// vdbeapi.c:923). Writer B begins once A has released the write lock, and
+// Close comes after B's first call: had A's count still been in the gate,
+// B's Commit would have passed for a call nested in it and published B's
+// writes after the gate closed.
+func TestClose_NextWriterCommitRefusedAfterHandoff(t *testing.T) {
+	for _, end := range []string{"Commit", "Rollback"} {
+		t.Run(end, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "a.db")
+			db, err := testOpen(t, path, Options{DisableAutoCheckpoint: true})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = db.Close() })
+			createNS(t, db, "t")
+			putN(t, db, "t", 10, 100)
+
+			txA, err := db.BeginWrite()
+			require.NoError(t, err)
+			ns, err := txA.GetNamespace("t")
+			require.NoError(t, err)
+			require.NoError(t, txA.Put(ns, closeRescueKey(100), []byte("a")))
+
+			var (
+				fired               bool
+				bBegin, bPut, bEnd  error
+				gateClosed, timeout bool
+				closed              = make(chan error, 1)
+			)
+			testWriterLocksReleasedHook = func() {
+				if fired {
+					return
+				}
+				fired = true
+				// A has handed the write lock on and is still inside its
+				// Commit or Rollback.
+				txB, err := db.BeginWrite()
+				if bBegin = err; err != nil {
+					return
+				}
+				if bPut = txB.Put(ns, closeRescueKey(200), []byte("b")); bPut != nil {
+					return
+				}
+				go func() { closed <- db.Close() }()
+				deadline := time.Now().Add(10 * time.Second)
+				for !db.pager.wgate.closed() {
+					if time.Now().After(deadline) {
+						timeout = true
+						return
+					}
+					time.Sleep(time.Millisecond)
+				}
+				gateClosed = true
+				bEnd = txB.Commit()
+			}
+			t.Cleanup(func() { testWriterLocksReleasedHook = nil })
+
+			if end == "Commit" {
+				require.NoError(t, txA.Commit())
+			} else {
+				require.NoError(t, txA.Rollback())
+			}
+			testWriterLocksReleasedHook = nil
+			require.True(t, fired, "the hook did not fire")
+			require.NoError(t, bBegin)
+			require.NoError(t, bPut)
+			require.False(t, timeout, "Close did not close the gate")
+			require.True(t, gateClosed)
+			require.ErrorIs(t, bEnd, ErrClosed, "writer B committed after Close closed the gate")
+			require.NoError(t, <-closed)
+
+			db, err = testOpen(t, path, Options{})
+			require.NoError(t, err)
+			defer func() { require.NoError(t, db.Close()) }()
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			defer rtx.Rollback()
+			rns, err := rtx.GetNamespace("t")
+			require.NoError(t, err)
+			hasA, err := rtx.Has(rns, closeRescueKey(100))
+			require.NoError(t, err)
+			require.Equal(t, end == "Commit", hasA, "writer A's outcome")
+			hasB, err := rtx.Has(rns, closeRescueKey(200))
+			require.NoError(t, err)
+			require.False(t, hasB, "writer B's write was published after Close closed the gate")
+			require.NoError(t, db.IntegrityCheck())
+		})
+	}
+}
+
 // Close waits for a Commit in flight to its end, the unwind of a panic
 // included. The panic strikes after the commit is published, with the pager
 // still in the writer state and writerOpMu released by the unwinding: a
