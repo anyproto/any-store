@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -219,4 +220,45 @@ func TestOpen_FirstMagicStillOpensAndIsRewritten(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, dbMagicV2, string(data[:16]))
 	assert.Equal(t, uint32(5), binary.BigEndian.Uint32(data[44:48]))
+}
+
+// A file the caller may read and not write still gets the error of its
+// format: the open for writing fails, and the header is then judged on a
+// read-only descriptor. A database this binary can use fails with the error
+// of the open itself.
+func TestOpen_ReadOnlyFileKeepsItsFormatError(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a file that opens for reading and not for writing")
+	}
+	healthy := referenceEmptyPage1(t, DefaultOptions())
+	newer := append([]byte(nil), healthy...)
+	newer[19] = 3
+	v1 := make([]byte, DefaultPageSize)
+	copy(v1, sqliteMagic)
+	for _, tc := range []struct {
+		name    string
+		content []byte
+		journal bool
+		want    error
+	}{
+		{name: "any-store v1", content: v1, want: ErrSQLiteFormat},
+		{name: "a newer format", content: newer, want: ErrNewerFormat},
+		{name: "a database of this format", content: healthy, want: os.ErrPermission},
+		{name: "a dead creator's page 1", content: v1, journal: true, want: os.ErrPermission},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "t.db")
+			require.NoError(t, os.WriteFile(path, tc.content, 0o444))
+			if tc.journal {
+				require.NoError(t, os.WriteFile(path+creationJournalSuffix, creationJournalHdr(DefaultPageSize), 0o644))
+			}
+
+			_, err := testOpen(t, path, DefaultOptions())
+
+			require.ErrorIs(t, err, tc.want)
+			after, rerr := os.ReadFile(path)
+			require.NoError(t, rerr)
+			assert.Equal(t, tc.content, after)
+		})
+	}
 }

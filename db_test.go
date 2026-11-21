@@ -11,6 +11,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -464,6 +465,20 @@ func TestOpen_AnyStoreV1File(t *testing.T) {
 		page := make([]byte, 4096)
 		copy(page, "SQLite format 3\x00")
 		require.NoError(t, os.WriteFile(path, page, 0o600))
+
+		db, err := Open(ctx, path, nil)
+		require.ErrorIs(t, err, ErrV1Database)
+		require.Nil(t, db)
+	})
+
+	t.Run("v1 file the caller may only read", func(t *testing.T) {
+		if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+			t.Skip("needs a file that opens for reading and not for writing")
+		}
+		path := filepath.Join(dir, "v1-readonly.db")
+		page := make([]byte, 4096)
+		copy(page, "SQLite format 3\x00")
+		require.NoError(t, os.WriteFile(path, page, 0o400))
 
 		db, err := Open(ctx, path, nil)
 		require.ErrorIs(t, err, ErrV1Database)

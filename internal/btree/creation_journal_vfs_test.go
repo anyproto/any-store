@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -23,10 +24,15 @@ import (
 //     name created since then is lost, and a name removed since then comes
 //     back, naming the file it named, with that file's last synced content.
 //
-// image writes that state out. Files that were in a directory before the
+// image writes that state out. Files that were in the directory before the
 // test adopted it are durable as they were.
+//
+// trace, when set, gets every event on the database file and its journal
+// (create, write, truncate, sync, remove), the WAL's creates, syncs and
+// removes, and the directory syncs. It runs with mu held.
 type powerLossFS struct {
 	mu       sync.Mutex
+	dir      os.FileInfo // the directory the files are in
 	nextIno  int
 	names    map[string]int // the names that exist now, and the file each names
 	synced   map[int][]byte // each file's content at its last sync
@@ -38,12 +44,36 @@ type powerLossFS struct {
 type powerLossFile struct {
 	*os.File
 	ino int
+	fs  *powerLossFS
+}
+
+func (f powerLossFile) WriteAt(b []byte, off int64) (int, error) {
+	n, err := f.File.WriteAt(b, off)
+	if err == nil && !strings.HasSuffix(f.Name(), "-wal") {
+		f.fs.mu.Lock()
+		f.fs.record("write", f.Name())
+		f.fs.mu.Unlock()
+	}
+	return n, err
+}
+
+func (f powerLossFile) Truncate(size int64) error {
+	err := f.File.Truncate(size)
+	if err == nil && !strings.HasSuffix(f.Name(), "-wal") {
+		f.fs.mu.Lock()
+		f.fs.record("truncate", f.Name())
+		f.fs.mu.Unlock()
+	}
+	return err
 }
 
 // newPowerLossFS installs a powerLossFS over dir for the rest of the test.
 func newPowerLossFS(t *testing.T, dir string) *powerLossFS {
 	t.Helper()
 	fs := &powerLossFS{names: map[string]int{}, synced: map[int][]byte{}, durable: map[string]int{}}
+	var err error
+	fs.dir, err = os.Stat(dir)
+	require.NoError(t, err)
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	for _, e := range entries {
@@ -95,7 +125,7 @@ func (fs *powerLossFS) vfs() VFS {
 					fs.record("create", name)
 				}
 			}
-			return powerLossFile{File: f, ino: ino}, nil
+			return powerLossFile{File: f, ino: ino, fs: fs}, nil
 		},
 		Remove: func(name string) error {
 			err := os.Remove(name)
@@ -133,33 +163,48 @@ func (fs *powerLossFS) vfs() VFS {
 	}
 }
 
-// dirSynced is testSyncDirHook: the names in path's directory are durable as
-// they are now.
-func (fs *powerLossFS) dirSynced(path string) {
-	dir := filepath.Dir(path)
+// dirSynced is testSyncDirHook. d is the descriptor that was synced: when it
+// is the files' directory, the names in it are durable as they are now.
+func (fs *powerLossFS) dirSynced(d *os.File) {
+	info, err := d.Stat()
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	for name := range fs.durable {
-		if filepath.Dir(name) == dir {
-			delete(fs.durable, name)
+	if err != nil || !os.SameFile(info, fs.dir) {
+		if fs.trace != nil {
+			fs.trace("sync-dir of another directory: " + d.Name())
 		}
+		return
 	}
-	for name, ino := range fs.names {
-		if filepath.Dir(name) == dir {
-			fs.durable[name] = ino
-		}
+	fs.namesDurable()
+	if fs.trace != nil {
+		fs.trace("sync-dir")
 	}
-	fs.record("sync-dir", path)
 }
 
-// image writes what a power loss now would leave of the files in fromDir
-// into toDir. The wal-index is not among them: it does not outlive a reboot.
-func (fs *powerLossFS) image(t *testing.T, fromDir, toDir string) {
+// namesDurable makes the names durable as they are now. The caller holds mu.
+func (fs *powerLossFS) namesDurable() {
+	clear(fs.durable)
+	for name, ino := range fs.names {
+		fs.durable[name] = ino
+	}
+}
+
+// durableFile returns what a power loss now would leave under name: whether
+// the name is there, and the content.
+func (fs *powerLossFS) durableFile(name string) (content []byte, ok bool) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	ino, ok := fs.durable[name]
+	return fs.synced[ino], ok
+}
+
+// image writes what a power loss now would leave of the files into toDir. The wal-index is not among them: it does not outlive a reboot.
+func (fs *powerLossFS) image(t *testing.T, toDir string) {
 	t.Helper()
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	for name, ino := range fs.durable {
-		if filepath.Dir(name) != fromDir || strings.HasSuffix(name, "-shm") {
+		if strings.HasSuffix(name, "-shm") {
 			continue
 		}
 		require.NoError(t, os.WriteFile(filepath.Join(toDir, filepath.Base(name)), fs.synced[ino], 0o644))
@@ -189,7 +234,7 @@ func forEachLockMode(t *testing.T, f func(t *testing.T, inProcess bool)) {
 func reopenAfterPowerLoss(t *testing.T, fs *powerLossFS, dir string, opts Options, live *DB) *DB {
 	t.Helper()
 	after := t.TempDir()
-	fs.image(t, dir, after)
+	fs.image(t, after)
 	require.NoError(t, live.Close())
 	ResetVFS()
 	testSyncDirHook = nil
@@ -279,6 +324,8 @@ func TestCreation_CommitToAWALAnotherHandleCreatedSurvivesPowerLoss(t *testing.T
 		require.NoError(t, err)
 		require.NoError(t, db.Close())
 		require.FileExists(t, path+"-wal", "setup: the first handle's WAL")
+		_, durable := fs.durableFile(path + "-wal")
+		require.False(t, durable, "setup: the first handle made the WAL's name durable")
 
 		db, err = testOpen(t, path, opts)
 		require.NoError(t, err)
@@ -291,12 +338,11 @@ func TestCreation_CommitToAWALAnotherHandleCreatedSurvivesPowerLoss(t *testing.T
 }
 
 // TestCreation_CommitAfterTheCreationsLastJournalStepSurvivesPowerLoss: the
-// creator's last step on its journal is not made durable (a sync of the
-// journal after its first fails, or the delete is not synced), another open
-// commits a row with a synced commit, and the power goes. Whatever the
-// journal's name and content come back as, it must not be hot beside the
-// database the row was committed to: a hot journal there truncates the
-// database, and the WAL beside the empty file is deleted with the row.
+// creation's last step, its journal's delete, is not durable when another
+// open commits a row with a synced commit, and the power goes. The journal
+// must not come back hot beside the database the row was committed to: a hot
+// journal there truncates the database, and the WAL beside the empty file is
+// deleted with the row.
 func TestCreation_CommitAfterTheCreationsLastJournalStepSurvivesPowerLoss(t *testing.T) {
 	forEachLockMode(t, func(t *testing.T, inProcess bool) {
 		dir := t.TempDir()
@@ -304,21 +350,15 @@ func TestCreation_CommitAfterTheCreationsLastJournalStepSurvivesPowerLoss(t *tes
 		opts := powerLossOpts(inProcess)
 		fs := newPowerLossFS(t, dir)
 
-		journalSyncs := 0
-		fs.failSync = func(name string) error {
-			if name == path+creationJournalSuffix {
-				if journalSyncs++; journalSyncs > 1 {
-					return errCreatorDied
-				}
-			}
-			return nil
-		}
-		if db, err := testOpen(t, path, opts); err == nil {
-			require.NoError(t, db.Close())
-		}
-		fs.failSync = nil
-
 		db, err := testOpen(t, path, opts)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+		require.NoFileExists(t, path+creationJournalSuffix)
+		left, durable := fs.durableFile(path + creationJournalSuffix)
+		require.True(t, durable, "setup: the journal's delete is durable")
+		require.Equal(t, creationJournalHdr(opts.PageSize), left, "setup: the journal that would come back is not hot")
+
+		db, err = testOpen(t, path, opts)
 		require.NoError(t, err)
 		createPutRow(t, db, "acknowledged")
 
@@ -326,6 +366,109 @@ func TestCreation_CommitAfterTheCreationsLastJournalStepSurvivesPowerLoss(t *tes
 		createRequireRow(t, db, "acknowledged")
 		require.NoError(t, db.IntegrityCheck())
 	})
+}
+
+// TestCreation_PowerLossAfterAKilledPlayback: a playback is killed after its
+// truncation of the database file and before the sync, so the disk still
+// holds the dead creator's page 1, marked by the hot journal. The next open
+// finds an empty file beside that journal, replaces the journal with its own
+// and dies before the new journal is synced; the directory reaches the disk
+// with the old journal's name gone and the new one not there yet. The disk
+// must not then hold the dead creator's page 1 with no hot journal beside it:
+// the open after the power loss would take it for a database.
+func TestCreation_PowerLossAfterAKilledPlayback(t *testing.T) {
+	forEachLockMode(t, func(t *testing.T, inProcess bool) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "test.db")
+		journal := path + creationJournalSuffix
+		opts := powerLossOpts(inProcess)
+		require.NoError(t, os.WriteFile(path, referenceEmptyPage1(t, opts), 0o644))
+		require.NoError(t, os.WriteFile(journal, creationJournalHdr(opts.PageSize), 0o644))
+		fs := newPowerLossFS(t, dir)
+
+		// The playback that is killed before its sync.
+		fs.failSync = func(name string) error {
+			if name == path {
+				return errCreatorDied
+			}
+			return nil
+		}
+		_, err := testOpen(t, path, opts)
+		require.ErrorIs(t, err, errCreatorDied)
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		require.Zero(t, info.Size(), "setup: the playback truncated the file")
+		left, _ := fs.durableFile(path)
+		require.NotEmpty(t, left, "setup: the truncation is durable")
+
+		// The open that dies between the delete of the journal it found and
+		// the sync of its own.
+		fs.failSync = func(name string) error {
+			if name == journal {
+				return errCreatorDied
+			}
+			return nil
+		}
+		removed := false
+		fs.trace = func(event string) {
+			if event == "remove "+filepath.Base(journal) {
+				removed = true
+				fs.namesDurable()
+			}
+		}
+		_, err = testOpen(t, path, opts)
+		require.ErrorIs(t, err, errCreatorDied)
+		require.True(t, removed, "setup: the journal found beside the empty file was not deleted")
+		fs.failSync, fs.trace = nil, nil
+
+		after := t.TempDir()
+		fs.image(t, after)
+		ResetVFS()
+		testSyncDirHook = nil
+		p := &pager{path: filepath.Join(after, "test.db")}
+		hot, err := p.hasHotCreationJournal()
+		require.NoError(t, err)
+		if !hot {
+			info, err := os.Stat(p.path)
+			require.NoError(t, err)
+			require.Zero(t, info.Size(), "the dead creator's page 1 is on disk with no hot journal beside it")
+		}
+		assertValidEmptyDB(t, p.path, opts)
+	})
+}
+
+// TestCreationJournal_JournalFoundIsDeletedAfterTheDatabaseFilesSync: a
+// journal found beside the database file is not written to. A hot one is
+// played back in pager_playback's order, the truncation, the sync of the
+// database file and then the journal's delete; one beside an empty file is
+// deleted after a sync of that file. The creation then opens its own.
+func TestCreationJournal_JournalFoundIsDeletedAfterTheDatabaseFilesSync(t *testing.T) {
+	for _, hot := range []bool{true, false} {
+		t.Run(map[bool]string{true: "hot", false: "beside an empty file"}[hot], func(t *testing.T) {
+			forEachLockMode(t, func(t *testing.T, inProcess bool) {
+				dir := t.TempDir()
+				path := filepath.Join(dir, "test.db")
+				opts := powerLossOpts(inProcess)
+				var content []byte
+				want := []string{"sync test.db", "remove test.db-journal", "create test.db-journal", "write test.db-journal"}
+				if hot {
+					content = referenceEmptyPage1(t, opts)
+					want = append([]string{"truncate test.db"}, want...)
+				}
+				require.NoError(t, os.WriteFile(path, content, 0o644))
+				require.NoError(t, os.WriteFile(path+creationJournalSuffix, creationJournalHdr(opts.PageSize), 0o644))
+				fs := newPowerLossFS(t, dir)
+				var events []string
+				fs.trace = func(event string) { events = append(events, event) }
+
+				db, err := testOpen(t, path, opts)
+				require.NoError(t, err)
+				defer func() { _ = db.Close() }()
+				require.GreaterOrEqual(t, len(events), len(want))
+				require.Equal(t, want, events[:len(want)])
+			})
+		})
+	}
 }
 
 // TestCreation_PowerLossBeforeAnyCommitCreatesTheDatabaseAgain: a creation
@@ -347,7 +490,7 @@ func TestCreation_PowerLossBeforeAnyCommitCreatesTheDatabaseAgain(t *testing.T) 
 		require.NoFileExists(t, path+creationJournalSuffix)
 
 		after := t.TempDir()
-		fs.image(t, dir, after)
+		fs.image(t, after)
 		ResetVFS()
 		testSyncDirHook = nil
 		require.FileExists(t, filepath.Join(after, "test.db"+creationJournalSuffix), "setup: the journal came back")
@@ -368,7 +511,9 @@ func TestCreation_PowerLossBeforeAnyCommitCreatesTheDatabaseAgain(t *testing.T) 
 // commits after it make, as the file system sees them. The journal and its
 // directory are synced before page 1 is written, the stale WAL's removal
 // before that directory sync; page 1 is synced before the journal's delete.
-// The directory is synced once at the first sync of each descriptor opened
+// The writes are the file system's, and the directory sync is the one of the
+// files' directory, told by the descriptor that was synced. The directory is
+// synced once at the first sync of each descriptor opened
 // with the create flag (the journal's, the WAL's of each open) and at no
 // other sync.
 func TestCreationJournal_OrderOfTheSyncs(t *testing.T) {
@@ -396,10 +541,12 @@ func TestCreationJournal_OrderOfTheSyncs(t *testing.T) {
 			"remove test.db-wal",
 			"create test.db-journal",
 			"stage journal-opened",
+			"write test.db-journal",
 			"stage before-journal-sync",
 			"sync test.db-journal",
-			"sync-dir test.db-journal",
+			"sync-dir",
 			"stage before-page1-write",
+			"write test.db",
 			"stage before-page1-sync",
 			"sync test.db",
 			"stage before-journal-delete",
@@ -409,14 +556,14 @@ func TestCreationJournal_OrderOfTheSyncs(t *testing.T) {
 		}, take())
 
 		createPutRow(t, db, "one")
-		require.Equal(t, []string{"sync test.db-wal", "sync-dir test.db-wal", "sync test.db-wal"}, take(),
+		require.Equal(t, []string{"sync test.db-wal", "sync-dir", "sync test.db-wal"}, take(),
 			"the WAL's header sync is its first, and syncs the directory")
 		createPutRow(t, db, "two")
 		require.Equal(t, []string{"sync test.db-wal"}, take())
 		require.NoError(t, db.Checkpoint(CheckpointTruncate))
-		require.Equal(t, []string{"sync test.db-wal", "sync test.db"}, take())
+		require.Equal(t, []string{"sync test.db-wal", "write test.db", "truncate test.db", "sync test.db"}, slices.Compact(take()))
 		createPutRow(t, db, "three")
-		require.NotContains(t, take(), "sync-dir test.db-wal")
+		require.NotContains(t, take(), "sync-dir")
 		require.NoError(t, db.Close())
 		take()
 
@@ -425,11 +572,11 @@ func TestCreationJournal_OrderOfTheSyncs(t *testing.T) {
 		db, err = testOpen(t, path, opts)
 		require.NoError(t, err)
 		defer func() { _ = db.Close() }()
-		require.NotContains(t, take(), "sync-dir test.db-wal")
+		require.NotContains(t, take(), "sync-dir")
 		createPutRow(t, db, "four")
 		got := take()
-		require.Equal(t, []string{"sync test.db-wal", "sync-dir test.db-wal"}, got[:2])
-		require.NotContains(t, got[2:], "sync-dir test.db-wal")
+		require.Equal(t, []string{"sync test.db-wal", "sync-dir"}, got[:2])
+		require.NotContains(t, got[2:], "sync-dir")
 	})
 }
 
