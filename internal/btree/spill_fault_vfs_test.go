@@ -599,11 +599,12 @@ func TestSpillFault_RootSplitStoppedHalfWay(t *testing.T) {
 	require.Greater(t, halfWay, 0, "no fault stopped the split with a zero-cell root")
 }
 
-// The cursors of a transaction in the error state are ended by its
-// rollback, before the cache they pin is discarded: a cursor left open on
-// another tree would otherwise keep pointers into the discarded cache and
-// unpin, at its Close, pages the next transaction holds. The commit of
-// such a transaction rolls it back the same way.
+// The cursors of a transaction in the error state are ended when the call
+// that met the error returns, and again by its rollback, before the cache
+// they pin is discarded: a cursor left open on another tree would otherwise
+// step on through its leaf, keep pointers into the discarded cache and
+// unpin, at its Close, pages the next transaction holds. The commit of such
+// a transaction rolls it back the same way.
 func TestSpillFault_RollbackTripsCursors(t *testing.T) {
 	const baseKeys = 150
 	for _, end := range []string{"rollback", "commit"} {
@@ -635,6 +636,9 @@ func TestSpillFault_RollbackTripsCursors(t *testing.T) {
 				}
 			}
 			require.ErrorIs(t, opErr, errInjectedSpillIO)
+			// The failed call ended the cursor as it returned.
+			require.Empty(t, c.stack, "the cursor still pins its leaf after the failed call")
+			require.ErrorIs(t, c.Next(), errInjectedSpillIO, "the cursor steps on after the failed call")
 			if end == "rollback" {
 				require.NoError(t, tx.Rollback())
 			} else {
@@ -648,6 +652,170 @@ func TestSpillFault_RollbackTripsCursors(t *testing.T) {
 			require.True(t, s.verify(t, "after the failed transaction"))
 		})
 	}
+}
+
+// The call during which a spill fails ends the transaction's cursors as it
+// returns, as SQLite's statement halt does (sqlite3VdbeHalt: closeAllCursors,
+// then sqlite3RollbackAll's trip, vdbeaux.c:3335, 3378): a cursor positioned
+// on another tree does not go on stepping through the leaf it pins. Each
+// call of a write transaction that can fetch a page is the failing one in
+// turn, a read and a move of another cursor included.
+func TestSpillFault_FailedCallEndsCursors(t *testing.T) {
+	bigKey := bytes.Repeat([]byte("k"), 3*4096)
+	longName := strings.Repeat("n", 3*4096)
+	open := func(t *testing.T) (*DB, *spillFaultFile) {
+		path := filepath.Join(t.TempDir(), "halt.db")
+		db, err := testOpen(t, path, Options{PageSize: 4096, CacheSize: closeRescueCache, DisableAutoCheckpoint: true})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = db.Close() })
+		createNS(t, db, "a")
+		putN(t, db, "a", closeRescueRows, closeRescueValSize)
+		createNS(t, db, "b")
+		putN(t, db, "b", 20, 10)
+		createNS(t, db, "c")
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		nsC, err := tx.GetNamespace("c")
+		require.NoError(t, err)
+		require.NoError(t, tx.Put(nsC, closeRescueKey(1), make([]byte, 10*4096)))
+		require.NoError(t, tx.Put(nsC, bigKey, []byte("v")))
+		require.NoError(t, tx.Commit())
+		f := &spillFaultFile{File: db.pager.wal.file}
+		db.pager.wal.file = f
+		return db, f
+	}
+	far := closeRescueKey(closeRescueRows - 1)
+	// Each case positions what it needs before the cache is filled, and
+	// returns the call that must meet the fault.
+	cases := []struct {
+		name string
+		call func(t *testing.T, tx *WriteTx) func() error
+	}{
+		{"Put", func(t *testing.T, tx *WriteTx) func() error {
+			ns := mustNS(t, tx, "a")
+			return func() error { return tx.Put(ns, far, []byte("x")) }
+		}},
+		{"Delete", func(t *testing.T, tx *WriteTx) func() error {
+			ns := mustNS(t, tx, "a")
+			return func() error { return tx.Delete(ns, far) }
+		}},
+		{"Get", func(t *testing.T, tx *WriteTx) func() error {
+			ns := mustNS(t, tx, "a")
+			return func() error { _, err := tx.Get(ns, far); return err }
+		}},
+		{"Has", func(t *testing.T, tx *WriteTx) func() error {
+			ns := mustNS(t, tx, "a")
+			return func() error { _, err := tx.Has(ns, far); return err }
+		}},
+		{"SeekKey", func(t *testing.T, tx *WriteTx) func() error {
+			ns := mustNS(t, tx, "a")
+			return func() error { _, err := tx.SeekKey(ns, far); return err }
+		}},
+		{"Count", func(t *testing.T, tx *WriteTx) func() error {
+			ns := mustNS(t, tx, "a")
+			return func() error { _, err := tx.Count(ns); return err }
+		}},
+		{"NamespaceSize", func(t *testing.T, tx *WriteTx) func() error {
+			ns := mustNS(t, tx, "a")
+			return func() error { _, err := tx.NamespaceSize(ns); return err }
+		}},
+		{"CreateNamespace", func(t *testing.T, tx *WriteTx) func() error {
+			return func() error { _, err := tx.CreateNamespace(longName); return err }
+		}},
+		{"DeleteNamespace", func(t *testing.T, tx *WriteTx) func() error {
+			return func() error { return tx.DeleteNamespace("a") }
+		}},
+		{"RenameNamespace", func(t *testing.T, tx *WriteTx) func() error {
+			return func() error { return tx.RenameNamespace("a", longName) }
+		}},
+		{"Cursor.Last", func(t *testing.T, tx *WriteTx) func() error {
+			c := tx.NewCursor(mustNS(t, tx, "a"))
+			t.Cleanup(c.Close)
+			return c.Last
+		}},
+		{"Cursor.Seek", func(t *testing.T, tx *WriteTx) func() error {
+			c := tx.NewCursor(mustNS(t, tx, "a"))
+			t.Cleanup(c.Close)
+			return func() error { return c.Seek(far) }
+		}},
+		{"Cursor.Next", func(t *testing.T, tx *WriteTx) func() error {
+			// On the last entry of a dirty leaf: the next step crosses to
+			// a leaf the full cache does not hold, and the one it leaves
+			// cannot make room.
+			c := tx.NewCursor(mustNS(t, tx, "a"))
+			t.Cleanup(c.Close)
+			require.NoError(t, c.Seek(closeRescueKey(closeRescueRows/2)))
+			leaf := &c.stack[len(c.stack)-1]
+			leaf.cellIdx = int(leaf.pg.header.cellCount) - 1
+			pg, err := tx.pager.getWritablePage(leaf.pgno)
+			require.NoError(t, err)
+			tx.pager.releasePage(pg)
+			return c.Next
+		}},
+		{"Cursor.RangeFraction", func(t *testing.T, tx *WriteTx) func() error {
+			c := tx.NewCursor(mustNS(t, tx, "a"))
+			t.Cleanup(c.Close)
+			return func() error { _, err := c.RangeFraction(closeRescueKey(1), far); return err }
+		}},
+		{"Cursor.Value", func(t *testing.T, tx *WriteTx) func() error {
+			c := tx.NewCursor(mustNS(t, tx, "c"))
+			t.Cleanup(c.Close)
+			require.NoError(t, c.SeekExact(closeRescueKey(1)))
+			return func() error { _, err := c.Value(); return err }
+		}},
+		{"Cursor.AppendValue", func(t *testing.T, tx *WriteTx) func() error {
+			c := tx.NewCursor(mustNS(t, tx, "c"))
+			t.Cleanup(c.Close)
+			require.NoError(t, c.SeekExact(closeRescueKey(1)))
+			return func() error { _, err := c.AppendValue(nil); return err }
+		}},
+		{"Cursor.Key", func(t *testing.T, tx *WriteTx) func() error {
+			c := tx.NewCursor(mustNS(t, tx, "c"))
+			t.Cleanup(c.Close)
+			require.NoError(t, c.SeekExact(bigKey))
+			return func() error { _, err := c.Key(); return err }
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, f := open(t)
+			p := db.pager
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			defer func() { _ = tx.Rollback() }()
+			// The cursor that must not go on: on the first of the 20 keys of
+			// "b", whose one leaf it pins.
+			cur := tx.NewCursor(mustNS(t, tx, "b"))
+			defer cur.Close()
+			require.NoError(t, cur.First())
+			call := tc.call(t, tx)
+			fillWriterCacheDirty(t, p)
+
+			f.arm(1, false, false)
+			err = call()
+			require.Equal(t, int64(1), f.fired.Load(), "the call met the fault")
+			require.ErrorIs(t, err, errInjectedSpillIO)
+			require.Equal(t, int32(pagerError), p.state.Load())
+
+			assert.Empty(t, cur.stack, "the cursor still pins its leaf after the failed call")
+			assert.False(t, cur.Valid())
+			assert.ErrorIs(t, cur.Next(), errInjectedSpillIO, "the cursor steps on after the failed call")
+			_, err = cur.Key()
+			assert.ErrorIs(t, err, errInjectedSpillIO)
+
+			require.NoError(t, tx.Rollback())
+			f.disarm()
+			require.NoError(t, db.IntegrityCheck())
+			require.Equal(t, 20, countKeys(t, db, "b"))
+		})
+	}
+}
+
+func mustNS(t *testing.T, tx *WriteTx, name string) *Namespace {
+	t.Helper()
+	ns, err := tx.GetNamespace(name)
+	require.NoError(t, err)
+	return ns
 }
 
 // A rename reads its new catalog entry back. With a name whose overflow
