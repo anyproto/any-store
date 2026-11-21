@@ -2520,6 +2520,11 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 // Modeled after SQLite's balance_deeper(): copies root content to a new child
 // page, then converts the root into an interior page pointing to the new child
 // and the right sibling. Handles both leaf and interior roots correctly.
+// Like SQLite's balance, which calls balance_deeper on an over-full root
+// (btree.c:9134-9145), it does not look at the height of the tree: a tree of
+// btCursorMaxDepth levels grows to one more, whose leaves the descents then
+// read as ErrCorrupt. See the known limitations in
+// docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 // DRIFT: splitRoot omits SQLite's anotherValidCursor() guard before deepening root See docs/btree/NOTES.md#drift-34-splitroot-missing-anothervalidcursor-corruption-guard
 func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) error {
 	// Allocate a new page for the old root's content
