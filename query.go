@@ -656,13 +656,6 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(wtx WriteTx, btWt
 		return
 	}
 
-	// Fast path: filter provably matches no documents — nothing to mutate,
-	// no write tx required. ModifyResult is the zero value (Matched=0,
-	// Modified=0).
-	if q.unsatisfiable() {
-		return
-	}
-
 	// Reclaim tombstones this bulk write creates once it commits, mirroring the
 	// single-doc mutators. Registered before the commit defer so it runs after
 	// commit; no-ops inside a caller-managed tx (the guard in maybeAutoCompactVectors).
@@ -720,6 +713,17 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(wtx WriteTx, btWt
 	btx := tx.btreeReadTx()
 	s, err := q.c.resolve(btx)
 	if err != nil {
+		return
+	}
+
+	// Fast path: the filter provably matches no documents, so there is
+	// nothing to mutate; ModifyResult is the zero value (Matched=0,
+	// Modified=0). It comes after the write transaction is entered: a write
+	// in a read transaction is ErrTxIsReadOnly whatever its filter matches,
+	// as SQLite's DELETE and UPDATE begin their write transaction
+	// (sqlite3BeginWriteOperation, delete.c:422, update.c:598) before they
+	// evaluate WHERE (sqlite3WhereBegin, delete.c:526, update.c:742).
+	if q.unsatisfiable() {
 		return
 	}
 

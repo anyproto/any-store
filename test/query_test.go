@@ -472,3 +472,27 @@ func TestQuery_TextSourceErrorsBeforeEmptyResult(t *testing.T) {
 		}
 	}
 }
+
+// A Delete or an Update declares its write before it looks at its filter: in
+// a read transaction it returns ErrTxIsReadOnly even when the filter matches
+// nothing, as a SQLite DELETE or UPDATE begins its write transaction before
+// it evaluates WHERE.
+func TestQuery_WriteVerbInReadTxIsReadOnlyForEmptyFilter(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1,"tags":["x"]}`)
+	for _, filter := range []string{`{"tags":{"$all":[]}}`, `{"tags":{"$in":[]}}`, `{"tags":"x"}`} {
+		t.Run(filter, func(t *testing.T) {
+			rtx, err := fx.ReadTx(ctx)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, rtx.Commit()) }()
+			_, err = coll.Find(filter).Delete(rtx.Context())
+			assert.ErrorIs(t, err, anystore.ErrTxIsReadOnly, "Delete")
+			_, err = coll.Find(filter).Update(rtx.Context(), `{"$set":{"y":1}}`)
+			assert.ErrorIs(t, err, anystore.ErrTxIsReadOnly, "Update")
+		})
+	}
+	assertQueryCount(t, coll.Find(`{"y":1}`), 0)
+	assertQueryCount(t, coll.Find(nil), 1)
+}

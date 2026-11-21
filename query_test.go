@@ -1006,7 +1006,7 @@ func TestQuery_Unsatisfiable_Iter_EmptyIn(t *testing.T) {
 
 // TestQuery_Unsatisfiable_Update_EmptyIn pins that UpdateMany with an
 // empty-$in filter parses the modifier (so a malformed modifier still
-// errors) but then short-circuits to ModifyResult{} with no write tx.
+// errors) but then short-circuits to ModifyResult{}, writing nothing.
 func TestQuery_Unsatisfiable_Update_EmptyIn(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "unsat_update")
@@ -1038,8 +1038,8 @@ func TestQuery_Unsatisfiable_Update_EmptyIn(t *testing.T) {
 }
 
 // TestQuery_Unsatisfiable_Delete_EmptyIn pins that DeleteMany with an
-// empty-$in filter returns a zero ModifyResult without opening a write
-// tx, and leaves the collection contents untouched.
+// empty-$in filter returns a zero ModifyResult and leaves the collection
+// contents untouched.
 func TestQuery_Unsatisfiable_Delete_EmptyIn(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "unsat_delete")
