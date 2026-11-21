@@ -407,10 +407,10 @@ func TestPayloadLimit_NamespaceName(t *testing.T) {
 }
 
 // payloadFixtureLeaf makes the root of namespace "t" a leaf with one cell
-// that declares a key of keyLen bytes and a value of valLen bytes, far more
-// than the file holds, with a local part and a pointer to an overflow page
-// that is no chain. Each page is well formed; only the lengths are wrong.
-func payloadFixtureLeaf(t *testing.T, db *DB, keyLen, valLen int) *Namespace {
+// that declares a key of keyLen bytes and a value of valLen bytes, with a
+// local part and overflowPg for the first overflow page: no chain of that
+// length follows it. Each page is well formed; only the cell is wrong.
+func payloadFixtureLeaf(t *testing.T, db *DB, keyLen, valLen int, overflowPg uint32) *Namespace {
 	t.Helper()
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -425,7 +425,7 @@ func payloadFixtureLeaf(t *testing.T, db *DB, keyLen, valLen int) *Namespace {
 	cell = append(cell, vb[:putVarint(vb[:], uint64(keyLen))]...)
 	cell = append(cell, vb[:putVarint(vb[:], uint64(valLen))]...)
 	cell = append(cell, bytes.Repeat([]byte("k"), nLocal)...) // local key, then local value
-	cell = binary.BigEndian.AppendUint32(cell, 2)             // "overflow" page: a b-tree page
+	cell = binary.BigEndian.AppendUint32(cell, overflowPg)
 	off := tx.pager.usableSize() - len(cell)
 	clear(pg.data)
 	copy(pg.data[off:], cell)
@@ -464,7 +464,8 @@ func TestPayloadLimit_DeclaredLengthOverFileSize(t *testing.T) {
 		db, err := testOpen(t, filepath.Join(t.TempDir(), "declared.db"), Options{PageSize: 4096})
 		require.NoError(t, err)
 		defer func(db *DB) { _ = db.Close() }(db)
-		ns := payloadFixtureLeaf(t, db, keyLen, valLen)
+		// The "overflow" page is page 2, a b-tree page.
+		ns := payloadFixtureLeaf(t, db, keyLen, valLen, 2)
 		for _, r := range reads {
 			var rerr error
 			n := allocatedBy(func() {
@@ -562,6 +563,91 @@ func TestPayloadLimit_DeclaredLengthOverFileSize(t *testing.T) {
 			}},
 		})
 	})
+}
+
+// TestPayloadLimit_SpilledKeyWithNoOverflowPage: a cell whose key spills and
+// whose first overflow pointer names no page of the file is ErrCorrupt before
+// a buffer for the key is allocated, in a file large enough to hold the key
+// it declares. Each read rebuilds that key: a cursor's Key, a lookup whose
+// key ties with the local part (the reader's and the writer's), and SeekKey.
+func TestPayloadLimit_SpilledKeyWithNoOverflowPage(t *testing.T) {
+	const declared = 4 << 20
+	const allowed = 1 << 20 // a quarter of the key; a rebuild allocates twice the key
+	probe := bytes.Repeat([]byte("k"), 8000)
+	reads := []struct {
+		name string
+		run  func(db *DB, ns *Namespace) error
+	}{
+		{"Cursor.Key", func(db *DB, ns *Namespace) error {
+			rtx, err := db.BeginRead()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = rtx.Rollback() }()
+			c := rtx.NewCursor(ns)
+			defer c.Close()
+			if err := c.First(); err != nil {
+				return err
+			}
+			_, err = c.Key()
+			return err
+		}},
+		{"ReadTx.Get", func(db *DB, ns *Namespace) error {
+			rtx, err := db.BeginRead()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = rtx.Rollback() }()
+			_, err = rtx.Get(ns, probe)
+			return err
+		}},
+		{"ReadTx.SeekKey", func(db *DB, ns *Namespace) error {
+			rtx, err := db.BeginRead()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = rtx.Rollback() }()
+			_, err = rtx.SeekKey(ns, []byte("a"))
+			return err
+		}},
+		{"WriteTx.Get", func(db *DB, ns *Namespace) error {
+			wtx, err := db.BeginWrite()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = wtx.Rollback() }()
+			_, err = wtx.Get(ns, probe)
+			return err
+		}},
+	}
+	for _, tc := range []struct {
+		name       string
+		overflowPg uint32
+	}{
+		{"pointer 0", 0},
+		{"pointer past the file", math.MaxUint32},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := testOpen(t, filepath.Join(t.TempDir(), "nopage.db"), Options{PageSize: 4096})
+			require.NoError(t, err)
+			defer func(db *DB) { _ = db.Close() }(db)
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			filler, err := tx.CreateNamespace("filler")
+			require.NoError(t, err)
+			require.NoError(t, tx.Put(filler, []byte("f"), payloadBytes(declared+declared/2, 1)))
+			require.NoError(t, tx.Commit())
+			ns := payloadFixtureLeaf(t, db, declared, 0, tc.overflowPg)
+			require.GreaterOrEqual(t, uint64(db.pager.dbSize.Load())*uint64(db.pager.pageSize), uint64(declared),
+				"the file cannot hold the key: the file-size bound would refuse it first")
+			for _, r := range reads {
+				var rerr error
+				n := allocatedBy(func() { rerr = r.run(db, ns) })
+				require.ErrorIs(t, rerr, ErrCorrupt, r.name)
+				require.Less(t, n, uint64(allowed), "%s allocated %d KiB for a key with no overflow page", r.name, n>>10)
+			}
+		})
+	}
 }
 
 // declareValLen rewrites, in place, the value length that cell idx of the
