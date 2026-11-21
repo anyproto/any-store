@@ -161,7 +161,7 @@ func walPage1Salt(t *testing.T, walPath string, set *[SaltLen]byte) (salt [SaltL
 	require.NoError(t, hdr.deserialize(data[:walHeaderSize]))
 	frameSize := walFrameSize + int(hdr.pageSize)
 	o1, o2 := walChecksum(data[:24], 0, 0) // the chain as written
-	n1, n2 := o1, o2                        // the chain after set
+	n1, n2 := o1, o2                       // the chain after set
 	var last [SaltLen]byte
 	var seen bool
 	for off := walHeaderSize; off+frameSize <= len(data); off += frameSize {
