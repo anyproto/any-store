@@ -3222,6 +3222,8 @@ func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 						b.Fatal(err)
 					}
 				}
+				// The deferred rollback releases every pin: not the verb.
+				b.StopTimer()
 			})
 		})
 	}
