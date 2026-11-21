@@ -905,6 +905,134 @@ func TestPayloadLimit_CursorKeyOfDamagedCell(t *testing.T) {
 	}
 }
 
+// TestPayloadLimit_SeekKeyOfDamagedCell: SeekKey reads the key of the cell it
+// lands on and nothing else, and agrees with a cursor's Seek and Key. A prefix
+// just below the damaged key lands on it and returns the key, for each of the
+// fixture's damages; the damaged key itself is an exact match, which the
+// search holds to the record size limit.
+func TestPayloadLimit_SeekKeyOfDamagedCell(t *testing.T) {
+	below := append(bytes.Clone(healthyKey), 0) // above the healthy key, below the damaged one
+	for _, d := range valueLengthDamages {
+		t.Run(d.name, func(t *testing.T) {
+			db, ns := damagedFixture(t, d.valLenFor)
+			d.damage(t, db, ns)
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			defer func() { _ = rtx.Rollback() }()
+			k, err := rtx.SeekKey(ns, below)
+			require.NoError(t, err, "SeekKey below the damaged key")
+			require.Equal(t, damagedKey, k)
+			for _, p := range []struct {
+				name   string
+				prefix []byte
+			}{{"below the damaged key", below}, {"the damaged key", damagedKey}} {
+				k, err := rtx.SeekKey(ns, p.prefix)
+				c := rtx.NewCursor(ns)
+				cerr := c.Seek(p.prefix)
+				var ck []byte
+				if cerr == nil {
+					ck, cerr = c.Key()
+				}
+				c.Close()
+				if cerr != nil {
+					require.ErrorIs(t, cerr, ErrCorrupt, "%s: the cursor", p.name)
+					require.ErrorIs(t, err, ErrCorrupt, "%s: SeekKey", p.name)
+					continue
+				}
+				require.NoError(t, err, "%s: SeekKey", p.name)
+				require.Equal(t, ck, k, p.name)
+			}
+		})
+	}
+}
+
+// TestPayloadLimit_SeekKeyNextLeafStartsWithDamagedCell: when the leaf a
+// SeekKey reaches holds no key at or after the prefix, it reads the first key
+// of the next leaf, and that key alone. A record over the record size limit
+// there, by its sum or by its value, does not fail it.
+func TestPayloadLimit_SeekKeyNextLeafStartsWithDamagedCell(t *testing.T) {
+	const val = 100
+	for _, d := range []struct {
+		name  string
+		limit func(keyLen int) int
+	}{
+		{"key and value over the limit together", func(keyLen int) int { return keyLen + val - 1 }},
+		{"value over the limit by itself", func(int) int { return val - 1 }},
+	} {
+		t.Run(d.name, func(t *testing.T) {
+			db, err := testOpen(t, filepath.Join(t.TempDir(), "next.db"), Options{PageSize: 4096})
+			require.NoError(t, err)
+			defer func(db *DB) { _ = db.Close() }(db)
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			ns, err := tx.CreateNamespace("t")
+			require.NoError(t, err)
+			for i := range 200 {
+				require.NoError(t, tx.Put(ns, fmt.Appendf(nil, "k-%04d", i), payloadBytes(val, byte(i))))
+			}
+			require.NoError(t, tx.Commit())
+
+			// The prefix sorts after the last key of the root's first child
+			// leaf and before the root's first divider: the search for it
+			// ends on that leaf with no key at or after it.
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			root, err := rtx.pager.getPageReader(ns.rootPage, rtx.walHdr.mxFrame, rtx.cache)
+			require.NoError(t, err)
+			require.True(t, root.header.isInterior(), "the records fit the root leaf")
+			divider, left, err := interiorCellKey(root.data, int(root.getCellOffset(0)))
+			require.NoError(t, err)
+			divider = bytes.Clone(divider)
+			rtx.pager.releasePage(root)
+			leaf, err := rtx.pager.getPageReader(left, rtx.walHdr.mxFrame, rtx.cache)
+			require.NoError(t, err)
+			require.True(t, leaf.header.isLeaf(), "the tree is deeper than two levels")
+			last, err := leafKeyAt(leaf, int(leaf.header.cellCount)-1, rtx.pager.leafLimits())
+			require.NoError(t, err)
+			prefix := append(bytes.Clone(last), 0)
+			rtx.pager.releasePage(leaf)
+			require.Positive(t, bytes.Compare(divider, prefix), "the search for the prefix does not take the first child")
+			c := rtx.NewCursor(ns)
+			require.NoError(t, c.Seek(prefix))
+			next, err := c.Key()
+			require.NoError(t, err)
+			next = bytes.Clone(next)
+			c.Close()
+			require.NoError(t, rtx.Rollback())
+
+			setPayloadLimit(t, d.limit(len(next)))
+			rtx, err = db.BeginRead()
+			require.NoError(t, err)
+			defer func() { _ = rtx.Rollback() }()
+			_, err = rtx.Get(ns, next)
+			require.ErrorIs(t, err, ErrCorrupt, "the record is within the limit")
+			k, err := rtx.SeekKey(ns, prefix)
+			require.NoError(t, err)
+			require.Equal(t, next, k)
+		})
+	}
+}
+
+// TestPayloadLimit_CountUntilOverDamagedCell: a range count whose leaf ends
+// with a damaged cell reads that cell's key, not the whole cell, and counts it.
+func TestPayloadLimit_CountUntilOverDamagedCell(t *testing.T) {
+	for _, d := range valueLengthDamages {
+		t.Run(d.name, func(t *testing.T) {
+			db, ns := damagedFixture(t, d.valLenFor)
+			d.damage(t, db, ns)
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			defer func() { _ = rtx.Rollback() }()
+			c := rtx.NewCursor(ns)
+			defer c.Close()
+			require.NoError(t, c.First())
+			n, err := c.CountUntil(damagedKey, true)
+			require.NoError(t, err)
+			require.Equal(t, 2, n)
+		})
+	}
+}
+
 // TestPayloadLimit_SplitBesideDamagedValueLengths: a split takes the key of
 // the first cell of each new page for the divider, and reads only that key.
 // On a leaf whose cells declare values over the file, the key that splits it
