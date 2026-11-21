@@ -101,9 +101,8 @@ type pager struct {
 	dbSize       atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
 	state        atomic.Int32  // pagerState
 
-	// noWalCommitSize memoizes the database file's size for multi-process
-	// readers whose snapshot header carries no committed size. See
-	// effectiveReaderDbSize.
+	// noWalCommitSize memoizes the database file's size for readers whose
+	// snapshot header carries no committed size. See effectiveReaderDbSize.
 	noWalCommitSize atomic.Pointer[noWalCommitSize]
 
 	// balanceQuickDispatchCount counts dispatches into splitLeafRightmostAppend.
@@ -856,15 +855,6 @@ func (p *pager) readPage1AtOpen() error {
 	p.dbSize.Store(nPage)
 	// Page 1 as read (readDbPage, pager.c:3063-3064).
 	p.dbFileVers.Store(header.FileChangeCount)
-	// With no commit in the WAL, the heap-shm modes' committed size is the
-	// file's, the count pagerPagecount falls back to (pager.c:3299-3306):
-	// from here on every snapshot carries it, and no open transaction
-	// changes it.
-	if p.inProcess || p.inMemory {
-		if f, n := p.wal.index.mxCommitFrame.LoadPos(); n == 0 {
-			p.wal.index.mxCommitFrame.StorePos(f, nPageFile)
-		}
-	}
 	return nil
 }
 
@@ -1050,10 +1040,12 @@ func (p *pager) initNewDB() error {
 	// The change counter initNewDB wrote is page 1's as this pager knows it.
 	p.dbFileVers.Store(p.header.FileChangeCount)
 	// A new database is one page, page 1, before its first commit
-	// (newDatabase sets nPage = 1, btree.c:3540-3541). In the heap-shm modes
-	// that is the committed size every snapshot carries until a commit
-	// records another.
-	if p.inProcess || p.inMemory {
+	// (newDatabase sets nPage = 1, btree.c:3540-3541). An in-memory database
+	// has no file for its readers to take that size from, so until a commit
+	// records another, every snapshot carries it as the committed size. The
+	// other modes' readers take it from the file, where page 1 was written
+	// above.
+	if p.inMemory {
 		if f, n := p.wal.index.mxCommitFrame.LoadPos(); n == 0 {
 			p.wal.index.mxCommitFrame.StorePos(f, 1)
 		}
@@ -2313,8 +2305,13 @@ func (p *pager) getHasContent(pgno uint32) bool {
 //
 // The in-process and in-memory modes publish no wal-index header; their
 // synthesized snapshot header carries the committed position's size
-// (walIndex.mxCommitFrame), which open and database creation seed and only a
-// published commit moves. There is no fallback for them.
+// (walIndex.mxCommitFrame), which only a published commit moves. As in
+// SQLite's header, it is 0 until a commit records one (walIndexRecover
+// zeroes the header and sets nPage from a commit frame, wal.c:1408, 1512)
+// and a WAL reset keeps it, so a non-zero size is always a commit's. An
+// in-process reader without one takes the file's, as above; an in-memory
+// database has no file, and its creation stores the new database's one
+// page as the committed size.
 //
 // No reader bound-checks against p.dbSize: that atomic is the writer's
 // allocation counter. An open write transaction moves it (a backup's shrink,
@@ -2330,7 +2327,7 @@ func (p *pager) effectiveReaderDbSize(hdr WalIndexHdr) (uint32, error) {
 	if hdr.isInit != 0 && hdr.nPage != 0 {
 		return hdr.nPage, nil
 	}
-	if !p.inProcess && !p.inMemory && p.file != nil {
+	if !p.inMemory && p.file != nil {
 		// One fstat per wal-index header, not per read begin (measured:
 		// ~390 ns and an allocation, about a sixth of a point read on a
 		// freshly opened database, which is in exactly this state). The
@@ -2339,7 +2336,9 @@ func (p *pager) effectiveReaderDbSize(hdr WalIndexHdr) (uint32, error) {
 		// need a commit, and a commit publishes a header with a size, which
 		// every later reset keeps. A header without a size appears again
 		// only when the index is rebuilt over a WAL with no commit, with the
-		// salts of a new WAL generation.
+		// salts of a new WAL generation. The in-process mode's synthesized
+		// header has no salts; its index is built once, at open, and its
+		// iChange, the restart count, moves at every reset.
 		if m := p.noWalCommitSize.Load(); m != nil && m.hdr == hdr {
 			return m.nPage, nil
 		}
@@ -2351,8 +2350,8 @@ func (p *pager) effectiveReaderDbSize(hdr WalIndexHdr) (uint32, error) {
 		p.noWalCommitSize.Store(&noWalCommitSize{hdr: hdr, nPage: n})
 		return n, nil
 	}
-	if p.inProcess || p.inMemory {
-		return 0, errors.New("btree: internal error: an in-process snapshot without a committed size")
+	if p.inMemory {
+		return 0, errors.New("btree: internal error: an in-memory snapshot without a committed size")
 	}
 	return p.dbSize.Load(), nil
 }
@@ -2468,7 +2467,7 @@ func (p *pager) pagerPageCount(walNPage uint32) (nPage uint32, ok bool, err erro
 // (effectiveReaderDbSize): the committed size of the live wal-index header,
 // which under the write lock is the snapshot page 1 is read at, or the
 // database file's size when the WAL has had no commit; in the in-process and
-// in-memory modes, the committed position's size.
+// in-memory modes, the committed position's size, with the same fallback.
 func (p *pager) committedPageCount() (uint32, error) {
 	if p.inProcess || p.inMemory {
 		f, n := p.wal.index.mxCommitFrame.LoadPos()

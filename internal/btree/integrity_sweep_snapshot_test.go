@@ -328,21 +328,26 @@ func sweepPatchFile(t *testing.T, db *DB, off int64, b []byte) {
 // btree.c:3294-3298: a file may hold pages past the logical size). Where the
 // snapshot's WAL commit recorded the database's size, that is a second count
 // the sweep has: it lists page 1 for the disagreement and sweeps the pages
-// the commit recorded.
+// the commit recorded. A TRUNCATE checkpoint empties the WAL and keeps that
+// size, as walRestartHdr keeps nPage (wal.c:2146-2160).
 func TestVerifyIntegritySweepDamagedPageCount(t *testing.T) {
+	inProcess := Options{PageSize: 4096, Checksum: true, DisableAutoCheckpoint: true, InProcess: true}
 	cases := []struct {
 		name string
 		opts Options
+		ckpt CheckpointMode
 	}{
-		{name: "multi-process", opts: sweepPeerOpts},
-		{name: "in-process", opts: Options{PageSize: 4096, Checksum: true, DisableAutoCheckpoint: true, InProcess: true}},
+		{name: "multi-process/full", opts: sweepPeerOpts, ckpt: CheckpointFull},
+		{name: "multi-process/truncate", opts: sweepPeerOpts, ckpt: CheckpointTruncate},
+		{name: "in-process/full", opts: inProcess, ckpt: CheckpointFull},
+		{name: "in-process/truncate", opts: inProcess, ckpt: CheckpointTruncate},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			db, n := sweepCountDB(t, tc.opts)
-			// Everything in the database file; the WAL's commit is still
-			// the snapshot's.
-			require.NoError(t, db.Checkpoint(CheckpointFull))
+			// Everything in the database file; the size the last commit
+			// recorded is still the snapshot's.
+			require.NoError(t, db.Checkpoint(tc.ckpt))
 			ctx := context.Background()
 			res, err := db.VerifyIntegrity(ctx)
 			require.NoError(t, err)
@@ -375,34 +380,48 @@ func TestVerifyIntegritySweepDamagedPageCount(t *testing.T) {
 // database (lockBtree, btree.c:3294-3298). The sweep covers the pages page 1
 // counts, as sqlite_dbpage and the integrity check do; the pages past them
 // are no part of the database. A page count damaged downwards is not told
-// apart from this, here or in SQLite.
+// apart from this, here or in SQLite. In every mode a snapshot carries a
+// size only once a commit has recorded one (walIndexRecover zeroes the
+// header and sets nPage from a commit frame, wal.c:1408, 1512), so the
+// file's length is never taken for a commit's.
 func TestVerifyIntegritySweepLogicalSizeBelowFile(t *testing.T) {
-	path := t.TempDir() + "/test.db"
-	db, err := testOpen(t, path, sweepPeerOpts)
-	require.NoError(t, err)
-	dmsPutRange(t, db, "t1", 0, 2000)
-	n := db.pager.dbSize.Load()
-	require.NoError(t, db.Checkpoint(CheckpointTruncate))
-	require.NoError(t, db.Close())
+	cases := []struct {
+		name string
+		opts Options
+	}{
+		{name: "multi-process", opts: sweepPeerOpts},
+		{name: "in-process", opts: Options{PageSize: 4096, Checksum: true, DisableAutoCheckpoint: true, InProcess: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := t.TempDir() + "/test.db"
+			db, err := testOpen(t, path, tc.opts)
+			require.NoError(t, err)
+			dmsPutRange(t, db, "t1", 0, 2000)
+			n := db.pager.dbSize.Load()
+			require.NoError(t, db.Checkpoint(CheckpointTruncate))
+			require.NoError(t, db.Close())
 
-	// Three pages past the database's end, with no valid tag.
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
-	require.NoError(t, err)
-	_, err = file.Write(bytes.Repeat([]byte{0xEE}, 3*int(sweepPeerOpts.PageSize)))
-	require.NoError(t, err)
-	require.NoError(t, file.Close())
+			// Three pages past the database's end, with no valid tag.
+			file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+			require.NoError(t, err)
+			_, err = file.Write(bytes.Repeat([]byte{0xEE}, 3*int(tc.opts.PageSize)))
+			require.NoError(t, err)
+			require.NoError(t, file.Close())
 
-	db, err = testOpen(t, path, sweepPeerOpts)
-	require.NoError(t, err)
-	defer func() { _ = db.Close() }()
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-	bound := db.pager.readerDbSizeBound(rtx.cache)
-	require.NoError(t, rtx.Rollback())
-	require.Equal(t, n+3, bound, "setup: the pager's count is the file's length")
+			db, err = testOpen(t, path, tc.opts)
+			require.NoError(t, err)
+			defer func() { _ = db.Close() }()
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			bound := db.pager.readerDbSizeBound(rtx.cache)
+			require.NoError(t, rtx.Rollback())
+			require.Equal(t, n+3, bound, "setup: the pager's count is the file's length")
 
-	res, err := db.VerifyIntegrity(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, int(n), res.Pages)
-	require.Empty(t, res.Errors)
+			res, err := db.VerifyIntegrity(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, int(n), res.Pages)
+			require.Empty(t, res.Errors)
+		})
+	}
 }

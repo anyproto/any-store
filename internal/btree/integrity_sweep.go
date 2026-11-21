@@ -184,11 +184,13 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 func (db *DB) sweepPageCount(tx *ReadTx) (total uint32, raw1 []byte, page1Errs []SweepError, err error) {
 	p := db.pager
 	bound := p.readerDbSizeBound(tx.cache)
-	// The size a WAL commit recorded, or 0. The in-process and in-memory
-	// modes seed their snapshots' size from the file's length at open; with
-	// a frame in the snapshot the size is a commit's.
+	// The size a WAL commit recorded, or 0. In every mode a snapshot's
+	// header carries a size only once a commit has recorded one, and a WAL
+	// reset keeps it, as in SQLite (effectiveReaderDbSize). The one other
+	// size is an in-memory database's before its first commit: its single
+	// page, which its page 1, written by the same creation, counts.
 	var commitN uint32
-	if n := tx.walHdr.nPage; n != 0 && n == bound && (tx.walHdr.mxFrame > 0 || !(p.inProcess || p.inMemory)) {
+	if n := tx.walHdr.nPage; n != 0 && n == bound {
 		commitN = n
 	}
 
