@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/assert"
@@ -319,7 +320,10 @@ func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
 		}
 	}
 
-	// The writer commits one document at a time for the whole backup.
+	// The writer commits one document at a time for the whole backup, and
+	// pauses briefly after each commit. A Step is busy while the source is in
+	// a write transaction (sqlite3_backup_step, backup.c:337-341), so the
+	// pause leaves each retry of a busy Step a gap to copy in.
 	stop := make(chan struct{})
 	running := make(chan struct{})
 	writerDone := make(chan struct{})
@@ -339,6 +343,7 @@ func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
 			if i == 10 {
 				close(running)
 			}
+			time.Sleep(time.Millisecond)
 		}
 	}()
 	select {
@@ -347,10 +352,9 @@ func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
 		require.NoError(t, writerErr)
 	}
 
-	// A writer that commits in a tight loop can keep every Step of a Backup
-	// busy until the busy timeout ends it with ErrBusy; that happens on a
-	// loaded machine with or without a shared codec. The test is about the
-	// race between the two writers, so a busy Backup is run again.
+	// A busy Backup is the busy timeout running out, which heavy load can
+	// still cause. The test is about the race between the two writers, so a
+	// busy Backup is run again.
 	//
 	// The stepped hook runs after each Step that copied and left pages to
 	// copy, so one call in the attempt that succeeded shows that its copy
