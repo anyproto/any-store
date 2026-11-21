@@ -670,7 +670,9 @@ func searchLeafWithOverflow(pg *page, key []byte, lim payloadLimits, p *pager, w
 		// a cell whose lengths pass singly and not together (one a release
 		// without the write-side limit could store) is compared like any
 		// other when a search for a neighbouring key probes it, and the
-		// neighbours stay readable. A match on it is refused below.
+		// neighbours stay readable. leafFullKey, which rebuilds a spilled
+		// key for the compare, tests the same way and holds only the key to
+		// the file size. A match on it is refused below.
 		if keyLen > uint64(payloadLimit) || valLen > uint64(payloadLimit) {
 			return 0, false, ErrCorrupt
 		}
@@ -729,8 +731,12 @@ func searchLeafWithOverflow(pg *page, key []byte, lim payloadLimits, p *pager, w
 		cmp := bytes.Compare(cellKey, key)
 		if cmp == 0 {
 			// The cell found is one a read will parse: report it only if
-			// the parsers accept it, so that Has does not answer true for
-			// a record Get calls corrupt.
+			// its lengths are within the record size limit, which every
+			// parse of it requires. The value is not tested against the
+			// file here; that runs where the value is read, so Has can
+			// answer true for a record whose Get is ErrCorrupt by that
+			// bound. SQLite's table seek skips a cell's payload size and
+			// compares its rowid only (btree.c:5880-5886).
 			if !payloadFits(keyLen, valLen) {
 				return 0, false, ErrCorrupt
 			}
@@ -945,7 +951,15 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	}
 	pos += n
 
-	if !payloadFits(keyLen, valLen) {
+	// The key is what this reads, so the key is what is bounded: its length
+	// here, singly as searchLeafWithOverflow tests it, and its bytes against
+	// the file below. The value's length only places the local part; its
+	// bounds are tested where a value is read. SQLite's index probe sizes
+	// the key it rebuilds the same way (btree.c:6159-6168), and
+	// sqlite3VdbeMemFromBtree tests the range it reads (vdbemem.c:1428).
+	// A damaged value length therefore does not hide the cell's neighbours
+	// from a search that has to compare this key.
+	if keyLen > uint64(payloadLimit) || valLen > uint64(payloadLimit) {
 		return nil, ErrCorrupt
 	}
 
@@ -973,7 +987,7 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	}
 
 	// Key overflows: allocate and reconstruct
-	if pos+nLocal+4 > dataLen || !payloadInFile(p, cache, totalPayload) {
+	if pos+nLocal+4 > dataLen || !payloadInFile(p, cache, int(keyLen)) {
 		return nil, ErrCorrupt
 	}
 	fullKey := make([]byte, int(keyLen))
@@ -1803,7 +1817,9 @@ func (bt *btree) cellFullKey(c *cellData) ([]byte, error) {
 	localKeyBytes := min(nLocal, int(keyLen))
 	keyOverflow := int(keyLen) - localKeyBytes
 
-	if !payloadInFile(bt.pager, bt.cache, totalPayload) {
+	// Only the key is read, so only the key's bytes are tested against the
+	// file, as in leafFullKey.
+	if !payloadInFile(bt.pager, bt.cache, int(keyLen)) {
 		return nil, ErrCorrupt
 	}
 	fullKey := make([]byte, int(keyLen))
