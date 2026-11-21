@@ -799,9 +799,8 @@ func (db *DB) Close() error {
 // in-memory database has no database file and reports false.
 //
 // When the close checkpointed, onCheckpointed (if not nil) runs after the
-// checkpoint and the truncate of the log, while the close still holds the
-// exclusive DB-file lock: no other process can attach, and so none can
-// commit, until it has returned.
+// checkpoint, while the close still holds the exclusive DB-file lock: no
+// other process can attach, and so none can commit, until it has returned.
 func (db *DB) CloseCheckpointed(onCheckpointed func()) (checkpointed bool, err error) {
 	if !db.closed.CompareAndSwap(false, true) {
 		return false, ErrClosed

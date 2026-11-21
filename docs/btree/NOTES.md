@@ -3163,9 +3163,9 @@ wrong, where C's cannot:
   probe and an append access a slot through `htSlotLoad`/`htSlotStore`: Go has no 16-bit atomics, so the
   aligned 32-bit word that holds two slots is loaded and stored; a store rewrites the neighbouring slot with
   the value it has just loaded, which is safe because only the holder of the write lock stores. The cleanup
-  of a rollback or of a dead writer's entries (`shmCleanupHashSegment`) does not call `htSlotStore`: it walks
-  the table a word at a time and loads and stores each word with `atomic.LoadUint32`/`atomic.StoreUint32`
-  itself, clearing both slots of a word in one store, where C's `walCleanupHash` stores plainly
+  of a rollback or of a dead writer's entries (`shmCleanupHashSegment`) does not call `htSlotStore`: it
+  loads each word of slots with `atomic.LoadUint32` and stores a word it changed with `atomic.StoreUint32`
+  itself, where C's `walCleanupHash` stores plainly
   (`wal.c:1260-1264`): a plain store that a reader loads concurrently is a data race in Go. The page
   numbers stay plain, as in C (the read after the bounds, the cleanup's `memset`, `wal.c:1271`): a reader
   reads only those of its window, written before its snapshot was published and not changed while it is in
