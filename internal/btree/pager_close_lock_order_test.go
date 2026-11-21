@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -98,7 +99,11 @@ func TestCloseNotLastClient_LeavesWAL(t *testing.T) {
 	before, err := os.Stat(path + "-wal")
 	require.NoError(t, err)
 	require.NotZero(t, before.Size())
-	require.NoError(t, db.Close())
+	ran := false
+	checkpointed, err := db.CloseCheckpointed(func() { ran = true })
+	require.NoError(t, err)
+	require.False(t, checkpointed, "a close with another process attached reported a checkpoint")
+	require.False(t, ran, "a close with another process attached ran the callback")
 	after, err := os.Stat(path + "-wal")
 	require.NoError(t, err)
 	require.Equal(t, before.Size(), after.Size(), "the WAL is the peer's too")
@@ -166,4 +171,34 @@ func TestCloseNotLastClient_PeerWriterNoBusyWait(t *testing.T) {
 	restartCheck(t, db2, 0, 60, 1)
 	restartCheck(t, db2, 100, 110, 7)
 	require.NoError(t, db2.IntegrityCheck())
+}
+
+// The last close runs CloseCheckpointed's callback after its checkpoint and
+// the truncate of the WAL, and before it lets go of the exclusive lock on
+// the database file: a shared lock from another descriptor, which every
+// process attaching takes (acquireSharedDBLock), is refused while it runs.
+// The durability sentinel is removed there, so no other process can attach
+// and commit between the checkpoint and the removal.
+func TestCloseCheckpointed_CallbackRunsUnderTheFileLock(t *testing.T) {
+	db, path := openRestartDB(t, restartModes[0])
+	restartPut(t, db, 0, 60, 1)
+
+	sharedLock := func() error {
+		f, err := os.Open(path)
+		require.NoError(t, err)
+		defer func() { _ = f.Close() }()
+		return syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
+	}
+	ran := false
+	checkpointed, err := db.CloseCheckpointed(func() {
+		ran = true
+		wal, err := os.Stat(path + "-wal")
+		require.NoError(t, err)
+		require.Zero(t, wal.Size(), "the callback ran before the WAL was truncated")
+		require.ErrorIs(t, sharedLock(), syscall.EWOULDBLOCK, "the callback ran without the exclusive lock on the database file")
+	})
+	require.NoError(t, err)
+	require.True(t, checkpointed)
+	require.True(t, ran)
+	require.NoError(t, sharedLock(), "the close kept the database file locked")
 }

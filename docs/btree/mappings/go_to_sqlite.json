@@ -792,7 +792,7 @@
       "pager.c:sqlite3PagerClose",
       "wal.c:sqlite3WalClose"
     ],
-    "note": "Close's body; also reports whether the close took sqlite3WalClose's last-connection branch and its checkpoint completed (the isDelete arm, wal.c:2531-2540). any-store-only use: the durability sentinel is cleared only then"
+    "note": "Close's body; also reports whether the close took sqlite3WalClose's last-connection branch and its checkpoint completed (the isDelete arm, wal.c:2531-2540), and then runs its callback while the close still holds the exclusive DB-file lock. any-store-only use: the durability sentinel is cleared only then, in that callback"
   },
   "db.go:*DB.CreateNamespace": {
     "sqlite": [

@@ -1672,16 +1672,19 @@ func (db *db) Close() error {
 }
 
 // closeBtree closes the btree and clears the durability sentinel when that
-// close checkpointed the whole log as the last client of the file. A close
-// that is not the last runs no checkpoint and leaves the sentinel set: the
-// commits of this handle and of the handles still attached can be in the log
-// alone, and if those processes are killed the next open must run the quick
-// check.
+// close checkpointed the whole log as the last client of the file. The
+// sentinel goes inside the btree close, after the checkpoint and while the
+// close still holds the exclusive DB-file lock, so no other process can open
+// the file and commit before it is gone. A close that is not the last runs no
+// checkpoint and leaves the sentinel set: the commits of this handle and of
+// the handles still attached can be in the log alone, and if those processes
+// are killed the next open must run the quick check.
 func (db *db) closeBtree() error {
-	checkpointed, err := db.btreeDB.CloseCheckpointed()
-	if checkpointed && db.recoveryController != nil {
-		db.recoveryController.MarkCleanAfterClose()
+	var onCheckpointed func()
+	if db.recoveryController != nil {
+		onCheckpointed = db.recoveryController.MarkCleanAfterClose
 	}
+	_, err := db.btreeDB.CloseCheckpointed(onCheckpointed)
 	return err
 }
 

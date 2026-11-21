@@ -220,6 +220,11 @@ type pager struct {
 	// isDelete (wal.c:2531-2540). Every commit is then in the synced database
 	// file, and no other process was attached to add one. Read after close.
 	closeCheckpointed bool
+	// onCloseCheckpointed, when set, is run by close once it has set
+	// closeCheckpointed, while it still holds the exclusive lock on the
+	// database file: no other process can attach, and so none can commit,
+	// before it returns. DB.CloseCheckpointed sets it.
+	onCloseCheckpointed func()
 
 	// registryKey is the key this handle holds in openDBs from open until
 	// close, "" when it holds none; registryPath is the absolute path the
@@ -4057,6 +4062,11 @@ func (p *pager) close() error {
 					}
 					return nil
 				})
+				// Still under the exclusive lock on the database file, which
+				// goes only with p.file.Close below.
+				if p.closeCheckpointed && p.onCloseCheckpointed != nil {
+					p.onCloseCheckpointed()
+				}
 			}
 		}
 		_ = p.wal.close(isLastClient)

@@ -9,15 +9,18 @@ package anystore
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/durability"
 )
 
 const (
@@ -120,4 +123,51 @@ func TestDurabilitySentinel_LastCloseRemovesAPeersMarker(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, n, "the peer's commit")
 	require.NoError(t, next.Close())
+}
+
+// lockProbeSentinel stands in for a handle's sentinel. When the close removes
+// it, it records whether the database file was still locked exclusively: a
+// process that attaches takes the file shared first, so while the lock is
+// held none can attach and commit before the marker is gone.
+type lockProbeSentinel struct {
+	dbPath          string
+	removed, locked bool
+}
+
+func (s *lockProbeSentinel) OnOpen(context.Context) (bool, error) { return false, nil }
+func (s *lockProbeSentinel) MarkDirty()                          {}
+func (s *lockProbeSentinel) MarkClean()                          {}
+
+func (s *lockProbeSentinel) Remove() {
+	s.removed = true
+	f, err := os.Open(s.dbPath)
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	s.locked = errors.Is(syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB), syscall.EWOULDBLOCK)
+}
+
+// The last close removes the sentinel before it releases the database file.
+// Removed after, it could remove the marker of a process that opened, passed
+// its quick check and committed in between, and that process's commit would
+// have no marker if it were then killed.
+func TestDurabilitySentinel_LastCloseRemovesItUnderTheFileLock(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.db")
+	d, err := Open(ctx, path, sentinelConfig())
+	require.NoError(t, err)
+	coll, err := d.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"1"}`)))
+
+	// The handle's sentinel is replaced by the probe.
+	dbi := d.(*db)
+	require.NoError(t, dbi.recoveryController.Stop())
+	probe := &lockProbeSentinel{dbPath: path}
+	dbi.recoveryController = durability.NewController(durability.Options{Sentinel: probe})
+
+	require.NoError(t, d.Close())
+	require.True(t, probe.removed, "the last close, which checkpointed, did not clear the sentinel")
+	require.True(t, probe.locked, "the last close cleared the sentinel after it had released the database file")
 }

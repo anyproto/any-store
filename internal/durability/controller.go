@@ -81,10 +81,13 @@ func (c *Controller) MarkCleanAfterCheck() {
 }
 
 // MarkCleanAfterClose marks the DB as clean after a close that checkpointed
-// the whole log as the last client (btree.DB.CloseCheckpointed reported
-// true). No other close may clear the sentinel: a close that leaves the log
-// to the processes still attached persists nothing, and a commit of theirs,
-// or of this process, can still be in the log alone when they are killed.
+// the whole log as the last client. It is the onCheckpointed callback of
+// btree.DB.CloseCheckpointed, so it runs while that close still holds the
+// exclusive DB-file lock: no other process can attach and commit between the
+// checkpoint and the removal. No other close may clear the sentinel: a close
+// that leaves the log to the processes still attached persists nothing, and a
+// commit of theirs, or of this process, can still be in the log alone when
+// they are killed.
 //
 // The marker is removed whatever this process's cached state: another
 // process may have created it while this one only read.

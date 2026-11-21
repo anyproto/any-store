@@ -785,7 +785,7 @@ func Open(path string, opts Options) (*DB, error) {
 
 // Close closes the database.
 func (db *DB) Close() error {
-	_, err := db.CloseCheckpointed()
+	_, err := db.CloseCheckpointed(nil)
 	return err
 }
 
@@ -796,7 +796,12 @@ func (db *DB) Close() error {
 // wal.c:2522-2540). It reports false for a close that left the log to the
 // processes still attached, for a database file that was moved, and for a
 // checkpoint that failed: commits may then exist only in the log.
-func (db *DB) CloseCheckpointed() (checkpointed bool, err error) {
+//
+// When the close checkpointed, onCheckpointed (if not nil) runs after the
+// checkpoint and the truncate of the log, while the close still holds the
+// exclusive DB-file lock: no other process can attach, and so none can
+// commit, until it has returned.
+func (db *DB) CloseCheckpointed(onCheckpointed func()) (checkpointed bool, err error) {
 	if !db.closed.CompareAndSwap(false, true) {
 		return false, ErrClosed
 	}
@@ -850,6 +855,7 @@ func (db *DB) CloseCheckpointed() (checkpointed bool, err error) {
 		}
 	}
 drained:
+	db.pager.onCloseCheckpointed = onCheckpointed
 	err = db.pager.close()
 	return db.pager.closeCheckpointed, err
 }
