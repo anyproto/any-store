@@ -837,11 +837,20 @@ is over) or `ErrValueTooLarge` before it touches a page, and `CreateNamespace` /
 `RenameNamespace` apply it to the master-table record (the name and a 4-byte root) before
 they allocate the root or delete the old name. Only `Put` brings a new record into a tree;
 the page rebuilds, a `Delete` that defragments its leaf among them, write back cells they
-have parsed. `searchLeafWithOverflow` tests the two lengths singly when it probes a cell,
-and so does `leafFullKey`, which rebuilds a spilled key for the compare; their sum is
-tested only for the cell the search reports as found. A cell over the limit by its sum (a
-release without the write-side limit could store one) therefore does not hide its
-neighbours, and `Has` does not answer true for it. `leafCellPayloadLen` (`walkSize`) tests
+have parsed. `searchLeafWithOverflow` bounds only the key's length when it probes a cell,
+and so do `leafFullKey`, which rebuilds a spilled key for the compare, and `Cursor.Key`,
+which calls it: the key is all they read. The value's length, whatever it declares, only
+places the key's local part, and `spilledLocalSize` (`page.go`) computes that part without
+adding the two lengths, which a damaged one could wrap. The search tests the sum only for
+the cell it reports as found, so every exact match is held to it, `Has` and an exact seek
+included. A cell whose declared value length is over the file, over the limit by itself or
+only with the key's (a release without the write-side limit could store the latter), or any
+64-bit value therefore does not hide its neighbours from a search, as long as the declared
+lengths give the cell's local part the size it was written with, so that the key's layout is
+intact. `Has` does not answer true for a cell over the limit (for one over the file only,
+see `Has` below), and a cursor that steps onto any of these cells reads its key and fails
+`Value`, as a SQLite table cursor reads the rowid of a row whose payload is corrupt
+(`sqlite3BtreeIntegerKey`, `btree.c:4917-4923`). `leafCellPayloadLen` (`walkSize`) tests
 the lengths singly, as before. These tests are looser than `payloadFits`, never stricter,
 so nothing `Put` accepts fails there. The overflow-chain readers have no cap of their own
 (their `maxIter` follows from the length asked for), and the 9-byte varint holds any length
@@ -858,10 +867,10 @@ before every allocation sized by a declared length, on the bytes that are read: 
 value for the value readers (`btree.AppendValue`, `ReadTx.AppendValue`, `Cursor.Value`,
 `Cursor.AppendValue`, `leafFullValue`), the key alone for the key readers (`leafFullKey`,
 `interiorFullKey`, `cellFullKey`, `collectInteriorCellsKeepBuf`). SQLite's index probe
-likewise sizes the key it rebuilds from the key alone (`btree.c:6159-6168`). A damaged value
-length therefore fails the read of that value, and not a search that compares the cell's
-key or a split that takes it for a divider. It is applied where the bytes are asked for, as
-in SQLite, not in the cell parsers, which have no pager. The 1 GiB cap stays as the limit of
+likewise sizes the key it rebuilds from the key alone (`btree.c:6159-6168`). A value length
+over the file therefore fails the read of that value, and not a search that compares the
+cell's key or a split that takes it for a divider. It is applied where the bytes are asked
+for, as in SQLite, not in the cell parsers, which have no pager. The 1 GiB cap stays as the limit of
 what is written and as the bound where the two differ (a file over 1 GiB).
 
 `Has` answers from the cell its search finds: it tests the record size limit there, not the
@@ -877,12 +886,13 @@ the `else` of `if( nByte+nZero<=pOut->szMalloc )` (`vdbe.c:3690`). `sqlite3Btree
 only asserts its lengths (`btree.c:9485`, `9540`). The value differs (2^30 here, 10^9
 there) and so does the layer, the b-tree being the lowest one every writer here passes
 through. Tests: `TestPayloadLimit_RealConstants`,
-`TestPayloadLimit_LengthsCheckedBeforeNarrowing`,
+`TestPayloadLimit_LengthsCheckedBeforeNarrowing`, `TestPayloadLimit_SpilledLocalSize`,
 `TestPayloadLimit_PutRefusesWhatReadRejects`, `TestPayloadLimit_NamespaceName`,
 `TestPayloadLimit_DeclaredLengthOverFileSize`,
 `TestPayloadLimit_NeighbourOfDamagedCellIsFound`,
+`TestPayloadLimit_CursorKeyOfDamagedCell`,
 `TestPayloadLimit_SplitBesideDamagedValueLengths`,
-`TestPayloadLimit_OverflowRecordWithinFileSize`.
+`TestPayloadLimit_OverflowRecordWithinFileSize`, `TestCov_LeafFullKeyBoundsTheKeyOnly`.
 
 <a id="old-drift-additive-maxiter-circular-chain-guard"></a>
 **Severity:** low
