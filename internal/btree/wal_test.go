@@ -2787,8 +2787,9 @@ var errInjectedInTxRange = errors.New("injected getInTxRange failure")
 // write transaction of its own goroutine, and returns the commit's result.
 // With spill, the transaction first writes its dirty pages to the WAL and
 // then changes the rows again, so that its commit has frames of its own to
-// look its pages up in.
-func putRowsAsync(db *DB, from, to int, spill bool) <-chan error {
+// look its pages up in. beforeCommit, when not nil, runs in that goroutine
+// immediately before Commit, after every Put and spill has succeeded.
+func putRowsAsync(db *DB, from, to int, spill bool, beforeCommit func()) <-chan error {
 	done := make(chan error, 1)
 	go func() {
 		tx, err := db.BeginWrite()
@@ -2817,6 +2818,9 @@ func putRowsAsync(db *DB, from, to int, spill bool) <-chan error {
 			_ = tx.Rollback()
 			done <- err
 			return
+		}
+		if beforeCommit != nil {
+			beforeCommit()
 		}
 		done <- tx.Commit()
 	}()
@@ -2852,18 +2856,23 @@ func TestCommit_InTxRangeErrorReleasesWALMutex(t *testing.T) {
 		}
 	})
 	createNS(t, db, "t")
-	require.NoError(t, waitCommit(t, putRowsAsync(db, 0, 100, false), "the first commit"))
+	require.NoError(t, waitCommit(t, putRowsAsync(db, 0, 100, false, nil), "the first commit"))
 
 	// Every page of a commit but the last is looked up in the frames the
 	// transaction wrote before, so a commit of many pages after a spill
-	// meets the failure.
-	testInTxRangeErrHook = func() error { return errInjectedInTxRange }
+	// meets the failure. The failure is armed once the transaction's spills
+	// and puts are done, so it is Commit's frame write that meets it.
 	t.Cleanup(func() { testInTxRangeErrHook = nil })
-	err = waitCommit(t, putRowsAsync(db, 100, 200, true), "the failing commit")
+	armed := false
+	err = waitCommit(t, putRowsAsync(db, 100, 200, true, func() {
+		armed = true
+		testInTxRangeErrHook = func() error { return errInjectedInTxRange }
+	}), "the failing commit")
+	require.True(t, armed, "setup: the transaction failed before its Commit")
 	require.ErrorIs(t, err, errInjectedInTxRange)
 	testInTxRangeErrHook = nil
 
-	require.NoError(t, waitCommit(t, putRowsAsync(db, 200, 300, false), "the next commit"))
+	require.NoError(t, waitCommit(t, putRowsAsync(db, 200, 300, false, nil), "the next commit"))
 	require.Equal(t, 200, countKeys(t, db, "t"))
 	require.NoError(t, db.IntegrityCheck())
 }
@@ -2882,7 +2891,7 @@ func TestCommit_FirstFrameWriteLooksNothingUp(t *testing.T) {
 			createNS(t, db, "t")
 			testInTxRangeErrHook = func() error { return errInjectedInTxRange }
 			t.Cleanup(func() { testInTxRangeErrHook = nil })
-			require.NoError(t, waitCommit(t, putRowsAsync(db, 0, 100, false), "a commit of several pages"))
+			require.NoError(t, waitCommit(t, putRowsAsync(db, 0, 100, false, nil), "a commit of several pages"))
 		})
 	}
 }
