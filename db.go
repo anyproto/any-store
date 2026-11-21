@@ -1125,7 +1125,10 @@ func (db *db) collection(ctx context.Context, collectionName string, opts ...Col
 		}
 		return coll, nil
 	}
-	if !errors.Is(err, ErrCollectionNotFound) {
+	// ErrCollectionClosed wraps ErrCollectionNotFound, but it says that the
+	// handles found were closed, not that the collection is missing: there
+	// is nothing to create.
+	if !errors.Is(err, ErrCollectionNotFound) || errors.Is(err, ErrCollectionClosed) {
 		return nil, err
 	}
 	coll, err = db.CreateCollection(ctx, collectionName, opts...)
