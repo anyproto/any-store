@@ -326,6 +326,14 @@ func TestFilterString_MatchAllRoundTrips(t *testing.T) {
 		{"And{}", And{}, `{}`},
 		{"And{And{}}", And{And{}}, `{"$and":[{}]}`},
 		{"And{And{}, a=1}", And{And{}, MustParseCondition(`{"a":1}`)}, ``},
+		{"Key{a, And{}}", Key{Path: []string{"a"}, Filter: And{}}, `{}`},
+		{"Key{a, All{}}", Key{Path: []string{"a"}, Filter: All{}}, `{}`},
+		{"Key{b.c, Nor{}}", Key{Path: []string{"b", "c"}, Filter: Nor{}}, `{}`},
+		{"Key{a, &And{}}", Key{Path: []string{"a"}, Filter: &And{}}, `{}`},
+		{"And{Key{a, All{}}, a=1}", And{Key{Path: []string{"a"}, Filter: All{}}, MustParseCondition(`{"a":1}`)}, ``},
+		{"Nor{}", Nor{}, `{}`},
+		{"Or{}", Or{}, `{"$nor":[{}]}`},
+		{"Or{Or{}, a=1}", Or{Or{}, MustParseCondition(`{"a":1}`)}, ``},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := tc.filter.String()

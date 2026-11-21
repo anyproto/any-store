@@ -542,8 +542,46 @@ func (e Key) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
+// String renders the path condition. A path condition whose inner filter
+// matches every value matches every document, since a path resolves to at
+// least one leaf (a missing one included), and renders as {}: the field form
+// {"a": {}} would parse back as an equality to the empty object. MongoDB has
+// no field-level always-true node either; its always-true filter is the
+// document-level {} (an empty $and).
 func (e Key) String() string {
+	if matchesEverything(e.Filter) {
+		return "{}"
+	}
 	return fmt.Sprintf(`{"%s": %s}`, strings.Join(e.Path, "."), e.Filter.String())
+}
+
+// matchesEverything reports whether f is one of the filters that match every
+// value and render as {}: All, or an And or a Nor with no conditions.
+func matchesEverything(f Filter) bool {
+	switch ft := f.(type) {
+	case All, *All:
+		return true
+	case And:
+		return noConditions(ft)
+	case *And:
+		return ft != nil && noConditions(*ft)
+	case Nor:
+		return len(ft) == 0
+	case *Nor:
+		return ft != nil && len(*ft) == 0
+	}
+	return false
+}
+
+// noConditions reports whether a conjunction has no condition: And.String
+// skips nil entries.
+func noConditions(e And) bool {
+	for _, f := range e {
+		if f != nil {
+			return false
+		}
+	}
+	return true
 }
 
 type And []Filter
@@ -809,7 +847,13 @@ func (e Or) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return result.SortAndMerge()
 }
 
+// String renders the disjunction. An Or with no conditions matches no
+// document; the parser rejects {"$or":[]}, so it renders as {"$nor":[{}]},
+// which parses back to a filter that matches nothing.
 func (e Or) String() string {
+	if len(e) == 0 {
+		return `{"$nor":[{}]}`
+	}
 	var subS []string
 	for _, f := range e {
 		subS = append(subS, f.String())
@@ -832,7 +876,13 @@ func (e Nor) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
+// String renders the negated disjunction. A Nor with no conditions matches
+// every document and renders as {}, which parses back to that: the parser
+// rejects {"$nor":[]}.
 func (e Nor) String() string {
+	if len(e) == 0 {
+		return "{}"
+	}
 	var subS []string
 	for _, f := range e {
 		subS = append(subS, f.String())
