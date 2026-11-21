@@ -296,9 +296,10 @@ func TestErrCorrupt_TreeWithACycleOfInteriorPages(t *testing.T) {
 	}}
 	// With the cycle in the index tree, Insert writes the data tree first
 	// and the index write then fails: the rollback must take the document
-	// out again. UpdateId and DeleteId write the index first and fail before
-	// they reach the data tree, so for them the check shows that document 1
-	// is as inserted, not that a write was rolled back.
+	// out again. UpdateId and DeleteId read document 1 from the data tree,
+	// write the index next and fail there, before they write the data tree,
+	// so for them the check shows that document 1 is as inserted, not that a
+	// write was rolled back.
 	insertIdx, updateIdx, deleteIdx := insert, updateId, deleteId
 	insertIdx.after = func(t *testing.T, coll Collection) {
 		t.Helper()
