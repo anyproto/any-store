@@ -128,8 +128,9 @@ func TestIntegrity_AEAD_VerifyIntegrity_AllGood(t *testing.T) {
 // TestIntegrity_ContinueOnIntegrityError_Cksum verifies that the flag
 // suppresses the read-path ErrPageIntegrity but still fires the callback.
 // Models the forensic-dump use case: read past corruption, log every hit.
-// A sweep leaves the setting as configured: the read after it still returns
-// the damaged document.
+// A sweep leaves the setting as configured: the first read of the damaged
+// page comes after the sweep, so it goes to the file through the codec, and
+// it still returns the damaged document and fires the callback.
 func TestIntegrity_ContinueOnIntegrityError_Cksum(t *testing.T) {
 	ctx := context.Background()
 	path, damaged := damagedSweepDB(t)
@@ -148,31 +149,26 @@ func TestIntegrity_ContinueOnIntegrityError_Cksum(t *testing.T) {
 	defer func() { _ = db.Close() }()
 	coll, err := db.OpenCollection(ctx, "c")
 	require.NoError(t, err)
-
-	forensicRead := func(when string) {
-		t.Helper()
-		doc, err := coll.FindId(ctx, sweepDocID(sweepDamagedDoc))
-		require.NoError(t, err, "a forensic read %s", when)
-		pad := string(doc.Value().GetStringBytes("pad"))
-		want := []byte(sweepDocPad(sweepDamagedDoc))
-		require.Len(t, pad, len(want))
-		require.NotEqual(t, string(want), pad, "the read returns the damaged bytes")
-	}
-	// The callback fires when the damaged page is read from the file; a
-	// later read of it can come from the reader's page cache and fire
-	// nothing, so the count is taken from the open to the first read.
-	forensicRead("before the sweep")
-	require.NotZero(t, fired.Load(), "reading the damaged page fires the callback")
-	require.Equal(t, damaged, lastPgno.Load())
+	require.Zero(t, fired.Load(), "setup: nothing has read the damaged page")
 
 	// The sweep lists the mismatch and fires the callback once for it.
-	fired.Store(0)
 	rep, err := db.VerifyIntegrity(ctx)
 	require.NoError(t, err)
 	require.Equal(t, []IntegrityError{{PageNo: damaged, Kind: IntegrityChecksumMismatch}}, rep.Errors)
 	require.Equal(t, uint32(1), fired.Load(), "one callback for one damaged page")
 
-	forensicRead("after the sweep")
+	// The first read of the damaged page: no page cache holds it, so it is
+	// read from the file and checked with the setting the sweep left.
+	fired.Store(0)
+	lastPgno.Store(0)
+	doc, err := coll.FindId(ctx, sweepDocID(sweepDamagedDoc))
+	require.NoError(t, err, "a forensic read after the sweep")
+	pad := string(doc.Value().GetStringBytes("pad"))
+	want := sweepDocPad(sweepDamagedDoc)
+	require.Len(t, pad, len(want))
+	require.NotEqual(t, want, pad, "the read returns the damaged bytes")
+	require.NotZero(t, fired.Load(), "reading the damaged page fires the callback")
+	require.Equal(t, damaged, lastPgno.Load())
 }
 
 // TestIntegrity_OnIntegrityError_Cksum_FiresOnSweep verifies that a
