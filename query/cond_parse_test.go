@@ -360,8 +360,7 @@ func TestFilterString_MatchAllRoundTrips(t *testing.T) {
 	}
 }
 
-// A path condition renders its path so that ParseCondition reads back the
-// same field-name bytes: a field name with a quote, a backslash, a control
+// A path condition quotes its joined path when rendered: a field name with a quote, a backslash, a control
 // byte or invalid UTF-8 parses back to the same path and selects the same
 // documents. Inserted as it is, `a":1,"b` turned
 // {"a\":1,\"b":{"$nin":[]}}, which matches every document, into a filter on
