@@ -1988,22 +1988,16 @@ func (c *collection) reloadPubSketch(tx *btree.ReadTx, collName string, idx *ind
 	// republishes live concurrently (settleSketches takes no c.mu) is
 	// overtaken by this snapshot's bytes, as a fresh object would be: a
 	// reader that read its row before that commit then publishes the
-	// pre-commit counts and stamps the epoch, and plans miss the commit's
-	// counts until a write transaction loads this collection's sketches
-	// (loadLiveSketches) or commits a change to this index's
-	// (settleSketches); one that uses other collections only leaves them.
-	// The stored row is right. SQLite's statistics go stale the same way
-	// between connections once the statistics tables exist: an ANALYZE that
-	// refreshes them changes no schema cookie (analyze.c calls no
-	// sqlite3ChangeCookie), so another connection keeps what it loaded
-	// until it reloads the schema (sqlite3InitOne, prepare.c). The ANALYZE
-	// that creates the tables is the exception: its CREATE TABLE changes
-	// the cookie (sqlite3EndTable, build.c), and the other connection
-	// reloads. Bytes
-	// of another shape (a snapshot older than this handle's definition) go
-	// into an object of their own: a published one is never reshaped. Bytes
-	// that do not decode publish nothing: the object would be an empty
-	// sketch, or an older load, in place of the counts readers have.
+	// pre-commit counts and stamps the epoch, and plans can miss the
+	// commit's counts until the sketches are next loaded or published. The
+	// stored row is right. SQLite's statistics can go stale the same way: a
+	// connection keeps those it loaded until it loads them again
+	// (sqlite3AnalysisLoad), and another connection's ANALYZE need not make
+	// it. Bytes of another shape (a snapshot older than this handle's
+	// definition) go into an object of their own: a published one is never
+	// reshaped. Bytes that do not decode publish nothing: the object would
+	// be an empty sketch, or an older load, in place of the counts readers
+	// have.
 	pub := idx.loadPubSketch()
 	into := pub
 	if pub == nil || pub == idx.sketch || !pub.SameShape(data) {
