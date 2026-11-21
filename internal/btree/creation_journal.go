@@ -240,22 +240,18 @@ func (j *creationJournal) abandon() {
 // creation, which then is not committed, as the delete's error is the
 // commit's there (pager.c:2109).
 //
-// The delete syncs no directory, as SQLite's does not unless
-// pPager->extraSync is set (pager.c:2109), which it is not at the default
-// synchronous level. Until the directory is synced again the name can come
-// back after a power loss, hot, beside the committed page 1; the open after
-// the power loss then rolls the creation back and creates the database
+// The delete syncs no directory. SQLite passes pPager->extraSync to its
+// delete (pager.c:2109). Until the directory is synced again the name can
+// come back after a power loss, hot, beside the committed page 1; the open
+// after the power loss then rolls the creation back and creates the database
 // again, which loses nothing, as long as nothing was committed to the
-// database. What is
-// committed to it goes to the WAL, and a commit is durable only after a sync
-// of the WAL, which is the first sync of some WAL descriptor or comes after
-// one. Every WAL descriptor is opened after this delete, since a creation runs
-// only while no process is attached to the database, and with the create
-// flag (wal.open, as sqlite3WalOpen at wal.c:1719-1720), so its first sync
-// also syncs this directory (dirSync, os_unix.c:6777, 3936-3954) and makes
-// the delete durable first. SQLite relies on the same sync: its creation of a
-// WAL database commits by a delete with no directory sync, and its WAL
-// descriptors carry the same flag.
+// database. What is committed to it goes to the WAL, and a commit is durable
+// only after a sync of the WAL, which is the first sync of some WAL
+// descriptor or comes after one. Every WAL descriptor is opened after this
+// delete, since a creation runs only while no process is attached to the
+// database, and with the create flag (wal.open, as sqlite3WalOpen at
+// wal.c:1719-1720), so its first sync also syncs this directory (dirSync,
+// os_unix.c:6777, 3936-3954) and makes the delete durable first.
 func (j *creationJournal) commit(p *pager) error {
 	_ = j.f.Close()
 	if err := osRemove(j.name); err != nil {

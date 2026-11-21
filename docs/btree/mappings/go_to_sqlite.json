@@ -765,7 +765,7 @@
       "os_unix.c:unixDelete",
       "pager.c:pager_end_transaction"
     ],
-    "note": "the commit point: the journal is closed and deleted with no directory sync, as in journal_mode=DELETE with extraSync off"
+    "note": "the commit point: the journal is closed and deleted with no directory sync; SQLite passes extraSync to its delete"
   },
   "creation_journal.go:*creationJournal.sync": {
     "sqlite": [
@@ -782,9 +782,10 @@
   },
   "creation_journal.go:*pager.deleteJournalOfEmptyDatabase": {
     "sqlite": [
+      "os_unix.c:unixAccess",
       "pager.c:hasHotJournal"
     ],
-    "note": "whatever lies under the journal's name beside a database file of zero bytes is deleted, unread, as hasHotJournal deletes a journal beside a database of zero pages"
+    "note": "a file a stat finds under the journal's name beside a database file of zero bytes is deleted, unread; hasHotJournal deletes a journal beside a database of zero pages"
   },
   "creation_journal.go:*pager.finalizeJournalOfEmptyDatabase": {
     "sqlite": [
@@ -1179,6 +1180,18 @@
     "sqlite": [],
     "note": ""
   },
+  "dbdir_other.go:databaseDir": {
+    "sqlite": [],
+    "note": "the directory of the path as given: Windows and js/wasm sync no directory, and wasip1 does not resolve the working directory"
+  },
+  "dbdir_unix.go:databaseDir": {
+    "sqlite": [
+      "os_unix.c:openDirectory",
+      "os_unix.c:unixFullPathname",
+      "pager.c:sqlite3PagerOpen"
+    ],
+    "note": "the directory dirSync syncs, from the full pathname resolved once at open: a relative path joined to the working directory, cut at its last separator, not cleaned; a full pathname too long for the OS fails the open; the files themselves are opened by the path as given"
+  },
   "dbfile_lock_other.go:acquireSharedDBLock": {
     "sqlite": [],
     "note": ""
@@ -1456,6 +1469,10 @@
   "osfuncs_vfs.go:SetVFS": {
     "sqlite": [],
     "note": "any-store test hook to inject VFS overrides"
+  },
+  "osfuncs_vfs.go:statThroughOpen": {
+    "sqlite": [],
+    "note": "osStat under a VFS, which has no stat: a read-only open through the VFS and an fstat"
   },
   "osfuncs_vfs_js.go:init": {
     "sqlite": [],
@@ -2476,7 +2493,7 @@
     "sqlite": [
       "os_unix.c:unixOpen"
     ],
-    "note": "UNIXFILE_DIRSYNC, set on a journal or WAL descriptor opened with the create flag; the directory is taken from the path as it resolves at open"
+    "note": "UNIXFILE_DIRSYNC, set on a journal or WAL descriptor opened with the create flag; the directory is the one the pager resolved at open (databaseDir), or the path's for a file opened outside a pager"
   },
   "syncdir_unix.go:*dirSync.sync": {
     "sqlite": [

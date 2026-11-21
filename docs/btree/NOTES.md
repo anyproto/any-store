@@ -436,7 +436,7 @@ Both support: PASSIVE, FULL, RESTART, TRUNCATE with identical semantics.
 | WAL undo (`sqlite3WalUndo`) | **Missing** -- Go uses pager-level rollback instead. The rollback clears the whole writer cache, where `pagerRollbackWal` reloads only logged and dirty pages (`pager.c:3147-3166`): a clean page 1 is read again by the next transaction, and in a schema format 6 file that sets the change counter's `dbFileVers` (2026-11-12, [drift-77](#drift-77-filechangecount-bumped-conditionally-not-unconditionally)) |
 | First-opener `ftruncate(shm, 3)` marker | **Aligned (2026-07-10)** -- `newPlatformShm` now runs SQLite's full DMS first-attacher election (`unixLockSharedMemory`, os_unix.c:4860-4913, 3.52.0): F_GETLK probe → three-way branch (F_UNLCK: WRLCK + UNCONDITIONAL truncate-to-3 + atomic downgrade to RDLCK; F_RDLCK: join shared; F_WRLCK: back off BUSY, never join — the os_unix.c:4864-4871 race). The `Size()==0` gate is gone; a crash-persisted stale shm is physically reset by the first attacher and `recoverLocked` rebuilds from the WAL. See [§drift-2026-06-25-25](#drift-2026-06-25-25-first-opener-does-not-reset-a-stale-persisted-shm-trusts-checksum-vali) (RESOLVED) and item 2 below |
 | Orphan-inode handling on open race | **Aligned** -- DB-file flock serializes last-client-unlink (see §SHM open/close protocol drift) |
-| Directory sync at a WAL descriptor's first sync (`UNIXFILE_DIRSYNC`) | **Aligned (2026-11-21)** -- the port gap is closed: `wal.open` opens the WAL with the create flag and sets the descriptor's `dirSync`, and its first sync (`wal.syncFile`, from the header write, a commit or a checkpoint) syncs the directory after the file, once, as `unixOpen` marks every WAL it opens with `SQLITE_OPEN_CREATE` (`os_unix.c:6569-6573`, `6777`; `sqlite3WalOpen`, `wal.c:1719-1720`) and `unixSync` consumes the mark (`os_unix.c:3936-3954`). So the WAL's name, and a creation journal's delete before it, are durable before a commit to the WAL is. The directory is the one the path resolved to at open (`pager.c:4792`). Unix and wasip1; none on Windows and js/wasm. See [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal) |
+| Directory sync at a WAL descriptor's first sync (`UNIXFILE_DIRSYNC`) | **Aligned (2026-11-21)** -- the port gap is closed: `wal.open` opens the WAL with the create flag and sets the descriptor's `dirSync`, and its first sync (`wal.syncFile`, from the header write, a commit or a checkpoint) syncs the directory after the file, once, as `unixOpen` marks every WAL it opens with `SQLITE_OPEN_CREATE` (`os_unix.c:6569-6573`, `6777`; `sqlite3WalOpen`, `wal.c:1719-1720`) and `unixSync` consumes the mark (`os_unix.c:3936-3954`). So the WAL's name, and a creation journal's delete before it, are durable before a commit to the WAL is. On Unix the directory is resolved once, when the database is opened (`databaseDir`, as `pager.c:4792`). Unix and wasip1; none on Windows and js/wasm. See [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal) |
 
 ### SHM open/close protocol drift (resolved 2026-04-21)
 
@@ -2817,17 +2817,15 @@ change to the directory made before it (the POSIX reading, and what ext4, XFS an
 measured here, and SQLite, which deletes the WAL with `dirSync` 0 at `pager.c:3356`, relies on the
 same).
 
-The delete of step 5 syncs no directory, as SQLite's does not unless `pPager->extraSync` is set
-(`pager.c:2109`), which it is not at the default synchronous level. A power loss
+The delete of step 5 syncs no directory; SQLite passes `pPager->extraSync` to its delete
+(`pager.c:2109`). A power loss
 before the directory is synced again can bring the journal back, hot, beside the committed
 page 1, and the open after it rolls the creation back and creates the database again. Nothing is
 lost by that as long as nothing was committed to the database, and nothing is durable in the
 database before a sync of its WAL: every WAL descriptor is opened after the delete (a creation
 runs only while no process is attached) and with the create flag, so the first sync of each
 syncs the directory too, before a commit to it is durable (`wal.syncFile`, the WAL row of the
-[WAL drift summary](#7-wal-write-ahead-log)). SQLite relies on the same sync: its creation of a
-WAL database commits by a delete with no directory sync, and every WAL descriptor it opens is
-marked `UNIXFILE_DIRSYNC`. The divergences of the journal itself are
+[WAL drift summary](#7-wal-write-ahead-log)). The divergences of the journal itself are
 [drift-2026-11-21-7](#drift-2026-11-21-7-creation-journal).
 
 `Open`'s first, unlocked look at the header does not judge a file with content: a header there
@@ -2927,7 +2925,7 @@ not yet durable when a peer commits), `TestCreation_PowerLossBeforeAnyCommitCrea
 `TestCreationJournal_OrderOfTheSyncs` (the writes and syncs as the file system sees them: one
 directory sync at the first sync of each journal and WAL descriptor, and none after) and
 `TestOpen_FirstLookRacingARecoveryDoesNotFail`; `TestDirSync_DirectoryIsTheOneResolvedAtOpen`
-(`syncdir_unix_test.go`).
+(`syncdir_unix_test.go`); `TestDatabaseDir_NameTooLongFailsTheOpen` (`dbdir_unix_test.go`).
 
 <a id="drift-2026-11-21-7-creation-journal"></a>
 ### Drift: The Creation Journal Is A Header Of any-store's Own
@@ -2938,7 +2936,8 @@ directory sync at the first sync of each journal and WAL descriptor, and none af
   `creation_journal.go:*pager.finalizeJournalOfEmptyDatabase`,
   `creation_journal.go:*pager.openCreationJournal`,
   `creation_journal.go:*creationJournal.sync`, `creation_journal.go:*creationJournal.commit`,
-  `creation_journal.go:creationJournalHdr`, `pager.go:*pager.createPage1`.
+  `creation_journal.go:creationJournalHdr`, `pager.go:*pager.createPage1`,
+  `dbdir_unix.go:databaseDir`.
 
 The creation of a database is a port of SQLite's rollback-journal transaction around
 `newDatabase` in `journal_mode=DELETE` (see
@@ -2957,8 +2956,9 @@ point. It differs from `pager.c` in these points.
    `pager.c:1612-1614`) before it truncates anything, syncs, and deletes the journal
    (`pager.c:2978-2983`, `2109`). Beside a database with content, any-store leaves a `-journal`
    file that is not a hot creation journal where it is: it rolls nothing back from it and does
-   not delete it. Beside a database of zero pages whatever lies under the
-   name is deleted before the creation, as in `hasHotJournal` (`pager.c:5178-5181`).
+   not delete it. Beside a database of zero pages a file found under the name by a stat, as
+   SQLite's existence test is one (`unixAccess`, `os_unix.c:6895-6898`), is deleted unread before
+   the creation; `hasHotJournal` deletes a journal there (`pager.c:5178-5181`).
 2. *An empty database file is synced before a journal beside it is deleted.* `hasHotJournal`
    deletes a journal beside a database of zero pages at once. `finalizeJournalOfEmptyDatabase`
    syncs the database file first: the journal may be the hot journal of a playback that was
@@ -2978,16 +2978,18 @@ point. It differs from `pager.c` in these points.
    wasip1: SQLite's unix VFS also serves its WASI builds and keeps `UNIXFILE_DIRSYNC` there
    (`os_unix.c:326-330`); whether a WASI host makes it durable is the host's. On Windows and
    js/wasm a sync is the file's alone, as SQLite's Windows VFS syncs no directory. The directory
-   is the one the file's path resolved to when it was opened (`pager.c:4792`). As in `unixSync`, a directory that does not open is skipped and the result of its
+   is resolved once, when the database is opened, from its full pathname on Unix (`databaseDir`,
+   as `pager.c:4792`), and a full pathname too long for the OS fails the open; on wasip1 it is the
+   directory of the path as given. The files are opened by the path as given. As in
+   `unixSync`, a directory that does not open is skipped and the result of its
    fsync is not looked at (`os_unix.c:3937-3951`). The journal and the database file are synced
    with `fdatasync`, the package's sync primitive
    ([drift-121](#drift-121-fdatasync-durability-primitive-platform-split-undocumented)), which is
    `F_FULLFSYNC` on Darwin, where SQLite's default is a plain `fsync`.
 
 Tests: `creation_journal_test.go` (`TestCreationJournal_WhichHeaderIsHot`,
-`_HotJournalStaysHotUntilTheDelete`, `_HotJournalRollsBackWhateverIsInTheFile`,
-`_JournalThatIsNotHotIsLeftAlone`, `_LeftoverJournalBesideEmptyFile`,
-`_ForeignJournalBesideEmptyFile`), and the process-kill and power-loss tests listed under
+`_HotJournalRollsBackWhateverIsInTheFile`, `_JournalThatIsNotHotIsLeftAlone`,
+`_JournalBesideEmptyFileIsDeleted`), and the process-kill and power-loss tests listed under
 drift-63.
 
 <a id="drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl"></a>
