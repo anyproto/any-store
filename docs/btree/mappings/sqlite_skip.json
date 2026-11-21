@@ -1332,6 +1332,10 @@
       {
         "file": "pager.c",
         "func": "writeSuperJournal"
+      },
+      {
+        "file": "pager.c",
+        "func": "zeroJournalHdr"
       }
     ]
   },

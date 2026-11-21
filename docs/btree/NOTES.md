@@ -436,6 +436,7 @@ Both support: PASSIVE, FULL, RESTART, TRUNCATE with identical semantics.
 | WAL undo (`sqlite3WalUndo`) | **Missing** -- Go uses pager-level rollback instead. The rollback clears the whole writer cache, where `pagerRollbackWal` reloads only logged and dirty pages (`pager.c:3147-3166`): a clean page 1 is read again by the next transaction, and in a schema format 6 file that sets the change counter's `dbFileVers` (2026-11-12, [drift-77](#drift-77-filechangecount-bumped-conditionally-not-unconditionally)) |
 | First-opener `ftruncate(shm, 3)` marker | **Aligned (2026-07-10)** -- `newPlatformShm` now runs SQLite's full DMS first-attacher election (`unixLockSharedMemory`, os_unix.c:4860-4913, 3.52.0): F_GETLK probe → three-way branch (F_UNLCK: WRLCK + UNCONDITIONAL truncate-to-3 + atomic downgrade to RDLCK; F_RDLCK: join shared; F_WRLCK: back off BUSY, never join — the os_unix.c:4864-4871 race). The `Size()==0` gate is gone; a crash-persisted stale shm is physically reset by the first attacher and `recoverLocked` rebuilds from the WAL. See [§drift-2026-06-25-25](#drift-2026-06-25-25-first-opener-does-not-reset-a-stale-persisted-shm-trusts-checksum-vali) (RESOLVED) and item 2 below |
 | Orphan-inode handling on open race | **Aligned** -- DB-file flock serializes last-client-unlink (see §SHM open/close protocol drift) |
+| Directory sync at a WAL descriptor's first sync (`UNIXFILE_DIRSYNC`) | **Aligned (2026-11-21)** -- the port gap is closed: `wal.open` opens the WAL with the create flag and sets the descriptor's `dirSync`, and its first sync (`wal.syncFile`, from the header write, a commit or a checkpoint) syncs the directory after the file, once, as `unixOpen` marks every WAL it opens with `SQLITE_OPEN_CREATE` (`os_unix.c:6569-6573`, `6777`; `sqlite3WalOpen`, `wal.c:1719-1720`) and `unixSync` consumes the mark (`os_unix.c:3936-3954`). So the WAL's name, and a creation journal's delete before it, are durable before a commit to the WAL is. Unix only, as in SQLite. See [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal) |
 
 ### SHM open/close protocol drift (resolved 2026-04-21)
 
@@ -2754,10 +2755,11 @@ transaction and its locks, and must instead abort and re-begin.
 
 <a id="drift-63-new-db-page-1-written-directly-to-file-bypassing-wal"></a>
 ### Drift: New DB Page 1 Written Directly To File Bypassing WAL
-- **Category:** changed-logic  -  **Severity:** low  -  **Status:** NARROWED 2026-11-21: creation runs under the exclusive DB-file lock and inside a rollback journal, a WAL beside a database of zero pages is deleted, and the codec is settled on the header read under the lock. What remains is listed below.
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** NARROWED 2026-11-21: creation runs under the exclusive DB-file lock and inside a rollback journal committed by its delete, a WAL beside a database of zero pages is deleted, and the codec is settled on the header read under the lock. What remains is listed below.
 - **Affected functions:** `pager.go:*pager.open`, `pager.go:*pager.createIfEmpty`,
   `pager.go:*pager.lockDBForCreate`, `pager.go:*pager.createPage1`, `pager.go:*pager.newPage1`,
-  `creation_journal.go` (all of it), `db.go:Open` (the `settleCodec` closure).
+  `creation_journal.go` (all of it), `syncdir_unix.go` (all of it), `wal.go:*wal.syncFile`,
+  `db.go:Open` (the `settleCodec` closure and the first look at the header).
 
 **SQLite.** A file of zero bytes is not a WAL database, and SQLite never opens a WAL on one:
 `pagerOpenWalIfPresent`, called from `sqlite3PagerSharedLock` after the SHARED lock is held
@@ -2796,30 +2798,48 @@ process attached to a database can be holding the exclusive lock's counterpart o
 creation is pending: every attached handle keeps the shared lock on a file that has a committed
 page 1.
 
-The creation is SQLite's journaled one, with the journal reduced to its header
-(`creation_journal.go`). Under the exclusive lock: (1) `<path>-journal` is created and its header
-written, recording an original size of zero pages; (2) the journal is fdatasynced and then its
-directory is fsynced, since the journal's name is new (`os_unix.c:6569-6573`, `6777`,
-`3940-3952`); (3) page 1 is written; (4) the database file is fdatasynced; (5) the journal's
-header is zeroed and the journal fdatasynced, which is the commit point; (6) the journal is
-deleted. Whatever a creator killed before step 5 left in the file — nothing, a whole page 1 that
-was never synced, or part of one after a power loss — the next open finds the journal hot and
-truncates the file before it creates the database itself, so no process ever attaches to a page 1
-whose sync did not complete, and no acknowledged commit rests on one. The directory sync of step
-2 comes after the stale WAL's removal and before page 1 exists, so it also makes that removal
-durable on a file system whose directory fsync covers every change to the directory made before
-it (the POSIX reading, and what ext4, XFS and APFS do; not measured here, and SQLite, which
-deletes the WAL with `dirSync` 0 at `pager.c:3356`, relies on the same). The divergences of the
-journal itself are [drift-2026-11-21-7](#drift-2026-11-21-7-creation-journal).
+The creation is SQLite's journaled one in `journal_mode=DELETE`, with the journal reduced to its
+header (`creation_journal.go`). Under the exclusive lock, after the stale WAL's removal: (1)
+`<path>-journal` is opened with the create flag and its header written, recording an original
+size of zero pages; (2) the journal is fdatasynced, and, as that is the first sync of a
+descriptor opened with the create flag, its directory is fsynced after it (`dirSync`, SQLite's
+`UNIXFILE_DIRSYNC`: `os_unix.c:6569-6573`, `6777`, `3936-3954`); (3) page 1 is written; (4) the
+database file is fdatasynced; (5) the journal is deleted, which is the commit point
+(`pager_end_transaction`, `pager.c:2109`). Whatever a creator killed before step 5 left in the
+file — nothing, a whole page 1 that was never synced, or part of one after a power loss — the
+next open finds the journal hot and truncates the file before it creates the database itself, so
+no process ever attaches to a page 1 whose sync did not complete, and no acknowledged commit rests
+on one. The directory sync of step 2 comes after the stale WAL's removal and before page 1
+exists, so it also makes that removal durable on a file system whose directory fsync covers every
+change to the directory made before it (the POSIX reading, and what ext4, XFS and APFS do; not
+measured here, and SQLite, which deletes the WAL with `dirSync` 0 at `pager.c:3356`, relies on the
+same).
 
-`Open`'s first, unlocked look at the header does not judge a file that lies beside a hot journal:
-that content is rolled back, so a header there that cannot be read, or that disagrees with the key
-options, is not an error (`db.go:Open`).
+The delete of step 5 syncs no directory, as SQLite deletes a journal with `pPager->extraSync`
+(`pager.c:2109`), which is 1 only for `synchronous=EXTRA` (`pager.c:3625-3637`). A power loss
+before the directory is synced again can bring the journal back, hot, beside the committed
+page 1, and the open after it rolls the creation back and creates the database again. Nothing is
+lost by that as long as nothing was committed to the database, and nothing is durable in the
+database before a sync of its WAL: every WAL descriptor is opened after the delete (a creation
+runs only while no process is attached) and with the create flag, so the first sync of each
+syncs the directory too, before a commit to it is durable (`wal.syncFile`, the WAL row of the
+[WAL drift summary](#7-wal-write-ahead-log)). SQLite relies on the same sync: its creation of a
+WAL database commits by a delete with no directory sync, and every WAL descriptor it opens is
+marked `UNIXFILE_DIRSYNC`. The divergences of the journal itself are
+[drift-2026-11-21-7](#drift-2026-11-21-7-creation-journal).
+
+`Open`'s first, unlocked look at the header does not judge a file with content: a header there
+that cannot be read, or that disagrees with the key options, can be gone by the time the open
+holds the DB-file lock (another process may roll a dead creator's page 1 back and create the
+database in between). `pager.open` settles the codec on the header it reads under the lock and
+returns that read's errors, as `sqlite3PagerSharedLock` reads the header only under SHARED
+(`pager.c:5272-5282`). Key options that cannot make a codec for a new file are refused by the
+first look, before anything is created (`db.go:Open`).
 
 The passphrase codec follows the same rule. `Open` builds it from a first, unlocked read of the
-header (so a wrong key option is refused before anything is created, and the key derivation
-mostly runs with no lock held), and `pager.open` calls `settleCodec` again on the header it read
-under the lock, and with "no database" before it asks for the exclusive lock. The second call
+header when it can (so the key derivation mostly runs with no lock held), and `pager.open` calls
+`settleCodec` again on the header it read under the lock, and with "no database" before it asks
+for the exclusive lock. The second call
 does nothing unless the file changed state in between; then the codec is rebuilt from the salt
 in the file. A new database keeps the salt drawn for it only if this open is the one that
 writes page 1.
@@ -2889,76 +2909,91 @@ process's encrypted database), `TestStaleWALBesideEmptyDatabaseNotReplayed` (a k
 WAL beside a removed or truncated main file, whole database or its tail in the WAL, plain and
 passphrase, both wal-index modes), `TestCreationJournal_CreatorKilled` (a creator killed with
 SIGKILL at each step of its creation, plain and passphrase),
-`TestCreationJournal_WaitingOpenerRollsBack`; `TestInitNewDB_Page1_CrashRecoverable`,
+`TestCreationJournal_WaitingOpenerRollsBack` (the creator is killed once the opener has been
+refused the lock); `TestInitNewDB_Page1_CrashRecoverable`,
 `TestInitNewDB_Page1_CrossProcessSerialization` (`pager_test.go`); the single-process tests of
-the journal in `creation_journal_test.go`; and, under the `vfs` tag,
-`TestCreation_CommitOverADeadCreatorsPage1SurvivesPowerLoss` (`creation_journal_vfs_test.go`: a
-synced commit made after a creator died before its page-1 sync is still there after a simulated
-power loss).
+the journal in `creation_journal_test.go`; and, under the `vfs` tag, in
+`creation_journal_vfs_test.go`, on a VFS that keeps a file's content as of its last sync and a
+name as of its directory's last sync: `TestCreation_CommitOverADeadCreatorsPage1SurvivesPowerLoss`
+(a synced commit made after a creator died before its page-1 sync),
+`TestCreation_FirstCommitToANewWALSurvivesPowerLoss`,
+`TestCreation_CommitToAWALAnotherHandleCreatedSurvivesPowerLoss` (a WAL whose creator never
+synced it), `TestCreation_CommitAfterTheCreationsLastJournalStepSurvivesPowerLoss` (the delete
+not yet durable when a peer commits), `TestCreation_PowerLossBeforeAnyCommitCreatesTheDatabaseAgain`,
+`TestCreationJournal_OrderOfTheSyncs` (the syncs as the file system sees them: one directory sync
+at the first sync of each journal and WAL descriptor, and none after) and
+`TestOpen_FirstLookRacingARecoveryDoesNotFail`.
 
 <a id="drift-2026-11-21-7-creation-journal"></a>
-### Drift: The Creation Journal Is A Header Of any-store's Own, Finalized By Zeroing
+### Drift: The Creation Journal Is A Header Of any-store's Own
 - **Category:** changed-logic  -  **Severity:** low  -  **Date:** 2026-11-21
 - **Affected functions:** `creation_journal.go:*pager.hasHotCreationJournal`,
   `creation_journal.go:*pager.creationPending`, `creation_journal.go:*pager.playbackCreationJournal`,
-  `creation_journal.go:*pager.openCreationJournal`,
-  `creation_journal.go:*pager.finalizeCreationJournal`, `creation_journal.go:creationJournalHdr`,
-  `pager.go:*pager.createPage1`, `syncdir_unix.go:syncDir`.
+  `creation_journal.go:*pager.openCreationJournal`, `creation_journal.go:creationJournalLeftover`,
+  `creation_journal.go:*creationJournal.sync`, `creation_journal.go:*creationJournal.commit`,
+  `creation_journal.go:creationJournalHdr`, `pager.go:*pager.createPage1`.
 
 The creation of a database is a port of SQLite's rollback-journal transaction around
-`newDatabase` (see [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal) for
-the sequence and SQLite's lines). It differs from `pager.c` in these points.
+`newDatabase` in `journal_mode=DELETE` (see
+[drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal) for the sequence and
+SQLite's lines): the journal is opened with the create flag, synced, with its directory at that
+first sync, before page 1 is written, and its delete, with no directory sync, is the commit
+point. It differs from `pager.c` in these points.
 
-1. *The commit point is the synced zeroing of the journal header; the delete follows it.* In
-   SQLite's default journal mode the commit point is the delete alone
-   (`sqlite3OsDelete(pPager->pVfs, pPager->zJournal, pPager->extraSync)`, `pager.c:2109`), and
-   `extraSync` is 0 unless `synchronous=EXTRA`, so the directory is not synced. A deleted name
-   can come back after a power loss. In SQLite that is covered before any WAL commit is durable:
-   every WAL descriptor opened with the create flag is marked `UNIXFILE_DIRSYNC`
-   (`os_unix.c:6569-6573`, `6777`), so the first sync of a connection's WAL also fsyncs the
-   directory (`os_unix.c:3940-3952`). any-store's WAL has no such directory sync. A creation
-   journal that came back hot beside a database with commits in it would truncate that database,
-   so the journal is made cold in its content first: `finalizeCreationJournal` writes 28 zero
-   bytes over the header and fdatasyncs, which is what SQLite does to finalize a journal it keeps
-   (`zeroJournalHdr`, `pager.c:1399-1404`, from `pager_end_transaction` in
-   `journal_mode=PERSIST`, `pager.c:2090-2094`). A journal whose first byte is zero is not hot
-   (`pager.c:5108-5114`, `5183-5199`). Then the file is deleted with no directory sync; a failed
-   delete, or a name that comes back, leaves a journal of zeros, which every later open reads and
-   passes over. Cost: one more fdatasync per creation.
-2. *The journal has its own magic and no page records.* The header has SQLite's 28-byte layout
+1. *The journal has its own magic and no page records.* The header has SQLite's 28-byte layout
    (`writeJournalHdr`, `pager.c:1438-1530`) with the magic `anyjrnl\x01`, an original size of zero
    pages and the page size; the record count, the checksum seed and the sector size are zero,
    and the header is not padded to a sector, since nothing follows it. `hasHotCreationJournal`
-   calls a journal hot only when it holds that whole header with an original size of zero; SQLite
-   calls any journal with a non-zero first byte hot and lets `pager_playback` stop at a bad magic
-   (`readJournalHdr` returns `SQLITE_DONE`), after which the journal is deleted. any-store leaves
-   a `-journal` file it did not write where it is: it rolls nothing back from it and does not
-   delete it (it may be the journal of a SQLite database at that path).
-3. *A stale journal beside an empty file is overwritten, not deleted first.* `hasHotJournal`
-   deletes it (`pager.c:5170-5181`); here the creation that follows opens the journal with
-   `O_TRUNC` and deletes it at its end.
-4. *The playback does not sync the journal and does not delete it.* `pagerSyncHotJournal`
-   (`pager.c:4048`) syncs a hot journal before it is played back because the process that left it
-   may not have. A creation journal is hot only beside a file with content, and page 1 is written
-   only after the journal and its directory were synced. After `playbackCreationJournal`
-   (truncate to zero, fdatasync) the same open creates the database under the same exclusive
-   lock, and that creation rewrites the journal; a process killed in between leaves an empty
-   file, which the next open creates again.
+   calls a journal hot only when it holds that whole header with an original size of zero.
+   SQLite calls any journal with a non-zero first byte hot (`pager.c:5185-5205`); `pager_playback`
+   stops at a magic it does not recognise (`readJournalHdr` returns `SQLITE_DONE`,
+   `pager.c:1612-1614`) before it truncates anything, syncs, and deletes the journal
+   (`pager.c:2978-2983`, `2109`). any-store leaves a `-journal` file it did not write where it is
+   beside a database: it rolls nothing back from it and does not delete it (it may be the journal
+   of a SQLite database at that path).
+2. *A file under the journal's name that no creation leaves there refuses the creation.* Beside a
+   database of zero pages `hasHotJournal` deletes whatever journal it finds, "probably an old
+   journal left over from a prior database with the same name" (`pager.c:5115-5119`,
+   `5178-5181`). `openCreationJournal` opens the name without truncating it and looks at what is
+   there first (`creationJournalLeftover`). What a creation can leave is taken over: nothing, a
+   creation header or the start of one, or zeros no longer than a header (a header whose write
+   did not reach the disk). Anything else, SQLite's journal included, fails the open with
+   `errForeignCreationJournal` and is left as it is; the database is created by the first open
+   after the file is removed.
+3. *A leftover journal is written over in place, not deleted first.* A creation that finds its
+   own kind of journal beside an empty file rewrites the header over it, with the same magic and
+   the same original size of zero pages, so a hot journal stays hot at every point of the rewrite.
+   That journal can be one whose playback was cut short: a process killed after its truncation
+   of the database file and before the sync leaves an empty file in its cache, while the disk may
+   still hold the dead creator's page 1. The journal stays hot until the new page 1 is synced and
+   the journal deleted, so it is never lost before a sync of the database file has covered the
+   truncation.
+4. *The playback does not finalize the journal.* `playbackCreationJournal` truncates the file to
+   zero pages and syncs it, as `pager_playback` does (`pager.c:2897`, `2978-2981`); where
+   `pager_playback` then finalizes the journal (`pager_end_transaction`, `pager.c:2982-2983`),
+   the same open goes on to create the database under the same exclusive lock and takes the
+   journal over (item 3). The order of SQLite's playback holds: the journal is finalized only
+   after a sync of the database file. `pagerSyncHotJournal` (`pager.c:4048`), which syncs a hot
+   journal before playing it back because the process that left it may not have, has no
+   counterpart: a creation journal is hot only beside a file with content, and page 1 is written
+   only after the journal and its directory were synced.
 5. *"No RESERVED lock" is "the caller holds the DB-file lock".* `hasHotJournal` asks
    `sqlite3OsCheckReservedLock` whether a writer is alive. A creator holds the DB-file lock
-   exclusively from before its journal exists until after it is finalized, so an open that holds
+   exclusively from before its journal is opened until after it is deleted, so an open that holds
    the lock, shared or exclusive, and sees a hot journal is looking at a dead creator's.
-6. *The directory sync is a function of the b-tree package* (`syncDir`), called once, after the
-   journal's first sync, where SQLite's is a flag on the descriptor consumed by its first
-   `unixSync`. Outside Unix it does nothing, as SQLite's Windows VFS syncs no directory. The
-   journal and the database file are synced with `fdatasync`, the package's sync primitive
+6. *Platforms.* The directory sync at a descriptor's first sync (`dirSync`) is the unix VFS's,
+   as in SQLite; outside Unix a sync is the file's alone, as SQLite's Windows VFS syncs no
+   directory. As in `unixSync`, a directory that does not open is skipped and the result of its
+   fsync is not looked at (`os_unix.c:3937-3951`). The journal and the database file are synced
+   with `fdatasync`, the package's sync primitive
    ([drift-121](#drift-121-fdatasync-durability-primitive-platform-split-undocumented)), which is
    `F_FULLFSYNC` on Darwin, where SQLite's default is a plain `fsync`.
 
 Tests: `creation_journal_test.go` (`TestCreationJournal_WhichHeaderIsHot`,
-`_OrderOfTheCreation`, `_HotJournalRollsBackWhateverIsInTheFile`,
-`_JournalThatIsNotHotIsLeftAlone`, `_StaleJournalBesideEmptyFile`), and the process-kill and
-power-loss tests listed under drift-63.
+`_HotJournalStaysHotUntilTheDelete`, `_HotJournalRollsBackWhateverIsInTheFile`,
+`_JournalThatIsNotHotIsLeftAlone`, `_LeftoverJournalBesideEmptyFile`,
+`_ForeignJournalBesideEmptyFile`), and the process-kill and power-loss tests listed under
+drift-63.
 
 <a id="drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl"></a>
 ### Drift: pageSlab And ConfigPageCache Idempotent Versus Reconfigurable Setup

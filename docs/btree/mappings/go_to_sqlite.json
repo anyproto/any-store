@@ -756,18 +756,29 @@
     "sqlite": [],
     "note": ""
   },
+  "creation_journal.go:*creationJournal.abandon": {
+    "sqlite": [],
+    "note": "closes the journal of a creation that failed before its commit point; the file stays, hot"
+  },
+  "creation_journal.go:*creationJournal.commit": {
+    "sqlite": [
+      "os_unix.c:unixDelete",
+      "pager.c:pager_end_transaction"
+    ],
+    "note": "the commit point: the journal is closed and deleted with no directory sync, as in journal_mode=DELETE without synchronous=EXTRA"
+  },
+  "creation_journal.go:*creationJournal.sync": {
+    "sqlite": [
+      "os_unix.c:unixSync",
+      "pager.c:syncJournal"
+    ],
+    "note": "the journal's sync before page 1 is written; its first sync, so the directory is synced after it"
+  },
   "creation_journal.go:*pager.creationPending": {
     "sqlite": [
       "pager.c:hasHotJournal"
     ],
     "note": "the file is empty or a hot creation journal lies beside it: the test sqlite3PagerSharedLock makes after the SHARED lock, extended by the empty file that newDatabase would fill"
-  },
-  "creation_journal.go:*pager.finalizeCreationJournal": {
-    "sqlite": [
-      "pager.c:pager_end_transaction",
-      "pager.c:zeroJournalHdr"
-    ],
-    "note": "the header is zeroed and synced (journal_mode=PERSIST's finalization) and then the journal is deleted; see drift-2026-11-21-7"
   },
   "creation_journal.go:*pager.hasHotCreationJournal": {
     "sqlite": [
@@ -778,25 +789,30 @@
   },
   "creation_journal.go:*pager.openCreationJournal": {
     "sqlite": [
-      "os_unix.c:unixSync",
+      "os_unix.c:unixOpen",
       "pager.c:pager_open_journal",
-      "pager.c:syncJournal",
       "pager.c:writeJournalHdr"
     ],
-    "note": "creates the journal, writes its header, syncs it and then its directory, all before page 1 is written"
+    "note": "opens the journal with the create flag, which sets its dirSync (UNIXFILE_DIRSYNC), without truncating it: a leftover of a creation is written over in place, anything else refuses the creation; then writes the header"
   },
   "creation_journal.go:*pager.playbackCreationJournal": {
     "sqlite": [
       "pager.c:pager_playback",
       "pager.c:pager_truncate"
     ],
-    "note": "truncates the file to the journal's original size, zero pages, and syncs it; no page records exist to play back"
+    "note": "truncates the file to the journal's original size, zero pages, and syncs it; no page records exist to play back, and the journal is kept for the creation that follows, which deletes it after its page 1 is synced"
   },
   "creation_journal.go:creationJournalHdr": {
     "sqlite": [
       "pager.c:writeJournalHdr"
     ],
     "note": "SQLite's 28-byte header layout with any-store's magic, original size 0 and the page size"
+  },
+  "creation_journal.go:creationJournalLeftover": {
+    "sqlite": [
+      "pager.c:hasHotJournal"
+    ],
+    "note": "what a creation can leave under the journal's name (nothing, a creation header or its start, zeros no longer than a header); hasHotJournal deletes any journal beside a database of zero pages instead"
   },
   "db.go:*DB.BeginRead": {
     "sqlite": [
@@ -1770,7 +1786,7 @@
       "pager.c:pager_write",
       "pager.c:sqlite3PagerCommitPhaseOne"
     ],
-    "note": "page 1 is written after the creation journal is synced and before it is finalized, as a PGHDR_NEED_SYNC page is"
+    "note": "page 1 is written after the creation journal and its directory are synced and before the journal's delete commits the creation, as a PGHDR_NEED_SYNC page is"
   },
   "pager.go:*pager.decryptPage": {
     "sqlite": [],
@@ -2431,16 +2447,34 @@
     "sqlite": [],
     "note": "heap-backed shm fallback for platforms without mmap support"
   },
-  "syncdir_other.go:syncDir": {
+  "syncdir_other.go:*dirSync.set": {
     "sqlite": [],
     "note": "no directory sync outside Unix, as in SQLite's Windows VFS"
+  },
+  "syncdir_other.go:*dirSync.sync": {
+    "sqlite": [
+      "os_win.c:winSync"
+    ],
+    "note": "the file's sync alone, as winSync syncs no directory"
+  },
+  "syncdir_unix.go:*dirSync.set": {
+    "sqlite": [
+      "os_unix.c:unixOpen"
+    ],
+    "note": "UNIXFILE_DIRSYNC, set on a journal or WAL descriptor opened with the create flag"
+  },
+  "syncdir_unix.go:*dirSync.sync": {
+    "sqlite": [
+      "os_unix.c:unixSync"
+    ],
+    "note": "fdatasync, then the directory at the first sync since set; racing first syncs wait for the directory sync"
   },
   "syncdir_unix.go:syncDir": {
     "sqlite": [
       "os_unix.c:openDirectory",
       "os_unix.c:unixSync"
     ],
-    "note": "the directory fsync unixSync does for a descriptor marked UNIXFILE_DIRSYNC"
+    "note": "the directory fsync unixSync does for a descriptor marked UNIXFILE_DIRSYNC; a directory that does not open, and the fsync's result, are ignored, as there"
   },
   "testseam.go:*DB.TestSeam": {
     "sqlite": [],
@@ -2685,6 +2719,12 @@
       "wal.c:walRewriteChecksums"
     ],
     "note": "in-tx frame-reuse checksum-chain rewrite (wal.c:3966-4009), called from writeFrames"
+  },
+  "wal.go:*wal.syncFile": {
+    "sqlite": [
+      "os_unix.c:unixSync"
+    ],
+    "note": "every sync of the WAL file; the first since open syncs the directory too (UNIXFILE_DIRSYNC set by wal.open, as unixOpen sets it on every WAL opened with the create flag)"
   },
   "wal.go:*wal.truncateFile": {
     "sqlite": [
