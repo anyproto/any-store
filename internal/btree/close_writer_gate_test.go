@@ -824,8 +824,10 @@ func TestClose_KeepsBackTheLeavesCursorsLent(t *testing.T) {
 			require.Nil(t, c3.nextCursor)
 
 			// Another database takes every buffer the allocator will give
-			// and writes it: the lent slices keep their content.
-			other, err := testOpen(t, filepath.Join(dir, "b.db"), Options{CacheSize: slabPages * 2, UsePageSlab: mode.slab})
+			// and writes it: the lent slices keep their content. A plain
+			// Open: testOpen resets the pool, and with it a buffer the
+			// teardown would have wrongly given back.
+			other, err := Open(filepath.Join(dir, "b.db"), Options{CacheSize: slabPages * 2, UsePageSlab: mode.slab})
 			require.NoError(t, err)
 			createNS(t, other, "t")
 			otx, err := other.BeginWrite()
@@ -988,8 +990,8 @@ func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
 				wantVal, err := cur.Value()
 				require.NoError(t, err)
 				wantVal = bytes.Clone(wantVal)
-				// The reads are not calls in flight.
-				require.Zero(t, db.pager.wgate.n.Load())
+				// Key and Value take the path outside the gate.
+				require.True(t, cur.readsPinnedLeaf())
 
 				var (
 					wg      sync.WaitGroup
@@ -1030,8 +1032,9 @@ func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
 				}()
 				<-started
 				require.NoError(t, db.Close())
-				// Another database takes what the first gave back.
-				other, err := testOpen(t, "", opts)
+				// Another database takes what the first gave back (a plain
+				// Open: testOpen resets the pool).
+				other, err := Open("", opts)
 				require.NoError(t, err)
 				createNS(t, other, "t")
 				putN(t, other, "t", 50, 300)
