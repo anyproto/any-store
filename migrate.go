@@ -88,22 +88,22 @@ type CopyReport struct {
 // whatever src is. config.InMemory is refused. A collection that inherits
 // the database's compression setting inherits config's in the copy.
 //
-// Nothing is replaced. If dstPath, dstPath+"-wal", dstPath+"-wal-shm" or
-// dstPath+".lock" exists, or dstPath is one of those names of an existing
-// file in any case (p+"-WAL" is p's log on a case-insensitive filesystem,
-// and is refused on every one), the call returns ErrDestinationExists and
-// leaves that file as it is. Found by the first check, before the call
-// takes its locks, it returns having touched nothing. The check is made
-// again under the locks and right before the publication (below), and a
-// file found then, one that appeared meanwhile, returns
+// Nothing is replaced. If dstPath, dstPath+"-wal", dstPath+"-wal-shm",
+// dstPath+".lock" or dstPath+"-journal" exists, or dstPath is one of those
+// names of an existing file in any case (p+"-WAL" is p's log on a
+// case-insensitive filesystem, and is refused on every one), the call returns
+// ErrDestinationExists and leaves that file as it is. Found by the first
+// check, before the call takes its locks, it returns having touched nothing.
+// The check is made again under the locks and right before the publication
+// (below), and a file found then, one that appeared meanwhile, returns
 // ErrDestinationExists after the call created its lock files, or built the
 // whole copy under its staging name, and removed them again. Apart from the
 // read bookkeeping in src's wal-index (its -wal-shm), which the call's read
 // of src changes as any reader of src does, no file but the copy's own lock
 // and staging files is created, written or removed, and those removed can
 // include ones a killed call left there; src's files are never renamed,
-// removed or otherwise written. A dstPath that ends in one of the names
-// this call keeps for itself, listed below, is refused too.
+// removed or otherwise written. A dstPath that ends in one of the names this
+// call keeps for itself, listed below, is refused too.
 //
 // One call at a time copies to a dstPath. For the whole call it holds an
 // exclusive lock of the operating system on the file dstPath+".copy-lock"
@@ -111,10 +111,11 @@ type CopyReport struct {
 // process dies. A second call for the same dstPath, from this process or
 // another, does not wait: it returns ErrBusy at once, and touches no file
 // but the copy's lock files. A dstPath that names a file a database at p
-// keeps beside it (p+"-wal", p+"-wal-shm" or p+".lock", in any case) is
-// read as p's file once p exists, so a call for it holds p+".copy-lock"
-// too, taken first: a copy to p and a copy to one of those names do not
-// run at once either, and the one that comes second returns ErrBusy. The
+// keeps beside it (p+"-wal", p+"-wal-shm", p+".lock" or p+"-journal", in
+// any case) is read as p's file once p exists, so a call for it holds
+// p+".copy-lock" too, taken first: a copy to p and a copy to one of those
+// names do not run at once either, and the one that comes second returns
+// ErrBusy. The
 // lock files are removed when the call returns, except after a failure to
 // take a lock, which can leave an unlocked lock file for the next call to
 // reuse. So a call that returns ErrBusy has created, written or removed no
@@ -126,37 +127,37 @@ type CopyReport struct {
 // copies in the process, and no lock file is made.
 //
 // Under the lock the copy is built in the staging file
-// dstPath+".copy-staging", in dstPath's own directory, so that publishing
-// it never crosses filesystems. Staging files a killed call left there
-// (that name, and its -wal, -wal-shm and .lock) are removed first: no other
-// copy can be using them while the lock is held. A database open at the
+// dstPath+".copy-staging", in dstPath's own directory, so that publishing it
+// never crosses filesystems. Staging files a killed call left there (that
+// name, and its -wal, -wal-shm, .lock and -journal) are removed first: no
+// other copy can be using them while the lock is held. A database open at the
 // staging name is no killed call's: an open database holds a lock of the
-// operating system on its file (a flock on Unix, LockFileEx on Windows),
-// and the call tries that lock, exclusively and without waiting, before it
+// operating system on its file (a flock on Unix, LockFileEx on Windows), and
+// the call tries that lock, exclusively and without waiting, before it
 // removes anything; if it is held the call returns ErrBusy and removes
-// nothing under the staging name. To try it the call opens the staging
-// file, only if it is what a copy leaves there, as it opens a lock file
-// (below). js/wasm and wasip1 have no such lock to try, and open nothing.
-// The copy is checkpointed, verified (each collection's options, document
-// count and index definitions against the source's snapshot, then
-// IntegrityCheck) and closed, and then published by renaming the staging
-// file to dstPath.
-// The files at and beside dstPath are checked again right before the
-// rename, so a file that appeared there while the copy ran also gives
-// ErrDestinationExists. The check and the rename are not one step, and the
-// locks exclude only other copies: a file that something else creates at
-// dstPath between them is replaced, and a -wal, -wal-shm or .lock that it
-// creates beside dstPath then is not seen, and is read as the copy's own
-// once the copy is opened. So let nothing else create files under dstPath's
-// name while the copy runs. The copy is never returned open; it has no
-// -wal or -wal-shm beside it.
+// nothing under the staging name. To try it the call opens the staging file,
+// only if it is what a copy leaves there, as it opens a lock file (below).
+// js/wasm and wasip1 have no such lock to try, and open nothing. The copy is
+// checkpointed, verified (each collection's options, document count and index
+// definitions against the source's snapshot, then IntegrityCheck) and closed,
+// and then published by renaming the staging file to dstPath. The files at
+// and beside dstPath are checked again right before the rename, so a file
+// that appeared there while the copy ran also gives ErrDestinationExists. The
+// check and the rename are not one step, and the locks exclude only other
+// copies: a file that something else creates at dstPath between them is
+// replaced, and a -wal, -wal-shm, .lock or -journal that it creates beside
+// dstPath then is not seen, and is read as the copy's own once the copy is
+// opened. So let nothing else create files under dstPath's name while the
+// copy runs. The copy is never returned open; it has no -wal, -wal-shm or
+// -journal beside it.
 //
 // The names dstPath+".copy-lock" and dstPath+".copy-staging", with the
-// -wal, -wal-shm and .lock of the latter, are reserved for this call, and
-// so, for a dstPath that is p's -wal, -wal-shm or .lock, is p+".copy-lock":
-// it creates them and removes them, whatever a file found there holds, but
-// a database open at the staging name and, at the staging name and at a
-// lock file's name, anything a copy does not leave there. The call opens a
+// -wal, -wal-shm, .lock and -journal of the latter, are reserved for this
+// call, and so, for a dstPath that is p's -wal, -wal-shm, .lock or
+// -journal, is p+".copy-lock": it creates them and removes them, whatever a
+// file found there holds, but a database open at the staging name and, at
+// the staging name and at a lock file's name, anything a copy does not
+// leave there. The call opens a
 // lock file, and the staging file to try its lock, only if it is a regular
 // file with one link, which is what a copy leaves there. A symbolic link, a
 // file with other links (on Unix; Windows does not report the count) or
@@ -625,8 +626,11 @@ func cutSuffixFold(s, suffix string) (before string, found bool) {
 }
 
 // sidecarSuffixes are the suffixes of the files a database at path keeps
-// beside it: its log, the log's index, and the durability sentinel.
-var sidecarSuffixes = [...]string{"-wal", "-wal-shm", ".lock"}
+// beside it: its log, the log's index, the durability sentinel, and the
+// journal of its creation, which is there while the database is created and
+// after a creator that was killed inside its creation, and which the next
+// open of the database reads.
+var sidecarSuffixes = [...]string{"-wal", "-wal-shm", ".lock", "-journal"}
 
 // sidecarBases lists the names whose database would keep a file at path:
 // path without a sidecar suffix it ends in, matched without regard to case,
@@ -768,10 +772,11 @@ func lockDestination(dstPath string) (unlock func(), err error) {
 // the log's index where that is a file. A path can name another file:
 // btree.DB.Path is cleaned lexically, and a ".." after a symbolic link to a
 // directory takes it to the link's parent, where the system resolves the
-// link first and goes up from its target. The durability sentinel (.lock),
-// which no process holds open, and the log's index where it is in memory
-// are stat'ed under the spelling the source was opened by, which the system
-// resolves as it did at the open.
+// link first and goes up from its target. The durability sentinel (.lock)
+// and the creation journal (-journal), which no open database holds open,
+// and the log's index where it is in memory are stat'ed under the spelling
+// the source was opened by, which the system resolves as it did at the
+// open.
 //
 // A file of the source that does not exist yet has no identity, and is not
 // compared by name either: a name a database keeps beside its file is
@@ -801,9 +806,10 @@ func sourceOutsideReservedNames(src *btree.DB, dstPath string) error {
 		}
 		return fi, nil
 	}
-	// In the order of databaseFiles: the file, -wal, -wal-shm, .lock.
+	// In the order of databaseFiles: the file, -wal, -wal-shm, .lock,
+	// -journal.
 	srcFiles := databaseFiles(open.Path)
-	srcInfos := []os.FileInfo{open.DB, open.WAL, open.SHM, nil}
+	srcInfos := []os.FileInfo{open.DB, open.WAL, open.SHM, nil, nil}
 	for i, p := range srcFiles {
 		if srcInfos[i] == nil {
 			if srcInfos[i], err = stat(p); err != nil {
