@@ -307,10 +307,11 @@ func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.P
 		lookupTx ReadTx
 		// shared is the transaction the pipeline reads through when other
 		// callers can reach it, nil for one of the iterator's own.
-		shared ReadTx
+		shared     ReadTx
+		closeState btree.CloseState
 	)
 	if pi, ok := inner.(*planIterator); ok {
-		shared = pi.shared
+		shared, closeState = pi.shared, pi.closeState
 	} else {
 		// An empty prefix: the rows a stage synthesizes end with the
 		// transaction too.
@@ -318,6 +319,9 @@ func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.P
 		if err != nil {
 			_ = inner.Close()
 			return nil, err
+		}
+		if tx != nil {
+			closeState = tx.btreeReadTx().CloseState()
 		}
 		if entered != nil {
 			entered.exit()
@@ -350,12 +354,13 @@ func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.P
 	// it parses stored documents into.
 	buf := q.c.db.syncPool.GetDocBuf()
 	return &aggIterator{
-		root:     root,
-		inner:    inner,
-		lookupTx: lookupTx,
-		shared:   shared,
-		c:        q.c,
-		buf:      buf,
+		root:       root,
+		inner:      inner,
+		lookupTx:   lookupTx,
+		shared:     shared,
+		closeState: closeState,
+		c:          q.c,
+		buf:        buf,
 		actx: &aggregate.Ctx{
 			Context:  ctx,
 			RowArena: buf.Arena,
@@ -545,7 +550,10 @@ type aggIterator struct {
 	// iterator's own: a blocking stage has its rows in memory, and ends
 	// with the transaction all the same.
 	shared ReadTx
-	actx   *aggregate.Ctx
+	// closeState tells whether DB.Close rolled shared back under its
+	// owner, taken as the iterator was built (planIterator.closeState).
+	closeState btree.CloseState
+	actx       *aggregate.Ctx
 	c      *collection
 	buf    *syncpool.DocBuffer
 	cur    *anyenc.Value
@@ -555,10 +563,10 @@ type aggIterator struct {
 
 // endedErr is why the rows' transaction can give no more: the inner
 // iterator was tripped — the transaction ended, or a savepoint it moved
-// inside was rolled back — or the transaction ended without a trip. Nil
-// while the rows keep coming. A blocking stage holds its rows in memory
-// and ends all the same: what its lookups and its stored rows came from is
-// gone.
+// inside was rolled back — or the transaction ended without a trip, or
+// DB.Close rolled it back under its owner. Nil while the rows keep coming.
+// A blocking stage holds its rows in memory and ends all the same: what its
+// lookups and its stored rows came from is gone.
 func (it *aggIterator) endedErr() error {
 	if it.shared == nil {
 		return nil
@@ -570,6 +578,9 @@ func (it *aggIterator) endedErr() error {
 	}
 	if it.shared.Done() {
 		return ErrTxIsUsed
+	}
+	if it.closeState.EndedByClose() {
+		return ErrDBIsClosed
 	}
 	return nil
 }
