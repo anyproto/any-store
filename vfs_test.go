@@ -31,6 +31,7 @@ var errInjectedRead = errors.New("injected read failure")
 type readFaults struct {
 	path   string
 	failAt int64 // -1: count only
+	err    error // what the read that fails returns
 	armed  atomic.Bool
 	reads  atomic.Int64
 	fired  atomic.Bool
@@ -48,7 +49,7 @@ func (f *readFaultFile) ReadAt(b []byte, off int64) (int, error) {
 			rf.fired.Store(true)
 			stack := string(debug.Stack())
 			rf.stack.Store(&stack)
-			return 0, errInjectedRead
+			return 0, rf.err
 		}
 	}
 	return f.File.ReadAt(b, off)
@@ -88,9 +89,15 @@ func buildImage(t *testing.T, build func(t *testing.T, db DB)) []byte {
 // copy just opened, so nothing of it is cached, and may close and reopen it
 // at rf.path.
 func eachReadFault(t *testing.T, build func(t *testing.T, db DB), body func(t *testing.T, db DB, rf *readFaults)) {
+	eachReadFaultOf(t, errInjectedRead, build, body)
+}
+
+// eachReadFaultOf is eachReadFault with fault as what the failing read
+// returns.
+func eachReadFaultOf(t *testing.T, fault error, build func(t *testing.T, db DB), body func(t *testing.T, db DB, rf *readFaults)) {
 	image := buildImage(t, build)
 	run := func(t *testing.T, failAt int64) int64 {
-		rf := &readFaults{path: filepath.Join(t.TempDir(), "copy.db"), failAt: failAt}
+		rf := &readFaults{path: filepath.Join(t.TempDir(), "copy.db"), failAt: failAt, err: fault}
 		require.NoError(t, os.WriteFile(rf.path, image, 0o600))
 		SetVFS(VFS{OpenFile: func(name string, flag int, perm os.FileMode) (File, error) {
 			f, err := os.OpenFile(name, flag, perm)

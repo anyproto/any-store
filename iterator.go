@@ -2,7 +2,6 @@ package anystore
 
 import (
 	"errors"
-	"io"
 	"sync/atomic"
 	"time"
 
@@ -172,7 +171,7 @@ func (pi *planIterator) Doc() (Doc, error) {
 	if pi.closed {
 		return nil, ErrIterClosed
 	}
-	if pi.err != nil && !errors.Is(pi.err, io.EOF) {
+	if pi.err != nil {
 		return nil, pi.err
 	}
 	var doc *anyenc.Value
@@ -252,10 +251,13 @@ func (pi *planIterator) Doc() (Doc, error) {
 	return pi.qb.coll.newItem(doc)
 }
 
+// Err returns the error that ended the iteration, nil for one that reached
+// its end. The end is the plan returning no document and no error (Next);
+// no error stands for it, io.EOF included, which a read past the end of a
+// file shorter than its page count returns wrapped. SQLite ends a loop on
+// SQLITE_DONE alone (OP_Next: "if( rc!=SQLITE_DONE ) goto
+// abort_due_to_error", vdbe.c).
 func (pi *planIterator) Err() error {
-	if pi.err != nil && errors.Is(pi.err, io.EOF) {
-		return nil
-	}
 	return pi.err
 }
 
