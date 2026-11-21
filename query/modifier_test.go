@@ -678,22 +678,81 @@ func TestModifier_PaddingRefusalLeavesDocumentUnchanged(t *testing.T) {
 	}
 }
 
-// A modifier that could be refused but is not runs once, on the document it
-// was given, as any other modifier does: the result is that document, and an
-// operation that changes a value an earlier one stored sees it once.
+// A modifier that could be refused but is not runs once, on a copy of the
+// document it was given: the copy is the result, the document is unchanged,
+// and an operation that changes a value an earlier one stored sees it once.
 func TestModifier_PaddingStagedAppliesOnce(t *testing.T) {
-	doc := anyenc.MustParseJson(`{"x":7,"arr":[1,2]}`)
+	const src = `{"x":7,"arr":[1,2]}`
+	doc := anyenc.MustParseJson(src)
 	mod := MustParseModifier(`{"$set":{"o":{"n":1},"arr.1500002":true},"$inc":{"o.n":1},"$rename":{"x":"y"}}`)
 	res, modified, err := mod.Modify(&anyenc.Arena{}, doc)
 	require.NoError(t, err)
 	assert.True(t, modified)
-	assert.Same(t, doc, res, "the modifier changes the document it is given")
-	assert.Equal(t, 2, doc.GetInt("o", "n"))
-	assert.Equal(t, 7, doc.GetInt("y"))
-	assert.Nil(t, doc.Get("x"))
-	arr := doc.GetArray("arr")
+	assert.NotSame(t, doc, res, "the result is a copy")
+	assert.Equal(t, anyenc.MustParseJson(src).String(), doc.String(), "the document given is unchanged")
+	assert.Equal(t, 2, res.GetInt("o", "n"))
+	assert.Equal(t, 7, res.GetInt("y"))
+	assert.Nil(t, res.Get("x"))
+	arr := res.GetArray("arr")
 	require.Len(t, arr, 1_500_003)
 	assert.Equal(t, anyenc.TypeTrue, arr[len(arr)-1].Type())
+}
+
+// The copy a staged modifier runs on is the document as it is in memory,
+// not an encode and parse of it: a branch nested deeper than the parser's 512
+// levels does not fail the modifier, and a key "\x1f", which anyenc's
+// encoding reads back as "", keeps its value, so a refusal on a path through
+// it is seen and leaves the document unchanged.
+func TestModifier_PaddingStagedCopiesTheDocumentAsItIs(t *testing.T) {
+	t.Run("a branch deeper than 512 levels", func(t *testing.T) {
+		a := &anyenc.Arena{}
+		deep := a.NewArray()
+		for cur, i := deep, 0; i < 600; i++ {
+			next := a.NewArray()
+			cur.SetArrayItem(0, next)
+			cur = next
+		}
+		doc := a.NewObject()
+		doc.Set("deep", deep)
+		doc.Set("labels", a.NewObject())
+		res, modified, err := MustParseModifier(`{"$set":{"labels.1500001":1}}`).Modify(a, doc)
+		require.NoError(t, err)
+		assert.True(t, modified)
+		assert.Equal(t, 1, res.GetInt("labels", "1500001"))
+		assert.Equal(t, anyenc.TypeArray, res.Get("deep").Type())
+	})
+	t.Run(`a key "\x1f"`, func(t *testing.T) {
+		const src = `{"x":7,"\u001f":[]}`
+		doc := anyenc.MustParseJson(src)
+		require.NotNil(t, doc.Get("\x1f"))
+		res, modified, err := MustParseModifier(`{"$rename":{"x":"\u001f.1500001"}}`).Modify(&anyenc.Arena{}, doc)
+		require.ErrorContains(t, err, "can't backfill more than 1500000 elements")
+		assert.Nil(t, res)
+		assert.False(t, modified)
+		assert.Equal(t, anyenc.MustParseJson(src).String(), doc.String())
+		assert.Equal(t, 7, doc.GetInt("x"))
+	})
+}
+
+// A parsed modifier can change its own operands: here the stored $set
+// operand's "a" becomes an empty array once the modifier has run. A second
+// application is then refused by the padding limit after its $set has
+// already run, and the document it was given is unchanged.
+func TestModifier_PaddingStagedRefusalAfterOperandChange(t *testing.T) {
+	mod := MustParseModifier(`{"$set":{"o":{"a":{},"c":[]}},"$inc":{"o.a.1500001":1},"$rename":{"o.c":"o.a"}}`)
+	// The first application meets "a" as an object; $rename then puts the
+	// operand's empty "c" array in its place.
+	res, _, err := mod.Modify(&anyenc.Arena{}, anyenc.MustParseJson(`{"x":1}`))
+	require.NoError(t, err)
+	require.NotNil(t, res.Get("o", "a"))
+	assert.Equal(t, anyenc.TypeArray, res.Get("o", "a").Type())
+
+	doc := anyenc.MustParseJson(`{"x":1}`)
+	res, modified, err := mod.Modify(&anyenc.Arena{}, doc)
+	require.ErrorContains(t, err, "can't backfill more than 1500000 elements")
+	assert.Nil(t, res)
+	assert.False(t, modified)
+	assert.Equal(t, `{"x":1}`, doc.String())
 }
 
 // Only a modifier with a segment past the padding limit, or too large for an

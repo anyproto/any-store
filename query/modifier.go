@@ -41,47 +41,24 @@ func (mRoot ModifierChain) Modify(a *anyenc.Arena, v *anyenc.Value) (result *any
 
 // paddingStaged is a parsed modifier with a path segment that names an array
 // index past anyencutil.MaxArrayPadding. On an array that segment is refused,
-// and the operations run in order on the caller's document: a refusal in the
+// and the operations run in order: on the caller's document, a refusal in the
 // middle would leave the operations before it applied, and a $rename whose
-// destination is refused has already removed its source. Modify therefore
-// runs the modifier on a copy of the document first, with its operands parsed
-// afresh from src (an operation can change a value an earlier one stored, and
-// the copy must not reach the operands the real run stores), and changes the
-// caller's document only after that trial succeeds. A modifier without such a
-// segment is never refused by the padding limit and runs directly.
+// destination is refused would already have removed its source. Modify
+// therefore applies the modifier once, to an in-memory copy of the document
+// (anyenc.Arena.Copy), and the copy is the result: on success it replaces the
+// document, and on a refusal it is dropped and the document is as it was.
+// MongoDB applies an update the same way, to a mutable copy that is stored
+// only when every operation succeeds. A modifier without such a segment is
+// never refused by the padding limit and runs on the document directly.
 type paddingStaged struct {
 	ModifierChain
-	src []byte // the modifier document, encoded
 }
 
 func (m paddingStaged) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	if v != nil {
-		if err = m.trial(v); err != nil {
-			return nil, false, err
-		}
+	if v == nil {
+		return m.ModifierChain.Modify(a, v)
 	}
-	return m.ModifierChain.Modify(a, v)
-}
-
-// trial runs a fresh parse of the modifier on a copy of v and returns its
-// error. The real run applies the same operations to the same content, so it
-// fails exactly when the trial does.
-func (m paddingStaged) trial(v *anyenc.Value) error {
-	var mp, dp anyenc.Parser
-	mv, err := mp.Parse(m.src)
-	if err != nil {
-		return err
-	}
-	fresh, err := parseModRoot(mv)
-	if err != nil {
-		return err
-	}
-	doc, err := dp.Parse(v.MarshalTo(nil))
-	if err != nil {
-		return err
-	}
-	_, _, err = fresh.Modify(&anyenc.Arena{}, doc)
-	return err
+	return m.ModifierChain.Modify(a, a.Copy(v))
 }
 
 // mayExceedPadding reports whether a path of the chain has a segment naming
