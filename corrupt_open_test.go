@@ -270,8 +270,8 @@ func TestErrCorrupt_TreeWithACycleOfInteriorPages(t *testing.T) {
 	type op struct {
 		name string
 		run  func(ctx context.Context, coll Collection) error
-		// rolledBack checks that the failed write left nothing behind.
-		rolledBack func(t *testing.T, coll Collection)
+		// after checks the data tree once the write has failed.
+		after func(t *testing.T, coll Collection)
 	}
 	// Where the data tree is sound, document 1 is still what was inserted.
 	firstDocUnchanged := func(t *testing.T, coll Collection) {
@@ -294,16 +294,19 @@ func TestErrCorrupt_TreeWithACycleOfInteriorPages(t *testing.T) {
 	deleteId := op{name: "DeleteId", run: func(ctx context.Context, coll Collection) error {
 		return coll.DeleteId(ctx, cyclicTreeID(1))
 	}}
-	// With the cycle in the index tree the data tree takes the write first
-	// and the index write then fails: the document write must not stay.
+	// With the cycle in the index tree, Insert writes the data tree first
+	// and the index write then fails: the rollback must take the document
+	// out again. UpdateId and DeleteId write the index first and fail before
+	// they reach the data tree, so for them the check shows that document 1
+	// is as inserted, not that a write was rolled back.
 	insertIdx, updateIdx, deleteIdx := insert, updateId, deleteId
-	insertIdx.rolledBack = func(t *testing.T, coll Collection) {
+	insertIdx.after = func(t *testing.T, coll Collection) {
 		t.Helper()
 		_, err := coll.FindId(ctx, cyclicTreeID(0))
 		require.ErrorIs(t, err, ErrDocNotFound)
 	}
-	updateIdx.rolledBack = firstDocUnchanged
-	deleteIdx.rolledBack = firstDocUnchanged
+	updateIdx.after = firstDocUnchanged
+	deleteIdx.after = firstDocUnchanged
 	for _, tc := range []struct {
 		name   string
 		nsName string
@@ -323,8 +326,8 @@ func TestErrCorrupt_TreeWithACycleOfInteriorPages(t *testing.T) {
 				require.ErrorIs(t, err, ErrCorrupt, o.name)
 				// The depth bound, not a page that fails its checksum.
 				require.NotErrorIs(t, err, ErrPageIntegrity, o.name)
-				if o.rolledBack != nil {
-					o.rolledBack(t, coll)
+				if o.after != nil {
+					o.after(t, coll)
 				}
 			}
 			doc, err := coll.FindId(ctx, cyclicTreeID(6000))
