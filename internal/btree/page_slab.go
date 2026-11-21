@@ -133,14 +133,17 @@ func (s *pageSlab) serves(pageSize int) bool {
 }
 
 // slabUsable reports whether Init allocates slots for these arguments: a slot
-// of at least MinPageSize bytes, at least one of them, and a slab whose byte
-// size an int can hold. The first two are SQLite's rule, sqlite3MallocInit's
-// `szPage<512 || nPage<=0` (malloc.c:165-168), which clears the configured
-// buffer; the third is Go's, since Go allocates the slab where C is handed
-// one. A slot is larger than a slice header, so the free list's size fits
-// whenever the slab's does.
+// of at least MinPageSize bytes, at least one of them, a slot of at most
+// MaxPageSize bytes, and a slab whose byte size an int can hold. The first
+// two are SQLite's rule, sqlite3MallocInit's `szPage<512 || nPage<=0`
+// (malloc.c:165-168), which clears the configured buffer; the last two are
+// Go's, since Go allocates the slab where C is handed one: a larger slot
+// serves no database (allocPageBuffer serves only a page of the slot's
+// size), and a slab past an int cannot be allocated. A slot is larger than a
+// slice header, so the free list's size fits whenever the slab's does.
+// DRIFT: Go-only slab bounds, a slot above MaxPageSize and a slab past an int See docs/btree/NOTES.md#drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl
 func slabUsable(pageSize, nPages int) bool {
-	return pageSize >= MinPageSize && nPages > 0 && nPages <= math.MaxInt/pageSize
+	return pageSize >= MinPageSize && pageSize <= MaxPageSize && nPages > 0 && nPages <= math.MaxInt/pageSize
 }
 
 // Init allocates one nPages*pageSize buffer and fills the free list with its

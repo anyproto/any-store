@@ -67,6 +67,7 @@ func TestInitPageBuffer_MisSizedPoolIsNotUsed(t *testing.T) {
 		{4096, -5},
 		{0, 0},
 		{math.MaxInt, 2}, // the pool's size overflows an int
+		{math.MaxInt, 1}, // a slot past the largest page size
 	}
 	for i, args := range configs {
 		t.Run(fmt.Sprintf("%d_%d", args[0], args[1]), func(t *testing.T) {

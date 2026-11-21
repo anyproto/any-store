@@ -2791,10 +2791,12 @@ allocation goes to `sqlite3Malloc`.
 
 Go's `pageSlab.Init` (behind `ConfigPageCache` and `anystore.InitPageBuffer`) keeps SQLite's rule
 for which arguments give slots: `slabUsable` requires `pageSize >= MinPageSize` (512) and
-`nPages > 0`, the `malloc.c:165-168` check. Go adds one condition of its own, because it allocates
-the slab where C is handed one: `nPages*pageSize` must fit an int. Any other arguments leave an
-initialized slab with no slots and slot size 0, which serves no request (`pageSlab.serves`), and
-`btree.Open` resolves `useSlab` to false for every database.
+`nPages > 0`, the `malloc.c:165-168` check. Go adds two conditions of its own, because it
+allocates the slab where C is handed one, and C has neither: `pageSize <= MaxPageSize` (65536),
+since a larger slot serves no database (no page size is larger, and the slab serves only a page of
+its own slot size, see drift-2026-06-25-22), and `nPages*pageSize` must fit an int. Any other
+arguments leave an initialized slab with no slots and slot size 0, which serves no request
+(`pageSlab.serves`), and `btree.Open` resolves `useSlab` to false for every database.
 
 What diverges is the lifecycle. Go has no shutdown, and `Init` is first-call-wins: a
 double-checked `s.initialized` guard makes every later call a no-op, so the slab is configured once

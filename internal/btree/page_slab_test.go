@@ -462,11 +462,13 @@ func TestAllocPageBuffer_SlabServesOnlyItsOwnPageSize(t *testing.T) {
 // empty, as SQLite leaves a configuration sqlite3MallocInit cleared
 // (`szPage<512 || nPage<=0`, malloc.c:165-168): nothing is allocated for it,
 // no request is served from it, and it never reports pressure. So is one
-// whose byte size overflows an int, which make would refuse with a panic.
+// with slots above MaxPageSize, which serve no database, and one whose byte
+// size overflows an int; make would refuse both of the latter with a panic.
 func TestPageSlab_InitWithoutPagesIsEmpty(t *testing.T) {
 	for _, args := range [][2]int{
 		{4096, 0}, {4096, -1}, {0, 16}, {-4096, 16}, {0, 0},
 		{256, 16}, {MinPageSize - 1, 16},
+		{MaxPageSize + 1, 16}, {math.MaxInt, 1},
 		{math.MaxInt, 2}, {4096, math.MaxInt/4096 + 1}, {MaxPageSize, math.MaxInt},
 	} {
 		var s pageSlab

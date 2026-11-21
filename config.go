@@ -16,15 +16,20 @@ import (
 // a later call, with the same or other arguments, does nothing.
 //
 // pageSize must be the database page size, 4096. It does not select a page
-// size. A pool of any other size is allocated as asked and never used: a
-// database with UseGlobalPageBuffer takes buffers from the pool only when they
-// are exactly its page size, and otherwise opens and runs on the default
-// allocator, without the pool's memory bound. (SQLite's page cache uses any
-// slot large enough for a page and its header; the buffers of this pool are
-// the pages themselves.) A pageSize below 512 or an nPages below 1 allocates
-// nothing and leaves every database on the default allocator, as SQLite
-// ignores such a configuration; so does an nPages*pageSize too large for an
-// int.
+// size. A pool of another size from 512 to 65536 is allocated as asked and
+// never used: a database with UseGlobalPageBuffer takes buffers from the pool
+// only when they are exactly its page size, and otherwise opens and runs on
+// the default allocator, without the pool's memory bound. (SQLite's page cache
+// uses any slot large enough for a page and its header; the buffers of this
+// pool are the pages themselves.) A pageSize below 512 or an nPages below 1
+// allocates nothing and leaves every database on the default allocator, as
+// SQLite ignores such a configuration. A pageSize above 65536, the largest
+// page size, or an nPages*pageSize too large for an int also allocates
+// nothing: these two bounds are this package's own, since SQLite is handed its
+// buffer and allocates none.
+//
+// The pool is a single allocation of nPages*pageSize bytes, made by the first
+// call, so nPages must fit the memory the process can spare.
 //
 // Example: InitPageBuffer(4096, 5000) pre-allocates ~20MB of page buffers.
 func InitPageBuffer(pageSize, nPages int) {
