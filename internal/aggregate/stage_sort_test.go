@@ -314,9 +314,12 @@ func TestSortStage_MemoryLimitBeforeArenaLimit(t *testing.T) {
 		e := rowLen(kept[0], true)
 		winner := `{"id":"0x","v":"a0"}` // one byte longer than a kept row
 		setSortArenaLimit(t, 4*e)
-		// Kept, the four rows charge 4e and four entries; the winner, kept
-		// after packing, would add one byte and one entry.
-		used := 4*e + 5*sortEntryOverhead + 1
+		// Kept, the four rows charge 4e and four entries. The winner is
+		// charged what keeping it at the tail charges, e+1 and an entry (the
+		// evicted row's e dead bytes are not more than the live ones, so the
+		// compaction guard would not run), before it is found not to fit
+		// even packed.
+		used := 5*e + 5*sortEntryOverhead + 1
 		err := run(4, used-1, append(slices.Clone(kept), winner)...)
 		require.ErrorIs(t, err, ErrMemoryLimitExceeded)
 		require.ErrorIs(t, run(4, used, append(slices.Clone(kept), winner)...), errSortTooLarge)
