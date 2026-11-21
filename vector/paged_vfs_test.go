@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -16,16 +18,22 @@ import (
 
 var errInjectedRead = errors.New("injected read failure")
 
-// oneReadFails fails the failAt-th read of the wrapped file made while armed.
+// oneReadFails fails the failAt-th read of the wrapped file made while armed,
+// and keeps the stack of that read when stack is set.
 type oneReadFails struct {
 	btree.File
 	armed  *atomic.Bool
 	reads  *atomic.Int64
+	stack  *atomic.Pointer[string]
 	failAt int64
 }
 
 func (f *oneReadFails) ReadAt(b []byte, off int64) (int, error) {
 	if f.armed.Load() && f.reads.Add(1)-1 == f.failAt {
+		if f.stack != nil {
+			stack := string(debug.Stack())
+			f.stack.Store(&stack)
+		}
 		return 0, errInjectedRead
 	}
 	return f.File.ReadAt(b, off)
@@ -66,12 +74,13 @@ func TestPagedSearch_ReadError(t *testing.T) {
 			run := func(failAt int64) int64 {
 				var armed atomic.Bool
 				var reads atomic.Int64
+				var stack atomic.Pointer[string]
 				btree.SetVFS(btree.VFS{OpenFile: func(name string, flag int, perm os.FileMode) (btree.File, error) {
 					f, err := os.OpenFile(name, flag, perm)
 					if err != nil || name != path {
 						return f, err
 					}
-					return &oneReadFails{File: f, armed: &armed, reads: &reads, failAt: failAt}, nil
+					return &oneReadFails{File: f, armed: &armed, reads: &reads, stack: &stack, failAt: failAt}, nil
 				}})
 				defer btree.ResetVFS()
 				db, err := btree.Open(path, btree.Options{})
@@ -81,13 +90,21 @@ func TestPagedSearch_ReadError(t *testing.T) {
 				// SearchHybrid routes by the graph's own copy of them.
 				p, err := AttachPaged(g, db, "emb", L2)
 				require.NoError(t, err)
+				// A read transaction before the fault is armed: the begin
+				// of the search's own then reads nothing of the file.
+				rtx, err := db.BeginRead()
+				require.NoError(t, err)
+				require.NoError(t, rtx.Rollback())
 
 				armed.Store(true)
 				got, err := tc.search(p)
 				armed.Store(false)
 				if failAt >= 0 {
-					// Every read the search makes is of a candidate's
-					// vector: whichever fails, the search fails.
+					// The read that failed fetched a candidate's vector,
+					// and the search returns its error.
+					at := stack.Load()
+					require.NotNil(t, at, "read %d did not happen", failAt)
+					require.True(t, strings.Contains(*at, "(*PagedHNSW).vecOf"), "read %d is not of a candidate's vector:\n%s", failAt, *at)
 					require.ErrorIs(t, err, errInjectedRead, "read %d", failAt)
 					return reads.Load()
 				}

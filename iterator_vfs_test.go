@@ -50,6 +50,9 @@ func TestReadFault_IterShortRead(t *testing.T) {
 			return errors.Join(err, iter.Close())
 		})
 		if err != nil {
+			// Only a read that failed ends the iteration with an error:
+			// the run with no fault returns all three and a nil Err.
+			require.True(t, rf.fired.Load(), "the iteration failed with no read failing: %v", err)
 			require.ErrorIs(t, err, io.EOF)
 			sawEOF = true
 			return
