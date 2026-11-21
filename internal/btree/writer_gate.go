@@ -106,6 +106,27 @@ func (g *writerGate) closed() bool {
 	return g.n.Load()&writerGateClosed != 0
 }
 
+// CloseState is a write transaction's view of DB.Close (ReadTx.CloseState).
+// It holds the database's writer gate, not the transaction, so it can be
+// read outside any call of the transaction: from a goroutine that holds
+// what an earlier call returned while the transaction ends, or after it.
+type CloseState struct {
+	g *writerGate
+}
+
+// EndedByClose reports whether DB.Close has closed the writer gate of the
+// transaction's database. For a transaction still open then, that is its
+// end: Close rolled it back, and what its owner still holds of it (a
+// document read earlier, the rows of a sort) is of a transaction that never
+// committed. False for a read transaction's. Every storage call of an ended
+// transaction reports ErrClosed by itself; this is for the callers that
+// have no such call to make. Once true it stays true, also for a
+// transaction that had ended by itself before Close came: a caller asks
+// after it has checked for that end.
+func (s CloseState) EndedByClose() bool {
+	return s.g != nil && s.g.closed()
+}
+
 // Test hooks of the gate's close, test-only:
 //   - testWriterGateClosingHook runs in DB.Close as it is about to close the
 //     gate: the last point at which a call of the write transaction can

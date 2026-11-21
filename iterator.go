@@ -94,6 +94,10 @@ type planIterator struct {
 	// memory.
 	tripped atomic.Bool
 	tripErr error
+	// closeState tells whether DB.Close rolled the write transaction back
+	// under its owner. Taken as the iterator is built: Doc reads it outside
+	// a call, when data.Tx may already be another transaction's.
+	closeState btree.CloseState
 	// mark is the transaction's savepoint mark as the iterator was opened
 	// or last moved (iterOpened, savepointMark): the savepoints whose
 	// rollback trips it are the ones opened by then and still open
@@ -127,7 +131,7 @@ func (pi *planIterator) Next() bool {
 		// still looks open to its handle. The plan may have rows in memory
 		// (a sort, a vector or text search) that no storage call stands
 		// behind any more.
-		if pi.data.Tx.EndedByClose() {
+		if pi.closeState.EndedByClose() {
 			pi.err = ErrDBIsClosed
 			return false
 		}
@@ -205,7 +209,7 @@ func (pi *planIterator) Doc() (Doc, error) {
 				return nil, ErrTxIsUsed
 			}
 			// Rolled back by DB.Close: see Next.
-			if pi.data.Tx.EndedByClose() {
+			if pi.closeState.EndedByClose() {
 				return nil, ErrDBIsClosed
 			}
 		}

@@ -2369,15 +2369,16 @@ func (tx *ReadTx) DatabaseSize() (uint32, error) {
 	return lockBtreePageCount(&h, tx.pager.readerDbSizeBound(tx.cache))
 }
 
-// EndedByClose reports whether DB.Close has ended this write transaction
-// under its owner (writerGate): it is rolled back, and what its owner still
-// holds of it — a document read earlier, the rows of a sort — is of a
-// transaction that never committed. False for a read transaction, which
-// Close waits for. Every storage call of an ended transaction reports
-// ErrClosed by itself; this is for the callers that have no such call to
-// make.
-func (tx *ReadTx) EndedByClose() bool {
-	return tx.writable && tx.pager.wgate.closed()
+// CloseState returns the handle that tells whether DB.Close has ended this
+// write transaction under its owner (CloseState.EndedByClose). Take it while
+// the transaction is open; it stays valid after the transaction ends, when
+// the transaction goes back to the pool and the next one rewrites it. A read
+// transaction's is the zero CloseState: Close waits for readers.
+func (tx *ReadTx) CloseState() CloseState {
+	if !tx.writable {
+		return CloseState{}
+	}
+	return CloseState{g: &tx.pager.wgate}
 }
 
 // GetNamespace returns a Namespace handle for the given name, respecting the

@@ -528,13 +528,14 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	}
 
 	pi := &planIterator{
-		plan:   plan,
-		tx:     tx,
-		shared: shared,
-		s:      s,
-		buf:    buf,
-		qb:     qb,
-		data:   qplanner.CursorSource{Tx: btx, Ns: s.ns},
+		plan:       plan,
+		tx:         tx,
+		shared:     shared,
+		closeState: btx.CloseState(),
+		s:          s,
+		buf:        buf,
+		qb:         qb,
+		data:       qplanner.CursorSource{Tx: btx, Ns: s.ns},
 	}
 	if shared != nil {
 		shared.iterOpened(pi)
