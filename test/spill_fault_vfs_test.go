@@ -248,13 +248,11 @@ func TestSpillFault_WriteTx(t *testing.T) {
 				}
 				return out
 			}
+			// Every delete of ops is of a document the transaction holds:
+			// a not-found is an error.
 			apply := func(tx anystore.WriteTx, op spillDocOp) error {
 				if op.del {
-					err := coll.DeleteId(tx.Context(), op.id)
-					if errors.Is(err, anystore.ErrDocNotFound) {
-						return nil
-					}
-					return err
+					return coll.DeleteId(tx.Context(), op.id)
 				}
 				return coll.UpsertOne(tx.Context(), anyenc.MustParseJson(op.doc))
 			}
@@ -344,8 +342,9 @@ func TestSpillFault_WriteTx(t *testing.T) {
 					// The transaction is over but for its rollback: a later
 					// write or read in it reports the error, a committed
 					// document is never "not found", and nothing more is
-					// written to the log, not even at the end.
-					writes := faults.writes.Load()
+					// written to the log, not by the operation's own
+					// savepoint rollback, not even at the end: the failed
+					// write is the log's last.
 					err = coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":"after the error"}`))
 					assert.ErrorIs(t, err, errInjectedSpillIO)
 					for id := range model {
@@ -364,7 +363,7 @@ func TestSpillFault_WriteTx(t *testing.T) {
 					} else {
 						assert.ErrorIs(t, tx.Commit(), errInjectedSpillIO, "the transaction cannot commit")
 					}
-					assert.Equal(t, writes, faults.writes.Load(), "a write of the log in the error state or at its end")
+					assert.Equal(t, faults.failAt.Load(), faults.writes.Load(), "a write of the log after the failed one")
 				})
 				faults.disarm()
 				guardedSpill(t, "after the failed transaction", func() {

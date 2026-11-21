@@ -150,13 +150,11 @@ func (s *spillFaultDB) spillOps(seed int64, n, baseKeys int) []spillOp {
 	return ops
 }
 
+// apply runs op. Every delete of spillOps is of a key the transaction holds:
+// a not-found is an error.
 func (s *spillFaultDB) apply(tx *WriteTx, op spillOp) error {
 	if op.del {
-		err := tx.Delete(s.ns, spillKey(op.key))
-		if errors.Is(err, ErrKeyNotFound) {
-			return nil
-		}
-		return err
+		return tx.Delete(s.ns, spillKey(op.key))
 	}
 	return tx.Put(s.ns, spillKey(op.key), op.val)
 }
@@ -283,9 +281,9 @@ func (s *spillFaultDB) runSpillFault(t *testing.T, c spillFaultCase, ops []spill
 		assert.Equal(t, int32(pagerError), p.state.Load(), "the transaction is in the error state")
 
 		// Every later operation reports the error, and nothing more is
-		// written to the log: not by them, not by the end of the
-		// transaction.
-		writes := s.file.writes.Load()
+		// written to the log: not by the savepoint rollback above, not by
+		// them, not by the end of the transaction. The failed write is the
+		// log's last.
 		assert.ErrorIs(t, tx.Put(s.ns, spillKey(1<<30), []byte("after the error")), errInjectedSpillIO)
 		assert.ErrorIs(t, tx.Delete(s.ns, spillKey(0)), errInjectedSpillIO)
 		_, err = tx.Savepoint()
@@ -312,7 +310,7 @@ func (s *spillFaultDB) runSpillFault(t *testing.T, c spillFaultCase, ops []spill
 		} else {
 			assert.NoError(t, tx.Rollback())
 		}
-		assert.Equal(t, writes, s.file.writes.Load(), "a write of the log in the error state or at its end")
+		assert.Equal(t, s.file.failAt.Load(), s.file.writes.Load(), "a write of the log after the failed one")
 	})
 	s.file.disarm()
 	assert.Equal(t, int32(pagerOpen), p.state.Load())
