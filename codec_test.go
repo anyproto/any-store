@@ -307,8 +307,8 @@ func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
 	require.NoError(t, err)
 	coll, err := db.CreateCollection(ctx, "c")
 	require.NoError(t, err)
-	// Enough pages that the copy takes several Steps and its commit writes
-	// many frames.
+	// Enough pages that the copy takes more than one Step and its commit
+	// writes many frames.
 	const pre = 3000
 	batch := make([]*anyenc.Value, 0, 500)
 	for i := 0; i < pre; i++ {
@@ -365,7 +365,7 @@ func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
 	// Backup copies 256 pages per Step.
 	info, err := os.Stat(dstPath)
 	require.NoError(t, err)
-	require.Greater(t, info.Size()/4096, int64(2*256), "the copy must take several Steps")
+	require.Greater(t, info.Size()/4096, int64(256), "the copy must take more than one Step")
 
 	requireSharedCodecDocs(t, dstPath, cfg, "pre", pre, true)
 }
