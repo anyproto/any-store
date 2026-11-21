@@ -1492,20 +1492,32 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 //
 // shm.region(seg, false) cannot serve here: it returns only what this process
 // has mapped already (docs/btree/NOTES.md, region(create=false)). The file's
-// size is checked instead, for a shm that has a file; segments are appended
-// whole, so a file that reaches the segment's end holds it. The heap shms
-// have no file and no other process: their segments are this process's own.
+// size is checked instead, for a shm that has a file. The size it must reach
+// is the end of the segment's mapping group, which is what region(seg, true)
+// maps and would extend the file to: unixShmMap compares st_size with
+// nReqRegion*szRegion, nReqRegion being rounded up to a whole group
+// (os_unix.c:5140-5165). A group is one segment unless the OS page is larger
+// than a segment (64 KiB pages). The heap shms have no file and no other
+// process: their segments are this process's own.
 func (wi *walIndex) mapSegmentForLookup(seg int) ([]byte, error) {
 	if f, ok := wi.shm.(shmFile); ok {
 		info, err := f.fileInfo()
 		if err != nil {
 			return nil, err
 		}
-		if need := int64(seg+1) * shmRegionSize; info.Size() < need {
-			return nil, fmt.Errorf("%w: the wal-index file has %d bytes, the segment ends at %d", errShmSegmentMissing, info.Size(), need)
+		if need := shmLookupFileSize(seg, shmRegionsPerMap()); info.Size() < need {
+			return nil, fmt.Errorf("%w: the wal-index file has %d bytes, the segment's mapping ends at %d", errShmSegmentMissing, info.Size(), need)
 		}
 	}
 	return wi.shm.region(seg, true)
+}
+
+// shmLookupFileSize is the size a wal-index file must have for a lookup to
+// map segment seg: the end of the group of regionsPerMap segments that holds
+// it, `nReqRegion = ((iRegion+nShmPerMap) / nShmPerMap) * nShmPerMap`
+// (os_unix.c:5140).
+func shmLookupFileSize(seg, regionsPerMap int) int64 {
+	return int64((seg+regionsPerMap)/regionsPerMap*regionsPerMap) * shmRegionSize
 }
 
 // errShmSegmentMissing is the failure of a lookup whose wal-index segment is

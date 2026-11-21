@@ -240,3 +240,27 @@ func TestWalIndexLookup_MissingSegmentFails(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(shmRegionSize), info.Size(), "the lookup extended the wal-index file")
 }
+
+// TestShmLookupFileSize_CoversTheMappingGroup: the size a lookup requires of
+// the wal-index file is the end of the group of segments one mmap covers,
+// which is what region(seg, true) would extend a shorter file to. With 64 KiB
+// OS pages a group is two segments: a file that holds segment 0 only must
+// fail the lookup of segment 0, or the mapping would add segment 1 as zeros.
+func TestShmLookupFileSize_CoversTheMappingGroup(t *testing.T) {
+	for _, tc := range []struct {
+		seg, regionsPerMap int
+		want               int64
+	}{
+		{0, 1, 1 * shmRegionSize},
+		{1, 1, 2 * shmRegionSize},
+		{5, 1, 6 * shmRegionSize},
+		{0, 2, 2 * shmRegionSize},
+		{1, 2, 2 * shmRegionSize},
+		{2, 2, 4 * shmRegionSize},
+		{3, 2, 4 * shmRegionSize},
+		{4, 8, 8 * shmRegionSize},
+		{8, 8, 16 * shmRegionSize},
+	} {
+		require.Equal(t, tc.want, shmLookupFileSize(tc.seg, tc.regionsPerMap), "segment %d, %d segments per mapping", tc.seg, tc.regionsPerMap)
+	}
+}
