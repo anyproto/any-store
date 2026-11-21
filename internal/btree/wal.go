@@ -2587,8 +2587,10 @@ func (w *wal) recoverLocked() error {
 	// commentary. The copy is plain, as walIndexRecover's memcpy is in C's
 	// default build (wal.c:1524-1533), and a reader of this process may be
 	// probing the segment: the copy rewrites the entries of every frame in a
-	// reader's window with the bytes they already have. This is the one
-	// store into a probed table that does not go through htSlotStore.
+	// reader's window with the bytes they already have. This is the one plain
+	// store into the slots of a table a reader may be probing: an append
+	// stores through htSlotStore, and shmCleanupHashSegment stores whole
+	// words with atomic.StoreUint32.
 	for seg, b := range priv {
 		region, err := w.index.shm.region(seg, true)
 		if err != nil {

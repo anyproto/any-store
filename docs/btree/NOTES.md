@@ -1482,6 +1482,17 @@ Default threshold is 10,000 frames vs SQLite's 1,000. Auto-checkpoint runs as
 PASSIVE (`tryCheckpoint()` -> `checkpointPassive()`), matching SQLite's default
 auto-checkpoint behavior. PASSIVE mode does not block writers or readers.
 
+<a id="known-gap-wal-frame-counter-has-no-bound"></a>
+**WAL Frame Counter Has No Bound** -- Severity: Minor (accepted; SQLite has the same)
+
+A frame number is a `uint32` that `writeFrames` advances with no check, as
+`walFrames` does (`iFrame++`, `wal.c:4225-4229`). A log of 2^32 frames (about
+17 TB of 4 KiB pages, with every checkpoint held back) wraps it: frame
+`0xffffffff` is also `READMARK_NOT_USED` (`wal.c:401`), and a transaction whose
+first frame number wraps to 0 reuses no frame (`if( iFirst && ...`,
+`wal.c:4138`; `canReuse` in `writeFrames` and `writeFramesMem`). Neither engine
+supports such a log. The frame write in `wal.go` says the same.
+
 **Frame-Reuse Within a Transaction (`walRewriteChecksums`)** -- Resolved 2026-04-22
 
 SQLite's `walRewriteChecksums` (`sqlitec/src/wal.c:3966-4009`) overwrites
@@ -3136,8 +3147,11 @@ wrong, where C's cannot:
   instead of failing. C passes `pWal->writeLock` as the extend flag (`wal.c:784-786`), `unixShmMap` leaves the
   region unmapped for a reader (`os_unix.c:5163-5164`), and `walHashGet` makes that an error
   (`wal.c:1185-1187`). `shmHashGet` now takes what is mapped (`region(seg, false)`) and otherwise goes through
-  `mapSegmentForLookup`, which fails with `errShmSegmentMissing` when the file does not reach the segment's
-  end and maps the segment otherwise. A writer's lookups do not extend either, where C's would (its extend
+  `mapSegmentForLookup`, which fails with `errShmSegmentMissing` when the file does not reach the end of the
+  segment's mapping group and maps the segment otherwise. The group is what `region(seg, true)` maps: one
+  segment, or several when the OS page is larger than a segment (64 KiB pages), so a 32 KiB file reaches the
+  end of segment 0 and still fails the lookup there; `unixShmMap` compares the file's size with
+  `nReqRegion*szRegion`, rounded up to a whole group (`os_unix.c:5140-5165`). A writer's lookups do not extend either, where C's would (its extend
   flag is set): a segment of a frame in the window was made by the writer of that frame. Test:
   `TestWalIndexLookup_MissingSegmentFails`.
 - **Bounds before page number; atomic slots.** The probe tested `aPgno` before the frame bounds and read and
@@ -3145,13 +3159,14 @@ wrong, where C's cannot:
   its snapshot while the writer of the same process changed them (an append, a rollback's
   `shmCleanupFromFrame`, the removal of a dead writer's entries). C loads the slot with `AtomicLoad`
   (`wal.c:3583`), tests `iFrame<=iLast && iFrame>=pWal->minFrame` before `sLoc.aPgno[iH-1]==pgno`
-  (`wal.c:3585`) and stores the slot with `AtomicStore` (`wal.c:1338`). The probe now has C's order, and
-  an append, a rollback's cleanup and a probe access a slot of a table that readers probe through
-  `htSlotLoad`/`htSlotStore`: Go has no
-  16-bit atomics, so the aligned 32-bit word that holds two slots is loaded and stored; a store rewrites the
-  neighbouring slot with the value it has just loaded, which is safe because only the holder of the write
-  lock stores. `shmCleanupHashSegment` clears its slots the same way, where C's `walCleanupHash` stores
-  plainly (`wal.c:1260-1264`): a plain store that a reader loads concurrently is a data race in Go. The page
+  (`wal.c:3585`) and stores the slot with `AtomicStore` (`wal.c:1338`). The probe now has C's order. A
+  probe and an append access a slot through `htSlotLoad`/`htSlotStore`: Go has no 16-bit atomics, so the
+  aligned 32-bit word that holds two slots is loaded and stored; a store rewrites the neighbouring slot with
+  the value it has just loaded, which is safe because only the holder of the write lock stores. The cleanup
+  of a rollback or of a dead writer's entries (`shmCleanupHashSegment`) does not call `htSlotStore`: it walks
+  the table a word at a time and loads and stores each word with `atomic.LoadUint32`/`atomic.StoreUint32`
+  itself, clearing both slots of a word in one store, where C's `walCleanupHash` stores plainly
+  (`wal.c:1260-1264`): a plain store that a reader loads concurrently is a data race in Go. The page
   numbers stay plain, as in C (the read after the bounds, the cleanup's `memset`, `wal.c:1271`): a reader
   reads only those of its window, written before its snapshot was published and not changed while it is in
   use. The whole-segment clears (a segment's first frame, the segments past a rollback target,
