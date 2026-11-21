@@ -1,6 +1,7 @@
 package anyenc
 
 import (
+	"math"
 	"sync"
 	"testing"
 
@@ -98,4 +99,58 @@ func TestArena_ApproxSize(t *testing.T) {
 		"ApproxSize must strictly grow after allocating a non-empty value")
 	assert.GreaterOrEqual(t, after-emptySize, 11,
 		"delta must cover at least the 11 payload bytes of 'hello world'")
+}
+
+// Copy keeps every value as it is in memory and shares no memory with its
+// source, including what an encode and parse would change or refuse: a key
+// "\x1f" (encoded like the empty key), a -0 number (encoded as +0) and
+// nesting past the parser's depth limit.
+func TestArena_Copy(t *testing.T) {
+	src := &Arena{}
+	v := testObject(src)
+	v.Set("\x1f", src.NewString("wart"))
+	v.Set("negzero", src.NewNumberFloat64(math.Copysign(0, -1)))
+	v.Set("vec", src.NewVectorF32([]float32{1, 2.5}))
+	v.Set("oid", src.NewObjectID(NewObjectID()))
+	v.Set("dt", src.NewDateTimeMillis(1_700_000_000_000))
+	v.Set("t", src.NewTrue())
+	v.Set("f", src.NewFalse())
+	v.Set("null", src.NewNull())
+	deep := src.NewArray()
+	for cur, i := deep, 0; i < 2*maxParseDepth; i++ {
+		next := src.NewArray()
+		cur.SetArrayItem(0, next)
+		cur = next
+	}
+	v.Set("deep", deep)
+	want := v.String()
+
+	a := &Arena{}
+	c := a.Copy(v)
+	assert.Equal(t, want, c.String())
+	assert.Equal(t, "wart", c.GetString("\x1f"))
+	assert.True(t, math.Signbit(c.GetFloat64("negzero")))
+	assert.Nil(t, a.Copy(nil))
+
+	// The copy and the source are independent both ways.
+	c.Set("s", a.NewString("changed"))
+	c.GetArray("a")[0] = a.NewNumberInt(9)
+	c.Del("i")
+	assert.Equal(t, want, v.String())
+	src.Reset()
+	testObject(src)
+	assert.Equal(t, "changed", c.GetString("s"))
+	assert.Equal(t, 9, c.GetInt("a", "0"))
+	assert.Equal(t, "wart", c.GetString("\x1f"))
+
+	// Keys and strings of a parsed value point into the parsed bytes; the
+	// copy does not.
+	buf := testObject(src).MarshalTo(nil)
+	var p Parser
+	pv, err := p.Parse(buf)
+	assert.NoError(t, err)
+	parsed := pv.String()
+	pc := a.Copy(pv)
+	clear(buf)
+	assert.Equal(t, parsed, pc.String())
 }
