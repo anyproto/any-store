@@ -486,7 +486,12 @@ func (db *DB) releaseWriterLocks(pager *pager, slot int, gate *writerGate, pre, 
 		}
 		return false
 	}
-	defer db.unlockWriter()
+	defer func() {
+		db.unlockWriter()
+		if gate != nil && testWriterLocksReleasedHook != nil {
+			testWriterLocksReleasedHook()
+		}
+	}()
 	if gate != nil {
 		defer gate.leave()
 	}
@@ -2623,9 +2628,10 @@ var testBeginWriteRetryHook func(err error)
 // pager panic used to leak the writer locks. Test-only.
 var testWriterFinishHook func()
 
-// testWriterLocksReleasedHook, when non-nil, runs in Commit and Rollback
-// once the transaction has released its locks, the write lock included: the
-// next write transaction can begin while it runs. Test-only.
+// testWriterLocksReleasedHook, when non-nil, runs in the releaseWriterLocks
+// of a Commit or a Rollback, in the deferred release of the write lock,
+// right after it: the next write transaction can begin while it runs, and
+// finds the writer gate as the handoff left it. Test-only.
 var testWriterLocksReleasedHook func()
 
 // Commit commits the transaction, writing all changes to the WAL.
@@ -2692,9 +2698,6 @@ func (tx *WriteTx) Commit() error {
 			}
 		}
 		db.releaseWriterLocks(pager, slot, gate, pre, post)
-		if testWriterLocksReleasedHook != nil {
-			testWriterLocksReleasedHook()
-		}
 	}()
 	if testWriterFinishHook != nil {
 		testWriterFinishHook()
@@ -2758,9 +2761,6 @@ func (tx *WriteTx) Rollback() error {
 			pre = db.writerUnwind(pager)
 		}
 		db.releaseWriterLocks(pager, slot, gate, pre, nil)
-		if testWriterLocksReleasedHook != nil {
-			testWriterLocksReleasedHook()
-		}
 	}()
 	if testWriterFinishHook != nil {
 		testWriterFinishHook()

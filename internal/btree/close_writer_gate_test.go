@@ -515,10 +515,13 @@ func TestClose_CommitRightAfterCallInFlight(t *testing.T) {
 // leaves it before the write lock passes on, as SQLite's COMMIT releases the
 // write lock inside the step that holds the connection mutex, and the next
 // BEGIN is another step that takes it (vdbe.c:4042, pager.c:2142,
-// vdbeapi.c:923). Writer B begins once A has released the write lock, and
-// Close comes after B's first call: had A's count still been in the gate,
-// B's Commit would have passed for a call nested in it and published B's
-// writes after the gate closed.
+// vdbeapi.c:923). Writer B begins at the handoff itself, from a hook that
+// A's releaseWriterLocks runs right after it releases the write lock, in
+// the same deferred call, and Close comes after B's first call: had A's
+// count still been in the gate, B's Commit would have passed for a call
+// nested in it and published B's writes after the gate closed. So the test
+// fails if the release leaves the gate after the write lock, wherever it
+// does.
 func TestClose_NextWriterCommitRefusedAfterHandoff(t *testing.T) {
 	for _, end := range []string{"Commit", "Rollback"} {
 		t.Run(end, func(t *testing.T) {
@@ -546,8 +549,8 @@ func TestClose_NextWriterCommitRefusedAfterHandoff(t *testing.T) {
 					return
 				}
 				fired = true
-				// A has handed the write lock on and is still inside its
-				// Commit or Rollback.
+				// A has just handed the write lock on, inside the
+				// deferred release of its Commit or Rollback.
 				txB, err := db.BeginWrite()
 				if bBegin = err; err != nil {
 					return
