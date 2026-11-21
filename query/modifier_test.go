@@ -738,25 +738,40 @@ func TestModifier_PaddingStagedCopiesTheDocumentAsItIs(t *testing.T) {
 	})
 }
 
-// A parsed modifier can change its own operands: here the stored $set
-// operand's "a" becomes an empty array once the modifier has run. A second
-// application is then refused by the padding limit after its $set has
-// already run, and the document it was given is unchanged.
-func TestModifier_PaddingStagedRefusalAfterOperandChange(t *testing.T) {
-	mod := MustParseModifier(`{"$set":{"o":{"a":{},"c":[]}},"$inc":{"o.a.1500001":1},"$rename":{"o.c":"o.a"}}`)
-	// The first application meets "a" as an object; $rename then puts the
-	// operand's empty "c" array in its place.
-	res, _, err := mod.Modify(&anyenc.Arena{}, anyenc.MustParseJson(`{"x":1}`))
+// A staged modifier stores copies of its operands. Its own earlier result,
+// passed back in, is left as it was when the modifier is refused: the first
+// application below stores {"n":1} at "o", increments it there, and turns
+// "arr" into an array; on the second, the copy's "o" is a new copy of the
+// operand, so the increment does not reach the earlier result's "o" before
+// the padding refusal. The operands stay as parsed, so every application to
+// the same document gives the same result.
+func TestModifier_PaddingStagedStoresCopiesOfItsOperands(t *testing.T) {
+	const src = `{"arr":{},"next":[]}`
+	mod := MustParseModifier(`{"$set":{"o":{"n":1}},"$inc":{"o.n":1,"arr.1500001":1},"$rename":{"next":"arr"}}`)
+	first, _, err := mod.Modify(&anyenc.Arena{}, anyenc.MustParseJson(src))
 	require.NoError(t, err)
-	require.NotNil(t, res.Get("o", "a"))
-	assert.Equal(t, anyenc.TypeArray, res.Get("o", "a").Type())
+	require.Equal(t, 2, first.GetInt("o", "n"))
+	require.Equal(t, anyenc.TypeArray, first.Get("arr").Type())
+	want := first.String()
 
-	doc := anyenc.MustParseJson(`{"x":1}`)
-	res, modified, err := mod.Modify(&anyenc.Arena{}, doc)
+	res, modified, err := mod.Modify(&anyenc.Arena{}, first)
 	require.ErrorContains(t, err, "can't backfill more than 1500000 elements")
 	assert.Nil(t, res)
 	assert.False(t, modified)
-	assert.Equal(t, `{"x":1}`, doc.String())
+	assert.Equal(t, want, first.String(), "the earlier result passed back in")
+
+	again, _, err := mod.Modify(&anyenc.Arena{}, anyenc.MustParseJson(src))
+	require.NoError(t, err)
+	assert.Equal(t, want, again.String(), "a later application")
+
+	// $push and $addToSet store copies too.
+	mod = MustParseModifier(`{"$push":{"p":{"n":1}},"$addToSet":{"s":{"n":1}},"$inc":{"p.0.n":1,"s.0.n":1,"m.1500001":1}}`)
+	for range 2 {
+		res, _, err = mod.Modify(&anyenc.Arena{}, anyenc.MustParseJson(`{"p":[],"s":[]}`))
+		require.NoError(t, err)
+		assert.Equal(t, 2, res.GetInt("p", "0", "n"))
+		assert.Equal(t, 2, res.GetInt("s", "0", "n"))
+	}
 }
 
 // Only a modifier with a segment past the padding limit, or too large for an

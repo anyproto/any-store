@@ -55,8 +55,11 @@ func MustParseModifier(modifier any) Modifier {
 // index past the padding limit (anyencutil.MaxArrayPadding) is applied once to
 // a copy of the document, and the copy is the result: the document passed in
 // is left as it was, whether the modifier succeeds or Modify returns an error,
-// whichever of its operations is refused. Any other modifier changes the
-// document passed in and returns it.
+// whichever of its operations is refused. Such a modifier stores copies of
+// its operands, so its result shares no memory with it: passing that result
+// back in leaves it as it was too, and the operands stay as parsed. Any other
+// modifier changes the document passed in and returns it, and its $set,
+// $push and $addToSet store their operands themselves.
 func ParseModifier(modifier any) (Modifier, error) {
 	if m, ok := modifier.(Modifier); ok {
 		return m, nil
@@ -71,7 +74,7 @@ func ParseModifier(modifier any) (Modifier, error) {
 		return nil, withSource(err, "modifier")
 	}
 	if chain, ok := m.(ModifierChain); ok && mayExceedPadding(chain) {
-		return paddingStaged{ModifierChain: chain}, nil
+		return paddingStaged{ModifierChain: ownOperands(chain)}, nil
 	}
 	return m, nil
 }

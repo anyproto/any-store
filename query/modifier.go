@@ -50,8 +50,47 @@ func (mRoot ModifierChain) Modify(a *anyenc.Arena, v *anyenc.Value) (result *any
 // MongoDB applies an update the same way, to a mutable copy that is stored
 // only when every operation succeeds. A modifier without such a segment is
 // never refused by the padding limit and runs on the document directly.
+//
+// The chain stores copies of its operands (ownOperands), as MongoDB copies an
+// operand from the immutable update spec into the document
+// (update/set_node.cpp: setValueBSONElement(val)). The copy the chain
+// runs on then shares no memory with the modifier or with the document
+// passed in, so no operation reaches that document, even when it is an
+// earlier result of the same modifier, and the operands stay as parsed.
 type paddingStaged struct {
 	ModifierChain
+}
+
+// ownOperands returns chain with its $set, $push and $addToSet set to store a
+// copy of their operand on every application.
+func ownOperands(chain ModifierChain) ModifierChain {
+	owned := make(ModifierChain, len(chain))
+	for i, m := range chain {
+		switch mt := m.(type) {
+		case modifierSet:
+			mt.copyVal = true
+			m = mt
+		case modifierPush:
+			mt.copyVal = true
+			m = mt
+		case modifierAddToSet:
+			mt.copyVal = true
+			m = mt
+		case ModifierChain:
+			m = ownOperands(mt)
+		}
+		owned[i] = m
+	}
+	return owned
+}
+
+// stored is the value an operation stores for operand val: val itself, or a
+// copy of it in a when the chain owns its operands (ownOperands).
+func stored(a *anyenc.Arena, val *anyenc.Value, copyVal bool) *anyenc.Value {
+	if copyVal {
+		return a.Copy(val)
+	}
+	return val
 }
 
 func (m paddingStaged) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
@@ -109,12 +148,13 @@ func mayExceedPadding(chain ModifierChain) bool {
 type modifierSet struct {
 	fieldPath []string
 	val       *anyenc.Value
+	copyVal   bool // store a copy of val (ownOperands)
 }
 
 func (m modifierSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		modified = !anyencutil.Equal(value, m.val)
-		return m.val, nil
+		return stored(a, m.val, m.copyVal), nil
 	})
 	if err != nil {
 		return nil, false, err
@@ -237,6 +277,7 @@ func (m modifierPop) getResultArray(arrayOfValues []*anyenc.Value) ([]*anyenc.Va
 type modifierPush struct {
 	fieldPath []string
 	val       *anyenc.Value
+	copyVal   bool // store a copy of val (ownOperands)
 }
 
 func (m modifierPush) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
@@ -248,7 +289,7 @@ func (m modifierPush) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.V
 		if err != nil {
 			return nil, fmt.Errorf("failed to pop item, %w", err)
 		}
-		value.SetArrayItem(len(arrayOfValues), m.val)
+		value.SetArrayItem(len(arrayOfValues), stored(a, m.val, m.copyVal))
 		modified = true
 		return value, nil
 	})
@@ -344,6 +385,7 @@ func removeElements(arrayOfValues []*anyenc.Value, value *anyenc.Value, shouldRe
 type modifierAddToSet struct {
 	fieldPath []string
 	val       *anyenc.Value
+	copyVal   bool // store a copy of val (ownOperands)
 }
 
 func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
@@ -355,7 +397,7 @@ func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anye
 		if err != nil {
 			return nil, fmt.Errorf("failed to pop item, %w", err)
 		}
-		modified = m.addElements(value, m.val)
+		modified = m.addElements(a, value)
 		return value, nil
 	})
 	if err != nil {
@@ -365,13 +407,13 @@ func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anye
 	return
 }
 
-func (m modifierAddToSet) addElements(value *anyenc.Value, addElem *anyenc.Value) bool {
+func (m modifierAddToSet) addElements(a *anyenc.Arena, value *anyenc.Value) bool {
 	arrayOfValues := value.GetArray()
 	if slices.ContainsFunc(arrayOfValues, func(val *anyenc.Value) bool {
-		return anyencutil.Equal(addElem, val)
+		return anyencutil.Equal(m.val, val)
 	}) {
 		return false
 	}
-	value.SetArrayItem(len(arrayOfValues), addElem)
+	value.SetArrayItem(len(arrayOfValues), stored(a, m.val, m.copyVal))
 	return true
 }
