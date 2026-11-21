@@ -134,10 +134,11 @@ type Collection interface {
 	WriteTx(ctx context.Context) (WriteTx, error)
 
 	// Close releases the handle: later operations through it fail with
-	// ErrCollectionClosed. A handle the open write transaction used is
-	// released once that use commits or rolls back — with the transaction,
-	// or with a savepoint that encloses its first use — and stays open if
-	// the collection is opened again before that.
+	// ErrCollectionClosed. A handle the open write transaction used, or
+	// got from an open of a collection nothing had open, is released once
+	// that use commits or rolls back — with the transaction, or with a
+	// savepoint that encloses its first use or that open — and stays open
+	// if the collection is opened again before that.
 	Close() error
 }
 
