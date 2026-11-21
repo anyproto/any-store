@@ -13,6 +13,16 @@ import (
 )
 
 // ModifyResult represents the result of a modification operation.
+//
+// A Query.Update or Query.Delete that returns an error reports Modified 0:
+// a failure during the write rolls back every document it changed. Matched
+// still counts the documents it matched before the failure. A failed commit
+// reports 0 as well, although its outcome can be unknown: in multi-process
+// mode a commit can fail after its commit frame reached the WAL (updating the
+// wal-index can fail there), and the recovery the next opener runs keeps that
+// frame. SQLite reports the same: a failed commit sets the statement's change
+// count to 0 (sqlite3VdbeHalt, vdbeaux.c:3422-3426), and its WAL recovery
+// keeps every commit frame it finds (wal.c:1509-1511).
 type ModifyResult struct {
 	// Matched is the number of documents matched by the query.
 	Matched int
@@ -687,7 +697,8 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(wtx WriteTx, btWt
 		}
 		// A write that does not commit modified nothing: Modified counts the
 		// documents the call wrote. Matched still reports the documents it
-		// matched before the failure.
+		// matched before the failure. A failed commit reports 0 too, though
+		// recovery can still keep it (see ModifyResult).
 		if err != nil {
 			_ = tx.Rollback()
 			result.Modified = 0
