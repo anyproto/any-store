@@ -4547,8 +4547,8 @@ func (c *Cursor) Next() error {
 		// A step within the pinned leaf moves the cursor's index on that
 		// leaf and reads nothing else, so it runs outside the gate, as a
 		// Key does (readsPinnedLeaf); a step off the leaf takes the gate.
-		// sqlite3BtreeNext splits the same way: it steps pCur->ix within a
-		// leaf itself and leaves the rest to btreeNext (btree.c:6376-6384).
+		// sqlite3BtreeNext too steps within a leaf without btreeNext
+		// (btree.c:6376-6383).
 		if c.readsPinnedLeaf() && len(c.stack) > 0 {
 			frame := &c.stack[len(c.stack)-1]
 			if frame.pg != nil && frame.cellIdx+1 < int(frame.pg.header.cellCount) {
@@ -4673,7 +4673,7 @@ func (c *Cursor) Next() error {
 func (c *Cursor) Previous() error {
 	if c.bt.writable && !c.gated {
 		// A step within the pinned leaf runs outside the gate, as in Next
-		// (sqlite3BtreePrevious, btree.c:6466-6473).
+		// (sqlite3BtreePrevious, btree.c:6467-6474).
 		if c.readsPinnedLeaf() && len(c.stack) > 0 {
 			frame := &c.stack[len(c.stack)-1]
 			if frame.pg != nil && frame.cellIdx > 0 {

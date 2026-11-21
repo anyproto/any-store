@@ -179,7 +179,7 @@
       "btree.c:moveToLeftmost",
       "btree.c:sqlite3BtreeNext"
     ],
-    "note": "a write transaction's cursor steps within its pinned leaf outside the writer gate and takes the gate for the rest, as sqlite3BtreeNext steps within a leaf itself and leaves the rest to btreeNext (drift-2026-11-21-25)"
+    "note": "a write transaction's cursor steps within its pinned leaf outside the writer gate, and takes the gate for other steps; sqlite3BtreeNext too steps within a leaf without btreeNext (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.Previous": {
     "sqlite": [
@@ -187,7 +187,7 @@
       "btree.c:moveToRightmost",
       "btree.c:sqlite3BtreePrevious"
     ],
-    "note": "a write transaction's cursor steps within its pinned leaf outside the writer gate and takes the gate for the rest, as sqlite3BtreePrevious steps within a leaf itself and leaves the rest to btreePrevious (drift-2026-11-21-25)"
+    "note": "a write transaction's cursor steps within its pinned leaf outside the writer gate, and takes the gate for other steps; sqlite3BtreePrevious too steps within a leaf without btreePrevious (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.Seek": {
     "sqlite": [
