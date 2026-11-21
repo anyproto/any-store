@@ -61,27 +61,46 @@ type paddingStaged struct {
 	ModifierChain
 }
 
-// ownOperands returns chain with its $set, $push and $addToSet set to store a
-// copy of their operand on every application.
+// ownOperands returns chain with its $set, $push and $addToSet replaced by
+// forms that store a copy of their operand on every application. The forms
+// are types of their own, not a flag, so that the plain modifiers every other
+// update parses keep their size.
 func ownOperands(chain ModifierChain) ModifierChain {
 	owned := make(ModifierChain, len(chain))
 	for i, m := range chain {
 		switch mt := m.(type) {
 		case modifierSet:
-			mt.copyVal = true
-			m = mt
+			m = ownedSet(mt)
 		case modifierPush:
-			mt.copyVal = true
-			m = mt
+			m = ownedPush(mt)
 		case modifierAddToSet:
-			mt.copyVal = true
-			m = mt
+			m = ownedAddToSet(mt)
 		case ModifierChain:
 			m = ownOperands(mt)
 		}
 		owned[i] = m
 	}
 	return owned
+}
+
+// ownedSet, ownedPush and ownedAddToSet are $set, $push and $addToSet storing
+// a copy of their operand (ownOperands).
+type (
+	ownedSet      modifierSet
+	ownedPush     modifierPush
+	ownedAddToSet modifierAddToSet
+)
+
+func (m ownedSet) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+	return modifierSet(m).modify(a, v, true)
+}
+
+func (m ownedPush) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+	return modifierPush(m).modify(a, v, true)
+}
+
+func (m ownedAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+	return modifierAddToSet(m).modify(a, v, true)
 }
 
 // stored is the value an operation stores for operand val: val itself, or a
@@ -148,13 +167,16 @@ func mayExceedPadding(chain ModifierChain) bool {
 type modifierSet struct {
 	fieldPath []string
 	val       *anyenc.Value
-	copyVal   bool // store a copy of val (ownOperands)
 }
 
 func (m modifierSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	return m.modify(a, v, false)
+}
+
+func (m modifierSet) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		modified = !anyencutil.Equal(value, m.val)
-		return stored(a, m.val, m.copyVal), nil
+		return stored(a, m.val, copyVal), nil
 	})
 	if err != nil {
 		return nil, false, err
@@ -277,10 +299,13 @@ func (m modifierPop) getResultArray(arrayOfValues []*anyenc.Value) ([]*anyenc.Va
 type modifierPush struct {
 	fieldPath []string
 	val       *anyenc.Value
-	copyVal   bool // store a copy of val (ownOperands)
 }
 
 func (m modifierPush) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	return m.modify(a, v, false)
+}
+
+func (m modifierPush) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			return nil, nil
@@ -289,7 +314,7 @@ func (m modifierPush) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.V
 		if err != nil {
 			return nil, fmt.Errorf("failed to pop item, %w", err)
 		}
-		value.SetArrayItem(len(arrayOfValues), stored(a, m.val, m.copyVal))
+		value.SetArrayItem(len(arrayOfValues), stored(a, m.val, copyVal))
 		modified = true
 		return value, nil
 	})
@@ -385,10 +410,13 @@ func removeElements(arrayOfValues []*anyenc.Value, value *anyenc.Value, shouldRe
 type modifierAddToSet struct {
 	fieldPath []string
 	val       *anyenc.Value
-	copyVal   bool // store a copy of val (ownOperands)
 }
 
 func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	return m.modify(a, v, false)
+}
+
+func (m modifierAddToSet) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			value = a.NewArray()
@@ -397,7 +425,7 @@ func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anye
 		if err != nil {
 			return nil, fmt.Errorf("failed to pop item, %w", err)
 		}
-		modified = m.addElements(a, value)
+		modified = m.addElements(a, value, copyVal)
 		return value, nil
 	})
 	if err != nil {
@@ -407,13 +435,13 @@ func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anye
 	return
 }
 
-func (m modifierAddToSet) addElements(a *anyenc.Arena, value *anyenc.Value) bool {
+func (m modifierAddToSet) addElements(a *anyenc.Arena, value *anyenc.Value, copyVal bool) bool {
 	arrayOfValues := value.GetArray()
 	if slices.ContainsFunc(arrayOfValues, func(val *anyenc.Value) bool {
 		return anyencutil.Equal(m.val, val)
 	}) {
 		return false
 	}
-	value.SetArrayItem(len(arrayOfValues), stored(a, m.val, m.copyVal))
+	value.SetArrayItem(len(arrayOfValues), stored(a, m.val, copyVal))
 	return true
 }
