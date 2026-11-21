@@ -879,6 +879,39 @@ func TestClose_KeepsBackTheLeavesCursorsLent(t *testing.T) {
 	}
 }
 
+// The pager's close releases what the transaction Close ended still holds
+// beside the cache: the page images of its savepoints, as sqlite3PagerClose
+// releases them (pager_unlock, releaseAllSavepoints, pager.c:1850; asserted
+// at 4228), and the page list of the last commit, through which a leaf a
+// cursor pins stayed reachable from the closed handle after the cursor.
+func TestClose_ReleasesSavepointsAndCommitPageList(t *testing.T) {
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "a.db"), Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	createNS(t, db, "t")
+	putN(t, db, "t", 50, 300)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.GetNamespace("t")
+	require.NoError(t, err)
+	sp, err := tx.Savepoint()
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, closeRescueKey(1), []byte("x")))
+	cur := tx.NewCursor(ns)
+	require.NoError(t, cur.Last())
+	p := db.pager
+	require.NotEmpty(t, p.savepoints[sp].pages)
+	require.Contains(t, p.dirtyBuf, cur.stack[len(cur.stack)-1].pg,
+		"the last commit's page list does not hold the leaf the cursor pins")
+
+	require.NoError(t, db.Close())
+	require.True(t, p.savepoints == nil, "the savepoints outlive the pager's close")
+	require.True(t, p.dirtyBuf == nil, "the last commit's page list outlives the pager's close")
+	cur.Close()
+	require.NoError(t, tx.Rollback())
+}
+
 // A move that Close refused before it disposed of the cache ends the
 // cursor's pin there: Close keeps nothing back for it.
 func TestClose_CursorAbandonedBeforeCacheDisposal(t *testing.T) {
