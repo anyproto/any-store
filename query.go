@@ -194,12 +194,14 @@ type planOpts struct {
 // programmatic consumers ever see), and the $text resolution (ftsSource:
 // placement, the one full-text index, the $fields scope).
 //
-// The verbs call this BEFORE their unsatisfiable() short-circuit, and so
-// before their transaction (validateSourcesIn): an invalid source must error
-// identically on every verb, not return 0/nil wherever an unrelated $in:[]
-// or $all:[] happens to make the filter unsatisfiable. MongoDB has the same
-// order for $text: the text index is looked up when $text is parsed, before
-// the filter is normalized.
+// The verbs call this BEFORE their unsatisfiable() short-circuit: an invalid
+// source must error identically on every verb, not return 0/nil wherever an
+// unrelated $in:[] or $all:[] happens to make the filter unsatisfiable.
+// MongoDB has the same order for $text: the text index is looked up when
+// $text is parsed, before the filter is normalized. The read verbs call it
+// before their transaction (validateSourcesIn, confirmSources); Update and
+// Delete in their write transaction, against the schema it resolves
+// (bulkWrite).
 func (q *collQuery) validateSources(s *collSchema) error {
 	if q.srcValidatedFor == s {
 		return nil
@@ -690,11 +692,6 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(wtx WriteTx, btWt
 	}
 	defer qb.Close()
 
-	// Source validation precedes the unsatisfiable() short-circuit (see Iter).
-	if _, err = q.validateSourcesIn(ctx); err != nil {
-		return
-	}
-
 	// Reclaim tombstones this bulk write creates once it commits, mirroring the
 	// single-doc mutators. Registered before the commit defer so it runs after
 	// commit; no-ops inside a caller-managed tx (the guard in maybeAutoCompactVectors).
@@ -755,10 +752,16 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(wtx WriteTx, btWt
 	if err != nil {
 		return
 	}
-	// The sources are checked against the schema this write resolved, before
-	// the empty answer below: a check reached against the unverified cached
-	// head would let a $text or $knn whose index a peer process dropped
-	// through as an empty write. compilePlan's check is then a memo hit.
+	// Source validation precedes the unsatisfiable() short-circuit (see Iter),
+	// and runs here, against the schema this write resolved: no read of its
+	// own, so it takes no reader slot (with every slot held, maybe by the
+	// caller, a write would otherwise wait for one), and the verdict is the
+	// verified one (a check against the unverified cached head would let a
+	// $text or $knn whose index a peer process dropped through as an empty
+	// write). compilePlan's check is then a memo hit. A SQLite statement too
+	// checks its schema cookie when it begins its transaction (OP_Transaction,
+	// vdbe.c:4164-4166) and, on SQLITE_SCHEMA, is prepared again against the
+	// schema it finds (sqlite3_step, vdbeapi.c:924-927).
 	if err = q.validateSources(s); err != nil {
 		return
 	}

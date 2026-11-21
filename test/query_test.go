@@ -1,6 +1,7 @@
 package test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -482,6 +483,34 @@ func TestQuery_TextSourceErrorsBeforeEmptyResult(t *testing.T) {
 				assertQueryCount(t, dst.Find(`{"id":"kept"}`), 1)
 			})
 		}
+	}
+}
+
+// A Delete or an Update checks its $text source in its own write transaction
+// and takes no reader slot for it: with ReadConcurrency 1 and the one slot
+// held by the caller's read transaction, the verb returns the source's error
+// instead of waiting for the slot.
+func TestQuery_WriteSourceErrorTakesNoReaderSlot(t *testing.T) {
+	fx := newFixture(t, &anystore.Config{ReadConcurrency: 1})
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1,"body":"hello world","tags":["x"]}`)
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rtx.Commit()) }()
+
+	// One deadline for every call: a verb that waits for the slot ends with
+	// it, and so do the calls after it.
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	for _, filter := range []string{
+		`{"$text":{"$search":"hello"}}`,
+		`{"$text":{"$search":"hello"},"tags":{"$all":[]}}`,
+	} {
+		_, err = coll.Find(filter).Delete(wctx)
+		require.ErrorIs(t, err, anystore.ErrNoFulltextIndex, "Delete %s", filter)
+		_, err = coll.Find(filter).Update(wctx, `{"$set":{"touched":true}}`)
+		require.ErrorIs(t, err, anystore.ErrNoFulltextIndex, "Update %s", filter)
 	}
 }
 
