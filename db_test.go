@@ -2584,6 +2584,54 @@ func TestWriteTx_HandleClosedBeforeCommitStoresItsSketches(t *testing.T) {
 		require.Equal(t, uint64(52), storedSketch(t, d, again).DocCount)
 	})
 
+	// The transaction first used the handle inside a savepoint and closed
+	// it there. The savepoint's commit hands the pin to the transaction:
+	// the handle works until the transaction ends.
+	t.Run("first used and closed in a savepoint that committed", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		sp, err := d.WriteTx(wtx.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(sp.Context(), doc(100)))
+		require.NoError(t, coll.Close())
+		require.NoError(t, sp.Commit())
+		require.NoError(t, coll.Insert(wtx.Context(), doc(101)), "the Close() waits for the transaction")
+		require.NoError(t, wtx.Commit())
+		require.ErrorIs(t, coll.Insert(ctx, doc(102)), ErrCollectionClosed, "the Close() took effect at the commit")
+		reopened(t, d, 52)
+	})
+
+	// The transaction opened the collection inside a savepoint, wrote and
+	// closed the handle there, and the savepoint rolled back: the use is
+	// undone, and the Close() takes effect with it. The next open makes a
+	// new handle, which loads the stored row.
+	t.Run("opened, written and closed in a savepoint that rolled back", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		sp, err := d.WriteTx(wtx.Context())
+		require.NoError(t, err)
+		coll, err := d.OpenCollection(sp.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(sp.Context(), doc(100)))
+		require.NoError(t, coll.Close())
+		require.NoError(t, sp.Rollback())
+		require.ErrorIs(t, coll.Insert(wtx.Context(), doc(101)), ErrCollectionClosed, "the Close() took effect at the rollback")
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		if again == coll {
+			t.Error("the open returned the closed handle")
+		}
+		require.NoError(t, again.Insert(wtx.Context(), doc(101)))
+		require.NoError(t, wtx.Commit())
+		reopened(t, d, 51)
+	})
+
 	t.Run("rollback", func(t *testing.T) {
 		d, _ := openSketchDB(t)
 		coll, err := d.OpenCollection(ctx, "c")
