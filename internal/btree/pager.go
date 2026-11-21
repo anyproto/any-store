@@ -2520,8 +2520,8 @@ func (p *pager) refreshHeaderFromPage1() error {
 // in a WAL that was never checkpointed); the pages are sealed with the
 // keyed salt's key whatever page 1 says, and every write of page 1, the
 // checkpoint's copy into the main file included, writes that salt. SQLCipher
-// reads its salt once, from the main file, and replaces it with the magic
-// in every decrypted page 1
+// reads its salt once, from the main file, and in its default header mode
+// replaces it with the magic in every decrypted page 1
 // (sqlcipher.c:1392-1409, 3271), so no image of page 1 reaches its key.
 // DRIFT: page 1's salt bytes are not read from a page image; SQLite's header has no KDF salt. See docs/btree/NOTES.md#drift-2026-11-21-19-the-kdf-salt-belongs-to-the-key-setup-not-to-page-1
 func (p *pager) adoptHeader(h dbHeader) {

@@ -191,9 +191,10 @@ func (db *DB) codecKind() IntegrityMode {
 // it has no OnIntegrityError, so they come back as the backup's error and
 // not through the source's hook. In SQLite the failure is the step's return
 // code, and sqlite3_backup_finish records it on the destination handle
-// (backup.c:255, 603-605); SQLCipher records a decrypt failure on the pager
-// that read the page (sqlcipher_codec_ctx_set_error, sqlcipher.c:1385-1389),
-// which is the destination's.
+// (backup.c:255, 603-605); outside recovery mode, SQLCipher records a
+// decrypt failure on the pager that read the page, which is the
+// destination's (sqlcipher_codec_ctx_set_error → sqlite3pager_error,
+// sqlcipher.c:3287-3291, 1385-1389).
 //
 // ~ setDestPgsz (backup.c:112-116), which tries to give the destination the
 // source's page size before it is first locked (a non-empty destination
