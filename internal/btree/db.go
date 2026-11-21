@@ -840,7 +840,7 @@ func Open(path string, opts Options) (*DB, error) {
 // the VFS a page read goes through, the Err of a caller's context, which a
 // count polls. Between two calls of its transaction the writer's goroutine
 // may call Close.
-// See docs/btree/NOTES.md#drift-2026-11-19-1-close-waits-for-the-writers-call-in-flight.
+// See docs/btree/NOTES.md#drift-2026-11-21-25-close-waits-for-the-writers-call-in-flight.
 //
 // A second Close returns ErrClosed.
 func (db *DB) Close() error {

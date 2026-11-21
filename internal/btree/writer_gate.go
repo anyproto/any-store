@@ -29,7 +29,7 @@ import "sync/atomic"
 // the last finalize (main.c:1283, 1371). In multi-thread mode the connection
 // has no mutex, and a close during another thread's step is the
 // application's error.
-// DRIFT: Close ends a write transaction under its goroutine, after waiting for the call in flight; C refuses or defers the close See docs/btree/NOTES.md#drift-2026-11-19-1-close-waits-for-the-writers-call-in-flight
+// DRIFT: Close ends a write transaction under its goroutine, after waiting for the call in flight; C refuses or defers the close See docs/btree/NOTES.md#drift-2026-11-21-25-close-waits-for-the-writers-call-in-flight
 //
 // The count is of calls, not of transactions, and nests: a gated call may
 // make another (a write saves the transaction's cursors, and each reads its

@@ -230,7 +230,7 @@
   },
   "btree.go:*Cursor.abandon": {
     "sqlite": [],
-    "note": "any-store: a move or Close refused at the writer gate lets go of the cursor's pages and returns a lent slab buffer (drift-2026-11-19-1)"
+    "note": "any-store: a move or Close refused at the writer gate lets go of the cursor's pages and returns a lent slab buffer (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.currentKeyEqual": {
     "sqlite": [],
@@ -238,55 +238,55 @@
   },
   "btree.go:*Cursor.enterGate": {
     "sqlite": [],
-    "note": "any-store: counts a cursor call of the write transaction in at the writer gate, once for the calls it makes on itself; C holds the connection mutex for the step, vdbeapi.c sqlite3_step (drift-2026-11-19-1)"
+    "note": "any-store: counts a cursor call of the write transaction in at the writer gate, once for the calls it makes on itself; C holds the connection mutex for the step, vdbeapi.c sqlite3_step (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.gatedAppendValue": {
     "sqlite": [],
-    "note": "any-store: AppendValue of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+    "note": "any-store: AppendValue of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.gatedAppendValueByKey": {
     "sqlite": [],
-    "note": "any-store: AppendValueByKey of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+    "note": "any-store: AppendValueByKey of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.gatedCountUntil": {
     "sqlite": [],
-    "note": "any-store: CountUntil of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+    "note": "any-store: CountUntil of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.gatedKey": {
     "sqlite": [],
-    "note": "any-store: Key of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+    "note": "any-store: Key of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.gatedMove": {
     "sqlite": [],
-    "note": "any-store: First, Last and Previous of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+    "note": "any-store: First, Last and Previous of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.gatedNext": {
     "sqlite": [],
-    "note": "any-store: Next of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+    "note": "any-store: Next of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.gatedRangeFraction": {
     "sqlite": [],
-    "note": "any-store: RangeFraction of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+    "note": "any-store: RangeFraction of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.gatedSeek": {
     "sqlite": [],
-    "note": "any-store: Seek, SeekNear and SeekExact of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+    "note": "any-store: Seek, SeekNear and SeekExact of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.gatedSkip": {
     "sqlite": [],
-    "note": "any-store: Skip and SkipBackward of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+    "note": "any-store: Skip and SkipBackward of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.gatedValue": {
     "sqlite": [],
-    "note": "any-store: Value of a write transaction's cursor, run inside the writer gate (drift-2026-11-19-1)"
+    "note": "any-store: Value of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.leaveGate": {
     "sqlite": [],
-    "note": "any-store: counts the call enterGate counted in out again (drift-2026-11-19-1)"
+    "note": "any-store: counts the call enterGate counted in out again (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.readsPinnedLeaf": {
     "sqlite": [],
-    "note": "any-store: whether Key or Value of a write transaction's cursor reads only the leaf the cursor pins and so runs outside the writer gate (drift-2026-11-19-1)"
+    "note": "any-store: whether Key or Value of a write transaction's cursor reads only the leaf the cursor pins and so runs outside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.releasePages": {
     "sqlite": [
@@ -994,7 +994,7 @@
   },
   "db.go:*ReadTx.CloseState": {
     "sqlite": [],
-    "note": "any-store: the handle on DB.Close's end of this write transaction, valid after the transaction is pooled (drift-2026-11-19-1)"
+    "note": "any-store: the handle on DB.Close's end of this write transaction, valid after the transaction is pooled (drift-2026-11-21-25)"
   },
   "db.go:*ReadTx.Count": {
     "sqlite": [
@@ -1767,7 +1767,7 @@
     "sqlite": [
       "pcache1.c:pcache1Destroy"
     ],
-    "note": "any-store: destroys the writer cache of a transaction Close ended, keeping back the leaves its cursors pin (drift-2026-11-19-1)"
+    "note": "any-store: destroys the writer cache of a transaction Close ended, keeping back the leaves its cursors pin (drift-2026-11-21-25)"
   },
   "pager.go:*pager.detachBackup": {
     "sqlite": [
@@ -2026,7 +2026,7 @@
   },
   "pager.go:*pager.returnLent": {
     "sqlite": [],
-    "note": "any-store: the last cursor off a lent slab buffer returns it (drift-2026-11-19-1)"
+    "note": "any-store: the last cursor off a lent slab buffer returns it (drift-2026-11-21-25)"
   },
   "pager.go:*pager.rollback": {
     "sqlite": [
@@ -2970,26 +2970,26 @@
   },
   "writer_gate.go:*writerGate.close": {
     "sqlite": [],
-    "note": "any-store: closes the gate and waits for the write transaction's call in flight; C takes the connection mutex, main.c sqlite3Close (drift-2026-11-19-1)"
+    "note": "any-store: closes the gate and waits for the write transaction's call in flight; C takes the connection mutex, main.c sqlite3Close (drift-2026-11-21-25)"
   },
   "writer_gate.go:*writerGate.closed": {
     "sqlite": [],
-    "note": "any-store: whether Close has closed the gate (drift-2026-11-19-1)"
+    "note": "any-store: whether Close has closed the gate (drift-2026-11-21-25)"
   },
   "writer_gate.go:*writerGate.enter": {
     "sqlite": [],
-    "note": "any-store: counts a call of the write transaction in, or refuses it once Close closed the gate; C holds the connection mutex for the step, vdbeapi.c sqlite3_step (drift-2026-11-19-1)"
+    "note": "any-store: counts a call of the write transaction in, or refuses it once Close closed the gate; C holds the connection mutex for the step, vdbeapi.c sqlite3_step (drift-2026-11-21-25)"
   },
   "writer_gate.go:*writerGate.leave": {
     "sqlite": [],
-    "note": "any-store: counts a call out and wakes a waiting Close (drift-2026-11-19-1)"
+    "note": "any-store: counts a call out and wakes a waiting Close (drift-2026-11-21-25)"
   },
   "writer_gate.go:CloseState.EndedByClose": {
     "sqlite": [],
-    "note": "any-store: whether DB.Close has closed the writer gate, so ended a write transaction still open (drift-2026-11-19-1)"
+    "note": "any-store: whether DB.Close has closed the writer gate, so ended a write transaction still open (drift-2026-11-21-25)"
   },
   "writer_gate.go:newWriterGate": {
     "sqlite": [],
-    "note": "any-store: the pager's writer gate, open (drift-2026-11-19-1)"
+    "note": "any-store: the pager's writer gate, open (drift-2026-11-21-25)"
   }
 }
