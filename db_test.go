@@ -2681,6 +2681,63 @@ func TestOpenCollection_HandOutAfterTheDeferredCloseTookEffect(t *testing.T) {
 	}
 }
 
+// A lookup by name in the write transaction's schema log goes by its schema
+// changes, whatever handles the transaction uses besides, and follows a
+// savepoint that rolls a change back.
+func TestWriteTx_NameLookupAmongPinnedHandles(t *testing.T) {
+	fx := newFixture(t)
+	for i := range 8 {
+		_, err := fx.CreateCollection(ctx, fmt.Sprintf("p%d", i))
+		require.NoError(t, err)
+	}
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wtx.Rollback() })
+	log := wtx.schemaLog()
+	use := func(from, to int) {
+		for i := from; i < to; i++ {
+			c, err := fx.OpenCollection(wtx.Context(), fmt.Sprintf("p%d", i))
+			require.NoError(t, err)
+			require.NoError(t, c.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":1}`)))
+		}
+	}
+	use(0, 3)
+	require.Len(t, log.log, 3, "setup: one pin per handle used")
+	require.Empty(t, log.changes, "a pin is not a schema change")
+	require.Nil(t, log.byName("p0"), "a used handle is found in the registry, not in the log")
+
+	kept, err := fx.CreateCollection(wtx.Context(), "kept")
+	require.NoError(t, err)
+	use(3, 6)
+	sp, err := fx.WriteTx(wtx.Context())
+	require.NoError(t, err)
+	_, err = fx.CreateCollection(sp.Context(), "undone")
+	require.NoError(t, err)
+	p6, err := fx.OpenCollection(sp.Context(), "p6")
+	require.NoError(t, err)
+	require.NoError(t, p6.Rename(sp.Context(), "p6r"))
+	require.Equal(t, []int{3, 7, 9}, log.changes,
+		"the created collection, the one made in the savepoint, and the rename of p6 after its pin")
+	require.NotNil(t, log.byName("undone"))
+	require.NotNil(t, log.byName("p6r"))
+	require.NoError(t, sp.Rollback())
+
+	require.Equal(t, []int{3}, log.changes, "the savepoint's changes left the index with its entries")
+	require.Nil(t, log.byName("undone"))
+	require.Nil(t, log.byName("p6r"))
+	_, err = fx.OpenCollection(wtx.Context(), "undone")
+	require.ErrorIs(t, err, ErrCollectionNotFound)
+	use(6, 8)
+	again, err := fx.OpenCollection(wtx.Context(), "kept")
+	require.NoError(t, err)
+	if again != kept {
+		t.Error("the created collection is not found by name among the pins")
+	}
+	require.NoError(t, wtx.Commit())
+	require.Empty(t, log.changes)
+	require.Empty(t, log.log)
+}
+
 // BenchmarkSketch_FindThenWriteAfterAPeersCommit is the cycle of a process
 // that shares its file: another process commits, this one plans a query and
 // then writes. The reader loads the stored sketch rows into the published
@@ -2746,7 +2803,9 @@ func BenchmarkSketch_RollbackThenFind(b *testing.B) {
 }
 
 // BenchmarkWriteTx_OpenCollections writes to one collection of a db holding n
-// open ones: the cost of a write must not depend on n.
+// open ones: the cost of a write must not depend on n. TxAll is one
+// transaction that opens every one of the n by name and writes to it: its
+// cost per collection must not depend on n either.
 func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 	for _, n := range []int{1, 1000, 20000} {
 		b.Run(fmt.Sprintf("open=%d", n), func(b *testing.B) {
@@ -2759,8 +2818,12 @@ func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 				require.NoError(b, err)
 				require.NoError(b, colls[i].EnsureIndex(tx.Context(), IndexInfo{Fields: []string{"a"}}))
 			}
+			names := make([]string, n)
+			for i := range colls {
+				names[i] = fmt.Sprintf("c%05d", i)
+				require.NoError(b, colls[i].Insert(tx.Context(), anyenc.MustParseJson(`{"id":1,"a":0,"v":0}`)))
+			}
 			coll := colls[0]
-			require.NoError(b, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1,"a":0,"v":0}`)))
 			require.NoError(b, tx.Commit())
 
 			inc := query.MustParseModifier(`{"$inc":{"v":1}}`)
@@ -2793,6 +2856,23 @@ func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 					}
 					require.NoError(b, tx.Commit())
 				}
+			})
+			// One tx uses every collection: an open by name, then a write.
+			// Reported per collection.
+			b.Run("TxAll", func(b *testing.B) {
+				b.ReportAllocs()
+				for range b.N {
+					tx, err := fx.WriteTx(ctx)
+					require.NoError(b, err)
+					for _, name := range names {
+						c, err := fx.OpenCollection(tx.Context(), name)
+						require.NoError(b, err)
+						_, err = c.UpdateId(tx.Context(), 1, inc)
+						require.NoError(b, err)
+					}
+					require.NoError(b, tx.Commit())
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n), "ns/coll")
 			})
 		})
 	}
