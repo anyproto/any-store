@@ -2,13 +2,14 @@
 
 package btree
 
-// syncDir does nothing outside Unix. SQLite's Windows VFS syncs no
-// directory: the SQLITE_OPEN_* flags that make the unix VFS do it are not
-// used there (winOpen, winSync). The other platforms that are not Unix
-// (js/wasm, wasip1) do as Windows does.
-func syncDir(path string) error {
-	if h := testSyncDirHook; h != nil {
-		h(path)
-	}
-	return nil
-}
+// dirSync does nothing outside Unix: a file's sync is its fdatasync alone.
+// SQLite's Windows VFS syncs no directory: UNIXFILE_DIRSYNC is the unix VFS's
+// (os_unix.c:6777), and winSync syncs the file only. The other platforms that
+// are not Unix (js/wasm, wasip1) do as Windows does.
+type dirSync struct{}
+
+// set does nothing.
+func (*dirSync) set() {}
+
+// sync syncs f.
+func (*dirSync) sync(f fileHandle, _ string) error { return fdatasync(f) }

@@ -902,13 +902,13 @@ var testOpenAfterWALOpenHook func(p *pager)
 
 // testOpenStageHook runs at named points of a file-backed open, so a test
 // can hold or kill a process there: "before-lock" (nothing opened or locked
-// yet; Open has made its first, unlocked read of the header), and the points
-// of a creation in order: "journal-playback" (a dead creator's file is about
-// to be truncated), "journal-created" (the journal is an empty file),
-// "before-journal-sync" (its header is written), "before-page1-write" (the
-// journal and its directory are synced), "before-page1-sync",
-// "before-journal-finalize" (page 1 is synced) and "journal-finalized" (the
-// creation is committed, the journal not yet deleted). Nil outside tests.
+// yet; Open has made its first, unlocked read of the header), and the
+// points of a creation in order: "journal-playback" (a dead creator's file
+// is about to be truncated), "journal-opened" (the journal is open and
+// empty), "before-journal-sync" (its header is written),
+// "before-page1-write" (the journal and its directory are synced),
+// "before-page1-sync", "before-journal-delete" (page 1 is synced) and
+// "journal-deleted" (the creation is committed). Nil outside tests.
 var testOpenStageHook func(p *pager, stage string)
 
 // BEGIN ENCRYPTION
@@ -1024,11 +1024,14 @@ func (p *pager) lockDBShared(f fileHandle) error {
 // A WAL found beside the empty file is deleted before page 1 is written, as
 // pagerOpenWalIfPresent deletes it when the database has no pages
 // (pager.c:3355-3356): recovery would otherwise apply its frames to the new
-// database. It is the log of a database that is gone, or of a database file
-// that was renamed or unlinked under a process still attached to it; that
-// process is not protected, here or in SQLite (docs/btree/NOTES.md, drift-63,
-// known limitations). The wal-index is left to the first attacher's
-// election, which truncates one that no process holds (newPlatformShm).
+// database. The removal is made durable before page 1 exists by the
+// directory sync that follows the creation journal's first sync
+// (createPage1). The WAL is the log of a database that is gone, or of a
+// database file that was renamed or unlinked under a process still attached
+// to it; that process is not protected, here or in SQLite
+// (docs/btree/NOTES.md, drift-63, known limitations). The wal-index is left
+// to the first attacher's election, which truncates one that no process
+// holds (newPlatformShm).
 // DRIFT: a database is created at open, under a flock, in a journaled transaction of any-store's own journal. See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
 func (p *pager) createIfEmpty(f fileHandle) (created bool, err error) {
 	// BEGIN ENCRYPTION
@@ -1196,11 +1199,12 @@ func (p *pager) newPage1() []byte {
 }
 
 // createPage1 writes page 1 of a new database to the file, in a transaction
-// of the creation journal (creation_journal.go): the journal is durable
-// before page 1 is written, and the creation is committed, by the journal's
-// finalization, only after page 1 is synced. The caller holds the DB-file
-// lock exclusively and the file is empty (createIfEmpty). open then reads
-// the page back as it reads any existing database's.
+// of the creation journal (creation_journal.go): the journal and its
+// directory are durable before page 1 is written, and the creation is
+// committed, by the journal's delete, only after page 1 is synced. The
+// caller holds the DB-file lock exclusively and the file is empty
+// (createIfEmpty). open then reads the page back as it reads any existing
+// database's.
 func (p *pager) createPage1() error {
 	buf := p.newPage1()
 	// BEGIN ENCRYPTION
@@ -1215,14 +1219,21 @@ func (p *pager) createPage1() error {
 		buf = ct
 	}
 	// END ENCRYPTION
-	jf, err := p.openCreationJournal()
+	j, err := p.openCreationJournal()
 	if err != nil {
 		return err
 	}
 	if h := testOpenStageHook; h != nil {
-		h(p, "before-page1-write")
+		h(p, "before-journal-sync")
 	}
-	if _, err = p.file.WriteAt(buf, 0); err == nil {
+	err = j.sync()
+	if err == nil {
+		if h := testOpenStageHook; h != nil {
+			h(p, "before-page1-write")
+		}
+		_, err = p.file.WriteAt(buf, 0)
+	}
+	if err == nil {
 		if h := testOpenStageHook; h != nil {
 			h(p, "before-page1-sync")
 		}
@@ -1231,13 +1242,13 @@ func (p *pager) createPage1() error {
 	if err != nil {
 		// The journal stays hot: whatever reached the file is rolled back
 		// by the next open.
-		_ = jf.Close()
+		j.abandon()
 		return err
 	}
 	if h := testOpenStageHook; h != nil {
-		h(p, "before-journal-finalize")
+		h(p, "before-journal-delete")
 	}
-	return p.finalizeCreationJournal(jf)
+	return j.commit(p)
 }
 
 // initNewDB initializes a brand new in-memory database: page 1 goes to the

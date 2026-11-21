@@ -5,23 +5,60 @@ package btree
 import (
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
-// syncDir fsyncs the directory that holds path, which makes the creation and
-// the removal of names in it durable. It is what unixSync does the first time
-// it syncs a file opened as a new journal (UNIXFILE_DIRSYNC, set at
-// os_unix.c:6777, used at os_unix.c:3940-3952). As there, a directory that
-// does not open is no error (osOpenDirectory's failure becomes SQLITE_OK)
-// while a failed fsync is, and the sync is a plain fsync (full_fsync(dirfd,
-// 0, 0)).
-func syncDir(path string) error {
-	if h := testSyncDirHook; h != nil {
-		h(path)
+// dirSync is SQLite's UNIXFILE_DIRSYNC flag for one open file: unixOpen sets
+// it on a descriptor it opens with the create flag as a main journal, a super
+// journal or a WAL (isNewJrnl, os_unix.c:6569-6573; os_unix.c:6777), and the
+// descriptor's first unixSync consumes it by syncing the directory after the
+// file (os_unix.c:3936-3954). The flag is the descriptor's, not the file's:
+// every descriptor so opened syncs the directory once, whether or not its open
+// created the file, so a name that some other descriptor created and never
+// synced is durable before anything synced through this one is relied on.
+type dirSync struct {
+	pending atomic.Bool
+	mu      sync.Mutex
+}
+
+// set marks the file as opened with the create flag.
+func (d *dirSync) set() { d.pending.Store(true) }
+
+// sync is unixSync for f, opened as path: f is synced, and then, on the first
+// sync since set, the directory that holds path. A failed sync of f returns
+// before the directory and leaves the flag set, as unixSync returns early
+// (os_unix.c:3930-3935). Callers that race to the first sync all wait for the
+// directory sync: none returns before it is done.
+func (d *dirSync) sync(f fileHandle, path string) error {
+	if err := fdatasync(f); err != nil {
+		return err
 	}
+	if d.pending.Load() {
+		d.mu.Lock()
+		if d.pending.Load() {
+			syncDir(path)
+			d.pending.Store(false)
+		}
+		d.mu.Unlock()
+	}
+	return nil
+}
+
+// syncDir fsyncs the directory that holds path, which makes the names created
+// and removed in it so far durable. It is unixSync's directory sync, and like
+// it, it reports nothing: a directory that does not open is skipped
+// (osOpenDirectory's SQLITE_CANTOPEN becomes SQLITE_OK, os_unix.c:3949-3951),
+// and the result of the fsync is not looked at (full_fsync(dirfd, 0, 0),
+// os_unix.c:3947, "Many systems (examples: AIX) are unable to fsync a
+// directory, so ignore errors on the fsync", os_unix.c:3937-3939). The sync
+// is a plain fsync, F_FULLFSYNC not even on Darwin, as full_fsync with
+// fullSync 0 is.
+func syncDir(path string) {
 	dir, err := os.Open(filepath.Dir(path))
 	if err != nil {
-		return nil
+		return
 	}
 	defer dir.Close()
 	for {
@@ -30,8 +67,7 @@ func syncDir(path string) error {
 			break
 		}
 	}
-	if err != nil {
-		return &os.PathError{Op: "fsync", Path: dir.Name(), Err: err}
+	if h := testSyncDirHook; h != nil && err == nil {
+		h(path)
 	}
-	return nil
 }

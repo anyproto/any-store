@@ -24,16 +24,15 @@ import (
 //
 // Here the journal is <path>-journal, holds its header and nothing else, and
 // lives from createPage1's first step to its last. The steps, all under the
-// exclusive DB-file lock:
+// exclusive DB-file lock, after createIfEmpty has deleted a stale WAL:
 //
-//  1. create the journal and write its header;
-//  2. sync the journal, then the directory (the journal's name is new);
+//  1. create the journal, with the create flag, and write its header;
+//  2. sync the journal; this first sync of its descriptor also syncs the
+//     directory (dirSync), which makes the journal's name, the database
+//     file's name and the stale WAL's removal durable;
 //  3. write page 1;
 //  4. sync the database file;
-//  5. zero the journal's header and sync the journal: the commit point;
-//  6. delete the journal.
-//
-// DRIFT: the commit point is the synced zeroing of the journal header, journal_mode=PERSIST's finalization, followed by the delete; SQLite's default finalization is the delete alone. See docs/btree/NOTES.md#drift-2026-11-21-7-creation-journal
+//  5. delete the journal: the commit point, as in journal_mode=DELETE.
 
 // creationJournalSuffix names the journal after the database, as SQLite does
 // (pager.c:4924-4927 `memcpy(pPtr, "-journal", 8)`).
@@ -75,9 +74,8 @@ func creationJournalHdr(pageSize uint32) []byte {
 //     caller that holds the lock at all is looking at a dead creator's.
 //   - "The database file itself is greater than 0 bytes": the caller's test.
 //     An empty file is created again, and the creation writes the journal
-//     over whatever is there, where SQLite deletes it (pager.c:5170-5181).
-//   - "The first byte of the journal file exists and is not 0x00": a
-//     finalized header is zeros.
+//     over whatever is there, where SQLite deletes it (pager.c:5178-5181).
+//   - "The first byte of the journal file exists and is not 0x00".
 //
 // Beyond those, the header must be a whole creation header that records an
 // original size of zero pages: the only rollback this journal describes is
@@ -121,11 +119,13 @@ func (p *pager) creationPending(f fileHandle) (os.FileInfo, bool, error) {
 // playbackCreationJournal rolls a dead creator's creation back: the file is
 // truncated to the original size its journal records, zero pages
 // (pager_truncate, called for the first journal header, pager.c:2895-2897),
-// and synced (pager_playback's sqlite3PagerSync, pager.c:2978-2982). The
+// and synced (pager_playback's sqlite3PagerSync, pager.c:2978-2981). The
 // caller holds the DB-file lock exclusively and has seen the journal hot
-// under it. The journal stays: the caller creates the database next, and
-// that creation starts by writing the journal anew. A process that dies in
-// between leaves an empty file, which is created again.
+// under it.
+//
+// The journal stays: the caller creates the database next, and that creation
+// starts by writing the journal anew. A process that dies in between leaves
+// an empty file, which is created again.
 //
 // pagerSyncHotJournal (pager.c:4048) has no counterpart: the journal is hot
 // only beside a file with content, and page 1 is written only after the
@@ -143,68 +143,90 @@ func (p *pager) playbackCreationJournal(f fileHandle) error {
 	return nil
 }
 
-// openCreationJournal is steps 1 and 2 of the creation: the journal exists,
-// holds its header, and both it and its name are durable when it returns.
-// pager_open_journal creates the file and writes the header
-// (pager.c:5831-5923, writeJournalHdr at pager.c:5910); syncJournal syncs it
-// before any page of the transaction is written to the database file
-// (pager.c:4286-4392). The journal is a new file, so that sync is followed
-// by one of its directory: unixOpen marks a journal it may create
-// (os_unix.c:6569-6573, UNIXFILE_DIRSYNC at os_unix.c:6777) and unixSync
-// then fsyncs the directory (os_unix.c:3940-3952). The same directory sync
-// covers the removal of a stale WAL just before (createIfEmpty), so that
-// name is gone for good before page 1 exists.
-func (p *pager) openCreationJournal() (fileHandle, error) {
-	name := p.path + creationJournalSuffix
-	jf, err := osOpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
-	if err != nil {
-		return nil, fmt.Errorf("btree: create the creation journal: %w", err)
-	}
-	if h := testOpenStageHook; h != nil {
-		h(p, "journal-created")
-	}
-	if _, err = jf.WriteAt(creationJournalHdr(p.pageSize), 0); err == nil {
-		if h := testOpenStageHook; h != nil {
-			h(p, "before-journal-sync")
-		}
-		if err = fdatasync(jf); err == nil {
-			err = syncDir(name)
-		}
-	}
-	if err != nil {
-		_ = jf.Close()
-		return nil, fmt.Errorf("btree: write the creation journal: %w", err)
-	}
-	return jf, nil
+// creationJournal is the open journal of a creation in progress.
+type creationJournal struct {
+	f    fileHandle
+	name string
+	// dirSync is set by the open, which has the create flag, so the
+	// journal's first sync also syncs its directory.
+	dirSync dirSync
 }
 
-// finalizeCreationJournal is steps 5 and 6: the creation's commit point and
-// the journal's removal. The header is zeroed and the journal synced, as
-// zeroJournalHdr does for a persistent journal (pager.c:1399-1404, reached
-// from pager_end_transaction, pager.c:2090-2094); from then on the journal
-// is not hot whatever becomes of its name. Then it is deleted
-// (pager.c:2107-2110), without a directory sync, as SQLite deletes with
-// dirSync 0 unless synchronous=EXTRA: a name that comes back after a power
-// loss names a journal of zeros. A failed delete is not an error for the
-// same reason.
-func (p *pager) finalizeCreationJournal(jf fileHandle) error {
-	_, err := jf.WriteAt(make([]byte, creationJournalHdrSize), 0)
-	if err == nil {
-		err = fdatasync(jf)
-	}
-	if cerr := jf.Close(); err == nil {
-		err = cerr
-	}
+// openCreationJournal is step 1 of the creation: the journal is open and
+// holds its header. pager_open_journal opens the journal with the create flag
+// (SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_MAIN_JOURNAL,
+// pager.c:5855-5863), which makes unixOpen set UNIXFILE_DIRSYNC on the
+// descriptor (os_unix.c:6569-6573, 6777), and writes the header
+// (writeJournalHdr, at pager.c:5910).
+func (p *pager) openCreationJournal() (*creationJournal, error) {
+	name := p.path + creationJournalSuffix
+	f, err := osOpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 	if err != nil {
-		return fmt.Errorf("btree: finalize the creation journal: %w", err)
+		return nil, fmt.Errorf("btree: open the creation journal: %w", err)
 	}
+	j := &creationJournal{f: f, name: name}
+	j.dirSync.set()
 	if h := testOpenStageHook; h != nil {
-		h(p, "journal-finalized")
+		h(p, "journal-opened")
 	}
-	_ = osRemove(p.path + creationJournalSuffix)
+	if _, err := f.WriteAt(creationJournalHdr(p.pageSize), 0); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("btree: write the creation journal: %w", err)
+	}
+	return j, nil
+}
+
+// sync is step 2: the journal is synced before page 1 is written to the
+// database file, as syncJournal syncs it before any page of the transaction
+// is (pager.c:4286-4392, called at pager.c:6612). It is the descriptor's first
+// sync, so the directory is synced after it (dirSync).
+func (j *creationJournal) sync() error {
+	if err := j.dirSync.sync(j.f, j.name); err != nil {
+		return fmt.Errorf("btree: sync the creation journal: %w", err)
+	}
 	return nil
 }
 
-// testSyncDirHook runs at the start of every syncDir with its argument. Nil
-// outside tests.
+// abandon closes the journal of a creation that failed before its commit
+// point. The file stays: hot, if its header reached it, and then the next
+// open rolls back whatever the creation put in the database file.
+func (j *creationJournal) abandon() {
+	_ = j.f.Close()
+}
+
+// commit is step 5, the creation's commit point: the journal is closed and
+// deleted, as pager_end_transaction finalizes a journal in
+// journal_mode=DELETE (pager.c:2100-2110). A delete that fails fails the
+// creation, which then is not committed, as the delete's error is the
+// commit's there (pager.c:2109).
+//
+// The delete syncs no directory, as SQLite deletes with pPager->extraSync
+// (pager.c:2109), which is 1 only for synchronous=EXTRA (pager.c:3625-3637).
+// Until the directory is synced again the name can come back after a power
+// loss, hot, beside the committed page 1; the open after the power loss then
+// rolls the creation back and creates the database again, which loses
+// nothing, as long as nothing was committed to the database. What is
+// committed to it goes to the WAL, and a commit is durable only after a sync
+// of the WAL, which is the first sync of some WAL descriptor or comes after
+// one. Every WAL descriptor is opened after this delete, since a creation runs
+// only while no process is attached to the database, and with the create
+// flag (wal.open, as sqlite3WalOpen at wal.c:1719-1720), so its first sync
+// also syncs this directory (dirSync, os_unix.c:6777, 3936-3954) and makes
+// the delete durable first. SQLite relies on the same sync: its creation of a
+// WAL database commits by a delete with no directory sync, and its WAL
+// descriptors carry the same flag.
+func (j *creationJournal) commit(p *pager) error {
+	_ = j.f.Close()
+	if err := osRemove(j.name); err != nil {
+		return fmt.Errorf("btree: commit the creation of the database: delete its journal: %w", err)
+	}
+	if h := testOpenStageHook; h != nil {
+		h(p, "journal-deleted")
+	}
+	return nil
+}
+
+// testSyncDirHook runs after every directory fsync that succeeded
+// (syncdir_unix.go), with the path of the file whose directory was synced.
+// Outside Unix no directory is synced and it never runs. Nil outside tests.
 var testSyncDirHook func(path string)
