@@ -6,7 +6,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/parser"
@@ -560,16 +559,26 @@ func TestModifierAddToSet_Modify(t *testing.T) {
 
 func BenchmarkModifier(b *testing.B) {
 	bench := func(b *testing.B, query string) {
-		doc := fastjson.MustParse(`{"a":2,"b":[3,2,1],"c":"test"}`)
-		a := &anyenc.Arena{}
-		d, err := parser.Parse(doc)
 		modifier, err := ParseModifier(query)
 		require.NoError(b, err)
+		// Every iteration modifies a document of its own, parsed outside the
+		// timer a batch at a time: a modifier that changes the document it is
+		// given would otherwise give each later iteration a different one.
+		const src = `{"a":2,"b":[3,2,1],"c":"test"}`
+		docs := make([]*anyenc.Value, 1024)
+		a := &anyenc.Arena{}
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
+			if i%len(docs) == 0 {
+				b.StopTimer()
+				for j := range docs {
+					docs[j] = anyenc.MustParseJson(src)
+				}
+				b.StartTimer()
+			}
 			a.Reset()
-			_, _, err := modifier.Modify(a, d)
+			_, _, err := modifier.Modify(a, docs[i%len(docs)])
 			require.NoError(b, err)
 		}
 	}
