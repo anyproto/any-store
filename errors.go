@@ -238,11 +238,12 @@ var (
 	// key/value pair a write stores, not to the document as a whole:
 	//
 	//   - the document itself: its encoded id as the key and its body as the value, the body
-	//     compressed unless compression is off, does not shrink it, or its plain encoding is over
-	//     1 GiB (it is then stored, and measured, plain);
-	//   - each index entry: the encoded indexed values followed by the id as the key, and a
-	//     one-byte value. An index key of exactly 1 GiB is therefore over the limit by that byte
-	//     and reported with this error, not with ErrKeyTooLarge.
+	//     compressed unless compression is off or does not shrink it. A body whose plain
+	//     encoding is over 1 GiB is kept plain, so it is over the limit and refused;
+	//   - each range-index entry: the encoded indexed values followed by the id as the key, and
+	//     a one-byte value. A range-index key of exactly 1 GiB is therefore over the limit by
+	//     that byte and reported with this error, not with ErrKeyTooLarge;
+	//   - each record a full-text or vector index stores, its key and its value.
 	//
 	// Nothing of the record is written, and the operation is rolled back like after any other
 	// failed write. Without the limit the record would be stored and every later read of it
