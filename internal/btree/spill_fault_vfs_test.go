@@ -693,12 +693,16 @@ func openHaltDB(t *testing.T, prep func(t *testing.T, db *DB)) (*DB, *spillFault
 // on another tree does not go on stepping through the leaf it pins. Each
 // method of a write transaction and of its cursors that passes an error to
 // the halt itself (ReadTx.halt, Cursor.halt, Cursor.fail) is the failing
-// call in one case, at one of its error exits; a saved cursor's restore,
-// which every move and read of it begins with, has a case of its own.
-// Methods that only return the error of one of these (Skip, SkipBackward,
-// SeekExact, AppendValueByKey, CountUntil, the DB namespace calls behind
-// the WriteTx ones) have none. Savepoint and ReleaseSavepoint fetch no page
-// and cannot meet a spill.
+// call in one case, at one of its error exits (Get, SeekKey and Count
+// reach AppendValue, AppendSeekKey and CountContext; the WriteTx namespace
+// calls reach the DB ones). RollbackToSavepoint is the exception: it meets
+// the spill only in the save of a cursor, whose Key halts first, and its
+// own exits return the error only as a later call does. A saved cursor's
+// restore, which every move and read of it begins with, has a case of its
+// own. Methods that only return the error of one of these (Skip,
+// SkipBackward, SeekExact, AppendValueByKey, CountUntil) have none.
+// Savepoint and ReleaseSavepoint fetch no page and cannot meet a spill.
+// TestSpillFault_LaterCallEndsCursors has the later calls.
 func TestSpillFault_FailedCallEndsCursors(t *testing.T) {
 	longName := strings.Repeat("n", 3*4096)
 	// longNS is a namespace whose catalog key spills: its lookup reads the
@@ -807,7 +811,8 @@ func TestSpillFault_FailedCallEndsCursors(t *testing.T) {
 		}},
 		{"RollbackToSavepoint", nil, func(t *testing.T, tx *WriteTx) func() error {
 			// The rollback saves the cursors first, and the save of one on
-			// a key that spills reads the key's overflow chain.
+			// a key that spills reads the key's overflow chain: Cursor.Key
+			// halts.
 			c := tx.NewCursor(mustNS(t, tx, "c"))
 			t.Cleanup(c.Close)
 			require.NoError(t, c.SeekExact(haltBigKey))
@@ -893,6 +898,65 @@ func TestSpillFault_FailedCallEndsCursors(t *testing.T) {
 			f.disarm()
 			require.NoError(t, db.IntegrityCheck())
 			require.Equal(t, 20, countKeys(t, db, "b"))
+		})
+	}
+}
+
+// A later call that returns the error of the failed spill ends the
+// transaction's cursors as well, a cursor opened since the failure
+// included, as every SQLite statement that ends in an error halts. Each
+// case is a call that returns the error without a fetch: the savepoint
+// calls, which test the state first, and the calls of a cursor the first
+// halt faulted, which report the error they were faulted with (First, Last
+// and Seek test the fault themselves; every other move and read begins with
+// the restore, as Next does). A cursor opened since has no position, and
+// a fetch would fail: until a halt ends it, its Next reports the end of
+// the tree. RollbackToSavepoint's case covers its own exit, which no call
+// of TestSpillFault_FailedCallEndsCursors reaches first.
+func TestSpillFault_LaterCallEndsCursors(t *testing.T) {
+	cases := []struct {
+		name string
+		call func(tx *WriteTx, sp int, faulted *Cursor) error
+	}{
+		{"Savepoint", func(tx *WriteTx, _ int, _ *Cursor) error { _, err := tx.Savepoint(); return err }},
+		{"ReleaseSavepoint", func(tx *WriteTx, sp int, _ *Cursor) error { return tx.ReleaseSavepoint(sp) }},
+		{"RollbackToSavepoint", func(tx *WriteTx, sp int, _ *Cursor) error { return tx.RollbackToSavepoint(sp) }},
+		{"faulted Cursor.First", func(_ *WriteTx, _ int, c *Cursor) error { return c.First() }},
+		{"faulted Cursor.Last", func(_ *WriteTx, _ int, c *Cursor) error { return c.Last() }},
+		{"faulted Cursor.Seek", func(_ *WriteTx, _ int, c *Cursor) error { return c.Seek(closeRescueKey(1)) }},
+		{"faulted Cursor.Next", func(_ *WriteTx, _ int, c *Cursor) error { return c.Next() }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, f := openHaltDB(t, nil)
+			p := db.pager
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			defer func() { _ = tx.Rollback() }()
+			nsA := mustNS(t, tx, "a")
+			nsB := mustNS(t, tx, "b")
+			sp, err := tx.Savepoint()
+			require.NoError(t, err)
+			cur := tx.NewCursor(nsB)
+			defer cur.Close()
+			require.NoError(t, cur.First())
+			fillWriterCacheDirty(t, p)
+
+			f.arm(1, false, false)
+			require.ErrorIs(t, tx.Put(nsA, closeRescueKey(closeRescueRows-1), []byte("x")), errInjectedSpillIO)
+			require.Equal(t, int64(1), f.fired.Load(), "the write met the fault")
+			require.Equal(t, int32(pagerError), p.state.Load())
+			require.Equal(t, cursorFault, cur.state, "the failed write did not end the cursor")
+
+			since := tx.NewCursor(nsB)
+			defer since.Close()
+			require.ErrorIs(t, tc.call(tx, sp, cur), errInjectedSpillIO)
+			assert.Equal(t, cursorFault, since.state, "the call did not end the cursor opened since the failure")
+			assert.ErrorIs(t, since.Next(), errInjectedSpillIO, "the cursor opened since the failure reports the end of its tree")
+
+			require.NoError(t, tx.Rollback())
+			f.disarm()
+			require.NoError(t, db.IntegrityCheck())
 		})
 	}
 }
