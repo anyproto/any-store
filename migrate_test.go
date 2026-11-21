@@ -791,7 +791,7 @@ func TestCopyToLatestFormat_Refusals(t *testing.T) {
 		require.Error(t, err)
 		assertNoCopy(t, dstPath)
 	})
-	for _, suffix := range []string{"", "-wal", "-wal-shm", ".lock"} {
+	for _, suffix := range []string{"", "-wal", "-wal-shm", ".lock", "-journal"} {
 		t.Run("the destination exists: "+suffix, func(t *testing.T) {
 			dstPath := filepath.Join(t.TempDir(), "copy.db")
 			require.NoError(t, os.WriteFile(dstPath+suffix, []byte("keep"), 0o644))
@@ -807,7 +807,7 @@ func TestCopyToLatestFormat_Refusals(t *testing.T) {
 	// case: a database published under one would be locked, or removed as
 	// a killed copy's leftover, by a copy to the name before the suffix.
 	for _, suffix := range []string{".copy-lock", ".copy-staging", ".copy-staging-wal", ".copy-staging-wal-shm",
-		".copy-staging.lock", ".COPY-LOCK", ".Copy-Staging", ".copy-\u017ftaging-WAL"} {
+		".copy-staging.lock", ".copy-staging-journal", ".COPY-LOCK", ".Copy-Staging", ".copy-\u017ftaging-WAL"} {
 		t.Run("the destination is a reserved name: "+suffix, func(t *testing.T) {
 			dstPath := filepath.Join(t.TempDir(), "copy.db")
 			_, err := CopyToLatestFormat(ctx, src, dstPath+suffix, nil)
@@ -1154,7 +1154,7 @@ func TestCopyToLatestFormat_StaleStagingRemoved(t *testing.T) {
 	dstDir := t.TempDir()
 	dstPath := filepath.Join(dstDir, "copy.db")
 	for _, name := range []string{"copy.db.copy-lock", "copy.db.copy-staging", "copy.db.copy-staging-wal",
-		"copy.db.copy-staging-wal-shm", "copy.db.copy-staging.lock"} {
+		"copy.db.copy-staging-wal-shm", "copy.db.copy-staging.lock", "copy.db.copy-staging-journal"} {
 		require.NoError(t, os.WriteFile(filepath.Join(dstDir, name), []byte("left by a killed copy"), 0o644))
 	}
 	// Not names of a copy to copy.db: they stay.
@@ -1248,7 +1248,8 @@ func TestCopyToLatestFormat_ClosedSource(t *testing.T) {
 // beside the destination is refused before anything is created or removed:
 // the copy would remove the file as a killed copy's staging file, with its
 // log and the commits not yet checkpointed out of it, or lock it as its
-// lock file. A copy to x+"-wal", x+"-wal-shm" or x+".lock" holds x's copy
+// lock file, or take it for the creation journal of the copy it creates. A
+// copy to x+"-wal", x+"-wal-shm", x+".lock" or x+"-journal" holds x's copy
 // lock too, so a source at x+".copy-lock" is refused for those as well. The
 // files are compared by identity, so another spelling of the destination is
 // refused too: a relative one, one through a symbolic link to the
@@ -1264,7 +1265,8 @@ func TestCopyToLatestFormat_SourceUnderReservedName(t *testing.T) {
 		{".copy-staging-wal", []string{"x"}},
 		{".copy-staging-wal-shm", []string{"x"}},
 		{".copy-staging.lock", []string{"x"}},
-		{".copy-lock", []string{"x", "x-wal", "x-wal-shm", "x.lock"}},
+		{".copy-staging-journal", []string{"x"}},
+		{".copy-lock", []string{"x", "x-wal", "x-wal-shm", "x.lock", "x-journal"}},
 	} {
 		suffix := tc.suffix
 		t.Run(suffix, func(t *testing.T) {
@@ -1345,6 +1347,7 @@ func TestCopyToLatestFormat_SourceThroughLinkAndDotDot(t *testing.T) {
 		{".copy-staging-wal", []string{"x"}},
 		{".copy-staging-wal-shm", []string{"x"}},
 		{".copy-staging.lock", []string{"x"}},
+		{".copy-staging-journal", []string{"x"}},
 		{".copy-lock", []string{"x", "x-wal"}},
 	} {
 		suffix := tc.suffix
@@ -1473,7 +1476,7 @@ func TestCopyToLatestFormat_SidecarAppearsBeforePublication(t *testing.T) {
 		return prevRename(oldpath, newpath)
 	}
 	defer func() { osRename = prevRename }()
-	for _, suffix := range []string{"", "-wal", "-wal-shm", ".lock"} {
+	for _, suffix := range []string{"", "-wal", "-wal-shm", ".lock", "-journal"} {
 		t.Run("appears: "+suffix, func(t *testing.T) {
 			dstPath := filepath.Join(t.TempDir(), "copy.db")
 			testHookBeforePublish = func(string) {
@@ -1491,9 +1494,10 @@ func TestCopyToLatestFormat_SidecarAppearsBeforePublication(t *testing.T) {
 }
 
 // Two copies whose destinations overlap, one at p and one at a name the
-// database at p keeps beside it (p+"-wal", p+"-wal-shm", p+".lock", in any
-// case): published both, the open of p would take the other copy for its
-// log, its log's index or its sentinel, and truncate or replace it. Their
+// database at p keeps beside it (p+"-wal", p+"-wal-shm", p+".lock",
+// p+"-journal", in any case): published both, the open of p would take the
+// other copy for its log, its log's index, its sentinel or its creation
+// journal, and truncate or replace it. Their
 // copy locks are different files, so a copy to such a name holds p's copy
 // lock too, and the two exclude each other however they interleave. A
 // chain needs no more: p+"-wal-wal" is p+"-wal"'s log, and meets it at
@@ -1519,7 +1523,7 @@ func TestCopyToLatestFormat_OverlappingDestinations(t *testing.T) {
 
 	// Each pair is a database's name and a name it keeps beside it, as
 	// suffixes of p.
-	for _, pair := range [][2]string{{"", "-wal"}, {"", "-wal-shm"}, {"", ".lock"}, {"", "-WAL"}, {"-wal", "-wal-wal"}} {
+	for _, pair := range [][2]string{{"", "-wal"}, {"", "-wal-shm"}, {"", ".lock"}, {"", "-journal"}, {"", "-WAL"}, {"-wal", "-wal-wal"}} {
 		for _, sidecarFirst := range []bool{false, true} {
 			first, second := "p"+pair[0], "p"+pair[1]
 			if sidecarFirst {
@@ -1597,7 +1601,7 @@ func TestCopyToLatestFormat_OverlappingDestinations(t *testing.T) {
 		p := filepath.Join(dir, "copy.db")
 		_, err := CopyToLatestFormat(ctx, src, p, nil)
 		require.NoError(t, err)
-		for _, suffix := range []string{"-wal", "-wal-shm", ".lock"} {
+		for _, suffix := range []string{"-wal", "-wal-shm", ".lock", "-journal"} {
 			_, err = CopyToLatestFormat(ctx, src, p+suffix, nil)
 			require.ErrorIs(t, err, ErrDestinationExists, suffix)
 		}
@@ -1624,6 +1628,7 @@ func TestCopyLockNames(t *testing.T) {
 		{"p-wal", want("p", "p-wal")},
 		{"p-wal-shm", want("p", "p-wal-shm")},
 		{"p.lock", want("p", "p.lock")},
+		{"p-journal", want("p", "p-journal")},
 		{"p-WAL", want("p", "p-WAL")},
 		{"p.loc\u212a", want("p", "p.loc\u212a")},
 		{"p-wal-wal", want("p-wal", "p-wal-wal")},
