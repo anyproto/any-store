@@ -1128,7 +1128,7 @@ func (p *pager) beginReadHdrBusy(busy *beginBusy) (hdr WalIndexHdr, maxFrame, mi
 	// spill, failed or not, never publishes its frames as a commit. In
 	// SQLite a connection with a private cache has its own Pager
 	// (pager.c:1947-1960 sets its errCode), and no other connection meets
-	// its error state (shared caches: docs/btree/NOTES.md#drift-2026-11-19-1-the-error-state-of-a-failed-spill).
+	// its error state (shared caches: docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill).
 	// The change state before the snapshot is taken: see wal.noteSnapshot.
 	// ~ pagerBeginReadTransaction (pager.c:3246-3267): every begin of every
 	// kind passes here, so none can take a snapshot holding another
@@ -2691,7 +2691,7 @@ func (p *pager) readWalFrameDataRaw(frame uint32, buf []byte) error {
 // Modeled after SQLite's pagerStress() (pager.c:4609-4681).
 // DRIFT: pagerStress guards pgno==1; C relies on page-1 staying pinned (never a victim) See docs/btree/NOTES.md#old-drift-pagerstress-page1-exclusion
 // DRIFT: pagerStress spills only for pagerWriter without closeInvalidated, and writeFrames re-checks under the WAL mutex; C needs no test, since a close cannot end its transaction under a statement See docs/btree/NOTES.md#drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer
-// DRIFT: any error of the spill's write puts the transaction in the error state, not only I/O and disk-full; the rollback cleans up, C's pager_unlock does once no page is referenced See docs/btree/NOTES.md#drift-2026-11-19-1-the-error-state-of-a-failed-spill
+// DRIFT: any error of the spill's write puts the transaction in the error state, not only I/O and disk-full; the rollback cleans up, C's pager_unlock does once no page is referenced See docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill
 func (p *pager) pagerStress(pg *page) error {
 	st := pagerState(p.state.Load())
 
@@ -2868,7 +2868,7 @@ var (
 	testCommitPostPublishHook func()
 )
 
-// DRIFT: the commit of a transaction in the error state returns the error and rolls the transaction back; C's sqlite3PagerCommitPhaseOne returns it and leaves the transaction to the VDBE's rollback See docs/btree/NOTES.md#drift-2026-11-19-1-the-error-state-of-a-failed-spill
+// DRIFT: the commit of a transaction in the error state returns the error and rolls the transaction back; C's sqlite3PagerCommitPhaseOne returns it and leaves the transaction to the VDBE's rollback See docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill
 func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC uint32, err error) {
 	p.writerOpMu.Lock()
 	defer p.writerOpMu.Unlock()
@@ -3081,7 +3081,7 @@ func (p *pager) unwindWriter() {
 
 // rollbackLocked is the inner rollback implementation. Caller must hold writerOpMu.
 // DRIFT: no sqlite3WalUndo; rollback resets wal.nFrame to savedWalFrame + rollbackToFrame trims pages See docs/btree/NOTES.md#old-drift-wal-undo-via-pager-rollback
-// DRIFT: a rollback in the error state cleans up and clears the error; C's sqlite3PagerRollback returns errCode and leaves the cleanup to pager_unlock See docs/btree/NOTES.md#drift-2026-11-19-1-the-error-state-of-a-failed-spill
+// DRIFT: a rollback in the error state cleans up and clears the error; C's sqlite3PagerRollback returns errCode and leaves the cleanup to pager_unlock See docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill
 func (p *pager) rollbackLocked() error {
 	st := pagerState(p.state.Load())
 	if st != pagerWriter && st != pagerError {
@@ -3312,7 +3312,7 @@ func (p *pager) freeSavepointPageBuffers(from, to int) {
 
 // savepoint creates a new savepoint and returns its ID.
 // Page copies are saved lazily in getWritablePage when pages are actually modified.
-// DRIFT: opening a savepoint in the error state returns the error; C's sqlite3PagerOpenSavepoint does not test errCode See docs/btree/NOTES.md#drift-2026-11-19-1-the-error-state-of-a-failed-spill
+// DRIFT: opening a savepoint in the error state returns the error; C's sqlite3PagerOpenSavepoint does not test errCode See docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill
 func (p *pager) savepoint() (int, error) {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return 0, p.writeStateErr()

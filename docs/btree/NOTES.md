@@ -1299,8 +1299,8 @@ comments in source):
    ends the transaction here (`WriteTx.Commit` marks it closed before the
    pager runs), no b-tree operation is running, and no later rollback call is
    guaranteed to release the WAL write lock.
-   A failed spill is not handled this way since 2026-11-19: see
-   [the error state of a failed spill](#drift-2026-11-19-1-the-error-state-of-a-failed-spill).
+   A failed spill is not handled this way since 2026-11-21: see
+   [the error state of a failed spill](#drift-2026-11-21-13-the-error-state-of-a-failed-spill).
 
 <a id="old-drift-pagerstress-page1-exclusion"></a>
 2. **Page-1 explicit exclusion** (`pager.go:pagerStress` AND
@@ -1322,11 +1322,11 @@ comments in source):
    `TestBackupWriterCacheBounded`.
 
 <a id="old-drift-pcache-create-drops-xstress-error"></a>
-3. **Resolved (2026-11-19)** — `pcache.create()` returns the xStress error and creates no
+3. **Resolved (2026-11-21)** — `pcache.create()` returns the xStress error and creates no
    page, as `sqlite3PcacheFetchStress` does with an error other than `SQLITE_BUSY`
    (`pcache.c:483-485`; the spill here returns no busy error), and every caller gives the
    fetch up (`getPageNormal`, `pager.c:5555-5556`); see
-   [the error state of a failed spill](#drift-2026-11-19-1-the-error-state-of-a-failed-spill).
+   [the error state of a failed spill](#drift-2026-11-21-13-the-error-state-of-a-failed-spill).
    Before, `create()` had no error return and handed out a page after a failed spill, while
    `pagerStress` had already run `pagerError`'s eager cleanup. The entry called that harmless.
    It was not: the purge freed the buffers of pages the running b-tree operation still held
@@ -3414,14 +3414,14 @@ SQLite's `pagerStress` (`pager.c:4609-4680`) has no test of the pager's state: i
 
 The lock order is `writerOpMu` → `w.mu`, as a commit's `writeFrames` takes them; under `w.mu` the rescue takes only the wal-index's own mutex and the shm's internal mutexes, and the shm unlock does not wait. A refused spill leaves the page dirty and the cache grows past its limit, as under `doNotSpill`. Regression tests: `TestCloseRescue_AbandonedWriterDoesNotSpill`, `TestCloseRescue_SpillSparesPeerWriterFrames` (step 1); `TestCloseRescue_SpillPastGuardWritesNothing`, `TestCloseRescue_SpillPastGuardSparesPeerWriterFrames` (step 2: `testStressGuardPassedHook` runs the rescue once a spill has passed step 1).
 
-<a id="drift-2026-11-19-1-the-error-state-of-a-failed-spill"></a>
+<a id="drift-2026-11-21-13-the-error-state-of-a-failed-spill"></a>
 ### Drift: The Error State Of A Failed Spill Is Cleaned Up By The Rollback, And Only The Writer Sees It
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `pcache.go:*pcache.create`, `pager.go:*pager.pagerStress`, `pager.go:*pager.getPageWriter`, `pager.go:*pager.writeStateErr`, `pager.go:*pager.commit`, `pager.go:*pager.rollbackLocked`, `pager.go:*pager.savepoint`, `pager.go:*pager.beginReadHdrBusy`, `db.go:*DB.Close`.
 
 SQLite: `sqlite3PcacheFetchStress` returns an error of the stress callback other than `SQLITE_BUSY` without creating the page (`pcache.c:483-485`; a busy one is dropped and the hard fetch retried, line 488), and `getPageNormal` gives the fetch up (`goto pager_acquire_err`, `pager.c:5555-5556`), so the b-tree operation that asked for the page fails with the error. `pagerStress` ends in `pager_error` (`pager.c:4680`), which for `SQLITE_FULL` and `SQLITE_IOERR` stores `errCode`, sets `PAGER_ERROR` and installs `getPageError` (`pager.c:1947-1960`): nothing is discarded while pages are referenced. From then on every page fetch returns `errCode` (`getPageError`, `pager.c:5710-5722`), as do the release and the rollback of a savepoint (`sqlite3PagerSavepoint`, `pager.c:7008`; opening one, `sqlite3PagerOpenSavepoint`, does not test it, `pager.c:6965-6974`), and `sqlite3PagerRollback` returns it without rolling anything back (`pager.c:6777`). The cleanup is `pager_unlock`'s, reached through `pagerUnlockIfUnused` when the last page reference is dropped (`pager.c:5471-5476`): it ends the WAL write transaction, discards the whole cache (`pager_reset`), clears `errCode`, puts the normal getter back and returns to `PAGER_OPEN` (`pager.c:1853-1864`, `1904-1920`). The VDBE rolls the transaction back after such a statement, with a trip code that ends every cursor (`sqlite3VdbeHalt`, `vdbeaux.c:3358-3384` for an I/O error, `3459-3472` when the statement rollback a full disk asks for fails; `sqlite3RollbackAll` → `sqlite3BtreeRollback`, `btree.c:4532-4536`): no statement after it runs in the error state.
 
-Here, since 2026-11-19: `pcache.create` returns the spill's error and creates no page; `getPageWriter`, `getPageNoContent`, the `freePage` fallback and `rollbackToSavepoint` return it. A spill never returns a busy error: a busy lock in the log's restart means append (`restartLogLocked`, as `walRestartLog`, `wal.c:3889-3890`). `pagerStress` stores the error in `pager.errCode` and sets `pagerError`, and nothing else: the cache is left as it is under the running operation, the victim still dirty. Every page fetch of the writer returns `errCode` (`getPageWriter` tests it first, `getPageError`'s rule), a cached page's as much as one to be read, and so does every operation that tests for `pagerWriter` (`getWritablePage`, the allocation and free paths, the overflow writers, the savepoint operations, opening one included) through `writeStateErr`. The transaction cannot commit. What differs from SQLite:
+Here, since 2026-11-21: `pcache.create` returns the spill's error and creates no page; `getPageWriter`, `getPageNoContent`, the `freePage` fallback and `rollbackToSavepoint` return it. A spill never returns a busy error: a busy lock in the log's restart means append (`restartLogLocked`, as `walRestartLog`, `wal.c:3889-3890`). `pagerStress` stores the error in `pager.errCode` and sets `pagerError`, and nothing else: the cache is left as it is under the running operation, the victim still dirty. Every page fetch of the writer returns `errCode` (`getPageWriter` tests it first, `getPageError`'s rule), a cached page's as much as one to be read, and so does every operation that tests for `pagerWriter` (`getWritablePage`, the allocation and free paths, the overflow writers, the savepoint operations, opening one included) through `writeStateErr`. The transaction cannot commit. What differs from SQLite:
 
 1. **Who cleans up, and when.** The error state outlives the operation that met it, until the caller ends the transaction; SQLite's never outlives the statement. There is no "last reference dropped" event to hang `pager_unlock` on, so the cleanup is `rollbackLocked`'s: it ends the transaction's cursors with `errCode` (`tripCursors`, as the failed commit's `pagerError` does), discards every dirty page and clears the cache, rewinds the log and the wal-index to the transaction's base, restores the header, clears `errCode` and releases the WAL write lock. `WriteTx.Rollback` reaches it and returns nil, where `sqlite3PagerRollback` returns `errCode`. `pager.commit` in the error state returns `errCode` (as `sqlite3PagerCommitPhaseOne`, `pager.c:6480`) and runs the same rollback, because a failed commit ends the transaction here. `DB.Close` ends a transaction in the error state as it ends one in `pagerWriter` (`rollbackForClose`). Until one of the three runs, the write lock stays held, as for any open write transaction.
 2. **Every spill error.** Any error of the spill's `writeFrames` puts the transaction in the error state, not only the I/O and disk-full classes `pager_error` tests for: a wal-index error there leaves the log as unknown as a failed write does. `errWriteEndedByClose` stays a refused spill ([the live writer](#drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer)).
