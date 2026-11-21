@@ -2789,9 +2789,13 @@ sqlite3GlobalConfig.nPage<=0 )` setting `pPage = 0; szPage = 0;` (`malloc.c:165-
 n = 0;` and `if( n==0 ) sz = 0;` (`pcache1.c:274-275`) leave a cleared one with no slots. Every page
 buffer then comes from `sqlite3Malloc` (`pcache1Alloc`, `pcache1.c:344` and `361`), but the cleared
 configuration still counts: `sqlite3MallocInit` keeps `nPage`, and with `pPage==0`, `pcache1Init`
-sets `pcache1.nInitPage = sqlite3GlobalConfig.nPage;` (`pcache1.c:730-737`), so each cache's
-initial bulk allocation is sized from that count (`pcache1InitBulk`, `pcache1.c:303-311`: `nPage`
-pages, or `-1024*nPage` bytes for a negative count, at most the cache's own size; none for 0).
+sets `pcache1.nInitPage = sqlite3GlobalConfig.nPage;` when each cache has its own group
+(`pcache1.separateCache`, `pcache1.c:730-737`), so each cache's initial bulk allocation is sized
+from that count (`pcache1InitBulk`, `pcache1.c:303-311`: `nPage` pages, or `-1024*nPage` bytes for
+a negative count, at most the cache's own size; none for 0). With `pPage==0` the caches are
+separate in every build but one: `SQLITE_ENABLE_MEMORY_MANAGEMENT` sets `pcache1.separateCache =
+0;` (`pcache1.c:715-716`), and then `pcache1.nInitPage = 0;` (`pcache1.c:735-736`) and no cache
+makes a bulk allocation.
 
 Go's `pageSlab.Init` (behind `ConfigPageCache` and `anystore.InitPageBuffer`) keeps SQLite's rule
 for which arguments give slots: `slabUsable` requires `pageSize >= MinPageSize` (512) and
@@ -2802,8 +2806,8 @@ its own slot size, see drift-2026-06-25-22), and `nPages*pageSize` must fit an i
 arguments leave an initialized slab with no slots and slot size 0, which serves no request
 (`pageSlab.serves`), and `btree.Open` resolves `useSlab` to false for every database. Such a
 database runs as one that never opted in: its caches make the default initial bulk allocation, up
-to 20 pages (`pcache.initBulk`, `SQLITE_DEFAULT_PCACHE_INITSZ`), where C sizes it from the cleared
-configuration's `nPage`.
+to 20 pages (`pcache.initBulk`, `SQLITE_DEFAULT_PCACHE_INITSZ`), where C, with separate caches,
+sizes it from the cleared configuration's `nPage`.
 
 What diverges is the lifecycle. Go has no shutdown, and `Init` is first-call-wins: a
 double-checked `s.initialized` guard makes every later call a no-op, so the slab is configured once
