@@ -142,12 +142,15 @@ func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 	// header field, from the copied page 1: the next lockBtree reads byte
 	// 20 (btree.c:3384, 3417) and nothing else in the handle depends on it.
 	// Here the usable size and the codec that owns the reserved bytes are
-	// fixed at Open. A destination with fewer reserved bytes than the
+	// fixed at Open. A destination with more reserved bytes than the
 	// source's pages have would let its codec write a trailer over cell
-	// content; one with more would be read by the wrong layout after the
-	// header is reloaded. Refused before a page is written.
+	// content; one with fewer would be read by the wrong layout after the
+	// header is reloaded. The kinds of codec are compared as SQLCipher
+	// compares the two sides' keys at init, refusing a keyed database with
+	// a plaintext one (backup.c:155-176 in SQLCipher v4.14.0). Refused
+	// before a page is written.
 	// DRIFT: the destination must already have the source's reserved space and kind of codec; SQLite's adopts them with page 1. See docs/btree/NOTES.md#drift-2026-11-19-2-a-backup-destination-has-the-geometry-of-the-source-file
-	if dst.pager.usableSize() != src.pager.usableSize() || dst.IntegrityMode() != src.IntegrityMode() {
+	if dst.pager.usableSize() != src.pager.usableSize() || dst.codecKind() != src.codecKind() {
 		return nil, ErrBackupCodecMismatch
 	}
 
@@ -156,6 +159,22 @@ func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 		src:   src,
 		iNext: 1, // ~ backup.c:188
 	}, nil
+}
+
+// codecKind is the kind of page codec db has installed, as an IntegrityMode:
+// IntegrityNone for none, IntegrityChecksum, or IntegrityAEAD for an
+// encryption codec. It is what db's file is sealed with, not what db
+// verifies: an in-memory database opened with a key or a codec has the
+// encryption kind, as a keyed in-memory database has a key in SQLCipher.
+func (db *DB) codecKind() IntegrityMode {
+	switch db.pager.codec.(type) {
+	case nil:
+		return IntegrityNone
+	case *cksumCodec:
+		return IntegrityChecksum
+	default:
+		return IntegrityAEAD
+	}
 }
 
 // BackupDestinationOptions returns the Options to open the destination of a
@@ -186,7 +205,7 @@ func (db *DB) BackupDestinationOptions() Options {
 	opts.InMemory = false
 	opts.OnIntegrityError = nil
 	opts.PageSize = db.pager.pageSize
-	opts.Checksum = db.IntegrityMode() == IntegrityChecksum
+	opts.Checksum = db.codecKind() == IntegrityChecksum
 	// A file whose header never recorded a format is read as format 5.
 	if opts.SchemaFormat = db.SchemaFormat(); opts.SchemaFormat == 0 {
 		opts.SchemaFormat = 5
