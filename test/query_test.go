@@ -392,9 +392,10 @@ func TestQuery_EmptyLogicalArrayIsParseError(t *testing.T) {
 // conjunction of no equalities would have let a Delete empty the collection.
 // The verbs and Explain answer a filter that provably matches nothing
 // without planning it; a $match before a $lookup is planned (its
-// transaction must know the iterator), so it runs {"$all":[]}'s index bounds
-// through the planner with each index, next to a selective conjunct on the
-// same field too.
+// transaction must know the iterator), so its count comes from a plan built
+// with each index among the candidates, next to a selective conjunct on the
+// same field too. The test checks the count, not which access path the plan
+// takes.
 func TestQuery_AllWithEmptyArrayMatchesNothing(t *testing.T) {
 	for _, index := range []string{"", "tags", "sparse tags"} {
 		for _, filter := range []string{
