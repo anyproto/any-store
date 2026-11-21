@@ -4214,20 +4214,18 @@ func (c *Cursor) Key() ([]byte, error) {
 		return nil, ErrCorrupt
 	}
 
-	lim := c.bt.leafLimits()
 	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
 	if oerr != nil {
 		return nil, oerr
 	}
-	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), lim)
-	if cerr != nil {
-		return nil, cerr
-	}
-	if cell.overflowPg != 0 {
-		// Key may be partial — use leafFullKey to reconstruct
-		return leafFullKey(frame.pg.data, int(off), lim, c.bt.pager, c.bt.walMaxFrame, c.bt.cache)
-	}
-	return cell.key, nil
+	// Only the key is read, so only the key is bounded: leafFullKey, not
+	// the parse of the whole cell. A cell whose declared value length is
+	// over the file, over the record size limit by itself or with the
+	// key's, or any 64-bit value yields its key here as long as the key's
+	// layout is intact, and fails Value, as a SQLite table cursor reads the
+	// rowid of a row whose payload is corrupt (sqlite3BtreeIntegerKey
+	// returns the parsed nKey, btree.c:4917-4923).
+	return leafFullKey(frame.pg.data, int(off), c.bt.leafLimits(), c.bt.pager, c.bt.walMaxFrame, c.bt.cache)
 }
 
 // Value returns the current value.
