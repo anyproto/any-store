@@ -26,10 +26,11 @@ import (
 // lives in the caller's aeadScratch, and Decrypt reports an integrity
 // failure to the hook its caller passes in, the calling database's own
 // Options.OnIntegrityError. SQLCipher, too, reports a page it cannot
-// decrypt to the connection the call came from: each pager passes its own
+// decrypt to the pager the call came from: each pager passes its own
 // codec_ctx to every codec call (pPager->xCodec(pPager->pCodec, ...)), and
-// sqlite3Codec records the failure on that ctx and its pager
-// (sqlcipher_codec_ctx_set_error → sqlite3pager_error).
+// outside recovery mode sqlite3Codec records the failure on that ctx and
+// its pager (sqlcipher_codec_ctx_set_error → sqlite3pager_error;
+// sqlcipher.c:3287-3291).
 //
 // Overhead() bytes are reserved at the end of every page for the codec's
 // per-page metadata (IV/nonce, authentication tag, padding). The btree cell
@@ -88,11 +89,13 @@ func (h integrityHook) fire(pgno uint32, inner error) {
 // and an unlocked pool drawn from by two of them hands out the same nonce
 // twice under one key. Here it follows the rule the buffers above follow:
 // one owner, one goroutine at a time. SQLCipher keeps no shared nonce state
-// either: every connection builds its own codec_ctx from the key
-// (sqlcipher_codec_ctx_init), and sqlcipher_page_cipher writes reserve_sz
-// fresh random bytes into each page it encrypts, straight from the
-// provider's random function (for OpenSSL the process-wide RAND_bytes,
-// which SQLCipher calls under its own global SQLCIPHER_MUTEX_PROVIDER_RAND).
+// either: every pager gets its own codec_ctx built from the key
+// (sqlcipher_codec_ctx_init; connections that share a shared-cache pager
+// share its ctx, sqlcipher.c:3417-3435), and sqlcipher_page_cipher writes
+// reserve_sz fresh random bytes into each page it encrypts, straight from
+// the provider's random function (for OpenSSL the process-wide RAND_bytes,
+// which the default build calls under SQLCipher's own global
+// SQLCIPHER_MUTEX_PROVIDER_RAND, crypto_openssl.c:131).
 // The pool here is an unlocked batch in front of crypto/rand, so it takes
 // its caller's ownership instead of a lock. It is allocated on the first
 // Encrypt, so a scratch that only ever decrypts (every reader's) never
@@ -100,7 +103,7 @@ func (h integrityHook) fire(pgno uint32, inner error) {
 //
 // Not safe for concurrent use: each caller (the pager's writer side, the
 // WAL's frame writer, each per-reader-tx pcache) owns one instance, the way
-// each SQLCipher connection owns its codec_ctx and the page buffer in it.
+// each SQLCipher pager owns its codec_ctx and the page buffer in it.
 // Must not be copied: a copy made after the first Encrypt would share the
 // pool with the original (go vet's copylocks check reports copies).
 type aeadScratch struct {
@@ -229,9 +232,11 @@ const noncePoolSize = 4096
 // noncePool batches crypto/rand.Read syscalls behind a userspace buffer.
 //
 // NOT safe for concurrent use, and it takes no lock: each pool belongs to
-// one aeadScratch, whose owner encrypts from one goroutine at a time (the
-// pager's and the WAL's under the database's write lock). A pool must never
-// be reachable from a codec, which is shared (see aeadScratch).
+// one aeadScratch, whose owner encrypts from one goroutine at a time. The
+// WAL's frame writer draws under the database's write lock; the pager's
+// only draw is initNewDB's page-1 encrypt, inside Open, which has the pager
+// to itself then. A pool must never be reachable from a codec, which is
+// shared (see aeadScratch).
 type noncePool struct {
 	buf [noncePoolSize]byte
 	off int // position to read from; starts == len(buf) so first call triggers a refill

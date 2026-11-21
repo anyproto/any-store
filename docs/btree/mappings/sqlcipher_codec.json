@@ -21,7 +21,7 @@
   },
   "pager.c:413-422": {
     "code": [
-      "codec.go:162-218"
+      "codec.go:165-221"
     ],
     "note": "CODEC1 / CODEC2 macro definitions. SQLCipher uses these to in-place encrypt/decrypt page buffers in pager paths (return-and-bail or pass-through-if-no-codec). Go has the same passthrough semantics in encryptWith / decryptWith, plus the higher-level encryptPageWithCodec / decryptPageWithCodec that handle the page-1 plaintext-prefix carve-out. We don't use macros — Go's nil-codec branch in those helpers is the equivalent of the `#else` arm (`O = (char*)D`)."
   },
@@ -81,7 +81,7 @@
     "code": [
       "pager.go:499-511",
       "pager.go:524-537",
-      "codec.go:183-218",
+      "codec.go:186-221",
       "codec_cksum.go:69-107"
     ],
     "note": "sqlcipherPagerSetCodec / sqlcipherPagerGetCodec / sqlcipherPagerCodec — install/retrieve the codec, and the WAL-side helper that returns a freshly-encrypted page buffer. Go's installCodec attaches the codec to the pager (and propagates it to the wal). The fresh-encrypted-buffer helper sqlcipherPagerCodec(p) is replaced by encryptPage(scratch, src, pgno) / encryptPageWithCodec — call sites (wal.go writeFrames fresh-append + reuse paths, pager.go initNewDB for page 1) thread their own scratch buffers in instead of allocating a fresh buffer per call."

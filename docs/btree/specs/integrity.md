@@ -49,7 +49,7 @@ For every page in the file:
 
 ### Page-1 header gap (limitation)
 
-`encryptPageWithCodec` (`codec.go:183-201`) preserves the first 100
+`encryptPageWithCodec` (`codec.go:186-204`) preserves the first 100
 bytes of page 1 (the SQLite-format DB header) as a plaintext prefix
 and only passes `src[100:]` to the codec. So:
 
@@ -143,14 +143,17 @@ last. `installCodec` stores `Options.OnIntegrityError` on the pager
 - `cksumCodec.Decrypt` fires on XXH3 mismatch (regardless of
   verify-on-read state — the toggle suppresses only the error return).
 - `aesCodec.Decrypt` and `chachaCodec.Decrypt` fire on
-  `cipher.AEAD.Open` failure before returning `ErrPageIntegrity`.
+  `cipher.AEAD.Open` failure before returning `errAEADAuthFail`, which
+  wraps `ErrPageIntegrity` (match it with `errors.Is`).
 
 The `VerifyIntegrity` sweep also fires the pager's hook on detected
 checksum mismatches so subscribers see one signal regardless of code
-path. SQLCipher reports a page it cannot decrypt to the connection the
-call came from the same way: each pager passes its own `codec_ctx` to
-every codec call, and `sqlite3Codec` records the failure there and on
-that pager (`sqlcipher_codec_ctx_set_error` → `sqlite3pager_error`).
+path. SQLCipher reports a page it cannot decrypt to the pager the call
+came from the same way: each pager passes its own `codec_ctx` to every
+codec call (connections that share a shared-cache pager share its ctx),
+and outside recovery mode `sqlite3Codec` records the failure there and on
+that pager (`sqlcipher_codec_ctx_set_error` → `sqlite3pager_error`,
+`sqlcipher.c:3287-3291`).
 
 ## Verification flow
 
