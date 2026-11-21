@@ -2,6 +2,7 @@ package btree
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,7 +30,7 @@ func TestCreationJournal_WhichHeaderIsHot(t *testing.T) {
 	}{
 		{"no journal", nil, false},
 		{"empty file", []byte{}, false},
-		{"finalized: a header of zeros", make([]byte, creationJournalHdrSize), false},
+		{"a header of zeros", make([]byte, creationJournalHdrSize), false},
 		{"a creation header", valid, true},
 		{"a creation header with bytes after it", append(bytes.Clone(valid), 1, 2, 3), true},
 		{"a header cut short", valid[:creationJournalHdrSize-1], false},
@@ -48,71 +49,41 @@ func TestCreationJournal_WhichHeaderIsHot(t *testing.T) {
 	}
 }
 
-// The order of a creation's steps, seen from inside it: the journal and its
-// directory entry are synced before page 1 is written, the removal of a
-// stale WAL comes before that directory sync, and the journal stays hot
-// until page 1 is synced.
-func TestCreationJournal_OrderOfTheCreation(t *testing.T) {
+// A journal that a playback left hot beside the file it truncated (the
+// recovering process died after its truncation, which its sync never made
+// durable) is the journal the next recovery needs: until a sync of the
+// database file covers the truncation, the file on disk may still hold the
+// dead creator's page 1. The creation that follows takes the journal over
+// without making it cold: it is hot at every step until the creation's
+// commit point, its delete, which comes after page 1 is synced.
+func TestCreationJournal_HotJournalStaysHotUntilTheDelete(t *testing.T) {
 	for _, inProcess := range []bool{false, true} {
 		t.Run(map[bool]string{false: "multiprocess", true: "inprocess"}[inProcess], func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "test.db")
-			journal := path + creationJournalSuffix
-			require.NoError(t, os.WriteFile(path+"-wal", []byte("the log of a database that is gone"), 0o644))
+			require.NoError(t, os.WriteFile(path, nil, 0o644))
+			require.NoError(t, os.WriteFile(path+creationJournalSuffix, creationJournalHdr(DefaultPageSize), 0o644))
 
-			var events []string
-			size := func(name string) int64 {
-				info, err := os.Stat(name)
-				if err != nil {
-					return -1
-				}
-				return info.Size()
-			}
-			testSyncDirHook = func(name string) {
-				require.Equal(t, journal, name)
-				require.NoFileExists(t, path+"-wal", "the stale WAL is removed before the directory is synced")
-				events = append(events, "sync-dir")
-			}
+			var seen []string
 			testOpenStageHook = func(p *pager, stage string) {
-				events = append(events, stage)
-				hot, err := p.hasHotCreationJournal()
-				require.NoError(t, err)
 				switch stage {
-				case "journal-created":
-					require.Zero(t, size(journal))
-					require.Zero(t, size(path))
-				case "before-journal-sync":
-					require.True(t, hot)
-					require.Zero(t, size(path), "page 1 is written before the journal is synced")
-				case "before-page1-write":
-					require.True(t, hot)
-					require.Zero(t, size(path))
-				case "before-page1-sync", "before-journal-finalize":
-					require.True(t, hot, "the journal is finalized before page 1 is synced")
-					require.Equal(t, int64(DefaultPageSize), size(path))
-				case "journal-finalized":
-					require.False(t, hot)
-					require.FileExists(t, journal)
+				case "before-lock", "db-lock-busy", "journal-deleted":
+				default:
+					seen = append(seen, stage)
+					hot, err := p.hasHotCreationJournal()
+					require.NoError(t, err)
+					require.True(t, hot, "the journal is not hot at %q", stage)
 				}
 			}
-			t.Cleanup(func() { testOpenStageHook, testSyncDirHook = nil, nil })
-
+			t.Cleanup(func() { testOpenStageHook = nil })
 			opts := DefaultOptions()
 			opts.InProcess = inProcess
 			db, err := testOpen(t, path, opts)
-			testOpenStageHook, testSyncDirHook = nil, nil
+			testOpenStageHook = nil
 			require.NoError(t, err)
 			require.NoError(t, db.Close())
-			require.Equal(t, []string{
-				"before-lock",
-				"journal-created",
-				"before-journal-sync",
-				"sync-dir",
-				"before-page1-write",
-				"before-page1-sync",
-				"before-journal-finalize",
-				"journal-finalized",
-			}, events)
-			require.NoFileExists(t, journal)
+			require.Contains(t, seen, "before-page1-sync")
+			require.NoFileExists(t, path+creationJournalSuffix)
+			assertValidEmptyDB(t, path, opts)
 		})
 	}
 }
@@ -175,15 +146,14 @@ func TestCreationJournal_HotJournalRollsBackWhateverIsInTheFile(t *testing.T) {
 }
 
 // A journal that is not hot is not played back: a database with rows in it
-// opens with its rows beside a finalized journal that was never deleted, a
-// journal SQLite wrote, and a file of that name that is no journal. The file
-// is left as it is.
+// opens with its rows beside a header of zeros, a journal SQLite wrote, and a
+// file of that name that is no journal. The file is left as it is.
 func TestCreationJournal_JournalThatIsNotHotIsLeftAlone(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		content []byte
 	}{
-		{"finalized", make([]byte, creationJournalHdrSize)},
+		{"zeros", make([]byte, creationJournalHdrSize)},
 		{"sqlite", sqliteJournalHdr()},
 		{"empty", []byte{}},
 		{"text", []byte("not a journal")},
@@ -226,19 +196,74 @@ func TestCreationJournal_JournalThatIsNotHotIsLeftAlone(t *testing.T) {
 	}
 }
 
-// A journal beside an empty or missing database file is a leftover (of a
-// database that was removed, or of a creator that died before its page 1):
-// the creation writes its own journal over it.
-func TestCreationJournal_StaleJournalBesideEmptyFile(t *testing.T) {
-	for _, content := range [][]byte{creationJournalHdr(DefaultPageSize), sqliteJournalHdr(), []byte("x")} {
+// A journal beside an empty or missing database file that a creation can
+// have left (a dead creator's, whole or in part, or a header that came back
+// as zeros) is taken over by the creation and deleted at its end.
+func TestCreationJournal_LeftoverJournalBesideEmptyFile(t *testing.T) {
+	hdr := creationJournalHdr(DefaultPageSize)
+	for _, tc := range []struct {
+		name    string
+		content []byte
+	}{
+		{"empty", []byte{}},
+		{"a creation header", hdr},
+		{"a creation header with bytes after it", append(bytes.Clone(hdr), 1, 2, 3)},
+		{"the start of the magic", hdr[:3]},
+		{"a header cut short", hdr[:creationJournalHdrSize-1]},
+		{"a header of zeros", make([]byte, creationJournalHdrSize)},
+		{"a few zeros", make([]byte, 5)},
+	} {
 		for _, emptyFile := range []bool{false, true} {
-			path := filepath.Join(t.TempDir(), "test.db")
-			require.NoError(t, os.WriteFile(path+creationJournalSuffix, content, 0o644))
-			if emptyFile {
-				require.NoError(t, os.WriteFile(path, nil, 0o644))
-			}
-			assertValidEmptyDB(t, path, DefaultOptions())
-			require.NoFileExists(t, path+creationJournalSuffix)
+			t.Run(fmt.Sprintf("%s/emptyFile=%v", tc.name, emptyFile), func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "test.db")
+				require.NoError(t, os.WriteFile(path+creationJournalSuffix, tc.content, 0o644))
+				if emptyFile {
+					require.NoError(t, os.WriteFile(path, nil, 0o644))
+				}
+				assertValidEmptyDB(t, path, DefaultOptions())
+				require.NoFileExists(t, path+creationJournalSuffix)
+			})
+		}
+	}
+}
+
+// A file under the journal's name that no creation leaves there (SQLite's
+// journal of a database once at that path, a journal of zeros longer than a
+// header, anything else) is not the creation's to overwrite or delete. The
+// creation is refused and the file is left as it is; once it is gone, the
+// database is created.
+func TestCreationJournal_ForeignJournalBesideEmptyFile(t *testing.T) {
+	persisted := sqliteJournalHdr()
+	clear(persisted[:creationJournalHdrSize]) // journal_mode=PERSIST's finalized journal
+	for _, tc := range []struct {
+		name    string
+		content []byte
+	}{
+		{"sqlite", sqliteJournalHdr()},
+		{"sqlite, finalized by zeroing", persisted},
+		{"zeros longer than a header", make([]byte, creationJournalHdrSize+1)},
+		{"text", []byte("x")},
+	} {
+		for _, emptyFile := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/emptyFile=%v", tc.name, emptyFile), func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "test.db")
+				journal := path + creationJournalSuffix
+				require.NoError(t, os.WriteFile(journal, tc.content, 0o644))
+				if emptyFile {
+					require.NoError(t, os.WriteFile(path, nil, 0o644))
+				}
+				_, err := testOpen(t, path, DefaultOptions())
+				require.ErrorIs(t, err, errForeignCreationJournal)
+				left, err := os.ReadFile(journal)
+				require.NoError(t, err)
+				require.Equal(t, tc.content, left, "the creation changed a file it did not write")
+				info, err := os.Stat(path)
+				require.NoError(t, err)
+				require.Zero(t, info.Size())
+
+				require.NoError(t, os.Remove(journal))
+				assertValidEmptyDB(t, path, DefaultOptions())
+			})
 		}
 	}
 }

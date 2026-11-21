@@ -902,10 +902,12 @@ var testOpenAfterWALOpenHook func(p *pager)
 
 // testOpenStageHook runs at named points of a file-backed open, so a test
 // can hold or kill a process there: "before-lock" (nothing opened or locked
-// yet; Open has made its first, unlocked read of the header), and the
-// points of a creation in order: "journal-playback" (a dead creator's file
-// is about to be truncated), "journal-opened" (the journal is open and
-// empty), "before-journal-sync" (its header is written),
+// yet; Open has made its first, unlocked read of the header);
+// "db-lock-busy" (a request for the shared DB-file lock was refused, and
+// the open waits to ask again); and the points of a creation in order:
+// "journal-playback" (a dead creator's file is about to be truncated),
+// "journal-opened" (the journal is open, holding what the open found under
+// its name), "before-journal-sync" (its header is written),
 // "before-page1-write" (the journal and its directory are synced),
 // "before-page1-sync", "before-journal-delete" (page 1 is synced) and
 // "journal-deleted" (the creation is committed). Nil outside tests.
@@ -999,6 +1001,9 @@ func (p *pager) lockDBShared(f fileHandle) error {
 		}
 		if attempt == 99 {
 			return fmt.Errorf("btree: DB-file lock still busy after retries (peer mid-close?)")
+		}
+		if h := testOpenStageHook; h != nil {
+			h(p, "db-lock-busy")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

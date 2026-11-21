@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -523,7 +524,7 @@ func creationStagesSeen(t *testing.T) (seen *[]string, stop func()) {
 	t.Helper()
 	seen = new([]string)
 	testOpenStageHook = func(_ *pager, stage string) {
-		if stage != "before-lock" {
+		if stage != "before-lock" && stage != "db-lock-busy" {
 			*seen = append(*seen, stage)
 		}
 	}
@@ -557,11 +558,11 @@ func killedCreatorChild(t *testing.T) bool {
 //   - killed before page 1 is written, the creator leaves an empty file, and
 //     the opener creates the database;
 //   - killed with page 1 in the file and the creation not committed (before
-//     the page's sync, or after it and before the journal is finalized), it
+//     the page's sync, or after it and before the journal is deleted), it
 //     leaves a hot journal: the opener rolls the file back to nothing and
 //     creates the database itself;
-//   - killed after the commit point, it leaves a database, and the opener
-//     opens it.
+//   - killed after the commit point, the journal's delete, it leaves a
+//     database, and the opener opens it.
 //
 // Without the journal an opener took the dead creator's page 1 as it found
 // it, synced or not, and could acknowledge a synced commit to the WAL on top
@@ -574,15 +575,16 @@ func TestCreationJournal_CreatorKilled(t *testing.T) {
 	for _, tc := range []struct {
 		at         string
 		page1      bool // the dead creator's page 1 is in the file
+		journal    bool // the dead creator's journal is beside it
 		rolledBack bool // the opener rolls it back
 		creates    bool // the opener creates the database
 	}{
-		{at: "journal-created", creates: true},
-		{at: "before-journal-sync", creates: true},
-		{at: "before-page1-write", creates: true},
-		{at: "before-page1-sync", page1: true, rolledBack: true, creates: true},
-		{at: "before-journal-finalize", page1: true, rolledBack: true, creates: true},
-		{at: "journal-finalized", page1: true},
+		{at: "journal-opened", journal: true, creates: true},
+		{at: "before-journal-sync", journal: true, creates: true},
+		{at: "before-page1-write", journal: true, creates: true},
+		{at: "before-page1-sync", page1: true, journal: true, rolledBack: true, creates: true},
+		{at: "before-journal-delete", page1: true, journal: true, rolledBack: true, creates: true},
+		{at: "journal-deleted", page1: true},
 	} {
 		for _, pass := range []string{"", "correct horse battery staple"} {
 			name := tc.at + "-plain"
@@ -604,7 +606,11 @@ func TestCreationJournal_CreatorKilled(t *testing.T) {
 				} else {
 					require.Zero(t, info.Size(), "setup: the dead creator wrote no page 1")
 				}
-				require.FileExists(t, path+creationJournalSuffix, "setup: the dead creator's journal")
+				if tc.journal {
+					require.FileExists(t, path+creationJournalSuffix, "setup: the dead creator's journal")
+				} else {
+					require.NoFileExists(t, path+creationJournalSuffix, "setup: the dead creator committed")
+				}
 
 				seen, stop := creationStagesSeen(t)
 				db, err := testOpen(t, path, opts)
@@ -618,7 +624,7 @@ func TestCreationJournal_CreatorKilled(t *testing.T) {
 				}
 				if tc.creates {
 					require.Contains(t, *seen, "before-page1-write", "the opener did not create the database")
-					require.Contains(t, *seen, "journal-finalized")
+					require.Contains(t, *seen, "journal-deleted")
 					require.NoFileExists(t, path+creationJournalSuffix)
 				} else {
 					require.Empty(t, *seen, "the opener created a database over a committed one")
@@ -645,7 +651,8 @@ func TestCreationJournal_CreatorKilled(t *testing.T) {
 // TestCreationJournal_WaitingOpenerRollsBack: an open is already waiting for
 // the creator's lock when the creator is killed between its write of page 1
 // and the sync. The lock comes free with the page in the file; the waiting
-// open must not take it for a database.
+// open must not take it for a database. The creator is killed only once the
+// open has been refused the lock.
 func TestCreationJournal_WaitingOpenerRollsBack(t *testing.T) {
 	if killedCreatorChild(t) {
 		return
@@ -655,7 +662,21 @@ func TestCreationJournal_WaitingOpenerRollsBack(t *testing.T) {
 	c := startCreateChild(t, "killed-creator", path, "", "before-page1-sync")
 	c.expect("AT")
 
-	seen, stop := creationStagesSeen(t)
+	var (
+		seen      []string
+		refused   = make(chan struct{})
+		refusedMu sync.Once
+	)
+	testOpenStageHook = func(_ *pager, stage string) {
+		switch stage {
+		case "before-lock":
+		case "db-lock-busy":
+			refusedMu.Do(func() { close(refused) })
+		default:
+			seen = append(seen, stage)
+		}
+	}
+	t.Cleanup(func() { testOpenStageHook = nil })
 	type opened struct {
 		db  *DB
 		err error
@@ -671,17 +692,17 @@ func TestCreationJournal_WaitingOpenerRollsBack(t *testing.T) {
 			_ = o.db.Close()
 		}
 		t.Fatalf("the open did not wait for the creator: %v", o.err)
-	case <-time.After(200 * time.Millisecond):
+	case <-refused:
 	}
 	require.NoError(t, c.cmd.Process.Kill())
 	_ = c.cmd.Wait()
 
 	o := <-openedCh
-	stop()
+	testOpenStageHook = nil
 	require.NoError(t, o.err)
 	defer func() { _ = o.db.Close() }()
-	require.Contains(t, *seen, "journal-playback", "the waiting open used the dead creator's page 1")
-	require.Contains(t, *seen, "before-page1-write")
+	require.Contains(t, seen, "journal-playback", "the waiting open used the dead creator's page 1")
+	require.Contains(t, seen, "before-page1-write")
 	require.NoFileExists(t, path+creationJournalSuffix)
 	createPutRow(t, o.db, "opener")
 	require.NoError(t, o.db.IntegrityCheck())
