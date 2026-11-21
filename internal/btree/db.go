@@ -824,10 +824,7 @@ func Open(path string, opts Options) (*DB, error) {
 // cache (disconnectAllVtab, main.c:1213), the Unix VFS's global mutex as it
 // closes a file (unixClose, os_unix.c:2350). In multi-thread mode an
 // ordinary build gives the connection no mutex (main.c:3388-3393), and a
-// close during another thread's step is the application's error; a build
-// with SQLITE_THREAD_MISUSE_WARNINGS gives it one that logs the misuse when
-// it finds the mutex held, and then waits for it (main.c:3388-3400,
-// checkMutexEnter, mutex.c:160-173).
+// close during another thread's step is the application's error.
 //
 // A registered write transaction is not waited for: Close rolls it back and
 // releases its locks, as sqlite3Close rolls back a transaction left open

@@ -303,10 +303,10 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 
 	// What follows fetches and writes pages of the destination's write
 	// transaction, so it is a call of that transaction (writerGate): a
-	// Close of the destination waits for this Step, and a Step that comes
-	// after it finds the transaction ended. sqlite3_backup_step holds the
-	// destination's connection mutex, which sqlite3_close takes
-	// (backup.c:326, main.c:1263).
+	// Close of the destination waits for this Step, and a Step that reaches
+	// the gate after it is refused, and the backup fails with ErrClosed.
+	// sqlite3_backup_step holds the destination's connection mutex, which
+	// sqlite3_close takes (backup.c:326, main.c:1263).
 	if err := b.dst.pager.wgate.enter(); err != nil {
 		b.rc = err
 		return err
@@ -549,13 +549,8 @@ func (b *Backup) update(iPage uint32, data []byte) {
 	// A write to the destination's write transaction, made on the source
 	// writer's goroutine: a call of that transaction, as in Step
 	// (backupUpdate takes the destination's mutex, backup.c:676). One that
-	// comes here after a Close of the destination is refused and fails the
-	// backup, as a Step then does; an update of a page not copied yet
-	// returned above and fails nothing. A Finish with neither between
-	// returns what the last Step left, as sqlite3_backup_finish returns
-	// p->rc (backup.c:603): nil after a Step that copied pages, the busy
-	// error after one that found the source busy, and ErrClosed after one
-	// that completed the copy, whose commit the closed gate refuses.
+	// reaches the gate after a Close of the destination is refused, and the
+	// backup fails with ErrClosed.
 	if err := b.dst.pager.wgate.enter(); err != nil {
 		b.rc = err
 		return
