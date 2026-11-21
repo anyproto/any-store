@@ -554,11 +554,11 @@ type aggIterator struct {
 	// owner, taken as the iterator was built (planIterator.closeState).
 	closeState btree.CloseState
 	actx       *aggregate.Ctx
-	c      *collection
-	buf    *syncpool.DocBuffer
-	cur    *anyenc.Value
-	err    error
-	closed bool
+	c          *collection
+	buf        *syncpool.DocBuffer
+	cur        *anyenc.Value
+	err        error
+	closed     bool
 }
 
 // endedErr is why the rows' transaction can give no more: the inner

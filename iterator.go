@@ -40,9 +40,10 @@ import (
 // transaction, it holds a read transaction of its own until its Close,
 // unless it has nothing to read (a filter that can match nothing, a $out or
 // $merge pipeline), and DB.Close waits for that with no timeout: such an
-// iterator, never closed, makes DB.Close block forever. Opened inside a transaction it holds none:
-// DB.Close waits for a ReadTx until its Commit and does not wait for a
-// WriteTx (see DB.Close). Close is safe to defer and to call twice.
+// iterator, never closed, makes DB.Close block forever. Opened inside a
+// transaction it holds none: DB.Close waits for a ReadTx until its Commit
+// and does not wait for a WriteTx (see DB.Close). Close is safe to defer and
+// to call twice.
 //
 // An Iterator belongs to one goroutine at a time. Opened with the context
 // of a transaction, its methods are calls on the transaction (see
