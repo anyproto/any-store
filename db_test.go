@@ -2858,6 +2858,61 @@ func TestWriteTx_SavepointRollbackWalksItsOwnEntries(t *testing.T) {
 	require.NoError(t, wtx.Commit())
 }
 
+// Handles a write transaction opened and then closed leave the registry when
+// the transaction ends, each found under its name: the end costs by the
+// handles it closes, not by the registry they are in.
+func TestWriteTx_ClosedHandlesLeaveTheRegistryByName(t *testing.T) {
+	const n = 64
+	for _, end := range []string{"commit", "rollback"} {
+		t.Run(end, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "r.db")
+			d, err := Open(ctx, path, nil)
+			require.NoError(t, err)
+			for i := range n {
+				_, err = d.CreateCollection(ctx, fmt.Sprintf("p%d", i))
+				require.NoError(t, err)
+			}
+			require.NoError(t, d.Close())
+			d, err = Open(ctx, path, nil)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = d.Close() })
+			dbi := d.(*db)
+			registered := func() int {
+				dbi.mu.Lock()
+				defer dbi.mu.Unlock()
+				return len(dbi.openedCollections)
+			}
+
+			wtx, err := d.WriteTx(ctx)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = wtx.Rollback() })
+			colls := make([]Collection, n)
+			for i := range colls {
+				colls[i], err = d.OpenCollection(wtx.Context(), fmt.Sprintf("p%d", i))
+				require.NoError(t, err)
+				require.NoError(t, colls[i].Close())
+			}
+			require.Equal(t, n, registered(), "setup: the closes wait for the transaction")
+
+			v := &visitCounts{}
+			testVisits = v
+			t.Cleanup(func() { testVisits = nil })
+			if end == "commit" {
+				require.NoError(t, wtx.Commit())
+			} else {
+				require.NoError(t, wtx.Rollback())
+			}
+			testVisits = nil
+			require.Equal(t, n, v.evict, "one registry entry looked at per handle")
+			require.Zero(t, registered())
+			for _, c := range colls {
+				_, err = c.Count(ctx)
+				require.ErrorIs(t, err, ErrCollectionClosed)
+			}
+		})
+	}
+}
+
 // BenchmarkSketch_FindThenWriteAfterAPeersCommit is the cycle of a process
 // that shares its file: another process commits, this one plans a query and
 // then writes. The reader loads the stored sketch rows into the published
