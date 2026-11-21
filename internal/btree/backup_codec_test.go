@@ -4,9 +4,13 @@ package btree
 // header ends up with, and which destinations a source can be copied into.
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -196,13 +200,41 @@ func walPage1Salt(t *testing.T, walPath string, set *[SaltLen]byte) (salt [SaltL
 	return salt, found
 }
 
-// A destination left by a backup that wrote the source's salt into page 1
-// (as every backup of a passphrase database did before the salt was kept)
-// and whose process died before the close checkpointed: the main file names
-// the salt the destination's pages are sealed with, the WAL's committed
-// page 1 another. The salt the codec was keyed with at Open is the one
-// every write of page 1 carries, so a backup over that destination is
-// readable, and its commit puts that salt back into the WAL's page 1.
+// legacyWALSalt is the salt legacyDestination writes into the WAL's page 1.
+var legacyWALSalt = [SaltLen]byte{0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab}
+
+// legacyDestination makes at path, with opts, a destination left by a
+// backup that wrote the source's salt into page 1 (as every backup of a
+// passphrase database did before the salt was kept) and whose process died
+// before the close checkpointed: the main file names the salt the pages are
+// sealed with, the WAL's committed page 1 names legacyWALSalt. It holds the
+// 30 values of codecFill in "t1" and an empty namespace "t0", and its handle
+// is closed without a checkpoint. It returns the main file's salt.
+func legacyDestination(t *testing.T, path string, opts Options) (keyed [SaltLen]byte) {
+	t.Helper()
+	db, err := testOpen(t, path, opts)
+	require.NoError(t, err)
+	codecFill(t, db, 0, 30)
+	require.NoError(t, db.Close())
+	keyed = headerSalt(t, path)
+	db, err = testOpen(t, path, opts)
+	require.NoError(t, err)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("t0") // a new root on page 1
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	rawClose(db)
+	other := legacyWALSalt
+	_, found := walPage1Salt(t, path+"-wal", &other)
+	require.True(t, found, "setup: page 1 is committed in the WAL")
+	require.Equal(t, keyed, headerSalt(t, path), "setup: the main file names the keyed salt")
+	return keyed
+}
+
+// A backup over a legacyDestination. The salt the codec was keyed with at
+// Open is the one every write of page 1 carries, so the copy is readable,
+// and its commit puts that salt back into the WAL's page 1.
 func TestBackup_DestinationWALPage1WithAnotherSalt(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -210,23 +242,7 @@ func TestBackup_DestinationWALPage1WithAnotherSalt(t *testing.T) {
 	srcPath, dstPath := filepath.Join(dir, "src.db"), filepath.Join(dir, "dst.db")
 
 	// given: the destination's committed page 1 in its WAL names another salt
-	dst, err := testOpen(t, dstPath, opts)
-	require.NoError(t, err)
-	codecFill(t, dst, 0, 30)
-	require.NoError(t, dst.Close())
-	keyed := headerSalt(t, dstPath)
-	dst, err = testOpen(t, dstPath, opts)
-	require.NoError(t, err)
-	tx, err := dst.BeginWrite()
-	require.NoError(t, err)
-	_, err = tx.CreateNamespace("t0") // a new root on page 1
-	require.NoError(t, err)
-	require.NoError(t, tx.Commit())
-	rawClose(dst)
-	other := [SaltLen]byte{0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab}
-	_, found := walPage1Salt(t, dstPath+"-wal", &other)
-	require.True(t, found, "setup: page 1 is committed in the WAL")
-	require.Equal(t, keyed, headerSalt(t, dstPath), "setup: the main file names the keyed salt")
+	keyed := legacyDestination(t, dstPath, opts)
 
 	src, err := testOpen(t, srcPath, opts)
 	require.NoError(t, err)
@@ -234,7 +250,7 @@ func TestBackup_DestinationWALPage1WithAnotherSalt(t *testing.T) {
 	codecFill(t, src, 0, 40)
 
 	// when
-	dst, err = testOpen(t, dstPath, opts)
+	dst, err := testOpen(t, dstPath, opts)
 	require.NoError(t, err)
 	b, err := dst.BackupInit(src)
 	require.NoError(t, err)
@@ -257,6 +273,132 @@ func TestBackup_DestinationWALPage1WithAnotherSalt(t *testing.T) {
 	require.NoError(t, err)
 	codecRequire(t, dst, 40)
 	require.NoError(t, dst.Close())
+}
+
+// A legacyDestination written by a commit that leaves page 1 alone, then
+// checkpointed. The WAL's page 1 still names the other salt, and the
+// checkpoint's copy of it into the main file carries the keyed salt, so the
+// file opens with the passphrase and holds the commit.
+func TestCheckpoint_WALPage1WithAnotherSalt(t *testing.T) {
+	opts := passphraseOptions(CipherAES256GCM)
+	path := filepath.Join(t.TempDir(), "dst.db")
+	keyed := legacyDestination(t, path, opts)
+
+	// given: a commit of one leaf, not of page 1
+	db, err := testOpen(t, path, opts)
+	require.NoError(t, err)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.GetNamespace("t0")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, u32key(0), []byte("leaf")))
+	require.NoError(t, tx.Commit())
+	got, found := walPage1Salt(t, path+"-wal", nil)
+	require.True(t, found)
+	require.Equal(t, legacyWALSalt, got, "setup: the commit left the WAL's page 1 as it was")
+
+	// when
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+
+	// then
+	require.Equal(t, keyed, headerSalt(t, path), "the main file's page 1 names the keyed salt")
+	require.NoError(t, db.Close())
+	db, err = testOpen(t, path, opts)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	codecRequire(t, db, 30)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rtx.Rollback()) }()
+	ns, err = rtx.GetNamespace("t0")
+	require.NoError(t, err)
+	v, err := rtx.Get(ns, u32key(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("leaf"), v)
+}
+
+const saltReaderChildEnv = "BTREE_TEST_SALT_READER_CHILD"
+
+// A backup over a legacyDestination while another process reads the
+// destination at the commit whose page 1 names the other salt, through the
+// backup and its close. The close's checkpoint may copy only the frames that
+// reader can see, so the page 1 it writes into the main file is that old
+// one, and it writes it with the keyed salt: once the reader is gone the
+// file opens with the passphrase and holds the copy.
+func TestBackup_WALPage1WithAnotherSaltUnderAReader(t *testing.T) {
+	if path := os.Getenv(saltReaderChildEnv); path != "" {
+		saltReaderChild(t, path)
+		return
+	}
+	if testing.Short() {
+		t.Skip("spawns a subprocess; excluded in -short")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	opts := passphraseOptions(CipherAES256GCM)
+	srcPath, dstPath := filepath.Join(dir, "src.db"), filepath.Join(dir, "dst.db")
+	keyed := legacyDestination(t, dstPath, opts)
+
+	// given: another process reads the destination at that commit
+	cmd := exec.Command(os.Args[0], "-test.run=^TestBackup_WALPage1WithAnotherSaltUnderAReader$", "-test.timeout=60s")
+	cmd.Env = append(os.Environ(), saltReaderChildEnv+"="+dstPath)
+	cmd.Stderr = os.Stderr
+	stdin, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	stdout, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	out := bufio.NewReader(stdout)
+	line, err := out.ReadString('\n')
+	require.NoError(t, err)
+	require.Equal(t, "READING\n", line)
+	go func() { _, _ = io.Copy(io.Discard, out) }()
+
+	src, err := testOpen(t, srcPath, opts)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, src.Close()) }()
+	codecFill(t, src, 0, 40)
+
+	// when: the backup and the close of its destination, under the reader
+	dst, err := testOpen(t, dstPath, opts)
+	require.NoError(t, err)
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	require.ErrorIs(t, b.Step(ctx, -1), ErrBackupDone)
+	require.NoError(t, b.Finish())
+	require.NoError(t, dst.Close())
+	// The reader ends without a checkpoint of its own.
+	require.NoError(t, stdin.Close())
+	require.NoError(t, cmd.Wait())
+
+	// then
+	got, found := walPage1Salt(t, dstPath+"-wal", nil)
+	require.True(t, found)
+	require.Equal(t, keyed, got, "setup: the backup's page 1 is in the WAL, past the checkpoint")
+	require.Equal(t, keyed, headerSalt(t, dstPath), "the main file's page 1 names the keyed salt")
+	dst, err = testOpen(t, dstPath, opts)
+	require.NoError(t, err)
+	codecRequire(t, dst, 40)
+	require.NoError(t, dst.Close())
+}
+
+// saltReaderChild is the reader of TestBackup_WALPage1WithAnotherSaltUnderAReader:
+// it holds a read transaction on the database at path until its stdin ends,
+// then leaves without a checkpoint.
+func saltReaderChild(t *testing.T, path string) {
+	db, err := Open(path, passphraseOptions(CipherAES256GCM))
+	require.NoError(t, err)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	ns, err := rtx.GetNamespace("t1")
+	require.NoError(t, err)
+	_, err = rtx.Get(ns, u32key(0))
+	require.NoError(t, err)
+	fmt.Println("READING")
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	require.NoError(t, rtx.Rollback())
+	rawClose(db)
 }
 
 // An in-memory database has a codec and no salt. The file its backup makes is
