@@ -466,11 +466,30 @@ func (db *DB) LastWriterUnwindError() error {
 // locks would be permanent — the exact bug class this function exists to end.
 // A panic there now propagates with the mutexes released. Reports whether
 // this call won the CAS.
-func (db *DB) releaseWriterLocks(pager *pager, slot int, pre, post func()) bool {
+//
+// gate is the writer gate the calling Commit or Rollback entered, nil for
+// Close's call, which is not a call of the transaction. It is left here,
+// whichever way this goes, and before the write lock passes on: the gate
+// counts calls, not transactions, and a count of this transaction still in
+// it when the next writer begins would let that writer's calls in as
+// nested ones after Close has closed the gate, its Commit included. In
+// SQLite the COMMIT's step releases the write lock under the connection
+// mutex (sqlite3VdbeHalt, vdbe.c:4042, down to
+// sqlite3WalEndWriteTransaction, pager.c:2142; the mutex from
+// vdbeapi.c:923), and the next BEGIN is another step, which takes it first.
+// A Close waiting at the gate goes on before the write lock is released,
+// and waits for it in its turn.
+func (db *DB) releaseWriterLocks(pager *pager, slot int, gate *writerGate, pre, post func()) bool {
 	if !db.writerLocksDone.CompareAndSwap(false, true) {
+		if gate != nil {
+			gate.leave()
+		}
 		return false
 	}
 	defer db.unlockWriter()
+	if gate != nil {
+		defer gate.leave()
+	}
 	defer db.mu.RUnlock()
 	defer db.unregisterWriter()
 	if pre != nil {
@@ -863,7 +882,7 @@ func (db *DB) Close() error {
 			// the shared teardown: the writerLocksDone CAS inside
 			// releaseWriterLocks makes it a no-op after a Commit or a
 			// Rollback that ended the transaction while Close waited.
-			db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil)
+			db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil, nil)
 		}
 		// A plain send, not lockWriter: closeCh is closed already, and this
 		// wait is for the holder to leave.
@@ -2599,6 +2618,11 @@ var testBeginWriteRetryHook func(err error)
 // pager panic used to leak the writer locks. Test-only.
 var testWriterFinishHook func()
 
+// testWriterLocksReleasedHook, when non-nil, runs in Commit and Rollback
+// once the transaction has released its locks, the write lock included: the
+// next write transaction can begin while it runs. Test-only.
+var testWriterLocksReleasedHook func()
+
 // Commit commits the transaction, writing all changes to the WAL.
 //
 // Lock ownership is NOT tied to the operation's success (the SQLite shape:
@@ -2618,7 +2642,8 @@ func (tx *WriteTx) Commit() error {
 	// DB.Close waits for one in flight, through the release of the locks
 	// and the unwind of a panic, and refuses one that comes after it closed
 	// the gate. The refused transaction is Close's to roll back and to
-	// release; this handle only ends.
+	// release; this handle only ends. The call leaves the gate in
+	// releaseWriterLocks, deferred below, before the write lock passes on.
 	gate := &tx.pager.wgate
 	if err := gate.enter(); err != nil {
 		tx.closed = true
@@ -2626,7 +2651,6 @@ func (tx *WriteTx) Commit() error {
 		tx.onCommitted = nil
 		return err
 	}
-	defer gate.leave()
 	tx.closed = true
 	tx.aux = nil
 	// Captured for the defer: on the normal path tx is returned to the pool
@@ -2662,7 +2686,10 @@ func (tx *WriteTx) Commit() error {
 				db.lastAutoCheckpointErr.Store(autoCheckpointResult{err: cpErr})
 			}
 		}
-		db.releaseWriterLocks(pager, slot, pre, post)
+		db.releaseWriterLocks(pager, slot, gate, pre, post)
+		if testWriterLocksReleasedHook != nil {
+			testWriterLocksReleasedHook()
+		}
 	}()
 	if testWriterFinishHook != nil {
 		testWriterFinishHook()
@@ -2702,7 +2729,8 @@ func (tx *WriteTx) Rollback() error {
 		return ErrTxClosed
 	}
 	// As in Commit: a Rollback that DB.Close refused has nothing to do,
-	// Close rolls the transaction back and releases its locks.
+	// Close rolls the transaction back and releases its locks. One let in
+	// leaves the gate in releaseWriterLocks, before the write lock passes on.
 	gate := &tx.pager.wgate
 	if gate.enter() != nil {
 		tx.closed = true
@@ -2710,7 +2738,6 @@ func (tx *WriteTx) Rollback() error {
 		tx.onCommitted = nil
 		return nil
 	}
-	defer gate.leave()
 	tx.closed = true
 	tx.aux = nil
 	tx.onCommitted = nil
@@ -2725,7 +2752,10 @@ func (tx *WriteTx) Rollback() error {
 		if !completed {
 			pre = db.writerUnwind(pager)
 		}
-		db.releaseWriterLocks(pager, slot, pre, nil)
+		db.releaseWriterLocks(pager, slot, gate, pre, nil)
+		if testWriterLocksReleasedHook != nil {
+			testWriterLocksReleasedHook()
+		}
 	}()
 	if testWriterFinishHook != nil {
 		testWriterFinishHook()

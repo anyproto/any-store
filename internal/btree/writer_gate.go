@@ -18,8 +18,9 @@ import "sync/atomic"
 // destination (Backup.Step, Backup.update). Closing the gate is therefore
 // the one decision that ends the transaction: a call that Close refused is
 // never followed by a Commit that publishes what the calls before it wrote.
-// A Commit or a Rollback in flight is waited for to its end, the release of
-// the transaction's locks and the unwind of a panic included.
+// A Commit or a Rollback in flight is waited for to its end, the unwind of a
+// panic included: it leaves the gate once it has released everything but
+// the write lock, and Close then waits for the write lock.
 //
 // SQLite needs none of this: sqlite3_step holds the connection mutex, which
 // sqlite3_close takes (vdbeapi.c sqlite3_step, main.c sqlite3Close), and
@@ -30,7 +31,11 @@ import "sync/atomic"
 // make another (a write saves the transaction's cursors, and each reads its
 // key). Only the outermost call is refused once the gate is closed; a call
 // that was let in before runs to its end, calls it makes included. A cursor
-// counts the calls it makes on itself as one (Cursor.enterGate).
+// counts the calls it makes on itself as one (Cursor.enterGate). Calls of
+// two transactions are never in the count together: a Commit or a Rollback
+// leaves the gate before the write lock passes on (releaseWriterLocks), as
+// SQLite's COMMIT releases its locks inside the step that holds the
+// connection mutex, and the next BEGIN is another step.
 //
 // Only the write transaction pays: two atomic adds per call, on a word no
 // other goroutine writes until Close. A read transaction never comes here;
