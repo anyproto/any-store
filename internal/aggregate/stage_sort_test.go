@@ -387,3 +387,46 @@ func TestSortStage_TopKWinnerFitsPacked(t *testing.T) {
 		})
 	}
 }
+
+// A top-K winner that does not fit even packed is refused before the live
+// entries are packed, whichever error it returns: after the error the kept
+// rows are still at their offsets, at full length, and the winner at the
+// tail. The evicted root is the first row in the arena, so packing would move
+// every other row.
+func TestSortStage_RejectedWinnerPacksNothing(t *testing.T) {
+	spec := MustParsePipeline(`[{"$sort": {"v": 1}}]`)[0].(SortSpec)
+	rowLen := func(j string) int {
+		v := anyenc.MustParseJson(j)
+		return len(spec.Sort.AppendKey(nil, v)) + len(v.MarshalTo(nil)) + 4 // the sequence number
+	}
+	// b4 sorts last: it is the heap's root, at offset 0.
+	kept := []string{`{"id":"4","v":"b4"}`, `{"id":"1","v":"b1"}`, `{"id":"2","v":"b2"}`, `{"id":"3","v":"b3"}`}
+	winner := `{"id":"0x","v":"a0"}`
+	e := rowLen(kept[0])
+	require.Equal(t, e+1, rowLen(winner))
+	setSortArenaLimit(t, 4*e)
+	for _, tc := range []struct {
+		name     string
+		memLimit int
+		wantErr  error
+	}{
+		// The budget is the kept rows' charge, so the winner's crosses it.
+		{"the budget", 4*e + 4*sortEntryOverhead, ErrMemoryLimitExceeded},
+		{"the arena limit", DefaultMemoryLimit, errSortTooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &SortStage{Src: newSliceSource(append(slices.Clone(kept), winner)...), Spec: spec, TopK: 4}
+			defer st.Close()
+			ctx := newTestCtx()
+			ctx.Mem = NewMemAccount(tc.memLimit)
+			_, err := st.Next(ctx)
+			require.ErrorIs(t, err, tc.wantErr)
+			assert.Equal(t, 5*e+1, len(st.arena))
+			rows := map[int]int{}
+			for _, en := range st.entries {
+				rows[int(en.off)] = int(en.keyLen + en.docLen)
+			}
+			assert.Equal(t, map[int]int{0: e, e: e, 2 * e: e, 3 * e: e}, rows)
+		})
+	}
+}

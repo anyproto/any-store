@@ -161,20 +161,23 @@ func (s *SortStage) collectAndSort(ctx *Ctx) error {
 			case fitsSortArena(len(s.arena)):
 				off = base
 			default:
-				// The tail is past the limit: pack the live entries, the
-				// root's bytes now dead, and move the candidate after them.
-				// A row that fits packed is kept, and charged at the end of
-				// the loop for the packed arena. A row that does not fit
-				// even packed is first charged what keeping it at the tail
-				// would charge, after the compaction guard, so one that also
-				// crosses MemoryLimit reports ErrMemoryLimitExceeded.
-				tail := len(s.arena)
-				if sortNeedsCompact(tail, s.liveBytes) {
-					tail = s.liveBytes
-				}
-				if off, err = s.admitAfterCompact(base, total); err != nil {
+				// The tail is past the limit. Packed, the kept rows take
+				// liveBytes, which counts the candidate and not the root.
+				// A row that does not fit even packed is not kept and
+				// nothing is packed: it is charged what keeping it at the
+				// tail would charge, after the compaction guard, so one that
+				// also crosses MemoryLimit reports ErrMemoryLimitExceeded.
+				// A row that fits packed is moved after the packed live
+				// entries and charged at the end of the loop for the packed
+				// arena.
+				if !fitsSortArena(s.liveBytes) {
+					tail := len(s.arena)
+					if sortNeedsCompact(tail, s.liveBytes) {
+						tail = s.liveBytes
+					}
 					return sortTooLarge(ctx, tail-prevLen)
 				}
+				off = s.admitAfterCompact(base, total)
 			}
 			s.entries[0] = sortEntry{off: uint32(off), keyLen: uint32(keyLen), docLen: uint32(total - keyLen)}
 			s.heapDown(0)
@@ -271,20 +274,17 @@ func (s *SortStage) compact() int {
 }
 
 // admitAfterCompact keeps the candidate built at arena[base:base+total] when
-// the arena's tail is past sortArenaLimit: it packs the live entries, with
-// the evicted root (entries[0], about to be overwritten) counted as dead, and
-// moves the candidate after them. Every live entry lies below base, so
-// packing never reaches the candidate's bytes. Returns the candidate's new
-// offset, or errSortTooLarge when the kept rows do not fit even packed.
-func (s *SortStage) admitAfterCompact(base, total int) (int, error) {
+// the arena's tail is past sortArenaLimit and the kept rows fit packed (the
+// caller checked liveBytes): it packs the live entries, with the evicted root
+// (entries[0], about to be overwritten) counted as dead, and moves the
+// candidate after them. Every live entry lies below base, so packing never
+// reaches the candidate's bytes. Returns the candidate's new offset.
+func (s *SortStage) admitAfterCompact(base, total int) int {
 	cand := s.arena[base : base+total]
 	s.entries[0].keyLen, s.entries[0].docLen = 0, 0 // the evicted root's bytes are dead
 	dst := s.compact()
-	if !fitsSortArena(dst + total) {
-		return 0, errSortTooLarge
-	}
 	s.arena = append(s.arena, cand...) // within capacity; copy handles the overlap
-	return dst, nil
+	return dst
 }
 
 // heapKeyLess reports whether key sorts before entries[i]'s key (max-heap of
