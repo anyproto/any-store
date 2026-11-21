@@ -179,14 +179,17 @@ type planOpts struct {
 
 // validateSources runs the source-detection guards against the schema
 // version s: the legacy-clause rejection, the _distance placement rule, the
-// $knn/$text exclusion, and the full $knn detection walk (placement, argument
+// $knn/$text exclusion, the full $knn detection walk (placement, argument
 // validation, index resolution, dim check — detection is the ONLY validation
-// programmatic consumers ever see).
+// programmatic consumers ever see), and the $text resolution (ftsSource:
+// placement, the one full-text index, the $fields scope).
 //
 // The verbs call this BEFORE their unsatisfiable() short-circuit, and so
 // before their transaction (validateSourcesIn): an invalid source must error
 // identically on every verb, not return 0/nil wherever an unrelated $in:[]
-// happens to make the filter unsatisfiable.
+// or $all:[] happens to make the filter unsatisfiable. MongoDB has the same
+// order for $text: the text index is looked up when $text is parsed, before
+// the filter is normalized.
 func (q *collQuery) validateSources(s *collSchema) error {
 	if q.srcValidatedFor == s {
 		return nil
@@ -208,6 +211,8 @@ func (q *collQuery) validateSources(s *collSchema) error {
 		if _, _, err := q.detectKnnQuery(s); err != nil {
 			return err
 		}
+	} else if _, _, err := q.ftsSource(s); err != nil {
+		return err
 	}
 	q.srcValidatedFor = s
 	return nil
@@ -246,7 +251,9 @@ func (q *collQuery) validateSourcesIn(ctx context.Context) error {
 func schemaDependent(err error) bool {
 	return errors.Is(err, ErrNoVectorIndex) || errors.Is(err, ErrAmbiguousVectorIndex) ||
 		errors.Is(err, ErrVectorIndexUnsupported) || errors.Is(err, ErrLegacyVectorClause) ||
-		errors.Is(err, ErrInvalidVectorQuery) // the dim check reads the index
+		errors.Is(err, ErrInvalidVectorQuery) || // the dim check reads the index
+		errors.Is(err, ErrNoFulltextIndex) || errors.Is(err, ErrMultipleFulltextIndexes) ||
+		errors.Is(err, ErrFulltextUnknownField) // $fields resolves against the index
 }
 
 // writeSorter applies the write-verb sorter rule: ordering decides WHICH

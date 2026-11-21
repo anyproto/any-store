@@ -425,3 +425,50 @@ func TestQuery_AllWithEmptyArrayMatchesNothing(t *testing.T) {
 		}
 	}
 }
+
+// A $text that names no usable full-text index is an error from every verb,
+// even when another conjunct makes the filter match nothing: MongoDB looks
+// the text index up when it parses $text, before it folds {"$all":[]} or
+// {"$in":[]} into a filter that matches nothing. An $out after such a $match
+// keeps its destination.
+func TestQuery_TextSourceErrorsBeforeEmptyResult(t *testing.T) {
+	for _, tc := range []struct {
+		name, text string
+		ftsIndex   bool
+		want       error
+	}{
+		{"no full-text index", `{"$search":"hello"}`, false, anystore.ErrNoFulltextIndex},
+		{"unknown field", `{"$search":"hello","$fields":"nope"}`, true, anystore.ErrFulltextUnknownField},
+	} {
+		for _, empty := range []string{`{"$all":[]}`, `{"$in":[]}`} {
+			filter := fmt.Sprintf(`{"$text":%s,"tags":%s}`, tc.text, empty)
+			t.Run(tc.name+"/"+filter, func(t *testing.T) {
+				fx := newFixture(t)
+				coll, err := fx.CreateCollection(ctx, "docs")
+				require.NoError(t, err)
+				if tc.ftsIndex {
+					require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
+						Kind: anystore.IndexKindFulltext, Fields: []string{"body"}}))
+				}
+				insertJSON(t, coll, `{"id":1,"body":"hello world","tags":["x"]}`)
+				dst, err := fx.CreateCollection(ctx, "published")
+				require.NoError(t, err)
+				insertJSON(t, dst, `{"id":"kept"}`)
+
+				_, err = coll.Find(filter).Count(ctx)
+				assert.ErrorIs(t, err, tc.want, "Count")
+				_, err = coll.Find(filter).Iter(ctx)
+				assert.ErrorIs(t, err, tc.want, "Iter")
+				_, err = coll.Find(filter).Update(ctx, `{"$set":{"touched":true}}`)
+				assert.ErrorIs(t, err, tc.want, "Update")
+				_, err = coll.Find(filter).Delete(ctx)
+				assert.ErrorIs(t, err, tc.want, "Delete")
+				_, err = coll.Aggregate(fmt.Sprintf(`[{"$match":%s},{"$out":"published"}]`, filter)).Count(ctx)
+				assert.ErrorIs(t, err, tc.want, "Aggregate $match, $out")
+
+				assertQueryCount(t, coll.Find(nil), 1)
+				assertQueryCount(t, dst.Find(`{"id":"kept"}`), 1)
+			})
+		}
+	}
+}

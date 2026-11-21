@@ -1189,34 +1189,47 @@ func ftsDocLenBuf(tx *btree.ReadTx, ns *btree.Namespace, docID uint64, buf []byt
 	return uint32(n), v, nil
 }
 
-// detectFtsQuery inspects the query's condition for a $text clause. If present,
-// it returns an FtsQuerySpec (whose search closure runs BM25 over the
-// collection's full-text index) and the residual filter (everything except the
-// $text clause). If absent, it returns (nil, q.cond, nil). Mirrors
-// detectVectorQuery. An error is returned for invalid placement or a missing
-// full-text index.
-func (q *collQuery) detectFtsQuery(s *collSchema) (*qplanner.FtsQuerySpec, query.Filter, error) {
+// ftsSource finds the query's $text clause and the full-text index of schema
+// version s that serves it, and returns fx == nil when the condition has no
+// $text. It errors for an invalid placement, a missing full-text index, two
+// of them, or a $fields scope the index does not cover. validateSources runs
+// it before the verbs' empty-result shortcut, as MongoDB looks the text index
+// up when it parses $text (TextMatchExpression), before any folding.
+func (q *collQuery) ftsSource(s *collSchema) (text query.Text, fx *ftsIndex, err error) {
 	text, hasText, err := findTextFilter(q.cond)
-	if err != nil {
-		return nil, nil, err
-	}
-	if !hasText {
-		return nil, q.cond, nil
+	if err != nil || !hasText {
+		return query.Text{}, nil, err
 	}
 	fxs := s.ftsIndexes
 	if len(fxs) == 0 {
-		return nil, nil, ErrNoFulltextIndex
+		return query.Text{}, nil, ErrNoFulltextIndex
 	}
 	// Creating a second full-text index is rejected (ErrMultipleFulltextIndexes),
 	// but a database written before that guard can still carry two. Refuse the
 	// query rather than silently searching whichever one load order puts first.
 	if len(fxs) > 1 {
-		return nil, nil, fmt.Errorf("%w (%q and %q)",
+		return query.Text{}, nil, fmt.Errorf("%w (%q and %q)",
 			ErrMultipleFulltextIndexes, fxs[0].info.Name, fxs[1].info.Name)
 	}
-	fx := fxs[0]
-	if _, _, err = fx.resolveScope(text.Fields); err != nil {
+	if _, _, err = fxs[0].resolveScope(text.Fields); err != nil {
+		return query.Text{}, nil, err
+	}
+	return text, fxs[0], nil
+}
+
+// detectFtsQuery inspects the query's condition for a $text clause. If present,
+// it returns an FtsQuerySpec (whose search closure runs BM25 over the
+// collection's full-text index) and the residual filter (everything except the
+// $text clause). If absent, it returns (nil, q.cond, nil). Mirrors
+// detectVectorQuery. An error is returned for invalid placement or a missing
+// full-text index (ftsSource).
+func (q *collQuery) detectFtsQuery(s *collSchema) (*qplanner.FtsQuerySpec, query.Filter, error) {
+	text, fx, err := q.ftsSource(s)
+	if err != nil {
 		return nil, nil, err
+	}
+	if fx == nil {
+		return nil, q.cond, nil
 	}
 	clauses := text.ParsedClauses()
 	spec := &qplanner.FtsQuerySpec{
