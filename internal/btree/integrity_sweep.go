@@ -71,12 +71,25 @@ func (db *DB) CksumCodec() *cksumCodec {
 // Read-only operation that opens its own internal read transaction.
 // Mismatches are collected into Result.Errors, and so is a page that cannot
 // be read (Kind IntegrityKindUnknown, the read's error in Inner); the sweep
-// goes on to the next page. Page 1 is also listed, with ErrHeaderCorrupt in
-// Inner, when its header disagrees with the page count the snapshot's WAL
-// commit recorded (sweepPageCount). The function's error is a read
-// transaction that cannot begin, a cancelled context, and, when no WAL
-// commit gives the page count, a page-1 header that cannot be read or is
-// not valid.
+// goes on to the next page. Where the snapshot's WAL commit recorded the
+// page count (sweepPageCount), page 1 is also listed, Kind
+// IntegrityKindUnknown, when its header is not valid or counts differently.
+// Inner is then the header's own error: ErrHeaderCorrupt, or ErrNewerFormat,
+// ErrOldFormat or ErrSQLiteFormat for a header of another format. A page 1
+// that cannot be read whole is listed with the read's error instead, the
+// error lockBtree returns before it looks at the header (btree.c:3288-3289);
+// its header, read alone, is listed as well, with ErrHeaderCorrupt, only
+// when it counts fewer pages than the commit.
+//
+// The function's error is a read transaction that cannot begin, a cancelled
+// context, and, when no WAL commit gives the page count, a page-1 header
+// that cannot be read or is not valid. A read begin at a snapshot whose
+// page-1 counters it does not hold yet reads them, so a page-1 header that
+// cannot be read is then the function's error and there is no report; at a
+// snapshot whose counters it holds, the sweep lists page 1 and goes on. A
+// sqlite_dbpage scan cannot begin in the first case either: every
+// transaction begins by reading page 1 (btree.c:3288-3289), and the pager
+// cache keeps it only while the snapshot is unchanged (pager.c:3261-3264).
 //
 // On checksum DBs the sweep temporarily clears the verify-on-read flag so
 // the read path doesn't abort on the first mismatch — the original flag
@@ -175,12 +188,17 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 // pager's count is the size a WAL commit of this snapshot recorded
 // (sqlite3WalDbsize, wal.c:3669-3674), it is a second count of the same
 // database, written by the commit that wrote page 1's (pager.commit keeps
-// the two equal). The sweep then covers the pages the commit recorded and
-// lists page 1 when its header cannot be read, is not a valid header, or
-// counts differently. Where the pager's count is the file's length, a
-// smaller count in page 1 stands, as it does for every reader, and a header
-// that cannot be read or gives no valid count is the sweep's error: there
-// is then no count to sweep to.
+// the two equal). The sweep then covers the pages the commit recorded.
+// Page 1 is listed with the read's error when it cannot be read whole, and
+// otherwise with the header's own error when its header is not valid or
+// counts differently (ErrHeaderCorrupt, or deserialize's error for a header
+// of another format): the read is judged first, as lockBtree returns a
+// failed read of page 1 before it checks the header (btree.c:3288-3289).
+// A header read alone that counts fewer pages than the commit is listed as
+// well. Where the pager's count is the file's length, a smaller count in
+// page 1 stands, as it does for every reader, and a header that cannot be
+// read or gives no valid count is the sweep's error: there is then no count
+// to sweep to.
 func (db *DB) sweepPageCount(tx *ReadTx) (total uint32, raw1 []byte, page1Errs []SweepError, err error) {
 	p := db.pager
 	bound := p.readerDbSizeBound(tx.cache)
