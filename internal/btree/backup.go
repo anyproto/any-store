@@ -51,9 +51,6 @@ var (
 	ErrBackupDone = errors.New("btree: backup done")
 )
 
-// dbHeaderSaltOff is the offset of dbHeader.Salt in page 1 (dbHeader.serialize).
-const dbHeaderSaltOff = 72
-
 // Backup tracks the state of an online-copy operation from src to dst.
 // ~ struct sqlite3_backup (backup.c:21–41). Fields renamed to Go idioms;
 // C names kept in comments.
@@ -67,10 +64,6 @@ type Backup struct {
 	dstWriteTx *WriteTx
 
 	src *DB // ~ pSrc (backup.c:29)
-
-	// dstSalt is the destination's KDF salt (header bytes 72-87), read once
-	// the destination is locked. Every copy of page 1 keeps it: see onePage.
-	dstSalt [SaltLen]byte
 
 	// rc is sticky: once a fatal error occurs, every subsequent call
 	// short-circuits with it. ~ backup.c:31 + isFatalError (backup.c:217–219).
@@ -238,20 +231,6 @@ func (b *Backup) onePage(iSrcPg uint32, srcData []byte, bUpdate bool, snapPageCo
 		putUint32BE(dstPg.data[28:32], snapPageCount)
 	}
 
-	// The KDF salt is the one header field that is the destination's own, on
-	// the first copy of page 1 and on every later one (an update, a
-	// restart): the destination's codec was keyed with it when the
-	// destination was opened, and seals every page this backup writes. With
-	// the source's salt in the header the next open would derive another key
-	// than the one the pages are sealed with. finalize reloads the in-memory
-	// header from these bytes, so the commit writes the same salt back.
-	// SQLite has no such field. Two plain or checksummed files both have a
-	// zero salt here.
-	// DRIFT: page 1 is not copied whole: the destination keeps its KDF salt. See docs/btree/NOTES.md#drift-2026-11-19-1-a-backup-destination-keeps-its-own-kdf-salt
-	if iSrcPg == 1 {
-		copy(dstPg.data[dbHeaderSaltOff:dbHeaderSaltOff+SaltLen], b.dstSalt[:])
-	}
-
 	// ~ backup.c:270: invalidate the btree parse-cache on the dst page.
 	// SQLite zeros the first byte of the "extra" space. any-store has no
 	// MemPage.isInit equivalent; the in-cache dstPg.header is stale now
@@ -369,9 +348,6 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 		}
 		b.dstWriteTx = wtx
 		b.iDstSchema = b.dst.localSchemaCookie.Load() // ~ iDestSchema capture
-		// The write begin has just read the header from the destination's
-		// page 1 (refreshHeaderFromPage1).
-		b.dstSalt = b.dst.pager.header.Salt
 		b.dstLocked = true
 	}
 
@@ -544,12 +520,15 @@ func (b *Backup) finalize(nSrcPage uint32) error {
 	// (pager.go:1946); without this reload that serialize would revert every
 	// page-1 header field (freelist trunk pointers, page size, text encoding,
 	// user/application metadata, file-change/version counters, ...) to
-	// the destination's own stale values. The salt is the exception: it is
-	// the destination's own in the copied bytes already (onePage). SQLite has no such re-serialize, so
-	// the verbatim-copied source fields survive there (only offset 28/40 and
-	// the WAL version bytes are patched). This mirrors the established
-	// savepoint page-1 restore at pager.go:2274.
-	b.dst.pager.header.deserialize(dstPg1.data[:dbHeaderSize])
+	// the destination's own stale values. The salt is the exception: the
+	// pager keeps the one the destination's codec was keyed with
+	// (adoptHeader), and every write of page 1 carries it. SQLite has no
+	// such re-serialize, so the verbatim-copied source fields survive there
+	// (only offset 28/40 and the WAL version bytes are patched). This mirrors
+	// the established savepoint page-1 restore at pager.go:2274.
+	header := b.dst.pager.header
+	header.deserialize(dstPg1.data[:dbHeaderSize])
+	b.dst.pager.adoptHeader(header)
 	// Bump the schema cookie AFTER the deserialize so it is not overwritten.
 	// ~ sqlite3BtreeUpdateMeta writes meta value #1 (the cookie) to offset 40.
 	newCookie := b.iDstSchema + 1

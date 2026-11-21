@@ -1646,6 +1646,9 @@ type wal struct {
 	// onIntegrityError is the database's integrity hook, propagated from
 	// the pager with codec; readFramePage passes it to every Decrypt.
 	onIntegrityError integrityHook
+	// keySalt is the pager's keySalt, propagated with codec: the KDF salt
+	// every frame of page 1 carries (encryptPageWithCodec).
+	keySalt [SaltLen]byte
 	// codecScratch is a page-sized scratch used by writeFrame to hold
 	// ciphertext. Allocated lazily on first use. Writes are
 	// single-writer-serialized, so one buffer is safe.
@@ -2630,7 +2633,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 					if w.codecScratch == nil {
 						w.codecScratch = make([]byte, w.pageSize)
 					}
-					ct, eerr := encryptPageWithCodec(w.codec, w.codecScratch, p.data, p.pgno, &w.codecAEAD)
+					ct, eerr := encryptPageWithCodec(w.codec, w.codecScratch, p.data, p.pgno, &w.codecAEAD, &w.keySalt)
 					if eerr != nil {
 						return eerr
 					}
@@ -2672,7 +2675,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 			if w.codecScratch == nil {
 				w.codecScratch = make([]byte, w.pageSize)
 			}
-			ct, eerr := encryptPageWithCodec(w.codec, w.codecScratch, p.data, p.pgno, &w.codecAEAD)
+			ct, eerr := encryptPageWithCodec(w.codec, w.codecScratch, p.data, p.pgno, &w.codecAEAD, &w.keySalt)
 			if eerr != nil {
 				return eerr
 			}

@@ -700,7 +700,7 @@ func Open(path string, opts Options) (*DB, error) {
 			if cerr != nil {
 				return nil, cerr
 			}
-			p.header.Salt = salt
+			p.keySalt = salt
 			p.installCodec(codec, opts.OnIntegrityError)
 		}
 	} else if opts.InMemory && (wantEncryption || opts.Checksum) {

@@ -350,6 +350,14 @@ type pager struct {
 	// to the codec, which may serve other databases too and keeps no hook
 	// of its own; the integrity sweep calls it directly.
 	onIntegrityError integrityHook
+	// keySalt is the KDF salt the codec was keyed with at Open: read from
+	// the main file's header, or drawn for a new encrypted file; zero
+	// without encryption and in memory. It is part of the key setup, as
+	// SQLCipher's ctx->kdf_salt is, which is read once from the main file
+	// (sqlcipher.c:1392-1409): every write of page 1 carries it
+	// (encryptPageWithCodec, also in the WAL, which gets a copy), and no
+	// image of page 1 sets it (adoptHeader).
+	keySalt [SaltLen]byte
 	// codecScratch is a reusable page-sized scratch buffer used on the
 	// writer side (initNewDB, getPageWriter, wal.writeFrame) to hold
 	// ciphertext while the source plaintext stays live in the pcache.
@@ -700,9 +708,11 @@ func (p *pager) open() (err error) {
 		return fmt.Errorf("btree: failed to read database header: %w", err)
 	}
 
-	if err := p.header.deserialize(buf[:dbHeaderSize]); err != nil {
+	header := p.header
+	if err := header.deserialize(buf[:dbHeaderSize]); err != nil {
 		return err
 	}
+	p.adoptHeader(header)
 
 	// The change-counter sentinel and the page count are judged further
 	// down, on the page 1 the open snapshot reads (the WAL's when it holds a
@@ -757,10 +767,12 @@ func (p *pager) open() (err error) {
 	p.wal.busyHandler = DefaultBusyTimeout(BusyTimeout)
 	// BEGIN ENCRYPTION
 	// Propagate codec to the WAL so frame writes/reads use the same
-	// cipher as the DB file, and the integrity hook so its decrypt
-	// failures reach this database's callback.
+	// cipher as the DB file, the integrity hook so its decrypt failures
+	// reach this database's callback, and the key salt its page-1 writes
+	// carry.
 	p.wal.codec = p.codec
 	p.wal.onIntegrityError = p.onIntegrityError
+	p.wal.keySalt = p.keySalt
 	// END ENCRYPTION
 	if err := p.wal.open(); err != nil {
 		return err
@@ -862,7 +874,7 @@ func (p *pager) readPage1AtOpen() error {
 	if err != nil {
 		return err
 	}
-	p.header = header
+	p.adoptHeader(header)
 	p.dbSize.Store(nPage)
 	// Page 1 as read (readDbPage, pager.c:3063-3064).
 	p.dbFileVers.Store(header.FileChangeCount)
@@ -916,7 +928,7 @@ func (p *pager) installCodec(c Codec, onError integrityHook) {
 // This is the any-store equivalent of SQLCipher's CODEC2 macro
 // (pager.c:412), unified into one function.
 func (p *pager) encryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
-	return encryptPageWithCodec(p.codec, scratch, src, pgno, &p.codecAEAD)
+	return encryptPageWithCodec(p.codec, scratch, src, pgno, &p.codecAEAD, &p.keySalt)
 }
 
 // decryptPage is the inverse. Returns src unchanged when no codec is
@@ -953,9 +965,8 @@ func (p *pager) initNewDB() error {
 	}
 
 	// BEGIN ENCRYPTION
-	// Preserve salt and ReservedSpace that may have been set by installCodec
-	// before initNewDB was called.
-	savedSalt := p.header.Salt
+	// Preserve the ReservedSpace that installCodec may have set before
+	// initNewDB was called.
 	savedReserve := p.header.ReservedSpace
 	// END ENCRYPTION
 
@@ -981,8 +992,8 @@ func (p *pager) initNewDB() error {
 	// BEGIN ENCRYPTION
 	if p.codec != nil {
 		p.header.ReservedSpace = savedReserve
-		p.header.Salt = savedSalt
 	}
+	p.header.Salt = p.keySalt
 	// END ENCRYPTION
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 	p.initCellScratch()
@@ -1052,10 +1063,12 @@ func (p *pager) initNewDB() error {
 	p.wal.busyHandler = DefaultBusyTimeout(BusyTimeout)
 	// BEGIN ENCRYPTION
 	// Propagate codec to the WAL so frame writes/reads use the same
-	// cipher as the DB file, and the integrity hook so its decrypt
-	// failures reach this database's callback.
+	// cipher as the DB file, the integrity hook so its decrypt failures
+	// reach this database's callback, and the key salt its page-1 writes
+	// carry.
 	p.wal.codec = p.codec
 	p.wal.onIntegrityError = p.onIntegrityError
+	p.wal.keySalt = p.keySalt
 	// END ENCRYPTION
 	if err := p.wal.open(); err != nil {
 		return err
@@ -2489,7 +2502,7 @@ func (p *pager) refreshHeaderFromPage1() error {
 		p.writerCache.clear()
 		return fmt.Errorf("refreshHeaderFromPage1: %w", err)
 	}
-	p.header = hdr
+	p.adoptHeader(hdr)
 	p.dbSize.Store(nPage)
 	if debugTrace {
 		trace("refreshHeaderFromPage1: nFrame=%d nBackfill=%d count=%d dbSize=%d headerSize=%d firstFree=%d totalFree=%d",
@@ -2497,6 +2510,21 @@ func (p *pager) refreshHeaderFromPage1() error {
 			p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs)
 	}
 	return nil
+}
+
+// adoptHeader makes h, decoded from an image of page 1, the pager's header,
+// with one field that is not the image's: the KDF salt stays keySalt, the
+// one the codec was keyed with. A page image can name another salt (one a
+// backup copied from its source before the destination kept its own, still
+// in a WAL that was never checkpointed); the pages are sealed with the
+// keyed salt's key whatever page 1 says, and the next write of page 1
+// writes that salt back. SQLCipher reads its salt once, from the main file,
+// and replaces it with the magic in every decrypted page 1
+// (sqlcipher.c:1392-1409, 3271), so no image of page 1 reaches its key.
+// DRIFT: page 1's salt bytes are not read from a page image; SQLite's header has no KDF salt. See docs/btree/NOTES.md#drift-2026-11-21-19-the-kdf-salt-belongs-to-the-key-setup-not-to-page-1
+func (p *pager) adoptHeader(h dbHeader) {
+	h.Salt = p.keySalt
+	p.header = h
 }
 
 // committedCounters returns the FileChangeCount and SchemaCookie from the
@@ -3372,7 +3400,9 @@ func (p *pager) rollbackToSavepoint(id int) error {
 				// and dbFileVers from the restored image (pager.c:2481-2484).
 				// The oldest copy is restored last, so it is the one kept.
 				if pgno == 1 {
-					p.header.deserialize(pg.data[:dbHeaderSize])
+					header := p.header
+					header.deserialize(pg.data[:dbHeaderSize])
+					p.adoptHeader(header)
 					p.dbSize.Store(p.header.DatabaseSize)
 					p.dbFileVers.Store(binary.BigEndian.Uint32(data[24:28]))
 					page1Restored = true
