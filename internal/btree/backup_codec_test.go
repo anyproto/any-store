@@ -5,6 +5,7 @@ package btree
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -152,12 +153,11 @@ func TestBackup_DestinationKeepsItsSalt(t *testing.T) {
 	}
 }
 
-// walPage1Salt returns the KDF salt in the header of the last committed copy
-// of page 1 in the WAL at walPath, and whether there is one. With set
-// non-nil it first writes set into the header of every copy of page 1 there
-// and rewrites the frame checksums to match, as if the frames had been
-// written so.
-func walPage1Salt(t *testing.T, walPath string, set *[SaltLen]byte) (salt [SaltLen]byte, found bool) {
+// walPage1 returns a copy of the last committed copy of page 1 in the WAL at
+// walPath, or nil if there is none. With set non-nil it first writes set into
+// the header of every copy of page 1 there and rewrites the frame checksums
+// to match, as if the frames had been written so.
+func walPage1(t *testing.T, walPath string, set *[SaltLen]byte) []byte {
 	t.Helper()
 	data, err := os.ReadFile(walPath)
 	require.NoError(t, err)
@@ -166,8 +166,7 @@ func walPage1Salt(t *testing.T, walPath string, set *[SaltLen]byte) (salt [SaltL
 	frameSize := walFrameSize + int(hdr.pageSize)
 	o1, o2 := walChecksum(data[:24], 0, 0) // the chain as written
 	n1, n2 := o1, o2                       // the chain after set
-	var last [SaltLen]byte
-	var seen bool
+	var last, committed []byte
 	for off := walHeaderSize; off+frameSize <= len(data); off += frameSize {
 		fh, pg := data[off:off+walFrameSize], data[off+walFrameSize:off+frameSize]
 		if binary.BigEndian.Uint32(fh[8:12]) != hdr.salt1 || binary.BigEndian.Uint32(fh[12:16]) != hdr.salt2 {
@@ -180,10 +179,9 @@ func walPage1Salt(t *testing.T, walPath string, set *[SaltLen]byte) (salt [SaltL
 		o1, o2 = c1, c2
 		if binary.BigEndian.Uint32(fh[0:4]) == 1 {
 			if set != nil {
-				copy(pg[72:88], set[:])
+				copy(pg[dbHeaderSaltOff:dbHeaderSaltOff+SaltLen], set[:])
 			}
-			copy(last[:], pg[72:88])
-			seen = true
+			last = pg
 		}
 		n1, n2 = walFrameChecksum(fh[:8], pg, n1, n2)
 		if set != nil {
@@ -191,13 +189,51 @@ func walPage1Salt(t *testing.T, walPath string, set *[SaltLen]byte) (salt [SaltL
 			binary.BigEndian.PutUint32(fh[20:24], n2)
 		}
 		if binary.BigEndian.Uint32(fh[4:8]) != 0 { // a commit frame
-			salt, found = last, seen
+			committed = last
 		}
 	}
 	if set != nil {
 		require.NoError(t, os.WriteFile(walPath, data, 0o644))
 	}
-	return salt, found
+	return bytes.Clone(committed)
+}
+
+// walPage1Salt returns the KDF salt in the header of the last committed copy
+// of page 1 in the WAL at walPath, and whether there is one. With set
+// non-nil it first writes set there, as walPage1 does.
+func walPage1Salt(t *testing.T, walPath string, set *[SaltLen]byte) (salt [SaltLen]byte, found bool) {
+	t.Helper()
+	pg := walPage1(t, walPath, set)
+	if pg == nil {
+		return salt, false
+	}
+	copy(salt[:], pg[dbHeaderSaltOff:dbHeaderSaltOff+SaltLen])
+	return salt, true
+}
+
+// requireStampedPage1 requires that page 1 of the main file, read through f,
+// is frame, an image of page 1 from the WAL, with keyed in bytes 72-87 and
+// every other byte as frame has it.
+func requireStampedPage1(t *testing.T, f io.ReaderAt, frame []byte, keyed [SaltLen]byte) {
+	t.Helper()
+	require.NotNil(t, frame, "setup: the WAL holds a committed page 1")
+	got := make([]byte, len(frame))
+	_, err := f.ReadAt(got, 0)
+	require.NoError(t, err)
+	require.Equal(t, keyed[:], got[dbHeaderSaltOff:dbHeaderSaltOff+SaltLen], "page 1 of the main file names the keyed salt")
+	want := bytes.Clone(frame)
+	copy(want[dbHeaderSaltOff:dbHeaderSaltOff+SaltLen], keyed[:])
+	require.True(t, bytes.Equal(want, got), "page 1 of the main file is the WAL's page 1 apart from the salt")
+}
+
+// requireStampedPage1File is requireStampedPage1 on the main file at path,
+// which no handle of this process may hold open.
+func requireStampedPage1File(t *testing.T, path string, frame []byte, keyed [SaltLen]byte) {
+	t.Helper()
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer f.Close()
+	requireStampedPage1(t, f, frame, keyed)
 }
 
 // legacyWALSalt is the salt legacyDestination writes into the WAL's page 1.
@@ -277,12 +313,16 @@ func TestBackup_DestinationWALPage1WithAnotherSalt(t *testing.T) {
 
 // A legacyDestination written by a commit that leaves page 1 alone, then
 // checkpointed. The WAL's page 1 still names the other salt, and the
-// checkpoint's copy of it into the main file carries the keyed salt, so the
-// file opens with the passphrase and holds the commit.
+// checkpoint copies it into the main file with the keyed salt and every
+// other byte as the frame has it, so the file opens with the passphrase and
+// holds the commit.
 func TestCheckpoint_WALPage1WithAnotherSalt(t *testing.T) {
+	// A schema format 5 commit writes page 1 whatever it changes.
+	useCurrentFormat(t)
 	opts := passphraseOptions(CipherAES256GCM)
 	path := filepath.Join(t.TempDir(), "dst.db")
 	keyed := legacyDestination(t, path, opts)
+	legacy := walPage1(t, path+"-wal", nil)
 
 	// given: a commit of one leaf, not of page 1
 	db, err := testOpen(t, path, opts)
@@ -293,15 +333,13 @@ func TestCheckpoint_WALPage1WithAnotherSalt(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Put(ns, u32key(0), []byte("leaf")))
 	require.NoError(t, tx.Commit())
-	got, found := walPage1Salt(t, path+"-wal", nil)
-	require.True(t, found)
-	require.Equal(t, legacyWALSalt, got, "setup: the commit left the WAL's page 1 as it was")
+	require.True(t, bytes.Equal(legacy, walPage1(t, path+"-wal", nil)), "setup: the commit left the WAL's page 1 as it was")
 
 	// when
 	require.NoError(t, db.Checkpoint(CheckpointFull))
 
-	// then
-	require.Equal(t, keyed, headerSalt(t, path), "the main file's page 1 names the keyed salt")
+	// then: read through the handle, which holds the file's lock
+	requireStampedPage1(t, db.pager.file, legacy, keyed)
 	require.NoError(t, db.Close())
 	db, err = testOpen(t, path, opts)
 	require.NoError(t, err)
@@ -317,18 +355,51 @@ func TestCheckpoint_WALPage1WithAnotherSalt(t *testing.T) {
 	require.Equal(t, []byte("leaf"), v)
 }
 
+// A legacyDestination opened, read and closed, with no write. The close's
+// checkpoint copies the WAL's page 1 into the main file with the keyed salt
+// and every other byte as the frame has it, so the file opens with the
+// passphrase.
+func TestCheckpoint_WALPage1WithAnotherSaltAtClose(t *testing.T) {
+	opts := passphraseOptions(CipherAES256GCM)
+	path := filepath.Join(t.TempDir(), "dst.db")
+	keyed := legacyDestination(t, path, opts)
+	legacy := walPage1(t, path+"-wal", nil)
+
+	// when
+	db, err := testOpen(t, path, opts)
+	require.NoError(t, err)
+	codecRequire(t, db, 30)
+	require.NoError(t, db.Close())
+
+	// then
+	requireStampedPage1File(t, path, legacy, keyed)
+	db, err = testOpen(t, path, opts)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	codecRequire(t, db, 30)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rtx.Rollback()) }()
+	_, err = rtx.GetNamespace("t0")
+	require.NoError(t, err)
+}
+
 const saltReaderChildEnv = "BTREE_TEST_SALT_READER_CHILD"
 
 // A backup over a legacyDestination while another process reads the
 // destination at the commit whose page 1 names the other salt, through the
 // backup and its close. The close's checkpoint may copy only the frames that
 // reader can see, so the page 1 it writes into the main file is that old
-// one, and it writes it with the keyed salt: once the reader is gone the
-// file opens with the passphrase and holds the copy.
+// one, and it writes it with the keyed salt and every other byte as the
+// frame has it: once the reader is gone the file opens with the passphrase
+// and holds the copy.
 func TestBackup_WALPage1WithAnotherSaltUnderAReader(t *testing.T) {
 	if path := os.Getenv(saltReaderChildEnv); path != "" {
 		saltReaderChild(t, path)
 		return
+	}
+	if !hasMmapShm {
+		t.Skip("a second process cannot open the database where it runs in-process only")
 	}
 	if testing.Short() {
 		t.Skip("spawns a subprocess; excluded in -short")
@@ -338,6 +409,7 @@ func TestBackup_WALPage1WithAnotherSaltUnderAReader(t *testing.T) {
 	opts := passphraseOptions(CipherAES256GCM)
 	srcPath, dstPath := filepath.Join(dir, "src.db"), filepath.Join(dir, "dst.db")
 	keyed := legacyDestination(t, dstPath, opts)
+	legacy := walPage1(t, dstPath+"-wal", nil)
 
 	// given: another process reads the destination at that commit
 	cmd := exec.Command(os.Args[0], "-test.run=^TestBackup_WALPage1WithAnotherSaltUnderAReader$", "-test.timeout=60s")
@@ -368,15 +440,15 @@ func TestBackup_WALPage1WithAnotherSaltUnderAReader(t *testing.T) {
 	require.ErrorIs(t, b.Step(ctx, -1), ErrBackupDone)
 	require.NoError(t, b.Finish())
 	require.NoError(t, dst.Close())
-	// The reader ends without a checkpoint of its own.
-	require.NoError(t, stdin.Close())
-	require.NoError(t, cmd.Wait())
 
-	// then
+	// then: the close's checkpoint wrote the reader's page 1
+	requireStampedPage1File(t, dstPath, legacy, keyed)
 	got, found := walPage1Salt(t, dstPath+"-wal", nil)
 	require.True(t, found)
 	require.Equal(t, keyed, got, "setup: the backup's page 1 is in the WAL, past the checkpoint")
-	require.Equal(t, keyed, headerSalt(t, dstPath), "the main file's page 1 names the keyed salt")
+	// The reader ends without a checkpoint of its own.
+	require.NoError(t, stdin.Close())
+	require.NoError(t, cmd.Wait())
 	dst, err = testOpen(t, dstPath, opts)
 	require.NoError(t, err)
 	codecRequire(t, dst, 40)
