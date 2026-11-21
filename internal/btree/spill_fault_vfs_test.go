@@ -652,91 +652,115 @@ func TestSpillFault_RollbackTripsCursors(t *testing.T) {
 	}
 }
 
+// haltBigKey is the key of openHaltDB's namespace "c" that spills to an
+// overflow chain.
+var haltBigKey = bytes.Repeat([]byte("k"), 3*4096)
+
+// openHaltDB is a database whose namespace "a" spans far more pages than
+// the writer cache holds, "b" holds 20 keys on one leaf, and "c" holds a key
+// whose value spills (closeRescueKey(1)) and one whose key spills
+// (haltBigKey). prep, when not nil, changes it further before its log is
+// set to fail on demand.
+func openHaltDB(t *testing.T, prep func(t *testing.T, db *DB)) (*DB, *spillFaultFile) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "halt.db")
+	db, err := testOpen(t, path, Options{PageSize: 4096, CacheSize: closeRescueCache, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	createNS(t, db, "a")
+	putN(t, db, "a", closeRescueRows, closeRescueValSize)
+	createNS(t, db, "b")
+	putN(t, db, "b", 20, 10)
+	createNS(t, db, "c")
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	nsC, err := tx.GetNamespace("c")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(nsC, closeRescueKey(1), make([]byte, 10*4096)))
+	require.NoError(t, tx.Put(nsC, haltBigKey, []byte("v")))
+	require.NoError(t, tx.Commit())
+	if prep != nil {
+		prep(t, db)
+	}
+	f := &spillFaultFile{File: db.pager.wal.file}
+	db.pager.wal.file = f
+	return db, f
+}
+
 // The call during which a spill fails ends the transaction's cursors as it
 // returns, as SQLite's statement halt does (sqlite3VdbeHalt: closeAllCursors,
 // then sqlite3RollbackAll's trip, vdbeaux.c:3335, 3378): a cursor positioned
 // on another tree does not go on stepping through the leaf it pins. Each
-// call of a write transaction that can fetch a page is the failing one in
-// turn, a read and a move of another cursor included.
+// method of a write transaction and of its cursors that passes an error to
+// the halt itself (ReadTx.halt, Cursor.halt, Cursor.fail) is the failing
+// call in one case, at one of its error exits; a saved cursor's restore,
+// which every move and read of it begins with, has a case of its own.
+// Methods that only return the error of one of these (Skip, SkipBackward,
+// SeekExact, AppendValueByKey, CountUntil, the DB namespace calls behind
+// the WriteTx ones) have none. Savepoint and ReleaseSavepoint fetch no page
+// and cannot meet a spill.
 func TestSpillFault_FailedCallEndsCursors(t *testing.T) {
-	bigKey := bytes.Repeat([]byte("k"), 3*4096)
 	longName := strings.Repeat("n", 3*4096)
-	open := func(t *testing.T) (*DB, *spillFaultFile) {
-		path := filepath.Join(t.TempDir(), "halt.db")
-		db, err := testOpen(t, path, Options{PageSize: 4096, CacheSize: closeRescueCache, DisableAutoCheckpoint: true})
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = db.Close() })
-		createNS(t, db, "a")
-		putN(t, db, "a", closeRescueRows, closeRescueValSize)
-		createNS(t, db, "b")
-		putN(t, db, "b", 20, 10)
-		createNS(t, db, "c")
-		tx, err := db.BeginWrite()
-		require.NoError(t, err)
-		nsC, err := tx.GetNamespace("c")
-		require.NoError(t, err)
-		require.NoError(t, tx.Put(nsC, closeRescueKey(1), make([]byte, 10*4096)))
-		require.NoError(t, tx.Put(nsC, bigKey, []byte("v")))
-		require.NoError(t, tx.Commit())
-		f := &spillFaultFile{File: db.pager.wal.file}
-		db.pager.wal.file = f
-		return db, f
-	}
+	// longNS is a namespace whose catalog key spills: its lookup reads the
+	// overflow chain, which the full cache does not hold.
+	longNS := strings.Repeat("m", 3*4096)
+	withLongNS := func(t *testing.T, db *DB) { createNS(t, db, longNS) }
 	far := closeRescueKey(closeRescueRows - 1)
 	// Each case positions what it needs before the cache is filled, and
 	// returns the call that must meet the fault.
 	cases := []struct {
 		name string
+		prep func(t *testing.T, db *DB)
 		call func(t *testing.T, tx *WriteTx) func() error
 	}{
-		{"Put", func(t *testing.T, tx *WriteTx) func() error {
+		{"Put", nil, func(t *testing.T, tx *WriteTx) func() error {
 			ns := mustNS(t, tx, "a")
 			return func() error { return tx.Put(ns, far, []byte("x")) }
 		}},
-		{"Delete", func(t *testing.T, tx *WriteTx) func() error {
+		{"Delete", nil, func(t *testing.T, tx *WriteTx) func() error {
 			ns := mustNS(t, tx, "a")
 			return func() error { return tx.Delete(ns, far) }
 		}},
-		{"Get", func(t *testing.T, tx *WriteTx) func() error {
+		{"Get", nil, func(t *testing.T, tx *WriteTx) func() error {
 			ns := mustNS(t, tx, "a")
 			return func() error { _, err := tx.Get(ns, far); return err }
 		}},
-		{"Has", func(t *testing.T, tx *WriteTx) func() error {
+		{"Has", nil, func(t *testing.T, tx *WriteTx) func() error {
 			ns := mustNS(t, tx, "a")
 			return func() error { _, err := tx.Has(ns, far); return err }
 		}},
-		{"SeekKey", func(t *testing.T, tx *WriteTx) func() error {
+		{"SeekKey", nil, func(t *testing.T, tx *WriteTx) func() error {
 			ns := mustNS(t, tx, "a")
 			return func() error { _, err := tx.SeekKey(ns, far); return err }
 		}},
-		{"Count", func(t *testing.T, tx *WriteTx) func() error {
+		{"Count", nil, func(t *testing.T, tx *WriteTx) func() error {
 			ns := mustNS(t, tx, "a")
 			return func() error { _, err := tx.Count(ns); return err }
 		}},
-		{"NamespaceSize", func(t *testing.T, tx *WriteTx) func() error {
+		{"NamespaceSize", nil, func(t *testing.T, tx *WriteTx) func() error {
 			ns := mustNS(t, tx, "a")
 			return func() error { _, err := tx.NamespaceSize(ns); return err }
 		}},
-		{"CreateNamespace", func(t *testing.T, tx *WriteTx) func() error {
+		{"CreateNamespace", nil, func(t *testing.T, tx *WriteTx) func() error {
 			return func() error { _, err := tx.CreateNamespace(longName); return err }
 		}},
-		{"DeleteNamespace", func(t *testing.T, tx *WriteTx) func() error {
+		{"DeleteNamespace", nil, func(t *testing.T, tx *WriteTx) func() error {
 			return func() error { return tx.DeleteNamespace("a") }
 		}},
-		{"RenameNamespace", func(t *testing.T, tx *WriteTx) func() error {
+		{"RenameNamespace", nil, func(t *testing.T, tx *WriteTx) func() error {
 			return func() error { return tx.RenameNamespace("a", longName) }
 		}},
-		{"Cursor.Last", func(t *testing.T, tx *WriteTx) func() error {
+		{"Cursor.Last", nil, func(t *testing.T, tx *WriteTx) func() error {
 			c := tx.NewCursor(mustNS(t, tx, "a"))
 			t.Cleanup(c.Close)
 			return c.Last
 		}},
-		{"Cursor.Seek", func(t *testing.T, tx *WriteTx) func() error {
+		{"Cursor.Seek", nil, func(t *testing.T, tx *WriteTx) func() error {
 			c := tx.NewCursor(mustNS(t, tx, "a"))
 			t.Cleanup(c.Close)
 			return func() error { return c.Seek(far) }
 		}},
-		{"Cursor.Next", func(t *testing.T, tx *WriteTx) func() error {
+		{"Cursor.Next", nil, func(t *testing.T, tx *WriteTx) func() error {
 			// On the last entry of a dirty leaf: the next step crosses to
 			// a leaf the full cache does not hold, and the one it leaves
 			// cannot make room.
@@ -750,33 +774,97 @@ func TestSpillFault_FailedCallEndsCursors(t *testing.T) {
 			tx.pager.releasePage(pg)
 			return c.Next
 		}},
-		{"Cursor.RangeFraction", func(t *testing.T, tx *WriteTx) func() error {
+		{"Cursor.RangeFraction", nil, func(t *testing.T, tx *WriteTx) func() error {
 			c := tx.NewCursor(mustNS(t, tx, "a"))
 			t.Cleanup(c.Close)
 			return func() error { _, err := c.RangeFraction(closeRescueKey(1), far); return err }
 		}},
-		{"Cursor.Value", func(t *testing.T, tx *WriteTx) func() error {
+		{"Cursor.Value", nil, func(t *testing.T, tx *WriteTx) func() error {
 			c := tx.NewCursor(mustNS(t, tx, "c"))
 			t.Cleanup(c.Close)
 			require.NoError(t, c.SeekExact(closeRescueKey(1)))
 			return func() error { _, err := c.Value(); return err }
 		}},
-		{"Cursor.AppendValue", func(t *testing.T, tx *WriteTx) func() error {
+		{"Cursor.AppendValue", nil, func(t *testing.T, tx *WriteTx) func() error {
 			c := tx.NewCursor(mustNS(t, tx, "c"))
 			t.Cleanup(c.Close)
 			require.NoError(t, c.SeekExact(closeRescueKey(1)))
 			return func() error { _, err := c.AppendValue(nil); return err }
 		}},
-		{"Cursor.Key", func(t *testing.T, tx *WriteTx) func() error {
+		{"Cursor.Key", nil, func(t *testing.T, tx *WriteTx) func() error {
 			c := tx.NewCursor(mustNS(t, tx, "c"))
 			t.Cleanup(c.Close)
-			require.NoError(t, c.SeekExact(bigKey))
+			require.NoError(t, c.SeekExact(haltBigKey))
 			return func() error { _, err := c.Key(); return err }
+		}},
+		{"WriteTx.GetNamespace", withLongNS, func(t *testing.T, tx *WriteTx) func() error {
+			return func() error { _, err := tx.GetNamespace(longNS); return err }
+		}},
+		{"ReadTx.GetNamespace", withLongNS, func(t *testing.T, tx *WriteTx) func() error {
+			// The read view a write transaction embeds resolves through
+			// the writer's cache.
+			return func() error { _, err := tx.ReadTx.GetNamespace(longNS); return err }
+		}},
+		{"RollbackToSavepoint", nil, func(t *testing.T, tx *WriteTx) func() error {
+			// The rollback saves the cursors first, and the save of one on
+			// a key that spills reads the key's overflow chain.
+			c := tx.NewCursor(mustNS(t, tx, "c"))
+			t.Cleanup(c.Close)
+			require.NoError(t, c.SeekExact(haltBigKey))
+			sp, err := tx.Savepoint()
+			require.NoError(t, err)
+			return func() error { return tx.RollbackToSavepoint(sp) }
+		}},
+		{"Cursor.First", nil, func(t *testing.T, tx *WriteTx) func() error {
+			// The root of "c" is not one of the pages the full cache holds.
+			c := tx.NewCursor(mustNS(t, tx, "c"))
+			t.Cleanup(c.Close)
+			return c.First
+		}},
+		{"Cursor.Previous", nil, func(t *testing.T, tx *WriteTx) func() error {
+			// On the first entry of a dirty leaf: Cursor.Next's case,
+			// stepping the other way.
+			c := tx.NewCursor(mustNS(t, tx, "a"))
+			t.Cleanup(c.Close)
+			require.NoError(t, c.Seek(closeRescueKey(closeRescueRows/2)))
+			leaf := &c.stack[len(c.stack)-1]
+			leaf.cellIdx = 0
+			pg, err := tx.pager.getWritablePage(leaf.pgno)
+			require.NoError(t, err)
+			tx.pager.releasePage(pg)
+			return c.Previous
+		}},
+		{"Cursor.SeekNear", func(t *testing.T, db *DB) {
+			// "z" after haltBigKey: the leaf of "c" begins and ends with
+			// keys on the page, and the key between them spills.
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			require.NoError(t, tx.Put(mustNS(t, tx, "c"), []byte("z"), []byte("v")))
+			require.NoError(t, tx.Commit())
+		}, func(t *testing.T, tx *WriteTx) func() error {
+			// The key sought lies between the first and the last key of the
+			// pinned leaf: the search stays in the leaf, and its comparison
+			// with the spilled key reads that key's overflow chain.
+			c := tx.NewCursor(mustNS(t, tx, "c"))
+			t.Cleanup(c.Close)
+			require.NoError(t, c.SeekExact(closeRescueKey(1)))
+			return func() error { return c.SeekNear(haltBigKey) }
+		}},
+		{"saved Cursor.Next", nil, func(t *testing.T, tx *WriteTx) func() error {
+			// A write to its tree saved the cursor: its next move seeks its
+			// key again, through a leaf the full cache does not hold.
+			ns := mustNS(t, tx, "a")
+			c := tx.NewCursor(ns)
+			t.Cleanup(c.Close)
+			require.NoError(t, c.Seek(far))
+			require.NoError(t, tx.Put(ns, closeRescueKey(1), []byte("x")))
+			require.Equal(t, cursorRequireSeek, c.state)
+			return c.Next
 		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			db, f := open(t)
+			db, f := openHaltDB(t, tc.prep)
 			p := db.pager
 			tx, err := db.BeginWrite()
 			require.NoError(t, err)
