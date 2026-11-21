@@ -2080,27 +2080,15 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 				// the next sibling subtree (saved during descent).
 				return tx.leftmostKeyAfter(fallbackPgno, fallbackIdx, buf, fallbackDepth)
 			}
-			off := pg.getCellOffset(idx)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
-			if cerr != nil {
-				tx.pager.releasePage(pg)
-				return buf, cerr
+			// A read of the key bounds the key only (leafFullKey), as
+			// Cursor.Key does. leafFullKey returns a slice into pg.data
+			// when the key is local: copy before the release.
+			key, kerr := leafFullKey(pg.data, int(pg.getCellOffset(idx)), lim, tx.pager, tx.walHdr.mxFrame, cache)
+			if kerr == nil {
+				buf = append(buf, key...)
 			}
-			if cell.overflowPg != 0 {
-				// leafFullKey returns a slice into pg.data when the key is
-				// local: copy before the release.
-				fullKey, kerr := leafFullKey(pg.data, int(off), lim, tx.pager, tx.walHdr.mxFrame, cache)
-				if kerr != nil {
-					tx.pager.releasePage(pg)
-					return buf, kerr
-				}
-				buf = append(buf, fullKey...)
-				tx.pager.releasePage(pg)
-				return buf, nil
-			}
-			buf = append(buf, cell.key...)
 			tx.pager.releasePage(pg)
-			return buf, nil
+			return buf, kerr
 		}
 		childPgno, cellIdx, serr := searchInteriorWithOverflow(pg, prefix, usableSize, tx.pager, tx.walHdr.mxFrame, cache)
 		if serr != nil {
@@ -2175,27 +2163,13 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte,
 				tx.pager.releasePage(pg)
 				return buf, ErrKeyNotFound
 			}
-			off := pg.getCellOffset(0)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
-			if cerr != nil {
-				tx.pager.releasePage(pg)
-				return buf, cerr
+			// The key alone is read and bounded, as in AppendSeekKey.
+			key, kerr := leafFullKey(pg.data, int(pg.getCellOffset(0)), lim, tx.pager, tx.walHdr.mxFrame, cache)
+			if kerr == nil {
+				buf = append(buf, key...)
 			}
-			if cell.overflowPg != 0 {
-				// leafFullKey returns a slice into pg.data when the key is
-				// local: copy before the release.
-				fullKey, kerr := leafFullKey(pg.data, int(off), lim, tx.pager, tx.walHdr.mxFrame, cache)
-				if kerr != nil {
-					tx.pager.releasePage(pg)
-					return buf, kerr
-				}
-				buf = append(buf, fullKey...)
-				tx.pager.releasePage(pg)
-				return buf, nil
-			}
-			buf = append(buf, cell.key...)
 			tx.pager.releasePage(pg)
-			return buf, nil
+			return buf, kerr
 		}
 		// Interior page: descend to cell[0].leftChild.
 		off, oerr := pg.getCellOffsetSafe(0)

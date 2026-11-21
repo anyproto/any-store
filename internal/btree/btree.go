@@ -4764,11 +4764,12 @@ func (c *Cursor) CountUntil(endKey []byte, endInclusive bool) (int, error) {
 				return count, oerr
 			}
 			lastCell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(lastOff), lim)
-			if cerr != nil {
-				return count, cerr
-			}
 
-			if lastCell.overflowPg == 0 {
+			// A last cell that does not parse whole is left to the
+			// per-entry path, which reads keys only (Cursor.Key), as
+			// SeekNear's and currentKeyEqual's fast paths fall back on a
+			// leafKeyAt error.
+			if cerr == nil && lastCell.overflowPg == 0 {
 				cmp := bytes.Compare(lastCell.key, endKey)
 				if cmp < 0 || (cmp == 0 && endInclusive) {
 					// All remaining entries on this page are within bounds
