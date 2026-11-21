@@ -122,6 +122,38 @@ func TestPagedExists_AbsentTakesNoReaderSlot(t *testing.T) {
 	}
 }
 
+// A :pmeta namespace dropped after PagedExists found it, before its read
+// transaction began, reads as absent: the namespace is resolved again in that
+// transaction, so the dropped root, now a free page, is not read.
+func TestPagedExists_NamespaceDroppedBeforeRead(t *testing.T) {
+	const n, dim = 20, 8
+	vecs, keys := randVectors(n, dim, 5)
+	g := NewFlatHNSW(dim, L2, 1)
+	for i := range vecs {
+		g.Add(keys[i], vecs[i])
+	}
+	db, err := btree.Open(filepath.Join(t.TempDir(), "p.db"), btree.Options{})
+	require.NoError(t, err)
+	defer db.Close()
+	require.NoError(t, PersistPaged(g, db, "emb", L2))
+
+	dropped := false
+	testPagedExistsLookedUpHook = func() {
+		dropped = true
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		require.NoError(t, wtx.DeleteNamespace("emb:pmeta"))
+		wtx.MarkSchemaChanged()
+		require.NoError(t, wtx.Commit())
+	}
+	defer func() { testPagedExistsLookedUpHook = nil }()
+
+	exists, err := PagedExists(db, "emb")
+	require.True(t, dropped, "setup: the namespace is dropped between the lookup and the read")
+	require.NoError(t, err)
+	require.False(t, exists)
+}
+
 // TestPagedVsMemory measures the latency and RAM trade of paging vectors from
 // the btree (Option B) vs the in-memory arena (Option A), warm cache.
 func TestPagedVsMemory(t *testing.T) {
