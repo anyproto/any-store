@@ -984,7 +984,7 @@ func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
 				db, err := testOpen(t, "", opts)
 				require.NoError(t, err)
 				createNS(t, db, "t")
-				putN(t, db, "t", 50, 300)
+				putTagged(t, db, 1, 50, 0xA1)
 				tx, err := db.BeginWrite()
 				require.NoError(t, err)
 				ns, err := tx.GetNamespace("t")
@@ -997,22 +997,17 @@ func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
 						gatedOpen.Add(1)
 					}
 				}
-				wantKey, err := cur.Key()
-				require.NoError(t, err)
-				wantKey = bytes.Clone(wantKey)
-				wantVal, err := cur.Value()
-				require.NoError(t, err)
-				wantVal = bytes.Clone(wantVal)
+				wantKey := closeRescueKey(1)
+				wantVal := taggedValue(wantKey, 0xA1)
 
 				var (
-					wg      sync.WaitGroup
 					started = make(chan struct{})
+					done    = make(chan struct{})
 					bad     atomic.Value
 					reads   int
 				)
-				wg.Add(1)
 				go func() {
-					defer wg.Done()
+					defer close(done)
 					for i := 0; ; i++ {
 						if i == 100 {
 							close(started)
@@ -1022,9 +1017,6 @@ func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
 						if kerr != nil || verr != nil {
 							if !errors.Is(kerr, ErrClosed) && kerr != nil || !errors.Is(verr, ErrClosed) && verr != nil {
 								bad.Store(fmt.Sprintf("Key: %v, Value: %v", kerr, verr))
-							}
-							if i < 100 {
-								close(started)
 							}
 							break
 						}
@@ -1041,16 +1033,19 @@ func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
 					}
 					cur.Close()
 				}()
-				<-started
+				select {
+				case <-started:
+				case <-done:
+				}
 				require.NoError(t, db.Close())
 				// Another database takes what the first gave back (a plain
-				// Open: testOpen resets the pool).
+				// Open: testOpen resets the pool), with other keys and values.
 				other, err := Open("", opts)
 				require.NoError(t, err)
 				createNS(t, other, "t")
-				putN(t, other, "t", 50, 300)
+				putTagged(t, other, 1001, 50, 0xB2)
 				require.NoError(t, other.Close())
-				wg.Wait()
+				<-done
 				testGatedPinnedLeafHook = nil
 				require.Nil(t, bad.Load())
 				require.NotZero(t, reads)
@@ -1150,12 +1145,13 @@ func TestWriterGate_PinnedLeafCallsStayOutside(t *testing.T) {
 
 // Close comes while a goroutine steps through the tree with Next or
 // Previous and reads every entry with Key and AppendValue, most of them
-// outside the gate: each read sees the right entry or ErrClosed, under the
-// race detector nothing Close does conflicts with them, and in slab mode
-// no slot is lost once the cursor is closed. The hook on the gated path
-// (testGatedPinnedLeafHook) checks that no call that could stay on the
-// pinned leaf took the gate while it was open.
+// outside the gate: each read sees the entry the scan has reached or
+// ErrClosed, under the race detector nothing Close does conflicts with
+// them, and in slab mode no slot is lost once the cursor is closed. The
+// hook on the gated path (testGatedPinnedLeafHook) checks that no call that
+// could stay on the pinned leaf took the gate while it was open.
 func TestClose_DuringInLeafStepsAndAppendValue(t *testing.T) {
+	const rows = 120
 	for _, mode := range []struct {
 		name string
 		slab bool
@@ -1181,31 +1177,36 @@ func TestClose_DuringInLeafStepsAndAppendValue(t *testing.T) {
 				db, err := testOpen(t, "", opts)
 				require.NoError(t, err)
 				createNS(t, db, "t")
-				putN(t, db, "t", 120, 300)
+				putTagged(t, db, 1, rows, 0xA1)
 				tx, err := db.BeginWrite()
 				require.NoError(t, err)
 				ns, err := tx.GetNamespace("t")
 				require.NoError(t, err)
 
-				// What every entry holds, read before the race.
-				want := map[string][]byte{}
-				cur := tx.NewCursor(ns)
-				require.NoError(t, cur.First())
-				for cur.Valid() {
-					k, err := cur.Key()
-					require.NoError(t, err)
-					v, err := cur.Value()
-					require.NoError(t, err)
-					want[string(k)] = bytes.Clone(v)
-					require.NoError(t, cur.Next())
+				// The scan runs forward from the first entry or back from
+				// the last, and wraps: its i-th read is of key 1+i%rows
+				// forward and rows-i%rows back.
+				back := it%2 == 1
+				wantKey := func(i int) []byte {
+					if back {
+						return closeRescueKey(rows - i%rows)
+					}
+					return closeRescueKey(1 + i%rows)
 				}
-				require.NoError(t, cur.First())
+				cur := tx.NewCursor(ns)
+				if back {
+					require.NoError(t, cur.Last())
+				} else {
+					require.NoError(t, cur.First())
+				}
 
-				// Every value is on its leaf: a read of the cursor on an
-				// entry, or a step with room on the leaf, could stay outside.
+				// While the gate is open the cursor stands on an entry, and
+				// every value is on its leaf: a read, or a step with room on
+				// the leaf, needs nothing but the leaf.
+				p := db.pager
 				var gatedOpen atomic.Int32
 				testGatedPinnedLeafHook = func(c *Cursor, step int) {
-					if c != cur || !c.readsPinnedLeaf() {
+					if c != cur || p.wgate.closed() || len(c.stack) == 0 {
 						return
 					}
 					f := c.stack[len(c.stack)-1]
@@ -1220,7 +1221,6 @@ func TestClose_DuringInLeafStepsAndAppendValue(t *testing.T) {
 					bad     atomic.Value
 					reads   int
 				)
-				back := it%2 == 1
 				go func() {
 					defer close(done)
 					var buf []byte
@@ -1233,8 +1233,13 @@ func TestClose_DuringInLeafStepsAndAppendValue(t *testing.T) {
 							buf, err = cur.AppendValue(buf[:0])
 						}
 						if err == nil {
-							if w, ok := want[string(k)]; !ok || !bytes.Equal(w, buf) {
-								bad.Store(fmt.Sprintf("read %d: another entry's bytes", i))
+							want := wantKey(i)
+							if !bytes.Equal(k, want) {
+								bad.Store(fmt.Sprintf("read %d: key %x, want %x", i, k, want))
+								break
+							}
+							if !bytes.Equal(buf, taggedValue(want, 0xA1)) {
+								bad.Store(fmt.Sprintf("read %d: the value of key %x is not its own", i, want))
 								break
 							}
 							reads++
@@ -1255,23 +1260,22 @@ func TestClose_DuringInLeafStepsAndAppendValue(t *testing.T) {
 							if !errors.Is(err, ErrClosed) {
 								bad.Store(fmt.Sprintf("read %d: %v", i, err))
 							}
-							if i < 100 {
-								close(started)
-							}
 							break
 						}
 					}
 					cur.Close()
 				}()
-				<-started
-				p := db.pager
+				select {
+				case <-started:
+				case <-done:
+				}
 				require.NoError(t, db.Close())
 				// Another database takes what the first gave back (a plain
-				// Open: testOpen resets the pool).
+				// Open: testOpen resets the pool), with other keys and values.
 				other, err := Open("", opts)
 				require.NoError(t, err)
 				createNS(t, other, "t")
-				putN(t, other, "t", 120, 300)
+				putTagged(t, other, 1001, rows, 0xB2)
 				require.NoError(t, other.Close())
 				<-done
 				testGatedPinnedLeafHook = nil
@@ -1289,4 +1293,24 @@ func TestClose_DuringInLeafStepsAndAppendValue(t *testing.T) {
 			}
 		})
 	}
+}
+
+// putTagged puts n entries into namespace "t", with the keys first,
+// first+1, ... (closeRescueKey) and the values taggedValue gives them.
+func putTagged(t *testing.T, db *DB, first, n int, tag byte) {
+	t.Helper()
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.GetNamespace("t")
+	require.NoError(t, err)
+	for i := first; i < first+n; i++ {
+		k := closeRescueKey(i)
+		require.NoError(t, tx.Put(ns, k, taggedValue(k, tag)))
+	}
+	require.NoError(t, tx.Commit())
+}
+
+// taggedValue is 300 bytes of a 4-byte key and a tag, over and over.
+func taggedValue(key []byte, tag byte) []byte {
+	return bytes.Repeat(append(bytes.Clone(key), tag), 60)
 }
