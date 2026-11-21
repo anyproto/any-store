@@ -650,10 +650,12 @@ func Open(path string, opts Options) (*DB, error) {
 	// code paths on plaintext databases.
 	//
 	// The codec is settled twice. Here, before p.open() and with no lock,
-	// from a first look at the file: a wrong key option or an unreadable
-	// header is refused before anything is created or attached, and a key
+	// from a first look at the file: a key option that cannot make a codec
+	// for a new file is refused before anything is created, and a key
 	// derivation is usually done before any lock is held. Then by p.open(),
-	// with the DB-file lock held, on the header it read under that lock.
+	// with the DB-file lock held, on the header it read under that lock;
+	// a file with content whose header is unreadable, or that the options
+	// do not fit, is refused there, before the WAL is opened.
 	// Between the two another process may create the database, or win its
 	// creation from this open; the second call then builds the codec again,
 	// from the salt that is in the file. It does nothing when the first
@@ -719,29 +721,24 @@ func Open(path string, opts Options) (*DB, error) {
 			settled.done, settled.exists, settled.salt, settled.cksum = true, fileExists, salt, useCksum
 			return nil
 		}
+		// A file with content is not judged by this look. Whatever it
+		// finds (a header the options refuse, one that does not parse, a
+		// file that ends before its header) can be gone by the time
+		// p.open() holds the DB-file lock: another process may roll a dead
+		// creator's page 1 back and create the database in between. So
+		// this look only builds a codec when it can, and p.open() settles
+		// it on the header it reads under the lock and returns that read's
+		// errors, as sqlite3PagerSharedLock reads the header only once it
+		// holds SHARED (pager.c:5272-5282). The options of a new file are
+		// checked here, before anything is created.
 		existingHeader, herr := readInitialHeader(path)
-		var serr error
-		hasContent := true
 		switch {
 		case herr == nil:
-			serr = p.settleCodec(&existingHeader)
+			_ = p.settleCodec(&existingHeader)
 		case errors.Is(herr, os.ErrNotExist) || errors.Is(herr, errEmptyFile):
-			hasContent = false
-			serr = p.settleCodec(nil)
-		default:
-			serr = fmt.Errorf("btree: read header: %w", herr)
-		}
-		if serr != nil && hasContent {
-			// The file has content this look refused. Beside a hot
-			// creation journal that content is a dead creator's page 1,
-			// which p.open() rolls back before it creates the database:
-			// it is no header to judge the options by.
-			if hot, jerr := p.hasHotCreationJournal(); jerr == nil && hot {
-				serr = p.settleCodec(nil)
+			if err := p.settleCodec(nil); err != nil {
+				return nil, err
 			}
-		}
-		if serr != nil {
-			return nil, serr
 		}
 	} else if opts.InMemory && (wantEncryption || opts.Checksum) {
 		// InMemory: build codec from zero salt; no on-disk marker.
