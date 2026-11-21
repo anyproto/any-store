@@ -254,7 +254,9 @@ type collection struct {
 	// pinned counts the entries of the open write transaction's schema log
 	// that reference this handle (txSchema.log): its creation, each schema
 	// change made through it, and the mark the transaction's first use of
-	// the handle leaves (logPin, from refreshLiveSketches).
+	// the handle leaves (logPin, from refreshLiveSketches) — or its open of
+	// the collection, when that open made the handle and loaded its
+	// sketches (db.openCollectionOnce).
 	// While it is non-zero the handle stays the collection's one registered
 	// handle. A second one — built from the writer's view or from the
 	// committed one — would not follow the transaction's outcome: its
@@ -1829,9 +1831,11 @@ func (c *collection) refreshSketches(tx *btree.ReadTx, s *collSchema) error {
 // then the sketches are its own (sketchTx) to the end. From that use on the
 // handle is pinned in the transaction's log (logPin), so it stays the
 // collection's one handle until the transaction ends: a Close() waits, and
-// an open by name returns it (see collection.pinned). A savepoint that
-// encloses the first use takes the pin with it when it rolls back, with the
-// deltas made inside it; the next use pins again. The epoch can move
+// an open by name returns it (see collection.pinned). A handle the
+// transaction's own open made is its own, and pinned, from its registration
+// (db.openCollectionOnce). A savepoint that encloses the first use, or that
+// open, takes the pin with it when it rolls back, with the deltas made
+// inside it; the next use pins again. The epoch can move
 // under an open write transaction: nothing commits under it, but a reader of
 // this process that took its snapshot at an older commit may only now count
 // it (wal.noteSnapshot). A load at that point would put the stored row over

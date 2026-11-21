@@ -434,9 +434,16 @@ func (c *collection) logPin(t *txSchema) error {
 	}
 	c.pinned++
 	c.db.mu.Unlock()
+	t.pin(c)
+	return nil
+}
+
+// pin appends the mark of a handle whose count (collection.pinned) the
+// caller raised under db.mu: logPin, and the open that registers a handle
+// the write transaction loaded (db.openCollectionOnce).
+func (t *txSchema) pin(c *collection) {
 	t.log = append(t.log, logEntry{c: c, kind: logPin})
 	c.logLast = len(t.log)
-	return nil
 }
 
 // install publishes the log as the commit becomes visible, before the epoch

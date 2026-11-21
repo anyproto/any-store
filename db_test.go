@@ -2520,6 +2520,45 @@ func TestWriteTx_HandleClosedBeforeCommitStoresItsSketches(t *testing.T) {
 		require.Equal(t, uint64(53), storedSketch(t, d, again).DocCount, "the next write counts on")
 	})
 
+	// The transaction's open made the handle (nothing had the collection
+	// open) and loaded its sketches: it is the transaction's one handle from
+	// the registration on, with no write through it yet.
+	t.Run("opened by the transaction and closed before any write", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		coll, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.Close())
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		if coll != again {
+			t.Error("the transaction has a second handle of the collection")
+		}
+		require.NoError(t, coll.Insert(wtx.Context(), doc(100)), "the handle the transaction opened first")
+		require.NoError(t, wtx.Commit())
+		require.Equal(t, uint64(51), storedSketch(t, d, again).DocCount)
+		require.NoError(t, again.Insert(ctx, doc(101)), "the second open cancelled the Close()")
+		require.Equal(t, uint64(52), storedSketch(t, d, again).DocCount, "the next write counts on")
+	})
+
+	// The same Close() with no open after it takes effect when the
+	// transaction ends.
+	t.Run("opened by the transaction, closed, written and committed", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		coll, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.Close())
+		require.NoError(t, coll.Insert(wtx.Context(), doc(100)), "the Close() waits for the transaction")
+		require.NoError(t, wtx.Commit())
+		require.ErrorIs(t, coll.Insert(ctx, doc(101)), ErrCollectionClosed, "the Close() took effect at the commit")
+		reopened(t, d, 51)
+	})
+
 	// The transaction first used the handle inside a savepoint that rolled
 	// back: the write after it holds the handle all the same.
 	t.Run("first used in a savepoint that rolled back", func(t *testing.T) {

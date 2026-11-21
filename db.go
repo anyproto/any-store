@@ -920,6 +920,20 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 			}
 			db.forgetLocked(existing.(*collection))
 		}
+		// A write transaction that loaded the handle has its sketches from
+		// here on (newCollection stamped them as its own): it pins the
+		// handle in the same critical section that registers it, as its
+		// first use of a registered handle does (refreshLiveSketches). A
+		// Close() between the open and that use then waits for the
+		// transaction like any other, and an open by name inside it returns
+		// this handle.
+		wt, _ := tx.Aux().(*commonTx)
+		if !tx.IsWriteTx() {
+			wt = nil
+		}
+		if wt != nil {
+			c.pinned++
+		}
 		c.since = db.sinceNow()
 		// The version is settled before the handle can be found. The
 		// handle's sketch stamps speak for the index objects of this
@@ -932,6 +946,9 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 		db.openedCollections[collectionName] = c
 		db.byIdentity[c.identity] = c
 		db.mu.Unlock()
+		if wt != nil {
+			wt.schema.pin(c)
+		}
 		if testHookRegistered != nil {
 			testHookRegistered(collectionName)
 		}
