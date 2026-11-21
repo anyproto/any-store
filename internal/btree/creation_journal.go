@@ -186,7 +186,7 @@ func (p *pager) openCreationJournal() (*creationJournal, error) {
 		return nil, fmt.Errorf("btree: open the creation journal: %w", err)
 	}
 	j := &creationJournal{f: f, name: name}
-	j.dirSync.set()
+	j.dirSync.set(name)
 	if h := testOpenStageHook; h != nil {
 		h(p, "journal-opened")
 	}
@@ -246,7 +246,7 @@ func creationJournalLeftover(f fileHandle) (bool, error) {
 // is (pager.c:4286-4392, called at pager.c:6612). It is the descriptor's first
 // sync, so the directory is synced after it (dirSync).
 func (j *creationJournal) sync() error {
-	if err := j.dirSync.sync(j.f, j.name); err != nil {
+	if err := j.dirSync.sync(j.f); err != nil {
 		return fmt.Errorf("btree: sync the creation journal: %w", err)
 	}
 	return nil
@@ -292,6 +292,6 @@ func (j *creationJournal) commit(p *pager) error {
 }
 
 // testSyncDirHook runs after every directory fsync that succeeded
-// (syncdir_unix.go), with the path of the file whose directory was synced.
-// Outside Unix no directory is synced and it never runs. Nil outside tests.
-var testSyncDirHook func(path string)
+// (syncdir_unix.go), with the directory's open descriptor, the one that was
+// synced. Nil outside tests.
+var testSyncDirHook func(dir *os.File)

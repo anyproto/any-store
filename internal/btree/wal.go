@@ -1708,7 +1708,7 @@ func (w *wal) open() (err error) {
 		return err
 	}
 	w.file = f
-	w.dirSync.set()
+	w.dirSync.set(w.path)
 
 	// Release the WAL file/shm on any error after this point so a failed open
 	// doesn't leak fds (see the equivalent guard in pager.open for why a leaked
@@ -2226,7 +2226,7 @@ func (w *wal) flushHeader() error {
 // delete in particular, creationJournal.commit), is durable before anything
 // synced to the WAL through this handle is relied on.
 func (w *wal) syncFile() error {
-	return w.dirSync.sync(w.file, w.path)
+	return w.dirSync.sync(w.file)
 }
 
 // writeHeader writes a fresh WAL header to disk. There is no log to
