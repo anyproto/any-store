@@ -19,6 +19,29 @@ func sqliteJournalHdr() []byte {
 	return hdr
 }
 
+func createPutRow(t *testing.T, db *DB, nsName string) {
+	t.Helper()
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace(nsName)
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("row-of-"+nsName), []byte("written-by-"+nsName)))
+	tx.MarkDataChanged()
+	require.NoError(t, tx.Commit())
+}
+
+func createRequireRow(t *testing.T, db *DB, nsName string) {
+	t.Helper()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rtx.Rollback()) }()
+	ns, err := rtx.GetNamespace(nsName)
+	require.NoError(t, err, "namespace %q written by the other process must be there", nsName)
+	val, err := rtx.Get(ns, []byte("row-of-"+nsName))
+	require.NoError(t, err)
+	require.Equal(t, []byte("written-by-"+nsName), val)
+}
+
 func TestCreationJournal_WhichHeaderIsHot(t *testing.T) {
 	valid := creationJournalHdr(4096)
 	origSizeOne := bytes.Clone(valid)

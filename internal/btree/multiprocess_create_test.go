@@ -129,29 +129,6 @@ func childWait(t *testing.T, in *bufio.Reader, token string) {
 	require.Equal(t, token, strings.TrimSpace(line))
 }
 
-func createPutRow(t *testing.T, db *DB, nsName string) {
-	t.Helper()
-	tx, err := db.BeginWrite()
-	require.NoError(t, err)
-	ns, err := tx.CreateNamespace(nsName)
-	require.NoError(t, err)
-	require.NoError(t, tx.Put(ns, []byte("row-of-"+nsName), []byte("written-by-"+nsName)))
-	tx.MarkDataChanged()
-	require.NoError(t, tx.Commit())
-}
-
-func createRequireRow(t *testing.T, db *DB, nsName string) {
-	t.Helper()
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-	defer func() { require.NoError(t, rtx.Rollback()) }()
-	ns, err := rtx.GetNamespace(nsName)
-	require.NoError(t, err, "namespace %q written by the other process must be there", nsName)
-	val, err := rtx.Get(ns, []byte("row-of-"+nsName))
-	require.NoError(t, err)
-	require.Equal(t, []byte("written-by-"+nsName), val)
-}
-
 // TestMultiProcessCreateRaceOneDatabase: two processes open the same new path
 // at once. The child is held just before its write of page 1 — after it has
 // decided the file is a new database — while the parent opens the same path.
