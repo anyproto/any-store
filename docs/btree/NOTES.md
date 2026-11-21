@@ -837,12 +837,13 @@ is over) or `ErrValueTooLarge` before it touches a page, and `CreateNamespace` /
 `RenameNamespace` apply it to the master-table record (the name and a 4-byte root) before
 they allocate the root or delete the old name. Only `Put` brings a new record into a tree;
 the page rebuilds, a `Delete` that defragments its leaf among them, write back cells they
-have parsed. `searchLeafWithOverflow` tests the two lengths singly when it probes a cell
-and their sum only for the cell it reports as found: a cell over the limit by its sum (a
-release without the write-side limit could store one) does not hide its neighbours, and
-`Has` does not answer true for a record `Get` rejects. `leafCellPayloadLen` (`walkSize`)
-tests them singly, as before. Both are looser than `payloadFits`, never stricter, so
-nothing `Put` accepts fails there. The overflow-chain readers have no cap of their own
+have parsed. `searchLeafWithOverflow` tests the two lengths singly when it probes a cell,
+and so does `leafFullKey`, which rebuilds a spilled key for the compare; their sum is
+tested only for the cell the search reports as found. A cell over the limit by its sum (a
+release without the write-side limit could store one) therefore does not hide its
+neighbours, and `Has` does not answer true for it. `leafCellPayloadLen` (`walkSize`) tests
+the lengths singly, as before. These tests are looser than `payloadFits`, never stricter,
+so nothing `Put` accepts fails there. The overflow-chain readers have no cap of their own
 (their `maxIter` follows from the length asked for), and the 9-byte varint holds any length
 under the cap.
 
@@ -853,12 +854,20 @@ bound is ported for that (2026-11-19): `sqlite3VdbeMemFromBtree` returns
 the Mem (`vdbemem.c:1428-1429`), and that size is `pageSize * nPage` (`btree.c:4981-4985`).
 `payloadInFile` (`page.go`) is the same test with the page count of the reader's snapshot
 (`readerDbSizeBound`: the read transaction's, or the live count for the writer). It runs
-before every allocation sized by a declared length: `btree.AppendValue`,
-`ReadTx.AppendValue`, `Cursor.Value`, `Cursor.AppendValue`, `leafFullKey`, `leafFullValue`,
-`interiorFullKey`, `cellFullKey` and `collectInteriorCellsKeepBuf`. It is applied where the
-bytes are asked for, as in SQLite, not in the cell parsers, which have no pager. The 1 GiB
-cap stays as the limit of what is written and as the bound where the two differ (a file
-over 1 GiB).
+before every allocation sized by a declared length, on the bytes that are read: key and
+value for the value readers (`btree.AppendValue`, `ReadTx.AppendValue`, `Cursor.Value`,
+`Cursor.AppendValue`, `leafFullValue`), the key alone for the key readers (`leafFullKey`,
+`interiorFullKey`, `cellFullKey`, `collectInteriorCellsKeepBuf`). SQLite's index probe
+likewise sizes the key it rebuilds from the key alone (`btree.c:6159-6168`). A damaged value
+length therefore fails the read of that value, and not a search that compares the cell's
+key or a split that takes it for a divider. It is applied where the bytes are asked for, as
+in SQLite, not in the cell parsers, which have no pager. The 1 GiB cap stays as the limit of
+what is written and as the bound where the two differ (a file over 1 GiB).
+
+`Has` answers from the cell its search finds: it tests the record size limit there, not the
+file size, so it can be true for a record whose `Get` fails the file-size bound. SQLite's
+table seek skips a cell's payload size and compares its rowid only (`btree.c:5880-5886`);
+a later read of the payload fails at `vdbemem.c:1428`.
 
 SQLite draws the write-side line above the b-tree: `SQLITE_MAX_LENGTH` is 1,000,000,000
 (`sqliteLimit.h:24`) and is tested where a value or a record is built. In `OP_MakeRecord`
@@ -871,6 +880,8 @@ through. Tests: `TestPayloadLimit_RealConstants`,
 `TestPayloadLimit_LengthsCheckedBeforeNarrowing`,
 `TestPayloadLimit_PutRefusesWhatReadRejects`, `TestPayloadLimit_NamespaceName`,
 `TestPayloadLimit_DeclaredLengthOverFileSize`,
+`TestPayloadLimit_NeighbourOfDamagedCellIsFound`,
+`TestPayloadLimit_SplitBesideDamagedValueLengths`,
 `TestPayloadLimit_OverflowRecordWithinFileSize`.
 
 <a id="old-drift-additive-maxiter-circular-chain-guard"></a>

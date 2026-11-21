@@ -161,11 +161,12 @@ var payloadLimit = maxPayloadAlloc
 // narrowed: on a 32-bit int a declared length of 1<<32+1 converts to 1. A
 // pair that passes fits an int of either width, and so does its sum.
 //
-// SQLite draws the same line above the b-tree: SQLITE_LIMIT_LENGTH
+// SQLite draws its line above the b-tree: SQLITE_LIMIT_LENGTH
 // (SQLITE_MAX_LENGTH, 1,000,000,000, sqliteLimit.h:24) is tested where a
-// value or a record is built, and a record over it is SQLITE_TOOBIG before
-// sqlite3BtreeInsert sees it. In OP_MakeRecord the test runs when the output
-// register must grow to hold the record (vdbe.c:3690-3699).
+// value or a record is built. In OP_MakeRecord the test runs only when the
+// output register must grow to hold the record (vdbe.c:3690-3699); a record
+// that fits the register's allocation is not tested, and sqlite3BtreeInsert
+// only asserts its lengths (btree.c:9485, 9540). Put tests every record.
 func payloadFits(keyLen, valLen uint64) bool {
 	limit := uint64(payloadLimit)
 	// The sum is not formed: two 64-bit lengths can wrap it.
