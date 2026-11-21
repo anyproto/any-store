@@ -260,6 +260,15 @@ type txSchema struct {
 	installed bool
 }
 
+// testVisits, when set, counts the entries the walks of the schema log look
+// at, for the tests that hold each walk to what its call needs. Tests only.
+var testVisits *visitCounts
+
+type visitCounts struct {
+	// discard counts the log entries discardLog walks.
+	discard int
+}
+
 type memoEntry struct {
 	c *collection
 	s *collSchema
@@ -275,6 +284,9 @@ type logEntry struct {
 	s    *collSchema
 	prev *collSchema
 	kind logKind
+	// prevLast is the handle's mark (collection.logLast) before the entry:
+	// what a rollback that discards the entry gives back (discardLog).
+	prevLast int32
 }
 
 type logKind uint8
@@ -387,17 +399,10 @@ func (t *txSchema) add(db *db, e logEntry) {
 	db.mu.Lock()
 	e.c.pinned++
 	db.mu.Unlock()
+	e.prevLast = int32(e.c.logLast)
 	t.changes = append(t.changes, len(t.log))
 	t.log = append(t.log, e)
 	e.c.logLast = len(t.log)
-}
-
-// remark sets every handle's last-entry mark from the log: after entries
-// were discarded, for the handles with entries left.
-func (t *txSchema) remark() {
-	for i := range t.log {
-		t.log[i].c.logLast = i + 1
-	}
 }
 
 // logVersion records next as the version c has from the commit of wtx on,
@@ -451,7 +456,7 @@ func (c *collection) logPin(t *txSchema) error {
 // caller raised under db.mu: logPin, and the open that registers a handle
 // the write transaction loaded (db.openCollectionOnce).
 func (t *txSchema) pin(c *collection) {
-	t.log = append(t.log, logEntry{c: c, kind: logPin})
+	t.log = append(t.log, logEntry{c: c, kind: logPin, prevLast: int32(c.logLast)})
 	c.logLast = len(t.log)
 }
 
@@ -529,9 +534,18 @@ func (db *db) settleLog(t *txSchema) {
 // objects, so the next write transaction rebases them
 // (resetUncommittedSketches). The handle of a collection created in the
 // scope ends here.
+//
+// Each handle gets back the mark it had before the scope (logEntry.prevLast),
+// so a rollback costs by the entries it discards, not by the log.
 func (db *db) discardLog(t *txSchema, from int) {
 	for i := len(t.log) - 1; i >= from; i-- {
 		e := &t.log[i]
+		if testVisits != nil {
+			testVisits.discard++
+		}
+		// From the end: a handle with several entries in the scope ends
+		// with the mark it had before the first of them.
+		e.c.logLast = int(e.prevLast)
 		switch e.kind {
 		case logCreate:
 			e.c.closed.Store(true)
@@ -561,15 +575,11 @@ func (db *db) discardLog(t *txSchema, from int) {
 	db.mu.Lock()
 	db.unpinLocked(t.log[from:])
 	db.mu.Unlock()
-	for i := from; i < len(t.log); i++ {
-		t.log[i].c.logLast = 0
-	}
 	clear(t.log[from:])
 	t.log = t.log[:from]
 	for len(t.changes) > 0 && t.changes[len(t.changes)-1] >= from {
 		t.changes = t.changes[:len(t.changes)-1]
 	}
-	t.remark()
 }
 
 // registerLocked puts c in the registry under name. A handle that holds the
