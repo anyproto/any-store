@@ -2415,9 +2415,13 @@ func TestOpenCollection_VersionIsInstalledBeforeTheHandleIsFound(t *testing.T) {
 	require.Equal(t, uint64(52), sketchDocCount(t, coll))
 }
 
-// A handle closed between a write and the commit: the documents commit, and
-// so do their counts. A handle that is closed because its collection is gone
-// for the transaction stores nothing.
+// A handle a write transaction used stays the collection's one handle until
+// the transaction ends: a Close() waits for that, and an open in between gets
+// the same handle. So the documents written before the Close() commit with
+// their counts, a drop through the reopened handle is the handle's own, and
+// no second set of sketches comes to exist for the commit to store over the
+// first. A handle that is closed because its collection is gone for the
+// transaction stores nothing.
 func TestWriteTx_HandleClosedBeforeCommitStoresItsSketches(t *testing.T) {
 	doc := func(id int) *anyenc.Value {
 		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":3}`, id))
@@ -2445,7 +2449,100 @@ func TestWriteTx_HandleClosedBeforeCommitStoresItsSketches(t *testing.T) {
 		require.NoError(t, coll.Insert(wtx.Context(), doc(100), doc(101)))
 		require.NoError(t, coll.Close())
 		require.NoError(t, wtx.Commit())
+		require.ErrorIs(t, coll.Insert(ctx, doc(102)), ErrCollectionClosed, "the Close() took effect at the commit")
 		reopened(t, d, 52)
+	})
+
+	// written returns the handle of "c" a write transaction wrote one
+	// document through and then closed.
+	written := func(t *testing.T, d DB) (WriteTx, Collection) {
+		t.Helper()
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		require.NoError(t, coll.Insert(wtx.Context(), doc(100)))
+		require.NoError(t, coll.Close())
+		return wtx, coll
+	}
+
+	t.Run("dropped through the next open", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, _ := written(t, d)
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, again.Drop(wtx.Context()))
+		require.NoError(t, wtx.Commit())
+		_, err = d.(*db).InspectIndexSketch(ctx, "c", "a")
+		require.ErrorIs(t, err, ErrIndexNotFound, "no row for a dropped collection")
+	})
+
+	t.Run("dropped and created again", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, _ := written(t, d)
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, again.Drop(wtx.Context()))
+		made, err := d.CreateCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, made.EnsureIndex(wtx.Context(), IndexInfo{Fields: []string{"a"}}))
+		require.NoError(t, wtx.Commit())
+		n, err := made.Count(ctx)
+		require.NoError(t, err)
+		require.Equal(t, 0, n, "setup: the new collection is empty")
+		require.Equal(t, uint64(0), storedSketch(t, d, made).DocCount)
+	})
+
+	t.Run("opened again, written after the commit", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, coll := written(t, d)
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		if coll != again {
+			t.Error("the transaction has a second handle of the collection")
+		}
+		require.NoError(t, wtx.Commit())
+		require.Equal(t, uint64(51), storedSketch(t, d, again).DocCount)
+		require.NoError(t, again.Insert(ctx, doc(101)))
+		require.Equal(t, uint64(52), storedSketch(t, d, again).DocCount, "the next write counts on")
+	})
+
+	t.Run("opened again and written in the transaction", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, _ := written(t, d)
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, again.Insert(wtx.Context(), doc(101)))
+		require.NoError(t, wtx.Commit())
+		require.Equal(t, uint64(52), storedSketch(t, d, again).DocCount)
+		require.NoError(t, again.Insert(ctx, doc(102)))
+		require.Equal(t, uint64(53), storedSketch(t, d, again).DocCount, "the next write counts on")
+	})
+
+	// The transaction first used the handle inside a savepoint that rolled
+	// back: the write after it holds the handle all the same.
+	t.Run("first used in a savepoint that rolled back", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		sp, err := d.WriteTx(wtx.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(sp.Context(), doc(99)))
+		require.NoError(t, sp.Rollback())
+		require.NoError(t, coll.Insert(wtx.Context(), doc(100)))
+		require.NoError(t, coll.Close())
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		if coll != again {
+			t.Error("the transaction has a second handle of the collection")
+		}
+		require.NoError(t, again.Insert(wtx.Context(), doc(101)))
+		require.NoError(t, wtx.Commit())
+		require.Equal(t, uint64(52), storedSketch(t, d, again).DocCount)
 	})
 
 	t.Run("rollback", func(t *testing.T) {
