@@ -528,6 +528,9 @@ func (p *pager) open() (err error) {
 
 	f, err := osOpenFile(p.path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
+		if herr := p.headerErrorOfUnwritableFile(); herr != nil {
+			return herr
+		}
 		return err
 	}
 	p.file = f
@@ -1007,6 +1010,38 @@ func (p *pager) lockDBShared(f fileHandle) error {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// headerErrorOfUnwritableFile is called when the database file did not open
+// for writing. It returns the error of the file's header when the file opens
+// for reading and its header says this binary cannot use it (another
+// format, a newer one, no database header), and nil otherwise; the caller
+// then returns the error of its own open. So a file the caller may only read
+// is still told apart by its format. unixOpen opens a file read-only when it
+// does not open read-write (os_unix.c:6689-6702), and lockBtree then judges
+// its header; here a database is never used read-only, and the read-only
+// descriptor serves that judgement alone.
+//
+// The header is read as open reads it: under the shared DB-file lock, and
+// not while a creation is pending.
+func (p *pager) headerErrorOfUnwritableFile() error {
+	f, err := osOpenFile(p.path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	if err := acquireSharedDBLock(f); err != nil {
+		return nil
+	}
+	if _, pending, err := p.creationPending(f); err != nil || pending {
+		return nil
+	}
+	buf := make([]byte, dbHeaderSize)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		return nil
+	}
+	var h dbHeader
+	return h.deserialize(buf)
 }
 
 // createIfEmpty turns a file whose creation is pending (creationPending: it
