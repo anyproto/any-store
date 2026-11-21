@@ -1102,7 +1102,8 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 			}
 		} else {
 			// A read failure, not an empty catalog: a prefix nothing
-			// matches leaves the cursor invalid with a nil error.
+			// matches leaves the cursor on the next key, or invalid past
+			// the last one, with a nil error.
 			return err
 		}
 		if err := cursor.Seek([]byte("idx:")); err == nil {
@@ -1121,7 +1122,8 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 			}
 		} else {
 			// A read failure, not an empty catalog: a prefix nothing
-			// matches leaves the cursor invalid with a nil error.
+			// matches leaves the cursor on the next key, or invalid past
+			// the last one, with a nil error.
 			return err
 		}
 		return nil
@@ -2247,7 +2249,8 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 	cursor := tx.NewCursor(db.systemNS)
 	defer cursor.Close()
 	// A Seek error is a read failure, not a collection without indexes (a
-	// prefix nothing matches leaves the cursor invalid with a nil error).
+	// prefix nothing matches leaves the cursor on the next key, or invalid
+	// past the last one, with a nil error).
 	if err := cursor.Seek([]byte(prefix)); err != nil {
 		return err
 	}
