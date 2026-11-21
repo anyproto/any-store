@@ -529,10 +529,10 @@ const (
 |---------|--------|-----|
 | Pager states | 7 (granular writer sub-states) | 4 (simplified) |
 | Journal modes | DELETE, TRUNCATE, PERSIST, MEMORY, WAL, OFF | WAL only |
-| Rollback journal | Full implementation | Not implemented |
+| Rollback journal | Full implementation | For the creation of a database only: a header with no page records ([drift-2026-11-21-7](#drift-2026-11-21-7-creation-journal)) |
 | Lock escalation | SHARED -> RESERVED -> PENDING -> EXCLUSIVE | WAL write lock only |
 | Multi-process support | Full (via file locks + SHM) | mmap-backed SHM on `(linux \|\| darwin) && (amd64 \|\| arm64)`; heap fallback (single-process) elsewhere |
-| Hot journal rollback | Automatic recovery | Not applicable (no rollback journal) |
+| Hot journal rollback | Automatic recovery | At open, for an interrupted creation: the file is truncated to nothing and created again |
 | Sub-journal (savepoint journal) | Written to disk | In-memory page copies |
 | NOCONTENT optimization | `PAGER_GET_NOCONTENT` flag | `getPageNoContent()` |
 | DONT_WRITE flag | `PGHDR_DONT_WRITE` in page flags (no effect in WAL mode: only `pager_write_pagelist` reads it) | None — frames are written at spill and commit |
