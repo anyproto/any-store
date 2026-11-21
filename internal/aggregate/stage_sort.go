@@ -137,7 +137,7 @@ func (s *SortStage) collectAndSort(ctx *Ctx) error {
 			// has been evicted, so the arena holds only kept rows: past the
 			// limit, they do not fit.
 			if !fitsSortArena(len(s.arena)) {
-				return errSortTooLarge
+				return sortTooLarge(ctx, len(s.arena)-prevLen)
 			}
 			s.entries = append(s.entries, sortEntry{off: uint32(base), keyLen: uint32(keyLen), docLen: uint32(total - keyLen)})
 			s.liveBytes += total
@@ -164,7 +164,7 @@ func (s *SortStage) collectAndSort(ctx *Ctx) error {
 				// The tail is past the limit: pack the live entries, the
 				// root's bytes now dead, and move the candidate after them.
 				if off, err = s.admitAfterCompact(base, total); err != nil {
-					return err
+					return sortTooLarge(ctx, len(s.arena)+total-prevLen)
 				}
 			}
 			s.entries[0] = sortEntry{off: uint32(off), keyLen: uint32(keyLen), docLen: uint32(total - keyLen)}
@@ -188,6 +188,17 @@ func (s *SortStage) collectAndSort(ctx *Ctx) error {
 		slices.SortStableFunc(s.entries, cmpEntry)
 	}
 	return nil
+}
+
+// sortTooLarge is the error for a row that does not fit the arena once kept,
+// growing it by grown bytes. The row is charged first, as if kept, so a row
+// that also crosses MemoryLimit reports ErrMemoryLimitExceeded, the error
+// callers match, as it would without the arena limit.
+func sortTooLarge(ctx *Ctx, grown int) error {
+	if err := ctx.Mem.Add(grown + sortEntryOverhead); err != nil {
+		return err
+	}
+	return errSortTooLarge
 }
 
 // growArena ensures spare capacity, growing in tiered steps (SortIter's policy).

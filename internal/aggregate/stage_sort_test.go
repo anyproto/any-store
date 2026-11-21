@@ -270,3 +270,55 @@ func TestSortStage_ResumesAfterSourceError(t *testing.T) {
 		st.Close()
 	}
 }
+
+// A row that crosses both the MemoryLimit budget and the arena limit is
+// ErrMemoryLimitExceeded, the error callers match: the stage charges the
+// budget for the row before it reports that the row does not fit.
+func TestSortStage_MemoryLimitBeforeArenaLimit(t *testing.T) {
+	spec := MustParsePipeline(`[{"$sort": {"v": 1}}]`)[0].(SortSpec)
+	rowLen := func(j string, topK bool) int {
+		v := anyenc.MustParseJson(j)
+		n := len(spec.Sort.AppendKey(nil, v)) + len(v.MarshalTo(nil))
+		if topK {
+			n += 4 // the sequence number
+		}
+		return n
+	}
+	kept := []string{`{"id":"1","v":"b1"}`, `{"id":"2","v":"b2"}`, `{"id":"3","v":"b3"}`, `{"id":"4","v":"b4"}`}
+	run := func(topK, memLimit int, rows ...string) error {
+		st := &SortStage{Src: newSliceSource(rows...), Spec: spec, TopK: topK}
+		defer st.Close()
+		ctx := newTestCtx()
+		ctx.Mem = NewMemAccount(memLimit)
+		for {
+			v, err := st.Next(ctx)
+			if err != nil || v == nil {
+				return err
+			}
+		}
+	}
+
+	t.Run("full sort", func(t *testing.T) {
+		full := 0
+		for _, r := range kept {
+			full += rowLen(r, false)
+		}
+		setSortArenaLimit(t, full-1)
+		// The fourth row crosses the arena limit, and its charge (the row and
+		// its entry) the budget.
+		err := run(0, full+4*sortEntryOverhead-1, kept...)
+		require.ErrorIs(t, err, ErrMemoryLimitExceeded)
+		require.ErrorIs(t, run(0, full+4*sortEntryOverhead, kept...), errSortTooLarge)
+	})
+	t.Run("a top-K winner that does not fit even packed", func(t *testing.T) {
+		e := rowLen(kept[0], true)
+		winner := `{"id":"0x","v":"a0"}` // one byte longer than a kept row
+		setSortArenaLimit(t, 4*e)
+		// Kept, the four rows charge 4e and four entries; the winner, kept
+		// after packing, would add one byte and one entry.
+		used := 4*e + 5*sortEntryOverhead + 1
+		err := run(4, used-1, append(slices.Clone(kept), winner)...)
+		require.ErrorIs(t, err, ErrMemoryLimitExceeded)
+		require.ErrorIs(t, run(4, used, append(slices.Clone(kept), winner)...), errSortTooLarge)
+	})
+}
