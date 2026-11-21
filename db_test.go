@@ -2648,7 +2648,7 @@ func TestOpenCollection_HandOutAfterTheDeferredCloseTookEffect(t *testing.T) {
 			// the writer commits there.
 			found, committed := make(chan struct{}), make(chan struct{})
 			var once sync.Once
-			testHookBeforeHandOut = func() {
+			testHookBeforeHandOut = func(*collection) {
 				once.Do(func() {
 					close(found)
 					<-committed

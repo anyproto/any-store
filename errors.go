@@ -66,7 +66,9 @@ var (
 	// ErrCollectionClosed is returned by operations on a collection handle
 	// that is no longer live: explicitly closed, dropped, or invalidated
 	// because another process renamed or dropped the collection (SQLite
-	// re-prepare style — re-open the collection to continue). It wraps
+	// re-prepare style — re-open the collection to continue). OpenCollection
+	// and Collection return it when the handle each attempt found was closed
+	// meanwhile, as by concurrent Close() calls. It wraps
 	// ErrCollectionNotFound so errors.Is matches what a fresh OpenCollection
 	// under the stale name returns.
 	ErrCollectionClosed = fmt.Errorf("any-store: collection handle is closed (dropped, renamed, or closed): %w", ErrCollectionNotFound)

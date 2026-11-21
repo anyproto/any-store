@@ -37,11 +37,16 @@ type DB interface {
 	// Returns the opened Collection or an error if the collection does not exist.
 	// Possible errors:
 	// - ErrCollectionNotFound: if the collection does not exist.
+	// - ErrCollectionClosed: the handle each attempt found was closed
+	//   meanwhile, as by concurrent Close() calls; open again.
 	OpenCollection(ctx context.Context, collectionName string) (Collection, error)
 
 	// Collection is a convenience method to get or create a collection.
 	// It first attempts to open the collection, and if it does not exist, it creates the collection.
 	// Returns the Collection or an error if there is an issue creating or opening the collection.
+	// Possible errors:
+	// - ErrCollectionClosed: the handle each attempt found was closed
+	//   meanwhile, as by concurrent Close() calls; open again.
 	Collection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error)
 
 	// GetCollectionNames returns a list of all collection names in the database.
@@ -802,7 +807,7 @@ func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collec
 			return coll, nil
 		}
 		if attempt == handOutAttempts-1 {
-			return nil, ErrCollectionNotFound
+			return nil, ErrCollectionClosed
 		}
 	}
 }
@@ -810,12 +815,13 @@ func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collec
 // handOutAttempts bounds the opens one call makes for a handle to hand out:
 // each one more needs another Close() to land between an open and its
 // hand-out. The same bound as openCollection has for a handle gone while it
-// was resolved.
+// was resolved. Out of attempts, the call returns ErrCollectionClosed, the
+// error of the race: the collection was there each time.
 const handOutAttempts = 3
 
 // testHookBeforeHandOut, when set, runs between an open that found its
 // handle and the hand-out of it. Tests only.
-var testHookBeforeHandOut func()
+var testHookBeforeHandOut func(c *collection)
 
 // handOut gives c to a caller that keeps it, and reports false when c was
 // closed since the open found it: the caller opens again and gets the handle
@@ -834,7 +840,7 @@ var testHookBeforeHandOut func()
 // after the hand-out.
 func (db *db) handOut(c *collection) bool {
 	if testHookBeforeHandOut != nil {
-		testHookBeforeHandOut()
+		testHookBeforeHandOut(c)
 	}
 	if !c.closePending.Load() && !c.closed.Load() {
 		return true
@@ -877,7 +883,7 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 		// for this caller: the name is free for the collection that has it
 		// now, if any.
 		if attempt == 2 {
-			return nil, ErrCollectionNotFound
+			return nil, ErrCollectionClosed
 		}
 	}
 }
@@ -889,6 +895,10 @@ var testHookBeforeRegister func(name string)
 // testHookRegistered, when set, runs right after a new handle entered the
 // registry, where any transaction can find it. Tests only.
 var testHookRegistered func(name string)
+
+// testHookFoundRegistered, when set, runs when an open found a handle in the
+// registry, before it resolves the handle. Tests only.
+var testHookFoundRegistered func(c *collection)
 
 // errHandleGone tells openCollection that the handle it found registered is
 // not live any more.
@@ -912,6 +922,9 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 		return coll, err
 	}
 	if coll, ok := db.registered(collectionName); ok {
+		if testHookFoundRegistered != nil {
+			testHookFoundRegistered(coll.(*collection))
+		}
 		return coll, db.resolveOpened(ctx, coll.(*collection), collectionName)
 	}
 
@@ -1085,7 +1098,7 @@ func (db *db) Collection(ctx context.Context, collectionName string, opts ...Col
 			return coll, nil
 		}
 		if attempt == handOutAttempts-1 {
-			return nil, ErrCollectionNotFound
+			return nil, ErrCollectionClosed
 		}
 	}
 }
