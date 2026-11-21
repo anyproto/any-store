@@ -80,9 +80,10 @@ func TestCollection_Stats(t *testing.T) {
 		assert.Equal(t, 1.0, st.CompressionRatio)
 	})
 
-	// Stats in a read transaction decodes each index's stored row into a
-	// sketch of its own while writers commit. Run Stats concurrently with
-	// inserts under -race to pin that it shares nothing with them.
+	// Stats runs concurrently with inserts: under -race this covers the
+	// reads Stats makes while writers commit. It checks only that no call
+	// fails and the counts once the writer is done; that Stats reports the
+	// row of its own snapshot is TestCollection_Stats_SketchOfItsTransaction.
 	t.Run("concurrent with writes", func(t *testing.T) {
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "test")

@@ -1785,8 +1785,12 @@ func sketchBehind(seen, epoch uint64) bool {
 // epoch it sampled: a later reader, or a writer, published newer sketches
 // while this one waited. A read that fails stamps nothing, and the next
 // reader loads again; the plan goes on with what is published. That is an
-// estimate: it picks the plan, and for $knn the driver, approximate or
-// exact (qplanner knn_plan.go), never the rows a plan returns.
+// estimate: it picks the plan, not the documents that match a filter. For
+// $knn the plan is part of the answer: the estimate picks between the
+// approximate driver and the exact probe (qplanner knn_plan.go), and under a
+// selective filter the driver's candidates can leave out the nearest
+// document that passes it, so the two can return different documents, and
+// the driver fewer than k.
 //
 // A writer has the live sketches to load (refreshLiveSketches), and may
 // return the error of a read that failed.
@@ -1980,11 +1984,17 @@ func (c *collection) reloadPubSketch(tx *btree.ReadTx, collName string, idx *ind
 	// overtaken by this snapshot's bytes, as a fresh object would be: a
 	// reader that read its row before that commit then publishes the
 	// pre-commit counts and stamps the epoch, and plans miss the commit's
-	// counts until the next write transaction loads or republishes. The
-	// stored row is right. SQLite's statistics go stale the same way
-	// between connections: ANALYZE changes no schema cookie (analyze.c has
-	// no sqlite3ChangeCookie), so another connection keeps what it loaded
-	// until it reloads the schema (sqlite3InitOne, prepare.c). Bytes
+	// counts until a write transaction loads this collection's sketches
+	// (loadLiveSketches) or commits a change to this index's
+	// (settleSketches); one that uses other collections only leaves them.
+	// The stored row is right. SQLite's statistics go stale the same way
+	// between connections once the statistics tables exist: an ANALYZE that
+	// refreshes them changes no schema cookie (analyze.c calls no
+	// sqlite3ChangeCookie), so another connection keeps what it loaded
+	// until it reloads the schema (sqlite3InitOne, prepare.c). The ANALYZE
+	// that creates the tables is the exception: its CREATE TABLE changes
+	// the cookie (sqlite3EndTable, build.c), and the other connection
+	// reloads. Bytes
 	// of another shape (a snapshot older than this handle's definition) go
 	// into an object of their own: a published one is never reshaped. Bytes
 	// that do not decode publish nothing: the object would be an empty
