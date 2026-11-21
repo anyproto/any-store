@@ -544,24 +544,38 @@ func TestDb_Close(t *testing.T) {
 			doc, err := it.Doc()
 			require.NoError(t, err)
 			require.Equal(t, float64(id), doc.Value().GetFloat64("id"))
+			require.Equal(t, u, doc.Value().GetString("u"))
 			require.NoError(t, it.Close())
 		}
+		it, err := c.Find(`{"u":"x1"}`).Iter(ctx)
+		require.NoError(t, err)
+		require.False(t, it.Next(), "the first half of the refused update was committed")
+		require.NoError(t, it.Close())
 	})
 
 	// What an iterator of the write transaction holds in memory is of the
-	// transaction Close rolled back: it is not handed out afterwards.
+	// transaction Close rolled back: it is not handed out afterwards. The
+	// filter's holds the document its Next parsed, the sort's the rows it
+	// sorted, the aggregation's the groups it built.
 	t.Run("ends the iterators of a rolled-back write transaction", func(t *testing.T) {
-		for _, q := range []string{"filter", "sort"} {
+		for _, q := range []string{"filter", "sort", "aggregate"} {
 			fx, coll := newColl(t)
 			wtx, err := fx.WriteTx(ctx)
 			require.NoError(t, err)
-			require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":3,"a":1}`),
-				anyenc.MustParseJson(`{"id":4,"a":1}`)))
-			find := coll.Find(`{"a":1}`)
-			if q == "sort" {
-				find = find.Sort("-id")
+			require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":3,"a":1,"b":2}`),
+				anyenc.MustParseJson(`{"id":4,"a":1,"b":1}`), anyenc.MustParseJson(`{"id":5,"a":2,"b":3}`)))
+			var it Iterator
+			switch q {
+			case "filter":
+				it, err = coll.Find(`{"a":1}`).Iter(wtx.Context())
+			case "sort":
+				it, err = coll.Find(`{"a":1}`).Sort("b").Iter(wtx.Context())
+				require.NoError(t, err)
+				// A field with no index: the plan sorts the rows in memory.
+				require.Contains(t, fmt.Sprint(it.(*planIterator).plan.Root), "-> Sort")
+			case "aggregate":
+				it, err = coll.Aggregate(`[{"$group":{"_id":"$a","n":{"$sum":1}}}]`).Iter(wtx.Context())
 			}
-			it, err := find.Iter(wtx.Context())
 			require.NoError(t, err)
 			require.True(t, it.Next())
 			_, err = it.Doc()
