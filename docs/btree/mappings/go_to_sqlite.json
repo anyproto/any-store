@@ -992,6 +992,10 @@
     ],
     "note": "BTREE_DATA_VERSION: changes made elsewhere only (btree.c:10436-10437), plus exactness of this snapshot"
   },
+  "db.go:*ReadTx.CloseState": {
+    "sqlite": [],
+    "note": "any-store: the handle on DB.Close's end of this write transaction, valid after the transaction is pooled (drift-2026-11-19-1)"
+  },
   "db.go:*ReadTx.Count": {
     "sqlite": [
       "btree.c:sqlite3BtreeCount"
@@ -1014,10 +1018,6 @@
   "db.go:*ReadTx.DiskSchemaCookie": {
     "sqlite": [],
     "note": ""
-  },
-  "db.go:*ReadTx.EndedByClose": {
-    "sqlite": [],
-    "note": "any-store: whether DB.Close ended this write transaction under its owner (drift-2026-11-19-1)"
   },
   "db.go:*ReadTx.Get": {
     "sqlite": [],
@@ -2983,6 +2983,10 @@
   "writer_gate.go:*writerGate.leave": {
     "sqlite": [],
     "note": "any-store: counts a call out and wakes a waiting Close (drift-2026-11-19-1)"
+  },
+  "writer_gate.go:CloseState.EndedByClose": {
+    "sqlite": [],
+    "note": "any-store: whether DB.Close has closed the writer gate, so ended a write transaction still open (drift-2026-11-19-1)"
   },
   "writer_gate.go:newWriterGate": {
     "sqlite": [],
