@@ -524,6 +524,193 @@ func TestPayloadLimit_DeclaredLengthOverFileSize(t *testing.T) {
 	})
 }
 
+// declareValLen rewrites, in place, the value length that cell idx of the
+// leaf page pgno declares. The new length takes a varint of the same width
+// and leaves the cell's local part the size it was: the cell stays well
+// formed and its key and overflow chain are where they were; only the length
+// is wrong.
+func declareValLen(t *testing.T, tx *WriteTx, pgno uint32, idx int, valLen uint64) {
+	t.Helper()
+	pg, err := tx.pager.getWritablePage(pgno)
+	require.NoError(t, err)
+	defer tx.pager.releasePage(pg)
+	require.True(t, pg.header.isLeaf())
+	off := int(pg.getCellOffset(idx))
+	keyLen, kn := getVarint(pg.data[off:])
+	oldLen, vn := getVarint(pg.data[off+kn:])
+	lim := tx.pager.leafLimits()
+	require.Equal(t, localPayloadSize(int(keyLen+oldLen), lim), localPayloadSize(int(keyLen+valLen), lim),
+		"the local part would change size")
+	var vb [9]byte
+	require.Equal(t, vn, putVarint(vb[:], valLen), "the length varint would change width")
+	copy(pg.data[off+kn:], vb[:vn])
+}
+
+// overFileValLen returns the largest value length with a 3-byte varint whose
+// cell, with a key of keyLen bytes, keeps the local part a value of oldLen
+// gives it: about 2 MiB, more than the files of these tests hold.
+func overFileValLen(t *testing.T, lim payloadLimits, keyLen, oldLen int) uint64 {
+	t.Helper()
+	for v := 1<<21 - 1; v >= 1<<20; v-- {
+		if localPayloadSize(keyLen+v, lim) == localPayloadSize(keyLen+oldLen, lim) {
+			return uint64(v)
+		}
+	}
+	t.Fatal("no value length keeps the local part")
+	return 0
+}
+
+// TestPayloadLimit_NeighbourOfDamagedCellIsFound: a search that has to
+// compare a cell's spilled key reads that key and nothing else, so only the
+// key is bounded there. A neighbour whose declared value is over the file,
+// or whose key and value pass the record size limit singly and not together,
+// does not hide the key beside it from Get, Has, SeekKey, a cursor seek or
+// the writer's Get. The damaged cell's own value read stays ErrCorrupt.
+func TestPayloadLimit_NeighbourOfDamagedCellIsFound(t *testing.T) {
+	// The two keys share their first 5000 bytes, more than a 4 KiB page,
+	// so both spill and their local parts are all "k". A search for the
+	// smaller one probes the larger one first, finds the local parts equal
+	// and rebuilds the larger key from its overflow chain to compare it.
+	prefix := bytes.Repeat([]byte("k"), 5000)
+	healthy := append(bytes.Clone(prefix), '1')
+	damaged := append(bytes.Clone(prefix), '2')
+	healthyVal := []byte("healthy")
+	// A 3-byte length varint; the cell keeps minLocal bytes on the page.
+	const damagedVal = 20000
+
+	setup := func(t *testing.T) (*DB, *Namespace) {
+		db, err := testOpen(t, filepath.Join(t.TempDir(), "neighbour.db"), Options{PageSize: 4096})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = db.Close() })
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := tx.CreateNamespace("t")
+		require.NoError(t, err)
+		require.NoError(t, tx.Put(ns, healthy, healthyVal))
+		require.NoError(t, tx.Put(ns, damaged, payloadBytes(damagedVal, 3)))
+		require.NoError(t, tx.Commit())
+		return db, ns
+	}
+	findHealthy := func(t *testing.T, db *DB, ns *Namespace) {
+		t.Helper()
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+		got, err := rtx.Get(ns, healthy)
+		require.NoError(t, err, "ReadTx.Get")
+		require.Equal(t, healthyVal, got)
+		ok, err := rtx.Has(ns, healthy)
+		require.NoError(t, err, "ReadTx.Has")
+		require.True(t, ok)
+		k, err := rtx.SeekKey(ns, healthy)
+		require.NoError(t, err, "ReadTx.SeekKey")
+		require.Equal(t, healthy, k)
+		c := rtx.NewCursor(ns)
+		require.NoError(t, c.Seek(healthy), "Cursor.Seek")
+		k, err = c.Key()
+		require.NoError(t, err)
+		require.Equal(t, healthy, k)
+		c.Close()
+		_, err = rtx.Get(ns, damaged)
+		require.ErrorIs(t, err, ErrCorrupt, "the damaged cell's value")
+		require.NoError(t, rtx.Rollback())
+
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		defer func() { _ = wtx.Rollback() }()
+		got, err = wtx.Get(ns, healthy)
+		require.NoError(t, err, "WriteTx.Get")
+		require.Equal(t, healthyVal, got)
+	}
+
+	t.Run("declared value over the file", func(t *testing.T) {
+		db, ns := setup(t)
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		valLen := overFileValLen(t, tx.pager.leafLimits(), len(damaged), damagedVal)
+		declareValLen(t, tx, ns.rootPage, 1, valLen)
+		require.NoError(t, tx.Commit())
+		require.Greater(t, valLen, uint64(db.pager.dbSize.Load())*uint64(db.pager.pageSize), "the file holds the value")
+		findHealthy(t, db, ns)
+		// Has answers from the key: the value is tested where it is read.
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+		ok, err := rtx.Has(ns, damaged)
+		require.NoError(t, err)
+		require.True(t, ok)
+	})
+	t.Run("key and value over the limit together", func(t *testing.T) {
+		db, ns := setup(t)
+		// A release without the write-side limit could store this cell:
+		// each length is within the limit, their sum is not.
+		setPayloadLimit(t, damagedVal)
+		findHealthy(t, db, ns)
+	})
+}
+
+// TestPayloadLimit_SplitBesideDamagedValueLengths: a split takes the key of
+// the first cell of each new page for the divider, and reads only that key.
+// On a leaf whose cells declare values over the file, the key that splits it
+// is written and read back.
+func TestPayloadLimit_SplitBesideDamagedValueLengths(t *testing.T) {
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "split.db"), Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer func(db *DB) { _ = db.Close() }(db)
+	// Six records whose keys spill take about 3000 bytes of the root leaf;
+	// a seventh with a 2000-byte value, sorted before them, splits it, and
+	// every page after the first starts with one of the six.
+	key := func(i byte) []byte { return append(bytes.Repeat([]byte("k"), 1100), i) }
+	// A 3-byte length varint; each cell keeps minLocal bytes on the page.
+	const val = 19500
+	const records = 6
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("t")
+	require.NoError(t, err)
+	for i := byte(1); i <= records; i++ {
+		require.NoError(t, tx.Put(ns, key(i), payloadBytes(val, i)))
+	}
+	require.NoError(t, tx.Commit())
+
+	tx, err = db.BeginWrite()
+	require.NoError(t, err)
+	root, err := tx.pager.getPage(ns.rootPage)
+	require.NoError(t, err)
+	require.True(t, root.header.isLeaf(), "the records do not fit the root leaf")
+	n := int(root.header.cellCount)
+	tx.pager.releasePage(root)
+	require.Equal(t, records, n)
+	valLen := overFileValLen(t, tx.pager.leafLimits(), len(key(1)), val)
+	for i := 0; i < n; i++ {
+		declareValLen(t, tx, ns.rootPage, i, valLen)
+	}
+	require.NoError(t, tx.Commit())
+	require.Greater(t, valLen, uint64(db.pager.dbSize.Load())*uint64(db.pager.pageSize), "the file holds the values")
+
+	tx, err = db.BeginWrite()
+	require.NoError(t, err)
+	newKey, newVal := key(0), payloadBytes(2000, 0)
+	require.NoError(t, tx.Put(ns, newKey, newVal))
+	require.NoError(t, tx.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	root, err = rtx.pager.getPageReader(ns.rootPage, rtx.walHdr.mxFrame, rtx.cache)
+	require.NoError(t, err)
+	split := root.header.isInterior()
+	rtx.pager.releasePage(root)
+	require.True(t, split, "the insert did not split the root leaf")
+	got, err := rtx.Get(ns, newKey)
+	require.NoError(t, err)
+	require.Equal(t, newVal, got)
+	for i := byte(1); i <= records; i++ {
+		_, err := rtx.Get(ns, key(i))
+		require.ErrorIs(t, err, ErrCorrupt, "the value of record %d", i)
+	}
+}
+
 // TestPayloadLimit_OverflowRecordWithinFileSize: the bound does not touch a
 // sound record. One of several megabytes in a file that holds it is read by
 // every path, by the writer inside the transaction that wrote it and by a
