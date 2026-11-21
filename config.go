@@ -170,7 +170,8 @@ type Config struct {
 	// mode, AEAD auth-tag failure in encryption mode). Plain databases
 	// never fire it. It receives the failures of the database it was
 	// opened with and no other, also when several databases share one
-	// Encryption.Codec.
+	// Encryption.Codec. The destination of a Backup is another database:
+	// its failures come back as Backup's error.
 	//
 	// The callback runs synchronously on the I/O goroutine and must not
 	// block. Push to a buffered channel + drain elsewhere if you need
