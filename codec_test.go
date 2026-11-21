@@ -351,8 +351,16 @@ func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
 	// busy until the busy timeout ends it with ErrBusy; that happens on a
 	// loaded machine with or without a shared codec. The test is about the
 	// race between the two writers, so a busy Backup is run again.
+	//
+	// The stepped hook runs after each Step that copied and left pages to
+	// copy, so one call in the attempt that succeeded shows that its copy
+	// took more than one Step.
+	var steps int
+	testBackupSteppedHook = func() { steps++ }
+	t.Cleanup(func() { testBackupSteppedHook = nil })
 	var backupErr error
 	for attempt := 0; attempt < 5; attempt++ {
+		steps = 0
 		if backupErr = db.Backup(ctx, dstPath); !errors.Is(backupErr, ErrBusy) {
 			break
 		}
@@ -362,10 +370,7 @@ func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
 	require.NoError(t, writerErr)
 	require.NoError(t, backupErr)
 	require.NoError(t, db.Close())
-	// Backup copies 256 pages per Step.
-	info, err := os.Stat(dstPath)
-	require.NoError(t, err)
-	require.Greater(t, info.Size()/4096, int64(256), "the copy must take more than one Step")
+	require.GreaterOrEqual(t, steps, 1, "the copy must take more than one Step")
 
 	requireSharedCodecDocs(t, dstPath, cfg, "pre", pre, true)
 }
