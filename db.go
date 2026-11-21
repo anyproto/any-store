@@ -111,28 +111,33 @@ type DB interface {
 	// Close waits, with no timeout, for every read transaction of this DB
 	// to end. A ReadTx ends with its Commit. An Iterator opened with a
 	// context that carries no transaction holds a read transaction of its
-	// own until its Close; one opened inside a transaction holds none, and
-	// ends with that transaction. A read transaction that is never ended
-	// makes Close block forever, and Close called by the goroutine that
-	// still holds one deadlocks on itself (a `defer it.Close()` that runs
-	// after `db.Close()`, or a return out of an iteration loop into it).
-	// While Close waits the database is already closing: an operation on a
-	// collection fails with ErrDBIsClosed, inside an open transaction too.
-	// What is already open goes on until it is ended: an iterator's Next
-	// and Doc, and the calls on the DB itself through an open read
-	// transaction.
+	// own until its Close, unless it has nothing to read (a filter that
+	// can match nothing, a $out or $merge pipeline); one opened inside a
+	// transaction holds none, and ends with that transaction. A read
+	// transaction that is never ended makes Close block forever, and Close
+	// called by the goroutine that still holds one deadlocks on itself (a
+	// `defer it.Close()` that runs after `db.Close()`, or a return out of
+	// an iteration loop into it). While Close waits the database is
+	// already closing: an operation on a collection fails with
+	// ErrDBIsClosed, inside an open transaction too. An open iterator's
+	// Next and Doc go on until it is closed. A call on the DB itself
+	// through an open read transaction may go on too (GetCollectionNames
+	// does) or fail with ErrDBIsClosed.
 	//
 	// Close does not wait for a write transaction to end. It waits for the
 	// one step of storage work the transaction is in, however long that
 	// step is (a count walks its whole tree), and then rolls the
 	// transaction back: what it wrote is discarded, an operation that was
-	// running ends with ErrDBIsClosed unless it was already past its last
-	// step, every later one fails with ErrDBIsClosed and so does an
-	// iterator opened in the transaction, its Commit fails with
-	// ErrDBIsClosed and its Rollback returns nil; the Rollback of a
-	// WriteTx opened inside it returns ErrDBIsClosed. A Commit that was
-	// already running when Close came is that step: it completes, and the
-	// transaction is committed. Only the Commit's own result says which.
+	// running ends with ErrDBIsClosed unless it was already in or past its
+	// last step, every later one fails with ErrDBIsClosed and so does an
+	// iterator opened in the transaction that reads through it, its Commit
+	// fails with ErrDBIsClosed and its Rollback returns nil; the Rollback
+	// of a WriteTx opened inside it returns ErrDBIsClosed. A Commit writes
+	// the transaction's pending full-text postings and index statistics,
+	// then commits the storage, and the storage commit is the step that
+	// decides: one already running when Close came completes, and the
+	// transaction is committed; a Commit that Close came to earlier fails
+	// with ErrDBIsClosed. Only the Commit's own result says which.
 	//
 	// Close must not be called from code that runs inside a step of storage
 	// work, on the goroutine doing that step: it would wait for itself.

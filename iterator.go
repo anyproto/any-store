@@ -37,9 +37,10 @@ import (
 // iterator is closed, advanced or not: they free the trees it reads.
 //
 // An Iterator must be closed. Opened with a context that carries no
-// transaction, it holds a read transaction of its own until its Close, and
-// DB.Close waits for that with no timeout: such an iterator, never closed,
-// makes DB.Close block forever. Opened inside a transaction it holds none:
+// transaction, it holds a read transaction of its own until its Close,
+// unless it has nothing to read (a filter that can match nothing, a $out or
+// $merge pipeline), and DB.Close waits for that with no timeout: such an
+// iterator, never closed, makes DB.Close block forever. Opened inside a transaction it holds none:
 // DB.Close waits for a ReadTx until its Commit and does not wait for a
 // WriteTx (see DB.Close). Close is safe to defer and to call twice.
 //
