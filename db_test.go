@@ -2933,6 +2933,39 @@ func TestWriteTx_SavepointRollbackWalksItsOwnEntries(t *testing.T) {
 	require.NoError(t, wtx.Commit())
 }
 
+// A savepoint rollback that discards no log entry leaves every handle's mark
+// as it is: it looks at no entry before the savepoint. One handle is given
+// a mark no walk of the log writes, and a failing verb on another handle
+// must leave it.
+func TestWriteTx_SavepointRollbackLeavesTheMarksBeforeIt(t *testing.T) {
+	fx := newFixture(t)
+	colls := make([]*collection, 2)
+	for i := range colls {
+		c, err := fx.CreateCollection(ctx, fmt.Sprintf("p%d", i))
+		require.NoError(t, err)
+		require.NoError(t, c.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+		colls[i] = c.(*collection)
+	}
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wtx.Rollback() })
+	log := wtx.schemaLog()
+	for _, c := range colls {
+		_, err := c.FindId(wtx.Context(), 1)
+		require.NoError(t, err)
+	}
+	require.Len(t, log.log, 2, "setup: one pin per collection used")
+
+	kept := colls[1].logLast
+	const mark = 1 << 20
+	colls[1].logLast = mark
+	require.ErrorIs(t, colls[0].Insert(wtx.Context(), anyenc.MustParseJson(`{"id":1}`)), ErrDocExists)
+	require.Len(t, log.log, 2, "setup: the rollback discarded no entry")
+	require.Equal(t, mark, colls[1].logLast, "the rollback rewrote the mark of a handle it did not discard")
+	colls[1].logLast = kept
+	require.NoError(t, wtx.Commit())
+}
+
 // Handles a write transaction opened and then closed leave the registry when
 // the transaction ends, each found under its name: the end costs by the
 // handles it closes, not by the registry they are in.
