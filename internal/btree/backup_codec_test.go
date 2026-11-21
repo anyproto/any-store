@@ -5,6 +5,7 @@ package btree
 
 import (
 	"context"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -145,6 +146,117 @@ func TestBackup_DestinationKeepsItsSalt(t *testing.T) {
 			require.Equal(t, srcSalt, headerSalt(t, srcPath))
 		})
 	}
+}
+
+// walPage1Salt returns the KDF salt in the header of the last committed copy
+// of page 1 in the WAL at walPath, and whether there is one. With set
+// non-nil it first writes set into the header of every copy of page 1 there
+// and rewrites the frame checksums to match, as if the frames had been
+// written so.
+func walPage1Salt(t *testing.T, walPath string, set *[SaltLen]byte) (salt [SaltLen]byte, found bool) {
+	t.Helper()
+	data, err := os.ReadFile(walPath)
+	require.NoError(t, err)
+	var hdr walHeader
+	require.NoError(t, hdr.deserialize(data[:walHeaderSize]))
+	frameSize := walFrameSize + int(hdr.pageSize)
+	o1, o2 := walChecksum(data[:24], 0, 0) // the chain as written
+	n1, n2 := o1, o2                        // the chain after set
+	var last [SaltLen]byte
+	var seen bool
+	for off := walHeaderSize; off+frameSize <= len(data); off += frameSize {
+		fh, pg := data[off:off+walFrameSize], data[off+walFrameSize:off+frameSize]
+		if binary.BigEndian.Uint32(fh[8:12]) != hdr.salt1 || binary.BigEndian.Uint32(fh[12:16]) != hdr.salt2 {
+			break
+		}
+		c1, c2 := walFrameChecksum(fh[:8], pg, o1, o2)
+		if c1 != binary.BigEndian.Uint32(fh[16:20]) || c2 != binary.BigEndian.Uint32(fh[20:24]) {
+			break
+		}
+		o1, o2 = c1, c2
+		if binary.BigEndian.Uint32(fh[0:4]) == 1 {
+			if set != nil {
+				copy(pg[72:88], set[:])
+			}
+			copy(last[:], pg[72:88])
+			seen = true
+		}
+		n1, n2 = walFrameChecksum(fh[:8], pg, n1, n2)
+		if set != nil {
+			binary.BigEndian.PutUint32(fh[16:20], n1)
+			binary.BigEndian.PutUint32(fh[20:24], n2)
+		}
+		if binary.BigEndian.Uint32(fh[4:8]) != 0 { // a commit frame
+			salt, found = last, seen
+		}
+	}
+	if set != nil {
+		require.NoError(t, os.WriteFile(walPath, data, 0o644))
+	}
+	return salt, found
+}
+
+// A destination left by a backup that wrote the source's salt into page 1
+// (as every backup of a passphrase database did before the salt was kept)
+// and whose process died before the close checkpointed: the main file names
+// the salt the destination's pages are sealed with, the WAL's committed
+// page 1 another. The salt the codec was keyed with at Open is the one
+// every write of page 1 carries, so a backup over that destination is
+// readable, and its commit puts that salt back into the WAL's page 1.
+func TestBackup_DestinationWALPage1WithAnotherSalt(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	opts := passphraseOptions(CipherAES256GCM)
+	srcPath, dstPath := filepath.Join(dir, "src.db"), filepath.Join(dir, "dst.db")
+
+	// given: the destination's committed page 1 in its WAL names another salt
+	dst, err := testOpen(t, dstPath, opts)
+	require.NoError(t, err)
+	codecFill(t, dst, 0, 30)
+	require.NoError(t, dst.Close())
+	keyed := headerSalt(t, dstPath)
+	dst, err = testOpen(t, dstPath, opts)
+	require.NoError(t, err)
+	tx, err := dst.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("t0") // a new root on page 1
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	rawClose(dst)
+	other := [SaltLen]byte{0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab}
+	_, found := walPage1Salt(t, dstPath+"-wal", &other)
+	require.True(t, found, "setup: page 1 is committed in the WAL")
+	require.Equal(t, keyed, headerSalt(t, dstPath), "setup: the main file names the keyed salt")
+
+	src, err := testOpen(t, srcPath, opts)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, src.Close()) }()
+	codecFill(t, src, 0, 40)
+
+	// when
+	dst, err = testOpen(t, dstPath, opts)
+	require.NoError(t, err)
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	require.ErrorIs(t, b.Step(ctx, -1), ErrBackupDone)
+	require.NoError(t, b.Finish())
+
+	// then: the commit wrote the keyed salt into the WAL's page 1
+	rawClose(dst)
+	got, found := walPage1Salt(t, dstPath+"-wal", nil)
+	require.True(t, found)
+	require.Equal(t, keyed, got, "the WAL's page 1 names the salt the pages are sealed with")
+	dst, err = testOpen(t, dstPath, opts)
+	require.NoError(t, err)
+	codecRequire(t, dst, 40)
+	require.NoError(t, dst.Close())
+
+	// and the close's checkpoint leaves it in the main file
+	require.Equal(t, keyed, headerSalt(t, dstPath))
+	dst, err = testOpen(t, dstPath, opts)
+	require.NoError(t, err)
+	codecRequire(t, dst, 40)
+	require.NoError(t, dst.Close())
 }
 
 // An in-memory database has a codec and no salt. The file its backup makes is
