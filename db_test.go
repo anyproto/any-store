@@ -2804,8 +2804,9 @@ func BenchmarkSketch_RollbackThenFind(b *testing.B) {
 
 // BenchmarkWriteTx_OpenCollections writes to one collection of a db holding n
 // open ones: the cost of a write must not depend on n. TxAll is one
-// transaction that opens every one of the n by name and writes to it: its
-// cost per collection must not depend on n either.
+// transaction that opens every one of the n by name and writes to it, and
+// TxAllFind one that reads from each instead: the cost of an open by name
+// must not depend on the number of collections the transaction uses.
 func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 	for _, n := range []int{1, 1000, 20000} {
 		b.Run(fmt.Sprintf("open=%d", n), func(b *testing.B) {
@@ -2870,6 +2871,25 @@ func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 						_, err = c.UpdateId(tx.Context(), 1, inc)
 						require.NoError(b, err)
 					}
+					require.NoError(b, tx.Commit())
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n), "ns/coll")
+			})
+			// The same with a lookup by id in place of the write: the tx
+			// uses every collection and its commit writes nothing, so the
+			// time is the opens and the lookups. Reported per collection.
+			b.Run("TxAllFind", func(b *testing.B) {
+				b.ReportAllocs()
+				for range b.N {
+					tx, err := fx.WriteTx(ctx)
+					require.NoError(b, err)
+					for _, name := range names {
+						c, err := fx.OpenCollection(tx.Context(), name)
+						require.NoError(b, err)
+						_, err = c.FindId(tx.Context(), 1)
+						require.NoError(b, err)
+					}
+					require.Len(b, tx.schemaLog().log, n, "every collection is pinned")
 					require.NoError(b, tx.Commit())
 				}
 				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n), "ns/coll")
