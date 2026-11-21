@@ -543,45 +543,36 @@ func (e Key) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 }
 
 // String renders the path condition. A path condition whose inner filter
-// matches every value matches every document, since a path resolves to at
-// least one leaf (a missing one included), and renders as {}: the field form
-// {"a": {}} would parse back as an equality to the empty object. MongoDB has
-// no field-level always-true node either; its always-true filter is the
-// document-level {} (an empty $and).
+// matches every value renders as {"<path>": {"$nin": []}}, which parses back
+// to a path condition whose inner filter matches every value too, on the same
+// path. The field form {"a": {}} would parse back as an equality to the empty
+// object, and the document-level {} would drop the path, which the query
+// layer validates: {"_distance": ...} without a $knn is an error, where {}
+// matches every document.
 func (e Key) String() string {
 	if matchesEverything(e.Filter) {
-		return "{}"
+		return fmt.Sprintf(`{"%s": {"$nin": []}}`, strings.Join(e.Path, "."))
 	}
 	return fmt.Sprintf(`{"%s": %s}`, strings.Join(e.Path, "."), e.Filter.String())
 }
 
 // matchesEverything reports whether f is one of the filters that match every
-// value and render as {}: All, or an And or a Nor with no conditions.
+// value: All, or an And or a Nor with no entries. An And of nil entries is
+// not one: And.Ok calls each entry.
 func matchesEverything(f Filter) bool {
 	switch ft := f.(type) {
 	case All, *All:
 		return true
 	case And:
-		return noConditions(ft)
+		return len(ft) == 0
 	case *And:
-		return ft != nil && noConditions(*ft)
+		return ft != nil && len(*ft) == 0
 	case Nor:
 		return len(ft) == 0
 	case *Nor:
 		return ft != nil && len(*ft) == 0
 	}
 	return false
-}
-
-// noConditions reports whether a conjunction has no condition: And.String
-// skips nil entries.
-func noConditions(e And) bool {
-	for _, f := range e {
-		if f != nil {
-			return false
-		}
-	}
-	return true
 }
 
 type And []Filter

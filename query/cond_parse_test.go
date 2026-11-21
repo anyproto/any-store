@@ -311,9 +311,11 @@ func TestParseCondition_AllWithEmptyArrayMatchesNothing(t *testing.T) {
 }
 
 // A filter that matches every document renders as {}: the parsed empty
-// object (All) and a Go-built And with no conditions, alone or nested. The
-// rendering is what Explain shows, and it parses back to a filter that
-// matches the same documents: the parser rejects null and {"$and":[]}.
+// object (All) and a Go-built And with no conditions, alone or nested. A path
+// condition over one of them renders as {"<path>": {"$nin": []}} and keeps
+// its path, which the query layer validates ("_distance"). The rendering is
+// what Explain shows, and it parses back to a filter that matches the same
+// documents: the parser rejects null and {"$and":[]}.
 func TestFilterString_MatchAllRoundTrips(t *testing.T) {
 	docs := []string{`{"a":1,"b":[{"c":1}]}`, `{"a":2,"b":[]}`, `{}`}
 	for _, tc := range []struct {
@@ -329,10 +331,12 @@ func TestFilterString_MatchAllRoundTrips(t *testing.T) {
 		{"And{}", And{}, `{}`},
 		{"And{And{}}", And{And{}}, `{"$and":[{}]}`},
 		{"And{And{}, a=1}", And{And{}, MustParseCondition(`{"a":1}`)}, ``},
-		{"Key{a, And{}}", Key{Path: []string{"a"}, Filter: And{}}, `{}`},
-		{"Key{a, All{}}", Key{Path: []string{"a"}, Filter: All{}}, `{}`},
-		{"Key{b.c, Nor{}}", Key{Path: []string{"b", "c"}, Filter: Nor{}}, `{}`},
-		{"Key{a, &And{}}", Key{Path: []string{"a"}, Filter: &And{}}, `{}`},
+		{"Key{a, And{}}", Key{Path: []string{"a"}, Filter: And{}}, `{"a": {"$nin": []}}`},
+		{"Key{a, All{}}", Key{Path: []string{"a"}, Filter: All{}}, `{"a": {"$nin": []}}`},
+		{"Key{b.c, Nor{}}", Key{Path: []string{"b", "c"}, Filter: Nor{}}, `{"b.c": {"$nin": []}}`},
+		{"Key{a, &And{}}", Key{Path: []string{"a"}, Filter: &And{}}, `{"a": {"$nin": []}}`},
+		{"$nin []", MustParseCondition(`{"a":{"$nin":[]}}`), `{"a": {"$nin": []}}`},
+		{"_distance $nin []", MustParseCondition(`{"_distance":{"$nin":[]}}`), `{"_distance": {"$nin": []}}`},
 		{"And{Key{a, All{}}, a=1}", And{Key{Path: []string{"a"}, Filter: All{}}, MustParseCondition(`{"a":1}`)}, ``},
 		{"Nor{}", Nor{}, `{}`},
 		{"Or{}", Or{}, `{"$nor":[{}]}`},
@@ -354,4 +358,13 @@ func TestFilterString_MatchAllRoundTrips(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Only an And with no entries matches every value: And.Ok calls each entry,
+// a nil one too.
+func TestMatchesEverything_OnlyEmptyNodes(t *testing.T) {
+	assert.True(t, matchesEverything(And{}))
+	assert.True(t, matchesEverything(&And{}))
+	assert.False(t, matchesEverything(And{nil}))
+	assert.False(t, matchesEverything(&And{nil, nil}))
 }

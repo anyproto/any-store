@@ -327,6 +327,20 @@ func TestQuery_GoEmptyAndMatchesAll(t *testing.T) {
 	}
 }
 
+// A path condition that matches every value keeps its path when it is
+// rendered: {"_distance":{"$nin":[]}} without a $knn is an error, and so is
+// its rendering, which a Delete must not run as {}.
+func TestQuery_MatchAllPathRenderingKeepsValidation(t *testing.T) {
+	coll := emptyLogicalColl(t)
+	f, err := query.ParseCondition(`{"_distance":{"$nin":[]}}`)
+	require.NoError(t, err)
+	for _, filter := range []any{f, f.String()} {
+		_, err = coll.Find(filter).Delete(ctx)
+		require.ErrorIs(t, err, anystore.ErrDistanceWithoutVector, "%v", filter)
+	}
+	assertQueryCount(t, coll.Find(nil), 5)
+}
+
 // An empty array under $and, $or or $nor is a parse error from every verb,
 // at every level and next to any other key. No verb treats it as "no filter":
 // a Delete or Update with it changes nothing.
