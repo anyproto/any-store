@@ -1505,7 +1505,7 @@ func (wi *walIndex) mapSegmentForLookup(seg int) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if need := shmLookupFileSize(seg, shmRegionsPerMap()); info.Size() < need {
+		if need := shmLookupFileSize(seg, f.regionsPerMap()); info.Size() < need {
 			return nil, fmt.Errorf("%w: the wal-index file has %d bytes, the segment's mapping ends at %d", errShmSegmentMissing, info.Size(), need)
 		}
 	}

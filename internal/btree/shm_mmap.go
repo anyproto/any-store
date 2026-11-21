@@ -460,6 +460,9 @@ func (s *mmapShm) fcntlLock(lockType int, offset int64) error {
 	return nil
 }
 
+// regionsPerMap returns the number of segments one mapping covers (shmFile).
+func (s *mmapShm) regionsPerMap() int { return shmRegionsPerMap() }
+
 // fileInfo returns the FileInfo of the shm file (shmFile).
 func (s *mmapShm) fileInfo() (os.FileInfo, error) {
 	s.mu.Lock()
