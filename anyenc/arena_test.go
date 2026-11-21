@@ -143,15 +143,25 @@ func TestArena_Copy(t *testing.T) {
 	assert.Equal(t, 9, c.GetInt("a", "0"))
 	assert.Equal(t, "wart", c.GetString("\x1f"))
 
-	// Keys and strings of a parsed value point into the parsed bytes; the
-	// copy does not.
+	// The keys of a value ParseOwned returns are in the bytes it was given,
+	// and its string and binary payloads in the parser's values; the copy
+	// shares neither, so it outlives a change to both.
 	buf := testObject(src).MarshalTo(nil)
 	var p Parser
-	pv, err := p.Parse(buf)
+	pv, err := p.ParseOwned(buf)
 	assert.NoError(t, err)
 	parsed := pv.String()
 	pc := a.Copy(pv)
-	clear(buf)
+	for _, k := range []string{"s", "b"} {
+		payload := pv.Get(k).v
+		assert.NotEmpty(t, payload, k)
+		for i := range payload {
+			payload[i] = 'X'
+		}
+	}
+	for i := range buf {
+		buf[i] = 'X'
+	}
 	assert.Equal(t, parsed, pc.String())
 }
 
