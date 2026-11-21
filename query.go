@@ -235,21 +235,45 @@ func (q *collQuery) validateSources(s *collSchema) error {
 // peer's DDL — the index dropped and recreated in another mode, say — would
 // otherwise keep the verb failing with the stale verdict (ErrNoVectorIndex,
 // ErrVectorIndexUnsupported) until some other operation of this process
-// happens to observe it. The success path stays transaction-free.
-func (q *collQuery) validateSourcesIn(ctx context.Context) error {
+// happens to observe it. The success path stays transaction-free; verified
+// reports whether the pass was reached against a verified schema (see
+// confirmSources).
+func (q *collQuery) validateSourcesIn(ctx context.Context) (verified bool, err error) {
 	s, verified, err := q.c.schemaFor(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	err = q.validateSources(s)
 	if err == nil || verified || !schemaDependent(err) {
-		return err
+		return verified, err
 	}
 	fresh, ferr := q.c.committedSchema(ctx)
 	if ferr != nil {
-		return ferr
+		return false, ferr
 	}
 	if fresh == s {
+		return true, err
+	}
+	return true, q.validateSources(fresh)
+}
+
+// confirmSources runs, for a read verb whose filter provably matches nothing,
+// the source check its run would have made. A pass validateSourcesIn reached
+// against the unverified cached head stands for a verb that runs, because
+// compilePlan validates again against the schema its transaction resolves.
+// The empty answer has no run, so a pass that depends on the schema — a $text
+// or $knn source names an index — is confirmed against the committed schema
+// first, through a short read: when a peer process has dropped the index, the
+// verb returns the error it returns for a filter that matches something, and
+// an $out after it does not replace its destination with nothing. MongoDB
+// looks the text index up on the current catalog when it parses $text. A
+// filter with neither source keeps its answer free of I/O.
+func (q *collQuery) confirmSources(ctx context.Context, verified bool) error {
+	if verified || !(query.ContainsText(q.cond) || query.ContainsKnn(q.cond)) {
+		return nil
+	}
+	fresh, err := q.c.committedSchema(ctx)
+	if err != nil {
 		return err
 	}
 	return q.validateSources(fresh)
@@ -492,17 +516,22 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	// Source validation precedes the unsatisfiable() short-circuit: an invalid
 	// $knn/_distance/legacy clause must error here exactly as it would with a
 	// satisfiable filter.
-	if err = q.validateSourcesIn(ctx); err != nil {
+	verified, err := q.validateSourcesIn(ctx)
+	if err != nil {
 		qb.Close()
 		return
 	}
 
 	// Fast path: filter provably matches no documents — return an empty
-	// iterator with no transaction, no plan construction, no I/O. Not for
-	// a $lookup's source: its reads go through a transaction that must
-	// know the iterator (lookupSource).
+	// iterator with no transaction, no plan construction, and no I/O unless
+	// a $text or $knn source must be confirmed (confirmSources). Not for a
+	// $lookup's source: its reads go through a transaction that must know
+	// the iterator (lookupSource).
 	if q.unsatisfiable() && !q.lookupSource {
 		qb.Close()
+		if err = q.confirmSources(ctx, verified); err != nil {
+			return nil, err
+		}
 		return &emptyIter{}, nil
 	}
 
@@ -662,7 +691,7 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(wtx WriteTx, btWt
 	defer qb.Close()
 
 	// Source validation precedes the unsatisfiable() short-circuit (see Iter).
-	if err = q.validateSourcesIn(ctx); err != nil {
+	if _, err = q.validateSourcesIn(ctx); err != nil {
 		return
 	}
 
@@ -724,6 +753,13 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(wtx WriteTx, btWt
 	btx := tx.btreeReadTx()
 	s, err := q.c.resolve(btx)
 	if err != nil {
+		return
+	}
+	// The sources are checked against the schema this write resolved, before
+	// the empty answer below: a check reached against the unverified cached
+	// head would let a $text or $knn whose index a peer process dropped
+	// through as an empty write. compilePlan's check is then a memo hit.
+	if err = q.validateSources(s); err != nil {
 		return
 	}
 
@@ -811,15 +847,17 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	}
 
 	// Source validation precedes the unsatisfiable() short-circuit (see Iter).
-	if err = q.validateSourcesIn(ctx); err != nil {
+	verified, err := q.validateSourcesIn(ctx)
+	if err != nil {
 		return 0, err
 	}
 
 	// Fast path: filter provably matches no documents (e.g. $in:[]). Skip
-	// the planner, the read tx, and the index walk entirely — the answer
-	// is unconditionally zero. See isUnsatisfiable.
+	// the planner, the read tx (unless a $text or $knn source must be
+	// confirmed, see confirmSources), and the index walk entirely — the
+	// answer is unconditionally zero. See isUnsatisfiable.
 	if q.unsatisfiable() {
-		return 0, nil
+		return 0, q.confirmSources(ctx, verified)
 	}
 
 	// Primary-key bounds (tight channel — sound for the pk, see pkBounds)
@@ -951,10 +989,14 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	// unsatisfiable short-circuit — Explain(Q) describes the plan producing
 	// Rows(Q), and for an unsatisfiable filter that is the empty plan the other
 	// verbs short-circuit to, not a plan that will never run.
-	if err = q.validateSourcesIn(ctx); err != nil {
+	verified, err := q.validateSourcesIn(ctx)
+	if err != nil {
 		return
 	}
 	if q.unsatisfiable() {
+		if err = q.confirmSources(ctx, verified); err != nil {
+			return
+		}
 		explain.Sql = "EmptyResult"
 		explain.Plan = "EmptyResult (filter is unsatisfiable)"
 		return
