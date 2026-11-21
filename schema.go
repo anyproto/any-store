@@ -250,6 +250,11 @@ func (db *db) endAnnouncement(cookie uint32) {
 type txSchema struct {
 	memo []memoEntry
 	log  []logEntry
+	// changes holds the positions in log of the entries that are schema
+	// changes, in log order: every entry but the pins (logPin). A lookup by
+	// name (byName) walks these alone, so the handles a transaction only
+	// uses cost it nothing.
+	changes []int
 	// installed reports that the commit published the log (install ran):
 	// the registry has to follow it (settleLog), whatever Commit returned.
 	installed bool
@@ -328,6 +333,7 @@ func (t *txSchema) release() {
 	t.memo = t.memo[:0]
 	clear(t.log)
 	t.log = t.log[:0]
+	t.changes = t.changes[:0]
 	t.installed = false
 }
 
@@ -361,11 +367,13 @@ func (c *collection) inTx(tx *btree.ReadTx) (s *collSchema, dropped bool) {
 // byName returns the entry under which the open write transaction has a
 // collection by name: the one it created or renamed to it, or the drop that
 // took the name. Only a handle's last change counts — the earlier ones are
-// superseded.
+// superseded. The pins are not visited (changes): the lookup costs by the
+// schema changes of the transaction, not by the handles it uses.
 func (t *txSchema) byName(name string) *logEntry {
-	for i := len(t.log) - 1; i >= 0; i-- {
+	for j := len(t.changes) - 1; j >= 0; j-- {
+		i := t.changes[j]
 		e := &t.log[i]
-		if e.kind == logPin || e.s.name != name || e.c.logLast != i+1 {
+		if e.s.name != name || e.c.logLast != i+1 {
 			continue
 		}
 		return e
@@ -379,6 +387,7 @@ func (t *txSchema) add(db *db, e logEntry) {
 	db.mu.Lock()
 	e.c.pinned++
 	db.mu.Unlock()
+	t.changes = append(t.changes, len(t.log))
 	t.log = append(t.log, e)
 	e.c.logLast = len(t.log)
 }
@@ -510,6 +519,7 @@ func (db *db) settleLog(t *txSchema) {
 	}
 	clear(t.log)
 	t.log = t.log[:0]
+	t.changes = t.changes[:0]
 }
 
 // discardLog drops the entries [from:] of the log: their scope rolled back.
@@ -556,6 +566,9 @@ func (db *db) discardLog(t *txSchema, from int) {
 	}
 	clear(t.log[from:])
 	t.log = t.log[:from]
+	for len(t.changes) > 0 && t.changes[len(t.changes)-1] >= from {
+		t.changes = t.changes[:len(t.changes)-1]
+	}
 	t.remark()
 }
 
