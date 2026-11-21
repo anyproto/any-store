@@ -375,12 +375,18 @@ func TestQuery_EmptyLogicalArrayIsParseError(t *testing.T) {
 // {"$all": []} matches no document (MongoDB's rule), alone and in a compound
 // filter, with and without an index on the field: next to the match-all {} a
 // conjunction of no equalities would have let a Delete empty the collection.
+// The verbs and Explain answer a filter that provably matches nothing
+// without planning it; a $match before a $lookup is planned (its
+// transaction must know the iterator), so it runs {"$all":[]}'s index bounds
+// through the planner with each index, next to a selective conjunct on the
+// same field too.
 func TestQuery_AllWithEmptyArrayMatchesNothing(t *testing.T) {
 	for _, index := range []string{"", "tags", "sparse tags"} {
 		for _, filter := range []string{
 			`{"tags":{"$all":[]}}`,
 			`{"$and":[{},{"tags":{"$all":[]}}]}`,
 			`{"$and":[{"a":{"$gte":1}},{"tags":{"$all":[]}}]}`,
+			`{"$and":[{"tags":"x"},{"tags":{"$all":[]}}]}`,
 			`{"$or":[{"tags":{"$all":[]}},{"a":1}]}`,
 		} {
 			t.Run(index+"/"+filter, func(t *testing.T) {
@@ -411,6 +417,10 @@ func TestQuery_AllWithEmptyArrayMatchesNothing(t *testing.T) {
 				n, err = coll.Aggregate(fmt.Sprintf(`[{"$match":%s}]`, filter)).Count(ctx)
 				require.NoError(t, err)
 				assert.Equal(t, want, n, "Aggregate $match")
+				n, err = coll.Aggregate(fmt.Sprintf(
+					`[{"$match":%s},{"$lookup":{"localField":"id","foreignField":"id","as":"self"}}]`, filter)).Count(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, want, n, "Aggregate $match, $lookup")
 
 				res, err := coll.Find(filter).Update(ctx, `{"$set":{"touched":true}}`)
 				require.NoError(t, err)

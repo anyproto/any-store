@@ -1401,3 +1401,41 @@ func collectIdsString(t testing.TB, q Query) []string {
 	require.NoError(t, iter.Err())
 	return out
 }
+
+// A bulk write whose commit fails wrote nothing: Modified is 0 and Matched
+// still reports the documents it matched, as for a failure inside the loop.
+// Rolling the btree transaction back under the commit makes the commit fail
+// as an I/O error would.
+func TestQuery_BulkWriteFailedCommitReportsNothingModified(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"n":1}`),
+		anyenc.MustParseJson(`{"id":2,"n":2}`),
+	))
+	failCommit := func() {
+		testHookBeforeBtreeCommit = func(btx *btree.WriteTx) { require.NoError(t, btx.Rollback()) }
+	}
+	t.Cleanup(func() { testHookBeforeBtreeCommit = nil })
+
+	failCommit()
+	res, err := coll.Find(nil).Update(ctx, `{"$inc":{"n":10}}`)
+	testHookBeforeBtreeCommit = nil
+	require.ErrorIs(t, err, btree.ErrTxClosed)
+	assert.Equal(t, 2, res.Matched, "Update")
+	assert.Equal(t, 0, res.Modified, "Update")
+
+	failCommit()
+	res, err = coll.Find(nil).Delete(ctx)
+	testHookBeforeBtreeCommit = nil
+	require.ErrorIs(t, err, btree.ErrTxClosed)
+	assert.Equal(t, 2, res.Matched, "Delete")
+	assert.Equal(t, 0, res.Modified, "Delete")
+
+	for id, want := range map[int]int{1: 1, 2: 2} {
+		doc, err := coll.FindId(ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, want, doc.Value().GetInt("n"))
+	}
+}

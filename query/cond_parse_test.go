@@ -284,7 +284,10 @@ func TestParseCondition_EmptyLogicalArrayRejected(t *testing.T) {
 // true everywhere, and next to the match-all {} it would let a Delete empty
 // the collection.
 func TestParseCondition_AllWithEmptyArrayMatchesNothing(t *testing.T) {
-	docs := []string{`{"tags":[1,2]}`, `{"tags":[]}`, `{"tags":null}`, `{"tags":1}`, `{}`}
+	// The "o" documents give the $elemMatch case object elements to test
+	// the inner {"$all":[]} on.
+	docs := []string{`{"tags":[1,2]}`, `{"tags":[]}`, `{"tags":null}`, `{"tags":1}`, `{}`,
+		`{"o":[{"tags":[1]}]}`, `{"o":[{"tags":[]},{}]}`}
 	for _, tc := range []struct {
 		filter string
 		want   bool

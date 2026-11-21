@@ -535,7 +535,7 @@ func packedLen(t *testing.T, srt query.Sort, r limitRow) int {
 }
 
 // sortRows runs rows through a SortIter and returns the emitted ids, the
-// error of the first Next, and the iterator (closed).
+// error of the first Next, and the iterator, still open.
 func sortRows(t *testing.T, srt query.Sort, topK int, rows []limitRow) ([]string, error, *SortIter) {
 	t.Helper()
 	plan := &Plan{}
@@ -544,7 +544,9 @@ func sortRows(t *testing.T, srt query.Sort, topK int, rows []limitRow) ([]string
 		hits[i] = fakeHit{key: r.docId, docId: r.docId, doc: r.doc}
 	}
 	it := &SortIter{Source: &fakeIter{plan: plan, hits: hits}, Sorter: srt, Plan: plan, TopK: topK}
-	defer it.Close()
+	// The caller sees what an error left in place; the test closes the
+	// iterator at its end.
+	t.Cleanup(it.Close)
 	var ids []string
 	for {
 		_, docId, _, err := it.Next()
@@ -596,7 +598,7 @@ func TestSortIter_ArenaLimitAppliesOnAdmission(t *testing.T) {
 		setSortArenaLimit(t, 4*e)
 		_, err, it := sortRows(t, srt, 4, append(slices.Clone(kept), winner))
 		require.ErrorIs(t, err, errSortTooLarge)
-		assert.Nil(t, it.arena, "a failed sort releases its arena")
+		assert.Nil(t, it.arena, "a failed sort releases its arena before Close")
 	})
 	t.Run("kept rows past the limit", func(t *testing.T) {
 		setSortArenaLimit(t, 4*e-1)
@@ -611,7 +613,7 @@ func TestSortIter_ArenaLimitAppliesOnAdmission(t *testing.T) {
 		setSortArenaLimit(t, 4*e-1)
 		_, err, it := sortRows(t, srt, 0, kept)
 		require.ErrorIs(t, err, errSortTooLarge)
-		assert.Nil(t, it.arena, "a failed sort releases its arena")
+		assert.Nil(t, it.arena, "a failed sort releases its arena before Close")
 		assert.Nil(t, it.entries)
 	})
 }
@@ -626,6 +628,8 @@ func TestSortIter_CloseReleasesArena(t *testing.T) {
 			mkLimitRow(a, "x", "1"), mkLimitRow(a, "y", "2"), mkLimitRow(a, "z", "3"),
 		})
 		require.NoError(t, err)
+		require.NotNil(t, it.arena, "TopK %d: the drained sort keeps its rows until Close", topK)
+		it.Close()
 		assert.Nil(t, it.arena, "TopK %d", topK)
 		assert.Nil(t, it.entries, "TopK %d", topK)
 	}

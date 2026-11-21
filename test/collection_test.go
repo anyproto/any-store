@@ -2678,6 +2678,7 @@ func TestQuery_FailedBulkWriteReportsNothingModified(t *testing.T) {
 
 			res, err := coll.Find(nil).Sort("id").Update(ctx, tc.mod)
 			require.Error(t, err)
+			assert.Equal(t, 1, res.Matched, "the write failed on the second document, after it changed the first")
 			assert.Equal(t, 0, res.Modified)
 
 			for id, want := range map[int]string{
