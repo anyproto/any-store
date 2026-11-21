@@ -587,10 +587,12 @@ func (db *db) unpinLocked(entries []logEntry) {
 		if c.pinned > 0 || !c.closePending.Load() {
 			continue
 		}
-		c.closePending.Store(false)
 		if c.closed.CompareAndSwap(false, true) {
 			db.evictLocked(c)
 		}
+		// Cleared after the handle is closed: an open that reads the two
+		// without db.mu (db.handOut) sees the pending close or its effect.
+		c.closePending.Store(false)
 	}
 }
 

@@ -302,7 +302,8 @@ type collection struct {
 
 	// closePending records a Close() that waits for pinned to reach zero
 	// (db.unpinLocked). An open that hands this handle to a caller in between
-	// clears it (db.handOut). Written under db.mu.
+	// clears it (db.handOut); one that comes after the close took effect
+	// opens again. Written under db.mu.
 	closePending atomic.Bool
 
 	closed atomic.Bool

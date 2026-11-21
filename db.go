@@ -793,25 +793,59 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 }
 
 func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collection, error) {
-	coll, err := db.openCollection(ctx, collectionName)
-	if err != nil {
-		return nil, err
+	for attempt := 0; ; attempt++ {
+		coll, err := db.openCollection(ctx, collectionName)
+		if err != nil {
+			return nil, err
+		}
+		if db.handOut(coll.(*collection)) {
+			return coll, nil
+		}
+		if attempt == handOutAttempts-1 {
+			return nil, ErrCollectionNotFound
+		}
 	}
-	return db.handOut(coll), nil
 }
 
-// handOut returns coll to a caller that keeps it. That cancels a Close() an
-// uncommitted schema change deferred (see collection.closePending): the
-// handle has a user again. An open the library makes for itself, or one that
-// ends in an error, hands nothing out. The unlocked read may miss a Close()
-// racing with the open; that close then stands, as if it came second.
-func (db *db) handOut(coll Collection) Collection {
-	if c := coll.(*collection); c.closePending.Load() {
-		db.mu.Lock()
-		c.closePending.Store(false)
-		db.mu.Unlock()
+// handOutAttempts bounds the opens one call makes for a handle to hand out:
+// each one more needs another Close() to land between an open and its
+// hand-out. The same bound as openCollection has for a handle gone while it
+// was resolved.
+const handOutAttempts = 3
+
+// testHookBeforeHandOut, when set, runs between an open that found its
+// handle and the hand-out of it. Tests only.
+var testHookBeforeHandOut func()
+
+// handOut gives c to a caller that keeps it, and reports false when c was
+// closed since the open found it: the caller opens again and gets the handle
+// the collection has now, never a closed one. Handing out cancels a Close()
+// the open write transaction deferred (see collection.closePending): the
+// handle has a user again. The check and the cancellation are one critical
+// section of db.mu, as the end of that transaction is (unpinLocked): either
+// the close is cancelled before the last pin goes, or it took effect and the
+// open is made again. An open the library makes for itself, or one that ends
+// in an error, hands nothing out.
+//
+// Without db.mu when there is nothing to cancel: no close is pending and
+// the handle is open. unpinLocked closes the handle before it clears the
+// pending close, so the two reads, in this order, cannot both miss a
+// deferred close that took effect. A Close() that arrives after them came
+// after the hand-out.
+func (db *db) handOut(c *collection) bool {
+	if testHookBeforeHandOut != nil {
+		testHookBeforeHandOut()
 	}
-	return coll
+	if !c.closePending.Load() && !c.closed.Load() {
+		return true
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if c.closed.Load() {
+		return false
+	}
+	c.closePending.Store(false)
+	return true
 }
 
 // registered returns the live handle the registry holds under name. The
@@ -1042,11 +1076,18 @@ func (db *db) liveLocked(name string) (Collection, bool) {
 }
 
 func (db *db) Collection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error) {
-	coll, err := db.collection(ctx, collectionName, opts...)
-	if err != nil {
-		return nil, err
+	for attempt := 0; ; attempt++ {
+		coll, err := db.collection(ctx, collectionName, opts...)
+		if err != nil {
+			return nil, err
+		}
+		if db.handOut(coll.(*collection)) {
+			return coll, nil
+		}
+		if attempt == handOutAttempts-1 {
+			return nil, ErrCollectionNotFound
+		}
 	}
-	return db.handOut(coll), nil
 }
 
 // collection opens or creates the collection without handing it out (see

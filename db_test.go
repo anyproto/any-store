@@ -2623,6 +2623,64 @@ func TestWriteTx_HandleClosedBeforeCommitStoresItsSketches(t *testing.T) {
 	})
 }
 
+// An open that found a handle whose Close() waits for the write transaction
+// never returns that handle closed: when the transaction ends between the
+// open and the hand-out, and the close takes effect, the open is made again.
+func TestOpenCollection_HandOutAfterTheDeferredCloseTookEffect(t *testing.T) {
+	for _, open := range []struct {
+		name string
+		fn   func(d DB) (Collection, error)
+	}{
+		{"OpenCollection", func(d DB) (Collection, error) { return d.OpenCollection(ctx, "c") }},
+		{"Collection", func(d DB) (Collection, error) { return d.Collection(ctx, "c") }},
+	} {
+		t.Run(open.name, func(t *testing.T) {
+			d, _ := openSketchDB(t)
+			coll, err := d.OpenCollection(ctx, "c")
+			require.NoError(t, err)
+			wtx, err := d.WriteTx(ctx)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = wtx.Rollback() })
+			require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":100,"a":3}`)))
+			require.NoError(t, coll.Close())
+
+			// The opener found the handle and stops before the hand-out;
+			// the writer commits there.
+			found, committed := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			testHookBeforeHandOut = func() {
+				once.Do(func() {
+					close(found)
+					<-committed
+				})
+			}
+			t.Cleanup(func() { testHookBeforeHandOut = nil })
+			type result struct {
+				coll Collection
+				err  error
+			}
+			res := make(chan result, 1)
+			go func() {
+				c, err := open.fn(d)
+				res <- result{c, err}
+			}()
+			<-found
+			require.NoError(t, wtx.Commit())
+			require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":101,"a":3}`)), ErrCollectionClosed,
+				"setup: the Close() took effect at the commit")
+			close(committed)
+			r := <-res
+			require.NoError(t, r.err)
+			if r.coll == coll {
+				t.Error("the open returned the handle the commit closed")
+			}
+			n, err := r.coll.Count(ctx)
+			require.NoError(t, err, "the handle an open returns is open")
+			require.Equal(t, 51, n)
+		})
+	}
+}
+
 // BenchmarkSketch_FindThenWriteAfterAPeersCommit is the cycle of a process
 // that shares its file: another process commits, this one plans a query and
 // then writes. The reader loads the stored sketch rows into the published
