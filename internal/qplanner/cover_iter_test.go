@@ -78,6 +78,20 @@ func TestCoverIter_Next_SeekError(t *testing.T) {
 	_, docId, _, err = it.Next()
 	require.ErrorIs(t, err, btree.ErrTxClosed)
 	assert.Nil(t, docId)
+
+	t.Run("first bound", func(t *testing.T) {
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		it := &CoverIter{
+			Source:  &CursorSource{Tx: rtx, Ns: ns},
+			IdxInfo: &IndexInfo{Name: "ci", FieldNames: []string{"id"}},
+			Bounds:  query.Bounds{{Start: anyenc.AppendAnyValue(nil, "alpha")}},
+		}
+		require.NoError(t, rtx.Rollback())
+		_, docId, _, err := it.Next()
+		require.ErrorIs(t, err, btree.ErrTxClosed)
+		assert.Nil(t, docId)
+	})
 }
 
 // TestCoverIter_Next_PrefixMismatch covers cover_iter.go:35 — when

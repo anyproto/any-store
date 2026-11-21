@@ -85,10 +85,13 @@ func TestPagedSearch_ReadError(t *testing.T) {
 				armed.Store(true)
 				got, err := tc.search(p)
 				armed.Store(false)
-				if err != nil {
-					require.ErrorIs(t, err, errInjectedRead)
+				if failAt >= 0 {
+					// Every read the search makes is of a candidate's
+					// vector: whichever fails, the search fails.
+					require.ErrorIs(t, err, errInjectedRead, "read %d", failAt)
 					return reads.Load()
 				}
+				require.NoError(t, err)
 				require.Equal(t, len(want), len(got), "read %d", failAt)
 				for i := range want {
 					require.Equal(t, want[i].Key, got[i].Key, "read %d: result %d", failAt, i)
