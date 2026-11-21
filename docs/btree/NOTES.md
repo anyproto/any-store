@@ -2883,22 +2883,46 @@ if this open is the one that writes page 1.
    `main.c:1718-1747`). `pager.lockDBShared` is that loop: the shared request is repeated
    through `DefaultBusyTimeout(BusyTimeout)` (the same delay table, 5 s), and exhaustion is an
    error that matches `ErrBusy`. One count (`beginBusy`) serves the open's wait for the shared
-   lock and a creation's waits for the exclusive one (`lockDBForCreate`). Three things differ.
-   Two waits of an open are not on that count. `wal.open`'s later wait for the WAL write lock
-   counts by itself ([drift-108](#drift-108-busy-handler-retry-count-resets-per-call)). And the
-   exclusive → shared conversion after a creation (`downgradeDBLock`) has a count of its own:
-   SQLite has no wait there, since its flock downgrade only records the new level
-   (`os_unix.c:2747-2750`) and its POSIX downgrade is never refused by another process (a
-   failure is `SQLITE_IOERR_RDLOCK`, `os_unix.c:2215-2224`), while a flock conversion here can
-   be refused. An `Open` can therefore wait for `BusyTimeout` up to three times. The third
-   difference: a multi-process open cannot tell a process that holds the file in in-process mode
-   (exclusive for the handle's life) from a peer inside its close or its creation. It waits the
-   whole `BusyTimeout` and fails with `ErrBusy` in each case, also when a creator or a closer
-   stalls for that long. The in-process open itself asks for its exclusive lock once and does
-   not wait: where the lock is real (Unix, Windows) it is refused at once with
-   `ErrInProcessLocked`; on wasm the lock functions are no-ops and a second runtime is not
-   refused
+   lock and a creation's waits for the exclusive one (`lockDBForCreate`). Two things differ.
+
+   *The open's other waits have budgets of their own*, where one `nBusy` serves every wait of a
+   step in SQLite. By stage:
+   - the shared DB-file lock and a creation's waits for the exclusive lock: the count above;
+   - each exclusive → shared conversion (`downgradeDBLock`, after a creation or after an
+     exclusive lock that found the database created): a count of its own. SQLite has no wait
+     there: its flock downgrade only records the new level (`os_unix.c:2747-2750`), and its
+     POSIX downgrade cannot be refused by another process, its failures being I/O errors
+     (`posixUnlock`: `SQLITE_IOERR_RDLOCK` if the conversion to the read lock fails,
+     `os_unix.c:2211-2224`; `SQLITE_IOERR_UNLOCK` if the release of the pending and reserved
+     bytes after it fails, `os_unix.c:2228-2238`). A flock conversion here can be refused;
+   - in multi-process mode, the wal-index election in `wal.open`: 100 tries 10 ms apart
+     ([drift-2026-07-10-2](#drift-2026-07-10-2-dms-busy-retried-in-open-instead-of-surfacing));
+   - in multi-process mode, `wal.open`'s wait for the WAL write lock when it finds no valid
+     wal-index header: a count of its own
+     ([drift-108](#drift-108-busy-handler-retry-count-resets-per-call));
+   - each of the open's two read begins (page 1 in `readPage1AtOpen`, then the header counters
+     in `Open`): a count of its own for a peer's wal-index recovery (`ErrBusyRecovery`,
+     [drift-2026-11-11-1](#drift-2026-11-11-1-attached-wal-index-recovery)), around the
+     `WAL_RETRY` loop of each attempt.
+
+   An open that meets contention at several stages waits at each of them.
+
+   *A multi-process open cannot tell a process that holds the file in in-process mode*
+   (exclusive for the handle's life) from a peer inside its close or its creation, and waits
+   for each the same way. The open goes on as soon as a request for the shared lock is granted,
+   so a creator or a closer that lets go before the busy handler gives up only delays it. It
+   fails with `ErrBusy` if the lock is still held when the handler gives up: always against an
+   in-process holder, and against a creator or a closer that stalls that long.
+
+   The in-process open itself asks for its exclusive lock once and does not wait: where the
+   lock is real (Unix, Windows) it is refused at once with `ErrInProcessLocked`. On wasm the
+   lock functions are no-ops, so the btree lock keeps no second runtime out
    ([drift-2026-06-25-07](#drift-2026-06-25-07-acquireexclusivedblock-is-a-no-op-on-plan9-wasip1-removing-the-cross-p)).
+   A storage backend can refuse one on its own: the wasm module's OPFS backend opens every file
+   with an exclusive sync access handle (`createSyncAccessHandle`, `wasm/vfs_opfs.go`), so
+   while one worker has the database open, another worker's `Open` fails when its open of the
+   file is refused, with the backend's error (an `os.PathError`) rather than
+   `ErrInProcessLocked`.
 5. *The WAL is deleted under the exclusive lock*, where SQLite deletes it under SHARED and
    relies on an empty database not being in WAL mode (`pager.c:3330-3337`). The wal-index file
    is not deleted, as in SQLite: the first attacher's election truncates a stale one
@@ -4087,7 +4111,7 @@ C `unixShmMap` with `isWrite==0` still maps *existing* regions of the shm file �
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `pager.go:*pager.open` (registration and the create/existing decision), `pager.go:*pager.rekeyRegistry`, `pager.go:*pager.createIfEmpty`, `db.go:registryKey`, `db.go:unstableOpenMu`, `inode_unstable_darwin.go`.
 
-SQLite's `findInodeInfo` keys its per-process inode registry on an fstat of the just-opened fd, under the process-wide `unixBigLock`; on macOS msdos volumes, where a zero-size file reports a wrong inode (ticket #3260; a FAT32 image on macOS 2026-10-15 reported 2^64−13 for an empty file and 13 after its first byte), it first writes one byte and fsyncs so the fstat sees a real inode (`os_unix.c:1553-1576`, 3.52.0) — safe there because 'S' is the first byte of every SQLite header and `unixFileSize` reports a size of 1 as 0. any-store's header does not start with that byte and a 1-byte file would not read as empty to `readInitialHeader`, the create/existing decision or another process, so on such a volume (darwin, `fstatfs` type `msdos` or `exfat`) an empty file is keyed by its absolute path instead, and `rekeyRegistry` moves the entry to the inode once the file has content: in `pager.open` after the create/existing decision, when the file holds a page 1 that this open (`createIfEmpty`, written and fdatasynced) or another process wrote — before any WAL open. Every open on such a volume takes `unstableOpenMu` for its key stat and store, and a path-keyed handle keeps it until its re-key, so the move from path to inode is atomic to the other openers in the process: two spellings of one empty file, or a joiner and its creator, meet on the mutex, the later one stats after the earlier one is keyed by inode and is refused at registration, and only one handle ever runs `createIfEmpty` on the file. The mutex is held across the open's wait for the DB-file lock (the busy handler's, up to `BusyTimeout` against a closing or creating peer), which SQLite's lock never is: latency only, for other opens on such volumes in this process. Wherever a (dev,ino) identity exists on a stable volume the key is the inode from the first stat, as in SQLite, and the mutex is never taken; Windows and wasm, and a VFS handle whose FileInfo carries no identity, key by path throughout, as before. Two processes creating one empty file at once are serialized by the exclusive DB-file lock ([drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal)). Regression tests (`openregistry_vfs_test.go`, vfs tag, a VFS that reports one inode for every empty file with `emptyFileInodeUnstable` forced on): `TestOpen_RegistryFollowsInodeOfNewFile`, `TestOpen_OpensOnUnstableVolumeSerializeOnCreate`, `TestOpen_JoinerDuringCreatorFdatasyncWaits`, `TestOpen_PathKeyedOpenJoinsContentByInode`, `TestOpen_TwoSpellingsSettleBeforeWAL`.
+SQLite's `findInodeInfo` keys its per-process inode registry on an fstat of the just-opened fd, under the process-wide `unixBigLock`; on macOS msdos volumes, where a zero-size file reports a wrong inode (ticket #3260; a FAT32 image on macOS 2026-10-15 reported 2^64−13 for an empty file and 13 after its first byte), it first writes one byte and fsyncs so the fstat sees a real inode (`os_unix.c:1553-1576`, 3.52.0) — safe there because 'S' is the first byte of every SQLite header and `unixFileSize` reports a size of 1 as 0. any-store's header does not start with that byte and a 1-byte file would not read as empty to `readInitialHeader`, the create/existing decision or another process, so on such a volume (darwin, `fstatfs` type `msdos` or `exfat`) an empty file is keyed by its absolute path instead, and `rekeyRegistry` moves the entry to the inode once the file has content: in `pager.open` after the create/existing decision, when the file holds a page 1 that this open (`createIfEmpty`, written and fdatasynced) or another process wrote — before any WAL open. Every open on such a volume takes `unstableOpenMu` for its key stat and store, and a path-keyed handle keeps it until its re-key, so the move from path to inode is atomic to the other openers in the process: two spellings of one empty file, or a joiner and its creator, meet on the mutex, the later one stats after the earlier one is keyed by inode and is refused at registration, and only one handle ever runs `createIfEmpty` on the file. The mutex is held across the open's waits for the DB-file lock (the busy handler's, against a closing or creating peer; [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal), item 4, gives their budgets), which SQLite's lock never is: latency only, for other opens on such volumes in this process. Wherever a (dev,ino) identity exists on a stable volume the key is the inode from the first stat, as in SQLite, and the mutex is never taken; Windows and wasm, and a VFS handle whose FileInfo carries no identity, key by path throughout, as before. Two processes creating one empty file at once are serialized by the exclusive DB-file lock ([drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal)). Regression tests (`openregistry_vfs_test.go`, vfs tag, a VFS that reports one inode for every empty file with `emptyFileInodeUnstable` forced on): `TestOpen_RegistryFollowsInodeOfNewFile`, `TestOpen_OpensOnUnstableVolumeSerializeOnCreate`, `TestOpen_JoinerDuringCreatorFdatasyncWaits`, `TestOpen_PathKeyedOpenJoinsContentByInode`, `TestOpen_TwoSpellingsSettleBeforeWAL`.
 
 <a id="drift-2026-06-25-01-transient-busy-locked-equivalent-errors-are-made-sticky-in-b-rc-so-a-b"></a>
 ### Drift: Transient BUSY/LOCKED-Equivalent Errors Are Made Sticky In b.rc So A Backup Cannot Be Retried Or Resumed

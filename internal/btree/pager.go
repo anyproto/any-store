@@ -648,11 +648,12 @@ func (p *pager) open() (err error) {
 	// inside its close or a creator writing page 1. One count serves this
 	// wait and the creation's waits for the exclusive lock (lockDBForCreate),
 	// as one nBusy serves every busy wait of a step in SQLite
-	// (sqlite3VdbeExec zeroes it on entry, vdbe.c:901). Two waits of an open
-	// are not on it: the conversion back to the shared lock after a creation
-	// (downgradeDBLock) and wal.open's wait for the WAL write lock, each
-	// with a count of its own. The in-process lock is not waited for: its
-	// holder keeps it for the handle's life.
+	// (sqlite3VdbeExec zeroes it on entry, vdbe.c:901). The open's other
+	// waits are not on it, and each has a budget of its own: a conversion
+	// back to the shared lock (downgradeDBLock), the wal-index election and
+	// the wait for the WAL write lock in wal.open, and each of the open's
+	// read begins (docs/btree/NOTES.md, drift-63, item 4). The in-process
+	// lock is not waited for: its holder keeps it for the handle's life.
 	dbLockBusy := &beginBusy{xBusy: DefaultBusyTimeout(BusyTimeout)}
 	if !p.inProcess {
 		if err := p.lockDBShared(f, dbLockBusy); err != nil {
@@ -1077,8 +1078,10 @@ func (p *pager) headerErrorOfUnwritableFile() error {
 // process can take it; the request then waits with a budget of its own.
 // SQLite's downgrade has no wait to count: with flock it only records the
 // new level (os_unix.c:2747-2750), and with POSIX locks another process
-// cannot refuse it (a failure there is SQLITE_IOERR_RDLOCK,
-// os_unix.c:2215-2224).
+// cannot refuse it. posixUnlock's failures there are I/O errors, not
+// SQLITE_BUSY: SQLITE_IOERR_RDLOCK if the conversion to the read lock
+// fails (os_unix.c:2211-2224), SQLITE_IOERR_UNLOCK if the release of the
+// pending and reserved bytes after it fails (os_unix.c:2228-2238).
 func (p *pager) downgradeDBLock(f fileHandle) error {
 	return p.lockDBShared(f, &beginBusy{xBusy: DefaultBusyTimeout(BusyTimeout)})
 }
