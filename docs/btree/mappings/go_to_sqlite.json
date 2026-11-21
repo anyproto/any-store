@@ -765,7 +765,7 @@
       "os_unix.c:unixDelete",
       "pager.c:pager_end_transaction"
     ],
-    "note": "the commit point: the journal is closed and deleted with no directory sync, as in journal_mode=DELETE without synchronous=EXTRA"
+    "note": "the commit point: the journal is closed and deleted with no directory sync, as in journal_mode=DELETE with extraSync off"
   },
   "creation_journal.go:*creationJournal.sync": {
     "sqlite": [
@@ -780,6 +780,20 @@
     ],
     "note": "the file is empty or a hot creation journal lies beside it: the test sqlite3PagerSharedLock makes after the SHARED lock, extended by the empty file that newDatabase would fill"
   },
+  "creation_journal.go:*pager.deleteJournalOfEmptyDatabase": {
+    "sqlite": [
+      "pager.c:hasHotJournal"
+    ],
+    "note": "whatever lies under the journal's name beside a database file of zero bytes is deleted, unread, as hasHotJournal deletes a journal beside a database of zero pages"
+  },
+  "creation_journal.go:*pager.finalizeJournalOfEmptyDatabase": {
+    "sqlite": [
+      "pager.c:hasHotJournal",
+      "pager.c:pager_end_transaction",
+      "pager.c:pager_playback"
+    ],
+    "note": "syncs the empty database file, then deletes the journal: pager_playback's sync and finalization; beside a file found empty the sync is any-store's addition"
+  },
   "creation_journal.go:*pager.hasHotCreationJournal": {
     "sqlite": [
       "pager.c:hasHotJournal",
@@ -793,26 +807,20 @@
       "pager.c:pager_open_journal",
       "pager.c:writeJournalHdr"
     ],
-    "note": "opens the journal with the create flag, which sets its dirSync (UNIXFILE_DIRSYNC), without truncating it: a leftover of a creation is written over in place, anything else refuses the creation; then writes the header"
+    "note": "opens the journal with the create flag, which sets its dirSync (UNIXFILE_DIRSYNC), and writes the header; a file found under the name was deleted before"
   },
   "creation_journal.go:*pager.playbackCreationJournal": {
     "sqlite": [
       "pager.c:pager_playback",
       "pager.c:pager_truncate"
     ],
-    "note": "truncates the file to the journal's original size, zero pages, and syncs it; no page records exist to play back, and the journal is kept for the creation that follows, which deletes it after its page 1 is synced"
+    "note": "truncates the file to the journal's original size, zero pages, syncs it, and then deletes the journal; no page records exist to play back"
   },
   "creation_journal.go:creationJournalHdr": {
     "sqlite": [
       "pager.c:writeJournalHdr"
     ],
     "note": "SQLite's 28-byte header layout with any-store's magic, original size 0 and the page size"
-  },
-  "creation_journal.go:creationJournalLeftover": {
-    "sqlite": [
-      "pager.c:hasHotJournal"
-    ],
-    "note": "what a creation can leave under the journal's name (nothing, a creation header or its start, zeros no longer than a header); hasHotJournal deletes any journal beside a database of zero pages instead"
   },
   "db.go:*DB.BeginRead": {
     "sqlite": [
@@ -1901,6 +1909,13 @@
     ],
     "note": ""
   },
+  "pager.go:*pager.headerErrorOfUnwritableFile": {
+    "sqlite": [
+      "btree.c:lockBtree",
+      "os_unix.c:unixOpen"
+    ],
+    "note": "a file that does not open for writing is opened read-only, as unixOpen does, to judge its header only: a database is never used read-only"
+  },
   "pager.go:*pager.initNewDB": {
     "sqlite": [
       "btree.c:newDatabase"
@@ -2449,7 +2464,7 @@
   },
   "syncdir_other.go:*dirSync.set": {
     "sqlite": [],
-    "note": "no directory sync outside Unix, as in SQLite's Windows VFS"
+    "note": "no directory sync on Windows and js/wasm, as in SQLite's Windows VFS"
   },
   "syncdir_other.go:*dirSync.sync": {
     "sqlite": [
@@ -2461,7 +2476,7 @@
     "sqlite": [
       "os_unix.c:unixOpen"
     ],
-    "note": "UNIXFILE_DIRSYNC, set on a journal or WAL descriptor opened with the create flag"
+    "note": "UNIXFILE_DIRSYNC, set on a journal or WAL descriptor opened with the create flag; the directory is taken from the path as it resolves at open"
   },
   "syncdir_unix.go:*dirSync.sync": {
     "sqlite": [
