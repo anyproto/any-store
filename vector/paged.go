@@ -49,12 +49,10 @@ func BuildPagedFromFlat(g *FlatHNSW, db *btree.DB, name string, metric Metric) (
 	if err != nil {
 		return nil, err
 	}
-	var vecNS *btree.Namespace
-	if vecNS, err = wtx.GetNamespace(name + ":vec"); err != nil {
-		if vecNS, err = wtx.CreateNamespace(name + ":vec"); err != nil {
-			_ = wtx.Rollback()
-			return nil, err
-		}
+	vecNS, err := ensureNS(wtx, name+":vec")
+	if err != nil {
+		_ = wtx.Rollback()
+		return nil, err
 	}
 	var keyBuf [8]byte
 	for id := uint32(0); id < uint32(len(g.keys)); id++ {

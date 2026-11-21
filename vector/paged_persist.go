@@ -120,18 +120,28 @@ func PersistPaged(g *FlatHNSW, db *btree.DB, name string, metric Metric) error {
 }
 
 // PagedExists reports whether a persisted paged index named name is present.
-func PagedExists(db *btree.DB, name string) bool {
-	ns, err := db.GetNamespace(name + ":pmeta")
-	if err != nil {
-		return false
-	}
+// Absent is a namespace or a meta record that is not there; a read that
+// fails is returned, and says nothing about the index.
+func PagedExists(db *btree.DB, name string) (bool, error) {
 	rtx, err := db.BeginRead()
 	if err != nil {
-		return false
+		return false, err
 	}
 	defer rtx.Rollback()
-	_, err = rtx.Get(ns, []byte(btreeMetaKey))
-	return err == nil
+	ns, err := rtx.GetNamespace(name + ":pmeta")
+	if err != nil {
+		if errors.Is(err, btree.ErrNamespaceNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if _, err = rtx.Get(ns, []byte(btreeMetaKey)); err != nil {
+		if errors.Is(err, btree.ErrKeyNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // OpenPaged reopens a persisted paged index, loading only its topology into RAM.

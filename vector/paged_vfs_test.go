@@ -104,3 +104,53 @@ func TestPagedSearch_ReadError(t *testing.T) {
 		})
 	}
 }
+
+// A read that fails while PagedExists looks the index up is returned: it is
+// not an index that is absent, which a caller would build over.
+func TestPagedExists_ReadError(t *testing.T) {
+	const n, dim = 200, 16
+	vecs, keys := randVectors(n, dim, 23)
+	g := NewFlatHNSW(dim, L2, 1)
+	for i := range vecs {
+		g.Add(keys[i], vecs[i])
+	}
+	path := filepath.Join(t.TempDir(), "p.db")
+	db, err := btree.Open(path, btree.Options{})
+	require.NoError(t, err)
+	require.NoError(t, PersistPaged(g, db, "emb", L2))
+	require.NoError(t, db.Checkpoint(btree.CheckpointFull))
+	require.NoError(t, db.Close())
+
+	run := func(failAt int64) int64 {
+		var armed atomic.Bool
+		var reads atomic.Int64
+		btree.SetVFS(btree.VFS{OpenFile: func(name string, flag int, perm os.FileMode) (btree.File, error) {
+			f, err := os.OpenFile(name, flag, perm)
+			if err != nil || name != path {
+				return f, err
+			}
+			return &oneReadFails{File: f, armed: &armed, reads: &reads, failAt: failAt}, nil
+		}})
+		defer btree.ResetVFS()
+		db, err := btree.Open(path, btree.Options{})
+		require.NoError(t, err)
+		defer db.Close()
+
+		armed.Store(true)
+		exists, err := PagedExists(db, "emb")
+		armed.Store(false)
+		if failAt >= 0 && failAt < reads.Load() {
+			require.ErrorIs(t, err, errInjectedRead, "read %d", failAt)
+			require.False(t, exists)
+			return reads.Load()
+		}
+		require.NoError(t, err)
+		require.True(t, exists)
+		return reads.Load()
+	}
+	total := run(-1)
+	require.NotZero(t, total, "the lookup read no page: there is no read to fail")
+	for failAt := int64(0); failAt < total; failAt++ {
+		run(failAt)
+	}
+}
