@@ -96,15 +96,16 @@ func StampPageChecksumForTest(page []byte) {
 // page that cannot be read (Kind IntegrityKindUnknown, the read's error in
 // Inner). When the last commit in the write-ahead log recorded the page
 // count, page 1 is also listed (Kind IntegrityKindUnknown) when its header
-// is not valid or disagrees with that count. Inner then wraps
-// ErrHeaderCorrupt, or, for the header of another format (an older or newer
-// any-store format, or SQLite's), is an error that names the format and
-// does not wrap ErrCorrupt. A page 1 that cannot be read whole is listed
-// with the read's error instead, and its header, read alone, is listed as
-// well only when it counts fewer pages than the commit. The returned error
-// is a sweep that could not start (the read transaction), a cancelled
-// context, and, when the log holds no commit to count the pages by, a
-// page-1 header that cannot be read or is not valid.
+// is not valid or disagrees with that count. Inner is then ErrHeaderCorrupt
+// or an error that wraps it, so errors.Is(Inner, ErrHeaderCorrupt) holds,
+// or, for the header of another format (an older or newer any-store format,
+// or SQLite's), an error that names the format and does not wrap
+// ErrCorrupt. A page 1 that cannot be read whole is listed with the read's
+// error instead, and its header, read alone, is listed as well only when
+// it counts fewer pages than the commit. The returned error is a sweep
+// that could not start (the read transaction), a cancelled context, and,
+// when the log holds no commit to count the pages by, a page-1 header that
+// cannot be read or is not valid.
 //
 // OnIntegrityError fires once for each page whose tag fails, not for a
 // page that could not be read.
