@@ -2768,12 +2768,16 @@ func (p *pager) pagerStress(pg *page) error {
 		// recorded and the state moves to pagerError, nothing else. The
 		// b-tree operation that asked for a page is still running and holds
 		// pointers into the cache, so the cache stays as it is, this page
-		// still dirty; the fetch fails with the error (pcache.create), every
-		// later fetch, write and the commit return it (writeStateErr), and the
-		// rollback discards the cache and rewinds the log (rollbackLocked),
-		// as pager_unlock does once no page is referenced
-		// (pager.c:1853-1864, 1904-1917). A transaction Close has ended
-		// meanwhile (rollbackForClose) is left as Close left it.
+		// still dirty. The fetch fails with the error (pcache.create), every
+		// later fetch, write and the commit return it (writeStateErr), the
+		// call ends the transaction's cursors as it returns (halt), and the
+		// rollback discards the cache, rewinds the log and releases the write
+		// lock (rollbackLocked). SQLite's cleanup, pager_unlock once no page
+		// is referenced, discards the cache and releases the write lock
+		// (pager.c:1853-1864, 1904-1917); it rewinds no log, and the next
+		// writer's walIndexAppend clears the index entries of the spilled
+		// frames (wal.c:1320-1329). A transaction Close has ended meanwhile
+		// (rollbackForClose) is left as Close left it.
 		p.errCode = err
 		p.state.CompareAndSwap(int32(pagerWriter), int32(pagerError))
 		return err

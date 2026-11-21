@@ -232,6 +232,16 @@
     "sqlite": [],
     "note": ""
   },
+  "btree.go:*Cursor.fault": {
+    "sqlite": [
+      "btree.c:btreeReleaseAllCursorPages"
+    ],
+    "note": "the CURSOR_FAULT branch of sqlite3BtreeTripAllCursors (sqlite3BtreeClearCursor, eState = CURSOR_FAULT, btree.c:4484-4488): no position saved"
+  },
+  "btree.go:*Cursor.halt": {
+    "sqlite": [],
+    "note": "the error exit of a call on a write transaction's cursor: pager.halt"
+  },
   "btree.go:*Cursor.releasePages": {
     "sqlite": [
       "btree.c:btreeReleaseAllCursorPages"
@@ -998,6 +1008,10 @@
   "db.go:*ReadTx.WalMaxFrame": {
     "sqlite": [],
     "note": ""
+  },
+  "db.go:*ReadTx.halt": {
+    "sqlite": [],
+    "note": "the error exit of a call of a write transaction: pager.halt"
   },
   "db.go:*ReadTx.leftmostKeyAfter": {
     "sqlite": [
@@ -1803,7 +1817,7 @@
       "pager.c:getPageNormal",
       "pager.c:sqlite3PagerGetData"
     ],
-    "note": "every fetch in pagerError returns pager.errCode, a cached page's too (getPageError's rule, tested inline)"
+    "note": "in the error state of a failed spill (pager.errCode set) every fetch returns pager.errCode, a cached page's too (getPageError's rule, tested inline)"
   },
   "pager.go:*pager.getWritablePage": {
     "sqlite": [
@@ -1811,6 +1825,10 @@
       "pager.c:sqlite3PagerWrite"
     ],
     "note": ""
+  },
+  "pager.go:*pager.halt": {
+    "sqlite": [],
+    "note": "sqlite3VdbeHalt's end of the cursors (closeAllCursors, vdbeaux.c:3335; sqlite3RollbackAll's trip, vdbeaux.c:3378, through sqlite3BtreeTripAllCursors, btree.c:4467-4492) as a call of the write transaction returns in the error state: every writer cursor faulted with pager.errCode, none saved"
   },
   "pager.go:*pager.initNewDB": {
     "sqlite": [
@@ -1856,7 +1874,7 @@
     "sqlite": [
       "pager.c:pager_error"
     ],
-    "note": "a failed commit's: pager_error with pager_unlock's cleanup at once. A failed spill only records the error (pagerStress, pager.errCode) and rollbackLocked cleans up"
+    "note": "a failed commit's end: the state and the cleanup at once, errCode left nil. SQLite's failed WAL commit never enters PAGER_ERROR: pagerWalFrames returns the error (pager.c:6512, 3219-3236) and the transaction is rolled back as any other (sqlite3PagerRollback, pager.c:6779-6782). A failed spill only records the error (pagerStress, pager.errCode) and rollbackLocked cleans up"
   },
   "pager.go:*pager.pagerPageCount": {
     "sqlite": [

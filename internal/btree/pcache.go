@@ -301,7 +301,9 @@ func (pc *pcache) initBulk() {
 
 // create allocates a new page in the cache and returns it pinned.
 // createFlag controls admission: 1=soft (may return nil under pressure),
-// 2=hard (always allocates). Matches SQLite pcache1.c:881-892 step 3.
+// 2=hard ("allocate a new page even if doing so is difficult", pcache.c:420):
+// it bypasses admission control (pcache1.c:881-892 step 3) and can still
+// fail with the stress callback's error.
 // If the cache is full, it evicts clean pages first. If no clean pages
 // are available and xStress is set, invokes the stress callback to spill
 // a dirty page, making it clean and evictable.
