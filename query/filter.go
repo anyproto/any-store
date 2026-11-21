@@ -542,8 +542,8 @@ func (e Key) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
-// String renders the path condition, with the path as a JSON string
-// (jsonQuoteBytes). A path condition whose inner filter matches every value
+// String renders the path condition, with the path quoted by jsonQuoteBytes,
+// so ParseCondition reads back the same field-name bytes. A path condition whose inner filter matches every value
 // renders as {"<path>": {"$nin": []}}, which parses back to a path condition
 // whose inner filter matches every value too, on the same path. The field
 // form {"a": {}} would parse back as an equality to the empty object, and the
@@ -1077,10 +1077,9 @@ func jsonQuote(s string) string {
 	return string(b)
 }
 
-// jsonQuoteBytes renders s as a JSON string literal that the parser reads
-// back as s: '"', '\' and the control bytes are escaped, and every other
-// byte is kept as it is, one of invalid UTF-8 too, which json.Marshal would
-// replace.
+// jsonQuoteBytes quotes s so that the parser reads back the same bytes: '"',
+// '\' and the control bytes are escaped, and every other byte is kept as it
+// is, one of invalid UTF-8 too, which json.Marshal would replace.
 func jsonQuoteBytes(s string) string {
 	const hex = "0123456789abcdef"
 	b := make([]byte, 0, len(s)+2)
