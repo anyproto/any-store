@@ -610,8 +610,9 @@ func (idx *index) putEntries(tx *btree.WriteTx, id []byte) error {
 				// out: it seeks the bare value and the Put below the full
 				// key, which at a divider take different paths down the
 				// tree (the divider is at or below every key of its right
-				// child, and equal to the first right after a split; the
-				// probe goes left of it), so the Put can succeed where
+				// child, and equal to the first when a leaf split has just
+				// copied it up from the new right leaf; the probe goes left
+				// of it), so the Put can succeed where
 				// the probe failed. As SQLite's OP_NoConflict, which aborts
 				// on a failed seek before it looks at the seek's result
 				// (vdbe.c:5414).
