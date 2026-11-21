@@ -134,11 +134,10 @@ type Collection interface {
 	WriteTx(ctx context.Context) (WriteTx, error)
 
 	// Close releases the handle: later operations through it fail with
-	// ErrCollectionClosed. A handle a write transaction changed the schema
-	// through, or ran a query.Modifier of, is released once that change or
-	// operation commits or rolls back — with the transaction, or with a
-	// savepoint that encloses it — and stays open if the collection is
-	// opened again before that.
+	// ErrCollectionClosed. A handle the open write transaction used is
+	// released once that use commits or rolls back — with the transaction,
+	// or with a savepoint that encloses its first use — and stays open if
+	// the collection is opened again before that.
 	Close() error
 }
 
@@ -254,13 +253,17 @@ type collection struct {
 
 	// pinned counts the entries of the open write transaction's schema log
 	// that reference this handle (txSchema.log): its creation, each schema
-	// change made through it, and the mark a verb leaves when it changes
-	// the schema or runs a modifier (logPin).
+	// change made through it, and the mark the transaction's first use of
+	// the handle leaves (logPin, from refreshLiveSketches).
 	// While it is non-zero the handle stays the collection's one registered
 	// handle. A second one — built from the writer's view or from the
 	// committed one — would not follow the transaction's outcome: its
 	// changes are installed on this handle at the commit, and a commit of
-	// this process verifies no handle (see schemaEpoch).
+	// this process verifies no handle (see schemaEpoch). Nor would it have
+	// the transaction's counts: the live sketches hold its uncommitted
+	// deltas from its first write on, the commit stores them, and a second
+	// handle would load the row without them and be stored over it, or keep
+	// them after a drop made through the other one.
 	//
 	// SQLite keeps one in-memory schema per connection, resets it when a
 	// transaction that changed it rolls back (sqlite3RollbackAll,
@@ -270,7 +273,11 @@ type collection struct {
 	// every statement checks the schema cookie and the schema generation it
 	// was prepared with (OP_Transaction). A handle carries no such check,
 	// so a second one must not come to exist; other users get this handle
-	// instead of an error, as they would without the Close().
+	// instead of an error, as they would without the Close(). The
+	// statistics follow the same rule there: one Index object per
+	// connection holds them (sqlite3FindIndex, analyze.c analysisLoader),
+	// and DROP TABLE removes that object and its sqlite_stat rows in the one
+	// statement (sqlite3ClearStatTables, build.c; OP_DropTable, vdbe.c).
 	//
 	// Guarded by db.mu.
 	pinned int
@@ -627,7 +634,7 @@ func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err erro
 // open by name with a second one that counts no modifier, and a write
 // through that one — a verb, a $merge/$out sink — would pass the gate.
 func (c *collection) runModifier(wtx WriteTx, mod query.Modifier, a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
-	if err := c.logPin(wtx); err != nil {
+	if err := c.logPin(wtx.schemaLog()); err != nil {
 		return nil, false, err
 	}
 	wtx.callbackBegin()
@@ -1636,7 +1643,7 @@ func (c *collection) beginDDL(wtx WriteTx) (*collSchema, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err = c.logPin(wtx); err != nil {
+	if err = c.logPin(wtx.schemaLog()); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -1810,7 +1817,12 @@ func (c *collection) refreshSketches(tx *btree.ReadTx, s *collSchema) error {
 // commits, so they cause no load.
 //
 // The transaction decides once per collection, at its first use of it, and
-// then the sketches are its own (sketchTx) to the end. The epoch can move
+// then the sketches are its own (sketchTx) to the end. From that use on the
+// handle is pinned in the transaction's log (logPin), so it stays the
+// collection's one handle until the transaction ends: a Close() waits, and
+// an open by name returns it (see collection.pinned). A savepoint that
+// encloses the first use takes the pin with it when it rolls back, with the
+// deltas made inside it; the next use pins again. The epoch can move
 // under an open write transaction: nothing commits under it, but a reader of
 // this process that took its snapshot at an older commit may only now count
 // it (wal.noteSnapshot). A load at that point would put the stored row over
@@ -1825,8 +1837,15 @@ func (c *collection) refreshSketches(tx *btree.ReadTx, s *collSchema) error {
 // fails before it writes, and the next one loads again.
 func (c *collection) refreshLiveSketches(tx *btree.ReadTx, s *collSchema) error {
 	t, _ := tx.Aux().(*commonTx)
-	if t != nil && c.sketchTx == t.sketchTx {
-		return nil
+	if t != nil {
+		if c.logLast == 0 {
+			if err := c.logPin(&t.schema); err != nil {
+				return err
+			}
+		}
+		if c.sketchTx == t.sketchTx {
+			return nil
+		}
 	}
 	epoch, _ := tx.ChangeEpoch()
 	stale := c.sketchLive.Load() != epoch

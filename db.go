@@ -1761,15 +1761,17 @@ func (db *db) forgetLocked(c *collection) {
 // would put them over a row another process may have written meanwhile. It
 // stays listed for a begin to rebase.
 //
-// A handle closed since the transaction wrote through it is written like
-// an open one: its documents commit, and so do their counts. The handles
-// that have no collection to store for are told apart below: one the
-// transaction dropped by its log, one whose creation a savepoint rolled
-// back by having no version at all.
+// A closed handle is skipped. One the transaction wrote through is not
+// closed before the transaction ends: it is pinned from its first use, a
+// Close() waits for the end, and an open returns the same handle
+// (collection.pinned), so its documents commit with their counts. What is
+// closed here has no collection to store for: its creation rolled back with
+// a savepoint, or it was closed without a write of this transaction on it.
+// One the transaction dropped is live until the install and told by the log.
 func (db *db) persistAllDirtySketches(tx *btree.WriteTx, t *commonTx) error {
 	gen := db.epoch.Load().gen
 	for _, c := range db.sketchDirty {
-		if c.sketchTx != t.sketchTx {
+		if c.closed.Load() || c.sketchTx != t.sketchTx {
 			continue
 		}
 		var s *collSchema

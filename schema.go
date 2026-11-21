@@ -275,7 +275,8 @@ type logEntry struct {
 type logKind uint8
 
 const (
-	// logPin references the handle without changing it: a verb began on it.
+	// logPin references the handle without changing it: the transaction
+	// uses it (refreshLiveSketches).
 	logPin logKind = iota
 	// logVersion replaces prev with s at the commit.
 	logVersion
@@ -417,16 +418,15 @@ func (c *collection) logDrop(wtx WriteTx, s *collSchema) {
 	wtx.schemaLog().add(c.db, logEntry{c: c, s: s, prev: s, kind: logDrop})
 }
 
-// logPin marks c as worked on by a verb of wtx, so that a Close() waits for
-// the transaction to end (collection.pinned). Under db.mu with the check
-// that the handle is live: a Close() cannot evict it in between. A handle
-// the log references already is pinned already; the log does not grow with
-// the verbs called on it.
-func (c *collection) logPin(wtx WriteTx) error {
+// logPin marks c as used by the write transaction of t, so that a Close()
+// waits for the transaction to end (collection.pinned). Under db.mu with the
+// check that the handle is live: a Close() cannot evict it in between. A
+// handle the log references already is pinned already; the log does not grow
+// with the operations on it.
+func (c *collection) logPin(t *txSchema) error {
 	if c.logLast != 0 {
 		return c.alive()
 	}
-	t := wtx.schemaLog()
 	c.db.mu.Lock()
 	if err := c.alive(); err != nil {
 		c.db.mu.Unlock()
