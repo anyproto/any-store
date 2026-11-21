@@ -995,9 +995,18 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	if pos+nLocal+4 > dataLen || !payloadInFile(p, cache, int(keyLen)) {
 		return nil, ErrCorrupt
 	}
+	// The first overflow pointer gets the chain readers' page test before
+	// the key's buffers are allocated: a pointer they would refuse (0, 1,
+	// or past the page count) fails here, not after an allocation sized by
+	// the declared key. accessPayload tests each page against the page
+	// count (btree.c:5227), and a chain that ends early is corrupt
+	// (btree.c:5327-5330).
+	overflowPg := binary.BigEndian.Uint32(data[pos+nLocal : pos+nLocal+4])
+	if overflowPg < 2 || overflowPg > p.readerDbSizeBound(cache) {
+		return nil, ErrCorrupt
+	}
 	fullKey := make([]byte, int(keyLen))
 	copy(fullKey, data[pos:pos+localKeyBytes])
-	overflowPg := binary.BigEndian.Uint32(data[pos+nLocal : pos+nLocal+4])
 
 	// Read key remainder from overflow chain.
 	// The overflow chain contains (keyRemainder || valueRemainder).
