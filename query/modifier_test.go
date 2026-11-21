@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -692,14 +693,21 @@ func TestModifier_PaddingRefusalLeavesDocumentUnchanged(t *testing.T) {
 }
 
 // A modifier that could be refused but is not runs once, on a copy of the
-// document it was given: the copy is the result, the document is unchanged,
-// and an operation that changes a value an earlier one stored sees it once.
+// document it was given: the copy is the result and the document is
+// unchanged. A counting operation added to the staged chain is called once.
 func TestModifier_PaddingStagedAppliesOnce(t *testing.T) {
 	const src = `{"x":7,"arr":[1,2]}`
 	doc := anyenc.MustParseJson(src)
-	mod := MustParseModifier(`{"$set":{"o":{"n":1},"arr.1500002":true},"$inc":{"o.n":1},"$rename":{"x":"y"}}`)
-	res, modified, err := mod.Modify(&anyenc.Arena{}, doc)
+	staged, ok := MustParseModifier(`{"$set":{"o":{"n":1},"arr.1500002":true},"$inc":{"o.n":1},"$rename":{"x":"y"}}`).(paddingStaged)
+	require.True(t, ok)
+	calls := 0
+	staged.ModifierChain = append(slices.Clone(staged.ModifierChain), ModifyFunc(func(_ *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+		calls++
+		return v, false, nil
+	}))
+	res, modified, err := staged.Modify(&anyenc.Arena{}, doc)
 	require.NoError(t, err)
+	assert.Equal(t, 1, calls, "the chain is applied once")
 	assert.True(t, modified)
 	assert.NotSame(t, doc, res, "the result is a copy")
 	assert.Equal(t, anyenc.MustParseJson(src).String(), doc.String(), "the document given is unchanged")
