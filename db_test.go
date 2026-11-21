@@ -2681,6 +2681,62 @@ func TestOpenCollection_HandOutAfterTheDeferredCloseTookEffect(t *testing.T) {
 	}
 }
 
+// An open whose every attempt finds its handle closed before it can hand it
+// out returns ErrCollectionClosed, the error of that race, not a catalog
+// miss: the collection is there throughout. Each attempt's handle is closed
+// at the hand-out, or, for an open that finds a registered handle, while it
+// resolves the handle.
+func TestOpenCollection_HandleClosedAtEveryAttempt(t *testing.T) {
+	for _, open := range []struct {
+		name string
+		fn   func(d DB) (Collection, error)
+	}{
+		{"OpenCollection", func(d DB) (Collection, error) { return d.OpenCollection(ctx, "c") }},
+		{"Collection", func(d DB) (Collection, error) { return d.Collection(ctx, "c") }},
+	} {
+		t.Run(open.name+" at the hand-out", func(t *testing.T) {
+			d, _ := openSketchDB(t)
+			attempts := 0
+			testHookBeforeHandOut = func(c *collection) {
+				attempts++
+				require.NoError(t, c.Close())
+			}
+			t.Cleanup(func() { testHookBeforeHandOut = nil })
+			_, err := open.fn(d)
+			require.ErrorIs(t, err, ErrCollectionClosed)
+			require.Equal(t, handOutAttempts, attempts, "setup: every attempt found a handle")
+			testHookBeforeHandOut = nil
+			coll, err := open.fn(d)
+			require.NoError(t, err, "setup: the collection is there")
+			n, err := coll.Count(ctx)
+			require.NoError(t, err)
+			require.Equal(t, 50, n)
+		})
+	}
+
+	t.Run("OpenCollection while it resolves a registered handle", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		_, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		rtx, err := d.ReadTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = rtx.Commit() })
+		// Each attempt finds a registered handle, which is closed before the
+		// attempt resolves it; another open registers the next one.
+		attempts := 0
+		testHookFoundRegistered = func(c *collection) {
+			attempts++
+			require.NoError(t, c.Close())
+			_, err := d.OpenCollection(ctx, "c")
+			require.NoError(t, err)
+		}
+		t.Cleanup(func() { testHookFoundRegistered = nil })
+		_, err = d.OpenCollection(rtx.Context(), "c")
+		require.ErrorIs(t, err, ErrCollectionClosed)
+		require.Equal(t, 3, attempts, "setup: every attempt found a registered handle")
+	})
+}
+
 // A lookup by name in the write transaction's schema log goes by its schema
 // changes, whatever handles the transaction uses besides, and follows a
 // savepoint that rolls a change back.
