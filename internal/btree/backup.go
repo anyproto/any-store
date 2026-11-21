@@ -195,11 +195,13 @@ func (db *DB) codecKind() IntegrityMode {
 // that read the page (sqlcipher_codec_ctx_set_error, sqlcipher.c:1385-1389),
 // which is the destination's.
 //
-// ~ setDestPgsz (backup.c:112-116), which gives the destination the source's
-// page size before it is first locked; VACUUM INTO passes the reserved bytes
-// along with it (vacuum.c:233, 281, sqlite3BtreeGetRequestedReserve). An
-// existing destination keeps its own geometry and BackupInit refuses it if
-// that differs.
+// ~ setDestPgsz (backup.c:112-116), which tries to give the destination the
+// source's page size before it is first locked (a non-empty destination
+// keeps its own, and a WAL one of another size is refused: backup.c:361,
+// 378-383); VACUUM INTO passes the reserved bytes along with it
+// (vacuum.c:233, 281, sqlite3BtreeGetRequestedReserve). An existing
+// destination keeps its own geometry and BackupInit refuses it if that
+// differs.
 func (db *DB) BackupDestinationOptions() Options {
 	opts := db.opts
 	opts.InMemory = false
