@@ -469,6 +469,8 @@ func TestQuery_TextSourceErrorsBeforeEmptyResult(t *testing.T) {
 				assert.ErrorIs(t, err, tc.want, "Count")
 				_, err = coll.Find(filter).Iter(ctx)
 				assert.ErrorIs(t, err, tc.want, "Iter")
+				_, err = coll.Find(filter).Explain(ctx)
+				assert.ErrorIs(t, err, tc.want, "Explain")
 				_, err = coll.Find(filter).Update(ctx, `{"$set":{"touched":true}}`)
 				assert.ErrorIs(t, err, tc.want, "Update")
 				_, err = coll.Find(filter).Delete(ctx)
