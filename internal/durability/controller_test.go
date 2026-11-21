@@ -108,15 +108,13 @@ func TestController_StartStop(t *testing.T) {
 // the file created it.
 func TestController_MarkCleanAfterCloseRemovesAPeersMarker(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	this, err := sentinel.New(dbPath)
-	require.NoError(t, err)
+	this := sentinel.New(dbPath)
 	controller := NewController(Options{Sentinel: this})
 	dirty, err := controller.OnOpen(context.Background())
 	require.NoError(t, err)
 	require.False(t, dirty, "setup: no marker at open")
 
-	peer, err := sentinel.New(dbPath) // the other process's tracker
-	require.NoError(t, err)
+	peer := sentinel.New(dbPath) // the other process's tracker
 	_, err = peer.OnOpen(context.Background())
 	require.NoError(t, err)
 	peer.MarkDirty()
