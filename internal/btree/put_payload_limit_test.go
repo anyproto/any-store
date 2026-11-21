@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -129,6 +130,31 @@ func TestPayloadLimit_LengthsCheckedBeforeNarrowing(t *testing.T) {
 	// Within the limit the two agree.
 	for _, tc := range [][2]uint64{{0, 0}, {1, 1<<30 - 1}, {1 << 30, 0}, {1 << 30, 1}, {0, 1<<30 + 1}} {
 		require.Equal(t, narrowed(tc[0], tc[1]), payloadFits(tc[0], tc[1]), "%v", tc)
+	}
+}
+
+// TestPayloadLimit_SpilledLocalSize: spilledLocalSize is localPayloadSize for
+// every pair of lengths whose sum an int holds, and for 64-bit lengths it is
+// btreePayloadToLocal's formula on the exact sum, which no uint64 holds.
+func TestPayloadLimit_SpilledLocalSize(t *testing.T) {
+	for _, lim := range []payloadLimits{indexLimits(4096), tableLeafLimits(4096), tableLeafLimits(1024 - 8)} {
+		over := uint64(lim.maxLocal) + 1
+		for _, tc := range [][2]uint64{{0, over}, {over, 0}, {1, over - 1}, {300, 4000}, {5001, 20000}, {1, 1<<30 - 1}, {1 << 30, 0}, {1 << 29, 1 << 29}} {
+			require.Equal(t, localPayloadSize(int(tc[0]+tc[1]), lim), spilledLocalSize(tc[0], tc[1], lim), "%v %+v", tc, lim)
+		}
+		m := big.NewInt(int64(overflowPageUsable(lim.usable)))
+		minLocal := big.NewInt(int64(lim.minLocal))
+		for _, tc := range [][2]uint64{{5001, 1 << 63}, {5001, math.MaxUint64}, {1 << 30, math.MaxUint64}, {math.MaxUint64, math.MaxUint64}, {0, math.MaxUint64}} {
+			surplus := new(big.Int).Add(new(big.Int).SetUint64(tc[0]), new(big.Int).SetUint64(tc[1]))
+			surplus.Sub(surplus, minLocal)
+			surplus.Mod(surplus, m)
+			surplus.Add(surplus, minLocal)
+			want := lim.minLocal
+			if surplus.Cmp(big.NewInt(int64(lim.maxLocal))) <= 0 {
+				want = int(surplus.Int64())
+			}
+			require.Equal(t, want, spilledLocalSize(tc[0], tc[1], lim), "%v %+v", tc, lim)
+		}
 	}
 }
 
@@ -274,10 +300,14 @@ func TestPayloadLimit_PutRefusesWhatReadRejects(t *testing.T) {
 					_, err = c.Value()
 				}
 				require.ErrorIs(t, err, ErrCorrupt)
-				// A search for a neighbour may probe the cell. It tests the
-				// two lengths singly, so the neighbours of a cell that is
-				// over the limit only by their sum are found.
-				if tc.keyLen > limit-1 || tc.valLen > limit-1 {
+				// A search for a neighbour may probe the cell. It bounds
+				// the key alone, so the neighbours are found unless the key
+				// itself is over the limit. Whether a lookup probes the cell
+				// depends on where it sits: the empty key of "value alone
+				// over the limit" sorts first and is not probed;
+				// TestPayloadLimit_NeighbourOfDamagedCellIsFound makes the
+				// probe certain.
+				if tc.keyLen > limit-1 {
 					return
 				}
 				for _, k := range neighbours {
@@ -570,93 +600,223 @@ func overFileValLen(t *testing.T, lim payloadLimits, keyLen, oldLen int) uint64 
 	return 0
 }
 
-// TestPayloadLimit_NeighbourOfDamagedCellIsFound: a search that has to
-// compare a cell's spilled key reads that key and nothing else, so only the
-// key is bounded there. A neighbour whose declared value is over the file,
-// or whose key and value pass the record size limit singly and not together,
-// does not hide the key beside it from Get, Has, SeekKey, a cursor seek or
-// the writer's Get. The damaged cell's own value read stays ErrCorrupt.
-func TestPayloadLimit_NeighbourOfDamagedCellIsFound(t *testing.T) {
-	// The two keys share their first 5000 bytes, more than a 4 KiB page,
-	// so both spill and their local parts are all "k". A search for the
-	// smaller one probes the larger one first, finds the local parts equal
-	// and rebuilds the larger key from its overflow chain to compare it.
-	prefix := bytes.Repeat([]byte("k"), 5000)
-	healthy := append(bytes.Clone(prefix), '1')
-	damaged := append(bytes.Clone(prefix), '2')
-	healthyVal := []byte("healthy")
-	// A 3-byte length varint; the cell keeps minLocal bytes on the page.
-	const damagedVal = 20000
+// The damaged-cell fixture: two keys that share their first 5000 bytes, more
+// than a 4 KiB page keeps, so both spill and their local parts are all "k".
+// A search for the smaller one probes the larger one first, finds the local
+// parts equal and rebuilds the larger key from its overflow chain to compare
+// it. A cursor that steps from the first reaches the second.
+var (
+	healthyKey = append(bytes.Repeat([]byte("k"), 5000), '1')
+	damagedKey = append(bytes.Repeat([]byte("k"), 5000), '2')
+	healthyVal = []byte("healthy")
+)
 
-	setup := func(t *testing.T) (*DB, *Namespace) {
-		db, err := testOpen(t, filepath.Join(t.TempDir(), "neighbour.db"), Options{PageSize: 4096})
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = db.Close() })
+// damagedValLen is the value length the fixture writes for the damaged key
+// unless a test asks for another: a 3-byte length varint, with which the
+// cell keeps minLocal bytes on the page.
+const damagedValLen = 20000
+
+// writtenValLen writes damagedValLen.
+func writtenValLen(payloadLimits) int { return damagedValLen }
+
+// congruentValLen returns a value length near damagedValLen with which the
+// cell keeps on its page what it would keep declaring the 64-bit length
+// declared: the two are equal modulo the overflow page's payload size, so
+// redeclareValLen can put declared in its place.
+func congruentValLen(declared uint64) func(payloadLimits) int {
+	return func(lim payloadLimits) int {
+		m := uint64(overflowPageUsable(lim.usable))
+		return damagedValLen + int((declared%m+m-damagedValLen%m)%m)
+	}
+}
+
+// damagedFixture writes the healthy record and the one to be damaged, whose
+// value has valLenFor(the file's leaf limits) bytes, into the root leaf of a
+// new namespace and commits. The healthy cell is written first and lies at
+// the end of the page, the other below it, at the start of the cell content
+// area.
+func damagedFixture(t *testing.T, valLenFor func(payloadLimits) int) (*DB, *Namespace) {
+	t.Helper()
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "neighbour.db"), Options{PageSize: 4096})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("t")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, healthyKey, healthyVal))
+	require.NoError(t, tx.Put(ns, damagedKey, payloadBytes(valLenFor(tx.pager.leafLimits()), 3)))
+	require.NoError(t, tx.Commit())
+	return db, ns
+}
+
+// redeclareValLen rewrites the value length that cell idx of the leaf page
+// pgno declares, at whatever varint width valLen takes. The cell must start
+// the cell content area, which grows down by the extra width, and the new
+// length must give the cell's local part the size it was written with: the
+// key, its local part and the overflow chain stay as they were; only the
+// length is wrong.
+func redeclareValLen(t *testing.T, tx *WriteTx, pgno uint32, idx int, valLen uint64) {
+	t.Helper()
+	pg, err := tx.pager.getWritablePage(pgno)
+	require.NoError(t, err)
+	defer tx.pager.releasePage(pg)
+	require.True(t, pg.header.isLeaf())
+	off := int(pg.getCellOffset(idx))
+	require.Equal(t, int(pg.header.cellContentOff), off, "the cell does not start the content area")
+	keyLen, kn := getVarint(pg.data[off:])
+	oldLen, vn := getVarint(pg.data[off+kn:])
+	lim := tx.pager.leafLimits()
+	require.Greater(t, int(keyLen+oldLen), lim.maxLocal, "the cell does not spill")
+	nLocal := localPayloadSize(int(keyLen+oldLen), lim)
+	require.Equal(t, nLocal, spilledLocalSize(keyLen, valLen, lim), "the local part would change size")
+	var vb [9]byte
+	w := putVarint(vb[:], valLen)
+	newOff := off - (w - vn)
+	require.GreaterOrEqual(t, newOff, pg.cellPointerOffset()+2*int(pg.header.cellCount))
+	cell := append([]byte(nil), pg.data[off:off+kn]...)
+	cell = append(cell, vb[:w]...)
+	cell = append(cell, pg.data[off+kn+vn:off+kn+vn+nLocal+overflowPtrSize]...)
+	copy(pg.data[newOff:], cell)
+	pg.header.cellContentOff = uint16(newOff)
+	pg.header.serialize(pg.data)
+	binary.BigEndian.PutUint16(pg.data[pg.cellPointerOffset()+2*idx:], uint16(newOff))
+}
+
+// findHealthy requires the healthy key, beside the damaged one, to be found
+// by Get, Has, SeekKey, a cursor seek and the writer's Get, and the damaged
+// key's Get to be ErrCorrupt.
+func findHealthy(t *testing.T, db *DB, ns *Namespace) {
+	t.Helper()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	got, err := rtx.Get(ns, healthyKey)
+	require.NoError(t, err, "ReadTx.Get")
+	require.Equal(t, healthyVal, got)
+	ok, err := rtx.Has(ns, healthyKey)
+	require.NoError(t, err, "ReadTx.Has")
+	require.True(t, ok)
+	k, err := rtx.SeekKey(ns, healthyKey)
+	require.NoError(t, err, "ReadTx.SeekKey")
+	require.Equal(t, healthyKey, k)
+	c := rtx.NewCursor(ns)
+	require.NoError(t, c.Seek(healthyKey), "Cursor.Seek")
+	k, err = c.Key()
+	require.NoError(t, err)
+	require.Equal(t, healthyKey, k)
+	c.Close()
+	_, err = rtx.Get(ns, damagedKey)
+	require.ErrorIs(t, err, ErrCorrupt, "the damaged cell's value")
+	require.NoError(t, rtx.Rollback())
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	defer func() { _ = wtx.Rollback() }()
+	got, err = wtx.Get(ns, healthyKey)
+	require.NoError(t, err, "WriteTx.Get")
+	require.Equal(t, healthyVal, got)
+}
+
+// valueLengthDamages are the ways the fixture's damaged cell is damaged: each
+// one leaves the key and the layout of the cell's local part as written and
+// makes the value unreadable.
+var valueLengthDamages = []struct {
+	name string
+	// valLenFor is the value length the fixture writes.
+	valLenFor func(payloadLimits) int
+	// damage damages the committed fixture.
+	damage func(t *testing.T, db *DB, ns *Namespace)
+}{
+	{"declared value over the file", writtenValLen, func(t *testing.T, db *DB, ns *Namespace) {
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
-		ns, err := tx.CreateNamespace("t")
-		require.NoError(t, err)
-		require.NoError(t, tx.Put(ns, healthy, healthyVal))
-		require.NoError(t, tx.Put(ns, damaged, payloadBytes(damagedVal, 3)))
-		require.NoError(t, tx.Commit())
-		return db, ns
-	}
-	findHealthy := func(t *testing.T, db *DB, ns *Namespace) {
-		t.Helper()
-		rtx, err := db.BeginRead()
-		require.NoError(t, err)
-		defer func() { _ = rtx.Rollback() }()
-		got, err := rtx.Get(ns, healthy)
-		require.NoError(t, err, "ReadTx.Get")
-		require.Equal(t, healthyVal, got)
-		ok, err := rtx.Has(ns, healthy)
-		require.NoError(t, err, "ReadTx.Has")
-		require.True(t, ok)
-		k, err := rtx.SeekKey(ns, healthy)
-		require.NoError(t, err, "ReadTx.SeekKey")
-		require.Equal(t, healthy, k)
-		c := rtx.NewCursor(ns)
-		require.NoError(t, c.Seek(healthy), "Cursor.Seek")
-		k, err = c.Key()
-		require.NoError(t, err)
-		require.Equal(t, healthy, k)
-		c.Close()
-		_, err = rtx.Get(ns, damaged)
-		require.ErrorIs(t, err, ErrCorrupt, "the damaged cell's value")
-		require.NoError(t, rtx.Rollback())
-
-		wtx, err := db.BeginWrite()
-		require.NoError(t, err)
-		defer func() { _ = wtx.Rollback() }()
-		got, err = wtx.Get(ns, healthy)
-		require.NoError(t, err, "WriteTx.Get")
-		require.Equal(t, healthyVal, got)
-	}
-
-	t.Run("declared value over the file", func(t *testing.T) {
-		db, ns := setup(t)
-		tx, err := db.BeginWrite()
-		require.NoError(t, err)
-		valLen := overFileValLen(t, tx.pager.leafLimits(), len(damaged), damagedVal)
+		valLen := overFileValLen(t, tx.pager.leafLimits(), len(damagedKey), damagedValLen)
 		declareValLen(t, tx, ns.rootPage, 1, valLen)
 		require.NoError(t, tx.Commit())
 		require.Greater(t, valLen, uint64(db.pager.dbSize.Load())*uint64(db.pager.pageSize), "the file holds the value")
-		findHealthy(t, db, ns)
-		// Has answers from the key: the value is tested where it is read.
+	}},
+	// A release without the write-side limit could store this cell: each
+	// length is within the limit, their sum is not.
+	{"key and value over the limit together", writtenValLen, func(t *testing.T, db *DB, ns *Namespace) {
+		setPayloadLimit(t, damagedValLen)
+	}},
+	{"value over the limit by itself", writtenValLen, func(t *testing.T, db *DB, ns *Namespace) {
+		setPayloadLimit(t, damagedValLen-1)
+	}},
+	// A length no int holds, and none of whose sums a uint64 holds.
+	{"declared value 1<<63", congruentValLen(1 << 63), func(t *testing.T, db *DB, ns *Namespace) {
+		redeclare(t, db, ns, 1<<63)
+	}},
+	{"declared value MaxUint64", congruentValLen(math.MaxUint64), func(t *testing.T, db *DB, ns *Namespace) {
+		redeclare(t, db, ns, math.MaxUint64)
+	}},
+}
+
+func redeclare(t *testing.T, db *DB, ns *Namespace, valLen uint64) {
+	t.Helper()
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	redeclareValLen(t, tx, ns.rootPage, 1, valLen)
+	require.NoError(t, tx.Commit())
+}
+
+// TestPayloadLimit_NeighbourOfDamagedCellIsFound: a search that has to
+// compare a cell's spilled key reads that key and nothing else, so only the
+// key is bounded there. A neighbour whose declared value is over the file,
+// over the record size limit by itself or together with the key, or any
+// 64-bit length, does not hide the key beside it from Get, Has, SeekKey, a
+// cursor seek or the writer's Get, as long as the declared lengths leave the
+// key's layout as written. The damaged cell's own Get stays ErrCorrupt.
+func TestPayloadLimit_NeighbourOfDamagedCellIsFound(t *testing.T) {
+	for _, d := range valueLengthDamages {
+		t.Run(d.name, func(t *testing.T) {
+			db, ns := damagedFixture(t, d.valLenFor)
+			d.damage(t, db, ns)
+			findHealthy(t, db, ns)
+		})
+	}
+	// Has answers from the key and the record size limit: a value the file
+	// cannot hold is tested where it is read.
+	t.Run("Has of a value over the file", func(t *testing.T) {
+		db, ns := damagedFixture(t, writtenValLen)
+		valueLengthDamages[0].damage(t, db, ns)
 		rtx, err := db.BeginRead()
 		require.NoError(t, err)
 		defer func() { _ = rtx.Rollback() }()
-		ok, err := rtx.Has(ns, damaged)
+		ok, err := rtx.Has(ns, damagedKey)
 		require.NoError(t, err)
 		require.True(t, ok)
 	})
-	t.Run("key and value over the limit together", func(t *testing.T) {
-		db, ns := setup(t)
-		// A release without the write-side limit could store this cell:
-		// each length is within the limit, their sum is not.
-		setPayloadLimit(t, damagedVal)
-		findHealthy(t, db, ns)
-	})
+}
+
+// TestPayloadLimit_CursorKeyOfDamagedCell: a cursor that steps onto a cell,
+// with no search that would test the record, reads its key and nothing else,
+// so Key returns the key of a cell whose value length is damaged in any of
+// the fixture's ways, and Value is ErrCorrupt.
+func TestPayloadLimit_CursorKeyOfDamagedCell(t *testing.T) {
+	for _, d := range valueLengthDamages {
+		t.Run(d.name, func(t *testing.T) {
+			db, ns := damagedFixture(t, d.valLenFor)
+			d.damage(t, db, ns)
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			defer func() { _ = rtx.Rollback() }()
+			c := rtx.NewCursor(ns)
+			defer c.Close()
+			require.NoError(t, c.First())
+			k, err := c.Key()
+			require.NoError(t, err)
+			require.Equal(t, healthyKey, k)
+			require.NoError(t, c.Next())
+			require.True(t, c.Valid())
+			k, err = c.Key()
+			require.NoError(t, err, "Cursor.Key of the damaged cell")
+			require.Equal(t, damagedKey, k)
+			_, err = c.Value()
+			require.ErrorIs(t, err, ErrCorrupt, "Cursor.Value of the damaged cell")
+		})
+	}
 }
 
 // TestPayloadLimit_SplitBesideDamagedValueLengths: a split takes the key of
