@@ -315,6 +315,51 @@ func TestIterator_Doc_FallbackPath(t *testing.T) {
 		"fallback must re-read the same document via docId")
 }
 
+// Doc of the document the iterator holds in memory is not a call on its
+// transaction, so another goroutine can end the transaction while it runs,
+// and the next write transaction then takes the ended one's storage handle
+// from the pool and rewrites it. Doc must read nothing of that handle: run
+// under -race.
+func TestIterator_DocOfHeldDocumentWhileTxEnds(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	for i := 0; i < 10; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":1}`, i))))
+	}
+	for round := 0; round < 20; round++ {
+		wtx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		it, err := coll.Find(`{"a":1}`).Iter(wtx.Context())
+		require.NoError(t, err)
+		require.True(t, it.Next())
+		require.NotNil(t, it.(*planIterator).plan.DocParsed, "Doc does not take the held-document path")
+
+		started, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(done)
+			for i := 0; ; i++ {
+				if i == 10 {
+					close(started)
+				}
+				if _, err := it.Doc(); err != nil {
+					if i < 10 {
+						close(started)
+					}
+					return
+				}
+			}
+		}()
+		<-started
+		require.NoError(t, wtx.Commit())
+		next, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		<-done
+		require.NoError(t, next.Rollback())
+		_ = it.Close()
+	}
+}
+
 func TestIterator_DocAfterClose(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
