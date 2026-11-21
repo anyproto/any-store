@@ -668,12 +668,9 @@ func searchLeafWithOverflow(pg *page, key []byte, lim payloadLimits, p *pager, w
 		// A probe reads the cell's key and nothing else, so only the key's
 		// length is bounded here. The value's length, whatever it declares,
 		// only places the key's local part, and is used without adding it
-		// to the key's: a damaged length can wrap the sum. A cell with a
-		// damaged value length is therefore compared like any other when a
-		// search for a neighbouring key probes it, and the neighbours stay
-		// readable as long as the key's layout is intact. leafFullKey, which
-		// rebuilds a spilled key for the compare, tests the same way and
-		// holds only the key to the file size. SQLite's index probe sizes
+		// to the key's: a damaged length can wrap the sum. leafFullKey,
+		// which rebuilds a spilled key for the compare, tests the same way
+		// and holds only the key to the file size. SQLite's index probe sizes
 		// what it reads from the key alone (btree.c:6159-6168). A match is
 		// tested below.
 		if keyLen > uint64(payloadLimit) {
@@ -962,10 +959,6 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	// bounds are tested where a value is read. SQLite's index probe sizes
 	// the key it rebuilds the same way (btree.c:6159-6168), and
 	// sqlite3VdbeMemFromBtree tests the range it reads (vdbemem.c:1428).
-	// A damaged value length therefore does not hide the cell's neighbours
-	// from a search that has to compare this key, as long as the key's
-	// layout is intact: the declared lengths give the local part the size
-	// the cell was written with.
 	if keyLen > uint64(payloadLimit) {
 		return nil, ErrCorrupt
 	}
@@ -4227,11 +4220,8 @@ func (c *Cursor) Key() ([]byte, error) {
 	if oerr != nil {
 		return nil, oerr
 	}
-	// Only the key is read, so only the key is bounded: leafFullKey, not
-	// the parse of the whole cell. A cell whose declared value length is
-	// over the file, over the record size limit by itself or with the
-	// key's, or any 64-bit value yields its key here as long as the key's
-	// layout is intact, and fails Value, as a SQLite table cursor reads the
+	// A read of the key bounds the key only (leafFullKey); Value tests the
+	// value's declared length. A SQLite table cursor likewise reads the
 	// rowid of a row whose payload is corrupt (sqlite3BtreeIntegerKey
 	// returns the parsed nKey, btree.c:4917-4923).
 	return leafFullKey(frame.pg.data, int(off), c.bt.leafLimits(), c.bt.pager, c.bt.walMaxFrame, c.bt.cache)

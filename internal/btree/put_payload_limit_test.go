@@ -133,9 +133,10 @@ func TestPayloadLimit_LengthsCheckedBeforeNarrowing(t *testing.T) {
 	}
 }
 
-// TestPayloadLimit_SpilledLocalSize: spilledLocalSize is localPayloadSize for
-// every pair of lengths whose sum an int holds, and for 64-bit lengths it is
-// btreePayloadToLocal's formula on the exact sum, which no uint64 holds.
+// TestPayloadLimit_SpilledLocalSize: for a pair of lengths whose sum is over
+// maxLocal, the only pairs it is called for, spilledLocalSize is
+// localPayloadSize when an int holds the sum, and for 64-bit lengths it is
+// btreePayloadToLocal's formula on the exact sum (math/big).
 func TestPayloadLimit_SpilledLocalSize(t *testing.T) {
 	for _, lim := range []payloadLimits{indexLimits(4096), tableLeafLimits(4096), tableLeafLimits(1024 - 8)} {
 		over := uint64(lim.maxLocal) + 1
@@ -849,11 +850,9 @@ func redeclare(t *testing.T, db *DB, ns *Namespace, valLen uint64) {
 
 // TestPayloadLimit_NeighbourOfDamagedCellIsFound: a search that has to
 // compare a cell's spilled key reads that key and nothing else, so only the
-// key is bounded there. A neighbour whose declared value is over the file,
-// over the record size limit by itself or together with the key, or any
-// 64-bit length, does not hide the key beside it from Get, Has, SeekKey, a
-// cursor seek or the writer's Get, as long as the declared lengths leave the
-// key's layout as written. The damaged cell's own Get stays ErrCorrupt.
+// key is bounded there. For each of the fixture's damages to the value
+// length, Get, Has, SeekKey, a cursor seek and the writer's Get find the key
+// beside the damaged cell, whose own Get stays ErrCorrupt.
 func TestPayloadLimit_NeighbourOfDamagedCellIsFound(t *testing.T) {
 	for _, d := range valueLengthDamages {
 		t.Run(d.name, func(t *testing.T) {

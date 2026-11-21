@@ -269,7 +269,7 @@ func localPayloadSize(totalPayload int, lim payloadLimits) int {
 // computed without forming that sum. A reader that reads only the key does
 // not bound the value's length (see leafFullKey), and two 64-bit lengths can
 // wrap a sum; btreePayloadToLocal's (nPayload-minLocal) % (usable-4) is taken
-// term by term instead. For lengths whose sum fits an int the result is
+// term by term instead. When an int holds that sum, the result is
 // localPayloadSize's. SQLite has one payload length per cell, which its cell
 // parsers read into a u32 (btreeParseCellPtr, btree.c:1280-1287), so it has
 // no sum to wrap.
