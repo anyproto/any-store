@@ -2522,8 +2522,11 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 // and the right sibling. Handles both leaf and interior roots correctly.
 // Like SQLite's balance, which calls balance_deeper on an over-full root
 // (btree.c:9134-9145), it does not look at the height of the tree: a tree of
-// btCursorMaxDepth levels grows to one more, whose leaves the descents then
-// read as ErrCorrupt. See the known limitations in
+// btCursorMaxDepth levels grows to one more, and from then on a lookup, a
+// write or a cursor that has to go below level btCursorMaxDepth (the root is
+// level 1) returns ErrCorrupt; countPage, walkSize and keyRank go one level
+// further. On a tree whose branches differ in depth, a leaf the split moves
+// to level btCursorMaxDepth or less still reads. See the known limitations in
 // docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 // DRIFT: splitRoot omits SQLite's anotherValidCursor() guard before deepening root See docs/btree/NOTES.md#drift-34-splitroot-missing-anothervalidcursor-corruption-guard
 func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) error {
