@@ -463,9 +463,7 @@ func TestAllocPageBuffer_SlabServesOnlyItsOwnPageSize(t *testing.T) {
 // (`szPage<512 || nPage<=0`, malloc.c:165-168): nothing is allocated for it,
 // no request is served from it, and it never reports pressure. So is one
 // with slots above MaxPageSize, which serve no database ({MaxPageSize+1, 16}
-// is a 1 MiB allocation Go could make), and one whose byte size is too large
-// to allocate ({math.MaxInt, 1}) or overflows an int, which make would refuse
-// with a panic.
+// could be allocated), and one whose byte size overflows an int.
 func TestPageSlab_InitWithoutPagesIsEmpty(t *testing.T) {
 	for _, args := range [][2]int{
 		{4096, 0}, {4096, -1}, {0, 16}, {-4096, 16}, {0, 0},
@@ -474,7 +472,7 @@ func TestPageSlab_InitWithoutPagesIsEmpty(t *testing.T) {
 		{math.MaxInt, 2}, {4096, math.MaxInt/4096 + 1}, {MaxPageSize, math.MaxInt},
 	} {
 		var s pageSlab
-		s.Init(args[0], args[1]) // a negative or overflowing size must not panic in make
+		s.Init(args[0], args[1]) // must not panic
 		if !s.initialized.Load() {
 			t.Fatalf("Init(%d, %d): not initialized", args[0], args[1])
 		}

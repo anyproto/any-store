@@ -237,9 +237,8 @@ func (q *collQuery) validateSources(s *collSchema) error {
 // peer's DDL — the index dropped and recreated in another mode, say — would
 // otherwise keep the verb failing with the stale verdict (ErrNoVectorIndex,
 // ErrVectorIndexUnsupported) until some other operation of this process
-// happens to observe it. The success path stays transaction-free; verified
-// reports whether the pass was reached against a verified schema (see
-// confirmSources).
+// happens to observe it. verified reports whether the pass was reached
+// against a verified schema (see confirmSources).
 func (q *collQuery) validateSourcesIn(ctx context.Context) (verified bool, err error) {
 	s, verified, err := q.c.schemaFor(ctx)
 	if err != nil {
@@ -268,8 +267,7 @@ func (q *collQuery) validateSourcesIn(ctx context.Context) (verified bool, err e
 // first, through a short read: when a peer process has dropped the index, the
 // verb returns the error it returns for a filter that matches something, and
 // an $out after it does not replace its destination with nothing. MongoDB
-// looks the text index up on the current catalog when it parses $text. A
-// filter with neither source keeps its answer free of I/O.
+// looks the text index up on the current catalog when it parses $text.
 func (q *collQuery) confirmSources(ctx context.Context, verified bool) error {
 	if verified || !(query.ContainsText(q.cond) || query.ContainsKnn(q.cond)) {
 		return nil
@@ -525,10 +523,9 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	}
 
 	// Fast path: filter provably matches no documents — return an empty
-	// iterator with no transaction, no plan construction, and no I/O unless
-	// a $text or $knn source must be confirmed (confirmSources). Not for a
-	// $lookup's source: its reads go through a transaction that must know
-	// the iterator (lookupSource).
+	// iterator, with no plan, once a $text or $knn source is confirmed
+	// (confirmSources). Not for a $lookup's source: its reads go through a
+	// transaction that must know the iterator (lookupSource).
 	if q.unsatisfiable() && !q.lookupSource {
 		qb.Close()
 		if err = q.confirmSources(ctx, verified); err != nil {
@@ -862,9 +859,8 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	}
 
 	// Fast path: filter provably matches no documents (e.g. $in:[]). Skip
-	// the planner, the read tx (unless a $text or $knn source must be
-	// confirmed, see confirmSources), and the index walk entirely — the
-	// answer is unconditionally zero. See isUnsatisfiable.
+	// the planner and the index walk — the answer is zero once a $text or
+	// $knn source is confirmed (confirmSources). See isUnsatisfiable.
 	if q.unsatisfiable() {
 		return 0, q.confirmSources(ctx, verified)
 	}
@@ -1274,9 +1270,9 @@ func (q *collQuery) unsatisfiable() bool {
 }
 
 // isUnsatisfiable reports whether the given filter provably matches no
-// documents. Used to short-circuit Count/Iter/Update/Delete before we
-// open a transaction, build a plan, or read any pages — the operation
-// degenerates into "the answer is zero / empty" with no I/O.
+// documents. Used to short-circuit Count/Iter/Update/Delete before they
+// build a plan — the operation degenerates into "the answer is zero /
+// empty".
 //
 // Currently detects:
 //   - empty $in (query.In{Values: empty}) — never matches anything;

@@ -760,8 +760,8 @@ func TestModifier_PaddingStagedCopiesTheDocumentAsItIs(t *testing.T) {
 // application below stores {"n":1} at "o", increments it there, and turns
 // "arr" into an array; on the second, the copy's "o" is a new copy of the
 // operand, so the increment does not reach the earlier result's "o" before
-// the padding refusal. The operands stay as parsed, so every application to
-// the same document gives the same result.
+// the padding refusal. Applying the modifier does not change its operands,
+// so every application to the same document gives the same result.
 func TestModifier_PaddingStagedStoresCopiesOfItsOperands(t *testing.T) {
 	const src = `{"arr":{},"next":[]}`
 	mod := MustParseModifier(`{"$set":{"o":{"n":1}},"$inc":{"o.n":1,"arr.1500001":1},"$rename":{"next":"arr"}}`)

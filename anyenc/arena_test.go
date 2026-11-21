@@ -101,10 +101,10 @@ func TestArena_ApproxSize(t *testing.T) {
 		"delta must cover at least the 11 payload bytes of 'hello world'")
 }
 
-// Copy keeps every value as it is in memory and shares no memory with its
-// source, including what an encode and parse would change or refuse: a key
-// "\x1f" (encoded like the empty key), a -0 number (encoded as +0) and
-// nesting past the parser's depth limit.
+// Copy keeps every value as it is in memory, and a change to its source's
+// keys and payloads does not reach the copy, including what an encode and
+// parse would change or refuse: a key "\x1f" (encoded like the empty key), a
+// -0 number (encoded as +0) and nesting past the parser's depth limit.
 func TestArena_Copy(t *testing.T) {
 	src := &Arena{}
 	v := testObject(src)

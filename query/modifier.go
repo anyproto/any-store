@@ -53,10 +53,8 @@ func (mRoot ModifierChain) Modify(a *anyenc.Arena, v *anyenc.Value) (result *any
 //
 // The chain stores copies of its operands (ownOperands), as MongoDB copies an
 // operand from the immutable update spec into the document
-// (update/set_node.cpp: setValueBSONElement(val)). The copy the chain
-// runs on then shares no memory with the modifier or with the document
-// passed in, so no operation reaches that document, even when it is an
-// earlier result of the same modifier, and the operands stay as parsed.
+// (update/set_node.cpp: setValueBSONElement(val)), so applying it does not
+// change its operands.
 type paddingStaged struct {
 	ModifierChain
 }

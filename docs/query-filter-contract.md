@@ -195,7 +195,7 @@ build per query and carry no such guarantee.
     `{"$all":[]}` is accepted and matches no document, as in MongoDB: not
     one whose array is empty, not one without the field. It is the empty
     `$in`, so a conjunct of it makes the whole filter match nothing (the
-    query layer answers without reading, as for `{"$in":[]}`), and its
+    query layer answers without a scan, as for `{"$in":[]}`), and its
     index bounds are empty: it narrows no seek, and the residual filter
     rejects every row. Pinned by
     `TestParseCondition_AllWithEmptyArrayMatchesNothing` and, through every
