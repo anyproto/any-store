@@ -104,6 +104,39 @@ func TestSentinelTracker_RemoveIgnoresCachedState(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+// The tracker's path is made absolute by New: after the working directory
+// changes, it still names the marker beside the database, and leaves alone a
+// file of the same name in the new working directory.
+func TestSentinelTracker_PathResolvedAtNew(t *testing.T) {
+	dirA, dirB := t.TempDir(), t.TempDir()
+	markerA := filepath.Join(dirA, "test.db"+lockFileSuffix)
+	markerB := filepath.Join(dirB, "test.db"+lockFileSuffix)
+	require.NoError(t, os.WriteFile(markerB, nil, 0o644)) // another database's marker
+
+	t.Chdir(dirA)
+	tracker, err := New("test.db")
+	require.NoError(t, err)
+	tracker.MarkDirty()
+	_, err = os.Stat(markerA)
+	require.NoError(t, err, "setup: a write creates the marker")
+
+	t.Chdir(dirB)
+	tracker.Remove()
+	_, err = os.Stat(markerA)
+	assert.True(t, os.IsNotExist(err), "Remove left the database's marker: %v", err)
+	_, err = os.Stat(markerB)
+	assert.NoError(t, err, "Remove removed a file in the new working directory")
+
+	tracker.MarkDirty()
+	_, err = os.Stat(markerA)
+	assert.NoError(t, err, "MarkDirty did not create the database's marker")
+	tracker.MarkClean()
+	_, err = os.Stat(markerA)
+	assert.True(t, os.IsNotExist(err), "MarkClean left the database's marker: %v", err)
+	_, err = os.Stat(markerB)
+	assert.NoError(t, err, "MarkClean removed a file in the new working directory")
+}
+
 func TestSentinelTracker_ConcurrentAccess(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
