@@ -198,6 +198,10 @@ type collection struct {
 	// openName is the name the handle was opened under: what the collection
 	// is called while no version is installed.
 	openName string
+	// regName is the name the handle was last put in the registry under
+	// (db.openedCollections): where an eviction finds it (db.evictLocked).
+	// A handle is in the registry under one name at most. Guarded by db.mu.
+	regName string
 
 	// identity identifies the collection this handle stands for: the coll:
 	// record value (the catalog token) followed by the data namespace's root

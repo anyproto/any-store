@@ -991,6 +991,7 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 		// the handle yet, so its lock is free under db.mu.
 		c.adopt(tx, schema)
 		db.openedCollections[collectionName] = c
+		c.regName = collectionName
 		db.byIdentity[c.identity] = c
 		db.mu.Unlock()
 		if wt != nil {
@@ -1798,16 +1799,16 @@ func (db *db) Flush(ctx context.Context, waitIdleTime time.Duration, mode FlushM
 	return db.recoveryController.Flush(ctx, waitIdleTime, mode.toRecoveryFlushMode())
 }
 
-// evictLocked removes c from the registry. Identity scan, not a delete by
-// name: the slot may be under an older name than the head's (a handle
-// opened through an old snapshot, a rename being settled). The caller holds
-// db.mu.
+// evictLocked removes c from the registry. By the name it was registered
+// under (collection.regName), not the head's: the slot may be under an older
+// name than that (a handle opened through an old snapshot, a rename being
+// settled). The caller holds db.mu.
 func (db *db) evictLocked(c *collection) {
-	for name, cur := range db.openedCollections {
-		if cur == Collection(c) {
-			delete(db.openedCollections, name)
-			break
-		}
+	if testVisits != nil {
+		testVisits.evict++
+	}
+	if cur, ok := db.openedCollections[c.regName]; ok && cur == Collection(c) {
+		delete(db.openedCollections, c.regName)
 	}
 	db.forgetLocked(c)
 }
