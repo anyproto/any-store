@@ -3672,7 +3672,8 @@ func (c *Cursor) fail(err error) error {
 
 // halt is the error exit of a call on a write transaction's cursor: when
 // the call left the transaction in the error state, the transaction's
-// cursors are ended (pager.halt). It returns err.
+// cursors are ended (pager.halt). A faulted cursor reports its fault
+// through it too. It returns err.
 func (c *Cursor) halt(err error) error {
 	if c.linked {
 		c.bt.pager.halt()
@@ -3699,12 +3700,13 @@ func (c *Cursor) revive() {
 // on the last entry when none follows, and cursorSkipNext records the
 // side, so that the move onward in that direction yields that entry
 // without stepping. A skipNext kept from an earlier restore stays unless
-// the seek sets one. A seek that fails ends the cursor.
+// the seek sets one. A seek that fails ends the cursor. A faulted cursor
+// reports its fault (halt).
 func (c *Cursor) restorePosition() error {
 	switch c.state {
 	case cursorRequireSeek:
 	case cursorFault:
-		return c.faultErr
+		return c.halt(c.faultErr)
 	default:
 		return nil
 	}
@@ -3750,7 +3752,7 @@ func (c *Cursor) restored() error {
 // First positions the cursor at the first (smallest) key.
 func (c *Cursor) First() error {
 	if c.state == cursorFault {
-		return c.faultErr
+		return c.halt(c.faultErr)
 	}
 	c.clearSaved()
 	if err := c.first(); err != nil {
@@ -3827,7 +3829,7 @@ func (c *Cursor) first() error {
 // Last positions the cursor at the last (largest) key.
 func (c *Cursor) Last() error {
 	if c.state == cursorFault {
-		return c.faultErr
+		return c.halt(c.faultErr)
 	}
 	c.clearSaved()
 	if err := c.last(); err != nil {
@@ -3884,7 +3886,7 @@ func (c *Cursor) last() error {
 // Seek positions the cursor at the first key >= the given key.
 func (c *Cursor) Seek(key []byte) error {
 	if c.state == cursorFault {
-		return c.faultErr
+		return c.halt(c.faultErr)
 	}
 	c.clearSaved()
 	if err := c.seek(key); err != nil {

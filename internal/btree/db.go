@@ -2610,7 +2610,8 @@ func (tx *WriteTx) Savepoint() (int, error) {
 	if tx.closed {
 		return 0, ErrTxClosed
 	}
-	return tx.pager.savepoint()
+	id, err := tx.pager.savepoint()
+	return id, tx.halt(err)
 }
 
 // RollbackToSavepoint rolls back all changes made since the given savepoint.
@@ -2635,7 +2636,7 @@ func (tx *WriteTx) ReleaseSavepoint(id int) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	return tx.pager.releaseSavepoint(id)
+	return tx.halt(tx.pager.releaseSavepoint(id))
 }
 
 // CreateNamespace creates a new namespace within this transaction.

@@ -4238,9 +4238,13 @@ func (p *pager) tripCursors(root uint32, err error, seq uint64) {
 // pages by then. Without the halt, a cursor positioned on another tree
 // would go on stepping through the leaf it pins, a step that needs no
 // fetch. The cursors are faulted without a save: the transaction can only
-// be rolled back, and the rollback ends every cursor for good. A later
-// call that fails in the error state faults them again, a cursor opened
-// since included. A transaction DB.Close ended is left as Close left it.
+// be rolled back, and the rollback ends every cursor for good. Every call
+// that returns errCode passes through the halt, as every SQLite statement
+// that ends in an error halts: the call that met the failed spill, and
+// each later one, whether a fetch failed, the state test of a savepoint
+// call did, or a cursor the halt faulted reported its fault. A cursor
+// opened since the failure is ended by the next of them. A transaction
+// DB.Close ended is left as Close left it.
 // Writer's goroutine only.
 // DRIFT: every cursor is faulted and no read cursor is saved, and the error state outlives the halt See docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill
 func (p *pager) halt() {
