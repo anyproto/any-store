@@ -85,11 +85,14 @@ func (db *DB) CksumCodec() *cksumCodec {
 // context, and, when no WAL commit gives the page count, a page-1 header
 // that cannot be read or is not valid. A read begin at a snapshot whose
 // page-1 counters it does not hold yet reads them, so a page-1 header that
-// cannot be read is then the function's error and there is no report; at a
-// snapshot whose counters it holds, the sweep lists page 1 and goes on. A
-// sqlite_dbpage scan cannot begin in the first case either: every
-// transaction begins by reading page 1 (btree.c:3288-3289), and the pager
-// cache keeps it only while the snapshot is unchanged (pager.c:3261-3264).
+// cannot be read is then the function's error and there is no report. At a
+// snapshot whose counters it holds, the read begins, and the sweep lists
+// page 1 and goes on only when a WAL commit of the snapshot gives the page
+// count; without one, the header that cannot be read is the function's
+// error, as above. A sqlite_dbpage scan cannot begin in the first case
+// either: every transaction begins by reading page 1 (btree.c:3288-3289),
+// and the pager cache keeps it only while the snapshot is unchanged
+// (pager.c:3261-3264).
 //
 // On checksum DBs the sweep temporarily clears the verify-on-read flag so
 // the read path doesn't abort on the first mismatch — the original flag
