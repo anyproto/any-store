@@ -5051,23 +5051,31 @@ func TestCov_TryMergeLeafParentWithSingleChild(t *testing.T) {
 }
 
 // =============================================================================
-// NEW COVERAGE TESTS — leafFullKey totalPayload overflow
+// NEW COVERAGE TESTS — leafFullKey length bounds
 // =============================================================================
 
-func TestCov_LeafFullKeyTotalPayloadOverflow(t *testing.T) {
-	// L805-807: totalPayload < 0 || totalPayload > maxPayloadAlloc
-	// Craft data with keyLen + valLen that sum to negative or > 1<<30
-	data := make([]byte, 20)
-	// keyLen = 0x20000000 (varint encoded), valLen = 0x20000000
-	// Sum = 0x40000000 > maxPayloadAlloc (1<<30 = 0x40000000)
-	// Actually maxPayloadAlloc = 1<<30 = 1073741824
-	// Need keyLen + valLen > 1073741824
-	// Use 5-byte varint for keyLen = 600000000
-	n := putVarint(data[0:], 600000000) // keyLen
-	n += putVarint(data[n:], 600000000) // valLen
-	// totalPayload = 1200000000 > 1073741824
+// leafFullKey bounds the key length and the value length each by
+// payloadLimit. Their sum is not bounded there: the value's bound is tested
+// where a value is read, so a cell whose lengths pass the limit only
+// together still yields its key. The cells are local and inside the page,
+// so only the length test can refuse them.
+func TestCov_LeafFullKeyBoundsEachLengthSingly(t *testing.T) {
+	setPayloadLimit(t, 100)
+	cell := func(keyLen, valLen int) []byte {
+		data := make([]byte, 300)
+		n := putVarint(data, uint64(keyLen))
+		putVarint(data[n:], uint64(valLen))
+		return data
+	}
 
-	_, err := leafFullKey(data, 0, indexLimits(4096), nil, 0, nil)
+	key, err := leafFullKey(cell(60, 60), 0, indexLimits(4096), nil, 0, nil)
+	require.NoError(t, err)
+	assert.Len(t, key, 60)
+
+	_, err = leafFullKey(cell(101, 1), 0, indexLimits(4096), nil, 0, nil)
+	assert.ErrorIs(t, err, ErrCorrupt)
+
+	_, err = leafFullKey(cell(1, 101), 0, indexLimits(4096), nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
