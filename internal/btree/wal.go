@@ -4417,10 +4417,11 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 				// its source's), and the next Open derives its key from the
 				// main file's salt. Bytes 72-87 are in the plaintext header,
 				// which the AEAD does not cover (drift-2026-06-25-14), so the
-				// page stays valid. In SQLCipher every frame of page 1 carries
-				// the ctx's salt already (sqlcipher.c:3312), so its verbatim
-				// copy needs no such step.
-				// DRIFT: the checkpoint writes the keyed KDF salt over page 1's salt bytes; SQLite copies every frame verbatim. See docs/btree/NOTES.md#drift-2026-11-21-19-the-kdf-salt-belongs-to-the-key-setup-not-to-page-1
+				// page stays valid. In its default header mode SQLCipher
+				// writes the ctx's salt into every frame of page 1
+				// (sqlcipher.c:3312), so its checkpoint copies each selected
+				// frame as it is (wal.c:2306-2315).
+				// DRIFT: the checkpoint writes the keyed KDF salt over page 1's salt bytes; SQLite copies each selected frame verbatim. See docs/btree/NOTES.md#drift-2026-11-21-19-the-kdf-salt-belongs-to-the-key-setup-not-to-page-1
 				if pgno == 1 && w.keySalt != ([SaltLen]byte{}) {
 					copy(pageData[dbHeaderSaltOff:dbHeaderSaltOff+SaltLen], w.keySalt[:])
 				}
