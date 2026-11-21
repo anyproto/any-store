@@ -3088,14 +3088,13 @@ func (p *pager) rollbackLocked() error {
 		return nil
 	}
 
-	// The cursors of a transaction in the error state are ended with its
-	// error before the cache goes, as a failed commit's are (pagerError):
-	// SQLite rolls such a transaction back with a trip code
-	// (sqlite3VdbeHalt → sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK) →
-	// sqlite3BtreeRollback, btree.c:4532-4536). A cursor left open pins
-	// pages of the cache, and its Close would otherwise unpin them in the
-	// next transaction's hands. The error state fails every fetch, so a
-	// cursor whose key would need one is tripped without its position.
+	// The cursors of a transaction in the error state were ended as the
+	// call that met the error returned (halt). They are ended here again
+	// with its error before the cache goes, as a failed commit's are
+	// (pagerError): a cursor left pinning pages of the cache would unpin
+	// them, at its Close, in the next transaction's hands. The error state
+	// fails every fetch, so a cursor whose key would need one is tripped
+	// without its position.
 	if st == pagerError {
 		p.tripCursors(0, p.writeStateErr(), 0)
 	}
@@ -4224,6 +4223,28 @@ func (p *pager) tripCursors(root uint32, err error, seq uint64) {
 		if root == 0 || c.bt.rootPage == root {
 			c.trip(err, seq)
 		}
+	}
+}
+
+// halt ends every writer cursor with errCode as a call of the write
+// transaction returns an error in the error state: SQLite's statement halt
+// (sqlite3VdbeHalt closes the statement's cursors, vdbeaux.c:3335, and
+// rolls back with a trip code, vdbeaux.c:3378, which trips the others,
+// btree.c:4533). The call that met the failed spill has stopped using its
+// pages by then. Without the halt, a cursor positioned on another tree
+// would go on stepping through the leaf it pins, a step that needs no
+// fetch. The cursors are faulted without a save: the transaction can only
+// be rolled back, and the rollback ends every cursor for good. A later
+// call that fails in the error state faults them again, a cursor opened
+// since included. A transaction DB.Close ended is left as Close left it.
+// Writer's goroutine only.
+// DRIFT: every cursor is faulted and no read cursor is saved, and the error state outlives the halt See docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill
+func (p *pager) halt() {
+	if p.errCode == nil || p.closeInvalidated.Load() {
+		return
+	}
+	for c := p.cursors; c != nil; c = c.nextCursor {
+		c.fault(p.errCode)
 	}
 }
 

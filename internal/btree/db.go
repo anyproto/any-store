@@ -1371,13 +1371,13 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 		return ErrNamespaceExists
 	}
 	if !errors.Is(err, ErrNamespaceNotFound) {
-		return err
+		return tx.halt(err)
 	}
 
 	// Allocate a new page for the namespace's B-tree root
 	rootPg, err := db.pager.allocatePage()
 	if err != nil {
-		return err
+		return tx.halt(err)
 	}
 	db.pager.rootCreated(rootPg.pgno)
 
@@ -1396,7 +1396,7 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	binary.BigEndian.PutUint32(rootPgBuf[:], rootPgno)
 
 	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
-	return bt.Put([]byte(name), rootPgBuf[:])
+	return tx.halt(bt.Put([]byte(name), rootPgBuf[:]))
 }
 
 // DeleteNamespace deletes a namespace. Must be called within a write transaction.
@@ -1411,14 +1411,14 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	// Uses getNamespaceLocked which sees dirty pages from the current write tx.
 	ns, err := db.getNamespaceLocked(name)
 	if err != nil {
-		return err
+		return tx.halt(err)
 	}
 	rootPage := ns.rootPage
 
 	// Delete namespace entry from master table
 	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	if err := bt.Delete([]byte(name)); err != nil {
-		return err
+		return tx.halt(err)
 	}
 
 	// Free all pages in the namespace's B-tree. A cursor still open on it
@@ -1428,7 +1428,7 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	// statement is running (vdbe.c OP_Destroy, SQLITE_LOCKED).
 	if rootPage != 0 {
 		db.pager.rootDropped(rootPage)
-		return db.freeTreePages(rootPage)
+		return tx.halt(db.freeTreePages(rootPage))
 	}
 	return nil
 }
@@ -1454,7 +1454,7 @@ func (db *DB) RenameNamespace(tx *WriteTx, oldName, newName string) error {
 	// the current write tx; page 1 may be an interior node after splits).
 	ns, err := db.getNamespaceLocked(oldName)
 	if err != nil {
-		return err
+		return tx.halt(err)
 	}
 	if oldName == newName {
 		return nil
@@ -1466,18 +1466,18 @@ func (db *DB) RenameNamespace(tx *WriteTx, oldName, newName string) error {
 		return ErrNamespaceExists
 	}
 	if !errors.Is(err, ErrNamespaceNotFound) {
-		return err
+		return tx.halt(err)
 	}
 
 	// Re-key the master-table cell; the root page is reused, no pages freed.
 	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	if err = bt.Delete([]byte(oldName)); err != nil {
-		return err
+		return tx.halt(err)
 	}
 	var rootPgBuf [4]byte
 	binary.BigEndian.PutUint32(rootPgBuf[:], ns.rootPage)
 	if err = bt.Put([]byte(newName), rootPgBuf[:]); err != nil {
-		return err
+		return tx.halt(err)
 	}
 
 	// Read-back guard: the rename must be resolvable before it is allowed to
@@ -1495,7 +1495,7 @@ func (db *DB) RenameNamespace(tx *WriteTx, oldName, newName string) error {
 		return fmt.Errorf("%w: rename read-back found no entry for %q", ErrCorrupt, newName)
 	}
 	if err != nil {
-		return err
+		return tx.halt(err)
 	}
 	if readBack.rootPage != ns.rootPage {
 		return fmt.Errorf("%w: rename read-back for %q resolved root %d, want %d",
@@ -1823,6 +1823,17 @@ type ReadTx struct {
 // walHdr.mxFrame per the per-connection-hdr spec.
 func (tx *ReadTx) WalMaxFrame() uint32 { return tx.walHdr.mxFrame }
 
+// halt is the error exit of a call of a write transaction: when the call
+// left the transaction in the error state, the transaction's cursors are
+// ended (pager.halt). A read transaction has no error state. It returns
+// err.
+func (tx *ReadTx) halt(err error) error {
+	if err != nil && tx.writable && !tx.closed {
+		tx.pager.halt()
+	}
+	return err
+}
+
 // txGetPage fetches a page respecting MVCC snapshot isolation.
 // For write transactions, pages are fetched from the writer cache or WAL.
 // For read transactions, getPageReader uses a private cache for snapshot isolation.
@@ -1863,7 +1874,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 	}
 	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
-		return buf, err
+		return buf, tx.halt(err)
 	}
 
 	// Search without starting a new read tx (we're already in one)
@@ -1874,7 +1885,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 			idx, found, serr := searchLeafWithOverflow(pg, key, lim, tx.pager, tx.walHdr.mxFrame, tx.cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
-				return buf, serr
+				return buf, tx.halt(serr)
 			}
 			if !found {
 				tx.pager.releasePage(pg)
@@ -1927,7 +1938,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 						fullVal[localValBytes:], tx.walHdr.mxFrame, tx.cache,
 					); err != nil {
 						tx.pager.releasePage(pg)
-						return buf[:start], err
+						return buf[:start], tx.halt(err)
 					}
 				}
 				tx.pager.releasePage(pg)
@@ -1940,12 +1951,12 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walHdr.mxFrame, tx.cache)
 		if serr != nil {
 			tx.pager.releasePage(pg)
-			return buf, serr
+			return buf, tx.halt(serr)
 		}
 		tx.pager.releasePage(pg)
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
-			return buf, err
+			return buf, tx.halt(err)
 		}
 	}
 }
@@ -1968,7 +1979,7 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 	}
 	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
-		return false, err
+		return false, tx.halt(err)
 	}
 
 	usableSize := tx.pager.usableSize()
@@ -1980,7 +1991,7 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 			)
 			tx.pager.releasePage(pg)
 			if serr != nil {
-				return false, serr
+				return false, tx.halt(serr)
 			}
 			return found, nil
 		}
@@ -1989,12 +2000,12 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 		)
 		if serr != nil {
 			tx.pager.releasePage(pg)
-			return false, serr
+			return false, tx.halt(serr)
 		}
 		tx.pager.releasePage(pg)
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
-			return false, err
+			return false, tx.halt(err)
 		}
 	}
 }
@@ -2016,7 +2027,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 	}
 	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
-		return buf, err
+		return buf, tx.halt(err)
 	}
 
 	usableSize := tx.pager.usableSize()
@@ -2036,7 +2047,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 			idx, _, serr := searchLeafWithOverflow(pg, prefix, lim, tx.pager, tx.walHdr.mxFrame, cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
-				return buf, serr
+				return buf, tx.halt(serr)
 			}
 			n := int(pg.header.cellCount)
 			if idx >= n {
@@ -2048,7 +2059,8 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 				}
 				// Non-rightmost leaf: navigate to the leftmost key of
 				// the next sibling subtree (saved during descent).
-				return tx.leftmostKeyAfter(fallbackPgno, fallbackIdx, buf)
+				buf, err = tx.leftmostKeyAfter(fallbackPgno, fallbackIdx, buf)
+				return buf, tx.halt(err)
 			}
 			off := pg.getCellOffset(idx)
 			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
@@ -2062,7 +2074,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 				fullKey, kerr := leafFullKey(pg.data, int(off), lim, tx.pager, tx.walHdr.mxFrame, cache)
 				if kerr != nil {
 					tx.pager.releasePage(pg)
-					return buf, kerr
+					return buf, tx.halt(kerr)
 				}
 				buf = append(buf, fullKey...)
 				tx.pager.releasePage(pg)
@@ -2075,7 +2087,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 		childPgno, cellIdx, serr := searchInteriorWithOverflow(pg, prefix, usableSize, tx.pager, tx.walHdr.mxFrame, cache)
 		if serr != nil {
 			tx.pager.releasePage(pg)
-			return buf, serr
+			return buf, tx.halt(serr)
 		}
 		// Track the deepest non-rightChild branch for cross-page navigation.
 		if childPgno != pg.header.rightChild {
@@ -2086,7 +2098,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 		tx.pager.releasePage(pg)
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
-			return buf, err
+			return buf, tx.halt(err)
 		}
 	}
 }
@@ -2222,7 +2234,8 @@ func (tx *ReadTx) CountContext(ctx context.Context, ns *Namespace) (int, error) 
 		return 0, ErrTxClosed
 	}
 	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
-	return bt.CountContext(ctx)
+	n, err := bt.CountContext(ctx)
+	return n, tx.halt(err)
 }
 
 // DatabaseSize returns the number of pages in the database, including page 1
@@ -2274,7 +2287,8 @@ func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 		return nil, ErrTxClosed
 	}
 	if tx.writable {
-		return tx.db.getNamespaceLocked(name)
+		ns, err := tx.db.getNamespaceLocked(name)
+		return ns, tx.halt(err)
 	}
 	return tx.db.getNamespaceAt(name, tx.walHdr.mxFrame, tx.cache)
 }
@@ -2407,7 +2421,8 @@ func (tx *WriteTx) GetNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
-	return tx.db.getNamespaceLocked(name)
+	ns, err := tx.db.getNamespaceLocked(name)
+	return ns, tx.halt(err)
 }
 
 // MarkDataChanged signals that this transaction modifies data, causing
@@ -2442,7 +2457,7 @@ func (tx *WriteTx) Put(ns *Namespace, key, value []byte) error {
 		return ErrTxClosed
 	}
 	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: true}
-	return bt.Put(key, value)
+	return tx.halt(bt.Put(key, value))
 }
 
 // Delete removes a key from the given namespace.
@@ -2451,7 +2466,7 @@ func (tx *WriteTx) Delete(ns *Namespace, key []byte) error {
 		return ErrTxClosed
 	}
 	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: true}
-	return bt.Delete(key)
+	return tx.halt(bt.Delete(key))
 }
 
 // AutoCheckpointThreshold is the default number of WAL frames after which
@@ -2610,9 +2625,9 @@ func (tx *WriteTx) RollbackToSavepoint(id int) error {
 		return ErrTxClosed
 	}
 	if _, err := tx.pager.saveAllCursors(0); err != nil {
-		return err
+		return tx.halt(err)
 	}
-	return tx.pager.rollbackToSavepoint(id)
+	return tx.halt(tx.pager.rollbackToSavepoint(id))
 }
 
 // ReleaseSavepoint releases a savepoint, merging its changes into the parent.
@@ -2631,7 +2646,8 @@ func (tx *WriteTx) CreateNamespace(name string) (*Namespace, error) {
 	if err := tx.db.CreateNamespace(tx, name); err != nil {
 		return nil, err
 	}
-	return tx.db.getNamespaceLocked(name)
+	ns, err := tx.db.getNamespaceLocked(name)
+	return ns, tx.halt(err)
 }
 
 // DeleteNamespace deletes a namespace within this transaction.

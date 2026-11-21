@@ -3650,11 +3650,33 @@ func (c *Cursor) trip(err error, seq uint64) {
 	c.state = cursorFault
 }
 
+// fault ends the cursor for good without saving its position: the
+// CURSOR_FAULT branch of sqlite3BtreeTripAllCursors (sqlite3BtreeClearCursor,
+// then eState = CURSOR_FAULT, btree.c:4484-4486), its pages released
+// (btreeReleaseAllCursorPages, btree.c:4488). Every use reports err.
+func (c *Cursor) fault(err error) {
+	c.releasePages()
+	c.clearSaved()
+	c.faultErr = err
+	c.faultSeq = 0
+	c.state = cursorFault
+}
+
 // fail is the error exit of a move that left the cursor without a
 // position it can be saved from: the cursor is ended with err, and
 // reports it from then on.
 func (c *Cursor) fail(err error) error {
 	c.trip(err, 0)
+	return c.halt(err)
+}
+
+// halt is the error exit of a call on a write transaction's cursor: when
+// the call left the transaction in the error state, the transaction's
+// cursors are ended (pager.halt). It returns err.
+func (c *Cursor) halt(err error) error {
+	if c.linked {
+		c.bt.pager.halt()
+	}
 	return err
 }
 
@@ -3733,7 +3755,7 @@ func (c *Cursor) First() error {
 	c.clearSaved()
 	if err := c.first(); err != nil {
 		c.releasePages()
-		return err
+		return c.halt(err)
 	}
 	return nil
 }
@@ -3810,7 +3832,7 @@ func (c *Cursor) Last() error {
 	c.clearSaved()
 	if err := c.last(); err != nil {
 		c.releasePages()
-		return err
+		return c.halt(err)
 	}
 	return nil
 }
@@ -3867,7 +3889,7 @@ func (c *Cursor) Seek(key []byte) error {
 	c.clearSaved()
 	if err := c.seek(key); err != nil {
 		c.releasePages()
-		return err
+		return c.halt(err)
 	}
 	return nil
 }
@@ -4020,7 +4042,7 @@ func (c *Cursor) SeekNear(key []byte) error {
 				if bytes.Compare(key, firstKey) >= 0 && bytes.Compare(key, lastKey) <= 0 {
 					idx, _, serr := c.bt.searchLeaf(leaf.pg, key)
 					if serr != nil {
-						return serr
+						return c.halt(serr)
 					}
 					leaf.cellIdx = idx
 					if idx < n {
@@ -4145,7 +4167,11 @@ func (c *Cursor) Key() ([]byte, error) {
 	}
 	if cell.overflowPg != 0 {
 		// Key may be partial — use leafFullKey to reconstruct
-		return leafFullKey(frame.pg.data, int(off), lim, c.bt.pager, c.bt.walMaxFrame, c.bt.cache)
+		k, err := leafFullKey(frame.pg.data, int(off), lim, c.bt.pager, c.bt.walMaxFrame, c.bt.cache)
+		if err != nil {
+			return nil, c.halt(err)
+		}
+		return k, nil
 	}
 	return cell.key, nil
 }
@@ -4214,7 +4240,7 @@ func (c *Cursor) Value() ([]byte, error) {
 				fullVal[localValBytes:], c.bt.walMaxFrame, c.bt.cache,
 			)
 			if err != nil {
-				return nil, err
+				return nil, c.halt(err)
 			}
 		}
 		return fullVal, nil
@@ -4287,7 +4313,7 @@ func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
 				fullVal[localValBytes:], c.bt.walMaxFrame, c.bt.cache,
 			)
 			if err != nil {
-				return buf[:start], err
+				return buf[:start], c.halt(err)
 			}
 		}
 		return buf, nil
@@ -4783,14 +4809,14 @@ func (c *Cursor) RangeFraction(low, high []byte) (float64, error) {
 	if len(low) > 0 {
 		r, err := c.keyRank(low)
 		if err != nil {
-			return 0, err
+			return 0, c.halt(err)
 		}
 		lo = r
 	}
 	if len(high) > 0 {
 		r, err := c.keyRank(high)
 		if err != nil {
-			return 0, err
+			return 0, c.halt(err)
 		}
 		hi = r
 	}
