@@ -2794,6 +2794,70 @@ func TestWriteTx_NameLookupAmongPinnedHandles(t *testing.T) {
 	require.Empty(t, log.log)
 }
 
+// A savepoint rollback walks the log entries its scope made, not the log: a
+// verb that fails on a collection the transaction has used costs the same
+// however many collections the transaction has used, and the handles keep
+// the marks they had before the scope.
+func TestWriteTx_SavepointRollbackWalksItsOwnEntries(t *testing.T) {
+	fx := newFixture(t)
+	const n = 64
+	for i := range n + 1 {
+		c, err := fx.CreateCollection(ctx, fmt.Sprintf("p%d", i))
+		require.NoError(t, err)
+		require.NoError(t, c.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	}
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wtx.Rollback() })
+	log := wtx.schemaLog()
+	colls := make([]Collection, n+1)
+	for i := range colls {
+		colls[i], err = fx.OpenCollection(ctx, fmt.Sprintf("p%d", i))
+		require.NoError(t, err)
+	}
+	use := func(from, to int) {
+		for i := from; i < to; i++ {
+			_, err := colls[i].FindId(wtx.Context(), 1)
+			require.NoError(t, err)
+		}
+	}
+	// failOn makes an insert into c fail and returns the entries the
+	// rollback of its savepoint walked.
+	failOn := func(c Collection) int {
+		v := &visitCounts{}
+		testVisits = v
+		defer func() { testVisits = nil }()
+		require.ErrorIs(t, c.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":1}`)), ErrDocExists)
+		return v.discard
+	}
+
+	use(0, 1)
+	require.Len(t, log.log, 1, "setup: one pin per collection used")
+	require.Equal(t, 0, failOn(colls[0]), "one collection used")
+	use(1, n)
+	require.Len(t, log.log, n, "setup: one pin per collection used")
+	require.Equal(t, 0, failOn(colls[0]), "%d collections used", n)
+	require.Len(t, log.log, n)
+	require.Equal(t, 1, colls[0].(*collection).logLast, "the used handle keeps its pin")
+
+	// The verb is the first use of the collection: the rollback walks its pin.
+	require.Equal(t, 1, failOn(colls[n]), "a first use in the failing verb")
+	require.Len(t, log.log, n)
+	require.Equal(t, 0, colls[n].(*collection).logLast, "the pin went with the savepoint")
+
+	// A handle with entries before the scope and in it gets back the mark
+	// of its last entry before the scope.
+	sp, err := fx.WriteTx(wtx.Context())
+	require.NoError(t, err)
+	require.NoError(t, colls[1].EnsureIndex(sp.Context(), IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, colls[1].EnsureIndex(sp.Context(), IndexInfo{Fields: []string{"b"}}))
+	require.Equal(t, n+2, colls[1].(*collection).logLast, "setup: the scope's changes are the handle's last")
+	require.NoError(t, sp.Rollback())
+	require.Len(t, log.log, n)
+	require.Equal(t, 2, colls[1].(*collection).logLast, "the handle's pin before the scope")
+	require.NoError(t, wtx.Commit())
+}
+
 // BenchmarkSketch_FindThenWriteAfterAPeersCommit is the cycle of a process
 // that shares its file: another process commits, this one plans a query and
 // then writes. The reader loads the stored sketch rows into the published
@@ -2862,7 +2926,8 @@ func BenchmarkSketch_RollbackThenFind(b *testing.B) {
 // open ones: the cost of a write must not depend on n. TxAll is one
 // transaction that opens every one of the n by name and writes to it, and
 // TxAllFind one that reads from each instead: the cost of an open by name
-// must not depend on the number of collections the transaction uses.
+// must not depend on the number of collections the transaction uses. Nor
+// must the cost of a verb that fails after them (FailAfterAll).
 func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 	for _, n := range []int{1, 1000, 20000} {
 		b.Run(fmt.Sprintf("open=%d", n), func(b *testing.B) {
@@ -2949,6 +3014,28 @@ func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 					require.NoError(b, tx.Commit())
 				}
 				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n), "ns/coll")
+			})
+			// A verb that fails, in a tx that has used every collection: the
+			// rollback of its savepoint must not cost by the collections
+			// the tx has used.
+			b.Run("FailAfterAll", func(b *testing.B) {
+				tx, err := fx.WriteTx(ctx)
+				require.NoError(b, err)
+				defer func() { _ = tx.Rollback() }()
+				for _, name := range names {
+					c, err := fx.OpenCollection(tx.Context(), name)
+					require.NoError(b, err)
+					_, err = c.FindId(tx.Context(), 1)
+					require.NoError(b, err)
+				}
+				dup := anyenc.MustParseJson(`{"id":1}`)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					if err := coll.Insert(tx.Context(), dup); !errors.Is(err, ErrDocExists) {
+						b.Fatal(err)
+					}
+				}
 			})
 		})
 	}
