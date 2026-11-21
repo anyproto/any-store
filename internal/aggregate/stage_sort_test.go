@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -324,4 +325,65 @@ func TestSortStage_MemoryLimitBeforeArenaLimit(t *testing.T) {
 		require.ErrorIs(t, err, ErrMemoryLimitExceeded)
 		require.ErrorIs(t, run(4, used, append(slices.Clone(kept), winner)...), errSortTooLarge)
 	})
+}
+
+// A top-K winner that does not fit at the arena's tail but fits packed is
+// kept, and charged for the packed arena: two successive winners, each
+// replacing one of the two rows first kept, are admitted within a budget of
+// the packed rows and their entries. Charged as kept at the tail, the second
+// winner crossed a budget the packed arena fits.
+func TestSortStage_TopKWinnerFitsPacked(t *testing.T) {
+	spec := MustParsePipeline(`[{"$sort": {"v": 1}}]`)[0].(SortSpec)
+	rowLen := func(j string) int {
+		v := anyenc.MustParseJson(j)
+		return len(spec.Sort.AppendKey(nil, v)) + len(v.MarshalTo(nil)) + 4 // the sequence number
+	}
+	// row is a document sorted by v whose row in the arena is size bytes.
+	row := func(v string, size int) string {
+		for n := size; n > 0; n-- {
+			j := fmt.Sprintf(`{"v":%q,"p":%q}`, v, strings.Repeat("x", n))
+			if rowLen(j) == size {
+				return j
+			}
+		}
+		t.Fatalf("no row of %d bytes", size)
+		return ""
+	}
+	const e = 65536
+	rows := []string{row("b1", e), row("b2", e), row("a1", e+1), row("a0", e-2)}
+	setSortArenaLimit(t, 2*e+1)
+	packed := (e + 1) + (e - 2) + 4*sortEntryOverhead
+	for _, tc := range []struct {
+		name     string
+		memLimit int
+		wantErr  error
+	}{
+		{"the packed charge", packed, nil},
+		// The tail charge of the first winner: the two rows, three entries
+		// and the winner. The second one's tail charge crosses it.
+		{"the first winner's tail charge", 3*e + 3*sortEntryOverhead + 1, nil},
+		{"one byte less than the packed charge", packed - 1, ErrMemoryLimitExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &SortStage{Src: newSliceSource(rows...), Spec: spec, TopK: 2}
+			defer st.Close()
+			ctx := newTestCtx()
+			ctx.Mem = NewMemAccount(tc.memLimit)
+			var got []string
+			for {
+				v, err := st.Next(ctx)
+				if tc.wantErr != nil {
+					require.ErrorIs(t, err, tc.wantErr)
+					return
+				}
+				require.NoError(t, err)
+				if v == nil {
+					break
+				}
+				got = append(got, string(v.GetStringBytes("v")))
+			}
+			assert.Equal(t, []string{"a0", "a1"}, got)
+			assert.Equal(t, packed, ctx.Mem.Used())
+		})
+	}
 }

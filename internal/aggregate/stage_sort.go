@@ -130,7 +130,6 @@ func (s *SortStage) collectAndSort(ctx *Ctx) error {
 		s.arena = v.MarshalTo(s.arena)
 		total := len(s.arena) - base
 		candBytes := s.arena[base:]
-		charged := 0 // of this row's charge, the part made before the end of the loop
 
 		switch {
 		case s.TopK <= 0 || len(s.entries) < s.TopK:
@@ -162,26 +161,19 @@ func (s *SortStage) collectAndSort(ctx *Ctx) error {
 			case fitsSortArena(len(s.arena)):
 				off = base
 			default:
-				// The tail is past the limit. The row is first charged what
-				// keeping it at the tail would charge, after the compaction
-				// guard (maybeCompact), so a row that also crosses
-				// MemoryLimit reports ErrMemoryLimitExceeded, as it would
-				// without the arena limit, however much the packing below
-				// shortens the arena. Then the live entries are packed, the
-				// root's bytes now dead, and the candidate moved after them.
-				// The packed arena is no longer than what was charged, so
-				// the difference settled at the end of the loop is not
-				// positive.
+				// The tail is past the limit: pack the live entries, the
+				// root's bytes now dead, and move the candidate after them.
+				// A row that fits packed is kept, and charged at the end of
+				// the loop for the packed arena. A row that does not fit
+				// even packed is first charged what keeping it at the tail
+				// would charge, after the compaction guard, so one that also
+				// crosses MemoryLimit reports ErrMemoryLimitExceeded.
 				tail := len(s.arena)
 				if sortNeedsCompact(tail, s.liveBytes) {
 					tail = s.liveBytes
 				}
-				charged = tail - prevLen + sortEntryOverhead
-				if err = ctx.Mem.Add(charged); err != nil {
-					return err
-				}
 				if off, err = s.admitAfterCompact(base, total); err != nil {
-					return err
+					return sortTooLarge(ctx, tail-prevLen)
 				}
 			}
 			s.entries[0] = sortEntry{off: uint32(off), keyLen: uint32(keyLen), docLen: uint32(total - keyLen)}
@@ -192,7 +184,7 @@ func (s *SortStage) collectAndSort(ctx *Ctx) error {
 			s.arena = s.arena[:base]
 		}
 
-		if err = ctx.Mem.Add(len(s.arena) - prevLen + sortEntryOverhead - charged); err != nil {
+		if err = ctx.Mem.Add(len(s.arena) - prevLen + sortEntryOverhead); err != nil {
 			return err
 		}
 	}
@@ -210,7 +202,7 @@ func (s *SortStage) collectAndSort(ctx *Ctx) error {
 // sortTooLarge is the error for a row that does not fit the arena once kept,
 // growing it by grown bytes. The row is charged first, as if kept, so a row
 // that also crosses MemoryLimit reports ErrMemoryLimitExceeded, the error
-// callers match, as it would without the arena limit.
+// callers match.
 func sortTooLarge(ctx *Ctx, grown int) error {
 	if err := ctx.Mem.Add(grown + sortEntryOverhead); err != nil {
 		return err
