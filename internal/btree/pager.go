@@ -4118,11 +4118,11 @@ type lentPage struct {
 // transaction that DB.Close ended under its goroutine (writerGate). That
 // goroutine makes no further call into the pager, but it can still be
 // reading a key or a value an earlier call returned, and those are slices of
-// the leaf a cursor pins (Cursor.Key, Cursor.Value); a Key or a Value of a
-// cursor that stands on its leaf can also be running, outside the gate
-// (Cursor.readsPinnedLeaf). Such a leaf is lent: its buffer returned to the
-// pool or to the slab now would be another database's while its borrower
-// reads it.
+// the leaf a cursor pins (Cursor.Key, Cursor.Value); a read or an in-leaf
+// step of a cursor that stands on its leaf can also be running, outside
+// the gate (Cursor.readsPinnedLeaf). Such a leaf is lent: its buffer
+// returned to the pool or to the slab now would be another database's
+// while its borrower reads it.
 //
 // So the leaves the transaction's cursors pin are taken out of the cache
 // first, untouched: neither the page nor the cursor that pins it is written
@@ -4167,7 +4167,7 @@ func (p *pager) destroyEndedWriterCache() {
 			lent[pg] = l
 		}
 		// The link is the list's; linked is the cursor's own flag, which a
-		// Key running outside the gate reads.
+		// call running outside the gate reads.
 		next := c.nextCursor
 		c.nextCursor = nil
 		c = next

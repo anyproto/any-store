@@ -3629,14 +3629,14 @@ func (c *Cursor) enterGate() error {
 	return err
 }
 
-// readsPinnedLeaf reports whether a Key or a Value of this write
+// readsPinnedLeaf reports whether a read or an in-leaf step of this write
 // transaction's cursor can run outside the writer gate: the cursor is on the
 // writer's list and stands on an entry, so what the call reads is the leaf
 // the cursor pins, and Close has not ended the transaction. Such a call
-// makes no call into the pager unless the entry has an overflow chain, for
-// which it goes back through the gate. Close can come while it runs, and
-// finds no call in flight; that is safe because the pager keeps back the
-// leaf of every cursor on the list when it disposes of the cache
+// makes no call into the pager; one that needs more than that leaf, an
+// overflow chain or a step off it, takes the gate. Close can come while it
+// runs, and finds no call in flight; that is safe because the pager keeps
+// back the leaf of every cursor on the list when it disposes of the cache
 // (destroyEndedWriterCache), for the slices earlier calls returned, and
 // writes neither that page nor the cursor. The call then completes on the
 // leaf as the transaction left it, as a call in flight does. A cursor that
@@ -3658,10 +3658,10 @@ func (c *Cursor) leaveGate() {
 // on itself meanwhile does. The gate's defer lives here, a panic in a b-tree
 // operation must not leave the call counted, and so the cursor's methods
 // themselves have none: a read transaction's cursor, which never comes
-// here, runs them as it would without the gate. Next, Key and Value, the
-// calls of a scan, have their own; the others share one per signature. Key
-// and Value come here only when they have more to do than read the pinned
-// leaf (readsPinnedLeaf).
+// here, runs them as it would without the gate. The calls of a scan have
+// their own; the others share one per signature. The reads and in-leaf
+// steps of a positioned cursor come here only when they need more than the
+// pinned leaf (readsPinnedLeaf).
 
 func (c *Cursor) gatedMove(move func(*Cursor) error) error {
 	if err := c.enterGate(); err != nil {
@@ -3679,6 +3679,15 @@ func (c *Cursor) gatedNext() error {
 	}
 	defer c.leaveGate()
 	return c.Next()
+}
+
+func (c *Cursor) gatedPrevious() error {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return err
+	}
+	defer c.leaveGate()
+	return c.Previous()
 }
 
 func (c *Cursor) gatedSeek(seek func(*Cursor, []byte) error, key []byte) error {
@@ -4441,7 +4450,7 @@ func (c *Cursor) Value() ([]byte, error) {
 // For overflow values, reads directly into buf with no intermediate allocation,
 // matching SQLite's accessPayload() offset approach.
 func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
-	if c.bt.writable && !c.gated {
+	if c.bt.writable && !c.gated && !c.readsPinnedLeaf() {
 		return c.gatedAppendValue(buf)
 	}
 	if err := c.restored(); err != nil {
@@ -4467,6 +4476,11 @@ func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
 	}
 
 	if cell.overflowPg != 0 {
+		// The overflow chain is read through the pager: a call of the
+		// write transaction (readsPinnedLeaf). buf is untouched so far.
+		if c.bt.writable && !c.gated {
+			return c.gatedAppendValue(buf)
+		}
 		pos := int(off)
 		keyLen, kn, verr := getVarintSafe(frame.pg.data[pos:])
 		if verr != nil {
@@ -4520,6 +4534,18 @@ func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
 // DRIFT: B+tree (leaf-only keys) drops interior-cell positions that SQLite B-tree visits See docs/btree/NOTES.md#drift-14-b-plus-tree-traversal-drops-interior-cell-keys-versus-sqlite
 func (c *Cursor) Next() error {
 	if c.bt.writable && !c.gated {
+		// A step within the pinned leaf moves the cursor's index on that
+		// leaf and reads nothing else, so it runs outside the gate, as a
+		// Key does (readsPinnedLeaf); a step off the leaf takes the gate.
+		// sqlite3BtreeNext splits the same way: it steps pCur->ix within a
+		// leaf itself and leaves the rest to btreeNext (btree.c:6376-6384).
+		if c.readsPinnedLeaf() && len(c.stack) > 0 {
+			frame := &c.stack[len(c.stack)-1]
+			if frame.pg != nil && frame.cellIdx+1 < int(frame.pg.header.cellCount) {
+				frame.cellIdx++
+				return nil
+			}
+		}
 		return c.gatedNext()
 	}
 	if c.state != cursorValid {
@@ -4636,7 +4662,16 @@ func (c *Cursor) Next() error {
 // leaf.
 func (c *Cursor) Previous() error {
 	if c.bt.writable && !c.gated {
-		return c.gatedMove((*Cursor).Previous)
+		// A step within the pinned leaf runs outside the gate, as in Next
+		// (sqlite3BtreePrevious, btree.c:6466-6473).
+		if c.readsPinnedLeaf() && len(c.stack) > 0 {
+			frame := &c.stack[len(c.stack)-1]
+			if frame.pg != nil && frame.cellIdx > 0 {
+				frame.cellIdx--
+				return nil
+			}
+		}
+		return c.gatedPrevious()
 	}
 	if c.state != cursorValid {
 		if err := c.restored(); err != nil {
