@@ -1189,9 +1189,10 @@ Two mechanisms coexist in the implementation, each solving a distinct problem:
    one (`walIndexRecover` zeroes the header and sets `nPage` from a commit frame,
    wal.c:1408, 1512) and a WAL reset keeps it, so a non-zero size is a commit's
    in every mode, and an in-process reader without one takes the file's. An
-   in-memory database has no file; it is without a committed size only before
-   its first commit, when it is the one page creation wrote (`newDatabase`
-   sets `nPage = 1`, btree.c:3540-3541), and its readers take 1. No reader
+   in-memory database has no file; it is without a committed size until a WAL
+   commit frame records one (a commit that writes no frame records none), and
+   until then it is the one page creation wrote (`newDatabase` sets
+   `nPage = 1`, btree.c:3540-3541), so its readers take 1. No reader
    there uses `pager.dbSize` either
    (until 2026-11-12 they did, and a reader of the committed snapshot failed on
    its pages above an uncommitted shrink). Until 2026-11-11 the
