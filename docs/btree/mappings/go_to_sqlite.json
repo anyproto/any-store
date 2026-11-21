@@ -1863,7 +1863,7 @@
   },
   "pager.go:*pager.downgradeDBLock": {
     "sqlite": [],
-    "note": "exclusive to shared after a creation; a flock conversion can be refused, so it waits with a count of its own"
+    "note": "exclusive to shared in the open; a flock conversion can be refused, so it waits with a count of its own"
   },
   "pager.go:*pager.encryptPage": {
     "sqlite": [],
