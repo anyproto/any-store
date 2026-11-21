@@ -176,8 +176,9 @@ func (a *Arena) NewBool(v bool) *Value {
 // come from a parser or arena that is reused afterwards. Every value is
 // copied as it is, a key "\x1f" or a -0 number included, and nesting has no
 // depth limit; an object's entries are copied in order without Set's search
-// for an existing key, so the copy takes time linear in the size of v. A nil
-// v returns nil.
+// for an existing key, so the copy takes time linear in the size of v. A
+// true, false or null copies to the value NewTrue, NewFalse or NewNull
+// returns, whatever storage v itself is in. A nil v returns nil.
 //
 // The returned value is valid until Reset is called on a.
 func (a *Arena) Copy(v *Value) *Value {
@@ -185,8 +186,12 @@ func (a *Arena) Copy(v *Value) *Value {
 		return nil
 	}
 	switch v.t {
-	case TypeNull, TypeTrue, TypeFalse:
-		return v // the shared, immutable singletons
+	case TypeNull:
+		return valueNull
+	case TypeTrue:
+		return valueTrue
+	case TypeFalse:
+		return valueFalse
 	}
 	c := a.c.getValue()
 	c.t = v.t

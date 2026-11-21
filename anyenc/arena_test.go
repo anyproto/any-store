@@ -154,3 +154,22 @@ func TestArena_Copy(t *testing.T) {
 	clear(buf)
 	assert.Equal(t, parsed, pc.String())
 }
+
+// A true, false or null in storage the caller owns copies to a value of the
+// arena's, so a later change to that storage does not reach the copy.
+func TestArena_CopyScalarTheCallerOwns(t *testing.T) {
+	a := &Arena{}
+	for _, tc := range []struct {
+		from, to *Value
+	}{
+		{a.NewTrue(), a.NewFalse()},
+		{a.NewFalse(), a.NewNull()},
+		{a.NewNull(), a.NewTrue()},
+	} {
+		v := *tc.from
+		c := a.Copy(&v)
+		v = *tc.to
+		assert.Equal(t, tc.from.Type(), c.Type())
+		assert.NotSame(t, &v, c)
+	}
+}
