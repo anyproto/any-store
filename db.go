@@ -1130,9 +1130,18 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 	return
 }
 
+// testQuickCheckReadHook, when set, is called inside the quick check's read
+// transaction; an error from it is the check's failure.
+var testQuickCheckReadHook func() error
+
 func (db *db) QuickCheck(ctx context.Context) (err error) {
 	// btree doesn't have a built-in quick check, just verify we can read
 	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		if f := testQuickCheckReadHook; f != nil {
+			if err := f(); err != nil {
+				return err
+			}
+		}
 		cursor := tx.NewCursor(db.systemNS)
 		defer cursor.Close()
 		if err := cursor.First(); err != nil {

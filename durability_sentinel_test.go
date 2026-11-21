@@ -56,6 +56,13 @@ func sentinelPeer(t *testing.T) bool {
 	case "write-and-close": // commits once and closes while the parent is attached
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"peer-1"}`)))
 		require.NoError(t, d.Close())
+	case "commit-twice-then-wait": // commits, waits for the parent's close, commits again, waits to be killed
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"peer-1"}`)))
+		require.NoError(t, os.WriteFile(path+".peer-ready", nil, 0o644))
+		sentinelWaitFile(t, path+".peer-go")
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"peer-2"}`)))
+		require.NoError(t, os.WriteFile(path+".peer-done", nil, 0o644))
+		time.Sleep(time.Hour) // killed by the parent
 	default:
 		t.Fatalf("unknown mode %q", mode)
 	}
@@ -69,6 +76,92 @@ func startSentinelPeer(t *testing.T, testName, path, mode string) *exec.Cmd {
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	require.NoError(t, cmd.Start())
 	return cmd
+}
+
+// A Close while another process has the database open runs no checkpoint and
+// leaves the sentinel, so when the remaining process is killed with SIGKILL
+// the next open runs the quick check.
+func TestDurabilitySentinel_CloseThatIsNotTheLastKeepsIt(t *testing.T) {
+	if sentinelPeer(t) {
+		return
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.db")
+	marker := path + ".lock"
+
+	first, err := Open(ctx, path, sentinelConfig())
+	require.NoError(t, err)
+	coll, err := first.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"first-1"}`)))
+	_, err = os.Stat(marker)
+	require.NoError(t, err, "setup: a write sets the sentinel")
+
+	// The second handle, in another process, has committed too: both
+	// processes know the sentinel as set.
+	peer := startSentinelPeer(t, "TestDurabilitySentinel_CloseThatIsNotTheLastKeepsIt", path, "commit-twice-then-wait")
+	killed := false
+	kill := func() {
+		if !killed {
+			killed = true
+			_ = peer.Process.Kill()
+			_ = peer.Wait()
+		}
+	}
+	defer kill()
+	sentinelWaitFile(t, path+".peer-ready")
+
+	// The close that is not the last: no checkpoint, the sentinel stays.
+	require.NoError(t, first.Close())
+	_, err = os.Stat(marker)
+	require.NoError(t, err, "a close with another process attached cleared the sentinel")
+
+	// The other handle commits and its process is killed.
+	require.NoError(t, os.WriteFile(path+".peer-go", nil, 0o644))
+	sentinelWaitFile(t, path+".peer-done")
+	kill()
+
+	// The next open finds the sentinel and runs the quick check: a failure
+	// injected into the check's read fails the open with ErrQuickCheckFailed.
+	errInjected := errors.New("injected failure of the quick check's read")
+	testQuickCheckReadHook = func() error { return errInjected }
+	t.Cleanup(func() { testQuickCheckReadHook = nil })
+	failed, err := Open(ctx, path, sentinelConfig())
+	testQuickCheckReadHook = nil
+	if err == nil {
+		_ = failed.Close()
+	}
+	require.ErrorIs(t, err, ErrQuickCheckFailed, "the open after a killed process ran no quick check")
+	require.ErrorIs(t, err, errInjected)
+	_, err = os.Stat(marker)
+	require.NoError(t, err, "an open whose quick check failed cleared the sentinel")
+
+	// Without the failure the check passes.
+	next, err := Open(ctx, path, sentinelConfig())
+	require.NoError(t, err)
+	stats, err := next.Stats(ctx)
+	require.NoError(t, err)
+	require.True(t, stats.DirtyOnOpen)
+	coll, err = next.OpenCollection(ctx, "c")
+	require.NoError(t, err)
+	n, err := coll.Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 3, n, "the commits of both processes")
+
+	// This close is the last and checkpoints: it clears the sentinel.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"next-1"}`)))
+	_, err = os.Stat(marker)
+	require.NoError(t, err, "setup: a write sets the sentinel")
+	require.NoError(t, next.Close())
+	_, err = os.Stat(marker)
+	require.True(t, os.IsNotExist(err), "the last close, which checkpointed, left the sentinel: %v", err)
+
+	clean, err := Open(ctx, path, sentinelConfig())
+	require.NoError(t, err)
+	stats, err = clean.Stats(ctx)
+	require.NoError(t, err)
+	require.False(t, stats.DirtyOnOpen)
+	require.NoError(t, clean.Close())
 }
 
 // The last close removes a marker another process created, although this
