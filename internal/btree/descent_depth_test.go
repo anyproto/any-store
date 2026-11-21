@@ -579,11 +579,12 @@ func TestDescentDepthBound_SeekKeyNextSubtreeDepth(t *testing.T) {
 }
 
 // TestDescentDepthBound_RootSplitAtMaxDepth: an insert whose split reaches
-// the root makes the tree a level deeper. On a tree of btCursorMaxDepth-1
-// levels that gives the deepest tree the descents read. On one of
-// btCursorMaxDepth levels it would give a tree whose leaves no descent
-// reaches, by a write that reported success: the root split is refused with
-// ErrCorrupt and the transaction rolls back to the tree as it was.
+// the root makes the tree a level deeper with no look at its height, as
+// SQLite's balance calls balance_deeper (btree.c:9134-9145). On a tree of
+// btCursorMaxDepth-1 levels that gives the deepest tree the descents read. On
+// one of btCursorMaxDepth levels the Put returns nil and leaves leaves no
+// descent reaches: the next lookup of a key on them is ErrCorrupt, as
+// moveToChild's test makes it in SQLite (btree.c:5448-5450).
 func TestDescentDepthBound_RootSplitAtMaxDepth(t *testing.T) {
 	// 200-byte keys: four cells fill a 1024-byte page, leaf or interior.
 	bigKey := func(class, i byte) []byte {
@@ -687,28 +688,24 @@ func TestDescentDepthBound_RootSplitAtMaxDepth(t *testing.T) {
 		readAll(t, db, ns, keys)
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
-		err = tx.Put(ns, newKey, nil)
-		if err == nil {
-			// The write went through: show what it left.
-			require.NoError(t, tx.Commit())
-			rtx, rerr := db.BeginRead()
-			require.NoError(t, rerr)
-			_, gerr := rtx.Get(ns, newKey)
-			_ = rtx.Rollback()
-			t.Fatalf("Put deepened a tree of %d levels and returned nil; Get of the key it wrote: %v", btCursorMaxDepth, gerr)
-		}
-		require.ErrorIs(t, err, ErrCorrupt)
-		require.NoError(t, tx.Rollback())
-		readAll(t, db, ns, keys)
+		rootBefore := firstChild(t, tx.pager, ns.rootPage, 0)
+		require.NoError(t, tx.Put(ns, newKey, nil))
+		require.NoError(t, tx.Commit())
+		require.NotEqual(t, rootBefore, firstChild(t, db.pager, ns.rootPage, 0), "the insert did not split the root")
+		// Every key sat on a leaf at level btCursorMaxDepth; the split moved
+		// each one level down, one step past the bound.
 		rtx, err := db.BeginRead()
 		require.NoError(t, err)
-		_, err = rtx.Get(ns, newKey)
-		require.ErrorIs(t, err, ErrKeyNotFound)
-		// The fixture is not a balanced tree, so the integrity check has
-		// nothing to say about it; the entry count has.
-		n, err := rtx.Count(ns)
-		require.NoError(t, err)
-		require.Equal(t, len(keys), n)
+		defer func() { _ = rtx.Rollback() }()
+		for _, k := range append(keys, newKey) {
+			_, err := rtx.Get(ns, k)
+			require.ErrorIs(t, err, ErrCorrupt, "key %x %x", k[0], k[1])
+		}
+		_, err = rtx.SeekKey(ns, newKey)
+		require.ErrorIs(t, err, ErrCorrupt)
+		c := rtx.NewCursor(ns)
+		require.ErrorIs(t, c.Seek(newKey), ErrCorrupt)
+		c.Close()
 		require.NoError(t, rtx.Rollback())
 		closesWithin(t, db)
 	})
