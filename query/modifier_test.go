@@ -607,6 +607,10 @@ func BenchmarkModifier(b *testing.B) {
 	b.Run("add to set", func(b *testing.B) {
 		bench(b, `{"$addToSet":{"b":[1,2,5]}}`)
 	})
+	b.Run("set past the padding limit", func(b *testing.B) {
+		// An object key past the limit: the modifier is staged.
+		bench(b, `{"$set":{"m.1500001":1}}`)
+	})
 }
 
 // $pull with a condition uses query semantics: ordering ops are type-bracketed,
