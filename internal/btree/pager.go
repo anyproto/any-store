@@ -3110,10 +3110,10 @@ func (p *pager) rollbackLocked() error {
 // state (the cache, hasContent, header, savepoints, WAL checksums) is left
 // untouched. DB.Close calls it with the writer gate closed and no call of
 // the transaction in flight (writerGate), so nothing reads that state
-// concurrently any more; it is left alone all the same, because the
-// database is closing and pager.close disposes of it
-// (destroyEndedWriterCache), and because the tests of the spill guard run
-// this from inside an operation.
+// concurrently any more; it is left alone all the same, because the tests
+// of the spill guard run this from inside an operation. The database is
+// closing: pager.close releases the cache (destroyEndedWriterCache) and the
+// savepoints, and the rest goes with the pager.
 // Caller must hold writerOpMu; it takes the WAL mutex inside it, the order
 // a commit's writeFrames takes them in.
 // DRIFT: ends the write transaction under the WAL mutex and marks the WAL (writeEndedByClose) for a writer still running; C cannot close under a statement See docs/btree/NOTES.md#drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer
@@ -3150,8 +3150,9 @@ func (p *pager) rollbackForClose() {
 
 	// Skip hasContent, header, savepoints, and WAL
 	// checksum restoration — all are writer-owned, non-atomic state that
-	// the writer goroutine may be reading concurrently. Touching them
-	// here would be a data race. None of it matters after Close().
+	// a writer goroutine still inside an operation would be reading (the
+	// spill guard's tests run this from there). pager.close releases the
+	// savepoints; the rest does not matter after Close().
 
 	p.state.Store(int32(pagerOpen))
 	w.endWrite()
@@ -4057,6 +4058,16 @@ func (p *pager) close() error {
 	} else {
 		p.writerCache.destroy()
 	}
+	// The savepoints go with the pager, as sqlite3PagerClose releases them
+	// (pager_unlock, releaseAllSavepoints, pager.c:1850; asserted gone at
+	// 4228): after a Close that ended a write transaction they hold its
+	// page images. So does the last commit's page list, which would keep a
+	// lent leaf (destroyEndedWriterCache) reachable from the closed handle
+	// after its cursor; SQLite's dirty list is the page cache's, freed with
+	// it (sqlite3PcacheClose, pager.c:4227).
+	p.freeSavepointPageBuffers(0, len(p.savepoints))
+	p.savepoints = nil
+	p.dirtyBuf = nil
 
 	// Tear down the mmap reader before closing the file so the fd
 	// remains valid during munmap. Matches SQLite's unixUnmapfile
