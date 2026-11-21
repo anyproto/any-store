@@ -88,7 +88,8 @@ type pager struct {
 	header      dbHeader
 	pageSize    uint32
 	path        string
-	usableSize_ int // pageSize - ReservedSpace; immutable after open, safe for concurrent reads
+	dir         string // the directory dirSync syncs, resolved by open (databaseDir)
+	usableSize_ int    // pageSize - ReservedSpace; immutable after open, safe for concurrent reads
 	// tableLeaf is the file's leaf-cell rule: set, leaf cells use the table-leaf
 	// payload limit (schema format 6 and later); clear, the index rule. Fixed by
 	// the header at open (setLeafRule); atomic because a backup into this
@@ -526,6 +527,12 @@ func (p *pager) open() (err error) {
 		h(p, "before-lock")
 	}
 
+	// The directory the journal's and the WAL's first syncs sync, resolved
+	// once, before any file is created.
+	if p.dir, err = databaseDir(p.path); err != nil {
+		return err
+	}
+
 	f, err := osOpenFile(p.path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		if herr := p.headerErrorOfUnwritableFile(); herr != nil {
@@ -773,6 +780,7 @@ func (p *pager) open() (err error) {
 
 	// Open WAL
 	p.wal = newWal(p.path+"-wal", p.pageSize)
+	p.wal.dir = p.dir
 	p.wal.inProcess = p.inProcess
 	p.wal.noCommitSync = p.noCommitSync
 	p.wal.inMemory = p.inMemory

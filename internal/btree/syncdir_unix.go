@@ -25,17 +25,16 @@ type dirSync struct {
 	dir string
 }
 
-// set marks the file, opened as path, as opened with the create flag. The
-// directory is taken from the path as it resolves now, as SQLite builds a
-// database's file names from the full pathname it resolves at open
-// (sqlite3OsFullPathname, pager.c:4792) and unixSync derives the directory
-// from that name (os_unix.c:3944): a working directory that changes later
-// does not change which directory is synced.
-func (d *dirSync) set(path string) {
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
+// set marks the file, opened as path, as opened with the create flag. dir
+// is the directory to sync: the database's, resolved when it was opened
+// (databaseDir), as unixSync takes it from the full pathname the file was
+// opened by (os_unix.c:3944). A file opened outside a pager (tests) has none,
+// and path's directory is synced.
+func (d *dirSync) set(path, dir string) {
+	if dir == "" {
+		dir = filepath.Dir(path)
 	}
-	d.dir = filepath.Dir(path)
+	d.dir = dir
 	d.pending.Store(true)
 }
 

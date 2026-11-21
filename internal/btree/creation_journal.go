@@ -205,7 +205,7 @@ func (p *pager) openCreationJournal() (*creationJournal, error) {
 		return nil, fmt.Errorf("btree: open the creation journal: %w", err)
 	}
 	j := &creationJournal{f: f, name: name}
-	j.dirSync.set(name)
+	j.dirSync.set(name, p.dir)
 	if h := testOpenStageHook; h != nil {
 		h(p, "journal-opened")
 	}

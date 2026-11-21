@@ -9,7 +9,7 @@ package btree
 type dirSync struct{}
 
 // set does nothing.
-func (*dirSync) set(string) {}
+func (*dirSync) set(string, string) {}
 
 // sync syncs f.
 func (*dirSync) sync(f fileHandle) error { return fdatasync(f) }
