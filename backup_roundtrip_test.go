@@ -9,6 +9,8 @@ package anystore_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -95,15 +97,26 @@ func fillRoundTrip(t *testing.T, db anystore.DB, from, n int) map[string]string 
 	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"n"}}))
 	want := make(map[string]string, n)
 	for i := from; i < from+n; i++ {
-		pad := 300
+		pad := fmt.Sprintf("%0300d", i)
 		if i%50 == 7 {
-			pad = 9000 // an overflow chain
+			pad = incompressible(i, 9000) // an overflow chain, also compressed
 		}
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":"d%05d","n":%d,"pad":"%0*d"}`, i, i, pad, i))
+		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":"d%05d","n":%d,"pad":"%s"}`, i, i, pad))
 		require.NoError(t, coll.Insert(ctx, doc))
 		want[fmt.Sprintf("d%05d", i)] = doc.String()
 	}
 	return want
+}
+
+// incompressible returns n base64 characters that compression cannot shorten,
+// the same for the same seed.
+func incompressible(seed, n int) string {
+	var b []byte
+	for c := 0; len(b) < n; c++ {
+		sum := sha256.Sum256(fmt.Appendf(nil, "%d/%d", seed, c))
+		b = base64.StdEncoding.AppendEncode(b, sum[:])
+	}
+	return string(b[:n])
 }
 
 // requireCopy opens the database at path with conf and requires that it is

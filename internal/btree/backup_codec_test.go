@@ -358,18 +358,19 @@ func TestBackupDestinationOptions_FollowTheFile(t *testing.T) {
 			require.Equal(t, tc.wantReservedLen, h.ReservedSpace)
 			if tc.wantMode != IntegrityAEAD {
 				// Without encryption the copy is the source's pages, byte for
-				// byte, the trailers included; page 1 past its header too (the
-				// header has the copy's own schema cookie).
+				// byte, the trailers included; page 1 past its header too,
+				// to its last byte (the header has the copy's own schema
+				// cookie and is not covered by page 1's trailer, which hashes
+				// bytes 100 on).
 				srcData, err := os.ReadFile(srcPath)
 				require.NoError(t, err)
 				dstData, err := os.ReadFile(dstPath)
 				require.NoError(t, err)
 				require.Equal(t, len(srcData), len(dstData))
-				usable := int(h.PageSize) - int(cksumOverhead) // a trailer covers the header
 				for off := 0; off < len(srcData); off += int(h.PageSize) {
 					from, to := off, off+int(h.PageSize)
 					if off == 0 {
-						from, to = dbHeaderSize, usable
+						from = dbHeaderSize
 					}
 					require.True(t, string(srcData[from:to]) == string(dstData[from:to]), "page %d differs", off/int(h.PageSize)+1)
 				}
