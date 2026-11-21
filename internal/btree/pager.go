@@ -355,8 +355,9 @@ type pager struct {
 	// without encryption and in memory. It is part of the key setup, as
 	// SQLCipher's ctx->kdf_salt is, which is read once from the main file
 	// (sqlcipher.c:1392-1409): every write of page 1 carries it
-	// (encryptPageWithCodec, also in the WAL, which gets a copy), and no
-	// image of page 1 sets it (adoptHeader).
+	// (encryptPageWithCodec, also in the WAL, which gets a copy, and the
+	// WAL's checkpoint into the main file), and no image of page 1 sets it
+	// (adoptHeader).
 	keySalt [SaltLen]byte
 	// codecScratch is a reusable page-sized scratch buffer used on the
 	// writer side (initNewDB, getPageWriter, wal.writeFrame) to hold
@@ -2517,9 +2518,10 @@ func (p *pager) refreshHeaderFromPage1() error {
 // one the codec was keyed with. A page image can name another salt (one a
 // backup copied from its source before the destination kept its own, still
 // in a WAL that was never checkpointed); the pages are sealed with the
-// keyed salt's key whatever page 1 says, and the next write of page 1
-// writes that salt back. SQLCipher reads its salt once, from the main file,
-// and replaces it with the magic in every decrypted page 1
+// keyed salt's key whatever page 1 says, and every write of page 1, the
+// checkpoint's copy into the main file included, writes that salt. SQLCipher
+// reads its salt once, from the main file, and replaces it with the magic
+// in every decrypted page 1
 // (sqlcipher.c:1392-1409, 3271), so no image of page 1 reaches its key.
 // DRIFT: page 1's salt bytes are not read from a page image; SQLite's header has no KDF salt. See docs/btree/NOTES.md#drift-2026-11-21-19-the-kdf-salt-belongs-to-the-key-setup-not-to-page-1
 func (p *pager) adoptHeader(h dbHeader) {

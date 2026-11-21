@@ -1647,7 +1647,8 @@ type wal struct {
 	// the pager with codec; readFramePage passes it to every Decrypt.
 	onIntegrityError integrityHook
 	// keySalt is the pager's keySalt, propagated with codec: the KDF salt
-	// every frame of page 1 carries (encryptPageWithCodec).
+	// every frame of page 1 this WAL writes carries (encryptPageWithCodec),
+	// and page 1 as the checkpoint copies it into the main file.
 	keySalt [SaltLen]byte
 	// codecScratch is a page-sized scratch used by writeFrame to hold
 	// ciphertext. Allocated lazily on first use. Writes are
@@ -4387,7 +4388,8 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			// nonce — and (b) WAL ciphertext and DB-file ciphertext share
 			// codec, key, and layout. See any-store-tests:docs/any-store/btree/plans/encryption-plan.md Task 8.
 			// Matches SQLCipher wal.c:2309-2315 (OsRead → OsWrite with no
-			// codec hook between them).
+			// codec hook between them), except for the KDF salt in page 1's
+			// header, below.
 			// END ENCRYPTION
 			for _, pgno := range pgnos {
 				// Skip orphan frames past the committed DB size (iDbpage>mxPage,
@@ -4407,6 +4409,20 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 				if n != len(pageData) {
 					backfillErr = io.ErrUnexpectedEOF
 					break
+				}
+				// Page 1 reaches the main file with the keyed salt, as every
+				// write of page 1 does (encryptPageWithCodec), whatever its
+				// frame names: a frame of page 1 written before every write
+				// carried the keyed salt can name another (a backup's copy of
+				// its source's), and the next Open derives its key from the
+				// main file's salt. Bytes 72-87 are in the plaintext header,
+				// which the AEAD does not cover (drift-2026-06-25-14), so the
+				// page stays valid. In SQLCipher every frame of page 1 carries
+				// the ctx's salt already (sqlcipher.c:3312), so its verbatim
+				// copy needs no such step.
+				// DRIFT: the checkpoint writes the keyed KDF salt over page 1's salt bytes; SQLite copies every frame verbatim. See docs/btree/NOTES.md#drift-2026-11-21-19-the-kdf-salt-belongs-to-the-key-setup-not-to-page-1
+				if pgno == 1 && w.keySalt != ([SaltLen]byte{}) {
+					copy(pageData[dbHeaderSaltOff:dbHeaderSaltOff+SaltLen], w.keySalt[:])
 				}
 				pageOffset := int64(pgno-1) * pageSz
 				n, err = dbFile.WriteAt(pageData, pageOffset)

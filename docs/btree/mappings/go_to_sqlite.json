@@ -2496,7 +2496,7 @@
       "wal.c:walIteratorNext",
       "wal.c:walMergesort"
     ],
-    "note": "includes the salt re-check after read lock 0 (version-3.52.0 wal.c:2256-2267)"
+    "note": "includes the salt re-check after read lock 0 (version-3.52.0 wal.c:2256-2267); copies frames verbatim as walCheckpoint does (wal.c:2311-2315), except that page 1 reaches the main file with the keyed KDF salt (drift-2026-11-21-19)"
   },
   "wal.go:*wal.close": {
     "sqlite": [
