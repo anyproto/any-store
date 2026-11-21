@@ -1874,7 +1874,7 @@
     "sqlite": [
       "pager.c:pager_error"
     ],
-    "note": "a failed commit's end: the state and the cleanup at once, errCode left nil. SQLite's failed WAL commit never enters PAGER_ERROR: pagerWalFrames returns the error (pager.c:6512, 3219-3236) and the transaction is rolled back as any other (sqlite3PagerRollback, pager.c:6779-6782). A failed spill only records the error (pagerStress, pager.errCode) and rollbackLocked cleans up"
+    "note": "a failed commit's end: the state and the cleanup at once. errCode is nil when the commit's frame write fails; when its fetch of page 1 meets a failed spill, pagerStress has set errCode already, and pagerError trips the cursors with it and clears it. SQLite's failed WAL commit never enters PAGER_ERROR: pagerWalFrames returns the error (pager.c:6512, 3219-3236) and the transaction is rolled back as any other (sqlite3PagerRollback, pager.c:6779-6782). A failed spill only records the error (pagerStress, pager.errCode) and rollbackLocked cleans up"
   },
   "pager.go:*pager.pagerPageCount": {
     "sqlite": [
