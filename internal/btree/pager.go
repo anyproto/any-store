@@ -644,25 +644,30 @@ func (p *pager) open() (err error) {
 		}
 	}
 
-	info, err := f.Stat()
-	if err != nil {
-		return err
-	}
-
+	// The file holds no database a process may use while it is empty or a
+	// dead creator's journal is hot beside it. The hot-journal test comes
+	// right after the lock, as in sqlite3PagerSharedLock (pager.c:5281-5282),
+	// before anything in the file is trusted. Then a database is created
+	// under the exclusive DB-file lock, or another process is found to have
+	// created one; either way the file holds a committed page 1 afterwards
+	// and the open goes on as for any existing database, under the lock it
+	// keeps. A lost creation is looked at again under the shared lock: its
+	// creator may have died before its commit point.
 	created := false
-	if info.Size() == 0 {
-		// No database in the file. Create one under the exclusive DB-file
-		// lock, or find that another process has; either way the file holds
-		// page 1 afterwards and the open goes on as for any existing
-		// database, under the lock it keeps.
+	var info os.FileInfo
+	for {
+		var pending bool
+		if info, pending, err = p.creationPending(f); err != nil {
+			return err
+		}
+		if !pending {
+			break
+		}
+		if created {
+			return fmt.Errorf("btree: database file is still empty after page 1 was written")
+		}
 		if created, err = p.createIfEmpty(f); err != nil {
 			return err
-		}
-		if info, err = f.Stat(); err != nil {
-			return err
-		}
-		if info.Size() == 0 {
-			return fmt.Errorf("btree: database file is still empty after page 1 was written")
 		}
 	}
 
@@ -896,10 +901,14 @@ func (p *pager) readPage1AtOpen() error {
 var testOpenAfterWALOpenHook func(p *pager)
 
 // testOpenStageHook runs at named points of a file-backed open, so a test
-// can hold one process there while another runs: "before-lock" (nothing
-// opened or locked yet; Open has made its first, unlocked read of the header)
-// and "before-page1-write" (this open is about to write page 1 of a new
-// database). Nil outside tests.
+// can hold or kill a process there: "before-lock" (nothing opened or locked
+// yet; Open has made its first, unlocked read of the header), and the points
+// of a creation in order: "journal-playback" (a dead creator's file is about
+// to be truncated), "journal-created" (the journal is an empty file),
+// "before-journal-sync" (its header is written), "before-page1-write" (the
+// journal and its directory are synced), "before-page1-sync",
+// "before-journal-finalize" (page 1 is synced) and "journal-finalized" (the
+// creation is committed, the journal not yet deleted). Nil outside tests.
 var testOpenStageHook func(p *pager, stage string)
 
 // BEGIN ENCRYPTION
@@ -995,12 +1004,14 @@ func (p *pager) lockDBShared(f fileHandle) error {
 	}
 }
 
-// createIfEmpty turns a file of zero bytes into a database of one page,
-// unless another process does it first. The caller holds the DB-file lock
-// (shared in multi-process mode, exclusive in in-process mode) and has seen
-// the file empty. On return the file holds page 1, written and synced by
-// this open (created is true) or by another process, and the caller's lock
-// is held again.
+// createIfEmpty turns a file whose creation is pending (creationPending: it
+// is empty, or a dead creator's journal is hot beside it) into a database of
+// one page, unless another process does it first. The caller holds the
+// DB-file lock (shared in multi-process mode, exclusive in in-process mode)
+// and has seen the creation pending. On return with created set, this open
+// has written page 1, synced it and committed the creation; with created
+// clear, a look made without a lock found another process's database, and
+// the caller looks again. Either way the caller's lock is held again.
 //
 // The decision "new database" and the write of page 1 are one step under the
 // exclusive DB-file lock, which no process attached to the database can hold
@@ -1010,12 +1021,15 @@ func (p *pager) lockDBShared(f fileHandle) error {
 // sqlite3BtreeSetVersion, btree.c:11489, and newDatabase, btree.c:3506), and
 // never opens a WAL on a file of zero pages.
 //
-// A WAL found beside the empty file belongs to a database that is gone: it is
-// deleted before page 1 is written, as pagerOpenWalIfPresent deletes it when
-// the database has no pages (pager.c:3355-3356). Recovery would otherwise
-// apply its frames to the new database. The wal-index is left to the first
-// attacher's election, which truncates a stale one (newPlatformShm).
-// DRIFT: page 1 of a new database is written and synced in place under the exclusive DB-file lock, with no rollback journal. See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
+// A WAL found beside the empty file is deleted before page 1 is written, as
+// pagerOpenWalIfPresent deletes it when the database has no pages
+// (pager.c:3355-3356): recovery would otherwise apply its frames to the new
+// database. It is the log of a database that is gone, or of a database file
+// that was renamed or unlinked under a process still attached to it; that
+// process is not protected, here or in SQLite (docs/btree/NOTES.md, drift-63,
+// known limitations). The wal-index is left to the first attacher's
+// election, which truncates one that no process holds (newPlatformShm).
+// DRIFT: a database is created at open, under a flock, in a journaled transaction of any-store's own journal. See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
 func (p *pager) createIfEmpty(f fileHandle) (created bool, err error) {
 	// BEGIN ENCRYPTION
 	// The codec of a new file, before the exclusive lock is asked for: a key
@@ -1029,6 +1043,20 @@ func (p *pager) createIfEmpty(f fileHandle) (created bool, err error) {
 	if !p.inProcess {
 		won, err := p.lockDBForCreate(f)
 		if err != nil || !won {
+			return false, err
+		}
+	}
+	// Exclusive, and creationPending held under it: the file is empty, or
+	// it has content and a hot journal, a dead creator's page 1 that may
+	// never have been synced. That one is rolled back to an empty file
+	// first, as sqlite3PagerSharedLock plays a hot journal back under the
+	// EXCLUSIVE lock (pager.c:5308, 5356).
+	info, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	if info.Size() != 0 {
+		if err := p.playbackCreationJournal(f); err != nil {
 			return false, err
 		}
 	}
@@ -1049,19 +1077,20 @@ func (p *pager) createIfEmpty(f fileHandle) (created bool, err error) {
 	return true, nil
 }
 
-// lockDBForCreate is called with the shared DB-file lock held on an empty
-// file. It returns true holding the exclusive lock with the file still
-// empty, or false holding the shared lock once the file has content, which
-// is another process's page 1, written and synced (its creator held the
-// exclusive lock until then).
+// lockDBForCreate is called with the shared DB-file lock held on a file
+// whose creation is pending (creationPending): empty, or left with a hot
+// journal by a creator that died. It returns true holding the exclusive lock
+// with the creation still pending, or false holding the shared lock after a
+// look that found a database in the file. That look was made without a
+// lock, so the caller repeats it under the shared one.
 //
 // Processes creating one file at once all hold the shared lock at first, and
 // none of them can have the exclusive one until the others let go. So a
 // process that is refused drops its lock and waits a moment, holding
 // nothing, then looks at the file again: the next request for the exclusive
 // lock is refused only while a creator is at work or a late arrival is
-// between its shared lock and its own request. A file that stays empty and
-// locked by another process for BusyTimeout is ErrBusy.
+// between its shared lock and its own request. A creation that stays pending
+// with the file locked by another process for BusyTimeout is ErrBusy.
 func (p *pager) lockDBForCreate(f fileHandle) (bool, error) {
 	deadline := time.Now().Add(BusyTimeout)
 	for {
@@ -1070,11 +1099,11 @@ func (p *pager) lockDBForCreate(f fileHandle) (bool, error) {
 			return false, fmt.Errorf("btree: acquire DB-file exclusive lock: %w", err)
 		}
 		if ok {
-			info, err := f.Stat()
+			_, pending, err := p.creationPending(f)
 			if err != nil {
 				return false, err
 			}
-			if info.Size() == 0 {
+			if pending {
 				return true, nil
 			}
 			return false, p.lockDBShared(f)
@@ -1085,14 +1114,18 @@ func (p *pager) lockDBForCreate(f fileHandle) (bool, error) {
 			return false, fmt.Errorf("btree: release DB-file lock: %w", err)
 		}
 		if time.Now().After(deadline) {
-			return false, fmt.Errorf("%w: database file is empty and locked by another process", ErrBusy)
+			return false, fmt.Errorf("%w: database file has no database yet and is locked by another process", ErrBusy)
 		}
 		time.Sleep(time.Millisecond + rand.N(2*time.Millisecond))
-		info, err := f.Stat()
+		// An unlocked look. A creator at work shows an empty file or a hot
+		// journal until its commit point, so this goes on asking for the
+		// exclusive lock until then. The caller looks again under the
+		// shared lock.
+		_, pending, err := p.creationPending(f)
 		if err != nil {
 			return false, err
 		}
-		if info.Size() != 0 {
+		if !pending {
 			return false, p.lockDBShared(f)
 		}
 	}
@@ -1162,10 +1195,12 @@ func (p *pager) newPage1() []byte {
 	return buf
 }
 
-// createPage1 writes page 1 of a new database to the file and syncs it. The
-// caller holds the DB-file lock exclusively and has seen the file empty
-// under it (createIfEmpty). open then reads the page back as it reads any
-// existing database's.
+// createPage1 writes page 1 of a new database to the file, in a transaction
+// of the creation journal (creation_journal.go): the journal is durable
+// before page 1 is written, and the creation is committed, by the journal's
+// finalization, only after page 1 is synced. The caller holds the DB-file
+// lock exclusively and the file is empty (createIfEmpty). open then reads
+// the page back as it reads any existing database's.
 func (p *pager) createPage1() error {
 	buf := p.newPage1()
 	// BEGIN ENCRYPTION
@@ -1180,13 +1215,29 @@ func (p *pager) createPage1() error {
 		buf = ct
 	}
 	// END ENCRYPTION
+	jf, err := p.openCreationJournal()
+	if err != nil {
+		return err
+	}
 	if h := testOpenStageHook; h != nil {
 		h(p, "before-page1-write")
 	}
-	if _, err := p.file.WriteAt(buf, 0); err != nil {
+	if _, err = p.file.WriteAt(buf, 0); err == nil {
+		if h := testOpenStageHook; h != nil {
+			h(p, "before-page1-sync")
+		}
+		err = fdatasync(p.file)
+	}
+	if err != nil {
+		// The journal stays hot: whatever reached the file is rolled back
+		// by the next open.
+		_ = jf.Close()
 		return err
 	}
-	return fdatasync(p.file)
+	if h := testOpenStageHook; h != nil {
+		h(p, "before-journal-finalize")
+	}
+	return p.finalizeCreationJournal(jf)
 }
 
 // initNewDB initializes a brand new in-memory database: page 1 goes to the

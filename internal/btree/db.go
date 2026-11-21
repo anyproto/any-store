@@ -720,15 +720,28 @@ func Open(path string, opts Options) (*DB, error) {
 			return nil
 		}
 		existingHeader, herr := readInitialHeader(path)
-		if herr != nil && !errors.Is(herr, os.ErrNotExist) && !errors.Is(herr, errEmptyFile) {
-			return nil, fmt.Errorf("btree: read header: %w", herr)
+		var serr error
+		hasContent := true
+		switch {
+		case herr == nil:
+			serr = p.settleCodec(&existingHeader)
+		case errors.Is(herr, os.ErrNotExist) || errors.Is(herr, errEmptyFile):
+			hasContent = false
+			serr = p.settleCodec(nil)
+		default:
+			serr = fmt.Errorf("btree: read header: %w", herr)
 		}
-		var first *dbHeader
-		if herr == nil {
-			first = &existingHeader
+		if serr != nil && hasContent {
+			// The file has content this look refused. Beside a hot
+			// creation journal that content is a dead creator's page 1,
+			// which p.open() rolls back before it creates the database:
+			// it is no header to judge the options by.
+			if hot, jerr := p.hasHotCreationJournal(); jerr == nil && hot {
+				serr = p.settleCodec(nil)
+			}
 		}
-		if err := p.settleCodec(first); err != nil {
-			return nil, err
+		if serr != nil {
+			return nil, serr
 		}
 	} else if opts.InMemory && (wantEncryption || opts.Checksum) {
 		// InMemory: build codec from zero salt; no on-disk marker.
