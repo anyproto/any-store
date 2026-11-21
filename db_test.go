@@ -472,13 +472,17 @@ func TestOpen_AnyStoreV1File(t *testing.T) {
 	})
 
 	t.Run("v1 file the caller may only read", func(t *testing.T) {
-		if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		if runtime.GOOS == "windows" {
 			t.Skip("needs a file that opens for reading and not for writing")
 		}
 		path := filepath.Join(dir, "v1-readonly.db")
 		page := make([]byte, 4096)
 		copy(page, "SQLite format 3\x00")
 		require.NoError(t, os.WriteFile(path, page, 0o400))
+		if f, err := os.OpenFile(path, os.O_RDWR, 0); err == nil {
+			_ = f.Close()
+			t.Skip("needs a file that opens for reading and not for writing")
+		}
 
 		db, err := Open(ctx, path, nil)
 		require.ErrorIs(t, err, ErrV1Database)

@@ -532,6 +532,14 @@ func TestCreationJournal_OrderOfTheSyncs(t *testing.T) {
 			events = nil
 			return got
 		}
+		// noDirSync fails on a directory sync among got, of the files'
+		// directory or of another.
+		noDirSync := func(got []string) {
+			t.Helper()
+			for _, e := range got {
+				require.False(t, strings.HasPrefix(e, "sync-dir"), "a directory sync where none is due: %q", e)
+			}
+		}
 
 		db, err := testOpen(t, path, opts)
 		require.NoError(t, err)
@@ -563,7 +571,7 @@ func TestCreationJournal_OrderOfTheSyncs(t *testing.T) {
 		require.NoError(t, db.Checkpoint(CheckpointTruncate))
 		require.Equal(t, []string{"sync test.db-wal", "write test.db", "truncate test.db", "sync test.db"}, slices.Compact(take()))
 		createPutRow(t, db, "three")
-		require.NotContains(t, take(), "sync-dir")
+		noDirSync(take())
 		require.NoError(t, db.Close())
 		take()
 
@@ -572,11 +580,11 @@ func TestCreationJournal_OrderOfTheSyncs(t *testing.T) {
 		db, err = testOpen(t, path, opts)
 		require.NoError(t, err)
 		defer func() { _ = db.Close() }()
-		require.NotContains(t, take(), "sync-dir")
+		noDirSync(take())
 		createPutRow(t, db, "four")
 		got := take()
 		require.Equal(t, []string{"sync test.db-wal", "sync-dir"}, got[:2])
-		require.NotContains(t, got[2:], "sync-dir")
+		noDirSync(got[2:])
 	})
 }
 
