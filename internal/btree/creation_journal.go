@@ -24,7 +24,8 @@ import (
 //
 // Here the journal is <path>-journal, holds its header and nothing else, and
 // lives from createPage1's first step to its last. The steps, all under the
-// exclusive DB-file lock, after createIfEmpty has deleted a stale WAL:
+// exclusive DB-file lock, after createIfEmpty has deleted a journal and a WAL
+// it found beside the empty file:
 //
 //  1. open the journal, with the create flag, and write its header;
 //  2. sync the journal; this first sync of its descriptor also syncs the
@@ -49,7 +50,7 @@ const creationJournalHdrSize = 28
 // creationJournalMagic opens the header. It is not SQLite's aJournalMagic
 // (pager.c:757): the file is not a journal SQLite can play back, and a
 // journal SQLite wrote is never taken for one of these.
-// DRIFT: the journal has its own magic; a journal that does not carry it is left alone, where pager_playback ends at a bad magic and deletes the file. See docs/btree/NOTES.md#drift-2026-11-21-7-creation-journal
+// DRIFT: the journal has its own magic; beside a database with content, a journal that does not carry it is left alone, where pager_playback ends at a bad magic and deletes the file. See docs/btree/NOTES.md#drift-2026-11-21-7-creation-journal
 var creationJournalMagic = [8]byte{'a', 'n', 'y', 'j', 'r', 'n', 'l', 0x01}
 
 // creationJournalHdr returns the header of a creation journal: original size
@@ -73,8 +74,8 @@ func creationJournalHdr(pageSize uint32) []byte {
 //     DB-file lock exclusively for as long as its journal is live, so a
 //     caller that holds the lock at all is looking at a dead creator's.
 //   - "The database file itself is greater than 0 bytes": the caller's test.
-//     An empty file is created again, and the creation reuses a journal a
-//     creator left (openCreationJournal), where SQLite deletes it
+//     An empty file is created again, and a journal beside it is deleted
+//     first (deleteJournalOfEmptyDatabase), as SQLite deletes it
 //     (pager.c:5178-5181).
 //   - "The first byte of the journal file exists and is not 0x00".
 //
@@ -117,22 +118,19 @@ func (p *pager) creationPending(f fileHandle) (os.FileInfo, bool, error) {
 	return info, hot, err
 }
 
-// playbackCreationJournal rolls a dead creator's creation back: the file is
-// truncated to the original size its journal records, zero pages
-// (pager_truncate, called for the first journal header, pager.c:2895-2897),
-// and synced (pager_playback's sqlite3PagerSync, pager.c:2978-2981). The
-// caller holds the DB-file lock exclusively and has seen the journal hot
-// under it.
+// playbackCreationJournal rolls a dead creator's creation back, in
+// pager_playback's order: the file is truncated to the original size its
+// journal records, zero pages (pager_truncate, called for the first journal
+// header, pager.c:2895-2897), and synced (sqlite3PagerSync, pager.c:2978-2981),
+// and only then is the journal finalized, by its delete
+// (pager_end_transaction, pager.c:2982-2983, 2109). Nothing is written to the
+// journal: it lies as the dead creator synced it until the truncation is
+// durable. The caller holds the DB-file lock exclusively and has seen the
+// journal hot under it.
 //
-// The journal is not finalized here: the caller creates the database next,
-// and that creation takes the journal over as it is and deletes it only
-// after page 1 is synced. So, as in pager_playback, where the journal is
-// finalized (pager_end_transaction, pager.c:2982-2983) only after the sync,
-// the journal stays hot until a sync of the database file has made the
-// truncation, or the page 1 written over it, durable. A process killed
-// between the truncation and its sync leaves an empty file beside the hot
-// journal, and the open that creates the database there keeps that journal
-// hot until its own page 1 is synced.
+// A process killed between the truncation and its sync leaves an empty file
+// beside the hot journal; deleteJournalOfEmptyDatabase finishes that
+// playback.
 //
 // pagerSyncHotJournal (pager.c:4048) has no counterpart: the journal is hot
 // only beside a file with content, and page 1 is written only after the
@@ -144,8 +142,42 @@ func (p *pager) playbackCreationJournal(f fileHandle) error {
 	if err := f.Truncate(0); err != nil {
 		return fmt.Errorf("btree: roll back an interrupted database creation: %w", err)
 	}
+	return p.finalizeJournalOfEmptyDatabase(f)
+}
+
+// deleteJournalOfEmptyDatabase deletes whatever lies under the journal's
+// name beside a database file of zero bytes, as hasHotJournal does: "If the
+// database is zero pages in size, that means that either (1) the journal is a
+// remnant from a prior database with the same name where the database file
+// but not the journal was deleted, or (2) the initial transaction that
+// populates a new database is being rolled back. In either case, the journal
+// file can be deleted" (pager.c:5170-5181). The file is not read: a dead
+// creator's journal, SQLite's and any other file go the same way. The caller
+// holds the DB-file lock exclusively.
+func (p *pager) deleteJournalOfEmptyDatabase(f fileHandle) error {
+	jf, err := osOpenFile(p.path+creationJournalSuffix, os.O_RDONLY, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("btree: open the creation journal: %w", err)
+	}
+	_ = jf.Close()
+	return p.finalizeJournalOfEmptyDatabase(f)
+}
+
+// finalizeJournalOfEmptyDatabase syncs the database file, which is empty,
+// and then deletes the journal beside it. The sync comes first because the
+// journal may be the hot journal of a playback that was killed after its
+// truncation: until a sync covers the truncation, the disk may still hold the
+// dead creator's page 1, and the journal is what marks it.
+// DRIFT: an empty database file is synced before a journal found beside it is deleted, where hasHotJournal deletes the journal at once. See docs/btree/NOTES.md#drift-2026-11-21-7-creation-journal
+func (p *pager) finalizeJournalOfEmptyDatabase(f fileHandle) error {
 	if err := fdatasync(f); err != nil {
 		return fmt.Errorf("btree: roll back an interrupted database creation: %w", err)
+	}
+	if err := osRemove(p.path + creationJournalSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("btree: delete the journal beside an empty database file: %w", err)
 	}
 	return nil
 }
@@ -159,26 +191,13 @@ type creationJournal struct {
 	dirSync dirSync
 }
 
-// errForeignCreationJournal is the error of a creation that finds, under the
-// journal's name, a file that no creation leaves there.
-var errForeignCreationJournal = errors.New("a file that is not a creation journal is in the way of the database's creation; it is left as it is")
-
 // openCreationJournal is step 1 of the creation: the journal is open and
 // holds its header. pager_open_journal opens the journal with the create flag
 // (SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_MAIN_JOURNAL,
 // pager.c:5855-5863), which makes unixOpen set UNIXFILE_DIRSYNC on the
 // descriptor (os_unix.c:6569-6573, 6777), and writes the header
-// (writeJournalHdr, at pager.c:5910).
-//
-// The file is not truncated. A file that a creator left under the name
-// (creationJournalLeftover) is written over in place: every creation header
-// has the same magic and the same original size of zero pages, the bytes
-// that make it hot, so a hot journal stays hot through the rewrite. That may
-// be the journal of a playback that did not get as far as its sync of the
-// database file (playbackCreationJournal); it stays hot until this
-// creation's page 1 is synced. Any other file is refused: the creation fails
-// with errForeignCreationJournal and the file is left as it is.
-// DRIFT: a file under the journal's name that no creation leaves there is refused and left alone, where hasHotJournal deletes any journal beside a database of zero pages. See docs/btree/NOTES.md#drift-2026-11-21-7-creation-journal
+// (writeJournalHdr, at pager.c:5910). createIfEmpty has deleted any file that
+// lay under the name, so the open creates the journal.
 func (p *pager) openCreationJournal() (*creationJournal, error) {
 	name := p.path + creationJournalSuffix
 	f, err := osOpenFile(name, os.O_RDWR|os.O_CREATE, 0666)
@@ -190,55 +209,11 @@ func (p *pager) openCreationJournal() (*creationJournal, error) {
 	if h := testOpenStageHook; h != nil {
 		h(p, "journal-opened")
 	}
-	ours, err := creationJournalLeftover(f)
-	if err == nil && !ours {
-		err = fmt.Errorf("btree: %s: %w", name, errForeignCreationJournal)
-	}
-	if err == nil {
-		if _, err = f.WriteAt(creationJournalHdr(p.pageSize), 0); err != nil {
-			err = fmt.Errorf("btree: write the creation journal: %w", err)
-		}
-	}
-	if err != nil {
+	if _, err = f.WriteAt(creationJournalHdr(p.pageSize), 0); err != nil {
 		_ = f.Close()
-		return nil, err
+		return nil, fmt.Errorf("btree: write the creation journal: %w", err)
 	}
 	return j, nil
-}
-
-// creationJournalLeftover reports whether f holds what a creation can leave
-// under the journal's name: nothing; a creation header, whole or the start of
-// one, with or without bytes after it (hasHotCreationJournal reads such a
-// header as hot); or zeros no longer than a header, as which a header whose
-// write did not reach the disk can come back after a power loss.
-func creationJournalLeftover(f fileHandle) (bool, error) {
-	info, err := f.Stat()
-	if err != nil {
-		return false, fmt.Errorf("btree: read the creation journal: %w", err)
-	}
-	size := info.Size()
-	if size == 0 {
-		return true, nil
-	}
-	hdr := make([]byte, min(size, creationJournalHdrSize))
-	n, err := f.ReadAt(hdr, 0)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return false, fmt.Errorf("btree: read the creation journal: %w", err)
-	}
-	hdr = hdr[:n]
-	m := min(len(hdr), len(creationJournalMagic))
-	if bytes.Equal(hdr[:m], creationJournalMagic[:m]) {
-		return true, nil
-	}
-	if size > creationJournalHdrSize {
-		return false, nil
-	}
-	for _, b := range hdr {
-		if b != 0 {
-			return false, nil
-		}
-	}
-	return true, nil
 }
 
 // sync is step 2: the journal is synced before page 1 is written to the
@@ -265,12 +240,13 @@ func (j *creationJournal) abandon() {
 // creation, which then is not committed, as the delete's error is the
 // commit's there (pager.c:2109).
 //
-// The delete syncs no directory, as SQLite deletes with pPager->extraSync
-// (pager.c:2109), which is 1 only for synchronous=EXTRA (pager.c:3625-3637).
-// Until the directory is synced again the name can come back after a power
-// loss, hot, beside the committed page 1; the open after the power loss then
-// rolls the creation back and creates the database again, which loses
-// nothing, as long as nothing was committed to the database. What is
+// The delete syncs no directory, as SQLite's does not unless
+// pPager->extraSync is set (pager.c:2109), which it is not at the default
+// synchronous level. Until the directory is synced again the name can come
+// back after a power loss, hot, beside the committed page 1; the open after
+// the power loss then rolls the creation back and creates the database
+// again, which loses nothing, as long as nothing was committed to the
+// database. What is
 // committed to it goes to the WAL, and a commit is durable only after a sync
 // of the WAL, which is the first sync of some WAL descriptor or comes after
 // one. Every WAL descriptor is opened after this delete, since a creation runs

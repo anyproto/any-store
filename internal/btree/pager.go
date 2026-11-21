@@ -1029,9 +1029,9 @@ func (p *pager) lockDBShared(f fileHandle) error {
 // A WAL found beside the empty file is deleted before page 1 is written, as
 // pagerOpenWalIfPresent deletes it when the database has no pages
 // (pager.c:3355-3356): recovery would otherwise apply its frames to the new
-// database. The removal is made durable before page 1 exists by the
-// directory sync that follows the creation journal's first sync
-// (createPage1). The WAL is the log of a database that is gone, or of a
+// database. The removal, and that of a journal found there, is made durable
+// before page 1 exists by the directory sync that follows the creation
+// journal's first sync (createPage1). The WAL is the log of a database that is gone, or of a
 // database file that was renamed or unlinked under a process still attached
 // to it; that process is not protected, here or in SQLite
 // (docs/btree/NOTES.md, drift-63, known limitations). The wal-index is left
@@ -1056,17 +1056,21 @@ func (p *pager) createIfEmpty(f fileHandle) (created bool, err error) {
 	}
 	// Exclusive, and creationPending held under it: the file is empty, or
 	// it has content and a hot journal, a dead creator's page 1 that may
-	// never have been synced. That one is rolled back to an empty file
-	// first, as sqlite3PagerSharedLock plays a hot journal back under the
-	// EXCLUSIVE lock (pager.c:5308, 5356).
+	// never have been synced. That one is rolled back to an empty file,
+	// as sqlite3PagerSharedLock plays a hot journal back under the
+	// EXCLUSIVE lock (pager.c:5308, 5356). Beside an empty file, whatever
+	// lies under the journal's name is deleted (pager.c:5178-5181).
 	info, err := f.Stat()
 	if err != nil {
 		return false, err
 	}
 	if info.Size() != 0 {
-		if err := p.playbackCreationJournal(f); err != nil {
-			return false, err
-		}
+		err = p.playbackCreationJournal(f)
+	} else {
+		err = p.deleteJournalOfEmptyDatabase(f)
+	}
+	if err != nil {
+		return false, err
 	}
 	if err := osRemove(p.path + "-wal"); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return false, fmt.Errorf("btree: delete the WAL beside an empty database file: %w", err)
