@@ -2,6 +2,8 @@ package durability
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,13 +13,15 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/durability/sentinel"
 )
 
 type mockTracker struct {
-	mu         sync.Mutex
-	dirty      atomic.Bool
-	dirtyCount atomic.Int32
-	cleanCount atomic.Int32
+	mu          sync.Mutex
+	dirty       atomic.Bool
+	dirtyCount  atomic.Int32
+	cleanCount  atomic.Int32
+	removeCount atomic.Int32
 }
 
 func (m *mockTracker) OnOpen(ctx context.Context) (bool, error) {
@@ -38,6 +42,13 @@ func (m *mockTracker) MarkClean() {
 	defer m.mu.Unlock()
 	m.dirty.Store(false)
 	m.cleanCount.Add(1)
+}
+
+func (m *mockTracker) Remove() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dirty.Store(false)
+	m.removeCount.Add(1)
 }
 
 func (m *mockTracker) Close() error {
@@ -86,10 +97,38 @@ func TestController_StartStop(t *testing.T) {
 	assert.Equal(t, int32(0), tracker.cleanCount.Load(), "Stop leaves the sentinel: only a close that checkpointed clears it")
 
 	controller.MarkCleanAfterClose()
-	assert.Equal(t, int32(1), tracker.cleanCount.Load())
+	assert.Equal(t, int32(1), tracker.removeCount.Load())
 
 	err = controller.Stop()
 	assert.NoError(t, err)
+}
+
+// A close that checkpointed as the last client removes the marker even when
+// this process found none at open and never wrote: another process sharing
+// the file created it.
+func TestController_MarkCleanAfterCloseRemovesAPeersMarker(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	this := sentinel.New(dbPath)
+	controller := NewController(Options{Sentinel: this})
+	dirty, err := controller.OnOpen(context.Background())
+	require.NoError(t, err)
+	require.False(t, dirty, "setup: no marker at open")
+
+	peer := sentinel.New(dbPath) // the other process's tracker
+	_, err = peer.OnOpen(context.Background())
+	require.NoError(t, err)
+	peer.MarkDirty()
+	_, err = os.Stat(dbPath + ".lock")
+	require.NoError(t, err, "setup: the peer's write created the marker")
+
+	controller.MarkCleanAfterClose()
+	_, err = os.Stat(dbPath + ".lock")
+	require.True(t, os.IsNotExist(err), "the close left another process's marker: %v", err)
+
+	// Nothing left to remove: no failure, nothing created.
+	controller.MarkCleanAfterClose()
+	_, err = os.Stat(dbPath + ".lock")
+	require.True(t, os.IsNotExist(err), "%v", err)
 }
 
 func TestController_IdleFlush(t *testing.T) {

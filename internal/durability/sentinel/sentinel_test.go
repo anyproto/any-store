@@ -73,6 +73,33 @@ func TestSentinelTracker_MarkClean(t *testing.T) {
 	assert.True(t, os.IsNotExist(err), "MarkClean should be idempotent")
 }
 
+// Remove does not consult the tracker's cached state: the file may be
+// another process's. A file that is not there counts as removed.
+func TestSentinelTracker_RemoveIgnoresCachedState(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	sentinelPath := dbPath + lockFileSuffix
+
+	tracker := New(dbPath)
+	dirty, err := tracker.OnOpen(context.Background())
+	require.NoError(t, err)
+	require.False(t, dirty)
+	require.NoError(t, os.WriteFile(sentinelPath, nil, 0o644)) // another process's marker
+
+	tracker.Remove()
+	_, err = os.Stat(sentinelPath)
+	assert.True(t, os.IsNotExist(err), "Remove left a marker the tracker had not seen: %v", err)
+
+	tracker.Remove()
+	_, err = os.Stat(sentinelPath)
+	assert.True(t, os.IsNotExist(err))
+	assert.False(t, tracker.isDirty)
+
+	// A later write creates the marker again.
+	tracker.MarkDirty()
+	_, err = os.Stat(sentinelPath)
+	assert.NoError(t, err)
+}
+
 func TestSentinelTracker_ConcurrentAccess(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")

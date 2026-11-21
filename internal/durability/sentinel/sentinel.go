@@ -91,3 +91,16 @@ func (s *SentinelTracker) MarkClean() {
 		s.isDirty = false
 	}
 }
+
+// Remove removes the sentinel file whatever this process remembers of it:
+// the file is shared by every process on the database, and one that this
+// process found absent at open, or has not written since, may have been
+// created by another. A file that is not there counts as removed.
+func (s *SentinelTracker) Remove() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := osRemove(s.path); err == nil || os.IsNotExist(err) {
+		s.isDirty = false
+	}
+}

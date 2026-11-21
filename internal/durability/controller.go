@@ -26,6 +26,9 @@ type Sentinel interface {
 	OnOpen(ctx context.Context) (dirty bool, err error)
 	MarkDirty()
 	MarkClean()
+	// Remove removes the shared marker whatever the process's own cached
+	// state; an absent marker counts as removed.
+	Remove()
 }
 
 type Controller struct {
@@ -82,9 +85,12 @@ func (c *Controller) MarkCleanAfterCheck() {
 // true). No other close may clear the sentinel: a close that leaves the log
 // to the processes still attached persists nothing, and a commit of theirs,
 // or of this process, can still be in the log alone when they are killed.
+//
+// The marker is removed whatever this process's cached state: another
+// process may have created it while this one only read.
 func (c *Controller) MarkCleanAfterClose() {
 	if c.opts.Sentinel != nil {
-		c.opts.Sentinel.MarkClean()
+		c.opts.Sentinel.Remove()
 	}
 }
 
