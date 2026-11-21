@@ -49,8 +49,8 @@ func TestRecovery_IdleFlushOutlivesOpenCtx(t *testing.T) {
 }
 
 // The sentinel file is named when the database is opened. After the working
-// directory changes, a flush and a write use the marker beside the database,
-// and neither they nor the close touch a file of the same name in the new
+// directory changes, a flush, a write and the last close use the marker beside
+// the database, and none of them touch a file of the same name in the new
 // working directory.
 func TestRecovery_SentinelPathResolvedAtOpen(t *testing.T) {
 	dirA, dirB := t.TempDir(), t.TempDir()
@@ -80,8 +80,37 @@ func TestRecovery_SentinelPathResolvedAtOpen(t *testing.T) {
 	require.NoError(t, err, "a write did not set the database's sentinel")
 
 	require.NoError(t, db.Close())
+	_, err = os.Stat(markerA)
+	require.True(t, os.IsNotExist(err), "the last close left the database's sentinel: %v", err)
 	_, err = os.Stat(markerB)
 	require.NoError(t, err, "the close removed a file in the new working directory")
+}
+
+// Open resolves the path once: a change of working directory after the
+// sentinel is set up and before the database file is opened leaves the
+// database and its marker together, in the directory the path was resolved
+// against.
+func TestRecovery_ChdirDuringOpenKeepsDatabaseAndSentinelTogether(t *testing.T) {
+	dirA, dirB := t.TempDir(), t.TempDir()
+	ctx := context.Background()
+	t.Chdir(dirA)
+	testHookBeforeBtreeOpen = func() { t.Chdir(dirB) }
+	t.Cleanup(func() { testHookBeforeBtreeOpen = nil })
+
+	db, err := Open(ctx, "test.db", &Config{Durability: DurabilityConfig{Sentinel: true}})
+	testHookBeforeBtreeOpen = nil
+	require.NoError(t, err)
+	defer db.Close()
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"doc1"}`)))
+
+	for _, name := range []string{"test.db", "test.db.lock"} {
+		_, err = os.Stat(filepath.Join(dirA, name))
+		require.NoError(t, err, "%s is not in the directory the path was resolved against", name)
+		_, err = os.Stat(filepath.Join(dirB, name))
+		require.True(t, os.IsNotExist(err), "%s is in the directory changed to during the open: %v", name, err)
+	}
 }
 
 // An in-memory database has no files on disk: with the sentinel on, a write
