@@ -3146,7 +3146,8 @@ wrong, where C's cannot:
   `shmCleanupFromFrame`, the removal of a dead writer's entries). C loads the slot with `AtomicLoad`
   (`wal.c:3583`), tests `iFrame<=iLast && iFrame>=pWal->minFrame` before `sLoc.aPgno[iH-1]==pgno`
   (`wal.c:3585`) and stores the slot with `AtomicStore` (`wal.c:1338`). The probe now has C's order, and
-  every access to a slot of a table that readers probe goes through `htSlotLoad`/`htSlotStore`: Go has no
+  an append, a rollback's cleanup and a probe access a slot of a table that readers probe through
+  `htSlotLoad`/`htSlotStore`: Go has no
   16-bit atomics, so the aligned 32-bit word that holds two slots is loaded and stored; a store rewrites the
   neighbouring slot with the value it has just loaded, which is safe because only the holder of the write
   lock stores. `shmCleanupHashSegment` clears its slots the same way, where C's `walCleanupHash` stores
@@ -3154,7 +3155,12 @@ wrong, where C's cannot:
   numbers stay plain, as in C (the read after the bounds, the cleanup's `memset`, `wal.c:1271`): a reader
   reads only those of its window, written before its snapshot was published and not changed while it is in
   use. The whole-segment clears (a segment's first frame, the segments past a rollback target,
-  `shmClearHash`) stay plain: no snapshot reaches those segments. Test:
+  `shmClearHash`) stay plain: no snapshot reaches those segments. Recovery's publication stays plain too:
+  `recoverLocked` copies each rebuilt segment over the shared one, slots included, as `walIndexRecover` does
+  with `memcpy` in C's default build (`wal.c:1524-1533`; only a `SQLITE_SAFER_WALINDEX_RECOVERY` build
+  stores just the words that differ, `wal.c:1534-1550`). A reader goroutine of the same handle can be
+  probing a segment while it is copied; the copy rewrites the entries of the frames in that reader's window
+  with the bytes they already hold. It is a data race by Go's memory model, accepted as C accepts it. Test:
   `TestWalIndexDeadWriter_CleanupUnderReader` under `-race` (the detector sees the heap index only; it does
   not track the mmap'd one).
 
@@ -3201,8 +3207,10 @@ rejects/skips — a different (and stricter) handling of out-of-range hash entri
 the last frame before the batch. That is right when the leftover is a dead writer's spill: its entries start at
 the first frame after the log's end, the batch's first frame finds its `aPgno` set, and the cleanup runs before
 the batch has indexed anything. It is wrong for a writer that died inside a rollback's cleanup, which clears
-the hash slots and then the page numbers in ascending order (`walCleanupHash`'s `memset`, `wal.c:1271`; here
-`shmCleanupHashSegment`): with the page numbers of the first frames cleared and the later ones not, the batch
+the hash slots and then the page numbers (`walCleanupHash`'s `memset`, `wal.c:1271`; here
+`shmCleanupHashSegment`). Neither `memset` nor Go's `clear` promises an order of stores, so a writer killed
+inside it may leave any part cleared, a prefix among them: with the page numbers of the first frames cleared
+and the later ones not, the batch
 indexes its first frames, finds a later `aPgno` set, and cleans back to the limit — removing the entries it has
 just written. The commit succeeds and those pages read as they were before it. By reading, C behaves the same
 in that state (the limit is `pWal->hdr.mxFrame`, the batch's own entries are above it, and the `assert(

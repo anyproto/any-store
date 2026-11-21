@@ -2584,7 +2584,11 @@ func (w *wal) recoverLocked() error {
 	// we skip the first htHdrSize (=136) bytes so the OLD header + ckpt info
 	// stay in place; they are overwritten only by writeHeader and the
 	// counter/mark publishes at the end, matching SQLite wal.c:1524-1533
-	// commentary.
+	// commentary. The copy is plain, as walIndexRecover's memcpy is in C's
+	// default build (wal.c:1524-1533), and a reader of this process may be
+	// probing the segment: the copy rewrites the entries of every frame in a
+	// reader's window with the bytes they already have. This is the one
+	// store into a probed table that does not go through htSlotStore.
 	for seg, b := range priv {
 		region, err := w.index.shm.region(seg, true)
 		if err != nil {
@@ -2757,6 +2761,9 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	// the first call of a transaction has iFirst == nf+1, an empty window.
 	// iFirst == 0 is the wrapped sum of a committed frame 0xffffffff: C's
 	// `if( iFirst && ...` (wal.c:4138) reuses nothing then, and so does this.
+	// The frame counter itself has no bound, here or in C (`iFrame++`,
+	// wal.c:4225-4229; 0xffffffff is also READMARK_NOT_USED, wal.c:401): a
+	// log of 2^32 frames is not supported.
 	iFirst := w.index.mxCommitFrame.LoadLocal() + 1
 	canReuse := iFirst != 0 && iFirst <= nf && !DiagDisableReuse.Load()
 
