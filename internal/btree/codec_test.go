@@ -135,8 +135,9 @@ func TestCodec_NoncePoolOwnedByScratch(t *testing.T) {
 	}
 }
 
-// A new pool is exhausted, so its first draw reads crypto/rand: the zero
-// buffer behind it is never handed out as nonces.
+// A new pool is exhausted, so its first draw reads crypto/rand: the whole
+// first nonce is the start of a fresh fill, and no byte of the zero buffer
+// behind it is handed out.
 func TestNoncePool_FirstDrawIsRandom(t *testing.T) {
 	var s aeadScratch
 	if err := s.drawNonce(s.nonce[:]); err != nil {
@@ -144,6 +145,9 @@ func TestNoncePool_FirstDrawIsRandom(t *testing.T) {
 	}
 	if s.nonce == ([24]byte{}) {
 		t.Fatalf("first nonce drawn is all zero")
+	}
+	if s.nonces.off != len(s.nonce) || !bytes.Equal(s.nonce[:], s.nonces.buf[:len(s.nonce)]) {
+		t.Fatalf("first nonce is not the start of a fresh fill (pool offset %d)", s.nonces.off)
 	}
 }
 

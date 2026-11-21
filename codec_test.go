@@ -296,7 +296,8 @@ func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
 	require.NoError(t, err)
 	codec, err := NewAESCodec(key)
 	require.NoError(t, err)
-	cfg := &Config{Encryption: EncryptionConfig{Codec: codec}}
+	// Uncompressed, so that the documents below fill hundreds of pages.
+	cfg := &Config{Encryption: EncryptionConfig{Codec: codec}, DisableCompression: true}
 
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "src.db")
@@ -361,6 +362,10 @@ func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
 	require.NoError(t, writerErr)
 	require.NoError(t, backupErr)
 	require.NoError(t, db.Close())
+	// Backup copies 256 pages per Step.
+	info, err := os.Stat(dstPath)
+	require.NoError(t, err)
+	require.Greater(t, info.Size()/4096, int64(2*256), "the copy must take several Steps")
 
 	requireSharedCodecDocs(t, dstPath, cfg, "pre", pre, true)
 }
