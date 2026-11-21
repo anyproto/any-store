@@ -47,3 +47,33 @@ func TestRecovery_IdleFlushOutlivesOpenCtx(t *testing.T) {
 		return os.IsNotExist(err)
 	}, 5*time.Second, 20*time.Millisecond, "idle flush should mark the sentinel clean after the open ctx is cancelled")
 }
+
+// An in-memory database has no files on disk: with the sentinel on, a write
+// creates no marker beside the path it was opened with, and its close, which
+// persists nothing, has none to clear.
+func TestRecovery_InMemoryHasNoSentinelFile(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "mem.db")
+	config := &Config{InMemory: true, Durability: DurabilityConfig{Sentinel: true}}
+
+	ctx := context.Background()
+	db, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"doc1"}`)))
+	_, err = os.Stat(dbPath + ".lock")
+	require.True(t, os.IsNotExist(err), "a write to an in-memory database created a sentinel file: %v", err)
+	require.NoError(t, db.Close())
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Empty(t, entries, "an in-memory database left files on disk")
+
+	db, err = Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	stats, err := db.Stats(ctx)
+	require.NoError(t, err)
+	require.False(t, stats.DirtyOnOpen)
+	require.NoError(t, db.Close())
+}

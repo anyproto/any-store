@@ -1703,7 +1703,9 @@ func (db *db) createRecoveryController(ctx context.Context, path string) (*durab
 		AutoFlushFunc: flushFunc,
 	}
 
-	if db.config.Durability.Sentinel {
+	// An in-memory database has no files on disk, and no close of it
+	// persists anything: it gets no sentinel file.
+	if db.config.Durability.Sentinel && !db.config.InMemory {
 		opts.Sentinel = sentinel.New(path)
 	}
 	controller := durability.NewController(opts)

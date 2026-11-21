@@ -795,7 +795,8 @@ func (db *DB) Close() error {
 // checkpoint completed (the branch of sqlite3WalClose that sets isDelete,
 // wal.c:2522-2540). It reports false for a close that left the log to the
 // processes still attached, for a database file that was moved, and for a
-// checkpoint that failed: commits may then exist only in the log.
+// checkpoint that failed: commits may then exist only in the log. An
+// in-memory database has no database file and reports false.
 //
 // When the close checkpointed, onCheckpointed (if not nil) runs after the
 // checkpoint and the truncate of the log, while the close still holds the

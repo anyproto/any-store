@@ -219,6 +219,8 @@ type pager struct {
 	// and its checkpoint completed: the arm of sqlite3WalClose that sets
 	// isDelete (wal.c:2531-2540). Every commit is then in the synced database
 	// file, and no other process was attached to add one. Read after close.
+	// An in-memory pager never sets it: the branch that does is the one for
+	// a database file.
 	closeCheckpointed bool
 	// onCloseCheckpointed, when set, is run by close once it has set
 	// closeCheckpointed, while it still holds the exclusive lock on the

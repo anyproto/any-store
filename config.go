@@ -275,6 +275,7 @@ type DurabilityConfig struct {
 	// A write creates the file. A flush removes it, and so does a Close that checkpointed as the last
 	// handle on the database file. A Close while another process still has the database open leaves it:
 	// that close runs no checkpoint, so if the remaining processes are killed the next open runs the check.
+	// An InMemory database has no sentinel file.
 	Sentinel bool
 
 	// Enable auto-flush according to IdleAfter and FlushMode
