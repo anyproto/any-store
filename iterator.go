@@ -37,14 +37,10 @@ import (
 // iterator is closed, advanced or not: they free the trees it reads.
 //
 // An Iterator must be closed. Opened with a context that carries no
-// transaction, it holds a read transaction of its own until its Close, and
-// DB.Close waits for that with no timeout: such an iterator, never closed,
-// makes DB.Close block forever. Two kinds hold none, because Iter returns
-// them with nothing left to read: that of a $out or $merge pipeline, and
-// that of a Find whose filter Iter rules out without reading, an empty $in
-// for one; a filter that matches nothing only by what the documents hold is
-// not ruled out. Opened inside a transaction an Iterator holds none:
-// DB.Close waits for a ReadTx until its Commit and does not wait for a
+// transaction, it can hold a read transaction of its own until its Close,
+// and DB.Close waits for that with no timeout: an iterator never closed can
+// make DB.Close block forever. Opened inside a transaction an Iterator holds
+// none: DB.Close waits for a ReadTx until its Commit and does not wait for a
 // WriteTx (see DB.Close). Close is safe to defer and to call twice.
 //
 // An Iterator belongs to one goroutine at a time. Opened with the context

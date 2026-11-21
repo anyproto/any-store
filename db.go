@@ -110,16 +110,11 @@ type DB interface {
 	//
 	// Close waits, with no timeout, for every read transaction of this DB
 	// to end. A ReadTx ends with its Commit. An Iterator opened with a
-	// context that carries no transaction holds a read transaction of its
-	// own until its Close, unless Iter returned it with nothing left to
-	// read: the iterator of a $out or $merge pipeline, which has written
-	// its output by then, and that of a Find whose filter Iter rules out
-	// without reading, an empty $in for one. A filter that matches nothing
-	// only by what the documents hold ({"id": {"$exists": false}}, say)
-	// gets an iterator that holds one. An Iterator opened inside a
-	// transaction holds none, and ends with that transaction. A read
-	// transaction that is never ended makes Close block forever, and Close
-	// called by the goroutine that still holds one deadlocks on itself (a
+	// context that carries no transaction can hold a read transaction of
+	// its own until its Close. An Iterator opened inside a transaction
+	// holds none, and ends with that transaction. A read transaction that
+	// is never ended makes Close block forever, and Close called by the
+	// goroutine that still holds one deadlocks on itself (a
 	// `defer it.Close()` that runs after `db.Close()`, or a return out of
 	// an iteration loop into it). While Close waits the database is
 	// already closing: an operation on a collection fails with
@@ -136,15 +131,9 @@ type DB interface {
 	// last step, every later one fails with ErrDBIsClosed and so does an
 	// iterator opened in the transaction that reads through it, its Commit
 	// fails with ErrDBIsClosed and its Rollback returns nil; the Rollback
-	// of a WriteTx opened inside it returns ErrDBIsClosed. A Commit writes
-	// the transaction's pending full-text postings and index statistics,
-	// then commits the storage. Close ends the transaction only after it
-	// has closed the collections, and what decides is whether the storage
-	// commit began before that: one that began first runs to its end and
-	// returns its own result, nil once the transaction is committed; one
-	// that comes later fails with ErrDBIsClosed. So a Commit called after
-	// Close can still commit, and one already running when Close is called
-	// can fail. Only the Commit's own result says which.
+	// of a WriteTx opened inside it returns ErrDBIsClosed. A Commit that
+	// runs while Close does may commit the transaction or fail with
+	// ErrDBIsClosed.
 	//
 	// Close must not be called from code that runs inside a step of storage
 	// work, on the goroutine doing that step: it would wait for itself.
