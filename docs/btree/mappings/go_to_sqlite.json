@@ -756,6 +756,48 @@
     "sqlite": [],
     "note": ""
   },
+  "creation_journal.go:*pager.creationPending": {
+    "sqlite": [
+      "pager.c:hasHotJournal"
+    ],
+    "note": "the file is empty or a hot creation journal lies beside it: the test sqlite3PagerSharedLock makes after the SHARED lock, extended by the empty file that newDatabase would fill"
+  },
+  "creation_journal.go:*pager.finalizeCreationJournal": {
+    "sqlite": [
+      "pager.c:pager_end_transaction",
+      "pager.c:zeroJournalHdr"
+    ],
+    "note": "the header is zeroed and synced (journal_mode=PERSIST's finalization) and then the journal is deleted; see drift-2026-11-21-7"
+  },
+  "creation_journal.go:*pager.hasHotCreationJournal": {
+    "sqlite": [
+      "pager.c:hasHotJournal",
+      "pager.c:readJournalHdr"
+    ],
+    "note": "hot only with a whole creation header of any-store's magic and an original size of zero; the reserved-lock test is the caller's DB-file lock"
+  },
+  "creation_journal.go:*pager.openCreationJournal": {
+    "sqlite": [
+      "os_unix.c:unixSync",
+      "pager.c:pager_open_journal",
+      "pager.c:syncJournal",
+      "pager.c:writeJournalHdr"
+    ],
+    "note": "creates the journal, writes its header, syncs it and then its directory, all before page 1 is written"
+  },
+  "creation_journal.go:*pager.playbackCreationJournal": {
+    "sqlite": [
+      "pager.c:pager_playback",
+      "pager.c:pager_truncate"
+    ],
+    "note": "truncates the file to the journal's original size, zero pages, and syncs it; no page records exist to play back"
+  },
+  "creation_journal.go:creationJournalHdr": {
+    "sqlite": [
+      "pager.c:writeJournalHdr"
+    ],
+    "note": "SQLite's 28-byte header layout with any-store's magic, original size 0 and the page size"
+  },
   "db.go:*DB.BeginRead": {
     "sqlite": [
       "btree.c:btreeBeginTrans",
@@ -1717,15 +1759,18 @@
     "sqlite": [
       "btree.c:newDatabase",
       "btree.c:sqlite3BtreeSetVersion",
-      "pager.c:pagerOpenWalIfPresent"
+      "pager.c:pagerOpenWalIfPresent",
+      "pager.c:sqlite3PagerSharedLock"
     ],
-    "note": "a file of zero pages becomes a one-page database under the exclusive DB-file lock; a WAL beside it is deleted first"
+    "note": "a file whose creation is pending becomes a one-page database under the exclusive DB-file lock: a dead creator's file is rolled back, a WAL beside it is deleted, and page 1 is created in a journaled transaction"
   },
   "pager.go:*pager.createPage1": {
     "sqlite": [
-      "btree.c:newDatabase"
+      "btree.c:newDatabase",
+      "pager.c:pager_write",
+      "pager.c:sqlite3PagerCommitPhaseOne"
     ],
-    "note": "written and synced in place, with no rollback journal"
+    "note": "page 1 is written after the creation journal is synced and before it is finalized, as a PGHDR_NEED_SYNC page is"
   },
   "pager.go:*pager.decryptPage": {
     "sqlite": [],
@@ -1866,7 +1911,7 @@
     "sqlite": [
       "pager.c:sqlite3PagerExclusiveLock"
     ],
-    "note": "flock upgrade with drop-and-retry between several creators, up to BusyTimeout"
+    "note": "flock upgrade with drop-and-retry between several creators, up to BusyTimeout; also the exclusive lock of a hot-journal playback"
   },
   "pager.go:*pager.lockDBShared": {
     "sqlite": [
@@ -2385,6 +2430,17 @@
   "shm_other.go:newPlatformShm": {
     "sqlite": [],
     "note": "heap-backed shm fallback for platforms without mmap support"
+  },
+  "syncdir_other.go:syncDir": {
+    "sqlite": [],
+    "note": "no directory sync outside Unix, as in SQLite's Windows VFS"
+  },
+  "syncdir_unix.go:syncDir": {
+    "sqlite": [
+      "os_unix.c:openDirectory",
+      "os_unix.c:unixSync"
+    ],
+    "note": "the directory fsync unixSync does for a descriptor marked UNIXFILE_DIRSYNC"
   },
   "testseam.go:*DB.TestSeam": {
     "sqlite": [],
