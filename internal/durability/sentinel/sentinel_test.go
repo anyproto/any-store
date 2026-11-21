@@ -93,15 +93,16 @@ func TestSentinelTracker_RemoveIgnoresCachedState(t *testing.T) {
 	_, err = os.Stat(sentinelPath)
 	assert.True(t, os.IsNotExist(err), "Remove left a marker the tracker had not seen: %v", err)
 
-	tracker.Remove()
-	_, err = os.Stat(sentinelPath)
-	assert.True(t, os.IsNotExist(err))
-	assert.False(t, tracker.isDirty)
-
-	// A later write creates the marker again.
+	// A marker this tracker set and another process removed: Remove finds
+	// none and counts it as removed, so the next write creates it again.
 	tracker.MarkDirty()
 	_, err = os.Stat(sentinelPath)
-	assert.NoError(t, err)
+	require.NoError(t, err, "setup: a write creates the marker")
+	require.NoError(t, os.Remove(sentinelPath)) // another process's flush
+	tracker.Remove()
+	tracker.MarkDirty()
+	_, err = os.Stat(sentinelPath)
+	assert.NoError(t, err, "a write after Remove found no marker did not create it")
 }
 
 // The tracker's path is made absolute by New: after the working directory
