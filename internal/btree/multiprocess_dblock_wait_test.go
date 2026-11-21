@@ -4,8 +4,8 @@ package btree
 
 // Two-process tests of an open's wait for the DB-file lock (re-exec pattern,
 // helpers in multiprocess_create_test.go). The holder is a child stopped at
-// a named point; the parent keeps it there for longer than a second, the
-// whole wait an open used to allow, and well short of BusyTimeout.
+// a named point; the parent keeps it there for dbLockHold, well short of
+// BusyTimeout.
 
 import (
 	"bufio"
