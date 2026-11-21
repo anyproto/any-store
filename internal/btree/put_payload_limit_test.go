@@ -3,10 +3,12 @@ package btree
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -513,12 +515,20 @@ func TestPayloadLimit_DeclaredLengthOverFileSize(t *testing.T) {
 				})
 			}},
 			{"IntegrityCheck", func(rtx *ReadTx, ns *Namespace) error {
-				// It reports what it finds as text; that it found the
-				// cell is all that is asked here.
-				if err := rtx.db.IntegrityCheck(); err != nil {
-					return ErrCorrupt
+				// It reports what it finds as text. The fixture's overflow
+				// pointer names a b-tree page, which it reports too; the
+				// finding asked for here is the key it could not read.
+				err := rtx.db.IntegrityCheck()
+				var ie *IntegrityError
+				if !errors.As(err, &ie) {
+					return fmt.Errorf("not an integrity report: %v", err)
 				}
-				return nil
+				for _, msg := range ie.Errors {
+					if strings.HasSuffix(msg, "cell 0: corrupt leaf key") {
+						return ErrCorrupt
+					}
+				}
+				return fmt.Errorf("the report does not name the cell's key: %v", err)
 			}},
 		})
 	})
@@ -712,9 +722,11 @@ func TestPayloadLimit_SplitBesideDamagedValueLengths(t *testing.T) {
 }
 
 // TestPayloadLimit_OverflowRecordWithinFileSize: the bound does not touch a
-// sound record. One of several megabytes in a file that holds it is read by
-// every path, by the writer inside the transaction that wrote it and by a
-// reader after it.
+// sound record. One of several megabytes in a file that holds it, its key
+// spilled too, is read back by the writer's Get inside the transaction that
+// wrote it, and after it by ReadTx.Get and Has, a cursor's Key, Value,
+// AppendValue and AppendValueByKey, and IntegrityCheck. The tree has one
+// leaf, so no interior key is read.
 func TestPayloadLimit_OverflowRecordWithinFileSize(t *testing.T) {
 	db, err := testOpen(t, filepath.Join(t.TempDir(), "big.db"), Options{PageSize: 4096})
 	require.NoError(t, err)
@@ -744,6 +756,17 @@ func TestPayloadLimit_OverflowRecordWithinFileSize(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(key, k))
 	v, err := c.Value()
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(value, v))
+	v, err = c.AppendValue(nil)
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(value, v))
+	ok, err := rtx.Has(ns, key)
+	require.NoError(t, err)
+	require.True(t, ok)
+	c2 := rtx.NewCursor(ns)
+	defer c2.Close()
+	v, err = c2.AppendValueByKey(key, nil)
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(value, v))
 	require.NoError(t, db.IntegrityCheck())
