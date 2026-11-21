@@ -3673,6 +3673,9 @@ func (c *Cursor) gatedMove(move func(*Cursor) error) error {
 }
 
 func (c *Cursor) gatedNext() error {
+	if testGatedPinnedLeafHook != nil {
+		testGatedPinnedLeafHook(c, 1)
+	}
 	if err := c.enterGate(); err != nil {
 		c.abandon()
 		return err
@@ -3682,6 +3685,9 @@ func (c *Cursor) gatedNext() error {
 }
 
 func (c *Cursor) gatedPrevious() error {
+	if testGatedPinnedLeafHook != nil {
+		testGatedPinnedLeafHook(c, -1)
+	}
 	if err := c.enterGate(); err != nil {
 		c.abandon()
 		return err
@@ -3708,14 +3714,15 @@ func (c *Cursor) gatedSkip(skip func(*Cursor, int) error, n int) error {
 	return skip(c, n)
 }
 
-// testGatedKeyValueHook, when non-nil, runs as a write transaction's Key or
-// Value takes the writer gate instead of reading the pinned leaf alone
-// (readsPinnedLeaf), with the cursor that makes the call. Test-only.
-var testGatedKeyValueHook func(c *Cursor)
+// testGatedPinnedLeafHook, when non-nil, runs as a write transaction's
+// cursor takes the writer gate for one of the calls that can run on the
+// pinned leaf alone (readsPinnedLeaf), with the cursor and the call: step
+// is 1 for a Next, -1 for a Previous and 0 for a read. Test-only.
+var testGatedPinnedLeafHook func(c *Cursor, step int)
 
 func (c *Cursor) gatedKey() ([]byte, error) {
-	if testGatedKeyValueHook != nil {
-		testGatedKeyValueHook(c)
+	if testGatedPinnedLeafHook != nil {
+		testGatedPinnedLeafHook(c, 0)
 	}
 	if err := c.enterGate(); err != nil {
 		return nil, err
@@ -3725,8 +3732,8 @@ func (c *Cursor) gatedKey() ([]byte, error) {
 }
 
 func (c *Cursor) gatedValue() ([]byte, error) {
-	if testGatedKeyValueHook != nil {
-		testGatedKeyValueHook(c)
+	if testGatedPinnedLeafHook != nil {
+		testGatedPinnedLeafHook(c, 0)
 	}
 	if err := c.enterGate(); err != nil {
 		return nil, err
@@ -3736,6 +3743,9 @@ func (c *Cursor) gatedValue() ([]byte, error) {
 }
 
 func (c *Cursor) gatedAppendValue(buf []byte) ([]byte, error) {
+	if testGatedPinnedLeafHook != nil {
+		testGatedPinnedLeafHook(c, 0)
+	}
 	if err := c.enterGate(); err != nil {
 		return buf, err
 	}

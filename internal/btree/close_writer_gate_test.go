@@ -956,7 +956,7 @@ func TestClose_CursorAbandonedBeforeCacheDisposal(t *testing.T) {
 // them. Close comes while a goroutine does nothing but read the entry: the
 // reads see the entry or ErrClosed, never another page's bytes, and under
 // the race detector nothing Close does conflicts with them. A hook on the
-// gated path (testGatedKeyValueHook) checks that the reads made while the
+// gated path (testGatedPinnedLeafHook) checks that the reads made while the
 // gate is open are the ones outside it: only a read that finds the gate
 // closed may take it, and is refused there.
 func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
@@ -979,7 +979,7 @@ func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
 			if testing.Short() {
 				iters = 20
 			}
-			t.Cleanup(func() { testGatedKeyValueHook = nil })
+			t.Cleanup(func() { testGatedPinnedLeafHook = nil })
 			for it := 0; it < iters; it++ {
 				db, err := testOpen(t, "", opts)
 				require.NoError(t, err)
@@ -992,7 +992,7 @@ func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
 				cur := tx.NewCursor(ns)
 				require.NoError(t, cur.First())
 				var gatedOpen atomic.Int32
-				testGatedKeyValueHook = func(c *Cursor) {
+				testGatedPinnedLeafHook = func(c *Cursor, _ int) {
 					if c == cur && !db.pager.wgate.closed() {
 						gatedOpen.Add(1)
 					}
@@ -1051,10 +1051,240 @@ func TestClose_DuringKeyAndValueOfPinnedLeaf(t *testing.T) {
 				putN(t, other, "t", 50, 300)
 				require.NoError(t, other.Close())
 				wg.Wait()
-				testGatedKeyValueHook = nil
+				testGatedPinnedLeafHook = nil
 				require.Nil(t, bad.Load())
 				require.NotZero(t, reads)
 				require.Zero(t, gatedOpen.Load(), "a Key or a Value of the cursor on its leaf took the writer gate while it was open")
+				require.NoError(t, tx.Rollback())
+			}
+		})
+	}
+}
+
+// The reads and in-leaf steps of a positioned writer cursor run outside the
+// gate; a call that needs more than the pinned leaf takes it. The hook on
+// the gated path (testGatedPinnedLeafHook) records every call of the cursor
+// that takes the gate: none while the cursor reads entries and steps within
+// a leaf, one for a step off the leaf in each direction, and one for an
+// AppendValue of a value with an overflow chain.
+func TestWriterGate_PinnedLeafCallsStayOutside(t *testing.T) {
+	db, err := testOpen(t, "", Options{CacheSize: 64, InMemory: true})
+	require.NoError(t, err)
+	defer db.Close()
+	createNS(t, db, "t")
+	putN(t, db, "t", 100, 300)
+	big := bytes.Repeat([]byte{0x5A}, 6000)
+	bigKey := closeRescueKey(1000)
+	{
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := tx.GetNamespace("t")
+		require.NoError(t, err)
+		require.NoError(t, tx.Put(ns, bigKey, big))
+		require.NoError(t, tx.Commit())
+	}
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	defer tx.Rollback()
+	ns, err := tx.GetNamespace("t")
+	require.NoError(t, err)
+	cur := tx.NewCursor(ns)
+	defer cur.Close()
+	require.NoError(t, cur.First())
+
+	var gated []int
+	testGatedPinnedLeafHook = func(c *Cursor, step int) {
+		if c == cur {
+			gated = append(gated, step)
+		}
+	}
+	defer func() { testGatedPinnedLeafHook = nil }()
+	leaf := func() (idx, n int) {
+		f := cur.stack[len(cur.stack)-1]
+		return f.cellIdx, int(f.pg.header.cellCount)
+	}
+
+	// Within the first leaf: read every entry and step to the last, then
+	// one back and forth again.
+	idx, n := leaf()
+	require.Zero(t, idx)
+	require.Greater(t, n, 2)
+	var buf []byte
+	for i := 0; i < n; i++ {
+		_, err = cur.Key()
+		require.NoError(t, err)
+		_, err = cur.Value()
+		require.NoError(t, err)
+		buf, err = cur.AppendValue(buf[:0])
+		require.NoError(t, err)
+		require.Len(t, buf, 300)
+		if i < n-1 {
+			require.NoError(t, cur.Next())
+		}
+	}
+	require.NoError(t, cur.Previous())
+	require.NoError(t, cur.Next())
+	idx, _ = leaf()
+	require.Equal(t, n-1, idx)
+	require.Empty(t, gated, "a read or an in-leaf step of the cursor took the gate")
+
+	// Off the leaf, forward and back.
+	require.NoError(t, cur.Next())
+	idx, _ = leaf()
+	require.Zero(t, idx)
+	require.Equal(t, []int{1}, gated)
+	require.NoError(t, cur.Previous())
+	idx, _ = leaf()
+	require.Equal(t, n-1, idx)
+	require.Equal(t, []int{1, -1}, gated)
+
+	// A value with an overflow chain is read through the gate.
+	require.NoError(t, cur.SeekExact(bigKey))
+	gated = nil
+	buf, err = cur.AppendValue(buf[:0])
+	require.NoError(t, err)
+	require.Equal(t, big, buf)
+	require.Equal(t, []int{0}, gated)
+}
+
+// Close comes while a goroutine steps through the tree with Next or
+// Previous and reads every entry with Key and AppendValue, most of them
+// outside the gate: each read sees the right entry or ErrClosed, under the
+// race detector nothing Close does conflicts with them, and in slab mode
+// no slot is lost once the cursor is closed. The hook on the gated path
+// (testGatedPinnedLeafHook) checks that no call that could stay on the
+// pinned leaf took the gate while it was open.
+func TestClose_DuringInLeafStepsAndAppendValue(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		slab bool
+	}{
+		{"slab", true},
+		{"pool", false},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			const slabPages = 512
+			opts := Options{CacheSize: 64, InMemory: true}
+			if mode.slab {
+				globalPageSlab.Reset()
+				globalPageSlab.Init(4096, slabPages)
+				defer globalPageSlab.Reset()
+				opts.UsePageSlab = true
+			}
+			iters := 100
+			if testing.Short() {
+				iters = 20
+			}
+			t.Cleanup(func() { testGatedPinnedLeafHook = nil })
+			for it := 0; it < iters; it++ {
+				db, err := testOpen(t, "", opts)
+				require.NoError(t, err)
+				createNS(t, db, "t")
+				putN(t, db, "t", 120, 300)
+				tx, err := db.BeginWrite()
+				require.NoError(t, err)
+				ns, err := tx.GetNamespace("t")
+				require.NoError(t, err)
+
+				// What every entry holds, read before the race.
+				want := map[string][]byte{}
+				cur := tx.NewCursor(ns)
+				require.NoError(t, cur.First())
+				for cur.Valid() {
+					k, err := cur.Key()
+					require.NoError(t, err)
+					v, err := cur.Value()
+					require.NoError(t, err)
+					want[string(k)] = bytes.Clone(v)
+					require.NoError(t, cur.Next())
+				}
+				require.NoError(t, cur.First())
+
+				// Every value is on its leaf: a read of the cursor on an
+				// entry, or a step with room on the leaf, could stay outside.
+				var gatedOpen atomic.Int32
+				testGatedPinnedLeafHook = func(c *Cursor, step int) {
+					if c != cur || !c.readsPinnedLeaf() {
+						return
+					}
+					f := c.stack[len(c.stack)-1]
+					if step == 0 || step > 0 && f.cellIdx+1 < int(f.pg.header.cellCount) || step < 0 && f.cellIdx > 0 {
+						gatedOpen.Add(1)
+					}
+				}
+
+				var (
+					started = make(chan struct{})
+					done    = make(chan struct{})
+					bad     atomic.Value
+					reads   int
+				)
+				back := it%2 == 1
+				go func() {
+					defer close(done)
+					var buf []byte
+					for i := 0; ; i++ {
+						if i == 100 {
+							close(started)
+						}
+						k, err := cur.Key()
+						if err == nil {
+							buf, err = cur.AppendValue(buf[:0])
+						}
+						if err == nil {
+							if w, ok := want[string(k)]; !ok || !bytes.Equal(w, buf) {
+								bad.Store(fmt.Sprintf("read %d: another entry's bytes", i))
+								break
+							}
+							reads++
+							if back {
+								err = cur.Previous()
+							} else {
+								err = cur.Next()
+							}
+						}
+						if err == nil && !cur.Valid() {
+							if back {
+								err = cur.Last()
+							} else {
+								err = cur.First()
+							}
+						}
+						if err != nil {
+							if !errors.Is(err, ErrClosed) {
+								bad.Store(fmt.Sprintf("read %d: %v", i, err))
+							}
+							if i < 100 {
+								close(started)
+							}
+							break
+						}
+					}
+					cur.Close()
+				}()
+				<-started
+				p := db.pager
+				require.NoError(t, db.Close())
+				// Another database takes what the first gave back (a plain
+				// Open: testOpen resets the pool).
+				other, err := Open("", opts)
+				require.NoError(t, err)
+				createNS(t, other, "t")
+				putN(t, other, "t", 120, 300)
+				require.NoError(t, other.Close())
+				<-done
+				testGatedPinnedLeafHook = nil
+				require.Nil(t, bad.Load())
+				require.NotZero(t, reads)
+				require.Zero(t, gatedOpen.Load(), "a call of the cursor that could stay on its leaf took the writer gate while it was open")
+				if mode.slab {
+					require.Empty(t, p.lent)
+					globalPageSlab.mu.Lock()
+					free := len(globalPageSlab.freeList)
+					globalPageSlab.mu.Unlock()
+					require.Equal(t, slabPages, free, "a slot was lost")
+				}
 				require.NoError(t, tx.Rollback())
 			}
 		})
