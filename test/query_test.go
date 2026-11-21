@@ -552,3 +552,35 @@ func TestQuery_WriteVerbInReadTxIsReadOnlyForEmptyFilter(t *testing.T) {
 	assertQueryCount(t, coll.Find(`{"y":1}`), 0)
 	assertQueryCount(t, coll.Find(nil), 1)
 }
+
+// Update and Delete refuse another database's read transaction with
+// ErrTxOtherInstance, and an ended one with ErrTxIsUsed, before they refuse a
+// read transaction as read-only, whatever the filter matches.
+func TestQuery_WriteVerbChecksTxBeforeReadOnly(t *testing.T) {
+	fx := newFixture(t)
+	other := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1,"tags":["x"]}`)
+	for _, filter := range []string{`{"tags":{"$in":[]}}`, `{"tags":"x"}`} {
+		t.Run(filter, func(t *testing.T) {
+			foreign, err := other.ReadTx(ctx)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, foreign.Commit()) }()
+			_, err = coll.Find(filter).Delete(foreign.Context())
+			assert.ErrorIs(t, err, anystore.ErrTxOtherInstance, "Delete")
+			_, err = coll.Find(filter).Update(foreign.Context(), `{"$set":{"y":1}}`)
+			assert.ErrorIs(t, err, anystore.ErrTxOtherInstance, "Update")
+
+			ended, err := fx.ReadTx(ctx)
+			require.NoError(t, err)
+			require.NoError(t, ended.Commit())
+			_, err = coll.Find(filter).Delete(ended.Context())
+			assert.ErrorIs(t, err, anystore.ErrTxIsUsed, "Delete")
+			_, err = coll.Find(filter).Update(ended.Context(), `{"$set":{"y":1}}`)
+			assert.ErrorIs(t, err, anystore.ErrTxIsUsed, "Update")
+		})
+	}
+	assertQueryCount(t, coll.Find(`{"y":1}`), 0)
+	assertQueryCount(t, coll.Find(nil), 1)
+}

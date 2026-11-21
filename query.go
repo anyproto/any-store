@@ -705,6 +705,12 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(wtx WriteTx, btWt
 		}
 	}()
 
+	// Another instance's transaction, or an ended one, is refused as such
+	// (ErrTxOtherInstance, ErrTxIsUsed) before the write scope refuses a
+	// read transaction as read-only.
+	if err = q.c.db.ctxTxUsable(ctx); err != nil {
+		return
+	}
 	tx, entered, err := q.c.db.enterWriteTx(ctx)
 	if err != nil {
 		return
