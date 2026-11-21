@@ -179,7 +179,7 @@
       "btree.c:moveToLeftmost",
       "btree.c:sqlite3BtreeNext"
     ],
-    "note": ""
+    "note": "a write transaction's cursor steps within its pinned leaf outside the writer gate and takes the gate for the rest, as sqlite3BtreeNext steps within a leaf itself and leaves the rest to btreeNext (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.Previous": {
     "sqlite": [
@@ -187,7 +187,7 @@
       "btree.c:moveToRightmost",
       "btree.c:sqlite3BtreePrevious"
     ],
-    "note": ""
+    "note": "a write transaction's cursor steps within its pinned leaf outside the writer gate and takes the gate for the rest, as sqlite3BtreePrevious steps within a leaf itself and leaves the rest to btreePrevious (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.Seek": {
     "sqlite": [
@@ -258,11 +258,15 @@
   },
   "btree.go:*Cursor.gatedMove": {
     "sqlite": [],
-    "note": "any-store: First, Last and Previous of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
+    "note": "any-store: First and Last of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.gatedNext": {
     "sqlite": [],
     "note": "any-store: Next of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
+  },
+  "btree.go:*Cursor.gatedPrevious": {
+    "sqlite": [],
+    "note": "any-store: Previous of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.gatedRangeFraction": {
     "sqlite": [],
@@ -286,7 +290,7 @@
   },
   "btree.go:*Cursor.readsPinnedLeaf": {
     "sqlite": [],
-    "note": "any-store: whether Key or Value of a write transaction's cursor reads only the leaf the cursor pins and so runs outside the writer gate (drift-2026-11-21-25)"
+    "note": "any-store: whether a read or an in-leaf step of a write transaction's cursor touches only the leaf the cursor pins and so runs outside the writer gate (drift-2026-11-21-25)"
   },
   "btree.go:*Cursor.releasePages": {
     "sqlite": [
