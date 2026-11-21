@@ -15,7 +15,8 @@ func TestSentinelTracker_OnOpen(t *testing.T) {
 	dbPath := filepath.Join(dir, "test.db")
 	sentinelPath := dbPath + lockFileSuffix
 
-	tracker := New(dbPath)
+	tracker, err := New(dbPath)
+	require.NoError(t, err)
 	ctx := context.Background()
 
 	dirty, err := tracker.OnOpen(ctx)
@@ -38,11 +39,12 @@ func TestSentinelTracker_MarkDirty(t *testing.T) {
 	dbPath := filepath.Join(dir, "test.db")
 	sentinelPath := dbPath + lockFileSuffix
 
-	tracker := New(dbPath)
+	tracker, err := New(dbPath)
+	require.NoError(t, err)
 
 	tracker.MarkDirty()
 
-	_, err := os.Stat(sentinelPath)
+	_, err = os.Stat(sentinelPath)
 	assert.NoError(t, err, "sentinel file should exist after MarkDirty")
 
 	tracker.MarkDirty()
@@ -57,10 +59,11 @@ func TestSentinelTracker_MarkClean(t *testing.T) {
 	dbPath := filepath.Join(dir, "test.db")
 	sentinelPath := dbPath + lockFileSuffix
 
-	tracker := New(dbPath)
+	tracker, err := New(dbPath)
+	require.NoError(t, err)
 
 	tracker.MarkDirty()
-	_, err := os.Stat(sentinelPath)
+	_, err = os.Stat(sentinelPath)
 	require.NoError(t, err)
 
 	tracker.MarkClean()
@@ -79,7 +82,8 @@ func TestSentinelTracker_RemoveIgnoresCachedState(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	sentinelPath := dbPath + lockFileSuffix
 
-	tracker := New(dbPath)
+	tracker, err := New(dbPath)
+	require.NoError(t, err)
 	dirty, err := tracker.OnOpen(context.Background())
 	require.NoError(t, err)
 	require.False(t, dirty)
@@ -104,7 +108,8 @@ func TestSentinelTracker_ConcurrentAccess(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	tracker := New(dbPath)
+	tracker, err := New(dbPath)
+	require.NoError(t, err)
 
 	done := make(chan bool, 10)
 	for i := 0; i < 10; i++ {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 )
@@ -24,13 +25,17 @@ type SentinelTracker struct {
 	isDirty bool // Track dirty state to avoid unnecessary syscalls
 }
 
-func New(dbPath string) *SentinelTracker {
-	sentinelPath := dbPath + lockFileSuffix
-	tracker := &SentinelTracker{
-		path: sentinelPath,
+// New returns the tracker of the sentinel file beside dbPath. The path is made
+// absolute here, when the database is opened, so a later change of the working
+// directory does not move the marker to another directory. SQLite also names
+// its -wal file from the full pathname it resolves once, at open (pager.c:4792,
+// pager.c:4927-4931).
+func New(dbPath string) (*SentinelTracker, error) {
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("sentinel: cannot resolve path: %w", err)
 	}
-
-	return tracker
+	return &SentinelTracker{path: abs + lockFileSuffix}, nil
 }
 
 func (s *SentinelTracker) OnOpen(ctx context.Context) (dirty bool, err error) {

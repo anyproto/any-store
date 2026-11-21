@@ -170,7 +170,10 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 	}
 
 	var quickCheckNeeded bool
-	ds.recoveryController, quickCheckNeeded = ds.createRecoveryController(ctx, path)
+	var err error
+	if ds.recoveryController, quickCheckNeeded, err = ds.createRecoveryController(ctx, path); err != nil {
+		return nil, err
+	}
 
 	cacheSize := config.CacheSize
 	if cacheSize <= 0 {
@@ -224,7 +227,6 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		}
 	}
 
-	var err error
 	if ds.btreeDB, err = btree.Open(path, opts); err != nil {
 		if errors.Is(err, btree.ErrPageSlabNotInitialized) {
 			return nil, ErrPageBufferNotInitialized
@@ -1697,10 +1699,10 @@ func (db *db) closeBtree() error {
 	return err
 }
 
-func (db *db) createRecoveryController(ctx context.Context, path string) (*durability.Controller, bool) {
+func (db *db) createRecoveryController(ctx context.Context, path string) (*durability.Controller, bool, error) {
 	flushFunc, err := durability.NewFlushFunc(db.config.Durability.FlushMode.toRecoveryFlushMode())
 	if err != nil {
-		return nil, false
+		return nil, false, nil
 	}
 
 	opts := durability.Options{
@@ -1715,7 +1717,11 @@ func (db *db) createRecoveryController(ctx context.Context, path string) (*durab
 	// An in-memory database has no files on disk, and no close of it
 	// persists anything: it gets no sentinel file.
 	if db.config.Durability.Sentinel && !db.config.InMemory {
-		opts.Sentinel = sentinel.New(path)
+		s, err := sentinel.New(path)
+		if err != nil {
+			return nil, false, err
+		}
+		opts.Sentinel = s
 	}
 	controller := durability.NewController(opts)
 
@@ -1723,10 +1729,10 @@ func (db *db) createRecoveryController(ctx context.Context, path string) (*durab
 
 	dirty, err := controller.OnOpen(ctx)
 	if err != nil {
-		return controller, false
+		return controller, false, nil
 	}
 
-	return controller, dirty
+	return controller, dirty, nil
 }
 
 func (db *db) Flush(ctx context.Context, waitIdleTime time.Duration, mode FlushMode) error {
