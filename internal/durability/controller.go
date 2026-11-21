@@ -77,6 +77,17 @@ func (c *Controller) MarkCleanAfterCheck() {
 	}
 }
 
+// MarkCleanAfterClose marks the DB as clean after a close that checkpointed
+// the whole log as the last client (btree.DB.CloseCheckpointed reported
+// true). No other close may clear the sentinel: a close that leaves the log
+// to the processes still attached persists nothing, and a commit of theirs,
+// or of this process, can still be in the log alone when they are killed.
+func (c *Controller) MarkCleanAfterClose() {
+	if c.opts.Sentinel != nil {
+		c.opts.Sentinel.MarkClean()
+	}
+}
+
 // Start runs the idle-flush loop. Only Stop (db.Close) ends it: the
 // loop is not tied to the opener's context, which is typically
 // call-scoped and cancelled right after Open returns, while the DB
@@ -97,6 +108,9 @@ func (c *Controller) Start() error {
 	return nil
 }
 
+// Stop ends the idle-flush loop and the tracking of writes. It leaves the
+// sentinel as it is: whether the database is clean is known only once the
+// btree is closed (MarkCleanAfterClose).
 func (c *Controller) Stop() error {
 	if !c.running.CompareAndSwap(true, false) {
 		return nil
@@ -108,10 +122,6 @@ func (c *Controller) Stop() error {
 		c.timer.Stop()
 		c.timerMu.Unlock()
 		c.autoFlushWG.Wait()
-	}
-
-	if c.opts.Sentinel != nil {
-		c.opts.Sentinel.MarkClean()
 	}
 
 	return nil

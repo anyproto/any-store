@@ -83,6 +83,9 @@ func TestController_StartStop(t *testing.T) {
 	err = controller.Stop()
 	require.NoError(t, err)
 	assert.False(t, flushCalled.Load())
+	assert.Equal(t, int32(0), tracker.cleanCount.Load(), "Stop leaves the sentinel: only a close that checkpointed clears it")
+
+	controller.MarkCleanAfterClose()
 	assert.Equal(t, int32(1), tracker.cleanCount.Load())
 
 	err = controller.Stop()

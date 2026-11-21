@@ -290,7 +290,7 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		if ds.recoveryController != nil {
 			_ = ds.recoveryController.Stop()
 		}
-		_ = ds.btreeDB.Close()
+		_ = ds.closeBtree()
 		return nil, err
 	}
 
@@ -1668,7 +1668,21 @@ func (db *db) Close() error {
 		log.Printf("recovery controller stop error: %v", err)
 	}
 
-	return db.btreeDB.Close()
+	return db.closeBtree()
+}
+
+// closeBtree closes the btree and clears the durability sentinel when that
+// close checkpointed the whole log as the last client of the file. A close
+// that is not the last runs no checkpoint and leaves the sentinel set: the
+// commits of this handle and of the handles still attached can be in the log
+// alone, and if those processes are killed the next open must run the quick
+// check.
+func (db *db) closeBtree() error {
+	checkpointed, err := db.btreeDB.CloseCheckpointed()
+	if checkpointed && db.recoveryController != nil {
+		db.recoveryController.MarkCleanAfterClose()
+	}
+	return err
 }
 
 func (db *db) createRecoveryController(ctx context.Context, path string) (*durability.Controller, bool) {

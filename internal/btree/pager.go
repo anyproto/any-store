@@ -215,6 +215,12 @@ type pager struct {
 	// inProcess uses heap-backed shm (faster, single-process only)
 	inProcess bool
 
+	// closeCheckpointed is set by close when it was the last client's close
+	// and its checkpoint completed: the arm of sqlite3WalClose that sets
+	// isDelete (wal.c:2531-2540). Every commit is then in the synced database
+	// file, and no other process was attached to add one. Read after close.
+	closeCheckpointed bool
+
 	// registryKey is the key this handle holds in openDBs from open until
 	// close, "" when it holds none; registryPath is the absolute path the
 	// key falls back to; unstableLocked is set while this open holds
@@ -4045,6 +4051,7 @@ func (p *pager) close() error {
 							}
 						}
 						p.wal.truncateFile()
+						p.closeCheckpointed = true
 					} else if debugTrace {
 						trace("close: NOT truncating WAL (cpErr=%v lockedWrite=%v)", cpErr, lockedWrite)
 					}

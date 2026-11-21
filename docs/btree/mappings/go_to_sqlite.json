@@ -786,6 +786,14 @@
     ],
     "note": ""
   },
+  "db.go:*DB.CloseCheckpointed": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeClose",
+      "pager.c:sqlite3PagerClose",
+      "wal.c:sqlite3WalClose"
+    ],
+    "note": "Close's body; also reports whether the close took sqlite3WalClose's last-connection branch and its checkpoint completed (the isDelete arm, wal.c:2531-2540). any-store-only use: the durability sentinel is cleared only then"
+  },
   "db.go:*DB.CreateNamespace": {
     "sqlite": [
       "btree.c:btreeCreateTable",
