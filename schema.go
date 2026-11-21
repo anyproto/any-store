@@ -260,9 +260,9 @@ type txSchema struct {
 	installed bool
 }
 
-// testVisits, when set, counts the entries the walks of the schema log and
-// the registry look at, for the tests that hold each walk to what its call
-// needs. Tests only.
+// testVisits, when set, counts the entries the walks of the schema log look
+// at, and the registry evictions, for the tests that hold each to what its
+// call needs. Tests only.
 var testVisits *visitCounts
 
 type visitCounts struct {
@@ -270,7 +270,7 @@ type visitCounts struct {
 	byName int
 	// discard counts the log entries discardLog walks.
 	discard int
-	// evict counts the registry entries db.evictLocked looks at.
+	// evict counts the calls of db.evictLocked.
 	evict int
 }
 

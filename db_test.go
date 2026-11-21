@@ -2967,8 +2967,8 @@ func TestWriteTx_SavepointRollbackLeavesTheMarksBeforeIt(t *testing.T) {
 }
 
 // Handles a write transaction opened and then closed leave the registry when
-// the transaction ends, each found under its name: the end costs by the
-// handles it closes, not by the registry they are in.
+// the transaction ends, with one eviction each. That an eviction looks only
+// under the handle's name is TestDB_EvictionLooksOnlyUnderTheRegisteredName.
 func TestWriteTx_ClosedHandlesLeaveTheRegistryByName(t *testing.T) {
 	const n = 64
 	for _, end := range []string{"commit", "rollback"} {
@@ -3011,7 +3011,7 @@ func TestWriteTx_ClosedHandlesLeaveTheRegistryByName(t *testing.T) {
 				require.NoError(t, wtx.Rollback())
 			}
 			testVisits = nil
-			require.Equal(t, n, v.evict, "one registry entry looked at per handle")
+			require.Equal(t, n, v.evict, "one eviction per handle")
 			require.Zero(t, registered())
 			for _, c := range colls {
 				_, err = c.Count(ctx)
@@ -3019,6 +3019,29 @@ func TestWriteTx_ClosedHandlesLeaveTheRegistryByName(t *testing.T) {
 			}
 		})
 	}
+}
+
+// An eviction deletes the registry slot of the name the handle was put in
+// the registry under (collection.regName) and looks nowhere else, so it
+// costs the same however many handles are registered. The registry is set
+// up by hand: the closed handle is under another name only, where an
+// eviction must leave it.
+func TestDB_EvictionLooksOnlyUnderTheRegisteredName(t *testing.T) {
+	fx := newFixture(t)
+	c, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+	h := c.(*collection)
+	dbi := fx.DB.(*db)
+	dbi.mu.Lock()
+	defer dbi.mu.Unlock()
+	require.Equal(t, "c", h.regName, "setup: registered under c")
+	require.NotContains(t, dbi.openedCollections, "c", "setup: Close() evicted the handle")
+	dbi.openedCollections["decoy"] = h
+	dbi.evictLocked(h)
+	got, kept := dbi.openedCollections["decoy"]
+	delete(dbi.openedCollections, "decoy")
+	require.True(t, kept && got == Collection(h), "the eviction searched the registry for the handle")
 }
 
 // BenchmarkSketch_FindThenWriteAfterAPeersCommit is the cycle of a process
