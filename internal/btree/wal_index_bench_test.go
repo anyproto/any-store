@@ -37,8 +37,10 @@ func BenchmarkShmHashGet(b *testing.B) {
 
 // BenchmarkWalIndexAppend is the cost of indexing one appended frame
 // (walIndex.set: the page number, the dead-writer guard, the hash slot), on a
-// wal-index of each kind. The segment is started over every 4000 frames,
-// which zeroes it once.
+// wal-index of each kind. The log is started over every 4000 frames. That is
+// inside the timing: the segment is cleared twice per cycle (by
+// rollbackToFrame(0) and by the set of frame 1), and the heap index also
+// drops its 4000 page-map entries.
 func BenchmarkWalIndexAppend(b *testing.B) {
 	for _, c := range []struct {
 		name      string
