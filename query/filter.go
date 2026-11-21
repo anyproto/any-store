@@ -542,18 +542,20 @@ func (e Key) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
-// String renders the path condition. A path condition whose inner filter
-// matches every value renders as {"<path>": {"$nin": []}}, which parses back
-// to a path condition whose inner filter matches every value too, on the same
-// path. The field form {"a": {}} would parse back as an equality to the empty
-// object, and the document-level {} would drop the path, which the query
-// layer validates: {"_distance": ...} without a $knn is an error, where {}
-// matches every document.
+// String renders the path condition, with the path as a JSON string
+// (jsonQuoteBytes). A path condition whose inner filter matches every value
+// renders as {"<path>": {"$nin": []}}, which parses back to a path condition
+// whose inner filter matches every value too, on the same path. The field
+// form {"a": {}} would parse back as an equality to the empty object, and the
+// document-level {} would drop the path, which the query layer validates:
+// {"_distance": ...} without a $knn is an error, where {} matches every
+// document.
 func (e Key) String() string {
+	path := jsonQuoteBytes(strings.Join(e.Path, "."))
 	if matchesEverything(e.Filter) {
-		return fmt.Sprintf(`{"%s": {"$nin": []}}`, strings.Join(e.Path, "."))
+		return fmt.Sprintf(`{%s: {"$nin": []}}`, path)
 	}
-	return fmt.Sprintf(`{"%s": %s}`, strings.Join(e.Path, "."), e.Filter.String())
+	return fmt.Sprintf(`{%s: %s}`, path, e.Filter.String())
 }
 
 // matchesEverything reports whether f is one of the filters that match every
@@ -1073,6 +1075,27 @@ func jsonQuote(s string) string {
 		return fmt.Sprintf("%q", s)
 	}
 	return string(b)
+}
+
+// jsonQuoteBytes renders s as a JSON string literal that the parser reads
+// back as s: '"', '\' and the control bytes are escaped, and every other
+// byte is kept as it is, one of invalid UTF-8 too, which json.Marshal would
+// replace.
+func jsonQuoteBytes(s string) string {
+	const hex = "0123456789abcdef"
+	b := make([]byte, 0, len(s)+2)
+	b = append(b, '"')
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"' || c == '\\':
+			b = append(b, '\\', c)
+		case c < 0x20:
+			b = append(b, '\\', 'u', '0', '0', hex[c>>4], hex[c&0xf])
+		default:
+			b = append(b, c)
+		}
+	}
+	return string(append(b, '"'))
 }
 
 // Knn is the {"<field>":{"$knn":{"$query":[…],"$k":N}}} approximate-nearest-neighbour

@@ -360,6 +360,40 @@ func TestFilterString_MatchAllRoundTrips(t *testing.T) {
 	}
 }
 
+// A path condition renders its path as a JSON string: a field name with a
+// quote, a backslash, a control byte or invalid UTF-8 parses back to the same
+// path and selects the same documents. Inserted as it is, `a":1,"b` turned
+// {"a\":1,\"b":{"$nin":[]}}, which matches every document, into a filter on
+// a=1.
+func TestKeyString_PathRoundTrips(t *testing.T) {
+	for _, tc := range []struct {
+		filter string
+		docs   []string
+	}{
+		{`{"a\":1,\"b":{"$nin":[]}}`, []string{`{"a":2}`, `{"a":1}`, `{}`}},
+		{`{"a\":1,\"b":2}`, []string{`{"a\":1,\"b":2}`, `{"a":1,"b":2}`, `{}`}},
+		{`{"a\\b":{"$nin":[]}}`, []string{`{"a":2}`, `{}`}},
+		{`{"a\\b":2}`, []string{`{"a\\b":2}`, `{"a":2}`}},
+		{`{"a\u001fb.c":2}`, []string{`{"a\u001fb":{"c":2}}`, `{"ab":{"c":2}}`}},
+		{"{\"a\xff\":2}", []string{"{\"a\xff\":2}", `{"a�":2}`}},
+	} {
+		t.Run(tc.filter, func(t *testing.T) {
+			f, err := ParseCondition(tc.filter)
+			require.NoError(t, err)
+			s := f.String()
+			back, err := ParseCondition(s)
+			require.NoError(t, err, s)
+			require.IsType(t, Key{}, back, s)
+			assert.Equal(t, f.(Key).Path, back.(Key).Path, s)
+			for _, d := range tc.docs {
+				doc := anyenc.MustParseJson(d)
+				assert.Equal(t, f.Ok(doc, &syncpool.DocBuffer{}), back.Ok(doc, &syncpool.DocBuffer{}), "%s on %s", s, d)
+			}
+			assert.True(t, back.Ok(anyenc.MustParseJson(tc.docs[0]), &syncpool.DocBuffer{}), "%s on %s", s, tc.docs[0])
+		})
+	}
+}
+
 // Only an And with no entries matches every value: And.Ok calls each entry,
 // a nil one too.
 func TestMatchesEverything_OnlyEmptyNodes(t *testing.T) {
