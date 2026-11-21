@@ -183,7 +183,7 @@ func TestCreationJournal_JournalThatIsNotHotIsLeftAlone(t *testing.T) {
 // Whatever lies under the journal's name beside an empty or missing database
 // file is deleted, and the database is created: a dead creator's journal,
 // whole or in part, SQLite's journal of a database once at that path, any
-// other file.
+// other file, one this process may not read.
 func TestCreationJournal_JournalBesideEmptyFileIsDeleted(t *testing.T) {
 	hdr := creationJournalHdr(DefaultPageSize)
 	origSizeOne := bytes.Clone(hdr)
@@ -193,21 +193,24 @@ func TestCreationJournal_JournalBesideEmptyFileIsDeleted(t *testing.T) {
 	persisted := sqliteJournalHdr()
 	clear(persisted[:creationJournalHdrSize]) // journal_mode=PERSIST's finalized journal
 	for _, tc := range []struct {
-		name    string
-		content []byte
+		name       string
+		content    []byte
+		unreadable bool // mode 000
 	}{
-		{"empty", []byte{}},
-		{"a creation header", hdr},
-		{"a creation header with bytes after it", append(bytes.Clone(hdr), 1, 2, 3)},
-		{"the start of the magic", hdr[:3]},
-		{"the start of the magic, then zeros", tornMagic},
-		{"a header cut short", hdr[:creationJournalHdrSize-1]},
-		{"a header of zeros", make([]byte, creationJournalHdrSize)},
-		{"the magic with an original size of one page", origSizeOne},
-		{"sqlite", sqliteJournalHdr()},
-		{"sqlite, finalized by zeroing", persisted},
-		{"zeros longer than a header", make([]byte, creationJournalHdrSize+1)},
-		{"text", []byte("x")},
+		{name: "empty", content: []byte{}},
+		{name: "a creation header", content: hdr},
+		{name: "a creation header of mode 000", content: hdr, unreadable: true},
+		{name: "a creation header with bytes after it", content: append(bytes.Clone(hdr), 1, 2, 3)},
+		{name: "the start of the magic", content: hdr[:3]},
+		{name: "the start of the magic, then zeros", content: tornMagic},
+		{name: "a header cut short", content: hdr[:creationJournalHdrSize-1]},
+		{name: "a header of zeros", content: make([]byte, creationJournalHdrSize)},
+		{name: "the magic with an original size of one page", content: origSizeOne},
+		{name: "sqlite", content: sqliteJournalHdr()},
+		{name: "sqlite, finalized by zeroing", content: persisted},
+		{name: "zeros longer than a header", content: make([]byte, creationJournalHdrSize+1)},
+		{name: "text", content: []byte("x")},
+		{name: "text of mode 000", content: []byte("x"), unreadable: true},
 	} {
 		for _, emptyFile := range []bool{false, true} {
 			for _, inProcess := range []bool{false, true} {
@@ -215,6 +218,13 @@ func TestCreationJournal_JournalBesideEmptyFileIsDeleted(t *testing.T) {
 					path := filepath.Join(t.TempDir(), "test.db")
 					journal := path + creationJournalSuffix
 					require.NoError(t, os.WriteFile(journal, tc.content, 0o644))
+					if tc.unreadable {
+						require.NoError(t, os.Chmod(journal, 0))
+						if f, err := os.Open(journal); err == nil {
+							_ = f.Close()
+							t.Skip("this process reads a file of mode 000")
+						}
+					}
 					if emptyFile {
 						require.NoError(t, os.WriteFile(path, nil, 0o644))
 					}
