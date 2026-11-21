@@ -8145,12 +8145,14 @@ func TestWriteOverflowChain_ContiguousOnFreshFreelist(t *testing.T) {
 // See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
 //
 // SQLite puts a WAL database's page 1 into the main file under the EXCLUSIVE
-// lock too, but through a rollback journal. These tests pin what holds
-// without one:
+// lock too, through a rollback journal, as the creation here does
+// (creation_journal.go). These tests pin:
 //
 //  1. A crash during the creation puts no user data at risk: a zero-length
 //     leftover is created again, and the complete page-1 image opens as a
-//     valid empty DB with no WAL present.
+//     valid empty DB with no WAL present. A crash that leaves anything else
+//     in the file leaves the creation journal hot beside it, and the next
+//     open rolls the file back (creation_journal_test.go).
 //
 //  2. Processes creating one path at once end with the image a single creator
 //     writes. Two-process tests of the creation itself, with one process held
@@ -8198,21 +8200,16 @@ func assertValidEmptyDB(t *testing.T, path string, opts Options) {
 	require.Equal(t, []byte("v"), got)
 }
 
-// TestInitNewDB_Page1_CrashRecoverable pins that a crash during the initial
-// direct-to-file page-1 creation leaves a recoverable / trivially re-derivable
-// empty page 1 with no pre-existing user data at risk.
+// TestInitNewDB_Page1_CrashRecoverable pins two states a creation can leave
+// when no journal is beside the file, and that Open accepts both:
+//   - a zero-length file (the creator died before it wrote page 1, or its
+//     file was rolled back), which the next open creates again; and
+//   - the complete page-1 image of a committed creation, which is a valid
+//     empty DB on its own with no WAL frame required.
 //
-// Because the new page 1 is written straight to the main file (not through
-// the WAL), the only crash states reachable mid-creation are:
-//   - a zero-length leftover file (WriteAt never landed / fdatasync skipped),
-//     which Open re-initializes cleanly on the next open, identical to C; and
-//   - the complete deterministic page-1 image (WriteAt+fdatasync completed),
-//     which is a valid empty DB on its own with no WAL frame required.
-//
-// A torn intermediate (header written, body still zero) is not produced by the
-// happy path; the recoverable invariant tested here is that the only persisted
-// new-DB image is one Open accepts as a clean empty DB, and that no earlier
-// user data ever existed to be lost.
+// A creator that dies with page 1 partly or wholly in the file and the
+// creation not committed leaves its journal hot; those states are covered in
+// creation_journal_test.go and multiprocess_create_test.go.
 func TestInitNewDB_Page1_CrashRecoverable(t *testing.T) {
 	opts := DefaultOptions()
 
@@ -8236,7 +8233,7 @@ func TestInitNewDB_Page1_CrashRecoverable(t *testing.T) {
 	})
 
 	t.Run("completed direct write opens with no WAL", func(t *testing.T) {
-		// Model "crash right after page-1 WriteAt+fdatasync, before any write
+		// Model "crash right after the creation committed, before any write
 		// transaction / WAL activity": only the bare deterministic page-1 image
 		// is on disk, with no WAL or shm. It must open as a valid empty DB,
 		// proving the direct-to-file image is self-consistent and re-derivable
