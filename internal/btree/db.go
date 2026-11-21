@@ -815,22 +815,28 @@ func Open(path string, opts Options) (*DB, error) {
 // called on the goroutine that holds one deadlocks. In serialized mode, the
 // default build, SQLite's sqlite3_close and sqlite3_close_v2 wait for the
 // connection mutex, so for a step running on another thread (main.c:1263,
-// vdbeapi.c:923), and, but for the shared b-tree mutexes of a shared cache
-// (disconnectAllVtab, main.c:1213), no longer: with a statement unfinalized,
-// or a backup that reads from the connection unfinished (backup.c:204),
-// sqlite3_close then returns SQLITE_BUSY (main.c:1283) and sqlite3_close_v2
-// leaves a zombie that is closed with the last of them (main.c:1307, 1371).
-// Neither waits for a statement to be finalized. In multi-thread mode the
-// connection has no mutex (main.c:3388-3393), and a close during another
-// thread's step is the application's error.
+// vdbeapi.c:923). Neither waits for a statement to be finalized: with a
+// statement unfinalized, or a backup that reads from the connection
+// unfinished (backup.c:204), sqlite3_close returns SQLITE_BUSY
+// (main.c:1283) and sqlite3_close_v2 leaves a zombie that is closed with
+// the last of them (main.c:1307, 1371). On the way a close takes other
+// mutexes too, and can wait for them: the shared b-tree mutexes of a shared
+// cache (disconnectAllVtab, main.c:1213), the Unix VFS's global mutex as it
+// closes a file (unixClose, os_unix.c:2350). In multi-thread mode an
+// ordinary build gives the connection no mutex (main.c:3388-3393), and a
+// close during another thread's step is the application's error; a build
+// with SQLITE_THREAD_MISUSE_WARNINGS gives it one that logs the misuse when
+// it finds the mutex held, and then waits for it (main.c:3388-3400,
+// checkMutexEnter, mutex.c:160-173).
 //
 // A registered write transaction is not waited for: Close rolls it back and
 // releases its locks, as sqlite3Close rolls back a transaction left open
 // with no statement running (sqlite3RollbackAll, main.c:1386). What Close
 // does wait for is the one call of that transaction that is in flight
 // (writerGate): a Put, a cursor move, a Commit, a Rollback, a Backup.Step
-// into this database. That call completes, a Commit included: a
-// transaction whose Commit was in flight when Close came is committed.
+// into this database. That call completes, a Commit included: a Commit in
+// flight when Close closed the gate runs to its end and returns its own
+// result, nil once the transaction is committed.
 // Every call of the transaction that comes later returns ErrClosed and
 // touches nothing, its Commit returns ErrClosed and its Rollback nil. The
 // wait has no bound of its own: a call is as long as its work, a Count or

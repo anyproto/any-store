@@ -26,9 +26,9 @@ import "sync/atomic"
 // sqlite3_step holds the connection mutex, which sqlite3_close takes
 // (vdbeapi.c:923, main.c:1263); sqlite3_close then refuses with SQLITE_BUSY
 // while a statement is unfinalized, and sqlite3_close_v2 leaves the close to
-// the last finalize (main.c:1283, 1371). In multi-thread mode the connection
-// has no mutex, and a close during another thread's step is the
-// application's error.
+// the last finalize (main.c:1283, 1371). In multi-thread mode an ordinary
+// build gives the connection no mutex (main.c:3388-3393), and a close during
+// another thread's step is the application's error.
 // DRIFT: Close ends a write transaction under its goroutine, after waiting for the call in flight; C refuses or defers the close See docs/btree/NOTES.md#drift-2026-11-21-25-close-waits-for-the-writers-call-in-flight
 //
 // The count is of calls, not of transactions, and nests: a gated call may
