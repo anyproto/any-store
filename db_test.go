@@ -505,8 +505,12 @@ func TestDb_Close(t *testing.T) {
 
 	// Once Close has refused one call of the write transaction it has
 	// refused its Commit: a statement that failed half-way, whose own
-	// rollback Close refused, is never committed by its transaction. Close
-	// is held between its two steps, the refusal and the rollback.
+	// rollback Close refused, is never committed by its transaction. The
+	// update writes the first document, moving its unique index entry, and
+	// Close comes from the modifier as the update turns to the second: the
+	// update's next write is refused, and so is the rollback of its
+	// savepoint. Close is held between its two steps, the refusal and the
+	// rollback, while the caller commits.
 	t.Run("a refused write transaction cannot commit", func(t *testing.T) {
 		fx := newFixture(t, &Config{})
 		if fx.tmpDir == "" {
@@ -522,10 +526,22 @@ func TestDb_Close(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":3,"u":"c"}`)))
 
-		done, release := closeToRollback(t, fx)
-		// The update of the unique field fails, and so does its rollback.
-		_, err = coll.Find(`{"id":1}`).Update(wtx.Context(), `{"$set":{"u":"b"}}`)
-		require.Error(t, err)
+		var (
+			calls   int
+			done    chan error
+			release func()
+		)
+		mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			calls++
+			if calls == 2 {
+				done, release = closeToRollback(t, fx)
+			}
+			v.Set("u", a.NewString(fmt.Sprintf("x%d", calls)))
+			return v, true, nil
+		})
+		_, err = coll.Find(`{"id":{"$in":[1,2]}}`).Update(wtx.Context(), mod)
+		require.ErrorIs(t, err, ErrDBIsClosed)
+		require.Equal(t, 2, calls)
 		// The caller keeps its earlier work and commits.
 		require.ErrorIs(t, wtx.Commit(), ErrDBIsClosed)
 		release()
