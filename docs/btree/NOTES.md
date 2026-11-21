@@ -2876,23 +2876,29 @@ if this open is the one that writes page 1.
    (`pager.c:3946-3962`, from `sqlite3PagerSharedLock`, `pager.c:5272`): `pagerLockDb` is
    repeated while it returns `SQLITE_BUSY` and the busy handler agrees, and the result is
    `SQLITE_BUSY` when the handler gives up. The handler's count is the connection's `nBusy`
-   (`sqlite3InvokeBusyHandler`, `main.c:1770-1780`), set to zero when a statement starts
-   (`vdbe.c:901`), and the default handler sleeps along `delays[]` until the total reaches the
-   timeout (`sqliteDefaultBusyCallback`, `main.c:1718-1747`). `pager.lockDBShared` is that
-   loop: the shared request is repeated through `DefaultBusyTimeout(BusyTimeout)` (the same
-   delay table, 5 s), and exhaustion is an error that matches `ErrBusy`. One count
-   (`beginBusy`) runs across all of an open's waits on the DB-file lock, a creation's waits in
-   `lockDBForCreate` included, so the open waits for that lock for `BusyTimeout` once. Three
-   things differ. `wal.open`'s later wait for the WAL write lock counts by itself
-   ([drift-108](#drift-108-busy-handler-retry-count-resets-per-call)), so an `Open` can wait
-   for `BusyTimeout` twice. The exclusive → shared conversion after a creation
-   (`downgradeDBLock`) has a count of its own, because SQLite's downgrade cannot fail and a
-   flock's can. And a multi-process open cannot tell a process that holds the file in
-   in-process mode (exclusive for the handle's life) from a peer inside its close or its
-   creation: it waits the whole `BusyTimeout` and fails with `ErrBusy`. The in-process open
-   itself asks for its exclusive lock once and is refused at once with `ErrInProcessLocked`,
-   whoever holds the file; mixing the two modes on one file from mmap-shm platforms is the only
-   way to meet the long wait.
+   (`sqlite3InvokeBusyHandler`, `main.c:1770-1780`), set to zero on every entry to
+   `sqlite3VdbeExec`, that is at each step (`vdbe.c:901`), and shared by every busy wait of that
+   step, the pager's and the WAL's (`btree.c:2504`, `wal.c:2109-2111`). The default handler
+   sleeps along `delays[]` until the total reaches the timeout (`sqliteDefaultBusyCallback`,
+   `main.c:1718-1747`). `pager.lockDBShared` is that loop: the shared request is repeated
+   through `DefaultBusyTimeout(BusyTimeout)` (the same delay table, 5 s), and exhaustion is an
+   error that matches `ErrBusy`. One count (`beginBusy`) serves the open's wait for the shared
+   lock and a creation's waits for the exclusive one (`lockDBForCreate`). Three things differ.
+   Two waits of an open are not on that count. `wal.open`'s later wait for the WAL write lock
+   counts by itself ([drift-108](#drift-108-busy-handler-retry-count-resets-per-call)). And the
+   exclusive → shared conversion after a creation (`downgradeDBLock`) has a count of its own:
+   SQLite has no wait there, since its flock downgrade only records the new level
+   (`os_unix.c:2747-2750`) and its POSIX downgrade is never refused by another process (a
+   failure is `SQLITE_IOERR_RDLOCK`, `os_unix.c:2215-2224`), while a flock conversion here can
+   be refused. An `Open` can therefore wait for `BusyTimeout` up to three times. The third
+   difference: a multi-process open cannot tell a process that holds the file in in-process mode
+   (exclusive for the handle's life) from a peer inside its close or its creation. It waits the
+   whole `BusyTimeout` and fails with `ErrBusy` in each case, also when a creator or a closer
+   stalls for that long. The in-process open itself asks for its exclusive lock once and does
+   not wait: where the lock is real (Unix, Windows) it is refused at once with
+   `ErrInProcessLocked`; on wasm the lock functions are no-ops and a second runtime is not
+   refused
+   ([drift-2026-06-25-07](#drift-2026-06-25-07-acquireexclusivedblock-is-a-no-op-on-plan9-wasip1-removing-the-cross-p)).
 5. *The WAL is deleted under the exclusive lock*, where SQLite deletes it under SHARED and
    relies on an empty database not being in WAL mode (`pager.c:3330-3337`). The wal-index file
    is not deleted, as in SQLite: the first attacher's election truncates a stale one
@@ -4066,7 +4072,7 @@ In SQLite's `unixLockSharedMemory`, the connection that finds the DMS byte unloc
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `shm_mmap.go:newPlatformShm` (the election retry loop).
 
-SQLite's `unixLockSharedMemory` returns `SQLITE_BUSY` when it observes a peer mid-election (`os_unix.c:4906-4908`, 3.52.0) and relies on higher-level retry (the comment at `os_unix.c:4865`: "it will try again"). Go's shm attach is a one-shot call inside `wal.open` with no busy-handler plumbing above it, so `newPlatformShm` retries the probe in-line — bounded at 100×10ms, mirroring `pager.open`'s DB-flock retry loop — and only after exhaustion fails the open with an error wrapping `ErrBusy` (`errors.Is(err, ErrBusy)` holds). The exclusive-DMS window is microseconds (WRLCK → ftruncate(3) → downgrade, nothing else under it), so a single retry normally suffices; the observable divergence is worst-case ~1s of open latency under pathological contention instead of an immediate BUSY to the application.
+SQLite's `unixLockSharedMemory` returns `SQLITE_BUSY` when it observes a peer mid-election (`os_unix.c:4906-4908`, 3.52.0) and relies on higher-level retry (the comment at `os_unix.c:4865`: "it will try again"). Go's shm attach is a one-shot call inside `wal.open` with no busy-handler plumbing above it, so `newPlatformShm` retries the probe in-line — bounded at 100×10ms, where the retry above SQLite's shm open is `walTryBeginRead`'s `WAL_RETRY` loop (the busy `xShmMap` is taken for transient, `wal.c:3094-3102`; up to `WAL_RETRY_PROTOCOL_LIMIT` = 100 tries with sleeps of `(cnt-9)*(cnt-9)*39` µs from the tenth, `wal.c:3043-3051`), not the busy handler — and only after exhaustion fails the open with an error wrapping `ErrBusy` (`errors.Is(err, ErrBusy)` holds). The exclusive-DMS window is microseconds (WRLCK → ftruncate(3) → downgrade, nothing else under it), so a single retry normally suffices; the observable divergence is worst-case ~1s of open latency under pathological contention instead of an immediate BUSY to the application.
 
 <a id="drift-2026-07-10-3-region-create-false-never-maps-existing-content"></a>
 ### Drift: region(create=false) Never Maps Existing Shm Content On A Fresh Attach
