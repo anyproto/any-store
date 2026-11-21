@@ -690,19 +690,12 @@ func openHaltDB(t *testing.T, prep func(t *testing.T, db *DB)) (*DB, *spillFault
 // The call during which a spill fails ends the transaction's cursors as it
 // returns, as SQLite's statement halt does (sqlite3VdbeHalt: closeAllCursors,
 // then sqlite3RollbackAll's trip, vdbeaux.c:3335, 3378): a cursor positioned
-// on another tree does not go on stepping through the leaf it pins. Each
-// method of a write transaction and of its cursors that passes an error to
-// the halt itself (ReadTx.halt, Cursor.halt, Cursor.fail) is the failing
-// call in one case, at one of its error exits (Get, SeekKey and Count
-// reach AppendValue, AppendSeekKey and CountContext; the WriteTx namespace
-// calls reach the DB ones). RollbackToSavepoint is the exception: it meets
-// the spill only in the save of a cursor, whose Key halts first, and its
-// own exits return the error only as a later call does. A saved cursor's
-// restore, which every move and read of it begins with, has a case of its
-// own. Methods that only return the error of one of these (Skip,
-// SkipBackward, SeekExact, AppendValueByKey, CountUntil) have none.
-// Savepoint and ReleaseSavepoint fetch no page and cannot meet a spill.
-// TestSpillFault_LaterCallEndsCursors has the later calls.
+// on another tree does not go on stepping through the leaf it pins. In each
+// case one call of the write transaction or of a cursor meets the failed
+// spill; the halt that ends the cursors can be the call's own or that of a
+// call it makes. TestSpillFault_CreateReadBackEndsCursors has the read-back
+// of CreateNamespace, and TestSpillFault_LaterCallEndsCursors the calls
+// that return the error without a fetch.
 func TestSpillFault_FailedCallEndsCursors(t *testing.T) {
 	longName := strings.Repeat("n", 3*4096)
 	// longNS is a namespace whose catalog key spills: its lookup reads the
@@ -906,13 +899,10 @@ func TestSpillFault_FailedCallEndsCursors(t *testing.T) {
 // transaction's cursors as well, a cursor opened since the failure
 // included, as every SQLite statement that ends in an error halts. Each
 // case is a call that returns the error without a fetch: the savepoint
-// calls, which test the state first, and the calls of a cursor the first
-// halt faulted, which report the error they were faulted with (First, Last
-// and Seek test the fault themselves; every other move and read begins with
-// the restore, as Next does). A cursor opened since has no position, and
-// a fetch would fail: until a halt ends it, its Next reports the end of
-// the tree. RollbackToSavepoint's case covers its own exit, which no call
-// of TestSpillFault_FailedCallEndsCursors reaches first.
+// calls, which test the state first, and calls of a cursor the first halt
+// faulted, which report the error they were faulted with. A cursor opened
+// since has no position, and a fetch would fail: until a halt ends it, its
+// Next reports the end of the tree.
 func TestSpillFault_LaterCallEndsCursors(t *testing.T) {
 	cases := []struct {
 		name string
@@ -959,6 +949,57 @@ func TestSpillFault_LaterCallEndsCursors(t *testing.T) {
 			require.NoError(t, db.IntegrityCheck())
 		})
 	}
+}
+
+// WriteTx.CreateNamespace reads the new entry back once DB.CreateNamespace
+// has inserted it, and that read's error passes through a halt of its own.
+// With a name whose overflow chain is longer than the writer cache, the
+// read-back needs pages the insertion spilled, and the spill that makes room
+// for them fails here: the insertion succeeded, the read-back did not, and
+// the cursor on another tree is ended.
+func TestSpillFault_CreateReadBackEndsCursors(t *testing.T) {
+	name := strings.Repeat("n", 3*closeRescueCache*4096)
+	// begin opens the write transaction and positions the cursor on "b" in
+	// the same way in both databases, so that the insertion writes as many
+	// frames in each.
+	begin := func(t *testing.T, db *DB) (*WriteTx, *Cursor) {
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = tx.Rollback() })
+		cur := tx.NewCursor(mustNS(t, tx, "b"))
+		t.Cleanup(cur.Close)
+		require.NoError(t, cur.First())
+		return tx, cur
+	}
+
+	// The writes of the insertion alone, and that the read-back writes too.
+	db, f := openHaltDB(t, nil)
+	tx, _ := begin(t, db)
+	before := f.writes.Load()
+	require.NoError(t, db.CreateNamespace(tx, name))
+	insert := f.writes.Load() - before
+	_, err := db.getNamespaceLocked(name)
+	require.NoError(t, err)
+	require.Greater(t, f.writes.Load()-before, insert, "the read-back spills")
+	require.NoError(t, tx.Rollback())
+
+	db, f = openHaltDB(t, nil)
+	tx, cur := begin(t, db)
+	before = f.writes.Load()
+	f.arm(insert+1, false, false)
+	_, err = tx.CreateNamespace(name)
+	require.ErrorIs(t, err, errInjectedSpillIO)
+	require.Equal(t, int64(1), f.fired.Load(), "the read-back met the fault")
+	require.Equal(t, insert+1, f.writes.Load()-before, "the fault fired at the first write of the read-back")
+	require.Equal(t, int32(pagerError), db.pager.state.Load())
+
+	assert.Empty(t, cur.stack, "the cursor still pins its leaf after the failed read-back")
+	assert.ErrorIs(t, cur.Next(), errInjectedSpillIO, "the cursor steps on after the failed read-back")
+
+	require.NoError(t, tx.Rollback())
+	f.disarm()
+	require.NoError(t, db.IntegrityCheck())
+	require.Equal(t, 20, countKeys(t, db, "b"))
 }
 
 func mustNS(t *testing.T, tx *WriteTx, name string) *Namespace {
