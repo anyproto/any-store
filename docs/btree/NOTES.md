@@ -2786,8 +2786,12 @@ only between `sqlite3_shutdown`, which clears the init flags (`main.c:380-395`),
 it cannot use, `if( sqlite3GlobalConfig.pPage==0 || sqlite3GlobalConfig.szPage<512 ||
 sqlite3GlobalConfig.nPage<=0 )` setting `pPage = 0; szPage = 0;` (`malloc.c:165-168`), and
 `sqlite3PCacheBufferSetup` (`pcache1.c:271-291`) builds the slot list, where `if( pBuf==0 ) sz =
-n = 0;` and `if( n==0 ) sz = 0;` (`pcache1.c:274-275`) leave a cleared one with no slots, so every
-allocation goes to `sqlite3Malloc`.
+n = 0;` and `if( n==0 ) sz = 0;` (`pcache1.c:274-275`) leave a cleared one with no slots. Every page
+buffer then comes from `sqlite3Malloc` (`pcache1Alloc`, `pcache1.c:344` and `361`), but the cleared
+configuration still counts: `sqlite3MallocInit` keeps `nPage`, and with `pPage==0`, `pcache1Init`
+sets `pcache1.nInitPage = sqlite3GlobalConfig.nPage;` (`pcache1.c:730-737`), so each cache's
+initial bulk allocation is sized from that count (`pcache1InitBulk`, `pcache1.c:303-311`: `nPage`
+pages, or `-1024*nPage` bytes for a negative count, at most the cache's own size; none for 0).
 
 Go's `pageSlab.Init` (behind `ConfigPageCache` and `anystore.InitPageBuffer`) keeps SQLite's rule
 for which arguments give slots: `slabUsable` requires `pageSize >= MinPageSize` (512) and
@@ -2796,7 +2800,10 @@ allocates the slab where C is handed one, and C has neither: `pageSize <= MaxPag
 since a larger slot serves no database (no page size is larger, and the slab serves only a page of
 its own slot size, see drift-2026-06-25-22), and `nPages*pageSize` must fit an int. Any other
 arguments leave an initialized slab with no slots and slot size 0, which serves no request
-(`pageSlab.serves`), and `btree.Open` resolves `useSlab` to false for every database.
+(`pageSlab.serves`), and `btree.Open` resolves `useSlab` to false for every database. Such a
+database runs as one that never opted in: its caches make the default initial bulk allocation, up
+to 20 pages (`pcache.initBulk`, `SQLITE_DEFAULT_PCACHE_INITSZ`), where C sizes it from the cleared
+configuration's `nPage`.
 
 What diverges is the lifecycle. Go has no shutdown, and `Init` is first-call-wins: a
 double-checked `s.initialized` guard makes every later call a no-op, so the slab is configured once
@@ -4033,7 +4040,7 @@ The consequence is that a database whose read-version byte is greater than 2 (a 
 
 What remains different:
 
-- **Equality, not "fits".** The C request is the whole allocation, `pCache->szAlloc = szPage + szExtra + ROUND8(sizeof(PgHdr1))` (`pcache1.c:787`, passed at 449), and a slot is addressed by pointer, so any slot at least that large serves it and a slot of exactly the page size does not. A Go page buffer is a slice whose length is the page size: the slab serves a page size equal to its slot size, and serving a larger slot would mean cutting it down on `Get` and restoring its full extent on `Put`. A slab with larger slots than the page size is unused in Go and used in C.
+- **Equality, not "fits".** The C request is the whole allocation, `pCache->szAlloc = szPage + szExtra + ROUND8(sizeof(PgHdr1))` (`pcache1.c:787`, passed at 449), and a slot is addressed by pointer, so any slot at least that large serves it and a slot of exactly the page size does not. A Go page buffer is a slice whose length is the page size: the slab serves a page size equal to its slot size, and serving a larger slot would mean cutting it down on `Get` and restoring its full extent on `Put`. A slab with larger slots than the page size is unused in Go. In C it is used only when its slot, rounded down to a multiple of 8 (`sz = ROUNDDOWN8(sz);`, `pcache1.c:276`), holds the whole `szAlloc`; a slot larger than the page but smaller than that is unused in C too.
 - **Resolved per database.** `btree.Open` sets `useSlab` only when the database opted in and the slab serves its page size; the page size cannot change after that, since the file's must match the process's buffer pool. A database the slab does not serve runs as one that did not opt in: its caches make their initial bulk allocation and return buffers without the slab's lock. In C a configured buffer turns the bulk allocation off for every cache (`pcache1Init` sets `nInitPage` only when `pPage==0`, `pcache1.c:730-737`), whether its slots fit or not. In a Go process every database has one page size, so a slab that does not serve it serves none.
 - **No overflow counter.** The pool-overflow status counters C updates on the fallback (`SQLITE_STATUS_PAGECACHE_OVERFLOW`, `pcache1.c:365-369`) have no counterpart: `nOverflow` counts only exhaustion of a slab that does serve the size.
 

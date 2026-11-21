@@ -9,10 +9,12 @@ import (
 
 // MaxArrayPadding is the largest number of null elements a numeric path
 // segment may add to an array to reach its index: {"$set": {"arr.N": v}} on
-// an array of length L appends N-L nulls before v. The limit and the error
-// are MongoDB's (kMaxPaddingAllowed, maybePadTo in update/path_support.cpp),
-// and stop one path segment from asking for an allocation proportional to a
-// number the caller wrote. A segment naming an index at most MaxArrayPadding
+// an array of length L appends N-L nulls before v. The limit and the reason
+// text, "can't backfill more than 1500000 elements", are MongoDB's
+// (kMaxPaddingAllowed, maybePadTo in update/path_support.cpp); the error
+// prefixes the reason with the field, and has no code and no errors.Is
+// target. The limit stops one path segment from asking for an allocation
+// proportional to a number the caller wrote. A segment naming an index at most MaxArrayPadding
 // is never refused by it.
 const MaxArrayPadding = 1_500_000
 

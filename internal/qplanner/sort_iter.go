@@ -255,11 +255,15 @@ func (it *SortIter) collectAndSort() error {
 		// Max-heap of size TopK: keep only the smallest K entries. Build the
 		// candidate's packed key + docId at the arena TAIL (in spare capacity)
 		// WITHOUT committing it, so we can decide membership before deciding to
-		// keep the bytes. A "loser" row truncates the tail back and costs no
-		// retained memory and no allocation, as SQLite's pushOntoSorter skips a
-		// row that would not stay among LIMIT+OFFSET records (select.c:833-846).
-		// The candidate's offset and length are native ints until it is kept:
-		// a loser past sortArenaLimit is no error.
+		// keep the bytes. A "loser" row truncates the tail back and keeps no
+		// entry, though a loser longer than the spare capacity grows the
+		// arena's backing array, and that capacity stays until the arena is
+		// released. SQLite's pushOntoSorter also keeps no record of a row that
+		// would not stay among LIMIT+OFFSET records (select.c:833-846), and
+		// compares the row's key registers with the largest kept entry before
+		// it builds a record at all (OP_IdxLE before makeSorterRecord,
+		// select.c:851-858). The candidate's offset and length are native ints
+		// until it is kept: a loser past sortArenaLimit is no error.
 		base := len(it.arena)
 		it.growArena(256)
 		if it.arena, err = it.appendSortKey(it.arena, doc, raw); err != nil {

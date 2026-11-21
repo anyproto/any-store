@@ -22,8 +22,11 @@ import (
 // the default allocator, without the pool's memory bound. (SQLite's page cache
 // uses any slot large enough for a page and its header; the buffers of this
 // pool are the pages themselves.) A pageSize below 512 or an nPages below 1
-// allocates nothing and leaves every database on the default allocator, as
-// SQLite ignores such a configuration. A pageSize above 65536, the largest
+// allocates nothing and leaves every database on the default allocator.
+// SQLite clears such a configuration too (sqlite3MallocInit) and allocates
+// pages from its default allocator, though each of its caches still sizes its
+// first bulk allocation from nPages; here every cache keeps its default one.
+// A pageSize above 65536, the largest
 // page size, or an nPages*pageSize too large for an int also allocates
 // nothing: these two bounds are this package's own, since SQLite is handed its
 // buffer and allocates none.
