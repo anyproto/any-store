@@ -90,11 +90,14 @@ type DB interface {
 	// Wait".
 	//
 	// The copy is a database of the source's kind: checksummed, encrypted
-	// with the same passphrase, key or codec (under a salt of its own, so
-	// a passphrase gives the copy a key of its own), or plain when the
-	// source is plain, as an in-memory database and the backups of one are.
-	// A file at path that already holds a database of another kind is not
-	// replaced: Backup returns an error and leaves it as it was.
+	// with the same passphrase, key or codec, or plain when the source is
+	// plain. An in-memory database has no checksums, so its copy is plain,
+	// or encrypted when it was opened with Encryption. An encrypted copy
+	// keeps the KDF salt of the file at path, or draws one when it creates
+	// the file, so a new copy of a passphrase database has a key of its
+	// own. A file at path that already holds a database of another kind is
+	// not replaced: Backup returns an error and leaves its content as it
+	// was.
 	//
 	// Backup never removes the file at path. If it fails before the copy is
 	// committed, the destination's transaction is rolled back: a destination
@@ -1201,7 +1204,9 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 	// defaults is still plain, and so is its backup; a backup of a database
 	// created before v2.5.0 is such a database too. A destination that
 	// exists keeps its own geometry, and BackupInit refuses it if that is
-	// not the source's, before anything is written to it.
+	// not the source's, before the copy writes a page: its content is
+	// unchanged, though closing it may checkpoint its WAL, as closing any
+	// database may.
 	dstOpts := db.btreeDB.BackupDestinationOptions()
 
 	if testBackupOpenHook != nil {

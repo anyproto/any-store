@@ -215,8 +215,9 @@ type Config struct {
 // v1; changing a passphrase requires exporting to a freshly-opened
 // database.
 //
-// InMemory databases ignore Encryption (there is no at-rest artifact
-// to protect).
+// An InMemory database keeps its pages unencrypted in memory (there is
+// no at-rest artifact to protect); its Backup is an encrypted file that
+// opens with the same Encryption.
 type EncryptionConfig struct {
 	// Passphrase is the user-supplied secret. Nil = no encryption.
 	Passphrase []byte
