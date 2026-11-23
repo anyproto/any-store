@@ -26,7 +26,7 @@ type SentinelTracker struct {
 
 // New returns the tracker of the sentinel file beside dbPath, named dbPath
 // with the suffix appended. dbPath is the name the database file is opened
-// by, which anystore.Open resolves once against the working directory.
+// by, the full name anystore.Open resolves once (btree.FullPathname).
 func New(dbPath string) *SentinelTracker {
 	sentinelPath := dbPath + lockFileSuffix
 	tracker := &SentinelTracker{

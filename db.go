@@ -143,8 +143,11 @@ type DBStats struct {
 // The config parameter can be nil for default settings.
 // Returns a DB instance or an error.
 //
-// A relative path is resolved against the working directory once, when the
-// database is opened.
+// The path is resolved to a full name once, when the database is opened
+// (btree.FullPathname), and the database file, its WAL and its sentinel file
+// are named from it. On Unix a relative path is joined to the working
+// directory, on Windows the name is GetFullPathNameW's, and on js/wasm and
+// wasip1 it is the path as given.
 func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	ds, err := open(ctx, path, config, 0)
 	if err != nil {
@@ -162,10 +165,12 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 	}
 	config.setDefaults()
 
-	// One name for the database file, its WAL and its sentinel file.
+	// One name for the database file, its WAL and its sentinel file, as
+	// SQLite resolves the name once and opens every file by it
+	// (pager.c:4792, pager.c:4929, pager.c:4948).
 	var err error
 	if !config.InMemory {
-		if path, err = fullPathname(path); err != nil {
+		if path, err = btree.FullPathname(path); err != nil {
 			return nil, fmt.Errorf("cannot resolve the database path: %w", err)
 		}
 	}

@@ -11,9 +11,12 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -451,6 +454,79 @@ func TestInspectIndexSketch_AccumulatesOnInsertAndDelete(t *testing.T) {
 	info, err = insp.InspectIndexSketch(ctx, "test", "a")
 	require.NoError(t, err)
 	assert.Equal(t, uint64(20), info.DocCount)
+}
+
+// In a working directory whose full name is longer than the OS takes, the
+// relative name "test.db" opens but the full name does not. The database file
+// is opened by the same full name as its sentinel file, so the open fails
+// rather than going on with a sentinel file it cannot reach.
+func TestOpen_FullNameTooLongFailsTheOpen(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("needs a PATH_MAX that a deep working directory exceeds")
+	}
+	t.Chdir(t.TempDir())
+	name := strings.Repeat("d", 200)
+	for range 25 { // 5000 bytes, past PATH_MAX on Linux (4096) and Darwin (1024)
+		require.NoError(t, os.Mkdir(name, 0o755))
+		require.NoError(t, os.Chdir(name))
+	}
+	f, err := os.Create("test.db.probe")
+	require.NoError(t, err, "setup: a relative name opens")
+	require.NoError(t, f.Close())
+
+	db, err := Open(context.Background(), "test.db", &Config{Durability: DurabilityConfig{Sentinel: true}})
+	if err == nil {
+		_ = db.Close()
+	}
+	require.ErrorIs(t, err, syscall.ENAMETOOLONG)
+}
+
+// On js/wasm the name a database is opened by is the name as given: a
+// relative name reaches the VFS unchanged, not joined to a working directory,
+// so the key of a database in a browser store stays the caller's.
+func TestOpen_RelativeNameReachesTheVFSUnchangedOnJS(t *testing.T) {
+	if runtime.GOOS != "js" {
+		t.Skip("js/wasm only: elsewhere a VFS needs -tags vfs, and Unix and Windows resolve a full name")
+	}
+	t.Chdir(t.TempDir())
+	var mu sync.Mutex
+	var names []string
+	SetVFS(VFS{
+		OpenFile: func(name string, flag int, perm os.FileMode) (File, error) {
+			mu.Lock()
+			names = append(names, name)
+			mu.Unlock()
+			f, err := os.OpenFile(name, flag, perm)
+			if err != nil {
+				return nil, err
+			}
+			return f, nil
+		},
+		Remove: func(name string) error {
+			mu.Lock()
+			names = append(names, name)
+			mu.Unlock()
+			return os.Remove(name)
+		},
+		Fdatasync: func(f File) error { return f.Sync() },
+	})
+	t.Cleanup(ResetVFS)
+
+	ctx := context.Background()
+	db, err := Open(ctx, "notes.db", nil)
+	require.NoError(t, err)
+	coll, err := db.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"doc1"}`)))
+	require.NoError(t, db.Close())
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Contains(t, names, "notes.db")
+	require.Contains(t, names, "notes.db-wal")
+	for _, name := range names {
+		require.True(t, strings.HasPrefix(name, "notes.db"), "the VFS was given %q", name)
+	}
 }
 
 func TestOpen_AnyStoreV1File(t *testing.T) {
