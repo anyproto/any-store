@@ -4,7 +4,6 @@ package btree
 
 import (
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -21,20 +20,18 @@ import (
 type dirSync struct {
 	pending atomic.Bool
 	mu      sync.Mutex
-	// dir is the directory to sync, resolved when the file was opened.
+	// dir is the directory to sync: the one of the name the file was
+	// opened by (databaseDir).
 	dir string
 }
 
-// set marks the file, opened as path, as opened with the create flag. dir
-// is the directory to sync: the database's, resolved when it was opened
-// (databaseDir), as unixSync takes it from the full pathname the file was
-// opened by (os_unix.c:3944). A file opened outside a pager (tests) has none,
-// and path's directory is synced.
-func (d *dirSync) set(path, dir string) {
-	if dir == "" {
-		dir = filepath.Dir(path)
-	}
-	d.dir = dir
+// set marks the file, opened as path, as opened with the create flag. The
+// directory to sync is taken from path, as unixSync takes it from the name
+// the file was opened by (osOpenDirectory(pFile->zPath, &dirfd),
+// os_unix.c:3945): a pager opens its journal and its WAL by names built from
+// the database's full name (FullPathname).
+func (d *dirSync) set(path string) {
+	d.dir = databaseDir(path)
 	d.pending.Store(true)
 }
 

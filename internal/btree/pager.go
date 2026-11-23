@@ -87,8 +87,7 @@ type pager struct {
 	master      *masterStore // InMemory "disk" — holds checkpointed page data
 	header      dbHeader
 	pageSize    uint32
-	path        string
-	dir         string // the directory dirSync syncs, resolved by open (databaseDir)
+	path        string // the database's full name once open has run (FullPathname)
 	usableSize_ int    // pageSize - ReservedSpace; immutable after open, safe for concurrent reads
 	// tableLeaf is the file's leaf-cell rule: set, leaf cells use the table-leaf
 	// payload limit (schema format 6 and later); clear, the index rule. Fixed by
@@ -527,9 +526,13 @@ func (p *pager) open() (err error) {
 		h(p, "before-lock")
 	}
 
-	// The directory the journal's and the WAL's first syncs sync, resolved
-	// once, before any file is created.
-	if p.dir, err = databaseDir(p.path); err != nil {
+	// The database's full name, resolved once, before any file is opened
+	// (sqlite3OsFullPathname, pager.c:4792). The database file, the creation
+	// journal, the WAL and its index are opened by it or by names built from
+	// it (pager.c:4915, pager.c:4929, pager.c:4948), the moved-file check
+	// stats it, and a first sync syncs its directory. A name Open has
+	// already resolved comes back unchanged.
+	if p.path, err = FullPathname(p.path); err != nil {
 		return err
 	}
 
@@ -780,7 +783,6 @@ func (p *pager) open() (err error) {
 
 	// Open WAL
 	p.wal = newWal(p.path+"-wal", p.pageSize)
-	p.wal.dir = p.dir
 	p.wal.inProcess = p.inProcess
 	p.wal.noCommitSync = p.noCommitSync
 	p.wal.inMemory = p.inMemory

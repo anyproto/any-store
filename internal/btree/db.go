@@ -615,10 +615,16 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 
+	// The database's full name, resolved once (sqlite3OsFullPathname,
+	// pager.c:4792): the first look at the header below and the pager open
+	// the database by it.
 	// canonicalPath is the lexical absolute path, used for db.path.
 	var canonicalPath string
 	if !opts.InMemory {
 		var err error
+		if path, err = FullPathname(path); err != nil {
+			return nil, err
+		}
 		canonicalPath, err = filepath.Abs(path)
 		if err != nil {
 			return nil, fmt.Errorf("btree: cannot resolve path: %w", err)
@@ -899,10 +905,9 @@ func (db *DB) Path() string {
 // OpenFiles is what DB.OpenFiles reports: the files a database has open,
 // identified by their descriptors, and the spelling they were opened by.
 type OpenFiles struct {
-	// Path is the database's path as Open was given it, neither made
-	// absolute nor cleaned: the spelling the database file and the files
-	// beside it (Path+"-wal", Path+"-wal-shm") were opened by, which the
-	// system resolves as it did then. Path() is its lexically cleaned
+	// Path is the database's full name (FullPathname), not cleaned: the
+	// spelling the database file and the files beside it (Path+"-wal",
+	// Path+"-wal-shm") were opened by. Path() is its lexically cleaned
 	// absolute form, which names another file when a ".." in it follows a
 	// symbolic link to a directory: the system resolves the link first.
 	Path string

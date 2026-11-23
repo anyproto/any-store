@@ -11,28 +11,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The directory is the full pathname up to its last separator, not cleaned:
-// each ".." stays for the OS to follow.
-func TestDatabaseDir_KeepsDotDot(t *testing.T) {
-	t.Chdir(t.TempDir())
-	wd, err := os.Getwd()
-	require.NoError(t, err)
-	for path, want := range map[string]string{
-		"x/../db":  wd + "/x/..",
-		"db":       wd,
-		"/x/../db": "/x/..",
-		"/db":      "/",
+// The directory is the name up to its last separator, not cleaned: each ".."
+// stays for the OS to follow. It is "/" for a file in the root directory and
+// "." for a name with no separator.
+func TestDatabaseDir_IsTheNameUpToItsLastSeparator(t *testing.T) {
+	for name, want := range map[string]string{
+		"/a/x/../db-wal": "/a/x/..",
+		"/a/db-journal":  "/a",
+		"/a//db":         "/a/",
+		"/db":            "/",
+		"db":             ".",
+		"x/db":           "x",
 	} {
-		got, err := databaseDir(path)
-		require.NoError(t, err)
-		require.Equal(t, want, got, path)
+		require.Equal(t, want, databaseDir(name), name)
 	}
 }
 
 // In a working directory whose full name is longer than the OS takes, the
-// relative name "test.db" opens but its full name does not. The open fails,
-// and before it has created any file: no database, journal or WAL whose
-// directory sync would be skipped.
+// relative name "test.db" opens but its full name does not. The database is
+// opened by its full name, so the open fails, and it has created no file.
 func TestDatabaseDir_NameTooLongFailsTheOpen(t *testing.T) {
 	t.Chdir(t.TempDir())
 	name := strings.Repeat("d", 200)

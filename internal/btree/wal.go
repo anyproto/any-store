@@ -1559,9 +1559,6 @@ type wal struct {
 	// (os_unix.c:6569-6573, 6777; sqlite3WalOpen, wal.c:1719-1720): the
 	// first sync of the file also syncs its directory (syncFile).
 	dirSync dirSync
-	// dir is the directory dirSync syncs: the database's, resolved by the
-	// pager at open (databaseDir).
-	dir string
 
 	// headerOnDisk is false when the WAL file is empty (0 bytes) and the
 	// header has not yet been written to disk. The header is written lazily
@@ -1711,7 +1708,7 @@ func (w *wal) open() (err error) {
 		return err
 	}
 	w.file = f
-	w.dirSync.set(w.path, w.dir)
+	w.dirSync.set(w.path)
 
 	// Release the WAL file/shm on any error after this point so a failed open
 	// doesn't leak fds (see the equivalent guard in pager.open for why a leaked

@@ -42,3 +42,52 @@ func TestDirSync_DirectoryIsTheOneResolvedAtOpen(t *testing.T) {
 	}
 	require.FileExists(t, filepath.Join(home, "test.db-wal"))
 }
+
+// The database, its creation journal and its WAL are opened by the full name
+// resolved once. A working directory that changes after the resolution and
+// before the database file is opened: every file is in the directory the
+// name was resolved against, that directory is the one synced, and the new
+// working directory gets nothing.
+func TestOpen_ChdirBeforeTheFilesOpenKeepsThemInTheResolvedDirectory(t *testing.T) {
+	home, elsewhere := t.TempDir(), t.TempDir()
+	homeInfo, err := os.Stat(home)
+	require.NoError(t, err)
+	var synced []os.FileInfo
+	testSyncDirHook = func(d *os.File) {
+		info, err := d.Stat()
+		require.NoError(t, err)
+		synced = append(synced, info)
+	}
+	t.Cleanup(func() { testSyncDirHook = nil })
+
+	t.Chdir(home)
+	testOpenStageHook = func(_ *pager, stage string) {
+		if stage == "before-lock" {
+			require.NoError(t, os.Chdir(elsewhere))
+		}
+	}
+	t.Cleanup(func() { testOpenStageHook = nil })
+	opts := DefaultOptions()
+	opts.NoCommitSync = false
+	db, err := testOpen(t, "test.db", opts)
+	testOpenStageHook = nil
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	createPutRow(t, db, "one")
+
+	require.FileExists(t, filepath.Join(home, "test.db"))
+	require.FileExists(t, filepath.Join(home, "test.db-wal"))
+	entries, err := os.ReadDir(elsewhere)
+	require.NoError(t, err)
+	require.Empty(t, entries, "a file was opened in the working directory changed to")
+	require.Len(t, synced, 2, "the creation journal's directory sync and the WAL's")
+	for _, info := range synced {
+		require.True(t, os.SameFile(homeInfo, info), "a directory other than the database's was synced")
+	}
+
+	files, err := db.OpenFiles()
+	require.NoError(t, err)
+	fi, err := os.Stat(files.Path)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(fi, files.DB), "OpenFiles.Path does not name the open database file")
+}

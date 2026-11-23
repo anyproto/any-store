@@ -151,11 +151,12 @@ func (p *pager) playbackCreationJournal(f fileHandle) error {
 // remnant from a prior database with the same name where the database file
 // but not the journal was deleted, or (2) the initial transaction that
 // populates a new database is being rolled back. In either case, the journal
-// file can be deleted" (pager.c:5170-5181). The file is not read: a dead
-// creator's journal, SQLite's and any other file go the same way. It is
-// found by a stat, as SQLite's xAccess(SQLITE_ACCESS_EXISTS) is one
-// (unixAccess, os_unix.c:6895-6898), so a file this process may not read is
-// deleted too. The caller holds the DB-file lock exclusively.
+// file can be deleted" (pager.c:5170-5181). What the file holds decides
+// nothing: a dead creator's journal, SQLite's and any other file go the same
+// way. With native file access it is found by a stat, as SQLite's
+// xAccess(SQLITE_ACCESS_EXISTS) is one (unixAccess, os_unix.c:6895-6898), so
+// a file this process may not read is deleted too. The caller holds the
+// DB-file lock exclusively.
 func (p *pager) deleteJournalOfEmptyDatabase(f fileHandle) error {
 	if _, err := osStat(p.path + creationJournalSuffix); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -205,7 +206,7 @@ func (p *pager) openCreationJournal() (*creationJournal, error) {
 		return nil, fmt.Errorf("btree: open the creation journal: %w", err)
 	}
 	j := &creationJournal{f: f, name: name}
-	j.dirSync.set(name, p.dir)
+	j.dirSync.set(name)
 	if h := testOpenStageHook; h != nil {
 		h(p, "journal-opened")
 	}
