@@ -474,14 +474,18 @@ func TestOpen_FullNameTooLongFailsTheOpen(t *testing.T) {
 	f, err := os.Create("test.db.probe")
 	require.NoError(t, err, "setup: a relative name opens")
 	require.NoError(t, f.Close())
+	require.NoError(t, os.Remove("test.db.probe"))
+	_, err = btree.FullPathname("test.db")
+	require.Error(t, err, "setup: getcwd fails in this working directory")
 
 	db, err := Open(context.Background(), "test.db", &Config{Durability: DurabilityConfig{Sentinel: true}})
 	if err == nil {
 		_ = db.Close()
 	}
 	require.Error(t, err)
-	_, statErr := os.Stat("test.db")
-	require.ErrorIs(t, statErr, os.ErrNotExist, "the failed open left a database file")
+	entries, err := os.ReadDir(".")
+	require.NoError(t, err)
+	require.Empty(t, entries, "the failed open left a file")
 }
 
 // On js/wasm the name a database is opened by is the name as given: a
