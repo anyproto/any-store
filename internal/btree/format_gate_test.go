@@ -227,7 +227,7 @@ func TestOpen_FirstMagicStillOpensAndIsRewritten(t *testing.T) {
 // read-only descriptor. A database this binary can use fails with the error
 // of the open itself.
 func TestOpen_ReadOnlyFileKeepsItsFormatError(t *testing.T) {
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" || runtime.GOOS == "js" {
 		t.Skip("needs a file that opens for reading and not for writing")
 	}
 	healthy := referenceEmptyPage1(t, DefaultOptions())
