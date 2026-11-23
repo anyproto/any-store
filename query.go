@@ -2,6 +2,7 @@ package anystore
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"slices"
 	"strings"
@@ -954,25 +955,28 @@ func countPlanRoot(plan *qplanner.Plan) (int, error) {
 // plan.Close — bulk writes must release the plan's cursors before mutating,
 // and iterators reuse their docId buffers between rows.
 //
-// The offsets are ints: the ids of one bulk write have no bound below the
-// buffer's own, and a 32-bit offset would wrap past 4 GiB.
+// Each id is stored after its length as a uvarint, so the buffer is the only
+// allocation curve and every offset is an int: the ids of one bulk write
+// have no bound below the buffer's own.
 func collectDistinctIDs(root qplanner.Iterator) ([][]byte, error) {
-	var idBuf []byte    // contiguous buffer for all ids
-	var idOffsets []int // start offset of each id in idBuf
+	var idBuf []byte // contiguous buffer: uvarint length, then the id, per id
+	n := 0
 	if err := qplanner.ForEachDistinct(root, func(docId []byte) error {
-		idOffsets = append(idOffsets, len(idBuf))
+		idBuf = binary.AppendUvarint(idBuf, uint64(len(docId)))
 		idBuf = append(idBuf, docId...)
+		n++
 		return nil
 	}); err != nil {
 		return nil, err
 	}
-	ids := make([][]byte, len(idOffsets))
-	for i, off := range idOffsets {
-		end := len(idBuf)
-		if i+1 < len(idOffsets) {
-			end = idOffsets[i+1]
-		}
-		ids[i] = idBuf[off:end]
+	ids := make([][]byte, n)
+	off := 0
+	for i := range ids {
+		l, k := binary.Uvarint(idBuf[off:])
+		off += k
+		end := off + int(l)
+		ids[i] = idBuf[off:end:end]
+		off = end
 	}
 	return ids, nil
 }

@@ -466,6 +466,36 @@ func TestCollQuery_Update(t *testing.T) {
 	assert.Equal(t, `{"id":2,"a":2,"b":1}`, doc.Value().String())
 }
 
+// The id list of a bulk write stores each id after its length as a uvarint;
+// these ids take a 1-, 2- and 3-byte length on both sides of each boundary.
+func TestCollQuery_BulkWriteIdLengths(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	lens := []int{1, 127, 128, 16383, 16384, 20000}
+	ids := make([]string, len(lens))
+	for i, l := range lens {
+		ids[i] = strings.Repeat(string(rune('a'+i)), l)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%q,"a":1}`, ids[i]))))
+	}
+
+	res, err := coll.Find(`{"a":1}`).Update(ctx, `{"$set":{"b":1}}`)
+	require.NoError(t, err)
+	assert.Equal(t, len(ids), res.Modified)
+	for _, id := range ids {
+		doc, err := coll.FindId(ctx, id)
+		require.NoError(t, err, "id of length %d", len(id))
+		assert.Equal(t, 1, doc.Value().GetInt("b"), "id of length %d", len(id))
+	}
+
+	res, err = coll.Find(`{"b":1}`).Delete(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, len(ids), res.Modified)
+	n, err := coll.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n)
+}
+
 func TestCollQuery_Sort(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
