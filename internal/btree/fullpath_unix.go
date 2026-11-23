@@ -4,8 +4,8 @@ package btree
 
 import (
 	"fmt"
-	"os"
 	"strings"
+	"syscall"
 )
 
 // FullPathname returns the full name of the database file at path. A
@@ -17,8 +17,10 @@ import (
 //
 // It is unixFullPathname's rule for a path that is not absolute: the name
 // starts from the working directory ("if( zPath[0]!='/' )", then osGetcwd,
-// os_unix.c:7021-7028). An absolute path is returned as given, so a full
-// name resolves to itself. A working directory that cannot be read fails
+// os_unix.c:7021-7028), the kernel's, as getcwd returns it: syscall.Getwd,
+// not os.Getwd, which can return $PWD, another name of the same directory
+// through which a ".." reaches another parent. An absolute path is returned
+// as given, so a full name resolves to itself. A working directory that cannot be read fails
 // the call, as unixFullPathname returns SQLITE_CANTOPEN (os_unix.c:7024).
 // Nothing is measured here: a full name too long for the OS fails when the
 // file is opened by it, where unixFullPathname fails for a name that does
@@ -28,7 +30,7 @@ func FullPathname(path string) (string, error) {
 	if strings.HasPrefix(path, "/") {
 		return path, nil
 	}
-	wd, err := os.Getwd()
+	wd, err := syscall.Getwd()
 	if err != nil {
 		return "", fmt.Errorf("btree: cannot resolve path: %w", err)
 	}
