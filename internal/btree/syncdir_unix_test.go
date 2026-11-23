@@ -61,9 +61,16 @@ func TestOpen_ChdirBeforeTheFilesOpenKeepsThemInTheResolvedDirectory(t *testing.
 	t.Cleanup(func() { testSyncDirHook = nil })
 
 	t.Chdir(home)
+	var journalAtHome, journalElsewhere bool
 	testOpenStageHook = func(_ *pager, stage string) {
-		if stage == "before-lock" {
+		switch stage {
+		case "before-lock":
 			require.NoError(t, os.Chdir(elsewhere))
+		case "journal-opened":
+			_, err := os.Stat(filepath.Join(home, "test.db"+creationJournalSuffix))
+			journalAtHome = err == nil
+			_, err = os.Stat(filepath.Join(elsewhere, "test.db"+creationJournalSuffix))
+			journalElsewhere = err == nil
 		}
 	}
 	t.Cleanup(func() { testOpenStageHook = nil })
@@ -73,6 +80,8 @@ func TestOpen_ChdirBeforeTheFilesOpenKeepsThemInTheResolvedDirectory(t *testing.
 	testOpenStageHook = nil
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
+	require.True(t, journalAtHome, "the creation journal was not created in the database's directory")
+	require.False(t, journalElsewhere, "the creation journal was created in the working directory changed to")
 	createPutRow(t, db, "one")
 
 	require.FileExists(t, filepath.Join(home, "test.db"))
