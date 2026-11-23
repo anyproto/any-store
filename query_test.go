@@ -466,13 +466,15 @@ func TestCollQuery_Update(t *testing.T) {
 	assert.Equal(t, `{"id":2,"a":2,"b":1}`, doc.Value().String())
 }
 
-// The id list of a bulk write stores each id after its length as a uvarint;
-// these ids take a 1-, 2- and 3-byte length on both sides of each boundary.
+// The id list of a bulk write stores each id after its length as a uvarint.
+// An encoded string id is 2 bytes longer than the string (type byte and
+// terminator), so these ids are 3, 127, 128, 16383, 16384 and 20002 bytes:
+// a 1-, 2- and 3-byte length, on both sides of each boundary.
 func TestCollQuery_BulkWriteIdLengths(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	lens := []int{1, 127, 128, 16383, 16384, 20000}
+	lens := []int{1, 125, 126, 16381, 16382, 20000}
 	ids := make([]string, len(lens))
 	for i, l := range lens {
 		ids[i] = strings.Repeat(string(rune('a'+i)), l)
