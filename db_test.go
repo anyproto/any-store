@@ -16,7 +16,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -457,9 +456,11 @@ func TestInspectIndexSketch_AccumulatesOnInsertAndDelete(t *testing.T) {
 }
 
 // In a working directory whose full name is longer than the OS takes, the
-// relative name "test.db" opens but the full name does not. The database file
-// is opened by the same full name as its sentinel file, so the open fails
-// rather than going on with a sentinel file it cannot reach.
+// relative name "test.db" opens but the full name cannot be built: getcwd
+// fails, as SQLite's open fails when osGetcwd does (os_unix.c:7023-7024).
+// The database file is opened by the same full name as its sentinel file,
+// so the open fails, and leaves no file, rather than going on with a
+// sentinel file it cannot reach.
 func TestOpen_FullNameTooLongFailsTheOpen(t *testing.T) {
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("needs a PATH_MAX that a deep working directory exceeds")
@@ -478,7 +479,9 @@ func TestOpen_FullNameTooLongFailsTheOpen(t *testing.T) {
 	if err == nil {
 		_ = db.Close()
 	}
-	require.ErrorIs(t, err, syscall.ENAMETOOLONG)
+	require.Error(t, err)
+	_, statErr := os.Stat("test.db")
+	require.ErrorIs(t, statErr, os.ErrNotExist, "the failed open left a database file")
 }
 
 // On js/wasm the name a database is opened by is the name as given: a
