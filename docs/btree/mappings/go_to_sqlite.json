@@ -1161,6 +1161,24 @@
     "sqlite": [],
     "note": "Thin wrapper over log.Logger.Printf for build-tagged tracing; any-store-specific debug scaffolding with no SQLite origin."
   },
+  "fullpath_other.go:FullPathname": {
+    "sqlite": [
+      "os_kv.c:kvvfsFullPathname"
+    ],
+    "note": "js/wasm and wasip1: the name as given, unchanged"
+  },
+  "fullpath_unix.go:FullPathname": {
+    "sqlite": [
+      "os_unix.c:unixFullPathname"
+    ],
+    "note": "a path that is not absolute is joined to the working directory, an absolute one is kept as given; no symbolic link is followed and no \".\" or \"..\" element removed; a name too long for the OS fails when the file is opened by it"
+  },
+  "fullpath_windows.go:FullPathname": {
+    "sqlite": [
+      "os_win.c:winFullPathname"
+    ],
+    "note": "GetFullPathNameW through syscall.FullPath"
+  },
   "integrity.go:*DB.IntegrityCheck": {
     "sqlite": [
       "btree.c:sqlite3BtreeIntegrityCheck"
