@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -53,6 +54,9 @@ func TestRecovery_IdleFlushOutlivesOpenCtx(t *testing.T) {
 // the database, and none of them touch a file of the same name in the new
 // working directory.
 func TestRecovery_SentinelPathResolvedAtOpen(t *testing.T) {
+	if runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
+		t.Skip("the name is the path as given there: a relative name follows the working directory")
+	}
 	dirA, dirB := t.TempDir(), t.TempDir()
 	markerA := filepath.Join(dirA, "test.db.lock")
 	markerB := filepath.Join(dirB, "test.db.lock")
@@ -91,6 +95,9 @@ func TestRecovery_SentinelPathResolvedAtOpen(t *testing.T) {
 // database and its marker together, in the directory the path was resolved
 // against.
 func TestRecovery_ChdirDuringOpenKeepsDatabaseAndSentinelTogether(t *testing.T) {
+	if runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
+		t.Skip("the name is the path as given there: a relative name follows the working directory")
+	}
 	dirA, dirB := t.TempDir(), t.TempDir()
 	ctx := context.Background()
 	t.Chdir(dirA)
