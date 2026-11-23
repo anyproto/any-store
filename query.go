@@ -210,7 +210,11 @@ func (q *collQuery) validateSources(s *collSchema) error {
 	if err := rejectLegacyVectorClause(q.cond, s.vindexes); err != nil {
 		return err
 	}
-	hasKnn := query.ContainsKnn(q.cond)
+	// One walk tells whether the filter has a source ($knn or $text) at all;
+	// a filter with neither skips both resolutions (ftsSource finds no $text
+	// and no misplaced one in such a tree).
+	hasSrc := query.ContainsSourceFilter(q.cond)
+	hasKnn := hasSrc && query.ContainsKnn(q.cond)
 	// _distance is synthetic and only produced by a $knn search: referencing it
 	// with no $knn (in filter or sort) is an error rather than a silent
 	// match-everything / sort-on-nothing.
@@ -224,8 +228,10 @@ func (q *collQuery) validateSources(s *collSchema) error {
 		if _, _, err := q.detectKnnQuery(s); err != nil {
 			return err
 		}
-	} else if _, _, err := q.ftsSource(s); err != nil {
-		return err
+	} else if hasSrc {
+		if _, _, err := q.ftsSource(s); err != nil {
+			return err
+		}
 	}
 	q.srcValidatedFor = s
 	return nil
