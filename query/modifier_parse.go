@@ -55,9 +55,10 @@ func MustParseModifier(modifier any) Modifier {
 // index past the padding limit (anyencutil.MaxArrayPadding) is applied once to
 // a copy of the document, and the copy is the result: the document passed in
 // is left as it was, whether the modifier succeeds or Modify returns an error.
-// Such a modifier stores copies of its operands, so applying it does not
-// change them. Any other modifier changes the document passed in and returns
-// it, and its $set, $push and $addToSet store their operands themselves.
+// Any other modifier changes the document passed in and returns it. $set,
+// $push and $addToSet store a copy of an object or array operand, so
+// applying a modifier never changes it, and every document gets a value of
+// its own.
 func ParseModifier(modifier any) (Modifier, error) {
 	if m, ok := modifier.(Modifier); ok {
 		return m, nil
@@ -72,7 +73,7 @@ func ParseModifier(modifier any) (Modifier, error) {
 		return nil, withSource(err, "modifier")
 	}
 	if chain, ok := m.(ModifierChain); ok && mayExceedPadding(chain) {
-		return paddingStaged{ModifierChain: ownOperands(chain)}, nil
+		return paddingStaged{ModifierChain: chain}, nil
 	}
 	return m, nil
 }
@@ -184,7 +185,36 @@ func newPopModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	}, nil
 }
 
+// refuseEachForm refuses, for $push and $addToSet, an operand object with a
+// key that starts with '$'. MongoDB reads {"$each": [...]} there as the
+// operator's modifiers (mods), which any-store does not implement: taken as a
+// value, the object would be stored as it is where MongoDB stores its
+// elements. Refusing every such key keeps those forms free to be implemented
+// later without changing what an accepted update does.
+func refuseEachForm(op, mods string, v *anyenc.Value) error {
+	obj, err := v.Object()
+	if err != nil {
+		return nil
+	}
+	var dollarKey string
+	obj.Visit(func(k []byte, _ *anyenc.Value) {
+		if dollarKey == "" && bytes.HasPrefix(k, opBytesPrefix) {
+			dollarKey = string(k)
+		}
+	})
+	if dollarKey == "" {
+		return nil
+	}
+	return &ParseError{
+		Op:     op,
+		Reason: op + " takes one value: its modifiers (" + mods + ") are not supported, and an object operand cannot have a key that starts with '$', got " + dollarKey,
+	}
+}
+
 func newPushModifier(key []byte, v *anyenc.Value) (Modifier, error) {
+	if err := refuseEachForm("$push", "$each, $position, $slice, $sort", v); err != nil {
+		return nil, err
+	}
 	return modifierPush{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v,
@@ -221,6 +251,9 @@ func newPullAllModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 }
 
 func newAddToSetModifier(key []byte, v *anyenc.Value) (Modifier, error) {
+	if err := refuseEachForm("$addToSet", "$each", v); err != nil {
+		return nil, err
+	}
 	return modifierAddToSet{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v,

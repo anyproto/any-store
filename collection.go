@@ -77,15 +77,19 @@ type Collection interface {
 	// Returns a modify result or error.
 	UpdateId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error)
 
-	// UpsertOne inserts a document if it does not exist, or updates it if it does.
-	// Returns the ID of the upserted document or an error if the operation fails.
+	// UpsertOne inserts a document if it does not exist, or replaces it if it
+	// does. Returns an error if the operation fails.
 	// An integer id above 2^53 in magnitude is the nearest float64, which can
 	// be another document's id: that document is then replaced (see
 	// Collection).
 	UpsertOne(ctx context.Context, doc *anyenc.Value) (err error)
 
-	// UpsertId updates a single document or creates new one
-	// Returns a modify result or error.
+	// UpsertId applies mod to the document with the given id, as UpdateId
+	// does, and when there is none inserts what mod makes of the document
+	// {<primary key>: id}, as MongoDB's upsert does: {id} alone when mod
+	// changes nothing. An insert returns Matched 0 and Modified 1. A mod
+	// that changes the id fails with ErrPrimaryKeyModification and writes
+	// nothing, as it does for an existing document.
 	// An integer id above 2^53 in magnitude is the nearest float64, which can
 	// be another document's id: that document is then the one updated (see
 	// Collection).
@@ -594,7 +598,57 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 	return
 }
 
+// maxDocDepth is the deepest nesting of objects and arrays a stored document
+// may have, the document itself being the first level. anyenc's parser reads
+// containers 512 levels deep, and a compressed document's object sits one
+// level below its wrapper, so 511 levels read back whether the document is
+// stored compressed or not. MongoDB refuses a document nested past 100
+// levels on write; here the bound is what the reader reads.
+const maxDocDepth = 511
+
+// checkDocDepth refuses a document nested deeper than maxDocDepth, which
+// every write checks before it stores one (insertItem, update): an insert of
+// a value built in an Arena, or a modifier's path, can nest deeper than the
+// parser reads, and the document stored would fail every later read.
+func checkDocDepth(v *anyenc.Value) error {
+	if nestsDeeper(v, maxDocDepth) {
+		return fmt.Errorf("any-store: document is nested deeper than %d levels", maxDocDepth)
+	}
+	return nil
+}
+
+// nestsDeeper reports whether v nests objects and arrays more than levels
+// deep, v included.
+func nestsDeeper(v *anyenc.Value, levels int) bool {
+	switch v.Type() {
+	case anyenc.TypeObject:
+		if levels == 0 {
+			return true
+		}
+		obj, _ := v.Object()
+		deeper := false
+		obj.Visit(func(_ []byte, f *anyenc.Value) {
+			deeper = deeper || nestsDeeper(f, levels-1)
+		})
+		return deeper
+	case anyenc.TypeArray:
+		if levels == 0 {
+			return true
+		}
+		arr, _ := v.Array()
+		for _, e := range arr {
+			if nestsDeeper(e, levels-1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (c *collection) insertItem(tx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, it item) (err error) {
+	if err = checkDocDepth(it.Value()); err != nil {
+		return err
+	}
 	buf.SmallBuf = c.appendId(buf.SmallBuf[:0], it.Value())
 	if c.compressionDisabled() {
 		buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
@@ -849,24 +903,38 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 		if txErr != nil {
 			return
 		}
-		if !modified {
-			if !isInsert {
-				res.Matched = 1
+		if !isInsert {
+			res.Matched = 1
+			if !modified {
+				return
 			}
-			return
+			res.Modified = 1
+			newIt, vErr := c.newItem(newVal)
+			if vErr != nil {
+				return false, vErr
+			}
+			return c.update(tx, s, newIt, prevItem)
 		}
-		res.Modified = 1
+		// A new id inserts what the modifier made of {id}, changed or not:
+		// {id} alone when it changes nothing (a lone $pull, $unset or $pop of
+		// a missing field), as MongoDB's upsert inserts the query's equality
+		// fields with the update applied to them.
+		if !modified && newVal == nil {
+			newVal = modValue
+		}
 		newIt, vErr := c.newItem(newVal)
 		if vErr != nil {
 			return false, vErr
 		}
-		if isInsert {
-			txErr = c.insertItem(tx, s, buf2, newIt)
-			return true, txErr
-		} else {
-			res.Matched = 1
-			return c.update(tx, s, newIt, prevItem)
+		// The id is immutable on this branch too, as update checks for an
+		// existing document: a modifier that changed it ($push into a field
+		// of an object id) would store the document under a key the lookup
+		// by id does not find.
+		if !bytes.Equal(c.appendId(buf2.SmallBuf[:0], newVal), buf.SmallBuf) {
+			return false, ErrPrimaryKeyModification
 		}
+		res.Modified = 1
+		return true, c.insertItem(tx, s, buf2, newIt)
 	})
 	returned = true
 	if err != nil {
@@ -876,6 +944,9 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 }
 
 func (c *collection) update(tx *btree.WriteTx, s *collSchema, it, prevIt item) (modified bool, err error) {
+	if err = checkDocDepth(it.Value()); err != nil {
+		return false, err
+	}
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 

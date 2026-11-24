@@ -51,61 +51,23 @@ func (mRoot ModifierChain) Modify(a *anyenc.Arena, v *anyenc.Value) (result *any
 // MongoDB applies an update the same way, to a mutable copy that is stored
 // only when every operation succeeds. A modifier without such a segment is
 // never refused by the padding limit and runs on the document directly.
-//
-// The chain stores copies of its operands (ownOperands), as MongoDB copies an
-// operand from the immutable update spec into the document
-// (update/set_node.cpp: setValueBSONElement(val)), so applying it does not
-// change its operands.
 type paddingStaged struct {
 	ModifierChain
 }
 
-// ownOperands returns chain with its $set, $push and $addToSet replaced by
-// forms that store a copy of their operand on every application. The forms
-// are types of their own, not a flag, so that the plain modifiers every other
-// update parses keep their size.
-func ownOperands(chain ModifierChain) ModifierChain {
-	owned := make(ModifierChain, len(chain))
-	for i, m := range chain {
-		switch mt := m.(type) {
-		case modifierSet:
-			m = ownedSet(mt)
-		case modifierPush:
-			m = ownedPush(mt)
-		case modifierAddToSet:
-			m = ownedAddToSet(mt)
-		case ModifierChain:
-			m = ownOperands(mt)
-		}
-		owned[i] = m
-	}
-	return owned
-}
-
-// ownedSet, ownedPush and ownedAddToSet are $set, $push and $addToSet storing
-// a copy of their operand (ownOperands).
-type (
-	ownedSet      modifierSet
-	ownedPush     modifierPush
-	ownedAddToSet modifierAddToSet
-)
-
-func (m ownedSet) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
-	return modifierSet(m).modify(a, v, true)
-}
-
-func (m ownedPush) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
-	return modifierPush(m).modify(a, v, true)
-}
-
-func (m ownedAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
-	return modifierAddToSet(m).modify(a, v, true)
-}
-
-// stored is the value an operation stores for operand val: val itself, or a
-// copy of it in a when the chain owns its operands (ownOperands).
-func stored(a *anyenc.Arena, val *anyenc.Value, copyVal bool) *anyenc.Value {
-	if copyVal {
+// stored is the value $set, $push and $addToSet store for their operand val:
+// a copy of it in a when it is an object or an array, val itself otherwise.
+// MongoDB copies an operand from the immutable update spec into the document
+// (update/set_node.cpp: setValueBSONElement(val)). Stored as itself, an
+// object or array operand would be shared by every document the modifier is
+// applied to — the matches of a filtered Update, or the documents of a caller
+// that reuses the parsed modifier — and a later operation of the same
+// modifier that changes it in place ($inc into the object $push appended,
+// $push into the array $set stored) would change the modifier, and through it
+// the next document. A scalar is never changed in place.
+func stored(a *anyenc.Arena, val *anyenc.Value) *anyenc.Value {
+	switch val.Type() {
+	case anyenc.TypeObject, anyenc.TypeArray:
 		return a.Copy(val)
 	}
 	return val
@@ -169,13 +131,9 @@ type modifierSet struct {
 }
 
 func (m modifierSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	return m.modify(a, v, false)
-}
-
-func (m modifierSet) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		modified = !anyencutil.Equal(value, m.val)
-		return stored(a, m.val, copyVal), nil
+		return stored(a, m.val), nil
 	})
 	if err != nil {
 		return nil, false, err
@@ -229,9 +187,15 @@ type modifierRename struct {
 	val       []string
 }
 
+// The walks to the field that $rename moves and to the array that $pop,
+// $pull and $pullAll change do not create the path: on a document without
+// it they leave the document as it was, as MongoDB does. Walked with
+// creation, a missing parent was set to {} — kept, and stored, once another
+// operation of the modifier changed the document.
+
 func (m modifierRename) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
 	var oldFieldValue *anyenc.Value
-	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
+	err = anyencutil.Walk(a, v, m.fieldPath, false, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value != nil {
 			modified = true
 			oldFieldValue = value
@@ -257,7 +221,7 @@ type modifierPop struct {
 }
 
 func (m modifierPop) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
+	err = anyencutil.Walk(a, v, m.fieldPath, false, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			return nil, nil
 		}
@@ -301,10 +265,6 @@ type modifierPush struct {
 }
 
 func (m modifierPush) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	return m.modify(a, v, false)
-}
-
-func (m modifierPush) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			// A missing field becomes an array holding the value, as in
@@ -315,7 +275,7 @@ func (m modifierPush) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (re
 		if err != nil {
 			return nil, notArrayError("$push", m.fieldPath, err)
 		}
-		value.SetArrayItem(len(arrayOfValues), stored(a, m.val, copyVal))
+		value.SetArrayItem(len(arrayOfValues), stored(a, m.val))
 		modified = true
 		return value, nil
 	})
@@ -333,7 +293,7 @@ type modifierPull struct {
 }
 
 func (m modifierPull) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
+	err = anyencutil.Walk(a, v, m.fieldPath, false, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			return nil, nil
 		}
@@ -368,7 +328,7 @@ type modifierPullAll struct {
 }
 
 func (m modifierPullAll) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
+	err = anyencutil.Walk(a, v, m.fieldPath, false, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			return nil, nil
 		}
@@ -421,10 +381,6 @@ type modifierAddToSet struct {
 }
 
 func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	return m.modify(a, v, false)
-}
-
-func (m modifierAddToSet) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			value = a.NewArray()
@@ -433,7 +389,7 @@ func (m modifierAddToSet) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool)
 		if err != nil {
 			return nil, notArrayError("$addToSet", m.fieldPath, err)
 		}
-		modified = m.addElements(a, value, copyVal)
+		modified = m.addElements(a, value)
 		return value, nil
 	})
 	if err != nil {
@@ -443,13 +399,13 @@ func (m modifierAddToSet) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool)
 	return
 }
 
-func (m modifierAddToSet) addElements(a *anyenc.Arena, value *anyenc.Value, copyVal bool) bool {
+func (m modifierAddToSet) addElements(a *anyenc.Arena, value *anyenc.Value) bool {
 	arrayOfValues := value.GetArray()
 	if slices.ContainsFunc(arrayOfValues, func(val *anyenc.Value) bool {
 		return anyencutil.Equal(m.val, val)
 	}) {
 		return false
 	}
-	value.SetArrayItem(len(arrayOfValues), stored(a, m.val, copyVal))
+	value.SetArrayItem(len(arrayOfValues), stored(a, m.val))
 	return true
 }

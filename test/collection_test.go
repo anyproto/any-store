@@ -6,6 +6,7 @@ import (
 	"math"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -2689,6 +2690,267 @@ func TestQuery_FailedBulkWriteReportsNothingModified(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, want, doc.Value().String())
 			}
+		})
+	}
+}
+
+// $push on a field a document does not have creates the array, as in
+// MongoDB, and so inserts the document an UpsertId of a new id makes; on a
+// field that holds something other than an array it is an error and writes
+// nothing.
+func TestCollection_PushMissingField(t *testing.T) {
+	push := query.MustParseModifier(`{"$push":{"tags":"a"}}`)
+	t.Run("upsert inserts", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		res, err := coll.UpsertId(ctx, 1, push)
+		require.NoError(t, err)
+		assert.Equal(t, anystore.ModifyResult{Matched: 0, Modified: 1}, res)
+		doc, err := coll.FindId(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, `{"id":1,"tags":["a"]}`, doc.Value().String())
+	})
+	t.Run("update creates the field", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+		res, err := coll.UpdateId(ctx, 1, push)
+		require.NoError(t, err)
+		assert.Equal(t, anystore.ModifyResult{Matched: 1, Modified: 1}, res)
+		res, err = coll.UpdateId(ctx, 1, push)
+		require.NoError(t, err)
+		assert.Equal(t, anystore.ModifyResult{Matched: 1, Modified: 1}, res)
+		doc, err := coll.FindId(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, `{"id":1,"tags":["a","a"]}`, doc.Value().String())
+	})
+	t.Run("not an array", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":"a"}`)))
+		_, err = coll.UpsertId(ctx, 1, push)
+		require.Error(t, err)
+		doc, err := coll.FindId(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, `{"id":1,"tags":"a"}`, doc.Value().String())
+	})
+}
+
+// $push and $addToSet written in MongoDB's $each form are refused: the
+// modifiers are not implemented, and the object would otherwise be stored
+// as it is.
+func TestCollection_PushEachRefused(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	for _, mod := range []string{
+		`{"$push":{"tags":{"$each":["a","b"]}}}`,
+		`{"$addToSet":{"tags":{"$each":["a","b"]}}}`,
+	} {
+		_, err := coll.Find(nil).Update(ctx, mod)
+		var pe *query.ParseError
+		require.ErrorAs(t, err, &pe, mod)
+		assert.ErrorContains(t, err, "are not supported")
+	}
+	doc, err := coll.FindId(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, `{"id":1}`, doc.Value().String())
+}
+
+// An UpsertId of an id with no document inserts what its modifier makes of
+// {id}, as MongoDB's upsert does: {id} alone when the modifier changes
+// nothing. A removal on a nested path creates none of it, so it inserts {id}
+// too. The document then exists, and the same modifier matches it and
+// changes nothing.
+func TestCollection_UpsertIdNoOpInsertsId(t *testing.T) {
+	for _, mod := range []string{
+		`{"$pull":{"tags":"x"}}`,
+		`{"$unset":{"name":""}}`,
+		`{"$pop":{"tags":1}}`,
+		`{"$pullAll":{"meta.tags":["x"]}}`,
+		`{"$rename":{"meta.old":"new"}}`,
+	} {
+		t.Run(mod, func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			res, err := coll.UpsertId(ctx, 1, query.MustParseModifier(mod))
+			require.NoError(t, err)
+			assert.Equal(t, anystore.ModifyResult{Matched: 0, Modified: 1}, res)
+			doc, err := coll.FindId(ctx, 1)
+			require.NoError(t, err)
+			assert.Equal(t, `{"id":1}`, doc.Value().String())
+
+			res, err = coll.UpsertId(ctx, 1, query.MustParseModifier(mod))
+			require.NoError(t, err)
+			assert.Equal(t, anystore.ModifyResult{Matched: 1, Modified: 0}, res)
+			assertQueryCount(t, coll.Find(nil), 1)
+		})
+	}
+	t.Run("custom primary key", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "c", anystore.CollectionOptions{PrimaryKey: "uuid"})
+		require.NoError(t, err)
+		_, err = coll.UpsertId(ctx, "a", query.MustParseModifier(`{"$pull":{"tags":"x"}}`))
+		require.NoError(t, err)
+		doc, err := coll.FindId(ctx, "a")
+		require.NoError(t, err)
+		assert.Equal(t, `{"uuid":"a"}`, doc.Value().String())
+	})
+}
+
+// The id of an UpsertId is immutable when it inserts, as when it updates: a
+// modifier that changes it fails with ErrPrimaryKeyModification and writes
+// nothing, so no document is stored under a key the id does not find. A
+// modifier that leaves the id as it was inserts the document under it.
+func TestCollection_UpsertIdKeepsTheId(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	objId := anyenc.MustParseJson(`{"tenant":1}`)
+	for _, tc := range []struct {
+		id  any
+		mod string
+	}{
+		{objId, `{"$push":{"id.tags":"a"}}`},
+		{objId, `{"$inc":{"id.tenant":1}}`},
+		{objId, `{"$set":{"id":2}}`},
+		{1, `{"$set":{"id":2}}`},
+		{"a", `{"$rename":{"id":"name"},"$set":{"id":"b"}}`},
+	} {
+		_, err := coll.UpsertId(ctx, tc.id, query.MustParseModifier(tc.mod))
+		require.ErrorIs(t, err, anystore.ErrPrimaryKeyModification, tc.mod)
+	}
+	assertQueryCount(t, coll.Find(nil), 0)
+
+	for _, id := range []any{objId, 1, "a", math.Copysign(0, -1)} {
+		res, err := coll.UpsertId(ctx, id, query.MustParseModifier(`{"$set":{"id":null,"n":1}}`))
+		require.ErrorIs(t, err, anystore.ErrPrimaryKeyModification, "%v", id)
+		res, err = coll.UpsertId(ctx, id, query.MustParseModifier(`{"$set":{"n":1}}`))
+		require.NoError(t, err, "%v", id)
+		assert.Equal(t, anystore.ModifyResult{Matched: 0, Modified: 1}, res)
+		doc, err := coll.FindId(ctx, id)
+		require.NoError(t, err, "%v", id)
+		assert.Equal(t, 1, doc.Value().GetInt("n"))
+	}
+	doc, err := coll.FindId(ctx, objId)
+	require.NoError(t, err)
+	assert.Equal(t, `{"id":{"tenant":1},"n":1}`, doc.Value().String())
+}
+
+// A modifier applied to several documents gives each a value of its own: the
+// object $push appends is a copy, so the $inc of the same modifier into it
+// changes that document only, not the next match, nor the parsed modifier a
+// caller applies again.
+func TestCollection_ModifierOperandPerDocument(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1}`), anyenc.MustParseJson(`{"id":2}`), anyenc.MustParseJson(`{"id":3}`)))
+	mod := query.MustParseModifier(`{"$push":{"p":{"n":1}},"$inc":{"p.0.n":1}}`)
+	res, err := coll.Find(`{"id":{"$in":[1,2]}}`).Update(ctx, mod)
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.Modified)
+	_, err = coll.UpdateId(ctx, 3, mod)
+	require.NoError(t, err)
+	for id := 1; id <= 3; id++ {
+		doc, err := coll.FindId(ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, fmt.Sprintf(`{"id":%d,"p":[{"n":2}]}`, id), doc.Value().String())
+	}
+}
+
+// A $pull, $pullAll, $pop or $rename of a path a document does not have
+// creates none of it, so another operation of the same update that writes
+// the document stores no {} parent for $exists to find.
+func TestCollection_RemovalStoresNoParent(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	for _, mod := range []string{
+		`{"$pull":{"meta.old":"x"},"$set":{"seen":1}}`,
+		`{"$pullAll":{"meta.old":["x"]},"$set":{"seen":2}}`,
+		`{"$pop":{"meta.old":1},"$set":{"seen":3}}`,
+		`{"$rename":{"meta.old":"new"},"$set":{"seen":4}}`,
+	} {
+		res, err := coll.UpdateId(ctx, 1, query.MustParseModifier(mod))
+		require.NoError(t, err)
+		assert.Equal(t, anystore.ModifyResult{Matched: 1, Modified: 1}, res, mod)
+	}
+	doc, err := coll.FindId(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, `{"id":1,"seen":4}`, doc.Value().String())
+	assertQueryCount(t, coll.Find(`{"meta":{"$exists":true}}`), 0)
+}
+
+// A write refuses a document nested deeper than the 511 levels every read of
+// it parses, the document itself being the first, and stores nothing: from
+// a modifier's path, a filtered Update, an Insert or UpsertOne of a value
+// built in an Arena. At 511 levels the document is written and reads back,
+// stored compressed or not.
+func TestCollection_DocumentDepthBounded(t *testing.T) {
+	// path names `objects` nested objects with an array at their bottom: with
+	// the document, objects+2 levels.
+	path := func(objects int) string { return strings.Repeat("a.", objects) + "tags" }
+	// deepDoc is {"id":id,"d":[[...[]...]]}, arrays nested arrays below the
+	// document: arrays+1 levels.
+	deepDoc := func(id, arrays int) *anyenc.Value {
+		a := &anyenc.Arena{}
+		d := a.NewArray()
+		for cur, i := d, 1; i < arrays; i++ {
+			next := a.NewArray()
+			cur.SetArrayItem(0, next)
+			cur = next
+		}
+		doc := a.NewObject()
+		doc.Set("id", a.NewNumberInt(id))
+		doc.Set("d", d)
+		return doc
+	}
+	for name, compression := range map[string]anystore.Compression{"s2": anystore.S2, "none": anystore.NoCompression} {
+		t.Run(name, func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "c", anystore.CollectionOptions{Compression: compression})
+			require.NoError(t, err)
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+
+			_, err = coll.UpdateId(ctx, 1, query.MustParseModifier(fmt.Sprintf(`{"$push":{%q:1}}`, path(509))))
+			require.NoError(t, err)
+			doc, err := coll.FindId(ctx, 1)
+			require.NoError(t, err)
+			want := doc.Value().String()
+			assert.Len(t, doc.Value().GetArray(strings.Split(path(509), ".")...), 1)
+
+			for _, mod := range []string{
+				fmt.Sprintf(`{"$push":{%q:1}}`, path(510)),
+				fmt.Sprintf(`{"$set":{%q:[]}}`, path(510)),
+				fmt.Sprintf(`{"$set":{%q:{}}}`, path(510)),
+			} {
+				_, err = coll.UpdateId(ctx, 1, query.MustParseModifier(mod))
+				require.ErrorContains(t, err, "nested deeper than 511 levels")
+				_, err = coll.UpsertId(ctx, 2, query.MustParseModifier(mod))
+				require.ErrorContains(t, err, "nested deeper than 511 levels")
+				_, err = coll.Find(`{"id":1}`).Update(ctx, mod)
+				require.ErrorContains(t, err, "nested deeper than 511 levels")
+			}
+			doc, err = coll.FindId(ctx, 1)
+			require.NoError(t, err)
+			assert.Equal(t, want, doc.Value().String())
+
+			require.ErrorContains(t, coll.Insert(ctx, deepDoc(2, 511)), "nested deeper than 511 levels")
+			require.ErrorContains(t, coll.UpsertOne(ctx, deepDoc(1, 511)), "nested deeper than 511 levels")
+			require.ErrorContains(t, coll.UpdateOne(ctx, deepDoc(1, 511)), "nested deeper than 511 levels")
+			assertQueryCount(t, coll.Find(nil), 1)
+
+			require.NoError(t, coll.Insert(ctx, deepDoc(2, 510)))
+			_, err = coll.FindId(ctx, 2)
+			require.NoError(t, err)
 		})
 	}
 }

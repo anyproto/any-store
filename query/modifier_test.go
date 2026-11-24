@@ -835,3 +835,72 @@ func TestParseModifier_StagesOnlyPathsPastThePaddingLimit(t *testing.T) {
 		assert.Equal(t, staged, isStaged, mod)
 	}
 }
+
+// A modifier gives every document it is applied to a value of its own: $set,
+// $push and $addToSet store a copy of an object or array operand, so a later
+// operation of the same modifier that changes it in place changes that
+// document's copy, not the operand, and the next document starts from the
+// operand as parsed. MongoDB copies an operand into each document. None of
+// these modifiers takes the staged path, and the first document has no array
+// to pad.
+func TestModifier_ObjectOperandsAreCopied(t *testing.T) {
+	for _, tc := range []struct{ mod, doc, want string }{
+		{`{"$push":{"p":{"n":1}},"$inc":{"p.0.n":1}}`, `{}`, `{"p":[{"n":2}]}`},
+		{`{"$push":{"p":{"n":1}},"$inc":{"p.0.n":1}}`, `{"p":[]}`, `{"p":[{"n":2}]}`},
+		{`{"$addToSet":{"s":{"n":1}},"$inc":{"s.0.n":1}}`, `{}`, `{"s":[{"n":2}]}`},
+		{`{"$set":{"o":{"n":1}},"$inc":{"o.n":1}}`, `{}`, `{"o":{"n":2}}`},
+		{`{"$set":{"arr":[1]},"$push":{"arr":2}}`, `{}`, `{"arr":[1,2]}`},
+	} {
+		mod := MustParseModifier(tc.mod)
+		_, staged := mod.(paddingStaged)
+		require.False(t, staged, tc.mod)
+		for i := range 3 {
+			res, modified, err := mod.Modify(&anyenc.Arena{}, anyenc.MustParseJson(tc.doc))
+			require.NoError(t, err)
+			assert.True(t, modified)
+			assert.Equal(t, tc.want, res.String(), "%s, application %d", tc.mod, i+1)
+		}
+	}
+}
+
+// $pull, $pullAll, $pop and the source of $rename leave a document that does
+// not have their path as it was, as MongoDB does: they create no missing
+// parent and pad no array, which another operation of the same modifier
+// would then have stored ({"meta":{}}).
+func TestModifier_RemovalsCreateNoPath(t *testing.T) {
+	testModCases(t, []modifierCase{
+		{`{"$pull":{"meta.old":"x"}}`, `{"id":1}`, `{"id":1}`, false},
+		{`{"$pull":{"meta.old":"x"},"$push":{"tags":"a"}}`, `{"id":1}`, `{"id":1,"tags":["a"]}`, true},
+		{`{"$pullAll":{"meta.old":["x"]},"$set":{"seen":true}}`, `{"id":1}`, `{"id":1,"seen":true}`, true},
+		{`{"$pop":{"meta.old":1},"$set":{"seen":true}}`, `{"id":1}`, `{"id":1,"seen":true}`, true},
+		{`{"$rename":{"meta.old":"new"},"$set":{"seen":true}}`, `{"id":1}`, `{"id":1,"seen":true}`, true},
+		{`{"$pull":{"a.b.c":1}}`, `{"a":{}}`, `{"a":{}}`, false},
+		{`{"$pull":{"items.3.tags":"x"}}`, `{"items":[{}]}`, `{"items":[{}]}`, false},
+		{`{"$pop":{"items.0.tags":-1}}`, `{"items":[{"tags":[1,2]}]}`, `{"items":[{"tags":[2]}]}`, true},
+	}...)
+}
+
+// $push and $addToSet take one value. MongoDB's modifiers ($each, and for
+// $push $position, $slice and $sort) are not implemented, so an operand
+// object with a key that starts with '$' is refused instead of stored as it
+// is; such a key deeper in the operand is a value like any other.
+func TestParseModifier_PushModifiersRefused(t *testing.T) {
+	testModCasesErr(t, []modifierCaseError{
+		{
+			mod: `{"$push":{"tags":{"$each":["a","b"]}}}`,
+			err: `parse modifier: $push takes one value: its modifiers ($each, $position, $slice, $sort) are not supported, and an object operand cannot have a key that starts with '$', got $each (at $push.tags)`,
+		},
+		{
+			mod: `{"$push":{"tags":{"n":1,"$slice":2}}}`,
+			err: `parse modifier: $push takes one value: its modifiers ($each, $position, $slice, $sort) are not supported, and an object operand cannot have a key that starts with '$', got $slice (at $push.tags)`,
+		},
+		{
+			mod: `{"$addToSet":{"tags":{"$each":["a","b"]}}}`,
+			err: `parse modifier: $addToSet takes one value: its modifiers ($each) are not supported, and an object operand cannot have a key that starts with '$', got $each (at $addToSet.tags)`,
+		},
+	}...)
+	testModCases(t, []modifierCase{
+		{`{"$push":{"tags":{"n":{"$each":1}}}}`, `{}`, `{"tags":[{"n":{"$each":1}}]}`, true},
+		{`{"$push":{"tags":["$each"]}}`, `{}`, `{"tags":[["$each"]]}`, true},
+	}...)
+}

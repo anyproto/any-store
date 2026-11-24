@@ -342,16 +342,35 @@ build per query and carry no such guarantee.
     A missing field is created by `$set`, by `$inc` (with the increment as
     its value), and by `$push` and `$addToSet`, which make it an array
     holding the value: `{"$push":{"tags":"a"}}` on `{"id":1}` gives
-    `{"id":1,"tags":["a"]}`, and through `UpsertId` of a new id it inserts
-    that document. `$unset`, `$rename`, `$pop`, `$pull` and `$pullAll` leave
-    a missing field missing. An array operator (`$push`, `$addToSet`, `$pop`,
-    `$pull`, `$pullAll`) on a field that holds anything else, `null`
-    included, is an error (`$push: field 'tags' must be an array: …`), and
-    `$inc` on a non-number is one too; the update then writes nothing. One
-    divergence: an `UpsertId` of a new id whose modifier changes nothing (a
-    `$pull` or `$unset` alone) inserts no document, where MongoDB inserts
-    `{_id: id}`. Pinned by `TestModifierPush_Modify` and its siblings
-    (query/modifier_test.go) and `TestCollection_PushMissingField`.
+    `{"id":1,"tags":["a"]}`. `$unset`, `$rename`, `$pop`, `$pull` and
+    `$pullAll` leave a missing field missing and create no part of a missing
+    path: `{"$pull":{"meta.old":"x"},"$set":{"seen":true}}` on `{"id":1}`
+    gives `{"id":1,"seen":true}`, with no `meta`. An array operator (`$push`,
+    `$addToSet`, `$pop`, `$pull`, `$pullAll`) on a field that holds anything
+    else, `null` included, is an error (`$push: field 'tags' must be an
+    array: …`), and `$inc` on a non-number is one too; the update then
+    writes nothing. `$push` and `$addToSet` take one value: MongoDB's
+    modifiers (`$each`, and for `$push` `$position`, `$slice` and `$sort`)
+    are not supported, and an operand object with a key that starts with
+    `$` is a parse error, not a value to store. `$set`, `$push` and
+    `$addToSet` store a copy of an object or array operand, as MongoDB
+    copies it into each document: every document an update reaches gets a
+    value of its own, and a later operation of the same modifier that
+    changes it (`{"$push":{"p":{"n":1}},"$inc":{"p.0.n":1}}`) changes that
+    document's copy, never the modifier or the next document. `UpsertId` of
+    an id with no document inserts what the modifier makes of
+    `{<primary key>: id}`, as MongoDB's upsert inserts the query's equality
+    fields with the update applied: `{"id":1,"tags":["a"]}` for the `$push`
+    above, and `{"id":1}` alone for a modifier that changes nothing (a lone
+    `$pull` or `$unset`). A modifier that changes the id fails with
+    `ErrPrimaryKeyModification` there as on an existing document. Pinned by
+    `TestModifierPush_Modify` and its siblings,
+    `TestModifier_RemovalsCreateNoPath`,
+    `TestParseModifier_PushModifiersRefused` and
+    `TestModifier_ObjectOperandsAreCopied` (query/modifier_test.go), and
+    through the collection by `TestCollection_PushMissingField`,
+    `TestCollection_UpsertIdNoOpInsertsId` and
+    `TestCollection_UpsertIdKeepsTheId` (test/collection_test.go).
     A numeric path segment sets an array element, padding the array with
     nulls up to it (`{"$set":{"arr.3":1}}` on `{"arr":[]}` gives
     `[null,null,null,1]`), but by no more than 1,500,000 nulls, MongoDB's
@@ -380,3 +399,15 @@ build per query and carry no such guarantee.
     satisfy it, as if it were a `$search` clause under the default `or`.
     `$exclude` entries have no such limit. Pinned by
     `TestFtsProbe_RequiredBitExhaustion`.
+
+20. **A stored document nests at most 511 levels.** The document is the
+    first level and each object or array in it one more. A write that would
+    store a deeper one — an `Insert`, `UpsertOne` or `UpdateOne` of a value
+    built in an `anyenc.Arena`, a modifier whose path or operand reaches
+    past it, a `$merge`/`$out` result — fails and stores nothing. The
+    parser reads containers 512 levels deep and a compressed document's
+    object one level below its wrapper, so 511 is what every stored
+    document reads back with. MongoDB refuses documents nested past 100
+    levels; JSON input stops at 300 (the parser's limit), so only a value
+    built in Go or a modifier gets near the bound. Pinned by
+    `TestCollection_DocumentDepthBounded` (test/collection_test.go).
