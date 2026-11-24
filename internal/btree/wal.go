@@ -2121,10 +2121,19 @@ func (w *wal) indexReadHdr(haveWriteLock, haveCkptLock bool) (WalIndexHdr, error
 	}
 	hdr, valid := w.index.readHeader()
 	if !valid {
-		return WalIndexHdr{}, fmt.Errorf("%w: wal-index header invalid after recovery", ErrCorrupt)
+		// Not ErrCorrupt: the wal-index is shared memory that recovery
+		// rebuilds, and a header that recovery could not publish (its
+		// segment could not be mapped) is no evidence about the database
+		// or the log. walIndexReadHdr returns walIndexRecover's own
+		// result here and no SQLITE_CORRUPT (wal.c:2716-2759).
+		return WalIndexHdr{}, errWalIndexUnpublished
 	}
 	return hdr, nil
 }
+
+// errWalIndexUnpublished is indexReadHdr's error when the wal-index header
+// is still not valid after recovery ran. It matches no exported error.
+var errWalIndexUnpublished = errors.New("btree: wal-index header invalid after recovery")
 
 // errWalIndexVersion is indexReadHdr's refusal of a wal-index written with
 // another wal-index version: the shared memory belongs to a build this one
@@ -3217,18 +3226,29 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 		return ErrWALCorrupt
 	}
 	if w.file == nil {
-		return ErrWALCorrupt
+		return ErrClosed
 	}
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
 	if _, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil {
-		// DRIFT: past-tail ReadAt failure remapped to ErrWALCorrupt; C propagates the raw short-read error See docs/btree/NOTES.md#drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt
-		if frame > nf {
-			return ErrWALCorrupt
-		}
-		return err
+		return frameReadErr(frame, nf, err)
 	}
 	return nil
+}
+
+// frameReadErr is the error of a failed read of frame from the WAL file,
+// err, in a process whose own count of frames is nf. A frame above that
+// count was resolved from a peer's wal-index entries; when the file ends
+// before it (a short read), the index points at a frame the file does not
+// hold, and the error is ErrWALCorrupt. Any other failure of the read is
+// returned as it is, as sqlite3WalReadFrame returns sqlite3OsRead's result
+// (wal.c:3649-3664): an I/O error says nothing about the log's content.
+// DRIFT: a short read of a frame above the local frame count is ErrWALCorrupt; C returns SQLITE_IOERR_SHORT_READ. See docs/btree/NOTES.md#drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt
+func frameReadErr(frame, nf uint32, err error) error {
+	if frame > nf && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
+		return ErrWALCorrupt
+	}
+	return err
 }
 
 // END ENCRYPTION
@@ -3323,19 +3343,14 @@ func (w *wal) readFramePageHook(frame, pgno uint32, buf, scratchBuf []byte, aead
 		return ErrWALCorrupt
 	}
 	if w.file == nil {
-		return ErrWALCorrupt
+		return ErrClosed
 	}
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
 	if _, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil {
 		// Multi-process: a stale nFrame view may have let us try to read
-		// past the peer's actual WAL tail. Treat that as corruption
-		// rather than leaking the raw I/O error.
-		// DRIFT: past-tail ReadAt failure remapped to ErrWALCorrupt; C propagates the raw short-read error See docs/btree/NOTES.md#drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt
-		if frame > nf {
-			return ErrWALCorrupt
-		}
-		return err
+		// past the peer's actual WAL tail (frameReadErr).
+		return frameReadErr(frame, nf, err)
 	}
 	// BEGIN ENCRYPTION
 	// Decrypt frame payload if a codec is installed. The page number binds

@@ -4049,7 +4049,7 @@ func TestReadWalFrameData_FileNil(t *testing.T) {
 
 	buf := make([]byte, 100)
 	err := p.readWalFrameData(1, buf)
-	assert.ErrorIs(t, err, ErrWALCorrupt)
+	assert.ErrorIs(t, err, ErrClosed)
 }
 
 // --- pager.go commit() debugTrace zero-content detection ---

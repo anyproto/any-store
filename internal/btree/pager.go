@@ -3251,7 +3251,7 @@ func (p *pager) readWalFrameDataRaw(frame uint32, buf []byte) error {
 		return ErrWALCorrupt
 	}
 	if p.wal.file == nil {
-		return ErrWALCorrupt
+		return ErrClosed
 	}
 	frameSize := int64(walFrameSize) + int64(p.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize

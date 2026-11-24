@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -2943,4 +2944,23 @@ func TestWriteFramesMem_InTxRangeErrorDropsAppendedFrames(t *testing.T) {
 	buf := make([]byte, 4096)
 	require.NoError(t, w.readFrame(nf+1, buf, nil, nil))
 	require.Equal(t, byte('c'), buf[0], "frame %d reads back a page of the failed write", nf+1)
+}
+
+// frameReadErr: only a short read of a frame above the local frame count
+// is ErrWALCorrupt, the index pointing at a frame the file does not hold.
+// An I/O error on such a frame is returned as it is, and is not corruption.
+func TestFrameReadErr(t *testing.T) {
+	eio := errors.New("input/output error")
+	pathErr := &os.PathError{Op: "read", Path: "db-wal", Err: eio}
+
+	require.ErrorIs(t, frameReadErr(11, 10, io.EOF), ErrWALCorrupt)
+	require.ErrorIs(t, frameReadErr(11, 10, io.ErrUnexpectedEOF), ErrWALCorrupt)
+
+	err := frameReadErr(11, 10, pathErr)
+	require.ErrorIs(t, err, eio)
+	require.NotErrorIs(t, err, ErrCorrupt)
+
+	// Within the local count the read's error is returned whatever it is.
+	require.Equal(t, io.EOF, frameReadErr(10, 10, io.EOF))
+	require.NotErrorIs(t, frameReadErr(10, 10, pathErr), ErrCorrupt)
 }

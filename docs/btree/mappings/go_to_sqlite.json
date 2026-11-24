@@ -3221,6 +3221,12 @@
     "sqlite": [],
     "note": "port of sqliteDefaultBusyCallback (main.c) — not in canonical sqlite_funcs list"
   },
+  "wal.go:frameReadErr": {
+    "sqlite": [
+      "wal.c:sqlite3WalReadFrame"
+    ],
+    "note": "the error of a failed frame read: ErrWALCorrupt only for a short read of a frame above the local frame count, the read's own error otherwise (drift-2026-07-10-1)"
+  },
   "wal.go:htFrameSegIdx": {
     "sqlite": [
       "wal.c:walFramePage"
