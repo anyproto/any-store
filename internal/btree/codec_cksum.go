@@ -29,14 +29,18 @@ const cksumOverhead = 16
 // post-prefix slice; the page-1 DB header is therefore NOT covered by
 // the per-page checksum. SQLite-format invariants in the header are
 // validated separately by dbHeader.deserialize at open time.
+//
+// Unlike the AEAD codecs, a cksumCodec is never shared between databases:
+// only buildCodec makes one, for checksum mode, once per Open, and
+// Options.Checksum cannot be combined with Options.Codec. Its verify flag
+// is therefore its database's own. A mismatch is reported, like an AEAD
+// failure, to the hook the caller passes to Decrypt.
 type cksumCodec struct {
 	// verify is 1 when verify-on-read is on. When 0, mismatches are
-	// detected (and OnError still fires) but the read returns the
-	// page bytes instead of an error. Mirrors PRAGMA
+	// detected (and still reported to Decrypt's onError) but the read
+	// returns the page bytes instead of an error. Mirrors PRAGMA
 	// checksum_verification.
 	verify atomic.Uint32
-	// onErrorField provides SetOnError + fire. Shared across all codecs.
-	onErrorField
 }
 
 // newCksumCodec returns a cksumCodec with verify-on-read enabled.
@@ -77,11 +81,11 @@ func (c *cksumCodec) Encrypt(dst, src []byte, pgno uint32, _ *aeadScratch) ([]by
 	return dst[:len(src)], nil
 }
 
-// Decrypt verifies the trailer hash. On mismatch fires OnError; if
+// Decrypt verifies the trailer hash. On mismatch reports to onError; if
 // verify-on is enabled, returns errCksumMismatch (which wraps
 // ErrPageIntegrity). dst receives src verbatim (this codec doesn't
 // transform plaintext).
-func (c *cksumCodec) Decrypt(dst, src []byte, pgno uint32, _ *aeadScratch) ([]byte, error) {
+func (c *cksumCodec) Decrypt(dst, src []byte, pgno uint32, _ *aeadScratch, onError integrityHook) ([]byte, error) {
 	if len(dst) < len(src) {
 		panic("btree: cksumCodec.Decrypt: dst too short")
 	}
@@ -94,7 +98,7 @@ func (c *cksumCodec) Decrypt(dst, src []byte, pgno uint32, _ *aeadScratch) ([]by
 	got.Lo = binary.LittleEndian.Uint64(src[bodyEnd : bodyEnd+8])
 	got.Hi = binary.LittleEndian.Uint64(src[bodyEnd+8 : bodyEnd+16])
 	if want != got {
-		c.fire(pgno, errCksumMismatch)
+		onError.fire(pgno, errCksumMismatch)
 		if c.VerifyOn() {
 			return nil, errCksumMismatch
 		}

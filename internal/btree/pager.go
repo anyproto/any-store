@@ -95,8 +95,8 @@ type pager struct {
 	master      *masterStore // InMemory "disk" — holds checkpointed page data
 	header      dbHeader
 	pageSize    uint32
-	path        string
-	usableSize_ int // pageSize - ReservedSpace; immutable after open, safe for concurrent reads
+	path        string // the database's full name once open has run (FullPathname)
+	usableSize_ int    // pageSize - ReservedSpace; immutable after open, safe for concurrent reads
 	// tableLeaf is the file's leaf-cell rule: set, leaf cells use the table-leaf
 	// payload limit (schema format 6 and later); clear, the index rule. Fixed by
 	// the header at open (setLeafRule); atomic because a backup into this
@@ -104,15 +104,14 @@ type pager struct {
 	tableLeaf atomic.Bool
 	// schemaFormat is the header's schema format as of open, for DB.SchemaFormat.
 	schemaFormat atomic.Uint32
-	// createFormat is Options.SchemaFormat: the schema format initNewDB writes,
+	// createFormat is Options.SchemaFormat: the schema format newPage1 writes,
 	// 0 for the current one.
 	createFormat uint32
 	dbSize       atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
 	state        atomic.Int32  // pagerState
 
-	// noWalCommitSize memoizes the database file's size for multi-process
-	// readers whose snapshot header carries no committed size. See
-	// effectiveReaderDbSize.
+	// noWalCommitSize memoizes the database file's size for readers whose
+	// snapshot header carries no committed size. See effectiveReaderDbSize.
 	noWalCommitSize atomic.Pointer[noWalCommitSize]
 
 	// balanceQuickDispatchCount counts dispatches into splitLeafRightmostAppend.
@@ -223,6 +222,19 @@ type pager struct {
 
 	// inProcess uses heap-backed shm (faster, single-process only)
 	inProcess bool
+
+	// closeCheckpointed is set by close when it was the last client's close
+	// and its checkpoint completed: the arm of sqlite3WalClose that sets
+	// isDelete (wal.c:2531-2540). Every commit is then in the synced database
+	// file, and no other process was attached to add one. Read after close.
+	// An in-memory pager never sets it: the branch that does is the one for
+	// a database file.
+	closeCheckpointed bool
+	// onCloseCheckpointed, when set, is run by close once it has set
+	// closeCheckpointed, while it still holds the exclusive lock on the
+	// database file: no other process can attach, and so none can commit,
+	// before it returns. DB.CloseCheckpointed sets it.
+	onCloseCheckpointed func()
 
 	// registryKey is the key this handle holds in openDBs from open until
 	// close, "" when it holds none; registryPath is the absolute path the
@@ -353,8 +365,23 @@ type pager struct {
 	// decrypts them after reads. Installed once at Open and immutable
 	// thereafter. Safe for concurrent use across the writer and readers.
 	codec Codec
+	// onIntegrityError is this database's Options.OnIntegrityError, set
+	// with the codec in installCodec and immutable thereafter. Every
+	// decrypt this pager makes (and its WAL's, which gets a copy) passes it
+	// to the codec, which may serve other databases too and keeps no hook
+	// of its own; the integrity sweep calls it directly.
+	onIntegrityError integrityHook
+	// keySalt is the KDF salt the codec was keyed with at Open: read from
+	// the main file's header, or drawn for a new encrypted file; zero
+	// without encryption and in memory. It is part of the key setup, as
+	// SQLCipher's ctx->kdf_salt is, which is read once from the main file
+	// (sqlcipher.c:1392-1409): every write of page 1 carries it
+	// (encryptPageWithCodec, also in the WAL, which gets a copy, and the
+	// WAL's checkpoint into the main file), and no image of page 1 sets it
+	// (adoptHeader).
+	keySalt [SaltLen]byte
 	// codecScratch is a reusable page-sized scratch buffer used on the
-	// writer side (initNewDB, getPageWriter, wal.writeFrame) to hold
+	// writer side (createPage1, getPageWriter, wal.writeFrame) to hold
 	// ciphertext while the source plaintext stays live in the pcache.
 	// Allocated once in installCodec; reused for the pager's lifetime.
 	// Safe to share because all three users are writer-serialized
@@ -362,10 +389,20 @@ type pager struct {
 	// because multiple read transactions may run concurrently.
 	// Modeled after SQLCipher's codec_ctx->buffer (crypto_impl.c).
 	codecScratch []byte
-	// codecAEAD holds the nonce/AAD scratch for writer-side codec calls.
-	// Heap-allocated as part of the pager struct; passed by pointer so
-	// the crypto/cipher.AEAD interface calls don't force per-call escape.
+	// codecAEAD holds the nonce/AAD scratch for writer-side codec calls,
+	// and the nonce pool createPage1's page-1 encrypt draws from: this
+	// pager's own, never shared with another database that has the same
+	// codec. Heap-allocated as part of the pager struct; passed by pointer
+	// so the crypto/cipher.AEAD interface calls don't force per-call escape.
 	codecAEAD aeadScratch
+	// settleCodec, when set, installs the codec that goes with the database
+	// header given, or with a file that has no database yet (nil). open
+	// calls it with the DB-file lock held, on the header it read under that
+	// lock, and before it asks for the exclusive lock to create a database;
+	// a call that finds the codec built for the salt the file carries (for
+	// a file with no database, a salt drawn for a new file) does nothing.
+	// Set by Open for a file-backed database.
+	settleCodec func(hdr *dbHeader) error
 	// END ENCRYPTION
 }
 
@@ -524,8 +561,25 @@ func (p *pager) open() (err error) {
 		return p.initNewDB()
 	}
 
+	if h := testOpenStageHook; h != nil {
+		h(p, "before-lock")
+	}
+
+	// The database's full name, resolved once, before any file is opened
+	// (sqlite3OsFullPathname, pager.c:4792). The database file, the creation
+	// journal, the WAL and its index are opened by it or by names built from
+	// it (pager.c:4915, pager.c:4929, pager.c:4948), the moved-file check
+	// stats it, and a first sync syncs its directory. A name Open has
+	// already resolved comes back unchanged.
+	if p.path, err = FullPathname(p.path); err != nil {
+		return err
+	}
+
 	f, err := osOpenFile(p.path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
+		if herr := p.headerErrorOfUnwritableFile(); herr != nil {
+			return herr
+		}
 		return err
 	}
 	p.file = f
@@ -576,8 +630,8 @@ func (p *pager) open() (err error) {
 	// SQLite, except for an empty file on a volume that reports a wrong
 	// inode for it (macOS msdos and exfat, SQLite ticket #3260): that
 	// handle is keyed by its absolute path until the file has content and
-	// rekeyRegistry moves it to the inode — at the create/existing decision
-	// below or after initNewDB writes page 1, before any WAL open. Every
+	// rekeyRegistry moves it to the inode — after the create/existing decision
+	// below, when the file holds a page 1, before any WAL open. Every
 	// open on such a volume takes unstableOpenMu for its key stat and store,
 	// and a path-keyed handle keeps it until its re-key, so the move from
 	// path to inode is atomic to the others: an opener that stats after the
@@ -626,23 +680,19 @@ func (p *pager) open() (err error) {
 	// process is refused at registration above; on Windows, where keys are
 	// paths, another spelling of this file fails here instead.
 	// (In-memory already returned above, so here p.inProcess implies file-backed.)
+	//
+	// A shared lock that is refused is waited for through the busy handler,
+	// as SQLite waits for its SHARED lock (pager_wait_on_lock from
+	// sqlite3PagerSharedLock, pager.c:5272): the holder is, for example, a
+	// last client inside its close or a creator writing page 1. One count
+	// serves this wait and the creation's waits for the exclusive lock
+	// (lockDBForCreate). The open's other waits have budgets of their own
+	// (docs/btree/NOTES.md, drift-63, item 4). The in-process lock is not
+	// waited for: its holder keeps it for the handle's life.
+	dbLockBusy := &beginBusy{xBusy: DefaultBusyTimeout(BusyTimeout)}
 	if !p.inProcess {
-		for attempt := 0; attempt < 100; attempt++ {
-			lockErr := acquireSharedDBLock(f)
-			if lockErr == nil {
-				break
-			}
-			if !errors.Is(lockErr, ErrBusy) {
-				_ = f.Close()
-				p.file = nil
-				return fmt.Errorf("btree: acquire DB-file shared lock: %w", lockErr)
-			}
-			if attempt == 99 {
-				_ = f.Close()
-				p.file = nil
-				return fmt.Errorf("btree: DB-file lock still busy after retries (peer mid-close?)")
-			}
-			time.Sleep(10 * time.Millisecond)
+		if err := p.lockDBShared(f, dbLockBusy); err != nil {
+			return err
 		}
 	} else {
 		if lockErr := acquireExclusiveDBLock(f); lockErr != nil {
@@ -656,13 +706,35 @@ func (p *pager) open() (err error) {
 		}
 	}
 
-	info, err := f.Stat()
-	if err != nil {
-		return err
+	// The file holds no database a process may use while it is empty or a
+	// dead creator's journal is hot beside it. The hot-journal test comes
+	// right after the lock, as in sqlite3PagerSharedLock (pager.c:5281-5282),
+	// before anything in the file is trusted. Then a database is created
+	// under the exclusive DB-file lock, or another process is found to have
+	// created one; either way the file holds a committed page 1 afterwards
+	// and the open goes on as for any existing database, under the lock it
+	// keeps. A lost creation is looked at again under the shared lock: its
+	// creator may have died before its commit point.
+	created := false
+	var info os.FileInfo
+	for {
+		var pending bool
+		if info, pending, err = p.creationPending(f); err != nil {
+			return err
+		}
+		if !pending {
+			break
+		}
+		if created {
+			return fmt.Errorf("btree: database file is still empty after page 1 was written")
+		}
+		if created, err = p.createIfEmpty(f, dbLockBusy); err != nil {
+			return err
+		}
 	}
 
-	// A path-keyed handle whose file has content by now (another process
-	// created it) joins it by inode here, before either branch opens the WAL.
+	// A path-keyed handle whose file has content by now (this open or another
+	// process created it) joins it by inode here, before the WAL opens.
 	if err := p.rekeyRegistry(); err != nil {
 		return err
 	}
@@ -670,22 +742,8 @@ func (p *pager) open() (err error) {
 		p.releaseUnstable()
 	}
 
-	if info.Size() == 0 {
-		// New database - initialize. initNewDB writes page 1 to the file
-		// (and fdatasyncs), so re-stat once afterwards to capture the
-		// identity of the now-materialized inode. Cheap: one extra Stat on
-		// the create path only.
-		if err := p.initNewDB(); err != nil {
-			return err
-		}
-		if info2, err := f.Stat(); err == nil {
-			p.openDev, p.openIno, p.openIdentOK = statIdentity(info2)
-		}
-		return nil
-	}
-
-	// Existing database - reuse the already-fetched info (no extra syscall)
-	// to capture the file identity for the close-time databaseIsUnmoved guard.
+	// The file identity for the close-time databaseIsUnmoved guard, from the
+	// stat of a file that has content.
 	p.openDev, p.openIno, p.openIdentOK = statIdentity(info)
 
 	// Existing database - read header
@@ -702,9 +760,24 @@ func (p *pager) open() (err error) {
 		return fmt.Errorf("btree: failed to read database header: %w", err)
 	}
 
-	if err := p.header.deserialize(buf[:dbHeaderSize]); err != nil {
+	header := p.header
+	if err := header.deserialize(buf[:dbHeaderSize]); err != nil {
 		return err
 	}
+
+	// BEGIN ENCRYPTION
+	// The codec is settled on this header, read under the DB-file lock: the
+	// salt the key is derived from (keySalt, set by setCodec) and the
+	// checksum marker are the file's. Open's first look at the file was
+	// unlocked; another process may have created the database since, or
+	// this open may have lost the creation to one.
+	if p.settleCodec != nil {
+		if err := p.settleCodec(&header); err != nil {
+			return err
+		}
+	}
+	// END ENCRYPTION
+	p.adoptHeader(header)
 
 	// The change-counter sentinel and the page count are judged further
 	// down, on the page 1 the open snapshot reads (the WAL's when it holds a
@@ -727,8 +800,13 @@ func (p *pager) open() (err error) {
 	// propagate it rather than draw mis-sized buffers from the shared pool.
 	// (C allocates per-pager pTmpSpace/PCache at the file's actual page size,
 	// pager.c:5016-5028, and so never mixes sizes the way this pool would.)
-	if err := initPageBufferPool(p.header.PageSize); err != nil {
-		return err
+	// A database this open created has the page size the pager was given,
+	// the one the pool is keyed to already; there is no on-disk size to
+	// reconcile.
+	if !created {
+		if err := initPageBufferPool(p.header.PageSize); err != nil {
+			return err
+		}
 	}
 
 	p.pageSize = p.header.PageSize
@@ -741,8 +819,9 @@ func (p *pager) open() (err error) {
 	// byte would otherwise feed degenerate geometry into maxLocalPayload /
 	// minLocalPayload / overflowPageUsable and the cell-content math. This
 	// floors only the on-disk-open path; the codec-install and new-DB paths
-	// derive usableSize from process-chosen Options, not untrusted bytes.
-	if p.usableSize_ < 480 {
+	// derive usableSize from process-chosen Options, not untrusted bytes: a
+	// database this open created is not held to the floor here.
+	if !created && p.usableSize_ < 480 {
 		return fmt.Errorf("%w: usable size %d < 480", ErrHeaderCorrupt, p.usableSize_)
 	}
 
@@ -759,8 +838,12 @@ func (p *pager) open() (err error) {
 	p.wal.busyHandler = DefaultBusyTimeout(BusyTimeout)
 	// BEGIN ENCRYPTION
 	// Propagate codec to the WAL so frame writes/reads use the same
-	// cipher as the DB file.
+	// cipher as the DB file, the integrity hook so its decrypt failures
+	// reach this database's callback, and the key salt its page-1 writes
+	// carry.
 	p.wal.codec = p.codec
+	p.wal.onIntegrityError = p.onIntegrityError
+	p.wal.keySalt = p.keySalt
 	// END ENCRYPTION
 	if err := p.wal.open(); err != nil {
 		return err
@@ -862,19 +945,10 @@ func (p *pager) readPage1AtOpen() error {
 	if err != nil {
 		return err
 	}
-	p.header = header
+	p.adoptHeader(header)
 	p.dbSize.Store(nPage)
 	// Page 1 as read (readDbPage, pager.c:3063-3064).
 	p.dbFileVers.Store(header.FileChangeCount)
-	// With no commit in the WAL, the heap-shm modes' committed size is the
-	// file's, the count pagerPagecount falls back to (pager.c:3299-3306):
-	// from here on every snapshot carries it, and no open transaction
-	// changes it.
-	if p.inProcess || p.inMemory {
-		if f, n := p.wal.index.mxCommitFrame.LoadPos(); n == 0 {
-			p.wal.index.mxCommitFrame.StorePos(f, nPageFile)
-		}
-	}
 	return nil
 }
 
@@ -883,17 +957,33 @@ func (p *pager) readPage1AtOpen() error {
 // window. Nil outside tests.
 var testOpenAfterWALOpenHook func(p *pager)
 
+// testOpenStageHook runs at named points of a file-backed open, so a test
+// can hold or kill a process there: "before-lock" (nothing opened or locked
+// yet; Open has made its first, unlocked read of the header);
+// "db-lock-busy" (a request for the shared DB-file lock was refused, and
+// the busy handler is asked whether to ask again); and the points of a
+// creation in order: "journal-playback" (a dead creator's file is about to
+// be truncated), "journal-opened" (the journal is open, holding what the
+// open found under its name), "before-journal-sync" (its header is
+// written), "before-page1-write" (the journal and its directory are
+// synced), "before-page1-sync", "before-journal-delete" (page 1 is synced),
+// "journal-deleted" (the creation is committed) and "after-page1-sync" (the
+// creation is over; in multi-process mode the exclusive DB-file lock is
+// still held). Nil outside tests.
+var testOpenStageHook func(p *pager, stage string)
+
 // BEGIN ENCRYPTION
 
 // installCodec attaches a page codec to the pager. Must be called before
 // any I/O. Sets the on-disk ReservedSpace header byte and the in-memory
 // usableSize_ so the btree cell code respects the codec's per-page
 // overhead. Calling with nil is a no-op (unencrypted mode).
-func (p *pager) installCodec(c Codec) {
+func (p *pager) installCodec(c Codec, onError integrityHook) {
 	if c == nil {
 		return
 	}
 	p.codec = c
+	p.onIntegrityError = onError
 	p.header.ReservedSpace = uint8(c.Overhead())
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 	// Pre-allocate one writer-side scratch buffer. Reused by all writer
@@ -901,6 +991,25 @@ func (p *pager) installCodec(c Codec) {
 	// freePageBuffer churn that turned sync.Pool.Put's eface box into a
 	// hot allocation site under encryption.
 	p.codecScratch = make([]byte, p.pageSize)
+}
+
+// setCodec replaces whatever codec is installed with c (nil: none) for a
+// file that carries salt in its header, and makes salt the keySalt; onError
+// is the database's integrity hook, which installCodec keeps with c. Like
+// installCodec it runs before any page I/O; unlike it, it can take back an
+// earlier choice, which Open makes before the DB-file lock is held and
+// settles again under it. It is the only place keySalt is set, so the salt
+// the codec is keyed with, and that every write of page 1 carries, is the
+// one in the header open reads under the DB-file lock, or the one drawn for
+// the database this open creates.
+func (p *pager) setCodec(c Codec, salt [SaltLen]byte, onError integrityHook) {
+	p.codec = nil
+	p.codecScratch = nil
+	p.keySalt = salt
+	p.header.Salt = salt
+	p.header.ReservedSpace = 0
+	p.usableSize_ = int(p.pageSize)
+	p.installCodec(c, onError)
 }
 
 // encryptPage transforms plaintext page bytes for writing to disk or WAL.
@@ -915,7 +1024,7 @@ func (p *pager) installCodec(c Codec) {
 // This is the any-store equivalent of SQLCipher's CODEC2 macro
 // (pager.c:412), unified into one function.
 func (p *pager) encryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
-	return encryptPageWithCodec(p.codec, scratch, src, pgno, &p.codecAEAD)
+	return encryptPageWithCodec(p.codec, scratch, src, pgno, &p.codecAEAD, &p.keySalt)
 }
 
 // decryptPage is the inverse. Returns src unchanged when no codec is
@@ -926,7 +1035,7 @@ func (p *pager) encryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
 // scratch. Reader-path callers must NOT go through this; they should
 // call decryptPageWithCodec directly with their own *aeadScratch.
 func (p *pager) decryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
-	return decryptPageWithCodec(p.codec, scratch, src, pgno, &p.codecAEAD)
+	return decryptPageWithCodec(p.codec, scratch, src, pgno, &p.codecAEAD, p.onIntegrityError)
 }
 
 // END ENCRYPTION
@@ -943,18 +1052,222 @@ func SetCreateLegacyFormatForTest(on bool) {
 	createLegacyFormat.Store(on)
 }
 
-// initNewDB initializes a brand new database file.
-// DRIFT: new-DB page 1 written+fdatasynced direct to file, bypassing WAL (C defers to WAL) See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
+// lockDBShared takes the shared DB-file lock. While another process holds
+// the lock exclusively (for example a last client inside its close, a
+// creator writing page 1, or a process that holds the file in in-process
+// mode) the request is repeated for as long as the busy handler allows,
+// which is pager_wait_on_lock's loop (pager.c:3946-3962); when the handler
+// gives up the error matches ErrBusy, SQLite's SQLITE_BUSY.
+func (p *pager) lockDBShared(f fileHandle, busy *beginBusy) error {
+	for {
+		lockErr := acquireSharedDBLock(f)
+		if lockErr == nil {
+			return nil
+		}
+		if !errors.Is(lockErr, ErrBusy) {
+			return fmt.Errorf("btree: acquire DB-file shared lock: %w", lockErr)
+		}
+		if h := testOpenStageHook; h != nil {
+			h(p, "db-lock-busy")
+		}
+		if !busy.retry() {
+			return fmt.Errorf("%w: DB-file lock still busy after retries (a peer inside its close or its creation, or holding the file in in-process mode)", ErrBusy)
+		}
+	}
+}
+
+// headerErrorOfUnwritableFile is called when the database file did not open
+// for writing. It returns the error of the file's header when the file opens
+// for reading and its header says this binary cannot use it (another
+// format, a newer one, no database header), and nil otherwise; the caller
+// then returns the error of its own open. So a file the caller may only read
+// is still told apart by its format. unixOpen opens a file read-only when it
+// does not open read-write (os_unix.c:6689-6702), and lockBtree then judges
+// its header; here a database is never used read-only, and the read-only
+// descriptor serves that judgement alone.
+//
+// The header is read as open reads it: under the shared DB-file lock, and
+// not while a creation is pending.
+func (p *pager) headerErrorOfUnwritableFile() error {
+	f, err := osOpenFile(p.path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	if err := acquireSharedDBLock(f); err != nil {
+		return nil
+	}
+	if _, pending, err := p.creationPending(f); err != nil || pending {
+		return nil
+	}
+	buf := make([]byte, dbHeaderSize)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		return nil
+	}
+	var h dbHeader
+	return h.deserialize(buf)
+}
+
+// downgradeDBLock turns the exclusive DB-file lock this handle holds into
+// the shared one. Nothing can be in its way, but a flock conversion may let
+// go of the lock for a moment (see dbfile_lock_unix.go), in which another
+// process can take it; the request then waits with a budget of its own.
+// SQLite's downgrade asks no busy handler; with flock it only records the
+// new level (os_unix.c:2747-2750).
+// DRIFT: a flock conversion from exclusive to shared can be refused, so the downgrade waits through the busy handler with a count of its own, where SQLite's downgrade is one unlock call that asks no busy handler (pagerUnlockDb, pager.c:1133-1149; with flock it only records the new level, os_unix.c:2747-2750). See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
+func (p *pager) downgradeDBLock(f fileHandle) error {
+	return p.lockDBShared(f, &beginBusy{xBusy: DefaultBusyTimeout(BusyTimeout)})
+}
+
+// createIfEmpty turns a file whose creation is pending (creationPending: it
+// is empty, or a dead creator's journal is hot beside it) into a database of
+// one page, unless another process does it first. The caller holds the
+// DB-file lock (shared in multi-process mode, exclusive in in-process mode)
+// and has seen the creation pending. On return with created set, this open
+// has written page 1, synced it and committed the creation; with created
+// clear, a look made without a lock found another process's database, and
+// the caller looks again. Either way the caller's lock is held again.
+//
+// The decision "new database" and the write of page 1 are one step under the
+// exclusive DB-file lock, which no process attached to the database can hold
+// across: every attached handle keeps the shared lock. SQLite creates a
+// WAL-mode database's page 1 the same way, in a rollback-journal transaction
+// that ends under the EXCLUSIVE lock (OP_JournalMode, vdbe.c:8061-8066, to
+// sqlite3BtreeSetVersion, btree.c:11489, and newDatabase, btree.c:3506), and
+// never opens a WAL on a file of zero pages.
+//
+// A WAL found beside the empty file is deleted before page 1 is written, as
+// pagerOpenWalIfPresent deletes it when the database has no pages
+// (pager.c:3355-3356): recovery would otherwise apply its frames to the new
+// database. The removal, and that of a journal found there, is made durable
+// before page 1 exists by the directory sync that follows the creation
+// journal's first sync (createPage1). The WAL is the log of a database that is gone, or of a
+// database file that was renamed or unlinked under a process still attached
+// to it; that process is not protected, here or in SQLite
+// (docs/btree/NOTES.md, drift-63, known limitations). The wal-index is left
+// to the first attacher's election, which truncates one that no process
+// holds (newPlatformShm).
+// DRIFT: a database is created at open, under a flock, in a journaled transaction of any-store's own journal. See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
+func (p *pager) createIfEmpty(f fileHandle, busy *beginBusy) (created bool, err error) {
+	// BEGIN ENCRYPTION
+	// The codec of a new file, before the exclusive lock is asked for: a key
+	// derivation, when one is needed here, is not done under it.
+	if p.settleCodec != nil {
+		if err := p.settleCodec(nil); err != nil {
+			return false, err
+		}
+	}
+	// END ENCRYPTION
+	if !p.inProcess {
+		won, err := p.lockDBForCreate(f, busy)
+		if err != nil || !won {
+			return false, err
+		}
+	}
+	// Exclusive, and creationPending held under it: the file is empty, or
+	// it has content and a hot journal, a dead creator's page 1 that may
+	// never have been synced. That one is rolled back to an empty file,
+	// as sqlite3PagerSharedLock plays a hot journal back under the
+	// EXCLUSIVE lock (pager.c:5308, 5356). Beside an empty file, whatever
+	// lies under the journal's name is deleted (pager.c:5178-5181).
+	info, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	if info.Size() != 0 {
+		err = p.playbackCreationJournal(f)
+	} else {
+		err = p.deleteJournalOfEmptyDatabase(f)
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := osRemove(p.path + "-wal"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("btree: delete the WAL beside an empty database file: %w", err)
+	}
+	if err := p.createPage1(); err != nil {
+		return false, err
+	}
+	if h := testOpenStageHook; h != nil {
+		h(p, "after-page1-sync")
+	}
+	if !p.inProcess {
+		// Shared again before the WAL is opened: the shared lock is what a
+		// closing peer's last-client test meets, and flock may let go of
+		// the lock inside a conversion.
+		if err := p.downgradeDBLock(f); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// lockDBForCreate is called with the shared DB-file lock held on a file
+// whose creation is pending (creationPending): empty, or left with a hot
+// journal by a creator that died. It returns true holding the exclusive lock
+// with the creation still pending, or false holding the shared lock after a
+// look that found a database in the file. That look was made without a
+// lock, so the caller repeats it under the shared one.
+//
+// Processes creating one file at once all hold the shared lock at first, and
+// none of them can have the exclusive one until the others let go. So a
+// process that is refused drops its lock and waits, holding nothing, then
+// looks at the file again: the next request for the exclusive lock is
+// refused only while a creator is at work or a late arrival is between its
+// shared lock and its own request. The waits are the busy handler's, on the
+// count the open's shared-lock wait started: a creation that stays pending
+// with the file locked by another process until the handler gives up is
+// ErrBusy.
+// DRIFT: a flock has no RESERVED step, so a creator refused the exclusive lock drops its shared one and asks again, holding nothing, while the busy handler allows on the open's count; the same loop serves a hot-journal playback, for which SQLite asks for EXCLUSIVE once (pager.c:5308). See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
+func (p *pager) lockDBForCreate(f fileHandle, busy *beginBusy) (bool, error) {
+	for {
+		ok, err := tryUpgradeDBLockExclusive(f)
+		if err != nil {
+			return false, fmt.Errorf("btree: acquire DB-file exclusive lock: %w", err)
+		}
+		if ok {
+			_, pending, err := p.creationPending(f)
+			if err != nil {
+				return false, err
+			}
+			if pending {
+				return true, nil
+			}
+			return false, p.downgradeDBLock(f)
+		}
+		// Refused. Whether the shared lock survived the refusal depends on
+		// the kernel's flock; drop it either way.
+		if err := unlockDBFile(f); err != nil {
+			return false, fmt.Errorf("btree: release DB-file lock: %w", err)
+		}
+		if !busy.retry() {
+			return false, fmt.Errorf("%w: database file has no database yet and is locked by another process", ErrBusy)
+		}
+		// An unlocked look. A creator at work shows an empty file or a hot
+		// journal until its commit point, so this goes on asking for the
+		// exclusive lock until then. The caller looks again under the
+		// shared lock.
+		_, pending, err := p.creationPending(f)
+		if err != nil {
+			return false, err
+		}
+		if !pending {
+			return false, p.lockDBShared(f, busy)
+		}
+	}
+}
+
+// newPage1 sets p.header and the page geometry for a brand new database and
+// returns the plaintext image of its page 1: the header and an empty leaf.
 // DRIFT: the schema format (6; 5 before v2.5.0) is any-store's own format version, unrelated to SQLite's schema formats 1-4. See docs/btree/NOTES.md#old-drift-schema-format-5-custom-not-sqlite-fmt4
-func (p *pager) initNewDB() error {
+func (p *pager) newPage1() []byte {
 	if p.pageSize == 0 {
 		p.pageSize = DefaultPageSize
 	}
 
 	// BEGIN ENCRYPTION
-	// Preserve salt and ReservedSpace that may have been set by installCodec
-	// before initNewDB was called.
-	savedSalt := p.header.Salt
+	// Preserve the ReservedSpace that installCodec may have set before the
+	// page is built.
 	savedReserve := p.header.ReservedSpace
 	// END ENCRYPTION
 
@@ -980,8 +1293,8 @@ func (p *pager) initNewDB() error {
 	// BEGIN ENCRYPTION
 	if p.codec != nil {
 		p.header.ReservedSpace = savedReserve
-		p.header.Salt = savedSalt
 	}
+	p.header.Salt = p.keySalt
 	// END ENCRYPTION
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 	p.initCellScratch()
@@ -1004,42 +1317,77 @@ func (p *pager) initNewDB() error {
 	buf[hdrOff+5] = byte(usable >> 8) // cell content offset (high byte)
 	buf[hdrOff+6] = byte(usable)      // cell content offset (low byte)
 	buf[hdrOff+7] = 0                 // fragmented free bytes
+	return buf
+}
 
-	if p.file != nil {
-		// BEGIN ENCRYPTION
-		// When a codec is installed, encrypt page 1 before writing to disk.
-		// The plaintext 100-byte dbHeader (carrying the salt) is preserved
-		// by encryptPage; only bytes >= dbHeaderSize are encrypted.
-		writeBuf := buf
-		if p.codec != nil {
-			ct, err := p.encryptPage(p.codecScratch, buf, 1)
-			if err != nil {
-				return err
-			}
-			writeBuf = ct
-		}
-		if _, err := p.file.WriteAt(writeBuf, 0); err != nil {
+// createPage1 writes page 1 of a new database to the file, in a transaction
+// of the creation journal (creation_journal.go): the journal and its
+// directory are durable before page 1 is written, and the creation is
+// committed, by the journal's delete, only after page 1 is synced. The
+// caller holds the DB-file lock exclusively and the file is empty
+// (createIfEmpty). open then reads the page back as it reads any existing
+// database's.
+func (p *pager) createPage1() error {
+	buf := p.newPage1()
+	// BEGIN ENCRYPTION
+	// When a codec is installed, encrypt page 1 before writing to disk.
+	// The plaintext 100-byte dbHeader (carrying the salt) is preserved
+	// by encryptPage; only bytes >= dbHeaderSize are encrypted.
+	if p.codec != nil {
+		ct, err := p.encryptPage(p.codecScratch, buf, 1)
+		if err != nil {
 			return err
 		}
-		// END ENCRYPTION
-		if err := fdatasync(p.file); err != nil {
-			return err
-		}
-		if err := p.rekeyRegistry(); err != nil {
-			return err
-		}
-		p.releaseUnstable()
+		buf = ct
 	}
+	// END ENCRYPTION
+	j, err := p.openCreationJournal()
+	if err != nil {
+		return err
+	}
+	if h := testOpenStageHook; h != nil {
+		h(p, "before-journal-sync")
+	}
+	err = j.sync()
+	if err == nil {
+		if h := testOpenStageHook; h != nil {
+			h(p, "before-page1-write")
+		}
+		_, err = p.file.WriteAt(buf, 0)
+	}
+	if err == nil {
+		if h := testOpenStageHook; h != nil {
+			h(p, "before-page1-sync")
+		}
+		err = fdatasync(p.file)
+	}
+	if err != nil {
+		// The journal stays hot: whatever reached the file is rolled back
+		// by the next open.
+		j.abandon()
+		return err
+	}
+	if h := testOpenStageHook; h != nil {
+		h(p, "before-journal-delete")
+	}
+	return j.commit(p)
+}
+
+// initNewDB initializes a brand new in-memory database: page 1 goes to the
+// master store and the WAL is heap-backed. A database in a file is created
+// by createIfEmpty and then opened like an existing one.
+func (p *pager) initNewDB() error {
+	buf := p.newPage1()
 
 	p.dbSize.Store(1)
 	p.writerCache = newPcache(int(p.pageSize), p.writerCache.maxPages, p.writerCache.purgeable)
 	p.writerCache.useSlab = p.useSlab
 	p.writerCache.xStress = p.pagerStress
 
-	// For inMemory mode, pre-populate page 1 in masterStore so reads find it.
+	// Pre-populate page 1 in masterStore so reads find it.
 	// Note: masterStore stores plaintext (encryption is a file-at-rest concern
 	// per encryption.md §7; InMemory has no "at rest").
-	if p.inMemory && p.master != nil {
+	if p.master != nil {
 		p.master.writePage(1, buf)
 	}
 
@@ -1051,8 +1399,12 @@ func (p *pager) initNewDB() error {
 	p.wal.busyHandler = DefaultBusyTimeout(BusyTimeout)
 	// BEGIN ENCRYPTION
 	// Propagate codec to the WAL so frame writes/reads use the same
-	// cipher as the DB file.
+	// cipher as the DB file, the integrity hook so its decrypt failures
+	// reach this database's callback, and the key salt its page-1 writes
+	// carry.
 	p.wal.codec = p.codec
+	p.wal.onIntegrityError = p.onIntegrityError
+	p.wal.keySalt = p.keySalt
 	// END ENCRYPTION
 	if err := p.wal.open(); err != nil {
 		return err
@@ -1060,14 +1412,10 @@ func (p *pager) initNewDB() error {
 	// The change counter initNewDB wrote is page 1's as this pager knows it.
 	p.dbFileVers.Store(p.header.FileChangeCount)
 	// A new database is one page, page 1, before its first commit
-	// (newDatabase sets nPage = 1, btree.c:3540-3541). In the heap-shm modes
-	// that is the committed size every snapshot carries until a commit
-	// records another.
-	if p.inProcess || p.inMemory {
-		if f, n := p.wal.index.mxCommitFrame.LoadPos(); n == 0 {
-			p.wal.index.mxCommitFrame.StorePos(f, 1)
-		}
-	}
+	// (newDatabase sets nPage = 1, btree.c:3540-3541). No commit has
+	// recorded a size, so the committed position keeps none: its readers
+	// take the size page 1 was written to above, the master store's
+	// (effectiveReaderDbSize).
 
 	p.state.Store(int32(pagerOpen))
 	return nil
@@ -1488,7 +1836,7 @@ func (p *pager) readTempPage(pgno, walMaxFrame, walMinFrame, dbSizeBound uint32,
 				if aeadS == nil {
 					aeadS = new(aeadScratch)
 				}
-				plain, derr := decryptPageWithCodec(p.codec, scratch, pg.data, pgno, aeadS)
+				plain, derr := decryptPageWithCodec(p.codec, scratch, pg.data, pgno, aeadS, p.onIntegrityError)
 				if derr != nil {
 					if ownScratch {
 						freePageBuffer(scratch, false)
@@ -1618,7 +1966,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 				if cache.codecScratch == nil {
 					cache.codecScratch = make([]byte, p.pageSize)
 				}
-				plain, derr := decryptPageWithCodec(p.codec, cache.codecScratch, pg.data, pgno, &cache.codecAEAD)
+				plain, derr := decryptPageWithCodec(p.codec, cache.codecScratch, pg.data, pgno, &cache.codecAEAD, p.onIntegrityError)
 				if derr != nil {
 					cache.discard(pg.pgno)
 					return nil, fmt.Errorf("btree: page %d: %w", pgno, derr)
@@ -1687,15 +2035,22 @@ func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
 // returns the raw stored bytes. Returns a fresh page-sized buffer; caller
 // owns it.
 //
+// The WAL lookup runs within the reader's frame window, as getPageReader's
+// does: up to walMaxFrame, from the floor its cache carries (readerMinFrame;
+// the live checkpoint frontier for a nil cache, which only a caller that
+// cannot race a WAL restart may pass). The live frontier under a read
+// transaction would let the frames of a WAL generation begun after its
+// snapshot, numbered from 1 again, into a slot-0 snapshot.
+//
 // Caller must hold a read lock (read transaction or equivalent) — same
 // concurrency contract as getPage.
-func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
+func (p *pager) readRawPage(pgno, walMaxFrame uint32, cache *pcache) ([]byte, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
 	buf := make([]byte, p.pageSize)
 	if walMaxFrame > 0 && p.wal != nil {
-		frame, err := p.wal.index.get(pgno, walMaxFrame, p.wal.index.liveMinFrame())
+		frame, err := p.wal.index.get(pgno, walMaxFrame, p.readerMinFrame(cache))
 		if err != nil {
 			// ErrCorrupt from a full/over-probed SHM hash chain: fail the read
 			// (C walFindFrame SQLITE_CORRUPT_BKPT, wal.c:3593) rather than
@@ -1726,6 +2081,35 @@ func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
 		return buf, nil
 	}
 	return nil, fmt.Errorf("btree: readRawPage: no backing storage for page %d", pgno)
+}
+
+// readRawPage1Header is readRawPage for page 1's header alone: the first
+// len(buf) bytes of page 1 (dbHeaderSize of them are outside the codec),
+// from its newest WAL frame in the reader's window, else from the database
+// file. For a page 1 that cannot be read whole.
+func (p *pager) readRawPage1Header(walMaxFrame uint32, cache *pcache, buf []byte) error {
+	if walMaxFrame > 0 && p.wal != nil {
+		frame, err := p.wal.index.get(1, walMaxFrame, p.readerMinFrame(cache))
+		if err != nil {
+			return err
+		}
+		if frame > 0 {
+			if err := p.readWalFrameData(frame, buf); err != nil {
+				return fmt.Errorf("btree: readRawPage1Header (WAL frame %d): %w", frame, err)
+			}
+			return nil
+		}
+	}
+	if p.file != nil {
+		if _, err := p.file.ReadAt(buf, 0); err != nil {
+			return fmt.Errorf("btree: readRawPage1Header: %w", err)
+		}
+		return nil
+	}
+	if p.master != nil && p.master.readPageInto(1, buf) {
+		return nil
+	}
+	return errors.New("btree: readRawPage1Header: no backing storage for page 1")
 }
 
 // END ENCRYPTION
@@ -2287,8 +2671,15 @@ func (p *pager) getHasContent(pgno uint32) bool {
 //
 // The in-process and in-memory modes publish no wal-index header; their
 // synthesized snapshot header carries the committed position's size
-// (walIndex.mxCommitFrame), which open and database creation seed and only a
-// published commit moves. There is no fallback for them.
+// (walIndex.mxCommitFrame), which only a published commit moves. As in
+// SQLite's header, it is 0 until a commit records one (walIndexRecover
+// zeroes the header and sets nPage from a commit frame, wal.c:1408, 1512)
+// and a WAL reset keeps it, so a non-zero size is always a commit's, in
+// every mode. An in-process reader without one takes the file's, as above.
+// An in-memory database has no file: its master store, which stands for
+// one, holds only what creation wrote until a commit is checkpointed into
+// it, and before the first commit the database is that one page, page 1
+// (newDatabase sets nPage = 1, btree.c:3540-3541). Its readers take 1.
 //
 // No reader bound-checks against p.dbSize: that atomic is the writer's
 // allocation counter. An open write transaction moves it (a backup's shrink,
@@ -2304,7 +2695,7 @@ func (p *pager) effectiveReaderDbSize(hdr WalIndexHdr) (uint32, error) {
 	if hdr.isInit != 0 && hdr.nPage != 0 {
 		return hdr.nPage, nil
 	}
-	if !p.inProcess && !p.inMemory && p.file != nil {
+	if !p.inMemory && p.file != nil {
 		// One fstat per wal-index header, not per read begin (measured:
 		// ~390 ns and an allocation, about a sixth of a point read on a
 		// freshly opened database, which is in exactly this state). The
@@ -2313,7 +2704,9 @@ func (p *pager) effectiveReaderDbSize(hdr WalIndexHdr) (uint32, error) {
 		// need a commit, and a commit publishes a header with a size, which
 		// every later reset keeps. A header without a size appears again
 		// only when the index is rebuilt over a WAL with no commit, with the
-		// salts of a new WAL generation.
+		// salts of a new WAL generation. The in-process mode's synthesized
+		// header has no salts; its index is built once, at open, and its
+		// iChange, the restart count, moves at every reset.
 		if m := p.noWalCommitSize.Load(); m != nil && m.hdr == hdr {
 			return m.nPage, nil
 		}
@@ -2325,8 +2718,9 @@ func (p *pager) effectiveReaderDbSize(hdr WalIndexHdr) (uint32, error) {
 		p.noWalCommitSize.Store(&noWalCommitSize{hdr: hdr, nPage: n})
 		return n, nil
 	}
-	if p.inProcess || p.inMemory {
-		return 0, errors.New("btree: internal error: an in-process snapshot without a committed size")
+	if p.inMemory {
+		// No commit yet: the new database's one page.
+		return 1, nil
 	}
 	return p.dbSize.Load(), nil
 }
@@ -2442,7 +2836,7 @@ func (p *pager) pagerPageCount(walNPage uint32) (nPage uint32, ok bool, err erro
 // (effectiveReaderDbSize): the committed size of the live wal-index header,
 // which under the write lock is the snapshot page 1 is read at, or the
 // database file's size when the WAL has had no commit; in the in-process and
-// in-memory modes, the committed position's size.
+// in-memory modes, the committed position's size, with the same fallback.
 func (p *pager) committedPageCount() (uint32, error) {
 	if p.inProcess || p.inMemory {
 		f, n := p.wal.index.mxCommitFrame.LoadPos()
@@ -2486,7 +2880,7 @@ func (p *pager) refreshHeaderFromPage1() error {
 		p.writerCache.clear()
 		return fmt.Errorf("refreshHeaderFromPage1: %w", err)
 	}
-	p.header = hdr
+	p.adoptHeader(hdr)
 	p.dbSize.Store(nPage)
 	if debugTrace {
 		trace("refreshHeaderFromPage1: nFrame=%d nBackfill=%d count=%d dbSize=%d headerSize=%d firstFree=%d totalFree=%d",
@@ -2494,6 +2888,22 @@ func (p *pager) refreshHeaderFromPage1() error {
 			p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs)
 	}
 	return nil
+}
+
+// adoptHeader makes h, decoded from an image of page 1, the pager's header,
+// with one field that is not the image's: the KDF salt stays keySalt, the
+// one the codec was keyed with. A page image can name another salt (one a
+// backup copied from its source before the destination kept its own, still
+// in a WAL that was never checkpointed); the pages are sealed with the
+// keyed salt's key whatever page 1 says, and every write of page 1, the
+// checkpoint's copy into the main file included, writes that salt. SQLCipher
+// reads its salt once, from the main file, and in its default header mode
+// replaces it with the magic in every decrypted page 1
+// (sqlcipher.c:1392-1409, 3271), so no image of page 1 reaches its key.
+// DRIFT: page 1's salt bytes are not read from a page image; SQLite's header has no KDF salt. See docs/btree/NOTES.md#drift-2026-11-21-19-the-kdf-salt-belongs-to-the-key-setup-not-to-page-1
+func (p *pager) adoptHeader(h dbHeader) {
+	h.Salt = p.keySalt
+	p.header = h
 }
 
 // committedCounters returns the FileChangeCount and SchemaCookie from the
@@ -3376,7 +3786,9 @@ func (p *pager) rollbackToSavepoint(id int) error {
 				// and dbFileVers from the restored image (pager.c:2481-2484).
 				// The oldest copy is restored last, so it is the one kept.
 				if pgno == 1 {
-					p.header.deserialize(pg.data[:dbHeaderSize])
+					header := p.header
+					header.deserialize(pg.data[:dbHeaderSize])
+					p.adoptHeader(header)
 					p.dbSize.Store(p.header.DatabaseSize)
 					p.dbFileVers.Store(binary.BigEndian.Uint32(data[24:28]))
 					page1Restored = true
@@ -3954,101 +4366,126 @@ func (p *pager) close() error {
 		if p.inMemory {
 			// InMemory: no peers, always last.
 			isLastClient = true
+		} else if !p.databaseIsUnmoved() {
+			// databaseIsUnmoved gate: matches SQLite's sqlite3PagerClose
+			// (pager.c:4189-4191), which passes a non-NULL buffer to
+			// sqlite3WalClose (enabling the close-time checkpoint) only when
+			// databaseIsUnmoved(pPager)==SQLITE_OK. A NULL buffer (moved DB)
+			// skips the WHOLE lock+checkpoint+truncate arm in sqlite3WalClose
+			// (the `if( zBuf!=0 && ...)` gate at wal.c:2522). Skipping is the
+			// safe behavior: if the DB file was renamed/unlinked/relinked
+			// out from under this fd, checkpointing into p.file would write
+			// committed WAL frames into a path that is no longer the real
+			// database — silently losing the transaction on the visible
+			// path or clobbering an unrelated file now living at p.path.
+			if debugTrace {
+				trace("close: skipping close-time checkpoint, DB file moved/unlinked since open (path=%s)", p.path)
+			}
 		} else {
-			// Hold WAL_WRITE_LOCK across checkpoint+truncate so a peer
-			// process cannot be mid-writeFrames. withWriteLock defers the
-			// unlock, so any early-return / panic inside the closure cannot
-			// leak the lock. Matches SQLite's sqlite3WalClose which guards
-			// walLimitSize with an exclusive DB-file lock (wal.c:2509-2534).
-			_ = p.withWriteLock(func(lockedWrite bool) error {
-				// databaseIsUnmoved gate: matches SQLite's sqlite3PagerClose
-				// (pager.c:4189-4191), which passes a non-NULL buffer to
-				// sqlite3WalClose (enabling the close-time checkpoint) only when
-				// databaseIsUnmoved(pPager)==SQLITE_OK. A NULL buffer (moved DB)
-				// skips the WHOLE checkpoint+truncate arm in sqlite3WalClose
-				// (the `if(zBuf!=0 ...)` gate at wal.c:2522). Skipping is the
-				// safe behavior: if the DB file was renamed/unlinked/relinked
-				// out from under this fd, checkpointing into p.file would write
-				// committed WAL frames into a path that is no longer the real
-				// database — silently losing the transaction on the visible
-				// path or clobbering an unrelated file now living at p.path.
-				// We therefore skip both the checkpoint and the dependent
-				// truncate (truncate stays gated on cpErr==nil below, and cpErr
-				// is left non-nil for the moved case).
-				moved := !p.databaseIsUnmoved()
-				if moved {
+			// The exclusive lock on the database file comes first, as in
+			// sqlite3WalClose (wal.c:2522-2523 `SQLITE_OK==(rc =
+			// sqlite3OsLock(pWal->pDbFd, SQLITE_LOCK_EXCLUSIVE))`): every
+			// attached process holds the file shared for as long as it is
+			// attached (pager.open), so with the lock this connection is the
+			// only one, and stays the only one until the file is closed. The
+			// checkpoint and the truncate both run under it: no other process
+			// can commit between the checkpoint's last look at the log and
+			// the truncate. Without the lock neither runs (the body of that
+			// `if` is skipped) and the WAL is left to the processes still
+			// attached.
+			//
+			// In-process mode has held the file exclusively since open
+			// (acquireExclusiveDBLock).
+			if p.inProcess {
+				isLastClient = true
+			} else if p.file != nil {
+				ok, err := tryUpgradeDBLockExclusive(p.file)
+				if err != nil {
 					if debugTrace {
-						trace("close: skipping close-time checkpoint, DB file moved/unlinked since open (path=%s)", p.path)
+						trace("close: DB-file exclusive upgrade error: %v", err)
 					}
-					return nil
+				} else {
+					isLastClient = ok
 				}
+			}
+			if !isLastClient {
 				if debugTrace {
-					trace("close: starting passive checkpoint before WAL truncation, dbSize=%d lockedWrite=%v", p.dbSize.Load(), lockedWrite)
+					trace("close: not the last client, no checkpoint, WAL left alone")
 				}
-				// A torn wal-index header must be repaired before the
-				// checkpoint reads its frontier. The PASSIVE checkpoint
-				// would take the write lock for that itself, but this
-				// close already holds it, so do it here, as
-				// walIndexReadHdr does for a caller with
-				// pWal->writeLock set (wal.c:2706-2711). On failure the
-				// checkpoint and the truncate are skipped.
-				var cpErr error
-				if lockedWrite {
-					_, cpErr = p.wal.indexReadHdr(true, false)
-				}
-				if cpErr == nil {
-					cpErr = p.wal.checkpointPassive(p.file, p.master)
-				}
-				if cpErr != nil {
+			} else {
+				// WAL_WRITE_LOCK is held across checkpoint+truncate.
+				// sqlite3WalClose switches the connection to exclusive
+				// locking mode instead (wal.c:2525-2527), where its wal-index
+				// locks are not taken at all; here the lock is free, its
+				// last holder being gone, and taking it lets the torn-header
+				// repair below run as a writer's. withWriteLock defers the
+				// unlock, so an early return or a panic inside the closure
+				// cannot leak it.
+				_ = p.withWriteLock(func(lockedWrite bool) error {
 					if debugTrace {
-						trace("close: checkpointPassive incomplete or failed: %v", cpErr)
+						trace("close: starting passive checkpoint before WAL truncation, dbSize=%d lockedWrite=%v", p.dbSize.Load(), lockedWrite)
 					}
-				}
-				// Truncate gating: matches SQLite's sqlite3WalClose (wal.c:2487-2551),
-				// which calls walLimitSize (wal.c:2534) only after obtaining an
-				// exclusive DB-file lock (wal.c:2509). We use a DB-file flock
-				// upgrade as the analog; failure leaves the WAL intact so peer
-				// readers can still find frames in the file.
-				if p.inProcess {
-					isLastClient = true
-				} else if p.file != nil {
-					ok, err := tryUpgradeDBLockExclusive(p.file)
-					if err != nil {
+					// A torn wal-index header must be repaired before the
+					// checkpoint reads its frontier. The PASSIVE checkpoint
+					// would take the write lock for that itself, but this
+					// close already holds it, so do it here, as
+					// walIndexReadHdr does for a caller with
+					// pWal->writeLock set (wal.c:2706-2711). On failure the
+					// checkpoint and the truncate are skipped.
+					var cpErr error
+					if lockedWrite {
+						_, cpErr = p.wal.indexReadHdr(true, false)
+					}
+					if cpErr == nil {
+						cpErr = p.wal.checkpointPassive(p.file, p.master)
+					}
+					// The WAL is truncated only after a checkpoint that
+					// completed (wal.c:2531 `if( rc==SQLITE_OK )`). What C
+					// does then depends on the persistent-WAL setting: it
+					// deletes the file unless the WAL is persistent
+					// (wal.c:2536-2540), and truncates a persistent one to
+					// zero only under a non-negative size limit (`else if(
+					// pWal->mxWalSize>=0 )`, wal.c:2541-2548), leaving it as
+					// it is otherwise. Here it is always truncated, never
+					// deleted (drift-55). With a shared wal-index the
+					// truncate also needs the write lock: a close that could
+					// not take it does not know the log is not being
+					// written.
+					if cpErr == nil && (lockedWrite || p.inProcess) {
 						if debugTrace {
-							trace("close: DB-file exclusive upgrade error: %v", err)
+							trace("close: TRUNCATING WAL (cpErr=nil isLastClient=true) nBackfill=%d mxFrame=%d",
+								p.wal.index.nBackfill.Load(), p.wal.authoritativeMxFrame())
 						}
-					} else {
-						isLastClient = ok
-					}
-				}
-				if cpErr == nil && isLastClient {
-					if debugTrace {
-						trace("close: TRUNCATING WAL (cpErr=nil isLastClient=true) nBackfill=%d mxFrame=%d",
-							p.wal.index.nBackfill.Load(), p.wal.authoritativeMxFrame())
-					}
-					// Forensic aid: BTREE_KEEP_WAL_ON_CLOSE=1 keeps the exact WAL
-					// bytes the close-time checkpoint consumed, so a post-mortem can
-					// replay the backfill decision after truncation. Deliberately NOT
-					// tied to debugtrace: trace logging serializes the hot paths
-					// (logger mutex + write syscalls) and suppresses the very races
-					// being hunted. One getenv + one file copy at close is inert.
-					// O_EXCL: first close wins (the workload process), so a later
-					// verifier open+close cannot clobber the evidence with its
-					// already-truncated WAL.
-					if os.Getenv("BTREE_KEEP_WAL_ON_CLOSE") == "1" {
-						if walBytes, rerr := os.ReadFile(p.path + "-wal"); rerr == nil {
-							if f, ferr := os.OpenFile(p.path+"-wal.pretruncate", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644); ferr == nil {
-								_, _ = f.Write(walBytes)
-								_ = f.Close()
+						// Forensic aid: BTREE_KEEP_WAL_ON_CLOSE=1 keeps the exact WAL
+						// bytes the close-time checkpoint consumed, so a post-mortem can
+						// replay the backfill decision after truncation. Deliberately NOT
+						// tied to debugtrace: trace logging serializes the hot paths
+						// (logger mutex + write syscalls) and suppresses the very races
+						// being hunted. One getenv + one file copy at close is inert.
+						// O_EXCL: first close wins (the workload process), so a later
+						// verifier open+close cannot clobber the evidence with its
+						// already-truncated WAL.
+						if os.Getenv("BTREE_KEEP_WAL_ON_CLOSE") == "1" {
+							if walBytes, rerr := os.ReadFile(p.path + "-wal"); rerr == nil {
+								if f, ferr := os.OpenFile(p.path+"-wal.pretruncate", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644); ferr == nil {
+									_, _ = f.Write(walBytes)
+									_ = f.Close()
+								}
 							}
 						}
+						p.wal.truncateFile()
+						p.closeCheckpointed = true
+					} else if debugTrace {
+						trace("close: NOT truncating WAL (cpErr=%v lockedWrite=%v)", cpErr, lockedWrite)
 					}
-					p.wal.truncateFile()
-				} else if debugTrace {
-					trace("close: NOT truncating WAL (cpErr=%v isLastClient=%v)", cpErr, isLastClient)
+					return nil
+				})
+				// Still under the exclusive lock on the database file, which
+				// goes only with p.file.Close below.
+				if p.closeCheckpointed && p.onCloseCheckpointed != nil {
+					p.onCloseCheckpointed()
 				}
-				return nil
-			})
+			}
 		}
 		_ = p.wal.close(isLastClient)
 	}

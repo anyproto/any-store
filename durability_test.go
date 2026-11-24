@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -46,4 +47,105 @@ func TestRecovery_IdleFlushOutlivesOpenCtx(t *testing.T) {
 		_, err := os.Stat(sentinelPath)
 		return os.IsNotExist(err)
 	}, 5*time.Second, 20*time.Millisecond, "idle flush should mark the sentinel clean after the open ctx is cancelled")
+}
+
+// The sentinel file is named when the database is opened. After the working
+// directory changes, a flush, a write and the last close use the marker beside
+// the database, and none of them touch a file of the same name in the new
+// working directory.
+func TestRecovery_SentinelPathResolvedAtOpen(t *testing.T) {
+	if runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
+		t.Skip("the name is the path as given there: a relative name follows the working directory")
+	}
+	dirA, dirB := t.TempDir(), t.TempDir()
+	markerA := filepath.Join(dirA, "test.db.lock")
+	markerB := filepath.Join(dirB, "test.db.lock")
+	require.NoError(t, os.WriteFile(markerB, nil, 0o644)) // another database's marker
+
+	ctx := context.Background()
+	t.Chdir(dirA)
+	db, err := Open(ctx, "test.db", &Config{Durability: DurabilityConfig{Sentinel: true}})
+	require.NoError(t, err)
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"doc1"}`)))
+	_, err = os.Stat(markerA)
+	require.NoError(t, err, "setup: a write sets the sentinel")
+
+	t.Chdir(dirB)
+	require.NoError(t, db.Flush(ctx, 0, FlushModeCheckpointPassive))
+	_, err = os.Stat(markerA)
+	require.True(t, os.IsNotExist(err), "the flush left the database's sentinel: %v", err)
+	_, err = os.Stat(markerB)
+	require.NoError(t, err, "the flush removed a file in the new working directory")
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"doc2"}`)))
+	_, err = os.Stat(markerA)
+	require.NoError(t, err, "a write did not set the database's sentinel")
+
+	require.NoError(t, db.Close())
+	_, err = os.Stat(markerA)
+	require.True(t, os.IsNotExist(err), "the last close left the database's sentinel: %v", err)
+	_, err = os.Stat(markerB)
+	require.NoError(t, err, "the close removed a file in the new working directory")
+}
+
+// Open resolves the path once: a change of working directory after the
+// sentinel is set up and before the database file is opened leaves the
+// database and its marker together, in the directory the path was resolved
+// against.
+func TestRecovery_ChdirDuringOpenKeepsDatabaseAndSentinelTogether(t *testing.T) {
+	if runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
+		t.Skip("the name is the path as given there: a relative name follows the working directory")
+	}
+	dirA, dirB := t.TempDir(), t.TempDir()
+	ctx := context.Background()
+	t.Chdir(dirA)
+	testHookBeforeBtreeOpen = func() { t.Chdir(dirB) }
+	t.Cleanup(func() { testHookBeforeBtreeOpen = nil })
+
+	db, err := Open(ctx, "test.db", &Config{Durability: DurabilityConfig{Sentinel: true}})
+	testHookBeforeBtreeOpen = nil
+	require.NoError(t, err)
+	defer db.Close()
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"doc1"}`)))
+
+	for _, name := range []string{"test.db", "test.db.lock"} {
+		_, err = os.Stat(filepath.Join(dirA, name))
+		require.NoError(t, err, "%s is not in the directory the path was resolved against", name)
+		_, err = os.Stat(filepath.Join(dirB, name))
+		require.True(t, os.IsNotExist(err), "%s is in the directory changed to during the open: %v", name, err)
+	}
+}
+
+// An in-memory database has no files on disk: with the sentinel on, a write
+// creates no marker beside the path it was opened with, and its close, which
+// persists nothing, has none to clear.
+func TestRecovery_InMemoryHasNoSentinelFile(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "mem.db")
+	config := &Config{InMemory: true, Durability: DurabilityConfig{Sentinel: true}}
+
+	ctx := context.Background()
+	db, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"doc1"}`)))
+	_, err = os.Stat(dbPath + ".lock")
+	require.True(t, os.IsNotExist(err), "a write to an in-memory database created a sentinel file: %v", err)
+	require.NoError(t, db.Close())
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Empty(t, entries, "an in-memory database left files on disk")
+
+	db, err = Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	stats, err := db.Stats(ctx)
+	require.NoError(t, err)
+	require.False(t, stats.DirtyOnOpen)
+	require.NoError(t, db.Close())
 }

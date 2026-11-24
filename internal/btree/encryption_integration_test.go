@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func tmpEncryptedFile(t *testing.T, name string) string {
@@ -121,6 +124,69 @@ func TestOpen_WrongKeyFails(t *testing.T) {
 	_, gnErr := db2.GetNamespace("x")
 	if gnErr == nil {
 		t.Fatalf("GetNamespace with wrong key returned nil error")
+	}
+}
+
+// TestOpen_PassphraseKeyDerivedOncePerOpen: an Open with a passphrase derives
+// its key once, when it creates the database (at a path with no file, or
+// with an empty one) and when it opens the database again. The open that
+// creates the database writes into page 1 the salt its key was derived
+// from, so the header it reads under the DB-file lock leaves that key in
+// place. SQLCipher derives the key of a codec context once, at its first
+// use (sqlcipher_codec_key_derive).
+func TestOpen_PassphraseKeyDerivedOncePerOpen(t *testing.T) {
+	var derived atomic.Int32
+	testDeriveKeyHook = func() { derived.Add(1) }
+	t.Cleanup(func() { testDeriveKeyHook = nil })
+
+	for _, inProcess := range []bool{true, false} {
+		for _, emptyFile := range []bool{false, true} {
+			name := "multi-process"
+			if inProcess {
+				name = "in-process"
+			}
+			if emptyFile {
+				name += "/empty-file"
+			} else {
+				name += "/no-file"
+			}
+			t.Run(name, func(t *testing.T) {
+				path := tmpEncryptedFile(t, "enc.db")
+				if emptyFile {
+					require.NoError(t, os.WriteFile(path, nil, 0o644))
+				}
+				opts := DefaultOptions()
+				opts.Key = []byte("correct horse battery staple")
+				opts.KDFIterations = 1000
+				opts.InProcess = inProcess
+
+				derived.Store(0)
+				db, err := testOpen(t, path, opts)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, derived.Load(), "key derivations of the open that created the database")
+				tx, err := db.BeginWrite()
+				require.NoError(t, err)
+				ns, err := tx.CreateNamespace("x")
+				require.NoError(t, err)
+				require.NoError(t, tx.Put(ns, []byte("k"), []byte("v")))
+				require.NoError(t, tx.Commit())
+				require.NoError(t, db.Close())
+
+				derived.Store(0)
+				db, err = testOpen(t, path, opts)
+				require.NoError(t, err)
+				defer func() { _ = db.Close() }()
+				require.EqualValues(t, 1, derived.Load(), "key derivations of an open of the database")
+				ns, err = db.GetNamespace("x")
+				require.NoError(t, err)
+				rtx, err := db.BeginRead()
+				require.NoError(t, err)
+				defer rtx.Rollback()
+				val, err := rtx.Get(ns, []byte("k"))
+				require.NoError(t, err)
+				require.Equal(t, []byte("v"), val)
+			})
+		}
 	}
 }
 

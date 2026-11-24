@@ -1347,3 +1347,59 @@ func putTagged(t *testing.T, db *DB, first, n int, tag byte) {
 func taggedValue(key []byte, tag byte) []byte {
 	return bytes.Repeat(append(bytes.Clone(key), tag), 60)
 }
+
+// Cursor.Key of a write transaction's cursor takes the gate when the key
+// itself spills, since its overflow chain is read through the pager, and
+// stays on the pinned leaf for a local key whose value spills.
+func TestWriterGate_KeyGatedOnlyForSpilledKey(t *testing.T) {
+	db, err := testOpen(t, "", Options{CacheSize: 64, InMemory: true})
+	require.NoError(t, err)
+	defer db.Close()
+	createNS(t, db, "t")
+	putN(t, db, "t", 100, 300)
+	bigVal := bytes.Repeat([]byte{0x5A}, 6000)
+	localKey := closeRescueKey(1000)
+	bigKey := append([]byte("zz"), bytes.Repeat([]byte{0x41}, 6000)...)
+	{
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := tx.GetNamespace("t")
+		require.NoError(t, err)
+		require.NoError(t, tx.Put(ns, localKey, bigVal))
+		require.NoError(t, tx.Put(ns, bigKey, []byte("v")))
+		require.NoError(t, tx.Commit())
+	}
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	defer tx.Rollback()
+	ns, err := tx.GetNamespace("t")
+	require.NoError(t, err)
+	cur := tx.NewCursor(ns)
+	defer cur.Close()
+
+	var gated []int
+	testGatedPinnedLeafHook = func(c *Cursor, step int) {
+		if c == cur {
+			gated = append(gated, step)
+		}
+	}
+	defer func() { testGatedPinnedLeafHook = nil }()
+
+	require.NoError(t, cur.SeekExact(localKey))
+	gated = nil
+	k, err := cur.Key()
+	require.NoError(t, err)
+	require.Equal(t, localKey, k)
+	require.Empty(t, gated, "Key of a local key took the gate")
+
+	require.NoError(t, cur.SeekExact(bigKey))
+	gated = nil
+	k, err = cur.Key()
+	require.NoError(t, err)
+	require.Equal(t, bigKey, k)
+	require.Equal(t, []int{0}, gated, "Key of a spilled key did not take the gate")
+	v, err := cur.Value()
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), v)
+}

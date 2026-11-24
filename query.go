@@ -297,7 +297,9 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 	if err = q.validateSources(s); err != nil {
 		return nil, nil, err
 	}
-	q.c.refreshSketches(btx, s)
+	if err = q.c.refreshSketches(btx, s); err != nil {
+		return nil, nil, err
+	}
 
 	// $text drives the query when present (CBO bypassed). The residual filter
 	// runs as a downstream FilterIter; a relevance/textScore sort is the

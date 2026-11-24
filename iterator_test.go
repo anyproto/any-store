@@ -101,10 +101,10 @@ func TestIterator_String(t *testing.T) {
 		"planIterator.String must return plan.String() verbatim (no wrapping/composition)")
 }
 
-// TestIterator_Err_HidesEOF pins iterator.go:114-118 — when pi.err is io.EOF
-// (used internally to signal normal termination), the public Err() returns
-// nil rather than surfacing the sentinel.
-func TestIterator_Err_HidesEOF(t *testing.T) {
+// TestIterator_Err_ReturnsEOF: the end of an iteration is the plan returning
+// no document and no error, so an io.EOF the plan returned is an error (a
+// short page read wraps it) and Err returns it as it is.
+func TestIterator_Err_ReturnsEOF(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "iter_eof")
 	require.NoError(t, err)
@@ -113,16 +113,21 @@ func TestIterator_Err_HidesEOF(t *testing.T) {
 	require.NoError(t, err)
 	defer it.Close()
 
+	// An iteration that reaches its end has no error.
+	assert.False(t, it.Next())
+	assert.NoError(t, it.Err())
+
 	pi, ok := it.(*planIterator)
 	require.True(t, ok)
 
-	// Inject io.EOF directly and verify Err() returns nil.
 	pi.err = io.EOF
-	assert.Nil(t, it.Err(), "Err must treat io.EOF as normal termination → nil")
+	assert.ErrorIs(t, it.Err(), io.EOF)
 
-	// With a non-EOF sentinel, Err() must propagate.
+	pi.err = fmt.Errorf("short page read: %w", io.EOF)
+	assert.ErrorIs(t, it.Err(), io.EOF)
+
 	pi.err = errors.New("other-error")
-	assert.NotNil(t, it.Err())
+	assert.EqualError(t, it.Err(), "other-error")
 }
 
 // TestIterator_NextAfterClose pins iterator.go:43-45 — once Close() has set

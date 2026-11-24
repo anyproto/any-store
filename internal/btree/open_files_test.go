@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// OpenFiles names the files by the path Open was given, uncleaned, and
+// OpenFiles names the files by the database's full name (FullPathname) and
 // identifies them by their descriptors: the database file, the log, and
 // the log's index when that is a file. An in-memory database has none; a
 // closed one, in memory or not, returns ErrClosed.
@@ -26,8 +26,12 @@ func TestOpenFiles(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if files.Path != path {
-			t.Errorf("InProcess=%v: Path %q, want %q as given", inProcess, files.Path, path)
+		want, err := FullPathname(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if files.Path != want {
+			t.Errorf("InProcess=%v: Path %q, want the full name %q", inProcess, files.Path, want)
 		}
 		for _, f := range []struct {
 			name string

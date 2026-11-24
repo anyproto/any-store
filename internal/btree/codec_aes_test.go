@@ -50,7 +50,7 @@ func TestAESCodec_RoundTrip(t *testing.T) {
 	}
 
 	pt := make([]byte, pageSize)
-	out, err := c.Decrypt(pt, ct, 7, &aeadScratch{})
+	out, err := c.Decrypt(pt, ct, 7, &aeadScratch{}, nil)
 	if err != nil {
 		t.Fatalf("Decrypt: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestAESCodec_TamperDetected(t *testing.T) {
 	// Flip a bit somewhere in the encrypted body.
 	ct[100] ^= 0x01
 	pt := make([]byte, pageSize)
-	if _, err := c.Decrypt(pt, ct, 1, &aeadScratch{}); !errors.Is(err, ErrPageIntegrity) {
+	if _, err := c.Decrypt(pt, ct, 1, &aeadScratch{}, nil); !errors.Is(err, ErrPageIntegrity) {
 		t.Fatalf("flipped-bit decrypt: got err=%v, want ErrPageIntegrity", err)
 	}
 }
@@ -84,7 +84,7 @@ func TestAESCodec_PageNumberBound(t *testing.T) {
 	ct, _ := c.Encrypt(dst, src, 5, &aeadScratch{})
 	// Decrypting with the wrong page number must fail.
 	pt := make([]byte, pageSize)
-	if _, err := c.Decrypt(pt, ct, 6, &aeadScratch{}); !errors.Is(err, ErrPageIntegrity) {
+	if _, err := c.Decrypt(pt, ct, 6, &aeadScratch{}, nil); !errors.Is(err, ErrPageIntegrity) {
 		t.Fatalf("wrong-pgno decrypt: got err=%v, want ErrPageIntegrity", err)
 	}
 }
@@ -115,7 +115,7 @@ func TestAESCodec_WrongKeyRejected(t *testing.T) {
 	dst := make([]byte, pageSize)
 	ct, _ := c1.Encrypt(dst, src, 1, &aeadScratch{})
 	pt := make([]byte, pageSize)
-	if _, err := c2.Decrypt(pt, ct, 1, &aeadScratch{}); !errors.Is(err, ErrPageIntegrity) {
+	if _, err := c2.Decrypt(pt, ct, 1, &aeadScratch{}, nil); !errors.Is(err, ErrPageIntegrity) {
 		t.Fatalf("wrong-key decrypt: got err=%v, want ErrPageIntegrity", err)
 	}
 }
@@ -148,12 +148,58 @@ func benchCodecEncrypt(b *testing.B, c Codec) {
 	const pageSize = 4096
 	src := make([]byte, pageSize)
 	dst := make([]byte, pageSize)
+	// One scratch for the whole run, as the pager and the WAL each keep
+	// one for their lifetime.
+	var s aeadScratch
 	b.SetBytes(pageSize)
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := c.Encrypt(dst, src, uint32(i+1), &aeadScratch{}); err != nil {
+		if _, err := c.Encrypt(dst, src, uint32(i+1), &s); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// Micro-benchmark: single Decrypt call of a valid page, with an integrity
+// hook passed as a database with OnIntegrityError passes one.
+// Run with: go test -bench BenchmarkCodec_Decrypt -run '^$' -benchtime=3s
+func BenchmarkCodec_Decrypt_AES256GCM(b *testing.B) {
+	benchCodecDecrypt(b, mustAES(b))
+}
+
+func BenchmarkCodec_Decrypt_ChaCha20Poly1305(b *testing.B) {
+	benchCodecDecrypt(b, mustChaCha(b))
+}
+
+func BenchmarkCodec_Decrypt_XChaCha20Poly1305(b *testing.B) {
+	benchCodecDecrypt(b, mustXChaCha(b))
+}
+
+func benchCodecDecrypt(b *testing.B, c Codec) {
+	b.Helper()
+	const pageSize, pgno = 4096, 7
+	src := make([]byte, pageSize)
+	ct := make([]byte, pageSize)
+	var w aeadScratch
+	if _, err := c.Encrypt(ct, src, pgno, &w); err != nil {
+		b.Fatal(err)
+	}
+	dst := make([]byte, pageSize)
+	// One scratch for the whole run, as each reader cache keeps one.
+	var s aeadScratch
+	var failures int
+	onError := integrityHook(func(uint32, error) { failures++ })
+	b.SetBytes(pageSize)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := c.Decrypt(dst, ct, pgno, &s, onError); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if failures != 0 {
+		b.Fatalf("onError fired %d times on valid pages", failures)
 	}
 }
 

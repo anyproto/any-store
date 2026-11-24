@@ -123,7 +123,9 @@ func (o *OPFSFS) MkdirAll(path string, perm fs.FileMode) error {
 	return err
 }
 
-// Remove deletes a file or empty directory by name.
+// Remove deletes a file or empty directory by name. A name that is not there
+// is os.ErrNotExist, as with os.Remove and the other backends: the open of a
+// new database removes a log that usually does not exist.
 func (o *OPFSFS) Remove(name string) error {
 	name = filepath.Clean(name)
 	parent, base, err := o.getParentAndBase(name, false)
@@ -132,6 +134,9 @@ func (o *OPFSFS) Remove(name string) error {
 	}
 	promise := parent.Call("removeEntry", base)
 	if _, err := awaitPromise(promise); err != nil {
+		if isJSNotFound(err) {
+			err = os.ErrNotExist
+		}
 		return &os.PathError{Op: "remove", Path: name, Err: err}
 	}
 	return nil

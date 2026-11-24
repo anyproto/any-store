@@ -605,9 +605,10 @@ func TestIteratorDeleteDuringIterationStaysConsistent(t *testing.T) {
 // all-commit happy path.
 //
 // Guarantees asserted here:
-//   - NO ACCUMULATION: after M rolled-back txs the sketch docCount is bounded to
-//     N + K (the most recent rolled-back tx's deltas, cleaned up at the next write
-//     tx begin), NOT N + (1+M)*K.
+//   - NO ACCUMULATION: after M rolled-back txs Stats, which reports the stored
+//     sketch, still counts N. The planner's sketch in memory is not looked
+//     at here: the rebase of one rolled-back tx's deltas at the next write tx
+//     begin is asserted beside the code (TestWriteTx_DirtyLists).
 //   - NO DISK POLLUTION: a clean commit after the rollbacks persists the true
 //     count (N+1), not the accumulated drift.
 //   - The real Count() is exact (== N) throughout (the sketch is advisory).
@@ -658,16 +659,12 @@ func TestSketchNoAccumulatingDriftAcrossRolledBackTxs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, N, cnt, "real Count after M rolled-back txs is STILL N")
 
-	// NO ACCUMULATION: sketch docCount is bounded to N+K (the last rolled-back tx's
-	// deltas, not yet cleaned up because no further write tx has begun), NOT the
-	// pre-fix N+(1+M)*K. The decisive check: it does not grow with M.
+	// NO ACCUMULATION: Stats reports the stored sketch, which no rolled-back
+	// tx reached: N, whatever M is.
 	st, err = coll.Stats(ctx)
 	require.NoError(t, err)
-	gotDrift := st.Indexes[0].SketchDocCount
-	t.Logf("after %d rolled-back txs (K=%d each): real Count=%d, sketch docCount=%d (bounded residual=N+K=%d, pre-fix would be %d)",
-		M, K, cnt, gotDrift, N+K, N+(1+M)*K)
-	assert.LessOrEqual(t, gotDrift, uint64(N+K),
-		"sketch docCount must be bounded to a single tx's deltas, not accumulate with M")
+	assert.Equal(t, uint64(N), st.Indexes[0].SketchDocCount,
+		"Stats counts nothing of the rolled-back txs")
 
 	// --- 3) On-disk sketch is still N: every tx above rolled back, persist never ran. ---
 	on, err := insp.InspectIndexSketch(ctx, "coll", "k")
@@ -685,15 +682,16 @@ func TestSketchNoAccumulatingDriftAcrossRolledBackTxs(t *testing.T) {
 	assert.Equal(t, uint64(N+1), on.DocCount,
 		"on-disk sketch == true N+1 (phantom deltas discarded, not persisted)")
 
-	// In-memory sketch now also reflects the true committed count.
+	// Stats reports the same row.
 	st, err = coll.Stats(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, uint64(N+1), st.Indexes[0].SketchDocCount, "in-memory sketch == true N+1")
+	assert.Equal(t, uint64(N+1), st.Indexes[0].SketchDocCount, "Stats == true N+1")
 }
 
 // A rolled-back write to one collection is cleaned up by the next write tx
-// even when that tx writes another collection: the phantom deltas neither stay
-// in memory nor reach disk with the other collection's commit.
+// even when that tx writes another collection: the phantom deltas do not
+// reach disk with the other collection's commit, and Stats does not report
+// them.
 func TestSketchRollbackCleanedByWriteToAnotherCollection(t *testing.T) {
 	const N = 10
 
@@ -708,7 +706,7 @@ func TestSketchRollbackCleanedByWriteToAnotherCollection(t *testing.T) {
 		}
 		return coll
 	}
-	sketchCounts := func(coll anystore.Collection, name string) (live, disk uint64) {
+	sketchCounts := func(coll anystore.Collection, name string) (stats, disk uint64) {
 		st, err := coll.Stats(ctx)
 		require.NoError(t, err)
 		require.Len(t, st.Indexes, 1)
@@ -727,16 +725,16 @@ func TestSketchRollbackCleanedByWriteToAnotherCollection(t *testing.T) {
 
 	require.NoError(t, b.Insert(ctx, anyenc.MustParseJson(`{"id":2000,"k":2000}`)))
 
-	live, disk := sketchCounts(a, "a")
-	assert.Equal(t, uint64(N), live, "a: live sketch rebased by a tx that wrote only b")
+	stats, disk := sketchCounts(a, "a")
+	assert.Equal(t, uint64(N), stats, "a: Stats after a tx that wrote only b")
 	assert.Equal(t, uint64(N), disk, "a: rolled-back deltas never persisted")
-	live, disk = sketchCounts(b, "b")
-	assert.Equal(t, uint64(N+1), live)
+	stats, disk = sketchCounts(b, "b")
+	assert.Equal(t, uint64(N+1), stats)
 	assert.Equal(t, uint64(N+1), disk)
 
 	require.NoError(t, a.Insert(ctx, anyenc.MustParseJson(`{"id":3000,"k":3000}`)))
-	live, disk = sketchCounts(a, "a")
-	assert.Equal(t, uint64(N+1), live)
+	stats, disk = sketchCounts(a, "a")
+	assert.Equal(t, uint64(N+1), stats)
 	assert.Equal(t, uint64(N+1), disk)
 }
 
@@ -773,15 +771,12 @@ func TestSketchNoDriftOnUniqueViolationRollback(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, cnt, "real Count unaffected by rolled-back unique-violation batches")
 
-	// Sketch docCount did NOT accumulate to 1 + 25*2: it is bounded to the last
-	// rolled-back batch's residual (≤ 1 + 2), cleaned up at each subsequent write-tx
-	// begin. Pre-fix this would be 51.
+	// Stats reports the stored sketch, which none of the rolled-back batches
+	// reached: 1, not 1 + 25*2.
 	st, err := coll.Stats(ctx)
 	require.NoError(t, err)
-	t.Logf("after 25 unique-violation rollbacks: real Count=%d, sketch docCount=%d (pre-fix would be %d)",
-		cnt, st.Indexes[0].SketchDocCount, 1+25*2)
-	assert.LessOrEqual(t, st.Indexes[0].SketchDocCount, uint64(1+2),
-		"sketch docCount bounded to one batch's deltas, not accumulating across unique-violation rollbacks")
+	assert.Equal(t, uint64(1), st.Indexes[0].SketchDocCount,
+		"Stats counts nothing of the rolled-back unique-violation batches")
 
 	// A clean commit persists the true count (2), not accumulated drift.
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"u":1}`)))

@@ -2140,7 +2140,7 @@ func TestShmHashWrite_CollisionLimit_Corrupt(t *testing.T) {
 	binary.LittleEndian.PutUint16(region[hashSlotOff((h0+1)&(htNSlot-1)):], 9)
 	binary.LittleEndian.PutUint16(region[hashSlotOff((h0+2)&(htNSlot-1)):], 11)
 
-	err = wi.shmHashWrite(pgno, frame)
+	err = wi.shmHashWrite(pgno, frame, frame-1)
 	require.ErrorIs(t, err, ErrCorrupt,
 		"shmHashWrite must return ErrCorrupt when the probe walks past nCollide=idx+1 occupied slots")
 }
@@ -2201,7 +2201,7 @@ func TestShmHashWrite_FirstFrameLazilyClearsSegment(t *testing.T) {
 	// Writing frame 1 (the segment's first entry of the new generation) must
 	// succeed — not ErrCorrupt — because the segment is zeroed first.
 	const pgno = uint32(777)
-	require.NoError(t, wi.shmHashWrite(pgno, 1),
+	require.NoError(t, wi.shmHashWrite(pgno, 1, 0),
 		"first frame of a segment must lazily clear stale entries, not trip the collision bound")
 
 	// The new entry is findable, and the junk is gone: a lookup for one of
@@ -2282,7 +2282,7 @@ func mustShmHashGet(t *testing.T, wi *walIndex, pgno, maxFrame, minFrame uint32)
 
 func mustShmHashWrite(t *testing.T, wi *walIndex, pgno, frame uint32) {
 	t.Helper()
-	if err := wi.shmHashWrite(pgno, frame); err != nil {
+	if err := wi.shmHashWrite(pgno, frame, frame-1); err != nil {
 		t.Fatalf("shmHashWrite(%d, %d): unexpected error: %v", pgno, frame, err)
 	}
 }
@@ -2785,7 +2785,11 @@ var errInjectedInTxRange = errors.New("injected getInTxRange failure")
 
 // putRowsAsync commits rows [from, to) of namespace t, 200-byte values, in a
 // write transaction of its own goroutine, and returns the commit's result.
-func putRowsAsync(db *DB, from, to int) <-chan error {
+// With spill, the transaction first writes its dirty pages to the WAL and
+// then changes the rows again, so that its commit has frames of its own to
+// look its pages up in. beforeCommit, when not nil, runs in that goroutine
+// immediately before Commit, after every Put and spill has succeeded.
+func putRowsAsync(db *DB, from, to int, spill bool, beforeCommit func()) <-chan error {
 	done := make(chan error, 1)
 	go func() {
 		tx, err := db.BeginWrite()
@@ -2794,13 +2798,29 @@ func putRowsAsync(db *DB, from, to int) <-chan error {
 			return
 		}
 		ns, err := tx.GetNamespace("t")
-		for i := from; err == nil && i < to; i++ {
-			err = tx.Put(ns, binary.BigEndian.AppendUint32(nil, uint32(i)), make([]byte, 200))
+		put := func(fill byte) {
+			val := make([]byte, 200)
+			val[0] = fill
+			for i := from; err == nil && i < to; i++ {
+				err = tx.Put(ns, binary.BigEndian.AppendUint32(nil, uint32(i)), val)
+			}
+		}
+		put(0)
+		if spill {
+			for _, pg := range db.pager.writerCache.dirtyPages() {
+				if err == nil && pg.pgno != 1 {
+					err = db.pager.pagerStress(pg)
+				}
+			}
+			put(1)
 		}
 		if err != nil {
 			_ = tx.Rollback()
 			done <- err
 			return
+		}
+		if beforeCommit != nil {
+			beforeCommit()
 		}
 		done <- tx.Commit()
 	}()
@@ -2822,38 +2842,56 @@ func waitCommit(t *testing.T, done <-chan error, what string) error {
 
 // A commit whose frame write fails looking up the transaction's frames
 // (getInTxRange) returns the error with the WAL's mutex free, so the next
-// transaction runs. The InMemory frame write returned that error with the
-// mutex held: the failed commit's own cleanup, and every transaction after
-// it, waited on the mutex for good.
+// transaction runs. A transaction has frames to look up in once it has
+// written pages out; an InMemory writer cache never does that, so its frame
+// write is covered below, on the WAL alone.
 func TestCommit_InTxRangeErrorReleasesWALMutex(t *testing.T) {
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), DefaultOptions())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		// A failed run can leave a commit stuck with the writer's
+		// locks, and Close would wait on it.
+		if !t.Failed() {
+			_ = db.Close()
+		}
+	})
+	createNS(t, db, "t")
+	require.NoError(t, waitCommit(t, putRowsAsync(db, 0, 100, false, nil), "the first commit"))
+
+	// Every page of a commit but the last is looked up in the frames the
+	// transaction wrote before, so a commit of many pages after a spill
+	// meets the failure. The failure is armed once the transaction's spills
+	// and puts are done, so it is Commit's frame write that meets it.
+	t.Cleanup(func() { testInTxRangeErrHook = nil })
+	armed := false
+	err = waitCommit(t, putRowsAsync(db, 100, 200, true, func() {
+		armed = true
+		testInTxRangeErrHook = func() error { return errInjectedInTxRange }
+	}), "the failing commit")
+	require.True(t, armed, "setup: the transaction failed before its Commit")
+	require.ErrorIs(t, err, errInjectedInTxRange)
+	testInTxRangeErrHook = nil
+
+	require.NoError(t, waitCommit(t, putRowsAsync(db, 200, 300, false, nil), "the next commit"))
+	require.Equal(t, 200, countKeys(t, db, "t"))
+	require.NoError(t, db.IntegrityCheck())
+}
+
+// The first frame write of a transaction looks nothing up: no frame of the
+// transaction is in the wal-index yet (walFrames' iFirst is 0 until then,
+// wal.c:4062-4064, 4138).
+func TestCommit_FirstFrameWriteLooksNothingUp(t *testing.T) {
 	for _, inMemory := range []bool{true, false} {
 		t.Run(fmt.Sprintf("InMemory=%v", inMemory), func(t *testing.T) {
 			opts := DefaultOptions()
 			opts.InMemory = inMemory
 			db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), opts)
 			require.NoError(t, err)
-			t.Cleanup(func() {
-				// A failed run can leave a commit stuck with the writer's
-				// locks, and Close would wait on it.
-				if !t.Failed() {
-					_ = db.Close()
-				}
-			})
+			t.Cleanup(func() { _ = db.Close() })
 			createNS(t, db, "t")
-			require.NoError(t, waitCommit(t, putRowsAsync(db, 0, 100), "the first commit"))
-
-			// Every page of a commit but the last is looked up in the
-			// transaction's frames, so a commit of many pages meets the
-			// failure.
 			testInTxRangeErrHook = func() error { return errInjectedInTxRange }
 			t.Cleanup(func() { testInTxRangeErrHook = nil })
-			err = waitCommit(t, putRowsAsync(db, 100, 200), "the failing commit")
-			require.ErrorIs(t, err, errInjectedInTxRange)
-			testInTxRangeErrHook = nil
-
-			require.NoError(t, waitCommit(t, putRowsAsync(db, 200, 300), "the next commit"))
-			require.Equal(t, 200, countKeys(t, db, "t"))
-			require.NoError(t, db.IntegrityCheck())
+			require.NoError(t, waitCommit(t, putRowsAsync(db, 0, 100, false, nil), "a commit of several pages"))
 		})
 	}
 }
@@ -2878,6 +2916,9 @@ func TestWriteFramesMem_InTxRangeErrorDropsAppendedFrames(t *testing.T) {
 		return &page{pgno: pgno, data: data}
 	}
 	require.NoError(t, w.writeFrames([]*page{pageOf(2, 0)}, true, 2))
+	// The transaction's first spill: from here on it has frames of its own
+	// to look pages up in.
+	require.NoError(t, w.writeFrames([]*page{pageOf(6, 'x')}, false, 0))
 	nf := w.nFrame.Load()
 
 	// A spill of two pages: the first is appended, the lookup for the
@@ -2894,6 +2935,8 @@ func TestWriteFramesMem_InTxRangeErrorDropsAppendedFrames(t *testing.T) {
 	require.ErrorIs(t, w.writeFrames([]*page{pageOf(3, 'a'), pageOf(4, 'b')}, false, 0), errInjectedInTxRange)
 	testInTxRangeErrHook = nil
 	require.Equal(t, nf, w.nFrame.Load())
+	require.True(t, w.mu.TryLock(), "the failed frame write returned with the WAL's mutex held")
+	w.mu.Unlock()
 
 	require.NoError(t, w.writeFrames([]*page{pageOf(5, 'c')}, false, 0))
 	require.Equal(t, nf+1, w.nFrame.Load())

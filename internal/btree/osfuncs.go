@@ -13,6 +13,10 @@ func osOpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
 
 var osRemove = os.Remove
 
+// osStat looks at a file's metadata by name, which needs no permission on
+// the file itself.
+var osStat = os.Stat
+
 // SetVFS replaces OS-level operations. Panics unless built with -tags vfs
 // or GOOS=js GOARCH=wasm.
 func SetVFS(_ VFS) {

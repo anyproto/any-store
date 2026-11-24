@@ -155,6 +155,11 @@ type commonTx struct {
 	// position that pairs nothing. Single-writer state, like the log.
 	savepoints []*savepointTx
 
+	// sketchTx names this write transaction to the collections whose live
+	// sketches it brought up or wrote to (collection.sketchTx): its version,
+	// kept to the end of the commit, where version is cleared first.
+	sketchTx uint64
+
 	// sketches is the indexes whose live sketch the commit persisted
 	// (persistSketches): settled as the commit becomes visible
 	// (settleSketches), left flagged by a commit that does not.
