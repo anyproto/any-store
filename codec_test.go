@@ -54,50 +54,6 @@ func TestEncryption_RoundTrip(t *testing.T) {
 	require.NoError(t, db2.Close())
 }
 
-func TestEncryption_WrongPassphraseFails(t *testing.T) {
-	dir, err := os.MkdirTemp("", "anystore-enc-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-	path := filepath.Join(dir, "enc.db")
-
-	cfg := &Config{
-		Encryption: EncryptionConfig{
-			Passphrase:    []byte("right"),
-			KDFIterations: 1000,
-		},
-	}
-	db, err := Open(context.Background(), path, cfg)
-	require.NoError(t, err)
-	require.NoError(t, db.Close())
-
-	cfg.Encryption.Passphrase = []byte("wrong")
-	_, err = Open(context.Background(), path, cfg)
-	require.ErrorIs(t, err, ErrWrongKey)
-	require.NotErrorIs(t, err, ErrCorrupt)
-}
-
-func TestEncryption_MissingPassphraseFails(t *testing.T) {
-	dir, err := os.MkdirTemp("", "anystore-enc-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-	path := filepath.Join(dir, "enc.db")
-
-	cfg := &Config{
-		Encryption: EncryptionConfig{
-			Passphrase:    []byte("pw"),
-			KDFIterations: 1000,
-		},
-	}
-	db, err := Open(context.Background(), path, cfg)
-	require.NoError(t, err)
-	require.NoError(t, db.Close())
-
-	// Reopen without passphrase.
-	_, err = Open(context.Background(), path, &Config{})
-	require.ErrorIs(t, err, ErrEncryptionKeyRequired)
-	require.NotErrorIs(t, err, ErrCorrupt)
-}
-
 func TestEncryption_DisabledByDefault(t *testing.T) {
 	var cfg EncryptionConfig
 	assert.False(t, cfg.Enabled())

@@ -9443,13 +9443,30 @@ func TestOpen_DamagedOnePageFileIsErrWrongKey(t *testing.T) {
 
 // A later page damaged under the right key does not fail the open: the
 // open authenticates page 1 only, and the read that meets the page reports
-// it, as before.
+// it as ErrPageIntegrity, as before; the integrity hook hears of that page.
 func TestOpen_DamagedLaterPageOpens(t *testing.T) {
+	var pages []uint32
 	path, opts := keyProofDB(t, true, nil)
-	damageFile(t, path, 2*int64(opts.PageSize)+1000)
+	opts.OnIntegrityError = func(pgno uint32, _ error) { pages = append(pages, pgno) }
+	damageFile(t, path, 2*int64(opts.PageSize)+1000) // page 3
 	db, err := Open(path, opts)
 	require.NoError(t, err)
-	require.NoError(t, db.Close())
+	defer db.Close()
+	require.Empty(t, pages, "the open reads no page but page 1")
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns, err := rtx.GetNamespace("x")
+	require.NoError(t, err)
+	cur := rtx.NewCursor(ns)
+	defer cur.Close()
+	for err = cur.First(); err == nil && cur.Valid(); err = cur.Next() {
+	}
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, ErrWrongKey)
+	require.Equal(t, []uint32{3}, pages)
 }
 
 // lastWALFrame returns the number of the last frame of the WAL at walPath
@@ -9711,28 +9728,10 @@ func TestOpen_PanickingIntegrityHookReleasesTheFile(t *testing.T) {
 	require.NotErrorIs(t, err, ErrDatabaseOpen)
 }
 
-// The two refusals of the codec settle are matchable and are not corruption.
-func TestOpen_EncryptionRefusalsAreSentinels(t *testing.T) {
-	path, opts := keyProofDB(t, true, nil)
-	plain := opts
-	plain.Key = nil
-	_, err := Open(path, plain)
-	require.ErrorIs(t, err, ErrKeyRequired)
-	require.NotErrorIs(t, err, ErrCorrupt)
-
-	encTestSetup(t)
-	plainPath := tmpEncryptedFile(t, "plain.db")
-	db, err := Open(plainPath, plain)
-	require.NoError(t, err)
-	require.NoError(t, db.Close())
-	_, err = Open(plainPath, opts)
-	require.ErrorIs(t, err, ErrNotEncrypted)
-	require.NotErrorIs(t, err, ErrCorrupt)
-}
-
 // A cursor of a write transaction whose commit failed reports the commit's
-// error, the one the pager's error state holds (Pager.errCode), not
-// corruption and not a read-only refusal: the database is sound.
+// error, the one the pager's error state holds (pager.errCode), not
+// corruption and not a read-only refusal: the database is sound. The commit
+// fails for real, in its WAL write, after its frames are written.
 func TestPagerError_CursorReportsTheCommitError(t *testing.T) {
 	db, err := testOpen(t, filepath.Join(t.TempDir(), "a.db"), Options{})
 	require.NoError(t, err)
@@ -9743,15 +9742,20 @@ func TestPagerError_CursorReportsTheCommitError(t *testing.T) {
 	require.NoError(t, err)
 	ns, err := tx.GetNamespace("t")
 	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("not committed"), []byte("v")))
 	cur := tx.NewCursor(ns)
 	defer cur.Close()
 	require.NoError(t, cur.First())
 
 	diskFull := errors.New("injected: no space left on device")
-	db.pager.pagerError(diskFull)
+	testCommitPublishErrHook = func() error { return diskFull }
+	t.Cleanup(func() { testCommitPublishErrHook = nil })
+	commitErr := tx.Commit()
+	testCommitPublishErrHook = nil
+	require.ErrorIs(t, commitErr, diskFull)
 
 	_, err = cur.Key()
-	require.ErrorIs(t, err, diskFull)
+	require.ErrorIs(t, err, diskFull, "the cursor reports the commit's error")
 	require.NotErrorIs(t, err, ErrCorrupt)
 	require.NotErrorIs(t, err, ErrReadOnly)
 	require.Nil(t, db.pager.errCode, "the error state ends with the cleanup")

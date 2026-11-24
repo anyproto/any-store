@@ -23,13 +23,23 @@ func TestOpen_SecondOpenInProcess(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	paths := []string{path, filepath.Join(dir, ".", "a.db")}
+	// The "./" spelling is built by hand: filepath.Join would clean it away.
+	dotted := dir + string(filepath.Separator) + "." + string(filepath.Separator) + "a.db"
+	require.NotEqual(t, path, dotted)
+	paths := []string{path, dotted}
 	if runtime.GOOS != "windows" && runtime.GOOS != "js" && runtime.GOOS != "wasip1" {
 		sym := filepath.Join(dir, "sym.db")
-		require.NoError(t, os.Symlink(path, sym))
+		if err := os.Symlink(path, sym); err == nil {
+			paths = append(paths, sym)
+		} else {
+			t.Logf("no symbolic link on this filesystem: %v", err)
+		}
 		hard := filepath.Join(dir, "hard.db")
-		require.NoError(t, os.Link(path, hard))
-		paths = append(paths, sym, hard)
+		if err := os.Link(path, hard); err == nil {
+			paths = append(paths, hard)
+		} else {
+			t.Logf("no hard link on this filesystem: %v", err)
+		}
 	}
 	for _, p := range paths {
 		_, err := anystore.Open(ctx, p, nil)

@@ -110,6 +110,16 @@ func TestOpen_WrongKey(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 300, n)
 	require.NoError(t, db.Close())
+
+	// A database with no collection, as Open leaves a new one.
+	empty := filepath.Join(t.TempDir(), "empty.db")
+	db, err = anystore.Open(ctx, empty, &right)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	wrong := anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: []byte("wrong passphrase"), KDFIterations: 1000}}
+	_, err = anystore.Open(ctx, empty, &wrong)
+	require.ErrorIs(t, err, anystore.ErrWrongKey)
+	require.NotErrorIs(t, err, anystore.ErrCorrupt)
 }
 
 // A page 1 damaged under the right key is corruption, not a wrong key:
@@ -178,11 +188,34 @@ func TestOpen_EncryptionRefusals(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, db.Close())
 
+		// An encrypted source over a plain file.
 		src, err := anystore.Open(ctx, path, &cfg)
 		require.NoError(t, err)
 		defer src.Close()
 		err = src.Backup(ctx, plain)
 		require.ErrorIs(t, err, anystore.ErrNotEncrypted)
+		require.NotErrorIs(t, err, anystore.ErrCorrupt)
+
+		// A plain source over an encrypted file.
+		plainSrc, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "src.db"), nil)
+		require.NoError(t, err)
+		defer plainSrc.Close()
+		require.NoError(t, src.Close())
+		err = plainSrc.Backup(ctx, path)
+		require.ErrorIs(t, err, anystore.ErrEncryptionKeyRequired)
+		require.NotErrorIs(t, err, anystore.ErrCorrupt)
+
+		// An encrypted source over a file encrypted under another key.
+		other := anystore.Config{Encryption: anystore.EncryptionConfig{
+			Passphrase:    []byte("another passphrase"),
+			KDFIterations: 1000,
+		}}
+		otherSrc, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "other.db"), &other)
+		require.NoError(t, err)
+		defer otherSrc.Close()
+		err = otherSrc.Backup(ctx, path)
+		require.ErrorIs(t, err, anystore.ErrWrongKey)
+		require.NotErrorIs(t, err, anystore.ErrCorrupt)
 	})
 }
 

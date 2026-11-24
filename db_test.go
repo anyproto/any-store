@@ -4033,3 +4033,27 @@ func TestBackup_DestinationOfAnotherKind(t *testing.T) {
 		backupRefused(t, src, path, ErrBackupFormatMismatch)
 	})
 }
+
+// IntegrityCheck's catalog check: a collection in the catalog with no data
+// namespace is damage, and the error matches ErrCorrupt, as the b-tree
+// check's findings do.
+func TestIntegrityCheck_MissingDataNamespaceMatchesErrCorrupt(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(ctx, filepath.Join(t.TempDir(), "a.db"), nil)
+	require.NoError(t, err)
+	defer d.Close()
+	coll, err := d.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	require.NoError(t, d.IntegrityCheck(ctx))
+
+	// The collection's data goes; its catalog entry stays.
+	wtx, err := d.(*db).btreeDB.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, wtx.DeleteNamespace("c"))
+	require.NoError(t, wtx.Commit())
+
+	err = d.IntegrityCheck(ctx)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.Contains(t, err.Error(), "data namespace missing")
+}

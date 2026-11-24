@@ -4163,3 +4163,23 @@ func TestCloseCheckpointed_InMemoryReportsFalse(t *testing.T) {
 	require.False(t, checkpointed)
 	require.False(t, ran)
 }
+
+// The two refusals of the codec settle (Open's settleCodec) are matchable
+// and are not corruption.
+func TestOpen_EncryptionRefusalsAreSentinels(t *testing.T) {
+	path, opts := keyProofDB(t, true, nil)
+	plain := opts
+	plain.Key = nil
+	_, err := Open(path, plain)
+	require.ErrorIs(t, err, ErrKeyRequired)
+	require.NotErrorIs(t, err, ErrCorrupt)
+
+	encTestSetup(t)
+	plainPath := tmpEncryptedFile(t, "plain.db")
+	db, err := Open(plainPath, plain)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	_, err = Open(plainPath, opts)
+	require.ErrorIs(t, err, ErrNotEncrypted)
+	require.NotErrorIs(t, err, ErrCorrupt)
+}
