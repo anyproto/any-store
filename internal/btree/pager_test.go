@@ -5621,8 +5621,12 @@ func TestCheckpointWithMode_FileReadPageDataError(t *testing.T) {
 	require.NoError(t, err)
 	p.wal.file = f
 
+	// The frame's page is cut short: a short read, as a page read of the
+	// frame gives it, not a raw EOF.
 	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
-	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrWALShortRead)
+	assert.ErrorIs(t, err, io.EOF)
+	assert.NotErrorIs(t, err, ErrCorrupt)
 
 	p.wal.close(false)
 	if p.file != nil {
