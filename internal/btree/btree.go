@@ -401,7 +401,7 @@ func interiorCellPrefixSizes(cells []cellData, usableSize int) []int {
 // whose child is childPgno, and returns the path to that page, its entry last.
 // The balance paths carry their path down from Put or Delete; this is for the
 // one place that needs a parent again after the tree above it was rewritten.
-// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
+// The path is bounded as Put's is.
 func (bt *btree) pathToChild(key []byte, childPgno uint32) ([]pathEntry, error) {
 	var path []pathEntry
 	pg, err := bt.getPage(bt.rootPage)
@@ -419,6 +419,9 @@ func (bt *btree) pathToChild(key []byte, childPgno uint32) ([]pathEntry, error) 
 		bt.pager.releasePage(pg)
 		if serr != nil {
 			return nil, serr
+		}
+		if len(path) >= btCursorMaxDepth-1 {
+			return nil, ErrCorrupt
 		}
 		path = append(path, pathEntry{pgno: pgno, cellIdx: uint16(idx), nCell: nCell})
 		if child == childPgno {
@@ -1181,7 +1184,6 @@ func (bt *btree) searchInterior(pg *page, key []byte) (childPgno uint32, cellIdx
 // AppendValue looks up a key in the B-tree and appends its value to buf.
 // The returned slice is safe to retain after the page is released.
 // Pass nil for buf to allocate a new slice (equivalent to Get).
-// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 	maxFrame, slot, err := bt.pager.beginRead()
 	if err != nil {
@@ -1212,6 +1214,9 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 	}
 
 	lim := bt.leafLimits()
+	// depth counts the child pointers followed, SQLite's pCur->iPage: see
+	// btCursorMaxDepth.
+	depth := 0
 	for {
 		if pg.header.isLeaf() {
 			idx, found, serr := searchLeafWithOverflow(pg, key, lim, bt.pager, maxFrame, bt.cache)
@@ -1291,6 +1296,10 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 			return buf, serr
 		}
 		bt.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return buf, ErrCorrupt
+		}
+		depth++
 		// Reject an out-of-range child pointer as corruption before fetching
 		// (~ getAndInitPage's pgno>btreePagecount guard, btree.c:2396-2399);
 		// see descendChild. Inlined here because this path reads with the
@@ -1334,7 +1343,6 @@ func (bt *btree) Has(key []byte) (bool, error) {
 const maxKeySize = 1 << 30 // 1GB
 
 // Put inserts or updates a key-value pair in the B-tree.
-// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 func (bt *btree) Put(key, value []byte) error {
 	// Validate key size. Both leaf and interior cells support overflow,
 	// so this is just a sanity limit to prevent absurd allocations.
@@ -1380,6 +1388,12 @@ func (bt *btree) Put(key, value []byte) error {
 		if serr != nil {
 			bt.pager.releasePage(pg)
 			return serr
+		}
+		// The path is SQLite's cursor stack (apPage/aiIdx): moveToChild
+		// refuses to push past it (btree.c:5448), see btCursorMaxDepth.
+		if len(path) >= btCursorMaxDepth-1 {
+			bt.pager.releasePage(pg)
+			return ErrCorrupt
 		}
 		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
@@ -2506,6 +2520,14 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 // Modeled after SQLite's balance_deeper(): copies root content to a new child
 // page, then converts the root into an interior page pointing to the new child
 // and the right sibling. Handles both leaf and interior roots correctly.
+// Like SQLite's balance, which calls balance_deeper on an over-full root
+// (btree.c:9134-9145), it does not look at the height of the tree: a tree of
+// btCursorMaxDepth levels grows to one more, and from then on a lookup, a
+// write or a cursor that has to go below level btCursorMaxDepth (the root is
+// level 1) returns ErrCorrupt; countPage, walkSize and keyRank go one level
+// further. On a tree whose branches differ in depth, a leaf the split moves
+// to level btCursorMaxDepth or less still reads. See the known limitations in
+// docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 // DRIFT: splitRoot omits SQLite's anotherValidCursor() guard before deepening root See docs/btree/NOTES.md#drift-34-splitroot-missing-anothervalidcursor-corruption-guard
 func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) error {
 	// Allocate a new page for the old root's content
@@ -2566,7 +2588,6 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 //
 // When fragmentation exceeds the threshold (60 bytes, matching SQLite's limit),
 // a full rebuild is triggered to defragment the page.
-// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 // DRIFT: the under-full trigger counts fragment bytes as used. See docs/btree/NOTES.md#drift-37-delete-rebalance-underfull-trigger-counts-fragbytes-as-used
 // DRIFT: a dropped cell's space becomes fragment bytes, not a freeblock. See docs/btree/NOTES.md#old-drift-no-freeblock-chain-fragbytes-rebuild
 func (bt *btree) Delete(key []byte) error {
@@ -2598,6 +2619,10 @@ func (bt *btree) Delete(key []byte) error {
 		if serr != nil {
 			bt.pager.releasePage(pg)
 			return serr
+		}
+		if len(path) >= btCursorMaxDepth-1 { // as in Put
+			bt.pager.releasePage(pg)
+			return ErrCorrupt
 		}
 		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
@@ -3507,6 +3532,17 @@ func (bt *btree) countPage(ctx context.Context, pgno uint32, depth int) (int, er
 // Matches SQLite's BTCURSOR_MAX_DEPTH (btreeInt.h). Any B-tree deeper than
 // this is considered corrupt. This limit also catches circular page references
 // that would otherwise cause infinite loops during cursor traversal.
+//
+// The rule is moveToChild's (btree.c:5448, inlined in sqlite3BtreeIndexMoveto
+// at btree.c:6227): with iPage the number of child pointers followed from the
+// root, a further step is refused once iPage >= BTCURSOR_MAX_DEPTH-1. A chain
+// of btCursorMaxDepth pages, root and leaf included, is the deepest one read.
+// It is applied by cursor navigation, the point lookups, the namespace
+// lookup and the descents of Put and Delete. SQLite's seeks, inserts and
+// deletes all go down through a cursor, so that one line bounds them. The
+// walks over a whole tree are not held to it: countPage, walkSize and keyRank
+// stop one level later, freeTreePages at its own bound, as SQLite's
+// clearDatabasePage recurses without a cursor (btree.c:10225).
 const btCursorMaxDepth = 20
 
 // Cursor provides ordered iteration over a B-tree.
