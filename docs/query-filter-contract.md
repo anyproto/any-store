@@ -400,12 +400,12 @@ build per query and carry no such guarantee.
 
 18. **Numbers are float64.** anyenc stores every number as a float64, so an
     integer is exact up to 2^53 (9,007,199,254,740,992) in magnitude and a
-    larger one, given as one of Go's built-in integer types (`int`,
-    `int64`, `uint64`, …) or written as a plain integer literal in JSON, is
-    the nearest float64 — in a stored document, a filter operand, an index
-    key and a document id alike. (The JSON parser rounds a number written
-    with an exponent twice, the digits and then the scaling, so
-    `9007199254740993e1` becomes `90071992547409920` where
+    larger one, given as a Go `int`, `uint` or sized integer (`int64`,
+    `uint64`, …; not `uintptr` or a named type) or written as a plain
+    integer literal in JSON, is the nearest float64 — in a stored document,
+    a filter operand, an index key and a document id alike. (The JSON parser
+    rounds a number written with an exponent twice, the digits and then the
+    scaling, so `9007199254740993e1` becomes `90071992547409920` where
     `90071992547409930`, the same integer, becomes `90071992547409936`.)
     Two such integers can be one value: `{"n":9007199254740993}` matches a
     document whose `n` is `9007199254740992`, and as ids they are one key:
