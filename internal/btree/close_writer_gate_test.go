@@ -313,6 +313,39 @@ func TestWriterGate(t *testing.T) {
 	})
 }
 
+// Once the gate is closed and empty, every call is refused, also when two
+// goroutines call at once. The API excludes two goroutines on one
+// transaction, but a refused call must not count: counted, even for a
+// moment, it is a call in flight to the other goroutine, whose call then
+// passes for a nested one and is let in.
+func TestWriterGate_DrainedRefusesRacingCalls(t *testing.T) {
+	const iterations, calls = 200, 1000
+	for i := range iterations {
+		g := newWriterGate()
+		g.close()
+		var admitted atomic.Int32
+		var start, wg sync.WaitGroup
+		start.Add(1)
+		for range 2 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				start.Wait()
+				for range calls {
+					if g.enter() == nil {
+						admitted.Add(1)
+						g.leave()
+					}
+				}
+			}()
+		}
+		start.Done()
+		wg.Wait()
+		require.Zero(t, admitted.Load(), "iteration %d: calls let in after the drain", i)
+		require.Equal(t, int32(writerGateClosed), g.n.Load(), "iteration %d", i)
+	}
+}
+
 // Close races a writer that puts, reads and scans without a pause. Run under
 // the race detector, this is the test of the gate: before it, pcache.destroy
 // raced the writer's page accesses, and without -race the writer panicked on
