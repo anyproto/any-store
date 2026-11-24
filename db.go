@@ -37,16 +37,18 @@ type DB interface {
 	// Returns the opened Collection or an error if the collection does not exist.
 	// Possible errors:
 	// - ErrCollectionNotFound: if the collection does not exist.
-	// - ErrCollectionClosed: the handle each attempt found was closed
-	//   meanwhile, as by concurrent Close() calls; open again.
+	// - ErrCollectionClosedDuringOpen: the collection was there, but the
+	//   handle each attempt found was closed before it could be returned,
+	//   as by concurrent Close() calls. It does not match
+	//   ErrCollectionNotFound; open again.
 	OpenCollection(ctx context.Context, collectionName string) (Collection, error)
 
 	// Collection is a convenience method to get or create a collection.
 	// It first attempts to open the collection, and if it does not exist, it creates the collection.
 	// Returns the Collection or an error if there is an issue creating or opening the collection.
 	// Possible errors:
-	// - ErrCollectionClosed: the handle each attempt found was closed
-	//   meanwhile, as by concurrent Close() calls; open again.
+	// - ErrCollectionClosedDuringOpen: as for OpenCollection; nothing was
+	//   created. Open again.
 	Collection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error)
 
 	// GetCollectionNames returns a list of all collection names in the database.
@@ -807,7 +809,7 @@ func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collec
 			return coll, nil
 		}
 		if attempt == handOutAttempts-1 {
-			return nil, ErrCollectionClosed
+			return nil, ErrCollectionClosedDuringOpen
 		}
 	}
 }
@@ -815,8 +817,10 @@ func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collec
 // handOutAttempts bounds the opens one call makes for a handle to hand out:
 // each one more needs another Close() to land between an open and its
 // hand-out. The same bound as openCollection has for a handle gone while it
-// was resolved. Out of attempts, the call returns ErrCollectionClosed, the
-// error of the race: the collection was there each time.
+// was resolved. Out of attempts, the call returns
+// ErrCollectionClosedDuringOpen, the error of the race: the collection was
+// there each time, and the error must not match ErrCollectionNotFound,
+// which a caller takes for a collection that is missing.
 const handOutAttempts = 3
 
 // testHookBeforeHandOut, when set, runs between an open that found its
@@ -881,9 +885,10 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 		}
 		// The registered handle was closed or retired while it was resolved
 		// for this caller: the name is free for the collection that has it
-		// now, if any.
+		// now, if any. Out of attempts, the error of the race, as out of
+		// hand-outs (handOutAttempts).
 		if attempt == 2 {
-			return nil, ErrCollectionClosed
+			return nil, ErrCollectionClosedDuringOpen
 		}
 	}
 }
@@ -1099,7 +1104,7 @@ func (db *db) Collection(ctx context.Context, collectionName string, opts ...Col
 			return coll, nil
 		}
 		if attempt == handOutAttempts-1 {
-			return nil, ErrCollectionClosed
+			return nil, ErrCollectionClosedDuringOpen
 		}
 	}
 }
@@ -1125,10 +1130,7 @@ func (db *db) collection(ctx context.Context, collectionName string, opts ...Col
 		}
 		return coll, nil
 	}
-	// ErrCollectionClosed wraps ErrCollectionNotFound, but it says that the
-	// handles found were closed, not that the collection is missing: there
-	// is nothing to create.
-	if !errors.Is(err, ErrCollectionNotFound) || errors.Is(err, ErrCollectionClosed) {
+	if !errors.Is(err, ErrCollectionNotFound) {
 		return nil, err
 	}
 	coll, err = db.CreateCollection(ctx, collectionName, opts...)

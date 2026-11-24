@@ -2730,11 +2730,12 @@ func TestOpenCollection_HandOutAfterTheDeferredCloseTookEffect(t *testing.T) {
 }
 
 // An open whose every attempt finds its handle closed before it can hand it
-// out returns ErrCollectionClosed, the error of that race, not a catalog
-// miss: the collection is there throughout, and Collection creates nothing.
-// Each attempt's handle is closed at the hand-out, or, for an open that
-// finds a registered handle, while it resolves the handle. Both public opens,
-// without a transaction and in a read transaction.
+// out returns ErrCollectionClosedDuringOpen, the error of that race, not a
+// catalog miss: the collection is there throughout, the error does not match
+// ErrCollectionNotFound, and Collection creates nothing. Each attempt's
+// handle is closed at the hand-out, or, for an open that finds a registered
+// handle, while it resolves the handle. Both public opens, without a
+// transaction and in a read transaction.
 func TestOpenCollection_HandleClosedAtEveryAttempt(t *testing.T) {
 	opens := []struct {
 		name string
@@ -2767,7 +2768,8 @@ func TestOpenCollection_HandleClosedAtEveryAttempt(t *testing.T) {
 				}
 				t.Cleanup(func() { testHookBeforeHandOut = nil })
 				_, err := open.fn(d, octx)
-				require.ErrorIs(t, err, ErrCollectionClosed)
+				require.ErrorIs(t, err, ErrCollectionClosedDuringOpen)
+				require.False(t, errors.Is(err, ErrCollectionNotFound), "the collection is there: not a catalog miss")
 				require.Equal(t, handOutAttempts, attempts, "setup: every attempt found a handle")
 				testHookBeforeHandOut = nil
 				coll, err := open.fn(d, octx)
@@ -2794,8 +2796,15 @@ func TestOpenCollection_HandleClosedAtEveryAttempt(t *testing.T) {
 				}
 				t.Cleanup(func() { testHookFoundRegistered = nil })
 				_, err = open.fn(d, octx)
-				require.ErrorIs(t, err, ErrCollectionClosed)
+				require.ErrorIs(t, err, ErrCollectionClosedDuringOpen)
+				require.False(t, errors.Is(err, ErrCollectionNotFound), "the collection is there: not a catalog miss")
 				require.Equal(t, 3, attempts, "every attempt found a registered handle, and no more were made")
+				testHookFoundRegistered = nil
+				coll, err := open.fn(d, octx)
+				require.NoError(t, err, "setup: the collection is there")
+				n, err := coll.Count(octx)
+				require.NoError(t, err)
+				require.Equal(t, 50, n)
 			})
 		}
 	}
