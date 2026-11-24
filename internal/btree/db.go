@@ -289,6 +289,9 @@ func buildCodec(opts Options, salt []byte, useCksum bool) (Codec, error) {
 		if len(opts.Key) == KeyLen {
 			raw = opts.Key
 		} else {
+			if h := testDeriveKeyHook; h != nil {
+				h()
+			}
 			raw = DeriveKey(opts.Key, salt, opts.KDFIterations)
 		}
 		return newCodecFromType(opts.CipherType, raw)
@@ -298,6 +301,10 @@ func buildCodec(opts Options, salt []byte, useCksum bool) (Codec, error) {
 	}
 	return nil, nil
 }
+
+// testDeriveKeyHook, when non-nil, runs inside buildCodec each time it
+// derives a key from a passphrase. Test-only.
+var testDeriveKeyHook func()
 
 // readInitialHeader opens the file at path and reads the database header.
 // Returns ErrNotExist if the file doesn't exist (distinguished by callers).
