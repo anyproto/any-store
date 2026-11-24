@@ -301,22 +301,29 @@ func (pc *pcache) initBulk() {
 
 // create allocates a new page in the cache and returns it pinned.
 // createFlag controls admission: 1=soft (may return nil under pressure),
-// 2=hard (always allocates). Matches SQLite pcache1.c:881-892 step 3.
+// 2=hard, which allocates a page even when doing so is difficult (SQLite's
+// eCreate 2, pcache.c:420): it bypasses admission control (pcache1.c:881-892
+// step 3) and can still fail with the stress callback's error.
 // If the cache is full, it evicts clean pages first. If no clean pages
 // are available and xStress is set, invokes the stress callback to spill
 // a dirty page, making it clean and evictable.
+//
+// An error is the stress callback's: the page is not created and the cache
+// is as the callback left it, the victim still dirty
+// (sqlite3PcacheFetchStress, pcache.c:481-484). The caller gives up the
+// fetch (getPageNormal's pager_acquire_err, pager.c:5555-5556). A nil page
+// with a nil error is a refused soft create.
 // DRIFT: pcache recycle/spill thresholds off-by-one ('>=' vs C 'nPage+1>=nMax' / strict '>') See docs/btree/NOTES.md#drift-127-pcache-recycle-and-spill-thresholds-off-by-one
 // DRIFT: create() merges SQLite's two-phase Fetch + FetchStress (soft create then spill+hard retry) See docs/btree/NOTES.md#old-drift-merged-fetch-fetchstress
-// DRIFT: pcache.create ignores xStress error (no error return); C FetchStress propagates non-BUSY r See docs/btree/NOTES.md#old-drift-pcache-create-drops-xstress-error
 // DRIFT: create() keeps evicted victim as recycled & reuses its buffer for both reader/writer cache See docs/btree/NOTES.md#old-drift-pcache-buffer-reuse-on-eviction
 // DRIFT: create() takes createFlag directly; no eCreate auto-select (readers=1 soft, writers=2 hard See docs/btree/NOTES.md#old-drift-no-ecreate-state-machine
-func (pc *pcache) create(pgno uint32, createFlag int) *page {
+func (pc *pcache) create(pgno uint32, createFlag int) (*page, error) {
 	if p := pc.hashFind(pgno); p != nil {
 		p.pinCount++
 		if !p.dirty {
 			pc.lruRemove(p)
 		}
-		return p
+		return p, nil
 	}
 
 	// Step 3: Admission control — refuse soft creates when thrashing.
@@ -332,10 +339,10 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	if createFlag == 1 && pc.purgeable {
 		nPinned := pc.nPage - pc.nRecyclable
 		if nPinned >= pc.maxPages*9/10 {
-			return nil
+			return nil, nil
 		}
 		if pc.useSlab && globalPageSlab.UnderPressure() && pc.nRecyclable < nPinned {
-			return nil
+			return nil, nil
 		}
 	}
 
@@ -373,7 +380,16 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 		if pc.nPage >= spill && pc.xStress != nil {
 			victim := pc.findSpillVictim()
 			if victim != nil {
-				pc.xStress(victim)
+				if err := pc.xStress(victim); err != nil {
+					// The fetch fails with the spill's error and the page
+					// is not created (pcache.c:481-484). A page evicted
+					// above is already out of the hash: its buffer goes
+					// back.
+					if recycled != nil {
+						pc.returnPageBuffer(recycled)
+					}
+					return nil, err
+				}
 				// After stress callback, victim should be clean. Retry eviction.
 				for pc.nPage >= pc.maxPages && pc.nRecyclable > 0 {
 					evicted := pc.evictOne()
@@ -417,7 +433,7 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	// former pc.pages[pgno] = p. Matches SQLite where a freshly allocated page is
 	// linked into apHash by pcache1FetchStage2 (pcache1.c).
 	pc.hashInsert(p)
-	return p
+	return p, nil
 }
 
 // resetPage initializes a page struct for pgno. Called from create() after

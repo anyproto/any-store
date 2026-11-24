@@ -296,6 +296,12 @@ type pager struct {
 	backupOwed atomic.Bool
 	spillBuf   [1]*page // pagerStress's argument to dispatchBackupUpdate
 
+	// errCode is the error that put the open write transaction in
+	// pagerError (Pager.errCode, pager.c:1947-1960): every page fetch, every
+	// write operation and the commit return it until the rollback, which
+	// clears it. Owned by the writer's goroutine, like the cache.
+	errCode error
+
 	// testOwner is the DB this pager belongs to, for the test seam's hooks.
 	testOwner *DB
 
@@ -1474,10 +1480,13 @@ func (p *pager) beginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot
 // part of (wal.beginReadHdrBusy).
 func (p *pager) beginReadHdrBusy(busy *beginBusy) (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	p.mu.RLock()
-	if pagerState(p.state.Load()) == pagerError {
-		p.mu.RUnlock()
-		return WalIndexHdr{}, 0, 0, 0, ErrCorrupt
-	}
+	// The writer's state is not tested: pagerError is the state of the open
+	// write transaction, which a read begin sees no more of than it does of
+	// pagerWriter. The snapshot is bounded by the committed frame, and a
+	// spill, failed or not, never publishes its frames as a commit. In
+	// SQLite a connection with a private cache has its own Pager
+	// (pager.c:1947-1960 sets its errCode), and no other connection meets
+	// its error state (shared caches: docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill).
 	// The change state before the snapshot is taken: see wal.noteSnapshot.
 	// ~ pagerBeginReadTransaction (pager.c:3246-3267): every begin of every
 	// kind passes here, so none can take a snapshot holding another
@@ -1625,6 +1634,16 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 		return nil, ErrInvalidPage
 	}
 
+	// The error state fails every fetch with its error (getPageError,
+	// pager.c:5710-5722), a cached page as much as one to be read: the log
+	// may end in a torn frame of this transaction, and a balance the failed
+	// spill stopped half-way leaves cached pages that hold part of the tree
+	// or none of it. errCode is the writer's own, as the cache is: a plain
+	// load.
+	if p.errCode != nil {
+		return nil, p.writeStateErr()
+	}
+
 	// Check writer cache first. SQLite returns cached pages directly without
 	// any WAL lookup (pager.c:5568-5573 getPageNormal). The writer cache is
 	// only accessed by the writer goroutine, so cached pages are always valid
@@ -1633,8 +1652,12 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 		return pg, nil
 	}
 
-	// Cache miss: create a new cached page (hard create — writer always succeeds).
-	pg := p.writerCache.create(pgno, 2)
+	// Create a new cached page (hard create). A failed spill fails the
+	// fetch, and no page is created (getPageNormal, pager.c:5555-5556).
+	pg, err := p.writerCache.create(pgno, 2)
+	if err != nil {
+		return nil, err
+	}
 
 	// Decide read-vs-zero up front, matching C getPageNormal
 	// (pager.c:5590,5615): a page whose number exceeds the logical database
@@ -1894,7 +1917,10 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 	// Cache miss: create a page in the reader cache (soft create — may be
 	// refused under memory pressure). Reader caches have no xStress callback.
 	// Matches SQLite pcache.c:486 — readers use createFlag=1.
-	pg := cache.create(pgno, 1)
+	pg, err := cache.create(pgno, 1)
+	if err != nil {
+		return nil, err
+	}
 	if pg == nil {
 		// Admission control refused the allocation. Fall back to an uncached
 		// temporary page read so the query still succeeds. We still have the
@@ -2018,7 +2044,10 @@ func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
 		return pg, nil
 	}
 	// Cache miss: create a blank page without any disk/WAL read (hard create — writer).
-	pg := p.writerCache.create(pgno, 2)
+	pg, err := p.writerCache.create(pgno, 2)
+	if err != nil {
+		return nil, err
+	}
 	clear(pg.data)
 	pg.header = pageHeader{}
 	return pg, nil
@@ -2117,10 +2146,14 @@ func (p *pager) readRawPage1Header(walMaxFrame uint32, cache *pcache, buf []byte
 // writeStateErr returns the error for a write operation attempted while the
 // pager is not in pagerWriter state: ErrClosed when the write transaction was
 // force-rolled-back by DB.Close (the writer goroutine lost its transaction to
-// Close, not to a read-only misuse), ErrReadOnly otherwise.
+// Close, not to a read-only misuse), the error that put the transaction in
+// the error state (Pager.errCode), ErrReadOnly otherwise.
 func (p *pager) writeStateErr() error {
 	if p.closeInvalidated.Load() {
 		return ErrClosed
+	}
+	if p.errCode != nil {
+		return p.errCode
 	}
 	return ErrReadOnly
 }
@@ -2380,11 +2413,19 @@ func (p *pager) freePage(pgno uint32) error {
 			}
 			return err
 		}
+		// The fetch ended the transaction (a failed spill): nothing more
+		// is written in it.
+		if pagerState(p.state.Load()) != pagerWriter {
+			return err
+		}
 		// No savepoints: safe to use cache.create (no rollback possible).
 		if debugTrace {
 			trace("freePage: getWritablePage(%d) failed: %v — using cache.create (no savepoints)", pgno, err)
 		}
-		newTrunkPg = p.writerCache.create(pgno, 2)
+		newTrunkPg, err = p.writerCache.create(pgno, 2)
+		if err != nil {
+			return err
+		}
 		p.writerCache.makeDirty(newTrunkPg)
 	} else {
 		if debugTrace {
@@ -3070,13 +3111,15 @@ func (p *pager) readWalFrameDataRaw(frame uint32, buf []byte) error {
 // Modeled after SQLite's pagerStress() (pager.c:4609-4681).
 // DRIFT: pagerStress guards pgno==1; C relies on page-1 staying pinned (never a victim) See docs/btree/NOTES.md#old-drift-pagerstress-page1-exclusion
 // DRIFT: pagerStress spills only for pagerWriter without closeInvalidated, and writeFrames re-checks under the WAL mutex; C needs no test, since a close cannot end its transaction under a statement See docs/btree/NOTES.md#drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer
+// DRIFT: any error of the spill's write puts the transaction in the error state, not only I/O and disk-full; the rollback cleans up, C's pager_unlock does once no page is referenced See docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill
 func (p *pager) pagerStress(pg *page) error {
 	st := pagerState(p.state.Load())
 
 	// Defense-in-depth: do not spill in error state (SQLite pager.c:4632).
-	// SQLite marks this path NEVER() — it should be unreachable because
-	// pcache.create is not called in error state — but the guard prevents
-	// writing to a potentially corrupt WAL if the invariant is violated.
+	// SQLite marks this path NEVER() — it should be unreachable because the
+	// page getters and the write operations test the state before they reach
+	// pcache.create — but the guard prevents writing to a WAL that may end
+	// in a torn frame if the invariant is violated.
 	if st == pagerError {
 		return nil
 	}
@@ -3144,11 +3187,22 @@ func (p *pager) pagerStress(pg *page) error {
 			// clean up. A refused spill.
 			return nil
 		}
-		// Transition to error state on WAL write failure, matching SQLite's
-		// return pager_error(pPager, rc) at pager.c:4680. Without this the
-		// error is silently dropped by pcache.create() (which has no error
-		// return) and the transaction continues on a corrupt WAL.
-		p.pagerError()
+		// pager_error (pager.c:1947-1960, from pager.c:4680): the error is
+		// recorded and the state moves to pagerError, nothing else. The
+		// b-tree operation that asked for a page is still running and holds
+		// pointers into the cache, so the cache stays as it is, this page
+		// still dirty. The fetch fails with the error (pcache.create), every
+		// later fetch, write and the commit return it (writeStateErr), the
+		// call ends the transaction's cursors as it returns (halt), and the
+		// rollback discards the cache, rewinds the log and releases the write
+		// lock (rollbackLocked). SQLite's cleanup, pager_unlock once no page
+		// is referenced, discards the cache and releases the write lock
+		// (pager.c:1853-1864, 1904-1917); it rewinds no log, and the next
+		// writer's walIndexAppend clears the index entries of the spilled
+		// frames (wal.c:1320-1329). A transaction Close has ended meanwhile
+		// (rollbackForClose) is left as Close left it.
+		p.errCode = err
+		p.state.CompareAndSwap(int32(pagerWriter), int32(pagerError))
 		return err
 	}
 
@@ -3241,11 +3295,19 @@ var (
 	testCommitPostPublishHook func()
 )
 
+// DRIFT: the commit of a transaction in the error state returns the error and rolls the transaction back; C's sqlite3PagerCommitPhaseOne returns it and leaves the transaction to the VDBE's rollback See docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill
 func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC uint32, err error) {
 	p.writerOpMu.Lock()
 	defer p.writerOpMu.Unlock()
-	if pagerState(p.state.Load()) != pagerWriter {
-		return 0, 0, 0, p.writeStateErr()
+	if st := pagerState(p.state.Load()); st != pagerWriter {
+		err := p.writeStateErr()
+		if st == pagerError {
+			// The commit of a transaction in the error state reports the
+			// error (sqlite3PagerCommitPhaseOne, pager.c:6480) and, as any
+			// failed commit here, ends the transaction: it is rolled back.
+			_ = p.rollbackLocked()
+		}
+		return 0, 0, 0, err
 	}
 
 	if debugTrace {
@@ -3446,10 +3508,22 @@ func (p *pager) unwindWriter() {
 
 // rollbackLocked is the inner rollback implementation. Caller must hold writerOpMu.
 // DRIFT: no sqlite3WalUndo; rollback resets wal.nFrame to savedWalFrame + rollbackToFrame trims pages See docs/btree/NOTES.md#old-drift-wal-undo-via-pager-rollback
+// DRIFT: a rollback in the error state cleans up and clears the error; C's sqlite3PagerRollback returns errCode and leaves the cleanup to pager_unlock See docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill
 func (p *pager) rollbackLocked() error {
 	st := pagerState(p.state.Load())
 	if st != pagerWriter && st != pagerError {
 		return nil
+	}
+
+	// The cursors of a transaction in the error state were ended as the
+	// call that met the error returned (halt). They are ended here again
+	// with its error before the cache goes, as a failed commit's are
+	// (pagerError): a cursor left pinning pages of the cache would unpin
+	// them, at its Close, in the next transaction's hands. The error state
+	// fails every fetch, so a cursor whose key would need one is tripped
+	// without its position.
+	if st == pagerError {
+		p.tripCursors(0, p.writeStateErr(), 0)
 	}
 
 	// A rollback that undoes anything restarts the backups: pagerRollbackWal
@@ -3510,6 +3584,7 @@ func (p *pager) rollbackLocked() error {
 		p.backupOwed.Store(false)
 		p.dispatchBackupRestart()
 	}
+	p.errCode = nil
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
 	return nil
@@ -3568,17 +3643,23 @@ func (p *pager) rollbackForClose() {
 	w.endWrite()
 }
 
-// pagerError transitions the pager to the error state. It ensures the WAL
+// pagerError ends the write transaction after a failed commit: the error
+// state and its cleanup at once. It ensures the WAL
 // write lock is released (fix 2.2) so that other connections are not blocked
 // indefinitely. Modeled after SQLite's pager_error() + pager_unlock() which
 // calls sqlite3WalEndWriteTransaction() when in PAGER_ERROR state.
+//
+// Only the commit calls it, where no b-tree operation is running and the
+// transaction ends whatever the outcome. A spill that fails under a running
+// operation records the error and leaves the cleanup to the rollback
+// (pagerStress).
 //
 // Recovery path: the cache is purged, the header is restored from the saved
 // snapshot, and the state transitions back to pagerOpen before this function
 // returns — callers must NOT rely on a persistent error state to fence out
 // subsequent transactions (anystore's failed-commit DDL unwind gates itself
 // for exactly this reason; see db.ddlUnwindGate).
-// DRIFT: pagerError eager-cleans (purge/WAL-rollback/unlock); C pager_error only sets errCode, defers See docs/btree/NOTES.md#old-drift-pagererror-eager-cleanup
+// DRIFT: pagerError eager-cleans a failed commit (purge/WAL-rollback/unlock); C pager_error only sets errCode, defers See docs/btree/NOTES.md#old-drift-pagererror-eager-cleanup
 func (p *pager) pagerError() {
 	p.state.Store(int32(pagerError))
 
@@ -3644,6 +3725,7 @@ func (p *pager) pagerError() {
 	// Transition back to open state now that we have cleaned up.
 	// This mirrors SQLite's pager_unlock() which transitions from
 	// PAGER_ERROR -> PAGER_OPEN after clearing the error.
+	p.errCode = nil
 	p.state.Store(int32(pagerOpen))
 }
 
@@ -3660,6 +3742,7 @@ func (p *pager) freeSavepointPageBuffers(from, to int) {
 
 // savepoint creates a new savepoint and returns its ID.
 // Page copies are saved lazily in getWritablePage when pages are actually modified.
+// DRIFT: opening a savepoint in the error state returns the error; C's sqlite3PagerOpenSavepoint does not test errCode See docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill
 func (p *pager) savepoint() (int, error) {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return 0, p.writeStateErr()
@@ -3771,7 +3854,17 @@ func (p *pager) rollbackToSavepoint(id int) error {
 			// Find the page in cache, or create a new one if evicted.
 			pg := p.writerCache.fetch(pgno)
 			if pg == nil {
-				pg = p.writerCache.create(pgno, 2)
+				var err error
+				if pg, err = p.writerCache.create(pgno, 2); err != nil {
+					// Not reached: spills are off (spillFlagRollback).
+					// A playback that stopped half-way would leave a
+					// cache that cannot be trusted: the transaction can
+					// only be rolled back.
+					p.doNotSpill &^= spillFlagRollback
+					p.errCode = err
+					p.state.CompareAndSwap(int32(pagerWriter), int32(pagerError))
+					return err
+				}
 			}
 			{
 				copy(pg.data, data)
@@ -4690,6 +4783,34 @@ func (p *pager) tripCursors(root uint32, err error, seq uint64) {
 		if root == 0 || c.bt.rootPage == root {
 			c.trip(err, seq)
 		}
+	}
+}
+
+// halt ends every writer cursor with errCode as a call of the write
+// transaction returns an error in the error state: SQLite's statement halt
+// (sqlite3VdbeHalt closes the statement's cursors, vdbeaux.c:3335, and
+// rolls back with a trip code, vdbeaux.c:3378, which trips the others,
+// btree.c:4533). The call that met the failed spill has stopped using its
+// pages by then. Without the halt, a cursor positioned on another tree
+// would go on stepping through the leaf it pins, a step that needs no
+// fetch. The cursors are faulted without a save: the transaction can only
+// be rolled back, and the rollback ends every cursor for good. Every call
+// that returns errCode passes through the halt, as every SQLite statement
+// that ends in an error halts: the call that met the failed spill, and
+// each later one, whether a fetch failed, the state test of a savepoint
+// call did, or a cursor the halt faulted reported its fault. A cursor
+// opened since the failure is ended by the next of them. Commit is the
+// exception: it rolls the transaction back, and the rollback ends the
+// cursors (rollbackLocked, pagerError). A transaction DB.Close ended is
+// left as Close left it.
+// Writer's goroutine only.
+// DRIFT: every cursor is faulted and no read cursor is saved, and the error state outlives the halt See docs/btree/NOTES.md#drift-2026-11-21-13-the-error-state-of-a-failed-spill
+func (p *pager) halt() {
+	if p.errCode == nil || p.closeInvalidated.Load() {
+		return
+	}
+	for c := p.cursors; c != nil; c = c.nextCursor {
+		c.fault(p.errCode)
 	}
 }
 

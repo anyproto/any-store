@@ -7,10 +7,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testCreate is pcache.create for a test that expects no spill to fail.
+func testCreate(pc *pcache, pgno uint32, createFlag int) *page {
+	pg, err := pc.create(pgno, createFlag)
+	if err != nil {
+		panic(err)
+	}
+	return pg
+}
+
 func TestPcacheCreateFetch(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	require.NotNil(t, pg)
 	assert.Equal(t, uint32(1), pg.pgno)
 	assert.Equal(t, 1, pg.pinCount)
@@ -30,12 +39,12 @@ func TestPcacheCreateFetch(t *testing.T) {
 func TestPcacheCreateExisting(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg1 := pc.create(5, 2)
+	pg1 := testCreate(pc, 5, 2)
 	pg1.data[0] = 42
 	pc.release(pg1)
 
 	// Create the same page again should return existing
-	pg2 := pc.create(5, 2)
+	pg2 := testCreate(pc, 5, 2)
 	assert.Equal(t, uint8(42), pg2.data[0])
 	pc.release(pg2)
 }
@@ -43,7 +52,7 @@ func TestPcacheCreateExisting(t *testing.T) {
 func TestPcacheRelease(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	assert.Equal(t, 1, pg.pinCount)
 	pc.release(pg)
 	assert.Equal(t, 0, pg.pinCount)
@@ -55,9 +64,9 @@ func TestPcacheRelease(t *testing.T) {
 func TestPcacheDirtyPages(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg1 := pc.create(1, 2)
-	pg2 := pc.create(2, 2)
-	pg3 := pc.create(3, 2)
+	pg1 := testCreate(pc, 1, 2)
+	pg2 := testCreate(pc, 2, 2)
+	pg3 := testCreate(pc, 3, 2)
 
 	// No dirty pages initially
 	assert.Empty(t, pc.dirtyPages())
@@ -87,7 +96,7 @@ func TestPcacheDirtyPages(t *testing.T) {
 func TestPcacheMakeCleanPinned(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.makeDirty(pg)
 	assert.True(t, pg.dirty)
 	assert.Equal(t, 1, pc.nDirty)
@@ -109,7 +118,7 @@ func TestPcacheMakeCleanPinned(t *testing.T) {
 func TestPcacheMakeCleanUnpinnedNonPurgeable(t *testing.T) {
 	pc := newPcache(4096, 100, false) // non-purgeable (InMemory)
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.makeDirty(pg)
 	pc.release(pg) // unpinned; dirty pages stay off LRU
 	assert.Equal(t, 0, pg.pinCount)
@@ -132,7 +141,7 @@ func TestPcacheMakeCleanUnpinnedNonPurgeable(t *testing.T) {
 func TestPcacheMakeCleanUnpinnedPurgeable(t *testing.T) {
 	pc := newPcache(4096, 100, true) // purgeable
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.makeDirty(pg)
 	pc.release(pg) // unpinned; dirty pages stay off LRU until cleaned
 	assert.Equal(t, 0, pg.pinCount)
@@ -149,14 +158,14 @@ func TestPcacheLRUEviction(t *testing.T) {
 
 	// Create and release 3 clean pages
 	for i := uint32(1); i <= 3; i++ {
-		pg := pc.create(i, 2)
+		pg := testCreate(pc, i, 2)
 		pc.release(pg)
 	}
 	assert.Equal(t, 3, pc.nPage)
 	assert.Equal(t, 3, pc.nRecyclable)
 
 	// Creating a 4th page should evict the oldest clean page (page 1)
-	pg4 := pc.create(4, 2)
+	pg4 := testCreate(pc, 4, 2)
 	assert.NotNil(t, pg4)
 	assert.Nil(t, pc.hashFind(1)) // page 1 should be evicted
 	assert.NotNil(t, pc.hashFind(2))
@@ -168,16 +177,16 @@ func TestPcacheLRUEviction(t *testing.T) {
 func TestPcacheDirtyPagesNotEvicted(t *testing.T) {
 	pc := newPcache(4096, 2, true) // max 2 pages
 
-	pg1 := pc.create(1, 2)
+	pg1 := testCreate(pc, 1, 2)
 	pc.makeDirty(pg1)
 	pc.release(pg1)
 
-	pg2 := pc.create(2, 2)
+	pg2 := testCreate(pc, 2, 2)
 	pc.makeDirty(pg2)
 	pc.release(pg2)
 
 	// Both are dirty, cache is "full" but dirty pages won't be evicted
-	pg3 := pc.create(3, 2)
+	pg3 := testCreate(pc, 3, 2)
 	assert.NotNil(t, pg3)
 	// All 3 should still be present (dirty pages can't be evicted)
 	assert.NotNil(t, pc.hashFind(1))
@@ -188,7 +197,7 @@ func TestPcacheDirtyPagesNotEvicted(t *testing.T) {
 func TestPcacheDiscard(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.release(pg)
 
 	pc.discard(1)
@@ -202,7 +211,7 @@ func TestPcacheDiscard(t *testing.T) {
 func TestPcacheDiscardDirty(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.makeDirty(pg)
 	pc.release(pg)
 
@@ -216,7 +225,7 @@ func TestPcacheClear(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	for i := uint32(1); i <= 10; i++ {
-		pg := pc.create(i, 2)
+		pg := testCreate(pc, i, 2)
 		if i%2 == 0 {
 			pc.makeDirty(pg)
 		}
@@ -236,7 +245,7 @@ func TestPcacheTruncate(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	for i := uint32(1); i <= 10; i++ {
-		pg := pc.create(i, 2)
+		pg := testCreate(pc, i, 2)
 		pc.release(pg)
 	}
 
@@ -261,7 +270,7 @@ func TestPcacheTruncateMaxKeyWindow(t *testing.T) {
 	require.GreaterOrEqual(t, nHash, uint32(minHashSize))
 	add := func(pgnos ...uint32) {
 		for _, i := range pgnos {
-			pc.release(pc.create(i, 2))
+			pc.release(testCreate(pc, i, 2))
 		}
 	}
 	has := func(pgnos ...uint32) {
@@ -324,7 +333,7 @@ func TestPcacheTruncateDirty(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	for i := uint32(1); i <= 5; i++ {
-		pg := pc.create(i, 2)
+		pg := testCreate(pc, i, 2)
 		pc.makeDirty(pg)
 		pc.release(pg)
 	}
@@ -339,7 +348,7 @@ func TestPcacheTruncateDirty(t *testing.T) {
 func TestPcacheFetchMovesFromLRU(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.release(pg)
 	assert.Equal(t, 1, pc.nRecyclable)
 
@@ -375,7 +384,7 @@ func TestPcacheStressCallbackInvoked(t *testing.T) {
 
 	// Fill cache with dirty pages and release them (unpinned)
 	for i := uint32(1); i <= 3; i++ {
-		pg := pc.create(i, 2)
+		pg := testCreate(pc, i, 2)
 		pc.makeDirty(pg)
 		pc.release(pg)
 	}
@@ -384,7 +393,7 @@ func TestPcacheStressCallbackInvoked(t *testing.T) {
 
 	// Creating a 4th page should trigger stress callback since no clean
 	// pages are available for eviction
-	pg4 := pc.create(4, 2)
+	pg4 := testCreate(pc, 4, 2)
 	require.NotNil(t, pg4)
 	assert.Equal(t, 1, stressCalled)
 	assert.NotZero(t, stressVictim)
@@ -404,14 +413,14 @@ func TestPcacheStressOnlyUnreferenced(t *testing.T) {
 	// Fill cache with dirty pages, but keep them ALL pinned
 	pgs := make([]*page, 3)
 	for i := uint32(1); i <= 3; i++ {
-		pg := pc.create(i, 2)
+		pg := testCreate(pc, i, 2)
 		pc.makeDirty(pg)
 		// Do NOT release — keep pinned
 		pgs[i-1] = pg
 	}
 
 	// All dirty pages are pinned, stress callback should not find a victim
-	pg4 := pc.create(4, 2)
+	pg4 := testCreate(pc, 4, 2)
 	require.NotNil(t, pg4)
 	assert.Equal(t, 0, stressCalled) // no victim found, no stress call
 	assert.Equal(t, 4, pc.nPage)     // cache grows beyond maxPages
@@ -435,13 +444,13 @@ func TestPcacheNoStressWhenCleanPagesAvailable(t *testing.T) {
 
 	// Fill cache with clean pages (released, not dirty)
 	for i := uint32(1); i <= 3; i++ {
-		pg := pc.create(i, 2)
+		pg := testCreate(pc, i, 2)
 		pc.release(pg)
 	}
 	assert.Equal(t, 3, pc.nRecyclable)
 
 	// Creating a 4th page should evict a clean page, NOT trigger stress
-	pg4 := pc.create(4, 2)
+	pg4 := testCreate(pc, 4, 2)
 	require.NotNil(t, pg4)
 	assert.Equal(t, 0, stressCalled) // clean eviction worked, no stress needed
 	assert.Equal(t, 3, pc.nPage)     // one was evicted
@@ -456,7 +465,7 @@ func TestPcacheLRUEvictionOrder(t *testing.T) {
 
 	pgs := make([]*page, 5)
 	for i := uint32(1); i <= 5; i++ {
-		pgs[i-1] = pc.create(i, 2)
+		pgs[i-1] = testCreate(pc, i, 2)
 	}
 	// Release in reverse order: 5, 4, 3, 2, 1
 	for i := 4; i >= 0; i-- {
@@ -481,9 +490,9 @@ func TestPcacheLRURefetchMovesMRU(t *testing.T) {
 	// not evicted first.
 	pc := newPcache(4096, 5, true)
 
-	pgA := pc.create(1, 2)
-	pgB := pc.create(2, 2)
-	pgC := pc.create(3, 2)
+	pgA := testCreate(pc, 1, 2)
+	pgB := testCreate(pc, 2, 2)
+	pgC := testCreate(pc, 3, 2)
 
 	// Release A, B, C in order
 	pc.release(pgA) // LRU: HEAD -> A -> TAIL
@@ -523,13 +532,13 @@ func TestPcacheStressDisabledForInMemory(t *testing.T) {
 
 	// Fill cache with dirty pages
 	for i := uint32(1); i <= 3; i++ {
-		pg := pc.create(i, 2)
+		pg := testCreate(pc, i, 2)
 		pc.makeDirty(pg)
 		pc.release(pg)
 	}
 
 	// Creating a 4th page should NOT trigger stress for non-purgeable caches
-	pg4 := pc.create(4, 2)
+	pg4 := testCreate(pc, 4, 2)
 	require.NotNil(t, pg4)
 	assert.Equal(t, 0, stressCalled) // non-purgeable skips stress entirely
 	assert.Equal(t, 4, pc.nPage)     // cache grows beyond maxPages
@@ -543,9 +552,9 @@ func TestPcacheDirtyMoveToFrontOnRelease(t *testing.T) {
 	// Release A → move to front: A → C → B
 	pc := newPcache(4096, 100, true)
 
-	pgA := pc.create(1, 2)
-	pgB := pc.create(2, 2)
-	pgC := pc.create(3, 2)
+	pgA := testCreate(pc, 1, 2)
+	pgB := testCreate(pc, 2, 2)
+	pgC := testCreate(pc, 3, 2)
 
 	pc.makeDirty(pgA)
 	pc.makeDirty(pgB)
@@ -572,9 +581,9 @@ func TestPcacheFindSpillVictimOldestFirst(t *testing.T) {
 	// dirty page (at the back of the list), not the most recently released.
 	pc := newPcache(4096, 100, true)
 
-	pgA := pc.create(1, 2)
-	pgB := pc.create(2, 2)
-	pgC := pc.create(3, 2)
+	pgA := testCreate(pc, 1, 2)
+	pgB := testCreate(pc, 2, 2)
+	pgC := testCreate(pc, 3, 2)
 
 	pc.makeDirty(pgA)
 	pc.makeDirty(pgB)
@@ -608,14 +617,14 @@ func TestPcacheBulkAlloc_InitBulkOnFirstCreate(t *testing.T) {
 		assert.Empty(t, pc.pFree)
 
 		// First create triggers initBulk (nBulk = min(50, 20) = 20)
-		pg1 := pc.create(1, 2)
+		pg1 := testCreate(pc, 1, 2)
 		require.NotNil(t, pg1)
 		assert.True(t, pc.bulkInit)
 		assert.Len(t, pc.pFree, 19, "pFree should have 19 (20 bulk - 1 used)")
 		assert.True(t, pg1.isBulkLocal, "page from initBulk should be isBulkLocal")
 
 		// Second create uses pFree
-		pg2 := pc.create(2, 2)
+		pg2 := testCreate(pc, 2, 2)
 		require.NotNil(t, pg2)
 		assert.Len(t, pc.pFree, 18)
 		assert.True(t, pg2.isBulkLocal)
@@ -634,7 +643,7 @@ func TestPcacheBulkAlloc_InitBulkOnFirstCreate(t *testing.T) {
 		pc.useSlab = true
 
 		// initBulk is a no-op in slab mode (SQLite: nInitPage=0 when pPage set)
-		pg := pc.create(1, 2)
+		pg := testCreate(pc, 1, 2)
 		require.NotNil(t, pg)
 		assert.True(t, pc.bulkInit, "bulkInit flag set even though it's a no-op")
 		assert.Empty(t, pc.pFree, "pFree empty — initBulk skipped in slab mode")
@@ -663,7 +672,7 @@ func TestPcacheBulkAlloc_FallbackToSlabAfterPFreeExhausted(t *testing.T) {
 	// Create 5 pages — all from slab (initBulk skipped in slab mode)
 	pgs := make([]*page, 5)
 	for i := uint32(1); i <= 5; i++ {
-		pgs[i-1] = pc.create(i, 2)
+		pgs[i-1] = testCreate(pc, i, 2)
 	}
 	assert.True(t, pc.bulkInit)
 	assert.Empty(t, pc.pFree, "pFree should be empty — initBulk skipped in slab mode")
@@ -685,7 +694,7 @@ func TestPcacheBulkAlloc_FallbackToSlabAfterPFreeExhausted(t *testing.T) {
 
 	// Create a new page — should allocate directly from slab (pFree is empty,
 	// bulkInit already done)
-	pg6 := pc.create(6, 2)
+	pg6 := testCreate(pc, 6, 2)
 	require.NotNil(t, pg6)
 	assert.Len(t, pg6.data, 4096)
 
@@ -708,7 +717,7 @@ func TestPcacheBulkAlloc_MaxBulk20(t *testing.T) {
 	pc := newPcache(4096, 5000, true)
 	// useSlab=false — initBulk fires
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	require.NotNil(t, pg)
 	// nBulk = min(5000, 20) = 20; 1 used for pg, 19 remain
 	assert.Len(t, pc.pFree, 19, "pFree should have 19 (20 bulk - 1 used)")
@@ -734,7 +743,7 @@ func TestPcacheBufferRecycling_EvictionFromPFreeOrSlab(t *testing.T) {
 	// Create and release 5 pages (fills cache)
 	pgs := make([]*page, 5)
 	for i := uint32(1); i <= 5; i++ {
-		pgs[i-1] = pc.create(i, 2)
+		pgs[i-1] = testCreate(pc, i, 2)
 	}
 	for _, pg := range pgs {
 		pc.release(pg)
@@ -743,7 +752,7 @@ func TestPcacheBufferRecycling_EvictionFromPFreeOrSlab(t *testing.T) {
 	assert.Equal(t, 5, pc.nPage)
 
 	// Create page 6 — should evict page 1 (LRU tail) and allocate from pFree/slab
-	pg6 := pc.create(6, 2)
+	pg6 := testCreate(pc, 6, 2)
 	require.NotNil(t, pg6)
 
 	// Verify the eviction happened correctly
@@ -767,7 +776,7 @@ func TestPcacheBufferRecycling_ReaderEvictionRecyclesDirect(t *testing.T) {
 
 	// Create and release 5 pages (fills cache)
 	for i := uint32(1); i <= 5; i++ {
-		pg := pc.create(i, 2)
+		pg := testCreate(pc, i, 2)
 		pc.release(pg)
 	}
 	assert.Equal(t, 5, pc.nRecyclable)
@@ -779,7 +788,7 @@ func TestPcacheBufferRecycling_ReaderEvictionRecyclesDirect(t *testing.T) {
 	globalPageSlab.mu.Unlock()
 
 	// Create page 6 — should evict page 1 and reuse its buffer directly
-	pg6 := pc.create(6, 2)
+	pg6 := testCreate(pc, 6, 2)
 	require.NotNil(t, pg6)
 
 	assert.Nil(t, pc.hashFind(1), "page 1 should have been evicted")
@@ -809,7 +818,7 @@ func TestPcacheBufferRecycling_ClearReturnsSlab(t *testing.T) {
 
 	// Create 10 pages — all from slab (initBulk is a no-op in slab mode)
 	for i := uint32(1); i <= 10; i++ {
-		pg := pc.create(i, 2)
+		pg := testCreate(pc, i, 2)
 		pc.release(pg)
 	}
 
@@ -845,7 +854,7 @@ func TestPcacheBufferRecycling_DiscardFreesBuffer(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 	pc.useSlab = true
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.release(pg)
 
 	// discard should remove the page and nil out its data
@@ -863,7 +872,7 @@ func TestPcacheBufferRecycling_TruncateFreesBuffers(t *testing.T) {
 	pc.useSlab = true
 
 	for i := uint32(1); i <= 10; i++ {
-		pg := pc.create(i, 2)
+		pg := testCreate(pc, i, 2)
 		pc.release(pg)
 	}
 	assert.Equal(t, 10, pc.nPage)
@@ -886,7 +895,7 @@ func TestPcacheBulkAlloc_NoSlabFallsBackToSyncPool(t *testing.T) {
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 100, true)
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	require.NotNil(t, pg)
 	assert.Len(t, pg.data, 4096)
 	assert.True(t, pc.bulkInit, "bulkInit should be set even without slab")
@@ -907,7 +916,7 @@ func TestPcacheAdmissionControl_SoftCreateRefusedAt90Percent(t *testing.T) {
 	// Pin 95 pages (95% of 100) — all pinned, none recyclable
 	pinned := make([]*page, 95)
 	for i := 0; i < 95; i++ {
-		pinned[i] = pc.create(uint32(i+1), 2)
+		pinned[i] = testCreate(pc, uint32(i+1), 2)
 	}
 	// nPinned = len(pages) - nRecyclable = 95 - 0 = 95
 	// threshold = maxPages * 9 / 10 = 90
@@ -916,11 +925,11 @@ func TestPcacheAdmissionControl_SoftCreateRefusedAt90Percent(t *testing.T) {
 	assert.Equal(t, 95, pc.nPage)
 
 	// Soft create should return nil
-	softPg := pc.create(200, 1)
+	softPg := testCreate(pc, 200, 1)
 	assert.Nil(t, softPg, "soft create should be refused when 95% pages are pinned")
 
 	// Hard create should succeed
-	hardPg := pc.create(200, 2)
+	hardPg := testCreate(pc, 200, 2)
 	assert.NotNil(t, hardPg, "hard create should always succeed")
 
 	// Cleanup
@@ -936,11 +945,11 @@ func TestPcacheAdmissionControl_SoftCreateAllowedBelow90Percent(t *testing.T) {
 
 	// Pin 80 pages, release all so nRecyclable=80
 	for i := 0; i < 80; i++ {
-		pg := pc.create(uint32(i+1), 2)
+		pg := testCreate(pc, uint32(i+1), 2)
 		pc.release(pg) // all go to LRU
 	}
 	// nPinned = 80 - 80 = 0 (all released); far below 90%
-	softPg := pc.create(200, 1)
+	softPg := testCreate(pc, 200, 1)
 	assert.NotNil(t, softPg, "soft create should succeed when pinned count is below 90%")
 	pc.release(softPg)
 }
@@ -967,12 +976,12 @@ func TestPcacheAdmissionControl_SlabPressureLowRecyclable(t *testing.T) {
 	// Create 10 pinned pages — nRecyclable=0, nPinned=10
 	pinned := make([]*page, 10)
 	for i := 0; i < 10; i++ {
-		pinned[i] = pc.create(uint32(i+1), 2) // hard create always works
+		pinned[i] = testCreate(pc, uint32(i+1), 2) // hard create always works
 	}
 	// nPinned=10, nRecyclable=0 — under slab pressure, soft create should
 	// be refused (nRecyclable=0 < nPinned=10). Readers fall back to
 	// readTempPage for uncached reads.
-	softPg := pc.create(200, 1)
+	softPg := testCreate(pc, 200, 1)
 	assert.Nil(t, softPg, "soft create should be refused under slab pressure with low recyclable")
 
 	// But if we release some pages (making them recyclable), soft create
@@ -982,7 +991,7 @@ func TestPcacheAdmissionControl_SlabPressureLowRecyclable(t *testing.T) {
 	}
 	// nPinned=5, nRecyclable=5 — nRecyclable >= nPinned, so step 3 passes.
 	// Step 4 recycles an LRU page under pressure.
-	softPg2 := pc.create(200, 1)
+	softPg2 := testCreate(pc, 200, 1)
 	assert.NotNil(t, softPg2, "soft create should succeed when recyclable >= pinned")
 	pc.release(softPg2)
 
@@ -1004,11 +1013,11 @@ func TestPcacheAdmissionControl_NonPurgeableIgnoresCreateFlag(t *testing.T) {
 	// Pin all 10 pages
 	pinned := make([]*page, 10)
 	for i := 0; i < 10; i++ {
-		pinned[i] = pc.create(uint32(i+1), 2)
+		pinned[i] = testCreate(pc, uint32(i+1), 2)
 	}
 
 	// Soft create should succeed for non-purgeable cache (no admission control)
-	softPg := pc.create(200, 1)
+	softPg := testCreate(pc, 200, 1)
 	assert.NotNil(t, softPg, "soft create should succeed for non-purgeable cache")
 	pc.release(softPg)
 
@@ -1032,7 +1041,7 @@ func TestPcacheUnpin_OverfullDiscardsImmediately(t *testing.T) {
 	// Create 6 pages with hard create (cache grows beyond maxPages=5)
 	pgs := make([]*page, 6)
 	for i := uint32(1); i <= 6; i++ {
-		pgs[i-1] = pc.create(i, 2)
+		pgs[i-1] = testCreate(pc, i, 2)
 	}
 	assert.Equal(t, 6, pc.nPage) // overfull
 
@@ -1060,7 +1069,7 @@ func BenchmarkPcacheCreateRecycle(b *testing.B) {
 	pc := newPcache(4096, 64, true)
 	b.ReportAllocs()
 	for i := range b.N {
-		pg := pc.create(uint32(i+1), 1)
+		pg := testCreate(pc, uint32(i+1), 1)
 		if pg == nil {
 			b.Fatal("create refused")
 		}

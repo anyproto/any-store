@@ -2,10 +2,12 @@ package btree
 
 import (
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -177,6 +179,70 @@ func TestCloseRescue_SpillPastGuardWritesNothing(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, closeRescueRows, countKeys(t, db, "t"))
 			require.NoError(t, db.IntegrityCheck())
+		})
+	}
+}
+
+// A write transaction a failed spill left in the error state still holds
+// the WAL write lock: only its rollback releases it. Close ends it as it
+// ends one in pagerWriter, without waiting on that lock for the busy
+// timeout, and the abandoned writer's next write reports ErrClosed.
+func TestCloseRescue_ErrorState(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		opts Options
+	}{
+		{"shared wal-index", Options{}},
+		{"InProcess", Options{InProcess: true}},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			opts := mode.opts
+			opts.CacheSize = closeRescueCache
+			opts.DisableAutoCheckpoint = true
+			path := filepath.Join(t.TempDir(), "test.db")
+			db, err := testOpen(t, path, opts)
+			require.NoError(t, err)
+			closed := false
+			t.Cleanup(func() {
+				if !closed {
+					_ = db.Close()
+				}
+			})
+			createNS(t, db, "t")
+			putN(t, db, "t", closeRescueRows, closeRescueValSize)
+
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			ns, err := tx.GetNamespace("t")
+			require.NoError(t, err)
+			require.NoError(t, tx.Put(ns, closeRescueKey(1), []byte("not committed")))
+			// What pagerStress leaves after a failed write of the log.
+			p := db.pager
+			errIO := errors.New("injected spill failure")
+			p.errCode = errIO
+			p.state.Store(int32(pagerError))
+			require.ErrorIs(t, tx.Put(ns, closeRescueKey(2), []byte("x")), errIO)
+
+			start := time.Now()
+			closed = true
+			require.NoError(t, db.Close())
+			require.Less(t, time.Since(start), time.Second, "Close waited on the write lock of the transaction it ends")
+			require.True(t, p.closeInvalidated.Load(), "Close did not end the transaction")
+			require.ErrorIs(t, tx.Put(ns, closeRescueKey(2), []byte("x")), ErrClosed)
+
+			db2, err := testOpen(t, path, Options{InProcess: opts.InProcess})
+			require.NoError(t, err)
+			defer func() { require.NoError(t, db2.Close()) }()
+			require.Equal(t, closeRescueRows, countKeys(t, db2, "t"))
+			rtx, err := db2.BeginRead()
+			require.NoError(t, err)
+			defer rtx.Rollback()
+			ns2, err := rtx.GetNamespace("t")
+			require.NoError(t, err)
+			v, err := rtx.Get(ns2, closeRescueKey(1))
+			require.NoError(t, err)
+			require.Len(t, v, closeRescueValSize)
+			require.NoError(t, db2.IntegrityCheck())
 		})
 	}
 }

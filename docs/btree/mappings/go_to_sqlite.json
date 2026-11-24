@@ -250,6 +250,12 @@
     "sqlite": [],
     "note": "any-store: counts a cursor call of the write transaction in at the writer gate, once for the calls it makes on itself; C holds the connection mutex for the step, vdbeapi.c sqlite3_step (drift-2026-11-21-25)"
   },
+  "btree.go:*Cursor.fault": {
+    "sqlite": [
+      "btree.c:btreeReleaseAllCursorPages"
+    ],
+    "note": "the CURSOR_FAULT branch of sqlite3BtreeTripAllCursors (sqlite3BtreeClearCursor, eState = CURSOR_FAULT, btree.c:4484-4488): no position saved"
+  },
   "btree.go:*Cursor.gatedAppendValue": {
     "sqlite": [],
     "note": "any-store: AppendValue of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
@@ -293,6 +299,10 @@
   "btree.go:*Cursor.gatedValue": {
     "sqlite": [],
     "note": "any-store: Value of a write transaction's cursor, run inside the writer gate (drift-2026-11-21-25)"
+  },
+  "btree.go:*Cursor.halt": {
+    "sqlite": [],
+    "note": "the error exit of a call on a write transaction's cursor: pager.halt"
   },
   "btree.go:*Cursor.leaveGate": {
     "sqlite": [],
@@ -933,7 +943,7 @@
       "btree.c:sqlite3BtreeClose",
       "pager.c:sqlite3PagerClose"
     ],
-    "note": ""
+    "note": "a write transaction still registered, in pagerWriter or pagerError, is ended first (rollbackForClose)"
   },
   "db.go:*DB.CloseCheckpointed": {
     "sqlite": [
@@ -1159,6 +1169,10 @@
   "db.go:*ReadTx.WalMaxFrame": {
     "sqlite": [],
     "note": ""
+  },
+  "db.go:*ReadTx.halt": {
+    "sqlite": [],
+    "note": "the error exit of a call of a write transaction: pager.halt"
   },
   "db.go:*ReadTx.leftmostKeyAfter": {
     "sqlite": [
@@ -1909,7 +1923,7 @@
       "pager.c:sqlite3PagerCommitPhaseTwo",
       "pager.c:pager_write_changecounter"
     ],
-    "note": "the schema-cookie bump before the page-1 decision is the sqlite3BtreeUpdateMeta equivalent; in schema format 6 the change counter is dbFileVers+1 once page 1 is fetched"
+    "note": "the schema-cookie bump before the page-1 decision is the sqlite3BtreeUpdateMeta equivalent; in schema format 6 the change counter is dbFileVers+1 once page 1 is fetched. In pagerError it returns pager.errCode and rolls the transaction back"
   },
   "pager.go:*pager.commitNeedsPage1": {
     "sqlite": [
@@ -2061,7 +2075,7 @@
       "pager.c:getPageNormal",
       "pager.c:sqlite3PagerGetData"
     ],
-    "note": ""
+    "note": "in the error state of a failed spill (pager.errCode set) every fetch returns pager.errCode, a cached page's too (getPageError's rule, tested inline)"
   },
   "pager.go:*pager.getWritablePage": {
     "sqlite": [
@@ -2069,6 +2083,10 @@
       "pager.c:sqlite3PagerWrite"
     ],
     "note": ""
+  },
+  "pager.go:*pager.halt": {
+    "sqlite": [],
+    "note": "sqlite3VdbeHalt's end of the cursors (closeAllCursors, vdbeaux.c:3335; sqlite3RollbackAll's trip, vdbeaux.c:3378, through sqlite3BtreeTripAllCursors, btree.c:4467-4492) as a call of the write transaction returns in the error state: every writer cursor faulted with pager.errCode, none saved"
   },
   "pager.go:*pager.headerErrorOfUnwritableFile": {
     "sqlite": [
@@ -2139,7 +2157,7 @@
     "sqlite": [
       "pager.c:pager_error"
     ],
-    "note": ""
+    "note": "a failed commit's end: the state and the cleanup at once. errCode is nil when the commit's frame write fails; when its fetch of page 1 meets a failed spill, pagerStress has set errCode already, and pagerError trips the cursors with it and clears it. SQLite's failed WAL commit never enters PAGER_ERROR: pagerWalFrames returns the error (pager.c:6512, 3219-3236) and the transaction is rolled back as any other (sqlite3PagerRollback, pager.c:6779-6782). A failed spill only records the error (pagerStress, pager.errCode) and rollbackLocked cleans up"
   },
   "pager.go:*pager.pagerPageCount": {
     "sqlite": [
@@ -2151,7 +2169,7 @@
     "sqlite": [
       "pager.c:pagerStress"
     ],
-    "note": ""
+    "note": "a failed write stores pager.errCode and sets pagerError, pager_error's part (pager.c:1947-1960), inline"
   },
   "pager.go:*pager.readDBPage": {
     "sqlite": [],
@@ -2266,7 +2284,7 @@
       "pager.c:pager_end_transaction",
       "pager.c:sqlite3PagerRollback"
     ],
-    "note": ""
+    "note": "in pagerError it first trips the cursors with pager.errCode (sqlite3BtreeRollback's tripCode), then cleans up and clears the error (pager_unlock's part)"
   },
   "pager.go:*pager.rollbackToSavepoint": {
     "sqlite": [
@@ -2284,7 +2302,7 @@
       "pager.c:sqlite3PagerOpenSavepoint",
       "wal.c:sqlite3WalSavepoint"
     ],
-    "note": ""
+    "note": "in the error state of a failed spill it returns pager.errCode, where sqlite3PagerOpenSavepoint does not test it (pager.c:6965-6974): a savepoint opened in a transaction that can only be rolled back has nothing to keep"
   },
   "pager.go:*pager.setCodec": {
     "sqlite": [],
@@ -2391,7 +2409,7 @@
       "pcache1.c:pcache1FetchNoMutex",
       "pcache1.c:pcache1FetchStage2"
     ],
-    "note": "initial 'already cached?' probe via hashFind (pcache1FetchNoMutex); on allocate, hashInsert links into apHash (was pc.pages[pgno]=p). nPage replaces len(pages)."
+    "note": "initial 'already cached?' probe via hashFind (pcache1FetchNoMutex); on allocate, hashInsert links into apHash (was pc.pages[pgno]=p). nPage replaces len(pages). Returns the xStress error without creating the page (sqlite3PcacheFetchStress)."
   },
   "pcache.go:*pcache.destroy": {
     "sqlite": [

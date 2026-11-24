@@ -39,7 +39,7 @@ func (tx *ReadTx) NamespaceSize(ns *Namespace) (NamespaceSize, error) {
 	}
 	var res NamespaceSize
 	if err := bt.walkSize(ns.rootPage, 0, &res); err != nil {
-		return NamespaceSize{}, err
+		return NamespaceSize{}, tx.halt(err)
 	}
 	return res, nil
 }

@@ -151,9 +151,11 @@ func TestReadPageMVCC_ValidPage(t *testing.T) {
 }
 
 // ============================================================
-// beginRead — pagerError state path (73.3% coverage)
+// beginRead — the writer's error state
 // ============================================================
 
+// pagerError is the state of the open write transaction: a read begins
+// under it as it does under pagerWriter.
 func TestBeginRead_PagerErrorState(t *testing.T) {
 	dir := t.TempDir()
 	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
@@ -161,12 +163,42 @@ func TestBeginRead_PagerErrorState(t *testing.T) {
 	require.NoError(t, p.open())
 	defer p.close()
 
-	// Force pager error state temporarily
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	// Deferred in the order that lets p.close run: a failed check must not
+	// leave the read or the write open under it.
+	defer p.endRead(slot)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
+	defer func() { _ = p.rollback() }()
+	pg, err := p.getPage(1)
+	require.NoError(t, err)
+	p.releasePage(pg)
+	errIO := errors.New("write failed")
+	p.errCode = errIO
 	p.state.Store(int32(pagerError))
-	_, _, err := p.beginRead()
-	assert.ErrorIs(t, err, ErrCorrupt)
-	// Restore
-	p.state.Store(int32(pagerOpen))
+
+	_, slot2, err := p.beginRead()
+	require.NoError(t, err)
+	p.endRead(slot2)
+
+	// The writer meets the error at every write and at every fetch, a
+	// cached page's too.
+	_, err = p.getWritablePage(1)
+	require.ErrorIs(t, err, errIO)
+	_, err = p.allocatePage()
+	require.ErrorIs(t, err, errIO)
+	require.ErrorIs(t, p.freePage(2), errIO)
+	_, err = p.getPage(1)
+	require.ErrorIs(t, err, errIO)
+	_, err = p.getPage(2)
+	require.ErrorIs(t, err, errIO)
+	_, err = p.savepoint()
+	require.ErrorIs(t, err, errIO)
+
+	require.NoError(t, p.rollback())
+	assert.Equal(t, int32(pagerOpen), p.state.Load())
+	assert.Nil(t, p.errCode)
 }
 
 // ============================================================
