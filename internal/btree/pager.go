@@ -966,9 +966,10 @@ func (p *pager) readPage1AtOpen() error {
 		}
 	}
 	header := p.header
-	// The copy read below must name the magic family of the file's first
-	// read, and then passes the same format checks (page1HeaderAtOpen).
-	fileVersioned := p.header.versioned
+	// The copy read below must fit the file's first read (first): its
+	// magic family, then the same format checks, then its geometry
+	// (page1HeaderAtOpen).
+	first := p.header
 	// Under a key, page 1 is the page the open proves the key on: its
 	// failed authentication goes to keyCheck, not to the integrity hook,
 	// until page1Unauthenticated has told a wrong key from a damaged page.
@@ -991,10 +992,10 @@ func (p *pager) readPage1AtOpen() error {
 			// encrypted and is judged before the key is: a file of
 			// another format is that, whatever the key.
 			unauthenticated = err
-			if err := p.page1FrameHeader(frame, &header, fileVersioned); err != nil {
+			if err := p.page1FrameHeader(frame, &header, &first); err != nil {
 				return err
 			}
-		} else if err := page1HeaderAtOpen(walBuf[:dbHeaderSize], &header, fileVersioned); err != nil {
+		} else if err := page1HeaderAtOpen(walBuf[:dbHeaderSize], &header, &first); err != nil {
 			return err
 		}
 	} else {
@@ -1021,7 +1022,7 @@ func (p *pager) readPage1AtOpen() error {
 				cut = err
 			}
 		}
-		if err := page1HeaderAtOpen(buf[:dbHeaderSize], &header, fileVersioned); err != nil {
+		if err := page1HeaderAtOpen(buf[:dbHeaderSize], &header, &first); err != nil {
 			return err
 		}
 		// BEGIN ENCRYPTION
@@ -1059,7 +1060,20 @@ func (p *pager) readPage1AtOpen() error {
 	}
 	// BEGIN ENCRYPTION
 	if unauthenticated != nil {
-		return p.page1Unauthenticated(unauthenticated, &keyCheck, nPage, maxFrame, minFrame)
+		// The pages the key is tried on are the database's. Where a WAL
+		// commit of the snapshot recorded its size, that size bounds them:
+		// it is a count of the same database that page 1's, which failed
+		// its authentication, cannot shrink, as a damaged count of 1 would
+		// leave no page to try. Page 1's count bounds them only where the
+		// file's length is the other count, which a file holding pages past
+		// the database (a shorter database written over a longer file)
+		// makes too large (sweepPageCount takes the commit's size the same
+		// way).
+		probeN := nPage
+		if hdr.nPage != 0 {
+			probeN = nPageFile
+		}
+		return p.page1Unauthenticated(unauthenticated, &keyCheck, probeN, maxFrame, minFrame)
 	}
 	// END ENCRYPTION
 	p.adoptHeader(header)
@@ -1094,29 +1108,42 @@ func (p *pager) page1Hook(kc *page1KeyCheck) integrityHook {
 // it, read without the codec: the first dbHeaderSize bytes of page 1 are
 // not encrypted (encryptPageWithCodec). The header is judged as page
 // 1's at open is (page1HeaderAtOpen).
-func (p *pager) page1FrameHeader(frame uint32, h *dbHeader, fileVersioned bool) error {
+func (p *pager) page1FrameHeader(frame uint32, h, first *dbHeader) error {
 	var buf [dbHeaderSize]byte
 	if err := p.readWalFrameDataRaw(frame, buf[:]); err != nil {
 		return fmt.Errorf("btree: read page-1 header (WAL frame %d): %w", frame, err)
 	}
-	return page1HeaderAtOpen(buf[:], h, fileVersioned)
+	return page1HeaderAtOpen(buf[:], h, first)
 }
 
 // page1HeaderAtOpen decodes into h the header of the page 1 that
 // readPage1AtOpen read, buf, from a WAL frame or again from the database
-// file, once its magic names the family the file's first read found
-// (fileVersioned). No commit moves a file between families: a page 1 of
+// file, and judges it against the header the file's first read found,
+// first. No commit moves a file between magic families: a page 1 of
 // another magic, an any-store family or SQLite's, does not fit the file,
 // and it is ErrHeaderCorrupt before anything in it is read as the format
-// its magic names (SQLite's would make the file an any-store v1 one).
-func page1HeaderAtOpen(buf []byte, h *dbHeader, fileVersioned bool) error {
+// its magic names (SQLite's would make the file an any-store v1 one). Nor
+// does a commit change the page size or the bytes reserved at the end of
+// each page, which the pager and the codec were set up with from the
+// first read, and which a WAL frame's page size had to match: a page 1
+// that declares others is ErrHeaderCorrupt too, under any key (the header
+// is outside the page's authentication), and is not adopted, nor written
+// to the database file by a checkpoint.
+func page1HeaderAtOpen(buf []byte, h, first *dbHeader) error {
 	if len(buf) < dbHeaderSize {
 		return ErrHeaderCorrupt
 	}
-	if versioned, ok := headerFamily(buf); !ok || versioned != fileVersioned {
+	if versioned, ok := headerFamily(buf); !ok || versioned != first.versioned {
 		return fmt.Errorf("%w: page 1's header magic is not of the file's family", ErrHeaderCorrupt)
 	}
-	return h.deserialize(buf)
+	if err := h.deserialize(buf); err != nil {
+		return err
+	}
+	if h.PageSize != first.PageSize || h.ReservedSpace != first.ReservedSpace {
+		return fmt.Errorf("%w: page 1 declares %d-byte pages with %d reserved bytes, the file was opened with %d and %d",
+			ErrHeaderCorrupt, h.PageSize, h.ReservedSpace, first.PageSize, first.ReservedSpace)
+	}
+	return nil
 }
 
 // keyProbePages bounds the pages proveKeyAtOpen tries.
@@ -1136,10 +1163,10 @@ func keyProbePgno(i, count, nPage uint32) uint32 {
 // page1Unauthenticated decides what a page 1 that failed its authentication
 // at open means, and returns the open's error. perr is the failed read's
 // error, which matches ErrPageIntegrity. nPage is the database's size at
-// the snapshot, by lockBtreePageCount: the open has judged page 1's header
-// and the size already, so a header that does not fit the file is
-// ErrHeaderCorrupt whatever the key. maxFrame and minFrame are the
-// snapshot's bounds.
+// the snapshot: the size its WAL commit recorded, or lockBtreePageCount's
+// where the WAL has none. The open has judged page 1's header and the size
+// already, so a header that does not fit the file is ErrHeaderCorrupt
+// whatever the key. maxFrame and minFrame are the snapshot's bounds.
 //
 // A key that authenticates any page of the database is the right key: a
 // wrong one passes a page's tag with probability about 2^-128. So the open
@@ -1834,6 +1861,16 @@ func (p *pager) beginWrite(readSnap WalIndexHdr) error {
 	if err != nil {
 		return err
 	}
+	// The WAL write lock is released by every way out of the begin but its
+	// success, a panic included: the page-1 read below calls the integrity
+	// hook, which is the caller's code (DB.BeginWriteContext releases the
+	// rest of what the begin holds).
+	begun := false
+	defer func() {
+		if !begun {
+			p.wal.endWrite()
+		}
+	}()
 	// If another process changed WAL state (committed or checkpointed),
 	// our writerCache has stale pages and must be cleared. We must also
 	// refresh p.header and p.dbSize from the new page 1 — without this,
@@ -1862,23 +1899,23 @@ func (p *pager) beginWrite(readSnap WalIndexHdr) error {
 	// read error out of lockBtree the same way (btree.c:3288-3289), and
 	// re-reads page 1 at the next transaction because it never kept the
 	// failed page. headerStale is that "page 1 not held" state here: the
-	// next begin clears the cache even if no state change is seen. We
-	// release the exclusive WAL write lock that beginWriteWithSnapshot
-	// acquired (the pager never reached pagerWriter, so the caller's error
-	// path only ends the read tx via endRead and would otherwise leak the
-	// write lock); the caller's read transaction itself is left intact.
+	// next begin clears the cache even if no state change is seen. The
+	// exclusive WAL write lock that beginWriteWithSnapshot acquired is
+	// released (the deferred endWrite above: the pager never reached
+	// pagerWriter, so the caller's error path only ends the read tx via
+	// endRead and would otherwise leak the write lock); the caller's read
+	// transaction itself is left intact.
 	p.headerStale = true
 	if err := p.refreshHeaderFromPage1(); err != nil {
-		p.wal.endWrite()
 		return err
 	}
 	p.headerStale = false
 	if checkPage1Invariant.Load() {
 		if err := p.checkPage1AtBegin(); err != nil {
-			p.wal.endWrite()
 			return err
 		}
 	}
+	begun = true
 	p.state.Store(int32(pagerWriter))
 	// Save a snapshot of the database header so rollback can restore it (fix 5.2).
 	p.savedHeader = p.header
@@ -3134,6 +3171,23 @@ func lockBtreePageCount(h *dbHeader, nPageFile uint32) (uint32, error) {
 		return 0, fmt.Errorf("%w: header DatabaseSize=%d exceeds the pager's page count %d", ErrHeaderCorrupt, h.DatabaseSize, nPageFile)
 	}
 	return h.DatabaseSize, nil
+}
+
+// page1DatabaseSize is lockBtreePageCount's size for the page 1 a reader
+// holds, data, against the pager's count nPageFile, for a caller that needs
+// the count alone: it reads the three fields the rule takes (the size at
+// offset 28, the change counter and the version-valid-for number) and
+// decodes nothing else. A header the rule refuses gives nPageFile, a bound
+// no larger than the pager's: the open and every write begin judge the
+// header (lockBtreePageCount).
+func page1DatabaseSize(data []byte, nPageFile uint32) uint32 {
+	size := binary.BigEndian.Uint32(data[28:32])
+	fcc := binary.BigEndian.Uint32(data[24:28])
+	vvf := binary.BigEndian.Uint32(data[92:96])
+	if size == 0 || vvf != fcc || size > nPageFile {
+		return nPageFile
+	}
+	return size
 }
 
 // pagerPageCount is SQLite's pagerPagecount (pager.c:3279-3306): walNPage,

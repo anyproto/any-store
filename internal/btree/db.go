@@ -1319,6 +1319,28 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	return db.BeginWriteContext(context.Background())
 }
 
+// pagerBeginWrite is BeginWriteContext's pager.beginWrite, on the read
+// snapshot it holds in slot. A panic out of it (the integrity hook is the
+// caller's code, and beginWrite's read of page 1 calls it) releases what
+// the begin holds before it goes on: the read slot, db.mu and the writer
+// lock, which beginWrite's error returns leave to BeginWriteContext.
+// beginWrite releases the WAL write lock itself. Unreleased, the writer
+// lock would keep every later write begin waiting, and Close, which waits
+// for it, would never return.
+func (db *DB) pagerBeginWrite(readSnap WalIndexHdr, slot int) error {
+	returned := false
+	defer func() {
+		if !returned {
+			db.pager.endRead(slot)
+			db.mu.RUnlock()
+			db.unlockWriter()
+		}
+	}()
+	err := db.pager.beginWrite(readSnap)
+	returned = true
+	return err
+}
+
 // BeginWriteContext is BeginWrite whose wait for the write lock also ends
 // with ctx: ctx.Err() when ctx ends first, at once when ctx has ended
 // already. Only the wait for this process's lock is ctx's; see lockWriter
@@ -1370,7 +1392,7 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*WriteTx, error) {
 		// inside beginWrite() (happens-before guarantee).
 		db.pager.writerWalSlot = slot
 
-		err = db.pager.beginWrite(readSnap)
+		err = db.pagerBeginWrite(readSnap, slot)
 		if err == nil {
 			break
 		}
@@ -1870,6 +1892,15 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The database's size, which bounds the root found below: for a
+	// reader, the snapshot's by lockBtree's rule, read from the page 1 the
+	// search starts on (page1DatabaseSize), not the pager's count, which a
+	// file holding pages past the database makes larger; for the writer,
+	// its live count, which its own allocations grow (sqlite3BtreeLastPage).
+	nPage := bt.pager.readerDbSizeBound(bt.cache)
+	if bt.cache != nil && bt.rootPage == 1 {
+		nPage = page1DatabaseSize(pg.data, nPage)
+	}
 
 	usableSize := bt.usablePageSize()
 	lim := bt.leafLimits()
@@ -1909,16 +1940,20 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 			rootPage := binary.BigEndian.Uint32(value)
 			bt.pager.releasePage(pg)
 			// The root is checked here, when the name is resolved, and not
-			// on every page get: a root of 0 or past the snapshot's page
-			// count is damage, as the schema load refuses a root page past
-			// the database ("invalid rootpage", prepare.c:135-140),
-			// btreeCursor a root below 1 (btree.c:4715-4717) and
-			// getAndInitPage any page past btreePagecount
-			// (btree.c:2386-2389). A root past the count would read as a
-			// zero page, an empty tree: the namespace would look empty, and
-			// a write would build on that page.
-			if rootPage == 0 || rootPage > bt.pager.readerDbSizeBound(bt.cache) {
-				return nil, fmt.Errorf("%w: namespace %q: root page %d is outside the database", ErrCorrupt, name, rootPage)
+			// on every page get: a root outside 2..nPage is damage, as the
+			// schema load refuses a root page past the database ("invalid
+			// rootpage", prepare.c:135-140), btreeCursor a root below 1
+			// (btree.c:4715-4717), getAndInitPage any page past
+			// btreePagecount (btree.c:2386-2389), and as IntegrityCheck
+			// reports a namespace root outside 2..nPage. A root past the
+			// count would read as a zero page, an empty tree, or as a stale
+			// page the file holds past the database: the namespace would
+			// look empty or hold records that are no longer the database's,
+			// and a write would build on that page. A root of 1 is the
+			// master table itself: a check of the namespace would walk the
+			// master and pass.
+			if rootPage < 2 || rootPage > nPage {
+				return nil, fmt.Errorf("%w: namespace %q: root page %d is outside the database's pages 2..%d", ErrCorrupt, name, rootPage, nPage)
 			}
 			return &Namespace{
 				name:     name,

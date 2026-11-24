@@ -1899,6 +1899,89 @@ func TestGetNamespace_RootPastTheDatabaseIsCorrupt(t *testing.T) {
 	require.Contains(t, err.Error(), "out of range")
 }
 
+// A namespace root of 1 is the master table, which no namespace has:
+// resolving it is ErrCorrupt, for a reader and for the writer, and a
+// namespace that resolved to it would be checked as the master and pass.
+func TestGetNamespace_RootOfTheMasterIsCorrupt(t *testing.T) {
+	db := tempDB(t)
+	commitRows(t, db, "x", 8, 100)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, tx.pager.wgate.enter())
+	master := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
+	require.NoError(t, master.Put([]byte("x"), []byte{0, 0, 0, 1}))
+	tx.pager.wgate.leave()
+	require.NoError(t, tx.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	_, err = rtx.GetNamespace("x")
+	require.NoError(t, rtx.Rollback())
+	require.ErrorIs(t, err, ErrCorrupt)
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = wtx.GetNamespace("x")
+	require.NoError(t, wtx.Rollback())
+	require.ErrorIs(t, err, ErrCorrupt)
+
+	require.ErrorIs(t, db.IntegrityCheck(), ErrCorrupt)
+}
+
+// A reader's bound on a namespace root is the database's size at its
+// snapshot, page 1's count, not the pager's count: with no commit in the
+// WAL that is the file's length, and a file can hold a page past the
+// database. A root on such a stale page, here a copy of another
+// namespace's root with its records, is ErrCorrupt, and its records are
+// not read as the namespace's.
+func TestGetNamespace_RootPastPage1sCountIsCorrupt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	opts := Options{PageSize: 4096}
+	db, err := testOpen(t, path, opts)
+	require.NoError(t, err)
+	commitRows(t, db, "x", 8, 100)
+	nPage := db.pager.dbSize.Load()
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	xns, err := tx.GetNamespace("x")
+	require.NoError(t, err)
+	require.NoError(t, tx.pager.wgate.enter())
+	var root [4]byte
+	binary.BigEndian.PutUint32(root[:], nPage+1)
+	master := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
+	require.NoError(t, master.Put([]byte("y"), root[:]))
+	tx.pager.wgate.leave()
+	require.NoError(t, tx.Commit())
+	require.Equal(t, nPage, db.pager.dbSize.Load())
+	require.NoError(t, db.Checkpoint(CheckpointTruncate))
+	require.NoError(t, db.Close())
+
+	// The file gets a page past the database: a copy of x's root.
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.EqualValues(t, int(nPage)*4096, len(data))
+	stale := data[int(xns.RootPage()-1)*4096 : int(xns.RootPage())*4096]
+	require.NoError(t, os.WriteFile(path, append(data, stale...), 0o644))
+
+	db, err = testOpen(t, path, opts)
+	require.NoError(t, err)
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	n, sizeErr := rtx.DatabaseSize()
+	_, err = rtx.GetNamespace("y")
+	require.NoError(t, rtx.Rollback())
+	require.NoError(t, sizeErr)
+	require.Equal(t, nPage, n)
+	require.ErrorIs(t, err, ErrCorrupt)
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = wtx.GetNamespace("y")
+	require.NoError(t, wtx.Rollback())
+	require.ErrorIs(t, err, ErrCorrupt)
+}
+
 // === Cover BeginWrite pager.beginWrite error (lines 254-259) ===
 // This needs to trigger an error from pager.beginWrite() specifically
 // inside the DB.BeginWrite() flow (not just pager-level).

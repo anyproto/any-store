@@ -418,14 +418,29 @@ func openErr(err error) error {
 		return ErrPageBufferNotInitialized
 	case errors.Is(err, btree.ErrSQLiteFormat):
 		return ErrV1Database
-	case errors.Is(err, btree.ErrNewerFormat), errors.Is(err, btree.ErrWALVersion):
-		return fmt.Errorf("%w: %w", ErrIncompatibleVersion, err)
 	case errors.Is(err, btree.ErrKeyRequired):
 		return ErrEncryptionKeyRequired
 	case errors.Is(err, btree.ErrNotEncrypted):
 		return ErrNotEncrypted
 	}
-	return busyErr(err)
+	return busyErr(versionErr(err))
+}
+
+// versionErr makes a version refusal of the btree match
+// ErrIncompatibleVersion, keeping the btree's error: a newer format of the
+// file, or a WAL or a live wal-index of a version this release does not
+// read or use, newer or older. Open applies it to every error it returns,
+// as busyErr: a peer can publish a wal-index of another version after
+// btree.Open has returned, and the write begin of the initialization then
+// refuses it.
+func versionErr(err error) error {
+	if err == nil || errors.Is(err, ErrIncompatibleVersion) {
+		return err
+	}
+	if errors.Is(err, btree.ErrNewerFormat) || errors.Is(err, btree.ErrWALVersion) {
+		return fmt.Errorf("%w: %w", ErrIncompatibleVersion, err)
+	}
+	return err
 }
 
 // isBusyErr reports one of the storage layer's "not now" errors: a lock that

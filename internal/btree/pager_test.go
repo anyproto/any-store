@@ -9699,6 +9699,59 @@ func TestOpen_KeyProbeStaysInsideTheDatabase(t *testing.T) {
 	require.Zero(t, fired.Load())
 }
 
+// A page 1 that fails its authentication, its count damaged down to 1 with
+// its change counters intact, does not take away the pages the key is
+// tried on: where the snapshot's WAL commit records the database's size,
+// that size bounds them, and a page under it proves the key. Page 1 here is
+// in the database file, and the commit that recorded the size, in the WAL,
+// did not write it.
+func TestOpen_KeyProbeTakesTheWALCommitsSize(t *testing.T) {
+	path, opts := keyProofDB(t, true, nil)
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.GetNamespace("x")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns, []byte("key-0000"), bytes.Repeat([]byte("w"), 1000)))
+	require.NoError(t, wtx.Commit())
+	cp := tmpEncryptedFile(t, "copy.db")
+	for _, suffix := range []string{"", "-wal"} {
+		data, err := os.ReadFile(path + suffix)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(cp+suffix, data, 0o600))
+	}
+	require.NoError(t, db.Close())
+
+	wal, err := os.ReadFile(cp + "-wal")
+	require.NoError(t, err)
+	frameSize := walFrameSize + int(opts.PageSize)
+	var commitSize uint32
+	for o := walHeaderSize; o+frameSize <= len(wal); o += frameSize {
+		require.NotEqual(t, uint32(1), binary.BigEndian.Uint32(wal[o:]), "the commit wrote page 1")
+		if n := binary.BigEndian.Uint32(wal[o+4:]); n != 0 {
+			commitSize = n
+		}
+	}
+	require.Greater(t, commitSize, uint32(1), "no commit in the WAL")
+
+	var one [4]byte
+	binary.BigEndian.PutUint32(one[:], 1)
+	f, err := os.OpenFile(cp, os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt(one[:], 28) // DatabaseSize
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	damageFile(t, cp, 1000)
+
+	var pages []uint32
+	opts.OnIntegrityError = func(pgno uint32, _ error) { pages = append(pages, pgno) }
+	_, err = Open(cp, opts)
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.NotErrorIs(t, err, ErrWrongKey)
+	require.Equal(t, []uint32{1}, pages)
+}
+
 // The header and the size are judged before the key, whatever page 1's
 // authentication says: a header that does not fit the file is
 // ErrHeaderCorrupt under any key.
@@ -9760,6 +9813,41 @@ func TestOpen_HeaderIsJudgedBeforeTheKey(t *testing.T) {
 		}
 		require.Zero(t, fired.Load())
 	})
+	// Each header is valid on its own, of one family, but the frame's
+	// declares another page size, or other reserved bytes, than the file
+	// the pager was set up from, whose page size the WAL's frames have.
+	// Under the right key the frame authenticates: adopted, its header
+	// would reach the database file at the next checkpoint.
+	for _, tc := range []struct {
+		name  string
+		off   int
+		value []byte
+	}{
+		{"WAL page 1 of another page size", 16, []byte{0x20, 0x00}}, // 8192
+		{"WAL page 1 of other reserved bytes", 20, []byte{0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, opts := keyProofDB(t, false, nil)
+			var fired atomic.Int32
+			opts.OnIntegrityError = func(uint32, error) { fired.Add(1) }
+			walPath := path + "-wal"
+			_, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
+			f, err := os.OpenFile(walPath, os.O_RDWR, 0)
+			require.NoError(t, err)
+			_, err = f.WriteAt(tc.value, off+walFrameSize+int64(tc.off))
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+			resealWAL(t, walPath, int(opts.PageSize))
+			for _, key := range [][]byte{opts.Key, []byte("wrong-passphrase")} {
+				o := opts
+				o.Key = key
+				_, err := Open(path, o)
+				require.ErrorIs(t, err, ErrHeaderCorrupt, "key %q", key)
+				require.NotErrorIs(t, err, ErrWrongKey)
+			}
+			require.Zero(t, fired.Load())
+		})
+	}
 }
 
 // A page the open could not read might have proved the key: when no page

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -32,31 +33,37 @@ func dirtyDB(t *testing.T, damage func(path string)) string {
 	return path
 }
 
-// A dirty open whose catalog's root page number points past the end of the
-// database met damage: ErrQuickCheckFailed. The page past the end is not
-// read as an empty catalog, and the marker stays.
-func TestOpen_DirtyCatalogRootPastTheDatabase(t *testing.T) {
-	path := dirtyDB(t, func(path string) {
-		// The catalog's master cell: key length, value length, the key,
-		// then the 4-byte root page number, on page 1.
-		data, err := os.ReadFile(path)
-		require.NoError(t, err)
-		cell := append([]byte{byte(len("_system")), 4}, "_system"...)
-		require.Equal(t, 1, bytes.Count(data[:4096], cell))
-		at := bytes.Index(data, cell) + len(cell)
-		require.EqualValues(t, 2, binary.BigEndian.Uint32(data[at:]))
-		binary.BigEndian.PutUint32(data[at:], 3)
-		require.NoError(t, os.WriteFile(path, data, 0o644))
-	})
-	// The edit breaks page 1's checksum; the open goes past it.
-	_, err := anystore.Open(context.Background(), path, &anystore.Config{
-		Durability:               anystore.DurabilityConfig{Sentinel: true},
-		ContinueOnIntegrityError: true,
-	})
-	require.ErrorIs(t, err, anystore.ErrQuickCheckFailed)
-	require.ErrorIs(t, err, anystore.ErrCorrupt)
-	_, err = os.Stat(path + ".lock")
-	require.NoError(t, err, "the marker stays")
+// A dirty open whose catalog's root page number is outside the database's
+// pages 2..2 met damage: ErrQuickCheckFailed, and not an incomplete check.
+// A root of 0 is no page; a root of 1 is the master table, which the check
+// would walk as the catalog and pass; the page past the end is not read as
+// an empty catalog. The marker stays.
+func TestOpen_DirtyCatalogRootOutsideTheDatabase(t *testing.T) {
+	for _, root := range []uint32{0, 1, 3} {
+		t.Run(fmt.Sprintf("root %d", root), func(t *testing.T) {
+			path := dirtyDB(t, func(path string) {
+				// The catalog's master cell: key length, value length,
+				// the key, then the 4-byte root page number, on page 1.
+				data, err := os.ReadFile(path)
+				require.NoError(t, err)
+				cell := append([]byte{byte(len("_system")), 4}, "_system"...)
+				require.Equal(t, 1, bytes.Count(data[:4096], cell))
+				at := bytes.Index(data, cell) + len(cell)
+				require.EqualValues(t, 2, binary.BigEndian.Uint32(data[at:]))
+				binary.BigEndian.PutUint32(data[at:], root)
+				require.NoError(t, os.WriteFile(path, data, 0o644))
+			})
+			// The edit breaks page 1's checksum; the open goes past it.
+			_, err := anystore.Open(context.Background(), path, &anystore.Config{
+				Durability:               anystore.DurabilityConfig{Sentinel: true},
+				ContinueOnIntegrityError: true,
+			})
+			require.ErrorIs(t, err, anystore.ErrQuickCheckFailed)
+			require.ErrorIs(t, err, anystore.ErrCorrupt)
+			_, err = os.Stat(path + ".lock")
+			require.NoError(t, err, "the marker stays")
+		})
+	}
 }
 
 // A dirty open whose catalog page the file holds only in part met damage:

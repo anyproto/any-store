@@ -3,7 +3,6 @@ package anystore
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -3841,46 +3840,6 @@ func TestSketchPasses_SkipUnverifiedHead(t *testing.T) {
 	assert.Equal(t, 1, n)
 }
 
-// A dirty open whose catalog's root page number is damaged to 0 is a quick
-// check that met damage: ErrQuickCheckFailed and ErrCorrupt, as before, and
-// not an incomplete check.
-func TestOpen_DirtyQuickCheckDamagedCatalogRoot(t *testing.T) {
-	ctx := context.Background()
-	cfg := func() *Config {
-		// The page-1 edit below breaks its checksum; the open goes past it.
-		return &Config{Durability: DurabilityConfig{Sentinel: true}, ContinueOnIntegrityError: true}
-	}
-	path := filepath.Join(t.TempDir(), "a.db")
-	db, err := Open(ctx, path, cfg())
-	require.NoError(t, err)
-	_, err = db.CreateCollection(ctx, "c")
-	require.NoError(t, err)
-	require.NoError(t, db.Close())
-
-	// The catalog's master cell: key length, value length, key, then the
-	// 4-byte root page number (parseLeafCellWithSize), on page 1.
-	data, err := os.ReadFile(path)
-	require.NoError(t, err)
-	cell := append([]byte{byte(len(systemNamespace)), 4}, systemNamespace...)
-	page1 := data[:4096]
-	require.Equal(t, 1, bytes.Count(page1, cell))
-	at := bytes.Index(page1, cell) + len(cell)
-	require.NotZero(t, binary.BigEndian.Uint32(data[at:]))
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
-	require.NoError(t, err)
-	_, err = f.WriteAt([]byte{0, 0, 0, 0}, int64(at))
-	require.NoError(t, err)
-	require.NoError(t, f.Close())
-	marker := path + ".lock"
-	require.NoError(t, os.WriteFile(marker, nil, 0o644))
-
-	_, err = Open(ctx, path, cfg())
-	require.ErrorIs(t, err, ErrQuickCheckFailed)
-	require.ErrorIs(t, err, ErrCorrupt)
-	_, err = os.Stat(marker)
-	require.NoError(t, err)
-}
-
 // The quick check of a dirty open fails the open as ErrQuickCheckFailed,
 // and so as ErrCorrupt, only when it met damage. A check that did not
 // finish returns what stopped it, and that is not corruption: the caller
@@ -4129,4 +4088,30 @@ func TestOpen_BusyInitializationMatchesErrBusy(t *testing.T) {
 	d, err = Open(ctx, path, nil)
 	require.NoError(t, err)
 	require.NoError(t, d.Close())
+}
+
+// A wal-index of another version that a peer publishes after btree.Open
+// has returned, before the write begin of Open's initialization, is the
+// version refusal it is at btree.Open: ErrIncompatibleVersion, keeping the
+// btree's error, for a newer wal-index and an older one.
+func TestOpen_WalIndexVersionAfterTheBtreeOpenIsIncompatible(t *testing.T) {
+	if !mmapShm() {
+		t.Skip("the wal-index is this process's memory: no other build publishes one")
+	}
+	ctx := context.Background()
+	for _, delta := range []int{1, -1} {
+		t.Run(fmt.Sprintf("version %+d", delta), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "a.db")
+			d, err := Open(ctx, path, nil)
+			require.NoError(t, err)
+			require.NoError(t, d.Close())
+
+			testHookAfterBtreeOpen = func(bdb *btree.DB) { bdb.TestSeam().PublishIndexVersion(delta) }
+			_, err = Open(ctx, path, nil)
+			testHookAfterBtreeOpen = nil
+			require.ErrorIs(t, err, ErrIncompatibleVersion)
+			require.ErrorIs(t, err, btree.ErrWALVersion)
+			require.NotErrorIs(t, err, ErrCorrupt)
+		})
+	}
 }

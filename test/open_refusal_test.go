@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -95,6 +96,47 @@ func TestOpen_PanickingIntegrityCallbackReleasesTheFile(t *testing.T) {
 
 	_, err = anystore.Open(ctx, path, cfg(nil))
 	require.ErrorIs(t, err, anystore.ErrQuickCheckFailed)
+	require.NotErrorIs(t, err, anystore.ErrDBAlreadyOpen)
+}
+
+// An integrity callback that panics in the write begin of Open's
+// initialization, at the first check of page 1's checksum, unwinds a begin
+// that holds the writer's locks and has not registered its transaction:
+// the begin releases them, and the open's cleanup closes the handle
+// instead of waiting for them forever. A recovered caller opens the file
+// again and gets the damage.
+func TestOpen_PanickingIntegrityCallbackInTheWriteBegin(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "a.db")
+	db, err := anystore.Open(ctx, path, nil)
+	require.NoError(t, err)
+	_, err = db.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	// Page 1's checksum trailer, the last 16 bytes of the page: its header
+	// is intact, and the open reads nothing else of page 1 before the
+	// write begin of its initialization checks it.
+	flipByte(t, path, 4096-8)
+
+	recovered := make(chan any, 1)
+	go func() {
+		defer func() { recovered <- recover() }()
+		db, err := anystore.Open(ctx, path, &anystore.Config{
+			OnIntegrityError: func(anystore.IntegrityError) { panic("integrity callback") },
+		})
+		if err == nil {
+			_ = db.Close()
+		}
+	}()
+	select {
+	case r := <-recovered:
+		require.Equal(t, "integrity callback", r)
+	case <-time.After(30 * time.Second):
+		t.Fatal("Open did not return: its cleanup waits for the locks of the write begin the callback unwound")
+	}
+
+	_, err = anystore.Open(ctx, path, nil)
+	require.ErrorIs(t, err, anystore.ErrPageIntegrity)
 	require.NotErrorIs(t, err, anystore.ErrDBAlreadyOpen)
 }
 

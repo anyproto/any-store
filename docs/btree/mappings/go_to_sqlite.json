@@ -1059,6 +1059,10 @@
     "sqlite": [],
     "note": ""
   },
+  "db.go:*DB.pagerBeginWrite": {
+    "sqlite": [],
+    "note": "BeginWriteContext's pager.beginWrite; a panic out of it (the integrity hook) releases the read slot, db.mu and the writer lock"
+  },
   "db.go:*DB.putReadTx": {
     "sqlite": [],
     "note": ""
@@ -1068,8 +1072,10 @@
     "note": ""
   },
   "db.go:*DB.resolveNamespace": {
-    "sqlite": [],
-    "note": "any-store master-table traversal for namespace->rootPage"
+    "sqlite": [
+      "prepare.c:sqlite3InitCallback"
+    ],
+    "note": "any-store master-table traversal for namespace->rootPage; a root outside 2..nPage (the reader's snapshot size from page 1, the writer's live count) is ErrCorrupt, as the schema load refuses a root past the database (prepare.c:135-140)"
   },
   "db.go:*DB.unregisterWriter": {
     "sqlite": [],
@@ -2456,9 +2462,15 @@
     ],
     "note": ""
   },
+  "pager.go:page1DatabaseSize": {
+    "sqlite": [
+      "btree.c:lockBtree"
+    ],
+    "note": "lockBtreePageCount's size from a page-1 image's three fields, for a reader's bound on a namespace root (resolveNamespace)"
+  },
   "pager.go:page1HeaderAtOpen": {
     "sqlite": [],
-    "note": "page 1 read again at open must name the file's magic family before its header is decoded; no SQLite counterpart (drift-2026-11-24-3)"
+    "note": "page 1 read again at open must name the file's magic family before its header is decoded, and declare the file's page size and reserved bytes; no SQLite counterpart (drift-2026-11-24-3)"
   },
   "pcache.go:*pcache.appendDirtyPages": {
     "sqlite": [
@@ -2787,6 +2799,10 @@
   "testseam.go:TestSeam.PeerPublish": {
     "sqlite": [],
     "note": "test seam: another process's commit, as a begin sees it"
+  },
+  "testseam.go:TestSeam.PublishIndexVersion": {
+    "sqlite": [],
+    "note": "test seam: the wal-index header of another build's version, as walIndexReadHdr refuses it (wal.c:2740-2741)"
   },
   "testseam.go:TestSeam.SetBusyTimeout": {
     "sqlite": [],

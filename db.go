@@ -245,9 +245,10 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 // existing file keeps its own. Every busy error it returns matches ErrBusy:
 // the btree's busy errors (a peer's recovery, a snapshot a peer's commit
 // overtook) are kinds of it, as SQLITE_BUSY_RECOVERY and
-// SQLITE_BUSY_SNAPSHOT are of SQLITE_BUSY.
+// SQLITE_BUSY_SNAPSHOT are of SQLITE_BUSY. Every version refusal matches
+// ErrIncompatibleVersion, also one met after btree.Open has returned.
 func open(ctx context.Context, path string, config *Config, createFormat uint32) (_ *db, err error) {
-	defer func() { err = busyErr(err) }()
+	defer func() { err = busyErr(versionErr(err)) }()
 	if config == nil {
 		config = &Config{}
 	}
@@ -1451,8 +1452,9 @@ func (db *db) checkCatalog(tx *btree.ReadTx) error {
 
 func (db *db) Backup(ctx context.Context, path string) (err error) {
 	// Whatever busy error ends the backup, at any step of it, is the one
-	// the caller matches.
-	defer func() { err = busyErr(err) }()
+	// the caller matches, and so is a version refusal met after the
+	// destination's open (a peer's wal-index of another version).
+	defer func() { err = busyErr(versionErr(err)) }()
 
 	// ~ backup.c:337-344: "If the source pager is currently in a
 	// write-transaction, return SQLITE_BUSY immediately." A Step would say
