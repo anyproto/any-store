@@ -205,6 +205,16 @@ func (db *DB) codecKind() IntegrityMode {
 // differs.
 func (db *DB) BackupDestinationOptions() Options {
 	opts := db.opts
+	if opts.InMemory {
+		// The in-process mode is forced on an in-memory database (Open),
+		// and it is no setting of the file: the destination takes the
+		// locking of a file, the platform's (Open forces the in-process
+		// mode only where there is no shared memory to map). In the
+		// in-process mode a destination another process has open was
+		// refused with ErrInProcessLocked, where a file opened by itself
+		// is shared with it.
+		opts.InProcess = false
+	}
 	opts.InMemory = false
 	opts.OnIntegrityError = nil
 	opts.PageSize = db.pager.pageSize
