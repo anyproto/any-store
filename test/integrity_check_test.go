@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -61,4 +62,58 @@ func TestIntegrityCheck_ClosedIsErrDBIsClosed(t *testing.T) {
 	err = db.IntegrityCheck(ctx)
 	require.ErrorIs(t, err, anystore.ErrDBIsClosed)
 	require.NotErrorIs(t, err, anystore.ErrCorrupt)
+}
+
+// IntegrityCheck runs in the read transaction its context carries, and so
+// needs no reader slot of its own: with one slot, held by the caller's
+// transaction, it runs. Without a transaction in the context it waits for a
+// slot until the context ends. A write transaction in the context holds no
+// reader slot, and the check reads the committed state beside it.
+func TestIntegrityCheck_ReadSlot(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "a.db"), &anystore.Config{ReadConcurrency: 1})
+	require.NoError(t, err)
+	defer db.Close()
+	coll, err := db.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	for i := 0; i < 50; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i))))
+	}
+
+	within := func(t *testing.T, d time.Duration, f func() error) error {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- f() }()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(d):
+			t.Fatal("IntegrityCheck did not return")
+			return nil
+		}
+	}
+
+	t.Run("in the caller's read transaction", func(t *testing.T) {
+		rtx, err := db.ReadTx(ctx)
+		require.NoError(t, err)
+		defer rtx.Commit()
+		require.NoError(t, within(t, 10*time.Second, func() error { return db.IntegrityCheck(rtx.Context()) }))
+	})
+	t.Run("waiting for a slot another reader holds", func(t *testing.T) {
+		rtx, err := db.ReadTx(ctx)
+		require.NoError(t, err)
+		defer rtx.Commit()
+		dctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		defer cancel()
+		err = within(t, 10*time.Second, func() error { return db.IntegrityCheck(dctx) })
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.NotErrorIs(t, err, anystore.ErrCorrupt)
+	})
+	t.Run("beside the caller's write transaction", func(t *testing.T) {
+		wtx, err := db.WriteTx(ctx)
+		require.NoError(t, err)
+		defer wtx.Rollback()
+		require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":"uncommitted"}`)))
+		require.NoError(t, within(t, 10*time.Second, func() error { return db.IntegrityCheck(wtx.Context()) }))
+	})
 }

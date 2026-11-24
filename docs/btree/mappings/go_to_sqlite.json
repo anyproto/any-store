@@ -1386,6 +1386,18 @@
     "sqlite": [],
     "note": "the report matches ErrCorrupt, or the error of a read that failed for a reason other than damage; SQLite returns the report as text with SQLITE_OK (drift-2026-11-24-4)"
   },
+  "integrity.go:*ReadTx.IntegrityCheck": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeIntegrityCheck"
+    ],
+    "note": "the check in the caller's read transaction, as sqlite3BtreeIntegrityCheck runs in its connection's (btree.c:11156)"
+  },
+  "integrity.go:*ReadTx.IntegrityCheckN": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeIntegrityCheck"
+    ],
+    "note": "the check in the caller's read transaction, as sqlite3BtreeIntegrityCheck runs in its connection's (btree.c:11156); the read view of a write transaction is refused"
+  },
   "integrity.go:*integrityChecker.checkList": {
     "sqlite": [
       "btree.c:checkList"

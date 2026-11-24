@@ -70,11 +70,17 @@ type DB interface {
 	// expensive than QuickCheck — intended for stress tests and offline
 	// diagnostics, not normal opens.
 	//
+	// The check reads one snapshot: that of the read transaction ctx
+	// carries, which it uses without waiting for a reader slot, or else that
+	// of a read transaction of its own, whose wait for a slot ends with ctx.
+	// A write transaction that ctx carries is not checked: the check reads
+	// the committed state, in a read transaction of its own.
+	//
 	// The error matches ErrCorrupt when the check found damage: a broken
 	// structure, a page that fails its checksum or authentication, or a
 	// collection in the catalog that has no data. It does not match
 	// ErrCorrupt when the check could not run or could not read: a closed
-	// database (ErrDBIsClosed), a cancelled ctx, a busy error, or a report
+	// database (ErrDBIsClosed), a cancelled ctx, a busy error (ErrBusy), or a report
 	// that lists a page that failed to read with an I/O error or a short
 	// read of the write-ahead log (ErrWALShortRead). Such a report matches
 	// that error, and what else it lists is inconclusive (the pages below
@@ -1357,34 +1363,56 @@ func (db *db) QuickCheck(ctx context.Context) (err error) {
 }
 
 func (db *db) IntegrityCheck(ctx context.Context) (err error) {
+	// A busy error of the check's read begin matches ErrBusy, as every
+	// busy error of this package does.
+	defer func() { err = busyErr(err) }()
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if err = db.btreeDB.IntegrityCheck(); err != nil {
+	// Both checks run in one read transaction, as sqlite3BtreeIntegrityCheck
+	// runs inside the transaction of its connection (btree.c:11156): the
+	// one ctx carries, which the check waits for nothing to use, or one of
+	// its own, whose wait for a reader slot ends with ctx. A Close waits for
+	// the whole check. A write transaction that ctx carries is not checked:
+	// the check reads a committed snapshot, through a read transaction of
+	// its own.
+	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		if tx.IsWriteTx() {
+			rtx, err := db.btreeDB.BeginReadContext(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = rtx.Rollback() }()
+			tx = rtx
+		}
+		if err := tx.IntegrityCheck(); err != nil {
+			return err
+		}
+		return db.checkCatalog(tx)
+	})
+}
+
+// checkCatalog is IntegrityCheck's check of the catalog in tx: every
+// cataloged collection must have its data namespace. A missing one is the
+// signature of a rename performed by a pre-fix version (catalog re-keyed to
+// the new name, data left under the old); its data survives as an orphan
+// namespace but the collection is unopenable until manually repaired.
+func (db *db) checkCatalog(tx *btree.ReadTx) error {
+	names, err := db.listCollectionNames(tx)
+	if err != nil {
 		return err
 	}
-	// Catalog consistency: every cataloged collection must have its data
-	// namespace. A missing one is the signature of a rename performed by a
-	// pre-fix version (catalog re-keyed to the new name, data left under the
-	// old); its data survives as an orphan
-	// namespace but the collection is unopenable until manually repaired.
-	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		names, lErr := db.listCollectionNames(tx)
-		if lErr != nil {
-			return lErr
-		}
-		for _, name := range names {
-			if _, nsErr := tx.GetNamespace(name); nsErr != nil {
-				if errors.Is(nsErr, btree.ErrNamespaceNotFound) {
-					return fmt.Errorf("%w: collection %q: data namespace missing (renamed by a pre-fix version); its data survives under the pre-rename namespace name", ErrCorrupt, name)
-				}
-				// Any other failure to resolve the namespace is itself an
-				// integrity problem — never mask it as a clean result.
-				return fmt.Errorf("collection %q: resolving data namespace: %w", name, nsErr)
+	for _, name := range names {
+		if _, nsErr := tx.GetNamespace(name); nsErr != nil {
+			if errors.Is(nsErr, btree.ErrNamespaceNotFound) {
+				return fmt.Errorf("%w: collection %q: data namespace missing (renamed by a pre-fix version); its data survives under the pre-rename namespace name", ErrCorrupt, name)
 			}
+			// Any other failure to resolve the namespace is itself an
+			// integrity problem — never mask it as a clean result.
+			return fmt.Errorf("collection %q: resolving data namespace: %w", name, nsErr)
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func (db *db) Backup(ctx context.Context, path string) (err error) {

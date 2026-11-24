@@ -4941,3 +4941,14 @@ SQLite's `pager_error` moves the pager to `PAGER_ERROR` and stores the code in `
 `pagerError` ends a failed commit at once ([the eager cleanup](#old-drift-pagererror-eager-cleanup)). It stores the commit's error in `errCode`, whatever the error is, unless a failed spill has stored one already, and trips the transaction's cursors with it (`tripCursors` with `writeStateErr`) before the cleanup clears it. A cursor of the failed transaction reports why the commit failed (an I/O error, a full disk), where it reported the read-only refusal of a pager without a writer, and where SQLite's would report "abort due to ROLLBACK". That error is not damage: it matches `ErrCorrupt` only when the commit's error did.
 
 Test: `TestPagerError_CursorReportsTheCommitError` (`pager_test.go`).
+
+<a id="drift-2026-11-24-6-the-integrity-check-runs-in-a-read-transaction"></a>
+### Drift: The Integrity Check Runs In A Read Transaction
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `integrity.go:*ReadTx.IntegrityCheckN`, `integrity.go:*DB.IntegrityCheckN`.
+
+`sqlite3BtreeIntegrityCheck` runs inside the transaction its connection has open (`assert( p->inTrans>TRANS_NONE && pBt->inTransaction>TRANS_NONE );`, `btree.c:11156`), a read or a write one, and reads the pages through the connection's pager: in a write transaction it checks the transaction's own pages, committed or not.
+
+`ReadTx.IntegrityCheckN` runs in the read transaction it is called on, and takes no other transaction or reader slot, so a caller that holds the only slot can check, and the check and its caller see one snapshot. It reads that snapshot through a page cache of its own, bounded by the transaction's frame window and page count. The read view of a write transaction is refused: it has no reader cache to bound such a walk, and its uncommitted pages are in the writer's cache, which only the writer's goroutine may read. `DB.IntegrityCheckN` begins a read transaction for the check, as `PRAGMA integrity_check` begins one when the connection has none. The public `IntegrityCheck` checks in the read transaction its context carries, and in one of its own otherwise, also when the context carries a write transaction: that transaction's changes are not checked.
+
+Tests: `TestIntegrityCheck_InTheCallersReadTx` (`integrity_test.go`), `TestIntegrityCheck_ReadSlot` (`test/integrity_check_test.go`).

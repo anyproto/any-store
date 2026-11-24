@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -512,6 +513,40 @@ func TestIntegrityCheck_ClosedHandleIsErrClosed(t *testing.T) {
 			require.NotErrorIs(t, err, ErrCorrupt)
 		})
 	}
+}
+
+// The check in a read transaction the caller holds takes no other reader
+// slot: with one slot, held by that transaction, it runs, where a check
+// that began a read of its own waited for the slot its caller held. It
+// checks that transaction's snapshot. A write transaction's read view and
+// an ended transaction are refused.
+func TestIntegrityCheck_InTheCallersReadTx(t *testing.T) {
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), Options{PageSize: 4096, MaxReaders: 1})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	commitRows(t, db, "t1", 8, 100)
+
+	tx, err := db.BeginRead()
+	require.NoError(t, err)
+	done := make(chan error, 1)
+	go func() { done <- tx.IntegrityCheck() }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the check waits for the reader slot its caller holds")
+	}
+	// A commit after the snapshot is not the snapshot's.
+	commitRows(t, db, "t2", 8, 100)
+	require.NoError(t, tx.IntegrityCheckN(0))
+	require.NoError(t, tx.Rollback())
+	require.ErrorIs(t, tx.IntegrityCheck(), ErrTxClosed)
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	require.ErrorIs(t, wtx.ReadTx.IntegrityCheck(), errIntegrityCheckWriteTx)
+	require.NoError(t, wtx.Rollback())
+	require.NoError(t, db.IntegrityCheck())
 }
 
 // A page reached through a wal-index that points past the end of the log

@@ -4057,3 +4057,45 @@ func TestIntegrityCheck_MissingDataNamespaceMatchesErrCorrupt(t *testing.T) {
 	require.ErrorIs(t, err, ErrCorrupt)
 	require.Contains(t, err.Error(), "data namespace missing")
 }
+
+// mmapShm reports whether the wal-index is shared memory other processes
+// map (linux, android, darwin and ios on amd64 and arm64): only there can a
+// test tear its header, as a writer between its two copies leaves it.
+func mmapShm() bool {
+	switch runtime.GOOS {
+	case "linux", "android", "darwin", "ios":
+		return runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64"
+	}
+	return false
+}
+
+// A busy IntegrityCheck matches ErrBusy, as every busy error of the package
+// does, and keeps the btree's busy error: here a rebuild of the wal-index
+// that another connection holds past the busy timeout.
+func TestIntegrityCheck_BusyMatchesErrBusy(t *testing.T) {
+	if !mmapShm() {
+		t.Skip("the wal-index is this process's memory: no other connection rebuilds it")
+	}
+	ctx := context.Background()
+	d, err := Open(ctx, filepath.Join(t.TempDir(), "a.db"), nil)
+	require.NoError(t, err)
+	defer d.Close()
+	_, err = d.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+
+	seam := d.(*db).btreeDB.TestSeam()
+	seam.SetBusyTimeout(100 * time.Millisecond)
+	restore := seam.TearHeader()
+	unlockWrite, err := seam.Lock("write")
+	require.NoError(t, err)
+	unlockRecover, err := seam.Lock("recover")
+	require.NoError(t, err)
+	err = d.IntegrityCheck(ctx)
+	restore()
+	unlockRecover()
+	unlockWrite()
+	require.ErrorIs(t, err, ErrBusy)
+	require.ErrorIs(t, err, btree.ErrBusyRecovery)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.NoError(t, d.IntegrityCheck(ctx))
+}

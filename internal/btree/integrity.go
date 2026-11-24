@@ -618,6 +618,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 // all issues found, which matches ErrCorrupt unless a page could not be
 // read (see IntegrityError). An error of another type is a check that could not
 // start: its read transaction (ErrClosed on a closed handle), or page 1.
+// It waits for a reader slot as BeginRead does; see IntegrityCheckN.
 func (db *DB) IntegrityCheck() error {
 	return db.IntegrityCheckN(100)
 }
@@ -628,19 +629,47 @@ var testIntegritySnapshotHook func()
 
 // IntegrityCheckN is like IntegrityCheck but stops after maxErrors issues.
 // Pass 0 for unlimited.
+//
+// It checks the snapshot of a read transaction of its own, admitted as
+// every reader is (BeginRead): a handle that is closed returns ErrClosed,
+// and a Close waits for a check that has begun. A caller that holds a read
+// transaction, or must bound the wait for a reader slot, checks through
+// ReadTx.IntegrityCheckN instead.
 func (db *DB) IntegrityCheckN(maxErrors int) error {
-	// The check's snapshot is a read transaction's, admitted as every
-	// reader is: a handle that is closed returns ErrClosed, and a Close
-	// waits for a check that has begun, as sqlite3BtreeIntegrityCheck runs
-	// inside a read transaction of the connection (btree.c:11156). A
-	// pager read without the admission found a closed handle's files gone
-	// and read page 1 as zeros: a header that is not one, which matched
-	// ErrCorrupt.
 	tx, err := db.BeginRead()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	return tx.IntegrityCheckN(maxErrors)
+}
+
+// errIntegrityCheckWriteTx is ReadTx.IntegrityCheckN's refusal of the read
+// view of a write transaction: the check reads the committed snapshot of a
+// read transaction, and a write transaction has no reader cache to bound it.
+var errIntegrityCheckWriteTx = errors.New("btree: IntegrityCheck runs in a read transaction, not in a write transaction")
+
+// IntegrityCheck is DB.IntegrityCheck on the snapshot of tx, a read
+// transaction.
+func (tx *ReadTx) IntegrityCheck() error {
+	return tx.IntegrityCheckN(100)
+}
+
+// IntegrityCheckN is DB.IntegrityCheckN on the snapshot of tx, a read
+// transaction, which the check takes no other transaction or reader slot
+// for: as sqlite3BtreeIntegrityCheck runs inside the transaction its
+// connection has open (btree.c:11156). The read view of a write
+// transaction is refused: the check walks a committed snapshot, through
+// a reader cache of its own.
+// DRIFT: the check runs in a read transaction only; sqlite3BtreeIntegrityCheck also runs in a write transaction, over its uncommitted pages. See docs/btree/NOTES.md#drift-2026-11-24-6-the-integrity-check-runs-in-a-read-transaction
+func (tx *ReadTx) IntegrityCheckN(maxErrors int) error {
+	if tx.closed {
+		return ErrTxClosed
+	}
+	if tx.writable {
+		return errIntegrityCheckWriteTx
+	}
+	db := tx.db
 	maxFrame := tx.walMaxFrame
 
 	// Use a private reader cache to avoid racing with the writer's cache.
