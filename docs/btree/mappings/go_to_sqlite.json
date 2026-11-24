@@ -2209,7 +2209,7 @@
     "sqlite": [
       "pager.c:pager_error"
     ],
-    "note": "a failed commit's end: the state and the cleanup at once. errCode is the commit's error, or, when its fetch of page 1 met a failed spill, the one pagerStress set already; pagerError trips the cursors with it and clears it (drift-2026-11-24-5). SQLite's failed WAL commit never enters PAGER_ERROR: pagerWalFrames returns the error (pager.c:6512, 3219-3236), pager_error stores only IOERR/FULL (pager.c:1955-1958), and the transaction is rolled back as any other (sqlite3PagerRollback, pager.c:6779-6782), its cursors tripped with SQLITE_ABORT_ROLLBACK (btree.c:4524-4533). A failed spill only records the error (pagerStress, pager.errCode) and rollbackLocked cleans up"
+    "note": "a failed commit's end: the state and the cleanup at once. errCode is the commit's error, or, when its fetch of page 1 met a failed spill, the one pagerStress set already; pagerError trips the cursors with it and clears it (drift-2026-11-24-5). SQLite's failed WAL commit never enters PAGER_ERROR: pagerWalFrames returns the error (pager.c:6512, 3219-3236), pager_error stores only IOERR/FULL (pager.c:1955-1958), and vdbeHalt rolls the transaction back with sqlite3RollbackAll(db, SQLITE_OK) (vdbeaux.c:3417-3425, main.c:1505), with which sqlite3BtreeRollback saves the cursors and trips them only with a failed save's error (btree.c:4526-4533), then rolls the pager back (sqlite3PagerRollback, pager.c:6779-6782); SQLITE_ABORT_ROLLBACK is the trip code of a statement that fails before its commit (vdbeaux.c:3378). A failed spill only records the error (pagerStress, pager.errCode) and rollbackLocked cleans up"
   },
   "pager.go:*pager.pagerPageCount": {
     "sqlite": [

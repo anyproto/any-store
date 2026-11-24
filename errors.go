@@ -255,21 +255,24 @@ var (
 	// ErrBackupFormatMismatch is returned (wrapped) by Backup when the file at its path is a
 	// database of another schema format than this one's (SchemaFormat). A backup copies the
 	// pages as they are, so it would turn the file into one of this database's format under
-	// whatever has it open. Nothing is written to the file. Back up to a new path, or to a
-	// database of this one's format.
+	// whatever has it open. No page of this database is copied, and the file keeps its
+	// contents; closing it may checkpoint its write-ahead log into it, as closing any database
+	// may. Back up to a new path, or to a database of this one's format.
 	ErrBackupFormatMismatch = btree.ErrBackupFormatMismatch
 
 	// ErrBackupCodecMismatch is returned (wrapped) by Backup when the file at its path is a
 	// database whose pages are laid out another way than this one's: plain, with checksums,
-	// or encrypted (an in-memory database's pages are plain). Nothing is written to the file.
-	// Back up to a new path, or to a database of this one's kind.
+	// or encrypted (an in-memory database's pages are plain). No page of this database is
+	// copied, and the file keeps its contents; closing it may checkpoint its write-ahead log
+	// into it, as closing any database may. Back up to a new path, or to a database of this
+	// one's kind.
 	ErrBackupCodecMismatch = btree.ErrBackupCodecMismatch
 
 	// ErrIncompatibleVersion is returned (wrapped) by Open, and by Backup for its destination,
 	// when the file was written in a format newer than this release reads, or its write-ahead log
-	// was, or a process that has the file open uses an index of the log (path+"-wal-shm") of a
-	// newer format. The files are intact and are left unchanged; open them with a release that
-	// knows the format. It does not match ErrCorrupt.
+	// has a version this release does not read, or a process that has the file open uses an
+	// index of the log (path+"-wal-shm") of a version this release does not use. The files are
+	// left unchanged; open them with the release that wrote them. It does not match ErrCorrupt.
 	ErrIncompatibleVersion = errors.New("any-store: incompatible version")
 
 	// ErrV1Database is returned by Open when the file was created by any-store
@@ -282,10 +285,11 @@ var (
 	// key opens it. It does not match ErrCorrupt or ErrPageIntegrity, and Config.OnIntegrityError
 	// is not called.
 	//
-	// Open authenticates page 1 with the key, once the file header and the database size it
-	// records have passed their checks (a header that fails them is ErrHeaderCorrupt, whatever
-	// the key). When that fails, it tries up to 16 other pages, spread over the database, with
-	// the same key:
+	// Open authenticates page 1 with the key once the file header and the database size it
+	// records have passed their checks, which do not depend on the key: a header that is
+	// malformed, or does not fit the file, is ErrHeaderCorrupt, and one of a newer format
+	// ErrIncompatibleVersion, whatever the key. When the authentication fails, Open tries up to
+	// 16 other pages, spread over the database, with the same key:
 	//
 	//   - if one of them authenticates, the key is right and page 1 is damaged: Open returns an
 	//     error that matches ErrPageIntegrity and ErrCorrupt, and Config.OnIntegrityError is
@@ -296,8 +300,8 @@ var (
 	//
 	// A wrong key is never reported as corruption: it would have to pass a page's
 	// authentication tag, a chance of about 2^-128. The reverse can happen: a database that is
-	// damaged on page 1 and on every other page tried, or that has no other page (a new, empty
-	// database is one page), is reported as ErrWrongKey although the key is right. So does a
+	// damaged on page 1 and on every other page tried, or that has no page but page 1, is
+	// reported as ErrWrongKey although the key is right. So does a
 	// file whose key salt in the header (bytes 72-87) was overwritten with another value that is
 	// not all zeros, when the key is derived from a passphrase; a salt overwritten with zeros
 	// makes the file one that is not encrypted, ErrNotEncrypted. ErrWrongKey therefore means

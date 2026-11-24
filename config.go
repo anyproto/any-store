@@ -209,8 +209,11 @@ type Config struct {
 	// as it happens: a page 1 that fails it may be a wrong key, and Open
 	// tells the two apart first (see ErrWrongKey). A wrong key calls the
 	// callback for no page, neither page 1 nor the other pages Open
-	// tried. A right key with a damaged page 1 calls it once, for page
-	// 1, before Open returns ErrPageIntegrity.
+	// tried. A damaged page 1 calls it once, for page 1, before Open
+	// returns ErrPageIntegrity, when another page Open tried authenticates
+	// under the key and so proves it. When none does, Open cannot tell the
+	// damage from a wrong key: it returns ErrWrongKey and calls the
+	// callback for no page, also when the key is right.
 	OnIntegrityError func(IntegrityError)
 }
 

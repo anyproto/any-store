@@ -233,7 +233,7 @@ The page-1 DB header (first 100 bytes) is outside the per-page hash; its invaria
 |---|---|
 | `ErrHeaderCorrupt` | `Open`: the file header is unusable. |
 | `ErrPageIntegrity` | A page fails its checksum or its AEAD authentication, on the read that meets it. |
-| `ErrQuickCheckFailed` | `Open` after an unclean shutdown (`Durability.Sentinel`): the quick check found damage. |
+| `ErrQuickCheckFailed` | `Open` after an unclean shutdown (`Durability.Sentinel`): the quick check, or the open's read of the catalog before it, found damage. |
 
 `IntegrityCheck` returns an error that matches `ErrCorrupt` when it found damage. A damaged write-ahead log index (`-wal-shm`, shared memory) matches `ErrCorrupt` too, as in SQLite; closing every handle on the file rebuilds it.
 

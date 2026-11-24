@@ -3917,11 +3917,15 @@ func (p *pager) rollbackForClose() {
 // spill has stored one already, and the transaction's cursors are ended
 // with it, not with the "read-only" a pager without a writer answers.
 // SQLite's pager_error stores only an SQLITE_IOERR or SQLITE_FULL
-// (pager.c:1955-1958), a failed WAL commit returns pagerWalFrames' code
-// without entering the error state (pager.c:6512), and sqlite3BtreeRollback
-// trips the cursors with SQLITE_ABORT_ROLLBACK or saves them
-// (btree.c:4524-4533).
-// DRIFT: a failed commit's error, whatever it is, is stored in errCode and ends the transaction's cursors; C's failed WAL commit never enters PAGER_ERROR, and its rollback trips cursors with SQLITE_ABORT_ROLLBACK See docs/btree/NOTES.md#drift-2026-11-24-5-a-failed-commit-ends-its-cursors-with-its-error
+// (pager.c:1955-1958), and a failed WAL commit returns pagerWalFrames' code
+// without entering the error state (pager.c:6512). vdbeHalt then rolls the
+// transaction back with sqlite3RollbackAll(db, SQLITE_OK)
+// (vdbeaux.c:3417-3425), which passes SQLITE_OK on to sqlite3BtreeRollback
+// (main.c:1505): the cursors are saved, and tripped only with the error of
+// a save that fails (btree.c:4526-4533). SQLITE_ABORT_ROLLBACK trips them on
+// the other path, a statement that fails with an I/O error, a full disk or
+// no memory before its commit (vdbeaux.c:3378).
+// DRIFT: a failed commit's error, whatever it is, is stored in errCode and ends the transaction's cursors; C's failed WAL commit never enters PAGER_ERROR, and its rollback (trip code SQLITE_OK) saves the cursors See docs/btree/NOTES.md#drift-2026-11-24-5-a-failed-commit-ends-its-cursors-with-its-error
 func (p *pager) pagerError(err error) {
 	if p.errCode == nil {
 		p.errCode = err
