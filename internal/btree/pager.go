@@ -811,16 +811,30 @@ func (p *pager) open() (err error) {
 	// stat of a file that has content.
 	p.openDev, p.openIno, p.openIdentOK = statIdentity(info)
 
-	// Existing database - read header
+	// Existing database - read header. A read that returns fewer bytes
+	// than the header is judged by the file's size, which creationPending
+	// took under the lock, and only then: a file shorter than the header
+	// holds no database, ErrHeaderCorrupt; a file that holds the header had
+	// the read come up short on its own, and the read's error is returned
+	// (io.ErrUnexpectedEOF when it gave none), as for a read of a page of
+	// the file (dbFileReadErr). sqlite3PagerReadFileheader zero-fills both
+	// (pager.c:3910-3913), and lockBtree then fails the zeros' magic.
+	// DRIFT: a read of the header at open that comes up short of bytes the file holds is the read's error, not zeros. See docs/btree/NOTES.md#drift-7-short-db-file-read-treated-as-hard-error
 	readSize := p.pageSize
 	if readSize == 0 {
 		readSize = DefaultPageSize
 	}
 	buf := make([]byte, readSize)
 	n, err := f.ReadAt(buf, 0)
-	if err != nil && n < dbHeaderSize {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return fmt.Errorf("%w: file of %d bytes is shorter than the header", ErrHeaderCorrupt, n)
+	if n < dbHeaderSize {
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return fmt.Errorf("btree: failed to read database header: %w", err)
+		}
+		if info.Size() < dbHeaderSize {
+			return fmt.Errorf("%w: file of %d bytes is shorter than the header", ErrHeaderCorrupt, info.Size())
+		}
+		if err == nil {
+			err = io.ErrUnexpectedEOF
 		}
 		return fmt.Errorf("btree: failed to read database header: %w", err)
 	}
@@ -1418,7 +1432,9 @@ func (p *pager) lockDBShared(f fileHandle, busy *beginBusy) error {
 // descriptor serves that judgement alone.
 //
 // The header is read as open reads it: under the shared DB-file lock, and
-// not while a creation is pending.
+// not while a creation is pending. A read that fails, or that returns
+// fewer bytes than the header with no error, judges nothing: the bytes it
+// did not return are not the file's.
 func (p *pager) headerErrorOfUnwritableFile() error {
 	f, err := osOpenFile(p.path, os.O_RDONLY, 0)
 	if err != nil {
@@ -1432,7 +1448,7 @@ func (p *pager) headerErrorOfUnwritableFile() error {
 		return nil
 	}
 	buf := make([]byte, dbHeaderSize)
-	if _, err := f.ReadAt(buf, 0); err != nil {
+	if n, err := f.ReadAt(buf, 0); err != nil || n < len(buf) {
 		return nil
 	}
 	var h dbHeader
@@ -2458,7 +2474,10 @@ func (p *pager) readRawPage(pgno, walMaxFrame uint32, cache *pcache) ([]byte, er
 // readRawPage1Header is readRawPage for page 1's header alone: the first
 // len(buf) bytes of page 1 (dbHeaderSize of them are outside the codec),
 // from its newest WAL frame in the reader's window, else from the database
-// file. For a page 1 that cannot be read whole.
+// file. For a page 1 that cannot be read whole. A read that does not
+// return all of them is judged as every read of a page is: of the file by
+// readDBPage (dbFileReadErr), of a frame by its count (frameReadResult).
+// Nothing is decoded from bytes the read did not return.
 func (p *pager) readRawPage1Header(walMaxFrame uint32, cache *pcache, buf []byte) error {
 	if walMaxFrame > 0 && p.wal != nil {
 		frame, err := p.wal.index.get(1, walMaxFrame, p.readerMinFrame(cache))
@@ -2473,7 +2492,7 @@ func (p *pager) readRawPage1Header(walMaxFrame uint32, cache *pcache, buf []byte
 		}
 	}
 	if p.file != nil {
-		if _, err := p.file.ReadAt(buf, 0); err != nil {
+		if err := p.readDBPage(1, buf); err != nil {
 			return fmt.Errorf("btree: readRawPage1Header: %w", err)
 		}
 		return nil

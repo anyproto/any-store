@@ -2500,10 +2500,20 @@ func (w *wal) writeHeader() error {
 func (w *wal) recoverLocked() error {
 	w.headerOnDisk = true
 
+	// The caller has found the file to hold the header (its Stat, under the
+	// locks it holds), so a read of it that comes up short came up short on
+	// its own: the read's error, io.ErrUnexpectedEOF when it gave none, and
+	// not a header of zeros, which would start the log over. It is not
+	// ErrWALShortRead: no wal-index has pointed at a frame, and a frame read
+	// that comes up short is what that error means. walIndexRecover returns
+	// the header read's code (wal.c:1429-1431).
 	buf := make([]byte, walHeaderSize)
 	if n, err := w.file.ReadAt(buf, 0); err != nil || n < len(buf) {
-		if err = frameReadResult(len(buf), n, err); err != nil {
-			return err
+		if n < len(buf) || !errors.Is(err, io.EOF) {
+			if err == nil {
+				err = io.ErrUnexpectedEOF
+			}
+			return fmt.Errorf("btree: WAL recovery: read the WAL header: %w", err)
 		}
 	}
 	if err := w.header.deserialize(buf); err != nil {

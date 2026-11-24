@@ -2337,17 +2337,17 @@ which can return outdated page content as if it were current.
 
 C `sqlite3WalReadFrame` (`wal.c:3649-3664`) is a bare `sqlite3OsRead` with no bounds check: `return sqlite3OsRead(pWal->pWalFd, pOut, (nOut>sz ? sz : nOut), iOffset);`. A read past the physical WAL tail surfaces as the OS layer's code (`SQLITE_IOERR_SHORT_READ` from `unixRead`), and `readDbPage` forgives short reads only on the DB-file branch, never the WAL branch (`pager.c:3042-3045`). The checkpoint's reads and a commit's reread of the frames whose checksums it rewrites return `sqlite3OsRead`'s code too (`walCheckpoint`, `wal.c:2311-2312`; `walRewriteChecksums`, `wal.c:4002`, `4010`).
 
-Every read of a WAL frame that does not return all its bytes with no error goes through `frameReadResult`, and nothing else does: the page readers, the checkpoint's reads of the frame headers and pages, and the commit's reread in `rewriteChecksums`. It judges the read by its count as well as its error. All the bytes with `io.EOF`, which `ReadAt` may return for a read that ends at the end of the file, are a read that succeeded. Fewer are a short read (`frameReadErr`), whatever the error that came with them: `ErrWALShortRead`, with the read's `io.EOF` or `io.ErrUnexpectedEOF` in the chain, and `io.ErrUnexpectedEOF` when a file system returned a short count with no error, as some do, which would otherwise hand a partial page to the codec, a checksum failure, damage. `ErrWALShortRead` means the wal-index points at a frame the file does not hold. Like `SQLITE_IOERR_SHORT_READ` it is an I/O error and not damage: the database file is sound, and an open after every handle has closed rebuilds the index from the log. Every other failure of the read is returned as it is, as in C. Recovery's reads, of the header and of frames within the file's size, take the same count rule.
+Every read of a WAL frame that does not return all its bytes with no error goes through `frameReadResult`, and nothing else does: the page readers, the checkpoint's reads of the frame headers and pages, and the commit's reread in `rewriteChecksums`. It judges the read by its count as well as its error. All the bytes with `io.EOF`, which `ReadAt` may return for a read that ends at the end of the file, are a read that succeeded. Fewer are a short read (`frameReadErr`), whatever the error that came with them: `ErrWALShortRead`, with the read's `io.EOF` or `io.ErrUnexpectedEOF` in the chain, and `io.ErrUnexpectedEOF` when a file system returned a short count with no error, as some do, which would otherwise hand a partial page to the codec, a checksum failure, damage. `ErrWALShortRead` means the wal-index points at a frame the file does not hold. Like `SQLITE_IOERR_SHORT_READ` it is an I/O error and not damage: the database file is sound, and an open after every handle has closed rebuilds the index from the log. Every other failure of the read is returned as it is, as in C. Recovery's reads of frames within the file's size take the same rule. Its read of the WAL header, which its caller found the file to hold, is judged by its count too, and a short one is the read's error (`io.ErrUnexpectedEOF` when it gave none): not a header of zeros, which would start the log over, and not `ErrWALShortRead`, since no wal-index has pointed at a frame. `walIndexRecover` returns the header read's code (`wal.c:1429-1431`).
 
 The frame-number guards in front of the read (frame 0, a frame above the count of a log only this process writes, an in-memory frame that is missing) are assertions in SQLite's terms: they return `errWalFrameRange`, which matches no exported error.
 
-Tests: `TestFrameReadErr`, `TestWALClosedFileReadIsErrClosed`, `TestRewriteChecksums_ShortReadIsErrWALShortRead` (`wal_test.go`), `TestWALFrameReadErrorsThroughEveryReader` (`pager_readfault_test.go`), `TestWALFrameRead_CountsItsBytes` (`pager_short_read_vfs_test.go`), `TestCheckpointWithMode_FileReadPageDataError` (`pager_test.go`), `TestIntegrityCheck_ShortWALReadKeepsItsIdentity` (`integrity_test.go`), `TestFlush_ShortWALReadIsErrWALShortRead` (`test/db_test.go`).
+Tests: `TestFrameReadErr`, `TestWALClosedFileReadIsErrClosed`, `TestRewriteChecksums_ShortReadIsErrWALShortRead` (`wal_test.go`), `TestWALFrameReadErrorsThroughEveryReader` (`pager_readfault_test.go`), `TestWALFrameRead_CountsItsBytes`, `TestWALRecovery_ShortReadOfTheHeader` (`pager_short_read_vfs_test.go`), `TestCheckpointWithMode_FileReadPageDataError` (`pager_test.go`), `TestIntegrityCheck_ShortWALReadKeepsItsIdentity` (`integrity_test.go`), `TestFlush_ShortWALReadIsErrWALShortRead` (`test/db_test.go`).
 
 
 <a id="drift-7-short-db-file-read-treated-as-hard-error"></a>
 ### Drift: A Short Read Of A Page Of The Database File Is An Error, Not Zeros
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `pager.go:*pager.dbFileReadErr`, and its callers `pager.go:*pager.readDBPage` (every page getter's read of the database file, `readRawPage` included), `pager.go:*pager.readPage1AtOpen`, `pager.go:*pager.proveKeyAtOpen`.
+- **Affected functions:** `pager.go:*pager.dbFileReadErr`, and its callers `pager.go:*pager.readDBPage` (every page getter's read of the database file, `readRawPage` and `readRawPage1Header` included), `pager.go:*pager.readPage1AtOpen`, `pager.go:*pager.proveKeyAtOpen`; the open's first read of the header, `pager.go:*pager.open`, and `pager.go:*pager.headerErrorOfUnwritableFile`.
 
 C `readDbPage` maps a short read of a page of the database file to success: after
 `sqlite3OsRead`, `if( rc==SQLITE_IOERR_SHORT_READ ){ rc = SQLITE_OK; }`
@@ -2371,18 +2371,26 @@ goes to `dbFileReadErr`, and nothing else does: a read that succeeds pays nothin
   `ErrCorrupt`, for a plain page as for one with a checksum or a tag.
 - Any other error of the read is returned as it is, as in C.
 
-At open, page 1 is read the same way, and a page 1 the file ends inside past its header is
-reported after the header and the size have been judged, which it does not change
+At open, the first read of the header, under the DB-file lock, is judged by the file's size
+that the open took under the lock: a file shorter than the header is `ErrHeaderCorrupt`, and a
+read that comes up short of a header the file holds is the read's error, where
+`sqlite3PagerReadFileheader` zero-fills it (`pager.c:3910-3913`) and `lockBtree` then fails the
+zeros' magic. A file that opens only for reading has its header judged only from a read that
+returned all of it (`headerErrorOfUnwritableFile`); any other read leaves the open's own error.
+Page 1 is then read the same way as every page, and a page 1 the file ends inside past its
+header is reported after the header and the size have been judged, which it does not change
 (`readPage1AtOpen`). The key probe counts a page the file ends inside with the pages that fail
 their authentication, and a short read of bytes the file holds as a page it could not read
 ([drift-2026-11-24-3](#drift-2026-11-24-3-open-tells-a-wrong-key-from-a-damaged-page-1)).
+`VerifyIntegrity`'s read of page 1's header alone, for a page 1 that cannot be read whole, is a
+read of the database file as every other (`readRawPage1Header`).
 
 A database written by a release before the dontWrite removal (resolved entry 5 under Known
 Implementation Gaps) can have a freed page at the end that is in neither the WAL nor the file
 until its next full checkpoint extends the file. A read of it (`Backup`, `VerifyIntegrity`) is
 `ErrCorrupt` here, where C reads zeros.
 
-Tests: `TestReadDBPage_PageCutShortIsCorrupt` (`pager_test.go`), `TestReadDBPage_ShortReadOfBytesTheFileHolds`, `TestOpen_ShortReadInTheKeyProofIsAReadError`, `TestOpen_ShortReadOfPage1IsAReadError` (`pager_short_read_vfs_test.go`), `TestOpen_DirtyCatalogPageCutShort` (`test/dirty_open_test.go`), `TestReadFault_IterShortRead` (`iterator_vfs_test.go`).
+Tests: `TestReadDBPage_PageCutShortIsCorrupt` (`pager_test.go`), `TestReadDBPage_ShortReadOfBytesTheFileHolds`, `TestOpen_ShortReadInTheKeyProofIsAReadError`, `TestOpen_ShortReadOfPage1IsAReadError`, `TestOpen_ShortReadOfTheHeaderIsAReadError`, `TestOpen_ShortReadOfAnUnwritableFilesHeader`, `TestVerifyIntegrity_ShortReadOfPage1sHeader` (`pager_short_read_vfs_test.go`), `TestOpen_DirtyCatalogPageCutShort` (`test/dirty_open_test.go`), `TestReadFault_IterShortRead` (`iterator_vfs_test.go`).
 
 <a id="drift-nocontent-realloc-savepoint-copy"></a>
 ### Drift: NOCONTENT Freelist Reallocation Under A Savepoint Is Journaled
@@ -3233,10 +3241,20 @@ point. It differs from `pager.c` in these points.
    with `fdatasync`, the package's sync primitive
    ([drift-121](#drift-121-fdatasync-durability-primitive-platform-split-undocumented)), which is
    `F_FULLFSYNC` on Darwin, where SQLite's default is a plain `fsync`.
+5. *A short read of the header is judged by the journal's size.* `hasHotJournal` reads the
+   journal's first byte and takes a short read for a zero byte, a journal that is not hot
+   (`pager.c:5198-5205`). `hasHotCreationJournal` reads the whole header, and when the read comes
+   up short it looks at the journal's size, and only then: a journal shorter than its header is
+   not hot, and one that holds it fails the open with the read's error (`io.ErrUnexpectedEOF`
+   when it gave none). A dead creator's journal taken for one that is not hot would stay beside
+   the database the handle commits to, and the next open would play it back and truncate the
+   database to nothing. `readJournalHdr` reads a header only within the journal's size
+   (`pager.c:1597-1599`) and returns a failed read's code (`pager.c:1608-1611`).
 
 Tests: `creation_journal_test.go` (`TestCreationJournal_WhichHeaderIsHot`,
 `_HotJournalRollsBackWhateverIsInTheFile`, `_JournalThatIsNotHotIsLeftAlone`,
-`_JournalBesideEmptyFileIsDeleted`), and the process-kill and power-loss tests listed under
+`_JournalBesideEmptyFileIsDeleted`), `TestCreationJournal_ShortReadOfAHotJournalFailsTheOpen`
+(`pager_short_read_vfs_test.go`), and the process-kill and power-loss tests listed under
 drift-63.
 
 <a id="drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl"></a>

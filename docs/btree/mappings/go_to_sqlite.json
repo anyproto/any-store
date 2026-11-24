@@ -892,7 +892,7 @@
       "pager.c:hasHotJournal",
       "pager.c:readJournalHdr"
     ],
-    "note": "hot only with a whole creation header of any-store's magic and an original size of zero; the reserved-lock test is the caller's DB-file lock"
+    "note": "hot only with a whole creation header of any-store's magic and an original size of zero; the reserved-lock test is the caller's DB-file lock; a short read of a journal that holds its header fails the open (drift-2026-11-21-7)"
   },
   "creation_journal.go:*pager.openCreationJournal": {
     "sqlite": [
@@ -2197,9 +2197,10 @@
     "sqlite": [
       "btree.c:lockBtree",
       "pager.c:pagerPagecount",
-      "pager.c:sqlite3PagerOpen"
+      "pager.c:sqlite3PagerOpen",
+      "pager.c:sqlite3PagerReadFileheader"
     ],
-    "note": "page 1 and the page count are read at one snapshot in readPage1AtOpen"
+    "note": "page 1 and the page count are read at one snapshot in readPage1AtOpen; the first read of the header, under the DB-file lock, that comes up short is judged by the file's size: the read's error when the file holds the header, ErrHeaderCorrupt when it is shorter (drift-7)"
   },
   "pager.go:*pager.page1FrameHeader": {
     "sqlite": [],
@@ -2284,7 +2285,7 @@
   },
   "pager.go:*pager.readRawPage1Header": {
     "sqlite": [],
-    "note": "page 1's header alone, for a page 1 the codec sweep cannot read whole"
+    "note": "page 1's header alone, for a page 1 the codec sweep cannot read whole; the file is read through readDBPage, a frame by its count (drift-7)"
   },
   "pager.go:*pager.readTempPage": {
     "sqlite": [
