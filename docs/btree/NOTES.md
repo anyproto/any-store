@@ -2839,10 +2839,16 @@ first look, before anything is created (`db.go:Open`).
 The passphrase codec follows the same rule. `Open` builds it from a first, unlocked read of the
 header when it can (so the key derivation mostly runs with no lock held), and `pager.open` calls
 `settleCodec` again on the header it read under the lock, and with "no database" before it asks
-for the exclusive lock. The second call
-does nothing unless the file changed state in between; then the codec is rebuilt from the salt
-in the file. A new database keeps the salt drawn for it only if this open is the one that
-writes page 1.
+for the exclusive lock. A later call does nothing while the codec was built for the salt the
+file carries: the salt in the header of a database, or, while the file holds no database, a salt
+drawn for a new file. That covers every open of an existing database and the open that creates
+one, whose page 1 carries the salt drawn for it, so each derives the key once, as SQLCipher
+derives a codec context's key once, at its first use (`sqlcipher_codec_key_derive`,
+`sqlcipher.c:1849-1880`, SQLCipher v4.14.0). When another process created the database in
+between, the codec is rebuilt from the salt in the file; when the first look read a header and
+the open then finds the creation pending (a dead creator's page 1, rolled back under the lock),
+it is rebuilt from a salt drawn for a new file. A new database keeps the salt drawn for it only
+if this open is the one that writes page 1.
 
 **What still differs from SQLite.**
 
@@ -2905,7 +2911,9 @@ Tests (`multiprocess_create_test.go`, two processes, one held at a named point o
 write while a second process opens the path; plain and passphrase),
 `TestMultiProcessCreateManyAtOnce` (six processes released together),
 `TestMultiProcessCreateLoserKeyFromWinnersSalt` (an open that saw no file and then finds another
-process's encrypted database), `TestStaleWALBesideEmptyDatabaseNotReplayed` (a killed process's
+process's encrypted database), `TestOpen_PassphraseKeyDerivedOncePerOpen`
+(`encryption_integration_test.go`: one key derivation by an open that creates an encrypted
+database and one by an open of it), `TestStaleWALBesideEmptyDatabaseNotReplayed` (a killed process's
 WAL beside a removed or truncated main file, whole database or its tail in the WAL, plain and
 passphrase, both wal-index modes), `TestCreationJournal_CreatorKilled` (a creator killed with
 SIGKILL at each step of its creation, plain and passphrase),
