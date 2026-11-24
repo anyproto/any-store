@@ -592,6 +592,65 @@ func TestCopyToLatestFormat_OldReleaseData(t *testing.T) {
 		assert.Contains(t, err.Error(), "IVF requires existing documents")
 		assertNoCopy(t, dstPath)
 	})
+	t.Run("an IVF index over fewer vectors than its NList is copied", func(t *testing.T) {
+		// Created over 8 vectors with 8 cells, then one deleted: the
+		// source's index works, and the copy keeps its definition, built
+		// over the 7 vectors left, where creating it anew is refused.
+		src, _ := openSource(t, nil)
+		coll, err := src.CreateCollection(ctx, "emb")
+		require.NoError(t, err)
+		vecs := vrand(8, 8, 5)
+		for i, v := range vecs {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, v))))
+		}
+		info := IndexInfo{Name: "ivf", Kind: IndexKindVector,
+			Vector: &VectorParams{Field: "v", Dim: 8, Metric: VectorL2, Mode: VectorModeIVFSQ, NList: 8}}
+		require.NoError(t, coll.CreateIndex(ctx, info))
+		require.NoError(t, coll.DeleteId(ctx, 0))
+		fresh := info
+		fresh.Name = "fresh"
+		require.ErrorIs(t, coll.CreateIndex(ctx, fresh), ErrInvalidConfig)
+
+		dstPath := filepath.Join(t.TempDir(), "copy.db")
+		report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+		require.NoError(t, err)
+		assert.Equal(t, 1, report.Indexes)
+		dstColl, err := openCopy(t, dstPath, nil).OpenCollection(ctx, "emb")
+		require.NoError(t, err)
+		require.NoError(t, dstColl.EnsureIndex(ctx, info), "the copy's definition is the source's")
+		assert.Equal(t, 3, nearestId(t, dstColl, fmt.Sprintf(`{"v":{"$knn":{"$query":%s,"$k":1}}}`, vqJSON(vecs[3]))))
+	})
+	t.Run("a vector index defined past today's bounds is copied as it is", func(t *testing.T) {
+		// As TestVectorIndex_EnsureKeepsEarlierDefinition: the catalog
+		// records an earlier release's CreateIndex wrote, unchecked.
+		src, _ := openSource(t, nil)
+		coll, err := src.CreateCollection(ctx, "emb")
+		require.NoError(t, err)
+		vecs := vrand(20, 4, 7)
+		for i, v := range vecs {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, v))))
+		}
+		olds := []IndexInfo{
+			{Name: "old", Kind: IndexKindVector,
+				Vector: &VectorParams{Field: "v", Dim: 4, Mode: VectorModeBruteForce, EfSearch: maxVectorEf + 1}},
+			{Name: "oldnan", Kind: IndexKindVector,
+				Vector: &VectorParams{Field: "v", Dim: 4, Mode: VectorModeBruteForce, CompactRatio: math.NaN()}},
+		}
+		d := src.(*db)
+		for _, old := range olds {
+			thisBuildTx(t, d, func(tx *btree.WriteTx) error { return d.registerIndex(tx, "emb", old) })
+		}
+
+		dstPath := filepath.Join(t.TempDir(), "copy.db")
+		report, err := CopyToLatestFormat(ctx, src, dstPath, nil)
+		require.NoError(t, err)
+		assert.Equal(t, len(olds), report.Indexes)
+		dstColl, err := openCopy(t, dstPath, nil).OpenCollection(ctx, "emb")
+		require.NoError(t, err)
+		for _, old := range olds {
+			require.NoError(t, dstColl.EnsureIndex(ctx, old), old.Name)
+		}
+	})
 	t.Run("an index in a removed vector mode fails the copy", func(t *testing.T) {
 		src, _ := openSource(t, nil)
 		coll, err := src.CreateCollection(ctx, "emb")

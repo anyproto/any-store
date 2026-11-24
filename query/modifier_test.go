@@ -3,8 +3,6 @@ package query
 import (
 	"fmt"
 	"slices"
-	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -651,53 +649,36 @@ func BenchmarkModifier(b *testing.B) {
 	})
 }
 
-// A $set of the value the field holds, to the order of its objects' fields,
-// keeps the document's own value and reports no change. A value that is
-// equal but orders an object's fields otherwise is stored, so the field
-// order a later write keeps is the operand's, and still reports no change.
-func TestModifierSet_IdenticalKeepsTheValue(t *testing.T) {
-	for _, tc := range []struct {
-		mod, doc string
-		kept     bool
-	}{
-		{`{"$set":{"a":[1,2,{"x":1,"y":[3]}]}}`, `{"a":[1,2,{"x":1,"y":[3]}]}`, true},
-		{`{"$set":{"a":{"x":1,"y":"s"}}}`, `{"a":{"x":1,"y":"s"}}`, true},
-		{`{"$set":{"a":5}}`, `{"a":5}`, true},
-		{`{"$set":{"a":{"y":"s","x":1}}}`, `{"a":{"x":1,"y":"s"}}`, false},
-		{`{"$set":{"a":[{"y":1,"x":1}]}}`, `{"a":[{"x":1,"y":1}]}`, false},
+// $set stores a copy of its operand also where the field holds an equal
+// value, and reports no change for that. The field's own value is not kept:
+// in a document built in Go it can be shared with another field, and a later
+// operation of the modifier would change both. Here left and right are one
+// empty array, and $set of [] to left gives left an array of its own, so the
+// $push to right leaves it empty. A value equal but with an object's fields
+// in another order reports no change too, and the copy stored has the
+// operand's order.
+func TestModifierSet_StoresItsOwnCopy(t *testing.T) {
+	a := &anyenc.Arena{}
+	shared := a.NewArray()
+	doc := a.NewObject()
+	doc.Set("left", shared)
+	doc.Set("right", shared)
+	res, modified, err := MustParseModifier(`{"$set":{"left":[]},"$push":{"right":1}}`).Modify(a, doc)
+	require.NoError(t, err)
+	assert.True(t, modified)
+	assert.Equal(t, `{"left":[],"right":[1]}`, res.String())
+
+	for _, tc := range []struct{ mod, doc string }{
+		{`{"$set":{"a":[1,2,{"x":1,"y":[3]}]}}`, `{"a":[1,2,{"x":1,"y":[3]}]}`},
+		{`{"$set":{"a":{"y":"s","x":1}}}`, `{"a":{"x":1,"y":"s"}}`},
 	} {
-		mod := MustParseModifier(tc.mod)
 		doc := anyenc.MustParseJson(tc.doc)
 		before := doc.Get("a")
-		res, modified, err := mod.Modify(&anyenc.Arena{}, doc)
+		res, modified, err := MustParseModifier(tc.mod).Modify(&anyenc.Arena{}, doc)
 		require.NoError(t, err)
 		assert.False(t, modified, tc.mod)
-		assert.Equal(t, tc.kept, res.Get("a") == before, tc.mod)
+		assert.NotSame(t, before, res.Get("a"), tc.mod)
 		assert.Equal(t, anyenc.MustParseJson(tc.mod).Get("$set", "a").String(), res.Get("a").String(), tc.mod)
-	}
-}
-
-// A filtered $set that matches documents already holding its value: a
-// 10,000-number array set to itself. The document is given its own array
-// back before each run, so every run starts from the same document.
-func BenchmarkModifier_SetIdenticalArray(b *testing.B) {
-	nums := make([]string, 10_000)
-	for i := range nums {
-		nums[i] = strconv.Itoa(i)
-	}
-	arr := "[" + strings.Join(nums, ",") + "]"
-	mod := MustParseModifier(`{"$set":{"arr":` + arr + `}}`)
-	doc := anyenc.MustParseJson(`{"id":1,"arr":` + arr + `}`)
-	orig := doc.Get("arr")
-	a := &anyenc.Arena{}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		doc.Set("arr", orig)
-		a.Reset()
-		if _, modified, err := mod.Modify(a, doc); err != nil || modified {
-			b.Fatal(modified, err)
-		}
 	}
 }
 
@@ -981,6 +962,10 @@ func TestModifier_RemovalPathViability(t *testing.T) {
 		{`{"$pop":{"items.3.x":1},"$set":{"seen":true}}`, `{"items":[]}`, `{"items":[],"seen":true}`, true},
 		{`{"$pullAll":{"items.3.x":[1]},"$set":{"seen":true}}`, `{"items":[]}`, `{"items":[],"seen":true}`, true},
 		{`{"$rename":{"items.3.x":"y"},"$set":{"seen":true}}`, `{"items":[]}`, `{"items":[],"seen":true}`, true},
+		// An index no 32-bit int holds is an index past the end on every
+		// target, up to MongoDB's bound, 2^32-1.
+		{`{"$pull":{"items.2147483648.x":1},"$set":{"seen":true}}`, `{"items":[]}`, `{"items":[],"seen":true}`, true},
+		{`{"$pop":{"items.4294967295.x":1},"$set":{"seen":true}}`, `{"items":[]}`, `{"items":[],"seen":true}`, true},
 		{`{"$pull":{"items.3":1}}`, `{"items":[]}`, `{"items":[]}`, false},
 		{`{"$unset":{"a.b":""}}`, `{"a":1}`, `{"a":1}`, false},
 		{`{"$unset":{"a.b.c":""}}`, `{"a":{"b":null}}`, `{"a":{"b":null}}`, false},
@@ -998,6 +983,11 @@ func TestModifier_RemovalPathViability(t *testing.T) {
 			`$rename: cannot use the part 'bad' of 'items.bad.x' to traverse the element []`},
 		{`{"$pull":{"items.bad":1}}`, `{"items":[1]}`,
 			`$pull: cannot use the part 'bad' of 'items.bad' to traverse the element [1]`},
+		// Past 2^32-1, or with a sign, a part is a name, as in MongoDB.
+		{`{"$pull":{"items.4294967296.x":1},"$set":{"seen":true}}`, `{"items":[]}`,
+			`$pull: cannot use the part '4294967296' of 'items.4294967296.x' to traverse the element []`},
+		{`{"$pull":{"items.+3.x":1}}`, `{"items":[]}`,
+			`$pull: cannot use the part '+3' of 'items.+3.x' to traverse the element []`},
 		{`{"$pull":{"a.b":1}}`, `{"a":1}`,
 			`$pull: cannot use the part 'b' of 'a.b' to traverse the element 1`},
 		{`{"$pop":{"a.b.c":1}}`, `{"a":{"b":null}}`,

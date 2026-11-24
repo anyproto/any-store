@@ -1,9 +1,7 @@
 package query
 
 import (
-	"bytes"
 	"fmt"
-	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -78,56 +76,6 @@ func stored(a *anyenc.Arena, val *anyenc.Value) *anyenc.Value {
 	return a.Copy(val)
 }
 
-// identical reports whether a and b are the same value to the order of
-// their objects' fields and the bits of their numbers: what storing b in
-// place of a leaves as it was. anyencutil.Equal is looser — it compares
-// objects whatever their fields' order and numbers as float64 — so a $set
-// it finds equal can still change the document: a field order is observable
-// (it is stored, and read back).
-func identical(a, b *anyenc.Value) bool {
-	if a == b {
-		return true
-	}
-	if a == nil || b == nil || a.Type() != b.Type() {
-		return false
-	}
-	switch a.Type() {
-	case anyenc.TypeNumber:
-		return math.Float64bits(a.GetFloat64()) == math.Float64bits(b.GetFloat64())
-	case anyenc.TypeArray:
-		aa, ba := a.GetArray(), b.GetArray()
-		if len(aa) != len(ba) {
-			return false
-		}
-		for i := range aa {
-			if !identical(aa[i], ba[i]) {
-				return false
-			}
-		}
-		return true
-	case anyenc.TypeObject:
-		ao, bo := a.GetObject(), b.GetObject()
-		if ao.Len() != bo.Len() {
-			return false
-		}
-		type field struct {
-			key []byte
-			val *anyenc.Value
-		}
-		fields := make([]field, 0, bo.Len())
-		bo.Visit(func(k []byte, v *anyenc.Value) {
-			fields = append(fields, field{k, v})
-		})
-		i, same := 0, true
-		ao.Visit(func(k []byte, v *anyenc.Value) {
-			same = same && bytes.Equal(k, fields[i].key) && identical(v, fields[i].val)
-			i++
-		})
-		return same
-	}
-	return anyencutil.Equal(a, b)
-}
-
 func (m paddingStaged) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
 	if v == nil {
 		return m.ModifierChain.Modify(a, v)
@@ -187,12 +135,6 @@ type modifierSet struct {
 
 func (m modifierSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
-		if identical(value, m.val) {
-			// The field holds the operand already, to the order of its
-			// objects' fields: the document stays as it is, and a copy of
-			// the operand would be made only to be dropped.
-			return value, nil
-		}
 		modified = !anyencutil.Equal(value, m.val)
 		return stored(a, m.val), nil
 	})
@@ -293,16 +235,20 @@ func walkExisting(v *anyenc.Value, path []string, op string, allowNonViable bool
 }
 
 // canHoldField reports whether part could name a field of v that v does not
-// have: v is an object, or an array and part an index, which a creating walk
-// would pad the array to (anyencutil.Walk). A scalar holds no field, and an
-// array none by name.
+// have: v is an object, or an array and part an index past its end. A scalar
+// holds no field, and an array none by name. An index is what MongoDB's
+// UpdateLeafNode::checkViability takes for one (str::parseUnsignedBase10Integer
+// at r8.0.0): decimal digits, no sign, that an unsigned 32-bit int holds. The
+// host's int plays no part, so an update's outcome does not depend on the word
+// size: items.2147483648 is an index past the end on a 32-bit target too,
+// though no int there holds it.
 func canHoldField(v *anyenc.Value, part string) bool {
 	switch v.Type() {
 	case anyenc.TypeObject:
 		return true
 	case anyenc.TypeArray:
-		idx, err := strconv.Atoi(part)
-		return err == nil && idx >= 0
+		_, err := strconv.ParseUint(part, 10, 32)
+		return err == nil
 	}
 	return false
 }

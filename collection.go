@@ -1174,14 +1174,24 @@ func (c *collection) Count(ctx context.Context) (count int, err error) {
 }
 
 func (c *collection) CreateIndex(ctx context.Context, info ...IndexInfo) (err error) {
-	return c.createIndexes(ctx, false, info...)
+	return c.createIndexes(ctx, false, false, info...)
 }
 
 func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err error) {
-	return c.createIndexes(ctx, true, info...)
+	return c.createIndexes(ctx, true, false, info...)
 }
 
-func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...IndexInfo) (err error) {
+// copyIndex is CreateIndex for CopyToLatestFormat: info is the definition of
+// an index the source's catalog holds, and the copy is created with it as it
+// is, without the bounds a new vector index is held to (createVectorIndex).
+func (c *collection) copyIndex(ctx context.Context, info IndexInfo) error {
+	return c.createIndexes(ctx, false, true, info)
+}
+
+// createIndexes creates the indexes info defines: ensure keeps an identical
+// index the catalog has (EnsureIndex), and copied creates a source's
+// definition (copyIndex).
+func (c *collection) createIndexes(ctx context.Context, ensure, copied bool, info ...IndexInfo) (err error) {
 	if len(info) == 0 {
 		return nil
 	}
@@ -1209,7 +1219,7 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 				continue
 			}
 			if idxInfo.Kind == IndexKindVector {
-				vi, viErr := c.createVectorIndex(tx, s, idxInfo)
+				vi, viErr := c.createVectorIndex(tx, s, idxInfo, copied)
 				if viErr != nil {
 					if ensure && errors.Is(viErr, ErrIndexExists) {
 						continue

@@ -138,7 +138,7 @@ const (
 // default), an M, EfConstruction, EfSearch or Closure past its bound, a Dim,
 // NList or NProbe its meta record cannot hold, or a NaN CompactRatio, which
 // no ratio reaches. It runs when an index is created, not when one an
-// earlier release created is opened or ensured (createVectorIndex).
+// earlier release created is opened, ensured or copied (createVectorIndex).
 func validateVectorTuning(p *VectorParams) error {
 	switch p.Metric {
 	case VectorCosine, VectorL2, VectorDot:
@@ -555,8 +555,10 @@ func (c *collection) loadVectorIndexAs(tx *btree.ReadTx, collName string, info I
 }
 
 // createVectorIndex creates a new vector index (namespaces + meta) and builds it
-// from the collection's existing documents, all within tx.
-func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info IndexInfo) (*vectorIndex, error) {
+// from the collection's existing documents, all within tx. copied creates the
+// definition of an index a source database holds (CopyToLatestFormat), which
+// the bounds of a new index do not apply to.
+func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info IndexInfo, copied bool) (*vectorIndex, error) {
 	if err := validateVectorParams(info.Vector); err != nil {
 		return nil, err
 	}
@@ -575,9 +577,12 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info In
 	// definition an earlier release created past them (an EfSearch above
 	// 65,536) is ErrIndexExists, which EnsureIndex keeps, as before. A
 	// refusal here returns before anything is built, and the operation's
-	// rollback takes the catalog record back out.
-	if err := validateVectorTuning(info.Vector); err != nil {
-		return nil, err
+	// rollback takes the catalog record back out. A copy keeps the source's
+	// definition, which an earlier release may have created past them.
+	if !copied {
+		if err := validateVectorTuning(info.Vector); err != nil {
+			return nil, err
+		}
 	}
 	if info.Vector.Mode.isBruteForce() {
 		// Brute-force: no namespaces, no graph, nothing to build from documents.
@@ -627,7 +632,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info In
 	// populated collection (the documented bulk-load pattern); creating it empty
 	// has no data to learn the centroids from.
 	if info.Vector.Mode.isIVF() {
-		if info.Vector.NList > len(vecs) {
+		if info.Vector.NList > len(vecs) && !copied {
 			// k-means cannot make more cells than it has vectors to train on,
 			// and sizes its centroid table by NList: FAISS refuses the same
 			// ("Number of training points should be at least as large as
@@ -639,7 +644,13 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info In
 		if len(vecs) == 0 {
 			return nil, fmt.Errorf("vector index: IVF requires existing documents to train — insert documents before creating the index")
 		}
-		ivf, err := vivf.BulkBuild(tx, prefix, ivfStoreParams(info.Vector, len(vecs)), ids, vecs)
+		// A copied index whose collection has fewer vectors than its NList
+		// (some were deleted since it was built) trains one cell per
+		// vector, as a rebuild of the source would (vivf ivfRebuildNList);
+		// its catalog record keeps the source's NList.
+		sp := ivfStoreParams(info.Vector, len(vecs))
+		sp.NList = min(sp.NList, len(vecs))
+		ivf, err := vivf.BulkBuild(tx, prefix, sp, ids, vecs)
 		if err != nil {
 			return nil, err
 		}

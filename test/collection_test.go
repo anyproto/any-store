@@ -2918,6 +2918,8 @@ func TestCollection_RemovalPathViability(t *testing.T) {
 		`{"$pull":{"items.3.x":1},"$set":{"seen":1}}`,
 		`{"$unset":{"a.b":""},"$set":{"seen":2}}`,
 		`{"$unset":{"items.bad.x":""},"$set":{"seen":3}}`,
+		// Past what a 32-bit int holds, an index past the end all the same.
+		`{"$pull":{"items.2147483648.x":1},"$set":{"seen":4}}`,
 	} {
 		res, err := coll.UpdateId(ctx, 1, query.MustParseModifier(mod))
 		require.NoError(t, err, mod)

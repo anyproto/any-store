@@ -694,6 +694,10 @@ func Rebuild(wtx *btree.WriteTx, prefix string) (*StoreIndex, error) {
 			return nil, err
 		}
 		mt.count, mt.nextLabel = 0, 0
+		// The count of cells a search probes, as the index opened with it:
+		// a 0 an earlier release stored is written back as the default, as
+		// the build below writes it for an index with vectors.
+		mt.nprobe = old.nprobe
 		mt.churn, mt.driftSum, mt.driftN = 0, 0, 0
 		mt.buildCount = 1 // churn-ratio denominator; a build never has n=0 otherwise
 		mt.build = newBuild()

@@ -813,6 +813,22 @@ func vectorKnnFilter(qv []float32, k int) query.Filter {
 	return query.Key{Path: []string{"v"}, Filter: query.NewKnn(qv, k)}
 }
 
+// nearestId runs filter, a $knn query that selects one document, and returns
+// that document's id. The iterator is closed whatever an assertion does: left
+// open, it would hold its read transaction, and DB.Close would wait for it.
+func nearestId(t *testing.T, coll Collection, filter string) int {
+	t.Helper()
+	iter, err := coll.Find(filter).Iter(ctx)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, iter.Close()) }()
+	require.True(t, iter.Next(), "no document: %v", iter.Err())
+	doc, err := iter.Doc()
+	require.NoError(t, err)
+	id := doc.Value().GetInt("id")
+	require.False(t, iter.Next(), "more than one document")
+	return id
+}
+
 func vqJSON(vec []float32) string {
 	parts := make([]string, len(vec))
 	for i, f := range vec {
