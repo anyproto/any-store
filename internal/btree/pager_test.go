@@ -9448,6 +9448,232 @@ func TestOpen_DamagedLaterPageOpens(t *testing.T) {
 	require.NoError(t, db.Close())
 }
 
+// lastWALFrame returns the number of the last frame of the WAL at walPath
+// that holds pgno, and the offset of its frame header in the file.
+func lastWALFrame(t *testing.T, walPath string, pageSize int, pgno uint32) (frame uint32, off int64) {
+	t.Helper()
+	data, err := os.ReadFile(walPath)
+	require.NoError(t, err)
+	frameSize := walFrameSize + pageSize
+	for o, f := walHeaderSize, uint32(1); o+frameSize <= len(data); o, f = o+frameSize, f+1 {
+		if binary.BigEndian.Uint32(data[o:]) == pgno {
+			frame, off = f, int64(o)
+		}
+	}
+	require.NotZero(t, frame, "no frame of page %d in the WAL", pgno)
+	return frame, off
+}
+
+// resealWAL recomputes the checksum chain of every frame of the WAL at
+// walPath, so that a frame whose bytes a test changed is still part of the
+// log for recovery: what is damaged is the page, not the log.
+func resealWAL(t *testing.T, walPath string, pageSize int) {
+	t.Helper()
+	data, err := os.ReadFile(walPath)
+	require.NoError(t, err)
+	frameSize := walFrameSize + pageSize
+	s1, s2 := walChecksum(data[:24], 0, 0)
+	for o := walHeaderSize; o+frameSize <= len(data); o += frameSize {
+		s1, s2 = walChecksum(data[o:o+8], s1, s2)
+		s1, s2 = walChecksum(data[o+walFrameSize:o+frameSize], s1, s2)
+		binary.BigEndian.PutUint32(data[o+16:], s1)
+		binary.BigEndian.PutUint32(data[o+20:], s2)
+	}
+	require.NoError(t, os.WriteFile(walPath, data, 0o600))
+}
+
+// A page 1 damaged in its WAL frame under the right key is damage, as in
+// the database file: the frame is part of the log (its WAL checksum is
+// valid), and a page that is only in the WAL proves the key. The integrity
+// hook hears of page 1, once.
+func TestOpen_DamagedPage1FrameUnderRightKeyIsCorrupt(t *testing.T) {
+	path, opts := keyProofDB(t, false, nil)
+	var pages []uint32
+	opts.OnIntegrityError = func(pgno uint32, _ error) { pages = append(pages, pgno) }
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, int64(opts.PageSize), info.Size(), "every page but the first is only in the WAL")
+	walPath := path + "-wal"
+	_, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
+	damageFile(t, walPath, off+walFrameSize+1000)
+	resealWAL(t, walPath, int(opts.PageSize))
+
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, ErrWrongKey)
+	require.Equal(t, []uint32{1}, pages)
+}
+
+// A database whose page 1 and every page the open tries are damaged cannot
+// prove the right key: it is reported as a wrong key, and the integrity hook
+// hears of none of the pages.
+func TestOpen_EveryPageTriedDamagedIsErrWrongKey(t *testing.T) {
+	path, opts := keyProofDB(t, true, nil)
+	var fired atomic.Int32
+	opts.OnIntegrityError = func(uint32, error) { fired.Add(1) }
+	head, err := os.ReadFile(path)
+	require.NoError(t, err)
+	nPage := binary.BigEndian.Uint32(head[28:32])
+	require.Greater(t, nPage, uint32(2*keyProbePages))
+	pageSize := int64(opts.PageSize)
+	damageFile(t, path, 1000)
+	count := min(nPage-1, keyProbePages)
+	for i := uint32(0); i < count; i++ {
+		damageFile(t, path, int64(keyProbePgno(i, count, nPage)-1)*pageSize+1000)
+	}
+
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrWrongKey)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.Zero(t, fired.Load())
+}
+
+// The pages the open tries are the database's, up to the size its header
+// records, not whatever the file holds past it. A database encrypted under
+// key A written over the head of a longer file under key B leaves B's pages
+// at the end of the file: B, which opens none of A's pages, is a wrong key
+// and not a key proven on a damaged page 1.
+func TestOpen_KeyProbeStaysInsideTheDatabase(t *testing.T) {
+	encTestSetup(t)
+	keyA := bytes.Repeat([]byte{0xA}, KeyLen)
+	keyB := bytes.Repeat([]byte{0xB}, KeyLen)
+	create := func(name string, key []byte, rows int) string {
+		path := tmpEncryptedFile(t, name)
+		opts := DefaultOptions()
+		opts.Key = key
+		opts.InProcess = true
+		db, err := Open(path, opts)
+		require.NoError(t, err)
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := wtx.CreateNamespace("x")
+		require.NoError(t, err)
+		for i := 0; i < rows; i++ {
+			require.NoError(t, wtx.Put(ns, []byte(fmt.Sprintf("key-%04d", i)), bytes.Repeat([]byte("v"), 1000)))
+		}
+		require.NoError(t, wtx.Commit())
+		require.NoError(t, db.Checkpoint(CheckpointFull))
+		require.NoError(t, db.Close())
+		return path
+	}
+	path := create("long.db", keyB, 400)
+	short, err := os.ReadFile(create("short.db", keyA, 1))
+	require.NoError(t, err)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt(short, 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	opts := DefaultOptions()
+	opts.InProcess = true
+	var fired atomic.Int32
+	opts.OnIntegrityError = func(uint32, error) { fired.Add(1) }
+	opts.Key = keyB
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrWrongKey)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.Zero(t, fired.Load())
+
+	opts.Key = keyA
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	require.Zero(t, fired.Load())
+}
+
+// The header and the size are judged before the key, whatever page 1's
+// authentication says: a header that does not fit the file is
+// ErrHeaderCorrupt under any key.
+func TestOpen_HeaderIsJudgedBeforeTheKey(t *testing.T) {
+	t.Run("file cut inside page 1", func(t *testing.T) {
+		path, opts := keyProofDB(t, true, nil)
+		require.NoError(t, os.Truncate(path, 2000))
+		for _, key := range [][]byte{opts.Key, []byte("wrong-passphrase")} {
+			o := opts
+			o.Key = key
+			_, err := Open(path, o)
+			require.ErrorIs(t, err, ErrHeaderCorrupt, "key %q", key)
+			require.NotErrorIs(t, err, ErrWrongKey)
+		}
+	})
+	t.Run("WAL page 1 larger than the log's commit", func(t *testing.T) {
+		path, opts := keyProofDB(t, false, nil)
+		walPath := path + "-wal"
+		_, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
+		f, err := os.OpenFile(walPath, os.O_RDWR, 0)
+		require.NoError(t, err)
+		var size [4]byte
+		binary.BigEndian.PutUint32(size[:], 1<<30)
+		_, err = f.WriteAt(size[:], off+walFrameSize+28) // DatabaseSize
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+		resealWAL(t, walPath, int(opts.PageSize))
+		for _, key := range [][]byte{opts.Key, []byte("wrong-passphrase")} {
+			o := opts
+			o.Key = key
+			_, err := Open(path, o)
+			require.ErrorIs(t, err, ErrHeaderCorrupt, "key %q", key)
+			require.NotErrorIs(t, err, ErrWrongKey)
+		}
+	})
+}
+
+// A page the open could not read might have proved the key: when no page
+// it tried authenticates and one could not be read, the open returns that
+// read's error, not ErrWrongKey, and not corruption.
+func TestOpen_UnreadableProbePageIsNotAWrongKey(t *testing.T) {
+	path, opts := keyProofDB(t, false, nil)
+	var fired atomic.Int32
+	opts.OnIntegrityError = func(uint32, error) { fired.Add(1) }
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, int64(opts.PageSize), info.Size(), "every page but the first is only in the WAL")
+	walPath := path + "-wal"
+	page1Frame, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
+	damageFile(t, walPath, off+walFrameSize+1000)
+	resealWAL(t, walPath, int(opts.PageSize))
+
+	eio := errors.New("injected: input/output error")
+	setWalReadFrameFaultHook(func(frame uint32) error {
+		if frame == page1Frame {
+			return nil
+		}
+		return eio
+	})
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, eio)
+	require.NotErrorIs(t, err, ErrWrongKey)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.Zero(t, fired.Load())
+
+	// Once the pages read, the key is proven and page 1 is damage.
+	setWalReadFrameFaultHook(nil)
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.EqualValues(t, 1, fired.Load())
+}
+
+// An integrity hook that panics inside Open (the key check calls it for a
+// damaged page 1) leaves nothing of the open behind: the file is not held
+// by the process, and the next Open reads it again.
+func TestOpen_PanickingIntegrityHookReleasesTheFile(t *testing.T) {
+	path, opts := keyProofDB(t, true, nil)
+	damageFile(t, path, 1000)
+	opts.OnIntegrityError = func(uint32, error) { panic("integrity hook") }
+	func() {
+		defer func() { require.Equal(t, "integrity hook", recover()) }()
+		_, _ = Open(path, opts)
+	}()
+
+	opts.OnIntegrityError = nil
+	_, err := Open(path, opts)
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.NotErrorIs(t, err, ErrDatabaseOpen)
+}
+
 // The two refusals of the codec settle are matchable and are not corruption.
 func TestOpen_EncryptionRefusalsAreSentinels(t *testing.T) {
 	path, opts := keyProofDB(t, true, nil)

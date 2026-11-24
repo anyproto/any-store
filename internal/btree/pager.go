@@ -601,8 +601,14 @@ func (p *pager) open() (err error) {
 	// finalizer at an arbitrary later time, and on Linux that close can land on
 	// an fd the runtime has since recycled to an unrelated file — corrupting it
 	// (observed as spurious "bad file descriptor" errors in later operations).
+	// The cleanup is armed until the open has succeeded, not only while err
+	// is set: a panic out of the open (the integrity hook is the caller's
+	// code, and the key check at open calls it) unwinds with err nil, and a
+	// caller that recovers would otherwise find the file held by this
+	// pager's openDBs entry for the life of the process.
+	opened := false
 	defer func() {
-		if err != nil {
+		if !opened {
 			if p.dbMmap != nil {
 				_ = p.dbMmap.unmap()
 				p.dbMmap = nil
@@ -877,6 +883,7 @@ func (p *pager) open() (err error) {
 	}
 
 	p.state.Store(int32(pagerOpen))
+	opened = true
 	return nil
 }
 
@@ -893,6 +900,9 @@ func (p *pager) open() (err error) {
 //     commit that shrank the database leaves the file long until a
 //     checkpoint truncates it), else the file's size.
 //   - lockBtreePageCount decides between page 1's size and that count.
+//   - Under a key, page 1 is authenticated where it is read. A page 1 that
+//     fails is judged after its header and the page count, which do not
+//     depend on the key (page1Unauthenticated).
 func (p *pager) readPage1AtOpen() error {
 	hdr, maxFrame, minFrame, slot, err := p.wal.beginReadHdr()
 	if err != nil {
@@ -915,22 +925,25 @@ func (p *pager) readPage1AtOpen() error {
 	// Under a key, page 1 is the page the open proves the key on: its
 	// failed authentication goes to keyCheck, not to the integrity hook,
 	// until page1Unauthenticated has told a wrong key from a damaged page.
-	var keyCheck page1KeyCheck
+	// unauthenticated is that failure's error.
+	var (
+		keyCheck        page1KeyCheck
+		unauthenticated error
+	)
 	if frame > 0 {
 		walBuf := make([]byte, p.pageSize)
 		if err := p.wal.readFramePageHook(frame, 1, walBuf, nil, nil, p.page1Hook(&keyCheck)); err != nil {
-			if p.keyed && errors.Is(err, ErrPageIntegrity) {
-				// The frame is read again for its header, which is not
-				// encrypted and is judged before the key is: a file of
-				// another format is that, whatever the key.
-				if herr := p.page1FrameHeader(frame, &header); herr != nil {
-					return herr
-				}
-				return p.page1Unauthenticated(err, &keyCheck, hdr.nPage, maxFrame, minFrame)
+			if !p.keyed || !errors.Is(err, ErrPageIntegrity) {
+				return err
 			}
-			return err
-		}
-		if err := header.deserialize(walBuf[:dbHeaderSize]); err != nil {
+			// The frame is read again for its header, which is not
+			// encrypted and is judged before the key is: a file of
+			// another format is that, whatever the key.
+			unauthenticated = err
+			if err := p.page1FrameHeader(frame, &header); err != nil {
+				return err
+			}
+		} else if err := header.deserialize(walBuf[:dbHeaderSize]); err != nil {
 			return err
 		}
 	} else {
@@ -956,7 +969,7 @@ func (p *pager) readPage1AtOpen() error {
 		// BEGIN ENCRYPTION
 		// Under a key the rest of page 1 is authenticated here, as
 		// SQLCipher's codec decrypts page 1 when lockBtree fetches it
-		// (sqlite3Codec from readDbPage; sqlcipher.c:3262-3290, v4.14.0).
+		// (sqlite3Codec from readDbPage; sqlcipher.c:3262-3295, v4.14.0).
 		// A page 1 cut short reads as zeros past its end and fails the
 		// same way. The checksum codec's page 1 is not verified by the
 		// open: it is by the first read of it, as before.
@@ -967,7 +980,7 @@ func (p *pager) readPage1AtOpen() error {
 				if !errors.Is(derr, ErrPageIntegrity) {
 					return derr
 				}
-				return p.page1Unauthenticated(derr, &keyCheck, hdr.nPage, maxFrame, minFrame)
+				unauthenticated = derr
 			}
 		}
 		// END ENCRYPTION
@@ -987,6 +1000,11 @@ func (p *pager) readPage1AtOpen() error {
 	if err != nil {
 		return err
 	}
+	// BEGIN ENCRYPTION
+	if unauthenticated != nil {
+		return p.page1Unauthenticated(unauthenticated, &keyCheck, nPage, maxFrame, minFrame)
+	}
+	// END ENCRYPTION
 	p.adoptHeader(header)
 	p.dbSize.Store(nPage)
 	// Page 1 as read (readDbPage, pager.c:3063-3064).
@@ -1029,10 +1047,23 @@ func (p *pager) page1FrameHeader(frame uint32, h *dbHeader) error {
 // keyProbePages bounds the pages proveKeyAtOpen tries.
 const keyProbePages = 16
 
+// keyProbePgno is the page proveKeyAtOpen tries i-th of count, in a
+// database of nPage pages: the count pages are spread evenly over pages
+// 2..nPage, the first and the last of them included.
+func keyProbePgno(i, count, nPage uint32) uint32 {
+	n := nPage - 1 // pages 2..nPage
+	if count < 2 || n <= count {
+		return 2 + i
+	}
+	return 2 + uint32(uint64(i)*uint64(n-1)/uint64(count-1))
+}
+
 // page1Unauthenticated decides what a page 1 that failed its authentication
 // at open means, and returns the open's error. perr is the failed read's
-// error, which matches ErrPageIntegrity; walNPage is the size the
-// snapshot's last WAL commit recorded, and maxFrame and minFrame are the
+// error, which matches ErrPageIntegrity. nPage is the database's size at
+// the snapshot, by lockBtreePageCount: the open has judged page 1's header
+// and the size already, so a header that does not fit the file is
+// ErrHeaderCorrupt whatever the key. maxFrame and minFrame are the
 // snapshot's bounds.
 //
 // A key that authenticates any page of the database is the right key: a
@@ -1041,74 +1072,94 @@ const keyProbePages = 16
 // authenticates, page 1 is damaged: the database's integrity hook is told,
 // as it is for any damaged page, and perr is returned. When none does, the
 // open returns ErrWrongKey and the hook is told nothing, of page 1 or of
-// the pages tried. The misreport that remains is on the side that keeps
-// the file: a database of one page, or one damaged on every page tried,
-// reports a wrong key.
+// the pages tried; unless a page could not be read, which might have
+// proved the key: that read's error is returned. The misreport that
+// remains is on the side that keeps the file: a database of one page, or
+// one damaged on every page tried, reports a wrong key.
 // DRIFT: a page 1 that fails its authentication at open is reported as a wrong key only when no other page tried authenticates either, and as a damaged page otherwise; SQLCipher reports SQLITE_NOTADB for both and never looks at another page. See docs/btree/NOTES.md#drift-2026-11-24-3-open-tells-a-wrong-key-from-a-damaged-page-1
-func (p *pager) page1Unauthenticated(perr error, kc *page1KeyCheck, walNPage, maxFrame, minFrame uint32) error {
-	// The pager's count (pagerPagecount): the pages there are to try.
-	nPage, _, err := p.pagerPageCount(walNPage)
-	if err != nil {
-		return err
+func (p *pager) page1Unauthenticated(perr error, kc *page1KeyCheck, nPage, maxFrame, minFrame uint32) error {
+	proven, tried, readErr := p.proveKeyAtOpen(nPage, maxFrame, minFrame)
+	if proven {
+		if kc.failed {
+			p.onIntegrityError.fire(1, kc.inner)
+		}
+		return perr
 	}
-	proven, tried := p.proveKeyAtOpen(nPage, maxFrame, minFrame)
-	if !proven {
-		return fmt.Errorf("%w: page 1 and %d other page(s) tried do not authenticate under it", ErrWrongKey, tried)
+	if readErr != nil {
+		return fmt.Errorf("btree: page 1 does not authenticate under the key, and a page that could tell a wrong key from a damaged page 1 could not be read: %w", readErr)
 	}
-	if kc.failed {
-		p.onIntegrityError.fire(1, kc.inner)
-	}
-	return perr
+	return fmt.Errorf("%w: page 1 and %d other page(s) tried do not authenticate under it", ErrWrongKey, tried)
 }
 
 // proveKeyAtOpen reports whether a page other than page 1 authenticates
-// under the pager's codec, and how many it tried. It tries up to
-// keyProbePages pages spread evenly over pages 2..nPage, so that damage to
-// one stretch of the file leaves some of them outside it, each as the
-// snapshot holds it: from its WAL frame when it has one in [minFrame,
-// maxFrame], else from the database file. A page that cannot be read is
-// passed over. No failure here reaches the integrity hook: with a wrong key
-// every page fails, and none of them is damaged.
-func (p *pager) proveKeyAtOpen(nPage, maxFrame, minFrame uint32) (proven bool, tried int) {
+// under the pager's codec, how many pages it tried, and the error of the
+// first page it could not read. It tries up to keyProbePages pages, spread
+// over pages 2..nPage (keyProbePgno) so that damage to one stretch of the
+// file leaves some of them outside it, each as the snapshot holds it: from
+// its WAL frame when it has one in [minFrame, maxFrame], else from the
+// database file. Pages past nPage are not the database's, whatever the
+// file holds there.
+//
+// A page that cannot be read (an I/O error, a failed wal-index lookup, a
+// WAL frame the log does not hold) is not tried: its error is kept, and
+// the probe goes on, since a later page can still prove the key. A page
+// the database file ends inside reads as zeros past the end, as page 1
+// does at open (readDbPage forgives the short read, pager.c:3042-3044),
+// and fails its authentication. No failure here reaches the integrity
+// hook: with a wrong key every page fails, and none of them is damaged.
+func (p *pager) proveKeyAtOpen(nPage, maxFrame, minFrame uint32) (proven bool, tried int, readErr error) {
 	if nPage < 2 {
-		return false, 0
+		return false, 0, nil
 	}
-	n := nPage - 1 // pages 2..nPage
-	count := min(n, keyProbePages)
+	count := min(nPage-1, keyProbePages)
 	buf := make([]byte, p.pageSize)
 	scratch := make([]byte, p.pageSize)
 	var aead aeadScratch
-	for i := uint32(0); i < count; i++ {
-		pgno := 2 + i
-		if count > 1 && n > count {
-			pgno = 2 + uint32(uint64(i)*uint64(n-1)/uint64(count-1))
+	keep := func(pgno uint32, err error) {
+		if readErr == nil {
+			readErr = fmt.Errorf("btree: page %d: %w", pgno, err)
 		}
+	}
+	for i := uint32(0); i < count; i++ {
+		pgno := keyProbePgno(i, count, nPage)
 		var frame uint32
 		if maxFrame > 0 {
 			var err error
 			if frame, err = p.wal.index.get(pgno, maxFrame, minFrame); err != nil {
+				keep(pgno, err)
 				continue
 			}
 		}
 		if frame > 0 {
-			tried++
-			if p.wal.readFramePageHook(frame, pgno, buf, scratch, &aead, nil) == nil {
-				return true, tried
+			err := p.wal.readFramePageHook(frame, pgno, buf, scratch, &aead, nil)
+			if err == nil {
+				return true, tried + 1, nil
 			}
+			if !errors.Is(err, ErrPageIntegrity) {
+				keep(pgno, err)
+				continue
+			}
+			tried++
 			continue
 		}
 		if p.file == nil {
+			keep(pgno, ErrClosed)
 			continue
 		}
-		if _, err := p.file.ReadAt(buf, int64(pgno-1)*int64(p.pageSize)); err != nil {
-			continue
+		n, err := p.file.ReadAt(buf, int64(pgno-1)*int64(p.pageSize))
+		if err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+				keep(pgno, err)
+				continue
+			}
+			clear(buf[n:])
 		}
 		tried++
 		if _, err := decryptPageWithCodec(p.codec, scratch, buf, pgno, &aead, nil); err == nil {
-			return true, tried
+			return true, tried, nil
 		}
 	}
-	return false, tried
+	return false, tried, readErr
 }
 
 // END ENCRYPTION

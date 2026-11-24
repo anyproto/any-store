@@ -2187,7 +2187,7 @@
   },
   "pager.go:*pager.page1Unauthenticated": {
     "sqlite": [],
-    "note": "a page 1 that fails its authentication at open: ErrWrongKey unless another page proves the key; SQLCipher returns SQLITE_NOTADB for both (sqlcipher.c:3273-3290, btree.c:3306-3311, v4.14.0; drift-2026-11-24-3)"
+    "note": "a page 1 that fails its authentication at open, judged after the header and the page count: ErrWrongKey unless another page proves the key or could not be read; SQLCipher returns SQLITE_NOTADB for both (sqlcipher.c:3264-3295, btree.c:3306, 3361-3362, v4.14.0; drift-2026-11-24-3)"
   },
   "pager.go:*pager.pagerError": {
     "sqlite": [
@@ -2209,7 +2209,7 @@
   },
   "pager.go:*pager.proveKeyAtOpen": {
     "sqlite": [],
-    "note": "tries up to keyProbePages other pages under the open's key; no SQLCipher counterpart (drift-2026-11-24-3)"
+    "note": "tries up to keyProbePages other pages of the database (up to lockBtreePageCount's size) under the open's key, and keeps the first read error; no SQLCipher counterpart (drift-2026-11-24-3)"
   },
   "pager.go:*pager.readDBPage": {
     "sqlite": [],
@@ -2415,6 +2415,10 @@
   "pager.go:SetCreateLegacyFormatForTest": {
     "sqlite": [],
     "note": "test hook: create schema format 5 files"
+  },
+  "pager.go:keyProbePgno": {
+    "sqlite": [],
+    "note": "the pages proveKeyAtOpen tries, spread over the database's pages; no SQLCipher counterpart (drift-2026-11-24-3)"
   },
   "pager.go:lockBtreePageCount": {
     "sqlite": [

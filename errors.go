@@ -252,13 +252,17 @@ var (
 	// key opens it. It does not match ErrCorrupt or ErrPageIntegrity, and Config.OnIntegrityError
 	// is not called.
 	//
-	// Open authenticates page 1 with the key. When that fails, it tries up to 16 other pages,
-	// spread over the database, with the same key:
+	// Open authenticates page 1 with the key, once the file header and the database size it
+	// records have passed their checks (a header that fails them is ErrHeaderCorrupt, whatever
+	// the key). When that fails, it tries up to 16 other pages, spread over the database, with
+	// the same key:
 	//
 	//   - if one of them authenticates, the key is right and page 1 is damaged: Open returns an
 	//     error that matches ErrPageIntegrity and ErrCorrupt, and Config.OnIntegrityError is
 	//     called for page 1;
-	//   - if none does, Open returns ErrWrongKey.
+	//   - if none does, Open returns ErrWrongKey;
+	//   - unless one of them could not be read (an I/O error): it might have proved the key,
+	//     and Open returns that read's error, which matches neither.
 	//
 	// A wrong key is never reported as corruption: it would have to pass a page's
 	// authentication tag, a chance of about 2^-128. The reverse can happen: a database that is
