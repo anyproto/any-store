@@ -2982,7 +2982,7 @@
   },
   "writer_gate.go:*writerGate.enter": {
     "sqlite": [],
-    "note": "any-store: counts a call of the write transaction in, or refuses it once Close closed the gate; C holds the connection mutex for the step, vdbeapi.c sqlite3_step (drift-2026-11-21-25)"
+    "note": "any-store: counts a call of the write transaction in by compare-and-swap, or refuses it uncounted once Close closed the gate and no call is in flight; C holds the connection mutex for the step, vdbeapi.c sqlite3_step (drift-2026-11-21-25)"
   },
   "writer_gate.go:*writerGate.leave": {
     "sqlite": [],
