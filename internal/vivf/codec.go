@@ -124,11 +124,11 @@ func decodeMeta(data []byte) (*meta, error) {
 		return nil, errors.New("vivf: unsupported meta version")
 	}
 	mt := &meta{}
-	mt.dim = int(get32())
-	mt.nlist = int(get32())
-	mt.pqM = int(get32()) // reserved subquantizer count, carried through
-	mt.assign = int(get32())
-	mt.nprobe = int(get32())
+	mt.dim = countOf(get32())
+	mt.nlist = countOf(get32())
+	mt.pqM = countOf(get32()) // reserved subquantizer count, carried through
+	mt.assign = countOf(get32())
+	mt.nprobe = countOf(get32())
 	mt.normalize = data[off] != 0
 	off++
 	mt.count = int64(get64())
@@ -157,6 +157,15 @@ func decodeMeta(data []byte) (*meta, error) {
 		off += 8
 	}
 	return mt, nil
+}
+
+// countOf is a count the meta record stores in four bytes, as an int: the
+// value itself, or math.MaxInt when it is past what an int holds. A 64-bit
+// build stores counts up to 2^32-1, and int(v) on a 32-bit target would read
+// one past 2^31-1 as a negative count (an NProbe of 2^32-1 as -1: no cell
+// probed, no hit).
+func countOf(v uint32) int {
+	return int(min(uint64(v), math.MaxInt))
 }
 
 // legacySubquantizers is the value earlier releases stored in the reserved

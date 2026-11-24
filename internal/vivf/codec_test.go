@@ -1,7 +1,9 @@
 package vivf
 
 import (
+	"encoding/binary"
 	"encoding/hex"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -37,6 +39,23 @@ func TestMetaLegacySubquantizers(t *testing.T) {
 		require.Equal(t, want, legacySubquantizers(dim), "dim %d", dim)
 		require.NotZero(t, legacySubquantizers(dim))
 	}
+}
+
+// A count is decoded without narrowing: a 64-bit build stores up to 2^32-1,
+// and a 32-bit build reads such a count as the largest int, never as a
+// negative one (an NProbe of 2^32-1 read as -1 probes no cell).
+func TestMetaCountsDoNotNarrow(t *testing.T) {
+	for _, v := range []uint32{0, 1, 16, 1<<31 - 1, 1 << 31, math.MaxUint32} {
+		got := countOf(v)
+		require.GreaterOrEqual(t, got, 0, "%d", v)
+		require.Equal(t, uint64(got), min(uint64(v), uint64(math.MaxInt)), "%d", v)
+	}
+	b := encodeMeta(&meta{dim: 8, nlist: 4, pqM: 4, assign: 1, build: 1})
+	binary.LittleEndian.PutUint32(b[20:], math.MaxUint32) // nprobe, as a 64-bit build stores 2^32-1
+	mt, err := decodeMeta(b)
+	require.NoError(t, err)
+	require.Equal(t, countOf(math.MaxUint32), mt.nprobe)
+	require.Positive(t, mt.nprobe)
 }
 
 // A record without the IVF-SQ layout flag names the removed IVF-PQ layout

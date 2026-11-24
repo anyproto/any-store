@@ -18,6 +18,9 @@ package vindex
 //   - Vectors live in an ARENA of fixed-size blocks (append-only, never moved),
 //     so a []float32 handed out earlier in the batch stays valid as the cache
 //     grows. reset() rewinds the write cursor; blocks are kept and refilled.
+//     A block is at most vecCacheMaxBlockBytes: it holds fewer vectors when
+//     they are large, and when one vector alone is larger the cache is off and
+//     every read is uncached.
 //   - A flat open-addressing probe table (linear probing, power-of-two, pre-sized
 //     for capVecs) maps label -> arena slot. reset() bumps a generation tag
 //     instead of clearing, so a new batch resets occupancy in O(1).
@@ -26,7 +29,9 @@ package vindex
 type vecCache struct {
 	dim     int
 	capVecs int
-	block   int         // vectors per arena block
+	limit   int         // vectors cached at most: capVecs, or 0 when a vector does not fit a block
+	block   int         // vectors per arena block: 1 << shift
+	shift   uint        // log2(block)
 	blocks  [][]float32 // arena; each len == block*dim
 	cur     int         // current block index
 	off     int         // vectors filled in the current block
@@ -42,10 +47,30 @@ type vecCache struct {
 // Arena block size: a power of two so slotSlice resolves a slot with a shift +
 // mask instead of integer division/modulo (it runs on every cache hit).
 const (
-	vecCacheBlockVecs  = 256 // vectors per arena block (1 << shift)
-	vecCacheBlockShift = 8
-	vecCacheBlockMask  = vecCacheBlockVecs - 1
+	vecCacheBlockShift = 8 // vectors per arena block (1 << shift), at most
+	// vecCacheMaxBlockBytes bounds one arena block, so that its size is
+	// computed and allocated without overflow on every target: 256 vectors
+	// of dim 2^23 are 8 GiB, a length past a 32-bit int. A block of large
+	// vectors holds fewer of them (vecCacheBlockShiftFor).
+	vecCacheMaxBlockBytes = 64 << 20
 )
+
+// vecCacheBlockShiftFor returns log2 of the vectors an arena block holds for
+// dim: 1 << vecCacheBlockShift, or the largest power of two below it whose
+// block stays within vecCacheMaxBlockBytes. ok is false when one vector alone
+// is larger: such vectors are not cached. The comparisons divide the bound
+// rather than multiply dim, so no product can overflow.
+func vecCacheBlockShiftFor(dim int) (shift uint, ok bool) {
+	const maxFloats = vecCacheMaxBlockBytes / 4
+	if dim <= 0 || dim > maxFloats {
+		return 0, false
+	}
+	shift = vecCacheBlockShift
+	for dim > maxFloats>>shift {
+		shift--
+	}
+	return shift, true
+}
 
 // reset prepares the cache for a new batch. Allocation-free once dim and capVecs
 // are stable (the arena blocks and probe table are reused): it just rewinds the
@@ -54,11 +79,17 @@ func (c *vecCache) reset(dim, capVecs int) {
 	if c.dim != dim || c.capVecs != capVecs || c.label == nil {
 		c.dim = dim
 		c.capVecs = capVecs
-		c.block = vecCacheBlockVecs
+		c.limit = capVecs
+		shift, ok := vecCacheBlockShiftFor(dim)
+		if !ok {
+			c.limit = 0 // every reserve misses: the caller reads uncached
+		}
+		c.shift = shift
+		c.block = 1 << shift
 		c.blocks = nil
-		// Probe table sized so capVecs entries stay under a ~0.67 load factor.
+		// Probe table sized so limit entries stay under a ~0.67 load factor.
 		n := 64
-		for n < capVecs+capVecs/2 {
+		for n < c.limit+c.limit/2 {
 			n <<= 1
 		}
 		c.label = make([]uint32, n)
@@ -92,7 +123,7 @@ func (c *vecCache) reserve(label uint32) ([]float32, bool) {
 		}
 		pos = (pos + 1) & c.mask
 	}
-	if c.count >= c.capVecs { // full → uncached read
+	if c.count >= c.limit { // full, or vectors too large to cache → uncached read
 		return nil, false
 	}
 	if c.off == c.block { // current arena block full → advance
@@ -115,8 +146,8 @@ func (c *vecCache) reserve(label uint32) ([]float32, bool) {
 // slotSlice resolves an arena slot to its dim-length backing slice. block is a
 // power of two, so the block index and in-block offset are a shift and a mask.
 func (c *vecCache) slotSlice(slot int32) []float32 {
-	b := int(slot) >> vecCacheBlockShift
-	o := (int(slot) & vecCacheBlockMask) * c.dim
+	b := int(slot) >> c.shift
+	o := (int(slot) & (c.block - 1)) * c.dim
 	return c.blocks[b][o : o+c.dim]
 }
 

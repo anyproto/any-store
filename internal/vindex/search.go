@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"fmt"
+	"math"
 	"slices"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -452,7 +453,9 @@ func (s *searcher) selectNeighborsHeuristic(cands []candidate, m int) ([]candida
 	// removes the dominant cost of the heuristic (it was ~64% of insert time, all
 	// btree reads). Distances use the same SIMD kernel; results are identical.
 	dim := s.ix.dim
-	if cap(s.keptVecs) < m*dim {
+	// m*dim is checked before it is computed: at a large M and Dim it passes
+	// what a 32-bit int holds, and the slab then grows with the vectors kept.
+	if dim > 0 && m <= math.MaxInt/dim && cap(s.keptVecs) < m*dim {
 		s.keptVecs = make([]float32, m*dim)
 	}
 	kept := s.keptVecs[:0]

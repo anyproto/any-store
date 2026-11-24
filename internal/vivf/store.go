@@ -33,12 +33,15 @@ type StoreParams struct {
 	Seed      int64
 }
 
+// defaultNProbe is the cells a search probes when the index names none.
+const defaultNProbe = 16
+
 func (p *StoreParams) withDefaults() {
 	if p.Assign < 1 {
 		p.Assign = 1
 	}
 	if p.NProbe < 1 {
-		p.NProbe = 16
+		p.NProbe = defaultNProbe
 	}
 }
 
@@ -500,6 +503,15 @@ func OpenTx(rtx *btree.ReadTx, prefix string) (*StoreIndex, error) {
 	ix.build = mt.build
 	ix.dim, ix.nlist = mt.dim, mt.nlist
 	ix.nprobe, ix.assign, ix.normalize = mt.nprobe, mt.assign, mt.normalize
+	if ix.nprobe < 1 {
+		// No build stores 0 (withDefaults), but an earlier release stored an
+		// NProbe of 2^32 or a multiple of it in four bytes, as 0: a search
+		// probing no cell finds nothing. Take the default, as a definition
+		// with NProbe 0 does. A count past NList needs no bound here: the
+		// search ranks the NList cells and probes at most all of them
+		// (nearestCellsInto).
+		ix.nprobe = defaultNProbe
+	}
 	ix.byteDist = simd.AcceleratedFloatByte()
 
 	cb, err := rtx.Get(ix.vcb, coarseKey)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -2261,7 +2262,9 @@ func vectorDefMatches(vv *anyenc.Value, p *VectorParams) bool {
 		quant == int(p.Quantization) &&
 		mode == int(p.Mode) &&
 		hvc == p.HybridCacheVectors &&
-		cr == p.CompactRatio &&
+		// A NaN ratio is refused for a new index, but an earlier release
+		// stored it; NaN != NaN, so two NaNs are compared as the same value.
+		(cr == p.CompactRatio || math.IsNaN(cr) && math.IsNaN(p.CompactRatio)) &&
 		nlist == p.NList &&
 		nprobe == p.NProbe &&
 		closure == p.Closure

@@ -151,6 +151,54 @@ func TestStoreSearchDimMismatch(t *testing.T) {
 	}
 }
 
+// An earlier release stored an NProbe of 2^32 in the meta record's four bytes
+// as 0. The index opens with the default instead, as a definition with
+// NProbe 0 does, and a search probes cells and finds a stored vector; a
+// rebuild writes the default to the record.
+func TestStoreStoredNProbeZeroIsTheDefault(t *testing.T) {
+	const dim = 16
+	vecs := clusteredVecs(200, dim, 4, 3)
+	db := openMem(t)
+	buildStore(t, db, StoreParams{Dim: dim, NList: 4, Assign: 1, NProbe: 4, Seed: 1}, vecs)
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	vmeta, err := wtx.GetNamespace("ivf" + nsMeta)
+	require.NoError(t, err)
+	b, err := wtx.Get(vmeta, metaKey)
+	require.NoError(t, err)
+	mt, err := decodeMeta(b)
+	require.NoError(t, err)
+	mt.nprobe = 0
+	require.NoError(t, wtx.Put(vmeta, metaKey, encodeMeta(mt)))
+	require.NoError(t, wtx.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	ix, err := OpenTx(rtx, "ivf")
+	require.NoError(t, err)
+	require.Equal(t, defaultNProbe, ix.NProbe())
+	cands, err := ix.SearchCandidates(rtx, vecs[17], 5)
+	require.NoError(t, err)
+	require.NotEmpty(t, cands)
+	require.Equal(t, bid(17), cands[0].DocID)
+	require.NoError(t, rtx.Rollback())
+
+	wtx, err = db.BeginWrite()
+	require.NoError(t, err)
+	_, err = Rebuild(wtx, "ivf")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Commit())
+	rtx, err = db.BeginRead()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rtx.Rollback()) }()
+	ix, err = OpenTx(rtx, "ivf")
+	require.NoError(t, err)
+	st, err := ix.Stats(rtx)
+	require.NoError(t, err)
+	require.Equal(t, defaultNProbe, st.NProbe, "the rebuilt record")
+}
+
 // TestStoreRecallReal builds the index on the real export and confirms its
 // recall@10 against the exact ground truth (HNSW reaches ~0.97 on it).
 func TestStoreRecallReal(t *testing.T) {

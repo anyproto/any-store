@@ -76,15 +76,21 @@ func dropVectorIndexNamespaces(tx *btree.WriteTx, collName, indexName string) er
 	return nil
 }
 
+// validateVectorParams refuses a definition no vector index is built or
+// opened with: no Vector params, no Field, a Dim not above 0 or an unknown
+// Mode, wrapped in ErrInvalidConfig; a Dot metric in the IVF mode
+// (ErrVectorMetricUnsupported); and the removed IVF-PQ mode
+// (ErrVectorIndexUnsupported). It runs when an index is created and when one
+// is opened; validateVectorTuning adds the bounds a new index is held to.
 func validateVectorParams(p *VectorParams) error {
 	if p == nil {
-		return fmt.Errorf("vector index requires Vector params")
+		return fmt.Errorf("%w: a vector index requires Vector params", ErrInvalidConfig)
 	}
 	if p.Field == "" {
-		return fmt.Errorf("vector index requires a Field")
+		return fmt.Errorf("%w: a vector index requires VectorParams.Field", ErrInvalidConfig)
 	}
 	if p.Dim <= 0 {
-		return fmt.Errorf("vector index requires Dim > 0")
+		return fmt.Errorf("%w: VectorParams.Dim is %d, not above 0", ErrInvalidConfig, p.Dim)
 	}
 	switch p.Mode {
 	case VectorModeBTree, VectorModeHybrid, VectorModeBruteForce:
@@ -100,7 +106,7 @@ func validateVectorParams(p *VectorParams) error {
 	case vectorModeIVFPQ:
 		return fmt.Errorf("%w: mode %s; create the index in another mode", ErrVectorIndexUnsupported, p.Mode)
 	default:
-		return fmt.Errorf("vector index: unknown mode %d", p.Mode)
+		return fmt.Errorf("%w: VectorParams.Mode %d is not one of the VectorMode constants", ErrInvalidConfig, p.Mode)
 	}
 	return nil
 }
@@ -126,14 +132,24 @@ const (
 )
 
 // validateVectorTuning refuses, wrapped in ErrInvalidConfig, a value of p
-// that an index cannot be built or stored with: a negative tuning value
-// (zero picks the default), an M, EfConstruction, EfSearch or Closure past
-// its bound, a Dim, NList or NProbe its meta record cannot hold, or a NaN
-// CompactRatio, which no ratio reaches and which matches no definition, its
-// own included, when EnsureIndex compares one. It runs when an index is
-// created, not when one an earlier release created is opened or ensured
-// (createVectorIndex).
+// that an index cannot be built or stored with: a Metric or Quantization
+// that is none of its constants (the HNSW modes would rank an unknown metric
+// by cosine and the IVF mode by L2), a negative tuning value (zero picks the
+// default), an M, EfConstruction, EfSearch or Closure past its bound, a Dim,
+// NList or NProbe its meta record cannot hold, or a NaN CompactRatio, which
+// no ratio reaches. It runs when an index is created, not when one an
+// earlier release created is opened or ensured (createVectorIndex).
 func validateVectorTuning(p *VectorParams) error {
+	switch p.Metric {
+	case VectorCosine, VectorL2, VectorDot:
+	default:
+		return fmt.Errorf("%w: VectorParams.Metric %d is not one of the VectorMetric constants", ErrInvalidConfig, p.Metric)
+	}
+	switch p.Quantization {
+	case VectorQuantNone, VectorQuantInt8:
+	default:
+		return fmt.Errorf("%w: VectorParams.Quantization %d is not one of the VectorQuantization constants", ErrInvalidConfig, p.Quantization)
+	}
 	for _, f := range [...]struct {
 		name   string
 		v, max int64

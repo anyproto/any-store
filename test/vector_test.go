@@ -2377,6 +2377,11 @@ func TestVectorIndex_TuningValidated(t *testing.T) {
 		{"Closure 256", anystore.VectorParams{Mode: ivf, Closure: 256}, "VectorParams.Closure"},
 		{"NList past the vectors", anystore.VectorParams{Mode: ivf, NList: n + 1}, "VectorParams.NList"},
 		{"CompactRatio NaN", anystore.VectorParams{CompactRatio: math.NaN()}, "VectorParams.CompactRatio"},
+		{"Dim -1", anystore.VectorParams{Dim: -1}, "VectorParams.Dim"},
+		{"Metric 3", anystore.VectorParams{Metric: 3}, "VectorParams.Metric"},
+		{"Metric 99 IVF", anystore.VectorParams{Mode: ivf, Metric: 99}, "VectorParams.Metric"},
+		{"Quantization 2", anystore.VectorParams{Quantization: 2}, "VectorParams.Quantization"},
+		{"Mode 99", anystore.VectorParams{Mode: 99}, "VectorParams.Mode"},
 	}
 	if math.MaxInt > math.MaxUint32 {
 		width := int64(math.MaxUint32) // a variable: past it is no int constant on a 32-bit target
@@ -2401,6 +2406,15 @@ func TestVectorIndex_TuningValidated(t *testing.T) {
 				require.ErrorIs(t, coll.DropIndex(ctx, "emb"), anystore.ErrIndexNotFound)
 			}
 		})
+	}
+	for name, p := range map[string]*anystore.VectorParams{
+		"Dim 0":     {Field: "v"},
+		"no Field":  {Dim: dim},
+		"no params": nil,
+	} {
+		err := coll.CreateIndex(ctx, anystore.IndexInfo{Name: "emb", Kind: anystore.IndexKindVector, Vector: p})
+		require.ErrorIs(t, err, anystore.ErrInvalidConfig, name)
+		require.ErrorIs(t, coll.DropIndex(ctx, "emb"), anystore.ErrIndexNotFound)
 	}
 
 	require.NoError(t, coll.CreateIndex(ctx, anystore.IndexInfo{Name: "ivf", Kind: anystore.IndexKindVector,
@@ -2475,4 +2489,10 @@ func TestVectorIndex_IVFNProbeSurvivesReopen(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, hits, 5)
 	assert.Equal(t, idBytesOf(17), hits[0].DocId)
+	// The default depth is 8 candidates per probed cell, capped at 4,096: the
+	// count is bounded before the multiply, which past 2^28 cells overflows a
+	// 32-bit int.
+	exp, err := coll.Find(fmt.Sprintf(`{"v":%s}`, vknnJSON(vecs[17], 5, 0))).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, exp.Sql, "KnnSearch(k=5,ef=4096)", exp.Sql)
 }
