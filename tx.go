@@ -51,6 +51,11 @@ type WriteTx interface {
 }
 
 // ReadTx represents a read-only transaction.
+//
+// A ReadTx must be ended with Commit (it has no Rollback; Commit releases
+// it and writes nothing). Until then it pins its snapshot and a reader
+// slot, and DB.Close waits for it with no timeout: a read transaction that
+// is never committed makes DB.Close block forever.
 type ReadTx interface {
 	// Context returns the context associated with the transaction.
 	Context() context.Context

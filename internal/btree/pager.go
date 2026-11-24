@@ -82,7 +82,16 @@ type pager struct {
 	// that DB.Close can safely force-rollback an abandoned transaction
 	// without racing with a concurrent commit. Per-connection pcache has
 	// no mutex, so this pager-level lock is the serialization point.
-	writerOpMu  sync.Mutex
+	writerOpMu sync.Mutex
+	// wgate counts the write transaction's calls in flight, so that DB.Close
+	// can wait for the one running before it ends the transaction and tears
+	// the pager down. See writerGate.
+	wgate writerGate
+	// lentMu guards what is left of a write transaction that DB.Close ended
+	// under its goroutine: the stacks of its cursors and lent, the page
+	// buffers those cursors had lent out. See destroyEndedWriterCache.
+	lentMu      sync.Mutex
+	lent        map[*page]lentPage
 	master      *masterStore // InMemory "disk" — holds checkpointed page data
 	header      dbHeader
 	pageSize    uint32
@@ -441,6 +450,7 @@ func newPager(path string, pageSize uint32, cacheSize int, purgeable bool) *page
 		keyScratch:       scratchPool[[]byte]{clearOnPut: true},
 	}
 	p.writerCache.xStress = p.pagerStress
+	p.wgate = newWriterGate()
 	return p
 }
 
@@ -3077,12 +3087,15 @@ func (p *pager) pagerStress(pg *page) error {
 	// writer state, pager.c:6056-6059), walFrames asserts the write lock
 	// (wal.c:4049), and the connection mutex (sqlite3_step, vdbeapi.c:923;
 	// sqlite3Close, main.c:1263) keeps a close from ending the transaction
-	// while a statement still fetches pages. DB.Close does end it so:
-	// rollbackForClose rewinds the log to the transaction's base frame and
-	// releases the write lock, leaving the dirty cache to a writer that may
-	// still be inside an operation and meets writeStateErr only at the next
-	// boundary. A spill from that writer would land where the next writer,
-	// in this process or another, appends. The guard has two steps. This
+	// while a statement still fetches pages. rollbackForClose does end it
+	// so: it rewinds the log to the transaction's base frame and releases
+	// the write lock without touching the dirty cache. DB.Close runs it
+	// only once the writer gate is closed and empty (writerGate), and no
+	// call of the transaction, so no spill, follows it; the guard is the
+	// pager's own, for a rescue that runs under an operation, as the tests
+	// of the guard run it. A spill after such a rescue would land where
+	// the next writer, in this process or another, appends. The guard has
+	// two steps. This
 	// one refuses a spill that starts after the rescue: rollbackForClose
 	// leaves the state pagerOpen, and sets closeInvalidated, which is loaded
 	// after the state, before it demotes it. A spill that passed this test
@@ -3504,10 +3517,13 @@ func (p *pager) rollbackLocked() error {
 
 // rollbackForClose is a variant of rollbackLocked for use by DB.Close().
 // It only performs WAL-level rollback and lock release — all writer-owned
-// state (hasContent, header, savepoints, WAL checksums)
-// is deliberately left untouched because the writer goroutine may still be
-// in a B-tree operation accessing those structures, and pcache has no mutex.
-// Since the database is closing, that state will be GC'd.
+// state (the cache, hasContent, header, savepoints, WAL checksums) is left
+// untouched. DB.Close calls it with the writer gate closed and no call of
+// the transaction in flight (writerGate), so nothing reads that state
+// concurrently any more; it is left alone all the same, because the tests
+// of the spill guard run this from inside an operation. The database is
+// closing: pager.close releases the cache (destroyEndedWriterCache) and the
+// savepoints, and the rest goes with the pager.
 // Caller must hold writerOpMu; it takes the WAL mutex inside it, the order
 // a commit's writeFrames takes them in.
 // DRIFT: ends the write transaction under the WAL mutex and marks the WAL (writeEndedByClose) for a writer still running; C cannot close under a statement See docs/btree/NOTES.md#drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer
@@ -3544,8 +3560,9 @@ func (p *pager) rollbackForClose() {
 
 	// Skip hasContent, header, savepoints, and WAL
 	// checksum restoration — all are writer-owned, non-atomic state that
-	// the writer goroutine may be reading concurrently. Touching them
-	// here would be a data race. None of it matters after Close().
+	// a writer goroutine still inside an operation would be reading (the
+	// spill guard's tests run this from there). pager.close releases the
+	// savepoints; the rest does not matter after Close().
 
 	p.state.Store(int32(pagerOpen))
 	w.endWrite()
@@ -4473,7 +4490,21 @@ func (p *pager) close() error {
 		_ = p.wal.close(isLastClient)
 	}
 
-	p.writerCache.destroy()
+	if p.wgate.closed() {
+		p.destroyEndedWriterCache()
+	} else {
+		p.writerCache.destroy()
+	}
+	// The savepoints go with the pager, as sqlite3PagerClose releases them
+	// (pager_unlock, releaseAllSavepoints, pager.c:1850; asserted gone at
+	// 4228): after a Close that ended a write transaction they hold its
+	// page images. So does the last commit's page list, which would keep a
+	// lent leaf (destroyEndedWriterCache) reachable from the closed handle
+	// after its cursor; SQLite's dirty list is the page cache's, freed with
+	// it (sqlite3PcacheClose, pager.c:4227).
+	p.freeSavepointPageBuffers(0, len(p.savepoints))
+	p.savepoints = nil
+	p.dirtyBuf = nil
 
 	// Tear down the mmap reader before closing the file so the fd
 	// remains valid during munmap. Matches SQLite's unixUnmapfile
@@ -4511,6 +4542,94 @@ var testBeforeRegistryDeleteHook func(p *pager)
 type createdRoot struct {
 	root uint32
 	seq  uint64
+}
+
+// lentPage is a page buffer that a cursor of an ended write transaction
+// still pins: n cursors pin it.
+type lentPage struct {
+	data []byte
+	n    int
+}
+
+// destroyEndedWriterCache is the disposal of the writer cache of a write
+// transaction that DB.Close ended under its goroutine (writerGate). That
+// goroutine makes no further call into the pager, but it can still be
+// reading a key or a value an earlier call returned, and those are slices of
+// the leaf a cursor pins (Cursor.Key, Cursor.Value); a read or an in-leaf
+// step of a cursor that stands on its leaf can also be running, outside
+// the gate (Cursor.readsPinnedLeaf). Such a leaf is lent: its buffer
+// returned to the pool or to the slab now would be another database's
+// while its borrower reads it.
+//
+// So the leaves the transaction's cursors pin are taken out of the cache
+// first, untouched: neither the page nor the cursor that pins it is written
+// here, only the cache's and the list's links. The rest of the cache is
+// destroyed as any other. A lent buffer of the default allocator stays with
+// its page and goes when the cursor does. One of the slab is noted in lent
+// until the cursor that pins it is moved or closed (Cursor.abandon), which
+// is where the slice it handed out stops being valid: the slab is the
+// process's fixed budget, and a slot that is not returned is lost to it. A
+// cursor that is never used again keeps its slot.
+//
+// The cursors are taken off the pager's list: they stay their owner's, and
+// the closed pager keeps none of them reachable.
+//
+// SQLite has no counterpart: no close ends a transaction under an open
+// statement, and with it a cursor. sqlite3_close refuses while one is
+// unfinalized, sqlite3_close_v2 leaves the close to its finalize (main.c:1283,
+// 1371), and sqlite3BtreeClose asserts that no cursor of the handle is open
+// (btree.c:2924-2935).
+// DRIFT: the leaves that cursors of a transaction ended by Close pin outlive the page cache; C cannot close under an open cursor See docs/btree/NOTES.md#drift-2026-11-21-25-close-waits-for-the-writers-call-in-flight
+func (p *pager) destroyEndedWriterCache() {
+	p.lentMu.Lock()
+	defer p.lentMu.Unlock()
+	var lent map[*page]lentPage
+	for c := p.cursors; c != nil; {
+		for i := range c.stack {
+			pg := c.stack[i].pg
+			if pg == nil {
+				continue
+			}
+			if lent == nil {
+				lent = make(map[*page]lentPage)
+			}
+			l := lent[pg]
+			if l.n == 0 {
+				l.data = pg.data
+				if pg.inCache && pg.cache == p.writerCache {
+					p.writerCache.hashRemove(pg)
+				}
+			}
+			l.n++
+			lent[pg] = l
+		}
+		// The link is the list's; linked is the cursor's own flag, which a
+		// call running outside the gate reads.
+		next := c.nextCursor
+		c.nextCursor = nil
+		c = next
+	}
+	p.cursors = nil
+	p.writerCache.destroy()
+	if p.useSlab {
+		p.lent = lent
+	}
+}
+
+// returnLent ends a cursor's pin of pg, a page of a write transaction that
+// DB.Close ended: the last pin of a lent slab buffer returns it. Caller
+// holds lentMu.
+func (p *pager) returnLent(pg *page) {
+	l, ok := p.lent[pg]
+	if !ok {
+		return
+	}
+	if l.n--; l.n > 0 {
+		p.lent[pg] = l
+		return
+	}
+	delete(p.lent, pg)
+	freePageBuffer(l.data, p.useSlab)
 }
 
 // linkCursor adds a writer's cursor to the list the writes save

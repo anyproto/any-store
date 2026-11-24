@@ -475,11 +475,35 @@ func (db *DB) LastWriterUnwindError() error {
 // locks would be permanent — the exact bug class this function exists to end.
 // A panic there now propagates with the mutexes released. Reports whether
 // this call won the CAS.
-func (db *DB) releaseWriterLocks(pager *pager, slot int, pre, post func()) bool {
+//
+// gate is the writer gate the calling Commit or Rollback entered, nil for
+// Close's call, which is not a call of the transaction. It is left here,
+// whichever way this goes, and before the write lock passes on: the gate
+// counts calls, not transactions, and a count of this transaction still in
+// it when the next writer begins would let that writer's calls in as
+// nested ones after Close has closed the gate, its Commit included. In
+// SQLite the COMMIT's step releases the write lock under the connection
+// mutex (sqlite3VdbeHalt, vdbe.c:4042, down to
+// sqlite3WalEndWriteTransaction, pager.c:2142; the mutex from
+// vdbeapi.c:923), and the next BEGIN is another step, which takes it first.
+// A Close waiting at the gate goes on before the write lock is released,
+// and waits for it in its turn.
+func (db *DB) releaseWriterLocks(pager *pager, slot int, gate *writerGate, pre, post func()) bool {
 	if !db.writerLocksDone.CompareAndSwap(false, true) {
+		if gate != nil {
+			gate.leave()
+		}
 		return false
 	}
-	defer db.unlockWriter()
+	defer func() {
+		db.unlockWriter()
+		if gate != nil && testWriterLocksReleasedHook != nil {
+			testWriterLocksReleasedHook()
+		}
+	}()
+	if gate != nil {
+		defer gate.leave()
+	}
 	defer db.mu.RUnlock()
 	defer db.unregisterWriter()
 	if pre != nil {
@@ -836,6 +860,51 @@ func Open(path string, opts Options) (*DB, error) {
 }
 
 // Close closes the database.
+//
+// Close waits for every read transaction of this handle to end
+// (db.mu.Lock against the RLock each ReadTx holds), with no timeout and no
+// error: a ReadTx that is never rolled back blocks Close forever, and Close
+// called on the goroutine that holds one deadlocks. In serialized mode, the
+// default build, SQLite's sqlite3_close and sqlite3_close_v2 wait for the
+// connection mutex, so for a step running on another thread (main.c:1263,
+// vdbeapi.c:923). Neither waits for a statement to be finalized: with a
+// statement unfinalized, or a backup that reads from the connection
+// unfinished (backup.c:204), sqlite3_close returns SQLITE_BUSY
+// (main.c:1283) and sqlite3_close_v2 leaves a zombie that is closed with
+// the last of them (main.c:1307, 1371). On the way a close takes other
+// mutexes too, and can wait for them: the shared b-tree mutexes of a shared
+// cache (disconnectAllVtab, main.c:1213), the Unix VFS's global mutex as it
+// closes a file (unixClose, os_unix.c:2350). In multi-thread mode an
+// ordinary build gives the connection no mutex (main.c:3388-3393), and a
+// close during another thread's step is the application's error.
+// DRIFT: Close waits, with no timeout, for every read transaction to end; C waits for none: an unfinalized statement makes sqlite3_close return SQLITE_BUSY and sqlite3_close_v2 leave a zombie See docs/btree/NOTES.md#drift-2026-11-21-26-close-waits-for-every-read-transaction-to-end
+//
+// A registered write transaction is not waited for: Close rolls it back and
+// releases its locks, as sqlite3Close rolls back a transaction left open
+// with no statement running (sqlite3RollbackAll, main.c:1386). What Close
+// does wait for is the one call of that transaction that is in flight
+// (writerGate): a Put, a cursor move, a Commit, a Rollback, a Backup.Step
+// into this database. That call completes, a Commit included: a Commit in
+// flight when Close closed the gate runs to its end and returns its own
+// result, nil once the transaction is committed.
+// Every call of the transaction that comes later returns ErrClosed and
+// touches nothing, its Commit returns ErrClosed and its Rollback nil. The
+// wait has no bound of its own: a call is as long as its work, a Count or
+// the drop of a namespace walks a whole tree, and a Step copies as many
+// pages as it was asked to. A cursor's read or step served entirely from
+// the leaf it pins is not waited for: it runs outside the gate, on a page
+// the teardown keeps back (Cursor.readsPinnedLeaf). An overflow read
+// enters the gate.
+//
+// Close must therefore not be called from inside a call of the write
+// transaction on that call's goroutine: it would wait for itself. That is
+// any code a call runs synchronously: Options.OnIntegrityError, a method of
+// the VFS a page read goes through, the Err of a caller's context, which a
+// count polls. Between two calls of its transaction the writer's goroutine
+// may call Close.
+// See docs/btree/NOTES.md#drift-2026-11-21-25-close-waits-for-the-writers-call-in-flight.
+//
+// A second Close returns ErrClosed.
 func (db *DB) Close() error {
 	_, err := db.CloseCheckpointed(nil)
 	return err
@@ -872,28 +941,40 @@ func (db *DB) CloseCheckpointed(onCheckpointed func()) (checkpointed bool, err e
 			testCloseWriterCheckedHook(registered)
 		}
 		if registered {
-			// Force-rollback the abandoned/in-flight tx.
-			// writerOpMu serializes with commit/rollback so we don't interleave
-			// with a concurrent Commit or Rollback call.
-			// Use rollbackForClose which skips writerCache operations to avoid
-			// racing with the writer's B-tree ops (pcache has no mutex).
-			db.pager.writerOpMu.Lock()
-			if pagerState(db.pager.state.Load()) == pagerWriter {
-				db.pager.rollbackForClose()
+			// The transaction's goroutine may be inside a call: a b-tree
+			// operation, which holds no lock, or its Commit or Rollback.
+			// Wait for that one call to return, and refuse every later call
+			// of the transaction, its Commit included, before anything it
+			// uses is taken from under it (writerGate). Closing the gate is
+			// the one decision: from here the transaction neither changes
+			// nor commits anything, so what it holds is rolled back.
+			db.pager.wgate.close()
+			if testWriterGateDrainedHook != nil {
+				testWriterGateDrainedHook()
 			}
+			// Force-rollback the abandoned tx. A Commit or a Rollback that
+			// was in flight has ended it already, and released its locks:
+			// rollbackForClose and releaseWriterLocks then find nothing to
+			// do. writerOpMu is rollbackForClose's contract; nothing
+			// contends for it once the gate is empty.
+			db.pager.writerOpMu.Lock()
+			db.pager.rollbackForClose()
 			db.pager.writerOpMu.Unlock()
 
 			// Exactly-once writer lock cleanup (endRead + RUnlock + Unlock) via
-			// the shared teardown: a writer goroutine completing concurrently
-			// could race with Close, and the writerLocksDone CAS inside
-			// releaseWriterLocks prevents the double-release.
-			db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil)
+			// the shared teardown: the writerLocksDone CAS inside
+			// releaseWriterLocks makes it a no-op after a Commit or a
+			// Rollback that ended the transaction while Close waited.
+			db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil, nil)
 		}
 		// A plain send, not lockWriter: closeCh is closed already, and this
 		// wait is for the holder to leave.
 		db.writeSem <- struct{}{}
 	}
 	db.unlockWriter()
+	if testCloseWaitingReadersHook != nil {
+		testCloseWaitingReadersHook()
+	}
 	// Wait for all active readers to finish
 	db.mu.Lock()
 	db.mu.Unlock()
@@ -911,6 +992,11 @@ drained:
 	err = db.pager.close()
 	return db.pager.closeCheckpointed, err
 }
+
+// testCloseWaitingReadersHook, when non-nil, runs in Close once the write
+// transaction is dealt with, before the wait for the read transactions.
+// Test-only.
+var testCloseWaitingReadersHook func()
 
 // SetClosing marks the database as closing, causing new transactions to fail.
 // Also unblocks the goroutines waiting for a reader slot or the write lock.
@@ -1431,6 +1517,10 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := db.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer db.pager.wgate.leave()
 
 	// Check if namespace already exists using proper tree traversal
 	// (page 1 may be an interior node after splits).
@@ -1480,6 +1570,10 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := db.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer db.pager.wgate.leave()
 
 	// Look up the namespace's root page using proper tree traversal
 	// (page 1 may be an interior node after splits).
@@ -1524,6 +1618,10 @@ func (db *DB) RenameNamespace(tx *WriteTx, oldName, newName string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := db.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer db.pager.wgate.leave()
 
 	// Resolve the old namespace via the writer path (sees dirty pages from
 	// the current write tx; page 1 may be an interior node after splits).
@@ -1943,6 +2041,12 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 	if tx.closed {
 		return buf, ErrTxClosed
 	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return buf, err
+		}
+		defer tx.pager.wgate.leave()
+	}
 	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
 		return buf, err
@@ -2057,6 +2161,12 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 	if tx.closed {
 		return false, ErrTxClosed
 	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return false, err
+		}
+		defer tx.pager.wgate.leave()
+	}
 	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
 		return false, err
@@ -2109,6 +2219,12 @@ func (tx *ReadTx) SeekKey(ns *Namespace, prefix []byte) ([]byte, error) {
 func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byte, error) {
 	if tx.closed {
 		return buf, ErrTxClosed
+	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return buf, err
+		}
+		defer tx.pager.wgate.leave()
 	}
 	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
@@ -2293,8 +2409,12 @@ func (tx *ReadTx) newCursor(ns *Namespace) *Cursor {
 	// The page stack lives in the cursor (BtCursor.apPage/aiIdx, btreeInt.h);
 	// without it every descent regrows the stack from nil.
 	c.stack = c.stackBuf[:0]
-	if tx.writable && !tx.closed {
+	// Joining the writer's list is a call of the write transaction: a
+	// cursor made after DB.Close ended the transaction stays off the list,
+	// which Close has disposed of, and every use of it is refused.
+	if tx.writable && !tx.closed && tx.pager.wgate.enter() == nil {
 		tx.pager.linkCursor(c)
+		tx.pager.wgate.leave()
 	}
 	return c
 }
@@ -2310,6 +2430,12 @@ func (tx *ReadTx) Count(ns *Namespace) (int, error) {
 func (tx *ReadTx) CountContext(ctx context.Context, ns *Namespace) (int, error) {
 	if tx.closed {
 		return 0, ErrTxClosed
+	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return 0, err
+		}
+		defer tx.pager.wgate.leave()
 	}
 	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
 	return bt.CountContext(ctx)
@@ -2332,6 +2458,11 @@ func (tx *ReadTx) CountContext(ctx context.Context, ns *Namespace) (int, error) 
 // which matches sqlite3BtreeLastPage's pBt->nPage for the writing connection.
 func (tx *ReadTx) DatabaseSize() (uint32, error) {
 	if tx.cache == nil {
+		// Once DB.Close has ended the transaction the count is one of a
+		// transaction that was rolled back.
+		if tx.pager.wgate.closed() {
+			return 0, ErrClosed
+		}
 		return tx.pager.dbSize.Load(), nil
 	}
 	pg, err := tx.pager.getPageReader(1, tx.walMaxFrame, tx.cache)
@@ -2345,6 +2476,18 @@ func (tx *ReadTx) DatabaseSize() (uint32, error) {
 		return 0, err
 	}
 	return lockBtreePageCount(&h, tx.pager.readerDbSizeBound(tx.cache))
+}
+
+// CloseState returns the handle that tells whether DB.Close has ended this
+// write transaction under its owner (CloseState.EndedByClose). Take it while
+// the transaction is open; it stays valid after the transaction ends, when
+// the transaction goes back to the pool and the next one rewrites it. A read
+// transaction's is the zero CloseState: Close waits for readers.
+func (tx *ReadTx) CloseState() CloseState {
+	if !tx.writable {
+		return CloseState{}
+	}
+	return CloseState{g: &tx.pager.wgate}
 }
 
 // GetNamespace returns a Namespace handle for the given name, respecting the
@@ -2362,6 +2505,12 @@ func (tx *ReadTx) DatabaseSize() (uint32, error) {
 func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
+	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return nil, err
+		}
+		defer tx.pager.wgate.leave()
 	}
 	if tx.writable {
 		return tx.db.getNamespaceLocked(name)
@@ -2497,6 +2646,10 @@ func (tx *WriteTx) GetNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return nil, err
+	}
+	defer tx.pager.wgate.leave()
 	return tx.db.getNamespaceLocked(name)
 }
 
@@ -2523,6 +2676,10 @@ func (tx *WriteTx) MarkSchemaChanged() {
 // A commit without changes is empty: FileChangeCount and SchemaCookie stay
 // as they are whatever MarkDataChanged and MarkSchemaChanged said.
 func (tx *WriteTx) HasChanges() bool {
+	if tx.pager.wgate.enter() != nil {
+		return false // ended by DB.Close: rolled back
+	}
+	defer tx.pager.wgate.leave()
 	return tx.pager.hasChanges()
 }
 
@@ -2531,6 +2688,10 @@ func (tx *WriteTx) Put(ns *Namespace, key, value []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	return bt.Put(key, value)
 }
@@ -2540,6 +2701,10 @@ func (tx *WriteTx) Delete(ns *Namespace, key []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	return bt.Delete(key)
 }
@@ -2563,6 +2728,12 @@ var testBeginWriteRetryHook func(err error)
 // pager panic used to leak the writer locks. Test-only.
 var testWriterFinishHook func()
 
+// testWriterLocksReleasedHook, when non-nil, runs in the releaseWriterLocks
+// of a Commit or a Rollback, in the deferred release of the write lock,
+// right after it: the next write transaction can begin while it runs, and
+// finds the writer gate as the handoff left it. Test-only.
+var testWriterLocksReleasedHook func()
+
 // Commit commits the transaction, writing all changes to the WAL.
 //
 // Lock ownership is NOT tied to the operation's success (the SQLite shape:
@@ -2577,6 +2748,19 @@ var testWriterFinishHook func()
 func (tx *WriteTx) Commit() error {
 	if tx.closed {
 		return ErrTxClosed
+	}
+	// A Commit is a call of the transaction like any other (writerGate):
+	// DB.Close waits for one in flight, through the release of the locks
+	// and the unwind of a panic, and refuses one that comes after it closed
+	// the gate. The refused transaction is Close's to roll back and to
+	// release; this handle only ends. The call leaves the gate in
+	// releaseWriterLocks, deferred below, before the write lock passes on.
+	gate := &tx.pager.wgate
+	if err := gate.enter(); err != nil {
+		tx.closed = true
+		tx.aux = nil
+		tx.onCommitted = nil
+		return err
 	}
 	tx.closed = true
 	tx.aux = nil
@@ -2613,7 +2797,7 @@ func (tx *WriteTx) Commit() error {
 				db.lastAutoCheckpointErr.Store(autoCheckpointResult{err: cpErr})
 			}
 		}
-		db.releaseWriterLocks(pager, slot, pre, post)
+		db.releaseWriterLocks(pager, slot, gate, pre, post)
 	}()
 	if testWriterFinishHook != nil {
 		testWriterFinishHook()
@@ -2652,6 +2836,16 @@ func (tx *WriteTx) Rollback() error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	// As in Commit: a Rollback that DB.Close refused has nothing to do,
+	// Close rolls the transaction back and releases its locks. One let in
+	// leaves the gate in releaseWriterLocks, before the write lock passes on.
+	gate := &tx.pager.wgate
+	if gate.enter() != nil {
+		tx.closed = true
+		tx.aux = nil
+		tx.onCommitted = nil
+		return nil
+	}
 	tx.closed = true
 	tx.aux = nil
 	tx.onCommitted = nil
@@ -2666,7 +2860,7 @@ func (tx *WriteTx) Rollback() error {
 		if !completed {
 			pre = db.writerUnwind(pager)
 		}
-		db.releaseWriterLocks(pager, slot, pre, nil)
+		db.releaseWriterLocks(pager, slot, gate, pre, nil)
 	}()
 	if testWriterFinishHook != nil {
 		testWriterFinishHook()
@@ -2685,6 +2879,10 @@ func (tx *WriteTx) Savepoint() (int, error) {
 	if tx.closed {
 		return 0, ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return 0, err
+	}
+	defer tx.pager.wgate.leave()
 	return tx.pager.savepoint()
 }
 
@@ -2699,6 +2897,10 @@ func (tx *WriteTx) RollbackToSavepoint(id int) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	if _, err := tx.pager.saveAllCursors(0); err != nil {
 		return err
 	}
@@ -2710,6 +2912,10 @@ func (tx *WriteTx) ReleaseSavepoint(id int) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	return tx.pager.releaseSavepoint(id)
 }
 
@@ -2718,6 +2924,10 @@ func (tx *WriteTx) CreateNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return nil, err
+	}
+	defer tx.pager.wgate.leave()
 	if err := tx.db.CreateNamespace(tx, name); err != nil {
 		return nil, err
 	}
@@ -2729,6 +2939,10 @@ func (tx *WriteTx) DeleteNamespace(name string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	return tx.db.DeleteNamespace(tx, name)
 }
 
@@ -2739,5 +2953,9 @@ func (tx *WriteTx) RenameNamespace(oldName, newName string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	return tx.db.RenameNamespace(tx, oldName, newName)
 }

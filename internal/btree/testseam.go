@@ -117,3 +117,14 @@ func SetTestWalRetryHook(f func(cnt int)) { testWalRetryHook = f }
 // begin of this process after an attempt failed with a busy error and
 // before the next one, with that error. Nil removes it.
 func SetTestBeginWriteRetryHook(f func(err error)) { testBeginWriteRetryHook = f }
+
+// SetTestWriterGateDrainedHook installs the hook that runs in every Close of
+// this process that found a write transaction, once it has closed the
+// writer gate and no call of the transaction is in flight, before it rolls
+// the transaction back. Nil removes it.
+func SetTestWriterGateDrainedHook(f func()) { testWriterGateDrainedHook = f }
+
+// SetTestCloseWaitingReadersHook installs the hook that runs in every Close
+// of this process before it waits for the read transactions to end. Nil
+// removes it.
+func SetTestCloseWaitingReadersHook(f func()) { testCloseWaitingReadersHook = f }

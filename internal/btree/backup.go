@@ -240,6 +240,9 @@ func (b *Backup) onePage(iSrcPg uint32, srcData []byte, bUpdate bool, snapPageCo
 		return err
 	}
 	defer b.dst.pager.releasePage(dstPg)
+	if testBackupPageFetchedHook != nil {
+		testBackupPageFetchedHook()
+	}
 
 	// ~ backup.c:269: memcpy(zOut, zIn, nCopy). nCopy == pageSize given
 	// our same-size invariant; SQLite's MIN(nSrcPgsz, nDestPgsz) reduces
@@ -308,6 +311,10 @@ func (b *Backup) stepBusy(err error) error {
 // change epoch for its snapshot. Test-only.
 var testBackupSampledHook func()
 
+// testBackupPageFetchedHook, when non-nil, runs in onePage once it holds the
+// destination page, before it writes it. Test-only.
+var testBackupPageFetchedHook func()
+
 // Step copies up to nPage pages from the source to the destination.
 // nPage < 0 means "copy all remaining pages in one call". Returns
 // ErrBackupDone when every source page has been copied; returns nil
@@ -372,6 +379,18 @@ func (b *Backup) Step(ctx context.Context, nPage int) error {
 		b.iDstSchema = b.dst.localSchemaCookie.Load() // ~ iDestSchema capture
 		b.dstLocked = true
 	}
+
+	// What follows fetches and writes pages of the destination's write
+	// transaction, so it is a call of that transaction (writerGate): a
+	// Close of the destination waits for this Step, and a Step that reaches
+	// the gate after it is refused, and the backup fails with ErrClosed.
+	// sqlite3_backup_step holds the destination's connection mutex, which
+	// sqlite3_close takes (backup.c:326, main.c:1263).
+	if err := b.dst.pager.wgate.enter(); err != nil {
+		b.rc = err
+		return err
+	}
+	defer b.dst.pager.wgate.leave()
 
 	// ~ backup.c:337-344: "If the source pager is currently in a
 	// write-transaction, return SQLITE_BUSY immediately."
@@ -609,6 +628,17 @@ func (b *Backup) update(iPage uint32, data []byte) {
 	if iPage >= b.iNext {
 		return
 	}
+
+	// A write to the destination's write transaction, made on the source
+	// writer's goroutine: a call of that transaction, as in Step
+	// (backupUpdate takes the destination's mutex, backup.c:676). One that
+	// reaches the gate after a Close of the destination is refused, and the
+	// backup fails with ErrClosed.
+	if err := b.dst.pager.wgate.enter(); err != nil {
+		b.rc = err
+		return
+	}
+	defer b.dst.pager.wgate.leave()
 
 	// bUpdate=true suppresses the page-1 DatabaseSize patch, which would
 	// be wrong to redo mid-backup.
