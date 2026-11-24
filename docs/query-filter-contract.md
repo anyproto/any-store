@@ -196,7 +196,7 @@ build per query and carry no such guarantee.
     `TestParseCondition_EmptyLogicalArrayRejected` (query/cond_parse_test.go)
     and, through every verb, by `TestQuery_EmptyObjectInLogicalOperator` and
     `TestQuery_EmptyLogicalArrayIsParseError` (test/query_test.go).
-    `{"$all":[]}` is accepted and matches no document, as in MongoDB: not
+    `{"tags":{"$all":[]}}` is accepted and matches no document, as in MongoDB: not
     one whose array is empty, not one without the field. It is the empty
     `$in`, so a conjunct of it makes the whole filter match nothing (the
     query layer answers without a scan, as for `{"$in":[]}`), and its
@@ -381,8 +381,13 @@ build per query and carry no such guarantee.
 
 18. **Numbers are float64.** anyenc stores every number as a float64, so an
     integer is exact up to 2^53 (9,007,199,254,740,992) in magnitude and a
-    larger one is the nearest float64 — in a stored document, a filter
-    operand, an index key and a document id alike. Two such integers can be
+    larger one, given as a Go integer or written as a plain integer literal
+    in JSON, is the nearest float64 — in a stored document, a filter
+    operand, an index key and a document id alike. (The JSON parser rounds
+    a number written with an exponent twice, the digits and then the
+    scaling, so `9007199254740993e1` becomes `90071992547409920` where
+    `90071992547409930`, the same integer, becomes `90071992547409936`.)
+    Two such integers can be
     one value: `{"n":9007199254740993}` matches a document whose `n` is
     `9007199254740992`, and as ids they are one key: with a document of id
     2^53 in the collection, `Insert` of id 2^53+1 fails with `ErrDocExists`,
@@ -392,12 +397,14 @@ build per query and carry no such guarantee.
     aggregation arithmetic has the same limit (docs/aggregation.md).
 
 19. **A `$text` query enforces at most 64 required clauses.** The required
-    clauses are the `$search` clauses under `"$defaultOperator": "and"` and
-    then the `$require` entries, in that order (a clause the analyzer reduces
-    to no terms does not count). The first 64 are enforced; every required
-    clause after them still matches and scores, but a document need not
-    satisfy it, as if it were a `$search` clause under the default `or`.
-    `$exclude` entries have no such limit. Pinned by
+    clauses are the clauses of `$search` under `"$defaultOperator": "and"`
+    and then those of the `$require` entries, in that order. Each `$require`
+    entry is parsed with the clause syntax, so one entry can be several
+    clauses: `"red blue"` is two, `"\"red blue\""` one phrase. A clause the
+    analyzer reduces to no terms does not count. The first 64 are enforced;
+    every required clause after them still matches and scores, but a
+    document need not satisfy it, as if it were a `$search` clause under the
+    default `or`. `$exclude` entries have no such limit. Pinned by
     `TestFtsProbe_RequiredBitExhaustion`.
 
 20. **A stored document nests at most 511 levels.** The document is the

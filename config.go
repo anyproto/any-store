@@ -118,8 +118,9 @@ type Config struct {
 	// The database does not survive process crashes. When true, InProcess
 	// and CommitSync=false are forced on automatically.
 	// The path argument to Open is ignored and can be any string (e.g. ":memory:").
-	// Without InMemory a path is always a file: ":memory:" names a file of
-	// that name in the working directory, unlike in SQLite.
+	// Without InMemory the path is an ordinary file path: ":memory:" has no
+	// special meaning, unlike in SQLite, and the filesystem's naming rules
+	// apply to it (Windows refuses ':' in a file name).
 	InMemory bool
 
 	// DisableCompression disables S2 compression for document values.
@@ -224,12 +225,12 @@ type Config struct {
 // (ChaCha20-Poly1305 / XChaCha20-Poly1305).
 //
 // Passphrase treatment:
+//   - nil → no encryption.
+//   - Empty (length 0) and not nil → Open fails.
 //   - Exactly 32 bytes → raw key, no KDF.
 //   - Any other length → PBKDF2-HMAC-SHA256 stretches it to 32 bytes
-//     against the 16-byte salt stored in the database header.
-//
-// An empty (length 0) non-nil Passphrase is rejected with an error; use
-// nil Passphrase to disable encryption.
+//     against the 16-byte salt stored in the database header, at
+//     KDFIterations rounds.
 //
 // Once a database is created with encryption, it must always be opened
 // with matching Encryption config. Reopening without the passphrase (or

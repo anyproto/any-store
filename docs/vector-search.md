@@ -63,11 +63,21 @@ Only `Field` and `Dim` are required. Other `VectorParams`:
 | `Quantization` | `VectorQuantNone` | `VectorQuantInt8` ≈ 4× smaller, RAM-resident vectors |
 | `Mode` | `VectorModeBTree` | `VectorModeHybrid` (RAM layer-0 cache), `VectorModeBruteForce` (exact O(N) scan, no graph), `VectorModeIVFSQ` (inverted-file cells of int8 vectors; Cosine/L2 only, always int8) |
 | `HybridCacheVectors` | `false` | hybrid only: also cache vectors in RAM for faster search |
-| `CompactRatio` | `0` (off) | HNSW: auto-compact the graph when tombstones reach this ratio of live nodes; `IVFSQ`: auto-rebuild (re-train the centroids) when the drift score reaches it |
-| `NList`, `NProbe`, `Closure` | `~4·√N`, `16`, `1` | `IVFSQ` only: coarse cells, at most the number of documents with a vector at creation; cells scanned per query (the recall dial), plus up to 64 more whose centroid is exactly as near as the farthest of them; cells each vector is placed in, at most 255 |
+| `CompactRatio` | `0` (off) | HNSW: auto-compact the graph when tombstones reach this ratio of live nodes; `IVFSQ`: auto-rebuild (re-train the centroids) when the drift score reaches it. A value not above 0 is off; NaN is refused |
+| `NList`, `NProbe`, `Closure` | `~4·√N`, `16`, `1` | `IVFSQ` only: coarse cells, at most the number of documents with a vector of the index's `Dim` at creation; cells scanned per query (the recall dial), plus up to 64 more whose centroid is exactly as near as the farthest of them; cells each vector is placed in, at most 255 |
 
-Index creation refuses a negative tuning value, or one past the bounds in the
-table, with `ErrInvalidConfig`.
+Creating an index (`CreateIndex`, or `EnsureIndex` of a name with no index)
+refuses with `ErrInvalidConfig`, and creates nothing:
+- a negative `M`, `EfConstruction`, `EfSearch`, `NList`, `NProbe` or `Closure`;
+- one past its bound in the table;
+- a `Dim`, `NList` or `NProbe` past 4,294,967,295 (2^32−1), which the index's
+  record stores in four bytes;
+- an explicit `NList` on a collection with no document holding a vector of the
+  index's `Dim`;
+- a NaN `CompactRatio`.
+
+An index an earlier release created past these bounds keeps working, and
+`EnsureIndex` of its identical definition keeps it.
 
 An index built by an earlier release in the removed `ivfpq` mode still opens with
 its collection but is quarantined: `$knn` on its field and `CompactVectorIndex`
@@ -362,8 +372,9 @@ O(live); for very large indexes prefer `0` and schedule
 - **Document encoding** — store the embedding as `anyenc.TypeVectorF32` (not a
   number array): ~2× smaller docs and a faster pipeline, recall unchanged.
 - **`Config{InMemory: true}`** keeps the whole DB resident — fastest, but many×
-  the RAM of a file-backed DB. The path `":memory:"` alone is an ordinary file
-  name: it opens a file called `:memory:` on disk.
+  the RAM of a file-backed DB. The path `":memory:"` has no special meaning: without
+  `InMemory` it is an ordinary file path, under the filesystem's naming rules
+  (Windows refuses `:` in a file name).
 
 ## 7. End-to-end example
 

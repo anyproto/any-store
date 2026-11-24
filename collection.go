@@ -30,8 +30,11 @@ import (
 // accessors that take no context, have the committed schema.
 //
 // Numbers, document ids among them, are float64: an integer above 2^53
-// (9,007,199,254,740,992) in magnitude is stored, looked up and compared as
-// the nearest float64, so two such integers can be one value. As ids they are
+// (9,007,199,254,740,992) in magnitude, given as a Go integer or as a plain
+// integer in JSON, is stored, looked up and compared as the nearest float64,
+// so two such integers can be one value. (JSON written with an exponent, as
+// 9007199254740993e1, is rounded twice by the parser and can land on another
+// float64; see docs/query-filter-contract.md, item 18.) As ids they are
 // one key: with a document of id 2^53 in the collection, an Insert of id
 // 2^53+1 fails with ErrDocExists, an UpsertOne with it replaces that
 // document, and FindId(2^53+1) returns it. Keep ids that can go past 2^53 as
@@ -156,8 +159,10 @@ type Collection interface {
 	// Returns a WriteTx or an error if there is an issue starting the transaction.
 	WriteTx(ctx context.Context) (WriteTx, error)
 
-	// Close releases the handle: later operations through it fail with
-	// ErrCollectionClosed. If the open write transaction has used the
+	// Close releases the handle: later operations on the collection through
+	// it (its reads, writes, queries and schema changes) fail with
+	// ErrCollectionClosed. ReadTx and WriteTx only begin a transaction of
+	// the DB, and work as before. If the open write transaction has used the
 	// handle (an open by the transaction counts), the release waits until
 	// that transaction ends, or until a savepoint that encloses that first
 	// use rolls back. An open of the collection before then keeps the
