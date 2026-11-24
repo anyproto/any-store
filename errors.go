@@ -145,7 +145,15 @@ var (
 	// Close the iterator first.
 	ErrIterOpen = errors.New("any-store: an iterator of the transaction is open on the collection")
 
-	// ErrQuickCheckFailed is returned when we did a quick check (e.g. when opening db in a dirty state with sentinel config on) and it failed, indicating possible database corruption.
+	// ErrQuickCheckFailed is returned (wrapped, with the damage the check met) by Open when the
+	// database was left dirty (Config.Durability.Sentinel is on and its marker file was found)
+	// and the quick check Open then runs found damage. It matches ErrCorrupt.
+	//
+	// A quick check that did not finish is not this error and does not match ErrCorrupt: Open
+	// then returns, wrapped, what stopped it, to match as itself: the ctx's error
+	// (context.Canceled, context.DeadlineExceeded, the latter also for the check's own limit of
+	// five minutes), ErrBusy, or an I/O error. The marker file stays, and the next Open runs
+	// the check again.
 	ErrQuickCheckFailed error = &nestedError{msg: "any-store: quick check failed on db open", parent: ErrCorrupt}
 
 	ErrDBIsClosed = btree.ErrClosed

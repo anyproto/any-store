@@ -3839,3 +3839,84 @@ func TestSketchPasses_SkipUnverifiedHead(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
 }
+
+// The quick check of a dirty open fails the open as ErrQuickCheckFailed,
+// and so as ErrCorrupt, only when it met damage. A check that did not
+// finish returns what stopped it, and that is not corruption: the caller
+// must not discard a file over a cancelled context or an I/O error. In
+// every case the sentinel stays and the next open checks again.
+func TestOpen_DirtyQuickCheckErrors(t *testing.T) {
+	ctx := context.Background()
+	cfg := func() *Config { return &Config{Durability: DurabilityConfig{Sentinel: true}} }
+	path := filepath.Join(t.TempDir(), "a.db")
+	db, err := Open(ctx, path, cfg())
+	require.NoError(t, err)
+	_, err = db.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	// The marker a process that died after a write leaves behind.
+	marker := path + ".lock"
+	require.NoError(t, os.WriteFile(marker, nil, 0o644))
+	t.Cleanup(func() { testQuickCheckReadHook = nil })
+
+	open := func(ctx context.Context, injected error) error {
+		testQuickCheckReadHook = nil
+		if injected != nil {
+			testQuickCheckReadHook = func() error { return injected }
+		}
+		db, err := Open(ctx, path, cfg())
+		testQuickCheckReadHook = nil
+		if err == nil {
+			require.NoError(t, db.Close())
+		}
+		return err
+	}
+	stillDirty := func() {
+		t.Helper()
+		_, err := os.Stat(marker)
+		require.NoError(t, err, "a failed quick check cleared the sentinel")
+	}
+
+	t.Run("damage", func(t *testing.T) {
+		damage := fmt.Errorf("page 7: %w", ErrPageIntegrity)
+		err := open(ctx, damage)
+		require.ErrorIs(t, err, ErrQuickCheckFailed)
+		require.ErrorIs(t, err, ErrCorrupt)
+		require.ErrorIs(t, err, ErrPageIntegrity)
+		stillDirty()
+	})
+	t.Run("io error", func(t *testing.T) {
+		eio := errors.New("input/output error")
+		err := open(ctx, &os.PathError{Op: "read", Path: path, Err: eio})
+		require.ErrorIs(t, err, eio)
+		require.NotErrorIs(t, err, ErrQuickCheckFailed)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		stillDirty()
+	})
+	t.Run("cancelled in the check", func(t *testing.T) {
+		err := open(ctx, context.Canceled)
+		require.ErrorIs(t, err, context.Canceled)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		stillDirty()
+	})
+	t.Run("deadline", func(t *testing.T) {
+		err := open(ctx, context.DeadlineExceeded)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		stillDirty()
+	})
+	t.Run("busy", func(t *testing.T) {
+		err := open(ctx, btree.ErrBusySnapshot)
+		require.ErrorIs(t, err, ErrBusy)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		stillDirty()
+	})
+	t.Run("clean", func(t *testing.T) {
+		db, err := Open(ctx, path, cfg())
+		require.NoError(t, err)
+		stats, err := db.Stats(ctx)
+		require.NoError(t, err)
+		require.True(t, stats.DirtyOnOpen)
+		require.NoError(t, db.Close())
+	})
+}

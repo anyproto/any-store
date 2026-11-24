@@ -342,7 +342,15 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 				_ = ds.recoveryController.Stop()
 			}
 			_ = ds.btreeDB.Close()
-			return nil, fmt.Errorf("%w: %w", ErrQuickCheckFailed, err)
+			// Only a check that met damage is ErrQuickCheckFailed, and so
+			// ErrCorrupt. One that did not finish (a cancelled ctx, its
+			// own time limit, a busy lock, an I/O error) says nothing
+			// about the file, and returns that error; the sentinel
+			// stays, so the next open checks again.
+			if errors.Is(err, ErrCorrupt) {
+				return nil, fmt.Errorf("%w: %w", ErrQuickCheckFailed, err)
+			}
+			return nil, fmt.Errorf("any-store: quick check on db open did not complete: %w", busyErr(err))
 		}
 		ds.dirtyQuickCheckDuration = time.Since(start)
 		if ds.recoveryController != nil {
