@@ -48,9 +48,15 @@ import (
 // (db.resetUncommittedSketches). A peer process's commits arrive only via the
 // reload at the next use (collection.refreshSketches), which is fail-soft for
 // a reader: a decode error keeps the stale copy. A plan-time read tolerates
-// all of this — a wrong cost means a slower query, and execution still runs
-// against the snapshot. An answer-time
-// read does not: a wrong estimate of zero is a wrong answer.
+// all of this: execution runs against the snapshot, and where the plans a
+// cost picks between return the same documents, a wrong cost means a slower
+// query. For $knn over an approximate vector index (any mode but brute
+// force) they do not: the cost picks between the index's search and an
+// exact probe of the filter's candidates (knn_plan.go), and under a
+// selective filter the two can return different documents, the search fewer
+// than k. The search is approximate whatever the estimates; they decide
+// whether a query gets its answer or the exact one. An answer-time read does
+// not tolerate a wrong estimate: one of zero is a wrong answer.
 //
 // Making an answer-time read safe requires storing sketches in the btree under
 // a versioned key and consulting them through the snapshot. Freshness checks or

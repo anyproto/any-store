@@ -1791,11 +1791,12 @@ func sketchBehind(seen, epoch uint64) bool {
 // while this one waited. A read that fails stamps nothing, and the next
 // reader loads again; the plan goes on with what is published. That is an
 // estimate: it picks the plan, not the documents that match a filter. For
-// $knn the plan is part of the answer: the estimate picks between the
-// approximate driver and the exact probe (qplanner knn_plan.go), and under a
-// selective filter the driver's candidates can leave out the nearest
+// $knn over an approximate vector index (any mode but brute force) the plan
+// is part of the answer: the estimate picks between the index's search and
+// an exact probe of the filter's candidates (qplanner knn_plan.go), and
+// under a selective filter the search's candidates can leave out the nearest
 // document that passes it, so the two can return different documents, and
-// the driver fewer than k.
+// the search fewer than k.
 //
 // A writer has the live sketches to load (refreshLiveSketches), and may
 // return the error of a read that failed.
