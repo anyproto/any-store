@@ -1045,6 +1045,9 @@ func TestPayloadLimit_CountUntilOverDamagedCell(t *testing.T) {
 // On a leaf whose cells declare values over the file, the key that splits it
 // is written and read back.
 func TestPayloadLimit_SplitBesideDamagedValueLengths(t *testing.T) {
+	// The record sizes below place the cells for schema format 6's local
+	// payload limits.
+	useCurrentFormat(t)
 	db, err := testOpen(t, filepath.Join(t.TempDir(), "split.db"), Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func(db *DB) { _ = db.Close() }(db)
