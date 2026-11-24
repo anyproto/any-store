@@ -332,22 +332,33 @@ type index struct {
 
 	// sketch is the WRITER-OWNED live selectivity sketch. It is mutated in place
 	// ONLY by the single writer (putEntries/deleteEntries, a savepoint's
-	// restoreImages, the writer's reloadSketch, serialized by the btree
+	// restoreImages, the writer's reloadLiveSketch, serialized by the btree
 	// write lock and the cross-process WAL write lock) and marshaled by
 	// persistSketches. No reader ever swaps or mutates it, so a concurrent
-	// read-tx reload can never lose the writer's accumulated increments. Inside a
-	// write tx it is also the planner's view (reflects this tx's own uncommitted
-	// inserts).
+	// read-tx reload can never lose the writer's accumulated increments. The
+	// writer replaces the object, under c.mu, only when the stored row has
+	// another shape (reloadLiveSketch). It is published while a write tx
+	// uses it, so it is also that tx's planner's view (reflects the tx's own
+	// uncommitted inserts), unless a reader loaded a copy of its own since.
 	sketch *qplanner.IndexSketch
 
 	// sketchPub is the READER-VISIBLE published sketch — the per-index
-	// analog of the collection's index set. The query/Stats path reads it lock-free via
+	// analog of the collection's index set. The query path reads it lock-free via
 	// loadPubSketch(); the advisory staleness tier decodes the disk bytes into
-	// it on a stale READ (in place while it is a reader-owned object, a fresh
-	// one while it is the live sketch — never into live); the writer
+	// it on a stale READ (in place while it is a reader-owned object, into
+	// sketchCopy while it is the live sketch — never into live); the writer
 	// republishes its live object into it at commit (a pointer Store, no
 	// clone). Non-nil once the index is published to readers.
 	sketchPub atomic.Pointer[qplanner.IndexSketch]
+	// sketchCopy is the reader-owned sketch the readers last decoded a
+	// stored row into (collection.reloadPubSketch), kept while the live
+	// sketch is the published one so that the next reader's load decodes
+	// into it again instead of allocating. Nil until a reader loads a
+	// stored row: after another process's commit, after an open that could
+	// not read the row, or for a handle opened through a read transaction
+	// whose snapshot was not exact for the change epoch. One more sketch
+	// per index. Under c.mu.
+	sketchCopy *qplanner.IndexSketch
 
 	sketchBuf []byte
 	// sketchImaged is the version of the savepoint whose scope holds the
@@ -426,12 +437,14 @@ func (idx *index) markSketchModified() {
 
 // sketchWrite precedes the sketch mutations of one entry write (putEntries,
 // deleteEntries): inside a savepoint it journals the live sketch, so the
-// savepoint's rollback restores it, then flags it modified. A write
+// savepoint's rollback restores it, then flags it modified, and the live
+// sketches are the transaction's (collection.sketchTx). A write
 // transaction of the db carries itself in the btree transaction's Aux
 // slot; a bare btree transaction journals nothing.
 func (idx *index) sketchWrite(tx *btree.WriteTx) {
 	if t, _ := tx.Aux().(*commonTx); t != nil {
 		t.journalSketch(idx)
+		idx.c.sketchTx = t.sketchTx
 	}
 	idx.markSketchModified()
 }
@@ -604,7 +617,22 @@ func (idx *index) putEntries(tx *btree.WriteTx, id []byte) error {
 			}
 			var err error
 			idx.seekBuf, err = tx.AppendSeekKey(idx.ns, seekKey, idx.seekBuf[:0])
-			if err == nil && qplanner.HasExactFieldPrefix(idx.seekBuf, key, lastInverted) {
+			if err != nil {
+				// ErrKeyNotFound: no key at or after the value, so no
+				// duplicate. A seek that failed found none and ruled none
+				// out: it seeks the bare value and the Put below the full
+				// key, which at a divider take different paths down the
+				// tree (the divider is at or below every key of its right
+				// child, and equal to the first when a leaf split has just
+				// copied it up from the new right leaf; the probe goes left
+				// of it), so the Put can succeed where
+				// the probe failed. As SQLite's OP_NoConflict, which aborts
+				// on a failed seek before it looks at the seek's result
+				// (vdbe.c:5414).
+				if err != btree.ErrKeyNotFound && !errors.Is(err, btree.ErrKeyNotFound) {
+					return err
+				}
+			} else if qplanner.HasExactFieldPrefix(idx.seekBuf, key, lastInverted) {
 				if !bytes.Equal(idx.seekBuf, idx.fullKeyBuf) {
 					return ErrUniqueConstraint
 				}
@@ -652,6 +680,11 @@ func (idx *index) markMultiKey(tx *btree.WriteTx) error {
 	idx.mkBuf, err = tx.AppendValue(idx.c.db.systemNS, key, idx.mkBuf[:0])
 	if err == nil && len(idx.mkBuf) == 1 && idx.mkBuf[0] == mkValMultiKey[0] {
 		return nil // already flagged in this tx's view
+	}
+	// An absent record (an index older than the flag) is set like a scalar
+	// one; a read that failed is the write's error.
+	if err != nil && err != btree.ErrKeyNotFound && !errors.Is(err, btree.ErrKeyNotFound) {
+		return err
 	}
 	return tx.Put(idx.c.db.systemNS, key, mkValMultiKey)
 }

@@ -159,11 +159,15 @@ func TestCommittedSize_ReaderDuringUncommittedShrink(t *testing.T) {
 	})
 }
 
-// TestCommittedSize_NewDatabase: a database that was just created has a
-// committed size of one page, page 1, before its first commit (newDatabase
-// sets nPage = 1, btree.c:3540-3541). Its first read, its first allocation,
-// a first transaction that rolls back and its first commit all start from
-// it.
+// TestCommittedSize_NewDatabase: a database that was just created is one
+// page, page 1, before its first commit (newDatabase sets nPage = 1,
+// btree.c:3540-3541). Its first read, its first allocation, a first
+// transaction that rolls back and its first commit all start from it. No
+// commit has recorded a size yet, so in every mode a snapshot carries none
+// (walIndexRecover zeroes the header and sets nPage only from a commit
+// frame, wal.c:1408, 1512) and its reader takes page 1 from the file
+// (pagerPagecount, pager.c:3292-3305); an in-memory database has no file,
+// and its reader takes the one page creation wrote.
 func TestCommittedSize_NewDatabase(t *testing.T) {
 	forEachRestartMode(t, func(t *testing.T, m restartMode) {
 		db, path := openRestartDB(t, m)
@@ -172,9 +176,7 @@ func TestCommittedSize_NewDatabase(t *testing.T) {
 		bound, snapNPage := db.pager.readerDbSizeBound(rtx.cache), rtx.walHdr.nPage
 		require.NoError(t, rtx.Rollback())
 		require.Equal(t, uint32(1), bound, "a new database is page 1")
-		if m.opts.InProcess || m.opts.InMemory {
-			require.Equal(t, uint32(1), snapNPage, "the snapshot carries the committed size")
-		}
+		require.Zero(t, snapNPage, "no commit has recorded a size")
 
 		wtx, err := db.BeginWrite()
 		require.NoError(t, err)

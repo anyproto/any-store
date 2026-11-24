@@ -26,11 +26,14 @@ import (
 const (
 	changePeerEnv     = "ANYSTORE_TEST_CHANGE_PEER_DB"
 	changePeerHoldEnv = "ANYSTORE_TEST_CHANGE_PEER_HOLD"
+	changePeerBulkEnv = "ANYSTORE_TEST_CHANGE_PEER_BULK"
 )
 
 // changePeer is the other process: one insert into the indexed collection.
 // With changePeerHoldEnv set it instead holds a write transaction on the
 // database until the file named there appears, after creating <file>.held.
+// With changePeerBulkEnv set it instead inserts 100 documents into c and
+// creates a collection: a schema change beside the writes.
 func changePeer(t *testing.T) bool {
 	path := os.Getenv(changePeerEnv)
 	if path == "" {
@@ -53,6 +56,20 @@ func changePeer(t *testing.T) bool {
 		require.NoError(t, db.Close())
 		return true
 	}
+	if os.Getenv(changePeerBulkEnv) != "" {
+		c, err := db.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		wtx, err := db.WriteTx(ctx)
+		require.NoError(t, err)
+		for i := 0; i < 100; i++ {
+			require.NoError(t, c.Insert(wtx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":7}`, 1000+i))))
+		}
+		require.NoError(t, wtx.Commit())
+		_, err = db.CreateCollection(ctx, "made-by-the-peer")
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+		return true
+	}
 	for _, name := range []string{"c", "c2"} {
 		c, err := db.OpenCollection(ctx, name)
 		if name == "c2" && err != nil {
@@ -65,51 +82,23 @@ func changePeer(t *testing.T) bool {
 	return true
 }
 
-func runChangePeer(t *testing.T, path string) {
+func runChangePeer(t *testing.T, path string, env ...string) {
 	t.Helper()
 	name := t.Name()
 	if i := bytes.IndexByte([]byte(name), '/'); i >= 0 {
 		name = name[:i]
 	}
 	cmd := exec.Command(os.Args[0], "-test.run=^"+name+"$", "-test.timeout=60s")
-	cmd.Env = append(os.Environ(), changePeerEnv+"="+path)
+	cmd.Env = append(append(os.Environ(), changePeerEnv+"="+path), env...)
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "peer failed:\n%s", out)
 }
 
-// openSketchDB makes a database with an indexed collection of 50 documents
-// and returns it reopened, so that no collection handle is open.
-func openSketchDB(t *testing.T) (DB, string) {
-	t.Helper()
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "p.db")
-	db, err := Open(ctx, path, nil)
-	require.NoError(t, err)
-	coll, err := db.CreateCollection(ctx, "c")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-	for i := 0; i < 50; i++ {
-		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%5))))
-	}
-	require.NoError(t, db.Close())
-	db, err = Open(ctx, path, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-	return db, path
-}
-
-func sketchDocCount(t *testing.T, coll Collection) uint64 {
-	t.Helper()
-	st, err := coll.Stats(context.Background())
-	require.NoError(t, err)
-	require.Len(t, st.Indexes, 1)
-	return st.Indexes[0].SketchDocCount
-}
-
 // The sketches of an open collection follow another process's commit,
 // whatever kind of transaction of this process is the first to begin after
-// it: one that reloads sketches, or one that never looks at them (a fast
-// read by id, a btree-level read, a backup, an integrity check).
+// it, and none of these looks at the published sketches: Stats, which reads
+// the stored row for itself, a fast read by id, a btree-level read, a write
+// transaction that does nothing, a backup, an integrity check.
 func TestChangeEpoch_PeerCommitReloadsSketches(t *testing.T) {
 	if changePeer(t) {
 		return
@@ -126,6 +115,8 @@ func TestChangeEpoch_PeerCommitReloadsSketches(t *testing.T) {
 
 			switch first {
 			case "stats":
+				_, err := coll.Stats(ctx)
+				require.NoError(t, err)
 			case "find-id":
 				_, err := coll.FindId(ctx, 1)
 				require.NoError(t, err)

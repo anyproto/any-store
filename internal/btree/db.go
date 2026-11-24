@@ -1427,6 +1427,12 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	if !errors.Is(err, ErrNamespaceNotFound) {
 		return err
 	}
+	// The master-table record is the name and the 4-byte root page number.
+	// Put would refuse one over the record size limit; refuse it before the
+	// root page is allocated.
+	if err = recordSizeErr(len(name), 4); err != nil {
+		return err
+	}
 
 	// Allocate a new page for the namespace's B-tree root
 	rootPg, err := db.pager.allocatePage()
@@ -1520,6 +1526,12 @@ func (db *DB) RenameNamespace(tx *WriteTx, oldName, newName string) error {
 		return ErrNamespaceExists
 	}
 	if !errors.Is(err, ErrNamespaceNotFound) {
+		return err
+	}
+
+	// The Put below would refuse a name over the record size limit; refuse
+	// it before the old name is deleted.
+	if err = recordSizeErr(len(newName), 4); err != nil {
 		return err
 	}
 
@@ -1732,6 +1744,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 
 	usableSize := bt.usablePageSize()
 	lim := bt.leafLimits()
+	depth := 0 // child pointers followed: see btCursorMaxDepth
 	for {
 		if pg.header.isLeaf() {
 			idx, found, serr := searchLeafWithOverflow(pg, nameKey, lim, bt.pager, bt.walMaxFrame, bt.cache)
@@ -1780,6 +1793,10 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 			return nil, serr
 		}
 		bt.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return nil, ErrCorrupt
+		}
+		depth++
 		pg, err = bt.descendChild(childPgno)
 		if err != nil {
 			return nil, err
@@ -1919,6 +1936,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 	// Search without starting a new read tx (we're already in one)
 	usableSize := tx.pager.usableSize()
 	lim := tx.pager.leafLimits()
+	depth := 0 // child pointers followed: see btCursorMaxDepth
 	for {
 		if pg.header.isLeaf() {
 			idx, found, serr := searchLeafWithOverflow(pg, key, lim, tx.pager, tx.walHdr.mxFrame, tx.cache)
@@ -1959,6 +1977,10 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				valOverflow := int(valLen) - localValBytes
 
 				// Grow buf to hold the full value — no intermediate allocations.
+				if !payloadInFile(tx.pager, tx.cache, totalPayload) {
+					tx.pager.releasePage(pg)
+					return buf, ErrCorrupt
+				}
 				start := len(buf)
 				buf = slices.Grow(buf, int(valLen))[:start+int(valLen)]
 				fullVal := buf[start:]
@@ -1993,6 +2015,10 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 			return buf, serr
 		}
 		tx.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return buf, ErrCorrupt
+		}
+		depth++
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return buf, err
@@ -2023,6 +2049,7 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 
 	usableSize := tx.pager.usableSize()
 	lim := tx.pager.leafLimits()
+	depth := 0 // child pointers followed: see btCursorMaxDepth
 	for {
 		if pg.header.isLeaf() {
 			_, found, serr := searchLeafWithOverflow(
@@ -2042,6 +2069,10 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 			return false, serr
 		}
 		tx.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return false, ErrCorrupt
+		}
+		depth++
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return false, err
@@ -2078,8 +2109,12 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 	// page number and cell index. If the leaf search overshoots (idx >= n),
 	// we re-read this interior page and descend into the next sibling subtree
 	// to find its leftmost key — no cursor allocation needed.
+	// depth counts the child pointers followed (see btCursorMaxDepth);
+	// fallbackDepth is its value on the saved page, where the walk into the
+	// next subtree resumes — the cursor's pop back to that ancestor.
 	var fallbackPgno uint32
 	var fallbackIdx int
+	var depth, fallbackDepth int
 
 	for {
 		if pg.header.isLeaf() {
@@ -2098,29 +2133,17 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 				}
 				// Non-rightmost leaf: navigate to the leftmost key of
 				// the next sibling subtree (saved during descent).
-				return tx.leftmostKeyAfter(fallbackPgno, fallbackIdx, buf)
+				return tx.leftmostKeyAfter(fallbackPgno, fallbackIdx, buf, fallbackDepth)
 			}
-			off := pg.getCellOffset(idx)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
-			if cerr != nil {
-				tx.pager.releasePage(pg)
-				return buf, cerr
+			// A read of the key bounds the key only (leafFullKey), as
+			// Cursor.Key does. leafFullKey returns a slice into pg.data
+			// when the key is local: copy before the release.
+			key, kerr := leafFullKey(pg.data, int(pg.getCellOffset(idx)), lim, tx.pager, tx.walHdr.mxFrame, cache)
+			if kerr == nil {
+				buf = append(buf, key...)
 			}
-			if cell.overflowPg != 0 {
-				// leafFullKey returns a slice into pg.data when the key is
-				// local: copy before the release.
-				fullKey, kerr := leafFullKey(pg.data, int(off), lim, tx.pager, tx.walHdr.mxFrame, cache)
-				if kerr != nil {
-					tx.pager.releasePage(pg)
-					return buf, kerr
-				}
-				buf = append(buf, fullKey...)
-				tx.pager.releasePage(pg)
-				return buf, nil
-			}
-			buf = append(buf, cell.key...)
 			tx.pager.releasePage(pg)
-			return buf, nil
+			return buf, kerr
 		}
 		childPgno, cellIdx, serr := searchInteriorWithOverflow(pg, prefix, usableSize, tx.pager, tx.walHdr.mxFrame, cache)
 		if serr != nil {
@@ -2132,8 +2155,13 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 			rightmost = false
 			fallbackPgno = pg.pgno
 			fallbackIdx = cellIdx
+			fallbackDepth = depth
 		}
 		tx.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return buf, ErrCorrupt
+		}
+		depth++
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return buf, err
@@ -2144,8 +2172,11 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 // leftmostKeyAfter navigates to the first key in the subtree immediately
 // following cell[cellIdx].leftChild on interior page interiorPgno.
 // Used when a leaf search overshoots and needs the next sibling's first key.
+// depth is the number of child pointers the caller followed from the root to
+// reach interiorPgno; the walk below it counts on from there, so the whole
+// chain is held to btCursorMaxDepth.
 // DRIFT: descent omits moveToChild's per-child nCell>=1 corruption guard See docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-
-func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte) ([]byte, error) {
+func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte, depth int) ([]byte, error) {
 	pg, err := tx.txGetPage(interiorPgno)
 	if err != nil {
 		return buf, err
@@ -2173,6 +2204,10 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 	// Descend to the leftmost key of this subtree.
 	lim := tx.pager.leafLimits()
 	cache := tx.cache // nil for writers, per-connection pcache for readers
+	if depth >= btCursorMaxDepth-1 {
+		return buf, ErrCorrupt
+	}
+	depth++
 	pg, err = tx.txDescendChild(nextPgno)
 	if err != nil {
 		return buf, err
@@ -2183,27 +2218,13 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 				tx.pager.releasePage(pg)
 				return buf, ErrKeyNotFound
 			}
-			off := pg.getCellOffset(0)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
-			if cerr != nil {
-				tx.pager.releasePage(pg)
-				return buf, cerr
+			// The key alone is read and bounded, as in AppendSeekKey.
+			key, kerr := leafFullKey(pg.data, int(pg.getCellOffset(0)), lim, tx.pager, tx.walHdr.mxFrame, cache)
+			if kerr == nil {
+				buf = append(buf, key...)
 			}
-			if cell.overflowPg != 0 {
-				// leafFullKey returns a slice into pg.data when the key is
-				// local: copy before the release.
-				fullKey, kerr := leafFullKey(pg.data, int(off), lim, tx.pager, tx.walHdr.mxFrame, cache)
-				if kerr != nil {
-					tx.pager.releasePage(pg)
-					return buf, kerr
-				}
-				buf = append(buf, fullKey...)
-				tx.pager.releasePage(pg)
-				return buf, nil
-			}
-			buf = append(buf, cell.key...)
 			tx.pager.releasePage(pg)
-			return buf, nil
+			return buf, kerr
 		}
 		// Interior page: descend to cell[0].leftChild.
 		off, oerr := pg.getCellOffsetSafe(0)
@@ -2217,6 +2238,10 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 		}
 		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
 		tx.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return buf, ErrCorrupt
+		}
+		depth++
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return buf, err
