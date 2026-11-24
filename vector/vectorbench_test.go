@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -180,7 +182,7 @@ func vectorbenchDisk(t *testing.T, m Metric) {
 // vbTimed wraps a search for timeSearchN: it counts the calls in *calls and
 // fails the test at the first error, so a run whose searches fail reports
 // no latency for them.
-func vbTimed(t *testing.T, name string, calls *int, search func(q []float32) error) func(q []float32) {
+func vbTimed(t testing.TB, name string, calls *int, search func(q []float32) error) func(q []float32) {
 	return func(q []float32) {
 		*calls++
 		if err := search(q); err != nil {
@@ -218,4 +220,58 @@ func vbFileSizes(path string) string {
 		}
 	}
 	return fmt.Sprintf("%.1f MiB total%s", float64(total)/(1<<20), parts.String())
+}
+
+// The -vectorbench.db mode's reload, run by the ordinary suite at a small
+// size: an index built at one dimension and reloaded with -vectorbench.dim
+// set to a larger one is queried at the dimension it was built with (a query
+// of the flag's would make the distance kernels panic), and a search that
+// fails fails the run rather than being timed.
+func TestVectorbenchReload(t *testing.T) {
+	const dim = 16
+	path := filepath.Join(t.TempDir(), "vb.db")
+	vbSet(t, vbDB, path)
+	vbSet(t, vbN, 300)
+	vbSet(t, vbDim, dim)
+	vbSet(t, vbQueries, 4)
+	vbSet(t, vbRecall, false)
+	vectorbenchDisk(t, Cosine) // the build run
+	*vbDim = 2 * dim
+	vectorbenchDisk(t, Cosine) // the reload run, with a conflicting flag
+
+	db, err := btree.Open(path, btree.Options{})
+	require.NoError(t, err)
+	p, err := openPaged(db, "emb")
+	require.NoError(t, err)
+	require.NoError(t, db.Close()) // every search now fails to begin its read
+	rec := &vbFatalRecorder{TB: t}
+	calls := 0
+	search := vbTimed(rec, "Search", &calls, func(q []float32) error { _, err := p.Search(q, 1); return err })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		search(make([]float32, dim))
+	}()
+	<-done
+	require.Equal(t, 1, calls)
+	require.Contains(t, rec.msg, "Search: ")
+}
+
+// vbSet sets a vectorbench flag's value for the test, and restores it after.
+func vbSet[T any](t *testing.T, flag *T, v T) {
+	old := *flag
+	*flag = v
+	t.Cleanup(func() { *flag = old })
+}
+
+// vbFatalRecorder is a testing.TB whose Fatalf records its message and ends
+// the goroutine, as testing.T's does, without failing the test.
+type vbFatalRecorder struct {
+	testing.TB
+	msg string
+}
+
+func (r *vbFatalRecorder) Fatalf(format string, args ...any) {
+	r.msg = fmt.Sprintf(format, args...)
+	runtime.Goexit()
 }

@@ -255,14 +255,7 @@ func TestVectorIndex_EnsureKeepsEarlierDefinition(t *testing.T) {
 	for _, old := range olds {
 		require.NoError(t, coll.EnsureIndex(ctx, old), old.Name)
 		require.ErrorIs(t, coll.CreateIndex(ctx, old), ErrIndexExists, old.Name)
-		iter, err := coll.Find(fmt.Sprintf(`{"v":{"$knn":{"$query":%s,"$k":1,"$index":%q}}}`, vqJSON(vecs[3]), old.Name)).Iter(ctx)
-		require.NoError(t, err)
-		require.True(t, iter.Next())
-		doc, err := iter.Doc()
-		require.NoError(t, err)
-		assert.Equal(t, 3, doc.Value().GetInt("id"), old.Name)
-		require.False(t, iter.Next())
-		require.NoError(t, iter.Close())
+		assert.Equal(t, 3, nearestId(t, coll, fmt.Sprintf(`{"v":{"$knn":{"$query":%s,"$k":1,"$index":%q}}}`, vqJSON(vecs[3]), old.Name)), old.Name)
 
 		fresh := old
 		fresh.Name = "new"

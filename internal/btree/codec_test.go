@@ -316,13 +316,14 @@ func TestCodec_SharedCodecTwoDatabasesWriting(t *testing.T) {
 }
 
 // One codec object in Options.Codec serving three databases: A and B each
-// with an OnIntegrityError of its own, C with none. A damaged page is
-// reported to the callback of the database it belongs to and to no other,
-// whatever order the databases were opened in: the callback is the
-// database's (installCodec stores it on the pager), not the codec's, which
-// is installed as given and so serves all three. The public API gives each
-// database a codec of its own; Options.Codec is the one place one object can
-// be shared.
+// with an OnIntegrityError of its own, C with none. A damaged page, read by
+// an ordinary transaction or by the integrity sweep, is reported to the
+// callback of the database it belongs to and to no other, whatever order
+// the databases were opened in: the callback is the database's
+// (installCodec stores it on the pager), not the codec's, which is
+// installed as given and so serves all three. The public API gives each
+// database a codec of its own; Options.Codec is the one place one object
+// can be shared.
 func TestCodec_SharedCodecIntegrityCallbackPerDatabase(t *testing.T) {
 	codec, err := NewAESCodec(bytes.Repeat([]byte{0x5a}, KeyLen))
 	require.NoError(t, err)
@@ -373,24 +374,56 @@ func TestCodec_SharedCodecIntegrityCallbackPerDatabase(t *testing.T) {
 	dbC, err := testOpen(t, pathC, Options{Codec: codec})
 	require.NoError(t, err)
 	defer dbC.Close()
+	assert.Zero(t, hitB.calls.Load(), "opening A and C must not reach B's callback")
 
-	// A's damaged page, read by the sweep, goes to A's callback only.
+	// readRows reads every row of db through an ordinary read transaction,
+	// which reads the damaged page on the way.
+	readRows := func(db *DB) error {
+		rtx, err := db.BeginRead()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rtx.Rollback() }()
+		ns, err := rtx.GetNamespace("data")
+		if err != nil {
+			return err
+		}
+		for i := range 200 {
+			if _, err := rtx.Get(ns, fmt.Appendf(nil, "k%05d", i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// A's damaged page, read by an ordinary transaction and then by the
+	// sweep, goes to A's callback only, each time.
+	before := hitA.calls.Load()
+	require.ErrorIs(t, readRows(dbA), ErrPageIntegrity, "A's read must fail on its damaged page")
+	assert.Greater(t, hitA.calls.Load(), before, "A's read failure must reach A's callback")
+	assert.Equal(t, uint32(damaged), hitA.page.Load())
+	assert.Zero(t, hitB.calls.Load(), "A's read failure must not reach B's callback")
+	before = hitA.calls.Load()
 	rep, err := dbA.VerifyIntegrity(context.Background())
 	require.NoError(t, err)
 	require.NotEmpty(t, rep.Errors, "A's damaged page must fail verification")
 	require.ErrorIs(t, rep.Errors[0].Inner, ErrPageIntegrity)
-	assert.Positive(t, hitA.calls.Load(), "A's failure must reach A's callback")
+	assert.Greater(t, hitA.calls.Load(), before, "A's sweep failure must reach A's callback")
 	assert.Equal(t, uint32(damaged), hitA.page.Load())
-	assert.Zero(t, hitB.calls.Load(), "A's failure must not reach B's callback")
+	assert.Zero(t, hitB.calls.Load(), "A's sweep failure must not reach B's callback")
 
-	// C has no callback: its failures reach no one.
-	before := hitA.calls.Load()
+	// C has no callback: its failures, read and sweep, reach no one.
+	before = hitA.calls.Load()
+	require.ErrorIs(t, readRows(dbC), ErrPageIntegrity, "C's read must fail on its damaged page")
+	assert.Equal(t, before, hitA.calls.Load(), "C's read failure must not reach A's callback")
+	assert.Zero(t, hitB.calls.Load(), "C's read failure must not reach B's callback")
 	rep, err = dbC.VerifyIntegrity(context.Background())
 	require.NoError(t, err)
 	require.NotEmpty(t, rep.Errors, "C's damaged page must fail verification")
-	assert.Equal(t, before, hitA.calls.Load(), "C's failure must not reach A's callback")
-	assert.Zero(t, hitB.calls.Load(), "C's failure must not reach B's callback")
+	assert.Equal(t, before, hitA.calls.Load(), "C's sweep failure must not reach A's callback")
+	assert.Zero(t, hitB.calls.Load(), "C's sweep failure must not reach B's callback")
 
+	require.NoError(t, readRows(dbB))
 	rep, err = dbB.VerifyIntegrity(context.Background())
 	require.NoError(t, err)
 	require.Empty(t, rep.Errors)
