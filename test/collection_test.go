@@ -2741,7 +2741,9 @@ func TestCollection_PushMissingField(t *testing.T) {
 
 // $push and $addToSet written in MongoDB's $each form are refused: the
 // modifiers are not implemented, and the object would otherwise be stored
-// as it is.
+// as it is. An operand object MongoDB does not read as that form is one
+// value, keys that start with '$' included: a DBRef is appended as MongoDB
+// appends it, and reads back as it was written.
 func TestCollection_PushEachRefused(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "c")
@@ -2749,16 +2751,27 @@ func TestCollection_PushEachRefused(t *testing.T) {
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
 	for _, mod := range []string{
 		`{"$push":{"tags":{"$each":["a","b"]}}}`,
+		`{"$push":{"tags":{"n":1,"$each":["a"]}}}`,
 		`{"$addToSet":{"tags":{"$each":["a","b"]}}}`,
 	} {
 		_, err := coll.Find(nil).Update(ctx, mod)
 		var pe *query.ParseError
 		require.ErrorAs(t, err, &pe, mod)
-		assert.ErrorContains(t, err, "are not supported")
+		assert.ErrorContains(t, err, "its $each form", mod)
 	}
 	doc, err := coll.FindId(ctx, 1)
 	require.NoError(t, err)
 	assert.Equal(t, `{"id":1}`, doc.Value().String())
+
+	res, err := coll.UpdateId(ctx, 1, query.MustParseModifier(`{"$push":{"refs":{"$ref":"users","$id":7}}}`))
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.Modified)
+	res, err = coll.UpdateId(ctx, 1, query.MustParseModifier(`{"$addToSet":{"refs":{"$ref":"users","$id":8}}}`))
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.Modified)
+	doc, err = coll.FindId(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, `{"id":1,"refs":[{"$ref":"users","$id":7},{"$ref":"users","$id":8}]}`, doc.Value().String())
 }
 
 // An UpsertId of an id with no document inserts what its modifier makes of

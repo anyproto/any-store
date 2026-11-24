@@ -683,7 +683,7 @@ func TestModifierSet_StoresItsOwnCopy(t *testing.T) {
 }
 
 // Parsing a $push and an $addToSet of a scalar, which refuseEachForm looks
-// at for a '$' key only when it is an object.
+// at for an $each key only when it is an object.
 func BenchmarkParseModifier_ScalarPush(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {
@@ -924,26 +924,30 @@ func TestModifier_RemovalsCreateNoPath(t *testing.T) {
 	}...)
 }
 
-// $push and $addToSet take one value. MongoDB's modifiers ($each, and for
-// $push $position, $slice and $sort) are not implemented, so an operand
-// object with a key that starts with '$' is refused instead of stored as it
-// is; such a key deeper in the operand is a value like any other.
+// $push and $addToSet take one value. Their $each form, with $push's
+// $position, $slice and $sort, is not implemented, so an operand MongoDB
+// reads as that form is refused instead of stored as it is: for $push an
+// object with an $each key wherever it is among the keys, for $addToSet one
+// whose first key is $each (push_node.cpp:80, addtoset_node.cpp:77-94 at
+// r8.0.0). Any other operand is a value, an object with keys that start
+// with '$' included, as in MongoDB: a DBRef is appended as it is, and so is
+// an object with $slice and no $each, an $addToSet operand with $each after
+// its first key, and $each deeper in the operand.
 func TestParseModifier_PushModifiersRefused(t *testing.T) {
+	const pushErr = `parse modifier: $push takes one value: its $each form ($each, $position, $slice, $sort), an operand object with an $each key, is not supported (at $push.tags)`
+	const addToSetErr = `parse modifier: $addToSet takes one value: its $each form ($each), an operand object whose first key is $each, is not supported (at $addToSet.tags)`
 	testModCasesErr(t, []modifierCaseError{
-		{
-			mod: `{"$push":{"tags":{"$each":["a","b"]}}}`,
-			err: `parse modifier: $push takes one value: its modifiers ($each, $position, $slice, $sort) are not supported, and an object operand cannot have a key that starts with '$', got $each (at $push.tags)`,
-		},
-		{
-			mod: `{"$push":{"tags":{"n":1,"$slice":2}}}`,
-			err: `parse modifier: $push takes one value: its modifiers ($each, $position, $slice, $sort) are not supported, and an object operand cannot have a key that starts with '$', got $slice (at $push.tags)`,
-		},
-		{
-			mod: `{"$addToSet":{"tags":{"$each":["a","b"]}}}`,
-			err: `parse modifier: $addToSet takes one value: its modifiers ($each) are not supported, and an object operand cannot have a key that starts with '$', got $each (at $addToSet.tags)`,
-		},
+		{mod: `{"$push":{"tags":{"$each":["a","b"]}}}`, err: pushErr},
+		{mod: `{"$push":{"tags":{"$slice":2,"$each":["a"]}}}`, err: pushErr},
+		{mod: `{"$push":{"tags":{"n":1,"$each":["a"]}}}`, err: pushErr},
+		{mod: `{"$addToSet":{"tags":{"$each":["a","b"]}}}`, err: addToSetErr},
+		{mod: `{"$addToSet":{"tags":{"$each":["a"],"n":1}}}`, err: addToSetErr},
 	}...)
 	testModCases(t, []modifierCase{
+		{`{"$push":{"refs":{"$ref":"users","$id":7}}}`, `{"refs":[]}`, `{"refs":[{"$ref":"users","$id":7}]}`, true},
+		{`{"$addToSet":{"refs":{"$ref":"users","$id":7}}}`, `{"refs":[]}`, `{"refs":[{"$ref":"users","$id":7}]}`, true},
+		{`{"$push":{"tags":{"n":1,"$slice":2}}}`, `{}`, `{"tags":[{"n":1,"$slice":2}]}`, true},
+		{`{"$addToSet":{"tags":{"n":1,"$each":["a"]}}}`, `{}`, `{"tags":[{"n":1,"$each":["a"]}]}`, true},
 		{`{"$push":{"tags":{"n":{"$each":1}}}}`, `{}`, `{"tags":[{"n":{"$each":1}}]}`, true},
 		{`{"$push":{"tags":["$each"]}}`, `{}`, `{"tags":[["$each"]]}`, true},
 	}...)

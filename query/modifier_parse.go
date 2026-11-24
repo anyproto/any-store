@@ -269,34 +269,47 @@ func newPopModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	}, nil
 }
 
-// refuseEachForm refuses, for $push and $addToSet, an operand object with a
-// key that starts with '$'. MongoDB reads {"$each": [...]} there as the
-// operator's modifiers (mods), which any-store does not implement: taken as a
-// value, the object would be stored as it is where MongoDB stores its
-// elements. Refusing every such key keeps those forms free to be implemented
-// later without changing what an accepted update does.
-func refuseEachForm(op, mods string, v *anyenc.Value) error {
+// eachKey is the key of MongoDB's $each form of $push and $addToSet.
+var eachKey = []byte("$each")
+
+// refuseEachForm refuses an operand of $push (firstOnly false) or $addToSet
+// (firstOnly true) that MongoDB reads as the operator's $each form, with its
+// modifiers (mods), which any-store does not implement: taken as a value,
+// the object would be stored as it is where MongoDB stores its elements.
+// MongoDB reads a $push operand object with an $each key, wherever it is
+// among the keys, as that form (PushNode::init, push_node.cpp:80 at r8.0.0:
+// modExpr[kEachClauseName]), and an $addToSet operand object only when $each
+// is its first key (AddToSetNode::init, addtoset_node.cpp:77-94). Any other
+// operand is one value, an object with keys that start with '$' included: a
+// DBRef ({"$ref":"users","$id":7}) is appended as it is, as MongoDB appends
+// it, and so is {"n":1,"$slice":2}.
+func refuseEachForm(op, mods string, v *anyenc.Value, firstOnly bool) error {
 	obj := v.GetObject()
 	if obj == nil {
 		return nil
 	}
-	var dollarKey string
+	found, first := false, true
 	obj.Visit(func(k []byte, _ *anyenc.Value) {
-		if dollarKey == "" && bytes.HasPrefix(k, opBytesPrefix) {
-			dollarKey = string(k)
+		if (first || !firstOnly) && bytes.Equal(k, eachKey) {
+			found = true
 		}
+		first = false
 	})
-	if dollarKey == "" {
+	if !found {
 		return nil
+	}
+	where := "with an $each key"
+	if firstOnly {
+		where = "whose first key is $each"
 	}
 	return &ParseError{
 		Op:     op,
-		Reason: op + " takes one value: its modifiers (" + mods + ") are not supported, and an object operand cannot have a key that starts with '$', got " + dollarKey,
+		Reason: op + " takes one value: its $each form (" + mods + "), an operand object " + where + ", is not supported",
 	}
 }
 
 func newPushModifier(key []byte, v *anyenc.Value) (Modifier, error) {
-	if err := refuseEachForm("$push", "$each, $position, $slice, $sort", v); err != nil {
+	if err := refuseEachForm("$push", "$each, $position, $slice, $sort", v, false); err != nil {
 		return nil, err
 	}
 	return modifierPush{
@@ -335,7 +348,7 @@ func newPullAllModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 }
 
 func newAddToSetModifier(key []byte, v *anyenc.Value) (Modifier, error) {
-	if err := refuseEachForm("$addToSet", "$each", v); err != nil {
+	if err := refuseEachForm("$addToSet", "$each", v, true); err != nil {
 		return nil, err
 	}
 	return modifierAddToSet{

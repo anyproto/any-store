@@ -355,9 +355,13 @@ build per query and carry no such guarantee.
     holds anything else, `null` included, is an error (`$push: field 'tags'
     must be an array: …`), and `$inc` on a non-number is one too; the update
     then writes nothing. `$push` and `$addToSet` take one value: MongoDB's
-    modifiers (`$each`, and for `$push` `$position`, `$slice` and `$sort`)
-    are not supported, and an operand object with a key that starts with
-    `$` is a parse error, not a value to store. `$set`, `$push` and
+    `$each` form (with `$position`, `$slice` and `$sort` for `$push`) is not
+    supported, and an operand MongoDB reads as that form is a parse error,
+    not a value to store: for `$push` an object with an `$each` key, for
+    `$addToSet` one whose first key is `$each`. Any other operand is a
+    value, an object with keys that start with `$` included:
+    `{"$push":{"refs":{"$ref":"users","$id":7}}}` appends the reference, as
+    MongoDB does. `$set`, `$push` and
     `$addToSet` store a copy of their operand, as MongoDB copies it into
     each document (a number, a bool, null, an object id or a date, which
     nothing changes in place, is stored as itself): every document an
