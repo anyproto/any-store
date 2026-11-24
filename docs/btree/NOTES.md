@@ -823,21 +823,19 @@ The Go implementation has:
 the specific cap values differ. SQLite's `nCell/usableSize > nPage` check is more
 precise (validates against actual database size), while Go uses a fixed 1 GB cap.
 
-The cap is also the write-side limit (2026-11-19). `Put` took any value and any key up to
-1 GiB, so a record whose key and value together passed `maxPayloadAlloc` was written and
-then rejected as `ErrCorrupt` by every parse of its cell (`parseLeafCellWithSize`,
-`leafFullKey`, `leafFullValue`, `leafKeyAt`); a value alone over the cap also failed the
-binary-search probes of its leaf (`searchLeafWithOverflow`), which made the neighbouring
-keys unreadable. Both sides now apply one rule, `payloadFits` (`page.go`): key length plus
-value length at most `maxPayloadAlloc` (`1<<30`), tested on the 64-bit lengths a cell
-declares before they are converted to `int` (on a 32-bit build a declared length of
-`1<<32+1` converts to 1, and the five parsers that converted first accepted it). The parsers
-answer `ErrCorrupt` for a cell that fails it; `Put` answers `ErrKeyTooLarge` (the key alone
-is over) or `ErrValueTooLarge` before it touches a page, and `CreateNamespace` /
-`RenameNamespace` apply it to the master-table record (the name and a 4-byte root) before
-they allocate the root or delete the old name. Only `Put` brings a new record into a tree,
-and it tests that record at entry, before any path writes it; the rest of what a split or a
-rebuild writes, under `Put` or `Delete`, comes from cells already in the tree.
+The cap is also the write-side limit: reads and writes apply one rule, `payloadFits`
+(`page.go`). Key length plus value length is at most `maxPayloadAlloc` (`1<<30`), tested on
+the 64-bit lengths a cell declares before they are converted to `int` (on a 32-bit build a
+declared length of `1<<32+1` would convert to 1). The leaf-cell parsers that test both
+lengths (`parseLeafCellWithSize`, `leafFullValue`, `leafKeyAt`) answer `ErrCorrupt` for a
+cell that fails it, and so do `parseInteriorCell` and `interiorFullKey` for a key over the
+cap. `Put` refuses such a record with `ErrKeyTooLarge` (the key alone is over) or
+`ErrValueTooLarge` before it touches a page, so it never writes a record that its own parse
+would reject, and `CreateNamespace` / `RenameNamespace` apply it to the master-table record
+(the name and a 4-byte root) before they allocate the root or delete the old name. Only
+`Put` brings a new record into a tree, and it tests that record at entry, before any path
+writes it; the rest of what a split or a rebuild writes, under `Put` or `Delete`, comes from
+cells already in the tree.
 
 A read of a leaf cell's key bounds the key only; the value's declared length is tested where
 the value is read. That length still places the key's local part, and `spilledLocalSize`
@@ -846,29 +844,29 @@ wrap. The search tests the sum only for the cell it reports as found, so every e
 is held to it, `Has` and an exact seek included. A damaged value length therefore need not
 make the cell's key, or a search for a neighbouring key, fail; a read of the value reports a
 length over its bounds. A SQLite table cursor reads the rowid of a row whose payload is
-corrupt the same way (`sqlite3BtreeIntegerKey`, `btree.c:4917-4923`). `leafCellPayloadLen`
-(`walkSize`) tests the lengths singly, as before. These tests are looser than `payloadFits`,
-never stricter, so nothing `Put` accepts fails there. The overflow-chain readers have no cap
-of their own (their `maxIter` follows from the length asked for), and the 9-byte varint
-holds any length under the cap.
+corrupt the same way (`sqlite3BtreeIntegerKey`, `btree.c:4916-4922`). `leafCellPayloadLen`
+(`walkSize`) tests the two lengths singly. These tests are looser than `payloadFits`, never
+stricter, so nothing `Put` accepts fails there. The overflow-chain readers have no cap of
+their own (their `maxIter` follows from the length asked for), and the 9-byte varint holds
+any length under the cap.
 
-The fixed cap alone let a damaged cell in a small file declare just under 1 GiB and have a
-reader allocate that much before the overflow chain turned out short. SQLite's precise
-bound is ported for that (2026-11-19): `sqlite3VdbeMemFromBtree` returns
-`SQLITE_CORRUPT_BKPT` when `amt+offset > sqlite3BtreeMaxRecordSize(pCur)` before it resizes
-the Mem (`vdbemem.c:1428-1429`), and that size is `pageSize * nPage` (`btree.c:4981-4985`).
-`payloadInFile` (`page.go`) is the same test with the page count of the reader's snapshot
-(`readerDbSizeBound`: the read transaction's, or the live count for the writer). It runs
-before every allocation sized by a declared length, on the bytes that are read: key and
-value for the value readers (`btree.AppendValue`, `ReadTx.AppendValue`, `Cursor.Value`,
-`Cursor.AppendValue`, `leafFullValue`), the key alone for the key readers (`leafFullKey`,
-`interiorFullKey`, `cellFullKey`, `collectInteriorCellsKeepBuf`). `leafFullKey` also gives
-its first overflow pointer the chain readers' page test before it allocates. SQLite's index
-probe likewise sizes the key it rebuilds from the key alone (`btree.c:6159-6168`). A value
-length over the file therefore fails the read of that value, not a read of the cell's key.
-It is applied where the bytes are asked for, as in SQLite, not in the cell parsers, which
-have no pager. The 1 GiB cap stays as the limit of what is written and as the bound where
-the two differ (a file over 1 GiB).
+A reader that allocates from a declared length first tests it against the size of the
+database it reads, so that a few damaged bytes in a small file cannot ask for up to 1 GiB
+before the overflow chain is found short. The test is SQLite's: `sqlite3VdbeMemFromBtree`
+returns `SQLITE_CORRUPT_BKPT` when `amt+offset > sqlite3BtreeMaxRecordSize(pCur)` before it
+resizes the Mem (`vdbemem.c:1428-1429`), and that size is `pageSize * nPage`
+(`btree.c:4978-4982`). `payloadInFile` (`page.go`) makes it with the page count of the
+reader's snapshot (`readerDbSizeBound`: the read transaction's, or the live count for the
+writer). It runs before every allocation sized by a declared length, on the bytes that are
+read: key and value for the value readers (`btree.AppendValue`, `ReadTx.AppendValue`,
+`Cursor.Value`, `Cursor.AppendValue`, `leafFullValue`), the key alone for the key readers
+(`leafFullKey`, `interiorFullKey`, `cellFullKey`, `collectInteriorCellsKeepBuf`).
+`leafFullKey` also gives its first overflow pointer the chain readers' page test before it
+allocates. SQLite's index probe likewise sizes the key it rebuilds from the key alone
+(`btree.c:6159-6168`). A value length over the file therefore fails the read of that value,
+not a read of the cell's key. The test is made where the bytes are asked for, as in SQLite,
+not in the cell parsers, which have no pager. The 1 GiB cap is the limit of what is written,
+and the tighter bound of the two in a file over 1 GiB.
 
 `Has` answers from the cell its search finds: it tests the record size limit there, not the
 file size, so it can be true for a record whose `Get` fails the file-size bound. SQLite's
