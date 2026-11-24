@@ -2011,7 +2011,7 @@
       "pager.c:sqlite3PagerOpenSavepoint",
       "wal.c:sqlite3WalSavepoint"
     ],
-    "note": ""
+    "note": "in the error state of a failed spill it returns pager.errCode, where sqlite3PagerOpenSavepoint does not test it (pager.c:6965-6974): a savepoint opened in a transaction that can only be rolled back has nothing to keep"
   },
   "pager.go:*pager.setHasContent": {
     "sqlite": [
