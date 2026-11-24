@@ -251,12 +251,15 @@ func (pi *planIterator) Doc() (Doc, error) {
 	return pi.qb.coll.newItem(doc)
 }
 
-// Err returns the error that ended the iteration, nil for one that reached
-// its end. The end is the plan returning no document and no error (Next);
-// no error stands for it, io.EOF included, which a read past the end of a
-// file shorter than its page count returns wrapped. SQLite ends a loop on
-// SQLITE_DONE alone (OP_Next: "if( rc!=SQLITE_DONE ) goto
-// abort_due_to_error", vdbe.c).
+// Err returns the error that ended the iteration, or nil when the iteration
+// reached its end. The end is never an error value: the plan reports it by
+// returning no document and no error (Next). An error that wraps io.EOF is
+// a read error like any other, and Err returns it: the pager returns one for
+// a short read of a database file shorter than its page count, where SQLite
+// zero-fills the page (pager.c:3042; see
+// docs/btree/NOTES.md#drift-7-short-db-file-read-treated-as-hard-error).
+// SQLite ends a loop on SQLITE_DONE alone (OP_Next: "if( rc!=SQLITE_DONE )
+// goto abort_due_to_error", vdbe.c).
 func (pi *planIterator) Err() error {
 	return pi.err
 }
