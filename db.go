@@ -99,6 +99,11 @@ type DB interface {
 	// not replaced: Backup returns an error and leaves its content as it
 	// was.
 	//
+	// Backup returns the destination's errors as well as the source's: a
+	// file at path that is damaged, or encrypted with another key, can give
+	// an error that matches ErrCorrupt while this database is sound. Rule
+	// that out before discarding this database.
+	//
 	// Backup never removes the file at path. If it fails before the copy is
 	// committed, the destination's transaction is rolled back: a destination
 	// that existed keeps its content, a new one is an empty database. The
