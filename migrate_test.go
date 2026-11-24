@@ -1967,3 +1967,121 @@ func TestCopyToLatestFormat_VerificationFailureIsNotErrCorrupt(t *testing.T) {
 		require.NotErrorIs(t, err, ErrPageIntegrity)
 	})
 }
+
+// A copy whose catalog lists a collection with no data namespace differs
+// from its source: ErrCopyVerifyFailed, naming the collection, and not the
+// b-tree's missing-namespace error, which the verification stopped on
+// before the integrity check could tell it.
+func TestCopyToLatestFormat_MissingNamespaceIsVerifyFailure(t *testing.T) {
+	ctx := context.Background()
+	dst, err := open(ctx, filepath.Join(t.TempDir(), "copy.db"), &Config{}, LatestSchemaFormat)
+	require.NoError(t, err)
+	defer dst.Close()
+	coll, err := dst.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	var want []copiedCollection
+	require.NoError(t, dst.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		cfg, err := dst.loadCollConfig(tx, "c")
+		if err != nil {
+			return err
+		}
+		indexes, err := dst.getIndexInfos(tx, "c")
+		if err != nil {
+			return err
+		}
+		want = append(want, copiedCollection{name: "c", cfg: cfg, indexes: indexes, docs: 1})
+		return nil
+	}))
+	require.NoError(t, verifyCopy(ctx, dst, want))
+
+	// The collection's data goes; its catalog entry stays.
+	wtx, err := dst.btreeDB.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, wtx.DeleteNamespace("c"))
+	require.NoError(t, wtx.Commit())
+
+	err = verifyCopy(ctx, dst, want)
+	require.ErrorIs(t, err, ErrCopyVerifyFailed)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, btree.ErrNamespaceNotFound)
+	require.Contains(t, err.Error(), `collection "c"`)
+}
+
+// damageStagedPages flips the last byte of every page of the staged copy at
+// stage but page 1, in its database file and in its log: the checksum
+// trailer, which leaves what the page holds as it was.
+func damageStagedPages(t *testing.T, stage string) {
+	t.Helper()
+	const pageSize, walHeader, frameHeader = 4096, 32, 24
+	flip := func(path string, first, step int64, skip func(off int64, data []byte) bool) {
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		for off := first; off+step <= int64(len(data)); off += step {
+			if !skip(off, data) {
+				data[off+step-1] ^= 0xFF
+			}
+		}
+		require.NoError(t, os.WriteFile(path, data, 0o644))
+	}
+	flip(stage, 0, pageSize, func(off int64, _ []byte) bool { return off == 0 })
+	flip(stage+"-wal", walHeader, frameHeader+pageSize, func(off int64, data []byte) bool {
+		return binary.BigEndian.Uint32(data[off:]) == 1
+	})
+}
+
+// Damage confined to the copy, met while the copy is built, is the copy's:
+// a page the index build reads back fails its checksum, and the call
+// returns ErrCopyVerifyFailed, not ErrCorrupt, which would send the caller
+// to discard a healthy source. Nothing is published, and the source opens
+// and checks as it was.
+func TestCopyToLatestFormat_DamageInTheCopyWhileItIsBuilt(t *testing.T) {
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Name: "n", Fields: []string{"n"}}))
+	pad := strings.Repeat("p", 200)
+	for i := 0; i < 2*copyBatch; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"n":%d,"pad":%q}`, i, i, pad))))
+	}
+	dstPath := filepath.Join(t.TempDir(), "copy.db")
+	damaged := false
+	testHookCopiedCollection = func(string) {
+		damageStagedPages(t, dstPath+".copy-staging")
+		damaged = true
+	}
+	defer func() { testHookCopiedCollection = nil }()
+
+	// A small cache, so that the index build reads the documents' pages
+	// back from the files.
+	_, err = CopyToLatestFormat(ctx, src, dstPath, &Config{CacheSize: 10})
+	require.True(t, damaged)
+	require.ErrorIs(t, err, ErrCopyVerifyFailed)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, ErrPageIntegrity)
+	require.Contains(t, err.Error(), `index "n"`)
+	_, err = os.Stat(dstPath)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.NoError(t, src.IntegrityCheck(ctx))
+}
+
+// The copy's pages are verified whatever Config.ContinueOnIntegrityError
+// says: a copy whose pages fail their checksum, their content intact, fails
+// its verification instead of being published to fail its first read.
+func TestCopyToLatestFormat_ContinueOnIntegrityErrorDoesNotSkipTheCopysChecksums(t *testing.T) {
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	for i := 0; i < 300; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%0200d"}`, i, i))))
+	}
+	dstPath := filepath.Join(t.TempDir(), "copy.db")
+	testHookCopiedCollection = func(string) { damageStagedPages(t, dstPath+".copy-staging") }
+	defer func() { testHookCopiedCollection = nil }()
+
+	_, err = CopyToLatestFormat(ctx, src, dstPath, &Config{ContinueOnIntegrityError: true})
+	require.ErrorIs(t, err, ErrCopyVerifyFailed)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	_, err = os.Stat(dstPath)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}

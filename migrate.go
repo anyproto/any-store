@@ -141,9 +141,11 @@ type CopyReport struct {
 // checkpointed, verified (each collection's options, document count and index
 // definitions against the source's snapshot, then IntegrityCheck) and closed,
 // and then published by renaming the staging file to dstPath. A copy that
-// fails the verification is not published, and the call returns
-// ErrCopyVerifyFailed, which does not match ErrCorrupt even when the copy is
-// damaged: the copy is what failed, not src. The files at
+// fails the verification, or that meets damage in itself while it is
+// built, is not published, and the call returns ErrCopyVerifyFailed, which
+// does not match ErrCorrupt even when the copy is damaged: the copy is what
+// failed, not src. The copy's pages are verified whatever
+// config.ContinueOnIntegrityError says. The files at
 // and beside dstPath are checked again right before the rename, so a file
 // that appeared there while the copy ran also gives ErrDestinationExists. The
 // check and the rename are not one step, and the locks exclude only other
@@ -215,6 +217,11 @@ func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Con
 	if config != nil {
 		cfg = *config // Open fills in the defaults of the Config it gets
 	}
+	// The copy's pages are verified as they are read back, whatever the
+	// forensic setting: with checksums off, a page of the copy that fails
+	// its checksum would pass the verification, and the copy published
+	// would fail its first read.
+	cfg.ContinueOnIntegrityError = false
 	if cfg.InMemory {
 		return CopyReport{}, errors.New("any-store: copy to latest format: Config.InMemory is not supported, the copy is a file")
 	}
@@ -263,6 +270,7 @@ func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Con
 	}()
 
 	if dst, err = open(ctx, stage, &cfg, LatestSchemaFormat); err != nil {
+		err = inCopy(err)
 		return
 	}
 	colls, err := copyCollections(ctx, s, dst, &report)
@@ -277,7 +285,7 @@ func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Con
 	closeErr := dst.Close()
 	dst = nil
 	if closeErr != nil {
-		return CopyReport{}, fmt.Errorf("any-store: copy to latest format: closing the copy: %w", closeErr)
+		return CopyReport{}, fmt.Errorf("any-store: copy to latest format: closing the copy: %w", inCopy(closeErr))
 	}
 	if err = removeStagingSidecars(stage); err != nil {
 		return
@@ -387,7 +395,7 @@ func copyCollection(ctx, rctx context.Context, s, dst *db, c *copiedCollection, 
 	}
 	dc, err := dst.CreateCollection(ctx, c.name, CollectionOptions{Compression: c.cfg.Compression, PrimaryKey: c.cfg.PrimaryKey})
 	if err != nil {
-		return fail(err)
+		return fail(inCopy(err))
 	}
 	// The copy's own handle: nobody else has the copy open.
 	defer func() { _ = dc.Close() }()
@@ -412,7 +420,7 @@ func copyCollection(ctx, rctx context.Context, s, dst *db, c *copiedCollection, 
 	}
 	for _, info := range c.indexes {
 		if err = dc.CreateIndex(ctx, info); err != nil {
-			return fmt.Errorf("any-store: copy to latest format: collection %q: index %q: %w", c.name, info.Name, err)
+			return fmt.Errorf("any-store: copy to latest format: collection %q: index %q: %w", c.name, info.Name, inCopy(err))
 		}
 		report.Indexes++
 	}
@@ -452,16 +460,16 @@ func copyDocuments(ctx context.Context, tx *btree.ReadTx, ns *btree.Namespace, d
 		}
 		if wtx == nil {
 			if wtx, err = dst.WriteTx(ctx); err != nil {
-				return fmt.Errorf("any-store: copy to latest format: %w", err)
+				return fmt.Errorf("any-store: copy to latest format: %w", inCopy(err))
 			}
 		}
 		if err = dc.Insert(wtx.Context(), doc); err != nil {
-			return fail(key, doc, err)
+			return fail(key, doc, inCopy(err))
 		}
 		if n++; n%copyBatch == 0 {
 			err, wtx = wtx.Commit(), nil
 			if err != nil {
-				return fmt.Errorf("any-store: copy to latest format: %w", err)
+				return fmt.Errorf("any-store: copy to latest format: %w", inCopy(err))
 			}
 			if testHookCopiedBatch != nil {
 				testHookCopiedBatch(n)
@@ -474,7 +482,7 @@ func copyDocuments(ctx context.Context, tx *btree.ReadTx, ns *btree.Namespace, d
 	if wtx != nil {
 		err, wtx = wtx.Commit(), nil
 		if err != nil {
-			return fmt.Errorf("any-store: copy to latest format: %w", err)
+			return fmt.Errorf("any-store: copy to latest format: %w", inCopy(err))
 		}
 	}
 	return nil
@@ -501,10 +509,7 @@ func documentName(key []byte, doc *anyenc.Value, pk string) string {
 // definitions, then the btree's IntegrityCheck.
 func verifyCopy(ctx context.Context, dst *db, want []copiedCollection) error {
 	if err := dst.Flush(ctx, 0, FlushModeCheckpointTruncate); err != nil {
-		if errors.Is(err, ErrCorrupt) {
-			return &copyVerifyError{finding: fmt.Errorf("checkpoint of the copy: %w", err)}
-		}
-		return fmt.Errorf("any-store: copy to latest format: checkpoint of the copy: %w", err)
+		return fmt.Errorf("any-store: copy to latest format: checkpoint of the copy: %w", inCopy(err))
 	}
 	mismatch := func(format string, args ...any) error {
 		return fmt.Errorf("%w: "+format, append([]any{errCopyDiffers}, args...)...)
@@ -529,6 +534,9 @@ func verifyCopy(ctx context.Context, dst *db, want []copiedCollection) error {
 				return mismatch("collection %q: options %+v, the source has %+v", w.name, cfg, w.cfg)
 			}
 			ns, err := tx.GetNamespace(w.name)
+			if errors.Is(err, btree.ErrNamespaceNotFound) {
+				return mismatch("collection %q: its data namespace is missing", w.name)
+			}
 			if err != nil {
 				return fmt.Errorf("collection %q: %w", w.name, err)
 			}
@@ -562,7 +570,7 @@ func verifyCopy(ctx context.Context, dst *db, want []copiedCollection) error {
 		// its verification. A check that could not run (a cancelled ctx,
 		// a read error) is returned as it is.
 		if errors.Is(err, errCopyDiffers) || errors.Is(err, ErrCorrupt) {
-			return &copyVerifyError{finding: err}
+			return fmt.Errorf("any-store: copy to latest format: %w", &copyVerifyError{finding: err})
 		}
 		return fmt.Errorf("any-store: copy to latest format: verifying the copy: %w", err)
 	}
@@ -574,16 +582,30 @@ func verifyCopy(ctx context.Context, dst *db, want []copiedCollection) error {
 var errCopyDiffers = errors.New("the copy differs from the source")
 
 // copyVerifyError is the error of a copy that failed its verification
-// (verifyCopy). Its text has the finding; it matches ErrCopyVerifyFailed and
-// nothing the finding matches, ErrCorrupt included: what is damaged is the
-// copy, and a caller that acts on ErrCorrupt acts on the source.
+// (verifyCopy), or that met damage in itself while it was built (inCopy).
+// Its text has the finding; it matches ErrCopyVerifyFailed and nothing the
+// finding matches, ErrCorrupt included: what is damaged is the copy, and a
+// caller that acts on ErrCorrupt acts on the source.
 type copyVerifyError struct{ finding error }
 
 func (e *copyVerifyError) Error() string {
-	return ErrCopyVerifyFailed.Error() + ": " + e.finding.Error()
+	return "the copy failed its verification: " + e.finding.Error()
 }
 
 func (e *copyVerifyError) Unwrap() error { return ErrCopyVerifyFailed }
+
+// inCopy is the error of an operation on the copy alone, err: the copy's
+// open, a write to it or its commit, an index built in it, its checkpoint
+// and its close. One that matches ErrCorrupt met damage in the copy, which
+// the source does not share: it is ErrCopyVerifyFailed (copyVerifyError),
+// not ErrCorrupt. Any other error is returned as it is. A read of the
+// source keeps its own error, ErrCorrupt included.
+func inCopy(err error) error {
+	if errors.Is(err, ErrCorrupt) {
+		return &copyVerifyError{finding: err}
+	}
+	return err
+}
 
 // primaryKeyOf is the primary key a stored collection config gives: "id"
 // when it names none.

@@ -78,7 +78,10 @@ type DB interface {
 	//
 	// The error matches ErrCorrupt when the check found damage: a broken
 	// structure, a page that fails its checksum or authentication, or a
-	// collection in the catalog that has no data. It does not match
+	// collection in the catalog that has no data. With
+	// Config.ContinueOnIntegrityError on, checksums are not verified: a page
+	// that fails its checksum is found only when what it holds breaks the
+	// structure (Config.OnIntegrityError is still called for it). It does not match
 	// ErrCorrupt when the check could not run or could not read: a closed
 	// database (ErrDBIsClosed), a cancelled ctx, a busy error (ErrBusy), or a report
 	// that lists a page that failed to read with an I/O error or a short
