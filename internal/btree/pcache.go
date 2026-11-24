@@ -163,12 +163,13 @@ func newPcache(pageSize, maxPages int, purgeable bool) *pcache {
 // pcache1ResizeHash floor (pcache1.c:543: "if( nNew<256 ) nNew = 256").
 const minHashSize = 256
 
-// maxHashPresize is the largest apHash a new cache is given (65,536 buckets,
-// 512 KiB). A cache configured for more pages starts at it and grows the table
-// as pages arrive, as SQLite's grows from 256 (pcache1ResizeHash): the
-// doublings past it cost little next to reading that many pages in, and a
-// configured size is not an allocation the process has to be able to make up
-// front, once per cache, readers included.
+// maxHashPresize is the largest apHash a new cache is given (65,536 buckets:
+// 512 KiB of pointers on a 64-bit target, 256 KiB on a 32-bit one). A cache
+// configured for more pages starts at it and grows the table as pages
+// arrive, as SQLite's grows from 256 (pcache1ResizeHash): the doublings past
+// it cost little next to reading that many pages in, and a configured size
+// is not an allocation the process has to be able to make up front, once
+// per cache, readers included.
 const maxHashPresize = 1 << 16
 
 // hashSizeFor returns the smallest power of two >= n that is also >= minHashSize.

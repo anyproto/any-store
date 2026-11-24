@@ -191,8 +191,11 @@ type Config struct {
 	// DurabilityConfig provides configuration for crash recovery and idle auto-flush
 	Durability DurabilityConfig
 
-	// Encryption, when non-empty, enables page-level AES-256-GCM encryption
-	// of the on-disk database file. Zero value means no encryption.
+	// Encryption configures page-level encryption of the database file. A
+	// Passphrase (or a 32-byte raw key passed as one) enables it; CipherType
+	// only selects the cipher, AES-256-GCM by default, and without a
+	// Passphrase the file is plain whatever CipherType says. The zero value
+	// means no encryption.
 	Encryption EncryptionConfig
 
 	// OnIntegrityError, when non-nil, is invoked from the read path on

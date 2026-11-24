@@ -137,9 +137,10 @@ type VectorParams struct {
 	// Dim not above 0, a Metric, Quantization or Mode that is none of its
 	// constants, a negative M, EfConstruction, EfSearch, NList, NProbe or
 	// Closure, one past its bound in its field's doc, and a NaN
-	// CompactRatio. The checks apply to an index being created: EnsureIndex
-	// of a definition identical to one in the catalog keeps that index
-	// without them.
+	// CompactRatio. The checks of Field, Dim and Mode run on every
+	// definition; the others apply to an index being created only:
+	// EnsureIndex of a definition identical to one in the catalog keeps that
+	// index without them.
 	M              int `json:"m,omitempty"`
 	EfConstruction int `json:"efConstruction,omitempty"`
 	EfSearch       int `json:"efSearch,omitempty"`

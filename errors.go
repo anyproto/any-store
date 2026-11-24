@@ -279,12 +279,14 @@ var (
 // ErrInvalidConfig is returned, wrapped with the name of the field at fault,
 // for a value nothing can be opened or created with, and nothing is:
 //   - by Open, for a Durability.FlushMode other than the FlushModeCheckpoint
-//     constants, and, with an Encryption.Passphrase, for a CipherType other
-//     than the Cipher constants or a KDFIterations above 100,000,000 when the
-//     passphrase is not a 32-byte key;
+//     constants and "" (the default, FlushModeCheckpointPassive), and, with
+//     an Encryption.Passphrase, for a CipherType other than the Cipher
+//     constants or a KDFIterations above 100,000,000 when the passphrase is
+//     not a 32-byte key;
 //   - by CreateIndex, and EnsureIndex of a name with no index, for a vector
 //     index with no Vector params, an empty Field, a Dim not above 0 or past
-//     2^32-1, a Metric, Quantization or Mode other than its constants, a
+//     2^32-1, a Metric, Quantization or Mode other than its constants (the
+//     value of the removed IVF-PQ mode is ErrVectorIndexUnsupported), a
 //     negative M, EfConstruction, EfSearch, NList, NProbe or Closure, an M
 //     past 32,767, an EfConstruction or EfSearch past 65,536, a Closure past
 //     255, an NList or NProbe past 2^32-1, a NaN CompactRatio, or an NList
@@ -292,7 +294,9 @@ var (
 //
 // The vector checks of the params, Field, Dim and Mode also run when an index
 // the catalog holds is loaded. Sizes Open can bound (CacheSize,
-// ReadConcurrency) are clamped instead; other fields take any value.
+// ReadConcurrency) are clamped instead. Other Config errors are not this one:
+// UseGlobalPageBuffer before InitPageBuffer is ErrPageBufferNotInitialized,
+// for one.
 var ErrInvalidConfig = errors.New("any-store: invalid configuration")
 
 // nestedError keeps its own text and matches parent under errors.Is.

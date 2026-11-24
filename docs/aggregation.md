@@ -469,6 +469,10 @@ iter, err := coll.Aggregate(pipeline).
     GroupLimit(200_000).
     MemoryLimit(1 << 30).
     Iter(ctx)
+if err != nil {
+    return err
+}
+defer iter.Close()
 ```
 
 ## 9. Iterator semantics

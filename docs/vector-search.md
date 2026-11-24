@@ -17,7 +17,10 @@ to the query.
 
 ## 1. Create a vector index
 
-Register an index of kind `IndexKindVector` with `VectorParams`:
+Register an index of kind `IndexKindVector` with `VectorParams`. The examples
+of sections 1 to 3 use 4-dimensional vectors, to stay readable; a text
+embedding model gives hundreds of dimensions (768, 1536, …), and `Dim` is
+whatever the model gives.
 
 ```go
 err := coll.EnsureIndex(ctx, anystore.IndexInfo{
@@ -25,7 +28,7 @@ err := coll.EnsureIndex(ctx, anystore.IndexInfo{
     Kind: anystore.IndexKindVector,
     Vector: &anystore.VectorParams{
         Field:  "embedding",           // path to the embedding field (required)
-        Dim:    768,                   // embedding dimension (required)
+        Dim:    4,                     // embedding dimension (required)
         Metric: anystore.VectorCosine, // VectorCosine (default) | VectorL2 | VectorDot
     },
 })
@@ -66,10 +69,17 @@ Only `Field` and `Dim` are required. Other `VectorParams`:
 | `CompactRatio` | `0` (off) | HNSW: auto-compact the graph when tombstones reach this ratio of live nodes; `IVFSQ`: auto-rebuild (re-train the centroids) when the drift score reaches it. A value not above 0 is off; NaN is refused |
 | `NList`, `NProbe`, `Closure` | `~4·√N`, `16`, `1` | `IVFSQ` only: coarse cells, at most the number of documents with a vector of the index's `Dim` at creation; cells scanned per query (the recall dial), plus up to 64 more whose centroid is exactly as near as the farthest of them; cells each vector is placed in, at most 255 |
 
+`CreateIndex` and `EnsureIndex` check a definition first, `EnsureIndex` of one
+identical to the catalog's included. It is refused with `ErrInvalidConfig` for
+no `Vector` params, an empty `Field`, a `Dim` not above 0, or a `Mode` that is
+none of its constants; with `ErrVectorIndexUnsupported` for `VectorMode(3)`,
+the value of the removed IVF-PQ mode, which stays reserved; and with
+`ErrVectorMetricUnsupported` for `VectorDot` in the IVF mode.
+
 Creating an index (`CreateIndex`, or `EnsureIndex` of a name with no index)
-refuses with `ErrInvalidConfig`, and creates nothing:
-- no `Vector` params, an empty `Field`, or a `Dim` not above 0;
-- a `Metric`, `Quantization` or `Mode` that is none of its constants;
+also holds it to the tuning checks, and refuses with `ErrInvalidConfig`, having
+created nothing:
+- a `Metric` or `Quantization` that is none of its constants;
 - a negative `M`, `EfConstruction`, `EfSearch`, `NList`, `NProbe` or `Closure`;
 - one past its bound in the table;
 - a `Dim`, `NList` or `NProbe` past 4,294,967,295 (2^32−1), which the index's
@@ -78,9 +88,12 @@ refuses with `ErrInvalidConfig`, and creates nothing:
   index's `Dim`;
 - a NaN `CompactRatio`.
 
-These checks apply to an index being created: `EnsureIndex` of a definition
-identical to one in the catalog keeps that index without them, so a definition
-an earlier release created past them is not refused at startup.
+The tuning checks apply to an index being created only: `EnsureIndex` of a
+definition identical to one in the catalog keeps that index without them, so a
+definition an earlier release created past them is not refused at startup, and
+`CopyToLatestFormat` copies such an index with its definition. The checks
+before them are not skipped: `EnsureIndex` of a quarantined `ivfpq` index's
+own definition returns `ErrVectorIndexUnsupported`.
 
 An index built by an earlier release in the removed `ivfpq` mode still opens with
 its collection but is quarantined: `$knn` on its field and `CompactVectorIndex`
@@ -117,12 +130,16 @@ obj := arena.NewObject()
 obj.Set("id", arena.NewNumberFloat64(1))
 obj.Set("title", arena.NewString("cat"))
 obj.Set("lang", arena.NewString("en"))
-obj.Set("embedding", arena.NewVectorF32([]float32{0.12, -0.03, /* ... Dim values */}))
-coll.Insert(ctx, obj)
+obj.Set("embedding", arena.NewVectorF32([]float32{0.12, -0.03, 0.41, 0.27})) // Dim values
+if err := coll.Insert(ctx, obj); err != nil {
+    return err
+}
 
 // Or a plain JSON array, when that's what you already have:
-coll.Insert(ctx, anyenc.MustParseJson(
-    `{"id":2, "title":"dog", "lang":"en", "embedding":[0.12, -0.03, ...]}`))
+if err := coll.Insert(ctx, anyenc.MustParseJson(
+    `{"id":2, "title":"dog", "lang":"en", "embedding":[0.15, -0.01, 0.38, 0.30]}`)); err != nil {
+    return err
+}
 ```
 
 The two encodings are interchangeable within a collection — the index reads both,
@@ -175,7 +192,7 @@ k-cut — the query denotes the k nearest *matching* documents (hybrid search):
 
 ```go
 // ANN + ordinary filters: the 10 nearest docs among those matching lang/year.
-q := coll.Find(`{"embedding":{"$knn":{"$query":[...], "$k":10}}, "lang":"en", "year":{"$gt":2020}}`)
+q := coll.Find(`{"embedding":{"$knn":{"$query":[0.1, 0.2, 0.3, 0.4], "$k":10}}, "lang":"en", "year":{"$gt":2020}}`)
 ```
 
 ### `$knn` is a ranked source, not a predicate

@@ -4396,17 +4396,17 @@ cost and a behavioral divergence (stale buffer contents are always cleared in Go
 <a id="drift-130-newpcache-hash-table-pre-sized-to-capacity"></a>
 ### Drift: newPcache Hash Table Pre Sized To Capacity
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `pcache.go:newPcache` (`internal/btree/pcache.go:141`; hashSizeFor at `pcache.go:176-182`;
-  minHashSize at `pcache.go:164`; maxHashPresize at `pcache.go:172`).
+- **Affected functions:** `pcache.go:newPcache` (`internal/btree/pcache.go:141`; hashSizeFor at `pcache.go:177-183`;
+  minHashSize at `pcache.go:164`; maxHashPresize at `pcache.go:173`).
 
 SQLite always seeds the pcache hash table to exactly 256 buckets — `pcache1Create` (`pcache1.c:789`) calls
 `pcache1ResizeHash` once and grows the table on demand thereafter (`pcache1.c:894`, with the 256 floor at
 `pcache1.c:543-544`). Go's `newPcache` (`pcache.go:141`) instead pre-sizes
-`apHash := make([]*page, hashSizeFor(min(maxPages, maxHashPresize)))`, where `hashSizeFor` (`pcache.go:176-182`) returns
+`apHash := make([]*page, hashSizeFor(min(maxPages, maxHashPresize)))`, where `hashSizeFor` (`pcache.go:177-183`) returns
 the smallest power of two `>= n` and `>= minHashSize` (256, `pcache.go:164`). With the default `defaultCacheSize=5000`
 this allocates 8192 buckets up front, and a larger configured cache allocates proportionally more, up to
-`maxHashPresize` (65,536 buckets, 512 KiB); a cache configured for more pages starts there and grows on demand as
-SQLite's does. The consequence is a larger eager hash-table allocation at cache creation than SQLite's fixed 256-bucket
+`maxHashPresize` (65,536 buckets: 512 KiB of pointers on a 64-bit target, 256 KiB on a 32-bit one); a cache
+configured for more pages starts there and grows on demand as SQLite's does. The consequence is a larger eager hash-table allocation at cache creation than SQLite's fixed 256-bucket
 seed — an intentional memory-vs-rehash tradeoff, recorded in an in-code DRIFT comment at `pcache.go:140`. The bound
 keeps a configured cache size from becoming an allocation made up front for every cache, readers' included: before
 it, a cache size past what the process could allocate failed at Open, and one past 2^62 pages never returned from
