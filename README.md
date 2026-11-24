@@ -225,6 +225,21 @@ fmt.Printf("scanned %d pages, %d errors\n", rep.Pages, len(rep.Errors))
 
 The page-1 DB header (first 100 bytes) is outside the per-page hash; its invariants are validated separately at open. Full design: [docs/btree/specs/integrity.md](docs/btree/specs/integrity.md).
 
+### Corruption errors
+
+`ErrCorrupt` means damage that is in the files and will still be there at the next `Open`; a caller may discard and rebuild the database on it. Match it with `errors.Is`. The kinds of damage match it too:
+
+| Error | When |
+|---|---|
+| `ErrHeaderCorrupt` | `Open`: the file header is unusable. |
+| `ErrPageIntegrity` | A page fails its checksum or its AEAD authentication, on the read that meets it. |
+| `ErrWALCorrupt` | The write-ahead log's index points at a frame the log does not hold. The damage is in the log, not in the database file: close every handle and open again before discarding anything. |
+| `ErrQuickCheckFailed` | `Open` after an unclean shutdown (`Durability.Sentinel`): the quick check found damage. |
+
+`IntegrityCheck` returns an error that matches `ErrCorrupt` when it found damage.
+
+Errors that are not damage do not match `ErrCorrupt` and are returned as themselves: a cancelled context, an I/O error or a full disk (also when they stop a commit, the quick check of a dirty `Open`, or an `IntegrityCheck`), `ErrBusy`, `ErrDBIsClosed`, `ErrV1Database`, `ErrIncompatibleVersion`, `ErrDBAlreadyOpen`, `ErrDBOpenInOtherProcess`, and the encryption errors below.
+
 ## Encryption
 
 ```go

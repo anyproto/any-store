@@ -285,16 +285,23 @@ var (
 	ErrNotEncrypted = errors.New("any-store: database file is not encrypted: clear Config.Encryption")
 
 	// ErrCorrupt is the umbrella for damaged database files: every error below that names a kind
-	// of damage matches it, as does a broken structure found while reading. Match it when the kind
-	// does not matter, for instance to discard and rebuild the database:
+	// of damage matches it (ErrHeaderCorrupt, ErrPageIntegrity, ErrWALCorrupt,
+	// ErrQuickCheckFailed), as do a broken structure found while reading and the report of
+	// IntegrityCheck. Match it when the kind does not matter, for instance to discard and
+	// rebuild the database:
 	//
 	//	if errors.Is(err, anystore.ErrCorrupt) { ... }
 	//
-	// It is not returned for a v1 file (ErrV1Database), a file from a newer release
-	// (ErrIncompatibleVersion) or a closed database.
+	// It means damage that is in the files and will be there at the next Open. It is not
+	// returned for a state that passes or that the caller can change:
 	//
-	// It is not returned for a wrong encryption key either: that is ErrWrongKey, which Open
-	// tells from a damaged page 1 (see there).
+	//   - a wrong encryption key (ErrWrongKey), or a Config.Encryption that does not fit the
+	//     file (ErrEncryptionKeyRequired, ErrNotEncrypted);
+	//   - a v1 file (ErrV1Database) or a file from a newer release (ErrIncompatibleVersion);
+	//   - a file that is open already (ErrDBAlreadyOpen, ErrDBOpenInOtherProcess), a busy lock
+	//     (ErrBusy), a closed database (ErrDBIsClosed);
+	//   - a cancelled context, an I/O error, a full disk: these are returned as themselves,
+	//     also when they end a commit, the quick check of a dirty Open, or an IntegrityCheck.
 	//
 	// A damaged page that nothing has read yet is not found by Open: it surfaces on the read that
 	// meets it, as ErrPageIntegrity.
@@ -302,10 +309,18 @@ var (
 
 	// ErrHeaderCorrupt is returned (wrapped) by Open when the file header is unusable: a file cut
 	// inside it or never a database, bad field values, or a size that disagrees with the file.
+	// It matches ErrCorrupt.
 	ErrHeaderCorrupt = btree.ErrHeaderCorrupt
 
-	// ErrWALCorrupt is returned (wrapped) when the write-ahead log index points at a frame the
-	// file does not hold. Recovery itself repairs a bad WAL header and drops torn frames silently.
+	// ErrWALCorrupt is returned (wrapped) by a read when the index of the write-ahead log points
+	// at a frame the log file does not hold: the file ends before it. It matches ErrCorrupt.
+	// An I/O error while reading a frame is not this error. Recovery itself repairs a bad WAL
+	// header and drops torn frames silently.
+	//
+	// What it reports is in the log (path+"-wal") and its index (path+"-wal-shm"), not in the
+	// database file: the index is rebuilt from the log when the database is next opened with no
+	// other process attached. Before discarding a database on ErrCorrupt, check for
+	// ErrWALCorrupt, close every handle on the file and open it again.
 	ErrWALCorrupt = btree.ErrWALCorrupt
 
 	// ErrValueTooLarge is returned (wrapped) by a write of a record over the record size limit:

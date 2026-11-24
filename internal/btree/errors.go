@@ -6,7 +6,11 @@ import (
 )
 
 var (
-	// ErrCorrupt indicates the database file is corrupted.
+	// ErrCorrupt indicates the database file is corrupted: damage that is in
+	// the files and will be there at the next open. Callers discard and
+	// rebuild a database on it, so no transient state may return it or an
+	// error that wraps it: not an I/O error, a full disk, a cancelled
+	// context, a busy lock, a wrong key or a closed handle.
 	ErrCorrupt = errors.New("btree: database is corrupt")
 
 	// ErrHeaderCorrupt indicates the file header is unusable: a file cut inside it or never a
