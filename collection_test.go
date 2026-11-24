@@ -258,6 +258,51 @@ func TestCollection_UpsertId(t *testing.T) {
 	})
 }
 
+// $push on a field a document does not have creates the array, as in
+// MongoDB, and so inserts the document an UpsertId of a new id makes; on a
+// field that holds something other than an array it is an error and writes
+// nothing.
+func TestCollection_PushMissingField(t *testing.T) {
+	push := query.MustParseModifier(`{"$push":{"tags":"a"}}`)
+	t.Run("upsert inserts", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		res, err := coll.UpsertId(ctx, 1, push)
+		require.NoError(t, err)
+		assert.Equal(t, ModifyResult{Matched: 0, Modified: 1}, res)
+		doc, err := coll.FindId(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, `{"id":1,"tags":["a"]}`, doc.Value().String())
+	})
+	t.Run("update creates the field", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+		res, err := coll.UpdateId(ctx, 1, push)
+		require.NoError(t, err)
+		assert.Equal(t, ModifyResult{Matched: 1, Modified: 1}, res)
+		res, err = coll.UpdateId(ctx, 1, push)
+		require.NoError(t, err)
+		assert.Equal(t, ModifyResult{Matched: 1, Modified: 1}, res)
+		doc, err := coll.FindId(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, `{"id":1,"tags":["a","a"]}`, doc.Value().String())
+	})
+	t.Run("not an array", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":"a"}`)))
+		_, err = coll.UpsertId(ctx, 1, push)
+		require.Error(t, err)
+		doc, err := coll.FindId(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, `{"id":1,"tags":"a"}`, doc.Value().String())
+	})
+}
+
 func TestCollection_DeleteOne(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")

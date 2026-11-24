@@ -347,7 +347,7 @@ func TestModifierPop_Modify(t *testing.T) {
 			{
 				`{"$pop":{"arr":1}}`,
 				`{"arr":"2"}`,
-				`failed to pop item, value doesn't contain array; it contains string`,
+				`$pop: field 'arr' must be an array: value doesn't contain array; it contains string`,
 			},
 			{
 				`{"$pop":{"arr":""}}`,
@@ -366,11 +366,19 @@ func TestModifierPop_Modify(t *testing.T) {
 func TestModifierPush_Modify(t *testing.T) {
 	t.Run("no error", func(t *testing.T) {
 		testModCases(t, []modifierCase{
+			// A missing field becomes an array holding the value, as in
+			// MongoDB, at any depth.
 			{
 				`{"$push":{"arr": -1}}`,
 				`{}`,
-				`{}`,
-				false,
+				`{"arr":[-1]}`,
+				true,
+			},
+			{
+				`{"$push":{"a.b.arr": {"x":1}}}`,
+				`{"a":{}}`,
+				`{"a":{"b":{"arr":[{"x":1}]}}}`,
+				true,
 			},
 			{
 				`{"$push":{"arr": 1}}`,
@@ -378,14 +386,27 @@ func TestModifierPush_Modify(t *testing.T) {
 				`{"arr":[1,1]}`,
 				true,
 			},
+			{
+				`{"$push":{"arr": [2]}}`,
+				`{"arr": []}`,
+				`{"arr":[[2]]}`,
+				true,
+			},
 		}...)
 	})
 	t.Run("error", func(t *testing.T) {
+		// A field that holds something other than an array is refused, as
+		// MongoDB refuses it, null included.
 		testModCasesErr(t, []modifierCaseError{
 			{
 				`{"$push":{"arr":1}}`,
 				`{"arr":"2"}`,
-				`failed to pop item, value doesn't contain array; it contains string`,
+				`$push: field 'arr' must be an array: value doesn't contain array; it contains string`,
+			},
+			{
+				`{"$push":{"a.arr":1}}`,
+				`{"a":{"arr":null}}`,
+				`$push: field 'a.arr' must be an array: value doesn't contain array; it contains null`,
 			},
 		}...)
 	})
@@ -467,7 +488,7 @@ func TestModifierPull_Modify(t *testing.T) {
 			{
 				`{"$pull":{"arr":1}}`,
 				`{"arr":"2"}`,
-				`failed to pop item, value doesn't contain array; it contains string`,
+				`$pull: field 'arr' must be an array: value doesn't contain array; it contains string`,
 			},
 		}...)
 	})
@@ -507,6 +528,11 @@ func TestModifierPullAll_Modify(t *testing.T) {
 				`{"$pullAll":{"arr":1}}`,
 				`{"arr":[1,2,3,4,5]}`,
 				`parse modifier: $pullAll must be an array, got 1 (at $pullAll.arr)`,
+			},
+			{
+				`{"$pullAll":{"arr":[1]}}`,
+				`{"arr":"2"}`,
+				`$pullAll: field 'arr' must be an array: value doesn't contain array; it contains string`,
 			},
 		}...)
 	})
@@ -552,7 +578,7 @@ func TestModifierAddToSet_Modify(t *testing.T) {
 			{
 				`{"$addToSet":{"arr":1}}`,
 				`{"arr":"2"}`,
-				`failed to pop item, value doesn't contain array; it contains string`,
+				`$addToSet: field 'arr' must be an array: value doesn't contain array; it contains string`,
 			},
 		}...)
 	})

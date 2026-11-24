@@ -333,3 +333,18 @@ build per query and carry no such guarantee.
     differently under two plans, and a `Limit` that cuts through the group
     returns different rows. A total order needs a unique last sort field:
     `Sort("field", "id")`.
+
+17. **Update modifiers treat missing and mistyped fields as MongoDB does.**
+    A missing field is created by `$set`, by `$inc` (with the increment as
+    its value), and by `$push` and `$addToSet`, which make it an array
+    holding the value: `{"$push":{"tags":"a"}}` on `{"id":1}` gives
+    `{"id":1,"tags":["a"]}`, and through `UpsertId` of a new id it inserts
+    that document. `$unset`, `$rename`, `$pop`, `$pull` and `$pullAll` leave
+    a missing field missing. An array operator (`$push`, `$addToSet`, `$pop`,
+    `$pull`, `$pullAll`) on a field that holds anything else, `null`
+    included, is an error (`$push: field 'tags' must be an array: …`), and
+    `$inc` on a non-number is one too; the update then writes nothing. One
+    divergence: an `UpsertId` of a new id whose modifier changes nothing (a
+    `$pull` or `$unset` alone) inserts no document, where MongoDB inserts
+    `{_id: id}`. Pinned by `TestModifierPush_Modify` and its siblings
+    (query/modifier_test.go) and `TestCollection_PushMissingField`.

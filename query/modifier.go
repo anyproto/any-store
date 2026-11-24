@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
@@ -262,7 +263,7 @@ func (m modifierPop) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Va
 		}
 		arrayOfValues, err := value.Array()
 		if err != nil {
-			return nil, fmt.Errorf("failed to pop item, %w", err)
+			return nil, notArrayError("$pop", m.fieldPath, err)
 		}
 		if len(arrayOfValues) == 0 {
 			return value, nil
@@ -306,11 +307,13 @@ func (m modifierPush) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.V
 func (m modifierPush) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
-			return nil, nil
+			// A missing field becomes an array holding the value, as in
+			// MongoDB; through an upsert, so does the new document's field.
+			value = a.NewArray()
 		}
 		arrayOfValues, err := value.Array()
 		if err != nil {
-			return nil, fmt.Errorf("failed to pop item, %w", err)
+			return nil, notArrayError("$push", m.fieldPath, err)
 		}
 		value.SetArrayItem(len(arrayOfValues), stored(a, m.val, copyVal))
 		modified = true
@@ -336,7 +339,7 @@ func (m modifierPull) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.V
 		}
 		arrayOfValues, err := value.Array()
 		if err != nil {
-			return nil, fmt.Errorf("failed to pop item, %w", err)
+			return nil, notArrayError("$pull", m.fieldPath, err)
 		}
 		if len(arrayOfValues) == 0 {
 			return value, nil
@@ -371,7 +374,7 @@ func (m modifierPullAll) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyen
 		}
 		arrayOfValues, err := value.Array()
 		if err != nil {
-			return nil, fmt.Errorf("failed to pop item, %w", err)
+			return nil, notArrayError("$pullAll", m.fieldPath, err)
 		}
 		modified = removeElements(arrayOfValues, value, func(value *anyenc.Value) bool {
 			return slices.ContainsFunc(m.removedValues, func(removedValue *anyenc.Value) bool {
@@ -405,6 +408,13 @@ func removeElements(arrayOfValues []*anyenc.Value, value *anyenc.Value, shouldRe
 	return modified
 }
 
+// notArrayError is the error of an array operator applied to a field that
+// holds something other than an array, which MongoDB refuses as well ("The
+// field 'a' must be an array but is of type string").
+func notArrayError(op string, fieldPath []string, err error) error {
+	return fmt.Errorf("%s: field '%s' must be an array: %w", op, strings.Join(fieldPath, "."), err)
+}
+
 type modifierAddToSet struct {
 	fieldPath []string
 	val       *anyenc.Value
@@ -421,7 +431,7 @@ func (m modifierAddToSet) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool)
 		}
 		_, err = value.Array()
 		if err != nil {
-			return nil, fmt.Errorf("failed to pop item, %w", err)
+			return nil, notArrayError("$addToSet", m.fieldPath, err)
 		}
 		modified = m.addElements(a, value, copyVal)
 		return value, nil
