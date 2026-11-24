@@ -339,7 +339,15 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		start := time.Now()
 		quickCheckCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
-		if err := ds.QuickCheck(quickCheckCtx); err != nil {
+		err := ds.QuickCheck(quickCheckCtx)
+		if err == nil {
+			// The read does not consult the ctx once it has begun: a check
+			// that ended after its ctx did (cancelled, or past its five
+			// minutes) did not finish in time, and does not mark the
+			// database clean.
+			err = quickCheckCtx.Err()
+		}
+		if err != nil {
 			if ds.recoveryController != nil {
 				_ = ds.recoveryController.Stop()
 			}

@@ -1832,12 +1832,21 @@ func (p *pager) getPage(pgno uint32) (*page, error) {
 	return p.getPageWriter(pgno, p.wal.nFrame.Load())
 }
 
+// errPageZero is the page getters' error for page number 0, which no page
+// has. A page number that comes from the file (a namespace's root in the
+// master table, a child or an overflow pointer) and is 0 is damage:
+// sqlite3PagerGet returns SQLITE_CORRUPT_BKPT for it (getPageNormal,
+// pager.c:5551; getPageMMap, pager.c:5665), as btreeCursor does for a
+// root below 1 (btree.c:4715-4717). It matches ErrCorrupt, and
+// ErrInvalidPage.
+var errPageZero = fmt.Errorf("%w: page number 0: %w", ErrCorrupt, ErrInvalidPage)
+
 // getPageWriter returns a page using the writer's cache, reading from
 // WAL or disk on cache miss. Used by the writer goroutine only.
 // DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
 func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 	if pgno == 0 {
-		return nil, ErrInvalidPage
+		return nil, errPageZero
 	}
 
 	// The error state fails every fetch with its error (getPageError,
@@ -2107,7 +2116,7 @@ func (p *pager) readTempPage(pgno, walMaxFrame, walMinFrame, dbSizeBound uint32,
 // DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
 func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, error) {
 	if pgno == 0 {
-		return nil, ErrInvalidPage
+		return nil, errPageZero
 	}
 	// If no reader cache provided, read an uncached temporary page.
 	// Never fall back to writerCache — that would race with the writer goroutine.
@@ -2237,7 +2246,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 // DRIFT: no btreeGetUnusedPage refcount>1 in-use ErrCorrupt check See docs/btree/NOTES.md#drift-10-missing-refcount-greater-than-one-in-use-page-corruption-det
 func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
 	if pgno == 0 {
-		return nil, ErrInvalidPage
+		return nil, errPageZero
 	}
 	// Cache hit: re-zero before returning. SQLite's NOCONTENT path always
 	// re-zeroes even on a cache hit (pager.c:5567-5618: the cache-hit shortcut
@@ -2281,7 +2290,7 @@ func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
 // concurrency contract as getPage.
 func (p *pager) readRawPage(pgno, walMaxFrame uint32, cache *pcache) ([]byte, error) {
 	if pgno == 0 {
-		return nil, ErrInvalidPage
+		return nil, errPageZero
 	}
 	buf := make([]byte, p.pageSize)
 	if walMaxFrame > 0 && p.wal != nil {

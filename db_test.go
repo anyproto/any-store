@@ -3,6 +3,7 @@ package anystore
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -3840,6 +3841,46 @@ func TestSketchPasses_SkipUnverifiedHead(t *testing.T) {
 	assert.Equal(t, 1, n)
 }
 
+// A dirty open whose catalog's root page number is damaged to 0 is a quick
+// check that met damage: ErrQuickCheckFailed and ErrCorrupt, as before, and
+// not an incomplete check.
+func TestOpen_DirtyQuickCheckDamagedCatalogRoot(t *testing.T) {
+	ctx := context.Background()
+	cfg := func() *Config {
+		// The page-1 edit below breaks its checksum; the open goes past it.
+		return &Config{Durability: DurabilityConfig{Sentinel: true}, ContinueOnIntegrityError: true}
+	}
+	path := filepath.Join(t.TempDir(), "a.db")
+	db, err := Open(ctx, path, cfg())
+	require.NoError(t, err)
+	_, err = db.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	// The catalog's master cell: key length, value length, key, then the
+	// 4-byte root page number (parseLeafCellWithSize), on page 1.
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	cell := append([]byte{byte(len(systemNamespace)), 4}, systemNamespace...)
+	page1 := data[:4096]
+	require.Equal(t, 1, bytes.Count(page1, cell))
+	at := bytes.Index(page1, cell) + len(cell)
+	require.NotZero(t, binary.BigEndian.Uint32(data[at:]))
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{0, 0, 0, 0}, int64(at))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	marker := path + ".lock"
+	require.NoError(t, os.WriteFile(marker, nil, 0o644))
+
+	_, err = Open(ctx, path, cfg())
+	require.ErrorIs(t, err, ErrQuickCheckFailed)
+	require.ErrorIs(t, err, ErrCorrupt)
+	_, err = os.Stat(marker)
+	require.NoError(t, err)
+}
+
 // The quick check of a dirty open fails the open as ErrQuickCheckFailed,
 // and so as ErrCorrupt, only when it met damage. A check that did not
 // finish returns what stopped it, and that is not corruption: the caller
@@ -3908,6 +3949,34 @@ func TestOpen_DirtyQuickCheckErrors(t *testing.T) {
 	t.Run("busy", func(t *testing.T) {
 		err := open(ctx, btree.ErrBusySnapshot)
 		require.ErrorIs(t, err, ErrBusy)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		stillDirty()
+	})
+	// The read does not consult the ctx once it has begun: a read that
+	// succeeds after the ctx ended is a check that did not finish in time.
+	t.Run("cancelled during a read that succeeds", func(t *testing.T) {
+		cctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		testQuickCheckReadHook = func() error { cancel(); return nil }
+		db, err := Open(cctx, path, cfg())
+		testQuickCheckReadHook = nil
+		if err == nil {
+			require.NoError(t, db.Close())
+		}
+		require.ErrorIs(t, err, context.Canceled)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		stillDirty()
+	})
+	t.Run("deadline passed during a read that succeeds", func(t *testing.T) {
+		dctx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		testQuickCheckReadHook = func() error { <-dctx.Done(); return nil }
+		db, err := Open(dctx, path, cfg())
+		testQuickCheckReadHook = nil
+		if err == nil {
+			require.NoError(t, db.Close())
+		}
+		require.ErrorIs(t, err, context.DeadlineExceeded)
 		require.NotErrorIs(t, err, ErrCorrupt)
 		stillDirty()
 	})

@@ -9486,6 +9486,39 @@ func resealWAL(t *testing.T, walPath string, pageSize int) {
 	require.NoError(t, os.WriteFile(walPath, data, 0o600))
 }
 
+// Page number 0 is no page: a getter asked for it was handed a page number
+// the file holds and that is damaged, as sqlite3PagerGet answers it with
+// SQLITE_CORRUPT_BKPT (pager.c:5551). A namespace whose master entry gives
+// root 0 reads as ErrCorrupt.
+func TestGetPage_PageZeroIsCorrupt(t *testing.T) {
+	db := tempDB(t)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("x")
+	require.NoError(t, err)
+	// The master entry of "x" with root 0, as damage would leave it.
+	require.NoError(t, tx.pager.wgate.enter())
+	master := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
+	require.NoError(t, master.Put([]byte("x"), []byte{0, 0, 0, 0}))
+	tx.pager.wgate.leave()
+	require.NoError(t, tx.Commit())
+
+	_, err = db.pager.getPageReader(0, 0, nil)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.ErrorIs(t, err, ErrInvalidPage)
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns, err := rtx.GetNamespace("x")
+	require.NoError(t, err)
+	require.Zero(t, ns.RootPage())
+	cur := rtx.NewCursor(ns)
+	defer cur.Close()
+	err = cur.First()
+	require.ErrorIs(t, err, ErrCorrupt)
+}
+
 // A page 1 damaged in its WAL frame under the right key is damage, as in
 // the database file: the frame is part of the log (its WAL checksum is
 // valid), and a page that is only in the WAL proves the key. The integrity
