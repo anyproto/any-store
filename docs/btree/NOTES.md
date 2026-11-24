@@ -4908,3 +4908,16 @@ The header is judged before the key: a file of another format, or with a header 
 `VerifyIntegrity` could list a damaged page 1 of an encrypted database only on a handle opened before the damage: an open after it now fails. The public `Open` failed there already, at its first write begin.
 
 Tests: `TestOpen_WrongKeyIsErrWrongKey`, `TestOpen_WrongRawKeyAndCodec`, `TestOpen_DamagedPage1UnderRightKeyIsCorrupt`, `TestOpen_DamagedHeadOfFileUnderRightKeyIsCorrupt`, `TestOpen_DamagedOnePageFileIsErrWrongKey`, `TestOpen_DamagedLaterPageOpens` (`pager_test.go`), `test/encryption_open_test.go`.
+
+<a id="drift-2026-11-24-4-integrity-checks-findings-are-an-error-that-matches-errcorrupt"></a>
+### Drift: The Integrity Check's Findings Are An Error That Matches ErrCorrupt
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `integrity.go:*DB.IntegrityCheckN`, `integrity.go:*IntegrityError.Unwrap`, `integrity.go:*integrityChecker.reportRead`.
+
+`sqlite3BtreeIntegrityCheck` returns its findings as text and a count (`*pnErr = sCheck.nErr;`, `btree.c:11263`) and returns `sCheck.rc` (`btree.c:11273`), which is only ever `SQLITE_NOMEM` or `SQLITE_INTERRUPT` (`btree.c:10567`, `10579`, `10590`). `OP_IntegrityCk` puts the text in a register (`vdbe.c:7273-7285`) and `PRAGMA integrity_check` returns it as rows: a damaged database is a successful statement whose result is not `ok`. A page the check cannot fetch is one more row, `"unable to get the page. error code=%d"` (`btree.c:10883-10884`), whatever the code; only `SQLITE_IOERR_NOMEM` is kept as the check's own result (`btree.c:10885`).
+
+`IntegrityCheck` returns an error, `*IntegrityError`, with the same lines. An error needs a kind a caller can match, and the kind of damage here is `ErrCorrupt`, on which a caller may discard and rebuild the database. So the report matches it, with one exception that SQLite's rows do not need: a page that failed to read for a reason other than damage. `reportRead` lists it like SQLite does and keeps the read's error unless that error is itself damage (`ErrCorrupt`, which a page failing its checksum or authentication matches, or `ErrInvalidPage`, a pointer out of the database). A report with such a read is inconclusive as a whole, not only on that line: the pages under an unread interior page are then listed as never used, and its subtree as of another depth. It matches the read's error and not `ErrCorrupt`.
+
+No new sentinel: the check's caller knows where the error came from, and the action on its findings is the action on `ErrCorrupt`.
+
+Tests: `TestIntegrityErrorMatches`, `TestIntegrityCheck_DamagedPageMatchesErrCorrupt`, `TestIntegrityCheck_FailedReadIsNotErrCorrupt` (`integrity_test.go`), `test/integrity_check_test.go`.

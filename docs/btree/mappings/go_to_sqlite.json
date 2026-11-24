@@ -1382,6 +1382,10 @@
     "sqlite": [],
     "note": ""
   },
+  "integrity.go:*IntegrityError.Unwrap": {
+    "sqlite": [],
+    "note": "the report matches ErrCorrupt, or the error of a read that failed for a reason other than damage; SQLite returns the report as text with SQLITE_OK (drift-2026-11-24-4)"
+  },
   "integrity.go:*integrityChecker.checkList": {
     "sqlite": [
       "btree.c:checkList"
@@ -1427,6 +1431,12 @@
       "btree.c:checkAppendMsg"
     ],
     "note": ""
+  },
+  "integrity.go:*integrityChecker.reportRead": {
+    "sqlite": [
+      "btree.c:checkAppendMsg"
+    ],
+    "note": "a finding that came out of a failed page read; keeps the read's error when it is not damage (btree.c:10883-10885 keeps only SQLITE_IOERR_NOMEM; drift-2026-11-24-4)"
   },
   "integrity.go:*integrityChecker.setReferenced": {
     "sqlite": [

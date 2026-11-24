@@ -16,17 +16,46 @@ package btree
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 )
 
-// IntegrityError is returned by IntegrityCheck when corruption is detected.
+// IntegrityError is returned by IntegrityCheck when the check has findings:
+// one line each in Errors.
+//
+// It matches ErrCorrupt (errors.Is) when every page the check asked for
+// was read, or failed as a damaged page does: the findings are then
+// damage, a page, a cell or a list whose content breaks the format, or a
+// page that fails its integrity check.
+//
+// A page the check could not read for another reason (an I/O error) is
+// listed too, as SQLite's check lists it ("unable to get the page. error
+// code=%d", btree.c:10883-10884), but it is not damage, and it makes the
+// rest of the report inconclusive: the pages below an unread page are
+// reported as never used, and its subtree's depth as differing. The error
+// then matches the first such read's error and not ErrCorrupt, whatever
+// else it lists; run the check again once the reads work.
+// DRIFT: the findings are an error that matches ErrCorrupt; sqlite3BtreeIntegrityCheck returns them as text with SQLITE_OK. See docs/btree/NOTES.md#drift-2026-11-24-4-integrity-checks-findings-are-an-error-that-matches-errcorrupt
 type IntegrityError struct {
 	Errors []string
+
+	// unread is the first error of a page read that failed for a reason
+	// other than damage, nil when there was none.
+	unread error
 }
 
 func (e *IntegrityError) Error() string {
 	return strings.Join(e.Errors, "\n")
+}
+
+// Unwrap gives what the report matches: ErrCorrupt, or the error of the
+// read that left it inconclusive.
+func (e *IntegrityError) Unwrap() error {
+	if e.unread != nil {
+		return e.unread
+	}
+	return ErrCorrupt
 }
 
 // integrityChecker holds state for a single integrity check run.
@@ -40,6 +69,7 @@ type integrityChecker struct {
 	leafLim     payloadLimits // leaf-cell rule of the snapshot's schema format
 	maxErrors   int           // stop after this many errors
 	errors      []string      // accumulated error messages
+	unread      error         // first failed read that is not damage
 
 	// Context for error messages
 	treeName string // current tree name (e.g., "master" or namespace name)
@@ -58,6 +88,22 @@ func (ic *integrityChecker) tooManyErrors() bool {
 func (ic *integrityChecker) report(format string, args ...any) {
 	if ic.tooManyErrors() {
 		return
+	}
+	ic.errors = append(ic.errors, fmt.Sprintf(format, args...))
+}
+
+// reportRead reports a finding that came out of a failed read of a page or
+// of an overflow chain, err. The read's error is damage when it says so: a
+// page that fails its integrity check, a chain or a pointer that breaks the
+// format (ErrCorrupt), a page number outside the database (ErrInvalidPage).
+// Any other error is the read itself failing: it is kept, and the report
+// no longer matches ErrCorrupt (IntegrityError).
+func (ic *integrityChecker) reportRead(err error, format string, args ...any) {
+	if ic.tooManyErrors() {
+		return
+	}
+	if ic.unread == nil && !errors.Is(err, ErrCorrupt) && !errors.Is(err, ErrInvalidPage) {
+		ic.unread = err
 	}
 	ic.errors = append(ic.errors, fmt.Sprintf(format, args...))
 }
@@ -127,7 +173,7 @@ func (ic *integrityChecker) checkList(isFreeList bool, firstPgno uint32, expecte
 
 		pg, err := ic.getPage(pgno)
 		if err != nil {
-			ic.report("%s: unable to get page %d: %v", context, pgno, err)
+			ic.reportRead(err, "%s: unable to get page %d: %v", context, pgno, err)
 			return
 		}
 
@@ -305,7 +351,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 
 	pg, err := ic.getPage(pgno)
 	if err != nil {
-		ic.report("%s: unable to get page: %v", context, err)
+		ic.reportRead(err, "%s: unable to get page: %v", context, err)
 		return 0
 	}
 	defer ic.pager.releasePage(pg)
@@ -392,7 +438,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 			if cell.overflowPg != 0 {
 				fk, fkerr := leafFullKey(pg.data, cellOff, leafLim, ic.pager, ic.walMaxFrame, ic.cache)
 				if fkerr != nil {
-					ic.report("%s cell %d: corrupt leaf key", context, i)
+					ic.reportRead(fkerr, "%s cell %d: corrupt leaf key", context, i)
 				} else {
 					fullKey = fk
 				}
@@ -451,7 +497,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 						// Surface the error class (I/O vs geometry) beside the
 						// hook's generic corrupt-value report, mirroring the
 						// key path's report above.
-						ic.report("%s cell %d: corrupt leaf value: %v", context, i, fverr)
+						ic.reportRead(fverr, "%s cell %d: corrupt leaf value: %v", context, i, fverr)
 						hookVal = nil
 					} else {
 						hookVal = fv
@@ -479,7 +525,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 			// This is the divider key D_i for this interior cell.
 			fullKey, fkerr := interiorFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, ic.cache)
 			if fkerr != nil {
-				ic.report("%s cell %d: corrupt interior key", context, i)
+				ic.reportRead(fkerr, "%s cell %d: corrupt interior key", context, i)
 			} else {
 				if prevKey != nil && bytes.Compare(prevKey, fullKey) >= 0 {
 					ic.report("%s cell %d: key out of order", context, i)
@@ -566,7 +612,9 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 
 // IntegrityCheck validates the internal consistency of the entire database.
 // Returns nil if the database is consistent, or an *IntegrityError with
-// all issues found.
+// all issues found, which matches ErrCorrupt unless a page could not be
+// read (see IntegrityError). An error of another type is a check that could not
+// start: its read transaction, or page 1.
 func (db *DB) IntegrityCheck() error {
 	return db.IntegrityCheckN(100)
 }
@@ -728,7 +776,7 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 	}
 
 	if len(ic.errors) > 0 {
-		return &IntegrityError{Errors: ic.errors}
+		return &IntegrityError{Errors: ic.errors, unread: ic.unread}
 	}
 	return nil
 }

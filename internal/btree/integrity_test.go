@@ -2,7 +2,9 @@ package btree
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -141,6 +143,7 @@ func TestIntegrityCheckCorruptPageType(t *testing.T) {
 
 	err = db.IntegrityCheck()
 	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCorrupt)
 	ie, ok := err.(*IntegrityError)
 	require.True(t, ok)
 	found := false
@@ -410,6 +413,86 @@ func TestIntegrityCheckOverflowAfterDeletes(t *testing.T) {
 func TestIntegrityErrorFormat(t *testing.T) {
 	ie := &IntegrityError{Errors: []string{"error 1", "error 2"}}
 	assert.Equal(t, "error 1\nerror 2", ie.Error())
+}
+
+// === What an IntegrityError matches ===
+
+// Findings match ErrCorrupt. A report with a page the check could not read
+// is inconclusive: it matches the read's error and not ErrCorrupt.
+func TestIntegrityErrorMatches(t *testing.T) {
+	ioErr := errors.New("input/output error")
+
+	damage := &IntegrityError{Errors: []string{"page 3: never used"}}
+	require.ErrorIs(t, damage, ErrCorrupt)
+
+	unread := &IntegrityError{Errors: []string{"unable to get page", "page 3: never used"}, unread: ioErr}
+	require.NotErrorIs(t, unread, ErrCorrupt)
+	require.ErrorIs(t, unread, ioErr)
+
+	// Wrapped, as the public IntegrityCheck may return it.
+	require.ErrorIs(t, fmt.Errorf("check: %w", damage), ErrCorrupt)
+}
+
+// A page that fails its checksum is damage the check reports: the report
+// matches ErrCorrupt and ErrPageIntegrity's parent, not a plain string.
+func TestIntegrityCheck_DamagedPageMatchesErrCorrupt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	opts := DefaultOptions()
+	opts.Checksum = true
+	opts.InProcess = true
+	setupSweepDB(t, path, opts)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, info.Size(), int64(2*opts.PageSize))
+	damageFile(t, path, int64(opts.PageSize)+200) // page 2
+
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	defer db.Close()
+	err = db.IntegrityCheck()
+	require.ErrorIs(t, err, ErrCorrupt)
+	var ie *IntegrityError
+	require.ErrorAs(t, err, &ie)
+	require.NotEmpty(t, ie.Errors)
+}
+
+// A page the check cannot read for a reason other than damage is listed,
+// and the report does not match ErrCorrupt: the file may be sound. It
+// matches the read's error.
+func TestIntegrityCheck_FailedReadIsNotErrCorrupt(t *testing.T) {
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
+
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	commitRows(t, db, "t1", 64, 200)
+	require.NoError(t, db.IntegrityCheck())
+
+	// A frame of a page other than page 1: page 1's read failing ends the
+	// check before it starts, with the read's error as it is.
+	nf := db.pager.wal.nFrame.Load()
+	var target uint32
+	for p := uint32(2); p <= db.pager.dbSize.Load() && target == 0; p++ {
+		target = mustWiGet(t, db.pager.wal.index, p, nf)
+	}
+	require.NotZero(t, target)
+
+	ioErr := errors.New("injected input/output error")
+	setWalReadFrameFaultHook(func(frame uint32) error {
+		if frame == target {
+			return ioErr
+		}
+		return nil
+	})
+	err = db.IntegrityCheck()
+	var ie *IntegrityError
+	require.ErrorAs(t, err, &ie)
+	require.NotEmpty(t, ie.Errors)
+	require.ErrorIs(t, err, ioErr)
+	require.NotErrorIs(t, err, ErrCorrupt)
+
+	setWalReadFrameFaultHook(nil)
+	require.NoError(t, db.IntegrityCheck())
 }
 
 // TestCheckListOverlargeTrunkContinuesWalk is a regression test for the drift

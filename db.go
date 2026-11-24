@@ -66,8 +66,18 @@ type DB interface {
 	// reachable-page coverage, orphan detection, freelist consistency,
 	// overflow-chain validation, key ordering, and master-page consistency.
 	// Returns nil if the database is structurally consistent, or an error
-	// aggregating up to 100 issues found. More expensive than QuickCheck —
-	// intended for stress tests and offline diagnostics, not normal opens.
+	// aggregating up to 100 issues found, one per line of its text. More
+	// expensive than QuickCheck — intended for stress tests and offline
+	// diagnostics, not normal opens.
+	//
+	// The error matches ErrCorrupt when the check found damage: a broken
+	// structure, a page that fails its checksum or authentication, or a
+	// collection in the catalog that has no data. It does not match
+	// ErrCorrupt when the check could not run or could not read: a
+	// cancelled ctx, a busy error, or a report that lists a page that
+	// failed to read with an I/O error. Such a report matches that error,
+	// and what else it lists is inconclusive (the pages below an unread
+	// page are listed as never used): run the check again.
 	IntegrityCheck(ctx context.Context) (err error)
 
 	// Flush perform checkpoint on the btree database
@@ -1340,7 +1350,7 @@ func (db *db) IntegrityCheck(ctx context.Context) (err error) {
 		for _, name := range names {
 			if _, nsErr := tx.GetNamespace(name); nsErr != nil {
 				if errors.Is(nsErr, btree.ErrNamespaceNotFound) {
-					return fmt.Errorf("collection %q: data namespace missing (renamed by a pre-fix version); its data survives under the pre-rename namespace name", name)
+					return fmt.Errorf("%w: collection %q: data namespace missing (renamed by a pre-fix version); its data survives under the pre-rename namespace name", ErrCorrupt, name)
 				}
 				// Any other failure to resolve the namespace is itself an
 				// integrity problem — never mask it as a clean result.
