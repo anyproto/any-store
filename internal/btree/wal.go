@@ -1827,13 +1827,18 @@ type wal struct {
 	// them on read. Propagated from the pager after wal creation via
 	// p.wal.codec = p.codec; see pager.open / pager.initNewDB.
 	codec Codec
+	// onIntegrityError is the database's integrity hook, propagated from
+	// the pager with codec; readFramePage passes it to every Decrypt.
+	onIntegrityError integrityHook
 	// codecScratch is a page-sized scratch used by writeFrame to hold
 	// ciphertext. Allocated lazily on first use. Writes are
 	// single-writer-serialized, so one buffer is safe.
 	codecScratch []byte
-	// codecAEAD is the nonce/AAD scratch for writeFrame's codec call.
-	// Embedded by value so nonce/aad slices live on the wal's heap
-	// allocation rather than escaping per-call.
+	// codecAEAD is the nonce/AAD scratch for writeFrame's codec call, and
+	// the nonce pool its encrypts draw from: this WAL's own, never shared
+	// with another database that has the same codec. Embedded by value so
+	// nonce/aad slices live on the wal's heap allocation rather than
+	// escaping per-call.
 	codecAEAD aeadScratch
 	// END ENCRYPTION
 }
@@ -3339,7 +3344,7 @@ func (w *wal) readFramePage(frame, pgno uint32, buf, scratchBuf []byte, aeadScra
 		if aeadS == nil {
 			aeadS = new(aeadScratch)
 		}
-		plain, derr := decryptPageWithCodec(w.codec, scratch, buf[:w.pageSize], pgno, aeadS)
+		plain, derr := decryptPageWithCodec(w.codec, scratch, buf[:w.pageSize], pgno, aeadS, w.onIntegrityError)
 		if derr != nil {
 			if ownScratch {
 				freePageBuffer(scratch, false)

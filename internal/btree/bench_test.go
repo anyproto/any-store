@@ -97,6 +97,52 @@ func BenchmarkGet(b *testing.B) {
 	}
 }
 
+// BenchmarkGet_AES256GCM is BenchmarkGet on an AES-256-GCM database with an
+// OnIntegrityError callback, and a page cache so small that most reads
+// decrypt a page: the read path's decrypt, with the integrity hook the
+// pager passes to it.
+func BenchmarkGet_AES256GCM(b *testing.B) {
+	const numKeys = 10000
+	const valSize = 100
+	opts := DefaultOptions()
+	opts.InProcess = true
+	opts.NoCommitSync = true
+	opts.Key = make([]byte, KeyLen)
+	opts.CacheSize = 8
+	opts.OnIntegrityError = func(pgno uint32, inner error) {
+		b.Errorf("integrity failure on page %d: %v", pgno, inner)
+	}
+	db, err := Open(filepath.Join(b.TempDir(), "bench.db"), opts)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = db.Close() })
+	ns := benchPopulate(b, db, numKeys, valSize)
+
+	keys := make([][]byte, numKeys)
+	for i := range keys {
+		keys[i] = binary.BigEndian.AppendUint32(nil, uint32(i+1))
+	}
+	// Spread the reads over the keys so that consecutive Gets mostly land
+	// on different leaves.
+	order := rand.New(rand.NewSource(1)).Perm(numKeys)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		tx, err := db.BeginRead()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err = tx.Get(ns, keys[order[i%numKeys]]); err != nil {
+			b.Fatal(err)
+		}
+		if err := tx.Rollback(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkGetBatch measures batched read throughput (many reads per transaction).
 func BenchmarkGetBatch(b *testing.B) {
 	const numKeys = 10000

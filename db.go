@@ -1329,6 +1329,16 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 	// identical Options to the source so page sizes match.
 	dstOpts := db.btreeDB.Options()
 	dstOpts.InMemory = false // destination is always a file (user gave us a path)
+	// The destination is a database of its own, and so are its integrity
+	// failures (a damaged page of an existing destination that the copy
+	// reads): they come back as Backup's error, not through the source's
+	// OnIntegrityError. In SQLite the failure is the step's return code, and
+	// sqlite3_backup_finish records it on the destination handle
+	// (backup.c:255, 603-605); outside recovery mode, SQLCipher records a
+	// decrypt failure on the pager that read the page, which is the
+	// destination's (sqlcipher_codec_ctx_set_error → sqlite3pager_error,
+	// sqlcipher.c:3287-3291, 1385-1389).
+	dstOpts.OnIntegrityError = nil
 	// The copy has its source's on-disk format: a backup of a database created
 	// before v2.5.0 is such a database too.
 	dstOpts.SchemaFormat = db.btreeDB.SchemaFormat()

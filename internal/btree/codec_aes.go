@@ -18,9 +18,11 @@ const aesNonceLen = 12
 // aesTagLen is the GCM authentication tag length.
 const aesTagLen = 16
 
-// aesCodec implements Codec using AES-256-GCM. One instance per DB — the
-// underlying cipher.AEAD is safe for concurrent use from writer and all
-// readers.
+// aesCodec implements Codec using AES-256-GCM. It holds only the immutable
+// cipher.AEAD, which is safe for concurrent use, so one instance can serve
+// the writer and readers of one database and several databases at once.
+// The nonce source is the caller's (aeadScratch), and so is the hook an
+// authentication failure is reported to (Decrypt's onError).
 //
 // Per-page layout (pageSize = 4096, bodyLen = 4064):
 //
@@ -32,9 +34,7 @@ const aesTagLen = 16
 // Padding at the tail keeps the total overhead a multiple of 16 (AES
 // block size), which is the SQLCipher convention for reserve areas.
 type aesCodec struct {
-	aead   cipher.AEAD
-	nonces *noncePool
-	onErrorField
+	aead cipher.AEAD
 }
 
 // NewAESCodec constructs the default codec. key must be exactly 32 bytes
@@ -52,7 +52,7 @@ func NewAESCodec(key []byte) (Codec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("btree: cipher.NewGCM: %w", err)
 	}
-	return &aesCodec{aead: aead, nonces: newNoncePool()}, nil
+	return &aesCodec{aead: aead}, nil
 }
 
 func (c *aesCodec) Overhead() int { return aesCodecOverhead }
@@ -75,9 +75,9 @@ func (c *aesCodec) Encrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte
 	nonce := s.nonce[:aesNonceLen]
 	aad := s.aad[:4]
 
-	// Draw a fresh random nonce from the userspace pool (amortizes
-	// crypto/rand.Read across many calls).
-	if err := c.nonces.Draw(nonce); err != nil {
+	// Draw a fresh random nonce from the scratch's own userspace pool
+	// (amortizes crypto/rand.Read across many calls).
+	if err := s.drawNonce(nonce); err != nil {
 		return nil, fmt.Errorf("btree: aesCodec.Encrypt: nonce draw: %w", err)
 	}
 
@@ -102,8 +102,8 @@ func (c *aesCodec) Encrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte
 
 // Decrypt is the inverse of Encrypt. Returns errAEADAuthFail (wrapping
 // ErrPageIntegrity) on any authentication failure (wrong key, corruption,
-// or pgno mismatch). dst must not alias src.
-func (c *aesCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error) {
+// or pgno mismatch), after reporting it to onError. dst must not alias src.
+func (c *aesCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch, onError integrityHook) ([]byte, error) {
 	if len(dst) < len(src) {
 		return nil, fmt.Errorf("btree: aesCodec.Decrypt: dst too small (%d < %d)", len(dst), len(src))
 	}
@@ -124,7 +124,7 @@ func (c *aesCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte
 	// dst and src are separate buffers — no aliasing.
 	pt, err := c.aead.Open(dst[:0], nonce, ctAndTag, aad)
 	if err != nil {
-		c.fire(pgno, err)
+		onError.fire(pgno, err)
 		return nil, errAEADAuthFail
 	}
 	if len(pt) != bodyLen {

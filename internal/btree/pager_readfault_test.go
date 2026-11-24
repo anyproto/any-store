@@ -215,17 +215,24 @@ func TestReadRawPageWALErrorPropagates(t *testing.T) {
 // the old fallthrough masked: an AEAD authentication failure on a WAL frame
 // (readFrame's codec path) is a true integrity failure and must surface —
 // serving the older DB-file plaintext instead would silently undo committed
-// writes. The codec's OnError sink must observe the failing page.
+// writes. The database's OnIntegrityError, which the WAL passes to the
+// codec, must observe the failing page.
 func TestWALDecryptFailurePropagatesFromReadFrame(t *testing.T) {
 	dir := t.TempDir()
 	key := make([]byte, KeyLen)
 	for i := range key {
 		key[i] = byte(i + 1)
 	}
+	var fired atomic.Uint32
+	var gotPgno atomic.Uint32
 	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{
 		PageSize:              4096,
 		Key:                   key,
 		DisableAutoCheckpoint: true,
+		OnIntegrityError: func(pgno uint32, _ error) {
+			fired.Store(1)
+			gotPgno.Store(pgno)
+		},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -251,16 +258,7 @@ func TestWALDecryptFailurePropagatesFromReadFrame(t *testing.T) {
 	}
 	require.NotZero(t, targetPgno, "expected a pgno>1 page resolvable to a WAL frame")
 
-	// Subscribe to the codec's OnError sink before tampering.
-	sink, ok := pager.codec.(OnErrorSink)
-	require.True(t, ok, "built-in AEAD codec must implement OnErrorSink")
-	var fired atomic.Uint32
-	var gotPgno atomic.Uint32
-	sink.SetOnError(func(pgno uint32, _ error) {
-		fired.Store(1)
-		gotPgno.Store(pgno)
-	})
-	t.Cleanup(func() { sink.SetOnError(nil) })
+	require.Zero(t, fired.Load(), "nothing is damaged yet")
 
 	// Flip one ciphertext byte of the target frame in the live -wal file.
 	frameSize := int64(walFrameSize) + int64(pager.pageSize)
@@ -281,8 +279,8 @@ func TestWALDecryptFailurePropagatesFromReadFrame(t *testing.T) {
 	_, err = pager.getPageReader(targetPgno, walMaxFrame, cache)
 	require.Error(t, err, "AEAD auth failure on a WAL frame must propagate")
 	require.Contains(t, err.Error(), "WAL decrypt frame")
-	require.Equal(t, uint32(1), fired.Load(), "codec OnError sink must fire")
-	require.Equal(t, targetPgno, gotPgno.Load(), "OnError must report the failing page")
+	require.Equal(t, uint32(1), fired.Load(), "the database's OnIntegrityError must fire")
+	require.Equal(t, targetPgno, gotPgno.Load(), "OnIntegrityError must report the failing page")
 }
 
 // TestWALReadFramePastTailRemapsToErrWALCorrupt pins the documented drift

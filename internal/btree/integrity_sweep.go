@@ -105,9 +105,9 @@ func (db *DB) CksumCodec() *cksumCodec {
 // one switch, shared by the writer and every reader) is left as it is
 // configured, on by default and off in a handle opened to read past damage.
 //
-// The codec's OnError hook fires once for each page whose tag fails: for a
-// checksum page the sweep fires it, for an AEAD page Decrypt does. A page
-// that could not be read fires nothing.
+// The database's integrity hook (Options.OnIntegrityError) fires once for
+// each page whose tag fails: for a checksum page the sweep fires it, for an
+// AEAD page Decrypt does. A page that could not be read fires nothing.
 //
 // Returns IntegrityNone with zero pages scanned for plain DBs and for
 // in-memory DBs, whose pages are stored without a codec.
@@ -155,21 +155,21 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 		case mode == IntegrityChecksum:
 			e = verifyCksumPage(pgno, raw)
 		case mode == IntegrityAEAD:
-			e = verifyAEADPage(db.pager.codec, pgno, raw)
+			e = verifyAEADPage(db.pager.codec, pgno, raw, db.pager.onIntegrityError)
 		}
 		if e != nil {
 			res.Errors = append(res.Errors, *e)
 		}
 		if e != nil && e.Kind == IntegrityChecksumMismatch {
-			// Fire the codec's OnError hook so subscribers see sweep
-			// mismatches the same way they see read-path mismatches. Only
-			// for a checksum that was compared and differed, as cksumvfs
-			// compares only after a read that succeeded (cksmRead): a page
-			// that could not be read is listed and notifies nobody. The
-			// AEAD codecs fire the hook themselves, from Decrypt.
-			if c := db.CksumCodec(); c != nil {
-				c.fire(pgno, errCksumMismatch)
-			}
+			// Fire the database's integrity hook (OnIntegrityError: the
+			// pager's, which its reads pass to the codec; the codec keeps
+			// none) so subscribers see sweep mismatches the same way they
+			// see read-path mismatches. Only for a checksum that was
+			// compared and differed, as cksumvfs compares only after a read
+			// that succeeded (cksmRead): a page that could not be read is
+			// listed and notifies nobody. The AEAD codecs fire the hook
+			// themselves, from Decrypt.
+			db.pager.onIntegrityError.fire(pgno, errCksumMismatch)
 		}
 	}
 	return res, nil
@@ -283,10 +283,12 @@ func verifyCksumPage(pgno uint32, raw []byte) *SweepError {
 // verifyAEADPage attempts a full decrypt of pgno's raw bytes through the
 // installed codec. AEAD's auth tag is the integrity check — a successful
 // Decrypt means the page is authentic. The plaintext output is discarded.
-func verifyAEADPage(codec Codec, pgno uint32, raw []byte) *SweepError {
+// onError is the database's integrity hook, which Decrypt fires for a tag
+// that fails.
+func verifyAEADPage(codec Codec, pgno uint32, raw []byte, onError integrityHook) *SweepError {
 	var s aeadScratch
 	dst := make([]byte, len(raw))
-	if _, derr := decryptPageWithCodec(codec, dst, raw, pgno, &s); derr != nil {
+	if _, derr := decryptPageWithCodec(codec, dst, raw, pgno, &s, onError); derr != nil {
 		return &SweepError{PageNo: pgno, Kind: IntegrityAEADAuthFail, Inner: derr}
 	}
 	return nil
