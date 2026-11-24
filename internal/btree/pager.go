@@ -1073,6 +1073,7 @@ func (p *pager) headerErrorOfUnwritableFile() error {
 // process can take it; the request then waits with a budget of its own.
 // SQLite's downgrade asks no busy handler; with flock it only records the
 // new level (os_unix.c:2747-2750).
+// DRIFT: a flock conversion from exclusive to shared can be refused, so the downgrade waits through the busy handler with a count of its own, where SQLite's downgrade is one unlock call that asks no busy handler (pagerUnlockDb, pager.c:1133-1149; with flock it only records the new level, os_unix.c:2747-2750). See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
 func (p *pager) downgradeDBLock(f fileHandle) error {
 	return p.lockDBShared(f, &beginBusy{xBusy: DefaultBusyTimeout(BusyTimeout)})
 }
