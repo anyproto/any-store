@@ -20,11 +20,11 @@ import (
 // os_unix.c:7021-7028), the kernel's, as getcwd returns it: syscall.Getwd,
 // not os.Getwd, which can return $PWD, another name of the same directory
 // through which a ".." reaches another parent. An absolute path is returned
-// as given, so a full name resolves to itself. A working directory that cannot be read fails
-// the call, as unixFullPathname returns SQLITE_CANTOPEN (os_unix.c:7024).
-// Nothing is measured here: a full name too long for the OS fails when the
-// file is opened by it, where unixFullPathname fails for a name that does
-// not fit its buffer (os_unix.c:6940-6942, 7030).
+// as given, so a full name resolves to itself. A working directory that
+// cannot be read fails the call, as unixFullPathname returns SQLITE_CANTOPEN
+// (os_unix.c:7024). Nothing is measured here: a full name too long for the
+// OS fails when the file is opened by it, where unixFullPathname fails for a
+// name that does not fit its buffer (os_unix.c:6940-6942, 7030).
 // DRIFT: no symbolic link is followed and no "." or ".." element is removed, where unixFullPathname follows each link and drops those elements as it appends (os_unix.c:6930-6939, 6964). See docs/btree/NOTES.md#drift-2026-11-23-1-full-pathname-follows-no-symbolic-link
 func FullPathname(path string) (string, error) {
 	if strings.HasPrefix(path, "/") {
