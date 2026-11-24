@@ -388,11 +388,11 @@ const saltReaderChildEnv = "BTREE_TEST_SALT_READER_CHILD"
 
 // A backup over a legacyDestination while another process reads the
 // destination at the commit whose page 1 names the other salt, through the
-// backup and its close. The close's checkpoint may copy only the frames that
-// reader can see, so the page 1 it writes into the main file is that old
-// one, and it writes it with the keyed salt and every other byte as the
-// frame has it: once the reader is gone the file opens with the passphrase
-// and holds the copy.
+// backup, a passive checkpoint and the destination's close. The checkpoint
+// may copy only the frames that reader can see, so the page 1 it writes into
+// the main file is that old one, and it writes it with the keyed salt and
+// every other byte as the frame has it: once the reader is gone the file
+// opens with the passphrase and holds the copy.
 func TestBackup_WALPage1WithAnotherSaltUnderAReader(t *testing.T) {
 	if path := os.Getenv(saltReaderChildEnv); path != "" {
 		saltReaderChild(t, path)
@@ -432,16 +432,19 @@ func TestBackup_WALPage1WithAnotherSaltUnderAReader(t *testing.T) {
 	defer func() { require.NoError(t, src.Close()) }()
 	codecFill(t, src, 0, 40)
 
-	// when: the backup and the close of its destination, under the reader
+	// when: the backup and a passive checkpoint of its destination, under the reader
 	dst, err := testOpen(t, dstPath, opts)
 	require.NoError(t, err)
 	b, err := dst.BackupInit(src)
 	require.NoError(t, err)
 	require.ErrorIs(t, b.Step(ctx, -1), ErrBackupDone)
 	require.NoError(t, b.Finish())
-	require.NoError(t, dst.Close())
+	require.NoError(t, dst.Checkpoint(CheckpointPassive))
 
-	// then: the close's checkpoint wrote the reader's page 1
+	// then: the checkpoint wrote the reader's page 1 (read through the
+	// handle, which holds the file's lock), and the close leaves it
+	requireStampedPage1(t, dst.pager.file, legacy, keyed)
+	require.NoError(t, dst.Close())
 	requireStampedPage1File(t, dstPath, legacy, keyed)
 	got, found := walPage1Salt(t, dstPath+"-wal", nil)
 	require.True(t, found)
