@@ -86,6 +86,12 @@ func (s TestSeam) SetBusyTimeout(d time.Duration) {
 // it.
 func SetTestPublishHeaderHook(f func(step string)) { testPublishHeaderHook = f }
 
+// SetTestChangeSwapHook installs the hook that runs in every begin of this
+// process that found a wal-index header the change state does not hold,
+// before each attempt to count it (wal.noteSnapshot): the begin has its
+// snapshot and has not moved the change epoch yet. Nil removes it.
+func SetTestChangeSwapHook(f func()) { testChangeSwapHook = f }
+
 // SetTestBeforeBeginWriteHook installs the hook that runs in every write
 // begin of this process once it has its read snapshot and before it takes
 // the WAL's write lock. Nil removes it.

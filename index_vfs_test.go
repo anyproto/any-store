@@ -233,6 +233,17 @@ func abs(n int) int {
 // reopen.
 func TestReadFault_MultiKeyFlag(t *testing.T) {
 	build := func(t *testing.T, db DB) {
+		// Other collections' sketch rows sit between the flag record and the
+		// sketch row of "docs", so the insert's first-use sketch load does
+		// not bring the flag's page into the cache.
+		for c := 0; c < 12; c++ {
+			coll, err := db.CreateCollection(ctx, fmt.Sprintf("a%02d", c))
+			require.NoError(t, err)
+			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}, IndexInfo{Fields: []string{"b"}}))
+			for i := 0; i < 200; i++ {
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":"%d"}`, i, i, i*7))))
+			}
+		}
 		coll, err := db.CreateCollection(ctx, "docs")
 		require.NoError(t, err)
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))

@@ -71,6 +71,16 @@ var (
 	// under the stale name returns.
 	ErrCollectionClosed = fmt.Errorf("any-store: collection handle is closed (dropped, renamed, or closed): %w", ErrCollectionNotFound)
 
+	// ErrCollectionClosedDuringOpen is returned by OpenCollection and
+	// Collection when the collection was there at each of their attempts,
+	// but the handle each attempt found was closed before it could be
+	// returned, as by a Close() of it in another goroutine: an open returns
+	// the handle the collection has, the same one to every caller. It does
+	// not match ErrCollectionNotFound or ErrCollectionClosed, and Collection
+	// has created nothing. Open again: the open finds the handle the
+	// collection has then, or returns ErrCollectionNotFound if it is gone.
+	ErrCollectionClosedDuringOpen = errors.New("any-store: collection handle closed during the open; open again")
+
 	// ErrInvalidIndexName is returned when an index name (given or derived from
 	// the field list) exceeds the maximum length (see validateIndexName).
 	ErrInvalidIndexName = errors.New("any-store: invalid index name")

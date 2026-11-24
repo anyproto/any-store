@@ -250,9 +250,28 @@ func (db *db) endAnnouncement(cookie uint32) {
 type txSchema struct {
 	memo []memoEntry
 	log  []logEntry
+	// changes holds the positions in log of the entries that are schema
+	// changes, in log order: every entry but the pins (logPin). A lookup by
+	// name (byName) walks these alone, so the handles a transaction only
+	// uses cost it nothing.
+	changes []int
 	// installed reports that the commit published the log (install ran):
 	// the registry has to follow it (settleLog), whatever Commit returned.
 	installed bool
+}
+
+// testVisits, when set, counts the entries the walks of the schema log look
+// at, and the registry evictions, for the tests that hold each to what its
+// call needs. Tests only.
+var testVisits *visitCounts
+
+type visitCounts struct {
+	// byName counts the log entries byName looks at.
+	byName int
+	// discard counts the log entries discardLog walks.
+	discard int
+	// evict counts the calls of db.evictLocked.
+	evict int
 }
 
 type memoEntry struct {
@@ -270,12 +289,16 @@ type logEntry struct {
 	s    *collSchema
 	prev *collSchema
 	kind logKind
+	// prevLast is the handle's mark (collection.logLast) before the entry:
+	// what a rollback that discards the entry gives back (discardLog).
+	prevLast int
 }
 
 type logKind uint8
 
 const (
-	// logPin references the handle without changing it: a verb began on it.
+	// logPin references the handle without changing it: the transaction
+	// uses it (refreshLiveSketches).
 	logPin logKind = iota
 	// logVersion replaces prev with s at the commit.
 	logVersion
@@ -327,6 +350,7 @@ func (t *txSchema) release() {
 	t.memo = t.memo[:0]
 	clear(t.log)
 	t.log = t.log[:0]
+	t.changes = t.changes[:0]
 	t.installed = false
 }
 
@@ -360,11 +384,16 @@ func (c *collection) inTx(tx *btree.ReadTx) (s *collSchema, dropped bool) {
 // byName returns the entry under which the open write transaction has a
 // collection by name: the one it created or renamed to it, or the drop that
 // took the name. Only a handle's last change counts — the earlier ones are
-// superseded.
+// superseded. The pins are not visited (changes): the lookup costs by the
+// schema changes of the transaction, not by the handles it uses.
 func (t *txSchema) byName(name string) *logEntry {
-	for i := len(t.log) - 1; i >= 0; i-- {
+	for j := len(t.changes) - 1; j >= 0; j-- {
+		i := t.changes[j]
 		e := &t.log[i]
-		if e.kind == logPin || e.s.name != name || e.c.logLast != i+1 {
+		if testVisits != nil {
+			testVisits.byName++
+		}
+		if e.s.name != name || e.c.logLast != i+1 {
 			continue
 		}
 		return e
@@ -378,16 +407,10 @@ func (t *txSchema) add(db *db, e logEntry) {
 	db.mu.Lock()
 	e.c.pinned++
 	db.mu.Unlock()
+	e.prevLast = e.c.logLast
+	t.changes = append(t.changes, len(t.log))
 	t.log = append(t.log, e)
 	e.c.logLast = len(t.log)
-}
-
-// remark sets every handle's last-entry mark from the log: after entries
-// were discarded, for the handles with entries left.
-func (t *txSchema) remark() {
-	for i := range t.log {
-		t.log[i].c.logLast = i + 1
-	}
 }
 
 // logVersion records next as the version c has from the commit of wtx on,
@@ -417,16 +440,15 @@ func (c *collection) logDrop(wtx WriteTx, s *collSchema) {
 	wtx.schemaLog().add(c.db, logEntry{c: c, s: s, prev: s, kind: logDrop})
 }
 
-// logPin marks c as worked on by a verb of wtx, so that a Close() waits for
-// the transaction to end (collection.pinned). Under db.mu with the check
-// that the handle is live: a Close() cannot evict it in between. A handle
-// the log references already is pinned already; the log does not grow with
-// the verbs called on it.
-func (c *collection) logPin(wtx WriteTx) error {
+// logPin marks c as used by the write transaction of t, so that a Close()
+// waits for the transaction to end (collection.pinned). Under db.mu with the
+// check that the handle is live: a Close() cannot evict it in between. A
+// handle the log references already is pinned already; the log does not grow
+// with the operations on it.
+func (c *collection) logPin(t *txSchema) error {
 	if c.logLast != 0 {
 		return c.alive()
 	}
-	t := wtx.schemaLog()
 	c.db.mu.Lock()
 	if err := c.alive(); err != nil {
 		c.db.mu.Unlock()
@@ -434,9 +456,16 @@ func (c *collection) logPin(wtx WriteTx) error {
 	}
 	c.pinned++
 	c.db.mu.Unlock()
-	t.log = append(t.log, logEntry{c: c, kind: logPin})
-	c.logLast = len(t.log)
+	t.pin(c)
 	return nil
+}
+
+// pin appends the mark of a handle whose count (collection.pinned) the
+// caller raised under db.mu: logPin, and the open that registers a handle
+// the write transaction loaded (db.openCollectionOnce).
+func (t *txSchema) pin(c *collection) {
+	t.log = append(t.log, logEntry{c: c, kind: logPin, prevLast: c.logLast})
+	c.logLast = len(t.log)
 }
 
 // install publishes the log as the commit becomes visible, before the epoch
@@ -503,6 +532,7 @@ func (db *db) settleLog(t *txSchema) {
 	}
 	clear(t.log)
 	t.log = t.log[:0]
+	t.changes = t.changes[:0]
 }
 
 // discardLog drops the entries [from:] of the log: their scope rolled back.
@@ -512,9 +542,18 @@ func (db *db) settleLog(t *txSchema) {
 // objects, so the next write transaction rebases them
 // (resetUncommittedSketches). The handle of a collection created in the
 // scope ends here.
+//
+// Each handle gets back the mark it had before the scope (logEntry.prevLast),
+// so a rollback costs by the entries it discards, not by the log.
 func (db *db) discardLog(t *txSchema, from int) {
 	for i := len(t.log) - 1; i >= from; i-- {
 		e := &t.log[i]
+		if testVisits != nil {
+			testVisits.discard++
+		}
+		// From the end: a handle with several entries in the scope ends
+		// with the mark it had before the first of them.
+		e.c.logLast = e.prevLast
 		switch e.kind {
 		case logCreate:
 			e.c.closed.Store(true)
@@ -544,12 +583,11 @@ func (db *db) discardLog(t *txSchema, from int) {
 	db.mu.Lock()
 	db.unpinLocked(t.log[from:])
 	db.mu.Unlock()
-	for i := from; i < len(t.log); i++ {
-		t.log[i].c.logLast = 0
-	}
 	clear(t.log[from:])
 	t.log = t.log[:from]
-	t.remark()
+	for len(t.changes) > 0 && t.changes[len(t.changes)-1] >= from {
+		t.changes = t.changes[:len(t.changes)-1]
+	}
 }
 
 // registerLocked puts c in the registry under name. A handle that holds the
@@ -567,6 +605,7 @@ func (db *db) registerLocked(c *collection, name string) {
 		db.evictLocked(other)
 	}
 	db.openedCollections[name] = c
+	c.regName = name
 	db.byIdentity[c.identity] = c
 }
 
@@ -580,10 +619,12 @@ func (db *db) unpinLocked(entries []logEntry) {
 		if c.pinned > 0 || !c.closePending.Load() {
 			continue
 		}
-		c.closePending.Store(false)
 		if c.closed.CompareAndSwap(false, true) {
 			db.evictLocked(c)
 		}
+		// Cleared after the handle is closed: an open that reads the two
+		// without db.mu (db.handOut) sees the pending close or its effect.
+		c.closePending.Store(false)
 	}
 }
 
@@ -628,7 +669,9 @@ func (c *collection) resolveAs(tx *btree.ReadTx, name string) (*collSchema, erro
 				// after DROP TABLE in the same SQLite transaction.
 				return nil, ErrCollectionClosed
 			}
-			c.refreshSketches(tx, e.s)
+			if err := c.refreshSketches(tx, e.s); err != nil {
+				return nil, err
+			}
 			return e.s, nil
 		}
 	}
@@ -641,14 +684,18 @@ func (c *collection) resolveAs(tx *btree.ReadTx, name string) (*collSchema, erro
 	if s := c.head.Load(); s != nil {
 		if s.current(e, tx.SnapshotSchemaCookie(), writer) {
 			if writer {
-				c.refreshSketches(tx, s)
+				if err := c.refreshSketches(tx, s); err != nil {
+					return nil, err
+				}
 			}
 			return s, nil
 		}
 	}
 	s, err := c.resolveSlow(tx, name)
 	if err == nil && writer {
-		c.refreshSketches(tx, s)
+		if err = c.refreshSketches(tx, s); err != nil {
+			return nil, err
+		}
 	}
 	return s, err
 }
@@ -870,7 +917,9 @@ func (c *collection) loadRangeIndex(tx *btree.ReadTx, name string, info IndexInf
 	}
 	idx.format = format
 	idx.outdated = indexFormatOutdated(format, info)
-	c.loadSketchAtOpen(tx, name, idx)
+	if err = c.loadSketchAtOpen(tx, name, idx); err != nil {
+		return nil, err
+	}
 	return idx, nil
 }
 

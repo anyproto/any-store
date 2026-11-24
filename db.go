@@ -37,11 +37,18 @@ type DB interface {
 	// Returns the opened Collection or an error if the collection does not exist.
 	// Possible errors:
 	// - ErrCollectionNotFound: if the collection does not exist.
+	// - ErrCollectionClosedDuringOpen: the collection was there, but the
+	//   handle each attempt found was closed before it could be returned,
+	//   as by concurrent Close() calls. It does not match
+	//   ErrCollectionNotFound; open again.
 	OpenCollection(ctx context.Context, collectionName string) (Collection, error)
 
 	// Collection is a convenience method to get or create a collection.
 	// It first attempts to open the collection, and if it does not exist, it creates the collection.
 	// Returns the Collection or an error if there is an issue creating or opening the collection.
+	// Possible errors:
+	// - ErrCollectionClosedDuringOpen: as for OpenCollection; nothing was
+	//   created. Open again.
 	Collection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error)
 
 	// GetCollectionNames returns a list of all collection names in the database.
@@ -551,6 +558,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	tx.readTx = &btWtx.ReadTx
 	tx.writeTx = btWtx
 	tx.modified.Store(false)
+	tx.sketchTx = version
 	btWtx.SetAux(tx)
 
 	db.checkStale(&btWtx.ReadTx)
@@ -648,9 +656,9 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 // sketches it wrote itself (savepointTx.images).
 //
 // Only db.sketchDirty is visited, and this is where a collection leaves it:
-// once closed, or once none of its indexes is flagged. An index with no
-// committed bytes keeps its flag through the rebase and stays listed for the
-// next commit to persist.
+// once closed, or once none of its indexes is flagged. An index whose row
+// could not be read keeps its flag through the rebase, and the collection
+// stays listed.
 func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
 	kept := db.sketchDirty[:0]
 	gen := db.epoch.Load().gen
@@ -663,10 +671,13 @@ func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
 			c.mu.Lock()
 			for _, idx := range s.indexes {
 				if idx.sketchModified {
-					// reloadSketch (writable) rebases live to the committed bytes and
-					// clears sketchModified; if there are no committed bytes yet
-					// (brand-new pre-commit index) it preserves the built sketch.
-					c.reloadSketch(tx, s.name, idx, true)
+					// reloadLiveSketch rebases live to the committed bytes, or
+					// to an empty sketch if there are none, and clears
+					// sketchModified.
+					// A read that fails leaves the index flagged: the first
+					// use of the collection loads it again, and may fail the
+					// operation for it (refreshLiveSketches).
+					_ = c.reloadLiveSketch(tx, s.name, idx)
 					flagged = flagged || idx.sketchModified
 				}
 			}
@@ -790,25 +801,62 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 }
 
 func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collection, error) {
-	coll, err := db.openCollection(ctx, collectionName)
-	if err != nil {
-		return nil, err
+	for attempt := 0; ; attempt++ {
+		coll, err := db.openCollection(ctx, collectionName)
+		if err != nil {
+			return nil, err
+		}
+		if db.handOut(coll.(*collection)) {
+			return coll, nil
+		}
+		if attempt == handOutAttempts-1 {
+			return nil, ErrCollectionClosedDuringOpen
+		}
 	}
-	return db.handOut(coll), nil
 }
 
-// handOut returns coll to a caller that keeps it. That cancels a Close() an
-// uncommitted schema change deferred (see collection.closePending): the
-// handle has a user again. An open the library makes for itself, or one that
-// ends in an error, hands nothing out. The unlocked read may miss a Close()
-// racing with the open; that close then stands, as if it came second.
-func (db *db) handOut(coll Collection) Collection {
-	if c := coll.(*collection); c.closePending.Load() {
-		db.mu.Lock()
-		c.closePending.Store(false)
-		db.mu.Unlock()
+// handOutAttempts bounds the opens one call makes for a handle to hand out:
+// each one more needs another Close() to land between an open and its
+// hand-out. The same bound as openCollection has for a handle gone while it
+// was resolved. Out of attempts, the call returns
+// ErrCollectionClosedDuringOpen, the error of the race: the collection was
+// there each time, and the error must not match ErrCollectionNotFound,
+// which a caller takes for a collection that is missing.
+const handOutAttempts = 3
+
+// testHookBeforeHandOut, when set, runs between an open that found its
+// handle and the hand-out of it. Tests only.
+var testHookBeforeHandOut func(c *collection)
+
+// handOut gives c to a caller that keeps it, and reports false when c was
+// closed since the open found it: the caller opens again and gets the handle
+// the collection has now, never a closed one. Handing out cancels a Close()
+// the open write transaction deferred (see collection.closePending): the
+// handle has a user again. The check and the cancellation are one critical
+// section of db.mu, as the end of that transaction is (unpinLocked): either
+// the close is cancelled before the last pin goes, or it took effect and the
+// open is made again. An open the library makes for itself, or one that ends
+// in an error, hands nothing out.
+//
+// Without db.mu when there is nothing to cancel: no close is pending and
+// the handle is open. unpinLocked closes the handle before it clears the
+// pending close, so the two reads, in this order, cannot both miss a
+// deferred close that took effect. A Close() that arrives after them came
+// after the hand-out.
+func (db *db) handOut(c *collection) bool {
+	if testHookBeforeHandOut != nil {
+		testHookBeforeHandOut(c)
 	}
-	return coll
+	if !c.closePending.Load() && !c.closed.Load() {
+		return true
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if c.closed.Load() {
+		return false
+	}
+	c.closePending.Store(false)
+	return true
 }
 
 // registered returns the live handle the registry holds under name. The
@@ -838,9 +886,10 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 		}
 		// The registered handle was closed or retired while it was resolved
 		// for this caller: the name is free for the collection that has it
-		// now, if any.
+		// now, if any. Out of attempts, the error of the race, as out of
+		// hand-outs (handOutAttempts).
 		if attempt == 2 {
-			return nil, ErrCollectionNotFound
+			return nil, ErrCollectionClosedDuringOpen
 		}
 	}
 }
@@ -848,6 +897,14 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 // testHookBeforeRegister, when set, runs between the load of a new handle and
 // its registration. Tests only.
 var testHookBeforeRegister func(name string)
+
+// testHookRegistered, when set, runs right after a new handle entered the
+// registry, where any transaction can find it. Tests only.
+var testHookRegistered func(name string)
+
+// testHookFoundRegistered, when set, runs when an open found a handle in the
+// registry, before it resolves the handle. Tests only.
+var testHookFoundRegistered func(c *collection)
 
 // errHandleGone tells openCollection that the handle it found registered is
 // not live any more.
@@ -871,6 +928,9 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 		return coll, err
 	}
 	if coll, ok := db.registered(collectionName); ok {
+		if testHookFoundRegistered != nil {
+			testHookFoundRegistered(coll.(*collection))
+		}
 		return coll, db.resolveOpened(ctx, coll.(*collection), collectionName)
 	}
 
@@ -913,12 +973,40 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 			}
 			db.forgetLocked(existing.(*collection))
 		}
+		// A write transaction that loaded the handle has its sketches from
+		// here on (newCollection stamped them as its own): it pins the
+		// handle in the same critical section that registers it, as its
+		// first use of a registered handle does (refreshLiveSketches). A
+		// Close() between the open and that use then waits for the
+		// transaction like any other, and an open by name inside it returns
+		// this handle.
+		wt, _ := tx.Aux().(*commonTx)
+		if !tx.IsWriteTx() {
+			wt = nil
+		}
+		if wt != nil {
+			c.pinned++
+		}
 		c.since = db.sinceNow()
+		// The version is settled before the handle can be found. The
+		// handle's sketch stamps speak for the index objects of this
+		// version (newCollection): were the handle registered first,
+		// another transaction could install a head it loaded at an older
+		// snapshot, and a write transaction that opened the handle would
+		// put its deltas on sketches it never loaded. Nothing else has
+		// the handle yet, so its lock is free under db.mu.
+		c.adopt(tx, schema)
 		db.openedCollections[collectionName] = c
+		c.regName = collectionName
 		db.byIdentity[c.identity] = c
 		db.mu.Unlock()
+		if wt != nil {
+			wt.schema.pin(c)
+		}
+		if testHookRegistered != nil {
+			testHookRegistered(collectionName)
+		}
 		opened = c
-		c.adopt(tx, schema)
 		return nil
 	})
 	if err != nil {
@@ -1008,11 +1096,18 @@ func (db *db) liveLocked(name string) (Collection, bool) {
 }
 
 func (db *db) Collection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error) {
-	coll, err := db.collection(ctx, collectionName, opts...)
-	if err != nil {
-		return nil, err
+	for attempt := 0; ; attempt++ {
+		coll, err := db.collection(ctx, collectionName, opts...)
+		if err != nil {
+			return nil, err
+		}
+		if db.handOut(coll.(*collection)) {
+			return coll, nil
+		}
+		if attempt == handOutAttempts-1 {
+			return nil, ErrCollectionClosedDuringOpen
+		}
 	}
-	return db.handOut(coll), nil
 }
 
 // collection opens or creates the collection without handing it out (see
@@ -1720,16 +1815,16 @@ func (db *db) Flush(ctx context.Context, waitIdleTime time.Duration, mode FlushM
 	return db.recoveryController.Flush(ctx, waitIdleTime, mode.toRecoveryFlushMode())
 }
 
-// evictLocked removes c from the registry. Identity scan, not a delete by
-// name: the slot may be under an older name than the head's (a handle
-// opened through an old snapshot, a rename being settled). The caller holds
-// db.mu.
+// evictLocked removes c from the registry. By the name it was registered
+// under (collection.regName), not the head's: the slot may be under an older
+// name than that (a handle opened through an old snapshot, a rename being
+// settled). The caller holds db.mu.
 func (db *db) evictLocked(c *collection) {
-	for name, cur := range db.openedCollections {
-		if cur == Collection(c) {
-			delete(db.openedCollections, name)
-			break
-		}
+	if testVisits != nil {
+		testVisits.evict++
+	}
+	if cur, ok := db.openedCollections[c.regName]; ok && cur == Collection(c) {
+		delete(db.openedCollections, c.regName)
 	}
 	db.forgetLocked(c)
 }
@@ -1746,10 +1841,25 @@ func (db *db) forgetLocked(c *collection) {
 // lists them on t for the settle (commonTx.settleSketches). Called once per
 // write transaction commit to batch sketch persistence. It removes nothing
 // from the list: the next write-tx begin does (resetUncommittedSketches).
+//
+// Only the collections whose live sketches are this transaction's
+// (collection.sketchTx) are written. One the transaction never used has
+// none of its deltas: what is flagged there is left over from a transaction
+// that did not commit, on counts no writer loaded since, and storing it
+// would put them over a row another process may have written meanwhile. It
+// stays listed for a begin to rebase.
+//
+// A closed handle is skipped. One the transaction wrote through is not
+// closed before the transaction ends: it is pinned from its first use, a
+// Close() waits for the end, and an open returns the same handle
+// (collection.pinned), so its documents commit with their counts. What is
+// closed here has no collection to store for: its creation rolled back with
+// a savepoint, or it was closed without a write of this transaction on it.
+// One the transaction dropped is live until the install and told by the log.
 func (db *db) persistAllDirtySketches(tx *btree.WriteTx, t *commonTx) error {
 	gen := db.epoch.Load().gen
 	for _, c := range db.sketchDirty {
-		if c.closed.Load() {
+		if c.closed.Load() || c.sketchTx != t.sketchTx {
 			continue
 		}
 		var s *collSchema

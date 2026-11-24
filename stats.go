@@ -3,6 +3,7 @@ package anystore
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"github.com/klauspost/compress/s2"
@@ -44,7 +45,10 @@ type IndexStats struct {
 	// its page count (including overflow pages) times the database page size.
 	SizeBytes int
 
-	// SketchDocCount is the document count tracked by the index sketch.
+	// SketchDocCount is the document count tracked by the index sketch: the
+	// stored sketch as the Stats call's transaction sees it, with a write
+	// transaction's own uncommitted changes when the call is made inside
+	// one. The same holds for SketchSize and SketchDistribution.
 	SketchDocCount uint64
 
 	// SketchSize is the number of buckets in the index sketch.
@@ -201,8 +205,8 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 			return rErr
 		}
 		stats.Name = s.name
-		c.refreshSketches(tx, s)
 		indexes, vindexes, ftsindexes := s.indexes, s.vindexes, s.ftsIndexes
+		var sketchRow []byte
 
 		// Documents: scan the collection B-tree summing stored and
 		// uncompressed value sizes.
@@ -251,12 +255,16 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 				PayloadBytes: idxSize.PayloadBytes,
 				SizeBytes:    idxSize.TotalPages() * pageSize,
 			}
-			if s := idx.loadPubSketch(); s != nil {
-				is.SketchDocCount = s.GetDocCount()
-				is.SketchSize = s.Size
+			var sk *qplanner.IndexSketch
+			if sk, sketchRow, iErr = c.statsSketch(tx, s.name, idx, sketchRow); iErr != nil {
+				return iErr
+			}
+			if sk != nil {
+				is.SketchDocCount = sk.GetDocCount()
+				is.SketchSize = sk.Size
 				// Report the full-key level — the most saturated, matching the
 				// pre-multi-level single-sketch semantics.
-				is.SketchDistribution = s.Distribution(s.NumLevels() - 1)
+				is.SketchDistribution = sk.Distribution(sk.NumLevels() - 1)
 			}
 			stats.IndexesSizeBytes += is.SizeBytes
 			stats.Indexes = append(stats.Indexes, is)
@@ -380,4 +388,34 @@ func uncompressedDocLen(val []byte) (int, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+// statsSketch returns the sketch Stats reports for idx in tx, with buf, the
+// scratch the row was read into, for the next index.
+//
+// The published sketch is not it: that one is the planner's, shared by
+// transactions at different snapshots and not snapshot-isolated (see
+// qplanner.IndexSketch), while Stats reports the sketch of the same
+// snapshot as the documents its transaction counts. So a read transaction
+// reports the stored row as its snapshot has it, decoded into a sketch of
+// its own: an empty one for no row or for bytes that do not decode, which is
+// what an open loads (loadSketchAtOpen) and need not agree with the
+// documents, and the error for a read that failed. A write
+// transaction reports the live sketch, which resolve brought up to the
+// stored row at its first use of the collection (refreshLiveSketches) and
+// which holds its own uncommitted changes since.
+func (c *collection) statsSketch(tx *btree.ReadTx, collName string, idx *index, buf []byte) (*qplanner.IndexSketch, []byte, error) {
+	if tx.IsWriteTx() {
+		return idx.sketch, buf, nil
+	}
+	sk := qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
+	data, err := c.readSketchRow(tx, sketchKey(collName, idx.info.Name), buf[:0])
+	if err != nil {
+		if errors.Is(err, btree.ErrKeyNotFound) {
+			return sk, buf, nil
+		}
+		return nil, buf, err
+	}
+	sk.UnmarshalBinary(data)
+	return sk, data, nil
 }
