@@ -158,6 +158,13 @@ type Collection interface {
 	// that transaction ends, or until a savepoint that encloses that first
 	// use rolls back. An open of the collection before then keeps the
 	// handle open.
+	//
+	// The handle is shared: every OpenCollection and Collection of this
+	// collection in the DB returns the same one (see Collection). Close
+	// ends it for every holder, so code that shares the collection with
+	// other code in the process should leave it open: DB.Close closes every
+	// handle. A later open of the collection returns a new handle; the
+	// closed one stays closed.
 	Close() error
 }
 

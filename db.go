@@ -129,8 +129,8 @@ type DB interface {
 	// Close closes the database connection.
 	// Returns an error if there is an issue closing the connection.
 	//
-	// Close waits, with no timeout, for every read transaction of this DB
-	// to end. A ReadTx ends with its Commit. An Iterator opened with a
+	// Close waits, with no timeout and no context to end the wait, for
+	// every read transaction of this DB to end. A ReadTx ends with its Commit. An Iterator opened with a
 	// context that carries no transaction can hold a read transaction of
 	// its own until its Close. An Iterator opened inside a transaction
 	// holds none, and ends with that transaction. A read transaction that
