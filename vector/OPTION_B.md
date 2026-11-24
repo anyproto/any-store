@@ -10,7 +10,7 @@ Branch `btree-vector-search`. Follows from
   RAM scales with the *graph*, not the *vectors*.
 
 This note prototypes and **measures** Option B instead of theorising. Prototype:
-`paged.go` (`PagedHNSW`); measurements: `paged_test.go`.
+`paged.go` (`pagedHNSW`); measurements: `paged_test.go`.
 
 ```
 go test ./vector -run TestPagedMatchesMemory -v      # correctness parity with Option A
@@ -20,7 +20,7 @@ go test ./vector -run TestPagedCachePressure -v      # cache < data (the regime 
 
 ## What was built
 
-`PagedHNSW` keeps only the **graph topology** in RAM (adjacency arena, levels,
+`pagedHNSW` keeps only the **graph topology** in RAM (adjacency arena, levels,
 entry point, tombstones — ~`M0*4` ≈ 128 B/node) and stores each node's vector in
 a `<name>:vec` btree namespace. During search every visited node's vector is read
 from the btree (`ReadTx.AppendValue`) into a reusable, zero-copy `[]float32`
@@ -148,10 +148,10 @@ the latency".
 
 ## Prototype limitations
 
-- `PagedHNSW` reuses an Option-A `FlatHNSW` for topology and reads host-endian
+- `pagedHNSW` reuses an Option-A `FlatHNSW` for topology and reads host-endian
   float32 bytes (a real build needs a portable on-disk encode and to load topology
   straight from the btree on open, not from a RAM-built graph).
 - One read tx per query; a server could pool readers / pin the entry-point and
-  upper layers. Single-threaded scratch (one query at a time per `PagedHNSW`).
+  upper layers. Single-threaded scratch (one query at a time per `pagedHNSW`).
 - The hybrid (`SearchHybrid`) routes on full float32 (it measures the *latency/Get*
   profile, not the RAM win); the RAM win needs the quantized slab, not yet built.

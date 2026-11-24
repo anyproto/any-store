@@ -35,7 +35,7 @@ first. That choice is the main thing to revisit (see "The real fork" below).
 
 ## Side by side
 
-| Dimension | This spike (`FlatHNSW`/`BtreeHNSW`) | pgvector HNSW |
+| Dimension | This spike (`FlatHNSW`/`btreeHNSW`) | pgvector HNSW |
 |-----------|-------------------------------------|---------------|
 | Graph residency | In-memory arena (SoA) | Disk pages, demand-paged via buffer cache |
 | Vector storage | Contiguous `[]float32` slab, dense `uint32` id | Inline in each `HnswElementTuple` |
@@ -128,7 +128,7 @@ go either way — and pgvector is the proof the disk-resident way works:
   on a warm page cache.
 
 This spike deliberately built Option A to get the fast path and the measurements
-first. The persistence layer (`BtreeHNSW`) is already record-per-node in btree
+first. The persistence layer (`btreeHNSW`) is already record-per-node in btree
 namespaces, so it's **one step from Option B**: traverse straight off the
 cursor/page cache instead of bulk-loading into the arena. A likely sweet spot is
 a hybrid — hot upper layers + entry point pinned in RAM, cold layer-0 pages

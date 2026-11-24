@@ -10,9 +10,11 @@
 //
 // It reports CPU/SIMD info, distance-kernel throughput (scalar vs SIMD), HNSW
 // build rate, recall vs exact brute force, and query latency / RAM for the
-// in-memory arena, on whatever box you run it on. The btree-paged index and the
-// route-in-RAM + paged-rerank hybrid are the vector package's own: its
-// TestMDDataset measures them.
+// in-memory arena, on whatever box you run it on. The btree-paged index, the
+// route-in-RAM + paged-rerank hybrid and the disk-backed run are the vector
+// package's own, unexported: its TestVectorbench runs them with the
+// -vectorbench.paged, -vectorbench.db and -vectorbench.cache flags (see
+// README.md).
 package main
 
 import (

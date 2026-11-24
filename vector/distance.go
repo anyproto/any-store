@@ -18,8 +18,9 @@
 //
 // The btree-backed variants (btreeHNSW, and pagedHNSW, which pages vectors
 // through the btree) are unexported: they take the module's internal btree
-// types, so only this package's own tests and benchmarks reach them
-// (TestMDDataset measures them).
+// types, so only this package's own tests and benchmarks reach them.
+// TestMDDataset measures them, and TestVectorbench runs cmd/vectorbench's
+// btree modes over them (vectorbench_test.go).
 //
 // Distance is computed with SIMD (AVX2/AVX-512 via github.com/viterin/vek,
 // pure-Go assembly, no CGO — the same library coder/hnsw uses) with scalar and

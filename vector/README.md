@@ -47,7 +47,7 @@ The goal was to answer three questions:
 - [ARM.md](./ARM.md) — how it runs on modern ARM (Apple Silicon / Graviton / mobile). **Now updated:** the NEON kernel landed (`internal/simd`), so `vector.SIMD()` is **true** on arm64 and the old scalar penalty is recovered, int8 included.
 - [PLAN_INTEGRATION.md](./PLAN_INTEGRATION.md) — **plan to land this in any-store** as a btree-resident vector index (full-btree/Option B): where it plugs into the existing index/write-tx machinery, on-disk namespaces, write/read paths, the cross-process MVCC reliability argument, API, and phasing.
 
-A self-contained, static, no-CGO benchmark binary lives at [`cmd/vectorbench`](../cmd/vectorbench) — build once, copy to any linux/amd64 box (no Go needed on the target). It measures the in-memory index only: the btree-backed indexes are unexported, since their entry points take the module's internal btree types, and its `-paged` and `-db` modes are gone. `TestMDDataset` measures the paged and hybrid indexes; the disk-backed runs in CROSS_HARDWARE.md were made with the earlier binary.
+A self-contained, static, no-CGO benchmark binary lives at [`cmd/vectorbench`](../cmd/vectorbench) — build once, copy to any linux/amd64 box (no Go needed on the target). Its btree-backed modes run from this package's tests, since the btree-backed indexes (`btreeHNSW`, `pagedHNSW`) take the module's internal btree types and are unexported: `-vectorbench.paged` measures the paged and hybrid indexes, and `-vectorbench.db <path>`, run twice, the build and then the cold reload from disk (`go test -c ./vector` makes a binary of them to copy as well; see the [vectorbench README](../cmd/vectorbench/README.md)).
 
 ## Three ways to land it — and the one that wins
 
@@ -64,7 +64,7 @@ map-based port in exactly the ways any-store already optimises elsewhere:
 - **Pooled scratch.** The two search heaps and the visited set are pooled and
   reused, so a steady-state query allocates nothing.
 
-`BtreeHNSW` reuses that same arena layout as its on-disk format: a forward
+`btreeHNSW` reuses that same arena layout as its on-disk format: a forward
 cursor over the (big-endian-keyed) nodes namespace yields nodes in id order,
 which is precisely the order `appendRaw` needs to rebuild the arenas.
 
@@ -159,7 +159,7 @@ lossless.
   faster build, ~2× less memory, ~zero query allocations, same recall.
 - **Persist with the arena layout as the on-disk format.** Durability via the
   btree costs only ~7 % build time and reloads losslessly. The natural next step
-  for real integration is to drive `BtreeHNSW` from collection write
+  for real integration is to drive `btreeHNSW` from collection write
   transactions and expose it as a vector index type.
 
 ## Known simplifications (this is a spike)
@@ -169,7 +169,7 @@ lossless.
   in lightweight HNSWs, negligible recall impact at these sizes).
 - `FlatHNSW.Add` is append-only (no per-key update/delete yet); deletes would
   need tombstones or a compaction pass.
-- `BtreeHNSW` serialises whole node records on change; a production version
+- `btreeHNSW` serialises whole node records on change; a production version
   would split the rarely-changing vector blob from the frequently-changing
   adjacency list to cut write amplification.
 - Search over the working set is in-memory; for datasets that exceed RAM the
