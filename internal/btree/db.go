@@ -289,6 +289,9 @@ func buildCodec(opts Options, salt []byte, useCksum bool) (Codec, error) {
 		if len(opts.Key) == KeyLen {
 			raw = opts.Key
 		} else {
+			if h := testDeriveKeyHook; h != nil {
+				h()
+			}
 			raw = DeriveKey(opts.Key, salt, opts.KDFIterations)
 		}
 		return newCodecFromType(opts.CipherType, raw)
@@ -298,6 +301,10 @@ func buildCodec(opts Options, salt []byte, useCksum bool) (Codec, error) {
 	}
 	return nil, nil
 }
+
+// testDeriveKeyHook, when non-nil, runs inside buildCodec each time it
+// derives a key from a passphrase. Test-only.
+var testDeriveKeyHook func()
 
 // readInitialHeader opens the file at path and reads the database header.
 // Returns ErrNotExist if the file doesn't exist (distinguished by callers).
@@ -615,10 +622,16 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 
+	// The database's full name, resolved once (sqlite3OsFullPathname,
+	// pager.c:4792): the first look at the header below and the pager open
+	// the database by it.
 	// canonicalPath is the lexical absolute path, used for db.path.
 	var canonicalPath string
 	if !opts.InMemory {
 		var err error
+		if path, err = FullPathname(path); err != nil {
+			return nil, err
+		}
 		canonicalPath, err = filepath.Abs(path)
 		if err != nil {
 			return nil, fmt.Errorf("btree: cannot resolve path: %w", err)
@@ -638,22 +651,33 @@ func Open(path string, opts Options) (*DB, error) {
 	p.mmapSize = opts.MmapSize
 
 	// BEGIN ENCRYPTION
-	// Build and install codec before p.open(). For an existing file we read
-	// the header first to discover the salt; for a new file we generate a
-	// fresh salt. InMemory databases skip encryption entirely (encryption.md §7).
+	// The codec goes with the file's header: a passphrase key is derived
+	// from the header's salt, and the checksum mode is read from it. For an
+	// existing file the header is read to discover them; for a new file a
+	// fresh salt is drawn. InMemory databases skip encryption entirely
+	// (encryption.md §7).
 	//
 	// The encryption marker on disk is a non-zero Salt field (bytes 72-87
 	// of page 1). ReservedSpace alone is NOT the marker, because the same
 	// byte is used by SQLite-compat tests that exercise reserve-related
 	// code paths on plaintext databases.
 	//
-	// Note: there is a TOCTOU window between readInitialHeader (which
-	// opens/reads/closes the file) and p.open() (which reopens and locks).
-	// An external process swapping the file in that window would surface
-	// as a decrypt error on the first page read — not silent corruption.
-	// The openDBs registration in p.open() refuses a same-process double-open.
-	// A future hardening could hold a shared lock across readInitialHeader
-	// and p.open().
+	// The codec is settled twice. Here, before p.open() and with no lock,
+	// from a first look at the file: a key option that cannot make a codec
+	// for a new file is refused before anything is created, and a key
+	// derivation is usually done before any lock is held. Then by p.open(),
+	// with the DB-file lock held, on the header it read under that lock;
+	// a file with content whose header is unreadable, or that the options
+	// do not fit, is refused there, before the WAL is opened.
+	// The second call does nothing while the file carries the salt the
+	// codec was built for: in every open of a database that already
+	// existed, and in an open that created the database, whose page 1
+	// carries the salt drawn for it. So an open derives a passphrase key
+	// once, as SQLCipher derives a codec context's key once, at its first
+	// use (sqlcipher_codec_key_derive, sqlcipher.c:1849-1880, v4.14.0).
+	// Between the two calls another process may create the database, or
+	// win its creation from this open; the second call then builds the
+	// codec again, from the salt that is in the file.
 	wantEncryption := opts.Key != nil || opts.Codec != nil
 	var zeroSalt [SaltLen]byte
 	// Resolve effective codec mode. Encryption is opt-in (errors if it
@@ -661,48 +685,80 @@ func Open(path string, opts Options) (*DB, error) {
 	// ReservedSpace marker on existing DBs and honored from Options.Checksum
 	// on new DBs — file state is authoritative on reopen, so users can't
 	// accidentally upgrade or downgrade a live database via config drift.
-	useCksum := false
 	if !opts.InMemory {
-		existingHeader, herr := readInitialHeader(path)
-		fileExists := herr == nil
-		if herr != nil && !errors.Is(herr, os.ErrNotExist) && !errors.Is(herr, errEmptyFile) {
-			return nil, fmt.Errorf("btree: read header: %w", herr)
+		// What the installed codec was built for.
+		var settled struct {
+			done   bool
+			exists bool
+			salt   [SaltLen]byte
+			cksum  bool
 		}
-		if fileExists {
-			fileEncrypted := existingHeader.Salt != zeroSalt
-			// Checksum-mode marker: zero salt + ReservedSpace == cksumOverhead (16).
-			// Any other non-zero ReservedSpace is left to higher-level
-			// integrity validation (e.g. tests synthesizing off-page cells).
-			fileCksum := !fileEncrypted && existingHeader.ReservedSpace == cksumOverhead
-			switch {
-			case fileEncrypted && !wantEncryption:
-				return nil, fmt.Errorf("btree: database file is encrypted, Options.Key or Options.Codec required")
-			case !fileEncrypted && wantEncryption:
-				return nil, fmt.Errorf("btree: database file is not encrypted, remove Options.Key/Codec")
-			}
-			useCksum = fileCksum
-		} else {
-			useCksum = opts.Checksum
-		}
-		wantCodec := wantEncryption || useCksum
-		if wantCodec {
-			var salt [SaltLen]byte
+		p.settleCodec = func(hdr *dbHeader) error {
+			fileExists := hdr != nil
+			useCksum := opts.Checksum
 			if fileExists {
-				salt = existingHeader.Salt
-			} else if wantEncryption {
-				if _, err := rand.Read(salt[:]); err != nil {
-					return nil, fmt.Errorf("btree: generate salt: %w", err)
+				fileEncrypted := hdr.Salt != zeroSalt
+				// Checksum-mode marker: zero salt + ReservedSpace == cksumOverhead (16).
+				// Any other non-zero ReservedSpace is left to higher-level
+				// integrity validation (e.g. tests synthesizing off-page cells).
+				fileCksum := !fileEncrypted && hdr.ReservedSpace == cksumOverhead
+				switch {
+				case fileEncrypted && !wantEncryption:
+					return fmt.Errorf("btree: database file is encrypted, Options.Key or Options.Codec required")
+				case !fileEncrypted && wantEncryption:
+					return fmt.Errorf("btree: database file is not encrypted, remove Options.Key/Codec")
+				}
+				useCksum = fileCksum
+			}
+			// The codec stays while it was built for the salt the file
+			// carries: the salt in the header of a database, or, for a file
+			// with no database yet, a salt drawn for a new file. A database
+			// this open created carries the salt drawn for it.
+			if settled.done && settled.cksum == useCksum &&
+				(fileExists && settled.salt == hdr.Salt || !fileExists && !settled.exists) {
+				return nil
+			}
+			var salt [SaltLen]byte
+			var codec Codec
+			if wantEncryption || useCksum {
+				if fileExists {
+					salt = hdr.Salt
+				} else if wantEncryption {
+					if _, err := rand.Read(salt[:]); err != nil {
+						return fmt.Errorf("btree: generate salt: %w", err)
+					}
+				}
+				var cerr error
+				codec, cerr = buildCodec(opts, salt[:], useCksum)
+				if cerr != nil {
+					return cerr
+				}
+				if sink, ok := codec.(OnErrorSink); ok && opts.OnIntegrityError != nil {
+					sink.SetOnError(opts.OnIntegrityError)
 				}
 			}
-			codec, cerr := buildCodec(opts, salt[:], useCksum)
-			if cerr != nil {
-				return nil, cerr
+			p.setCodec(codec, salt)
+			settled.done, settled.exists, settled.salt, settled.cksum = true, fileExists, salt, useCksum
+			return nil
+		}
+		// A file with content is not judged by this look. Whatever it
+		// finds (a header the options refuse, one that does not parse, a
+		// file that ends before its header) can be gone by the time
+		// p.open() holds the DB-file lock: another process may roll a dead
+		// creator's page 1 back and create the database in between. So
+		// this look only builds a codec when it can, and p.open() settles
+		// it on the header it reads under the lock and returns that read's
+		// errors, as sqlite3PagerSharedLock reads the header only once it
+		// holds SHARED (pager.c:5272-5282). The options of a new file are
+		// checked here, before anything is created.
+		existingHeader, herr := readInitialHeader(path)
+		switch {
+		case herr == nil:
+			_ = p.settleCodec(&existingHeader)
+		case errors.Is(herr, os.ErrNotExist) || errors.Is(herr, errEmptyFile):
+			if err := p.settleCodec(nil); err != nil {
+				return nil, err
 			}
-			if sink, ok := codec.(OnErrorSink); ok && opts.OnIntegrityError != nil {
-				sink.SetOnError(opts.OnIntegrityError)
-			}
-			p.header.Salt = salt
-			p.installCodec(codec)
 		}
 	} else if opts.InMemory && (wantEncryption || opts.Checksum) {
 		// InMemory: build codec from zero salt; no on-disk marker.
@@ -863,10 +919,9 @@ func (db *DB) Path() string {
 // OpenFiles is what DB.OpenFiles reports: the files a database has open,
 // identified by their descriptors, and the spelling they were opened by.
 type OpenFiles struct {
-	// Path is the database's path as Open was given it, neither made
-	// absolute nor cleaned: the spelling the database file and the files
-	// beside it (Path+"-wal", Path+"-wal-shm") were opened by, which the
-	// system resolves as it did then. Path() is its lexically cleaned
+	// Path is the database's full name (FullPathname), not cleaned: the
+	// spelling the database file and the files beside it (Path+"-wal",
+	// Path+"-wal-shm") were opened by. Path() is its lexically cleaned
 	// absolute form, which names another file when a ".." in it follows a
 	// symbolic link to a directory: the system resolves the link first.
 	Path string

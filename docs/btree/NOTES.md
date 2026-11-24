@@ -312,7 +312,7 @@ SQLite defines 4 schema format versions:
 ### Go
 
 The Go implementation creates files with `SchemaFormat = 6` (`maxSchemaFormat`, set in
-`pager.go:initNewDB()`); releases before v2.5.0 wrote 5.
+`pager.go:newPage1()`); releases before v2.5.0 wrote 5.
 
 ```go
 p.header = dbHeader{
@@ -436,6 +436,7 @@ Both support: PASSIVE, FULL, RESTART, TRUNCATE with identical semantics.
 | WAL undo (`sqlite3WalUndo`) | **Missing** -- Go uses pager-level rollback instead. The rollback clears the whole writer cache, where `pagerRollbackWal` reloads only logged and dirty pages (`pager.c:3147-3166`): a clean page 1 is read again by the next transaction, and in a schema format 6 file that sets the change counter's `dbFileVers` (2026-11-12, [drift-77](#drift-77-filechangecount-bumped-conditionally-not-unconditionally)) |
 | First-opener `ftruncate(shm, 3)` marker | **Aligned (2026-07-10)** -- `newPlatformShm` now runs SQLite's full DMS first-attacher election (`unixLockSharedMemory`, os_unix.c:4860-4913, 3.52.0): F_GETLK probe → three-way branch (F_UNLCK: WRLCK + UNCONDITIONAL truncate-to-3 + atomic downgrade to RDLCK; F_RDLCK: join shared; F_WRLCK: back off BUSY, never join — the os_unix.c:4864-4871 race). The `Size()==0` gate is gone; a crash-persisted stale shm is physically reset by the first attacher and `recoverLocked` rebuilds from the WAL. See [§drift-2026-06-25-25](#drift-2026-06-25-25-first-opener-does-not-reset-a-stale-persisted-shm-trusts-checksum-vali) (RESOLVED) and item 2 below |
 | Orphan-inode handling on open race | **Aligned** -- DB-file flock serializes last-client-unlink (see §SHM open/close protocol drift) |
+| Directory sync at a WAL descriptor's first sync (`UNIXFILE_DIRSYNC`) | **Aligned (2026-11-21)** -- the port gap is closed: `wal.open` opens the WAL with the create flag and sets the descriptor's `dirSync`, and its first sync (`wal.syncFile`, from the header write, a commit or a checkpoint) syncs the directory after the file, once, as `unixOpen` marks every WAL it opens with `SQLITE_OPEN_CREATE` (`os_unix.c:6569-6573`, `6777`; `sqlite3WalOpen`, `wal.c:1719-1720`) and `unixSync` consumes the mark (`os_unix.c:3936-3954`). So the WAL's name, and a creation journal's delete before it, are durable before a commit to the WAL is. The directory is that of the name the WAL was opened by, which is built from the database's full name, resolved once at open (`FullPathname`, as `pager.c:4792`, `4929`; `databaseDir`, as `openDirectory`, `os_unix.c:3874-3893`). Unix and wasip1; none on Windows and js/wasm. See [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal) |
 
 ### SHM open/close protocol drift (resolved 2026-04-21)
 
@@ -529,10 +530,10 @@ const (
 |---------|--------|-----|
 | Pager states | 7 (granular writer sub-states) | 4 (simplified) |
 | Journal modes | DELETE, TRUNCATE, PERSIST, MEMORY, WAL, OFF | WAL only |
-| Rollback journal | Full implementation | Not implemented |
+| Rollback journal | Full implementation | For the creation of a database only: a header with no page records ([drift-2026-11-21-7](#drift-2026-11-21-7-creation-journal)) |
 | Lock escalation | SHARED -> RESERVED -> PENDING -> EXCLUSIVE | WAL write lock only |
 | Multi-process support | Full (via file locks + SHM) | mmap-backed SHM on `(linux \|\| darwin) && (amd64 \|\| arm64)`; heap fallback (single-process) elsewhere |
-| Hot journal rollback | Automatic recovery | Not applicable (no rollback journal) |
+| Hot journal rollback | Automatic recovery | At open, for an interrupted creation: the file is truncated to nothing and created again |
 | Sub-journal (savepoint journal) | Written to disk | In-memory page copies |
 | NOCONTENT optimization | `PAGER_GET_NOCONTENT` flag | `getPageNoContent()` |
 | DONT_WRITE flag | `PGHDR_DONT_WRITE` in page flags (no effect in WAL mode: only `pager_write_pagelist` reads it) | None — frames are written at spill and commit |
@@ -2854,23 +2855,255 @@ transaction and its locks, and must instead abort and re-begin.
 
 <a id="drift-63-new-db-page-1-written-directly-to-file-bypassing-wal"></a>
 ### Drift: New DB Page 1 Written Directly To File Bypassing WAL
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `db.go:Open`
-  (`internal/btree/pager.go:552-564 (Open new-DB path calls initNewDB before any txn)`),
-  `pager.go:*pager.initNewDB` (`internal/btree/pager.go:763-865`).
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** NARROWED 2026-11-21: creation runs under the exclusive DB-file lock and inside a rollback journal committed by its delete, a WAL beside a database of zero pages is deleted, and the codec is settled on the header read under the lock. What remains is listed below.
+- **Affected functions:** `pager.go:*pager.open`, `pager.go:*pager.createIfEmpty`,
+  `pager.go:*pager.lockDBForCreate`, `pager.go:*pager.createPage1`, `pager.go:*pager.newPage1`,
+  `creation_journal.go` (all of it), `syncdir_unix.go` (all of it), `wal.go:*wal.syncFile`,
+  `db.go:Open` (the `settleCodec` closure and the first look at the header).
 
-SQLite defers page-1 creation to the first write transaction: `newDatabase` dirties page 1 via
-`sqlite3PagerWrite(pP1->pDbPage)` (`btree.c:3518`) and never touches the file directly, so the
-actual disk write of the new page 1 happens later through the normal commit path (a WAL frame or
-rollback-journal transaction) when the enclosing write transaction commits. Go's
-`Open` -> `p.open()` -> `initNewDB()` instead eagerly builds the page-1 image (DB header + empty
-leaf-index page) into a local buffer and writes it straight to the main DB file via
-`p.file.WriteAt(writeBuf, 0)` followed by `fdatasync(p.file)` (`pager.go:827-833`), all inside
-`Open()` before any transaction begins and entirely bypassing the WAL. The consequence is that
-initial database creation is not a transactional, WAL-mediated change as in SQLite -- the new
-page 1 is durably committed to the main file outside of any transaction, so a crash mid-creation
-or any reader/recovery logic that assumes page 1 first appears via the WAL sees a state SQLite
-would never produce.
+**SQLite.** A file of zero bytes is not a WAL database, and SQLite never opens a WAL on one:
+`pagerOpenWalIfPresent`, called from `sqlite3PagerSharedLock` after the SHARED lock is held
+(`pager.c:5272`, `pager.c:5436`), takes the page count and, when it is zero, deletes the `-wal`
+instead of opening it (`pager.c:3355-3356`); the page count for the snapshot is taken after that
+(`pager.c:5444-5448`). A database becomes a WAL database through `PRAGMA journal_mode=WAL`:
+`OP_JournalMode` calls `sqlite3BtreeSetVersion(pBt, 2)` in a transaction that "always uses a
+rollback journal" (`vdbe.c:8061-8066`), whose write begin runs `newDatabase` on an empty file
+(`btree.c:3715`, `btree.c:3506-3541`: page 1 through `sqlite3PagerWrite`, `nPage = 1`) and whose
+commit writes page 1, bytes 18 and 19 set to 2, into the main file under the EXCLUSIVE lock
+(`sqlite3PagerExclusiveLock`, `pager.c:6423-6433`, from `syncJournal` on the commit path). The WAL
+is opened only on a later `lockBtree` that reads those bytes (`btree.c:3339`). So page 1 of a
+WAL database is in the main file, written under the EXCLUSIVE DB-file lock, before any WAL
+exists. Page 1 of an empty file is not copied into the journal either: `pager_write` journals a
+page only `if( pPg->pgno<=pPager->dbOrigSize )` and otherwise marks it `PGHDR_NEED_SYNC`
+(`pager.c:6093-6100`). What the journal holds is its header, which records the original size, zero
+pages (`pager.c:1520`), and page 1 is written to the file only after that journal is synced
+(`syncJournal` at `pager.c:6612`, `pager_write_pagelist` at `pager.c:6650`). A creator that dies
+before its commit point leaves the journal hot (`hasHotJournal`, `pager.c:5134-5199`), and the next
+`sqlite3PagerSharedLock` plays it back before anything in the file is used (`pager.c:5281-5356`):
+`pager_truncate(pPager, mxPg)` with `mxPg` 0 empties the file (`pager.c:2895-2897`).
+
+**any-store.** Every database is a WAL database from its first open, and `Open` of a new path
+leaves a database of one page rather than an empty file. `pager.open` takes its DB-file lock
+(shared in multi-process mode, exclusive in in-process mode) and asks whether a creation is
+pending (`creationPending`): the file is empty, or it has content and a hot creation journal
+beside it. If so it calls `createIfEmpty`, which takes the exclusive lock (`lockDBForCreate`,
+multi-process mode), asks again under it, rolls a dead creator's file back to zero bytes
+(`playbackCreationJournal`) or deletes a journal it finds beside an empty file
+(`deleteJournalOfEmptyDatabase`, `pager.c:5178-5181`), deletes `<path>-wal`, creates page 1 in a
+journaled transaction
+(`createPage1`, below), and goes back to the shared lock. The open then continues exactly as for
+an existing database: header read from the file, WAL open, page 1 and page count at one snapshot
+(`readPage1AtOpen`). An open that finds a database in the file under the exclusive lock, or sees
+one appear while waiting for that lock, lost the creation to another process; it takes the shared
+lock and asks once more, because the look that found the database was made without a lock. No
+process attached to a database can be holding the exclusive lock's counterpart on a file whose
+creation is pending: every attached handle keeps the shared lock on a file that has a committed
+page 1.
+
+The creation is SQLite's journaled one in `journal_mode=DELETE`, with the journal reduced to its
+header (`creation_journal.go`). Under the exclusive lock, after the stale WAL's removal: (1)
+`<path>-journal` is opened with the create flag and its header written, recording an original
+size of zero pages; (2) the journal is fdatasynced, and, as that is the first sync of a
+descriptor opened with the create flag, its directory is fsynced after it (`dirSync`, SQLite's
+`UNIXFILE_DIRSYNC`: `os_unix.c:6569-6573`, `6777`, `3936-3954`); (3) page 1 is written; (4) the
+database file is fdatasynced; (5) the journal is deleted, which is the commit point
+(`pager_end_transaction`, `pager.c:2109`). Whatever a creator killed before step 5 left in the
+file — nothing, a whole page 1 that was never synced, or part of one after a power loss — the
+next open finds the journal hot and truncates the file before it creates the database itself, so
+no process ever attaches to a page 1 whose sync did not complete, and no acknowledged commit rests
+on one. The directory sync of step 2 comes after the stale WAL's removal and before page 1
+exists, so it also makes that removal durable on a file system whose directory fsync covers every
+change to the directory made before it (the POSIX reading, and what ext4, XFS and APFS do; not
+measured here, and SQLite, which deletes the WAL with `dirSync` 0 at `pager.c:3356`, relies on the
+same).
+
+The delete of step 5 syncs no directory; SQLite passes `pPager->extraSync` to its delete
+(`pager.c:2109`). A power loss
+before the directory is synced again can bring the journal back, hot, beside the committed
+page 1, and the open after it rolls the creation back and creates the database again. Nothing is
+lost by that as long as nothing was committed to the database, and nothing is durable in the
+database before a sync of its WAL: every WAL descriptor is opened after the delete (a creation
+runs only while no process is attached) and with the create flag, so the first sync of each
+syncs the directory too, before a commit to it is durable (`wal.syncFile`, the WAL row of the
+[WAL drift summary](#7-wal-write-ahead-log)). The divergences of the journal itself are
+[drift-2026-11-21-7](#drift-2026-11-21-7-creation-journal).
+
+`Open`'s first, unlocked look at the header does not judge a file with content: a header there
+that cannot be read, or that disagrees with the key options, can be gone by the time the open
+holds the DB-file lock (another process may roll a dead creator's page 1 back and create the
+database in between). `pager.open` settles the codec on the header it reads under the lock and
+returns that read's errors, as `sqlite3PagerSharedLock` reads the header only under SHARED
+(`pager.c:5272-5282`). Key options that cannot make a codec for a new file are refused by the
+first look, before anything is created (`db.go:Open`).
+
+The passphrase codec follows the same rule. `Open` builds it from a first, unlocked read of the
+header when it can (so the key derivation mostly runs with no lock held), and `pager.open` calls
+`settleCodec` again on the header it read under the lock, and with "no database" before it asks
+for the exclusive lock. A later call does nothing while the codec was built for the salt the
+file carries: the salt in the header of a database, or, while the file holds no database, a salt
+drawn for a new file. That covers every open of an existing database and the open that creates
+one, whose page 1 carries the salt drawn for it, so each derives the key once, as SQLCipher
+derives a codec context's key once, at its first use (`sqlcipher_codec_key_derive`,
+`sqlcipher.c:1849-1880`, SQLCipher v4.14.0). When another process created the database in
+between, the codec is rebuilt from the salt in the file; when the first look read a header and
+the open then finds the creation pending (a dead creator's page 1, rolled back under the lock),
+it is rebuilt from a salt drawn for a new file. A new database keeps the salt drawn for it only
+if this open is the one that writes page 1.
+
+**What still differs from SQLite.**
+
+1. *The journal exists for the creation only*, and is any-store's own file:
+   [drift-2026-11-21-7](#drift-2026-11-21-7-creation-journal). A file with content and no hot
+   journal beside it is judged by its header, as before: one that is shorter than the header, or
+   whose header does not parse, is `ErrHeaderCorrupt`, and one that holds a whole header and less
+   than a whole page 1 opens, with the missing bytes read as zeros (`readPage1AtOpen`, as
+   `readDbPage` reads a short page). A creation cannot leave such a file any more; a file cut by
+   other means can.
+2. *Created at open, not at the first write transaction.* An `Open` that never writes still
+   leaves a one-page file. The hot-journal test runs once per open for the same reason, where
+   SQLite runs it at every acquisition of the SHARED lock (`pager.c:5281-5282`).
+3. *The lock is a flock.* SQLite goes SHARED → RESERVED → EXCLUSIVE with fcntl byte ranges, and
+   two connections cannot both hold RESERVED. A flock has no such step: several creators all
+   hold the shared lock at first and none can upgrade. A refused creator drops its lock, sleeps
+   1-3 ms holding nothing, asks whether the creation is still pending and requests the lock again;
+   a creation that stays pending with the file locked by another process for `BusyTimeout` is
+   `ErrBusy`. The same loop serves the playback of a hot journal, for which SQLite asks for
+   EXCLUSIVE once and returns busy (`pager.c:5308`). The exclusive lock becomes shared
+   again before the WAL is opened, so a kernel that lets go of a flock inside a conversion (see
+   the two flock entries below) leaves this handle unlocked only while it is attached to
+   nothing.
+4. *The WAL is deleted under the exclusive lock*, where SQLite deletes it under SHARED and
+   relies on an empty database not being in WAL mode (`pager.c:3330-3337`). The wal-index file
+   is not deleted, as in SQLite: the first attacher's election truncates a stale one
+   (`newPlatformShm`).
+5. *In-process mode* holds the exclusive DB-file lock for the handle's whole life (Windows,
+   linux/386 and any other target without mmap shm), so the same sequence runs with no lock
+   change. On wasm the lock functions are no-ops: nothing serializes two runtimes that share one
+   storage (two WASI instances over one directory, two browser tabs over one IndexedDB store),
+   and one of them can delete the other's WAL or roll its creation back. One runtime per database
+   is the caller's to ensure there
+   ([drift-2026-06-25-07](#drift-2026-06-25-07-acquireexclusivedblock-is-a-no-op-on-plan9-wasip1-removing-the-cross-p)).
+
+**Known limitations.**
+
+- *A database file renamed or unlinked while a process is attached to it.* The `-wal` and
+  `-wal-shm` names are derived from the path, here and in SQLite (`os_unix.c:4976`, `5005`). A
+  second process that creates a database at the old path deletes the `-wal` name, which was the
+  attached process's log, and attaches to the attached process's live `-wal-shm`. In SQLite this
+  corrupts too ("unlinking or renaming a database file while in use", howtocorrupt §2.4; SQLite
+  only logs `file unlinked while open`, `os_unix.c:1657`). One thing is worse here: the new
+  opener finds its WAL shorter than a header and initializes the shared wal-index
+  (`wal.open` → `initHeaderStateLocked`), which SQLite does not do to an index whose header is
+  valid (`walIndexReadHdr` recovers only `if( badHdr )`, `wal.c:2694-2723`). The attached process
+  then loses sight of its commits that were not checkpointed. That reset is
+  [drift-2026-07-10-3](#drift-2026-07-10-3-region-create-false-never-maps-existing-content):
+  every fresh attach rebuilds or initializes the index.
+- *A database path replaced while an open waits for the lock.* The pending test is made on the
+  descriptor and the WAL is deleted by name, as `pagerOpenWalIfPresent` does (`pager.c:3352-3356`).
+- *Two spellings of one database file through a symbolic link* give two `-wal` names, two
+  wal-indexes and two creation journals: every name beside the database is built from the path
+  as the caller spelled it. SQLite resolves symbolic links before it builds them
+  (`unixFullPathname`, `os_unix.c:6975`). A layout that reaches one database file by two paths
+  is not supported.
+
+Tests (`multiprocess_create_test.go`, two processes, one held at a named point of its open by
+`testOpenStageHook`): `TestMultiProcessCreateRaceOneDatabase` (a creator held before its page-1
+write while a second process opens the path; plain and passphrase),
+`TestMultiProcessCreateManyAtOnce` (six processes released together),
+`TestMultiProcessCreateLoserKeyFromWinnersSalt` (an open that saw no file and then finds another
+process's encrypted database), `TestOpen_PassphraseKeyDerivedOncePerOpen`
+(`encryption_integration_test.go`: one key derivation by an open that creates an encrypted
+database and one by an open of it), `TestStaleWALBesideEmptyDatabaseNotReplayed` (a killed process's
+WAL beside a removed or truncated main file, whole database or its tail in the WAL, plain and
+passphrase, both wal-index modes), `TestCreationJournal_CreatorKilled` (a creator killed with
+SIGKILL at each step of its creation, plain and passphrase),
+`TestCreationJournal_WaitingOpenerRollsBack` (the creator is killed once the opener has been
+refused the lock); `TestInitNewDB_Page1_CrashRecoverable`,
+`TestInitNewDB_Page1_CrossProcessSerialization` (`pager_test.go`); the single-process tests of
+the journal in `creation_journal_test.go`; and, under the `vfs` tag, in
+`creation_journal_vfs_test.go`, on a VFS that keeps a file's content as of its last sync and a
+name as of its directory's last sync: `TestCreation_CommitOverADeadCreatorsPage1SurvivesPowerLoss`
+(a synced commit made after a creator died before its page-1 sync),
+`TestCreation_FirstCommitToANewWALSurvivesPowerLoss`,
+`TestCreation_CommitToAWALAnotherHandleCreatedSurvivesPowerLoss` (a WAL whose creator never
+synced it), `TestCreation_CommitAfterTheCreationsLastJournalStepSurvivesPowerLoss` (the delete
+not yet durable when a peer commits), `TestCreation_PowerLossBeforeAnyCommitCreatesTheDatabaseAgain`,
+`TestCreation_PowerLossAfterAKilledPlayback`,
+`TestCreationJournal_JournalFoundIsDeletedAfterTheDatabaseFilesSync`,
+`TestCreationJournal_OrderOfTheSyncs` (the writes and syncs as the file system sees them: one
+directory sync at the first sync of each journal and WAL descriptor, and none after) and
+`TestOpen_FirstLookRacingARecoveryDoesNotFail`; `TestDirSync_DirectoryIsTheOneResolvedAtOpen`,
+`TestOpen_ChdirBeforeTheFilesOpenKeepsThemInTheResolvedDirectory` (`syncdir_unix_test.go`);
+`TestDatabaseDir_IsTheNameUpToItsLastSeparator`, `TestDatabaseDir_NameTooLongFailsTheOpen`
+(`dbdir_unix_test.go`).
+
+<a id="drift-2026-11-21-7-creation-journal"></a>
+### Drift: The Creation Journal Is A Header Of any-store's Own
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `creation_journal.go:*pager.hasHotCreationJournal`,
+  `creation_journal.go:*pager.creationPending`, `creation_journal.go:*pager.playbackCreationJournal`,
+  `creation_journal.go:*pager.deleteJournalOfEmptyDatabase`,
+  `creation_journal.go:*pager.finalizeJournalOfEmptyDatabase`,
+  `creation_journal.go:*pager.openCreationJournal`,
+  `creation_journal.go:*creationJournal.sync`, `creation_journal.go:*creationJournal.commit`,
+  `creation_journal.go:creationJournalHdr`, `pager.go:*pager.createPage1`.
+
+The creation of a database is a port of SQLite's rollback-journal transaction around
+`newDatabase` in `journal_mode=DELETE` (see
+[drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal) for the sequence and
+SQLite's lines): the journal is opened with the create flag, synced, with its directory at that
+first sync, before page 1 is written, and its delete, with no directory sync, is the commit
+point. It differs from `pager.c` in these points.
+
+1. *The journal has its own magic and no page records.* The header has SQLite's 28-byte layout
+   (`writeJournalHdr`, `pager.c:1438-1530`) with the magic `anyjrnl\x01`, an original size of zero
+   pages and the page size; the record count, the checksum seed and the sector size are zero,
+   and the header is not padded to a sector, since nothing follows it. `hasHotCreationJournal`
+   calls a journal hot only when it holds that whole header with an original size of zero.
+   SQLite calls any journal with a non-zero first byte hot (`pager.c:5185-5205`); `pager_playback`
+   stops at a magic it does not recognise (`readJournalHdr` returns `SQLITE_DONE`,
+   `pager.c:1612-1614`) before it truncates anything, syncs, and deletes the journal
+   (`pager.c:2978-2983`, `2109`). Beside a database with content, any-store leaves a `-journal`
+   file that is not a hot creation journal where it is: it rolls nothing back from it and does
+   not delete it. Beside a database of zero pages a file found under the name is deleted before
+   the creation, whatever it holds; `hasHotJournal` deletes a journal there
+   (`pager.c:5178-5181`). With native file access the file is found by a stat, as SQLite's
+   existence test is one (`unixAccess`, `os_unix.c:6895-6898`).
+2. *An empty database file is synced before a journal beside it is deleted.* `hasHotJournal`
+   deletes a journal beside a database of zero pages at once. `finalizeJournalOfEmptyDatabase`
+   syncs the database file first: the journal may be the hot journal of a playback that was
+   killed after its truncation and before its sync, and then the disk may still hold the dead
+   creator's page 1, which only that journal marks. The sync is made only when a journal is
+   found. The playback itself is `pager_playback`'s: the truncation, the sync, and then the
+   journal's delete (`pager.c:2895-2897`, `2978-2983`), with nothing written to the journal.
+   `pagerSyncHotJournal` (`pager.c:4048`), which syncs a hot journal before playing it back
+   because the process that left it may not have, has no counterpart: a creation journal is hot
+   only beside a file with content, and page 1 is written only after the journal and its
+   directory were synced.
+3. *"No RESERVED lock" is "the caller holds the DB-file lock".* `hasHotJournal` asks
+   `sqlite3OsCheckReservedLock` whether a writer is alive. A creator holds the DB-file lock
+   exclusively from before its journal is opened until after it is deleted, so an open that holds
+   the lock, shared or exclusive, and sees a hot journal is looking at a dead creator's.
+4. *Platforms.* The directory sync at a descriptor's first sync (`dirSync`) is built on Unix and
+   wasip1: SQLite's unix VFS also serves its WASI builds and keeps `UNIXFILE_DIRSYNC` there
+   (`os_unix.c:326-330`); whether a WASI host makes it durable is the host's. On Windows and
+   js/wasm a sync is the file's alone, as SQLite's Windows VFS syncs no directory. The database,
+   the journal and the WAL are opened by the database's full name, resolved once at open
+   (`FullPathname`, as `pager.c:4792`, `4915`, `4929`, `4948`), and the directory synced is that
+   of the name the file was opened by, cut at its last `/` (`databaseDir`, as `openDirectory`,
+   `os_unix.c:3874-3893`, which `unixSync` gives `pFile->zPath`, `os_unix.c:3945`). A full name
+   too long for the OS fails the open. What differs in the full name itself is
+   [drift-2026-11-23-1](#drift-2026-11-23-1-full-pathname-follows-no-symbolic-link). As in
+   `unixSync`, a directory that does not open is skipped and the result of its
+   fsync is not looked at (`os_unix.c:3937-3951`). The journal and the database file are synced
+   with `fdatasync`, the package's sync primitive
+   ([drift-121](#drift-121-fdatasync-durability-primitive-platform-split-undocumented)), which is
+   `F_FULLFSYNC` on Darwin, where SQLite's default is a plain `fsync`.
+
+Tests: `creation_journal_test.go` (`TestCreationJournal_WhichHeaderIsHot`,
+`_HotJournalRollsBackWhateverIsInTheFile`, `_JournalThatIsNotHotIsLeftAlone`,
+`_JournalBesideEmptyFileIsDeleted`), and the process-kill and power-loss tests listed under
+drift-63.
 
 <a id="drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl"></a>
 ### Drift: pageSlab And ConfigPageCache Idempotent Versus Reconfigurable Setup
@@ -3922,9 +4155,9 @@ C `unixShmMap` with `isWrite==0` still maps *existing* regions of the shm file �
 <a id="drift-2026-10-15-1-empty-file-registry-key-is-the-path"></a>
 ### Drift: On Volumes With Unstable Empty-File Inodes, An Empty File's openDBs Key Is Its Path Until It Has Content
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `pager.go:*pager.open` (registration and the create/existing decision), `pager.go:*pager.rekeyRegistry`, `pager.go:*pager.initNewDB`, `db.go:registryKey`, `db.go:unstableOpenMu`, `inode_unstable_darwin.go`.
+- **Affected functions:** `pager.go:*pager.open` (registration and the create/existing decision), `pager.go:*pager.rekeyRegistry`, `pager.go:*pager.createIfEmpty`, `db.go:registryKey`, `db.go:unstableOpenMu`, `inode_unstable_darwin.go`.
 
-SQLite's `findInodeInfo` keys its per-process inode registry on an fstat of the just-opened fd, under the process-wide `unixBigLock`; on macOS msdos volumes, where a zero-size file reports a wrong inode (ticket #3260; a FAT32 image on macOS 2026-10-15 reported 2^64−13 for an empty file and 13 after its first byte), it first writes one byte and fsyncs so the fstat sees a real inode (`os_unix.c:1553-1576`, 3.52.0) — safe there because 'S' is the first byte of every SQLite header and `unixFileSize` reports a size of 1 as 0. any-store's header does not start with that byte and a 1-byte file would not read as empty to `readInitialHeader`, the create/existing decision or another process, so on such a volume (darwin, `fstatfs` type `msdos` or `exfat`) an empty file is keyed by its absolute path instead, and `rekeyRegistry` moves the entry to the inode once the file has content: at the create/existing decision after the flock (a file another process created meanwhile is joined by inode) or in `initNewDB` after page 1 is written and fdatasynced — both before any WAL open. Every open on such a volume takes `unstableOpenMu` for its key stat and store, and a path-keyed handle keeps it until its re-key, so the move from path to inode is atomic to the other openers in the process: two spellings of one empty file, or a joiner and its creator, meet on the mutex, the later one stats after the earlier one is keyed by inode and is refused at registration, and only one handle ever runs `initNewDB` on the file. The mutex is held across the DB-file flock retry (up to 1 s against a closing peer), which SQLite's lock never is: latency only, for other opens on such volumes in this process. Wherever a (dev,ino) identity exists on a stable volume the key is the inode from the first stat, as in SQLite, and the mutex is never taken; Windows and wasm, and a VFS handle whose FileInfo carries no identity, key by path throughout, as before. Two processes creating one empty file at once remain unserialized (the pre-existing cross-process class of drift-63). Regression tests (`openregistry_vfs_test.go`, vfs tag, a VFS that reports one inode for every empty file with `emptyFileInodeUnstable` forced on): `TestOpen_RegistryFollowsInodeOfNewFile`, `TestOpen_OpensOnUnstableVolumeSerializeOnCreate`, `TestOpen_JoinerDuringCreatorFdatasyncWaits`, `TestOpen_PathKeyedOpenJoinsContentByInode`, `TestOpen_TwoSpellingsSettleBeforeWAL`.
+SQLite's `findInodeInfo` keys its per-process inode registry on an fstat of the just-opened fd, under the process-wide `unixBigLock`; on macOS msdos volumes, where a zero-size file reports a wrong inode (ticket #3260; a FAT32 image on macOS 2026-10-15 reported 2^64−13 for an empty file and 13 after its first byte), it first writes one byte and fsyncs so the fstat sees a real inode (`os_unix.c:1553-1576`, 3.52.0) — safe there because 'S' is the first byte of every SQLite header and `unixFileSize` reports a size of 1 as 0. any-store's header does not start with that byte and a 1-byte file would not read as empty to `readInitialHeader`, the create/existing decision or another process, so on such a volume (darwin, `fstatfs` type `msdos` or `exfat`) an empty file is keyed by its absolute path instead, and `rekeyRegistry` moves the entry to the inode once the file has content: in `pager.open` after the create/existing decision, when the file holds a page 1 that this open (`createIfEmpty`, written and fdatasynced) or another process wrote — before any WAL open. Every open on such a volume takes `unstableOpenMu` for its key stat and store, and a path-keyed handle keeps it until its re-key, so the move from path to inode is atomic to the other openers in the process: two spellings of one empty file, or a joiner and its creator, meet on the mutex, the later one stats after the earlier one is keyed by inode and is refused at registration, and only one handle ever runs `createIfEmpty` on the file. The mutex is held across the DB-file flock retry (up to 1 s against a closing peer) and across a creation's wait for the exclusive lock, which SQLite's lock never is: latency only, for other opens on such volumes in this process. Wherever a (dev,ino) identity exists on a stable volume the key is the inode from the first stat, as in SQLite, and the mutex is never taken; Windows and wasm, and a VFS handle whose FileInfo carries no identity, key by path throughout, as before. Two processes creating one empty file at once are serialized by the exclusive DB-file lock ([drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal)). Regression tests (`openregistry_vfs_test.go`, vfs tag, a VFS that reports one inode for every empty file with `emptyFileInodeUnstable` forced on): `TestOpen_RegistryFollowsInodeOfNewFile`, `TestOpen_OpensOnUnstableVolumeSerializeOnCreate`, `TestOpen_JoinerDuringCreatorFdatasyncWaits`, `TestOpen_PathKeyedOpenJoinsContentByInode`, `TestOpen_TwoSpellingsSettleBeforeWAL`.
 
 <a id="drift-2026-06-25-01-transient-busy-locked-equivalent-errors-are-made-sticky-in-b-rc-so-a-b"></a>
 ### Drift: Transient BUSY/LOCKED-Equivalent Errors Are Made Sticky In b.rc So A Backup Cannot Be Retried Or Resumed
@@ -4032,6 +4265,8 @@ For file-backed databases that run in forced in-process mode (heap-backed WAL-in
 
 To prove "last client" at close, the Go pager upgrades its lifetime DB-file lock from shared to exclusive by issuing a single `syscall.Flock(fd, LOCK_EX|LOCK_NB)` through `flockNB` (`internal/btree/dbfile_lock_unix.go:78`), with `tryUpgradeDBLockExclusive` mapping `ErrBusy` to `(false, nil)` (`internal/btree/dbfile_lock_unix.go:60-61`). Per BSD `flock(2)` semantics a shared→exclusive conversion on one open file description is not atomic: the kernel first drops the existing `LOCK_SH` and only then tries to install `LOCK_EX`, so when the exclusive grant cannot be satisfied immediately the `LOCK_NB` attempt fails *after* the shared lock has already been released. The caller therefore observes `(false, nil)` and treats itself as a non-last client (`internal/btree/pager.go:3277-3284`), unaware that its DB-file SHARED lock is now gone. SQLite's flock VFS sidesteps this entirely: in `flockLock` every lock at or above `SHARED_LOCK` is physically an exclusive `flock` (`os_unix.c:2682-2685`), so once any lock is held an upgrade just bumps the in-memory level and returns `SQLITE_OK` without re-issuing `robust_flock` (`os_unix.c:2696-2701`), and `flockCheckReservedLock` documents that the connection's lock is already exclusive (`os_unix.c:2643-2656`); the held lock is never momentarily dropped, and SQLite's real DB-file close protocol additionally uses atomic fcntl byte-range conversions that do not release the prior lock on failure. The consequence is that a non-last client whose upgrade fails returns `isLastClient=false` but has silently dropped its lifetime DB-file shared lock, opening a window (until its fd closes) in which a peer process's concurrent `tryUpgradeDBLockExclusive` sees no contention, wrongly declares itself last client, and truncates the WAL / unlinks the shm while this client is still attached — re-opening the early-truncation / orphan-inode race the DB-file lock protocol exists to prevent.
 
+The second caller, `pager.lockDBForCreate` (the creation of a new database, [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal)), does not depend on which way the kernel behaves: after a refused upgrade it releases the lock itself (`unlockDBFile`), and it is attached to no WAL or wal-index while it holds nothing.
+
 <a id="drift-2026-06-25-09-downgradedblocktoshared-can-leave-the-db-file-fully-unlocked-or-spurio"></a>
 ### Drift: downgradeDBLockToShared Can Leave The DB File Fully Unlocked Or Spuriously Return ErrBusy
 - **Category:** changed-logic  -  **Severity:** low
@@ -4039,7 +4274,7 @@ To prove "last client" at close, the Go pager upgrades its lifetime DB-file lock
 
 To convert an exclusive DB-file lock back to shared, the Go code calls `downgradeDBLockToShared`, which simply issues `flockNB(fd, syscall.LOCK_SH)` (`internal/btree/dbfile_lock_unix.go:67-70`); that wrapper performs a real `syscall.Flock(fd, LOCK_SH|LOCK_NB)` and maps `EWOULDBLOCK`/`EAGAIN` to `ErrBusy` (`internal/btree/dbfile_lock_unix.go:74-85`). On BSD `flock` a lock-mode conversion is not atomic — the kernel first drops the existing exclusive lock and then tries to acquire the shared one — so with `LOCK_NB` set the re-acquire can fail if another process grabs a lock in the window, leaving the file with no lock at all while the call returns `ErrBusy`. SQLite's `flockUnlock` deliberately avoids any syscall for an exclusive→shared down-conversion: it observes that an exclusive lock already subsumes shared access and merely updates the in-memory state, `pFile->eFileLock = SHARED_LOCK; return SQLITE_OK;` (`os_unix.c:2747-2751`), reserving an actual `robust_flock(LOCK_UN)` only for the full `NO_LOCK` release path (`os_unix.c:2734-2763`), so its downgrade can never fail and never relinquishes the kernel lock.
 
-The consequence is that a caller invoking downgrade after a successful exclusive upgrade may end up with the DB file silently unlocked (losing the mutual exclusion that serializes last-client-unlink against new openers) while receiving an unexpected `ErrBusy` from an operation that semantically cannot be busy; this is currently latent because no caller invokes `downgradeDBLockToShared` today, but the hazard is inherited by any future use of this cross-platform lock API (also stubbed in `dbfile_lock_windows.go`).
+The consequence is that a caller invoking downgrade after a successful exclusive upgrade may end up with the DB file silently unlocked (losing the mutual exclusion that serializes last-client-unlink against new openers) while receiving an unexpected `ErrBusy` from an operation that semantically cannot be busy; this is currently latent because no caller invokes `downgradeDBLockToShared` today, but the hazard is inherited by any future use of this cross-platform lock API (also stubbed in `dbfile_lock_windows.go`). The two exclusive→shared conversions in the open path do not use it: after a new database's page 1 is written (`createIfEmpty`), and when an open gets the exclusive lock and finds that another process has created the database (`lockDBForCreate`), both [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal). They go through `pager.lockDBShared`, which repeats the shared request while it is refused, and they run before the WAL is opened, so a lock dropped inside the conversion leaves the handle unlocked only while it is attached to nothing.
 
 <a id="drift-2026-06-25-10-flocknb-does-not-retry-on-eintr-no-robust-flock-equivalent"></a>
 ### Drift: flockNB Does Not Retry On EINTR (No robust_flock Equivalent)
@@ -4323,3 +4558,18 @@ Here the limit is in the b-tree, and it is the cell parsers' cap ([old-drift-cor
 `payloadInFile` multiplies the page size by `readerDbSizeBound`. For the writer that is `pager.dbSize`, which a write begin sets by the same rule (`refreshHeaderFromPage1` through `lockBtreePageCount`) and `allocatePage` grows: SQLite's count. For a reader it is `pcache.dbSize`, the pager's count at its snapshot (`effectiveReaderDbSize`: the size the WAL's last commit records, else the database file's size), and page 1 is not read for it. In a file any-store writes the two agree: a commit that changes the page count writes page 1 with it (`commitNeedsPage1`). They differ when page 1's size field is damaged, or when the count is the database file's size and the file holds pages past its committed size. A trusted page-1 size below the pager's count then bounds a SQLite reader more tightly than this one, and one above it ends the SQLite transaction at its start with `SQLITE_CORRUPT`, where this reader goes on under the pager's count. Where page 1's size is untrusted, SQLite takes the pager's count too. The bound decides only whether a declared length is refused before a buffer is sized by it; a length within it whose bytes are not in the file still fails on the overflow chain.
 
 The key readers bound a key's length by `payloadInFile` too, `pageSize * nPage`, where SQLite's index probe uses `nCell/usableSize > nPage` (`btree.c:6164`), with the same `nPage`. Both bounds are at least `nPage * usableSize`, more than the file's pages can hold of one payload, so a key whose length falls between them fails on the overflow chain under either. The page numbers a reader follows (`descendChild`, the overflow-chain readers) are bounded by the same pager's count, where SQLite tests `btreePagecount`, that is `pBt->nPage` (`btree.c:2365`, `2386`, `5227`). Tests: `TestPayloadLimit_DeclaredLengthOverFileSize`, `TestPayloadLimit_OverflowRecordWithinFileSize`.
+
+<a id="drift-2026-11-23-1-full-pathname-follows-no-symbolic-link"></a>
+### Drift: The Full Pathname Follows No Symbolic Link And Keeps Its "." And ".." Elements
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `fullpath_unix.go:FullPathname`.
+
+SQLite resolves a database's name once, `rc = sqlite3OsFullPathname(pVfs, zFilename, nPathname, zPathname);` (`pager.c:4792`), builds the `-journal` and `-wal` names from the result (`pager.c:4915`, `4929`) and opens the database by it, `rc = sqlite3OsOpen(pVfs, pPager->zFilename, pPager->fd, vfsFlags, &fout);` (`pager.c:4948`). `FullPathname` is that resolution, with each platform's `xFullPathname`:
+
+- **Unix.** `unixFullPathname` starts a path that is not absolute from the working directory (`if( zPath[0]!='/' )`, then `osGetcwd(zPwd, sizeof(zPwd)-2)`, `os_unix.c:7021-7028`). `FullPathname` returns `cwd + "/" + path` for such a path, with the kernel's working directory (`syscall.Getwd`, as `getcwd`), and an absolute path as given.
+- **Windows.** `winFullPathname` calls `osGetFullPathNameW((LPCWSTR)zConverted, nByte, zTemp, 0)` (`os_win.c:6034`); `FullPathname` calls `syscall.FullPath`, which is `GetFullPathNameW`.
+- **js/wasm and wasip1.** The name as given, as `kvvfsFullPathname` copies it (`memcpy(zOut, zPath, nPath);`, `os_kv.c:996`).
+
+On Unix two things differ. `unixFullPathname` appends the name element by element: it drops a `.` element, backs up one element at a `..` (`os_unix.c:6930-6939`), and after each element it appends it calls `osLstat` and, for a symbolic link, `osReadlink`, and goes on from the link's target (`os_unix.c:6953-6975`). `FullPathname` follows no link, and so it removes no `.` or `..` either: a `..` after a link names the parent of the link's target, which only the OS resolves. The full name is therefore not SQLite's string, and the OS resolves each `.` and `..` it keeps: a database reached through a link has its `-wal` beside the link, where SQLite puts it beside the target. A name too long for the OS is not measured: it fails when the file is opened by it, where `unixFullPathname` returns `SQLITE_CANTOPEN` for a name that does not fit its buffer (`os_unix.c:6940-6942`, `7030`).
+
+Tests: `TestFullPathname_Unix`, `_UnixWorkingDirectoryOfTheCall` (`fullpath_unix_test.go`), `TestFullPathname_Windows` (`fullpath_windows_test.go`), `TestFullPathname_AsGiven` (`fullpath_other_test.go`).

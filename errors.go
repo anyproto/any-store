@@ -182,11 +182,12 @@ var (
 
 	// ErrDestinationExists is returned (possibly wrapped) by
 	// CopyToLatestFormat when a file is at the destination path, or at one
-	// of the paths a database keeps beside it: path+"-wal", path+"-wal-shm"
-	// and the sentinel path+".lock"; or when the destination is one of
-	// those paths of a file that exists. The call replaces nothing: a file
-	// that was there is left as it was. One found before the call takes its
-	// copy locks refuses it before it creates anything.
+	// of the paths a database keeps beside it: path+"-wal", path+"-wal-shm",
+	// the sentinel path+".lock" and the creation journal path+"-journal";
+	// or when the destination is one of those paths of a file that exists.
+	// The call replaces nothing: a file that was there is left as it was.
+	// One found before the call takes its copy locks refuses it before it
+	// creates anything.
 	// The check is made again under the locks and right before the copy is
 	// published, and a file that appeared by then refuses the call after it
 	// created its lock files, or built the copy under its staging name, and

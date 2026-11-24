@@ -28,7 +28,11 @@ func init() {
 	defaultFdatasync = func(File) error {
 		panic("btree: SetVFS not called — anystore on wasm requires a VFS backend")
 	}
+	// The browser backends are reached through the VFS alone: a stat is
+	// one through its OpenFile.
+	defaultStat = statThroughOpen
 	osOpenFile = defaultOpenFile
 	osRemove = defaultRemove
 	fdatasync = defaultFdatasync
+	osStat = defaultStat
 }

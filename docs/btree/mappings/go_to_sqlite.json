@@ -760,6 +760,73 @@
     "sqlite": [],
     "note": ""
   },
+  "creation_journal.go:*creationJournal.abandon": {
+    "sqlite": [],
+    "note": "closes the journal of a creation that failed before its commit point; the file stays, hot"
+  },
+  "creation_journal.go:*creationJournal.commit": {
+    "sqlite": [
+      "os_unix.c:unixDelete",
+      "pager.c:pager_end_transaction"
+    ],
+    "note": "the commit point: the journal is closed and deleted with no directory sync; SQLite passes extraSync to its delete"
+  },
+  "creation_journal.go:*creationJournal.sync": {
+    "sqlite": [
+      "os_unix.c:unixSync",
+      "pager.c:syncJournal"
+    ],
+    "note": "the journal's sync before page 1 is written; its first sync, so the directory is synced after it"
+  },
+  "creation_journal.go:*pager.creationPending": {
+    "sqlite": [
+      "pager.c:hasHotJournal"
+    ],
+    "note": "the file is empty or a hot creation journal lies beside it: the test sqlite3PagerSharedLock makes after the SHARED lock, extended by the empty file that newDatabase would fill"
+  },
+  "creation_journal.go:*pager.deleteJournalOfEmptyDatabase": {
+    "sqlite": [
+      "os_unix.c:unixAccess",
+      "pager.c:hasHotJournal"
+    ],
+    "note": "a file found under the journal's name beside a database file of zero bytes is deleted, whatever it holds; with native file access it is found by a stat; hasHotJournal deletes a journal beside a database of zero pages"
+  },
+  "creation_journal.go:*pager.finalizeJournalOfEmptyDatabase": {
+    "sqlite": [
+      "pager.c:hasHotJournal",
+      "pager.c:pager_end_transaction",
+      "pager.c:pager_playback"
+    ],
+    "note": "syncs the empty database file, then deletes the journal: pager_playback's sync and finalization; beside a file found empty the sync is any-store's addition"
+  },
+  "creation_journal.go:*pager.hasHotCreationJournal": {
+    "sqlite": [
+      "pager.c:hasHotJournal",
+      "pager.c:readJournalHdr"
+    ],
+    "note": "hot only with a whole creation header of any-store's magic and an original size of zero; the reserved-lock test is the caller's DB-file lock"
+  },
+  "creation_journal.go:*pager.openCreationJournal": {
+    "sqlite": [
+      "os_unix.c:unixOpen",
+      "pager.c:pager_open_journal",
+      "pager.c:writeJournalHdr"
+    ],
+    "note": "opens the journal with the create flag, which sets its dirSync (UNIXFILE_DIRSYNC), and writes the header; a file found under the name was deleted before"
+  },
+  "creation_journal.go:*pager.playbackCreationJournal": {
+    "sqlite": [
+      "pager.c:pager_playback",
+      "pager.c:pager_truncate"
+    ],
+    "note": "truncates the file to the journal's original size, zero pages, syncs it, and then deletes the journal; no page records exist to play back"
+  },
+  "creation_journal.go:creationJournalHdr": {
+    "sqlite": [
+      "pager.c:writeJournalHdr"
+    ],
+    "note": "SQLite's 28-byte header layout with any-store's magic, original size 0 and the page size"
+  },
   "db.go:*DB.BeginRead": {
     "sqlite": [
       "btree.c:btreeBeginTrans",
@@ -1117,6 +1184,12 @@
     "sqlite": [],
     "note": ""
   },
+  "dbdir_unix.go:databaseDir": {
+    "sqlite": [
+      "os_unix.c:openDirectory"
+    ],
+    "note": "the directory dirSync syncs: the name the file was opened by, cut at its last separator, not cleaned; / for a file in the root directory, . for a name with no separator"
+  },
   "dbfile_lock_other.go:acquireSharedDBLock": {
     "sqlite": [],
     "note": ""
@@ -1128,6 +1201,10 @@
   "dbfile_lock_other.go:tryUpgradeDBLockExclusive": {
     "sqlite": [],
     "note": ""
+  },
+  "dbfile_lock_other.go:unlockDBFile": {
+    "sqlite": [],
+    "note": "no-op: no cross-process file lock on this target"
   },
   "dbfile_lock_unix.go:acquireSharedDBLock": {
     "sqlite": [],
@@ -1145,6 +1222,16 @@
     "sqlite": [],
     "note": ""
   },
+  "dbfile_lock_unix.go:unlockDBFile": {
+    "sqlite": [
+      "os_unix.c:flockUnlock"
+    ],
+    "note": "drops the flock after a refused upgrade to exclusive (lockDBForCreate)"
+  },
+  "dbfile_lock_windows.go:unlockDBFile": {
+    "sqlite": [],
+    "note": "no-op: the multi-process lock protocol never runs on Windows"
+  },
   "debug_trace.go:trace": {
     "sqlite": [],
     "note": "Go-only no-op stub under !debugtrace build tag; debug tracing facility with no SQLite counterpart"
@@ -1156,6 +1243,24 @@
   "debug_trace_on.go:trace": {
     "sqlite": [],
     "note": "Thin wrapper over log.Logger.Printf for build-tagged tracing; any-store-specific debug scaffolding with no SQLite origin."
+  },
+  "fullpath_other.go:FullPathname": {
+    "sqlite": [
+      "os_kv.c:kvvfsFullPathname"
+    ],
+    "note": "js/wasm and wasip1: the name as given, unchanged"
+  },
+  "fullpath_unix.go:FullPathname": {
+    "sqlite": [
+      "os_unix.c:unixFullPathname"
+    ],
+    "note": "a path that is not absolute is joined to the working directory, an absolute one is kept as given; no symbolic link is followed and no \".\" or \"..\" element removed; a name too long for the OS fails when the file is opened by it"
+  },
+  "fullpath_windows.go:FullPathname": {
+    "sqlite": [
+      "os_win.c:winFullPathname"
+    ],
+    "note": "GetFullPathNameW through syscall.FullPath"
   },
   "integrity.go:*DB.IntegrityCheck": {
     "sqlite": [
@@ -1387,6 +1492,10 @@
   "osfuncs_vfs.go:SetVFS": {
     "sqlite": [],
     "note": "any-store test hook to inject VFS overrides"
+  },
+  "osfuncs_vfs.go:statThroughOpen": {
+    "sqlite": [],
+    "note": "osStat under a VFS, which has no stat: a read-only open through the VFS and an fstat"
   },
   "osfuncs_vfs_js.go:init": {
     "sqlite": [],
@@ -1727,6 +1836,23 @@
     ],
     "note": "the pager's count for a write begin, the one its readers use"
   },
+  "pager.go:*pager.createIfEmpty": {
+    "sqlite": [
+      "btree.c:newDatabase",
+      "btree.c:sqlite3BtreeSetVersion",
+      "pager.c:pagerOpenWalIfPresent",
+      "pager.c:sqlite3PagerSharedLock"
+    ],
+    "note": "a file whose creation is pending becomes a one-page database under the exclusive DB-file lock: a dead creator's file is rolled back, a WAL beside it is deleted, and page 1 is created in a journaled transaction"
+  },
+  "pager.go:*pager.createPage1": {
+    "sqlite": [
+      "btree.c:newDatabase",
+      "pager.c:pager_write",
+      "pager.c:sqlite3PagerCommitPhaseOne"
+    ],
+    "note": "page 1 is written after the creation journal and its directory are synced and before the journal's delete commits the creation, as a PGHDR_NEED_SYNC page is"
+  },
   "pager.go:*pager.decryptPage": {
     "sqlite": [],
     "note": ""
@@ -1840,11 +1966,18 @@
     ],
     "note": ""
   },
+  "pager.go:*pager.headerErrorOfUnwritableFile": {
+    "sqlite": [
+      "btree.c:lockBtree",
+      "os_unix.c:unixOpen"
+    ],
+    "note": "a file that does not open for writing is opened read-only, as unixOpen does, to judge its header only: a database is never used read-only"
+  },
   "pager.go:*pager.initNewDB": {
     "sqlite": [
       "btree.c:newDatabase"
     ],
-    "note": "any-store initializes empty page 1 at pager open; SQLite defers to btree layer"
+    "note": "in-memory databases only; a database in a file is created by createIfEmpty"
   },
   "pager.go:*pager.installCodec": {
     "sqlite": [],
@@ -1861,6 +1994,24 @@
       "btree.c:decodeFlags"
     ],
     "note": "the file's leaf rule for a given usable size"
+  },
+  "pager.go:*pager.lockDBForCreate": {
+    "sqlite": [
+      "pager.c:sqlite3PagerExclusiveLock"
+    ],
+    "note": "flock upgrade with drop-and-retry between several creators, up to BusyTimeout; also the exclusive lock of a hot-journal playback"
+  },
+  "pager.go:*pager.lockDBShared": {
+    "sqlite": [
+      "pager.c:pager_wait_on_lock"
+    ],
+    "note": "shared DB-file flock, retried for a second against an exclusive holder"
+  },
+  "pager.go:*pager.newPage1": {
+    "sqlite": [
+      "btree.c:newDatabase"
+    ],
+    "note": "header and empty leaf image of page 1"
   },
   "pager.go:*pager.notePage1Read": {
     "sqlite": [
@@ -2026,6 +2177,10 @@
       "wal.c:sqlite3WalSavepoint"
     ],
     "note": ""
+  },
+  "pager.go:*pager.setCodec": {
+    "sqlite": [],
+    "note": "replaces the codec chosen before the DB-file lock was held"
   },
   "pager.go:*pager.setHasContent": {
     "sqlite": [
@@ -2368,6 +2523,35 @@
     "sqlite": [],
     "note": "heap-backed shm fallback for platforms without mmap support"
   },
+  "syncdir_other.go:*dirSync.set": {
+    "sqlite": [],
+    "note": "no directory sync on Windows and js/wasm, as in SQLite's Windows VFS"
+  },
+  "syncdir_other.go:*dirSync.sync": {
+    "sqlite": [
+      "os_win.c:winSync"
+    ],
+    "note": "the file's sync alone, as winSync syncs no directory"
+  },
+  "syncdir_unix.go:*dirSync.set": {
+    "sqlite": [
+      "os_unix.c:unixOpen"
+    ],
+    "note": "UNIXFILE_DIRSYNC, set on a journal or WAL descriptor opened with the create flag; the directory is that of the name the file was opened by (databaseDir), which a pager builds from the database's full name (FullPathname)"
+  },
+  "syncdir_unix.go:*dirSync.sync": {
+    "sqlite": [
+      "os_unix.c:unixSync"
+    ],
+    "note": "fdatasync, then the directory at the first sync since set; racing first syncs wait for the directory sync"
+  },
+  "syncdir_unix.go:syncDir": {
+    "sqlite": [
+      "os_unix.c:openDirectory",
+      "os_unix.c:unixSync"
+    ],
+    "note": "the directory fsync unixSync does for a descriptor marked UNIXFILE_DIRSYNC; a directory that does not open, and the fsync's result, are ignored, as there"
+  },
   "testseam.go:*DB.TestSeam": {
     "sqlite": [],
     "note": "test seam for the packages above"
@@ -2611,6 +2795,12 @@
       "wal.c:walRewriteChecksums"
     ],
     "note": "in-tx frame-reuse checksum-chain rewrite (wal.c:3966-4009), called from writeFrames"
+  },
+  "wal.go:*wal.syncFile": {
+    "sqlite": [
+      "os_unix.c:unixSync"
+    ],
+    "note": "every sync of the WAL file; the first since open syncs the directory too (UNIXFILE_DIRSYNC set by wal.open, as unixOpen sets it on every WAL opened with the create flag)"
   },
   "wal.go:*wal.truncateFile": {
     "sqlite": [

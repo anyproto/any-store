@@ -1208,15 +1208,11 @@
   {
     "group": "rollback_journal",
     "category": "legacy",
-    "reason": "any-store is WAL-only; rollback-journal mode (super-journal, sub-journal, hot-journal recovery, playback, change-counter writes, journal headers) is not implemented.",
+    "reason": "any-store is WAL-only; rollback-journal mode (super-journal, sub-journal, page records and their playback, change-counter writes) is not implemented. The one journaled transaction is the creation of a database (creation_journal.go), whose journal is a header alone.",
     "funcs": [
       {
         "file": "pager.c",
         "func": "addToSavepointBitvecs"
-      },
-      {
-        "file": "pager.c",
-        "func": "hasHotJournal"
       },
       {
         "file": "pager.c",
@@ -1273,14 +1269,6 @@
       },
       {
         "file": "pager.c",
-        "func": "pager_open_journal"
-      },
-      {
-        "file": "pager.c",
-        "func": "pager_playback"
-      },
-      {
-        "file": "pager.c",
         "func": "pager_playback_one_page"
       },
       {
@@ -1290,19 +1278,11 @@
       },
       {
         "file": "pager.c",
-        "func": "pager_truncate"
-      },
-      {
-        "file": "pager.c",
         "func": "pager_write_changecounter"
       },
       {
         "file": "pager.c",
         "func": "pager_write_pagelist"
-      },
-      {
-        "file": "pager.c",
-        "func": "readJournalHdr"
       },
       {
         "file": "pager.c",
@@ -1348,14 +1328,6 @@
       {
         "file": "pager.c",
         "func": "subjournalPageIfRequired"
-      },
-      {
-        "file": "pager.c",
-        "func": "syncJournal"
-      },
-      {
-        "file": "pager.c",
-        "func": "writeJournalHdr"
       },
       {
         "file": "pager.c",
