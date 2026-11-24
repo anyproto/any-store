@@ -181,10 +181,11 @@ func TestVerifyIntegritySweepsPagesAPeerAdded(t *testing.T) {
 
 // TestVerifyIntegritySweepBesideGrowingCommit: a sweep that begins while a
 // commit which grew the database has not yet published its frames reads the
-// snapshot before that commit, and that snapshot's page count. The writer's
-// count already includes pages no reader can see; a sweep bounded by it read
-// past its snapshot and reported a healthy database's pages as errors (and,
-// with mmap on, read mapped memory past the end of the file).
+// snapshot before that commit, and that snapshot's page count, not the
+// writer's. The writer's count already includes the commit's new pages, which
+// are in no WAL frame of the snapshot and not in the database file (with mmap
+// on, past the end of the mapped file); the sweep neither reads nor lists
+// them.
 func TestVerifyIntegritySweepBesideGrowingCommit(t *testing.T) {
 	cases := []struct {
 		name string

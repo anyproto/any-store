@@ -548,8 +548,8 @@ func TestIntegrity_OverlappingSweepsKeepVerificationOn(t *testing.T) {
 // TestIntegrity_InMemoryHasNoIntegrityMode: an in-memory database stores
 // its pages as they are, with no codec, whatever Config.Encryption says
 // (EncryptionConfig: "InMemory databases ignore Encryption"). There is no
-// page tag to verify: the mode is IntegrityNone and a sweep scans nothing,
-// where it used to try the cipher's tag on plain pages and list every one.
+// page tag to verify: the mode is IntegrityNone, and a sweep scans no page,
+// lists none and fires no callback.
 func TestIntegrity_InMemoryHasNoIntegrityMode(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
