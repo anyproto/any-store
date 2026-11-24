@@ -495,6 +495,25 @@ func TestIntegrityCheck_FailedReadIsNotErrCorrupt(t *testing.T) {
 	require.NoError(t, db.IntegrityCheck())
 }
 
+// IntegrityCheck on a closed handle is ErrClosed, in either shared-memory
+// mode. In the in-process mode the heap wal-index outlives the files, and a
+// check that bypassed the read admission read page 1 as zeros:
+// ErrHeaderCorrupt, which matches ErrCorrupt.
+func TestIntegrityCheck_ClosedHandleIsErrClosed(t *testing.T) {
+	for _, inProcess := range []bool{false, true} {
+		t.Run(fmt.Sprintf("inProcess=%v", inProcess), func(t *testing.T) {
+			db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), Options{PageSize: 4096, InProcess: inProcess})
+			require.NoError(t, err)
+			commitRows(t, db, "t1", 8, 100)
+			require.NoError(t, db.Close())
+
+			err = db.IntegrityCheck()
+			require.ErrorIs(t, err, ErrClosed)
+			require.NotErrorIs(t, err, ErrCorrupt)
+		})
+	}
+}
+
 // A page reached through a wal-index that points past the end of the log
 // is a short read, and the report keeps that identity: it matches
 // ErrWALShortRead and not ErrCorrupt, so a caller can tell an index to

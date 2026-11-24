@@ -617,7 +617,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 // Returns nil if the database is consistent, or an *IntegrityError with
 // all issues found, which matches ErrCorrupt unless a page could not be
 // read (see IntegrityError). An error of another type is a check that could not
-// start: its read transaction, or page 1.
+// start: its read transaction (ErrClosed on a closed handle), or page 1.
 func (db *DB) IntegrityCheck() error {
 	return db.IntegrityCheckN(100)
 }
@@ -629,12 +629,19 @@ var testIntegritySnapshotHook func()
 // IntegrityCheckN is like IntegrityCheck but stops after maxErrors issues.
 // Pass 0 for unlimited.
 func (db *DB) IntegrityCheckN(maxErrors int) error {
-	// Start a read transaction
-	walHdr, maxFrame, minFrame, slot, err := db.pager.beginReadHdr()
+	// The check's snapshot is a read transaction's, admitted as every
+	// reader is: a handle that is closed returns ErrClosed, and a Close
+	// waits for a check that has begun, as sqlite3BtreeIntegrityCheck runs
+	// inside a read transaction of the connection (btree.c:11156). A
+	// pager read without the admission found a closed handle's files gone
+	// and read page 1 as zeros: a header that is not one, which matched
+	// ErrCorrupt.
+	tx, err := db.BeginRead()
 	if err != nil {
 		return err
 	}
-	defer db.pager.endRead(slot)
+	defer tx.Rollback()
+	maxFrame := tx.walMaxFrame
 
 	// Use a private reader cache to avoid racing with the writer's cache.
 	// Its WAL floor is the snapshot's, as for every reader cache: on slot 0
@@ -644,7 +651,7 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// generation's frames, numbered from 1 again, into this snapshot.
 	cache := newPcache(int(db.pager.pageSize), 200, true)
 	cache.useSlab = db.pager.useSlab
-	cache.minFrame = minFrame
+	cache.minFrame = tx.cache.minFrame
 	defer cache.destroy()
 
 	// Read page 1 to get the current header
@@ -670,10 +677,7 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// invalid page numbers. Nor may pager.dbSize, the writer's live count: a
 	// write transaction open in this process that has truncated the database
 	// would cap the check below pages the committed snapshot still owns.
-	maxPossible, err := db.pager.effectiveReaderDbSize(walHdr)
-	if err != nil {
-		return err
-	}
+	maxPossible := tx.cache.dbSize
 	// The page count by lockBtree's rule (btree.c:3294-3298), which is the
 	// btreePagecount the integrity check walks (btree.c:11163-11168): page
 	// 1's size when it is non-zero and the change counter matches

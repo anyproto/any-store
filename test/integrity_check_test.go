@@ -47,3 +47,18 @@ func TestIntegrityCheck_DamageMatchesErrCorrupt(t *testing.T) {
 	err = db.IntegrityCheck(ctx)
 	require.ErrorIs(t, err, anystore.ErrCorrupt)
 }
+
+// IntegrityCheck on a closed database is ErrDBIsClosed: a check that cannot
+// run says nothing about the file, and must not read as damage.
+func TestIntegrityCheck_ClosedIsErrDBIsClosed(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "a.db"), nil)
+	require.NoError(t, err)
+	_, err = db.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	err = db.IntegrityCheck(ctx)
+	require.ErrorIs(t, err, anystore.ErrDBIsClosed)
+	require.NotErrorIs(t, err, anystore.ErrCorrupt)
+}

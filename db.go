@@ -73,11 +73,13 @@ type DB interface {
 	// The error matches ErrCorrupt when the check found damage: a broken
 	// structure, a page that fails its checksum or authentication, or a
 	// collection in the catalog that has no data. It does not match
-	// ErrCorrupt when the check could not run or could not read: a
-	// cancelled ctx, a busy error, or a report that lists a page that
-	// failed to read with an I/O error. Such a report matches that error,
-	// and what else it lists is inconclusive (the pages below an unread
-	// page are listed as never used): run the check again.
+	// ErrCorrupt when the check could not run or could not read: a closed
+	// database (ErrDBIsClosed), a cancelled ctx, a busy error, or a report
+	// that lists a page that failed to read with an I/O error or a short
+	// read of the write-ahead log (ErrWALShortRead). Such a report matches
+	// that error, and what else it lists is inconclusive (the pages below
+	// an unread page are listed as never used): run the check again, for
+	// ErrWALShortRead once every handle has closed the file.
 	IntegrityCheck(ctx context.Context) (err error)
 
 	// Flush perform checkpoint on the btree database
