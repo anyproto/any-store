@@ -284,8 +284,9 @@ func TestFtsProbe_BoundedUpdateSameRows(t *testing.T) {
 	assert.ElementsMatch(t, expected, marked)
 }
 
-// The CBO must route the SYN-191 shapes to probe plans and broad queries to
-// the driver, and Count on a covered probe plan must fetch no documents.
+// The CBO must route the selective shapes (a restriction to a few ids, a
+// selective index equality) to probe plans and broad queries to the driver,
+// and Count on a covered probe plan must fetch no documents.
 func TestFtsProbe_PlanChoice(t *testing.T) {
 	fx, coll := ftsProbeColl(t)
 	defer fx.finish()

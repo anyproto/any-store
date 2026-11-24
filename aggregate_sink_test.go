@@ -331,8 +331,8 @@ func TestCollection_AggregateMerge(t *testing.T) {
 	})
 }
 
-// TestCollection_AggregateMaterializeThenQuery is the motivating flow of
-// SYN-129: derive values with $group, materialize them with $merge, then
+// TestCollection_AggregateMaterializeThenQuery is the flow $merge is for:
+// derive values with $group, materialize them with $merge, then
 // filter/sort on the derived field through a declared index instead of
 // recomputing client-side.
 func TestCollection_AggregateMaterializeThenQuery(t *testing.T) {

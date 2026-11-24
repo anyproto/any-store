@@ -426,7 +426,10 @@ build per query and carry no such guarantee.
     every required clause after them still matches and scores, but a
     document need not satisfy it, as if it were a `$search` clause under the
     default `or`. `$exclude` entries have no such limit. Pinned by
-    `TestFtsProbe_RequiredBitExhaustion`.
+    `TestFtsProbe_RequiredBitExhaustion` and, with 63 `$search` clauses and
+    a `$require` entry holding the 64th and 65th,
+    `TestFtsOps_RequiredClausesBudgetSpansSearchAndRequire`
+    (test/fulltext_test.go).
 
 20. **A stored document nests at most 511 levels.** The document is the
     first level and each object or array in it one more. A write that would

@@ -907,3 +907,62 @@ func TestFtsWeights_UpdateMovesTermBetweenFields(t *testing.T) {
 	assert.InDelta(t, scores[0], scores[1], 1e-9,
 		"identical-content docs must score identically (stale FieldMask if not): ids=%v scores=%v", ids, scores)
 }
+
+// A $text query enforces its first 64 required clauses, counted across
+// $search and $require in that order (query contract, item 19): 63 $search
+// clauses under "and", then one $require entry that parses into clauses 64
+// and 65. A document with the first 64 matches; one missing the 64th does
+// not, though it has the 65th; one with all 65 matches and scores above the
+// one with 64, as the 65th still scores. The full-text driver and the
+// primary-key probe give the same rows and scores.
+func TestFtsOps_RequiredClausesBudgetSpansSearchAndRequire(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "req")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Name: "ft", Kind: anystore.IndexKindFulltext, Fields: []string{"body"}}))
+	term := func(i int) string { return fmt.Sprintf("req%02d", i) }
+	terms := func(from, to, skip int) string {
+		var words []string
+		for i := from; i <= to; i++ {
+			if i != skip {
+				words = append(words, term(i))
+			}
+		}
+		return strings.Join(words, " ")
+	}
+	insertJSON(t, coll,
+		fmt.Sprintf(`{"id":"first64","body":%q}`, terms(1, 64, 0)),
+		fmt.Sprintf(`{"id":"miss64","body":%q}`, terms(1, 65, 64)),
+		fmt.Sprintf(`{"id":"all65","body":%q}`, terms(1, 65, 0)),
+		`{"id":"only65","body":"req65"}`,
+		`{"id":"other","body":"unrelated words"}`,
+	)
+	cond := map[string]any{
+		"$text": map[string]any{
+			"$search":          terms(1, 63, 0),
+			"$defaultOperator": "and",
+			"$require":         []any{term(64) + " " + term(65)},
+		},
+		"id": map[string]any{"$in": []any{"first64", "miss64", "all65", "only65", "other"}},
+	}
+	var driverScores []float64
+	for _, plan := range []struct {
+		name, index, source string
+	}{
+		{"driver", "ft", "FtsSearch"},
+		{"probe", "id", "FtsProbe"},
+	} {
+		q := coll.Find(cond).IndexHint(anystore.IndexHint{IndexName: plan.index, Boost: 1 << 30})
+		exp, err := q.Explain(ctx)
+		require.NoError(t, err)
+		require.Contains(t, exp.Plan+" "+exp.Sql, plan.source, plan.name)
+		ids, scores := collectIter(t, q)
+		require.Equal(t, []string{"all65", "first64"}, ids, plan.name)
+		assert.Greater(t, scores[0], scores[1], "%s: the 65th clause scores", plan.name)
+		if driverScores == nil {
+			driverScores = scores
+		} else {
+			assert.Equal(t, driverScores, scores, plan.name)
+		}
+	}
+}

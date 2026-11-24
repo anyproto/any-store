@@ -228,6 +228,93 @@ func TestPager_InstallCodec_NilIsNoop(t *testing.T) {
 	}
 }
 
+// One codec object in Options.Codec serving two databases whose writers
+// commit at the same time, each from its own goroutine: every commit
+// encrypts its frames through the shared codec, so a codec that kept state
+// of its own across encrypts (a nonce source, a scratch buffer) would repeat
+// a nonce under the key or mix two pages. Both files reopen with the codec,
+// hold every row, and pass the integrity sweep. Run it with -race.
+func TestCodec_SharedCodecTwoDatabasesWriting(t *testing.T) {
+	codec, err := NewAESCodec(bytes.Repeat([]byte{0x3c}, KeyLen))
+	require.NoError(t, err)
+	dir := t.TempDir()
+	paths := []string{filepath.Join(dir, "a.db"), filepath.Join(dir, "b.db")}
+	rows := 300
+	if testing.Short() {
+		rows = 60
+	}
+	key := func(j int) []byte { return fmt.Appendf(nil, "k%05d", j) }
+	value := func(db, j int) []byte { return bytes.Repeat([]byte{byte(db*101 + j)}, 300) }
+
+	dbs := make([]*DB, len(paths))
+	for i, path := range paths {
+		db, err := testOpen(t, path, Options{Codec: codec})
+		require.NoError(t, err)
+		dbs[i] = db
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		_, err = tx.CreateNamespace("data")
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+	}
+	start := make(chan struct{})
+	errs := make([]error, len(dbs))
+	var wg sync.WaitGroup
+	for i, db := range dbs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			// One commit per row: every commit encrypts its frames.
+			for j := range rows {
+				tx, err := db.BeginWrite()
+				if err != nil {
+					errs[i] = err
+					return
+				}
+				ns, err := tx.GetNamespace("data")
+				if err == nil {
+					err = tx.Put(ns, key(j), value(i, j))
+				}
+				if err != nil {
+					_ = tx.Rollback()
+					errs[i] = err
+					return
+				}
+				if err := tx.Commit(); err != nil {
+					errs[i] = err
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	for i, db := range dbs {
+		require.NoError(t, errs[i])
+		require.NoError(t, db.Close())
+	}
+
+	for i, path := range paths {
+		db, err := testOpen(t, path, Options{Codec: codec})
+		require.NoError(t, err)
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		ns, err := rtx.GetNamespace("data")
+		require.NoError(t, err)
+		for j := range rows {
+			got, err := rtx.Get(ns, key(j))
+			require.NoError(t, err, "%s row %d", path, j)
+			require.Equal(t, value(i, j), got, "%s row %d", path, j)
+		}
+		require.NoError(t, rtx.Rollback())
+		rep, err := db.VerifyIntegrity(context.Background())
+		require.NoError(t, err)
+		require.Empty(t, rep.Errors, path)
+		require.NoError(t, db.Close())
+	}
+}
+
 // One codec object in Options.Codec serving three databases: A and B each
 // with an OnIntegrityError of its own, C with none. A damaged page is
 // reported to the callback of the database it belongs to and to no other,

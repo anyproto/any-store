@@ -106,12 +106,12 @@ func vectorbenchPaged(t *testing.T, m Metric) {
 	require.NoError(t, err)
 
 	gets0, calls := p.Gets(), 0
-	pagNs := timeSearchN(func(q []float32) { _, _ = p.Search(q, k); calls++ }, qVecs, 2000)
+	pagNs := timeSearchN(vbTimed(t, "Search", &calls, func(q []float32) error { _, err := p.Search(q, k); return err }), qVecs, 2000)
 	t.Logf("B  paged vectors       : %9.1f us/q   RAM=%7.1f MiB (topology only) %5.0f reads/q  (%.1fx)",
 		pagNs/1000, vbMiB(p.TopologyBytes()), float64(p.Gets()-gets0)/float64(calls), pagNs/memNs)
 
 	gets0, calls = p.Gets(), 0
-	hybNs := timeSearchN(func(q []float32) { _, _ = p.SearchHybrid(q, k); calls++ }, qVecs, 2000)
+	hybNs := timeSearchN(vbTimed(t, "SearchHybrid", &calls, func(q []float32) error { _, err := p.SearchHybrid(q, k); return err }), qVecs, 2000)
 	t.Logf("B' hybrid route+rerank : %9.1f us/q   RAM=routing-slab + topology   %5.0f reads/q  (%.1fx)",
 		hybNs/1000, float64(p.Gets()-gets0)/float64(calls), hybNs/memNs)
 	t.Logf("(a quantized routing slab makes B' RAM ~25%% [int8] or ~3%% [binary] of A)")
@@ -134,15 +134,21 @@ func vectorbenchDisk(t *testing.T, m Metric) {
 	exists, err := pagedExists(db, "emb")
 	require.NoError(t, err)
 	if exists {
-		qVecs, _, _, _ := GenMDDataset(*vbQueries, *vbDim, *vbSeed+1)
 		t.Logf("RELOAD run: reopening the on-disk index at %s (cold, cache=%d pages)", path, *vbCache)
 		tl := time.Now()
 		p, err := openPaged(db, "emb")
 		require.NoError(t, err)
 		t.Logf("reloaded %d nodes (topology only) in %s; topology RAM=%.1f MiB (vectors stay on disk)",
 			p.PhysLen(), time.Since(tl).Round(time.Millisecond), vbMiB(p.TopologyBytes()))
+		// The index has the dimension, metric and search depth of the run
+		// that built it, whatever the flags of this one: the queries are
+		// generated for its dimension, and the settings logged are its own.
+		meta := vbPersistedMeta(t, db, "emb")
+		t.Logf("index: dim=%d metric=%s ef=%d (as built; -vectorbench.dim, -metric and -ef do not apply to a reload)",
+			meta.dim, meta.metric, meta.EfSearch)
+		qVecs, _, _, _ := GenMDDataset(*vbQueries, meta.dim, *vbSeed+1)
 		gets0, calls := p.Gets(), 0
-		pagNs := timeSearchN(func(q []float32) { _, _ = p.Search(q, k); calls++ }, qVecs, 2000)
+		pagNs := timeSearchN(vbTimed(t, "Search", &calls, func(q []float32) error { _, err := p.Search(q, k); return err }), qVecs, 2000)
 		t.Logf("B  paged vectors (cold disk): %8.1f us/q   %5.0f reads/q",
 			pagNs/1000, float64(p.Gets()-gets0)/float64(calls))
 		t.Logf("(cold = the btree page cache started empty in this process; run again for a warmer cache)")
@@ -161,14 +167,41 @@ func vectorbenchDisk(t *testing.T, m Metric) {
 	p, err := attachPaged(g, db, "emb", m)
 	require.NoError(t, err)
 	gets0, calls := p.Gets(), 0
-	pagNs := timeSearchN(func(q []float32) { _, _ = p.Search(q, k); calls++ }, qVecs, 2000)
+	pagNs := timeSearchN(vbTimed(t, "Search", &calls, func(q []float32) error { _, err := p.Search(q, k); return err }), qVecs, 2000)
 	t.Logf("B  paged vectors (warm) : %8.1f us/q   %5.0f reads/q  (%.1fx)",
 		pagNs/1000, float64(p.Gets()-gets0)/float64(calls), pagNs/memNs)
 	gets0, calls = p.Gets(), 0
-	hybNs := timeSearchN(func(q []float32) { _, _ = p.SearchHybrid(q, k); calls++ }, qVecs, 2000)
+	hybNs := timeSearchN(vbTimed(t, "SearchHybrid", &calls, func(q []float32) error { _, err := p.SearchHybrid(q, k); return err }), qVecs, 2000)
 	t.Logf("B' hybrid route+rerank  : %8.1f us/q   %5.0f reads/q  (%.1fx)",
 		hybNs/1000, float64(p.Gets()-gets0)/float64(calls), hybNs/memNs)
 	t.Logf("run the same command again to measure the cold reload from disk (drop the OS cache first for a true cold read)")
+}
+
+// vbTimed wraps a search for timeSearchN: it counts the calls in *calls and
+// fails the test at the first error, so a run whose searches fail reports
+// no latency for them.
+func vbTimed(t *testing.T, name string, calls *int, search func(q []float32) error) func(q []float32) {
+	return func(q []float32) {
+		*calls++
+		if err := search(q); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
+// vbPersistedMeta reads the meta record of the persisted index name: the
+// dimension, metric and search depth it was built with.
+func vbPersistedMeta(t *testing.T, db *btree.DB, name string) indexMeta {
+	ns, err := db.GetNamespace(name + ":pmeta")
+	require.NoError(t, err)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	b, err := rtx.Get(ns, []byte(btreeMetaKey))
+	require.NoError(t, err)
+	meta, err := decodeMeta(b)
+	require.NoError(t, err)
+	return meta
 }
 
 func vbMiB(bytes int) float64 { return float64(bytes) / (1 << 20) }
