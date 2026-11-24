@@ -61,7 +61,7 @@ every collection, document and index of `db`:
   collection that inherits the database's compression setting keeps
   inheriting, from `config.DisableCompression`.
 - **Nothing is replaced.** If the destination path, or its `-wal`,
-  `-wal-shm` or `.lock` file, exists, or the destination is one of those
+  `-wal-shm`, `.lock` or `-journal` file, exists, or the destination is one of those
   names of an existing file (`app.db-wal` beside `app.db`, in any case:
   `app.db-WAL` is `app.db`'s log on a case-insensitive filesystem, and is
   refused on every filesystem), the call returns
@@ -81,8 +81,8 @@ every collection, document and index of `db`:
   the next one. A second call for the same destination, from this process or
   another, does not wait: it returns `ErrBusy` at once, and touches no file
   but the copy's lock files. A destination that names a file a database
-  keeps beside it (`app.db-wal`, `app.db-wal-shm` or `app.db.lock`, in any
-  case) is read as `app.db`'s file once `app.db` exists, so a copy to it
+  keeps beside it (`app.db-wal`, `app.db-wal-shm`, `app.db.lock` or
+  `app.db-journal`, in any case) is read as `app.db`'s file once `app.db` exists, so a copy to it
   holds `app.db.copy-lock` too: a copy to `app.db` and a copy to one of
   those names do not run at once either, and the one that comes second
   returns `ErrBusy`. The lock files are removed when the call returns,
@@ -96,18 +96,19 @@ every collection, document and index of `db`:
   destination. The rename stays within one directory, so it works wherever
   the destination can be written, including filesystems and platforms
   without hard links. Right before the rename the destination and its
-  `-wal`, `-wal-shm` and `.lock` are checked again, so a file that appeared
+  `-wal`, `-wal-shm`, `.lock` and `-journal` are checked again, so a file that appeared
   there while the copy ran also gives `ErrDestinationExists`. The check and
   the rename are not one step, and the locks exclude only other copies: a
   file that something else creates at the destination between them is
-  replaced, and a `-wal`, `-wal-shm` or `.lock` that it creates beside the
+  replaced, and a `-wal`, `-wal-shm`, `.lock` or `-journal` that it creates beside the
   destination then is not seen, and is read as the copy's own once the copy
   is opened. So do not let anything else create files under the
   destination's name while the copy runs.
 - **Reserved names.** `<destination>.copy-lock` and
-  `<destination>.copy-staging`, with the `-wal`, `-wal-shm` and `.lock` of
-  the latter, belong to the copy, and so, for a destination `app.db-wal`,
-  `app.db-wal-shm` or `app.db.lock`, does `app.db.copy-lock`: it creates
+  `<destination>.copy-staging`, with the `-wal`, `-wal-shm`, `.lock` and
+  `-journal` of the latter, belong to the copy, and so, for a destination
+  `app.db-wal`, `app.db-wal-shm`, `app.db.lock` or `app.db-journal`, does
+  `app.db.copy-lock`: it creates
   them, and removes whatever it finds there. Staging files a killed copy
   left are removed by the next copy to that destination, under its lock.
   Keep nothing of your own under these names; a destination that ends in one
@@ -136,17 +137,18 @@ every collection, document and index of `db`:
   checked against the source's snapshot: its options, its document count
   and its index definitions. Then `IntegrityCheck` runs on the copy. A
   mismatch fails the call.
-- **Returned closed.** The copy has no `-wal` or `-wal-shm` file beside it.
+- **Returned closed.** The copy has no `-wal`, `-wal-shm` or `-journal`
+  file beside it.
   `report` gives the number of collections, documents and indexes copied,
   and how long the call took.
 - **The source's files are never renamed or removed.** A source whose
-  database file, or its `-wal`, `-wal-shm` or `.lock`, is under one of the
+  database file, or its `-wal`, `-wal-shm`, `.lock` or `-journal`, is under one of the
   destination's reserved names (`app.db.copy-staging` copied to `app.db`)
   is refused before anything is created or removed, on every platform: the
   copy would take it for a killed copy's staging file. The files are
   compared by identity: what each reserved name names, with the files the
   source has open (its database file, its log, and its `-wal-shm` where
-  that is a file) and with its `.lock`. So every spelling of the
+  that is a file) and with its `.lock` and `-journal`. So every spelling of the
   destination is refused: a relative path, one through a symbolic link,
   one in another case on a case-insensitive filesystem. So is a source
   opened under a path that names another file than the one it opened: a

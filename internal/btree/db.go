@@ -291,6 +291,9 @@ func buildCodec(opts Options, salt []byte, useCksum bool) (Codec, error) {
 		if len(opts.Key) == KeyLen {
 			raw = opts.Key
 		} else {
+			if h := testDeriveKeyHook; h != nil {
+				h()
+			}
 			raw = DeriveKey(opts.Key, salt, opts.KDFIterations)
 		}
 		return newCodecFromType(opts.CipherType, raw)
@@ -300,6 +303,10 @@ func buildCodec(opts Options, salt []byte, useCksum bool) (Codec, error) {
 	}
 	return nil, nil
 }
+
+// testDeriveKeyHook, when non-nil, runs inside buildCodec each time it
+// derives a key from a passphrase. Test-only.
+var testDeriveKeyHook func()
 
 // readInitialHeader opens the file at path and reads the database header.
 // Returns ErrNotExist if the file doesn't exist (distinguished by callers).
@@ -617,10 +624,16 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 
+	// The database's full name, resolved once (sqlite3OsFullPathname,
+	// pager.c:4792): the first look at the header below and the pager open
+	// the database by it.
 	// canonicalPath is the lexical absolute path, used for db.path.
 	var canonicalPath string
 	if !opts.InMemory {
 		var err error
+		if path, err = FullPathname(path); err != nil {
+			return nil, err
+		}
 		canonicalPath, err = filepath.Abs(path)
 		if err != nil {
 			return nil, fmt.Errorf("btree: cannot resolve path: %w", err)
@@ -640,22 +653,33 @@ func Open(path string, opts Options) (*DB, error) {
 	p.mmapSize = opts.MmapSize
 
 	// BEGIN ENCRYPTION
-	// Build and install codec before p.open(). For an existing file we read
-	// the header first to discover the salt; for a new file we generate a
-	// fresh salt. InMemory databases skip encryption entirely (encryption.md §7).
+	// The codec goes with the file's header: a passphrase key is derived
+	// from the header's salt, and the checksum mode is read from it. For an
+	// existing file the header is read to discover them; for a new file a
+	// fresh salt is drawn. InMemory databases skip encryption entirely
+	// (encryption.md §7).
 	//
 	// The encryption marker on disk is a non-zero Salt field (bytes 72-87
 	// of page 1). ReservedSpace alone is NOT the marker, because the same
 	// byte is used by SQLite-compat tests that exercise reserve-related
 	// code paths on plaintext databases.
 	//
-	// Note: there is a TOCTOU window between readInitialHeader (which
-	// opens/reads/closes the file) and p.open() (which reopens and locks).
-	// An external process swapping the file in that window would surface
-	// as a decrypt error on the first page read — not silent corruption.
-	// The openDBs registration in p.open() refuses a same-process double-open.
-	// A future hardening could hold a shared lock across readInitialHeader
-	// and p.open().
+	// The codec is settled twice. Here, before p.open() and with no lock,
+	// from a first look at the file: a key option that cannot make a codec
+	// for a new file is refused before anything is created, and a key
+	// derivation is usually done before any lock is held. Then by p.open(),
+	// with the DB-file lock held, on the header it read under that lock;
+	// a file with content whose header is unreadable, or that the options
+	// do not fit, is refused there, before the WAL is opened.
+	// The second call does nothing while the file carries the salt the
+	// codec was built for: in every open of a database that already
+	// existed, and in an open that created the database, whose page 1
+	// carries the salt drawn for it. So an open derives a passphrase key
+	// once, as SQLCipher derives a codec context's key once, at its first
+	// use (sqlcipher_codec_key_derive, sqlcipher.c:1849-1880, v4.14.0).
+	// Between the two calls another process may create the database, or
+	// win its creation from this open; the second call then builds the
+	// codec again, from the salt that is in the file.
 	wantEncryption := opts.Key != nil || opts.Codec != nil
 	var zeroSalt [SaltLen]byte
 	// Resolve effective codec mode. Encryption is opt-in (errors if it
@@ -663,45 +687,77 @@ func Open(path string, opts Options) (*DB, error) {
 	// ReservedSpace marker on existing DBs and honored from Options.Checksum
 	// on new DBs — file state is authoritative on reopen, so users can't
 	// accidentally upgrade or downgrade a live database via config drift.
-	useCksum := false
 	if !opts.InMemory {
-		existingHeader, herr := readInitialHeader(path)
-		fileExists := herr == nil
-		if herr != nil && !errors.Is(herr, os.ErrNotExist) && !errors.Is(herr, errEmptyFile) {
-			return nil, fmt.Errorf("btree: read header: %w", herr)
+		// What the installed codec was built for.
+		var settled struct {
+			done   bool
+			exists bool
+			salt   [SaltLen]byte
+			cksum  bool
 		}
-		if fileExists {
-			fileEncrypted := existingHeader.Salt != zeroSalt
-			// Checksum-mode marker: zero salt + ReservedSpace == cksumOverhead (16).
-			// Any other non-zero ReservedSpace is left to higher-level
-			// integrity validation (e.g. tests synthesizing off-page cells).
-			fileCksum := !fileEncrypted && existingHeader.ReservedSpace == cksumOverhead
-			switch {
-			case fileEncrypted && !wantEncryption:
-				return nil, fmt.Errorf("btree: database file is encrypted, Options.Key or Options.Codec required")
-			case !fileEncrypted && wantEncryption:
-				return nil, fmt.Errorf("btree: database file is not encrypted, remove Options.Key/Codec")
-			}
-			useCksum = fileCksum
-		} else {
-			useCksum = opts.Checksum
-		}
-		wantCodec := wantEncryption || useCksum
-		if wantCodec {
-			var salt [SaltLen]byte
+		p.settleCodec = func(hdr *dbHeader) error {
+			fileExists := hdr != nil
+			useCksum := opts.Checksum
 			if fileExists {
-				salt = existingHeader.Salt
-			} else if wantEncryption {
-				if _, err := rand.Read(salt[:]); err != nil {
-					return nil, fmt.Errorf("btree: generate salt: %w", err)
+				fileEncrypted := hdr.Salt != zeroSalt
+				// Checksum-mode marker: zero salt + ReservedSpace == cksumOverhead (16).
+				// Any other non-zero ReservedSpace is left to higher-level
+				// integrity validation (e.g. tests synthesizing off-page cells).
+				fileCksum := !fileEncrypted && hdr.ReservedSpace == cksumOverhead
+				switch {
+				case fileEncrypted && !wantEncryption:
+					return fmt.Errorf("btree: database file is encrypted, Options.Key or Options.Codec required")
+				case !fileEncrypted && wantEncryption:
+					return fmt.Errorf("btree: database file is not encrypted, remove Options.Key/Codec")
+				}
+				useCksum = fileCksum
+			}
+			// The codec stays while it was built for the salt the file
+			// carries: the salt in the header of a database, or, for a file
+			// with no database yet, a salt drawn for a new file. A database
+			// this open created carries the salt drawn for it.
+			if settled.done && settled.cksum == useCksum &&
+				(fileExists && settled.salt == hdr.Salt || !fileExists && !settled.exists) {
+				return nil
+			}
+			var salt [SaltLen]byte
+			var codec Codec
+			if wantEncryption || useCksum {
+				if fileExists {
+					salt = hdr.Salt
+				} else if wantEncryption {
+					if _, err := rand.Read(salt[:]); err != nil {
+						return fmt.Errorf("btree: generate salt: %w", err)
+					}
+				}
+				var cerr error
+				codec, cerr = buildCodec(opts, salt[:], useCksum)
+				if cerr != nil {
+					return cerr
 				}
 			}
-			codec, cerr := buildCodec(opts, salt[:], useCksum)
-			if cerr != nil {
-				return nil, cerr
+			p.setCodec(codec, salt, opts.OnIntegrityError)
+			settled.done, settled.exists, settled.salt, settled.cksum = true, fileExists, salt, useCksum
+			return nil
+		}
+		// A file with content is not judged by this look. Whatever it
+		// finds (a header the options refuse, one that does not parse, a
+		// file that ends before its header) can be gone by the time
+		// p.open() holds the DB-file lock: another process may roll a dead
+		// creator's page 1 back and create the database in between. So
+		// this look only builds a codec when it can, and p.open() settles
+		// it on the header it reads under the lock and returns that read's
+		// errors, as sqlite3PagerSharedLock reads the header only once it
+		// holds SHARED (pager.c:5272-5282). The options of a new file are
+		// checked here, before anything is created.
+		existingHeader, herr := readInitialHeader(path)
+		switch {
+		case herr == nil:
+			_ = p.settleCodec(&existingHeader)
+		case errors.Is(herr, os.ErrNotExist) || errors.Is(herr, errEmptyFile):
+			if err := p.settleCodec(nil); err != nil {
+				return nil, err
 			}
-			p.keySalt = salt
-			p.installCodec(codec, opts.OnIntegrityError)
 		}
 	} else if opts.InMemory && (wantEncryption || opts.Checksum) {
 		// InMemory: build codec from zero salt; no on-disk marker.
@@ -781,8 +837,25 @@ func Open(path string, opts Options) (*DB, error) {
 
 // Close closes the database.
 func (db *DB) Close() error {
+	_, err := db.CloseCheckpointed(nil)
+	return err
+}
+
+// CloseCheckpointed closes the database and reports whether the close
+// checkpointed the whole log into the database file as the last client: it
+// held the exclusive DB-file lock, so no other process was attached, and its
+// checkpoint completed (the branch of sqlite3WalClose that sets isDelete,
+// wal.c:2522-2540). It reports false for a close that left the log to the
+// processes still attached, for a database file that was moved, and for a
+// checkpoint that failed: commits may then exist only in the log. An
+// in-memory database has no database file and reports false.
+//
+// When the close checkpointed, onCheckpointed (if not nil) runs after the
+// checkpoint, while the close still holds the exclusive DB-file lock: no
+// other process can attach, and so none can commit, until it has returned.
+func (db *DB) CloseCheckpointed(onCheckpointed func()) (checkpointed bool, err error) {
 	if !db.closed.CompareAndSwap(false, true) {
-		return ErrClosed
+		return false, ErrClosed
 	}
 	db.closing.Store(true)
 	db.closeOnce.Do(func() { close(db.closeCh) })
@@ -834,7 +907,9 @@ func (db *DB) Close() error {
 		}
 	}
 drained:
-	return db.pager.close()
+	db.pager.onCloseCheckpointed = onCheckpointed
+	err = db.pager.close()
+	return db.pager.closeCheckpointed, err
 }
 
 // SetClosing marks the database as closing, causing new transactions to fail.
@@ -859,10 +934,9 @@ func (db *DB) Path() string {
 // OpenFiles is what DB.OpenFiles reports: the files a database has open,
 // identified by their descriptors, and the spelling they were opened by.
 type OpenFiles struct {
-	// Path is the database's path as Open was given it, neither made
-	// absolute nor cleaned: the spelling the database file and the files
-	// beside it (Path+"-wal", Path+"-wal-shm") were opened by, which the
-	// system resolves as it did then. Path() is its lexically cleaned
+	// Path is the database's full name (FullPathname), not cleaned: the
+	// spelling the database file and the files beside it (Path+"-wal",
+	// Path+"-wal-shm") were opened by. Path() is its lexically cleaned
 	// absolute form, which names another file when a ".." in it follows a
 	// symbolic link to a directory: the system resolves the link first.
 	Path string
@@ -1368,6 +1442,12 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	if !errors.Is(err, ErrNamespaceNotFound) {
 		return err
 	}
+	// The master-table record is the name and the 4-byte root page number.
+	// Put would refuse one over the record size limit; refuse it before the
+	// root page is allocated.
+	if err = recordSizeErr(len(name), 4); err != nil {
+		return err
+	}
 
 	// Allocate a new page for the namespace's B-tree root
 	rootPg, err := db.pager.allocatePage()
@@ -1461,6 +1541,12 @@ func (db *DB) RenameNamespace(tx *WriteTx, oldName, newName string) error {
 		return ErrNamespaceExists
 	}
 	if !errors.Is(err, ErrNamespaceNotFound) {
+		return err
+	}
+
+	// The Put below would refuse a name over the record size limit; refuse
+	// it before the old name is deleted.
+	if err = recordSizeErr(len(newName), 4); err != nil {
 		return err
 	}
 
@@ -1673,6 +1759,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 
 	usableSize := bt.usablePageSize()
 	lim := bt.leafLimits()
+	depth := 0 // child pointers followed: see btCursorMaxDepth
 	for {
 		if pg.header.isLeaf() {
 			idx, found, serr := searchLeafWithOverflow(pg, nameKey, lim, bt.pager, bt.walMaxFrame, bt.cache)
@@ -1721,6 +1808,10 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 			return nil, serr
 		}
 		bt.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return nil, ErrCorrupt
+		}
+		depth++
 		pg, err = bt.descendChild(childPgno)
 		if err != nil {
 			return nil, err
@@ -1860,6 +1951,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 	// Search without starting a new read tx (we're already in one)
 	usableSize := tx.pager.usableSize()
 	lim := tx.pager.leafLimits()
+	depth := 0 // child pointers followed: see btCursorMaxDepth
 	for {
 		if pg.header.isLeaf() {
 			idx, found, serr := searchLeafWithOverflow(pg, key, lim, tx.pager, tx.walHdr.mxFrame, tx.cache)
@@ -1900,6 +1992,10 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				valOverflow := int(valLen) - localValBytes
 
 				// Grow buf to hold the full value — no intermediate allocations.
+				if !payloadInFile(tx.pager, tx.cache, totalPayload) {
+					tx.pager.releasePage(pg)
+					return buf, ErrCorrupt
+				}
 				start := len(buf)
 				buf = slices.Grow(buf, int(valLen))[:start+int(valLen)]
 				fullVal := buf[start:]
@@ -1934,6 +2030,10 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 			return buf, serr
 		}
 		tx.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return buf, ErrCorrupt
+		}
+		depth++
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return buf, err
@@ -1964,6 +2064,7 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 
 	usableSize := tx.pager.usableSize()
 	lim := tx.pager.leafLimits()
+	depth := 0 // child pointers followed: see btCursorMaxDepth
 	for {
 		if pg.header.isLeaf() {
 			_, found, serr := searchLeafWithOverflow(
@@ -1983,6 +2084,10 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 			return false, serr
 		}
 		tx.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return false, ErrCorrupt
+		}
+		depth++
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return false, err
@@ -2019,8 +2124,12 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 	// page number and cell index. If the leaf search overshoots (idx >= n),
 	// we re-read this interior page and descend into the next sibling subtree
 	// to find its leftmost key — no cursor allocation needed.
+	// depth counts the child pointers followed (see btCursorMaxDepth);
+	// fallbackDepth is its value on the saved page, where the walk into the
+	// next subtree resumes — the cursor's pop back to that ancestor.
 	var fallbackPgno uint32
 	var fallbackIdx int
+	var depth, fallbackDepth int
 
 	for {
 		if pg.header.isLeaf() {
@@ -2039,29 +2148,17 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 				}
 				// Non-rightmost leaf: navigate to the leftmost key of
 				// the next sibling subtree (saved during descent).
-				return tx.leftmostKeyAfter(fallbackPgno, fallbackIdx, buf)
+				return tx.leftmostKeyAfter(fallbackPgno, fallbackIdx, buf, fallbackDepth)
 			}
-			off := pg.getCellOffset(idx)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
-			if cerr != nil {
-				tx.pager.releasePage(pg)
-				return buf, cerr
+			// A read of the key bounds the key only (leafFullKey), as
+			// Cursor.Key does. leafFullKey returns a slice into pg.data
+			// when the key is local: copy before the release.
+			key, kerr := leafFullKey(pg.data, int(pg.getCellOffset(idx)), lim, tx.pager, tx.walHdr.mxFrame, cache)
+			if kerr == nil {
+				buf = append(buf, key...)
 			}
-			if cell.overflowPg != 0 {
-				// leafFullKey returns a slice into pg.data when the key is
-				// local: copy before the release.
-				fullKey, kerr := leafFullKey(pg.data, int(off), lim, tx.pager, tx.walHdr.mxFrame, cache)
-				if kerr != nil {
-					tx.pager.releasePage(pg)
-					return buf, kerr
-				}
-				buf = append(buf, fullKey...)
-				tx.pager.releasePage(pg)
-				return buf, nil
-			}
-			buf = append(buf, cell.key...)
 			tx.pager.releasePage(pg)
-			return buf, nil
+			return buf, kerr
 		}
 		childPgno, cellIdx, serr := searchInteriorWithOverflow(pg, prefix, usableSize, tx.pager, tx.walHdr.mxFrame, cache)
 		if serr != nil {
@@ -2073,8 +2170,13 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 			rightmost = false
 			fallbackPgno = pg.pgno
 			fallbackIdx = cellIdx
+			fallbackDepth = depth
 		}
 		tx.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return buf, ErrCorrupt
+		}
+		depth++
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return buf, err
@@ -2085,8 +2187,11 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 // leftmostKeyAfter navigates to the first key in the subtree immediately
 // following cell[cellIdx].leftChild on interior page interiorPgno.
 // Used when a leaf search overshoots and needs the next sibling's first key.
+// depth is the number of child pointers the caller followed from the root to
+// reach interiorPgno; the walk below it counts on from there, so the whole
+// chain is held to btCursorMaxDepth.
 // DRIFT: descent omits moveToChild's per-child nCell>=1 corruption guard See docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-
-func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte) ([]byte, error) {
+func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte, depth int) ([]byte, error) {
 	pg, err := tx.txGetPage(interiorPgno)
 	if err != nil {
 		return buf, err
@@ -2114,6 +2219,10 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 	// Descend to the leftmost key of this subtree.
 	lim := tx.pager.leafLimits()
 	cache := tx.cache // nil for writers, per-connection pcache for readers
+	if depth >= btCursorMaxDepth-1 {
+		return buf, ErrCorrupt
+	}
+	depth++
 	pg, err = tx.txDescendChild(nextPgno)
 	if err != nil {
 		return buf, err
@@ -2124,27 +2233,13 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 				tx.pager.releasePage(pg)
 				return buf, ErrKeyNotFound
 			}
-			off := pg.getCellOffset(0)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
-			if cerr != nil {
-				tx.pager.releasePage(pg)
-				return buf, cerr
+			// The key alone is read and bounded, as in AppendSeekKey.
+			key, kerr := leafFullKey(pg.data, int(pg.getCellOffset(0)), lim, tx.pager, tx.walHdr.mxFrame, cache)
+			if kerr == nil {
+				buf = append(buf, key...)
 			}
-			if cell.overflowPg != 0 {
-				// leafFullKey returns a slice into pg.data when the key is
-				// local: copy before the release.
-				fullKey, kerr := leafFullKey(pg.data, int(off), lim, tx.pager, tx.walHdr.mxFrame, cache)
-				if kerr != nil {
-					tx.pager.releasePage(pg)
-					return buf, kerr
-				}
-				buf = append(buf, fullKey...)
-				tx.pager.releasePage(pg)
-				return buf, nil
-			}
-			buf = append(buf, cell.key...)
 			tx.pager.releasePage(pg)
-			return buf, nil
+			return buf, kerr
 		}
 		// Interior page: descend to cell[0].leftChild.
 		off, oerr := pg.getCellOffsetSafe(0)
@@ -2158,6 +2253,10 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 		}
 		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
 		tx.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return buf, ErrCorrupt
+		}
+		depth++
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return buf, err

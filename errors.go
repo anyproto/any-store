@@ -71,6 +71,16 @@ var (
 	// under the stale name returns.
 	ErrCollectionClosed = fmt.Errorf("any-store: collection handle is closed (dropped, renamed, or closed): %w", ErrCollectionNotFound)
 
+	// ErrCollectionClosedDuringOpen is returned by OpenCollection and
+	// Collection when the collection was there at each of their attempts,
+	// but the handle each attempt found was closed before it could be
+	// returned, as by a Close() of it in another goroutine: an open returns
+	// the handle the collection has, the same one to every caller. It does
+	// not match ErrCollectionNotFound or ErrCollectionClosed, and Collection
+	// has created nothing. Open again: the open finds the handle the
+	// collection has then, or returns ErrCollectionNotFound if it is gone.
+	ErrCollectionClosedDuringOpen = errors.New("any-store: collection handle closed during the open; open again")
+
 	// ErrInvalidIndexName is returned when an index name (given or derived from
 	// the field list) exceeds the maximum length (see validateIndexName).
 	ErrInvalidIndexName = errors.New("any-store: invalid index name")
@@ -172,11 +182,12 @@ var (
 
 	// ErrDestinationExists is returned (possibly wrapped) by
 	// CopyToLatestFormat when a file is at the destination path, or at one
-	// of the paths a database keeps beside it: path+"-wal", path+"-wal-shm"
-	// and the sentinel path+".lock"; or when the destination is one of
-	// those paths of a file that exists. The call replaces nothing: a file
-	// that was there is left as it was. One found before the call takes its
-	// copy locks refuses it before it creates anything.
+	// of the paths a database keeps beside it: path+"-wal", path+"-wal-shm",
+	// the sentinel path+".lock" and the creation journal path+"-journal";
+	// or when the destination is one of those paths of a file that exists.
+	// The call replaces nothing: a file that was there is left as it was.
+	// One found before the call takes its copy locks refuses it before it
+	// creates anything.
 	// The check is made again under the locks and right before the copy is
 	// published, and a file that appeared by then refuses the call after it
 	// created its lock files, or built the copy under its staging name, and
@@ -232,6 +243,33 @@ var (
 	// ErrWALCorrupt is returned (wrapped) when the write-ahead log index points at a frame the
 	// file does not hold. Recovery itself repairs a bad WAL header and drops torn frames silently.
 	ErrWALCorrupt = btree.ErrWALCorrupt
+
+	// ErrValueTooLarge is returned (wrapped) by a write of a record over the record size limit:
+	// a stored key and its value together may take 1 GiB (1<<30 bytes). The limit applies to each
+	// key/value pair a write stores, not to the document as a whole:
+	//
+	//   - the document itself: its encoded id as the key and its body as the value, the body
+	//     compressed unless compression is off or does not shrink it. A body whose plain
+	//     encoding is over 1 GiB is kept plain, so it is over the limit and refused;
+	//   - each range-index entry: the encoded indexed values followed by the id as the key, and
+	//     a one-byte value. A range-index key of exactly 1 GiB is therefore over the limit by
+	//     that byte and reported with this error, not with ErrKeyTooLarge;
+	//   - each record a full-text or vector index stores, its key and its value.
+	//
+	// Nothing of the record is written, and the operation is rolled back like after any other
+	// failed write. Without the limit the record would be stored and every later read of it
+	// would report ErrCorrupt.
+	//
+	// ErrKeyTooLarge is a separate error, not a kind of this one: a caller that handles records
+	// over the limit checks for both.
+	ErrValueTooLarge = btree.ErrValueTooLarge
+
+	// ErrKeyTooLarge is returned (wrapped) by a write of a record whose key alone is over 1 GiB:
+	// a document's encoded id, or an index entry's key. Which of the two errors an oversized
+	// document gets depends on the pair that fails first: an update that grows an indexed field
+	// past the limit writes the index entry before the document and returns this error even when
+	// the id is short. It does not match ErrValueTooLarge; see there.
+	ErrKeyTooLarge = btree.ErrKeyTooLarge
 
 	// ErrPageBufferNotInitialized is returned when UseGlobalPageBuffer is set
 	// but InitPageBuffer was not called before opening the database.

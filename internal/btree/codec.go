@@ -243,7 +243,7 @@ const noncePoolSize = 4096
 // NOT safe for concurrent use, and it takes no lock: each pool belongs to
 // one aeadScratch, whose owner encrypts from one goroutine at a time. The
 // WAL's frame writer draws under the database's write lock; the pager's
-// only draw is initNewDB's page-1 encrypt, inside Open, which has the pager
+// only draw is createPage1's page-1 encrypt, inside Open, which has the pager
 // to itself then. A pool must never be reachable from a codec, which is
 // shared (see aeadScratch).
 type noncePool struct {

@@ -12,8 +12,8 @@ import (
 // On Windows, mmap-backed WAL-index SHM is unavailable, so any-store forces
 // InProcess=true for file-backed databases (db.go via hasMmapShm=false). The
 // multi-process SHARED-lock protocol is therefore never exercised on Windows:
-// acquireSharedDBLock / tryUpgradeDBLockExclusive / downgradeDBLockToShared are
-// no-op stubs that must compile but never run.
+// acquireSharedDBLock / tryUpgradeDBLockExclusive / downgradeDBLockToShared /
+// unlockDBFile are no-op stubs that must compile but never run.
 //
 // acquireExclusiveDBLock IS used: in-process mode is single-process only (heap
 // SHM is process-local), so on open it takes a non-blocking, whole-file
@@ -25,6 +25,7 @@ import (
 func acquireSharedDBLock(_ fileHandle) error               { return nil }
 func tryUpgradeDBLockExclusive(_ fileHandle) (bool, error) { return true, nil }
 func downgradeDBLockToShared(_ fileHandle) error           { return nil }
+func unlockDBFile(_ fileHandle) error                      { return nil }
 
 func acquireExclusiveDBLock(fd fileHandle) error {
 	if fd == nil {

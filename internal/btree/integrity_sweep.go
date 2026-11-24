@@ -41,10 +41,12 @@ type SweepResult struct {
 	Errors []SweepError
 }
 
-// IntegrityMode returns the codec mode currently installed on the DB.
-// Plain DBs (no codec) report IntegrityNone.
+// IntegrityMode returns the integrity mode of the pages the DB stores.
+// Plain DBs (no codec) report IntegrityNone, and so does every in-memory
+// DB: its store and its WAL hold pages as the b-tree wrote them, past any
+// codec the options named (wal.writeFramesMem), so no page carries a tag.
 func (db *DB) IntegrityMode() IntegrityMode {
-	if db.pager.codec == nil {
+	if db.pager.codec == nil || db.pager.inMemory {
 		return IntegrityNone
 	}
 	if _, ok := db.pager.codec.(*cksumCodec); ok {
@@ -53,9 +55,9 @@ func (db *DB) IntegrityMode() IntegrityMode {
 	return IntegrityAEAD
 }
 
-// CksumCodec returns the active *cksumCodec if one is installed, else nil.
-// Used by anystore wrappers to expose the runtime PRAGMA-equivalent toggle
-// (SetVerifyOnRead). No-op for AEAD codecs.
+// CksumCodec returns the active *cksumCodec if one is installed, else nil
+// (plain and AEAD databases). The anystore wrapper turns verify-on-read off
+// through it for Config.ContinueOnIntegrityError.
 func (db *DB) CksumCodec() *cksumCodec {
 	if c, ok := db.pager.codec.(*cksumCodec); ok {
 		return c
@@ -63,33 +65,57 @@ func (db *DB) CksumCodec() *cksumCodec {
 	return nil
 }
 
-// VerifyIntegrity walks every page in the database (1..DatabaseSize) and
-// verifies the per-page integrity tag. For checksum-mode DBs this re-hashes
-// the trailer and compares it; for AEAD-mode DBs it attempts a decrypt
-// (the AEAD tag IS the integrity tag).
+// VerifyIntegrity walks every page of the snapshot its read transaction
+// holds (1..ReadTx.DatabaseSize) and verifies the per-page integrity tag.
+// For checksum-mode DBs this re-hashes the trailer and compares it; for
+// AEAD-mode DBs it attempts a decrypt (the AEAD tag IS the integrity tag).
 //
 // Read-only operation that opens its own internal read transaction.
-// Mismatches are collected into Result.Errors; non-integrity errors
-// (file I/O, cancelled context) are returned as the function's error.
+// Mismatches are collected into Result.Errors, and so is a page that cannot
+// be read (Kind IntegrityKindUnknown, the read's error in Inner); the sweep
+// goes on to the next page. Where the snapshot's WAL commit recorded the
+// page count (sweepPageCount), page 1 is also listed, Kind
+// IntegrityKindUnknown, when its header is not valid or counts differently.
+// Inner is then the header's own error: ErrHeaderCorrupt, or ErrNewerFormat,
+// ErrOldFormat or ErrSQLiteFormat for a header of another format. A page 1
+// that cannot be read whole is listed with the read's error instead, the
+// error lockBtree returns before it looks at the header (btree.c:3288-3289);
+// its header, read alone, is listed as well, with ErrHeaderCorrupt, only
+// when it counts fewer pages than the commit.
 //
-// On checksum DBs the sweep temporarily clears the verify-on-read flag so
-// the read path doesn't abort on the first mismatch — the original flag
-// is restored on return. On AEAD DBs there is no toggle (disabling AEAD
-// verification would be a vulnerability); per-page Decrypt errors are
-// caught and routed into the result instead of bubbling up.
+// The function's error is a read transaction that cannot begin, a cancelled
+// context, and, when no WAL commit gives the page count, a page-1 header
+// that cannot be read or is not valid. A read begin at a snapshot whose
+// page-1 counters it does not hold yet reads them, so a page-1 header that
+// cannot be read is then the function's error and there is no report. At a
+// snapshot whose counters it holds, the read begins, and the sweep lists
+// page 1 and goes on only when a WAL commit of the snapshot gives the page
+// count; without one, the header that cannot be read is the function's
+// error, as above. A sqlite_dbpage scan cannot begin in the first case
+// either: every transaction begins by reading page 1 (btree.c:3288-3289),
+// and the pager cache keeps it only while the snapshot is unchanged
+// (pager.c:3261-3264).
 //
-// Returns IntegrityNone with zero pages scanned for plain DBs.
+// The sweep reads every page raw, with its own read (readRawPage), and its
+// read begin reads only page 1's header, which is outside the codec. A
+// checksum page it hashes itself, never through the codec; an AEAD page it
+// hands to the codec's Decrypt, which is the only way to check the tag. It
+// changes nothing in how the handle's other transactions read: the
+// checksum codec's verify-on-read flag (cksumCodec.SetVerify, the handle's
+// one switch, shared by the writer and every reader) is left as it is
+// configured, on by default and off in a handle opened to read past damage.
+//
+// The database's integrity hook (Options.OnIntegrityError) fires once for
+// each page whose tag fails: for a checksum page the sweep fires it, for an
+// AEAD page Decrypt does. A page that could not be read fires nothing.
+//
+// Returns IntegrityNone with zero pages scanned for plain DBs and for
+// in-memory DBs, whose pages are stored without a codec.
 func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 	mode := db.IntegrityMode()
 	res := SweepResult{Mode: mode}
 	if mode == IntegrityNone {
 		return res, nil
-	}
-
-	if c := db.CksumCodec(); c != nil {
-		prev := c.VerifyOn()
-		c.SetVerify(false)
-		defer c.SetVerify(prev)
 	}
 
 	tx, err := db.BeginReadContext(ctx)
@@ -98,41 +124,144 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 	}
 	defer tx.Rollback()
 
-	total := db.pager.header.DatabaseSize
+	if err := ctx.Err(); err != nil {
+		return res, err
+	}
+	total, raw1, page1Errs, err := db.sweepPageCount(tx)
+	if err != nil {
+		return res, err
+	}
+	res.Errors = page1Errs
+
+	// A 64-bit counter: the largest page count is the largest uint32, and a
+	// uint32 counter would wrap to 0 below it and never end the loop.
 	maxFrame := tx.walMaxFrame
-	for pgno := uint32(1); pgno <= total; pgno++ {
+	for i := uint64(1); i <= uint64(total); i++ {
+		pgno := uint32(i)
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
-		switch mode {
-		case IntegrityChecksum:
-			if e := verifyCksumPage(db.pager, pgno, maxFrame); e != nil {
-				// Fire the database's integrity hook (the pager's, which its
-				// reads pass to the codec; the codec keeps none) so
-				// subscribers see sweep mismatches the same way they see
-				// read-path mismatches.
-				db.pager.onIntegrityError.fire(pgno, errCksumMismatch)
-				res.Errors = append(res.Errors, *e)
-			}
-		case IntegrityAEAD:
-			if e := verifyAEADPage(db.pager, pgno, maxFrame); e != nil {
-				res.Errors = append(res.Errors, *e)
+		res.Pages++
+		// Page 1 was read for the count; a read that failed is listed.
+		raw := raw1
+		if pgno != 1 {
+			if raw, err = db.pager.readRawPage(pgno, maxFrame, tx.cache); err != nil {
+				res.Errors = append(res.Errors, SweepError{PageNo: pgno, Inner: err})
 			}
 		}
-		res.Pages++
+		var e *SweepError
+		switch {
+		case raw == nil:
+		case mode == IntegrityChecksum:
+			e = verifyCksumPage(pgno, raw)
+		case mode == IntegrityAEAD:
+			e = verifyAEADPage(db.pager.codec, pgno, raw, db.pager.onIntegrityError)
+		}
+		if e != nil {
+			res.Errors = append(res.Errors, *e)
+		}
+		if e != nil && e.Kind == IntegrityChecksumMismatch {
+			// Fire the database's integrity hook (OnIntegrityError: the
+			// pager's, which its reads pass to the codec; the codec keeps
+			// none) so subscribers see sweep mismatches the same way they
+			// see read-path mismatches. Only for a checksum that was
+			// compared and differed, as cksumvfs compares only after a read
+			// that succeeded (cksmRead): a page that could not be read is
+			// listed and notifies nobody. The AEAD codecs fire the hook
+			// themselves, from Decrypt.
+			db.pager.onIntegrityError.fire(pgno, errCksumMismatch)
+		}
 	}
 	return res, nil
 }
 
-// verifyCksumPage reads pgno's raw on-disk bytes and re-hashes the body to
-// compare against the trailer. Mirrors the codec's Encrypt/Decrypt range:
+// sweepPageCount returns the number of pages VerifyIntegrity sweeps under
+// tx, page 1's raw bytes (nil when the page could not be read) and the
+// errors found on the way, all of page 1.
+//
+// The sweep covers the pages of the snapshot it reads, by the rule a read
+// transaction counts them (ReadTx.DatabaseSize, lockBtree's): page 1's size
+// checked against the pager's count for this snapshot. The pager's in-memory
+// header is the writer's, refreshed only at open, at a write begin and by a
+// commit: it lags a peer process's growth and runs ahead of every snapshot
+// while a commit is under way.
+//
+// Page 1 is read raw, as every page of the sweep is; its header is stored
+// outside the codec. Decoding the page would return a damaged page 1 as the
+// sweep's error instead of listing it. When the page cannot be read whole,
+// its header is read on its own, so that a fault past the header costs the
+// report page 1 and not every other page.
+//
+// Being outside the codec, the header's page count has no tag, and one
+// damaged downwards with the change counters intact is a well-formed header:
+// lockBtree accepts a size below the pager's count (btree.c:3294-3298,
+// 3401-3408), since a file may hold pages past the database's end. Where the
+// pager's count is the size a WAL commit of this snapshot recorded
+// (sqlite3WalDbsize, wal.c:3669-3674), it is a second count of the same
+// database, written by the commit that wrote page 1's (pager.commit keeps
+// the two equal). The sweep then covers the pages the commit recorded.
+// Page 1 is listed with the read's error when it cannot be read whole, and
+// otherwise with the header's own error when its header is not valid or
+// counts differently (ErrHeaderCorrupt, or deserialize's error for a header
+// of another format): the read is judged first, as lockBtree returns a
+// failed read of page 1 before it checks the header (btree.c:3288-3289).
+// A header read alone that counts fewer pages than the commit is listed as
+// well. Where the pager's count is the file's length, a smaller count in
+// page 1 stands, as it does for every reader, and a header that cannot be
+// read or gives no valid count is the sweep's error: there is then no count
+// to sweep to.
+// DRIFT: page 1 is read raw (its header alone when the page cannot be read whole) and, where a WAL commit recorded the snapshot's size, its count is checked against that size and page 1 listed when they differ; lockBtree reads page 1 through the pager and takes a smaller count as it stands. See docs/btree/NOTES.md#drift-2026-06-25-12-verifyintegrity-bounds-the-sweep-with-the-live-writer-header-pager-hea
+func (db *DB) sweepPageCount(tx *ReadTx) (total uint32, raw1 []byte, page1Errs []SweepError, err error) {
+	p := db.pager
+	bound := p.readerDbSizeBound(tx.cache)
+	// The size a WAL commit recorded, or 0. In every mode a snapshot's
+	// header carries a size only once a commit has recorded one, and a WAL
+	// reset keeps it, as in SQLite (effectiveReaderDbSize).
+	var commitN uint32
+	if n := tx.walHdr.nPage; n != 0 && n == bound {
+		commitN = n
+	}
+
+	var hdr [dbHeaderSize]byte
+	raw1, readErr := p.readRawPage(1, tx.walMaxFrame, tx.cache)
+	hdrErr := readErr
+	if readErr == nil {
+		copy(hdr[:], raw1)
+	} else {
+		raw1 = nil
+		page1Errs = append(page1Errs, SweepError{PageNo: 1, Inner: readErr})
+		hdrErr = p.readRawPage1Header(tx.walMaxFrame, tx.cache, hdr[:])
+	}
+	if hdrErr == nil {
+		var h dbHeader
+		if hdrErr = h.deserialize(hdr[:]); hdrErr == nil {
+			total, hdrErr = lockBtreePageCount(&h, bound)
+		}
+	}
+	switch {
+	case commitN == 0:
+		if hdrErr != nil {
+			return 0, nil, nil, hdrErr
+		}
+	case hdrErr != nil:
+		// An unreadable page 1 is listed already, with the read's error.
+		if readErr == nil {
+			page1Errs = append(page1Errs, SweepError{PageNo: 1, Inner: hdrErr})
+		}
+		total = commitN
+	case total != commitN:
+		page1Errs = append(page1Errs, SweepError{PageNo: 1, Inner: fmt.Errorf(
+			"%w: header DatabaseSize=%d, the WAL commit of the snapshot recorded %d pages", ErrHeaderCorrupt, total, commitN)})
+		total = commitN
+	}
+	return total, raw1, page1Errs, nil
+}
+
+// verifyCksumPage re-hashes the body of pgno's raw on-disk bytes and
+// compares it against the trailer. Mirrors the codec's Encrypt/Decrypt range:
 // pages 2+ hash [0..end-16], page 1 hashes [dbHeaderSize..end-16] because
 // encryptPageWithCodec preserves the page-1 plaintext prefix.
-func verifyCksumPage(p *pager, pgno, walMaxFrame uint32) *SweepError {
-	raw, err := p.readRawPage(pgno, walMaxFrame)
-	if err != nil {
-		return &SweepError{PageNo: pgno, Inner: err}
-	}
+func verifyCksumPage(pgno uint32, raw []byte) *SweepError {
 	start := 0
 	if pgno == 1 {
 		start = dbHeaderSize
@@ -154,14 +283,12 @@ func verifyCksumPage(p *pager, pgno, walMaxFrame uint32) *SweepError {
 // verifyAEADPage attempts a full decrypt of pgno's raw bytes through the
 // installed codec. AEAD's auth tag is the integrity check — a successful
 // Decrypt means the page is authentic. The plaintext output is discarded.
-func verifyAEADPage(p *pager, pgno, walMaxFrame uint32) *SweepError {
-	raw, err := p.readRawPage(pgno, walMaxFrame)
-	if err != nil {
-		return &SweepError{PageNo: pgno, Inner: err}
-	}
+// onError is the database's integrity hook, which Decrypt fires for a tag
+// that fails.
+func verifyAEADPage(codec Codec, pgno uint32, raw []byte, onError integrityHook) *SweepError {
 	var s aeadScratch
 	dst := make([]byte, len(raw))
-	if _, derr := decryptPageWithCodec(p.codec, dst, raw, pgno, &s, p.onIntegrityError); derr != nil {
+	if _, derr := decryptPageWithCodec(codec, dst, raw, pgno, &s, onError); derr != nil {
 		return &SweepError{PageNo: pgno, Kind: IntegrityAEADAuthFail, Inner: derr}
 	}
 	return nil

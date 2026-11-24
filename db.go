@@ -37,11 +37,18 @@ type DB interface {
 	// Returns the opened Collection or an error if the collection does not exist.
 	// Possible errors:
 	// - ErrCollectionNotFound: if the collection does not exist.
+	// - ErrCollectionClosedDuringOpen: the collection was there, but the
+	//   handle each attempt found was closed before it could be returned,
+	//   as by concurrent Close() calls. It does not match
+	//   ErrCollectionNotFound; open again.
 	OpenCollection(ctx context.Context, collectionName string) (Collection, error)
 
 	// Collection is a convenience method to get or create a collection.
 	// It first attempts to open the collection, and if it does not exist, it creates the collection.
 	// Returns the Collection or an error if there is an issue creating or opening the collection.
+	// Possible errors:
+	// - ErrCollectionClosedDuringOpen: as for OpenCollection; nothing was
+	//   created. Open again.
 	Collection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error)
 
 	// GetCollectionNames returns a list of all collection names in the database.
@@ -130,9 +137,10 @@ type DB interface {
 
 	// VerifyIntegrity walks every page and verifies its per-page integrity
 	// tag (XXH3-128 trailer for cksum mode, AEAD auth tag for encrypted mode).
-	// Plain DBs return IntegrityNone with zero pages scanned. Mismatches are
-	// returned in IntegrityReport.Errors; the function only errors on I/O or
-	// context cancellation. See IntegrityConfig.
+	// Plain and in-memory DBs return IntegrityNone with zero pages scanned.
+	// Mismatches and pages that cannot be read are returned in
+	// IntegrityReport.Errors; the function errors when the sweep cannot
+	// start, cannot establish the page count, or is cancelled.
 	VerifyIntegrity(ctx context.Context) (IntegrityReport, error)
 }
 
@@ -157,6 +165,12 @@ type DBStats struct {
 // Open opens a database at the specified path with the given configuration.
 // The config parameter can be nil for default settings.
 // Returns a DB instance or an error.
+//
+// The path is resolved to a full name once, when the database is opened
+// (btree.FullPathname), and the database file, its WAL and its sentinel file
+// are named from it. On Unix a relative path is joined to the working
+// directory, on Windows the name is GetFullPathNameW's, and on js/wasm and
+// wasip1 it is the path as given.
 func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	ds, err := open(ctx, path, config, 0)
 	if err != nil {
@@ -173,6 +187,16 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		config = &Config{}
 	}
 	config.setDefaults()
+
+	// One name for the database file, its WAL and its sentinel file, as
+	// SQLite resolves the name once and opens every file by it
+	// (pager.c:4792, pager.c:4929, pager.c:4948).
+	var err error
+	if !config.InMemory {
+		if path, err = btree.FullPathname(path); err != nil {
+			return nil, fmt.Errorf("cannot resolve the database path: %w", err)
+		}
+	}
 
 	sPool := syncpool.NewSyncPool(config.SyncPoolElementMaxSize)
 
@@ -239,7 +263,9 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		}
 	}
 
-	var err error
+	if testHookBeforeBtreeOpen != nil {
+		testHookBeforeBtreeOpen()
+	}
 	if ds.btreeDB, err = btree.Open(path, opts); err != nil {
 		if errors.Is(err, btree.ErrPageSlabNotInitialized) {
 			return nil, ErrPageBufferNotInitialized
@@ -305,7 +331,7 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		if ds.recoveryController != nil {
 			_ = ds.recoveryController.Stop()
 		}
-		_ = ds.btreeDB.Close()
+		_ = ds.closeBtree()
 		return nil, err
 	}
 
@@ -565,6 +591,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	tx.readTx = &btWtx.ReadTx
 	tx.writeTx = btWtx
 	tx.modified.Store(false)
+	tx.sketchTx = version
 	btWtx.SetAux(tx)
 
 	db.checkStale(&btWtx.ReadTx)
@@ -662,9 +689,9 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 // sketches it wrote itself (savepointTx.images).
 //
 // Only db.sketchDirty is visited, and this is where a collection leaves it:
-// once closed, or once none of its indexes is flagged. An index with no
-// committed bytes keeps its flag through the rebase and stays listed for the
-// next commit to persist.
+// once closed, or once none of its indexes is flagged. An index whose row
+// could not be read keeps its flag through the rebase, and the collection
+// stays listed.
 func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
 	kept := db.sketchDirty[:0]
 	gen := db.epoch.Load().gen
@@ -677,10 +704,13 @@ func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
 			c.mu.Lock()
 			for _, idx := range s.indexes {
 				if idx.sketchModified {
-					// reloadSketch (writable) rebases live to the committed bytes and
-					// clears sketchModified; if there are no committed bytes yet
-					// (brand-new pre-commit index) it preserves the built sketch.
-					c.reloadSketch(tx, s.name, idx, true)
+					// reloadLiveSketch rebases live to the committed bytes, or
+					// to an empty sketch if there are none, and clears
+					// sketchModified.
+					// A read that fails leaves the index flagged: the first
+					// use of the collection loads it again, and may fail the
+					// operation for it (refreshLiveSketches).
+					_ = c.reloadLiveSketch(tx, s.name, idx)
 					flagged = flagged || idx.sketchModified
 				}
 			}
@@ -804,25 +834,62 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 }
 
 func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collection, error) {
-	coll, err := db.openCollection(ctx, collectionName)
-	if err != nil {
-		return nil, err
+	for attempt := 0; ; attempt++ {
+		coll, err := db.openCollection(ctx, collectionName)
+		if err != nil {
+			return nil, err
+		}
+		if db.handOut(coll.(*collection)) {
+			return coll, nil
+		}
+		if attempt == handOutAttempts-1 {
+			return nil, ErrCollectionClosedDuringOpen
+		}
 	}
-	return db.handOut(coll), nil
 }
 
-// handOut returns coll to a caller that keeps it. That cancels a Close() an
-// uncommitted schema change deferred (see collection.closePending): the
-// handle has a user again. An open the library makes for itself, or one that
-// ends in an error, hands nothing out. The unlocked read may miss a Close()
-// racing with the open; that close then stands, as if it came second.
-func (db *db) handOut(coll Collection) Collection {
-	if c := coll.(*collection); c.closePending.Load() {
-		db.mu.Lock()
-		c.closePending.Store(false)
-		db.mu.Unlock()
+// handOutAttempts bounds the opens one call makes for a handle to hand out:
+// each one more needs another Close() to land between an open and its
+// hand-out. The same bound as openCollection has for a handle gone while it
+// was resolved. Out of attempts, the call returns
+// ErrCollectionClosedDuringOpen, the error of the race: the collection was
+// there each time, and the error must not match ErrCollectionNotFound,
+// which a caller takes for a collection that is missing.
+const handOutAttempts = 3
+
+// testHookBeforeHandOut, when set, runs between an open that found its
+// handle and the hand-out of it. Tests only.
+var testHookBeforeHandOut func(c *collection)
+
+// handOut gives c to a caller that keeps it, and reports false when c was
+// closed since the open found it: the caller opens again and gets the handle
+// the collection has now, never a closed one. Handing out cancels a Close()
+// the open write transaction deferred (see collection.closePending): the
+// handle has a user again. The check and the cancellation are one critical
+// section of db.mu, as the end of that transaction is (unpinLocked): either
+// the close is cancelled before the last pin goes, or it took effect and the
+// open is made again. An open the library makes for itself, or one that ends
+// in an error, hands nothing out.
+//
+// Without db.mu when there is nothing to cancel: no close is pending and
+// the handle is open. unpinLocked closes the handle before it clears the
+// pending close, so the two reads, in this order, cannot both miss a
+// deferred close that took effect. A Close() that arrives after them came
+// after the hand-out.
+func (db *db) handOut(c *collection) bool {
+	if testHookBeforeHandOut != nil {
+		testHookBeforeHandOut(c)
 	}
-	return coll
+	if !c.closePending.Load() && !c.closed.Load() {
+		return true
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if c.closed.Load() {
+		return false
+	}
+	c.closePending.Store(false)
+	return true
 }
 
 // registered returns the live handle the registry holds under name. The
@@ -852,9 +919,10 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 		}
 		// The registered handle was closed or retired while it was resolved
 		// for this caller: the name is free for the collection that has it
-		// now, if any.
+		// now, if any. Out of attempts, the error of the race, as out of
+		// hand-outs (handOutAttempts).
 		if attempt == 2 {
-			return nil, ErrCollectionNotFound
+			return nil, ErrCollectionClosedDuringOpen
 		}
 	}
 }
@@ -862,6 +930,18 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 // testHookBeforeRegister, when set, runs between the load of a new handle and
 // its registration. Tests only.
 var testHookBeforeRegister func(name string)
+
+// testHookRegistered, when set, runs right after a new handle entered the
+// registry, where any transaction can find it. Tests only.
+var testHookRegistered func(name string)
+
+// testHookFoundRegistered, when set, runs when an open found a handle in the
+// registry, before it resolves the handle. Tests only.
+var testHookFoundRegistered func(c *collection)
+
+// testHookBeforeBtreeOpen, when set, runs in open after the path is resolved
+// and the sentinel is set up, just before btree.Open. Tests only.
+var testHookBeforeBtreeOpen func()
 
 // errHandleGone tells openCollection that the handle it found registered is
 // not live any more.
@@ -885,6 +965,9 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 		return coll, err
 	}
 	if coll, ok := db.registered(collectionName); ok {
+		if testHookFoundRegistered != nil {
+			testHookFoundRegistered(coll.(*collection))
+		}
 		return coll, db.resolveOpened(ctx, coll.(*collection), collectionName)
 	}
 
@@ -927,12 +1010,40 @@ func (db *db) openCollectionOnce(ctx context.Context, collectionName string) (Co
 			}
 			db.forgetLocked(existing.(*collection))
 		}
+		// A write transaction that loaded the handle has its sketches from
+		// here on (newCollection stamped them as its own): it pins the
+		// handle in the same critical section that registers it, as its
+		// first use of a registered handle does (refreshLiveSketches). A
+		// Close() between the open and that use then waits for the
+		// transaction like any other, and an open by name inside it returns
+		// this handle.
+		wt, _ := tx.Aux().(*commonTx)
+		if !tx.IsWriteTx() {
+			wt = nil
+		}
+		if wt != nil {
+			c.pinned++
+		}
 		c.since = db.sinceNow()
+		// The version is settled before the handle can be found. The
+		// handle's sketch stamps speak for the index objects of this
+		// version (newCollection): were the handle registered first,
+		// another transaction could install a head it loaded at an older
+		// snapshot, and a write transaction that opened the handle would
+		// put its deltas on sketches it never loaded. Nothing else has
+		// the handle yet, so its lock is free under db.mu.
+		c.adopt(tx, schema)
 		db.openedCollections[collectionName] = c
+		c.regName = collectionName
 		db.byIdentity[c.identity] = c
 		db.mu.Unlock()
+		if wt != nil {
+			wt.schema.pin(c)
+		}
+		if testHookRegistered != nil {
+			testHookRegistered(collectionName)
+		}
 		opened = c
-		c.adopt(tx, schema)
 		return nil
 	})
 	if err != nil {
@@ -1022,11 +1133,18 @@ func (db *db) liveLocked(name string) (Collection, bool) {
 }
 
 func (db *db) Collection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error) {
-	coll, err := db.collection(ctx, collectionName, opts...)
-	if err != nil {
-		return nil, err
+	for attempt := 0; ; attempt++ {
+		coll, err := db.collection(ctx, collectionName, opts...)
+		if err != nil {
+			return nil, err
+		}
+		if db.handOut(coll.(*collection)) {
+			return coll, nil
+		}
+		if attempt == handOutAttempts-1 {
+			return nil, ErrCollectionClosedDuringOpen
+		}
 	}
-	return db.handOut(coll), nil
 }
 
 // collection opens or creates the collection without handing it out (see
@@ -1115,6 +1233,11 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 					return err
 				}
 			}
+		} else {
+			// A read failure, not an empty catalog: a prefix nothing
+			// matches leaves the cursor on the next key, or invalid past
+			// the last one, with a nil error.
+			return err
 		}
 		if err := cursor.Seek([]byte("idx:")); err == nil {
 			for cursor.Valid() {
@@ -1130,6 +1253,11 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 					return err
 				}
 			}
+		} else {
+			// A read failure, not an empty catalog: a prefix nothing
+			// matches leaves the cursor on the next key, or invalid past
+			// the last one, with a nil error.
+			return err
 		}
 		return nil
 	})
@@ -1145,9 +1273,18 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 	return
 }
 
+// testQuickCheckReadHook, when set, is called inside the quick check's read
+// transaction; an error from it is the check's failure.
+var testQuickCheckReadHook func() error
+
 func (db *db) QuickCheck(ctx context.Context) (err error) {
 	// btree doesn't have a built-in quick check, just verify we can read
 	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		if f := testQuickCheckReadHook; f != nil {
+			if err := f(); err != nil {
+				return err
+			}
+		}
 		cursor := tx.NewCursor(db.systemNS)
 		defer cursor.Close()
 		if err := cursor.First(); err != nil {
@@ -1683,7 +1820,24 @@ func (db *db) Close() error {
 		log.Printf("recovery controller stop error: %v", err)
 	}
 
-	return db.btreeDB.Close()
+	return db.closeBtree()
+}
+
+// closeBtree closes the btree and clears the durability sentinel when that
+// close checkpointed the whole log as the last client of the file. The
+// sentinel goes inside the btree close, after the checkpoint and while the
+// close still holds the exclusive DB-file lock, so no other process can open
+// the file and commit before it is gone. A close that is not the last runs no
+// checkpoint and leaves the sentinel set: the commits of this handle and of
+// the handles still attached can be in the log alone, and if those processes
+// are killed the next open must run the quick check.
+func (db *db) closeBtree() error {
+	var onCheckpointed func()
+	if db.recoveryController != nil {
+		onCheckpointed = db.recoveryController.MarkCleanAfterClose
+	}
+	_, err := db.btreeDB.CloseCheckpointed(onCheckpointed)
+	return err
 }
 
 func (db *db) createRecoveryController(ctx context.Context, path string) (*durability.Controller, bool) {
@@ -1701,7 +1855,9 @@ func (db *db) createRecoveryController(ctx context.Context, path string) (*durab
 		AutoFlushFunc: flushFunc,
 	}
 
-	if db.config.Durability.Sentinel {
+	// An in-memory database has no files on disk, and no close of it
+	// persists anything: it gets no sentinel file.
+	if db.config.Durability.Sentinel && !db.config.InMemory {
 		opts.Sentinel = sentinel.New(path)
 	}
 	controller := durability.NewController(opts)
@@ -1724,16 +1880,16 @@ func (db *db) Flush(ctx context.Context, waitIdleTime time.Duration, mode FlushM
 	return db.recoveryController.Flush(ctx, waitIdleTime, mode.toRecoveryFlushMode())
 }
 
-// evictLocked removes c from the registry. Identity scan, not a delete by
-// name: the slot may be under an older name than the head's (a handle
-// opened through an old snapshot, a rename being settled). The caller holds
-// db.mu.
+// evictLocked removes c from the registry. By the name it was registered
+// under (collection.regName), not the head's: the slot may be under an older
+// name than that (a handle opened through an old snapshot, a rename being
+// settled). The caller holds db.mu.
 func (db *db) evictLocked(c *collection) {
-	for name, cur := range db.openedCollections {
-		if cur == Collection(c) {
-			delete(db.openedCollections, name)
-			break
-		}
+	if testVisits != nil {
+		testVisits.evict++
+	}
+	if cur, ok := db.openedCollections[c.regName]; ok && cur == Collection(c) {
+		delete(db.openedCollections, c.regName)
 	}
 	db.forgetLocked(c)
 }
@@ -1750,10 +1906,25 @@ func (db *db) forgetLocked(c *collection) {
 // lists them on t for the settle (commonTx.settleSketches). Called once per
 // write transaction commit to batch sketch persistence. It removes nothing
 // from the list: the next write-tx begin does (resetUncommittedSketches).
+//
+// Only the collections whose live sketches are this transaction's
+// (collection.sketchTx) are written. One the transaction never used has
+// none of its deltas: what is flagged there is left over from a transaction
+// that did not commit, on counts no writer loaded since, and storing it
+// would put them over a row another process may have written meanwhile. It
+// stays listed for a begin to rebase.
+//
+// A closed handle is skipped. One the transaction wrote through is not
+// closed before the transaction ends: it is pinned from its first use, a
+// Close() waits for the end, and an open returns the same handle
+// (collection.pinned), so its documents commit with their counts. What is
+// closed here has no collection to store for: its creation rolled back with
+// a savepoint, or it was closed without a write of this transaction on it.
+// One the transaction dropped is live until the install and told by the log.
 func (db *db) persistAllDirtySketches(tx *btree.WriteTx, t *commonTx) error {
 	gen := db.epoch.Load().gen
 	for _, c := range db.sketchDirty {
-		if c.closed.Load() {
+		if c.closed.Load() || c.sketchTx != t.sketchTx {
 			continue
 		}
 		var s *collSchema
@@ -2128,6 +2299,8 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 			return fmt.Errorf("%w: %w", ErrIndexMismatch, ErrVectorIndexUnsupported)
 		}
 		return ErrIndexMismatch
+	} else if !errors.Is(err, btree.ErrKeyNotFound) {
+		return err
 	}
 	var a anyenc.Arena
 	obj := a.NewObject()
@@ -2211,6 +2384,35 @@ func (db *db) removeIndex(tx *btree.WriteTx, collName, indexName string) error {
 	return nil
 }
 
+// deleteOptionalRecord deletes a record of the system namespace that a
+// collection or an index may not have (its config, a sketch, a multikey
+// flag). An absent record is not an error; every other error is the
+// caller's, so the DDL transaction rolls back and no half of it commits.
+func (db *db) deleteOptionalRecord(tx *btree.WriteTx, key []byte) error {
+	if err := tx.Delete(db.systemNS, key); err != nil && !errors.Is(err, btree.ErrKeyNotFound) {
+		return err
+	}
+	return nil
+}
+
+// moveOptionalRecord moves such a record from one key to another. A record
+// that is absent stays absent; one that was read is moved or the error is
+// returned: a failed read is not an absent record, and a record deleted
+// under the old key and not written under the new one is lost.
+func (db *db) moveOptionalRecord(tx *btree.WriteTx, from, to []byte) error {
+	val, err := tx.AppendValue(db.systemNS, from, nil)
+	if err != nil {
+		if errors.Is(err, btree.ErrKeyNotFound) {
+			return nil
+		}
+		return err
+	}
+	if err = tx.Delete(db.systemNS, from); err != nil {
+		return err
+	}
+	return tx.Put(db.systemNS, to, val)
+}
+
 // removeCollection removes collection metadata from the system namespace
 func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 	tx.MarkSchemaChanged()
@@ -2222,8 +2424,11 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 	prefix := indexKeyPrefix(collName)
 	cursor := tx.NewCursor(db.systemNS)
 	defer cursor.Close()
+	// A Seek error is a read failure, not a collection without indexes (a
+	// prefix nothing matches leaves the cursor on the next key, or invalid
+	// past the last one, with a nil error).
 	if err := cursor.Seek([]byte(prefix)); err != nil {
-		return nil
+		return err
 	}
 	var keysToDelete [][]byte
 	var idxNames []string
@@ -2257,12 +2462,15 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 	// keyed by collection name; the multikey flag is keyed by the namespace
 	// name.
 	for _, name := range idxNames {
-		_ = tx.Delete(db.systemNS, sketchKey(collName, name))
-		_ = tx.Delete(db.systemNS, multikeyKey(indexNsName(collName, name)))
+		if err := db.deleteOptionalRecord(tx, sketchKey(collName, name)); err != nil {
+			return err
+		}
+		if err := db.deleteOptionalRecord(tx, multikeyKey(indexNsName(collName, name))); err != nil {
+			return err
+		}
 	}
 	// Remove collection config
-	_ = tx.Delete(db.systemNS, collConfigKey(collName))
-	return nil
+	return db.deleteOptionalRecord(tx, collConfigKey(collName))
 }
 
 // renameCollection renames a collection: the catalog metadata in the system
@@ -2352,10 +2560,10 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 		return err
 	}
 
-	// Rename collection config
-	if cfgData, err := tx.AppendValue(db.systemNS, collConfigKey(oldName), nil); err == nil {
-		_ = tx.Delete(db.systemNS, collConfigKey(oldName))
-		_ = tx.Put(db.systemNS, collConfigKey(newName), cfgData)
+	// Rename collection config: it holds the primary key, and a collection
+	// that lost it reopens under the default one.
+	if err = db.moveOptionalRecord(tx, collConfigKey(oldName), collConfigKey(newName)); err != nil {
+		return err
 	}
 
 	// Rename index keys. A Seek error is a real read failure (an empty or
@@ -2412,18 +2620,11 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 		// rename back resurrect a stale record — for the multikey flag that
 		// means tight seeks against an index that has since seen arrays,
 		// i.e. silently dropped docs. Moved (delete+put), never copied.
-		if skData, err := tx.AppendValue(db.systemNS, sketchKey(oldName, e.name), nil); err == nil {
-			_ = tx.Delete(db.systemNS, sketchKey(oldName, e.name))
-			if err = tx.Put(db.systemNS, sketchKey(newName, e.name), skData); err != nil {
-				return err
-			}
+		if err := db.moveOptionalRecord(tx, sketchKey(oldName, e.name), sketchKey(newName, e.name)); err != nil {
+			return err
 		}
-		oldMk := multikeyKey(indexNsName(oldName, e.name))
-		if mkVal, err := tx.AppendValue(db.systemNS, oldMk, nil); err == nil {
-			_ = tx.Delete(db.systemNS, oldMk)
-			if err = tx.Put(db.systemNS, multikeyKey(indexNsName(newName, e.name)), mkVal); err != nil {
-				return err
-			}
+		if err := db.moveOptionalRecord(tx, multikeyKey(indexNsName(oldName, e.name)), multikeyKey(indexNsName(newName, e.name))); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -2455,7 +2656,7 @@ func (db *db) listCollectionNames(tx *btree.ReadTx) ([]string, error) {
 	defer cursor.Close()
 	prefix := []byte("coll:")
 	if err := cursor.Seek(prefix); err != nil {
-		return nil, nil
+		return nil, err
 	}
 	var names []string
 	for cursor.Valid() {

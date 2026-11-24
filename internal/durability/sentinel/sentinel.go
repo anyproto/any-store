@@ -24,6 +24,9 @@ type SentinelTracker struct {
 	isDirty bool // Track dirty state to avoid unnecessary syscalls
 }
 
+// New returns the tracker of the sentinel file beside dbPath, named dbPath
+// with the suffix appended. dbPath is the name the database file is opened
+// by, the full name anystore.Open resolves once (btree.FullPathname).
 func New(dbPath string) *SentinelTracker {
 	sentinelPath := dbPath + lockFileSuffix
 	tracker := &SentinelTracker{
@@ -86,6 +89,19 @@ func (s *SentinelTracker) MarkClean() {
 	if !s.isDirty {
 		return
 	}
+
+	if err := osRemove(s.path); err == nil || os.IsNotExist(err) {
+		s.isDirty = false
+	}
+}
+
+// Remove removes the sentinel file whatever this process remembers of it:
+// the file is shared by every process on the database, and one that this
+// process found absent at open, or has not written since, may have been
+// created by another. A file that is not there counts as removed.
+func (s *SentinelTracker) Remove() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if err := osRemove(s.path); err == nil || os.IsNotExist(err) {
 		s.isDirty = false
