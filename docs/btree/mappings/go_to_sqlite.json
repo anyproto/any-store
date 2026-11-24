@@ -1607,7 +1607,7 @@
     "sqlite": [
       "malloc.c:sqlite3MallocInit"
     ],
-    "note": "szPage<512 || nPage<=0 clears the configuration; Go adds the int overflow of the slab size"
+    "note": "szPage<512 || nPage<=0 clears the configuration; Go adds a slot above MaxPageSize and the int overflow of the slab size"
   },
   "pager.go:*masterStore.readPageInto": {
     "sqlite": [],
