@@ -147,7 +147,8 @@ var (
 
 	// ErrQuickCheckFailed is returned (wrapped, with the damage the check met) by Open when the
 	// database was left dirty (Config.Durability.Sentinel is on and its marker file was found)
-	// and the quick check Open then runs found damage. It matches ErrCorrupt.
+	// and the quick check Open then runs found damage, or Open's read of the catalog's root
+	// before it did. It matches ErrCorrupt.
 	//
 	// A quick check that did not finish is not this error and does not match ErrCorrupt: Open
 	// then returns, wrapped, what stopped it, to match as itself: the ctx's error

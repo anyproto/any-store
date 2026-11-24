@@ -549,6 +549,29 @@ func TestIntegrityCheck_InTheCallersReadTx(t *testing.T) {
 	require.NoError(t, db.IntegrityCheck())
 }
 
+// A namespace whose master entry gives root 0 is reported, also when its
+// former pages went to the freelist and nothing else is out of place: no
+// namespace has root 0, and resolving it is ErrCorrupt, as a scan of it
+// is.
+func TestIntegrityCheck_NamespaceRootZeroIsReported(t *testing.T) {
+	db := tempDB(t)
+	commitRows(t, db, "x", 64, 200)
+	require.NoError(t, db.IntegrityCheck())
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, db.DeleteNamespace(tx, "x"))
+	require.NoError(t, tx.pager.wgate.enter())
+	master := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
+	require.NoError(t, master.Put([]byte("x"), []byte{0, 0, 0, 0}))
+	tx.pager.wgate.leave()
+	require.NoError(t, tx.Commit())
+
+	err = db.IntegrityCheck()
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.Contains(t, err.Error(), `"x": namespace root page 0 out of range`)
+}
+
 // A page reached through a wal-index that points past the end of the log
 // is a short read, and the report keeps that identity: it matches
 // ErrWALShortRead and not ErrCorrupt, so a caller can tell an index to

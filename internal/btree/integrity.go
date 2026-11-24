@@ -790,9 +790,13 @@ func (tx *ReadTx) IntegrityCheckN(maxErrors int) error {
 			ic.treeName = string(key)
 			ic.checkTreePage(rootPage, nil, nil, nil)
 			ic.treeName = savedName
-		case rootPage != 0:
-			// rootPage == 0 is a valid empty namespace (intentionally skipped;
-			// exercised by TestDeleteNamespace_RootPageZero).
+		default:
+			// A namespace has no root of 0, or 1, the master's: every one
+			// is created with a page of its own (CreateNamespace), and
+			// resolving its name refuses a root of 0 (resolveNamespace).
+			// SQLite's check skips a root of 0, which only a view or a
+			// virtual table has (btree.c:11220), and its schema load
+			// refuses a table's root past the database (prepare.c:135-140).
 			ic.report("tree master cell key %q: namespace root page %d out of range", string(key), rootPage)
 		}
 	}

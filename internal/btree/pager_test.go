@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9503,10 +9504,44 @@ func resealWAL(t *testing.T, walPath string, pageSize int) {
 	require.NoError(t, os.WriteFile(walPath, data, 0o600))
 }
 
+// A page of the database that the file holds only in part reads as zeros
+// past the end of the file, as readDbPage reads it (pager.c:3041-3044), and
+// not as an error of the read: its own check reports the damage, here its
+// checksum. A file cut at a page boundary is a page count the header's
+// check refuses, not this.
+func TestReadDBPage_ShortReadIsZeros(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	opts := DefaultOptions()
+	opts.Checksum = true
+	db, err := testOpen(t, path, opts)
+	require.NoError(t, err)
+	commitRows(t, db, "t", 64, 200)
+	require.NoError(t, db.Checkpoint(CheckpointTruncate))
+	require.NoError(t, db.Close())
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	pageSize := int64(opts.PageSize)
+	last := uint32(info.Size() / pageSize)
+	require.NoError(t, os.Truncate(path, info.Size()-pageSize/2))
+
+	db, err = testOpen(t, path, opts)
+	require.NoError(t, err)
+	defer db.Close()
+	buf := bytes.Repeat([]byte{0xFF}, int(pageSize))
+	require.NoError(t, db.pager.readDBPage(last, buf))
+	require.Equal(t, make([]byte, pageSize/2), buf[pageSize/2:])
+
+	err = db.IntegrityCheck()
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, io.EOF)
+	require.NotErrorIs(t, err, io.ErrUnexpectedEOF)
+}
+
 // Page number 0 is no page: a getter asked for it was handed a page number
 // the file holds and that is damaged, as sqlite3PagerGet answers it with
 // SQLITE_CORRUPT_BKPT (pager.c:5551). A namespace whose master entry gives
-// root 0 reads as ErrCorrupt.
+// root 0 does not resolve, ErrCorrupt, and a cursor on a root 0 reads as
+// ErrCorrupt.
 func TestGetPage_PageZeroIsCorrupt(t *testing.T) {
 	db := tempDB(t)
 	tx, err := db.BeginWrite()
@@ -9527,9 +9562,9 @@ func TestGetPage_PageZeroIsCorrupt(t *testing.T) {
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)
 	defer rtx.Rollback()
-	ns, err := rtx.GetNamespace("x")
-	require.NoError(t, err)
-	require.Zero(t, ns.RootPage())
+	_, err = rtx.GetNamespace("x")
+	require.ErrorIs(t, err, ErrCorrupt)
+	ns := &Namespace{db: db, name: "x"}
 	cur := rtx.NewCursor(ns)
 	defer cur.Close()
 	err = cur.First()

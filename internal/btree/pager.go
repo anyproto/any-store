@@ -485,10 +485,16 @@ func (p *pager) takeCellBuf(minCap int) []byte {
 // the current window), falls back to ReadAt. Matches SQLite's
 // getPageMMap → getPageNormal gate (pager.c:5670-5710).
 //
-// Callers preserve the legacy ReadAt error semantics: short reads
-// past EOF return the underlying io.ErrUnexpectedEOF / fs error from
-// ReadAt; the mmap path returns nil on success because the slice is
-// exactly len(buf) (checked in dbMmap.fetch).
+// A read that comes up short (the file ends inside or before the page)
+// is not an error: the part of buf past the end reads as zeros, as
+// readDbPage takes sqlite3OsRead's SQLITE_IOERR_SHORT_READ for SQLITE_OK
+// (pager.c:3041-3044) and unixRead zero-fills what it did not read
+// (os_unix.c:3574-3577). The caller reads the page only when it is within
+// the snapshot's page count, so a page the file holds only in part is
+// damage, and the page's own checks report it: its checksum or
+// authentication tag, or its format. Any other failure of the read is
+// returned as it is. The mmap path returns nil on success because the
+// slice is exactly len(buf) (checked in dbMmap.fetch).
 func (p *pager) readDBPage(pgno uint32, buf []byte) error {
 	if p.file == nil {
 		return fmt.Errorf("btree: db file closed")
@@ -516,8 +522,15 @@ func (p *pager) readDBPage(pgno uint32, buf []byte) error {
 		// using xRead()" pattern (os_unix.c:5579-5582).
 	}
 
-	_, err := p.file.ReadAt(buf, offset)
-	return err
+	n, err := p.file.ReadAt(buf, offset)
+	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			clear(buf[n:])
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // recycleCellBuf returns a byte buffer to the pager's free-list for reuse. If

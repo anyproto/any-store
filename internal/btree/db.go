@@ -1908,6 +1908,18 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 			}
 			rootPage := binary.BigEndian.Uint32(value)
 			bt.pager.releasePage(pg)
+			// The root is checked here, when the name is resolved, and not
+			// on every page get: a root of 0 or past the snapshot's page
+			// count is damage, as the schema load refuses a root page past
+			// the database ("invalid rootpage", prepare.c:135-140),
+			// btreeCursor a root below 1 (btree.c:4715-4717) and
+			// getAndInitPage any page past btreePagecount
+			// (btree.c:2386-2389). A root past the count would read as a
+			// zero page, an empty tree: the namespace would look empty, and
+			// a write would build on that page.
+			if rootPage == 0 || rootPage > bt.pager.readerDbSizeBound(bt.cache) {
+				return nil, fmt.Errorf("%w: namespace %q: root page %d is outside the database", ErrCorrupt, name, rootPage)
+			}
 			return &Namespace{
 				name:     name,
 				rootPage: rootPage,

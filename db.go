@@ -361,6 +361,12 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 	if err = ds.init(ctx); err != nil {
 		_ = ds.recoveryController.Stop()
 		_ = ds.btreeDB.Close()
+		// init resolves the catalog's root, which the quick check of a
+		// dirty open then reads: damage init meets there is what the
+		// check would have met, and the open reports it as the check's.
+		if quickCheckNeeded && errors.Is(err, ErrCorrupt) {
+			return nil, fmt.Errorf("%w: %w", ErrQuickCheckFailed, err)
+		}
 		return nil, err
 	}
 
