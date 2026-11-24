@@ -135,9 +135,10 @@ func childWait(t *testing.T, in *bufio.Reader, token string) {
 // Both must end up on one database: each sees the other's commit, and the
 // file checks clean, live and after a reopen.
 //
-// Before creation ran under an exclusive DB-file lock, the parent's open went
-// through while the child was held (both had seen an empty file), and the
-// child's page 1 then replaced the parent's, checkpointed, database.
+// The held child has the exclusive DB-file lock, so the parent's open waits
+// for it. If that open returns while the child is still held, the parent
+// commits and checkpoints through it before the child goes on, and the
+// child's page 1 must not replace that database.
 func TestMultiProcessCreateRaceOneDatabase(t *testing.T) {
 	if os.Getenv(createChildRoleEnv) == "creator" {
 		path, pass := os.Getenv(createChildPathEnv), os.Getenv(createChildPassEnv)
@@ -315,8 +316,10 @@ func TestMultiProcessCreateManyAtOnce(t *testing.T) {
 // from the salt in the file it opened, not from the salt it drew for a file
 // it did not create.
 //
-// Before the codec was settled under the lock, this open failed with an AEAD
-// error that matches ErrPageIntegrity, on a healthy database.
+// The open must succeed and read and write the creator's database: a key
+// from the drawn salt fails it with an AEAD error that matches
+// ErrPageIntegrity, on a healthy database. The creator stays attached in one
+// case and has closed in the other.
 func TestMultiProcessCreateLoserKeyFromWinnersSalt(t *testing.T) {
 	const pass = "correct horse battery staple"
 	if os.Getenv(createChildRoleEnv) == "late-opener" {
@@ -386,9 +389,10 @@ func TestMultiProcessCreateLoserKeyFromWinnersSalt(t *testing.T) {
 // SQLite deletes a WAL it finds beside a database of zero pages
 // (pagerOpenWalIfPresent).
 //
-// The old frames were recovered and applied before: a WAL holding the whole
-// old database brought it back, and a WAL holding its tail gave the new file
-// the old page count or pages of a tree whose other pages were gone.
+// The WAL holds either the whole old database or only its tail, a page 1
+// among it. The new database has no namespaces, one page and a clean
+// integrity check, and after a commit and a reopen it holds that commit's
+// namespace alone: no old page and no old page count comes back.
 func TestStaleWALBesideEmptyDatabaseNotReplayed(t *testing.T) {
 	if os.Getenv(createChildRoleEnv) == "wal-writer" {
 		path, pass := os.Getenv(createChildPathEnv), os.Getenv(createChildPassEnv)
