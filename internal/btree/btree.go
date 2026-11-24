@@ -170,7 +170,7 @@ func parseLeafCell(data []byte, offset int) (cellData, int, error) {
 // c.key may be a prefix (not the full key). Callers needing the full key must
 // check c.overflowPg != 0 and use leafFullKey.
 // DRIFT: leaf cell-size computation omits SQLite's `if nSize<4 nSize=4` clamp See docs/btree/NOTES.md#drift-26-leaf-cell-size-missing-four-byte-minimum-clamp
-// DRIFT: payload lengths are capped at maxPayloadAlloc, not checked against the database size. See docs/btree/NOTES.md#old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation
+// DRIFT: a cell whose key and value lengths sum over maxPayloadAlloc (1 GiB) is ErrCorrupt (payloadFits); SQLite's cell parsers cap no payload length. See docs/btree/NOTES.md#old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation
 func parseLeafCellWithSize(data []byte, offset int, lim payloadLimits) (cellData, int, error) {
 	var c cellData
 	pos := offset

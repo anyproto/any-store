@@ -1506,6 +1506,10 @@
     "sqlite": [],
     "note": ""
   },
+  "page.go:payloadFits": {
+    "sqlite": [],
+    "note": "no C counterpart: the 1 GiB cap on key length plus value length, tested on the 64-bit declared lengths without forming their sum; the cell parsers answer ErrCorrupt over it and Put refuses a record over it. btreeParseCellPtrIndex reads the payload length into a u32 and caps nothing; SQLite's write limit is SQLITE_LIMIT_LENGTH in OP_MakeRecord (vdbe.c:3697)"
+  },
   "page.go:payloadInFile": {
     "sqlite": [
       "btree.c:sqlite3BtreeMaxRecordSize",

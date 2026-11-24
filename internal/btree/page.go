@@ -167,6 +167,7 @@ var payloadLimit = maxPayloadAlloc
 // output register must grow to hold the record (vdbe.c:3690-3699); a record
 // that fits the register's allocation is not tested, and sqlite3BtreeInsert
 // only asserts its lengths (btree.c:9485, 9540). Put tests every record.
+// DRIFT: a 1 GiB cap on key plus value, for the cell parsers and for Put; SQLite's parsers cap no payload length and its write limit is SQLITE_LIMIT_LENGTH, above the b-tree. See docs/btree/NOTES.md#old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation
 func payloadFits(keyLen, valLen uint64) bool {
 	limit := uint64(payloadLimit)
 	// The sum is not formed: two 64-bit lengths can wrap it.

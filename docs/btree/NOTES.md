@@ -819,9 +819,14 @@ The Go implementation has:
 <a id="old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation"></a>
 **Severity:** low
 
-**Classification: Divergent** -- Both implementations protect against corruption, but
-the specific cap values differ. SQLite's `nCell/usableSize > nPage` check is more
-precise (validates against actual database size), while Go uses a fixed 1 GB cap.
+**Classification: Divergent** -- Go's cell parsers refuse, with `ErrCorrupt`, a cell whose
+key and value lengths sum over 1 GiB (`maxPayloadAlloc`, tested by `payloadFits`); SQLite's
+parsers read the payload length into a `u32` and test it against nothing
+(`btreeParseCellPtr`, `btree.c:1280-1287`; `btreeParseCellPtrIndex`, `btree.c:1359-1366`).
+The bound against the database size is SQLite's in both: a reader tests a declared length
+against `pageSize * nPage` before it sizes a buffer by it (`payloadInFile`, below), though a
+reader's page count is the pager's
+([drift-2026-11-24-2](#drift-2026-11-24-2-a-readers-file-size-bound-takes-the-pagers-page-count)).
 
 The cap is also the write-side limit: reads and writes apply one rule, `payloadFits`
 (`page.go`). Key length plus value length is at most `maxPayloadAlloc` (`1<<30`), tested on
