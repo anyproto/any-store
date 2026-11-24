@@ -39,7 +39,7 @@
     "sqlite": [
       "backup.c:backupOnePage"
     ],
-    "note": "page-size always equal (enforced at BackupInit) so the backup.c:251–276 loop collapses to one iteration"
+    "note": "page-size always equal (enforced at BackupInit) so the backup.c:251–276 loop collapses to one iteration; the destination's writes of page 1 carry its own KDF salt, not the copied one (drift-2026-11-21-19)"
   },
   "backup.go:*Backup.restart": {
     "sqlite": [
@@ -65,11 +65,21 @@
     ],
     "note": "re-copies an already-copied page the source logged, at a commit or a spill; no-op on a done or finished backup"
   },
+  "backup.go:*DB.BackupDestinationOptions": {
+    "sqlite": [
+      "backup.c:setDestPgsz"
+    ],
+    "note": "the Options a backup's destination is created with: the handle's, with page size, checksum mode and schema format read from the open source file (drift-2026-11-19-2); SQLite tries to give the destination the source's page size here (an existing or WAL destination keeps its own, backup.c:361, 378-383) and takes the reserved bytes from the copied page 1"
+  },
   "backup.go:*DB.BackupInit": {
     "sqlite": [
       "backup.c:sqlite3_backup_init"
     ],
-    "note": "minus the handle/name resolution (DRIFT #2 in any-store-tests:docs/any-store/btree/plans/2026-04-22-sqlite-backup-port.md): takes (dst, src *btree.DB) directly"
+    "note": "minus the handle/name resolution (DRIFT #2 in any-store-tests:docs/any-store/btree/plans/2026-04-22-sqlite-backup-port.md): takes (dst, src *btree.DB) directly; refuses a destination of another page size, schema format, reserved space or kind of codec (drift-2026-11-11-8, drift-2026-11-19-2)"
+  },
+  "backup.go:*DB.codecKind": {
+    "sqlite": [],
+    "note": "No SQLite counterpart: the kind of codec a handle has installed (none, checksum, encryption), which BackupInit compares as SQLCipher's sqlite3_backup_init compares whether each side has a key (backup.c:155-176 in SQLCipher v4.14.0); a keyed in-memory database has the encryption kind (drift-2026-11-19-2)"
   },
   "backup.go:backupBusy": {
     "sqlite": [
@@ -674,7 +684,7 @@
   },
   "codec.go:encryptPageWithCodec": {
     "sqlite": [],
-    "note": ""
+    "note": "No SQLite counterpart. Writes the database's keyed KDF salt into every page 1 it encrypts, as SQLCipher's sqlite3Codec writes its ctx's kdf_salt (sqlcipher.c:3304-3312; drift-2026-11-21-19)"
   },
   "codec.go:encryptWith": {
     "sqlite": [],
@@ -1762,6 +1772,10 @@
     ],
     "note": ""
   },
+  "pager.go:*pager.adoptHeader": {
+    "sqlite": [],
+    "note": "No SQLite counterpart: installs a header decoded from page 1 with the KDF salt the codec was keyed with, not the image's (drift-2026-11-21-19); SQLCipher reads its salt once, from the main file (sqlcipher_codec_ctx_init_kdf_salt)"
+  },
   "pager.go:*pager.allocateFromFreelist": {
     "sqlite": [
       "btree.c:allocateBtreePage"
@@ -2716,7 +2730,7 @@
       "wal.c:walIteratorNext",
       "wal.c:walMergesort"
     ],
-    "note": "includes the salt re-check after read lock 0 (version-3.52.0 wal.c:2256-2267)"
+    "note": "includes the salt re-check after read lock 0 (version-3.52.0 wal.c:2256-2267); copies frames verbatim as walCheckpoint does (wal.c:2311-2315), except that page 1 reaches the main file with the keyed KDF salt (drift-2026-11-21-19)"
   },
   "wal.go:*wal.close": {
     "sqlite": [

@@ -28,6 +28,14 @@ var (
 	// destination with Options.SchemaFormat set to the source's SchemaFormat.
 	ErrBackupFormatMismatch = errors.New("btree: backup source and destination must have the same schema format")
 
+	// ErrBackupCodecMismatch — the destination's pages are not laid out like
+	// the source's: another reserved space at the end of each page, or
+	// another kind of page codec (none, checksum, encryption). A handle's
+	// codec and usable size are fixed when it is opened, so a destination
+	// that exists as such a file cannot receive the source's pages. Create
+	// the destination with the source's BackupDestinationOptions.
+	ErrBackupCodecMismatch = errors.New("btree: backup source and destination must have the same reserved space and kind of page codec (plain, checksum or encrypted)")
+
 	// ErrBackupDstBusy — ~ checkReadTransaction (backup.c:124–130)
 	// ("destination database is in use"). Raised when dst already has an
 	// open read/write transaction at BackupInit time.
@@ -130,11 +138,82 @@ func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 		return nil, ErrBackupFormatMismatch
 	}
 
+	// SQLite's destination takes the reserved space, like every other
+	// header field, from the copied page 1: the next lockBtree reads byte
+	// 20 (btree.c:3384, 3417) and nothing else in the handle depends on it.
+	// Here the usable size and the codec that owns the reserved bytes are
+	// fixed at Open. A destination with more reserved bytes than the
+	// source's pages have would let its codec write a trailer over cell
+	// content; one with fewer would be read by the wrong layout after the
+	// header is reloaded. The kinds of codec are compared as SQLCipher
+	// compares the two sides' keys at init, refusing a keyed database with
+	// a plaintext one (backup.c:155-176 in SQLCipher v4.14.0). Refused
+	// before a page is written.
+	// DRIFT: the destination must already have the source's reserved space and kind of codec; SQLite's adopts them with page 1. See docs/btree/NOTES.md#drift-2026-11-19-2-a-backup-destination-has-the-geometry-of-the-source-file
+	if dst.pager.usableSize() != src.pager.usableSize() || dst.codecKind() != src.codecKind() {
+		return nil, ErrBackupCodecMismatch
+	}
+
 	return &Backup{
 		dst:   dst,
 		src:   src,
 		iNext: 1, // ~ backup.c:188
 	}, nil
+}
+
+// codecKind is the kind of page codec db has installed, as an IntegrityMode:
+// IntegrityNone for none, IntegrityChecksum, or IntegrityAEAD for an
+// encryption codec. It is what db's file is sealed with, not what db
+// verifies: an in-memory database opened with a key or a codec has the
+// encryption kind, as a keyed in-memory database has a key in SQLCipher.
+func (db *DB) codecKind() IntegrityMode {
+	switch db.pager.codec.(type) {
+	case nil:
+		return IntegrityNone
+	case *cksumCodec:
+		return IntegrityChecksum
+	default:
+		return IntegrityAEAD
+	}
+}
+
+// BackupDestinationOptions returns the Options to open the destination of a
+// backup of db with: the handle's own (its key or codec among them), with the
+// page geometry taken from the open file and not from what the handle asked
+// for. A file keeps the page size, the checksum mode and the schema format it
+// was created with whatever Options say (Open), so Options().Checksum is true
+// on a plain file opened with defaults, and a destination created from it
+// would stamp a checksum trailer over the last bytes of pages that reserve no
+// room for one. The destination is always a file.
+//
+// The destination is a database of its own, and so are its integrity
+// failures (a damaged page of an existing destination that the copy reads):
+// it has no OnIntegrityError, so they come back as the backup's error and
+// not through the source's hook. In SQLite the failure is the step's return
+// code, and sqlite3_backup_finish records it on the destination handle
+// (backup.c:255, 603-605); outside recovery mode, SQLCipher records a
+// decrypt failure on the pager that read the page, which is the
+// destination's (sqlcipher_codec_ctx_set_error → sqlite3pager_error,
+// sqlcipher.c:3287-3291, 1385-1389).
+//
+// ~ setDestPgsz (backup.c:112-116), which tries to give the destination the
+// source's page size before it is first locked (a non-empty destination
+// keeps its own, and a WAL one of another size is refused: backup.c:361,
+// 378-383); VACUUM INTO passes the reserved bytes along with it
+// (vacuum.c:233, 281, sqlite3BtreeGetRequestedReserve). An existing
+// destination keeps its own geometry and BackupInit refuses it if that
+// differs.
+func (db *DB) BackupDestinationOptions() Options {
+	opts := db.opts
+	opts.InMemory = false
+	opts.OnIntegrityError = nil
+	opts.PageSize = db.pager.pageSize
+	opts.Checksum = db.codecKind() == IntegrityChecksum
+	// A file whose header never recorded a format is read as format 5.
+	if opts.SchemaFormat = db.SchemaFormat(); opts.SchemaFormat == 0 {
+		opts.SchemaFormat = 5
+	}
+	return opts
 }
 
 // onePage copies page iSrcPg from the source into the destination.
@@ -462,12 +541,16 @@ func (b *Backup) finalize(nSrcPage uint32) error {
 	// unconditionally re-serializes p.header over page 1 at commit
 	// (pager.go:1946); without this reload that serialize would revert every
 	// page-1 header field (freelist trunk pointers, page size, text encoding,
-	// user/application metadata, salt, file-change/version counters, ...) to
-	// the destination's own stale values. SQLite has no such re-serialize, so
-	// the verbatim-copied source fields survive there (only offset 28/40 and
-	// the WAL version bytes are patched). This mirrors the established
-	// savepoint page-1 restore at pager.go:2274.
-	b.dst.pager.header.deserialize(dstPg1.data[:dbHeaderSize])
+	// user/application metadata, file-change/version counters, ...) to
+	// the destination's own stale values. The salt is the exception: the
+	// pager keeps the one the destination's codec was keyed with
+	// (adoptHeader), and every write of page 1 carries it. SQLite has no
+	// such re-serialize, so the verbatim-copied source fields survive there
+	// (only offset 28/40 and the WAL version bytes are patched). This mirrors
+	// the established savepoint page-1 restore at pager.go:2274.
+	header := b.dst.pager.header
+	header.deserialize(dstPg1.data[:dbHeaderSize])
+	b.dst.pager.adoptHeader(header)
 	// Bump the schema cookie AFTER the deserialize so it is not overwritten.
 	// ~ sqlite3BtreeUpdateMeta writes meta value #1 (the cookie) to offset 40.
 	newCookie := b.iDstSchema + 1

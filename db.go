@@ -96,6 +96,21 @@ type DB interface {
 	// the bound is worked out in docs/btree/NOTES.md, "How Long A Backup Can
 	// Wait".
 	//
+	// The copy is a database of the source's kind: checksummed, encrypted
+	// with the same passphrase, key or codec, or plain when the source is
+	// plain. An in-memory database has no checksums, so its copy is plain,
+	// or encrypted when it was opened with Encryption. An encrypted copy
+	// keeps the KDF salt of the file at path, or draws one when it creates
+	// the file, so a new copy of a passphrase database has a key of its
+	// own. A file at path that already holds a database of another kind is
+	// not replaced: Backup returns an error and leaves its content as it
+	// was.
+	//
+	// Backup returns the destination's errors as well as the source's: a
+	// file at path that is damaged, or encrypted with another key, can give
+	// an error that matches ErrCorrupt while this database is sound. Rule
+	// that out before discarding this database.
+	//
 	// Backup never removes the file at path. If it fails before the copy is
 	// committed, the destination's transaction is rolled back: a destination
 	// that existed keeps its content, a new one is an empty database. The
@@ -1325,26 +1340,16 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 
 	// ~ SQLite's recommended online-backup pattern (see backup.c header
 	// comment at lines 11-13 and the sqlite3_backup_init/step/finish
-	// sequence). We open a fresh destination DB at `path` with
-	// identical Options to the source so page sizes match.
-	dstOpts := db.btreeDB.Options()
-	dstOpts.InMemory = false // destination is always a file (user gave us a path)
-	// The destination is a database of its own, and so are its integrity
-	// failures (a damaged page of an existing destination that the copy
-	// reads): they come back as Backup's error, not through the source's
-	// OnIntegrityError. In SQLite the failure is the step's return code, and
-	// sqlite3_backup_finish records it on the destination handle
-	// (backup.c:255, 603-605); outside recovery mode, SQLCipher records a
-	// decrypt failure on the pager that read the page, which is the
-	// destination's (sqlcipher_codec_ctx_set_error → sqlite3pager_error,
-	// sqlcipher.c:3287-3291, 1385-1389).
-	dstOpts.OnIntegrityError = nil
-	// The copy has its source's on-disk format: a backup of a database created
-	// before v2.5.0 is such a database too.
-	dstOpts.SchemaFormat = db.btreeDB.SchemaFormat()
-	if dstOpts.SchemaFormat == 0 {
-		dstOpts.SchemaFormat = 5
-	}
+	// sequence). The destination is opened as a file with the page geometry
+	// of the source file as it is (page size, checksum mode, schema format),
+	// not as this handle's Config asked for it: a plain file opened with
+	// defaults is still plain, and so is its backup; a backup of a database
+	// created before v2.5.0 is such a database too. A destination that
+	// exists keeps its own geometry, and BackupInit refuses it if that is
+	// not the source's, before the copy writes a page: its content is
+	// unchanged, though closing it may checkpoint its WAL, as closing any
+	// database may.
+	dstOpts := db.btreeDB.BackupDestinationOptions()
 
 	if testBackupOpenHook != nil {
 		testBackupOpenHook(nil)

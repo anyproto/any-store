@@ -188,15 +188,24 @@ func decryptWith(c Codec, dst, src []byte, pgno uint32, s *aeadScratch, onError 
 // stay plaintext for pgno==1, rest encrypted). Used from wal.go, which
 // doesn't hold a pager reference. dst must have len >= len(src) and must
 // not alias src. Returns src unchanged when c is nil.
-func encryptPageWithCodec(c Codec, dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error) {
+//
+// The header of page 1 gets keySalt, the KDF salt the writing database's
+// codec was keyed with (pager.keySalt), whatever salt src holds: the salt
+// written is the one the key came from. SQLCipher's codec does the same at
+// every encrypt of page 1, copying its ctx's kdf_salt over the head of the
+// page (memcpy(ctx->buffer, ... kdf_salt, offset), sqlcipher.c:3304-3312,
+// in its default header mode).
+// DRIFT: page 1's salt bytes are written from the key setup, not from the page image; SQLite's header has no KDF salt. See docs/btree/NOTES.md#drift-2026-11-21-19-the-kdf-salt-belongs-to-the-key-setup-not-to-page-1
+func encryptPageWithCodec(c Codec, dst, src []byte, pgno uint32, s *aeadScratch, keySalt *[SaltLen]byte) ([]byte, error) {
 	if c == nil {
 		return src, nil
 	}
 	plainPrefix := 0
 	if pgno == 1 {
 		plainPrefix = dbHeaderSize
+		copy(dst[:plainPrefix], src[:plainPrefix])
+		copy(dst[dbHeaderSaltOff:dbHeaderSaltOff+SaltLen], keySalt[:])
 	}
-	copy(dst[:plainPrefix], src[:plainPrefix])
 	if _, err := c.Encrypt(dst[plainPrefix:], src[plainPrefix:], pgno, s); err != nil {
 		return nil, err
 	}

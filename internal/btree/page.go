@@ -75,6 +75,8 @@ const (
 
 	// dbHeaderSize is the size of the database file header on page 1.
 	dbHeaderSize = 100
+	// dbHeaderSaltOff is the offset of dbHeader.Salt in page 1.
+	dbHeaderSaltOff = 72
 
 	// Magic string identifying our database format.
 	// dbMagicV2 is the header magic written by newly created databases. The magic
