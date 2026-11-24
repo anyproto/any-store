@@ -845,7 +845,7 @@ wrap. The search tests the sum only for the cell it reports as found, so every e
 is held to it, `Has` and an exact seek included. A damaged value length therefore need not
 make the cell's key, or a search for a neighbouring key, fail; a read of the value reports a
 length over its bounds. A SQLite table cursor reads the rowid of a row whose payload is
-corrupt the same way (`sqlite3BtreeIntegerKey`, `btree.c:4916-4922`). `leafCellPayloadLen`
+corrupt the same way (`sqlite3BtreeIntegerKey`, `btree.c:4917-4923`). `leafCellPayloadLen`
 (`walkSize`) tests the two lengths singly. These tests are looser than `payloadFits`, never
 stricter, so nothing `Put` accepts fails there. The overflow-chain readers have no cap of
 their own (their `maxIter` follows from the length asked for), and the 9-byte varint holds

@@ -4225,7 +4225,7 @@ func (c *Cursor) Key() ([]byte, error) {
 	// A read of the key bounds the key only (leafFullKey); Value tests the
 	// value's declared length. A SQLite table cursor likewise reads the
 	// rowid of a row whose payload is corrupt (sqlite3BtreeIntegerKey
-	// returns the parsed nKey, btree.c:4916-4922).
+	// returns the parsed nKey, btree.c:4917-4923).
 	return leafFullKey(frame.pg.data, int(off), c.bt.leafLimits(), c.bt.pager, c.bt.walMaxFrame, c.bt.cache)
 }
 
