@@ -1086,3 +1086,41 @@ func TestParseModifier_GoValueBoundAndCopied(t *testing.T) {
 	_, err = ParseModifier(src)
 	require.ErrorAs(t, err, &pe)
 }
+
+// A nil value in a modifier built in Go is null, as it marshals: the modifier
+// given as the value and the one given as its bytes do the same to one
+// document. A nil $set operand sets the field to null (a nil result is a
+// removal to the walk), a nil $pull operand pulls the nulls, a nil element
+// of a $pullAll operand pulls them too, and a nil field of a $push operand
+// is stored as null.
+func TestParseModifier_GoValueNilIsNull(t *testing.T) {
+	a := &anyenc.Arena{}
+	set := a.NewObject()
+	set.Set("status", nil)
+	pull := a.NewObject()
+	pull.Set("tags", nil)
+	all := a.NewArray()
+	all.SetArrayItem(0, nil)
+	pullAll := a.NewObject()
+	pullAll.Set("more", all)
+	operand := a.NewObject()
+	operand.Set("n", nil)
+	push := a.NewObject()
+	push.Set("p", operand)
+	src := a.NewObject()
+	src.Set("$set", set)
+	src.Set("$pull", pull)
+	src.Set("$pullAll", pullAll)
+	src.Set("$push", push)
+
+	const doc = `{"status":"ready","tags":[null,1],"more":[2,null]}`
+	const want = `{"status":null,"tags":[1],"more":[2],"p":[{"n":null}]}`
+	for name, modifier := range map[string]any{"value": src, "bytes": src.MarshalTo(nil)} {
+		res, modified, err := MustParseModifier(modifier).Modify(&anyenc.Arena{}, anyenc.MustParseJson(doc))
+		require.NoError(t, err, name)
+		assert.True(t, modified, name)
+		assert.Equal(t, want, res.String(), name)
+		assert.Equal(t, anyenc.TypeNull, res.Get("status").Type(), name)
+		require.NotNil(t, res.Get("status"), name)
+	}
+}

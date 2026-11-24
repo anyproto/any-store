@@ -2988,8 +2988,10 @@ func TestCollection_UpsertIdUnchangedInsertsId(t *testing.T) {
 // A value that contains itself is refused before anything encodes or
 // copies it: a ModifyFunc's document whose id contains itself, through an
 // UpsertId of a new id (which encodes the id to check it is unchanged) and
-// of an existing one, and a Go-built $push operand that contains itself,
-// when the modifier is parsed. Nothing is stored.
+// of an existing one, a Go-built $push operand that contains itself, when
+// the modifier is parsed, and a lookup id that contains itself or nests past
+// 510 levels, by FindId, FindIdWithParser, UpdateId, UpsertId and DeleteId.
+// Nothing is stored.
 func TestCollection_SelfContainingValuesRefused(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "c")
@@ -3021,6 +3023,37 @@ func TestCollection_SelfContainingValuesRefused(t *testing.T) {
 	doc, err := coll.FindId(ctx, 1)
 	require.NoError(t, err)
 	assert.Equal(t, `{"id":1}`, doc.Value().String())
+
+	// A lookup id that contains itself is refused before it is encoded, by
+	// every method that takes an id.
+	selfKey := a.NewObject()
+	selfKey.Set("self", selfKey)
+	_, err = coll.FindId(ctx, selfKey)
+	require.ErrorContains(t, err, "id is nested deeper than 510 levels")
+	_, err = coll.FindIdWithParser(ctx, &anyenc.Parser{}, selfKey)
+	require.ErrorContains(t, err, "id is nested deeper than 510 levels")
+	_, err = coll.UpdateId(ctx, selfKey, query.MustParseModifier(`{"$set":{"x":1}}`))
+	require.ErrorContains(t, err, "id is nested deeper than 510 levels")
+	_, err = coll.UpsertId(ctx, selfKey, query.MustParseModifier(`{"$set":{"x":1}}`))
+	require.ErrorContains(t, err, "id is nested deeper than 510 levels")
+	require.ErrorContains(t, coll.DeleteId(ctx, selfKey), "id is nested deeper than 510 levels")
+	assertQueryCount(t, coll.Find(nil), 1)
+
+	// An id of 510 levels, as deep as a stored document's id can be, is
+	// looked up, and one of 511 is refused.
+	deepId := func(levels int) *anyenc.Value {
+		id := a.NewArray()
+		for cur, i := id, 1; i < levels; i++ {
+			next := a.NewArray()
+			cur.SetArrayItem(0, next)
+			cur = next
+		}
+		return id
+	}
+	_, err = coll.FindId(ctx, deepId(510))
+	require.ErrorIs(t, err, anystore.ErrDocNotFound)
+	_, err = coll.FindId(ctx, deepId(511))
+	require.ErrorContains(t, err, "id is nested deeper than 510 levels")
 }
 
 // A write refuses a document nested deeper than the 511 levels every read of

@@ -62,7 +62,9 @@ func MustParseModifier(modifier any) Modifier {
 // value of its own.
 //
 // A modifier given as an *anyenc.Value is copied, so the parsed modifier does
-// not depend on the caller's value after the call. It may nest at most 512
+// not depend on the caller's value after the call, and a nil value in it is
+// read as null, as it marshals: Set("x", nil) in a $set sets x to null, as
+// {"$set":{"x":null}} does, not a removal. It may nest at most 512
 // levels, the modifier object being the first, as anyenc's parser reads, so
 // an operand is at most 510 levels deep; a deeper one, or a value that
 // contains itself, is a *ParseError.
@@ -82,7 +84,9 @@ func ParseModifier(modifier any) (Modifier, error) {
 		if nestsDeeper(goValue, maxModifierDepth) {
 			return nil, &ParseError{Source: "modifier", Reason: fmt.Sprintf("modifier is nested deeper than %d levels", maxModifierDepth)}
 		}
-		v = (&anyenc.Arena{}).Copy(goValue)
+		a := &anyenc.Arena{}
+		v = a.Copy(goValue)
+		fillNulls(a, v)
 	}
 	m, err := parseModRoot(v)
 	if err != nil {
@@ -124,6 +128,38 @@ func nestsDeeper(v *anyenc.Value, levels int) bool {
 		}
 	}
 	return false
+}
+
+// fillNulls gives each nil field and element of v, a copy the parsed modifier
+// owns, an explicit null. Built in Go, Set("x", nil) leaves a nil value that
+// marshals as null, and the modifier reads it as the parsed form reads null:
+// as an operand, nil would be a removal to $set (anyencutil.Walk removes a
+// field its finalize returns nil for) and match no null to $pull. v is
+// bounded by maxModifierDepth.
+func fillNulls(a *anyenc.Arena, v *anyenc.Value) {
+	switch v.Type() {
+	case anyenc.TypeObject:
+		obj := v.GetObject()
+		var nils []string
+		obj.Visit(func(k []byte, f *anyenc.Value) {
+			if f == nil {
+				nils = append(nils, string(k))
+			} else {
+				fillNulls(a, f)
+			}
+		})
+		for _, k := range nils {
+			obj.Set(k, a.NewNull())
+		}
+	case anyenc.TypeArray:
+		for i, e := range v.GetArray() {
+			if e == nil {
+				v.SetArrayItem(i, a.NewNull())
+			} else {
+				fillNulls(a, e)
+			}
+		}
+	}
 }
 
 func parseModRoot(v *anyenc.Value) (m Modifier, err error) {

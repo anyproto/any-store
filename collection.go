@@ -40,6 +40,10 @@ import (
 // Insert of id 2^53+1 fails with ErrDocExists, an UpsertOne with it replaces
 // that document, and FindId(2^53+1) returns it. Keep ids that can go past
 // 2^53 as strings.
+//
+// An id given as an *anyenc.Value to FindId, FindIdWithParser, UpdateId,
+// UpsertId or DeleteId nests at most 510 levels, as a stored document's id
+// can; a deeper one, or one that contains itself, is an error.
 type Collection interface {
 	// Name returns the committed name of the collection: a rename made in an
 	// open write transaction shows once it commits.
@@ -504,6 +508,9 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 	if err = c.alive(); err != nil {
 		return
 	}
+	if err = checkIdDepth(docId); err != nil {
+		return
+	}
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -626,6 +633,19 @@ const maxDocDepth = 511
 func checkDocDepth(v *anyenc.Value) error {
 	if nestsDeeper(v, maxDocDepth) {
 		return fmt.Errorf("any-store: document is nested deeper than %d levels", maxDocDepth)
+	}
+	return nil
+}
+
+// checkIdDepth refuses an id given as an *anyenc.Value that nests deeper
+// than a stored document's id can, one level below its document: at most
+// maxDocDepth-1 levels. FindId, UpdateId, UpsertId and DeleteId check it
+// before they encode the id: built in Go, the value has no parser's bound,
+// and encoding one that contains itself would recurse until the stack ran
+// out.
+func checkIdDepth(id any) error {
+	if v, ok := id.(*anyenc.Value); ok && nestsDeeper(v, maxDocDepth-1) {
+		return fmt.Errorf("any-store: id is nested deeper than %d levels", maxDocDepth-1)
 	}
 	return nil
 }
@@ -826,6 +846,9 @@ func (c *collection) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx
 }
 
 func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error) {
+	if err = checkIdDepth(id); err != nil {
+		return
+	}
 	// mod.Modify (user code) runs inside the write tx below. A panic there unwinds
 	// through here with err still nil, so gate on a normal return: compaction opens
 	// its own write tx and must never run mid-panic. See Insert and doWriteTxW.
@@ -876,6 +899,9 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 }
 
 func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error) {
+	if err = checkIdDepth(id); err != nil {
+		return
+	}
 	// mod.Modify (user code) runs inside the write tx below; see UpdateId.
 	returned := false
 	defer func() {
@@ -1106,6 +1132,9 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 }
 
 func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
+	if err = checkIdDepth(id); err != nil {
+		return
+	}
 	// See Insert: gated on a normal return, not on err == nil alone.
 	returned := false
 	defer func() {
