@@ -1712,6 +1712,10 @@
     "sqlite": [],
     "note": "bounds-checked wrapper around getVarint; same util.c decoder"
   },
+  "page.go:headerFamily": {
+    "sqlite": [],
+    "note": "the any-store magic family of a header; SQLite has one magic"
+  },
   "page.go:indexLimits": {
     "sqlite": [
       "btree.c:lockBtree"
@@ -2443,6 +2447,10 @@
       "pager.c:sqlite3PagerOpen"
     ],
     "note": ""
+  },
+  "pager.go:page1HeaderAtOpen": {
+    "sqlite": [],
+    "note": "page 1 read again at open must name the file's magic family before its header is decoded; no SQLite counterpart (drift-2026-11-24-3)"
   },
   "pcache.go:*pcache.appendDirtyPages": {
     "sqlite": [

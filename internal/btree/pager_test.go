@@ -9672,6 +9672,32 @@ func TestOpen_HeaderIsJudgedBeforeTheKey(t *testing.T) {
 			require.NotErrorIs(t, err, ErrWrongKey)
 		}
 	})
+	t.Run("WAL page 1 of another magic family", func(t *testing.T) {
+		// Each header is valid on its own: the file's of this format, the
+		// frame's SQLite's, which alone would be a v1 database. The header
+		// is outside the authentication, so the frame still authenticates
+		// under the right key.
+		path, opts := keyProofDB(t, false, nil)
+		var fired atomic.Int32
+		opts.OnIntegrityError = func(uint32, error) { fired.Add(1) }
+		walPath := path + "-wal"
+		_, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
+		f, err := os.OpenFile(walPath, os.O_RDWR, 0)
+		require.NoError(t, err)
+		_, err = f.WriteAt([]byte(sqliteMagic), off+walFrameSize)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+		resealWAL(t, walPath, int(opts.PageSize))
+		for _, key := range [][]byte{opts.Key, []byte("wrong-passphrase")} {
+			o := opts
+			o.Key = key
+			_, err := Open(path, o)
+			require.ErrorIs(t, err, ErrHeaderCorrupt, "key %q", key)
+			require.NotErrorIs(t, err, ErrSQLiteFormat)
+			require.NotErrorIs(t, err, ErrWrongKey)
+		}
+		require.Zero(t, fired.Load())
+	})
 }
 
 // A page the open could not read might have proved the key: when no page
@@ -9708,6 +9734,107 @@ func TestOpen_UnreadableProbePageIsNotAWrongKey(t *testing.T) {
 	_, err = Open(path, opts)
 	require.ErrorIs(t, err, ErrPageIntegrity)
 	require.EqualValues(t, 1, fired.Load())
+}
+
+// faultCodec is a codec that fails its Decrypt of the pages in fail with
+// their error, as a codec whose key service is not available does, and
+// otherwise decrypts as the codec it wraps.
+type faultCodec struct {
+	Codec
+	fail map[uint32]error
+}
+
+func (c *faultCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch, onError integrityHook) ([]byte, error) {
+	if err := c.fail[pgno]; err != nil {
+		return nil, err
+	}
+	return c.Codec.Decrypt(dst, src, pgno, s, onError)
+}
+
+// A codec's error that is not a failed authentication proves nothing about
+// the key, in the database file as in the WAL: the open goes on to the
+// next page, and when no page authenticates it returns that error, not
+// ErrWrongKey. A page after it that authenticates, in the same open, proves
+// the key.
+func TestOpen_CodecErrorOnAProbePageIsNotAWrongKey(t *testing.T) {
+	encTestSetup(t)
+	codec, err := newCodecFromType(CipherAES256GCM, bytes.Repeat([]byte{0x5A}, KeyLen))
+	require.NoError(t, err)
+	unavailable := errors.New("injected: key service unavailable")
+	create := func(t *testing.T, rows int) (string, Options) {
+		t.Helper()
+		path := tmpEncryptedFile(t, "enc.db")
+		opts := DefaultOptions()
+		opts.Codec = codec
+		opts.InProcess = true
+		db, err := Open(path, opts)
+		require.NoError(t, err)
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := wtx.CreateNamespace("x")
+		require.NoError(t, err)
+		for i := 0; i < rows; i++ {
+			require.NoError(t, wtx.Put(ns, []byte(fmt.Sprintf("key-%04d", i)), bytes.Repeat([]byte("v"), 1000)))
+		}
+		require.NoError(t, wtx.Commit())
+		require.NoError(t, db.Checkpoint(CheckpointFull))
+		require.NoError(t, db.Close())
+		damageFile(t, path, 1000)
+		return path, opts
+	}
+
+	t.Run("the only other page", func(t *testing.T) {
+		path, opts := create(t, 0)
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		require.Equal(t, 2*int64(opts.PageSize), info.Size())
+		var fired atomic.Int32
+		opts.OnIntegrityError = func(uint32, error) { fired.Add(1) }
+		opts.Codec = &faultCodec{Codec: codec, fail: map[uint32]error{2: unavailable}}
+		_, err = Open(path, opts)
+		require.ErrorIs(t, err, unavailable)
+		require.NotErrorIs(t, err, ErrWrongKey)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		require.Zero(t, fired.Load())
+	})
+	t.Run("a page after it proves the key", func(t *testing.T) {
+		path, opts := create(t, 400)
+		var pages []uint32
+		opts.OnIntegrityError = func(pgno uint32, _ error) { pages = append(pages, pgno) }
+		opts.Codec = &faultCodec{Codec: codec, fail: map[uint32]error{2: unavailable}}
+		_, err := Open(path, opts)
+		require.ErrorIs(t, err, ErrPageIntegrity)
+		require.NotErrorIs(t, err, unavailable)
+		require.Equal(t, []uint32{1}, pages)
+	})
+}
+
+// A page that could not be read is skipped, and a page after it that
+// authenticates, in the same open, proves the key: page 1 in the WAL is
+// damage.
+func TestOpen_UnreadableProbePageThenAProvingOne(t *testing.T) {
+	path, opts := keyProofDB(t, false, nil)
+	var pages []uint32
+	opts.OnIntegrityError = func(pgno uint32, _ error) { pages = append(pages, pgno) }
+	walPath := path + "-wal"
+	page1Frame, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
+	damageFile(t, walPath, off+walFrameSize+1000)
+	resealWAL(t, walPath, int(opts.PageSize))
+	firstProbe, _ := lastWALFrame(t, walPath, int(opts.PageSize), 2)
+	require.NotEqual(t, page1Frame, firstProbe)
+
+	eio := errors.New("injected: input/output error")
+	setWalReadFrameFaultHook(func(frame uint32) error {
+		if frame == firstProbe {
+			return eio
+		}
+		return nil
+	})
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
+	_, err := Open(path, opts)
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.NotErrorIs(t, err, eio)
+	require.Equal(t, []uint32{1}, pages)
 }
 
 // An integrity hook that panics inside Open (the key check calls it for a

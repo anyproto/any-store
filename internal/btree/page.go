@@ -391,6 +391,20 @@ func (h *dbHeader) serialize(buf []byte) {
 	binary.BigEndian.PutUint32(buf[96:100], 1)
 }
 
+// headerFamily reports the family of any-store magics the first 16 bytes of
+// a database header, magic, belong to: versioned (dbMagicFmt) or not
+// (dbMagicV2, dbMagicV1). ok is false for any other magic, SQLite's
+// included.
+func headerFamily(magic []byte) (versioned, ok bool) {
+	switch string(magic[:16]) {
+	case dbMagicV2, dbMagicV1:
+		return false, true
+	case dbMagicFmt:
+		return true, true
+	}
+	return false, false
+}
+
 // deserialize reads the database header from the first 100 bytes of buf.
 func (h *dbHeader) deserialize(buf []byte) error {
 	if len(buf) < dbHeaderSize {

@@ -918,9 +918,8 @@ func (p *pager) readPage1AtOpen() error {
 		}
 	}
 	header := p.header
-	// The copy read below passes the same format checks as the file's first
-	// read (dbHeader.deserialize), and it must name the same magic family:
-	// no commit moves a file between them.
+	// The copy read below must name the magic family of the file's first
+	// read, and then passes the same format checks (page1HeaderAtOpen).
 	fileVersioned := p.header.versioned
 	// Under a key, page 1 is the page the open proves the key on: its
 	// failed authentication goes to keyCheck, not to the integrity hook,
@@ -940,10 +939,10 @@ func (p *pager) readPage1AtOpen() error {
 			// encrypted and is judged before the key is: a file of
 			// another format is that, whatever the key.
 			unauthenticated = err
-			if err := p.page1FrameHeader(frame, &header); err != nil {
+			if err := p.page1FrameHeader(frame, &header, fileVersioned); err != nil {
 				return err
 			}
-		} else if err := header.deserialize(walBuf[:dbHeaderSize]); err != nil {
+		} else if err := page1HeaderAtOpen(walBuf[:dbHeaderSize], &header, fileVersioned); err != nil {
 			return err
 		}
 	} else {
@@ -963,7 +962,7 @@ func (p *pager) readPage1AtOpen() error {
 				return fmt.Errorf("%w: file of %d bytes is shorter than the header", ErrHeaderCorrupt, n)
 			}
 		}
-		if err := header.deserialize(buf[:dbHeaderSize]); err != nil {
+		if err := page1HeaderAtOpen(buf[:dbHeaderSize], &header, fileVersioned); err != nil {
 			return err
 		}
 		// BEGIN ENCRYPTION
@@ -984,10 +983,6 @@ func (p *pager) readPage1AtOpen() error {
 			}
 		}
 		// END ENCRYPTION
-	}
-
-	if header.versioned != fileVersioned {
-		return fmt.Errorf("%w: header magic differs between the file and its WAL", ErrHeaderCorrupt)
 	}
 
 	// sqlite3WalDbsize: the snapshot header's nPage. In the heap-shm modes
@@ -1035,13 +1030,31 @@ func (p *pager) page1Hook(kc *page1KeyCheck) integrityHook {
 
 // page1FrameHeader decodes into h the header of page 1 as WAL frame holds
 // it, read without the codec: the first dbHeaderSize bytes of page 1 are
-// not encrypted (encryptPageWithCodec).
-func (p *pager) page1FrameHeader(frame uint32, h *dbHeader) error {
+// not encrypted (encryptPageWithCodec). The header is judged as page
+// 1's at open is (page1HeaderAtOpen).
+func (p *pager) page1FrameHeader(frame uint32, h *dbHeader, fileVersioned bool) error {
 	var buf [dbHeaderSize]byte
 	if err := p.readWalFrameDataRaw(frame, buf[:]); err != nil {
 		return fmt.Errorf("btree: read page-1 header (WAL frame %d): %w", frame, err)
 	}
-	return h.deserialize(buf[:])
+	return page1HeaderAtOpen(buf[:], h, fileVersioned)
+}
+
+// page1HeaderAtOpen decodes into h the header of the page 1 that
+// readPage1AtOpen read, buf, from a WAL frame or again from the database
+// file, once its magic names the family the file's first read found
+// (fileVersioned). No commit moves a file between families: a page 1 of
+// another magic, an any-store family or SQLite's, does not fit the file,
+// and it is ErrHeaderCorrupt before anything in it is read as the format
+// its magic names (SQLite's would make the file an any-store v1 one).
+func page1HeaderAtOpen(buf []byte, h *dbHeader, fileVersioned bool) error {
+	if len(buf) < dbHeaderSize {
+		return ErrHeaderCorrupt
+	}
+	if versioned, ok := headerFamily(buf); !ok || versioned != fileVersioned {
+		return fmt.Errorf("%w: page 1's header magic is not of the file's family", ErrHeaderCorrupt)
+	}
+	return h.deserialize(buf)
 }
 
 // keyProbePages bounds the pages proveKeyAtOpen tries.
@@ -1101,7 +1114,8 @@ func (p *pager) page1Unauthenticated(perr error, kc *page1KeyCheck, nPage, maxFr
 // file holds there.
 //
 // A page that cannot be read (an I/O error, a failed wal-index lookup, a
-// WAL frame the log does not hold) is not tried: its error is kept, and
+// WAL frame the log does not hold), or that the codec fails on with an
+// error that is not ErrPageIntegrity, is not tried: its error is kept, and
 // the probe goes on, since a later page can still prove the key. A page
 // the database file ends inside reads as zeros past the end, as page 1
 // does at open (readDbPage forgives the short read, pager.c:3042-3044),
@@ -1154,10 +1168,18 @@ func (p *pager) proveKeyAtOpen(nPage, maxFrame, minFrame uint32) (proven bool, t
 			}
 			clear(buf[n:])
 		}
-		tried++
-		if _, err := decryptPageWithCodec(p.codec, scratch, buf, pgno, &aead, nil); err == nil {
-			return true, tried, nil
+		// A codec's error that is not a failed authentication (a key
+		// service that is not available, say) tried nothing, as for a
+		// page in the WAL.
+		_, err = decryptPageWithCodec(p.codec, scratch, buf, pgno, &aead, nil)
+		if err == nil {
+			return true, tried + 1, nil
 		}
+		if !errors.Is(err, ErrPageIntegrity) {
+			keep(pgno, err)
+			continue
+		}
+		tried++
 	}
 	return false, tried, readErr
 }
