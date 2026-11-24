@@ -177,6 +177,8 @@ res, _ := orders.Aggregate(`[
 
 The database file behaves like SQLite in WAL mode: any process may open it at any moment and read or write concurrently. Coordination runs through file locks and a shared-memory WAL index; snapshot reads are never blocked, writers serialize, and busy situations back off through a configurable handler. DDL from a peer process (created/dropped collections and indexes) is reconciled automatically on the next transaction.
 
+One process holds one handle on a database file: a second `Open` of a file the process has open returns `ErrDBAlreadyOpen`. Where multi-process access is not available (anything but linux and darwin on amd64 and arm64), `Open` of a file that another process has open returns `ErrDBOpenInOtherProcess` at once; js/wasm and wasip1 take no file lock and do not detect the other process.
+
 ## Durability
 
 Any Store performs WAL checkpoints and fsync after idle periods.

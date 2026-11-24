@@ -169,6 +169,26 @@ var (
 
 	ErrDBIsNotOpened = errors.New("any-store: database is not opened")
 
+	// ErrDBAlreadyOpen is returned by Open, and (wrapped) by Backup for its destination, when
+	// this process already has the file open, or is opening it: one process holds one handle
+	// on a database file. The file is recognised by its identity, not by its name, so a second
+	// path to it (a hard link or a symbolic link) is refused too; on Windows, js/wasm and
+	// wasip1 it is recognised by its full path. Nothing was locked or changed. Use the handle
+	// that is open, or close it first.
+	ErrDBAlreadyOpen = btree.ErrDatabaseOpen
+
+	// ErrDBOpenInOtherProcess is returned by Open, and (wrapped) by Backup for its destination,
+	// on a platform without multi-process access, when another process has the file open.
+	// Multi-process access needs linux or darwin on amd64 or arm64; everywhere else a database
+	// file belongs to one process at a time, and a second process is refused at once, without
+	// waiting. Nothing was changed. On Windows a second Open in the same process that names
+	// the file by another path (a link) is refused with this error too.
+	//
+	// It is not returned on linux or darwin on amd64 or arm64, where a second process opens
+	// the file, nor on js/wasm and wasip1, which take no lock on the file: there a second
+	// process is not detected.
+	ErrDBOpenInOtherProcess = btree.ErrInProcessLocked
+
 	// ErrUnsupportedDB is returned by a package function that takes a DB,
 	// such as SchemaFormat, when that DB is not one this package opened: a
 	// type of the caller's own that implements the interface.
