@@ -210,6 +210,7 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 // page 1 stands, as it does for every reader, and a header that cannot be
 // read or gives no valid count is the sweep's error: there is then no count
 // to sweep to.
+// DRIFT: page 1 is read raw (its header alone when the page cannot be read whole) and, where a WAL commit recorded the snapshot's size, its count is checked against that size and page 1 listed when they differ; lockBtree reads page 1 through the pager and takes a smaller count as it stands. See docs/btree/NOTES.md#drift-2026-06-25-12-verifyintegrity-bounds-the-sweep-with-the-live-writer-header-pager-hea
 func (db *DB) sweepPageCount(tx *ReadTx) (total uint32, raw1 []byte, page1Errs []SweepError, err error) {
 	p := db.pager
 	bound := p.readerDbSizeBound(tx.cache)
