@@ -7,12 +7,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/query"
 )
 
 // TestCoverIter_Next covers all branches of CoverIter.Next:
 // - empty-start bound → skip (continue)
-// - AppendSeekKey error → skip (continue)
+// - AppendSeekKey finds no key → skip (continue)
 // - seek result doesn't have prefix → skip
 // - happy path → return key + extracted docId
 func TestCoverIter_Next(t *testing.T) {
@@ -51,6 +52,45 @@ func TestCoverIter_Next(t *testing.T) {
 		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		assert.Nil(t, docId, "missing prefix must not yield")
+	})
+}
+
+// A seek that fails is not a key that is absent: Next returns the error, for
+// the first bound and for a later one, and keeps none of the matches of the
+// bounds before it as a complete result.
+func TestCoverIter_Next_SeekError(t *testing.T) {
+	db, ns := coverageBtree(t, "cover_seek_error", []string{"alpha", "beta"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	it := &CoverIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ci", FieldNames: []string{"id"}},
+		Bounds: query.Bounds{
+			{Start: anyenc.AppendAnyValue(nil, "alpha")},
+			{Start: anyenc.AppendAnyValue(nil, "beta")},
+		},
+	}
+	_, docId, _, err := it.Next()
+	require.NoError(t, err)
+	require.NotNil(t, docId)
+	// The transaction ends under the iterator: every later seek fails.
+	require.NoError(t, rtx.Rollback())
+	_, docId, _, err = it.Next()
+	require.ErrorIs(t, err, btree.ErrTxClosed)
+	assert.Nil(t, docId)
+
+	t.Run("first bound", func(t *testing.T) {
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		it := &CoverIter{
+			Source:  &CursorSource{Tx: rtx, Ns: ns},
+			IdxInfo: &IndexInfo{Name: "ci", FieldNames: []string{"id"}},
+			Bounds:  query.Bounds{{Start: anyenc.AppendAnyValue(nil, "alpha")}},
+		}
+		require.NoError(t, rtx.Rollback())
+		_, docId, _, err := it.Next()
+		require.ErrorIs(t, err, btree.ErrTxClosed)
+		assert.Nil(t, docId)
 	})
 }
 

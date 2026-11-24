@@ -123,7 +123,7 @@ func TestWalIndexMapError_LookupsFail(t *testing.T) {
 	require.ErrorIs(t, err, errSegmentMap)
 	_, err = wi.getLatest(pgno)
 	require.ErrorIs(t, err, errSegmentMap)
-	_, err = db.pager.readRawPage(pgno, mx)
+	_, err = db.pager.readRawPage(pgno, mx, nil)
 	require.ErrorIs(t, err, errSegmentMap)
 	_, _, err = db.pager.headerCountersAt(mx, 1, false)
 	require.ErrorIs(t, err, errSegmentMap)

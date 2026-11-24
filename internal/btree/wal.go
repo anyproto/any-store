@@ -1732,6 +1732,12 @@ type wal struct {
 	ckptLatest map[uint32]uint32
 	ckptPgnos  []uint32
 
+	// dirSync is set when open opens the WAL file, with the create flag, as
+	// unixOpen sets UNIXFILE_DIRSYNC on every WAL it opens so
+	// (os_unix.c:6569-6573, 6777; sqlite3WalOpen, wal.c:1719-1720): the
+	// first sync of the file also syncs its directory (syncFile).
+	dirSync dirSync
+
 	// headerOnDisk is false when the WAL file is empty (0 bytes) and the
 	// header has not yet been written to disk. The header is written lazily
 	// on the first writeFrames call. This matches SQLite's behavior where
@@ -1880,6 +1886,7 @@ func (w *wal) open() (err error) {
 		return err
 	}
 	w.file = f
+	w.dirSync.set(w.path)
 
 	// Release the WAL file/shm on any error after this point so a failed open
 	// doesn't leak fds (see the equivalent guard in pager.open for why a leaked
@@ -2383,11 +2390,21 @@ func (w *wal) flushHeader() error {
 	if _, err := w.file.WriteAt(buf, 0); err != nil {
 		return err
 	}
-	if err := fdatasync(w.file); err != nil {
+	if err := w.syncFile(); err != nil {
 		return err
 	}
 	w.headerOnDisk = true
 	return nil
+}
+
+// syncFile syncs the WAL file, and, at the first sync since open, its
+// directory after it (dirSync): unixSync on a descriptor marked
+// UNIXFILE_DIRSYNC (os_unix.c:3936-3954). So the WAL's name, and every name
+// created or removed in the directory before it (a creation journal's
+// delete in particular, creationJournal.commit), is durable before anything
+// synced to the WAL through this handle is relied on.
+func (w *wal) syncFile() error {
+	return w.dirSync.sync(w.file)
 }
 
 // writeHeader writes a fresh WAL header to disk. There is no log to
@@ -2409,7 +2426,7 @@ func (w *wal) writeHeader() error {
 	if _, err := w.file.WriteAt(buf, 0); err != nil {
 		return err
 	}
-	if err := fdatasync(w.file); err != nil {
+	if err := w.syncFile(); err != nil {
 		return err
 	}
 
@@ -2959,7 +2976,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		}
 
 		if !w.noCommitSync {
-			if err := fdatasync(w.file); err != nil {
+			if err := w.syncFile(); err != nil {
 				return err
 			}
 		}
@@ -4459,7 +4476,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	// Always sync regardless of noCommitSync: noCommitSync only skips per-commit
 	// syncs (like SQLite synchronous=NORMAL), but checkpoint always syncs.
 	if w.file != nil {
-		if err := fdatasync(w.file); err != nil {
+		if err := w.syncFile(); err != nil {
 			_ = w.index.unlock(lockRead0, lockExclusive)
 			return err
 		}

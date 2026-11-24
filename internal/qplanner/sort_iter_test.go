@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
@@ -121,6 +122,53 @@ func TestSortIter_FallbackFetch(t *testing.T) {
 	}
 	assert.Equal(t, []string{"a", "b", "c"}, got,
 		"sort-by-id must return ascending a,b,c after fallback-fetch")
+}
+
+// The fallback fetch skips a document that is gone and returns every other
+// error: a row it could not read is not a row to leave out of the result.
+func TestSortIter_FallbackFetch_Error(t *testing.T) {
+	db, ns := coverageBtree(t, "sort_fallback_error", []string{"a", "b", "c"})
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+	srt, err := query.ParseSort("id")
+	require.NoError(t, err)
+	newIter := func(rtx *btree.ReadTx, ids ...string) *SortIter {
+		plan := &Plan{}
+		source := &fakeIter{plan: plan}
+		for _, id := range ids {
+			source.hits = append(source.hits, fakeHit{docId: anyenc.AppendAnyValue(nil, id)})
+		}
+		return &SortIter{Source: source, Data: &CursorSource{Tx: rtx, Ns: ns}, Sorter: srt, Buf: buf, Plan: plan}
+	}
+
+	t.Run("document gone", func(t *testing.T) {
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+		it := newIter(rtx, "a", "gone", "c")
+		defer it.Close()
+		var got []string
+		for {
+			_, docId, _, err := it.Next()
+			require.NoError(t, err)
+			if docId == nil {
+				break
+			}
+			got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+		}
+		assert.Equal(t, []string{"a", "c"}, got)
+	})
+	t.Run("read error", func(t *testing.T) {
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		require.NoError(t, rtx.Rollback())
+		it := newIter(rtx, "a", "b", "c")
+		defer it.Close()
+		_, docId, _, err := it.Next()
+		require.ErrorIs(t, err, btree.ErrTxClosed)
+		assert.Nil(t, docId)
+	})
 }
 
 // TestSortIter_SourceError propagates an error from Source.Next through

@@ -170,7 +170,7 @@ func parseLeafCell(data []byte, offset int) (cellData, int, error) {
 // c.key may be a prefix (not the full key). Callers needing the full key must
 // check c.overflowPg != 0 and use leafFullKey.
 // DRIFT: leaf cell-size computation omits SQLite's `if nSize<4 nSize=4` clamp See docs/btree/NOTES.md#drift-26-leaf-cell-size-missing-four-byte-minimum-clamp
-// DRIFT: payload lengths are capped at maxPayloadAlloc, not checked against the database size. See docs/btree/NOTES.md#old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation
+// DRIFT: a cell whose key and value lengths sum over maxPayloadAlloc (1 GiB) is ErrCorrupt (payloadFits); SQLite's cell parsers cap no payload length. See docs/btree/NOTES.md#old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation
 func parseLeafCellWithSize(data []byte, offset int, lim payloadLimits) (cellData, int, error) {
 	var c cellData
 	pos := offset
@@ -198,13 +198,10 @@ func parseLeafCellWithSize(data []byte, offset int, lim payloadLimits) (cellData
 	}
 	pos += n
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc || int(valLen) < 0 || int(valLen) > maxPayloadAlloc {
+	if !payloadFits(keyLen, valLen) {
 		return c, 0, ErrCorrupt
 	}
 	totalPayload := int(keyLen) + int(valLen)
-	if totalPayload < 0 || totalPayload > maxPayloadAlloc {
-		return c, 0, ErrCorrupt
-	}
 	maxLocal := 0
 	if lim.usable > 0 {
 		maxLocal = lim.maxLocal
@@ -279,7 +276,7 @@ func parseInteriorCell(data []byte, offset int, usableSize ...int) (cellData, in
 	}
 	pos += n
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
+	if !payloadFits(keyLen, 0) {
 		return c, 0, ErrCorrupt
 	}
 
@@ -401,7 +398,7 @@ func interiorCellPrefixSizes(cells []cellData, usableSize int) []int {
 // whose child is childPgno, and returns the path to that page, its entry last.
 // The balance paths carry their path down from Put or Delete; this is for the
 // one place that needs a parent again after the tree above it was rewritten.
-// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
+// The path is bounded as Put's is.
 func (bt *btree) pathToChild(key []byte, childPgno uint32) ([]pathEntry, error) {
 	var path []pathEntry
 	pg, err := bt.getPage(bt.rootPage)
@@ -419,6 +416,9 @@ func (bt *btree) pathToChild(key []byte, childPgno uint32) ([]pathEntry, error) 
 		bt.pager.releasePage(pg)
 		if serr != nil {
 			return nil, serr
+		}
+		if len(path) >= btCursorMaxDepth-1 {
+			return nil, ErrCorrupt
 		}
 		path = append(path, pathEntry{pgno: pgno, cellIdx: uint16(idx), nCell: nCell})
 		if child == childPgno {
@@ -665,23 +665,28 @@ func searchLeafWithOverflow(pg *page, key []byte, lim payloadLimits, p *pager, w
 		}
 		payloadStart := pos + vn
 
-		// The same bounds as parseLeafCellWithSize, before the lengths are
-		// added or used as slice bounds.
-		if keyLen > maxPayloadAlloc || valLen > maxPayloadAlloc {
+		// A probe reads the cell's key and nothing else, so only the key's
+		// length is bounded here. The value's length, whatever it declares,
+		// only places the key's local part, and is used without adding it
+		// to the key's: a damaged length can wrap the sum. leafFullKey,
+		// which rebuilds a spilled key for the compare, tests the same way
+		// and holds only the key to the file size. SQLite's index probe sizes
+		// what it reads from the key alone (btree.c:6159-6168). A match is
+		// tested below.
+		if keyLen > uint64(payloadLimit) {
 			return 0, false, ErrCorrupt
 		}
-		totalPayload := int(keyLen) + int(valLen)
 		var cellKey []byte
-		if totalPayload <= maxLocal {
+		if valLen <= uint64(maxLocal) && keyLen <= uint64(maxLocal)-valLen {
 			// Fast path: no overflow, key fully on-page
 			end := payloadStart + int(keyLen)
-			if int(keyLen) < 0 || end > dataLen {
+			if end > dataLen {
 				return 0, false, ErrCorrupt
 			}
 			cellKey = data[payloadStart:end]
 		} else {
 			// Overflow cell — may need to read full key
-			nLocal := localPayloadSize(totalPayload, lim)
+			nLocal := spilledLocalSize(keyLen, valLen, lim)
 			localKeyBytes := min(nLocal, int(keyLen))
 			if localKeyBytes == int(keyLen) {
 				// Key fits fully in local portion
@@ -724,6 +729,18 @@ func searchLeafWithOverflow(pg *page, key []byte, lim payloadLimits, p *pager, w
 
 		cmp := bytes.Compare(cellKey, key)
 		if cmp == 0 {
+			// The cell found is the one a Get goes on to parse whole:
+			// report it only if its key and value together are within the
+			// record size limit, which that parse requires. The test is
+			// the search's, so every exact match is held to it, Has and an
+			// exact seek included. The value is not tested against the
+			// file here; that runs where the value is read, so Has can
+			// answer true for a record whose Get is ErrCorrupt by that
+			// bound. SQLite's table seek skips a cell's payload size and
+			// compares its rowid only (btree.c:5880-5886).
+			if !payloadFits(keyLen, valLen) {
+				return 0, false, ErrCorrupt
+			}
 			return mid, true, nil
 		}
 		if cmp < 0 {
@@ -935,20 +952,19 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	}
 	pos += n
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
-		return nil, ErrCorrupt
-	}
-	if int(valLen) < 0 || int(valLen) > maxPayloadAlloc {
+	// The key is what this reads, so the key is what is bounded: its length
+	// here, as searchLeafWithOverflow tests it, and its bytes against the
+	// file below. The value's length, whatever it declares, only places the
+	// local part, and is not added to the key's (spilledLocalSize): its
+	// bounds are tested where a value is read. SQLite's index probe sizes
+	// the key it rebuilds the same way (btree.c:6159-6168), and
+	// sqlite3VdbeMemFromBtree tests the range it reads (vdbemem.c:1428).
+	if keyLen > uint64(payloadLimit) {
 		return nil, ErrCorrupt
 	}
 
-	totalPayload := int(keyLen) + int(valLen)
-	if totalPayload < 0 || totalPayload > maxPayloadAlloc {
-		return nil, ErrCorrupt
-	}
-	maxLocal := lim.maxLocal
-
-	if totalPayload <= maxLocal {
+	maxLocal := uint64(lim.maxLocal)
+	if valLen <= maxLocal && keyLen <= maxLocal-valLen {
 		// No overflow: key is fully on-page
 		if pos+int(keyLen) > dataLen {
 			return nil, ErrCorrupt
@@ -957,7 +973,7 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	}
 
 	// Overflow cell
-	nLocal := localPayloadSize(totalPayload, lim)
+	nLocal := spilledLocalSize(keyLen, valLen, lim)
 	localKeyBytes := min(nLocal, int(keyLen))
 
 	if localKeyBytes == int(keyLen) {
@@ -969,12 +985,21 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	}
 
 	// Key overflows: allocate and reconstruct
-	if pos+nLocal+4 > dataLen {
+	if pos+nLocal+4 > dataLen || !payloadInFile(p, cache, int(keyLen)) {
+		return nil, ErrCorrupt
+	}
+	// The first overflow pointer gets the chain readers' page test before
+	// the key's buffers are allocated: a pointer they would refuse (0, 1,
+	// or past the page count) fails here, not after an allocation sized by
+	// the declared key. accessPayload tests each page against the page
+	// count (btree.c:5227), and a chain that ends early is corrupt
+	// (btree.c:5309-5311).
+	overflowPg := binary.BigEndian.Uint32(data[pos+nLocal : pos+nLocal+4])
+	if overflowPg < 2 || overflowPg > p.readerDbSizeBound(cache) {
 		return nil, ErrCorrupt
 	}
 	fullKey := make([]byte, int(keyLen))
 	copy(fullKey, data[pos:pos+localKeyBytes])
-	overflowPg := binary.BigEndian.Uint32(data[pos+nLocal : pos+nLocal+4])
 
 	// Read key remainder from overflow chain.
 	// The overflow chain contains (keyRemainder || valueRemainder).
@@ -1017,17 +1042,11 @@ func leafFullValue(data []byte, offset int, lim payloadLimits, p *pager, walMaxF
 	}
 	pos += n
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
-		return nil, ErrCorrupt
-	}
-	if int(valLen) < 0 || int(valLen) > maxPayloadAlloc {
+	if !payloadFits(keyLen, valLen) {
 		return nil, ErrCorrupt
 	}
 
 	totalPayload := int(keyLen) + int(valLen)
-	if totalPayload < 0 || totalPayload > maxPayloadAlloc {
-		return nil, ErrCorrupt
-	}
 	maxLocal := lim.maxLocal
 
 	if totalPayload <= maxLocal {
@@ -1053,6 +1072,9 @@ func leafFullValue(data []byte, offset int, lim payloadLimits, p *pager, walMaxF
 		return data[pos+localKeyBytes : pos+localKeyBytes+int(valLen)], nil
 	}
 
+	if !payloadInFile(p, cache, totalPayload) {
+		return nil, ErrCorrupt
+	}
 	fullVal := make([]byte, int(valLen))
 	copy(fullVal, data[pos+localKeyBytes:pos+nLocal])
 	overflowPg := binary.BigEndian.Uint32(data[pos+nLocal : pos+nLocal+4])
@@ -1081,7 +1103,7 @@ func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFr
 	keyStart := offset + 4 + n
 	maxLocal := maxLocalPayload(usableSize)
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
+	if !payloadFits(keyLen, 0) {
 		return nil, ErrCorrupt
 	}
 
@@ -1094,7 +1116,7 @@ func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFr
 
 	// Overflow: read local portion + overflow chain
 	localSize := interiorLocalPayloadSize(int(keyLen), usableSize)
-	if keyStart+localSize+4 > dataLen {
+	if keyStart+localSize+4 > dataLen || !payloadInFile(p, cache, int(keyLen)) {
 		return nil, ErrCorrupt
 	}
 	fullKey := make([]byte, int(keyLen))
@@ -1181,7 +1203,6 @@ func (bt *btree) searchInterior(pg *page, key []byte) (childPgno uint32, cellIdx
 // AppendValue looks up a key in the B-tree and appends its value to buf.
 // The returned slice is safe to retain after the page is released.
 // Pass nil for buf to allocate a new slice (equivalent to Get).
-// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 	maxFrame, slot, err := bt.pager.beginRead()
 	if err != nil {
@@ -1212,6 +1233,9 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 	}
 
 	lim := bt.leafLimits()
+	// depth counts the child pointers followed, SQLite's pCur->iPage: see
+	// btCursorMaxDepth.
+	depth := 0
 	for {
 		if pg.header.isLeaf() {
 			idx, found, serr := searchLeafWithOverflow(pg, key, lim, bt.pager, maxFrame, bt.cache)
@@ -1251,6 +1275,10 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 				keyOverflow := int(keyLen) - localKeyBytes
 				overflowSize := totalPayload - nLocal
 
+				if !payloadInFile(bt.pager, bt.cache, totalPayload) {
+					bt.pager.releasePage(pg)
+					return buf, ErrCorrupt
+				}
 				start := len(buf)
 				buf = append(buf, make([]byte, int(valLen))...)
 				fullVal := buf[start:]
@@ -1291,6 +1319,10 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 			return buf, serr
 		}
 		bt.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return buf, ErrCorrupt
+		}
+		depth++
 		// Reject an out-of-range child pointer as corruption before fetching
 		// (~ getAndInitPage's pgno>btreePagecount guard, btree.c:2396-2399);
 		// see descendChild. Inlined here because this path reads with the
@@ -1327,19 +1359,34 @@ func (bt *btree) Has(key []byte) (bool, error) {
 	return true, nil
 }
 
-// maxKeySize returns the maximum key size. Since both leaf and interior cells
-// support overflow (matching SQLite's index btrees), the key can be very large.
-// We limit it to prevent absurd allocations. SQLite limits index keys to about
-// 1/4 of SQLITE_MAX_LENGTH. We use a generous 1GB limit.
-const maxKeySize = 1 << 30 // 1GB
+// maxKeySize is the maximum key size. Both leaf and interior cells support
+// overflow (matching SQLite's index btrees), so a key may be as large as a
+// whole record: the record size limit, with an empty value.
+const maxKeySize = maxPayloadAlloc
 
-// Put inserts or updates a key-value pair in the B-tree.
-// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
-func (bt *btree) Put(key, value []byte) error {
-	// Validate key size. Both leaf and interior cells support overflow,
-	// so this is just a sanity limit to prevent absurd allocations.
-	if len(key) > maxKeySize {
+// recordSizeErr is the write side of payloadFits: nil for a record that may
+// be written, ErrKeyTooLarge when the key alone is over the record size limit
+// and ErrValueTooLarge when the key and the value together are.
+// DRIFT: two errors, by whether the key alone is over the limit; OP_MakeRecord returns SQLITE_TOOBIG for any record over SQLITE_LIMIT_LENGTH. See docs/btree/NOTES.md#drift-2026-11-24-1-put-refuses-a-record-over-the-record-size-limit
+func recordSizeErr(keyLen, valLen int) error {
+	if payloadFits(uint64(keyLen), uint64(valLen)) {
+		return nil
+	}
+	if keyLen > payloadLimit {
 		return ErrKeyTooLarge
+	}
+	return ErrValueTooLarge
+}
+
+// Put inserts or updates a key-value pair in the B-tree. A record over the
+// record size limit is refused with ErrKeyTooLarge or ErrValueTooLarge and
+// nothing is written.
+// DRIFT: every record is tested here against the record size limit (key plus value, 1 GiB); SQLite tests SQLITE_LIMIT_LENGTH (10^9) in OP_MakeRecord, above sqlite3BtreeInsert. See docs/btree/NOTES.md#drift-2026-11-24-1-put-refuses-a-record-over-the-record-size-limit
+func (bt *btree) Put(key, value []byte) error {
+	// A record the cell parsers would reject is refused here, before a
+	// page is touched: see payloadFits.
+	if err := recordSizeErr(len(key), len(value)); err != nil {
+		return err
 	}
 
 	// The cursors open on this tree are saved before a page of it changes
@@ -1380,6 +1427,12 @@ func (bt *btree) Put(key, value []byte) error {
 		if serr != nil {
 			bt.pager.releasePage(pg)
 			return serr
+		}
+		// The path is SQLite's cursor stack (apPage/aiIdx): moveToChild
+		// refuses to push past it (btree.c:5448), see btCursorMaxDepth.
+		if len(path) >= btCursorMaxDepth-1 {
+			bt.pager.releasePage(pg)
+			return ErrCorrupt
 		}
 		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
@@ -1773,6 +1826,11 @@ func (bt *btree) cellFullKey(c *cellData) ([]byte, error) {
 	localKeyBytes := min(nLocal, int(keyLen))
 	keyOverflow := int(keyLen) - localKeyBytes
 
+	// Only the key is read, so only the key's bytes are tested against the
+	// file, as in leafFullKey.
+	if !payloadInFile(bt.pager, bt.cache, int(keyLen)) {
+		return nil, ErrCorrupt
+	}
 	fullKey := make([]byte, int(keyLen))
 	copy(fullKey, c.key[:localKeyBytes])
 	overflowBuf := make([]byte, keyOverflow)
@@ -1851,6 +1909,10 @@ func (bt *btree) collectInteriorCellsKeepBuf(pg *page) ([]cellData, []byte, erro
 			keyLen, kn := getVarint(pg.data[pos:])
 			pos += kn
 			localSize := interiorLocalPayloadSize(int(keyLen), usable)
+			if !payloadInFile(bt.pager, bt.cache, int(keyLen)) {
+				bt.pager.recycleCellBuf(buf)
+				return nil, nil, ErrCorrupt
+			}
 			fullKey := make([]byte, int(keyLen))
 			copy(fullKey, pg.data[pos:pos+localSize])
 			overflowPg := binary.BigEndian.Uint32(pg.data[pos+localSize : pos+localSize+4])
@@ -2506,6 +2568,14 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 // Modeled after SQLite's balance_deeper(): copies root content to a new child
 // page, then converts the root into an interior page pointing to the new child
 // and the right sibling. Handles both leaf and interior roots correctly.
+// Like SQLite's balance, which calls balance_deeper on an over-full root
+// (btree.c:9134-9145), it does not look at the height of the tree: a tree of
+// btCursorMaxDepth levels grows to one more, and from then on a lookup, a
+// write or a cursor that has to go below level btCursorMaxDepth (the root is
+// level 1) returns ErrCorrupt; countPage, walkSize and keyRank go one level
+// further. On a tree whose branches differ in depth, a leaf the split moves
+// to level btCursorMaxDepth or less still reads. See the known limitations in
+// docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 // DRIFT: splitRoot omits SQLite's anotherValidCursor() guard before deepening root See docs/btree/NOTES.md#drift-34-splitroot-missing-anothervalidcursor-corruption-guard
 func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) error {
 	// Allocate a new page for the old root's content
@@ -2566,7 +2636,6 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 //
 // When fragmentation exceeds the threshold (60 bytes, matching SQLite's limit),
 // a full rebuild is triggered to defragment the page.
-// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 // DRIFT: the under-full trigger counts fragment bytes as used. See docs/btree/NOTES.md#drift-37-delete-rebalance-underfull-trigger-counts-fragbytes-as-used
 // DRIFT: a dropped cell's space becomes fragment bytes, not a freeblock. See docs/btree/NOTES.md#old-drift-no-freeblock-chain-fragbytes-rebuild
 func (bt *btree) Delete(key []byte) error {
@@ -2598,6 +2667,10 @@ func (bt *btree) Delete(key []byte) error {
 		if serr != nil {
 			bt.pager.releasePage(pg)
 			return serr
+		}
+		if len(path) >= btCursorMaxDepth-1 { // as in Put
+			bt.pager.releasePage(pg)
+			return ErrCorrupt
 		}
 		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
@@ -3507,6 +3580,17 @@ func (bt *btree) countPage(ctx context.Context, pgno uint32, depth int) (int, er
 // Matches SQLite's BTCURSOR_MAX_DEPTH (btreeInt.h). Any B-tree deeper than
 // this is considered corrupt. This limit also catches circular page references
 // that would otherwise cause infinite loops during cursor traversal.
+//
+// The rule is moveToChild's (btree.c:5448, inlined in sqlite3BtreeIndexMoveto
+// at btree.c:6227): with iPage the number of child pointers followed from the
+// root, a further step is refused once iPage >= BTCURSOR_MAX_DEPTH-1. A chain
+// of btCursorMaxDepth pages, root and leaf included, is the deepest one read.
+// It is applied by cursor navigation, the point lookups, the namespace
+// lookup and the descents of Put and Delete. SQLite's seeks, inserts and
+// deletes all go down through a cursor, so that one line bounds them. The
+// walks over a whole tree are not held to it: countPage, walkSize and keyRank
+// stop one level later, freeTreePages at its own bound, as SQLite's
+// clearDatabasePage recurses without a cursor (btree.c:10225).
 const btCursorMaxDepth = 20
 
 // Cursor provides ordered iteration over a B-tree.
@@ -3955,7 +4039,7 @@ func leafKeyAt(pg *page, idx int, lim payloadLimits) ([]byte, error) {
 		pos++
 	} else {
 		kl, n, kerr := getVarintSafe(data[pos:])
-		if kerr != nil || kl > maxPayloadAlloc {
+		if kerr != nil || kl > uint64(payloadLimit) {
 			return nil, ErrCorrupt
 		}
 		keyLen = int(kl)
@@ -3969,16 +4053,16 @@ func leafKeyAt(pg *page, idx int, lim payloadLimits) ([]byte, error) {
 		pos++
 	} else {
 		vl, n, verr := getVarintSafe(data[pos:])
-		if verr != nil || vl > maxPayloadAlloc {
+		if verr != nil || vl > uint64(payloadLimit) {
 			return nil, ErrCorrupt
 		}
 		valLen = int(vl)
 		pos += n
 	}
-	totalPayload := keyLen + valLen
-	if totalPayload > maxPayloadAlloc {
+	if !payloadFits(uint64(keyLen), uint64(valLen)) {
 		return nil, ErrCorrupt
 	}
+	totalPayload := keyLen + valLen
 	if totalPayload > lim.maxLocal {
 		nLocal := localPayloadSize(totalPayload, lim)
 		if pos+nLocal+overflowPtrSize > dataLen {
@@ -4134,20 +4218,15 @@ func (c *Cursor) Key() ([]byte, error) {
 		return nil, ErrCorrupt
 	}
 
-	lim := c.bt.leafLimits()
 	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
 	if oerr != nil {
 		return nil, oerr
 	}
-	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), lim)
-	if cerr != nil {
-		return nil, cerr
-	}
-	if cell.overflowPg != 0 {
-		// Key may be partial — use leafFullKey to reconstruct
-		return leafFullKey(frame.pg.data, int(off), lim, c.bt.pager, c.bt.walMaxFrame, c.bt.cache)
-	}
-	return cell.key, nil
+	// A read of the key bounds the key only (leafFullKey); Value tests the
+	// value's declared length. A SQLite table cursor likewise reads the
+	// rowid of a row whose payload is corrupt (sqlite3BtreeIntegerKey
+	// returns the parsed nKey, btree.c:4917-4923).
+	return leafFullKey(frame.pg.data, int(off), c.bt.leafLimits(), c.bt.pager, c.bt.walMaxFrame, c.bt.cache)
 }
 
 // Value returns the current value.
@@ -4201,6 +4280,9 @@ func (c *Cursor) Value() ([]byte, error) {
 		valOverflow := int(valLen) - localValBytes
 
 		// Allocate full value buffer and copy local portion
+		if !payloadInFile(c.bt.pager, c.bt.cache, totalPayload) {
+			return nil, ErrCorrupt
+		}
 		fullVal := make([]byte, int(valLen))
 		if localValBytes > 0 {
 			copy(fullVal, cell.value)
@@ -4271,6 +4353,9 @@ func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
 		valOverflow := int(valLen) - localValBytes
 
 		// Grow buf to hold the full value
+		if !payloadInFile(c.bt.pager, c.bt.cache, totalPayload) {
+			return buf, ErrCorrupt
+		}
 		start := len(buf)
 		buf = slices.Grow(buf, int(valLen))[:start+int(valLen)]
 		fullVal := buf[start:]
@@ -4671,11 +4756,12 @@ func (c *Cursor) CountUntil(endKey []byte, endInclusive bool) (int, error) {
 				return count, oerr
 			}
 			lastCell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(lastOff), lim)
-			if cerr != nil {
-				return count, cerr
-			}
 
-			if lastCell.overflowPg == 0 {
+			// A last cell that does not parse whole is left to the
+			// per-entry path, which reads keys only (Cursor.Key), as
+			// SeekNear's and currentKeyEqual's fast paths fall back on a
+			// leafKeyAt error.
+			if cerr == nil && lastCell.overflowPg == 0 {
 				cmp := bytes.Compare(lastCell.key, endKey)
 				if cmp < 0 || (cmp == 0 && endInclusive) {
 					// All remaining entries on this page are within bounds

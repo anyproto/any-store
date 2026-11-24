@@ -160,7 +160,9 @@ func runDisk(path string, cache, n, dim, ef, k, queries int, seed int64, m vecto
 
 	qVecs, _, _, _ := vector.GenMDDataset(queries, dim, seed+1)
 
-	if vector.PagedExists(db, "emb") {
+	exists, err := vector.PagedExists(db, "emb")
+	must(err)
+	if exists {
 		// ---- RELOAD RUN (cold) ----
 		fmt.Printf("\n=== RELOAD run: reopening on-disk index at %s (cold cache=%d pages) ===\n", path, cache)
 		t := time.Now()

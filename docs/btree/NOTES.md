@@ -312,7 +312,7 @@ SQLite defines 4 schema format versions:
 ### Go
 
 The Go implementation creates files with `SchemaFormat = 6` (`maxSchemaFormat`, set in
-`pager.go:initNewDB()`); releases before v2.5.0 wrote 5.
+`pager.go:newPage1()`); releases before v2.5.0 wrote 5.
 
 ```go
 p.header = dbHeader{
@@ -436,6 +436,7 @@ Both support: PASSIVE, FULL, RESTART, TRUNCATE with identical semantics.
 | WAL undo (`sqlite3WalUndo`) | **Missing** -- Go uses pager-level rollback instead. The rollback clears the whole writer cache, where `pagerRollbackWal` reloads only logged and dirty pages (`pager.c:3147-3166`): a clean page 1 is read again by the next transaction, and in a schema format 6 file that sets the change counter's `dbFileVers` (2026-11-12, [drift-77](#drift-77-filechangecount-bumped-conditionally-not-unconditionally)) |
 | First-opener `ftruncate(shm, 3)` marker | **Aligned (2026-07-10)** -- `newPlatformShm` now runs SQLite's full DMS first-attacher election (`unixLockSharedMemory`, os_unix.c:4860-4913, 3.52.0): F_GETLK probe → three-way branch (F_UNLCK: WRLCK + UNCONDITIONAL truncate-to-3 + atomic downgrade to RDLCK; F_RDLCK: join shared; F_WRLCK: back off BUSY, never join — the os_unix.c:4864-4871 race). The `Size()==0` gate is gone; a crash-persisted stale shm is physically reset by the first attacher and `recoverLocked` rebuilds from the WAL. See [§drift-2026-06-25-25](#drift-2026-06-25-25-first-opener-does-not-reset-a-stale-persisted-shm-trusts-checksum-vali) (RESOLVED) and item 2 below |
 | Orphan-inode handling on open race | **Aligned** -- DB-file flock serializes last-client-unlink (see §SHM open/close protocol drift) |
+| Directory sync at a WAL descriptor's first sync (`UNIXFILE_DIRSYNC`) | **Aligned (2026-11-21)** -- the port gap is closed: `wal.open` opens the WAL with the create flag and sets the descriptor's `dirSync`, and its first sync (`wal.syncFile`, from the header write, a commit or a checkpoint) syncs the directory after the file, once, as `unixOpen` marks every WAL it opens with `SQLITE_OPEN_CREATE` (`os_unix.c:6569-6573`, `6777`; `sqlite3WalOpen`, `wal.c:1719-1720`) and `unixSync` consumes the mark (`os_unix.c:3936-3954`). So the WAL's name, and a creation journal's delete before it, are durable before a commit to the WAL is. The directory is that of the name the WAL was opened by, which is built from the database's full name, resolved once at open (`FullPathname`, as `pager.c:4792`, `4929`; `databaseDir`, as `openDirectory`, `os_unix.c:3874-3893`). Unix and wasip1; none on Windows and js/wasm. See [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal) |
 
 ### SHM open/close protocol drift (resolved 2026-04-21)
 
@@ -554,10 +555,10 @@ const (
 |---------|--------|-----|
 | Pager states | 7 (granular writer sub-states) | 4 (simplified) |
 | Journal modes | DELETE, TRUNCATE, PERSIST, MEMORY, WAL, OFF | WAL only |
-| Rollback journal | Full implementation | Not implemented |
+| Rollback journal | Full implementation | For the creation of a database only: a header with no page records ([drift-2026-11-21-7](#drift-2026-11-21-7-creation-journal)) |
 | Lock escalation | SHARED -> RESERVED -> PENDING -> EXCLUSIVE | WAL write lock only |
 | Multi-process support | Full (via file locks + SHM) | mmap-backed SHM on `(linux \|\| darwin) && (amd64 \|\| arm64)`; heap fallback (single-process) elsewhere |
-| Hot journal rollback | Automatic recovery | Not applicable (no rollback journal) |
+| Hot journal rollback | Automatic recovery | At open, for an interrupted creation: the file is truncated to nothing and created again |
 | Sub-journal (savepoint journal) | Written to disk | In-memory page copies |
 | NOCONTENT optimization | `PAGER_GET_NOCONTENT` flag | `getPageNoContent()` |
 | DONT_WRITE flag | `PGHDR_DONT_WRITE` in page flags (no effect in WAL mode: only `pager_write_pagelist` reads it) | None — frames are written at spill and commit |
@@ -836,7 +837,7 @@ The Go implementation has:
 | Aspect | SQLite | Go |
 |--------|--------|-----|
 | Max local payload | `BT_MAX_LOCAL = 65501` | `payloadLimits.maxLocal` computed from usableSize: the index limit for interior cells, the file's leaf limit (`pager.leafLimits`) for leaf cells |
-| Max total payload | Validated against `nPage * usableSize` | `maxPayloadAlloc = 1 << 30` |
+| Max total payload | Validated against `nPage * pageSize` (`sqlite3BtreeMaxRecordSize`) | `maxPayloadAlloc = 1 << 30` in the parsers and for writes; `payloadInFile` (`nPage * pageSize`) before a reader allocates |
 | Approach | Per-access bounds checking with macros | Per-access bounds checking with error returns |
 | Overflow protection | Trust chain structure | `maxIter` + bounds checks |
 | Max tree depth | `BTCURSOR_MAX_DEPTH = 20` | `btCursorMaxDepth` (same value) |
@@ -844,9 +845,74 @@ The Go implementation has:
 <a id="old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation"></a>
 **Severity:** low
 
-**Classification: Divergent** -- Both implementations protect against corruption, but
-the specific cap values differ. SQLite's `nCell/usableSize > nPage` check is more
-precise (validates against actual database size), while Go uses a fixed 1 GB cap.
+**Classification: Divergent** -- Go's cell parsers refuse, with `ErrCorrupt`, a cell whose
+key and value lengths sum over 1 GiB (`maxPayloadAlloc`, tested by `payloadFits`); SQLite's
+parsers read the payload length into a `u32` and test it against nothing
+(`btreeParseCellPtr`, `btree.c:1280-1287`; `btreeParseCellPtrIndex`, `btree.c:1359-1366`).
+The bound against the database size is SQLite's in both: a reader tests a declared length
+against `pageSize * nPage` before it sizes a buffer by it (`payloadInFile`, below), though a
+reader's page count is the pager's
+([drift-2026-11-24-2](#drift-2026-11-24-2-a-readers-file-size-bound-takes-the-pagers-page-count)).
+
+The cap is also the write-side limit: reads and writes apply one rule, `payloadFits`
+(`page.go`). Key length plus value length is at most `maxPayloadAlloc` (`1<<30`), tested on
+the 64-bit lengths a cell declares before they are converted to `int` (on a 32-bit build a
+declared length of `1<<32+1` would convert to 1). The leaf-cell parsers that test both
+lengths (`parseLeafCellWithSize`, `leafFullValue`, `leafKeyAt`) answer `ErrCorrupt` for a
+cell that fails it, and so do `parseInteriorCell` and `interiorFullKey` for a key over the
+cap. `Put` refuses such a record before it touches a page, so it never writes a record that
+its own parse would reject: see
+[drift-2026-11-24-1](#drift-2026-11-24-1-put-refuses-a-record-over-the-record-size-limit).
+
+A read of a leaf cell's key bounds the key only; the value's declared length is tested where
+the value is read. That length still places the key's local part, and `spilledLocalSize`
+(`page.go`) computes that part without adding the two lengths, which a damaged one could
+wrap. The search tests the sum only for the cell it reports as found, so every exact match
+is held to it, `Has` and an exact seek included. A damaged value length therefore need not
+make the cell's key, or a search for a neighbouring key, fail; a read of the value reports a
+length over its bounds. A SQLite table cursor reads the rowid of a row whose payload is
+corrupt the same way (`sqlite3BtreeIntegerKey`, `btree.c:4917-4923`). `leafCellPayloadLen`
+(`walkSize`) tests the two lengths singly. These tests are looser than `payloadFits`, never
+stricter, so nothing `Put` accepts fails there. The overflow-chain readers have no cap of
+their own (their `maxIter` follows from the length asked for), and the 9-byte varint holds
+any length under the cap.
+
+A reader that allocates from a declared length first tests it against the size of the
+database it reads, so that a few damaged bytes in a small file cannot ask for up to 1 GiB
+before the overflow chain is found short. The test is SQLite's: `sqlite3VdbeMemFromBtree`
+returns `SQLITE_CORRUPT_BKPT` when `amt+offset > sqlite3BtreeMaxRecordSize(pCur)` before it
+resizes the Mem (`vdbemem.c:1428-1429`), and that size is `pageSize * nPage`
+(`btree.c:4978-4982`). `payloadInFile` (`page.go`) makes it with the page count of the
+reader's snapshot (`readerDbSizeBound`: the read transaction's, or the live count for the
+writer); a reader's count is the pager's, not page 1's
+([drift-2026-11-24-2](#drift-2026-11-24-2-a-readers-file-size-bound-takes-the-pagers-page-count)).
+It runs before every allocation sized by a declared length, on the bytes that are
+read: key and value for the value readers (`btree.AppendValue`, `ReadTx.AppendValue`,
+`Cursor.Value`, `Cursor.AppendValue`, `leafFullValue`), the key alone for the key readers
+(`leafFullKey`, `interiorFullKey`, `cellFullKey`, `collectInteriorCellsKeepBuf`).
+`leafFullKey` also gives its first overflow pointer the chain readers' page test before it
+allocates. SQLite's index probe likewise sizes the key it rebuilds from the key alone
+(`btree.c:6159-6168`). A value length over the file therefore fails the read of that value,
+not a read of the cell's key. The test is made where the bytes are asked for, as in SQLite,
+not in the cell parsers, which have no pager. The 1 GiB cap is the limit of what is written,
+and the tighter bound of the two in a file over 1 GiB.
+
+`Has` answers from the cell its search finds: it tests the record size limit there, not the
+file size, so it can be true for a record whose `Get` fails the file-size bound. SQLite's
+table seek skips a cell's payload size and compares its rowid only (`btree.c:5880-5886`);
+a later read of the payload fails at `vdbemem.c:1428`.
+
+Tests: `TestPayloadLimit_RealConstants`,
+`TestPayloadLimit_LengthsCheckedBeforeNarrowing`, `TestPayloadLimit_SpilledLocalSize`,
+`TestPayloadLimit_PutRefusesWhatReadRejects`, `TestPayloadLimit_NamespaceName`,
+`TestPayloadLimit_DeclaredLengthOverFileSize`,
+`TestPayloadLimit_NeighbourOfDamagedCellIsFound`,
+`TestPayloadLimit_CursorKeyOfDamagedCell`, `TestPayloadLimit_SeekKeyOfDamagedCell`,
+`TestPayloadLimit_SeekKeyNextLeafStartsWithDamagedCell`,
+`TestPayloadLimit_CountUntilOverDamagedCell`,
+`TestPayloadLimit_SpilledKeyWithNoOverflowPage`,
+`TestPayloadLimit_SplitBesideDamagedValueLengths`,
+`TestPayloadLimit_OverflowRecordWithinFileSize`, `TestCov_LeafFullKeyBoundsTheKeyOnly`.
 
 <a id="old-drift-additive-maxiter-circular-chain-guard"></a>
 **Severity:** low
@@ -914,6 +980,33 @@ input. Auto-vacuum and PENDING_BYTE checks are absent because those features don
 (`verifyCksumPage` / `verifyAEADPage`) that re-hashes (cksum codec) or AEAD-decrypts every
 page to detect ciphertext tampering or bit-rot. No SQLite analogue: stock SQLite has no
 page-level MAC, and this is the codec layer's own consistency check. Any-store-specific.
+It reads every page raw, with its own read (`readRawPage`), not the codec's read path. A
+checksum page it hashes itself (`verifyCksumPage`) and never passes to `cksumCodec.Decrypt`;
+an AEAD page it passes to the codec's `Decrypt` (`verifyAEADPage` →
+`decryptPageWithCodec`), the only way to check that tag. Its read begin reads page 1's
+header only, which is outside the codec, and its page count comes from the raw page 1. So
+the checksum sweep needs nothing from the codec's verify-on-read flag and leaves it as
+configured: on by default, off in a handle opened with `Config.ContinueOnIntegrityError`,
+the one place that sets it. The sweep once cleared that flag for its duration and restored
+the saved value on return. The flag is the handle's one switch (`cksumCodec.verify`),
+shared by the writer and every reader, so for that time every other read returned a
+damaged page as good, a write to such a page committed it with a fresh checksum, and two
+overlapping sweeps left the flag off (the second saved the first's `false`). cksumvfs keeps
+its `PRAGMA checksum_verification` per open database file and its WAL partner
+(`sqlite3_file_control` on the named database, `pragma.c:495`; `p->verifyCksm` and
+`p->pPartner->verifyCksm`, `cksumvfs.c:563-565`): two databases attached to one connection
+have two settings.
+The codec's OnError hook fires once for each page whose tag fails: for a checksum page the
+sweep fires it, only after a comparison that differed (drift-2026-06-25-13, resolved); for
+an AEAD page the codec's `Decrypt` fires it. A page the sweep could not read is listed
+(`IntegrityKindUnknown`) and fires nothing, in either mode.
+An in-memory database has no integrity mode (`IntegrityMode` returns `IntegrityNone`, the
+sweep scans nothing): its store and WAL hold pages as the b-tree wrote them, past any
+codec the options named (`wal.writeFramesMem`), so no page carries a tag. The sweep used
+to try the configured codec on those pages and list every one.
+The pages it covers are those of its read transaction's snapshot, counted as SQLite counts
+them for `sqlite_dbpage` and the integrity check (see
+[the resolved drift](#drift-2026-06-25-12-verifyintegrity-bounds-the-sweep-with-the-live-writer-header-pager-hea)).
 
 <a id="old-drift-checklist-unconditional-size-mismatch-report"></a>
 **Resolved (stale, 2026-06-25)** — Go now implements the `nErrAtStart==len(ic.errors)` suppression guard at integrity.go:108,168,172; the cited C line is stale (guard is now btree.c:10763, with nErrAtStart captured at btree.c:10713).
@@ -1207,9 +1300,17 @@ Two mechanisms coexist in the implementation, each solving a distinct problem:
    in-process and in-memory modes publish no wal-index header: their synthesized
    snapshot header carries the size of the walIndex's committed position, the
    commit frame and its size in one word (`mxframe.go`), which only a published
-   commit moves and which open and database creation seed; no reader there uses
-   `pager.dbSize` either (until 2026-11-12 they did, and a reader of the committed
-   snapshot failed on its pages above an uncommitted shrink). Until 2026-11-11 the
+   commit moves. As in SQLite's header, that size is 0 until a commit records
+   one (`walIndexRecover` zeroes the header and sets `nPage` from a commit frame,
+   wal.c:1408, 1512) and a WAL reset keeps it, so a non-zero size is a commit's
+   in every mode, and an in-process reader without one takes the file's. An
+   in-memory database has no file; it is without a committed size until a WAL
+   commit frame records one (a commit that writes no frame records none), and
+   until then it is the one page creation wrote (`newDatabase` sets
+   `nPage = 1`, btree.c:3540-3541), so its readers take 1. No reader
+   there uses `pager.dbSize` either
+   (until 2026-11-12 they did, and a reader of the committed snapshot failed on
+   its pages above an uncommitted shrink). Until 2026-11-11 the
    fallback was `pager.dbSize` in every mode, and a WAL reset published a header
    without a size: see [drift-2026-11-11-3](#drift-2026-11-11-3-reader-size-without-a-wal-commit-is-memoized).
    This is the pager's count, the bound for page reads; the database's logical
@@ -2797,23 +2898,290 @@ transaction and its locks, and must instead abort and re-begin.
 
 <a id="drift-63-new-db-page-1-written-directly-to-file-bypassing-wal"></a>
 ### Drift: New DB Page 1 Written Directly To File Bypassing WAL
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `db.go:Open`
-  (`internal/btree/pager.go:552-564 (Open new-DB path calls initNewDB before any txn)`),
-  `pager.go:*pager.initNewDB` (`internal/btree/pager.go:763-865`).
+- **Category:** changed-logic  -  **Severity:** low  -  **Status:** NARROWED 2026-11-21: creation runs under the exclusive DB-file lock and inside a rollback journal committed by its delete, a WAL beside a database of zero pages is deleted, and the codec is settled on the header read under the lock. What remains is listed below.
+- **Affected functions:** `pager.go:*pager.open`, `pager.go:*pager.createIfEmpty`,
+  `pager.go:*pager.lockDBForCreate`, `pager.go:*pager.lockDBShared`,
+  `pager.go:*pager.downgradeDBLock`, `pager.go:*pager.createPage1`, `pager.go:*pager.newPage1`,
+  `creation_journal.go` (all of it), `syncdir_unix.go` (all of it), `wal.go:*wal.syncFile`,
+  `db.go:Open` (the `settleCodec` closure and the first look at the header).
 
-SQLite defers page-1 creation to the first write transaction: `newDatabase` dirties page 1 via
-`sqlite3PagerWrite(pP1->pDbPage)` (`btree.c:3518`) and never touches the file directly, so the
-actual disk write of the new page 1 happens later through the normal commit path (a WAL frame or
-rollback-journal transaction) when the enclosing write transaction commits. Go's
-`Open` -> `p.open()` -> `initNewDB()` instead eagerly builds the page-1 image (DB header + empty
-leaf-index page) into a local buffer and writes it straight to the main DB file via
-`p.file.WriteAt(writeBuf, 0)` followed by `fdatasync(p.file)` (`pager.go:827-833`), all inside
-`Open()` before any transaction begins and entirely bypassing the WAL. The consequence is that
-initial database creation is not a transactional, WAL-mediated change as in SQLite -- the new
-page 1 is durably committed to the main file outside of any transaction, so a crash mid-creation
-or any reader/recovery logic that assumes page 1 first appears via the WAL sees a state SQLite
-would never produce.
+**SQLite.** A file of zero bytes is not a WAL database, and SQLite never opens a WAL on one:
+`pagerOpenWalIfPresent`, called from `sqlite3PagerSharedLock` after the SHARED lock is held
+(`pager.c:5272`, `pager.c:5436`), takes the page count and, when it is zero, deletes the `-wal`
+instead of opening it (`pager.c:3355-3356`); the page count for the snapshot is taken after that
+(`pager.c:5444-5448`). A database becomes a WAL database through `PRAGMA journal_mode=WAL`:
+`OP_JournalMode` calls `sqlite3BtreeSetVersion(pBt, 2)` in a transaction that "always uses a
+rollback journal" (`vdbe.c:8061-8066`), whose write begin runs `newDatabase` on an empty file
+(`btree.c:3715`, `btree.c:3506-3541`: page 1 through `sqlite3PagerWrite`, `nPage = 1`) and whose
+commit writes page 1, bytes 18 and 19 set to 2, into the main file under the EXCLUSIVE lock
+(`sqlite3PagerExclusiveLock`, `pager.c:6423-6433`, from `syncJournal` on the commit path). The WAL
+is opened only on a later `lockBtree` that reads those bytes (`btree.c:3339`). So page 1 of a
+WAL database is in the main file, written under the EXCLUSIVE DB-file lock, before any WAL
+exists. Page 1 of an empty file is not copied into the journal either: `pager_write` journals a
+page only `if( pPg->pgno<=pPager->dbOrigSize )` and otherwise marks it `PGHDR_NEED_SYNC`
+(`pager.c:6093-6100`). What the journal holds is its header, which records the original size, zero
+pages (`pager.c:1520`), and page 1 is written to the file only after that journal is synced
+(`syncJournal` at `pager.c:6612`, `pager_write_pagelist` at `pager.c:6650`). A creator that dies
+before its commit point leaves the journal hot (`hasHotJournal`, `pager.c:5134-5199`), and the next
+`sqlite3PagerSharedLock` plays it back before anything in the file is used (`pager.c:5281-5356`):
+`pager_truncate(pPager, mxPg)` with `mxPg` 0 empties the file (`pager.c:2895-2897`).
+
+**any-store.** Every database is a WAL database from its first open, and `Open` of a new path
+leaves a database of one page rather than an empty file. `pager.open` takes its DB-file lock
+(shared in multi-process mode, exclusive in in-process mode) and asks whether a creation is
+pending (`creationPending`): the file is empty, or it has content and a hot creation journal
+beside it. If so it calls `createIfEmpty`, which takes the exclusive lock (`lockDBForCreate`,
+multi-process mode), asks again under it, rolls a dead creator's file back to zero bytes
+(`playbackCreationJournal`) or deletes a journal it finds beside an empty file
+(`deleteJournalOfEmptyDatabase`, `pager.c:5178-5181`), deletes `<path>-wal`, creates page 1 in a
+journaled transaction
+(`createPage1`, below), and goes back to the shared lock. The open then continues exactly as for
+an existing database: header read from the file, WAL open, page 1 and page count at one snapshot
+(`readPage1AtOpen`). An open that finds a database in the file under the exclusive lock, or sees
+one appear while waiting for that lock, lost the creation to another process; it takes the shared
+lock and asks once more, because the look that found the database was made without a lock. No
+process attached to a database can be holding the exclusive lock's counterpart on a file whose
+creation is pending: every attached handle keeps the shared lock on a file that has a committed
+page 1.
+
+The creation is SQLite's journaled one in `journal_mode=DELETE`, with the journal reduced to its
+header (`creation_journal.go`). Under the exclusive lock, after the stale WAL's removal: (1)
+`<path>-journal` is opened with the create flag and its header written, recording an original
+size of zero pages; (2) the journal is fdatasynced, and, as that is the first sync of a
+descriptor opened with the create flag, its directory is fsynced after it (`dirSync`, SQLite's
+`UNIXFILE_DIRSYNC`: `os_unix.c:6569-6573`, `6777`, `3936-3954`); (3) page 1 is written; (4) the
+database file is fdatasynced; (5) the journal is deleted, which is the commit point
+(`pager_end_transaction`, `pager.c:2109`). Whatever a creator killed before step 5 left in the
+file — nothing, a whole page 1 that was never synced, or part of one after a power loss — the
+next open finds the journal hot and truncates the file before it creates the database itself, so
+no process ever attaches to a page 1 whose sync did not complete, and no acknowledged commit rests
+on one. The directory sync of step 2 comes after the stale WAL's removal and before page 1
+exists, so it also makes that removal durable on a file system whose directory fsync covers every
+change to the directory made before it (the POSIX reading, and what ext4, XFS and APFS do; not
+measured here, and SQLite, which deletes the WAL with `dirSync` 0 at `pager.c:3356`, relies on the
+same).
+
+The delete of step 5 syncs no directory; SQLite passes `pPager->extraSync` to its delete
+(`pager.c:2109`). A power loss
+before the directory is synced again can bring the journal back, hot, beside the committed
+page 1, and the open after it rolls the creation back and creates the database again. Nothing is
+lost by that as long as nothing was committed to the database, and nothing is durable in the
+database before a sync of its WAL: every WAL descriptor is opened after the delete (a creation
+runs only while no process is attached) and with the create flag, so the first sync of each
+syncs the directory too, before a commit to it is durable (`wal.syncFile`, the WAL row of the
+[WAL drift summary](#7-wal-write-ahead-log)). The divergences of the journal itself are
+[drift-2026-11-21-7](#drift-2026-11-21-7-creation-journal).
+
+`Open`'s first, unlocked look at the header does not judge a file with content: a header there
+that cannot be read, or that disagrees with the key options, can be gone by the time the open
+holds the DB-file lock (another process may roll a dead creator's page 1 back and create the
+database in between). `pager.open` settles the codec on the header it reads under the lock and
+returns that read's errors, as `sqlite3PagerSharedLock` reads the header only under SHARED
+(`pager.c:5272-5282`). Key options that cannot make a codec for a new file are refused by the
+first look, before anything is created (`db.go:Open`).
+
+The passphrase codec follows the same rule. `Open` builds it from a first, unlocked read of the
+header when it can (so the key derivation mostly runs with no lock held), and `pager.open` calls
+`settleCodec` again on the header it read under the lock, and with "no database" before it asks
+for the exclusive lock. A later call does nothing while the codec was built for the salt the
+file carries: the salt in the header of a database, or, while the file holds no database, a salt
+drawn for a new file. That covers every open of an existing database and the open that creates
+one, whose page 1 carries the salt drawn for it, so each derives the key once, as SQLCipher
+derives a codec context's key once, at its first use (`sqlcipher_codec_key_derive`,
+`sqlcipher.c:1849-1880`, SQLCipher v4.14.0). When another process created the database in
+between, the codec is rebuilt from the salt in the file; when the first look read a header and
+the open then finds the creation pending (a dead creator's page 1, rolled back under the lock),
+it is rebuilt from a salt drawn for a new file. A new database keeps the salt drawn for it only
+if this open is the one that writes page 1.
+
+**What still differs from SQLite.**
+
+1. *The journal exists for the creation only*, and is any-store's own file:
+   [drift-2026-11-21-7](#drift-2026-11-21-7-creation-journal). A file with content and no hot
+   journal beside it is judged by its header, as before: one that is shorter than the header, or
+   whose header does not parse, is `ErrHeaderCorrupt`, and one that holds a whole header and less
+   than a whole page 1 opens, with the missing bytes read as zeros (`readPage1AtOpen`, as
+   `readDbPage` reads a short page). A creation cannot leave such a file any more; a file cut by
+   other means can.
+2. *Created at open, not at the first write transaction.* An `Open` that never writes still
+   leaves a one-page file. The hot-journal test runs once per open for the same reason, where
+   SQLite runs it at every acquisition of the SHARED lock (`pager.c:5281-5282`).
+3. *The lock is a flock.* SQLite goes SHARED → RESERVED → EXCLUSIVE with fcntl byte ranges, and
+   two connections cannot both hold RESERVED. A flock has no such step: several creators all
+   hold the shared lock at first and none can upgrade. A refused creator drops its lock, waits
+   holding nothing, asks whether the creation is still pending and requests the lock again. The
+   same loop serves the playback of a hot journal, for which SQLite asks for
+   EXCLUSIVE once and returns busy (`pager.c:5308`). The exclusive lock becomes shared
+   again before the WAL is opened, so a kernel that lets go of a flock inside a conversion (see
+   the two flock entries below) leaves this handle unlocked only while it is attached to
+   nothing.
+4. *The waits for the DB-file lock.* SQLite waits for its SHARED lock in `pager_wait_on_lock`
+   (`pager.c:3946-3962`, from `sqlite3PagerSharedLock`, `pager.c:5272`): `pagerLockDb` is
+   repeated while it returns `SQLITE_BUSY` and the busy handler agrees, and the result is
+   `SQLITE_BUSY` when the handler gives up. `pager.lockDBShared` is that loop, on
+   `DefaultBusyTimeout(BusyTimeout)`, SQLite's default handler (`sqliteDefaultBusyCallback`,
+   `main.c:1718-1747`), and an error that matches `ErrBusy` when the handler gives up. Two
+   things differ.
+
+   *The open's waits do not share one count.* In SQLite the busy handler counts its calls in
+   the connection's `nBusy` (`sqlite3InvokeBusyHandler`, `main.c:1770-1780`), which is zeroed
+   when a statement step begins (`vdbe.c:901`), so the busy-handler waits of one step share one
+   budget. Here one count serves the open's wait for the shared lock and a creation's waits for
+   the exclusive one (`lockDBForCreate`); the open's other waits, for example a conversion back
+   to the shared lock (`downgradeDBLock`) and the WAL's waits in `wal.open`, have budgets of
+   their own, so an open that meets contention at several of them can wait longer than one
+   timeout. SQLite's downgrade asks no busy handler (with flock it only records the new level,
+   `os_unix.c:2747-2750`); a flock conversion here can be refused, so `downgradeDBLock` waits.
+
+   *A multi-process open cannot tell a process that holds the file in in-process mode*
+   (exclusive for the handle's life) from a peer inside its close or its creation, and waits
+   for each the same way: it goes on as soon as a request for the shared lock is granted, and
+   fails with `ErrBusy` if the lock is still held when the busy handler gives up.
+
+   The in-process open itself asks for its exclusive lock once and does not wait: where the
+   lock is real (Unix, Windows) it is refused at once with `ErrInProcessLocked`. On wasm the
+   lock functions are no-ops, so the btree lock keeps no second runtime out
+   ([drift-2026-06-25-07](#drift-2026-06-25-07-acquireexclusivedblock-is-a-no-op-on-plan9-wasip1-removing-the-cross-p)).
+   A storage backend can refuse one on its own: the wasm module's OPFS backend opens every file
+   with an exclusive sync access handle (`createSyncAccessHandle`, `wasm/vfs_opfs.go`), so
+   while one worker has the database open, another worker's `Open` fails when its open of the
+   file is refused, with the backend's error (an `os.PathError`) rather than
+   `ErrInProcessLocked`.
+5. *The WAL is deleted under the exclusive lock*, where SQLite deletes it under SHARED and
+   relies on an empty database not being in WAL mode (`pager.c:3330-3337`). The wal-index file
+   is not deleted, as in SQLite: the first attacher's election truncates a stale one
+   (`newPlatformShm`).
+6. *In-process mode* holds the exclusive DB-file lock for the handle's whole life (Windows,
+   linux/386 and any other target without mmap shm), so the same sequence runs with no lock
+   change. On wasm the lock functions are no-ops: nothing serializes two runtimes that share one
+   storage (two WASI instances over one directory, two browser tabs over one IndexedDB store),
+   and one of them can delete the other's WAL or roll its creation back. One runtime per database
+   is the caller's to ensure there
+   ([drift-2026-06-25-07](#drift-2026-06-25-07-acquireexclusivedblock-is-a-no-op-on-plan9-wasip1-removing-the-cross-p)).
+
+**Known limitations.**
+
+- *A database file renamed or unlinked while a process is attached to it.* The `-wal` and
+  `-wal-shm` names are derived from the path, here and in SQLite (`os_unix.c:4976`, `5005`). A
+  second process that creates a database at the old path deletes the `-wal` name, which was the
+  attached process's log, and attaches to the attached process's live `-wal-shm`. In SQLite this
+  corrupts too ("unlinking or renaming a database file while in use", howtocorrupt §2.4; SQLite
+  only logs `file unlinked while open`, `os_unix.c:1657`). One thing is worse here: the new
+  opener finds its WAL shorter than a header and initializes the shared wal-index
+  (`wal.open` → `initHeaderStateLocked`), which SQLite does not do to an index whose header is
+  valid (`walIndexReadHdr` recovers only `if( badHdr )`, `wal.c:2694-2723`). The attached process
+  then loses sight of its commits that were not checkpointed. That reset is
+  [drift-2026-07-10-3](#drift-2026-07-10-3-region-create-false-never-maps-existing-content):
+  every fresh attach rebuilds or initializes the index.
+- *A database path replaced while an open waits for the lock.* The pending test is made on the
+  descriptor and the WAL is deleted by name, as `pagerOpenWalIfPresent` does (`pager.c:3352-3356`).
+- *Two spellings of one database file through a symbolic link* give two `-wal` names, two
+  wal-indexes and two creation journals: every name beside the database is built from the path
+  as the caller spelled it. SQLite resolves symbolic links before it builds them
+  (`unixFullPathname`, `os_unix.c:6975`). A layout that reaches one database file by two paths
+  is not supported.
+
+Tests (`multiprocess_create_test.go`, two processes, one held at a named point of its open by
+`testOpenStageHook`): `TestMultiProcessCreateRaceOneDatabase` (a creator held before its page-1
+write while a second process opens the path; plain and passphrase),
+`TestMultiProcessCreateManyAtOnce` (six processes released together),
+`TestOpenWaitsForCreatorHoldingDBLock`, `TestOpenWaitsForLastCloserHoldingDBLock` (vfs tag) and
+`TestOpenAgainstInProcessHolder` (`multiprocess_dblock_wait*_test.go`: the wait for a holder of
+the exclusive lock, and the refusal of an in-process open),
+`TestMultiProcessCreateLoserKeyFromWinnersSalt` (an open that saw no file and then finds another
+process's encrypted database), `TestOpen_PassphraseKeyDerivedOncePerOpen`
+(`encryption_integration_test.go`: one key derivation by an open that creates an encrypted
+database and one by an open of it), `TestStaleWALBesideEmptyDatabaseNotReplayed` (a killed process's
+WAL beside a removed or truncated main file, whole database or its tail in the WAL, plain and
+passphrase, both wal-index modes), `TestCreationJournal_CreatorKilled` (a creator killed with
+SIGKILL at each step of its creation, plain and passphrase),
+`TestCreationJournal_WaitingOpenerRollsBack` (the creator is killed once the opener has been
+refused the lock); `TestInitNewDB_Page1_CrashRecoverable`,
+`TestInitNewDB_Page1_CrossProcessSerialization` (`pager_test.go`); the single-process tests of
+the journal in `creation_journal_test.go`; and, under the `vfs` tag, in
+`creation_journal_vfs_test.go`, on a VFS that keeps a file's content as of its last sync and a
+name as of its directory's last sync: `TestCreation_CommitOverADeadCreatorsPage1SurvivesPowerLoss`
+(a synced commit made after a creator died before its page-1 sync),
+`TestCreation_FirstCommitToANewWALSurvivesPowerLoss`,
+`TestCreation_CommitToAWALAnotherHandleCreatedSurvivesPowerLoss` (a WAL whose creator never
+synced it), `TestCreation_CommitAfterTheCreationsLastJournalStepSurvivesPowerLoss` (the delete
+not yet durable when a peer commits), `TestCreation_PowerLossBeforeAnyCommitCreatesTheDatabaseAgain`,
+`TestCreation_PowerLossAfterAKilledPlayback`,
+`TestCreationJournal_JournalFoundIsDeletedAfterTheDatabaseFilesSync`,
+`TestCreationJournal_OrderOfTheSyncs` (the writes and syncs as the file system sees them: one
+directory sync at the first sync of each journal and WAL descriptor, and none after) and
+`TestOpen_FirstLookRacingARecoveryDoesNotFail`; `TestDirSync_DirectoryIsTheOneResolvedAtOpen`,
+`TestOpen_ChdirBeforeTheFilesOpenKeepsThemInTheResolvedDirectory` (`syncdir_unix_test.go`);
+`TestDatabaseDir_IsTheNameUpToItsLastSeparator`, `TestDatabaseDir_NameTooLongFailsTheOpen`
+(`dbdir_unix_test.go`).
+
+<a id="drift-2026-11-21-7-creation-journal"></a>
+### Drift: The Creation Journal Is A Header Of any-store's Own
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `creation_journal.go:*pager.hasHotCreationJournal`,
+  `creation_journal.go:*pager.creationPending`, `creation_journal.go:*pager.playbackCreationJournal`,
+  `creation_journal.go:*pager.deleteJournalOfEmptyDatabase`,
+  `creation_journal.go:*pager.finalizeJournalOfEmptyDatabase`,
+  `creation_journal.go:*pager.openCreationJournal`,
+  `creation_journal.go:*creationJournal.sync`, `creation_journal.go:*creationJournal.commit`,
+  `creation_journal.go:creationJournalHdr`, `pager.go:*pager.createPage1`.
+
+The creation of a database is a port of SQLite's rollback-journal transaction around
+`newDatabase` in `journal_mode=DELETE` (see
+[drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal) for the sequence and
+SQLite's lines): the journal is opened with the create flag, synced, with its directory at that
+first sync, before page 1 is written, and its delete, with no directory sync, is the commit
+point. It differs from `pager.c` in these points.
+
+1. *The journal has its own magic and no page records.* The header has SQLite's 28-byte layout
+   (`writeJournalHdr`, `pager.c:1438-1530`) with the magic `anyjrnl\x01`, an original size of zero
+   pages and the page size; the record count, the checksum seed and the sector size are zero,
+   and the header is not padded to a sector, since nothing follows it. `hasHotCreationJournal`
+   calls a journal hot only when it holds that whole header with an original size of zero.
+   SQLite calls any journal with a non-zero first byte hot (`pager.c:5185-5205`); `pager_playback`
+   stops at a magic it does not recognise (`readJournalHdr` returns `SQLITE_DONE`,
+   `pager.c:1612-1614`) before it truncates anything, syncs, and deletes the journal
+   (`pager.c:2978-2983`, `2109`). Beside a database with content, any-store leaves a `-journal`
+   file that is not a hot creation journal where it is: it rolls nothing back from it and does
+   not delete it. Beside a database of zero pages a file found under the name is deleted before
+   the creation, whatever it holds; `hasHotJournal` deletes a journal there
+   (`pager.c:5178-5181`). With native file access the file is found by a stat, as SQLite's
+   existence test is one (`unixAccess`, `os_unix.c:6895-6898`).
+2. *An empty database file is synced before a journal beside it is deleted.* `hasHotJournal`
+   deletes a journal beside a database of zero pages at once. `finalizeJournalOfEmptyDatabase`
+   syncs the database file first: the journal may be the hot journal of a playback that was
+   killed after its truncation and before its sync, and then the disk may still hold the dead
+   creator's page 1, which only that journal marks. The sync is made only when a journal is
+   found. The playback itself is `pager_playback`'s: the truncation, the sync, and then the
+   journal's delete (`pager.c:2895-2897`, `2978-2983`), with nothing written to the journal.
+   `pagerSyncHotJournal` (`pager.c:4048`), which syncs a hot journal before playing it back
+   because the process that left it may not have, has no counterpart: a creation journal is hot
+   only beside a file with content, and page 1 is written only after the journal and its
+   directory were synced.
+3. *"No RESERVED lock" is "the caller holds the DB-file lock".* `hasHotJournal` asks
+   `sqlite3OsCheckReservedLock` whether a writer is alive. A creator holds the DB-file lock
+   exclusively from before its journal is opened until after it is deleted, so an open that holds
+   the lock, shared or exclusive, and sees a hot journal is looking at a dead creator's.
+4. *Platforms.* The directory sync at a descriptor's first sync (`dirSync`) is built on Unix and
+   wasip1: SQLite's unix VFS also serves its WASI builds and keeps `UNIXFILE_DIRSYNC` there
+   (`os_unix.c:326-330`); whether a WASI host makes it durable is the host's. On Windows and
+   js/wasm a sync is the file's alone, as SQLite's Windows VFS syncs no directory. The database,
+   the journal and the WAL are opened by the database's full name, resolved once at open
+   (`FullPathname`, as `pager.c:4792`, `4915`, `4929`, `4948`), and the directory synced is that
+   of the name the file was opened by, cut at its last `/` (`databaseDir`, as `openDirectory`,
+   `os_unix.c:3874-3893`, which `unixSync` gives `pFile->zPath`, `os_unix.c:3945`). A full name
+   too long for the OS fails the open. What differs in the full name itself is
+   [drift-2026-11-23-1](#drift-2026-11-23-1-full-pathname-follows-no-symbolic-link). As in
+   `unixSync`, a directory that does not open is skipped and the result of its
+   fsync is not looked at (`os_unix.c:3937-3951`). The journal and the database file are synced
+   with `fdatasync`, the package's sync primitive
+   ([drift-121](#drift-121-fdatasync-durability-primitive-platform-split-undocumented)), which is
+   `F_FULLFSYNC` on Darwin, where SQLite's default is a plain `fsync`.
+
+Tests: `creation_journal_test.go` (`TestCreationJournal_WhichHeaderIsHot`,
+`_HotJournalRollsBackWhateverIsInTheFile`, `_JournalThatIsNotHotIsLeftAlone`,
+`_JournalBesideEmptyFileIsDeleted`), and the process-kill and power-loss tests listed under
+drift-63.
 
 <a id="drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl"></a>
 ### Drift: pageSlab And ConfigPageCache Idempotent Versus Reconfigurable Setup
@@ -2960,7 +3328,7 @@ header", and it matches `ErrCorrupt`. A DB file too short to hold page 1 is a re
 (`io.EOF`) rather than a zero-filled `NOTADB`, because the page getters do not zero-fill a short
 read ([drift-7](#drift-7-short-db-file-read-treated-as-hard-error)); the begin fails either way.
 
-Every write begin (2026-11-12). The refresh now runs at every `beginWrite`, not only when another process's change was seen: `lockBtree` reads page 1 at the start of every SQLite transaction (`sqlite3BtreeBeginTrans`, `btree.c:3707`), and a schema format 6 commit no longer rewrites page 1 each time, so the header must not be carried over from the last transaction. Page 1 normally comes from the writer cache; the cache is cleared first only when a change was seen, or a refresh failed. The count is `committedPageCount`: the live wal-index header's size, the file's size when the WAL has no commit (the readers' memo, so no `fstat` per begin), the committed position's size in the in-process and in-memory modes. Rollback and `pagerError` restore the page count the transaction began with (`savedDbSize`), not the header's size field, which is 0 for an untrusted header.
+Every write begin (2026-11-12). The refresh now runs at every `beginWrite`, not only when another process's change was seen: `lockBtree` reads page 1 at the start of every SQLite transaction (`sqlite3BtreeBeginTrans`, `btree.c:3707`), and a schema format 6 commit no longer rewrites page 1 each time, so the header must not be carried over from the last transaction. Page 1 normally comes from the writer cache; the cache is cleared first only when a change was seen, or a refresh failed. The count is `committedPageCount`: the live wal-index header's size, the file's size when the WAL has no commit (the readers' memo, so no `fstat` per begin), the committed position's size in the in-process and in-memory modes, with the same fallback. Rollback and `pagerError` restore the page count the transaction began with (`savedDbSize`), not the header's size field, which is 0 for an untrusted header.
 
 Residual divergence: SQLite needs no "refresh pending" state, because a transaction whose page-1
 read failed never keeps the page (`lockBtree` releases it and leaves `pBt->pPage1` zero,
@@ -3339,7 +3707,7 @@ does correctly restore `aReadMark[0]=0` after clobbering all slots, unlike `rese
 
 SQLite sizes the database at the start of every transaction with `pagerPagecount` (`pager.c:3279-3306`): `sqlite3WalDbsize`, i.e. `pWal->hdr.nPage`, when it is non-zero, else an `fstat` of the database file. `walRestartHdr` zeroes `mxFrame` and leaves `hdr.nPage` alone (`wal.c:2146-2160`), so the first branch keeps answering after a RESTART or TRUNCATE.
 
-Go had neither half. `doResetWAL` published the reset header with `nPage = 0`, and `effectiveReaderDbSize` fell back to the process-local `pager.dbSize`, which only a write begin refreshes. A process that had not written since a peer grew the database therefore bounded its readers by its own stale size as soon as any process reset the WAL, and valid pages failed with `ErrCorrupt` ("invalid page number" from `IntegrityCheck`, whose cap used the equally process-local `walIndex.maxPage`). Both rules are now ported: the reset header keeps the last commit's size, and without a committed size a multi-process reader takes the file's. A failed file-size query fails the read begin, as `pagerPagecount` returns the `fstat` error (`pager.c:3299-3303`); until 2026-11-12 it fell back to the local size (regression test `TestReaderSizeStatErrorPropagates`, vfs tag). The in-process and in-memory modes publish no wal-index header; their readers take the size of the committed position, frame and size kept in one word and moved only by a published commit (`commitFrameCounter`). Until 2026-11-12 they took `pager.dbSize`, which an open write transaction moves.
+Go had neither half. `doResetWAL` published the reset header with `nPage = 0`, and `effectiveReaderDbSize` fell back to the process-local `pager.dbSize`, which only a write begin refreshes. A process that had not written since a peer grew the database therefore bounded its readers by its own stale size as soon as any process reset the WAL, and valid pages failed with `ErrCorrupt` ("invalid page number" from `IntegrityCheck`, whose cap used the equally process-local `walIndex.maxPage`). Both rules are now ported: the reset header keeps the last commit's size, and without a committed size a multi-process reader takes the file's. A failed file-size query fails the read begin, as `pagerPagecount` returns the `fstat` error (`pager.c:3299-3303`); until 2026-11-12 it fell back to the local size (regression test `TestReaderSizeStatErrorPropagates`, vfs tag). The in-process and in-memory modes publish no wal-index header; their readers take the size of the committed position, frame and size kept in one word and moved only by a published commit (`commitFrameCounter`). Until 2026-11-12 they took `pager.dbSize`, which an open write transaction moves. That size is 0 until a commit records one, as in SQLite's header, and an in-process reader without one takes the file's, memoized like a multi-process reader's; an in-memory database has no file, and its reader without one, before the first commit, takes the one page creation wrote.
 
 The remaining difference is that the file size is read once per wal-index header, not once per transaction (`pager.noWalCommitSize`). Measured on an M2: the `fstat` costs about 390 ns and one allocation, a sixth of a point read on a freshly opened, checkpointed database — the state a read-mostly process stays in. The memo is exact as long as the file's size cannot change under an unchanged 48-byte header that carries no size: the file changes only when a checkpoint copies frames into it; frames need a commit; a commit publishes a header with a size, and every later reset keeps it; a header without a size reappears only when a process rebuilds the index over a WAL holding no commit, which after a TRUNCATE means freshly drawn salts. The one way back to the identical header is a WAL whose frames have been destroyed behind an intact WAL header, and then the stale (smaller) size fails closed: pages beyond it read as corrupt, none are served wrongly.
 
@@ -3930,7 +4298,7 @@ In SQLite's `unixLockSharedMemory`, the connection that finds the DMS byte unloc
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `shm_mmap.go:newPlatformShm` (the election retry loop).
 
-SQLite's `unixLockSharedMemory` returns `SQLITE_BUSY` when it observes a peer mid-election (`os_unix.c:4906-4908`, 3.52.0) and relies on higher-level retry (the comment at `os_unix.c:4865`: "it will try again"). Go's shm attach is a one-shot call inside `wal.open` with no busy-handler plumbing above it, so `newPlatformShm` retries the probe in-line — bounded at 100×10ms, mirroring `pager.open`'s DB-flock retry loop — and only after exhaustion fails the open with an error wrapping `ErrBusy` (`errors.Is(err, ErrBusy)` holds). The exclusive-DMS window is microseconds (WRLCK → ftruncate(3) → downgrade, nothing else under it), so a single retry normally suffices; the observable divergence is worst-case ~1s of open latency under pathological contention instead of an immediate BUSY to the application.
+SQLite's `unixLockSharedMemory` returns `SQLITE_BUSY` when it observes a peer mid-election (`os_unix.c:4906-4908`, 3.52.0) and relies on higher-level retry (the comment at `os_unix.c:4865`: "it will try again"). Go's shm attach is a one-shot call inside `wal.open` with no busy-handler plumbing above it, so `newPlatformShm` retries the probe in-line, 100 tries 10 ms apart, and only after exhaustion fails the open with an error wrapping `ErrBusy` (`errors.Is(err, ErrBusy)` holds). The retry above SQLite's shm open is `walTryBeginRead`'s `WAL_RETRY` loop (`wal.c:3405-3407`), not the busy handler: a busy `xShmMap` is taken for transient (`wal.c:3094-3102`), retried up to `WAL_RETRY_PROTOCOL_LIMIT` times with growing sleeps (`wal.c:3043-3051`), and then `SQLITE_PROTOCOL` (`wal.c:3047-3049`). The exclusive-DMS window is microseconds (WRLCK → ftruncate(3) → downgrade, nothing else under it), so a single retry normally suffices. The divergence is the retry's shape and how it ends, `ErrBusy` here and `SQLITE_PROTOCOL` in SQLite. Neither returns the busy election to the application at once.
 
 <a id="drift-2026-07-10-3-region-create-false-never-maps-existing-content"></a>
 ### Drift: region(create=false) Never Maps Existing Shm Content On A Fresh Attach
@@ -3943,9 +4311,9 @@ C `unixShmMap` with `isWrite==0` still maps *existing* regions of the shm file �
 <a id="drift-2026-10-15-1-empty-file-registry-key-is-the-path"></a>
 ### Drift: On Volumes With Unstable Empty-File Inodes, An Empty File's openDBs Key Is Its Path Until It Has Content
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `pager.go:*pager.open` (registration and the create/existing decision), `pager.go:*pager.rekeyRegistry`, `pager.go:*pager.initNewDB`, `db.go:registryKey`, `db.go:unstableOpenMu`, `inode_unstable_darwin.go`.
+- **Affected functions:** `pager.go:*pager.open` (registration and the create/existing decision), `pager.go:*pager.rekeyRegistry`, `pager.go:*pager.createIfEmpty`, `db.go:registryKey`, `db.go:unstableOpenMu`, `inode_unstable_darwin.go`.
 
-SQLite's `findInodeInfo` keys its per-process inode registry on an fstat of the just-opened fd, under the process-wide `unixBigLock`; on macOS msdos volumes, where a zero-size file reports a wrong inode (ticket #3260; a FAT32 image on macOS 2026-10-15 reported 2^64−13 for an empty file and 13 after its first byte), it first writes one byte and fsyncs so the fstat sees a real inode (`os_unix.c:1553-1576`, 3.52.0) — safe there because 'S' is the first byte of every SQLite header and `unixFileSize` reports a size of 1 as 0. any-store's header does not start with that byte and a 1-byte file would not read as empty to `readInitialHeader`, the create/existing decision or another process, so on such a volume (darwin, `fstatfs` type `msdos` or `exfat`) an empty file is keyed by its absolute path instead, and `rekeyRegistry` moves the entry to the inode once the file has content: at the create/existing decision after the flock (a file another process created meanwhile is joined by inode) or in `initNewDB` after page 1 is written and fdatasynced — both before any WAL open. Every open on such a volume takes `unstableOpenMu` for its key stat and store, and a path-keyed handle keeps it until its re-key, so the move from path to inode is atomic to the other openers in the process: two spellings of one empty file, or a joiner and its creator, meet on the mutex, the later one stats after the earlier one is keyed by inode and is refused at registration, and only one handle ever runs `initNewDB` on the file. The mutex is held across the DB-file flock retry (up to 1 s against a closing peer), which SQLite's lock never is: latency only, for other opens on such volumes in this process. Wherever a (dev,ino) identity exists on a stable volume the key is the inode from the first stat, as in SQLite, and the mutex is never taken; Windows and wasm, and a VFS handle whose FileInfo carries no identity, key by path throughout, as before. Two processes creating one empty file at once remain unserialized (the pre-existing cross-process class of drift-63). Regression tests (`openregistry_vfs_test.go`, vfs tag, a VFS that reports one inode for every empty file with `emptyFileInodeUnstable` forced on): `TestOpen_RegistryFollowsInodeOfNewFile`, `TestOpen_OpensOnUnstableVolumeSerializeOnCreate`, `TestOpen_JoinerDuringCreatorFdatasyncWaits`, `TestOpen_PathKeyedOpenJoinsContentByInode`, `TestOpen_TwoSpellingsSettleBeforeWAL`.
+SQLite's `findInodeInfo` keys its per-process inode registry on an fstat of the just-opened fd, under the process-wide `unixBigLock`; on macOS msdos volumes, where a zero-size file reports a wrong inode (ticket #3260; a FAT32 image on macOS 2026-10-15 reported 2^64−13 for an empty file and 13 after its first byte), it first writes one byte and fsyncs so the fstat sees a real inode (`os_unix.c:1553-1576`, 3.52.0) — safe there because 'S' is the first byte of every SQLite header and `unixFileSize` reports a size of 1 as 0. any-store's header does not start with that byte and a 1-byte file would not read as empty to `readInitialHeader`, the create/existing decision or another process, so on such a volume (darwin, `fstatfs` type `msdos` or `exfat`) an empty file is keyed by its absolute path instead, and `rekeyRegistry` moves the entry to the inode once the file has content: in `pager.open` after the create/existing decision, when the file holds a page 1 that this open (`createIfEmpty`, written and fdatasynced) or another process wrote — before any WAL open. Every open on such a volume takes `unstableOpenMu` for its key stat and store, and a path-keyed handle keeps it until its re-key, so the move from path to inode is atomic to the other openers in the process: two spellings of one empty file, or a joiner and its creator, meet on the mutex, the later one stats after the earlier one is keyed by inode and is refused at registration, and only one handle ever runs `createIfEmpty` on the file. The mutex is held across the open's waits for the DB-file lock (the busy handler's, against a closing or creating peer; [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal), item 4), which SQLite's lock never is: latency only, for other opens on such volumes in this process. Wherever a (dev,ino) identity exists on a stable volume the key is the inode from the first stat, as in SQLite, and the mutex is never taken; Windows and wasm, and a VFS handle whose FileInfo carries no identity, key by path throughout, as before. Two processes creating one empty file at once are serialized by the exclusive DB-file lock ([drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal)). Regression tests (`openregistry_vfs_test.go`, vfs tag, a VFS that reports one inode for every empty file with `emptyFileInodeUnstable` forced on): `TestOpen_RegistryFollowsInodeOfNewFile`, `TestOpen_OpensOnUnstableVolumeSerializeOnCreate`, `TestOpen_JoinerDuringCreatorFdatasyncWaits`, `TestOpen_PathKeyedOpenJoinsContentByInode`, `TestOpen_TwoSpellingsSettleBeforeWAL`.
 
 <a id="drift-2026-06-25-01-transient-busy-locked-equivalent-errors-are-made-sticky-in-b-rc-so-a-b"></a>
 ### Drift: Transient BUSY/LOCKED-Equivalent Errors Are Made Sticky In b.rc So A Backup Cannot Be Retried Or Resumed
@@ -3956,7 +4324,7 @@ SQLite distinguishes transient contention from real failure: `isFatalError` (`ba
 
 <a id="drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b"></a>
 ### Drift: Point-Lookup And Mutation Descent Loops Omit SQLite's BTCURSOR_MAX_DEPTH Bound
-- **Category:** error-handling  -  **Severity:** medium
+- **Category:** error-handling  -  **Severity:** medium  -  **Status:** RESOLVED 2026-11-19: cursor navigation, the point lookups, the namespace lookup and the descents of `Put` and `Delete` apply `moveToChild`'s rule (`btree.c:5448`, inlined at `btree.c:6227`): with the number of child pointers followed from the root standing for `pCur->iPage`, a further step returns `ErrCorrupt` once that number reaches `btCursorMaxDepth-1`. A chain of 20 pages, root and leaf included, is read; a 21st level is corruption, as in SQLite. `btree.Put`, `btree.Delete` and `pathToChild` test the length of the path they already build, which is the cursor's `apPage`/`aiIdx` stack; `btree.AppendValue`, `ReadTx.AppendValue`, `ReadTx.Has`, `ReadTx.AppendSeekKey` and `DB.resolveNamespace` (the master-tree lookup) carry a counter. `ReadTx.leftmostKeyAfter`, the walk into the next subtree that `AppendSeekKey` makes when the leaf it reached holds nothing at or after the key, continues the count from the level of the page it restarts at, as a cursor that pops back to that ancestor and descends again would. The entry below named only the `btree.go` loops; the four `db.go` descents were as unbounded, and they are the ones a `ReadTx` lookup runs. The path growth it mentions was real for `Put`, `Delete` and `pathToChild`: a test process with two `Put`s on a cyclic tree reached about 3 GB in ten seconds. The walks over a whole tree are not held to that rule, and SQLite's are not all cursor walks either (`clearDatabasePage` recurses directly, `btree.c:10225`). Not changed: `countPage` and `walkSize` stop one level later than SQLite (`depth > btCursorMaxDepth`, counted from 0 at the root) and `keyRank` at `depth >= btCursorMaxDepth`, so each reads a chain one page longer than a cursor would before it reports corruption; `freeTreePages` has its own bound of 64 (`maxTreeDepth`), standing in for `clearDatabasePage`'s reference-count check. Tests: `TestDescentDepthBound_Cycle`, `TestDescentDepthBound_SeekKeyNextSubtree`, `TestDescentDepthBound_MasterTreeCycle`, `TestDescentDepthBound_AcceptsMaxDepth`, and `TestErrCorrupt_TreeWithACycleOfInteriorPages` at the collection level. Two known limitations, both as in SQLite. A write is not held to the bound: `splitRoot` deepens the tree with no look at its height, as `balance` calls `balance_deeper` on an over-full root (`btree.c:9134-9145`, `9034-9079`). An insert whose split reaches the root of a tree of 20 levels returns nil, and from then on a descent that has to go below level 20 returns `ErrCorrupt`, where SQLite's `moveToChild` refuses the step (`btree.c:5448-5450`): "If a tree that appears to be taller than this is encountered, it is assumed that the database is corrupt" (`btreeInt.h:494-495`). SQLite sizes the bound for "a maximum database size of 2^31 pages a minimum fanout of 2 for a root-node and 3 for all other internal nodes" (`btreeInt.h:490-492`). And the deepening moves every branch one level down, not only the one written: on a damaged tree whose branches differ in depth, a root split reached through a short branch pushes a branch of 20 levels elsewhere to 21, and the keys on it read as `ErrCorrupt` from then on; `balance_deeper` copies the whole root whatever the depth of its branches. Test: `TestDescentDepthBound_RootSplitAtMaxDepth`. What follows describes the code before that.
 - **Affected functions:** `btree.go:AppendValue` (`internal/btree/btree.go:1076`), `btree.go:Put` (`internal/btree/btree.go:1217`), `btree.go:Delete` (`internal/btree/btree.go:2576`), `btree.go:*btree.pathToChild`, `btree.go:descendChild` (`internal/btree/btree.go:123`).
 
 Go's point-lookup and mutation paths walk the tree with unbounded `for` loops that carry no depth counter. `AppendValue` (the engine behind `Get`/`Has`) spins `for {` until it hits a leaf (`internal/btree/btree.go:1076`), while `Put`, `Delete` and `pathToChild` (the re-descent of a three-way parent split) loop on interior pages without a counter. Each iteration descends via `descendChild` (`internal/btree/btree.go:123`), which validates only that the child pgno is in range (`childPgno != 0 && childPgno <= readerDbSizeBound`) and that a descended interior page has `cellCount >= 1`; neither check tracks how many levels have been traversed. SQLite instead caps cursor descent at `BTCURSOR_MAX_DEPTH` (20, `btreeInt.h:497`): `moveToChild` returns `SQLITE_CORRUPT_BKPT` once `pCur->iPage >= BTCURSOR_MAX_DEPTH-1` (`btree.c:5448`), and the inlined descent in `sqlite3BtreeIndexMoveto` applies the identical guard (`btree.c:6227`), so any chain deeper than 20 levels — including a cyclic interior loop — is rejected as corruption rather than followed indefinitely.
@@ -3974,10 +4342,24 @@ SQLite keeps the two cases strictly apart. `sqlite3BtreeFirst` calls `moveToRoot
 
 <a id="drift-2026-06-25-12-verifyintegrity-bounds-the-sweep-with-the-live-writer-header-pager-hea"></a>
 ### Drift: VerifyIntegrity Bounds The Sweep With The Live Writer Header Instead Of The Read-Tx Snapshot Page Count
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `integrity_sweep.go:*DB.VerifyIntegrity` (`internal/btree/integrity_sweep.go:101-103`).
+- **Category:** changed-logic  -  **Severity:** medium  -  **Status:** RESOLVED 2026-11-19: the sweep counts and reads the pages of its read transaction's snapshot. The count is `lockBtreePageCount` over page 1 of the snapshot and `pager.readerDbSizeBound(tx.cache)`, the rule of `ReadTx.DatabaseSize`, checked against the size the snapshot's WAL commit recorded when there is one; every page is looked up in the WAL within the transaction's frame window, floor included (`readRawPage` takes the reader cache and uses `readerMinFrame`).
+- **Affected functions:** `integrity_sweep.go:*DB.VerifyIntegrity`, `integrity_sweep.go:*DB.sweepPageCount`, `pager.go:*pager.readRawPage`, `pager.go:*pager.readRawPage1Header`.
 
-`VerifyIntegrity` opens a read transaction and then drives the page loop from `total := db.pager.header.DatabaseSize` (`internal/btree/integrity_sweep.go:101`), the live writer's global header page count, while reading each page against the captured snapshot frame `maxFrame := tx.walMaxFrame` (`internal/btree/integrity_sweep.go:102-103`). The two bounds come from different points in time: the sweep ceiling tracks the writer, but `readRawPage(pgno, maxFrame)` resolves bytes against the reader's WAL snapshot. SQLite derives the per-transaction page count from `sqlite3PagerPagecount`, which returns `pPager->dbSize` and asserts a read transaction is open (`pager.c:3925-3928`); that field is seeded for the reader by `sqlite3WalDbsize` -> `pWal->hdr.nPage` (`wal.c:3655-3657`, consumed at `pager.c:3292`), i.e. the snapshot's own page count, so the ceiling and the page reads always describe the same database image. This package already exposes that snapshot-consistent bound via `ReadTx.DatabaseSize` (`internal/btree/db.go:1774-1775`) and `pager.readerDbSizeBound(tx.cache)` (`internal/btree/pager.go:1946-1951`), but the sweep bypasses both and reads the unsynchronized live header. The consequence is a data race and snapshot inconsistency: if a concurrent writer or peer process grows the DB during the sweep, `total` exceeds the snapshot's page count and `readRawPage` finds no WAL frame at or below `maxFrame` for the new pages, falling back to a stale/past-EOF `readDBPage` and recording phantom `SweepError`s, while a shrink reads freed pages or skips live ones — false corruption that can drive callers into destructive recovery.
+`VerifyIntegrity` opened a read transaction and then drove the page loop from `db.pager.header.DatabaseSize`, the pager's in-memory header, while reading each page at the transaction's `walMaxFrame`. That header is the writer's: it is refreshed at open, at a write begin (`refreshHeaderFromPage1`) and by a commit, never by a read transaction, and `pager.commit` sets its size before it writes a frame. The count and the page reads described two different database images, in both directions:
+
+- **Too few pages.** In a process that had only read since a peer process grew the database, the header still held the size from open. The sweep verified those pages and reported the rest clean without reading them (`TestVerifyIntegritySweepsPagesAPeerAdded`: 2 pages swept of 170, a damaged page among the others).
+- **Too many pages.** A sweep that began while a commit which grew the database had not yet published its frames read past its snapshot: the new pages are in no frame at or below its `walMaxFrame` and not in the database file, so each was listed as a page error on a healthy database. With mmap on the read went to mapped memory past the end of the file and the process died of SIGBUS (`dbMmap.remap` maps the requested length whatever the file's size). `TestVerifyIntegritySweepBesideGrowingCommit` covers both read paths. The header field was also read with no lock against the committing goroutine.
+
+SQLite has one page count per read transaction. `sqlite3PagerPagecount` returns `pPager->dbSize` (`pager.c:3925-3929`), which `pagerPagecount` sets at the read begin from `sqlite3WalDbsize`, `pWal->hdr.nPage` of the snapshot, or from the file's size when the WAL has no commit (`pager.c:3279-3306`, `wal.c:3669-3674`). `lockBtree` derives the b-tree's `nPage` from page 1 and that count (`btree.c:3294-3298`, `3401-3408`), and both whole-file walks use it: `sqlite3BtreeIntegrityCheck` (`btreePagecount`, `btree.c:11163`) and the `sqlite_dbpage` table (`sqlite3BtreeLastPage`, `dbpage.c:260`), which is what a `verify_checksum(data) FROM sqlite_dbpage` scan of a cksumvfs database is bounded by. `IntegrityCheckN` and `Backup.Step` already took their count from the snapshot's page 1 and the pager's count for the snapshot. They do not treat a header that is not valid alike: `Backup.Step` goes through `lockBtreePageCount` and fails with `ErrHeaderCorrupt` on a size above the pager's count or on unequal non-zero change counters, as `lockBtree` fails the first (`SQLITE_CORRUPT_BKPT`, `btree.c:3401-3408`); `IntegrityCheckN` caps the size at the pager's count, takes the pager's count on any counter mismatch, and goes on. The sweep follows `lockBtreePageCount`, with the difference below when a WAL commit recorded the size.
+
+Three things in the sweep remain its own, with no SQLite counterpart to align with:
+
+- **Page 1 is read raw for the count.** The sweep reads every page without the codec, page 1 included, and takes the header from its first 100 bytes, which the codec does not cover. `ReadTx.DatabaseSize` decodes page 1 through the codec; on an AEAD database a damaged page 1 would then be the sweep's error instead of a listed page (`TestVerifyIntegrity_DamagedPage1Listed`). A cksumvfs database with verification on fails every read of a damaged page (`cksmRead`, `SQLITE_IOERR_DATA`), page 1 at the transaction's begin, so a `sqlite_dbpage` scan that reads the page from the file, a full-page VFS read, gets past damage only with verification off (a page already in the pager cache is returned without a read, `pager.c:5568`); the sweep reads raw so that it lists damage whatever the setting. When page 1 cannot be read whole (an I/O error past its header), the sweep reads the header alone (`readRawPage1Header`), lists page 1 with the read's error and goes on from page 2; with no WAL commit to give the count, the header's count is the one it sweeps to (`TestVerifyIntegritySweepPage1BodyUnreadable`, over a file longer than the database, so the file's length would sweep too far). A sweep that can read page 1 reads it once.
+- **A page that cannot be read is listed, and the sweep goes on** (`SweepError` with `IntegrityKindUnknown`, pinned by `TestReadRawPageWALErrorPropagates`), where an SQLite scan stops at the first read error. The function's error is a read transaction that cannot begin, a cancelled context, and a page count that cannot be established: with no WAL commit to give it, a page-1 header that cannot be read, that `dbHeader.deserialize` rejects (magic, format versions, page size, payload fractions), or that fails `lockBtreePageCount`. The hook side of this is drift-2026-06-25-13. **Known limitation:** a read begin at a snapshot whose page-1 counters the handle does not hold yet reads them (`readHeaderCountersAt`), so a page-1 header that cannot be read is then the function's error and there is no report. At a snapshot whose counters it holds, the read begins, and the sweep lists page 1 and goes on only when a WAL commit of the snapshot gives the page count; without one (a reopened, checkpointed database whose WAL has had no commit since), the header that cannot be read is the function's error, as above. A `sqlite_dbpage` scan does the same in the first case: every transaction begins by reading page 1 and returns that read's error (`rc = btreeGetPage(pBt, 1, &pPage1, 0); if( rc!=SQLITE_OK ) return rc;`, `btree.c:3288-3289`), and in WAL mode the pager cache keeps page 1 across transactions only while the snapshot is unchanged (`pager.c:3261-3264`).
+
+- **Page 1's count is checked against the WAL commit's.** The header is outside both codecs, so its page count carries no tag, and a count damaged downwards with the change counters intact is a well-formed header: `lockBtree` accepts a size below the pager's count (`btree.c:3294-3298`), because a file may hold pages past the database's end. A sweep that trusted it reported the remaining pages clean without reading them (41 pages of 169 after one flipped bit). cksumvfs has no such gap: its checksum covers the whole page, header included (`cksmCompute((u8*)zBuf, iAmt-8, cksum)`, `cksumvfs.c:450`). When the pager's count for the snapshot is the size a WAL commit recorded (`sqlite3WalDbsize`, `wal.c:3669-3674`), it is a second count of the same database: `pager.commit` writes page 1 whenever the size changes and passes the same size to the commit frame. In every mode a snapshot's header carries a size only once a commit has recorded one, as SQLite's does (`walIndexRecover` zeroes the header and sets `nPage` from a commit frame, `wal.c:1408`, `1512`), and a WAL reset keeps it (`walRestartHdr` zeroes `mxFrame` only, `wal.c:2146-2160`), so a non-zero size is the commit's after a TRUNCATE checkpoint too. `sweepPageCount` then sweeps the pages the commit recorded and lists page 1 (`IntegrityKindUnknown`) when the header is not valid or counts differently, in either direction, with the header's own error in `Inner`: `ErrHeaderCorrupt`, or `dbHeader.deserialize`'s `ErrNewerFormat`, `ErrOldFormat` or `ErrSQLiteFormat` for a header of another format (`TestVerifyIntegritySweepDamagedPageCount`, after a FULL and after a TRUNCATE checkpoint). A page 1 that cannot be read whole is listed with the read's error instead. That is SQLite's order: `lockBtree` returns a failed read of page 1 before it looks at the header (`btree.c:3288-3289`), and keeps the header's codes apart after it (`SQLITE_NOTADB` for the magic and the read version, `btree.c:3306-3312`, `3325`; `SQLITE_CORRUPT_BKPT` for a size above the pager's count, `btree.c:3401-3403`). The header of such a page 1, read alone, is listed as well, with `ErrHeaderCorrupt`, only when it counts fewer pages than the commit. When the pager's count is the file's length, a smaller count in page 1 stands, as for every reader (`TestVerifyIntegritySweepLogicalSizeBelowFile`): damage to the count is then not told apart from a longer file, here or in SQLite's b-tree layer. Only the sweep makes the cross-check; `ReadTx.DatabaseSize`, `IntegrityCheckN` and `Backup.Step` take the smaller count as SQLite does.
+
+The slot-0 case of the frame floor (`TestReadRawPageSlot0IgnoresNewWALGeneration`): a snapshot of a fully checkpointed WAL reads nothing from the WAL (`walFindFrame`, `wal.c:3538-3541`), a WAL restart needs only read slots 1-4 and can run under it, and the next writer's frames are numbered from 1 again, below the snapshot's `mxFrame`. `readRawPage` looked pages up from the live checkpoint frontier and returned those frames.
 
 <a id="drift-2026-06-25-18-walksize-has-no-visited-page-set-so-a-corrupt-dag-cycle-triggers-expon"></a>
 ### Drift: walkSize Has No Visited-Page Set So A Corrupt DAG Cycle Triggers Exponential Re-Traversal
@@ -4039,6 +4421,8 @@ For file-backed databases that run in forced in-process mode (heap-backed WAL-in
 
 To prove "last client" at close, the Go pager upgrades its lifetime DB-file lock from shared to exclusive by issuing a single `syscall.Flock(fd, LOCK_EX|LOCK_NB)` through `flockNB` (`internal/btree/dbfile_lock_unix.go:78`), with `tryUpgradeDBLockExclusive` mapping `ErrBusy` to `(false, nil)` (`internal/btree/dbfile_lock_unix.go:60-61`). Per BSD `flock(2)` semantics a shared→exclusive conversion on one open file description is not atomic: the kernel first drops the existing `LOCK_SH` and only then tries to install `LOCK_EX`, so when the exclusive grant cannot be satisfied immediately the `LOCK_NB` attempt fails *after* the shared lock has already been released. The caller therefore observes `(false, nil)` and treats itself as a non-last client (`internal/btree/pager.go:3277-3284`), unaware that its DB-file SHARED lock is now gone. SQLite's flock VFS sidesteps this entirely: in `flockLock` every lock at or above `SHARED_LOCK` is physically an exclusive `flock` (`os_unix.c:2682-2685`), so once any lock is held an upgrade just bumps the in-memory level and returns `SQLITE_OK` without re-issuing `robust_flock` (`os_unix.c:2696-2701`), and `flockCheckReservedLock` documents that the connection's lock is already exclusive (`os_unix.c:2643-2656`); the held lock is never momentarily dropped, and SQLite's real DB-file close protocol additionally uses atomic fcntl byte-range conversions that do not release the prior lock on failure. The consequence is that a non-last client whose upgrade fails returns `isLastClient=false` but has silently dropped its lifetime DB-file shared lock, opening a window (until its fd closes) in which a peer process's concurrent `tryUpgradeDBLockExclusive` sees no contention, wrongly declares itself last client, and truncates the WAL / unlinks the shm while this client is still attached — re-opening the early-truncation / orphan-inode race the DB-file lock protocol exists to prevent. Since 2026-11-19 the upgrade is the first step of `pager.close` (§SHM open/close protocol drift, item 1): a closer whose upgrade fails runs no checkpoint and no truncate, and only closes its descriptors after it, so the unlocked window is no longer than it was; the conversion itself is unchanged.
 
+The second caller, `pager.lockDBForCreate` (the creation of a new database, [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal)), does not depend on which way the kernel behaves: after a refused upgrade it releases the lock itself (`unlockDBFile`), and it is attached to no WAL or wal-index while it holds nothing.
+
 <a id="drift-2026-06-25-09-downgradedblocktoshared-can-leave-the-db-file-fully-unlocked-or-spurio"></a>
 ### Drift: downgradeDBLockToShared Can Leave The DB File Fully Unlocked Or Spuriously Return ErrBusy
 - **Category:** changed-logic  -  **Severity:** low
@@ -4046,7 +4430,7 @@ To prove "last client" at close, the Go pager upgrades its lifetime DB-file lock
 
 To convert an exclusive DB-file lock back to shared, the Go code calls `downgradeDBLockToShared`, which simply issues `flockNB(fd, syscall.LOCK_SH)` (`internal/btree/dbfile_lock_unix.go:67-70`); that wrapper performs a real `syscall.Flock(fd, LOCK_SH|LOCK_NB)` and maps `EWOULDBLOCK`/`EAGAIN` to `ErrBusy` (`internal/btree/dbfile_lock_unix.go:74-85`). On BSD `flock` a lock-mode conversion is not atomic — the kernel first drops the existing exclusive lock and then tries to acquire the shared one — so with `LOCK_NB` set the re-acquire can fail if another process grabs a lock in the window, leaving the file with no lock at all while the call returns `ErrBusy`. SQLite's `flockUnlock` deliberately avoids any syscall for an exclusive→shared down-conversion: it observes that an exclusive lock already subsumes shared access and merely updates the in-memory state, `pFile->eFileLock = SHARED_LOCK; return SQLITE_OK;` (`os_unix.c:2747-2751`), reserving an actual `robust_flock(LOCK_UN)` only for the full `NO_LOCK` release path (`os_unix.c:2734-2763`), so its downgrade can never fail and never relinquishes the kernel lock.
 
-The consequence is that a caller invoking downgrade after a successful exclusive upgrade may end up with the DB file silently unlocked (losing the mutual exclusion that serializes last-client-unlink against new openers) while receiving an unexpected `ErrBusy` from an operation that semantically cannot be busy; this is currently latent because no caller invokes `downgradeDBLockToShared` today, but the hazard is inherited by any future use of this cross-platform lock API (also stubbed in `dbfile_lock_windows.go`).
+The consequence is that a caller invoking downgrade after a successful exclusive upgrade may end up with the DB file silently unlocked (losing the mutual exclusion that serializes last-client-unlink against new openers) while receiving an unexpected `ErrBusy` from an operation that semantically cannot be busy; this is currently latent because no caller invokes `downgradeDBLockToShared` today, but the hazard is inherited by any future use of this cross-platform lock API (also stubbed in `dbfile_lock_windows.go`). The two exclusive→shared conversions in the open path do not use it: after a new database's page 1 is written (`createIfEmpty`), and when an open gets the exclusive lock and finds that another process has created the database (`lockDBForCreate`), both [drift-63](#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal). They go through `pager.downgradeDBLock`, which repeats the shared request through the busy handler while it is refused, and they run before the WAL is opened, so a lock dropped inside the conversion leaves the handle unlocked only while it is attached to nothing.
 
 <a id="drift-2026-06-25-10-flocknb-does-not-retry-on-eintr-no-robust-flock-equivalent"></a>
 ### Drift: flockNB Does Not Retry On EINTR (No robust_flock Equivalent)
@@ -4067,22 +4451,22 @@ When walking an interior page, Go's `checkTreePage` anchors the expected subtree
 
 <a id="drift-2026-06-25-13-checksum-sweep-fires-the-onerror-errcksummismatch-hook-even-for-plain-"></a>
 ### Drift: Checksum Sweep Fires The OnError(errCksumMismatch) Hook Even For Plain File-I/O Read Errors
-- **Category:** error-handling  -  **Severity:** low
-- **Affected functions:** `integrity_sweep.go:*DB.VerifyIntegrity` (`internal/btree/integrity_sweep.go:109`), `integrity_sweep.go:verifyCksumPage` (`internal/btree/integrity_sweep.go:132`).
+- **Category:** error-handling  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-19: the sweep fires the hook only for a page whose checksum was compared and differed (`Kind == IntegrityChecksumMismatch`); a page it could not read is listed and fires nothing (`TestReadRawPageWALErrorPropagates`). What remains is in the report, not the hook: for a frame above this process's `nFrame`, `wal.readFrameRaw` returns `ErrWALCorrupt` in place of the read's own error (drift-2026-07-10-1), so `SweepError.Inner` does not carry the cause there.
+- **Affected functions:** `integrity_sweep.go:*DB.VerifyIntegrity`, `integrity_sweep.go:verifyCksumPage`.
 
-In `VerifyIntegrity`'s checksum branch, any non-nil `SweepError` returned by `verifyCksumPage` (`internal/btree/integrity_sweep.go:109`) triggers the codec's OnError hook with a hard-coded `errCksumMismatch` (`internal/btree/integrity_sweep.go:113`), regardless of which failure produced it. But `verifyCksumPage` returns two distinct error shapes: a genuine trailer mismatch carries `Kind: IntegrityChecksumMismatch` (`internal/btree/integrity_sweep.go:149`, whose `want != got` compare mirrors the codec at `codec_cksum.go:96`), while a failed raw-page read returns `&SweepError{PageNo: pgno, Inner: err}` with `Kind` left at the zero value `IntegrityKindUnknown` (`internal/btree/integrity_sweep.go:132-134`). The sweep loop never inspects the kind before calling `c.fire`, so a transient file-I/O read fault is reported through the same `errCksumMismatch` notification as an actual corrupt page.
+In `VerifyIntegrity`'s checksum branch, any non-nil `SweepError` returned by `verifyCksumPage` triggered the codec's OnError hook with a hard-coded `errCksumMismatch`, regardless of which failure produced it. But `verifyCksumPage` returns two distinct error shapes: a genuine trailer mismatch carries `Kind: IntegrityChecksumMismatch` (its `want != got` compare mirrors `cksumCodec.Decrypt`), while a failed raw-page read returns `&SweepError{PageNo: pgno, Inner: err}` with `Kind` left at the zero value `IntegrityKindUnknown`. The sweep loop did not inspect the kind before calling `c.fire`, so a transient file-I/O read fault was reported through the same `errCksumMismatch` notification as an actual corrupt page.
 
-SQLite's cksumvfs keeps the two cases strictly separate: `cksmRead` computes and compares the trailer only when the underlying `xRead` succeeded (`rc==SQLITE_OK`), surfacing a real trailer mismatch as `SQLITE_IOERR_DATA` (`cksumvfs.c:451`, `cksumvfs.c:455`), whereas a plain read failure propagates the original `xRead` error code (e.g. `SQLITE_IOERR_READ`) and never reaches the checksum comparison at all — C never relabels an I/O fault as a data/checksum fault. The consequence is that subscribers wired to the codec OnError hook (anystore corruption handlers) receive a checksum-mismatch event for a transient read error during a sweep, potentially marking a healthy database corrupt or kicking off recovery; severity is low because the collected `SweepError` itself still carries the correct kind and inner error, so only the side-channel OnError notification is misclassified.
+SQLite's cksumvfs keeps the two cases strictly separate: `cksmRead` computes and compares the trailer only when the underlying `xRead` succeeded (`rc==SQLITE_OK`), surfacing a real trailer mismatch as `SQLITE_IOERR_DATA` (`cksumvfs.c:451`, `cksumvfs.c:455`), whereas a plain read failure propagates the original `xRead` error code (e.g. `SQLITE_IOERR_READ`) and never reaches the checksum comparison at all — C never relabels an I/O fault as a data/checksum fault. Subscribers wired to the codec OnError hook (anystore corruption handlers) therefore received a checksum-mismatch event for a transient read error during a sweep, which could mark a healthy database corrupt or start a recovery. The severity was low because the sweep's report gave such a page the read's kind, `IntegrityKindUnknown`: only the hook misclassified it.
 
 <a id="drift-2026-06-25-14-page-1-db-header-bytes-0-99-is-excluded-from-both-checksum-and-aead-in"></a>
 ### Drift: Page-1 DB Header Bytes 0..99 Excluded From Both Checksum And AEAD Integrity Coverage
 
 - **Category:** missing-feature  -  **Severity:** low
-- **Affected functions:** `integrity_sweep.go:verifyCksumPage` (`internal/btree/integrity_sweep.go:131`), `integrity_sweep.go:verifyAEADPage` (`internal/btree/integrity_sweep.go:157`), `codec.go:encryptPageWithCodec` (`internal/btree/codec.go:149`).
+- **Affected functions:** `integrity_sweep.go:verifyCksumPage`, `integrity_sweep.go:verifyAEADPage`, `codec.go:encryptPageWithCodec`.
 
-For page 1 the Go integrity sweep starts its hash at `dbHeaderSize` rather than 0: `verifyCksumPage` sets `start = dbHeaderSize` when `pgno == 1` (`internal/btree/integrity_sweep.go:137-138`) and hashes only `raw[start:bodyEnd]` (`internal/btree/integrity_sweep.go:144`), so the first 100 bytes of page 1 never enter the XXH3-128. That exclusion is structural, baked into the codec write path: `encryptPageWithCodec` copies the first `dbHeaderSize` bytes as a plaintext prefix and only encrypts/authenticates the remainder (`internal/btree/codec.go:153-158`), and the cksumCodec documents that "the page-1 DB header is therefore NOT covered by the per-page checksum" (`internal/btree/codec_cksum.go:26-31`). For the AEAD codec, `verifyAEADPage` decrypts only that same post-prefix slice (`internal/btree/integrity_sweep.go:164`), so the header bytes carry no authentication tag and the SQLite-format invariants there are instead checked only by `dbHeader.deserialize` at open time.
+For page 1 the Go integrity sweep starts its hash at `dbHeaderSize` rather than 0: `verifyCksumPage` sets `start = dbHeaderSize` when `pgno == 1` and hashes only `raw[start:bodyEnd]`, so the first 100 bytes of page 1 never enter the XXH3-128. That exclusion is structural, baked into the codec write path: `encryptPageWithCodec` copies the first `dbHeaderSize` bytes as a plaintext prefix and only encrypts/authenticates the remainder, and the cksumCodec documents that "the page-1 DB header is therefore NOT covered by the per-page checksum" (`internal/btree/codec_cksum.go:26-31`). For the AEAD codec, `verifyAEADPage` decrypts only that same post-prefix slice, so the header bytes carry no authentication tag. What is checked of them is their format, not their integrity: `dbHeader.deserialize` at open, at every write begin, and in every sweep, which decodes its snapshot's header (`sweepPageCount`) and applies `lockBtreePageCount`. A header that stops being valid after open (a payload-fraction byte, the magic) is found by the next sweep: listed against page 1 when a WAL commit gives the page count, the sweep's `ErrHeaderCorrupt` otherwise. A header `DatabaseSize` of 0 is not an error: the pager's count stands in. A page count that differs from the one the snapshot's WAL commit recorded is listed (drift-2026-06-25-12); any other field changed to another valid value passes.
 
-SQLite's cksumvfs, by contrast, checksums the entire page including page 1's 100-byte database header: the read path computes `cksmCompute((u8*)zBuf, iAmt-8, cksum)` starting at offset 0 of the page buffer (`cksumvfs.c:450`), and the `verify_checksum()` SQL function does the same with `cksmCompute(data, nByte-8, cksum)` over the whole blob (`cksumvfs.c:353`); `cksmCompute` walks from `a[0]` to `a[nByte]` with no header carve-out (`cksumvfs.c:299`). The consequence is that bit-rot or tampering confined to the page-1 header — e.g. a flipped DatabaseSize or freelist-trunk pointer that still parses as structurally valid — passes `VerifyIntegrity` clean, whereas an equivalent SQLite cksumvfs database would flag it; for the AEAD codec this is an authentication gap on file-structure metadata.
+SQLite's cksumvfs, by contrast, checksums the entire page including page 1's 100-byte database header: the read path computes `cksmCompute((u8*)zBuf, iAmt-8, cksum)` starting at offset 0 of the page buffer (`cksumvfs.c:450`), and the `verify_checksum()` SQL function does the same with `cksmCompute(data, nByte-8, cksum)` over the whole blob (`cksumvfs.c:353`); `cksmCompute` walks from `a[0]` to `a[nByte]` with no header carve-out (`cksumvfs.c:299`). The consequence is that bit-rot or tampering confined to the page-1 header — e.g. a flipped freelist-trunk pointer or schema cookie that still parses as structurally valid, or a `DatabaseSize` lowered in a snapshot with no WAL commit — passes `VerifyIntegrity` clean, whereas an equivalent SQLite cksumvfs database would flag it; for the AEAD codec this is an authentication gap on file-structure metadata.
 
 <a id="drift-2026-06-25-15-remap-grows-mapping-to-a-single-page-end-and-always-full-unmaps-re-mma"></a>
 ### Drift: Remap Always Unmaps And Re-mmaps The Whole Region Instead Of Extending In Place
@@ -4311,9 +4695,29 @@ Three further rules of the same SQLite routines were ported with it (2026-11-11)
 
 Regression tests (`internal/btree/walindex_torn_header_test.go`): `TestTornWalIndexHeader_CheckpointKeepsPeerCommits`, `_PassiveCheckpointKeepsPeerCommits`, `_CloseKeepsPeerCommits`, `_ReaderRecovers`, `_WriterRecovers` (two processes: the writer dies between the header copies), `_ReaderRetriesWhileWriteLockBusy`, `_BusyRecoveryWhenRecoverLockHeld`, `_CheckpointBusyWhenWriteLockHeld`.
 
+<a id="drift-2026-11-24-1-put-refuses-a-record-over-the-record-size-limit"></a>
+### Drift: Put Refuses A Record Over The Record Size Limit; SQLite Tests Its Length Limit Above The B-Tree
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.Put`, `btree.go:recordSizeErr`, `page.go:payloadFits`; `db.go:*DB.CreateNamespace`, `db.go:*DB.RenameNamespace` (the master-table record).
+
+SQLite's length limit is `SQLITE_LIMIT_LENGTH`, `SQLITE_MAX_LENGTH` by default, 1,000,000,000 (`sqliteLimit.h:24`), and it is tested where a value or a record is built, above the b-tree. `OP_MakeRecord` tests `nByte+nZero>db->aLimit[SQLITE_LIMIT_LENGTH]` (`vdbe.c:3697`) and jumps to `too_big:`, which sets "string or blob too big" and returns `SQLITE_TOOBIG` (`vdbe.c:9298-9300`). That test runs only when the output register must grow to hold the record: it is in the `else` of `if( nByte+nZero<=pOut->szMalloc )` (`vdbe.c:3690`). `sqlite3BtreeInsert` only asserts its lengths (`btree.c:9485`, `9540`).
+
+Here the limit is in the b-tree, and it is the cell parsers' cap ([old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation](#old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation)): key length plus value length at most `maxPayloadAlloc`, 2^30 bytes (`payloadFits`). `Put` tests every record against it before it touches a page, and refuses one over it with one of two errors (`recordSizeErr`): `ErrKeyTooLarge` when the key alone is over the limit, `ErrValueTooLarge` otherwise, where SQLite has the one code. `CreateNamespace` and `RenameNamespace` apply the same test to the master-table record (the name and a 4-byte root page number) before they allocate the root or delete the old name. Holding writes to the parsers' cap means `Put` never writes a record its own parse would reject, and the b-tree is the lowest layer every writer here passes through. Only `Put` brings a new record into a tree, and it tests that record at entry, before any path writes it; the rest of what a split or a rebuild writes, under `Put` or `Delete`, comes from cells already in the tree. Tests: `TestPayloadLimit_RealConstants`, `TestPayloadLimit_PutRefusesWhatReadRejects`, `TestPayloadLimit_NamespaceName`.
+
+<a id="drift-2026-11-24-2-a-readers-file-size-bound-takes-the-pagers-page-count"></a>
+### Drift: A Reader's File-Size Bound On A Declared Length Takes The Pager's Page Count, Not Page 1's
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `page.go:payloadInFile` (its page count is `pager.go:*pager.readerDbSizeBound`'s).
+
+`sqlite3BtreeMaxRecordSize` is `pCur->pBt->pageSize * (sqlite3_int64)pCur->pBt->nPage` (`btree.c:4978-4982`). `pBt->nPage` is the count `lockBtree` sets at the start of every transaction (`btree.c:3707`, `3448`): page 1's in-header size (offset 28) when it is non-zero and the change counter equals the version-valid-for number, else the pager's count (`btree.c:3294-3298`); a trusted size larger than the pager's count is `SQLITE_CORRUPT_BKPT` (`btree.c:3401-3407`). A write then grows it as it allocates pages (`allocateBtreePage`, `btree.c:6763-6786`).
+
+`payloadInFile` multiplies the page size by `readerDbSizeBound`. For the writer that is `pager.dbSize`, which a write begin sets by the same rule (`refreshHeaderFromPage1` through `lockBtreePageCount`) and `allocatePage` grows: SQLite's count. For a reader it is `pcache.dbSize`, the pager's count at its snapshot (`effectiveReaderDbSize`: the size the WAL's last commit records, else the database file's size), and page 1 is not read for it. In a file any-store writes the two agree: a commit that changes the page count writes page 1 with it (`commitNeedsPage1`). They differ when page 1's size field is damaged, or when the count is the database file's size and the file holds pages past its committed size. A trusted page-1 size below the pager's count then bounds a SQLite reader more tightly than this one, and one above it ends the SQLite transaction at its start with `SQLITE_CORRUPT`, where this reader goes on under the pager's count. Where page 1's size is untrusted, SQLite takes the pager's count too. The bound decides only whether a declared length is refused before a buffer is sized by it; a length within it whose bytes are not in the file still fails on the overflow chain.
+
+The key readers bound a key's length by `payloadInFile` too, `pageSize * nPage`, where SQLite's index probe uses `nCell/usableSize > nPage` (`btree.c:6164`), with the same `nPage`. Both bounds are at least `nPage * usableSize`, more than the file's pages can hold of one payload, so a key whose length falls between them fails on the overflow chain under either. The page numbers a reader follows (`descendChild`, the overflow-chain readers) are bounded by the same pager's count, where SQLite tests `btreePagecount`, that is `pBt->nPage` (`btree.c:2365`, `2386`, `5227`). Tests: `TestPayloadLimit_DeclaredLengthOverFileSize`, `TestPayloadLimit_OverflowRecordWithinFileSize`.
+
 <a id="drift-2026-11-23-1-full-pathname-follows-no-symbolic-link"></a>
 ### Drift: The Full Pathname Follows No Symbolic Link And Keeps Its "." And ".." Elements
-- **Category:** changed-logic  -  **Severity:** low  -  **Date:** 2026-11-23
+- **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `fullpath_unix.go:FullPathname`.
 
 SQLite resolves a database's name once, `rc = sqlite3OsFullPathname(pVfs, zFilename, nPathname, zPathname);` (`pager.c:4792`), builds the `-journal` and `-wal` names from the result (`pager.c:4915`, `4929`) and opens the database by it, `rc = sqlite3OsOpen(pVfs, pPager->zFilename, pPager->fd, vfsFlags, &fout);` (`pager.c:4948`). `FullPathname` is that resolution, with each platform's `xFullPathname`:

@@ -553,6 +553,24 @@ func TestOpen_AnyStoreV1File(t *testing.T) {
 		require.Nil(t, db)
 	})
 
+	t.Run("v1 file the caller may only read", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("needs a file that opens for reading and not for writing")
+		}
+		path := filepath.Join(dir, "v1-readonly.db")
+		page := make([]byte, 4096)
+		copy(page, "SQLite format 3\x00")
+		require.NoError(t, os.WriteFile(path, page, 0o400))
+		if f, err := os.OpenFile(path, os.O_RDWR, 0); err == nil {
+			_ = f.Close()
+			t.Skip("needs a file that opens for reading and not for writing")
+		}
+
+		db, err := Open(ctx, path, nil)
+		require.ErrorIs(t, err, ErrV1Database)
+		require.Nil(t, db)
+	})
+
 	t.Run("v2 file still opens", func(t *testing.T) {
 		path := filepath.Join(dir, "v2.db")
 		db, err := Open(ctx, path, nil)
@@ -1699,7 +1717,9 @@ func TestCheckStale_ConsumesOnlySnapshotCounters(t *testing.T) {
 // commit republished the live sketch and recorded the counters. A peer's
 // commit (the local counters left behind) still reloads, into a reader-owned
 // sketch that is allocated once and reused by later reloads of the same
-// shape; the live sketch is never touched.
+// shape; a reader never touches the live sketch. The live sketch is the next
+// write transaction's to load: it takes the peer's row before its own
+// deltas, however many readers loaded that row before it.
 func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 	skipIfInMemory(t, "models another process's commit; not applicable in-memory")
 	fx := newFixture(t)
@@ -1763,7 +1783,7 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 
 	// The bytes on disk change under a peer, in either stored encoding: the
 	// reload decodes them into the same reader-owned object, and the live
-	// sketch keeps its count.
+	// sketch keeps its count while only readers pass.
 	docs, liveDocs := uint64(40), uint64(2)
 	for _, enc := range []struct {
 		name    string
@@ -1787,12 +1807,17 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 			stalePass()
 			return row
 		}
-		peerWrites(1)
+		// own is the shape of the live sketch (the index has one field; the
+		// first pass's writer leaves the live sketch with two levels, see
+		// below), other is the shape it does not have.
+		own := live.Levels
+		other := 3 - own
+		peerWrites(own)
 		pub = idx.loadPubSketch()
 		require.NotSame(t, live, pub, enc.name)
 		require.Equal(t, docs, pub.GetDocCount(), enc.name)
 
-		peerWrites(1)
+		peerWrites(own)
 		assert.Same(t, pub, idx.loadPubSketch(), "%s: the reader-owned sketch is reused", enc.name)
 		assert.Equal(t, docs, pub.GetDocCount(), enc.name)
 		assert.Equal(t, liveDocs, live.GetDocCount(), enc.name)
@@ -1812,19 +1837,58 @@ func TestCheckStale_OwnCommitBeforePassSkipsReload(t *testing.T) {
 
 		// Bytes of another shape never reshape the published object: they are
 		// decoded into a fresh one.
-		peerWrites(2)
+		peerWrites(other)
 		assert.NotSame(t, pub, idx.loadPubSketch(), enc.name)
-		assert.Equal(t, 1, pub.Levels, enc.name)
-		assert.Equal(t, 2, idx.loadPubSketch().Levels, enc.name)
+		assert.Equal(t, own, pub.Levels, enc.name)
+		assert.Equal(t, other, idx.loadPubSketch().Levels, enc.name)
 		assert.Equal(t, docs, idx.loadPubSketch().GetDocCount(), enc.name)
 		assert.Same(t, live, idx.sketch, enc.name)
+		assert.Equal(t, liveDocs, live.GetDocCount(), "%s: readers alone leave the live sketch", enc.name)
+
+		// A write of this process: the readers before it loaded the peer's
+		// row into the published sketch only, so the writer loads it into
+		// the live one and its delta goes on top. The row has another
+		// shape than the live object, which was published and may still be
+		// in a planner's hands: it is left as it is, and a fresh object
+		// becomes the live one. The reader below holds the old object
+		// across the load (a data race if the load reshaped it). The row
+		// the writer stores holds the peer's counts and its own, and the
+		// published sketch is the live one again.
+		held, stop, stopped := live, make(chan struct{}), make(chan struct{})
+		heldCounters := held.Snapshot(nil)
+		go func() {
+			defer close(stopped)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = held.Estimate(held.NumLevels()-1, []byte{1})
+					_ = held.EntryCount(0)
+					_ = held.Distribution(0)
+				}
+			}
+		}()
+		insertErr := coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"own-%s","a":7}`, enc.name)))
+		close(stop)
+		<-stopped
+		require.NoError(t, insertErr)
+		live = idx.sketch
+		// Compared as a bool: a failed NotSame prints both sketches.
+		require.True(t, held != live, "%s: a row of another shape is not decoded into the published object", enc.name)
+		assert.Equal(t, own, held.Levels, enc.name)
+		assert.True(t, slices.Equal(heldCounters, held.Snapshot(nil)), "%s: the object a reader may hold is as it was", enc.name)
+		liveDocs = docs + 1
+		assert.Equal(t, other, live.Levels, enc.name)
+		assert.Equal(t, liveDocs, live.GetDocCount(), "%s: the peer's row and the own delta", enc.name)
+		stored, err := dbi.InspectIndexSketch(ctx, "c", idx.info.Name)
+		require.NoError(t, err)
+		assert.Equal(t, liveDocs, stored.DocCount, "%s: the stored row", enc.name)
+		require.Same(t, live, idx.loadPubSketch(), enc.name)
 
 		// After a commit of this process the published sketch is the live
 		// one, and a reload decodes into a fresh object. A row that does not
 		// decode must not publish that object, empty, over the live counts.
-		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"own-%s","a":7}`, enc.name))))
-		liveDocs++
-		require.Same(t, live, idx.loadPubSketch(), enc.name)
 		settled, err := dbi.btreeDB.BeginRead()
 		require.NoError(t, err)
 		e0 = epochOf(settled)
@@ -2172,9 +2236,10 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		assert.EqualValues(t, 1, on.DocCount)
 	})
 
-	// reloadSketch has nothing to rebase to and keeps the flag: the collection
-	// stays listed until a commit writes the row.
-	t.Run("sketches: no committed row keeps the collection listed", func(t *testing.T) {
+	// No stored row is no statistics: the rebase empties the live sketch,
+	// which is then as the file has it, and the collection leaves the list.
+	// Nothing of the rolled-back transaction is stored by a later commit.
+	t.Run("sketches: no committed row is rebased to an empty sketch", func(t *testing.T) {
 		fx := newFixture(t)
 		dbi := fx.DB.(*db)
 		a, b := create(t, fx, "a", rangeIdx), create(t, fx, "b", rangeIdx)
@@ -2188,16 +2253,24 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, a.Insert(tx.Context(), doc(2)))
 		require.NoError(t, tx.Rollback())
+		assert.Equal(t, []string{"a"}, names(dbi.sketchDirty))
+		assert.EqualValues(t, 2, idx.sketch.GetDocCount())
 
 		tx, err = fx.WriteTx(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, []string{"a"}, names(dbi.sketchDirty))
-		assert.True(t, idx.sketchModified)
+		assert.Empty(t, names(dbi.sketchDirty))
+		assert.False(t, idx.sketchModified)
+		assert.Zero(t, idx.sketch.GetDocCount())
 		require.NoError(t, b.Insert(tx.Context(), doc(1)))
 		require.NoError(t, tx.Commit())
-		assert.False(t, idx.sketchModified)
 		_, err = dbi.InspectIndexSketch(ctx, "a", "a")
-		require.NoError(t, err, "the commit persisted the row")
+		require.ErrorIs(t, err, ErrIndexNotFound, "a commit that did not use the collection stores no row for it")
+
+		require.NoError(t, a.Insert(ctx, doc(2)))
+		assert.False(t, idx.sketchModified)
+		on, err := dbi.InspectIndexSketch(ctx, "a", "a")
+		require.NoError(t, err, "the commit of a transaction that wrote to the collection stored the row")
+		assert.EqualValues(t, 1, on.DocCount, "the document counted since the index had no statistics")
 
 		require.NoError(t, b.Insert(ctx, doc(2)))
 		assert.Equal(t, []string{"b"}, names(dbi.sketchDirty))
@@ -2395,8 +2468,762 @@ func TestWriteTx_DirtyLists(t *testing.T) {
 	})
 }
 
+// A handle a write transaction opens has its version installed before any
+// other transaction can find the handle. The handle's sketch stamps speak
+// for the sketches the writer loaded; a reader at an older snapshot that
+// found the handle first would install the ones it loads, and the writer
+// would put its count on them and store a row that misses a commit.
+func TestOpenCollection_VersionIsInstalledBeforeTheHandleIsFound(t *testing.T) {
+	d, _ := openSketchDB(t)
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":3}`, id))
+	}
+	old, err := d.ReadTx(ctx) // at 50 documents
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = old.Commit() })
+	h, err := d.OpenCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, h.Insert(ctx, doc(100)))
+	require.NoError(t, h.Close()) // 51 documents, no handle
+
+	wtx, err := d.WriteTx(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wtx.Rollback() })
+	hooked := false
+	testHookRegistered = func(name string) {
+		if name != "c" || hooked {
+			return
+		}
+		hooked = true
+		o, err := d.OpenCollection(old.Context(), "c")
+		require.NoError(t, err)
+		n, err := o.Find(`{"a":3}`).Count(old.Context())
+		require.NoError(t, err)
+		require.Equal(t, 10, n, "setup: the older reader used the handle at its snapshot")
+	}
+	defer func() { testHookRegistered = nil }()
+	coll, err := d.OpenCollection(wtx.Context(), "c")
+	require.NoError(t, err)
+	require.True(t, hooked, "setup: the write transaction made the handle")
+	require.NoError(t, coll.Insert(wtx.Context(), doc(101)))
+	require.NoError(t, wtx.Commit())
+	require.NoError(t, old.Commit())
+
+	n, err := coll.Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 52, n, "setup: the documents")
+	require.Equal(t, uint64(52), storedSketch(t, d, coll).DocCount)
+	require.Equal(t, uint64(52), sketchDocCount(t, coll))
+}
+
+// A handle a write transaction used stays the collection's one handle until
+// the transaction ends: a Close() waits for that, and an open in between gets
+// the same handle. So the documents written before the Close() commit with
+// their counts, a drop through the reopened handle is the handle's own, and
+// no second set of sketches comes to exist for the commit to store over the
+// first. A handle that is closed because its collection is gone for the
+// transaction stores nothing.
+func TestWriteTx_HandleClosedBeforeCommitStoresItsSketches(t *testing.T) {
+	doc := func(id int) *anyenc.Value {
+		return anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":3}`, id))
+	}
+	reopened := func(t *testing.T, d DB, want int) {
+		t.Helper()
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		require.Equal(t, uint64(want), storedSketch(t, d, coll).DocCount, "the stored row")
+		docs, sketch := statsDocCounts(t, ctx, coll)
+		require.Equal(t, want, docs, "setup: the documents")
+		require.Equal(t, uint64(want), sketch)
+		require.Equal(t, uint64(want), sketchDocCount(t, coll), "the sketch the next handle loads")
+		require.NoError(t, coll.Insert(ctx, doc(900)))
+		require.Equal(t, uint64(want+1), storedSketch(t, d, coll).DocCount, "the next write counts on")
+	}
+
+	t.Run("commit", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		require.NoError(t, coll.Insert(wtx.Context(), doc(100), doc(101)))
+		require.NoError(t, coll.Close())
+		require.NoError(t, wtx.Commit())
+		require.ErrorIs(t, coll.Insert(ctx, doc(102)), ErrCollectionClosed, "the Close() took effect at the commit")
+		reopened(t, d, 52)
+	})
+
+	// written returns the handle of "c" a write transaction wrote one
+	// document through and then closed.
+	written := func(t *testing.T, d DB) (WriteTx, Collection) {
+		t.Helper()
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		require.NoError(t, coll.Insert(wtx.Context(), doc(100)))
+		require.NoError(t, coll.Close())
+		return wtx, coll
+	}
+
+	t.Run("dropped through the next open", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, _ := written(t, d)
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, again.Drop(wtx.Context()))
+		require.NoError(t, wtx.Commit())
+		_, err = d.(*db).InspectIndexSketch(ctx, "c", "a")
+		require.ErrorIs(t, err, ErrIndexNotFound, "no row for a dropped collection")
+	})
+
+	t.Run("dropped and created again", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, _ := written(t, d)
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, again.Drop(wtx.Context()))
+		made, err := d.CreateCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, made.EnsureIndex(wtx.Context(), IndexInfo{Fields: []string{"a"}}))
+		require.NoError(t, wtx.Commit())
+		n, err := made.Count(ctx)
+		require.NoError(t, err)
+		require.Equal(t, 0, n, "setup: the new collection is empty")
+		require.Equal(t, uint64(0), storedSketch(t, d, made).DocCount)
+	})
+
+	t.Run("opened again, written after the commit", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, coll := written(t, d)
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		if coll != again {
+			t.Error("the transaction has a second handle of the collection")
+		}
+		require.NoError(t, wtx.Commit())
+		require.Equal(t, uint64(51), storedSketch(t, d, again).DocCount)
+		require.NoError(t, again.Insert(ctx, doc(101)))
+		require.Equal(t, uint64(52), storedSketch(t, d, again).DocCount, "the next write counts on")
+	})
+
+	t.Run("opened again and written in the transaction", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, _ := written(t, d)
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, again.Insert(wtx.Context(), doc(101)))
+		require.NoError(t, wtx.Commit())
+		require.Equal(t, uint64(52), storedSketch(t, d, again).DocCount)
+		require.NoError(t, again.Insert(ctx, doc(102)))
+		require.Equal(t, uint64(53), storedSketch(t, d, again).DocCount, "the next write counts on")
+	})
+
+	// The transaction's open made the handle (nothing had the collection
+	// open) and loaded its sketches: it is the transaction's one handle from
+	// the registration on, with no write through it yet.
+	t.Run("opened by the transaction and closed before any write", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		coll, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.Close())
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		if coll != again {
+			t.Error("the transaction has a second handle of the collection")
+		}
+		require.NoError(t, coll.Insert(wtx.Context(), doc(100)), "the handle the transaction opened first")
+		require.NoError(t, wtx.Commit())
+		require.Equal(t, uint64(51), storedSketch(t, d, again).DocCount)
+		require.NoError(t, again.Insert(ctx, doc(101)), "the second open cancelled the Close()")
+		require.Equal(t, uint64(52), storedSketch(t, d, again).DocCount, "the next write counts on")
+	})
+
+	// The same Close() with no open after it takes effect when the
+	// transaction ends.
+	t.Run("opened by the transaction, closed, written and committed", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		coll, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.Close())
+		require.NoError(t, coll.Insert(wtx.Context(), doc(100)), "the Close() waits for the transaction")
+		require.NoError(t, wtx.Commit())
+		require.ErrorIs(t, coll.Insert(ctx, doc(101)), ErrCollectionClosed, "the Close() took effect at the commit")
+		reopened(t, d, 51)
+	})
+
+	// The transaction first used the handle inside a savepoint that rolled
+	// back: the write after it holds the handle all the same.
+	t.Run("first used in a savepoint that rolled back", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		sp, err := d.WriteTx(wtx.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(sp.Context(), doc(99)))
+		require.NoError(t, sp.Rollback())
+		require.NoError(t, coll.Insert(wtx.Context(), doc(100)))
+		require.NoError(t, coll.Close())
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		if coll != again {
+			t.Error("the transaction has a second handle of the collection")
+		}
+		require.NoError(t, again.Insert(wtx.Context(), doc(101)))
+		require.NoError(t, wtx.Commit())
+		require.Equal(t, uint64(52), storedSketch(t, d, again).DocCount)
+	})
+
+	// The transaction first used the handle inside a savepoint and closed
+	// it there. The savepoint's commit hands the pin to the transaction:
+	// the handle works until the transaction ends.
+	t.Run("first used and closed in a savepoint that committed", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		sp, err := d.WriteTx(wtx.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(sp.Context(), doc(100)))
+		require.NoError(t, coll.Close())
+		require.NoError(t, sp.Commit())
+		require.NoError(t, coll.Insert(wtx.Context(), doc(101)), "the Close() waits for the transaction")
+		require.NoError(t, wtx.Commit())
+		require.ErrorIs(t, coll.Insert(ctx, doc(102)), ErrCollectionClosed, "the Close() took effect at the commit")
+		reopened(t, d, 52)
+	})
+
+	// The transaction opened the collection inside a savepoint, wrote and
+	// closed the handle there, and the savepoint rolled back: the use is
+	// undone, and the Close() takes effect with it. The next open makes a
+	// new handle, which loads the stored row.
+	t.Run("opened, written and closed in a savepoint that rolled back", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		sp, err := d.WriteTx(wtx.Context())
+		require.NoError(t, err)
+		coll, err := d.OpenCollection(sp.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(sp.Context(), doc(100)))
+		require.NoError(t, coll.Close())
+		require.NoError(t, sp.Rollback())
+		require.ErrorIs(t, coll.Insert(wtx.Context(), doc(101)), ErrCollectionClosed, "the Close() took effect at the rollback")
+		again, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		if again == coll {
+			t.Error("the open returned the closed handle")
+		}
+		require.NoError(t, again.Insert(wtx.Context(), doc(101)))
+		require.NoError(t, wtx.Commit())
+		reopened(t, d, 51)
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		coll, err := d.OpenCollection(ctx, "c")
+		require.NoError(t, err)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		require.NoError(t, coll.Insert(wtx.Context(), doc(100), doc(101)))
+		require.NoError(t, coll.Close())
+		require.NoError(t, wtx.Rollback())
+		reopened(t, d, 50)
+	})
+
+	// The collection was made inside a savepoint that rolled back: its
+	// handle is closed, and no row is stored for a collection that does not
+	// exist, for one of that name to load later.
+	t.Run("a collection whose creation rolled back", func(t *testing.T) {
+		d, _ := openSketchDB(t)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wtx.Rollback() })
+		sp, err := d.WriteTx(wtx.Context())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = sp.Rollback() })
+		made, err := d.CreateCollection(sp.Context(), "made")
+		require.NoError(t, err)
+		require.NoError(t, made.EnsureIndex(sp.Context(), IndexInfo{Fields: []string{"a"}}))
+		require.NoError(t, made.Insert(sp.Context(), doc(1)))
+		require.NoError(t, sp.Rollback())
+		c, err := d.OpenCollection(wtx.Context(), "c")
+		require.NoError(t, err)
+		require.NoError(t, c.Insert(wtx.Context(), doc(100)))
+		require.NoError(t, wtx.Commit())
+		_, err = d.(*db).InspectIndexSketch(ctx, "made", "a")
+		require.ErrorIs(t, err, ErrIndexNotFound)
+		require.Equal(t, uint64(51), storedSketch(t, d, c).DocCount)
+	})
+}
+
+// An open that found a handle whose Close() waits for the write transaction
+// never returns that handle closed: when the transaction ends between the
+// open and the hand-out, and the close takes effect, the open is made again.
+func TestOpenCollection_HandOutAfterTheDeferredCloseTookEffect(t *testing.T) {
+	for _, open := range []struct {
+		name string
+		fn   func(d DB) (Collection, error)
+	}{
+		{"OpenCollection", func(d DB) (Collection, error) { return d.OpenCollection(ctx, "c") }},
+		{"Collection", func(d DB) (Collection, error) { return d.Collection(ctx, "c") }},
+	} {
+		t.Run(open.name, func(t *testing.T) {
+			d, _ := openSketchDB(t)
+			coll, err := d.OpenCollection(ctx, "c")
+			require.NoError(t, err)
+			wtx, err := d.WriteTx(ctx)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = wtx.Rollback() })
+			require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":100,"a":3}`)))
+			require.NoError(t, coll.Close())
+
+			// The opener found the handle and stops before the hand-out;
+			// the writer commits there.
+			found, committed := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			testHookBeforeHandOut = func(*collection) {
+				once.Do(func() {
+					close(found)
+					<-committed
+				})
+			}
+			t.Cleanup(func() { testHookBeforeHandOut = nil })
+			type result struct {
+				coll Collection
+				err  error
+			}
+			res := make(chan result, 1)
+			go func() {
+				c, err := open.fn(d)
+				res <- result{c, err}
+			}()
+			<-found
+			require.NoError(t, wtx.Commit())
+			require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":101,"a":3}`)), ErrCollectionClosed,
+				"setup: the Close() took effect at the commit")
+			close(committed)
+			r := <-res
+			require.NoError(t, r.err)
+			if r.coll == coll {
+				t.Error("the open returned the handle the commit closed")
+			}
+			n, err := r.coll.Count(ctx)
+			require.NoError(t, err, "the handle an open returns is open")
+			require.Equal(t, 51, n)
+		})
+	}
+}
+
+// An open whose every attempt finds its handle closed before it can hand it
+// out returns ErrCollectionClosedDuringOpen, the error of that race, not a
+// catalog miss: the collection is there throughout, the error does not match
+// ErrCollectionNotFound, and Collection creates nothing. Each attempt's
+// handle is closed at the hand-out, or, for an open that finds a registered
+// handle, while it resolves the handle. Both public opens, without a
+// transaction and in a read transaction.
+func TestOpenCollection_HandleClosedAtEveryAttempt(t *testing.T) {
+	opens := []struct {
+		name string
+		fn   func(d DB, ctx context.Context) (Collection, error)
+	}{
+		{"OpenCollection", func(d DB, ctx context.Context) (Collection, error) { return d.OpenCollection(ctx, "c") }},
+		{"Collection", func(d DB, ctx context.Context) (Collection, error) { return d.Collection(ctx, "c") }},
+	}
+	txs := []struct {
+		name string
+		ctx  func(t *testing.T, d DB) context.Context
+	}{
+		{"no transaction", func(*testing.T, DB) context.Context { return ctx }},
+		{"read transaction", func(t *testing.T, d DB) context.Context {
+			rtx, err := d.ReadTx(ctx)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = rtx.Commit() })
+			return rtx.Context()
+		}},
+	}
+	for _, open := range opens {
+		for _, tx := range txs {
+			t.Run(open.name+" at the hand-out, "+tx.name, func(t *testing.T) {
+				d, _ := openSketchDB(t)
+				octx := tx.ctx(t, d)
+				attempts := 0
+				testHookBeforeHandOut = func(c *collection) {
+					attempts++
+					require.NoError(t, c.Close())
+				}
+				t.Cleanup(func() { testHookBeforeHandOut = nil })
+				_, err := open.fn(d, octx)
+				require.ErrorIs(t, err, ErrCollectionClosedDuringOpen)
+				require.False(t, errors.Is(err, ErrCollectionNotFound), "the collection is there: not a catalog miss")
+				require.Equal(t, handOutAttempts, attempts, "setup: every attempt found a handle")
+				testHookBeforeHandOut = nil
+				coll, err := open.fn(d, octx)
+				require.NoError(t, err, "setup: the collection is there")
+				n, err := coll.Count(octx)
+				require.NoError(t, err)
+				require.Equal(t, 50, n)
+			})
+
+			t.Run(open.name+" while it resolves a registered handle, "+tx.name, func(t *testing.T) {
+				d, _ := openSketchDB(t)
+				_, err := d.OpenCollection(ctx, "c")
+				require.NoError(t, err)
+				octx := tx.ctx(t, d)
+				// Each attempt finds a registered handle, which is closed
+				// before the attempt resolves it; another open registers the
+				// next one.
+				attempts := 0
+				testHookFoundRegistered = func(c *collection) {
+					attempts++
+					require.NoError(t, c.Close())
+					_, err := d.OpenCollection(ctx, "c")
+					require.NoError(t, err)
+				}
+				t.Cleanup(func() { testHookFoundRegistered = nil })
+				_, err = open.fn(d, octx)
+				require.ErrorIs(t, err, ErrCollectionClosedDuringOpen)
+				require.False(t, errors.Is(err, ErrCollectionNotFound), "the collection is there: not a catalog miss")
+				require.Equal(t, 3, attempts, "every attempt found a registered handle, and no more were made")
+				testHookFoundRegistered = nil
+				coll, err := open.fn(d, octx)
+				require.NoError(t, err, "setup: the collection is there")
+				n, err := coll.Count(octx)
+				require.NoError(t, err)
+				require.Equal(t, 50, n)
+			})
+		}
+	}
+}
+
+// A lookup by name in the write transaction's schema log goes by its schema
+// changes, whatever handles the transaction uses besides: it looks at no pin.
+// It follows a savepoint that rolls a change back.
+func TestWriteTx_NameLookupAmongPinnedHandles(t *testing.T) {
+	fx := newFixture(t)
+	for i := range 8 {
+		_, err := fx.CreateCollection(ctx, fmt.Sprintf("p%d", i))
+		require.NoError(t, err)
+	}
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wtx.Rollback() })
+	log := wtx.schemaLog()
+	use := func(from, to int) {
+		for i := from; i < to; i++ {
+			c, err := fx.OpenCollection(wtx.Context(), fmt.Sprintf("p%d", i))
+			require.NoError(t, err)
+			require.NoError(t, c.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":1}`)))
+		}
+	}
+	// visits returns the log entries byName looks at for name.
+	visits := func(name string) int {
+		v := &visitCounts{}
+		testVisits = v
+		defer func() { testVisits = nil }()
+		log.byName(name)
+		return v.byName
+	}
+	use(0, 3)
+	require.Len(t, log.log, 3, "setup: one pin per handle used")
+	require.Empty(t, log.changes, "a pin is not a schema change")
+	require.Nil(t, log.byName("p0"), "a used handle is found in the registry, not in the log")
+	require.Zero(t, visits("p0"), "a log of pins")
+
+	kept, err := fx.CreateCollection(wtx.Context(), "kept")
+	require.NoError(t, err)
+	use(3, 6)
+	sp, err := fx.WriteTx(wtx.Context())
+	require.NoError(t, err)
+	_, err = fx.CreateCollection(sp.Context(), "undone")
+	require.NoError(t, err)
+	p6, err := fx.OpenCollection(sp.Context(), "p6")
+	require.NoError(t, err)
+	require.NoError(t, p6.Rename(sp.Context(), "p6r"))
+	require.Equal(t, []int{3, 7, 9}, log.changes,
+		"the created collection, the one made in the savepoint, and the rename of p6 after its pin")
+	require.NotNil(t, log.byName("undone"))
+	require.NotNil(t, log.byName("p6r"))
+	require.NoError(t, sp.Rollback())
+
+	require.Equal(t, []int{3}, log.changes, "the savepoint's changes left the index with its entries")
+	require.Nil(t, log.byName("undone"))
+	require.Nil(t, log.byName("p6r"))
+	_, err = fx.OpenCollection(wtx.Context(), "undone")
+	require.ErrorIs(t, err, ErrCollectionNotFound)
+	use(6, 8)
+	require.Len(t, log.log, 9, "setup: eight pins and the creation")
+	require.Equal(t, 1, visits("kept"), "the one schema change among the pins")
+	again, err := fx.OpenCollection(wtx.Context(), "kept")
+	require.NoError(t, err)
+	if again != kept {
+		t.Error("the created collection is not found by name among the pins")
+	}
+	require.NoError(t, wtx.Commit())
+	require.Empty(t, log.changes)
+	require.Empty(t, log.log)
+}
+
+// A savepoint rollback walks the log entries its scope made, not the log: a
+// verb that fails on a collection the transaction has used costs the same
+// however many collections the transaction has used, and the handles keep
+// the marks they had before the scope.
+func TestWriteTx_SavepointRollbackWalksItsOwnEntries(t *testing.T) {
+	fx := newFixture(t)
+	const n = 64
+	for i := range n + 1 {
+		c, err := fx.CreateCollection(ctx, fmt.Sprintf("p%d", i))
+		require.NoError(t, err)
+		require.NoError(t, c.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	}
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wtx.Rollback() })
+	log := wtx.schemaLog()
+	colls := make([]Collection, n+1)
+	for i := range colls {
+		colls[i], err = fx.OpenCollection(ctx, fmt.Sprintf("p%d", i))
+		require.NoError(t, err)
+	}
+	use := func(from, to int) {
+		for i := from; i < to; i++ {
+			_, err := colls[i].FindId(wtx.Context(), 1)
+			require.NoError(t, err)
+		}
+	}
+	// failOn makes an insert into c fail and returns the entries the
+	// rollback of its savepoint walked.
+	failOn := func(c Collection) int {
+		v := &visitCounts{}
+		testVisits = v
+		defer func() { testVisits = nil }()
+		require.ErrorIs(t, c.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":1}`)), ErrDocExists)
+		return v.discard
+	}
+
+	use(0, 1)
+	require.Len(t, log.log, 1, "setup: one pin per collection used")
+	require.Equal(t, 0, failOn(colls[0]), "one collection used")
+	use(1, n)
+	require.Len(t, log.log, n, "setup: one pin per collection used")
+	require.Equal(t, 0, failOn(colls[0]), "%d collections used", n)
+	require.Len(t, log.log, n)
+	require.Equal(t, 1, colls[0].(*collection).logLast, "the used handle keeps its pin")
+
+	// The verb is the first use of the collection: the rollback walks its pin.
+	require.Equal(t, 1, failOn(colls[n]), "a first use in the failing verb")
+	require.Len(t, log.log, n)
+	require.Equal(t, 0, colls[n].(*collection).logLast, "the pin went with the savepoint")
+
+	// A handle with entries before the scope and in it gets back the mark
+	// of its last entry before the scope.
+	sp, err := fx.WriteTx(wtx.Context())
+	require.NoError(t, err)
+	require.NoError(t, colls[1].EnsureIndex(sp.Context(), IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, colls[1].EnsureIndex(sp.Context(), IndexInfo{Fields: []string{"b"}}))
+	require.Equal(t, n+2, colls[1].(*collection).logLast, "setup: the scope's changes are the handle's last")
+	require.NoError(t, sp.Rollback())
+	require.Len(t, log.log, n)
+	require.Equal(t, 2, colls[1].(*collection).logLast, "the handle's pin before the scope")
+	require.NoError(t, wtx.Commit())
+}
+
+// A savepoint rollback that discards no log entry leaves every handle's mark
+// as it is: it looks at no entry before the savepoint. One handle is given
+// a mark no walk of the log writes, and a failing verb on another handle
+// must leave it.
+func TestWriteTx_SavepointRollbackLeavesTheMarksBeforeIt(t *testing.T) {
+	fx := newFixture(t)
+	colls := make([]*collection, 2)
+	for i := range colls {
+		c, err := fx.CreateCollection(ctx, fmt.Sprintf("p%d", i))
+		require.NoError(t, err)
+		require.NoError(t, c.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+		colls[i] = c.(*collection)
+	}
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wtx.Rollback() })
+	log := wtx.schemaLog()
+	for _, c := range colls {
+		_, err := c.FindId(wtx.Context(), 1)
+		require.NoError(t, err)
+	}
+	require.Len(t, log.log, 2, "setup: one pin per collection used")
+
+	kept := colls[1].logLast
+	const mark = 1 << 20
+	colls[1].logLast = mark
+	require.ErrorIs(t, colls[0].Insert(wtx.Context(), anyenc.MustParseJson(`{"id":1}`)), ErrDocExists)
+	require.Len(t, log.log, 2, "setup: the rollback discarded no entry")
+	require.Equal(t, mark, colls[1].logLast, "the rollback rewrote the mark of a handle it did not discard")
+	colls[1].logLast = kept
+	require.NoError(t, wtx.Commit())
+}
+
+// Handles a write transaction opened and then closed leave the registry when
+// the transaction ends, with one eviction each. That an eviction looks only
+// under the handle's name is TestDB_EvictionLooksOnlyUnderTheRegisteredName.
+func TestWriteTx_ClosedHandlesLeaveTheRegistryByName(t *testing.T) {
+	const n = 64
+	for _, end := range []string{"commit", "rollback"} {
+		t.Run(end, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "r.db")
+			d, err := Open(ctx, path, nil)
+			require.NoError(t, err)
+			for i := range n {
+				_, err = d.CreateCollection(ctx, fmt.Sprintf("p%d", i))
+				require.NoError(t, err)
+			}
+			require.NoError(t, d.Close())
+			d, err = Open(ctx, path, nil)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = d.Close() })
+			dbi := d.(*db)
+			registered := func() int {
+				dbi.mu.Lock()
+				defer dbi.mu.Unlock()
+				return len(dbi.openedCollections)
+			}
+
+			wtx, err := d.WriteTx(ctx)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = wtx.Rollback() })
+			colls := make([]Collection, n)
+			for i := range colls {
+				colls[i], err = d.OpenCollection(wtx.Context(), fmt.Sprintf("p%d", i))
+				require.NoError(t, err)
+				require.NoError(t, colls[i].Close())
+			}
+			require.Equal(t, n, registered(), "setup: the closes wait for the transaction")
+
+			v := &visitCounts{}
+			testVisits = v
+			t.Cleanup(func() { testVisits = nil })
+			if end == "commit" {
+				require.NoError(t, wtx.Commit())
+			} else {
+				require.NoError(t, wtx.Rollback())
+			}
+			testVisits = nil
+			require.Equal(t, n, v.evict, "one eviction per handle")
+			require.Zero(t, registered())
+			for _, c := range colls {
+				_, err = c.Count(ctx)
+				require.ErrorIs(t, err, ErrCollectionClosed)
+			}
+		})
+	}
+}
+
+// An eviction deletes the registry slot of the name the handle was put in
+// the registry under (collection.regName) and looks nowhere else, so it
+// costs the same however many handles are registered. The registry is set
+// up by hand: the closed handle is under another name only, where an
+// eviction must leave it.
+func TestDB_EvictionLooksOnlyUnderTheRegisteredName(t *testing.T) {
+	fx := newFixture(t)
+	c, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+	h := c.(*collection)
+	dbi := fx.DB.(*db)
+	dbi.mu.Lock()
+	defer dbi.mu.Unlock()
+	require.Equal(t, "c", h.regName, "setup: registered under c")
+	require.NotContains(t, dbi.openedCollections, "c", "setup: Close() evicted the handle")
+	dbi.openedCollections["decoy"] = h
+	dbi.evictLocked(h)
+	got, kept := dbi.openedCollections["decoy"]
+	delete(dbi.openedCollections, "decoy")
+	require.True(t, kept && got == Collection(h), "the eviction searched the registry for the handle")
+}
+
+// BenchmarkSketch_FindThenWriteAfterAPeersCommit is the cycle of a process
+// that shares its file: another process commits, this one plans a query and
+// then writes. The reader loads the stored sketch rows into the published
+// sketches and the writer into the live ones, every time.
+func BenchmarkSketch_FindThenWriteAfterAPeersCommit(b *testing.B) {
+	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
+		b.Skip("models another process's commit; not applicable in-memory")
+	}
+	fx := newFixture(b)
+	dbi := fx.DB.(*db)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(b, err)
+	require.NoError(b, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	for i := 0; i < 200; i++ {
+		require.NoError(b, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%5))))
+	}
+	docs := [2]*anyenc.Value{anyenc.MustParseJson(`{"id":1,"a":1}`), anyenc.MustParseJson(`{"id":1,"a":2}`)}
+	q := coll.Find(`{"a":3}`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dbi.btreeDB.ForgetSeenHeader() // the newest commit is another process's
+		if _, err := q.Count(ctx); err != nil {
+			b.Fatal(err)
+		}
+		if err := coll.UpdateOne(ctx, docs[i&1]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkSketch_RollbackThenFind is a write transaction that rolls back,
+// then a query: the counts the transaction left on the live sketches of two
+// indexes are there when the query plans, and the next transaction's begin
+// rebases them.
+func BenchmarkSketch_RollbackThenFind(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(b, err)
+	require.NoError(b, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}, IndexInfo{Fields: []string{"b"}}))
+	for i := 0; i < 200; i++ {
+		require.NoError(b, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%5, i%7))))
+	}
+	doc := anyenc.MustParseJson(`{"id":1000,"a":3,"b":3}`)
+	q := coll.Find(`{"a":3}`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		wtx, err := fx.WriteTx(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err = coll.Insert(wtx.Context(), doc); err != nil {
+			b.Fatal(err)
+		}
+		if err = wtx.Rollback(); err != nil {
+			b.Fatal(err)
+		}
+		if _, err = q.Count(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkWriteTx_OpenCollections writes to one collection of a db holding n
-// open ones: the cost of a write must not depend on n.
+// open ones: the cost of a write must not depend on n. TxAll is one
+// transaction that opens every one of the n by name and writes to it, and
+// TxAllFind one that reads from each instead: the cost of an open by name
+// must not depend on the number of collections the transaction uses. Nor
+// must the cost of a verb that fails after them (FailAfterAll).
 func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 	for _, n := range []int{1, 1000, 20000} {
 		b.Run(fmt.Sprintf("open=%d", n), func(b *testing.B) {
@@ -2409,8 +3236,12 @@ func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 				require.NoError(b, err)
 				require.NoError(b, colls[i].EnsureIndex(tx.Context(), IndexInfo{Fields: []string{"a"}}))
 			}
+			names := make([]string, n)
+			for i := range colls {
+				names[i] = fmt.Sprintf("c%05d", i)
+				require.NoError(b, colls[i].Insert(tx.Context(), anyenc.MustParseJson(`{"id":1,"a":0,"v":0}`)))
+			}
 			coll := colls[0]
-			require.NoError(b, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1,"a":0,"v":0}`)))
 			require.NoError(b, tx.Commit())
 
 			inc := query.MustParseModifier(`{"$inc":{"v":1}}`)
@@ -2443,6 +3274,66 @@ func BenchmarkWriteTx_OpenCollections(b *testing.B) {
 					}
 					require.NoError(b, tx.Commit())
 				}
+			})
+			// One tx uses every collection: an open by name, then a write.
+			// Reported per collection.
+			b.Run("TxAll", func(b *testing.B) {
+				b.ReportAllocs()
+				for range b.N {
+					tx, err := fx.WriteTx(ctx)
+					require.NoError(b, err)
+					for _, name := range names {
+						c, err := fx.OpenCollection(tx.Context(), name)
+						require.NoError(b, err)
+						_, err = c.UpdateId(tx.Context(), 1, inc)
+						require.NoError(b, err)
+					}
+					require.NoError(b, tx.Commit())
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n), "ns/coll")
+			})
+			// The same with a lookup by id in place of the write: the tx
+			// uses every collection and its commit writes nothing, so the
+			// time is the opens and the lookups. Reported per collection.
+			b.Run("TxAllFind", func(b *testing.B) {
+				b.ReportAllocs()
+				for range b.N {
+					tx, err := fx.WriteTx(ctx)
+					require.NoError(b, err)
+					for _, name := range names {
+						c, err := fx.OpenCollection(tx.Context(), name)
+						require.NoError(b, err)
+						_, err = c.FindId(tx.Context(), 1)
+						require.NoError(b, err)
+					}
+					require.Len(b, tx.schemaLog().log, n, "every collection is pinned")
+					require.NoError(b, tx.Commit())
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n), "ns/coll")
+			})
+			// A verb that fails, in a tx that has used every collection: the
+			// rollback of its savepoint must not cost by the collections
+			// the tx has used.
+			b.Run("FailAfterAll", func(b *testing.B) {
+				tx, err := fx.WriteTx(ctx)
+				require.NoError(b, err)
+				defer func() { _ = tx.Rollback() }()
+				for _, name := range names {
+					c, err := fx.OpenCollection(tx.Context(), name)
+					require.NoError(b, err)
+					_, err = c.FindId(tx.Context(), 1)
+					require.NoError(b, err)
+				}
+				dup := anyenc.MustParseJson(`{"id":1}`)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					if err := coll.Insert(tx.Context(), dup); !errors.Is(err, ErrDocExists) {
+						b.Fatal(err)
+					}
+				}
+				// The deferred rollback releases every pin: not the verb.
+				b.StopTimer()
 			})
 		})
 	}
