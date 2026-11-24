@@ -91,7 +91,8 @@ var (
 	// short: the wal-index points at a frame past the end of the log file,
 	// as SQLite's read of it gives SQLITE_IOERR_SHORT_READ
 	// (sqlite3WalReadFrame, wal.c:3649-3664; unixRead). A read returns it
-	// wrapped with the read's own error (io.EOF): frameReadErr. Deliberately NOT
+	// wrapped with the short read's own error, io.EOF or io.ErrUnexpectedEOF
+	// (frameReadErr, frameReadResult). Deliberately NOT
 	// wrapping ErrCorrupt: the database file is not damaged, and the
 	// wal-index is rebuilt from the log when every handle has closed it.
 	ErrWALShortRead = errors.New("btree: WAL frame read came up short: the wal-index points past the end of the log")

@@ -227,7 +227,7 @@ The page-1 DB header (first 100 bytes) is outside the per-page hash; its invaria
 
 ### Corruption errors
 
-`ErrCorrupt` means damage that is in the files and will still be there at the next `Open`; a caller may discard and rebuild the database on it. Match it with `errors.Is`. The kinds of damage match it too:
+`ErrCorrupt` means damage that is in the files and will still be there at the next `Open`; a caller may discard and rebuild the database on it. Match it with `errors.Is`. The damage is in the database the call read: `Backup` also reads the file at its path, and can return `ErrCorrupt` or `ErrHeaderCorrupt` for a damaged destination while the source is sound, so rule that out before discarding the source. The kinds of damage match it too:
 
 | Error | When |
 |---|---|
@@ -235,9 +235,9 @@ The page-1 DB header (first 100 bytes) is outside the per-page hash; its invaria
 | `ErrPageIntegrity` | A page fails its checksum or its AEAD authentication, on the read that meets it. |
 | `ErrQuickCheckFailed` | `Open` after an unclean shutdown (`Durability.Sentinel`): the quick check, or the open's read of the catalog before it, found damage. |
 
-`IntegrityCheck` returns an error that matches `ErrCorrupt` when it found damage. A damaged write-ahead log index (`-wal-shm`, shared memory) matches `ErrCorrupt` too, as in SQLite; closing every handle on the file rebuilds it.
+A read of a page that the database file ends inside (a file cut short) matches `ErrCorrupt` too; a read that came up short of bytes the file holds is that read's error. `IntegrityCheck` returns an error that matches `ErrCorrupt` when it found damage. A damaged write-ahead log index (`-wal-shm`, shared memory) matches `ErrCorrupt` too, as in SQLite; closing every handle on the file rebuilds it.
 
-Errors that are not damage do not match `ErrCorrupt` and are returned as themselves: a cancelled context, an I/O error or a full disk (also when they stop a commit, the quick check of a dirty `Open`, or an `IntegrityCheck`), `ErrBusy`, `ErrDBIsClosed`, `ErrV1Database`, `ErrIncompatibleVersion`, `ErrDBAlreadyOpen`, `ErrDBOpenInOtherProcess`, `ErrCopyVerifyFailed` (`CopyToLatestFormat`'s copy failed its verification, not the source), and the encryption errors below. So does `ErrWALShortRead`: the write-ahead log's index points past the end of the log; close every handle on the file and open it again.
+Errors that are not damage do not match `ErrCorrupt` and are returned as themselves: a cancelled context, an I/O error or a full disk (also when they stop a commit, the quick check of a dirty `Open`, or an `IntegrityCheck`), `ErrBusy`, `ErrDBIsClosed`, `ErrV1Database`, `ErrIncompatibleVersion`, `ErrDBAlreadyOpen`, `ErrDBOpenInOtherProcess`, `ErrCopyVerifyFailed` (`CopyToLatestFormat`'s copy failed its verification, not the source), and the encryption errors below. So does `ErrWALShortRead`: the write-ahead log's index points past the end of the log; close every handle on the file and open it again. It keeps the short read's own error (`io.EOF`, or `io.ErrUnexpectedEOF`).
 
 ## Encryption
 

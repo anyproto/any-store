@@ -795,10 +795,14 @@ func (tx *ReadTx) IntegrityCheckN(maxErrors int) error {
 		default:
 			// A namespace has no root of 0, or 1, the master's: every one
 			// is created with a page of its own (CreateNamespace), and
-			// resolving its name refuses a root of 0 (resolveNamespace).
-			// SQLite's check skips a root of 0, which only a view or a
-			// virtual table has (btree.c:11220), and its schema load
-			// refuses a table's root past the database (prepare.c:135-140).
+			// resolving its name refuses a root outside 2..nPage
+			// (resolveNamespace). SQLite's check skips a root of 0
+			// (btree.c:11220), which a view or a virtual table has, and
+			// which also marks a partial check: PRAGMA
+			// integrity_check(table) puts one first in the root array
+			// (pragma.c:1764), and the check reads it so (btree.c:11148-11152).
+			// Its schema load refuses a table's root past the database
+			// (prepare.c:135-140).
 			ic.report("tree master cell key %q: namespace root page %d out of range", string(key), rootPage)
 		}
 	}

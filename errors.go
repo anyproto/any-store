@@ -295,9 +295,11 @@ var (
 	//   - if one of them authenticates, the key is right and page 1 is damaged: Open returns an
 	//     error that matches ErrPageIntegrity and ErrCorrupt, and Config.OnIntegrityError is
 	//     called for page 1;
-	//   - if none does, Open returns ErrWrongKey;
-	//   - unless one of them could not be read (an I/O error): it might have proved the key,
-	//     and Open returns that read's error, which matches neither.
+	//   - if none does, and every one of them was read and failed its authentication, Open
+	//     returns ErrWrongKey;
+	//   - if one of them could not be read (an I/O error) and none authenticates, it might
+	//     have proved the key: Open returns that read's error, which matches neither, and
+	//     Config.OnIntegrityError is not called.
 	//
 	// A wrong key is never reported as corruption: it would have to pass a page's
 	// authentication tag, a chance of about 2^-128. The reverse can happen: a database that is
@@ -326,17 +328,22 @@ var (
 
 	// ErrCorrupt is the umbrella for damaged database files: every error below that names a kind
 	// of damage matches it (ErrHeaderCorrupt, ErrPageIntegrity, ErrQuickCheckFailed), as do a
-	// broken structure found while reading and the report of IntegrityCheck. Match it when the
-	// kind does not matter, for instance to discard and rebuild the database:
+	// broken structure found while reading, a page of the database that the file ends inside
+	// (a file cut short), and the report of IntegrityCheck. Match it when the kind does not
+	// matter, for instance to discard and rebuild the database:
 	//
 	//	if errors.Is(err, anystore.ErrCorrupt) { ... }
 	//
-	// It means damage that is in the files and will be there at the next Open. It is not
-	// returned for a state that passes or that the caller can change:
+	// It means damage that is in the files and will be there at the next Open: of the database
+	// the call read. Backup reads two, and can return it, or ErrHeaderCorrupt, for a damaged
+	// file at its path while the database it copies is sound (see DB.Backup): rule that out
+	// before discarding the source. It is not returned for a state that passes or that the
+	// caller can change:
 	//
 	//   - a wrong encryption key (ErrWrongKey), or a Config.Encryption that does not fit the
 	//     file (ErrEncryptionKeyRequired, ErrNotEncrypted);
-	//   - a v1 file (ErrV1Database) or a file from a newer release (ErrIncompatibleVersion);
+	//   - a v1 file (ErrV1Database), or a file, a write-ahead log or its index of a version this
+	//     release does not read (ErrIncompatibleVersion);
 	//   - a file that is open already (ErrDBAlreadyOpen, ErrDBOpenInOtherProcess), a busy lock
 	//     (ErrBusy), a closed database (ErrDBIsClosed);
 	//   - a write-ahead log index that points past the end of the log (ErrWALShortRead);
@@ -355,12 +362,13 @@ var (
 	// It matches ErrCorrupt.
 	ErrHeaderCorrupt = btree.ErrHeaderCorrupt
 
-	// ErrWALShortRead is returned (wrapped) by a read, or a checkpoint (Flush), when the index of
-	// the write-ahead log (path+"-wal-shm") points at a frame past the end of the log file
-	// (path+"-wal"): the read of the frame comes up short, as SQLite's does with
-	// SQLITE_IOERR_SHORT_READ. The error matches the read's own too (io.EOF). An I/O error while
-	// reading a frame is not this error. Recovery itself repairs a bad WAL header and drops torn
-	// frames silently.
+	// ErrWALShortRead is returned (wrapped) by a read, a commit or a checkpoint (Flush), when the
+	// index of the write-ahead log (path+"-wal-shm") points at a frame past the end of the log
+	// file (path+"-wal"): the read of the frame comes up short, as SQLite's does with
+	// SQLITE_IOERR_SHORT_READ. The error keeps the short read's own error: io.EOF, or
+	// io.ErrUnexpectedEOF, which does not match io.EOF, for a read that returned fewer bytes
+	// than it asked for and no error. An I/O error while reading a frame is not this error.
+	// Recovery itself repairs a bad WAL header and drops torn frames silently.
 	//
 	// The database is not damaged, and the error does not match ErrCorrupt. Close every handle on
 	// the file, in every process, and open it again: the index is rebuilt from the log.
