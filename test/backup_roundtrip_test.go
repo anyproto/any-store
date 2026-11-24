@@ -1,4 +1,4 @@
-package anystore_test
+package test
 
 // What a backup is for: the copy reopens with the credentials of its source
 // and holds the same documents. One round trip per kind of database (plain,

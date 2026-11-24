@@ -3408,7 +3408,7 @@ A destination such a backup left, committed and never checkpointed, names one sa
 
 Why not the other way round (create the destination with the source's salt, so the two files share a key): an existing destination has a salt already and would have to be re-keyed under an open handle and a live WAL; and one key would then seal two files' worth of pages with random nonces, where the nonce collision bound is per key. A destination that `Backup` creates has a salt of its own, so with a passphrase it has a key of its own. An existing destination keeps the salt it has, which is the source's if the file is a copy of the source made outside `Backup`. A raw 32-byte key or a caller's codec is the same key in both files, as before; the built-in codecs draw random nonces, so that is a matter of how many pages one key seals and not of a repeated counter.
 
-Regression tests: `backup_codec_test.go` (`TestBackup_DestinationKeepsItsSalt`, `TestBackup_DestinationWALPage1WithAnotherSalt`, `TestCheckpoint_WALPage1WithAnotherSalt`, `TestCheckpoint_WALPage1WithAnotherSaltAtClose`, `TestBackup_WALPage1WithAnotherSaltUnderAReader`, `TestBackup_InMemorySourceIntoEncryptedFile`), root `backup_roundtrip_test.go`.
+Regression tests: `backup_codec_test.go` (`TestBackup_DestinationKeepsItsSalt`, `TestBackup_DestinationWALPage1WithAnotherSalt`, `TestCheckpoint_WALPage1WithAnotherSalt`, `TestCheckpoint_WALPage1WithAnotherSaltAtClose`, `TestBackup_WALPage1WithAnotherSaltUnderAReader`, `TestBackup_InMemorySourceIntoEncryptedFile`), `test/backup_roundtrip_test.go`.
 
 <a id="drift-2026-11-19-2-a-backup-destination-has-the-geometry-of-the-source-file"></a>
 ### Drift: A Backup Destination Must Already Have The Reserved Space And Codec Kind Of The Source File
@@ -3424,7 +3424,7 @@ Regression tests: `backup_codec_test.go` (`TestBackup_DestinationKeepsItsSalt`, 
 
 The backup of an in-memory database is a plain file, or an encrypted one when the database was opened with a key or a codec. What changed is that a plain file's backup is plain too.
 
-Regression tests: `backup_codec_test.go` (`TestBackupDestinationOptions_FollowTheFile`, `TestBackupDestinationOptions_InMemorySource`, `TestBackupInit_RefusesAnotherCodec`, `TestBackup_BetweenCiphersOfOneReserve`), root `backup_roundtrip_test.go` (`TestBackupRoundTrip`, `TestBackupRoundTrip_OverExistingOfAnotherKind`).
+Regression tests: `backup_codec_test.go` (`TestBackupDestinationOptions_FollowTheFile`, `TestBackupDestinationOptions_InMemorySource`, `TestBackupInit_RefusesAnotherCodec`, `TestBackup_BetweenCiphersOfOneReserve`), `test/backup_roundtrip_test.go` (`TestBackupRoundTrip`, `TestBackupRoundTrip_OverExistingOfAnotherKind`).
 
 <a id="drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer"></a>
 ### Drift: pagerStress Spills Only For The Live Writer
