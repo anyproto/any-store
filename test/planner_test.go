@@ -11,6 +11,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/pipeperf"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1333,8 +1334,8 @@ func TestQPlanner_IdSortOffsetSkip(t *testing.T) {
 
 func TestProfile_IndexedSortPipeline(t *testing.T) {
 	ctx := context.Background()
-	anystore.EnablePipelinePerfCounters(true)
-	t.Cleanup(func() { anystore.EnablePipelinePerfCounters(false) })
+	pipeperf.Enable(true)
+	t.Cleanup(func() { pipeperf.Enable(false) })
 	db := newFixture(t)
 
 	coll, err := db.CreateCollection(ctx, "golden")
@@ -1382,7 +1383,7 @@ func TestProfile_IndexedSortPipeline(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		anystore.ResetPipelinePerfCounters()
+		pipeperf.Reset()
 		start := time.Now()
 		var docs int
 
@@ -1398,7 +1399,7 @@ func TestProfile_IndexedSortPipeline(t *testing.T) {
 			require.NoError(t, it.Close())
 		}
 		elapsed := time.Since(start)
-		s := anystore.SnapshotPipelinePerfCounters()
+		s := pipeperf.Snapshot()
 		p := s.Planner
 
 		t.Logf("[%s] elapsed=%s docs=%d", c.name, elapsed, docs)
@@ -2899,18 +2900,18 @@ func TestOffsetSkip_IndexOrdered_PrefixSkip(t *testing.T) {
 	// is multi-key so the fast-skip bails immediately and the fetch count
 	// stays ~limit+offset (slow-but-correct path preserved).
 	t.Run("perf_proof_scalar_skips_fetch", func(t *testing.T) {
-		anystore.EnablePipelinePerfCounters(true)
-		defer anystore.EnablePipelinePerfCounters(false)
+		pipeperf.Enable(true)
+		defer pipeperf.Enable(false)
 
 		const limit, offset = 10, 1000
 
-		anystore.ResetPipelinePerfCounters()
+		pipeperf.Reset()
 		_ = queryIdsHinted(t, coll, "a", nil, "a", limit, offset)
-		scalar := anystore.SnapshotPipelinePerfCounters().Planner
+		scalar := pipeperf.Snapshot().Planner
 
-		anystore.ResetPipelinePerfCounters()
+		pipeperf.Reset()
 		_ = queryIdsHinted(t, coll, "tags", nil, "tags", limit, offset)
-		array := anystore.SnapshotPipelinePerfCounters().Planner
+		array := pipeperf.Snapshot().Planner
 
 		t.Logf("scalar(a): FetchYields=%d FetchNextCalls=%d", scalar.FetchYields, scalar.FetchNextCalls)
 		t.Logf("array(tags): FetchYields=%d FetchNextCalls=%d", array.FetchYields, array.FetchNextCalls)

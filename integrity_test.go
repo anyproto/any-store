@@ -18,32 +18,6 @@ import (
 	"github.com/anyproto/any-store/v2/query"
 )
 
-func TestVerifyPageChecksum_GoodPage(t *testing.T) {
-	page := make([]byte, 4096)
-	for i := range page[:4080] {
-		page[i] = byte(i)
-	}
-	StampPageChecksumForTest(page)
-	if !VerifyPageChecksum(page) {
-		t.Fatal("good page reported as bad")
-	}
-}
-
-func TestVerifyPageChecksum_BadPage(t *testing.T) {
-	page := make([]byte, 4096)
-	StampPageChecksumForTest(page)
-	page[100] ^= 0xff
-	if VerifyPageChecksum(page) {
-		t.Fatal("corrupted page reported as good")
-	}
-}
-
-func TestVerifyPageChecksum_RejectsBadSize(t *testing.T) {
-	if VerifyPageChecksum(make([]byte, 100)) {
-		t.Fatal("non-page-sized buffer should not pass")
-	}
-}
-
 // writeAndCloseIntegrityDB creates a DB at path with the given config,
 // writes a row, flushes, and closes. Returns the path. Used to set up
 // fixture databases for corruption / sweep tests.

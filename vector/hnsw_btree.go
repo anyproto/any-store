@@ -10,7 +10,7 @@ import (
 	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
-// BtreeHNSW lands the arena HNSW on top of any-store's embedded btree engine.
+// btreeHNSW lands the arena HNSW on top of any-store's embedded btree engine.
 // It keeps the working graph in memory as a FlatHNSW (so search runs at
 // in-memory speed) while durably persisting every node — vector + per-layer
 // adjacency — into two btree namespaces:
@@ -27,9 +27,9 @@ import (
 // This batches the (relatively expensive) durable writes the same way a bulk
 // import would.
 //
-// BtreeHNSW is not safe for concurrent Add/Flush; serialise those externally.
+// btreeHNSW is not safe for concurrent Add/Flush; serialise those externally.
 // Concurrent Search is safe (it only reads the in-memory FlatHNSW).
-type BtreeHNSW struct {
+type btreeHNSW struct {
 	db      *btree.DB
 	nodesNS *btree.Namespace
 	metaNS  *btree.Namespace
@@ -42,14 +42,14 @@ type BtreeHNSW struct {
 	dirty   map[uint32]struct{}
 	tombing map[uint32]struct{} // ids tombstoned since last Flush
 
-	stats WriteStats
+	stats writeStats
 }
 
-// WriteStats accumulates write-amplification telemetry. RecordsWritten counts
+// writeStats accumulates write-amplification telemetry. RecordsWritten counts
 // btree Put calls; the byte counters split node-record payload into the
 // (large, rarely-changing) vector part and the (small, churning) adjacency part
 // — the split that motivates storing them in separate namespaces.
-type WriteStats struct {
+type writeStats struct {
 	Flushes        int
 	RecordsWritten int // total btree Put calls (nodes + tombstones + meta)
 	NodeRecords    int // node Puts only
@@ -65,12 +65,12 @@ const (
 	tombMark         = 1
 )
 
-// OpenBtreeHNSW opens (or creates) a persistent index named name inside db. If
+// openBtreeHNSW opens (or creates) a persistent index named name inside db. If
 // the namespaces already hold an index its parameters and dim are taken from
 // the stored meta and the dim/metric arguments are only used when creating a
 // fresh index.
-func OpenBtreeHNSW(db *btree.DB, name string, dim int, m Metric) (*BtreeHNSW, error) {
-	b := &BtreeHNSW{db: db, metric: m, dim: dim,
+func openBtreeHNSW(db *btree.DB, name string, dim int, m Metric) (*btreeHNSW, error) {
+	b := &btreeHNSW{db: db, metric: m, dim: dim,
 		dirty: make(map[uint32]struct{}), tombing: make(map[uint32]struct{})}
 
 	// Ensure namespaces exist.
@@ -113,7 +113,7 @@ func OpenBtreeHNSW(db *btree.DB, name string, dim int, m Metric) (*BtreeHNSW, er
 }
 
 // load reconstructs the in-memory FlatHNSW from the persisted records.
-func (b *BtreeHNSW) load() error {
+func (b *btreeHNSW) load() error {
 	rtx, err := b.db.BeginRead()
 	if err != nil {
 		return err
@@ -198,21 +198,21 @@ func (b *BtreeHNSW) load() error {
 
 // Add inserts a vector into the in-memory graph and records the touched nodes
 // for the next Flush. It does not write to disk.
-func (b *BtreeHNSW) Add(key uint64, vec []float32) {
+func (b *btreeHNSW) Add(key uint64, vec []float32) {
 	b.flat.Add(key, vec)
 }
 
 // Delete tombstones key. Persistence is a single tiny record on the next Flush
 // — the node's own record is retained because it still routes searches.
-func (b *BtreeHNSW) Delete(key uint64) bool { return b.flat.Delete(key) }
+func (b *btreeHNSW) Delete(key uint64) bool { return b.flat.Delete(key) }
 
 // Update changes key's vector (delete-old + reinsert-new). On Flush this costs
 // one tombstone plus the new node and its touched neighbours.
-func (b *BtreeHNSW) Update(key uint64, vec []float32) bool { return b.flat.Update(key, vec) }
+func (b *btreeHNSW) Update(key uint64, vec []float32) bool { return b.flat.Update(key, vec) }
 
 // Flush durably writes all nodes and tombstones touched since the last Flush,
 // plus the index meta, in a single btree write transaction.
-func (b *BtreeHNSW) Flush() error {
+func (b *btreeHNSW) Flush() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if len(b.dirty) == 0 && len(b.tombing) == 0 {
@@ -294,22 +294,22 @@ func (b *BtreeHNSW) Flush() error {
 }
 
 // Stats returns accumulated write-amplification telemetry.
-func (b *BtreeHNSW) Stats() WriteStats {
+func (b *btreeHNSW) Stats() writeStats {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.stats
 }
 
 // Search runs an in-memory ANN search over the working graph.
-func (b *BtreeHNSW) Search(query []float32, k int) []SearchResult {
+func (b *btreeHNSW) Search(query []float32, k int) []SearchResult {
 	return b.flat.Search(query, k)
 }
 
 // Len returns the number of indexed vectors.
-func (b *BtreeHNSW) Len() int { return b.flat.Len() }
+func (b *btreeHNSW) Len() int { return b.flat.Len() }
 
 // SetEf adjusts the query-time candidate list size.
-func (b *BtreeHNSW) SetEf(ef int) { b.flat.EfSearch = ef }
+func (b *btreeHNSW) SetEf(ef int) { b.flat.EfSearch = ef }
 
 // ---------------------------------------------------------------------------
 // Serialisation

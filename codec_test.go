@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,8 +18,7 @@ import (
 
 // Cipher round-trips and the passphrase-derived key path behind Config.
 // The end-to-end encryption behaviour these drive is codec.go's public
-// surface: NewAESCodec, NewChaCha20Poly1305Codec, NewXChaCha20Poly1305Codec
-// and DeriveKey.
+// surface: the CipherType values and EncryptionConfig.
 
 func TestEncryption_RoundTrip(t *testing.T) {
 	dir, err := os.MkdirTemp("", "anystore-enc-*")
@@ -142,56 +140,16 @@ func TestEncryption_AllCipherTypes_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestEncryption_BringYourOwnCodec(t *testing.T) {
-	// BYO codec path: user constructs the codec themselves with an
-	// externally-derived 32-byte key. Skips Passphrase/KDFIterations.
-	dir, err := os.MkdirTemp("", "anystore-enc-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-	path := filepath.Join(dir, "enc.db")
-
-	// Derive a key however you like — here we use DeriveKey exposed at
-	// the anystore level; an HSM-backed codec would compute this differently.
-	salt := []byte("sixteen-byte-slt")
-	require.Len(t, salt, 16)
-	key := DeriveKey([]byte("my-pass"), salt, 1000)
-	codec, err := NewChaCha20Poly1305Codec(key)
-	require.NoError(t, err)
-
-	cfg := &Config{
-		Encryption: EncryptionConfig{Codec: codec},
-	}
-	db, err := Open(context.Background(), path, cfg)
-	require.NoError(t, err)
-	coll, err := db.CreateCollection(context.Background(), "c")
-	require.NoError(t, err)
-	require.NoError(t, coll.Insert(context.Background(), anyenc.MustParseJson(`{"id":"k","v":"hello"}`)))
-	require.NoError(t, db.Close())
-
-	// Reopen with the same codec (user reconstructs it from the same key).
-	codec2, err := NewChaCha20Poly1305Codec(key)
-	require.NoError(t, err)
-	cfg.Encryption = EncryptionConfig{Codec: codec2}
-	db2, err := Open(context.Background(), path, cfg)
-	require.NoError(t, err)
-	defer db2.Close()
-	coll2, err := db2.OpenCollection(context.Background(), "c")
-	require.NoError(t, err)
-	got, err := coll2.FindId(context.Background(), "k")
-	require.NoError(t, err)
-	assert.Equal(t, `{"id":"k","v":"hello"}`, got.Value().String())
-}
-
-// sharedCodecDoc is the document number i of a shared-codec test, padded so
-// that a few of them fill a page.
-func sharedCodecDoc(prefix string, i int) *anyenc.Value {
+// encryptedDoc is the document number i of an encrypted-database test, padded
+// so that a few of them fill a page.
+func encryptedDoc(prefix string, i int) *anyenc.Value {
 	return anyenc.MustParseJson(fmt.Sprintf(`{"id":"%s-%d","pad":"%0300d"}`, prefix, i, i))
 }
 
-// requireSharedCodecDocs reads every document of collection "c" in the
+// requireEncryptedDocs reads every document of collection "c" in the
 // database at path, which must hold the ids prefix-0..prefix-(n-1) and,
 // only when moreOK, other documents besides.
-func requireSharedCodecDocs(t *testing.T, path string, cfg *Config, prefix string, n int, moreOK bool) {
+func requireEncryptedDocs(t *testing.T, path string, cfg *Config, prefix string, n int, moreOK bool) {
 	t.Helper()
 	ctx := context.Background()
 	db, err := Open(ctx, path, cfg)
@@ -202,7 +160,7 @@ func requireSharedCodecDocs(t *testing.T, path string, cfg *Config, prefix strin
 	for i := 0; i < n; i++ {
 		got, err := coll.FindId(ctx, fmt.Sprintf("%s-%d", prefix, i))
 		require.NoError(t, err)
-		require.Equal(t, sharedCodecDoc(prefix, i).String(), got.Value().String())
+		require.Equal(t, encryptedDoc(prefix, i).String(), got.Value().String())
 	}
 	count, err := coll.Count(ctx)
 	require.NoError(t, err)
@@ -225,80 +183,20 @@ func requireSharedCodecDocs(t *testing.T, path string, cfg *Config, prefix strin
 	require.GreaterOrEqual(t, count, n)
 }
 
-// One codec object in Config.Encryption.Codec serving two databases that
-// write at the same time. Each database encrypts its pages through it from
-// its own writer, so the codec must not keep per-encrypt state of its own
-// (a shared nonce source repeats nonces under one key). Run it with -race.
-func TestEncryption_SharedCodecTwoDatabases(t *testing.T) {
-	ctx := context.Background()
-	key := make([]byte, 32)
-	_, err := rand.Read(key)
-	require.NoError(t, err)
-	codec, err := NewAESCodec(key)
-	require.NoError(t, err)
-	cfg := &Config{Encryption: EncryptionConfig{Codec: codec}}
-
-	dir := t.TempDir()
-	paths := []string{filepath.Join(dir, "a.db"), filepath.Join(dir, "b.db")}
-	prefixes := []string{"a", "b"}
-	const docs = 300
-
-	colls := make([]Collection, len(paths))
-	dbs := make([]DB, len(paths))
-	for i, path := range paths {
-		db, err := Open(ctx, path, cfg)
-		require.NoError(t, err)
-		dbs[i] = db
-		colls[i], err = db.CreateCollection(ctx, "c")
-		require.NoError(t, err)
-	}
-
-	start := make(chan struct{})
-	errs := make([]error, len(paths))
-	var wg sync.WaitGroup
-	for i := range dbs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			// One commit per document: every commit encrypts its frames.
-			for j := 0; j < docs; j++ {
-				if err := colls[i].Insert(ctx, sharedCodecDoc(prefixes[i], j)); err != nil {
-					errs[i] = err
-					return
-				}
-			}
-		}()
-	}
-	close(start)
-	wg.Wait()
-	for i, db := range dbs {
-		require.NoError(t, errs[i])
-		require.NoError(t, db.Close())
-	}
-
-	for i, path := range paths {
-		requireSharedCodecDocs(t, path, cfg, prefixes[i], docs, false)
-	}
-}
-
-// A database with a caller-supplied codec backed up while it is written to.
-// Backup opens the destination with the source's options, so the
-// destination's writer encrypts through the same codec object as the
-// source's writer, at the same time. Run it with -race.
+// A database encrypted with a 32-byte key backed up while it is written to:
+// the source's writer and the destination's encrypt pages at the same time.
+// Run it with -race.
 //
-// The config is a raw-key AES codec with the default page size and no
-// checksum mode: the destination then has the source's page geometry and
-// needs no KDF salt, so the copy is readable with the same codec.
-func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
+// A 32-byte key is used as it is, with no KDF, and the default page size and
+// no checksum mode give the destination the source's page geometry: the
+// copy, which has a salt of its own, opens with the same Config.
+func TestEncryption_BackupWhileWriting(t *testing.T) {
 	ctx := context.Background()
 	key := make([]byte, 32)
 	_, err := rand.Read(key)
-	require.NoError(t, err)
-	codec, err := NewAESCodec(key)
 	require.NoError(t, err)
 	// Uncompressed, so that the documents below fill hundreds of pages.
-	cfg := &Config{Encryption: EncryptionConfig{Codec: codec}, DisableCompression: true}
+	cfg := &Config{Encryption: EncryptionConfig{Passphrase: key}, DisableCompression: true}
 
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "src.db")
@@ -313,7 +211,7 @@ func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
 	const pre = 3000
 	batch := make([]*anyenc.Value, 0, 500)
 	for i := 0; i < pre; i++ {
-		batch = append(batch, sharedCodecDoc("pre", i))
+		batch = append(batch, encryptedDoc("pre", i))
 		if len(batch) == cap(batch) {
 			require.NoError(t, coll.Insert(ctx, batch...))
 			batch = batch[:0]
@@ -336,7 +234,7 @@ func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
 				return
 			default:
 			}
-			if err := coll.Insert(ctx, sharedCodecDoc("w", i)); err != nil {
+			if err := coll.Insert(ctx, encryptedDoc("w", i)); err != nil {
 				writerErr = err
 				return
 			}
@@ -376,22 +274,19 @@ func TestEncryption_SharedCodecBackupWhileWriting(t *testing.T) {
 	require.NoError(t, db.Close())
 	require.GreaterOrEqual(t, steps, 1, "the copy must take more than one Step")
 
-	requireSharedCodecDocs(t, dstPath, cfg, "pre", pre, true)
+	requireEncryptedDocs(t, dstPath, cfg, "pre", pre, true)
 }
 
-// One codec object in Config.Encryption.Codec serving three databases: A
-// and B each with an OnIntegrityError of its own, C with none. A damaged
-// page is reported to the callback of the database it belongs to and to no
-// other, whatever order the databases were opened in: the callback is the
-// database's, not the codec's.
-func TestEncryption_SharedCodecIntegrityCallbackPerDatabase(t *testing.T) {
+// Three databases encrypted with one key: A and B each with an
+// OnIntegrityError of its own, C with none. A damaged page is reported to the
+// callback of the database it belongs to and to no other, whatever order the
+// databases were opened in.
+func TestEncryption_IntegrityCallbackPerDatabase(t *testing.T) {
 	ctx := context.Background()
 	key := make([]byte, 32)
 	_, err := rand.Read(key)
 	require.NoError(t, err)
-	codec, err := NewAESCodec(key)
-	require.NoError(t, err)
-	enc := EncryptionConfig{Codec: codec}
+	enc := EncryptionConfig{Passphrase: key}
 
 	dir := t.TempDir()
 	pathA := filepath.Join(dir, "a.db")

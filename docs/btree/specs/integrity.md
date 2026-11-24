@@ -110,7 +110,7 @@ plain DBs simply stay plain.
 | `PRAGMA checksum_verification = ON` (default) | default — corrupt reads fail with `ErrCodecTamper` |
 | `PRAGMA checksum_verification = OFF` (forensic) | `Config.ContinueOnIntegrityError = true` (cksum mode only) |
 | `SELECT count(*), verify_checksum(data) FROM sqlite_dbpage GROUP BY 2` | `(*DB).VerifyIntegrity(ctx) (IntegrityReport, error)` |
-| `verify_checksum(BLOB)` SQL function | `anystore.VerifyPageChecksum([]byte) bool` |
+| `verify_checksum(BLOB)` SQL function | none exported (`btree.VerifyPageChecksum` inside the module); `VerifyIntegrity` checks every page |
 | auto-enable on open with reserve_bytes==8 | automatic: `IntegrityMode()` reports state |
 | `SQLITE_IOERR_DATA` on read | `ErrCodecTamper` returned + `OnIntegrityError` callback fires |
 

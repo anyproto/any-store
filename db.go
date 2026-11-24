@@ -96,7 +96,7 @@ type DB interface {
 	// Wait".
 	//
 	// The copy is a database of the source's kind: checksummed, encrypted
-	// with the same passphrase, key or codec, or plain when the source is
+	// with the same passphrase or key, or plain when the source is
 	// plain. An in-memory database has no checksums, so its copy is plain,
 	// or encrypted when it was opened with Encryption. An encrypted copy
 	// keeps the KDF salt of the file at path, or draws one when it creates
@@ -268,7 +268,6 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		Key:                   config.Encryption.Passphrase,
 		KDFIterations:         config.Encryption.KDFIterations,
 		CipherType:            config.Encryption.CipherType,
-		Codec:                 config.Encryption.Codec,
 		MmapSize:              config.MmapSize,
 		Checksum:              !config.Encryption.Enabled() && !config.InMemory,
 		SchemaFormat:          createFormat,

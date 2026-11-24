@@ -27,7 +27,7 @@ func TestPagedMatchesMemory(t *testing.T) {
 	db, err := btree.Open(":memory:", btree.Options{InMemory: true})
 	require.NoError(t, err)
 	defer db.Close()
-	p, err := BuildPagedFromFlat(g, db, "emb", L2)
+	p, err := buildPagedFromFlat(g, db, "emb", L2)
 	require.NoError(t, err)
 
 	// Identical graph + identical vectors => identical results.
@@ -63,7 +63,7 @@ func TestPersistReloadParity(t *testing.T) {
 	{
 		db, err := btree.Open(path, btree.Options{})
 		require.NoError(t, err)
-		require.NoError(t, PersistPaged(g, db, "emb", L2))
+		require.NoError(t, persistPaged(g, db, "emb", L2))
 		require.NoError(t, db.Checkpoint(btree.CheckpointFull))
 		require.NoError(t, db.Close())
 	}
@@ -71,13 +71,13 @@ func TestPersistReloadParity(t *testing.T) {
 	db, err := btree.Open(path, btree.Options{})
 	require.NoError(t, err)
 	defer db.Close()
-	exists, err := PagedExists(db, "emb")
+	exists, err := pagedExists(db, "emb")
 	require.NoError(t, err)
 	require.True(t, exists)
-	exists, err = PagedExists(db, "none")
+	exists, err = pagedExists(db, "none")
 	require.NoError(t, err)
 	require.False(t, exists)
-	p, err := OpenPaged(db, "emb")
+	p, err := openPaged(db, "emb")
 	require.NoError(t, err)
 	require.Equal(t, n, p.PhysLen())
 
@@ -92,7 +92,7 @@ func TestPersistReloadParity(t *testing.T) {
 	}
 }
 
-// PagedExists for a name with no :pmeta namespace takes no reader slot: a
+// pagedExists for a name with no :pmeta namespace takes no reader slot: a
 // caller that holds the only one gets the answer instead of waiting for
 // itself.
 func TestPagedExists_MissingNamespaceTakesNoReaderSlot(t *testing.T) {
@@ -111,7 +111,7 @@ func TestPagedExists_MissingNamespaceTakesNoReaderSlot(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		exists, err := PagedExists(db, "none")
+		exists, err := pagedExists(db, "none")
 		done <- result{exists, err}
 	}()
 	select {
@@ -119,11 +119,11 @@ func TestPagedExists_MissingNamespaceTakesNoReaderSlot(t *testing.T) {
 		require.NoError(t, r.err)
 		require.False(t, r.exists)
 	case <-time.After(10 * time.Second):
-		t.Fatal("PagedExists waits for a reader slot to look up a name with no :pmeta namespace")
+		t.Fatal("pagedExists waits for a reader slot to look up a name with no :pmeta namespace")
 	}
 }
 
-// A :pmeta namespace dropped after PagedExists found it, before its read
+// A :pmeta namespace dropped after pagedExists found it, before its read
 // transaction began, reads as absent: the namespace is resolved again in that
 // transaction, so the dropped root, now a free page, is not read.
 func TestPagedExists_NamespaceDroppedBeforeRead(t *testing.T) {
@@ -136,7 +136,7 @@ func TestPagedExists_NamespaceDroppedBeforeRead(t *testing.T) {
 	db, err := btree.Open(filepath.Join(t.TempDir(), "p.db"), btree.Options{})
 	require.NoError(t, err)
 	defer db.Close()
-	require.NoError(t, PersistPaged(g, db, "emb", L2))
+	require.NoError(t, persistPaged(g, db, "emb", L2))
 
 	dropped := false
 	testPagedExistsLookedUpHook = func() {
@@ -149,7 +149,7 @@ func TestPagedExists_NamespaceDroppedBeforeRead(t *testing.T) {
 	}
 	defer func() { testPagedExistsLookedUpHook = nil }()
 
-	exists, err := PagedExists(db, "emb")
+	exists, err := pagedExists(db, "emb")
 	require.True(t, dropped, "setup: the namespace is dropped between the lookup and the read")
 	require.NoError(t, err)
 	require.False(t, exists)
@@ -178,7 +178,7 @@ func TestPagedVsMemory(t *testing.T) {
 	db, err := btree.Open(":memory:", btree.Options{InMemory: true})
 	require.NoError(t, err)
 	defer db.Close()
-	p, err := BuildPagedFromFlat(g, db, "emb", L2)
+	p, err := buildPagedFromFlat(g, db, "emb", L2)
 	require.NoError(t, err)
 
 	bench := func(search func(q []float32)) float64 {
@@ -242,7 +242,7 @@ func TestPagedCachePressure(t *testing.T) {
 		db, err := btree.Open(path, btree.Options{CacheSize: cachePages})
 		require.NoError(t, err)
 		defer db.Close()
-		p, err := BuildPagedFromFlat(g, db, "emb", L2)
+		p, err := buildPagedFromFlat(g, db, "emb", L2)
 		require.NoError(t, err)
 		// warm
 		for i := 0; i < 100; i++ {

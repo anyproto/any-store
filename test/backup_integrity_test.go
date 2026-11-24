@@ -20,13 +20,11 @@ import (
 // reads there comes back as Backup's error, and the source's
 // OnIntegrityError, which receives the source's failures only, is not
 // called. Both kinds of database with page integrity are covered: the
-// default checksummed one, and one encrypted by a caller's codec, which
-// the destination shares with the source.
+// default checksummed one, and one encrypted with a 32-byte key, which the
+// destination is encrypted with too.
 func TestBackup_DestinationIntegrityFailureIsBackupsError(t *testing.T) {
 	key := make([]byte, 32)
 	_, err := rand.Read(key)
-	require.NoError(t, err)
-	codec, err := anystore.NewAESCodec(key)
 	require.NoError(t, err)
 
 	for _, tc := range []struct {
@@ -34,7 +32,7 @@ func TestBackup_DestinationIntegrityFailureIsBackupsError(t *testing.T) {
 		enc  anystore.EncryptionConfig
 	}{
 		{"checksum", anystore.EncryptionConfig{}},
-		{"codec", anystore.EncryptionConfig{Codec: codec}},
+		{"key", anystore.EncryptionConfig{Passphrase: key}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()

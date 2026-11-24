@@ -196,9 +196,8 @@ type Config struct {
 	// every per-page integrity failure (XXH3 trailer mismatch in cksum
 	// mode, AEAD auth-tag failure in encryption mode). Plain databases
 	// never fire it. It receives the failures of the database it was
-	// opened with and no other, also when several databases share one
-	// Encryption.Codec. The destination of a Backup is another database:
-	// its failures come back as Backup's error.
+	// opened with and no other. The destination of a Backup is another
+	// database: its failures come back as Backup's error.
 	//
 	// The callback runs synchronously on the I/O goroutine and must not
 	// block. Push to a buffered channel + drain elsewhere if you need
@@ -213,22 +212,16 @@ type Config struct {
 
 // EncryptionConfig enables page-level encryption of the database file.
 //
-// Three ways to enable encryption, in increasing order of control:
+// Encryption is enabled by a passphrase, or by a key given as a passphrase
+// of exactly 32 bytes, and uses one of the built-in ciphers:
 //
-//  1. Passphrase (common case):
-//     cfg.Encryption.Passphrase = []byte("my-pass")
-//     Default cipher is AES-256-GCM. Set CipherType to pick a different
-//     built-in (ChaCha20-Poly1305 / XChaCha20-Poly1305).
+//	cfg.Encryption.Passphrase = []byte("my-pass")
+//	cfg.Encryption.CipherType = anystore.CipherChaCha20Poly1305 // optional
 //
-//  2. Passphrase + CipherType (pick cipher, keep passphrase KDF):
-//     cfg.Encryption.Passphrase = []byte("my-pass")
-//     cfg.Encryption.CipherType = anystore.CipherChaCha20Poly1305
+// The default cipher is AES-256-GCM; CipherType picks another built-in
+// (ChaCha20-Poly1305 / XChaCha20-Poly1305).
 //
-//  3. Bring-your-own Codec (HSM, external KMS, custom AEAD):
-//     cfg.Encryption.Codec = myCodec  // must implement anystore.Codec
-//     Passphrase / CipherType / KDFIterations are ignored in this mode.
-//
-// Passphrase treatment (modes 1 and 2):
+// Passphrase treatment:
 //   - Exactly 32 bytes → raw key, no KDF.
 //   - Any other length → PBKDF2-HMAC-SHA256 stretches it to 32 bytes
 //     against the 16-byte salt stored in the database header.
@@ -259,16 +252,12 @@ type EncryptionConfig struct {
 	// CipherType selects the built-in AEAD when Passphrase is set.
 	// Zero value (CipherAES256GCM) is the default.
 	CipherType CipherType
-
-	// Codec, when non-nil, bypasses Passphrase / KDFIterations / CipherType
-	// and is used verbatim. Use this for HSM-backed or other externally-
-	// keyed codecs.
-	Codec Codec
 }
 
-// Enabled reports whether this config will install a codec on Open.
+// Enabled reports whether this config encrypts the database: whether
+// Passphrase is set.
 func (e EncryptionConfig) Enabled() bool {
-	return e.Passphrase != nil || e.Codec != nil
+	return e.Passphrase != nil
 }
 
 // FlushMode controls checkpoint behavior during flush, matching SQLite's

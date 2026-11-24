@@ -13,6 +13,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/pipeperf"
 )
 
 // Every index key ends with the document's primary key, so a sort that
@@ -689,7 +690,7 @@ func TestKeyset_Pagination(t *testing.T) {
 				assert.Contains(t, line, "IndexScan(modifiedAt)", "page %d", page)
 				assert.False(t, sortsInMemory(line), "page %d: %s", page, line)
 
-				anystore.ResetPipelinePerfCounters()
+				pipeperf.Reset()
 				rows := keysetRows(t, q)
 				fetched := qplannerSnapshot().Planner.FetchYields
 				assert.GreaterOrEqual(t, fetched, uint64(len(rows)), "page %d: every returned row is fetched", page)

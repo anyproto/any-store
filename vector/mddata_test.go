@@ -75,7 +75,7 @@ func TestMDDataset(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	p, err := BuildPagedFromFlat(g, db, "emb", Cosine)
+	p, err := buildPagedFromFlat(g, db, "emb", Cosine)
 	if err != nil {
 		t.Fatal(err)
 	}

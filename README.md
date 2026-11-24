@@ -234,9 +234,9 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 })
 ```
 
-Whole-file page-level AEAD; bring-your-own key management via `EncryptionConfig.Codec`.
+Whole-file page-level AEAD with a built-in cipher. A `Passphrase` of exactly 32 bytes is used as the key itself; any other length is stretched with PBKDF2-HMAC-SHA256 against a salt stored in the file.
 
-`Backup` of an encrypted database writes an encrypted copy that opens with the same passphrase, key or codec. A copy that `Backup` creates has a salt of its own, so with a passphrase its derived key differs from the source's. A file that already exists at the path keeps the salt it has, which is the source's when that file is a copy of the source made outside `Backup`.
+`Backup` of an encrypted database writes an encrypted copy that opens with the same passphrase or key. A copy that `Backup` creates has a salt of its own, so with a passphrase its derived key differs from the source's. A file that already exists at the path keeps the salt it has, which is the source's when that file is a copy of the source made outside `Backup`.
 
 An independent Go implementation following design conventions from [SQLCipher](https://www.zetetic.net/sqlcipher/) (BSD-3-Clause) — reserved-tail page overhead, the page-1 plaintext-prefix rule, PBKDF2-HMAC-SHA256 key derivation. No SQLCipher code is included; the cryptography is Go-native and uses AEAD rather than SQLCipher's encrypt-then-MAC construction. Not SQLCipher-compatible on disk. See [NOTICE.md](NOTICE.md).
 

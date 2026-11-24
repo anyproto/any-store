@@ -47,7 +47,7 @@ The goal was to answer three questions:
 - [ARM.md](./ARM.md) — how it runs on modern ARM (Apple Silicon / Graviton / mobile). **Now updated:** the NEON kernel landed (`internal/simd`), so `vector.SIMD()` is **true** on arm64 and the old scalar penalty is recovered, int8 included.
 - [PLAN_INTEGRATION.md](./PLAN_INTEGRATION.md) — **plan to land this in any-store** as a btree-resident vector index (full-btree/Option B): where it plugs into the existing index/write-tx machinery, on-disk namespaces, write/read paths, the cross-process MVCC reliability argument, API, and phasing.
 
-A self-contained, static, no-CGO benchmark binary lives at [`cmd/vectorbench`](../cmd/vectorbench) — build once, copy to any linux/amd64 box (no Go needed on the target), and run `-db <path>` twice for build-then-cold-reload measurements.
+A self-contained, static, no-CGO benchmark binary lives at [`cmd/vectorbench`](../cmd/vectorbench) — build once, copy to any linux/amd64 box (no Go needed on the target). It measures the in-memory index only: the btree-backed indexes are unexported, since their entry points take the module's internal btree types, and its `-paged` and `-db` modes are gone. `TestMDDataset` measures the paged and hybrid indexes; the disk-backed runs in CROSS_HARDWARE.md were made with the earlier binary.
 
 ## Three ways to land it — and the one that wins
 

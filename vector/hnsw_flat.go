@@ -21,7 +21,7 @@ import (
 //     (see flatScratch / visitedList), so a steady-state search allocates
 //     nothing.
 //
-// The same arena layout is what BtreeHNSW serialises to / from disk.
+// The same arena layout is what btreeHNSW serialises to / from disk.
 type FlatHNSW struct {
 	M              int     // max neighbours per node on layers >= 1
 	M0             int     // max neighbours per node on layer 0 (commonly 2*M)
@@ -59,7 +59,7 @@ type FlatHNSW struct {
 	hasEntry bool
 
 	// notifyDirty, when set, is called with the id of every node whose data or
-	// adjacency changed. BtreeHNSW uses it to track which records to persist.
+	// adjacency changed. btreeHNSW uses it to track which records to persist.
 	notifyDirty func(id uint32)
 	// notifyDelete, when set, is called with the id of every tombstoned node so
 	// the persistence layer can record a (cheap) tombstone instead of rewriting
@@ -247,7 +247,7 @@ func (h *FlatHNSW) addLocked(key uint64, vec []float32) {
 // appendRaw bulk-loads a single node directly into the arenas, bypassing the
 // search/connect machinery. Nodes MUST be appended in ascending id order
 // (0,1,2,…) so the dense-id invariant holds. neighborsPerLayer[l] holds the
-// already-computed neighbour ids for layer l. Used by BtreeHNSW to reconstruct
+// already-computed neighbour ids for layer l. Used by btreeHNSW to reconstruct
 // an index from its persisted records without re-running construction (which
 // would pick different random levels). The caller is responsible for setting
 // the entry point afterwards via setEntry.
@@ -280,7 +280,7 @@ func (h *FlatHNSW) appendRaw(key uint64, level int32, vec []float32, neighborsPe
 // appendTopo bulk-loads a node's TOPOLOGY only (key, level, per-layer
 // neighbours) without a vector — the vector stays on disk for a paged index.
 // Like appendRaw, nodes must arrive in ascending id order. The resulting
-// FlatHNSW must only be used through a PagedHNSW (its vector slab is empty, so
+// FlatHNSW must only be used through a pagedHNSW (its vector slab is empty, so
 // vectorAt / in-memory Search would be invalid).
 func (h *FlatHNSW) appendTopo(key uint64, level int32, neighborsPerLayer [][]uint32) {
 	id := uint32(len(h.keys))
@@ -313,7 +313,7 @@ func (h *FlatHNSW) setEntry(id uint32, top int32) {
 }
 
 // snapshot returns a node's persisted form: its key, level, vector copy, and
-// per-layer neighbour ids. Used by BtreeHNSW to serialise a node.
+// per-layer neighbour ids. Used by btreeHNSW to serialise a node.
 func (h *FlatHNSW) snapshot(id uint32) (key uint64, level int32, vec []float32, neighborsPerLayer [][]uint32) {
 	level = h.level[id]
 	key = h.keys[id]

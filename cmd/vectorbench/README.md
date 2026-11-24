@@ -38,7 +38,6 @@ it to the target box and run it.
 | `-k` | 10 | neighbours per query |
 | `-queries` | 200 | queries for recall + latency |
 | `-metric` | cosine | `cosine` \| `l2` \| `dot` |
-| `-paged` | true | also measure the btree-paged + hybrid indexes |
 | `-recall` | true | measure recall vs exact brute force (O(n)/query) |
 | `-seed` | 2024 | dataset RNG seed |
 
@@ -50,8 +49,10 @@ it to the target box and run it.
 2. **Distance kernel** — scalar vs unrolled vs SIMD ns/comparison.
 3. **Build** — HNSW construction rate (docs/s), with progress.
 4. **Recall** — recall@k vs exact brute force, swept over ef.
-5. **Query latency / RAM** — for the in-memory arena (A), the btree-paged index
-   (B), and the route-in-RAM + paged-rerank hybrid (B′), plus btree reads/query.
+5. **Query latency / RAM** — for the in-memory arena (A). The btree-paged index
+   (B) and the route-in-RAM + paged-rerank hybrid (B′) are the `vector`
+   package's own, unexported: `go test ./vector -run TestMDDataset -v` measures
+   them.
 
 The dataset is synthetic topic-clustered markdown documents embedded with the
 feature-hashing trick (deterministic, offline) — representative geometry, not
@@ -60,9 +61,9 @@ behind the numbers.
 
 ## Memory notes (for low-RAM targets)
 
-Peak RAM ≈ the arena (n·dim·4) **plus** a brute-force copy (`-recall`) **plus**
-the paged index's btree copy (`-paged`). On a tight box, run with
-`-recall=false -paged=false` to measure just the in-memory index, or lower `-n`.
+Peak RAM ≈ the arena (n·dim·4) **plus** a brute-force copy (`-recall`). On a
+tight box, run with `-recall=false` to measure just the in-memory index, or
+lower `-n`.
 ```
-n=75000 dim=768  → ~220 MiB arena; ~600 MiB peak with recall+paged on
+n=75000 dim=768  → ~220 MiB arena
 ```

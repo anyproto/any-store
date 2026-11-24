@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/query"
 )
 
@@ -219,11 +220,11 @@ func cyclicTreeDB(t *testing.T, nsName string) (DB, Collection) {
 	secondPg := readPage(second)
 	off = firstChildOff(secondPg)
 	binary.BigEndian.PutUint32(secondPg[off:off+4], root)
-	StampPageChecksumForTest(secondPg)
+	btree.StampPageChecksum(secondPg)
 	// The page must pass its checksum: a page that fails it is refused when
 	// it is read, before its child pointer is followed, and that error
 	// matches ErrCorrupt too.
-	require.True(t, VerifyPageChecksum(secondPg), "the patched page does not pass its checksum")
+	require.True(t, btree.VerifyPageChecksum(secondPg), "the patched page does not pass its checksum")
 	_, err = f.WriteAt(secondPg, int64(second-1)*pageSize)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())

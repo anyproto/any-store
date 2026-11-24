@@ -14,7 +14,12 @@
 //   - FlatHNSW: an arena/SoA (struct-of-arrays) HNSW that keeps every vector in
 //     one contiguous []float32 slab and every adjacency list in flat []uint32
 //     slices — no per-node maps, no per-vector allocations. This is the variant
-//     wired into the btree for persistence (see BtreeHNSW).
+//     wired into the btree for persistence (see btreeHNSW).
+//
+// The btree-backed variants (btreeHNSW, and pagedHNSW, which pages vectors
+// through the btree) are unexported: they take the module's internal btree
+// types, so only this package's own tests and benchmarks reach them
+// (TestMDDataset measures them).
 //
 // Distance is computed with SIMD (AVX2/AVX-512 via github.com/viterin/vek,
 // pure-Go assembly, no CGO — the same library coder/hnsw uses) with scalar and

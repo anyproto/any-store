@@ -8,24 +8,24 @@ import (
 	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
-// paged_persist.go gives PagedHNSW a durable, reopenable on-disk form using the
+// paged_persist.go gives pagedHNSW a durable, reopenable on-disk form using the
 // vector/adjacency SPLIT recommended in DELETE_UPDATE.md §4:
 //
 //	<name>:topo   one small record per node: key + level + per-layer neighbours
 //	<name>:vec    one record per node: the raw vector (paged during search)
 //	<name>:pmeta  index parameters + entry point
 //
-// OpenPaged loads ONLY the :topo records into RAM (the navigable graph) and
+// openPaged loads ONLY the :topo records into RAM (the navigable graph) and
 // leaves the vectors in :vec, so a reopened index keeps Option B's small
 // resident footprint — the topology survives a restart, the vectors stay on
 // disk. This is what lets vectorbench build once and then reopen-and-search a
 // cold on-disk index without rebuilding.
 
-// newPagedHNSW builds the PagedHNSW wrapper (shared by BuildPagedFromFlat and
-// OpenPaged): graph topology in g, vectors read from vecNS.
-func newPagedHNSW(g *FlatHNSW, db *btree.DB, vecNS *btree.Namespace, metric Metric) *PagedHNSW {
+// newPagedHNSW builds the pagedHNSW wrapper (shared by buildPagedFromFlat and
+// openPaged): graph topology in g, vectors read from vecNS.
+func newPagedHNSW(g *FlatHNSW, db *btree.DB, vecNS *btree.Namespace, metric Metric) *pagedHNSW {
 	sf := make([]float32, g.dim)
-	return &PagedHNSW{
+	return &pagedHNSW{
 		g:        g,
 		db:       db,
 		vecNS:    vecNS,
@@ -36,11 +36,11 @@ func newPagedHNSW(g *FlatHNSW, db *btree.DB, vecNS *btree.Namespace, metric Metr
 	}
 }
 
-// AttachPaged wraps an in-RAM FlatHNSW with an existing on-disk :vec namespace
-// (already populated, e.g. by PersistPaged) without writing anything. The
+// attachPaged wraps an in-RAM FlatHNSW with an existing on-disk :vec namespace
+// (already populated, e.g. by persistPaged) without writing anything. The
 // returned index can do pure paged Search AND the route-in-RAM SearchHybrid,
 // because its topology source g still holds the full vectors in RAM.
-func AttachPaged(g *FlatHNSW, db *btree.DB, name string, metric Metric) (*PagedHNSW, error) {
+func attachPaged(g *FlatHNSW, db *btree.DB, name string, metric Metric) (*pagedHNSW, error) {
 	vecNS, err := db.GetNamespace(name + ":vec")
 	if err != nil {
 		return nil, err
@@ -59,9 +59,9 @@ func ensureNS(wtx *btree.WriteTx, name string) (*btree.Namespace, error) {
 	return wtx.CreateNamespace(name)
 }
 
-// PersistPaged writes g to db under name in the split on-disk form (:topo, :vec,
+// persistPaged writes g to db under name in the split on-disk form (:topo, :vec,
 // :pmeta) in a single write transaction.
-func PersistPaged(g *FlatHNSW, db *btree.DB, name string, metric Metric) error {
+func persistPaged(g *FlatHNSW, db *btree.DB, name string, metric Metric) error {
 	wtx, err := db.BeginWrite()
 	if err != nil {
 		return err
@@ -119,7 +119,7 @@ func PersistPaged(g *FlatHNSW, db *btree.DB, name string, metric Metric) error {
 	return wtx.Commit()
 }
 
-// PagedExists reports whether a persisted paged index named name is present.
+// pagedExists reports whether a persisted paged index named name is present.
 // Absent is a namespace or a meta record that is not there; a read that
 // fails is returned, and says nothing about the index.
 //
@@ -127,7 +127,7 @@ func PersistPaged(g *FlatHNSW, db *btree.DB, name string, metric Metric) error {
 // so it takes no reader slot (btree.Options.MaxReaders). Otherwise the
 // namespace and its meta record are read in one read transaction, which
 // waits for a slot.
-func PagedExists(db *btree.DB, name string) (bool, error) {
+func pagedExists(db *btree.DB, name string) (bool, error) {
 	if _, err := db.GetNamespace(name + ":pmeta"); err != nil {
 		if errors.Is(err, btree.ErrNamespaceNotFound) {
 			return false, nil
@@ -158,13 +158,13 @@ func PagedExists(db *btree.DB, name string) (bool, error) {
 	return true, nil
 }
 
-// testPagedExistsLookedUpHook, when non-nil, runs inside PagedExists after
+// testPagedExistsLookedUpHook, when non-nil, runs inside pagedExists after
 // the namespace lookup that takes no reader slot found the namespace, before
 // the read transaction begins. Test-only.
 var testPagedExistsLookedUpHook func()
 
-// OpenPaged reopens a persisted paged index, loading only its topology into RAM.
-func OpenPaged(db *btree.DB, name string) (*PagedHNSW, error) {
+// openPaged reopens a persisted paged index, loading only its topology into RAM.
+func openPaged(db *btree.DB, name string) (*pagedHNSW, error) {
 	pmetaNS, err := db.GetNamespace(name + ":pmeta")
 	if err != nil {
 		return nil, err
@@ -223,7 +223,7 @@ func OpenPaged(db *btree.DB, name string) (*PagedHNSW, error) {
 }
 
 // PhysLen returns the number of nodes (live + tombstoned) in the loaded graph.
-func (p *PagedHNSW) PhysLen() int { return len(p.g.keys) }
+func (p *pagedHNSW) PhysLen() int { return len(p.g.keys) }
 
 // encodeTopo: key(8) | level(4) | per layer [count(2) ids(count*4)].
 func encodeTopo(buf []byte, key uint64, level int32, nbrs [][]uint32) []byte {

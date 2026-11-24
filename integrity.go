@@ -57,22 +57,6 @@ type IntegrityReport struct {
 	Errors []IntegrityError
 }
 
-// VerifyPageChecksum returns true iff the trailing 16 bytes of `page` are
-// the XXH3-128 of page[:len(page)-16]. Returns false for invalid sizes.
-// Public; mirrors SQLite's verify_checksum() SQL function. Computes over
-// the full page; for the codec-equivalent (which excludes the page-1 DB
-// header for page 1), use (DB).VerifyIntegrity instead.
-func VerifyPageChecksum(page []byte) bool {
-	return btree.VerifyPageChecksum(page)
-}
-
-// StampPageChecksumForTest writes a valid XXH3-128 trailer into the last
-// 16 bytes of `page`. Test/migration helper; production code never calls
-// this directly — codec.Encrypt does it during normal page writes.
-func StampPageChecksumForTest(page []byte) {
-	btree.StampPageChecksum(page)
-}
-
 // VerifyIntegrity walks every page in the database and verifies its
 // per-page integrity tag. For checksum-mode DBs this re-hashes the trailer;
 // for AEAD-mode DBs it attempts decryption (the AEAD tag IS the integrity

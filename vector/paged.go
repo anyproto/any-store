@@ -9,7 +9,7 @@ import (
 	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
-// PagedHNSW is a prototype of "Option B" from COMPARISON_pgvector.md: instead of
+// pagedHNSW is a prototype of "Option B" from COMPARISON_pgvector.md: instead of
 // holding every vector in a contiguous RAM arena, it keeps only the graph
 // *topology* (adjacency + levels + entry point) resident and reads each node's
 // vector from the btree on demand during traversal — paging it through the same
@@ -25,7 +25,7 @@ import (
 // This prototype borrows an existing FlatHNSW purely for its in-RAM topology
 // (neighbors/level/entry/deleted); the vectors it reads come from the btree, not
 // from the FlatHNSW slab. Search is single-threaded (one reusable scratch).
-type PagedHNSW struct {
+type pagedHNSW struct {
 	g     *FlatHNSW // topology source (its vector slab is ignored)
 	db    *btree.DB
 	vecNS *btree.Namespace
@@ -40,11 +40,11 @@ type PagedHNSW struct {
 	gets int // btree point-lookups performed (telemetry)
 }
 
-// BuildPagedFromFlat persists g's vectors into a <name>:vec btree namespace and
-// returns a PagedHNSW that traverses g's topology while reading vectors from the
+// buildPagedFromFlat persists g's vectors into a <name>:vec btree namespace and
+// returns a pagedHNSW that traverses g's topology while reading vectors from the
 // btree. g's own vector slab can be released afterwards (the paged index does
 // not use it).
-func BuildPagedFromFlat(g *FlatHNSW, db *btree.DB, name string, metric Metric) (*PagedHNSW, error) {
+func buildPagedFromFlat(g *FlatHNSW, db *btree.DB, name string, metric Metric) (*pagedHNSW, error) {
 	wtx, err := db.BeginWrite()
 	if err != nil {
 		return nil, err
@@ -83,13 +83,13 @@ func f32bytes(v []float32) []byte {
 }
 
 // Gets returns the cumulative number of btree vector lookups (telemetry).
-func (p *PagedHNSW) Gets() int { return p.gets }
+func (p *pagedHNSW) Gets() int { return p.gets }
 
 // vecOf reads node id's vector from the btree into the reusable scratch and
 // returns it as []float32 (zero-copy when the read fits scratch's capacity).
 // A read that fails, or a record of another length, is an error: the scratch
 // still holds the vector read before it.
-func (p *PagedHNSW) vecOf(rtx *btree.ReadTx, id uint32, keyBuf []byte) ([]float32, error) {
+func (p *pagedHNSW) vecOf(rtx *btree.ReadTx, id uint32, keyBuf []byte) ([]float32, error) {
 	binary.BigEndian.PutUint64(keyBuf, uint64(id))
 	p.gets++
 	b, err := rtx.AppendValue(p.vecNS, keyBuf, p.scratchB[:0])
@@ -109,7 +109,7 @@ func (p *PagedHNSW) vecOf(rtx *btree.ReadTx, id uint32, keyBuf []byte) ([]float3
 // Search runs the HNSW query reading vectors from the btree. It opens one read
 // transaction for the query (the realistic unit) so the traversal sees a
 // consistent snapshot and benefits from the reader's page cache.
-func (p *PagedHNSW) Search(query []float32, k int) ([]SearchResult, error) {
+func (p *pagedHNSW) Search(query []float32, k int) ([]SearchResult, error) {
 	g := p.g
 	if !g.hasEntry || k <= 0 {
 		return nil, nil
@@ -156,7 +156,7 @@ func (p *PagedHNSW) Search(query []float32, k int) ([]SearchResult, error) {
 	return out, nil
 }
 
-func (p *PagedHNSW) greedyClosest(g *FlatHNSW, ep uint32, layer int32, dist func(uint32) float32) uint32 {
+func (p *pagedHNSW) greedyClosest(g *FlatHNSW, ep uint32, layer int32, dist func(uint32) float32) uint32 {
 	best := ep
 	bestDist := dist(ep)
 	for {
@@ -174,7 +174,7 @@ func (p *PagedHNSW) greedyClosest(g *FlatHNSW, ep uint32, layer int32, dist func
 
 // searchLayer mirrors FlatHNSW.searchLayer but pulls vectors through dist() (a
 // btree read) and respects tombstones the same way.
-func (p *PagedHNSW) searchLayer(g *FlatHNSW, ep uint32, ef int, layer int32, dist func(uint32) float32) []candidate {
+func (p *pagedHNSW) searchLayer(g *FlatHNSW, ep uint32, ef int, layer int32, dist func(uint32) float32) []candidate {
 	var vis visitedList
 	vis.prepare(len(g.keys))
 	var cand, res cheap
@@ -233,7 +233,7 @@ func (p *PagedHNSW) searchLayer(g *FlatHNSW, ep uint32, ef int, layer int32, dis
 // Because the prototype reuses the same float32 vectors for routing and rerank,
 // the *results* are identical to Search; what it isolates is the latency/Get
 // profile of the hybrid (in-RAM routing + ef paged rerank reads).
-func (p *PagedHNSW) SearchHybrid(query []float32, k int) ([]SearchResult, error) {
+func (p *pagedHNSW) SearchHybrid(query []float32, k int) ([]SearchResult, error) {
 	g := p.g
 	if !g.hasEntry || k <= 0 {
 		return nil, nil
@@ -282,7 +282,7 @@ func sortResultsByDist(r []SearchResult) {
 
 // TopologyBytes approximates the resident RAM of the paged index: the graph
 // arenas WITHOUT the vector slab (the whole point — vectors live on disk).
-func (p *PagedHNSW) TopologyBytes() int {
+func (p *pagedHNSW) TopologyBytes() int {
 	g := p.g
 	return cap(g.links)*4 + cap(g.counts)*4 + cap(g.keys)*8 +
 		cap(g.level)*4 + cap(g.linkOff)*4 + cap(g.countOff)*4 + cap(g.deleted)

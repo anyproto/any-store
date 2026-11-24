@@ -56,17 +56,17 @@ func TestPagedSearch_ReadError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "p.db")
 	db, err := btree.Open(path, btree.Options{})
 	require.NoError(t, err)
-	require.NoError(t, PersistPaged(g, db, "emb", L2))
+	require.NoError(t, persistPaged(g, db, "emb", L2))
 	require.NoError(t, db.Checkpoint(btree.CheckpointFull))
 	require.NoError(t, db.Close())
 	want := g.Search(query, k)
 
 	for _, tc := range []struct {
 		name   string
-		search func(p *PagedHNSW) ([]SearchResult, error)
+		search func(p *pagedHNSW) ([]SearchResult, error)
 	}{
-		{"Search", func(p *PagedHNSW) ([]SearchResult, error) { return p.Search(query, k) }},
-		{"SearchHybrid", func(p *PagedHNSW) ([]SearchResult, error) { return p.SearchHybrid(query, k) }},
+		{"Search", func(p *pagedHNSW) ([]SearchResult, error) { return p.Search(query, k) }},
+		{"SearchHybrid", func(p *pagedHNSW) ([]SearchResult, error) { return p.SearchHybrid(query, k) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// run searches a database just opened, so no page of it is
@@ -88,7 +88,7 @@ func TestPagedSearch_ReadError(t *testing.T) {
 				defer db.Close()
 				// The graph in memory with the vectors read from the file:
 				// SearchHybrid routes by the graph's own copy of them.
-				p, err := AttachPaged(g, db, "emb", L2)
+				p, err := attachPaged(g, db, "emb", L2)
 				require.NoError(t, err)
 				// A read transaction before the fault is armed: the begin
 				// of the search's own then reads nothing of the file.
@@ -104,7 +104,7 @@ func TestPagedSearch_ReadError(t *testing.T) {
 					// and the search returns its error.
 					at := stack.Load()
 					require.NotNil(t, at, "read %d did not happen", failAt)
-					require.True(t, strings.Contains(*at, "(*PagedHNSW).vecOf"), "read %d is not of a candidate's vector:\n%s", failAt, *at)
+					require.True(t, strings.Contains(*at, "(*pagedHNSW).vecOf"), "read %d is not of a candidate's vector:\n%s", failAt, *at)
 					require.ErrorIs(t, err, errInjectedRead, "read %d", failAt)
 					return reads.Load()
 				}
@@ -125,7 +125,7 @@ func TestPagedSearch_ReadError(t *testing.T) {
 	}
 }
 
-// A read that fails while PagedExists looks the index up is returned: it is
+// A read that fails while pagedExists looks the index up is returned: it is
 // not an index that is absent, which a caller would build over.
 func TestPagedExists_ReadError(t *testing.T) {
 	const n, dim = 200, 16
@@ -137,7 +137,7 @@ func TestPagedExists_ReadError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "p.db")
 	db, err := btree.Open(path, btree.Options{})
 	require.NoError(t, err)
-	require.NoError(t, PersistPaged(g, db, "emb", L2))
+	require.NoError(t, persistPaged(g, db, "emb", L2))
 	require.NoError(t, db.Checkpoint(btree.CheckpointFull))
 	require.NoError(t, db.Close())
 
@@ -157,7 +157,7 @@ func TestPagedExists_ReadError(t *testing.T) {
 		defer db.Close()
 
 		armed.Store(true)
-		exists, err := PagedExists(db, "emb")
+		exists, err := pagedExists(db, "emb")
 		armed.Store(false)
 		if failAt >= 0 && failAt < reads.Load() {
 			require.ErrorIs(t, err, errInjectedRead, "read %d", failAt)
