@@ -447,6 +447,12 @@ build per query and carry no such guarantee.
     built in Go or a modifier gets near the bound. A value built in Go that
     contains itself is refused the same way, before anything walks it to
     the end: the document a `query.ModifyFunc` returns, and an operand of a
-    modifier given as an `*anyenc.Value` (item 17). Pinned by
+    modifier given as an `*anyenc.Value` (item 17). An id given as an
+    `*anyenc.Value` to `FindId`, `FindIdWithParser`, `UpdateId`, `UpsertId`
+    or `DeleteId` nests at most 511 levels, the id of a 512-level document
+    an earlier release could store uncompressed and that still reads back:
+    such a document is found and deleted by its id, and an update of it is
+    refused like any write past the bound. Pinned by
     `TestCollection_DocumentDepthBounded` and
-    `TestCollection_SelfContainingValuesRefused` (test/collection_test.go).
+    `TestCollection_SelfContainingValuesRefused` (test/collection_test.go),
+    and `TestCollection_LegacyDeepIdIsLookedUp` (collection_test.go).

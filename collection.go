@@ -42,8 +42,12 @@ import (
 // 2^53 as strings.
 //
 // An id given as an *anyenc.Value to FindId, FindIdWithParser, UpdateId,
-// UpsertId or DeleteId nests at most 510 levels, as a stored document's id
-// can; a deeper one, or one that contains itself, is an error.
+// UpsertId or DeleteId nests at most 511 levels, the deepest id a stored
+// document that reads back can have (an earlier release could store one); a
+// deeper one, or one that contains itself, is an error. A write stores a
+// document of at most 511 levels, so the id of a document written today
+// nests at most 510, and an UpdateId of a document an earlier release stored
+// deeper is refused.
 type Collection interface {
 	// Name returns the committed name of the collection: a rename made in an
 	// open write transaction shows once it commits.
@@ -637,15 +641,23 @@ func checkDocDepth(v *anyenc.Value) error {
 	return nil
 }
 
+// maxIdLookupDepth is the deepest an id given to FindId, FindIdWithParser,
+// UpdateId, UpsertId or DeleteId may nest: the deepest id a stored document
+// that reads back can have, one level below a document of 512 levels, the
+// parser's bound. An earlier release checked no depth on a write and could
+// store such a document uncompressed; a write today is held to maxDocDepth,
+// so the id of a document it stores nests at most 510 levels.
+const maxIdLookupDepth = 511
+
 // checkIdDepth refuses an id given as an *anyenc.Value that nests deeper
-// than a stored document's id can, one level below its document: at most
-// maxDocDepth-1 levels. FindId, UpdateId, UpsertId and DeleteId check it
-// before they encode the id: built in Go, the value has no parser's bound,
-// and encoding one that contains itself would recurse until the stack ran
-// out.
+// than maxIdLookupDepth. FindId, FindIdWithParser, UpdateId, UpsertId and
+// DeleteId check it before they encode the id: built in Go, the value has no
+// parser's bound, and encoding one that contains itself would recurse until
+// the stack ran out. A document an UpdateId or UpsertId writes is held to
+// maxDocDepth on its own (checkDocDepth).
 func checkIdDepth(id any) error {
-	if v, ok := id.(*anyenc.Value); ok && nestsDeeper(v, maxDocDepth-1) {
-		return fmt.Errorf("any-store: id is nested deeper than %d levels", maxDocDepth-1)
+	if v, ok := id.(*anyenc.Value); ok && nestsDeeper(v, maxIdLookupDepth) {
+		return fmt.Errorf("any-store: id is nested deeper than %d levels", maxIdLookupDepth)
 	}
 	return nil
 }

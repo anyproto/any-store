@@ -1779,3 +1779,63 @@ func TestSketch_ReadersLoadIntoOneCopy(t *testing.T) {
 	require.Equal(t, uint64(52), readers.GetDocCount())
 	require.Equal(t, uint64(52), live.GetDocCount())
 }
+
+// An earlier release checked no depth on a write, so it could store,
+// uncompressed, a document of 512 levels, the parser's bound, whose id nests
+// 511. The id-taking methods look such an id up, as a scan reads the
+// document: FindId returns it and DeleteId removes it. A write of the
+// document is held to today's bound, 511 levels: UpdateId of it is refused
+// and leaves it as it was. An id one level deeper is refused before the
+// lookup.
+func TestCollection_LegacyDeepIdIsLookedUp(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	deepId := func(levels int) *anyenc.Value {
+		a := &anyenc.Arena{}
+		id := a.NewObject()
+		for cur, i := id, 1; i < levels; i++ {
+			next := a.NewObject()
+			cur.Set("a", next)
+			cur = next
+		}
+		return id
+	}
+	id := deepId(maxIdLookupDepth)
+	doc := (&anyenc.Arena{}).NewObject()
+	doc.Set("id", id)
+	putStored(t, fx.DB, "c", id.MarshalTo(nil), doc.MarshalTo(nil))
+	assert.Equal(t, []string{doc.String()}, scanAll(t, coll), "the scan reads it")
+
+	got, err := coll.FindId(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, doc.String(), got.Value().String())
+	_, err = coll.UpdateId(ctx, id, query.MustParseModifier(`{"$set":{"x":1}}`))
+	require.ErrorContains(t, err, "document is nested deeper than 511 levels")
+	got, err = coll.FindId(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, doc.String(), got.Value().String())
+
+	_, err = coll.FindId(ctx, deepId(maxIdLookupDepth+1))
+	require.ErrorContains(t, err, "id is nested deeper than 511 levels")
+	require.NoError(t, coll.DeleteId(ctx, id))
+	assert.Empty(t, scanAll(t, coll))
+}
+
+// scanAll returns the documents of coll in a full scan, as JSON. The
+// iterator is closed whatever an assertion does: left open, it would hold
+// its read transaction, and the fixture's Close would wait for it.
+func scanAll(t *testing.T, coll Collection) []string {
+	t.Helper()
+	iter, err := coll.Find(nil).Iter(ctx)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, iter.Close()) }()
+	var docs []string
+	for iter.Next() {
+		doc, err := iter.Doc()
+		require.NoError(t, err)
+		docs = append(docs, doc.Value().String())
+	}
+	require.NoError(t, iter.Err())
+	return docs
+}
