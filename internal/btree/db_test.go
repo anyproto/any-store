@@ -4151,3 +4151,15 @@ func TestOpen_RefusedUntilCloseCompletes(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db3.Close())
 }
+
+// An in-memory database has no database file, so its close persists nothing
+// to one: CloseCheckpointed reports false and does not run its callback.
+func TestCloseCheckpointed_InMemoryReportsFalse(t *testing.T) {
+	db, _ := openRestartDB(t, restartModes[2])
+	restartPut(t, db, 0, 60, 1)
+	ran := false
+	checkpointed, err := db.CloseCheckpointed(func() { ran = true })
+	require.NoError(t, err)
+	require.False(t, checkpointed)
+	require.False(t, ran)
+}

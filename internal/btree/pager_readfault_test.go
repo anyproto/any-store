@@ -155,6 +155,8 @@ func TestReadRawPageWALErrorPropagates(t *testing.T) {
 	opts := DefaultOptions()
 	opts.Checksum = true
 	opts.DisableAutoCheckpoint = true
+	var mismatches atomic.Int32
+	opts.OnIntegrityError = func(uint32, error) { mismatches.Add(1) }
 	db, err := testOpen(t, filepath.Join(dir, "test.db"), opts)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -188,42 +190,49 @@ func TestReadRawPageWALErrorPropagates(t *testing.T) {
 	})
 
 	// Direct: readRawPage must propagate, not fall back to the disk copy.
-	_, err = db.pager.readRawPage(targetPgno, walMaxFrame)
+	_, err = db.pager.readRawPage(targetPgno, walMaxFrame, rtx.cache)
 	require.ErrorIs(t, err, sentinel, "readRawPage readFrameRaw failure must propagate")
 	require.Contains(t, err.Error(), "WAL frame")
 	require.NoError(t, rtx.Rollback())
 
-	// End-to-end: the sweep reports the failing page and keeps sweeping.
+	// End-to-end: the sweep lists the failing page, as a page it could not
+	// read, and goes on to the last page of the snapshot.
+	nPages := db.pager.dbSize.Load()
+	require.Less(t, targetPgno, nPages, "setup: pages follow the failing one")
 	res, err := db.VerifyIntegrity(context.Background())
 	require.NoError(t, err, "the sweep itself must not abort on a per-page read error")
-	require.Greater(t, res.Pages, 0)
-	var found bool
-	for _, se := range res.Errors {
-		if se.PageNo == targetPgno && se.Inner != nil && errors.Is(se.Inner, sentinel) {
-			found = true
-			break
-		}
-	}
-	require.True(t, found,
-		"VerifyIntegrity must report a SweepError for page %d wrapping the WAL read failure; got %+v",
-		targetPgno, res.Errors)
+	require.Equal(t, int(nPages), res.Pages, "the sweep goes on after the page it could not read")
+	require.Len(t, res.Errors, 1)
+	require.Equal(t, targetPgno, res.Errors[0].PageNo)
+	require.Equal(t, IntegrityKindUnknown, res.Errors[0].Kind)
+	require.ErrorIs(t, res.Errors[0].Inner, sentinel)
+	// The checksum of a page that could not be read was never compared:
+	// the codec's hook, which reports checksum mismatches, stays silent.
+	require.Zero(t, mismatches.Load(), "no checksum-mismatch notification for a read error")
 }
 
 // TestWALDecryptFailurePropagatesFromReadFrame pins the highest-severity case
 // the old fallthrough masked: an AEAD authentication failure on a WAL frame
 // (readFrame's codec path) is a true integrity failure and must surface —
 // serving the older DB-file plaintext instead would silently undo committed
-// writes. The codec's OnError sink must observe the failing page.
+// writes. The database's OnIntegrityError, which the WAL passes to the
+// codec, must observe the failing page.
 func TestWALDecryptFailurePropagatesFromReadFrame(t *testing.T) {
 	dir := t.TempDir()
 	key := make([]byte, KeyLen)
 	for i := range key {
 		key[i] = byte(i + 1)
 	}
+	var fired atomic.Uint32
+	var gotPgno atomic.Uint32
 	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{
 		PageSize:              4096,
 		Key:                   key,
 		DisableAutoCheckpoint: true,
+		OnIntegrityError: func(pgno uint32, _ error) {
+			fired.Store(1)
+			gotPgno.Store(pgno)
+		},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -249,16 +258,7 @@ func TestWALDecryptFailurePropagatesFromReadFrame(t *testing.T) {
 	}
 	require.NotZero(t, targetPgno, "expected a pgno>1 page resolvable to a WAL frame")
 
-	// Subscribe to the codec's OnError sink before tampering.
-	sink, ok := pager.codec.(OnErrorSink)
-	require.True(t, ok, "built-in AEAD codec must implement OnErrorSink")
-	var fired atomic.Uint32
-	var gotPgno atomic.Uint32
-	sink.SetOnError(func(pgno uint32, _ error) {
-		fired.Store(1)
-		gotPgno.Store(pgno)
-	})
-	t.Cleanup(func() { sink.SetOnError(nil) })
+	require.Zero(t, fired.Load(), "nothing is damaged yet")
 
 	// Flip one ciphertext byte of the target frame in the live -wal file.
 	frameSize := int64(walFrameSize) + int64(pager.pageSize)
@@ -279,8 +279,8 @@ func TestWALDecryptFailurePropagatesFromReadFrame(t *testing.T) {
 	_, err = pager.getPageReader(targetPgno, walMaxFrame, cache)
 	require.Error(t, err, "AEAD auth failure on a WAL frame must propagate")
 	require.Contains(t, err.Error(), "WAL decrypt frame")
-	require.Equal(t, uint32(1), fired.Load(), "codec OnError sink must fire")
-	require.Equal(t, targetPgno, gotPgno.Load(), "OnError must report the failing page")
+	require.Equal(t, uint32(1), fired.Load(), "the database's OnIntegrityError must fire")
+	require.Equal(t, targetPgno, gotPgno.Load(), "OnIntegrityError must report the failing page")
 }
 
 // TestWALReadFramePastTailRemapsToErrWALCorrupt pins the documented drift

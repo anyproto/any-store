@@ -5,22 +5,23 @@ import (
 	"testing"
 )
 
+// testAEADOnError checks that an AEAD codec reports an authentication
+// failure to the hook passed to that Decrypt call, and to no other: two
+// calls through one codec with two hooks each reach their own.
 func testAEADOnError(t *testing.T, mk func() (Codec, error)) {
 	t.Helper()
 	c, err := mk()
 	if err != nil {
 		t.Fatal(err)
 	}
-	sink, ok := c.(OnErrorSink)
-	if !ok {
-		t.Fatalf("codec %T does not implement OnErrorSink", c)
+	type hits struct{ fired, pgno atomic.Uint32 }
+	var a, b hits
+	hook := func(h *hits) integrityHook {
+		return func(pgno uint32, _ error) {
+			h.fired.Add(1)
+			h.pgno.Store(pgno)
+		}
 	}
-	var fired uint32
-	var gotPgno uint32
-	sink.SetOnError(func(pgno uint32, _ error) {
-		atomic.StoreUint32(&fired, 1)
-		atomic.StoreUint32(&gotPgno, pgno)
-	})
 	pageSize := 4096
 	src := make([]byte, pageSize)
 	for i := range src {
@@ -34,15 +35,23 @@ func testAEADOnError(t *testing.T, mk func() (Codec, error)) {
 	}
 	out[100] ^= 0x01
 	dst2 := make([]byte, pageSize)
-	_, derr := c.Decrypt(dst2, out, 42, &s)
-	if derr == nil {
+	if _, derr := c.Decrypt(dst2, out, 42, &s, hook(&a)); derr == nil {
 		t.Fatal("expected decrypt error on tampered ciphertext")
 	}
-	if atomic.LoadUint32(&fired) != 1 {
-		t.Fatal("OnError did not fire on AEAD tamper")
+	if got := a.fired.Load(); got != 1 {
+		t.Fatalf("onError fired %d times on AEAD tamper, want 1", got)
 	}
-	if atomic.LoadUint32(&gotPgno) != 42 {
-		t.Fatalf("OnError pgno = %d, want 42", atomic.LoadUint32(&gotPgno))
+	if got := a.pgno.Load(); got != 42 {
+		t.Fatalf("onError pgno = %d, want 42", got)
+	}
+	if _, derr := c.Decrypt(dst2, out, 42, &s, hook(&b)); derr == nil {
+		t.Fatal("expected decrypt error on tampered ciphertext")
+	}
+	if _, derr := c.Decrypt(dst2, out, 42, &s, nil); derr == nil {
+		t.Fatal("expected decrypt error on tampered ciphertext")
+	}
+	if a.fired.Load() != 1 || b.fired.Load() != 1 {
+		t.Fatalf("hooks fired a=%d b=%d, want 1 each: each failure goes to its own call's hook", a.fired.Load(), b.fired.Load())
 	}
 }
 

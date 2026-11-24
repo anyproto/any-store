@@ -26,6 +26,9 @@ type Sentinel interface {
 	OnOpen(ctx context.Context) (dirty bool, err error)
 	MarkDirty()
 	MarkClean()
+	// Remove removes the shared marker whatever the process's own cached
+	// state; an absent marker counts as removed.
+	Remove()
 }
 
 type Controller struct {
@@ -77,6 +80,23 @@ func (c *Controller) MarkCleanAfterCheck() {
 	}
 }
 
+// MarkCleanAfterClose marks the DB as clean after a close that checkpointed
+// the whole log as the last client. It is the onCheckpointed callback of
+// btree.DB.CloseCheckpointed, so it runs while that close still holds the
+// exclusive DB-file lock: no other process can attach and commit between the
+// checkpoint and the removal. No other close may clear the sentinel: a close
+// that leaves the log to the processes still attached persists nothing, and a
+// commit of theirs, or of this process, can still be in the log alone when
+// they are killed.
+//
+// The marker is removed whatever this process's cached state: another
+// process may have created it while this one only read.
+func (c *Controller) MarkCleanAfterClose() {
+	if c.opts.Sentinel != nil {
+		c.opts.Sentinel.Remove()
+	}
+}
+
 // Start runs the idle-flush loop. Only Stop (db.Close) ends it: the
 // loop is not tied to the opener's context, which is typically
 // call-scoped and cancelled right after Open returns, while the DB
@@ -97,6 +117,9 @@ func (c *Controller) Start() error {
 	return nil
 }
 
+// Stop ends the idle-flush loop and the tracking of writes. It leaves the
+// sentinel as it is: whether the database is clean is known only once the
+// btree is closed (MarkCleanAfterClose).
 func (c *Controller) Stop() error {
 	if !c.running.CompareAndSwap(true, false) {
 		return nil
@@ -108,10 +131,6 @@ func (c *Controller) Stop() error {
 		c.timer.Stop()
 		c.timerMu.Unlock()
 		c.autoFlushWG.Wait()
-	}
-
-	if c.opts.Sentinel != nil {
-		c.opts.Sentinel.MarkClean()
 	}
 
 	return nil

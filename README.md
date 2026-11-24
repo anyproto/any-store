@@ -82,6 +82,8 @@ func main() {
 
 The full end-to-end example lives in [`example/`](example) and the [API docs](https://pkg.go.dev/github.com/anyproto/any-store/v2).
 
+> **Document size.** Each key/value pair a write stores is limited to 1 GiB (`1<<30` bytes): a document's encoded id with its stored body, each range-index entry's key with its one-byte value, and each record a full-text or vector index stores. A write over the limit stores nothing and fails with `ErrValueTooLarge`, or with `ErrKeyTooLarge` when a key alone is over it; the two are separate errors, check for both.
+
 > **Choosing document ids.** Unlike SQLite there is no hidden rowid — the document id is the btree key. Increment-like ids (`anyenc.NewObjectID()`, timestamps, sequences) keep inserts append-ordered and reads cache-friendly; fully random ids (e.g. UUIDv4) scatter them. In practice this only matters for very hot write/read paths or huge collections.
 
 ## Transactions
@@ -98,6 +100,8 @@ if err := tx.Commit(); err != nil { // or tx.Rollback()
 Any operation run with `tx.Context()` joins the transaction. Read transactions (`db.ReadTx`) pin a consistent snapshot; writers never block readers. One write transaction is active at a time — across all processes.
 
 A transaction begins with a context, as does an operation run without one, which opens its own. The wait for this process's writer lock, or for a reader slot once `Config.ReadConcurrency` of them are held, ends with the context's error when the context ends first; a context that has ended already begins nothing; a context that never ends waits until the database closes (`ErrDBIsClosed`). The wait behind another process's writer is the busy handler's: it ends with the busy error (`ErrBusy`) after the busy timeout, not with the context. `Commit` and `Rollback` do not consult the context. `TxFromContext` returns the transaction a context carries.
+
+`db.Close` waits for every read transaction of the database to end, and has no timeout. Commit each `ReadTx`, and close each `Iterator`: one opened without a transaction can hold a read transaction of its own until its `Close`. (An iterator opened inside a transaction holds none; it ends with the transaction.) A read transaction that is never ended blocks `Close` forever, and `Close` called by the goroutine that still holds one deadlocks on itself, as when a deferred `it.Close()` runs after `db.Close()`. While `Close` waits, an operation on a collection already fails with `ErrDBIsClosed`, and an open iterator's `Next` and `Doc` go on until it is closed; a call on the `DB` itself through an open read transaction may go on too (`GetCollectionNames` does) or fail with `ErrDBIsClosed`. A write transaction does not hold `Close` back. `Close` waits for the one step of storage work the transaction is in, which is as long as that step (a count walks its whole tree), and rolls the transaction back: its writes are discarded, an operation that was running ends with `ErrDBIsClosed` unless it was already in or past its last step, later ones fail with `ErrDBIsClosed`, as do the transaction's iterators that read through it and its `Commit`, and its `Rollback` returns nil (the `Rollback` of a `WriteTx` opened inside it returns `ErrDBIsClosed`). A `Commit` that runs while `Close` does may commit the transaction or fail with `ErrDBIsClosed`. Do not call `Close` from code that runs inside a storage step: `Config.OnIntegrityError`, the methods of a custom VFS, or the methods of a context passed to an operation.
 
 `db.Backup` is the exception to the waits: it does not wait for this process's writer lock or for a reader slot. The copy advances between this process's write transactions; if one stays open, or no reader slot is free, for the busy timeout, `Backup` returns an error that matches `ErrBusy` (`errors.Is`) and can be called again. With a context that carries a write transaction of the same database it returns that error at once: it would be waiting for its caller. It looks at its context between the batches of the copy, not inside one. The destination file is never removed. If `Backup` fails before the copy is committed, a destination that existed keeps its content and a new one is an empty database; the copy is committed in one step at the end, and an error after that leaves the completed copy. A batch of the copy begins its transactions with the ordinary waits behind another process, so `Backup` can return later than the busy timeout after it last copied. Two backups in opposite directions between the same two databases are busy for each other until one has ended.
 
@@ -191,13 +195,13 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 db.Flush(ctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive)
 ```
 
-**Sentinel:** when enabled, a `.lock` file marks not-explicitly-persisted writes so an unclean shutdown triggers an integrity quick check on open.
+**Sentinel:** when enabled, a `.lock` file marks not-explicitly-persisted writes so an unclean shutdown triggers an integrity quick check on open. A flush removes the file, and so does a `Close` that checkpointed as the last handle on the database; a `Close` while another process still has the database open leaves it. An in-memory database has no sentinel file.
 
 **Lifetime:** the idle flush runs until `Close`. It is not bound to the context passed to `Open`, which only bounds the open itself; a DB that is never closed keeps the flush goroutine alive.
 
 ## Integrity
 
-Every non-encrypted database carries an XXH3-128 page-trailer checksum (16 bytes/page) by default — corruption is caught on read. There is no opt-out; the cost is <1% on writes and effectively zero on reads. Encrypted databases derive integrity from the cipher's AEAD tag instead. File state is authoritative on reopen — existing plain databases stay plain, existing checksum databases auto-install the codec regardless of caller config.
+Every non-encrypted database carries an XXH3-128 page-trailer checksum (16 bytes/page) by default — corruption is caught on read. There is no opt-out; the cost is <1% on writes and effectively zero on reads. Encrypted databases derive integrity from the cipher's AEAD tag instead. File state is authoritative on reopen — existing plain databases stay plain, existing checksum databases auto-install the codec regardless of caller config. An in-memory database has no checksums: its `Backup` is a plain file, or an encrypted one when the database was opened with `Encryption`. `Backup` copies a database as the kind of file it is, and returns an error, leaving the destination as it was, when the file at the destination path is a database of another kind (plain, checksummed, encrypted).
 
 Conceptually mirrors SQLite's [`cksumvfs`](https://sqlite.org/cksumvfs.html), generalized to also surface AEAD failures via the same API.
 
@@ -231,6 +235,8 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 ```
 
 Whole-file page-level AEAD; bring-your-own key management via `EncryptionConfig.Codec`.
+
+`Backup` of an encrypted database writes an encrypted copy that opens with the same passphrase, key or codec. A copy that `Backup` creates has a salt of its own, so with a passphrase its derived key differs from the source's. A file that already exists at the path keeps the salt it has, which is the source's when that file is a copy of the source made outside `Backup`.
 
 An independent Go implementation following design conventions from [SQLCipher](https://www.zetetic.net/sqlcipher/) (BSD-3-Clause) — reserved-tail page overhead, the page-1 plaintext-prefix rule, PBKDF2-HMAC-SHA256 key derivation. No SQLCipher code is included; the cryptography is Go-native and uses AEAD rather than SQLCipher's encrypt-then-MAC construction. Not SQLCipher-compatible on disk. See [NOTICE.md](NOTICE.md).
 

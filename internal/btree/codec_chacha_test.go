@@ -47,7 +47,7 @@ func testChachaRoundTrip(t *testing.T, c Codec) {
 		t.Fatalf("ciphertext length = %d, want %d", len(ct), pageSize)
 	}
 	pt := make([]byte, pageSize)
-	out, err := c.Decrypt(pt, ct, 7, &aeadScratch{})
+	out, err := c.Decrypt(pt, ct, 7, &aeadScratch{}, nil)
 	if err != nil {
 		t.Fatalf("Decrypt: %v", err)
 	}
@@ -79,7 +79,7 @@ func testChachaTamperDetected(t *testing.T, c Codec) {
 	ct, _ := c.Encrypt(dst, src, 1, &aeadScratch{})
 	ct[100] ^= 0x01
 	pt := make([]byte, pageSize)
-	if _, err := c.Decrypt(pt, ct, 1, &aeadScratch{}); !errors.Is(err, ErrPageIntegrity) {
+	if _, err := c.Decrypt(pt, ct, 1, &aeadScratch{}, nil); !errors.Is(err, ErrPageIntegrity) {
 		t.Fatalf("flipped-bit decrypt: got err=%v, want ErrPageIntegrity", err)
 	}
 }
@@ -101,7 +101,7 @@ func TestChaCha20Poly1305Codec_PageNumberBound(t *testing.T) {
 	dst := make([]byte, pageSize)
 	ct, _ := c.Encrypt(dst, src, 5, &aeadScratch{})
 	pt := make([]byte, pageSize)
-	if _, err := c.Decrypt(pt, ct, 6, &aeadScratch{}); !errors.Is(err, ErrPageIntegrity) {
+	if _, err := c.Decrypt(pt, ct, 6, &aeadScratch{}, nil); !errors.Is(err, ErrPageIntegrity) {
 		t.Fatalf("wrong-pgno decrypt: got err=%v, want ErrPageIntegrity", err)
 	}
 }

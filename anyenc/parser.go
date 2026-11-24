@@ -20,6 +20,11 @@ const maxParseDepth = 512
 // otherwise demand a multi-gigabyte allocation before any data is verified.
 const maxDecompressedSize = 1 << 30
 
+// decompressedLimit is maxDecompressedSize. It is a variable only so that a
+// test can lower it: the decoders refuse a compressed object over it and
+// MarshalCompressed does not write one.
+var decompressedLimit = maxDecompressedSize
+
 var (
 	valueTrue  = &Value{t: TypeTrue}
 	valueFalse = &Value{t: TypeFalse}
@@ -469,8 +474,8 @@ func parseCompressedObjectS2(b []byte, c *cache, depth int) (*Value, []byte, err
 	if err != nil {
 		return nil, nil, fmt.Errorf("compressed object: s2 header: %w", err)
 	}
-	if dLen > maxDecompressedSize {
-		return nil, nil, fmt.Errorf("compressed object: decoded size %d exceeds limit %d", dLen, maxDecompressedSize)
+	if dLen > decompressedLimit {
+		return nil, nil, fmt.Errorf("compressed object: decoded size %d exceeds limit %d", dLen, decompressedLimit)
 	}
 	c.decompBuf, err = s2.Decode(c.decompBuf[:cap(c.decompBuf)], compressed)
 	if err != nil {

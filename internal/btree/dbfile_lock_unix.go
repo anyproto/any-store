@@ -69,6 +69,22 @@ func downgradeDBLockToShared(fd fileHandle) error {
 	return flockNB(fd, syscall.LOCK_SH)
 }
 
+// unlockDBFile releases whatever flock fd holds, if any.
+func unlockDBFile(fd fileHandle) error {
+	if fd == nil {
+		return fmt.Errorf("btree: dbfile lock: nil fd")
+	}
+	for {
+		err := syscall.Flock(int(fd.Fd()), syscall.LOCK_UN)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, syscall.EINTR) {
+			return fmt.Errorf("btree: flock(unlock): %w", err)
+		}
+	}
+}
+
 // flockNB is a thin wrapper that maps EWOULDBLOCK/EAGAIN to ErrBusy so
 // callers share the same BUSY handling they use for shm fcntl locks.
 func flockNB(fd fileHandle, how int) error {

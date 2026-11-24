@@ -1208,15 +1208,11 @@
   {
     "group": "rollback_journal",
     "category": "legacy",
-    "reason": "any-store is WAL-only; rollback-journal mode (super-journal, sub-journal, hot-journal recovery, playback, change-counter writes, journal headers) is not implemented.",
+    "reason": "any-store is WAL-only; rollback-journal mode (super-journal, sub-journal, page records and their playback, change-counter writes) is not implemented. The one journaled transaction is the creation of a database (creation_journal.go), whose journal is a header alone.",
     "funcs": [
       {
         "file": "pager.c",
         "func": "addToSavepointBitvecs"
-      },
-      {
-        "file": "pager.c",
-        "func": "hasHotJournal"
       },
       {
         "file": "pager.c",
@@ -1273,14 +1269,6 @@
       },
       {
         "file": "pager.c",
-        "func": "pager_open_journal"
-      },
-      {
-        "file": "pager.c",
-        "func": "pager_playback"
-      },
-      {
-        "file": "pager.c",
         "func": "pager_playback_one_page"
       },
       {
@@ -1290,19 +1278,11 @@
       },
       {
         "file": "pager.c",
-        "func": "pager_truncate"
-      },
-      {
-        "file": "pager.c",
         "func": "pager_write_changecounter"
       },
       {
         "file": "pager.c",
         "func": "pager_write_pagelist"
-      },
-      {
-        "file": "pager.c",
-        "func": "readJournalHdr"
       },
       {
         "file": "pager.c",
@@ -1351,14 +1331,6 @@
       },
       {
         "file": "pager.c",
-        "func": "syncJournal"
-      },
-      {
-        "file": "pager.c",
-        "func": "writeJournalHdr"
-      },
-      {
-        "file": "pager.c",
         "func": "writeSuperJournal"
       },
       {
@@ -1370,7 +1342,7 @@
   {
     "group": "pager_lock_state_machine",
     "category": "feature-not-ported",
-    "reason": "any-store has no OS-level file-lock promotion ladder (SHARED/RESERVED/PENDING/EXCLUSIVE) or busy-handler retry loop; WAL + writerOpMu + readerCaches channel provide concurrency without lock upgrades.",
+    "reason": "any-store has no OS-level file-lock promotion ladder (SHARED/RESERVED/PENDING/EXCLUSIVE); WAL + writerOpMu + readerCaches channel provide concurrency without lock upgrades. The busy-handler wait for the shared DB-file lock at open is ported (pager_wait_on_lock, as lockDBShared).",
     "funcs": [
       {
         "file": "pager.c",
@@ -1391,10 +1363,6 @@
       {
         "file": "pager.c",
         "func": "pager_unlock"
-      },
-      {
-        "file": "pager.c",
-        "func": "pager_wait_on_lock"
       },
       {
         "file": "pager.c",
@@ -2115,11 +2083,6 @@
       {
         "file": "backup.c",
         "func": "isFatalError"
-      },
-      {
-        "file": "backup.c",
-        "func": "setDestPgsz",
-        "reason": "negotiates destination page size; any-store enforces equal page size at BackupInit instead."
       },
       {
         "file": "backup.c",

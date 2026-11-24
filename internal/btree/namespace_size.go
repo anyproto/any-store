@@ -24,6 +24,12 @@ func (tx *ReadTx) NamespaceSize(ns *Namespace) (NamespaceSize, error) {
 	if tx.closed {
 		return NamespaceSize{}, ErrTxClosed
 	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return NamespaceSize{}, err
+		}
+		defer tx.pager.wgate.leave()
+	}
 	bt := &btree{
 		pager:       tx.pager,
 		cache:       tx.cache,
@@ -134,7 +140,7 @@ func leafCellPayloadLen(data []byte, offset int) (keyLen, valLen int, err error)
 	if e != nil {
 		return 0, 0, ErrCorrupt
 	}
-	if int64(kl) < 0 || int64(vl) < 0 || kl > maxPayloadAlloc || vl > maxPayloadAlloc {
+	if int64(kl) < 0 || int64(vl) < 0 || kl > uint64(payloadLimit) || vl > uint64(payloadLimit) {
 		return 0, 0, ErrCorrupt
 	}
 	return int(kl), int(vl), nil

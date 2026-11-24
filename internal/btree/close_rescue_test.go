@@ -12,12 +12,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// rescueAsClose runs what DB.Close does to a registered write transaction it
-// finds in flight, rollbackForClose under writerOpMu, and stops there. Close
-// goes on to release the writer's locks and close the pager without waiting
-// for the abandoned writer, and has no seam between the two steps; the test
-// keeps the handle and its WAL open instead, which is the window in which
-// the abandoned writer can still fetch pages.
+// rescueAsClose runs the pager's part of what DB.Close does to a registered
+// write transaction, rollbackForClose under writerOpMu, and stops there. It
+// leaves out what DB.Close does first: close the writer gate and wait for
+// the transaction's call in flight, after which no call of the transaction
+// reaches the pager (close_writer_gate_test.go). With the gate open and the
+// handle and its WAL open, the abandoned writer can still fetch pages, and
+// the tests here pin the pager's own guard against a spill in that state.
 func rescueAsClose(db *DB) {
 	db.pager.writerOpMu.Lock()
 	db.pager.rollbackForClose()

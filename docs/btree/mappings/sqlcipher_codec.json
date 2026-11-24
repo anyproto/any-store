@@ -21,7 +21,7 @@
   },
   "pager.c:413-422": {
     "code": [
-      "codec.go:128-162"
+      "codec.go:165-221"
     ],
     "note": "CODEC1 / CODEC2 macro definitions. SQLCipher uses these to in-place encrypt/decrypt page buffers in pager paths (return-and-bail or pass-through-if-no-codec). Go has the same passthrough semantics in encryptWith / decryptWith, plus the higher-level encryptPageWithCodec / decryptPageWithCodec that handle the page-1 plaintext-prefix carve-out. We don't use macros — Go's nil-codec branch in those helpers is the equivalent of the `#else` arm (`O = (char*)D`)."
   },
@@ -31,7 +31,7 @@
       "wal.go:1280-1293",
       "pcache.go:81-95"
     ],
-    "note": "Pager struct codec fields (xCodec, xCodecSizeChng, xCodecFree, pCodec). In Go the codec lives on the pager (codec, codecScratch, codecAEAD), and a copy is propagated to the wal struct (set in initNewDB / open) and to each pcache (per-tx scratch on first use). xCodecFree has no equivalent — Go's GC reclaims codec state. xCodecSizeChng has no equivalent because page size and reserved space are fixed at open."
+    "note": "Pager struct codec fields (xCodec, xCodecSizeChng, xCodecFree, pCodec). In Go the codec lives on the pager (codec, onIntegrityError, codecScratch, codecAEAD); the codec and the integrity hook are copied to the wal struct (set in initNewDB / open), and each pcache gets its own scratch on first use. xCodecFree has no equivalent — Go's GC reclaims codec state. xCodecSizeChng has no equivalent because page size and reserved space are fixed at open."
   },
   "pager.c:835-837": {
     "code": [],
@@ -81,8 +81,8 @@
     "code": [
       "pager.go:499-511",
       "pager.go:524-537",
-      "codec.go:149-181",
-      "codec_cksum.go:65-103"
+      "codec.go:186-221",
+      "codec_cksum.go:69-107"
     ],
     "note": "sqlcipherPagerSetCodec / sqlcipherPagerGetCodec / sqlcipherPagerCodec — install/retrieve the codec, and the WAL-side helper that returns a freshly-encrypted page buffer. Go's installCodec attaches the codec to the pager (and propagates it to the wal). The fresh-encrypted-buffer helper sqlcipherPagerCodec(p) is replaced by encryptPage(scratch, src, pgno) / encryptPageWithCodec — call sites (wal.go writeFrames fresh-append + reuse paths, pager.go initNewDB for page 1) thread their own scratch buffers in instead of allocating a fresh buffer per call."
   },
@@ -124,19 +124,19 @@
   },
   "backup.c:156-175": {
     "code": [],
-    "note": "sqlite3_backup_init refuses cross-encryption-status backups (one DB keyed, the other plaintext) because SQLCipher copies pages verbatim and a mismatched codec would either leave ciphertext where plaintext is expected or vice versa. Any-store's backup (backup.go) does NOT copy verbatim: src.pager.getPageReader transparently runs the source codec's Decrypt before handing srcData to onePage, and the destination's writer cache → wal.writeFrames runs dst's codec's Encrypt at commit. So plaintext-src → encrypted-dst and encrypted-src → plaintext-dst both 'work' at the byte level. PARTIAL GAP, salt edition: any-store stores the KDF salt in dbHeader (page 1, bytes 24-32, see codec_kdf.go:SaltLen). backup.onePage copies page 1 verbatim from src to dst (after patching only the DatabaseSize field at offset 28), so the destination ends up with the SOURCE's salt baked into its own page 1. For raw-key codecs (Options.Codec / Options.Key bound directly) this is harmless. For KDF-derived codecs (passphrase + salt → key) the dst, on the next reopen, will re-derive its key from (dst's passphrase, src's salt) — wrong key, can't decrypt. SQLCipher's check rejects this case at Init; any-store currently does not. Either reject the cross-codec case in BackupInit, or refresh the salt on dst's page 1 after copy."
+    "note": "sqlite3_backup_init refuses cross-encryption-status backups (one DB keyed, the other plaintext): it asks whether each side has a key (sqlcipherCodecGetKey) and errors with \"backup is not supported with encrypted databases\". SQLCipher's backup does not copy ciphertext: the source pager decrypts each page on read (CODEC1) and the destination's codec encrypts it on write. Any-store's backup (backup.go) moves plaintext the same way: src.pager.getPageReader runs the source codec's Decrypt before handing srcData to onePage, and the destination's writer cache → wal.writeFrames runs dst's codec's Encrypt at commit. The reserved bytes differ between a plaintext and an encrypted file, though, and each handle's usable size is fixed at Open, so BackupInit refuses a pair of another usable size or another kind of installed codec (ErrBackupCodecMismatch; a keyed in-memory database counts as encrypted, as in SQLCipher; docs/btree/NOTES.md#drift-2026-11-19-2-a-backup-destination-has-the-geometry-of-the-source-file). The salt: any-store stores the KDF salt in dbHeader (page 1, bytes 72-87, see codec_kdf.go:SaltLen), and the destination's codec is keyed at Open with the destination's own salt, which the pager keeps (keySalt). Every write of page 1 carries that salt (encryptPageWithCodec, and the checkpoint's copy of page 1 into the main file) and no image of page 1 sets it (adoptHeader), so the copied page 1 never brings the source's salt into the destination's header. SQLCipher gets the same result from its codec, which in its default header mode writes the ctx's kdf_salt over the head of page 1 at every encrypt (sqlcipher.c:3304-3312). See docs/btree/NOTES.md#drift-2026-11-21-19-the-kdf-salt-belongs-to-the-key-setup-not-to-page-1."
   },
   "backup.c:261-268": {
     "code": [],
-    "note": "backupOnePage — capture src/dst reserved-bytes and codec presence so the page-size-change branch below (281-299) can reject incompatible backups. No port: any-store backup runs over already-decrypted in-memory pages (see backup.go), so reserved-bytes alignment is not a backup concern."
+    "note": "backupOnePage — capture src/dst reserved-bytes and codec presence so the page-size-change branch below (281-299) can reject incompatible backups. Go: BackupInit compares the two handles' usable size and kind of codec once (ErrBackupCodecMismatch); the pages a backup moves are already decrypted (see backup.go). See docs/btree/NOTES.md#drift-2026-11-19-2-a-backup-destination-has-the-geometry-of-the-source-file."
   },
   "backup.c:281-299": {
     "code": [],
-    "note": "backupOnePage — refuses backup if src and dst page sizes differ AND a codec is present, or attempts to align dst reserved-bytes to src. No port: any-store enforces matching page size at backup setup (BackupInit), so this branch is unreachable. Drift, intentional."
+    "note": "backupOnePage — refuses backup if src and dst page sizes differ AND a codec is present, or attempts to align dst reserved-bytes to src. Go: any-store enforces matching page size and matching reserved bytes at backup setup (BackupInit: ErrBackupPageSizeMismatch, ErrBackupCodecMismatch) and does not realign an open destination; a new destination is created with the source file's geometry (DB.BackupDestinationOptions). Drift, intentional: docs/btree/NOTES.md#drift-2026-11-19-2-a-backup-destination-has-the-geometry-of-the-source-file."
   },
   "backup.c:801-803": {
     "code": [],
-    "note": "sqlite3BtreeCopyFile — calls sqlite3PagerAlignReserve so dst reserved-bytes match src. No port: any-store has no equivalent CopyFile-from-btree primitive (backup is the only cross-DB copy path), and reserved-bytes alignment is enforced at BackupInit."
+    "note": "sqlite3BtreeCopyFile — calls sqlite3PagerAlignReserve so dst reserved-bytes match src. No port: any-store has no equivalent CopyFile-from-btree primitive (backup is the only cross-DB copy path), and equal reserved bytes are required at BackupInit (ErrBackupCodecMismatch)."
   },
   "pragma.c:444-446": {
     "code": [],
@@ -144,7 +144,7 @@
   },
   "pragma.c:520-525": {
     "code": [],
-    "note": "PRAGMA rekey = '...' — re-encrypts the entire DB with a new key. GAP: any-store has no rekey API. The 'use backup' workaround only works for raw-key codecs and even then is awkward (copy through a fresh DB), and it does NOT work for KDF-derived codecs because page 1's salt gets copied verbatim and the destination ends up with the source's salt in its header (see backup.c:156-175 GAP note). Add a real Rekey path: walk every page through src.codec.Decrypt → dst.codec.Encrypt with a fresh salt for KDF codecs, written under a single tx so a crash leaves either the old or new key intact. This is a non-trivial feature but it's the only correct way to rotate a key today."
+    "note": "PRAGMA rekey = '...' — re-encrypts the entire DB with a new key. GAP: any-store has no rekey API. A backup is not one: its destination is opened with the source's passphrase, key or codec, under a salt of its own (see the backup.c:156-175 note), so the copy is sealed under the same secret. Add a real Rekey path: walk every page through src.codec.Decrypt → dst.codec.Encrypt with a fresh salt for KDF codecs, written under a single tx so a crash leaves either the old or new key intact. This is a non-trivial feature but it's the only correct way to rotate a key today."
   },
   "pragma.c:2783-2829": {
     "code": [],
