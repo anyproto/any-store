@@ -1499,6 +1499,7 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 // (os_unix.c:5140-5165). A group is one segment unless the OS page is larger
 // than a segment (64 KiB pages). The heap shms have no file and no other
 // process: their segments are this process's own.
+// DRIFT: a writer's lookup does not extend the wal-index file either, where walIndexPageRealloc passes pWal->writeLock as the extend flag (wal.c:784-786); a segment missing from the file fails a writer's lookup too. See docs/btree/NOTES.md#drift-92-shmhashget-skips-segment-on-map-io-error
 func (wi *walIndex) mapSegmentForLookup(seg int) ([]byte, error) {
 	if f, ok := wi.shm.(shmFile); ok {
 		info, err := f.fileInfo()

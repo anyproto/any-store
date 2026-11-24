@@ -2730,7 +2730,7 @@
       "wal.c:walHashGet",
       "wal.c:walIndexPage"
     ],
-    "note": ""
+    "note": "a segment missing from the file fails the lookup; a writer's lookup does not extend the file either, where C's extend flag is pWal->writeLock (drift-92)"
   },
   "wal.go:*walIndex.prepareHeader": {
     "sqlite": [
