@@ -185,7 +185,10 @@ coll.Find(map[string]any{"$text": map[string]any{
 
 `$require`/`$exclude` take a string or an array of strings; each entry uses the
 clause syntax above. There is deliberately no inline `+`/`-` syntax: `-9` stays
-the term `9`, and boolean intent lives in these typed fields.
+the term `9`, and boolean intent lives in these typed fields. At most 64
+required clauses are enforced: the `$search` clauses under `"and"`, then the
+`$require` entries; a required clause past the 64th matches and scores but no
+longer gates ([query contract](query-filter-contract.md), item 19).
 
 **`$fields`** scopes every clause to the listed fields of the index (names as
 given in `IndexInfo.Fields`, nested paths included; an unknown name fails with

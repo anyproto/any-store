@@ -188,7 +188,11 @@ build per query and carry no such guarantee.
     shape would make a filter built from an empty list match nothing or
     everything depending on the operator, and a `Delete` with it could empty
     the collection; a caller that means "every document" passes `{}` or a
-    nil filter. Pinned by `TestParseCondition_EmptyObjectMatchesAll` and
+    nil filter. The Go values are not parsed and keep that arithmetic:
+    `query.And{}` and `query.Nor{}` match every document and `query.Or{}`
+    none, on every verb, `Delete` included; build one from a list only
+    where an empty list should mean that. Pinned by
+    `TestParseCondition_EmptyObjectMatchesAll` and
     `TestParseCondition_EmptyLogicalArrayRejected` (query/cond_parse_test.go)
     and, through every verb, by `TestQuery_EmptyObjectInLogicalOperator` and
     `TestQuery_EmptyLogicalArrayIsParseError` (test/query_test.go).
@@ -348,6 +352,13 @@ build per query and carry no such guarantee.
     `$pull` or `$unset` alone) inserts no document, where MongoDB inserts
     `{_id: id}`. Pinned by `TestModifierPush_Modify` and its siblings
     (query/modifier_test.go) and `TestCollection_PushMissingField`.
+    A numeric path segment sets an array element, padding the array with
+    nulls up to it (`{"$set":{"arr.3":1}}` on `{"arr":[]}` gives
+    `[null,null,null,1]`), but by no more than 1,500,000 nulls, MongoDB's
+    limit: a segment that needs more is an error (`can't backfill more than
+    1500000 elements`) and the update writes nothing. Pinned by
+    `TestModifier_ArrayPaddingIsBounded` and
+    `TestModifier_PaddingRefusalLeavesDocumentUnchanged`.
 
 18. **Numbers are float64.** anyenc stores every number as a float64, so an
     integer is exact up to 2^53 (9,007,199,254,740,992) in magnitude and a
@@ -360,3 +371,12 @@ build per query and carry no such guarantee.
     it. There is no integer type next to the float (MongoDB has int, long and
     decimal); integers that can go past 2^53 belong in strings. The
     aggregation arithmetic has the same limit (docs/aggregation.md).
+
+19. **A `$text` query enforces at most 64 required clauses.** The required
+    clauses are the `$search` clauses under `"$defaultOperator": "and"` and
+    then the `$require` entries, in that order (a clause the analyzer reduces
+    to no terms does not count). The first 64 are enforced; every required
+    clause after them still matches and scores, but a document need not
+    satisfy it, as if it were a `$search` clause under the default `or`.
+    `$exclude` entries have no such limit. Pinned by
+    `TestFtsProbe_RequiredBitExhaustion`.
