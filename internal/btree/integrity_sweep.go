@@ -41,10 +41,12 @@ type SweepResult struct {
 	Errors []SweepError
 }
 
-// IntegrityMode returns the codec mode currently installed on the DB.
-// Plain DBs (no codec) report IntegrityNone.
+// IntegrityMode returns the integrity mode of the pages the DB stores.
+// Plain DBs (no codec) report IntegrityNone, and so does every in-memory
+// DB: its store and its WAL hold pages as the b-tree wrote them, past any
+// codec the options named (wal.writeFramesMem), so no page carries a tag.
 func (db *DB) IntegrityMode() IntegrityMode {
-	if db.pager.codec == nil {
+	if db.pager.codec == nil || db.pager.inMemory {
 		return IntegrityNone
 	}
 	if _, ok := db.pager.codec.(*cksumCodec); ok {
@@ -53,9 +55,9 @@ func (db *DB) IntegrityMode() IntegrityMode {
 	return IntegrityAEAD
 }
 
-// CksumCodec returns the active *cksumCodec if one is installed, else nil.
-// Used by anystore wrappers to expose the runtime PRAGMA-equivalent toggle
-// (SetVerifyOnRead). No-op for AEAD codecs.
+// CksumCodec returns the active *cksumCodec if one is installed, else nil
+// (plain and AEAD databases). The anystore wrapper turns verify-on-read off
+// through it for Config.ContinueOnIntegrityError.
 func (db *DB) CksumCodec() *cksumCodec {
 	if c, ok := db.pager.codec.(*cksumCodec); ok {
 		return c
@@ -64,9 +66,9 @@ func (db *DB) CksumCodec() *cksumCodec {
 }
 
 // VerifyIntegrity walks every page of the snapshot its read transaction
-// holds (1..ReadTx.DatabaseSize) and verifies the per-page integrity tag. For checksum-mode DBs this re-hashes
-// the trailer and compares it; for AEAD-mode DBs it attempts a decrypt
-// (the AEAD tag IS the integrity tag).
+// holds (1..ReadTx.DatabaseSize) and verifies the per-page integrity tag.
+// For checksum-mode DBs this re-hashes the trailer and compares it; for
+// AEAD-mode DBs it attempts a decrypt (the AEAD tag IS the integrity tag).
 //
 // Read-only operation that opens its own internal read transaction.
 // Mismatches are collected into Result.Errors, and so is a page that cannot
@@ -94,24 +96,26 @@ func (db *DB) CksumCodec() *cksumCodec {
 // and the pager cache keeps it only while the snapshot is unchanged
 // (pager.c:3261-3264).
 //
-// On checksum DBs the sweep temporarily clears the verify-on-read flag so
-// the read path doesn't abort on the first mismatch — the original flag
-// is restored on return. On AEAD DBs there is no toggle (disabling AEAD
-// verification would be a vulnerability); per-page Decrypt errors are
-// caught and routed into the result instead of bubbling up.
+// The sweep reads every page raw, with its own read (readRawPage), and its
+// read begin reads only page 1's header, which is outside the codec. A
+// checksum page it hashes itself, never through the codec; an AEAD page it
+// hands to the codec's Decrypt, which is the only way to check the tag. It
+// changes nothing in how the handle's other transactions read: the
+// checksum codec's verify-on-read flag (cksumCodec.SetVerify, the handle's
+// one switch, shared by the writer and every reader) is left as it is
+// configured, on by default and off in a handle opened to read past damage.
 //
-// Returns IntegrityNone with zero pages scanned for plain DBs.
+// The codec's OnError hook fires once for each page whose tag fails: for a
+// checksum page the sweep fires it, for an AEAD page Decrypt does. A page
+// that could not be read fires nothing.
+//
+// Returns IntegrityNone with zero pages scanned for plain DBs and for
+// in-memory DBs, whose pages are stored without a codec.
 func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 	mode := db.IntegrityMode()
 	res := SweepResult{Mode: mode}
 	if mode == IntegrityNone {
 		return res, nil
-	}
-
-	if c := db.CksumCodec(); c != nil {
-		prev := c.VerifyOn()
-		c.SetVerify(false)
-		defer c.SetVerify(prev)
 	}
 
 	tx, err := db.BeginReadContext(ctx)
@@ -156,9 +160,13 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 		if e != nil {
 			res.Errors = append(res.Errors, *e)
 		}
-		if mode == IntegrityChecksum && (raw == nil || e != nil) {
+		if e != nil && e.Kind == IntegrityChecksumMismatch {
 			// Fire the codec's OnError hook so subscribers see sweep
-			// mismatches the same way they see read-path mismatches.
+			// mismatches the same way they see read-path mismatches. Only
+			// for a checksum that was compared and differed, as cksumvfs
+			// compares only after a read that succeeded (cksmRead): a page
+			// that could not be read is listed and notifies nobody. The
+			// AEAD codecs fire the hook themselves, from Decrypt.
 			if c := db.CksumCodec(); c != nil {
 				c.fire(pgno, errCksumMismatch)
 			}
@@ -202,6 +210,7 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 // page 1 stands, as it does for every reader, and a header that cannot be
 // read or gives no valid count is the sweep's error: there is then no count
 // to sweep to.
+// DRIFT: page 1 is read raw (its header alone when the page cannot be read whole) and, where a WAL commit recorded the snapshot's size, its count is checked against that size and page 1 listed when they differ; lockBtree reads page 1 through the pager and takes a smaller count as it stands. See docs/btree/NOTES.md#drift-2026-06-25-12-verifyintegrity-bounds-the-sweep-with-the-live-writer-header-pager-hea
 func (db *DB) sweepPageCount(tx *ReadTx) (total uint32, raw1 []byte, page1Errs []SweepError, err error) {
 	p := db.pager
 	bound := p.readerDbSizeBound(tx.cache)
