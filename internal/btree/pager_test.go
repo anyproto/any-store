@@ -9508,37 +9508,60 @@ func resealWAL(t *testing.T, walPath string, pageSize int) {
 	require.NoError(t, os.WriteFile(walPath, data, 0o600))
 }
 
-// A page of the database that the file holds only in part reads as zeros
-// past the end of the file, as readDbPage reads it (pager.c:3041-3044), and
-// not as an error of the read: its own check reports the damage, here its
-// checksum. A file cut at a page boundary is a page count the header's
-// check refuses, not this.
-func TestReadDBPage_ShortReadIsZeros(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "test.db")
-	opts := DefaultOptions()
-	opts.Checksum = true
-	db, err := testOpen(t, path, opts)
-	require.NoError(t, err)
-	commitRows(t, db, "t", 64, 200)
-	require.NoError(t, db.Checkpoint(CheckpointTruncate))
-	require.NoError(t, db.Close())
-	info, err := os.Stat(path)
-	require.NoError(t, err)
-	pageSize := int64(opts.PageSize)
-	last := uint32(info.Size() / pageSize)
-	require.NoError(t, os.Truncate(path, info.Size()-pageSize/2))
+// A page of the database that the database file holds only in part is
+// damage: its read is ErrCorrupt, where readDbPage reads zeros past the end
+// of the file (pager.c:3041-3044). In a plain database nothing would report
+// those zeros: here the file is cut inside the last overflow page of a
+// value, after its link to the next page and the first bytes of the value
+// it holds, and the value is not returned with zeros in their place. A
+// file cut at a page boundary is a page count the header's check refuses,
+// not this. A read that comes up short of bytes the file holds is the
+// read's error (pager_short_read_vfs_test.go).
+func TestReadDBPage_PageCutShortIsCorrupt(t *testing.T) {
+	for _, checksum := range []bool{false, true} {
+		t.Run(fmt.Sprintf("checksum=%v", checksum), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "test.db")
+			opts := DefaultOptions()
+			opts.Checksum = checksum
+			db, err := testOpen(t, path, opts)
+			require.NoError(t, err)
+			wtx, err := db.BeginWrite()
+			require.NoError(t, err)
+			ns, err := wtx.CreateNamespace("t")
+			require.NoError(t, err)
+			val := bytes.Repeat([]byte{0xAB}, 5*int(opts.PageSize))
+			require.NoError(t, wtx.Put(ns, []byte("k"), val))
+			require.NoError(t, wtx.Commit())
+			require.NoError(t, db.Checkpoint(CheckpointTruncate))
+			require.NoError(t, db.Close())
+			info, err := os.Stat(path)
+			require.NoError(t, err)
+			pageSize := int64(opts.PageSize)
+			last := uint32(info.Size() / pageSize)
+			require.NoError(t, os.Truncate(path, info.Size()-pageSize+8))
 
-	db, err = testOpen(t, path, opts)
-	require.NoError(t, err)
-	defer db.Close()
-	buf := bytes.Repeat([]byte{0xFF}, int(pageSize))
-	require.NoError(t, db.pager.readDBPage(last, buf))
-	require.Equal(t, make([]byte, pageSize/2), buf[pageSize/2:])
+			db, err = testOpen(t, path, opts)
+			require.NoError(t, err)
+			defer db.Close()
+			buf := make([]byte, pageSize)
+			err = db.pager.readDBPage(last, buf)
+			require.ErrorIs(t, err, ErrCorrupt)
+			require.NotErrorIs(t, err, io.EOF)
 
-	err = db.IntegrityCheck()
-	require.ErrorIs(t, err, ErrCorrupt)
-	require.NotErrorIs(t, err, io.EOF)
-	require.NotErrorIs(t, err, io.ErrUnexpectedEOF)
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			defer rtx.Rollback()
+			ns, err = rtx.GetNamespace("t")
+			require.NoError(t, err)
+			got, err := rtx.Get(ns, []byte("k"))
+			require.ErrorIs(t, err, ErrCorrupt, "the value came back, %d bytes", len(got))
+
+			err = db.IntegrityCheck()
+			require.ErrorIs(t, err, ErrCorrupt)
+			require.NotErrorIs(t, err, io.EOF)
+			require.NotErrorIs(t, err, io.ErrUnexpectedEOF)
+		})
+	}
 }
 
 // Page number 0 is no page: a getter asked for it was handed a page number

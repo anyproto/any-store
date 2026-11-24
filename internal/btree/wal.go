@@ -2501,8 +2501,10 @@ func (w *wal) recoverLocked() error {
 	w.headerOnDisk = true
 
 	buf := make([]byte, walHeaderSize)
-	if _, err := w.file.ReadAt(buf, 0); err != nil {
-		return err
+	if n, err := w.file.ReadAt(buf, 0); err != nil || n < len(buf) {
+		if err = frameReadResult(len(buf), n, err); err != nil {
+			return err
+		}
 	}
 	if err := w.header.deserialize(buf); err != nil {
 		if errors.Is(err, ErrWALVersion) {
@@ -2566,8 +2568,10 @@ func (w *wal) recoverLocked() error {
 	// checkpoint would truncate the acknowledged commits behind it. Only a
 	// frame that fails validation (salts, pgno, checksum) ends the scan.
 	for offset+frameSize <= info.Size() {
-		if _, err := w.file.ReadAt(scratch, offset); err != nil {
-			return fmt.Errorf("btree: WAL recovery: read frame %d: %w", len(parsed)+1, err)
+		if n, err := w.file.ReadAt(scratch, offset); err != nil || n < len(scratch) {
+			if err = frameReadResult(len(scratch), n, err); err != nil {
+				return fmt.Errorf("btree: WAL recovery: read frame %d: %w", len(parsed)+1, err)
+			}
 		}
 		fr.deserialize(scratch[:walFrameSize])
 		if fr.salt1 != w.header.salt1 || fr.salt2 != w.header.salt2 {
@@ -3247,8 +3251,10 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 	}
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
-	if _, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil {
-		return frameReadErr(err)
+	if n, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil || n < int(w.pageSize) {
+		if err = frameReadResult(int(w.pageSize), n, err); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -3258,16 +3264,36 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 // the wal-index points at a frame the file does not hold, as SQLite's read
 // gives SQLITE_IOERR_SHORT_READ (sqlite3WalReadFrame returns
 // sqlite3OsRead's result, wal.c:3649-3664; unixRead), and the read's own
-// error stays in the chain (io.EOF), as SQLITE_IOERR_SHORT_READ is a kind
-// of SQLITE_IOERR. Any other failure of the read is returned as it is: an
-// I/O error says nothing about the log's content. Every read of a frame
-// goes through it: the page readers and the checkpoint's (walCheckpoint
-// returns sqlite3OsRead's code, wal.c:2311-2312).
+// error stays in the chain (io.EOF, or io.ErrUnexpectedEOF), as
+// SQLITE_IOERR_SHORT_READ is a kind of SQLITE_IOERR. Any other failure of
+// the read is returned as it is: an I/O error says nothing about the log's
+// content. Every read of a frame goes through it (frameReadResult): the
+// page readers, the checkpoint's (walCheckpoint returns sqlite3OsRead's
+// code, wal.c:2311-2312) and a commit's reread of the frames whose
+// checksums it rewrites (walRewriteChecksums keeps it, wal.c:4002, 4010).
 func frameReadErr(err error) error {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return fmt.Errorf("%w: %w", ErrWALShortRead, err)
 	}
 	return err
+}
+
+// frameReadResult judges a read of size bytes of a WAL frame that did not
+// return them all with no error: ReadAt returned n bytes and err. The
+// readers call it only then. All size bytes with io.EOF, which ReadAt may
+// return for a read that ends at the end of the file, are a read that
+// succeeded: nil. Fewer are a short read, whatever ReadAt said with them
+// (frameReadErr): of its io.EOF, or of io.ErrUnexpectedEOF when it gave no
+// error, as a file system that returns a short count with no error does
+// (io.ReaderAt does not allow it). Any other error is returned as it is.
+func frameReadResult(size, n int, err error) error {
+	if n >= size && (err == nil || errors.Is(err, io.EOF)) {
+		return nil
+	}
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	return frameReadErr(err)
 }
 
 // errWalFrameRange is the error of a frame read the wal-index cannot have
@@ -3373,10 +3399,12 @@ func (w *wal) readFramePageHook(frame, pgno uint32, buf, scratchBuf []byte, aead
 	}
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
-	if _, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil {
+	if n, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil || n < int(w.pageSize) {
 		// Multi-process: a stale nFrame view may have let us try to read
 		// past the peer's actual WAL tail (frameReadErr).
-		return frameReadErr(err)
+		if err = frameReadResult(int(w.pageSize), n, err); err != nil {
+			return err
+		}
 	}
 	// BEGIN ENCRYPTION
 	// Decrypt frame payload if a codec is installed. The page number binds
@@ -3424,8 +3452,10 @@ func (w *wal) readFramePgno(frame uint32) (uint32, error) {
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	headerOffset := int64(walHeaderSize) + int64(frame-1)*frameSize
 	var hdr [4]byte
-	if _, err := w.file.ReadAt(hdr[:], headerOffset); err != nil {
-		return 0, frameReadErr(err)
+	if n, err := w.file.ReadAt(hdr[:], headerOffset); err != nil || n < len(hdr) {
+		if err = frameReadResult(len(hdr), n, err); err != nil {
+			return 0, err
+		}
 	}
 	return binary.BigEndian.Uint32(hdr[:4]), nil
 }
@@ -4168,12 +4198,10 @@ func (w *wal) buildBackfillMap(lo, hi uint32) (map[uint32]uint32, error) {
 	var frame walFrame
 	for i := lo; i < hi; i++ {
 		off := int64(walHeaderSize) + int64(i)*frameSize
-		n, err := w.file.ReadAt(frameBuf, off)
-		if err != nil {
-			return nil, frameReadErr(err)
-		}
-		if n != len(frameBuf) {
-			return nil, frameReadErr(io.ErrUnexpectedEOF)
+		if n, err := w.file.ReadAt(frameBuf, off); err != nil || n < len(frameBuf) {
+			if err = frameReadResult(len(frameBuf), n, err); err != nil {
+				return nil, err
+			}
 		}
 		frame.deserialize(frameBuf)
 		// Overwrite keeps the latest frame, since i increases monotonically.
@@ -4217,8 +4245,10 @@ func (w *wal) rewriteChecksums(iLast uint32) error {
 		// Read cksum1/cksum2 from the WAL header (bytes 24..31 of the
 		// 32-byte walHeader).
 		var hdrCksumBuf [8]byte
-		if _, err := w.file.ReadAt(hdrCksumBuf[:], 24); err != nil {
-			return err
+		if n, err := w.file.ReadAt(hdrCksumBuf[:], 24); err != nil || n < len(hdrCksumBuf) {
+			if err = frameReadResult(len(hdrCksumBuf), n, err); err != nil {
+				return err
+			}
 		}
 		s1 = binary.BigEndian.Uint32(hdrCksumBuf[0:4])
 		s2 = binary.BigEndian.Uint32(hdrCksumBuf[4:8])
@@ -4227,8 +4257,10 @@ func (w *wal) rewriteChecksums(iLast uint32) error {
 		// 16..23 of the 24-byte walFrame struct.
 		prevOff := int64(walHeaderSize) + int64(w.iReCksum-2)*frameSize
 		var prevCksumBuf [8]byte
-		if _, err := w.file.ReadAt(prevCksumBuf[:], prevOff+16); err != nil {
-			return err
+		if n, err := w.file.ReadAt(prevCksumBuf[:], prevOff+16); err != nil || n < len(prevCksumBuf) {
+			if err = frameReadResult(len(prevCksumBuf), n, err); err != nil {
+				return err
+			}
 		}
 		s1 = binary.BigEndian.Uint32(prevCksumBuf[0:4])
 		s2 = binary.BigEndian.Uint32(prevCksumBuf[4:8])
@@ -4242,12 +4274,17 @@ func (w *wal) rewriteChecksums(iLast uint32) error {
 	for i := w.iReCksum; i <= iLast; i++ {
 		off := int64(walHeaderSize) + int64(i-1)*frameSize
 
-		// Read the existing frame header + page data.
-		if _, err := w.file.ReadAt(frameHdr[:], off); err != nil {
-			return err
+		// Read the existing frame header + page data. A read that comes
+		// up short is ErrWALShortRead, as for every reader of a frame.
+		if n, err := w.file.ReadAt(frameHdr[:], off); err != nil || n < len(frameHdr) {
+			if err = frameReadResult(len(frameHdr), n, err); err != nil {
+				return err
+			}
 		}
-		if _, err := w.file.ReadAt(pageData, off+walFrameSize); err != nil {
-			return err
+		if n, err := w.file.ReadAt(pageData, off+walFrameSize); err != nil || n < len(pageData) {
+			if err = frameReadResult(len(pageData), n, err); err != nil {
+				return err
+			}
 		}
 
 		// Recompute checksums over (header-first-8 + page data).
@@ -4674,14 +4711,10 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 				}
 				frameIdx := latest[pgno]
 				off := int64(walHeaderSize) + int64(frameIdx)*frameSize
-				n, err := w.file.ReadAt(pageData, off+walFrameSize)
-				if err != nil {
-					backfillErr = frameReadErr(err)
-					break
-				}
-				if n != len(pageData) {
-					backfillErr = frameReadErr(io.ErrUnexpectedEOF)
-					break
+				if n, err := w.file.ReadAt(pageData, off+walFrameSize); err != nil || n < len(pageData) {
+					if backfillErr = frameReadResult(len(pageData), n, err); backfillErr != nil {
+						break
+					}
 				}
 				// Page 1 reaches the main file with the keyed salt, as every
 				// write of page 1 does (encryptPageWithCodec), whatever its
@@ -4699,7 +4732,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 					copy(pageData[dbHeaderSaltOff:dbHeaderSaltOff+SaltLen], w.keySalt[:])
 				}
 				pageOffset := int64(pgno-1) * pageSz
-				n, err = dbFile.WriteAt(pageData, pageOffset)
+				n, err := dbFile.WriteAt(pageData, pageOffset)
 				if err != nil {
 					backfillErr = err
 					break

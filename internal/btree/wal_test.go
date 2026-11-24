@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -1719,6 +1720,52 @@ func TestWriteFrames_ChecksumChainConsistentAfterRewrite(t *testing.T) {
 	buf := make([]byte, 4096)
 	require.NoError(t, w2.readFrame(frame, buf, nil, nil))
 	assert.Equal(t, byte(0x77), buf[0], "recovery should yield the overwritten data, not the original")
+}
+
+// A commit that rewrites the checksums of the frames it reused reads them
+// back, and a read that comes up short there is ErrWALShortRead, as for
+// every reader of a frame, keeping the read's io.EOF: the checksum seed in
+// the frame before the first one reused, and a frame's header and page.
+// walRewriteChecksums returns sqlite3OsRead's code (wal.c:4002, 4010).
+func TestRewriteChecksums_ShortReadIsErrWALShortRead(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reused uint32 // the frame the second spill reuses
+		cut    int64  // where the log is cut, from the start of frame 1
+	}{
+		{"a frame's page", 1, int64(walFrameSize) + 4096 + walFrameSize + 100},
+		{"the checksum seed in the frame before", 2, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "test.wal")
+			w := newWal(path, 4096)
+			require.NoError(t, w.open())
+			t.Cleanup(func() { _ = w.close(false) })
+			_, err := w.beginWrite()
+			require.NoError(t, err)
+			t.Cleanup(w.endWrite)
+
+			// Frames 1 and 2, then one of them written again: it is
+			// reused, and the commit rewrites the checksums from it on.
+			require.NoError(t, w.writeFrames([]*page{
+				{pgno: 3, data: make([]byte, 4096)},
+				{pgno: 5, data: make([]byte, 4096)},
+			}, false, 0))
+			pgno := map[uint32]uint32{1: 3, 2: 5}[tc.reused]
+			again := &page{pgno: pgno, data: bytes.Repeat([]byte{0x77}, 4096)}
+			require.NoError(t, w.writeFrames([]*page{again}, false, 0))
+			require.Equal(t, uint32(2), w.nFrame.Load())
+			require.Equal(t, tc.reused, w.iReCksum)
+
+			require.NoError(t, os.Truncate(path, walHeaderSize+tc.cut))
+			w.mu.Lock()
+			err = w.rewriteChecksums(2)
+			w.mu.Unlock()
+			require.ErrorIs(t, err, ErrWALShortRead)
+			require.ErrorIs(t, err, io.EOF)
+			require.NotErrorIs(t, err, ErrCorrupt)
+		})
+	}
 }
 
 // TestWriteFrames_SavepointRollbackResetsIReCksum confirms that

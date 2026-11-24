@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -59,16 +60,17 @@ func TestOpen_DirtyCatalogRootPastTheDatabase(t *testing.T) {
 }
 
 // A dirty open whose catalog page the file holds only in part met damage:
-// the page reads as zeros past the end of the file, as SQLite's readDbPage
-// reads it, and fails its checksum. It is ErrQuickCheckFailed, not a check
-// that did not complete, and the marker stays.
+// the read of a page of the database that the file ends inside is
+// ErrCorrupt, not an error of the read. It is ErrQuickCheckFailed, not a
+// check that did not complete, and the marker stays.
 func TestOpen_DirtyCatalogPageCutShort(t *testing.T) {
 	path := dirtyDB(t, func(path string) {
 		require.NoError(t, os.Truncate(path, 4096+2048))
 	})
 	_, err := anystore.Open(context.Background(), path, &anystore.Config{Durability: anystore.DurabilityConfig{Sentinel: true}})
 	require.ErrorIs(t, err, anystore.ErrQuickCheckFailed)
-	require.ErrorIs(t, err, anystore.ErrPageIntegrity)
+	require.ErrorIs(t, err, anystore.ErrCorrupt)
+	require.NotErrorIs(t, err, io.EOF)
 	_, err = os.Stat(path + ".lock")
 	require.NoError(t, err, "the marker stays")
 }

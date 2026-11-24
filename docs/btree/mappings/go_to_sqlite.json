@@ -2001,6 +2001,12 @@
     ],
     "note": "page 1 is written after the creation journal and its directory are synced and before the journal's delete commits the creation, as a PGHDR_NEED_SYNC page is"
   },
+  "pager.go:*pager.dbFileReadErr": {
+    "sqlite": [
+      "pager.c:readDbPage"
+    ],
+    "note": "a read of a page of the database file that came up short: the read's error when the file holds the page, ErrCorrupt (errPageCutShort) when the file ends inside it; readDbPage zero-fills both (pager.c:3042-3044; drift-7)"
+  },
   "pager.go:*pager.decryptPage": {
     "sqlite": [],
     "note": ""
@@ -2228,8 +2234,10 @@
     "note": "tries up to keyProbePages other pages of the database (up to lockBtreePageCount's size) under the open's key, and keeps the first read error; no SQLCipher counterpart (drift-2026-11-24-3)"
   },
   "pager.go:*pager.readDBPage": {
-    "sqlite": [],
-    "note": ""
+    "sqlite": [
+      "pager.c:readDbPage"
+    ],
+    "note": "the database-file branch of readDbPage; a read that did not return the whole page goes to dbFileReadErr (drift-7)"
   },
   "pager.go:*pager.readHeaderCounters": {
     "sqlite": [],
@@ -3250,6 +3258,12 @@
       "wal.c:sqlite3WalReadFrame"
     ],
     "note": "the error of a failed frame read: ErrWALShortRead for a short read (SQLITE_IOERR_SHORT_READ from unixRead), the read's own error otherwise (drift-2026-07-10-1)"
+  },
+  "wal.go:frameReadResult": {
+    "sqlite": [
+      "wal.c:sqlite3WalReadFrame"
+    ],
+    "note": "a frame read judged by its count and its error: all the bytes with io.EOF succeed, fewer are a short read (frameReadErr), io.ErrUnexpectedEOF when no error came with them (drift-2026-07-10-1)"
   },
   "wal.go:htFrameSegIdx": {
     "sqlite": [

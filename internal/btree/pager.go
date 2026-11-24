@@ -485,16 +485,13 @@ func (p *pager) takeCellBuf(minCap int) []byte {
 // the current window), falls back to ReadAt. Matches SQLite's
 // getPageMMap → getPageNormal gate (pager.c:5670-5710).
 //
-// A read that comes up short (the file ends inside or before the page)
-// is not an error: the part of buf past the end reads as zeros, as
-// readDbPage takes sqlite3OsRead's SQLITE_IOERR_SHORT_READ for SQLITE_OK
-// (pager.c:3041-3044) and unixRead zero-fills what it did not read
-// (os_unix.c:3574-3577). The caller reads the page only when it is within
-// the snapshot's page count, so a page the file holds only in part is
-// damage, and the page's own checks report it: its checksum or
-// authentication tag, or its format. Any other failure of the read is
-// returned as it is. The mmap path returns nil on success because the
-// slice is exactly len(buf) (checked in dbMmap.fetch).
+// The caller reads the page only when it is within the snapshot's page
+// count. A read that does not return the whole page with no error is
+// judged by dbFileReadErr, and only then: a page the file holds only in
+// part is damage, a read that came up short of bytes the file holds is
+// that read's error, and any other failure of the read is returned as it
+// is. The mmap path returns nil on success because the slice is exactly
+// len(buf) (checked in dbMmap.fetch).
 func (p *pager) readDBPage(pgno uint32, buf []byte) error {
 	if p.file == nil {
 		return fmt.Errorf("btree: db file closed")
@@ -523,14 +520,52 @@ func (p *pager) readDBPage(pgno uint32, buf []byte) error {
 	}
 
 	n, err := p.file.ReadAt(buf, offset)
-	if err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			clear(buf[n:])
-			return nil
-		}
-		return err
+	if err != nil || n < len(buf) {
+		return p.dbFileReadErr(pgno, len(buf), n, err)
 	}
 	return nil
+}
+
+// errPageCutShort is the error of a read of a page within the database's
+// page count that the database file holds only in part, or not at all: the
+// file ends inside or before it. It matches ErrCorrupt.
+var errPageCutShort = nestedError("btree: the database file ends inside a page of the database", ErrCorrupt)
+
+// dbFileReadErr judges a read of size bytes of page pgno from the database
+// file that did not return them all with no error: ReadAt returned n bytes
+// and err. It runs only then, so a read that succeeds pays nothing for it.
+//
+//   - All size bytes with io.EOF, which ReadAt may return for a read that
+//     ends at the end of the file: the read succeeded, nil.
+//   - Fewer, with io.EOF, io.ErrUnexpectedEOF or no error: the file's size
+//     decides (Stat, on the descriptor). When the file holds the page's
+//     bytes, the read came up short of them on its own, and its error is
+//     returned (io.ErrUnexpectedEOF when it gave none): a read that may
+//     succeed when it is tried again says nothing about the file. When the
+//     file ends inside or before the page, the page is cut short:
+//     errPageCutShort, which matches ErrCorrupt. A Stat that fails leaves
+//     the read's error.
+//   - Any other error is returned as it is.
+//
+// DRIFT: a page within the database's page count that the database file holds only in part is ErrCorrupt, and a read that came up short of bytes the file holds is the read's error; readDbPage zero-fills both and returns SQLITE_OK. See docs/btree/NOTES.md#drift-7-short-db-file-read-treated-as-hard-error
+func (p *pager) dbFileReadErr(pgno uint32, size, n int, err error) error {
+	if n >= size && (err == nil || errors.Is(err, io.EOF)) {
+		return nil
+	}
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return err
+	}
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	info, serr := p.file.Stat()
+	if serr != nil {
+		return err
+	}
+	if end := int64(pgno-1)*int64(p.pageSize) + int64(size); info.Size() >= end {
+		return err
+	}
+	return fmt.Errorf("%w: page %d, the file is %d bytes", errPageCutShort, pgno, info.Size())
 }
 
 // recycleCellBuf returns a byte buffer to the pager's free-list for reuse. If
@@ -941,6 +976,10 @@ func (p *pager) readPage1AtOpen() error {
 	var (
 		keyCheck        page1KeyCheck
 		unauthenticated error
+		// cut is the error of a page 1 that the database file holds only
+		// in part (errPageCutShort), returned once the header and the
+		// size have been judged.
+		cut error
 	)
 	if frame > 0 {
 		walBuf := make([]byte, p.pageSize)
@@ -961,18 +1000,25 @@ func (p *pager) readPage1AtOpen() error {
 	} else {
 		// The whole page, as readDbPage reads it from the file
 		// (pager.c:3039-3043): a read error anywhere in page 1 fails the
-		// open, as it fails lockBtree (btree.c:3288-3289). A short read is
-		// not an error there, the rest of the page reads as zeros; only a
-		// file too short to hold the header is unusable.
+		// open, as it fails lockBtree (btree.c:3288-3289). A read that
+		// came up short is judged as every read of a page of the file is
+		// (dbFileReadErr): short of bytes the file holds, it is the read's
+		// error; in a file too short to hold the header, the header is
+		// unusable; in a file that ends inside page 1 past its header, the
+		// page is damaged, which the open reports after it has judged the
+		// header and the size, as it reports them whatever the rest of the
+		// page holds.
 		buf := make([]byte, p.pageSize)
 		n, err := p.file.ReadAt(buf, 0)
-		if err != nil {
-			short := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
-			if !short {
-				return fmt.Errorf("btree: failed to read database page 1: %w", err)
-			}
-			if n < dbHeaderSize {
-				return fmt.Errorf("%w: file of %d bytes is shorter than the header", ErrHeaderCorrupt, n)
+		if err != nil || n < len(buf) {
+			if err := p.dbFileReadErr(1, len(buf), n, err); err != nil {
+				if !errors.Is(err, errPageCutShort) {
+					return fmt.Errorf("btree: failed to read database page 1: %w", err)
+				}
+				if n < dbHeaderSize {
+					return fmt.Errorf("%w: file of %d bytes is shorter than the header", ErrHeaderCorrupt, n)
+				}
+				cut = err
 			}
 		}
 		if err := page1HeaderAtOpen(buf[:dbHeaderSize], &header, fileVersioned); err != nil {
@@ -982,10 +1028,10 @@ func (p *pager) readPage1AtOpen() error {
 		// Under a key the rest of page 1 is authenticated here, as
 		// SQLCipher's codec decrypts page 1 when lockBtree fetches it
 		// (sqlite3Codec from readDbPage; sqlcipher.c:3263-3295, v4.14.0).
-		// A page 1 cut short reads as zeros past its end and fails the
-		// same way. The checksum codec's page 1 is not verified by the
-		// open: it is by the first read of it, as before.
-		if p.keyed {
+		// A page 1 cut short is damage whatever the key, and is not
+		// authenticated. The checksum codec's page 1 is not verified by
+		// the open: it is by the first read of it, as before.
+		if p.keyed && cut == nil {
 			scratch := make([]byte, p.pageSize)
 			if _, derr := decryptPageWithCodec(p.codec, scratch, buf, 1, new(aeadScratch), p.page1Hook(&keyCheck)); derr != nil {
 				derr = fmt.Errorf("btree: page 1: %w", derr)
@@ -1007,6 +1053,9 @@ func (p *pager) readPage1AtOpen() error {
 	nPage, err := lockBtreePageCount(&header, nPageFile)
 	if err != nil {
 		return err
+	}
+	if cut != nil {
+		return fmt.Errorf("btree: database page 1: %w", cut)
 	}
 	// BEGIN ENCRYPTION
 	if unauthenticated != nil {
@@ -1129,11 +1178,14 @@ func (p *pager) page1Unauthenticated(perr error, kc *page1KeyCheck, nPage, maxFr
 // A page that cannot be read (an I/O error, a failed wal-index lookup, a
 // WAL frame the log does not hold), or that the codec fails on with an
 // error that is not ErrPageIntegrity, is not tried: its error is kept, and
-// the probe goes on, since a later page can still prove the key. A page
-// the database file ends inside reads as zeros past the end, as page 1
-// does at open (readDbPage forgives the short read, pager.c:3042-3044),
-// and fails its authentication. No failure here reaches the integrity
-// hook: with a wrong key every page fails, and none of them is damaged.
+// the probe goes on, since a later page can still prove the key. A read of
+// the database file that comes up short is judged as every read of a page
+// of the file is (dbFileReadErr): short of bytes the file holds, it is a
+// page that could not be read; a page the file ends inside is damaged
+// whatever the key, and is counted with the pages that fail their
+// authentication, which prove nothing either. No failure here reaches the
+// integrity hook: with a wrong key every page fails, and none of them is
+// damaged.
 func (p *pager) proveKeyAtOpen(nPage, maxFrame, minFrame uint32) (proven bool, tried int, readErr error) {
 	if nPage < 2 {
 		return false, 0, nil
@@ -1174,12 +1226,17 @@ func (p *pager) proveKeyAtOpen(nPage, maxFrame, minFrame uint32) (proven bool, t
 			continue
 		}
 		n, err := p.file.ReadAt(buf, int64(pgno-1)*int64(p.pageSize))
-		if err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-				keep(pgno, err)
+		if err != nil || n < len(buf) {
+			if err = p.dbFileReadErr(pgno, len(buf), n, err); err != nil {
+				if errors.Is(err, errPageCutShort) {
+					// Damage, whatever the key: it proves nothing, as
+					// a page that fails its authentication does not.
+					tried++
+				} else {
+					keep(pgno, err)
+				}
 				continue
 			}
-			clear(buf[n:])
 		}
 		// A codec's error that is not a failed authentication (a key
 		// service that is not available, say) tried nothing, as for a
@@ -2036,7 +2093,6 @@ func (p *pager) notePage1Read(pgno uint32, data []byte) {
 // cache.codecScratch / &cache.codecAEAD. Pass nil/nil for the rare nil-
 // cache path (admission-control refusal, integrity checks); the codec
 // falls back to allocPageBuffer in that case.
-// DRIFT: short DB-file read on in-bounds page is hard error in Go, zero-pad OK in C See docs/btree/NOTES.md#drift-7-short-db-file-read-treated-as-hard-error
 func (p *pager) readTempPage(pgno, walMaxFrame, walMinFrame, dbSizeBound uint32, codecBuf []byte, codecAEAD *aeadScratch) (*page, error) {
 	pg := p.acquireTempPage()
 	pg.pgno = pgno
@@ -3113,10 +3169,12 @@ func (p *pager) pagerPageCount(walNPage uint32) (nPage uint32, ok bool, err erro
 //     commit would have loaded it anyway.
 //   - Its header must decode as a database header. An image that is not
 //     one is SQLite's SQLITE_NOTADB (btree.c:3306), which any-store reports
-//     as ErrHeaderCorrupt here as it does at open. A database file too short
-//     to hold page 1 is a read error instead: the page getters do not
-//     zero-fill a short read (drift-7), where SQLite would zero-fill and
-//     then fail the magic check. Either way the begin fails.
+//     as ErrHeaderCorrupt here as it does at open. A database file that
+//     ends inside page 1 is damage instead, errPageCutShort (ErrCorrupt),
+//     and a read of page 1 that came up short of bytes the file holds is
+//     that read's error: the page getters do not zero-fill a short read
+//     (dbFileReadErr, drift-7), where SQLite would zero-fill and then fail
+//     the magic check. Either way the begin fails.
 //   - The size comes out of lockBtreePageCount against the pager's count
 //     (committedPageCount).
 //
@@ -3350,8 +3408,8 @@ func (p *pager) readWalFrameDataRaw(frame uint32, buf []byte) error {
 	}
 	frameSize := int64(walFrameSize) + int64(p.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
-	if _, err := p.wal.file.ReadAt(buf, offset); err != nil {
-		return frameReadErr(err)
+	if n, err := p.wal.file.ReadAt(buf, offset); err != nil || n < len(buf) {
+		return frameReadResult(len(buf), n, err)
 	}
 	return nil
 }
