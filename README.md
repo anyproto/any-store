@@ -15,12 +15,12 @@ Schema-less documents, rich indexes, full-text and vector search, ACID transacti
 * **Full-text search** — btree-resident inverted index with BM25 ranking via `$text`: phrases, prefixes, anchored and per-field matching for search-as-you-type. See [docs/full-text-search.md](docs/full-text-search.md).
 * **Vector search** — btree-resident ANN indexes (IVF-SQ, HNSW, brute-force) via `$knn`. See [docs/vector-search.md](docs/vector-search.md) and [docs/vector-engine.md](docs/vector-engine.md).
 * **Aggregation** — MongoDB-style pipelines: shaping (`$match`, `$group`, `$sort`, `$unwind`, `$facet`, ...), computed expressions (arithmetic, conditionals, comparisons, date math), field-to-field `$expr` predicates, primary-key `$lookup` joins, and materialization via `$merge`/`$out` — with planner pushdown. See [docs/aggregation.md](docs/aggregation.md).
-* **ACID transactions** — snapshot-isolated read transactions, single-writer write transactions.
-* **Multi-process** — SQLite-like contract: any number of OS processes may open, read and write the same database file at any time (WAL + shared-memory index, busy handling, cross-process DDL reconciliation).
-* **Durability** — idle auto-flush, explicit checkpointing, crash-safe WAL recovery, sentinel-triggered quick check after unclean shutdown.
+* **ACID transactions** — snapshot-isolated read transactions, single-writer write transactions. By default a commit survives a process crash and is synced at the next checkpoint, as in SQLite's WAL mode at `synchronous=NORMAL`; `CommitSync` syncs every commit (see [Durability](#durability)).
+* **Multi-process** — SQLite-like contract on Linux and Darwin, amd64 and arm64: any number of OS processes may open, read and write the same database file at any time (WAL + shared-memory index, busy handling, cross-process DDL reconciliation). Other targets run one process at a time (see [Multi-process](#multi-process)).
+* **Durability** — SQLite's WAL durability levels, crash-safe WAL recovery, explicit checkpointing, opt-in idle auto-flush, sentinel-triggered quick check after unclean shutdown.
 * **Integrity & encryption** — per-page XXH3-128 checksums by default; optional AES-GCM or (X)ChaCha20-Poly1305 (AEAD doubles as integrity).
 * **Streaming iterators** — low-memory scans with a cursor API; [AnyEnc](anyenc) arena encoding minimizes GC churn.
-* **Cross-platform** — pure Go, no CGO; runs anywhere Go runs, including `js/wasm` (see [wasm/](wasm)).
+* **Cross-platform** — pure Go, no CGO; builds for every Go target, `js/wasm` included (see [wasm/](wasm)), with multi-process access on Linux and Darwin, amd64 and arm64.
 * **CLI** — inspection, import/export and interactive shell.
 
 ## Quick start
@@ -177,11 +177,15 @@ res, _ := orders.Aggregate(`[
 
 ## Multi-process
 
-The database file behaves like SQLite in WAL mode: any process may open it at any moment and read or write concurrently. Coordination runs through file locks and a shared-memory WAL index; snapshot reads are never blocked, writers serialize, and busy situations back off through a configurable handler. DDL from a peer process (created/dropped collections and indexes) is reconciled automatically on the next transaction.
+On Linux (Android included) and Darwin (macOS, iOS), on amd64 and arm64, the database file behaves like SQLite in WAL mode: any process may open it at any moment and read or write concurrently. Coordination runs through file locks and a shared-memory WAL index; snapshot reads are never blocked, writers serialize, and a lock held by another process is retried, with SQLite's backoff, until the busy timeout ends with `ErrBusy`. The busy timeout is fixed at 5 seconds; there is no option to change it. DDL from a peer process (created/dropped collections and indexes) is reconciled automatically on the next transaction.
+
+Every other target runs a database in one process at a time, with its WAL index in that process's memory. On Windows, FreeBSD and the other Unix systems, and on 32-bit targets, the process that opens the file first holds an exclusive lock on it, and another process's `Open` fails. `js/wasm` and `wasip1` take no lock at all: nothing stops a second process, or a second browser tab, from opening the file, so the application has to prevent it.
 
 ## Durability
 
-Any Store performs WAL checkpoints and fsync after idle periods.
+By default a commit is written to the WAL and not synced, as in SQLite's WAL mode at `synchronous=NORMAL`: the WAL is synced when a checkpoint copies it into the database file — automatically once it holds `Config.AutoCheckpointAfter` frames (10,000 by default), on `Flush`, and on the last `Close` of the database. A process crash loses no committed transaction. A power loss or an OS crash leaves the database consistent, but the commits made since the last sync can be lost although they returned without error. `Config.CommitSync` syncs the WAL on every commit, as `synchronous=FULL` does: a commit that returned survives a power loss, at the cost of a sync per commit.
+
+Auto-flush (`Durability.AutoFlush`, off by default) adds a checkpoint, and so a sync, once the database has been idle for `IdleAfter`:
 
 ```go
 db, _ := anystore.Open(ctx, "data.db", &anystore.Config{

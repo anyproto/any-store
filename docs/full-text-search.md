@@ -382,8 +382,8 @@ every insert, update, and delete.
 - **Batch your writes.** A batch insert (one `Insert(docs...)` call or one
   `WriteTx`) collapses the per-term postings rewrites to once-per-touched-chunk
   at commit — substantially faster and lower-allocation than per-document
-  transactions. Each commit also pays the durability flush once for the whole
-  batch.
+  transactions. Each commit also pays its WAL write (and, with `CommitSync`,
+  its sync) once for the whole batch.
 - **Interactive edits are cheap.** The diff-based update touches only changed
   terms, so editing a small note runs at tens of thousands of edits/second.
 - **Queries are interactive.** BM25 ranking over the postings is sub-millisecond
@@ -404,7 +404,7 @@ every insert, update, and delete.
 
 ```go
 ctx := context.Background()
-db, _ := anystore.Open(ctx, ":memory:", nil)
+db, _ := anystore.Open(ctx, ":memory:", &anystore.Config{InMemory: true}) // InMemory, not the path, keeps it in memory
 defer db.Close()
 
 coll, _ := db.CreateCollection(ctx, "pages")

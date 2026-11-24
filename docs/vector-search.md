@@ -361,14 +361,15 @@ O(live); for very large indexes prefer `0` and schedule
   see §1.
 - **Document encoding** — store the embedding as `anyenc.TypeVectorF32` (not a
   number array): ~2× smaller docs and a faster pipeline, recall unchanged.
-- **`:memory:`** keeps the whole DB resident — fastest, but many× the RAM of a
-  file-backed DB.
+- **`Config{InMemory: true}`** keeps the whole DB resident — fastest, but many×
+  the RAM of a file-backed DB. The path `":memory:"` alone is an ordinary file
+  name: it opens a file called `:memory:` on disk.
 
 ## 7. End-to-end example
 
 ```go
 ctx := context.Background()
-db, _ := anystore.Open(ctx, ":memory:", nil)
+db, _ := anystore.Open(ctx, ":memory:", &anystore.Config{InMemory: true}) // InMemory, not the path, keeps it in memory
 defer db.Close()
 
 coll, _ := db.CreateCollection(ctx, "docs")

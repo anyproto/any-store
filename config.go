@@ -118,6 +118,8 @@ type Config struct {
 	// The database does not survive process crashes. When true, InProcess
 	// and CommitSync=false are forced on automatically.
 	// The path argument to Open is ignored and can be any string (e.g. ":memory:").
+	// Without InMemory a path is always a file: ":memory:" names a file of
+	// that name in the working directory, unlike in SQLite.
 	InMemory bool
 
 	// DisableCompression disables S2 compression for document values.
