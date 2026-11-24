@@ -2010,16 +2010,16 @@
     ],
     "note": "fans out the per-page update to all attached Backups for every page the source logs: a commit's pages and each spilled page (pager.c:3219-3225)"
   },
+  "pager.go:*pager.downgradeDBLock": {
+    "sqlite": [],
+    "note": "exclusive to shared in the open; a flock conversion can be refused, so it waits with a count of its own"
+  },
   "pager.go:*pager.effectiveReaderDbSize": {
     "sqlite": [
       "pager.c:pagerPagecount",
       "wal.c:sqlite3WalDbsize"
     ],
     "note": "a reader's page count for its snapshot; the file-size fallback is memoized per wal-index header (drift-2026-11-11-3)"
-  },
-  "pager.go:*pager.downgradeDBLock": {
-    "sqlite": [],
-    "note": "exclusive to shared in the open; a flock conversion can be refused, so it waits with a count of its own"
   },
   "pager.go:*pager.encryptPage": {
     "sqlite": [],
