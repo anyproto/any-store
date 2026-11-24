@@ -362,8 +362,9 @@ type pager struct {
 	// header given, or with a file that has no database yet (nil). open
 	// calls it with the DB-file lock held, on the header it read under that
 	// lock, and before it asks for the exclusive lock to create a database;
-	// a call that finds the codec already built for the same file state
-	// does nothing. Set by Open for a file-backed database.
+	// a call that finds the codec built for the salt the file carries (for
+	// a file with no database, a salt drawn for a new file) does nothing.
+	// Set by Open for a file-backed database.
 	settleCodec func(hdr *dbHeader) error
 	// END ENCRYPTION
 }

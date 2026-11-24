@@ -662,11 +662,15 @@ func Open(path string, opts Options) (*DB, error) {
 	// with the DB-file lock held, on the header it read under that lock;
 	// a file with content whose header is unreadable, or that the options
 	// do not fit, is refused there, before the WAL is opened.
-	// Between the two another process may create the database, or win its
-	// creation from this open; the second call then builds the codec again,
-	// from the salt that is in the file. It does nothing when the first
-	// look still holds, which is every open of a database that already
-	// existed.
+	// The second call does nothing while the file carries the salt the
+	// codec was built for: in every open of a database that already
+	// existed, and in an open that created the database, whose page 1
+	// carries the salt drawn for it. So an open derives a passphrase key
+	// once, as SQLCipher derives a codec context's key once, at its first
+	// use (sqlcipher_codec_key_derive, sqlcipher.c:1849-1880, v4.14.0).
+	// Between the two calls another process may create the database, or
+	// win its creation from this open; the second call then builds the
+	// codec again, from the salt that is in the file.
 	wantEncryption := opts.Key != nil || opts.Codec != nil
 	var zeroSalt [SaltLen]byte
 	// Resolve effective codec mode. Encryption is opt-in (errors if it
@@ -699,9 +703,12 @@ func Open(path string, opts Options) (*DB, error) {
 				}
 				useCksum = fileCksum
 			}
-			if settled.done && settled.exists == fileExists && settled.cksum == useCksum &&
-				(!fileExists || settled.salt == hdr.Salt) {
-				// A new file keeps the salt drawn for it.
+			// The codec stays while it was built for the salt the file
+			// carries: the salt in the header of a database, or, for a file
+			// with no database yet, a salt drawn for a new file. A database
+			// this open created carries the salt drawn for it.
+			if settled.done && settled.cksum == useCksum &&
+				(fileExists && settled.salt == hdr.Salt || !fileExists && !settled.exists) {
 				return nil
 			}
 			var salt [SaltLen]byte
