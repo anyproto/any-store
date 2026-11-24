@@ -3257,12 +3257,15 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 // err. A short read (the file ends before the frame) is ErrWALShortRead:
 // the wal-index points at a frame the file does not hold, as SQLite's read
 // gives SQLITE_IOERR_SHORT_READ (sqlite3WalReadFrame returns
-// sqlite3OsRead's result, wal.c:3649-3664; unixRead). Any other failure of
-// the read is returned as it is: an I/O error says nothing about the log's
-// content.
+// sqlite3OsRead's result, wal.c:3649-3664; unixRead), and the read's own
+// error stays in the chain (io.EOF), as SQLITE_IOERR_SHORT_READ is a kind
+// of SQLITE_IOERR. Any other failure of the read is returned as it is: an
+// I/O error says nothing about the log's content. Every read of a frame
+// goes through it: the page readers and the checkpoint's (walCheckpoint
+// returns sqlite3OsRead's code, wal.c:2311-2312).
 func frameReadErr(err error) error {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return ErrWALShortRead
+		return fmt.Errorf("%w: %w", ErrWALShortRead, err)
 	}
 	return err
 }
@@ -4167,10 +4170,10 @@ func (w *wal) buildBackfillMap(lo, hi uint32) (map[uint32]uint32, error) {
 		off := int64(walHeaderSize) + int64(i)*frameSize
 		n, err := w.file.ReadAt(frameBuf, off)
 		if err != nil {
-			return nil, err
+			return nil, frameReadErr(err)
 		}
 		if n != len(frameBuf) {
-			return nil, io.ErrUnexpectedEOF
+			return nil, frameReadErr(io.ErrUnexpectedEOF)
 		}
 		frame.deserialize(frameBuf)
 		// Overwrite keeps the latest frame, since i increases monotonically.
@@ -4673,11 +4676,11 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 				off := int64(walHeaderSize) + int64(frameIdx)*frameSize
 				n, err := w.file.ReadAt(pageData, off+walFrameSize)
 				if err != nil {
-					backfillErr = err
+					backfillErr = frameReadErr(err)
 					break
 				}
 				if n != len(pageData) {
-					backfillErr = io.ErrUnexpectedEOF
+					backfillErr = frameReadErr(io.ErrUnexpectedEOF)
 					break
 				}
 				// Page 1 reaches the main file with the keyed salt, as every

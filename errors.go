@@ -345,9 +345,10 @@ var (
 	// It matches ErrCorrupt.
 	ErrHeaderCorrupt = btree.ErrHeaderCorrupt
 
-	// ErrWALShortRead is returned (wrapped) by a read when the index of the write-ahead log
-	// (path+"-wal-shm") points at a frame past the end of the log file (path+"-wal"): the read of
-	// the frame comes up short, as SQLite's does with SQLITE_IOERR_SHORT_READ. An I/O error while
+	// ErrWALShortRead is returned (wrapped) by a read, or a checkpoint (Flush), when the index of
+	// the write-ahead log (path+"-wal-shm") points at a frame past the end of the log file
+	// (path+"-wal"): the read of the frame comes up short, as SQLite's does with
+	// SQLITE_IOERR_SHORT_READ. The error matches the read's own too (io.EOF). An I/O error while
 	// reading a frame is not this error. Recovery itself repairs a bad WAL header and drops torn
 	// frames silently.
 	//

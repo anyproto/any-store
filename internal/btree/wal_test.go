@@ -2952,12 +2952,13 @@ func TestWriteFramesMem_InTxRangeErrorDropsAppendedFrames(t *testing.T) {
 
 // frameReadErr: a short read of a frame is ErrWALShortRead, the index
 // pointing at a frame the file does not hold, as SQLite's read gives
-// SQLITE_IOERR_SHORT_READ; it is not corruption. Any other failure of the
-// read is returned as it is.
+// SQLITE_IOERR_SHORT_READ; it is not corruption, and the read's own error
+// stays in the chain. Any other failure of the read is returned as it is.
 func TestFrameReadErr(t *testing.T) {
 	for _, short := range []error{io.EOF, io.ErrUnexpectedEOF} {
 		err := frameReadErr(short)
 		require.ErrorIs(t, err, ErrWALShortRead)
+		require.ErrorIs(t, err, short)
 		require.NotErrorIs(t, err, ErrCorrupt)
 	}
 
