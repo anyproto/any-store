@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sync"
@@ -641,8 +640,18 @@ func (p *pager) open() (err error) {
 	// process is refused at registration above; on Windows, where keys are
 	// paths, another spelling of this file fails here instead.
 	// (In-memory already returned above, so here p.inProcess implies file-backed.)
+	//
+	// A shared lock that is refused is waited for through the busy handler,
+	// as SQLite waits for its SHARED lock (pager_wait_on_lock from
+	// sqlite3PagerSharedLock, pager.c:5272): the holder is, for example, a
+	// last client inside its close or a creator writing page 1. One count
+	// serves this wait and the creation's waits for the exclusive lock
+	// (lockDBForCreate). The open's other waits have budgets of their own
+	// (docs/btree/NOTES.md, drift-63, item 4). The in-process lock is not
+	// waited for: its holder keeps it for the handle's life.
+	dbLockBusy := &beginBusy{xBusy: DefaultBusyTimeout(BusyTimeout)}
 	if !p.inProcess {
-		if err := p.lockDBShared(f); err != nil {
+		if err := p.lockDBShared(f, dbLockBusy); err != nil {
 			return err
 		}
 	} else {
@@ -679,7 +688,7 @@ func (p *pager) open() (err error) {
 		if created {
 			return fmt.Errorf("btree: database file is still empty after page 1 was written")
 		}
-		if created, err = p.createIfEmpty(f); err != nil {
+		if created, err = p.createIfEmpty(f, dbLockBusy); err != nil {
 			return err
 		}
 	}
@@ -908,13 +917,15 @@ var testOpenAfterWALOpenHook func(p *pager)
 // can hold or kill a process there: "before-lock" (nothing opened or locked
 // yet; Open has made its first, unlocked read of the header);
 // "db-lock-busy" (a request for the shared DB-file lock was refused, and
-// the open waits to ask again); and the points of a creation in order:
-// "journal-playback" (a dead creator's file is about to be truncated),
-// "journal-opened" (the journal is open, holding what the open found under
-// its name), "before-journal-sync" (its header is written),
-// "before-page1-write" (the journal and its directory are synced),
-// "before-page1-sync", "before-journal-delete" (page 1 is synced) and
-// "journal-deleted" (the creation is committed). Nil outside tests.
+// the busy handler is asked whether to ask again); and the points of a
+// creation in order: "journal-playback" (a dead creator's file is about to
+// be truncated), "journal-opened" (the journal is open, holding what the
+// open found under its name), "before-journal-sync" (its header is
+// written), "before-page1-write" (the journal and its directory are
+// synced), "before-page1-sync", "before-journal-delete" (page 1 is synced),
+// "journal-deleted" (the creation is committed) and "after-page1-sync" (the
+// creation is over; in multi-process mode the exclusive DB-file lock is
+// still held). Nil outside tests.
 var testOpenStageHook func(p *pager, stage string)
 
 // BEGIN ENCRYPTION
@@ -990,12 +1001,14 @@ func SetCreateLegacyFormatForTest(on bool) {
 	createLegacyFormat.Store(on)
 }
 
-// lockDBShared takes the shared DB-file lock, waiting up to a second for a
-// process that holds it exclusively: a last client inside its close, or a
-// creator writing page 1. It is also how an exclusive lock held by this
-// handle becomes a shared one.
-func (p *pager) lockDBShared(f fileHandle) error {
-	for attempt := 0; ; attempt++ {
+// lockDBShared takes the shared DB-file lock. While another process holds
+// the lock exclusively (for example a last client inside its close, a
+// creator writing page 1, or a process that holds the file in in-process
+// mode) the request is repeated for as long as the busy handler allows,
+// which is pager_wait_on_lock's loop (pager.c:3946-3962); when the handler
+// gives up the error matches ErrBusy, SQLite's SQLITE_BUSY.
+func (p *pager) lockDBShared(f fileHandle, busy *beginBusy) error {
+	for {
 		lockErr := acquireSharedDBLock(f)
 		if lockErr == nil {
 			return nil
@@ -1003,13 +1016,12 @@ func (p *pager) lockDBShared(f fileHandle) error {
 		if !errors.Is(lockErr, ErrBusy) {
 			return fmt.Errorf("btree: acquire DB-file shared lock: %w", lockErr)
 		}
-		if attempt == 99 {
-			return fmt.Errorf("btree: DB-file lock still busy after retries (peer mid-close?)")
-		}
 		if h := testOpenStageHook; h != nil {
 			h(p, "db-lock-busy")
 		}
-		time.Sleep(10 * time.Millisecond)
+		if !busy.retry() {
+			return fmt.Errorf("%w: DB-file lock still busy after retries (a peer inside its close or its creation, or holding the file in in-process mode)", ErrBusy)
+		}
 	}
 }
 
@@ -1045,6 +1057,17 @@ func (p *pager) headerErrorOfUnwritableFile() error {
 	return h.deserialize(buf)
 }
 
+// downgradeDBLock turns the exclusive DB-file lock this handle holds into
+// the shared one. Nothing can be in its way, but a flock conversion may let
+// go of the lock for a moment (see dbfile_lock_unix.go), in which another
+// process can take it; the request then waits with a budget of its own.
+// SQLite's downgrade asks no busy handler; with flock it only records the
+// new level (os_unix.c:2747-2750).
+// DRIFT: a flock conversion from exclusive to shared can be refused, so the downgrade waits through the busy handler with a count of its own, where SQLite's downgrade is one unlock call that asks no busy handler (pagerUnlockDb, pager.c:1133-1149; with flock it only records the new level, os_unix.c:2747-2750). See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
+func (p *pager) downgradeDBLock(f fileHandle) error {
+	return p.lockDBShared(f, &beginBusy{xBusy: DefaultBusyTimeout(BusyTimeout)})
+}
+
 // createIfEmpty turns a file whose creation is pending (creationPending: it
 // is empty, or a dead creator's journal is hot beside it) into a database of
 // one page, unless another process does it first. The caller holds the
@@ -1074,7 +1097,7 @@ func (p *pager) headerErrorOfUnwritableFile() error {
 // to the first attacher's election, which truncates one that no process
 // holds (newPlatformShm).
 // DRIFT: a database is created at open, under a flock, in a journaled transaction of any-store's own journal. See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
-func (p *pager) createIfEmpty(f fileHandle) (created bool, err error) {
+func (p *pager) createIfEmpty(f fileHandle, busy *beginBusy) (created bool, err error) {
 	// BEGIN ENCRYPTION
 	// The codec of a new file, before the exclusive lock is asked for: a key
 	// derivation, when one is needed here, is not done under it.
@@ -1085,7 +1108,7 @@ func (p *pager) createIfEmpty(f fileHandle) (created bool, err error) {
 	}
 	// END ENCRYPTION
 	if !p.inProcess {
-		won, err := p.lockDBForCreate(f)
+		won, err := p.lockDBForCreate(f, busy)
 		if err != nil || !won {
 			return false, err
 		}
@@ -1114,11 +1137,14 @@ func (p *pager) createIfEmpty(f fileHandle) (created bool, err error) {
 	if err := p.createPage1(); err != nil {
 		return false, err
 	}
+	if h := testOpenStageHook; h != nil {
+		h(p, "after-page1-sync")
+	}
 	if !p.inProcess {
 		// Shared again before the WAL is opened: the shared lock is what a
 		// closing peer's last-client test meets, and flock may let go of
 		// the lock inside a conversion.
-		if err := p.lockDBShared(f); err != nil {
+		if err := p.downgradeDBLock(f); err != nil {
 			return false, err
 		}
 	}
@@ -1134,14 +1160,15 @@ func (p *pager) createIfEmpty(f fileHandle) (created bool, err error) {
 //
 // Processes creating one file at once all hold the shared lock at first, and
 // none of them can have the exclusive one until the others let go. So a
-// process that is refused drops its lock and waits a moment, holding
-// nothing, then looks at the file again: the next request for the exclusive
-// lock is refused only while a creator is at work or a late arrival is
-// between its shared lock and its own request. A creation that stays pending
-// with the file locked by another process for BusyTimeout is ErrBusy.
-// DRIFT: a flock has no RESERVED step, so a creator refused the exclusive lock drops its shared one, sleeps 1-3 ms holding nothing and asks again until BusyTimeout; the same loop serves a hot-journal playback, for which SQLite asks for EXCLUSIVE once (pager.c:5308). See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
-func (p *pager) lockDBForCreate(f fileHandle) (bool, error) {
-	deadline := time.Now().Add(BusyTimeout)
+// process that is refused drops its lock and waits, holding nothing, then
+// looks at the file again: the next request for the exclusive lock is
+// refused only while a creator is at work or a late arrival is between its
+// shared lock and its own request. The waits are the busy handler's, on the
+// count the open's shared-lock wait started: a creation that stays pending
+// with the file locked by another process until the handler gives up is
+// ErrBusy.
+// DRIFT: a flock has no RESERVED step, so a creator refused the exclusive lock drops its shared one and asks again, holding nothing, while the busy handler allows on the open's count; the same loop serves a hot-journal playback, for which SQLite asks for EXCLUSIVE once (pager.c:5308). See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
+func (p *pager) lockDBForCreate(f fileHandle, busy *beginBusy) (bool, error) {
 	for {
 		ok, err := tryUpgradeDBLockExclusive(f)
 		if err != nil {
@@ -1155,17 +1182,16 @@ func (p *pager) lockDBForCreate(f fileHandle) (bool, error) {
 			if pending {
 				return true, nil
 			}
-			return false, p.lockDBShared(f)
+			return false, p.downgradeDBLock(f)
 		}
 		// Refused. Whether the shared lock survived the refusal depends on
 		// the kernel's flock; drop it either way.
 		if err := unlockDBFile(f); err != nil {
 			return false, fmt.Errorf("btree: release DB-file lock: %w", err)
 		}
-		if time.Now().After(deadline) {
+		if !busy.retry() {
 			return false, fmt.Errorf("%w: database file has no database yet and is locked by another process", ErrBusy)
 		}
-		time.Sleep(time.Millisecond + rand.N(2*time.Millisecond))
 		// An unlocked look. A creator at work shows an empty file or a hot
 		// journal until its commit point, so this goes on asking for the
 		// exclusive lock until then. The caller looks again under the
@@ -1175,7 +1201,7 @@ func (p *pager) lockDBForCreate(f fileHandle) (bool, error) {
 			return false, err
 		}
 		if !pending {
-			return false, p.lockDBShared(f)
+			return false, p.lockDBShared(f, busy)
 		}
 	}
 }

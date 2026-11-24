@@ -560,6 +560,7 @@ func TestCreationJournal_OrderOfTheSyncs(t *testing.T) {
 			"stage before-journal-delete",
 			"remove test.db-journal",
 			"stage journal-deleted",
+			"stage after-page1-sync",
 			"create test.db-wal",
 		}, take())
 

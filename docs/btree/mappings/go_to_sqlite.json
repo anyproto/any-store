@@ -1889,6 +1889,10 @@
     ],
     "note": "a reader's page count for its snapshot; the file-size fallback is memoized per wal-index header (drift-2026-11-11-3)"
   },
+  "pager.go:*pager.downgradeDBLock": {
+    "sqlite": [],
+    "note": "exclusive to shared in the open; a flock conversion can be refused, so it waits with a count of its own"
+  },
   "pager.go:*pager.encryptPage": {
     "sqlite": [],
     "note": ""
@@ -1999,13 +2003,13 @@
     "sqlite": [
       "pager.c:sqlite3PagerExclusiveLock"
     ],
-    "note": "flock upgrade with drop-and-retry between several creators, up to BusyTimeout; also the exclusive lock of a hot-journal playback"
+    "note": "flock upgrade with drop-and-retry between several creators, on the open's busy-handler count; also the exclusive lock of a hot-journal playback"
   },
   "pager.go:*pager.lockDBShared": {
     "sqlite": [
       "pager.c:pager_wait_on_lock"
     ],
-    "note": "shared DB-file flock, retried for a second against an exclusive holder"
+    "note": "shared DB-file flock, repeated through the busy handler; ErrBusy when it gives up"
   },
   "pager.go:*pager.newPage1": {
     "sqlite": [

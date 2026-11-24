@@ -129,9 +129,10 @@ func shmRegionsPerMap() int {
 // validate stale content, and recoverLocked rebuilds the wal-index from the
 // authoritative WAL file.
 //
-// Retry policy: bounded 100×10ms in-open loop, mirroring pager.open's
-// DB-flock retry; exhaustion wraps ErrBusy. (C surfaces SQLITE_BUSY to the
-// caller instead — DRIFT below.) The exclusive window is microseconds
+// Retry policy: bounded 100×10ms in-open loop; exhaustion wraps ErrBusy.
+// (C surfaces SQLITE_BUSY to the caller, walTryBeginRead, which takes it for
+// transient and retries up to WAL_RETRY_PROTOCOL_LIMIT times with growing
+// sleeps, wal.c:3043-3051, 3094-3102 — DRIFT below.) The exclusive window is microseconds
 // (WRLCK → ftruncate → downgrade), so a single retry normally suffices.
 //
 // Intra-process safety: POSIX fcntl record locks are per-(process, inode). A

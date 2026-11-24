@@ -1342,7 +1342,7 @@
   {
     "group": "pager_lock_state_machine",
     "category": "feature-not-ported",
-    "reason": "any-store has no OS-level file-lock promotion ladder (SHARED/RESERVED/PENDING/EXCLUSIVE) or busy-handler retry loop; WAL + writerOpMu + readerCaches channel provide concurrency without lock upgrades.",
+    "reason": "any-store has no OS-level file-lock promotion ladder (SHARED/RESERVED/PENDING/EXCLUSIVE); WAL + writerOpMu + readerCaches channel provide concurrency without lock upgrades. The busy-handler wait for the shared DB-file lock at open is ported (pager_wait_on_lock, as lockDBShared).",
     "funcs": [
       {
         "file": "pager.c",
@@ -1363,10 +1363,6 @@
       {
         "file": "pager.c",
         "func": "pager_unlock"
-      },
-      {
-        "file": "pager.c",
-        "func": "pager_wait_on_lock"
       },
       {
         "file": "pager.c",
