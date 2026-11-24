@@ -2939,7 +2939,7 @@ directory sync at the first sync of each journal and WAL descriptor, and none af
 
 <a id="drift-2026-11-21-7-creation-journal"></a>
 ### Drift: The Creation Journal Is A Header Of any-store's Own
-- **Category:** changed-logic  -  **Severity:** low  -  **Date:** 2026-11-21
+- **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `creation_journal.go:*pager.hasHotCreationJournal`,
   `creation_journal.go:*pager.creationPending`, `creation_journal.go:*pager.playbackCreationJournal`,
   `creation_journal.go:*pager.deleteJournalOfEmptyDatabase`,
@@ -4427,7 +4427,7 @@ Regression tests (`internal/btree/walindex_torn_header_test.go`): `TestTornWalIn
 
 <a id="drift-2026-11-23-1-full-pathname-follows-no-symbolic-link"></a>
 ### Drift: The Full Pathname Follows No Symbolic Link And Keeps Its "." And ".." Elements
-- **Category:** changed-logic  -  **Severity:** low  -  **Date:** 2026-11-23
+- **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `fullpath_unix.go:FullPathname`.
 
 SQLite resolves a database's name once, `rc = sqlite3OsFullPathname(pVfs, zFilename, nPathname, zPathname);` (`pager.c:4792`), builds the `-journal` and `-wal` names from the result (`pager.c:4915`, `4929`) and opens the database by it, `rc = sqlite3OsOpen(pVfs, pPager->zFilename, pPager->fd, vfsFlags, &fout);` (`pager.c:4948`). `FullPathname` is that resolution, with each platform's `xFullPathname`:
