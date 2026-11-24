@@ -187,14 +187,15 @@ var (
 
 	// ErrDBOpenInOtherProcess is returned by Open, and (wrapped) by Backup for its destination,
 	// on a platform without multi-process access, when another process has the file open.
-	// Multi-process access needs linux or darwin on amd64 or arm64; everywhere else a database
-	// file belongs to one process at a time, and a second process is refused at once, without
-	// waiting. Nothing was changed. On Windows a second Open in the same process that names
-	// the file by another path (a link) is refused with this error too.
+	// Multi-process access needs a target Go builds with the linux or darwin tag (linux,
+	// android, darwin, ios) on amd64 or arm64; everywhere else a database file belongs to one
+	// process at a time, and a second process is refused at once, without waiting. Nothing was
+	// changed. On Windows a second Open in the same process that names the file by another path
+	// (a link) is refused with this error too.
 	//
-	// It is not returned on linux or darwin on amd64 or arm64, where a second process opens
-	// the file, nor on js/wasm and wasip1, which take no lock on the file: there a second
-	// process is not detected.
+	// It is not returned on linux, android, darwin or ios on amd64 or arm64, where a second
+	// process opens the file, nor on js/wasm and wasip1, which take no lock on the file: there
+	// a second process is not detected.
 	ErrDBOpenInOtherProcess = btree.ErrInProcessLocked
 
 	// ErrUnsupportedDB is returned by a package function that takes a DB,
@@ -292,9 +293,10 @@ var (
 	// authentication tag, a chance of about 2^-128. The reverse can happen: a database that is
 	// damaged on page 1 and on every other page tried, or that has no other page (a new, empty
 	// database is one page), is reported as ErrWrongKey although the key is right. So does a
-	// file whose key salt in the header (bytes 72-87) was overwritten, when the key is derived
-	// from a passphrase. ErrWrongKey therefore means "this key does not open this file", and
-	// never "discard the file".
+	// file whose key salt in the header (bytes 72-87) was overwritten with another value that is
+	// not all zeros, when the key is derived from a passphrase; a salt overwritten with zeros
+	// makes the file one that is not encrypted, ErrNotEncrypted. ErrWrongKey therefore means
+	// "this key does not open this file", and never "discard the file".
 	//
 	// Once Open has returned a database the key is proven, and a page that fails its
 	// authentication later is damaged: ErrPageIntegrity.
@@ -302,8 +304,8 @@ var (
 
 	// ErrEncryptionKeyRequired is returned by Open, and (wrapped) by Backup for its destination,
 	// when the file is encrypted and Config.Encryption is empty: no Passphrase and no Codec.
-	// Nothing past the file's header was read, and the file is left unchanged. Open it with the
-	// Config.Encryption it was created with. It does not match ErrCorrupt.
+	// Open decides it from the file's header alone, and the file is left unchanged. Open it with
+	// the Config.Encryption it was created with. It does not match ErrCorrupt.
 	ErrEncryptionKeyRequired = errors.New("any-store: database file is encrypted: set Config.Encryption")
 
 	// ErrNotEncrypted is returned by Open, and (wrapped) by Backup for its destination, when

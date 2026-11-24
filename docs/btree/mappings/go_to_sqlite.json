@@ -1436,7 +1436,7 @@
     "sqlite": [
       "btree.c:checkAppendMsg"
     ],
-    "note": "a finding that came out of a failed page read; keeps the read's error when it is not damage (btree.c:10883-10885 keeps only SQLITE_IOERR_NOMEM; drift-2026-11-24-4)"
+    "note": "a finding that came out of a failed page read; keeps the read's error when it is not damage (btree.c:10883-10885 lists the failure as a line and sets the check's rc only for SQLITE_IOERR_NOMEM, as SQLITE_NOMEM; drift-2026-11-24-4)"
   },
   "integrity.go:*integrityChecker.setReferenced": {
     "sqlite": [
@@ -2187,13 +2187,13 @@
   },
   "pager.go:*pager.page1Unauthenticated": {
     "sqlite": [],
-    "note": "a page 1 that fails its authentication at open, judged after the header and the page count: ErrWrongKey unless another page proves the key or could not be read; SQLCipher returns SQLITE_NOTADB for both (sqlcipher.c:3264-3295, btree.c:3306, 3361-3362, v4.14.0; drift-2026-11-24-3)"
+    "note": "a page 1 that fails its authentication at open, judged after the header and the page count: ErrWrongKey unless another page proves the key or could not be read; SQLCipher returns SQLITE_NOTADB for both (sqlcipher.c:3263-3295, btree.c:3306, 3361-3362, v4.14.0; drift-2026-11-24-3)"
   },
   "pager.go:*pager.pagerError": {
     "sqlite": [
       "pager.c:pager_error"
     ],
-    "note": "a failed commit's end: the state and the cleanup at once. errCode is nil when the commit's frame write fails; when its fetch of page 1 meets a failed spill, pagerStress has set errCode already, and pagerError trips the cursors with it and clears it. SQLite's failed WAL commit never enters PAGER_ERROR: pagerWalFrames returns the error (pager.c:6512, 3219-3236) and the transaction is rolled back as any other (sqlite3PagerRollback, pager.c:6779-6782). A failed spill only records the error (pagerStress, pager.errCode) and rollbackLocked cleans up"
+    "note": "a failed commit's end: the state and the cleanup at once. errCode is the commit's error, or, when its fetch of page 1 met a failed spill, the one pagerStress set already; pagerError trips the cursors with it and clears it (drift-2026-11-24-5). SQLite's failed WAL commit never enters PAGER_ERROR: pagerWalFrames returns the error (pager.c:6512, 3219-3236), pager_error stores only IOERR/FULL (pager.c:1955-1958), and the transaction is rolled back as any other (sqlite3PagerRollback, pager.c:6779-6782), its cursors tripped with SQLITE_ABORT_ROLLBACK (btree.c:4524-4533). A failed spill only records the error (pagerStress, pager.errCode) and rollbackLocked cleans up"
   },
   "pager.go:*pager.pagerPageCount": {
     "sqlite": [

@@ -26,8 +26,9 @@ var (
 	ErrWrongKey = errors.New("btree: wrong encryption key")
 
 	// ErrKeyRequired is returned by Open for a file that is encrypted when
-	// the options carry neither Key nor Codec. The file is not read past
-	// its header and is left unchanged. It does not wrap ErrCorrupt.
+	// the options carry neither Key nor Codec. It is decided from the
+	// file's header alone, and the file is left unchanged. It does not wrap
+	// ErrCorrupt.
 	ErrKeyRequired = errors.New("btree: database file is encrypted, Options.Key or Options.Codec required")
 
 	// ErrNotEncrypted is returned by Open for a file that is not encrypted

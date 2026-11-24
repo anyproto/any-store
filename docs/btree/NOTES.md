@@ -1429,12 +1429,14 @@ comments in source):
    returns the error (`pager.c:6512`, `3219-3236`), and the VDBE rolls the
    transaction back as any other (`sqlite3PagerRollback` →
    `sqlite3PagerSavepoint`, `pager.c:6779-6782`, → `sqlite3WalUndo`). Here
-   a commit whose frame write fails passes through `pagerError` with
-   `errCode` nil, a state SQLite has no counterpart of. A commit whose fetch
+   a commit whose frame write fails passes through `pagerError`, which stores
+   the commit's error in `errCode` and trips the cursors with it
+   ([drift-2026-11-24-5](#drift-2026-11-24-5-a-failed-commit-ends-its-cursors-with-its-error)),
+   a state SQLite has no counterpart of. A commit whose fetch
    of page 1 meets a failed spill (page 1 can be evicted here,
    [entry 2](#old-drift-pagerstress-page1-exclusion)) is in the error state of a failed spill already, with `errCode`
-   set by `pagerStress`: `pagerError` trips the cursors with that error and
-   clears it as it cleans up.
+   set by `pagerStress`: `pagerError` keeps that error, trips the cursors
+   with it and clears it as it cleans up.
    A failed spill does not run this cleanup: `pagerStress` only sets the error
    state, and the rollback cleans up; see
    [the error state of a failed spill](#drift-2026-11-21-13-the-error-state-of-a-failed-spill).
@@ -4897,7 +4899,7 @@ Tests: `TestFullPathname_Unix`, `_UnixWorkingDirectoryOfTheCall` (`fullpath_unix
 - **Category:** added-logic  -  **Severity:** low
 - **Affected functions:** `pager.go:*pager.readPage1AtOpen`, `pager.go:*pager.page1Unauthenticated`, `pager.go:*pager.proveKeyAtOpen`, `pager.go:keyProbePgno`.
 
-SQLCipher cannot tell the two apart and does not try. Its codec decrypts page 1 when `lockBtree` first fetches it. A page whose HMAC does not match is an error of `sqlcipher_page_cipher` (`if(sqlcipher_memcmp(hmac_in, hmac_out, ctx->hmac_sz) != 0)`, `sqlcipher.c:1685-1699`, v4.14.0), on which `sqlite3Codec` zeroes the page buffer and sets the codec's error (`sqlcipher.c:3273-3290`). `lockBtree` then finds no magic in the zeroed page and returns `SQLITE_NOTADB` (`rc = SQLITE_NOTADB;` before `if( memcmp(page1, zMagicHeader, 16)!=0 )`, `btree.c:3306-3311`). So a wrong key and a page 1 with a broken HMAC both give "file is not a database" (`wont-open-with-invalid-derived-key`, `test/sqlcipher-core.test:139-145`; `hmac-tamper-resistence-first-page`, `test/sqlcipher-integrity.test:44-75`), and a broken HMAC on a later page gives `SQLITE_CORRUPT`, "database disk image is malformed" (`hmac-tamper-resistence`, `test/sqlcipher-integrity.test:123-152`).
+SQLCipher cannot tell the two apart and does not try. Its codec decrypts page 1 when `lockBtree` first fetches it (`sqlite3Codec`, `sqlcipher.c:3263-3295`, v4.14.0). In the default header mode the first 16 bytes of page 1 in the buffer are the SQLite magic, put there in place of the salt (`memcpy(ctx->buffer, ctx->plaintext_header_sz ? pData : (void *) SQLITE_FILE_HEADER, offset)`, `sqlcipher.c:3270-3271`). A page whose HMAC does not match is an error of `sqlcipher_page_cipher` (`if(sqlcipher_memcmp(hmac_in, hmac_out, ctx->hmac_sz) != 0)`, `sqlcipher.c:1685-1699`), on which `sqlite3Codec` zeroes the rest of the buffer, sets the codec's error, and copies the buffer back (`sqlcipher.c:3286-3295`). `lockBtree` then finds the magic (`btree.c:3310`), but the payload fractions at bytes 21-23 are zeros and not 64, 32, 32 (`if( memcmp(&page1[21], "\100\040\040",3)!=0 )`, `btree.c:3361-3362`), and it returns the `SQLITE_NOTADB` it set before the checks (`btree.c:3306`). So a wrong key and a page 1 with a broken HMAC both give "file is not a database" (`wont-open-with-invalid-derived-key`, `test/sqlcipher-core.test:139-145`; `hmac-tamper-resistence-first-page`, `test/sqlcipher-integrity.test:44-75`), and a broken HMAC on a later page gives `SQLITE_CORRUPT`, "database disk image is malformed" (`hmac-tamper-resistence`, `test/sqlcipher-integrity.test:123-154`).
 
 any-store reports damage as `ErrCorrupt`, and a caller is told it may discard and rebuild a database on that error. A wrong key must not reach that branch, and a damaged page 1 must. So `Open` of a file opened under a key (`Options.Key` or `Options.Codec`; `pager.keyed`) authenticates page 1 where it reads it (`readPage1AtOpen`, the counterpart of the codec's decrypt under `lockBtree`), and when that fails it looks further:
 
@@ -4908,9 +4910,9 @@ any-store reports damage as `ErrCorrupt`, and a caller is told it may discard an
 
 The pages are spread and not the first ones because damage tends to be a contiguous stretch: with the head of the file overwritten, page 1 and its neighbours fail together. The bound keeps a wrong key cheap on a large file: 16 page reads, not a scan.
 
-What is still misreported is reported as a wrong key, the answer on which a caller keeps the file: a database of one page, a database damaged on page 1 and on every page tried, and a file whose header salt (bytes 72-87, outside the tag: [drift-2026-06-25-14](#drift-2026-06-25-14-page-1-db-header-bytes-0-99-is-excluded-from-both-checksum-and-aead-in)) was overwritten, since the key derived from a passphrase is then another key. A wrong key is never reported as damage.
+What is still misreported is reported as a wrong key, the answer on which a caller keeps the file: a database of one page, a database damaged on page 1 and on every page tried, and a file whose header salt (bytes 72-87, outside the tag: [drift-2026-06-25-14](#drift-2026-06-25-14-page-1-db-header-bytes-0-99-is-excluded-from-both-checksum-and-aead-in)) was overwritten with another value that is not all zeros, since the key derived from a passphrase is then another key. A salt overwritten with zeros is the marker of a file that is not encrypted, and the codec settle refuses the key before any page is read (`ErrNotEncrypted`). A wrong key is never reported as damage.
 
-The header is judged before the key: a file of another format, a header that does not decode, a WAL page 1 of another magic family than the file's, or a header whose trusted size exceeds the pager's count is refused with that error (`ErrHeaderCorrupt` for the last two) whatever the key, as before. Page 1's authentication is decided only after these checks, which read nothing the key protects. The checksum codec's page 1 is not verified by the open; the first read of it does that, as before. After a successful open the key is proven, and every later authentication failure is damage. The successful open pays one decrypt of page 1 and no probe.
+The header is judged before the key: a file of another format, a header that does not decode, a WAL page 1 of another magic family than the file's, or a header whose trusted size exceeds the pager's count is refused with that error (`ErrHeaderCorrupt` for the last two) whatever the key, as before. Page 1's authentication is decided only after these checks, which read nothing the key protects. The checksum codec's page 1 in the database file is not verified by the open; the first read of it does that, as before. A page 1 in a WAL frame was read through the codec at open before, under any codec, and still is. After a successful open the key is proven, and every later authentication failure is damage. A successful open whose page 1 is in the database file pays one extra decrypt of it, and no probe.
 
 `VerifyIntegrity` could list a damaged page 1 of an encrypted database only on a handle opened before the damage: an open after it now fails. The public `Open` failed there already, at its first write begin.
 
@@ -4921,10 +4923,21 @@ Tests: `TestOpen_WrongKeyIsErrWrongKey`, `TestOpen_WrongRawKeyAndCodec`, `TestOp
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `integrity.go:*DB.IntegrityCheckN`, `integrity.go:*IntegrityError.Unwrap`, `integrity.go:*integrityChecker.reportRead`.
 
-`sqlite3BtreeIntegrityCheck` returns its findings as text and a count (`*pnErr = sCheck.nErr;`, `btree.c:11263`) and returns `sCheck.rc` (`btree.c:11273`), which is only ever `SQLITE_NOMEM` or `SQLITE_INTERRUPT` (`btree.c:10567`, `10579`, `10590`). `OP_IntegrityCk` puts the text in a register (`vdbe.c:7273-7285`) and `PRAGMA integrity_check` returns it as rows: a damaged database is a successful statement whose result is not `ok`. A page the check cannot fetch is one more row, `"unable to get the page. error code=%d"` (`btree.c:10883-10884`), whatever the code; only `SQLITE_IOERR_NOMEM` is kept as the check's own result (`btree.c:10885`).
+`sqlite3BtreeIntegrityCheck` returns its findings as text and a count (`*pnErr = sCheck.nErr;`, `btree.c:11263`) and returns `sCheck.rc` (`btree.c:11273`), which is only ever `SQLITE_NOMEM` or `SQLITE_INTERRUPT` (`btree.c:10567`, `10579`, `10590`, `10885`). `checkAppendMsg` adds each finding to one text, a line each (`btree.c:10601-10624`; `sCheck` starts zeroed, `rc` `SQLITE_OK`, `btree.c:11159`). `OP_IntegrityCk` puts that text in a register (`vdbe.c:7273-7285`), and `PRAGMA integrity_check` returns it as one result row for the b-tree checks of a database (`pragma.c:1782-1789`): a damaged database is a successful statement whose result is not `ok`. A page the check cannot fetch is one more line, `"unable to get the page. error code=%d"` (`btree.c:10883-10884`), whatever the code; a fetch that failed with `SQLITE_IOERR_NOMEM` also sets the check's result, as `SQLITE_NOMEM` (`btree.c:10885`).
 
 `IntegrityCheck` returns an error, `*IntegrityError`, with the same lines. An error needs a kind a caller can match, and the kind of damage here is `ErrCorrupt`, on which a caller may discard and rebuild the database. So the report matches it, with one exception that SQLite's rows do not need: a page that failed to read for a reason other than damage. `reportRead` lists it like SQLite does and keeps the read's error unless that error is itself damage (`ErrCorrupt`, which a page failing its checksum or authentication matches, or `ErrInvalidPage`, a pointer out of the database). A short read of a WAL frame (`ErrWALShortRead`) is kept: the index points past the log, which an open after every handle has closed rebuilds. A report with such a read is inconclusive as a whole, not only on that line: the pages under an unread interior page are then listed as never used, and its subtree as of another depth. It matches the read's error and not `ErrCorrupt`.
 
 No new sentinel: the check's caller knows where the error came from, and the action on its findings is the action on `ErrCorrupt`.
 
 Tests: `TestIntegrityErrorMatches`, `TestIntegrityCheck_DamagedPageMatchesErrCorrupt`, `TestIntegrityCheck_FailedReadIsNotErrCorrupt` (`integrity_test.go`), `test/integrity_check_test.go`.
+
+<a id="drift-2026-11-24-5-a-failed-commit-ends-its-cursors-with-its-error"></a>
+### Drift: A Failed Commit Ends Its Cursors With Its Error
+- **Category:** error-handling  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.pagerError`.
+
+SQLite's `pager_error` moves the pager to `PAGER_ERROR` and stores the code in `Pager.errCode` only for an `SQLITE_IOERR` or `SQLITE_FULL` (`if( rc2==SQLITE_FULL || rc2==SQLITE_IOERR )`, `pager.c:1955-1958`), and `pager_unlock` clears it (`pager.c:1919`). A failed WAL commit does not pass through it: `sqlite3PagerCommitPhaseOne` returns `pagerWalFrames`' code (`pager.c:6512`), and the transaction's rollback ends its cursors in `sqlite3BtreeRollback`, whose trip code is `SQLITE_ABORT_ROLLBACK`, or `SQLITE_OK`, with which it saves them (`btree.c:4524-4533`).
+
+`pagerError` ends a failed commit at once ([the eager cleanup](#old-drift-pagererror-eager-cleanup)). It stores the commit's error in `errCode`, whatever the error is, unless a failed spill has stored one already, and trips the transaction's cursors with it (`tripCursors` with `writeStateErr`) before the cleanup clears it. A cursor of the failed transaction reports why the commit failed (an I/O error, a full disk), where it reported the read-only refusal of a pager without a writer, and where SQLite's would report "abort due to ROLLBACK". That error is not damage: it matches `ErrCorrupt` only when the commit's error did.
+
+Test: `TestPagerError_CursorReportsTheCommitError` (`pager_test.go`).

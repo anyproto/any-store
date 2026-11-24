@@ -969,7 +969,7 @@ func (p *pager) readPage1AtOpen() error {
 		// BEGIN ENCRYPTION
 		// Under a key the rest of page 1 is authenticated here, as
 		// SQLCipher's codec decrypts page 1 when lockBtree fetches it
-		// (sqlite3Codec from readDbPage; sqlcipher.c:3262-3295, v4.14.0).
+		// (sqlite3Codec from readDbPage; sqlcipher.c:3263-3295, v4.14.0).
 		// A page 1 cut short reads as zeros past its end and fails the
 		// same way. The checksum codec's page 1 is not verified by the
 		// open: it is by the first read of it, as before.
@@ -3877,12 +3877,17 @@ func (p *pager) rollbackForClose() {
 // subsequent transactions (anystore's failed-commit DDL unwind gates itself
 // for exactly this reason; see db.ddlUnwindGate).
 // DRIFT: pagerError eager-cleans a failed commit (purge/WAL-rollback/unlock); C pager_error only sets errCode, defers See docs/btree/NOTES.md#old-drift-pagererror-eager-cleanup
+//
+// The commit's error, whatever it is, is the error state's, unless a failed
+// spill has stored one already, and the transaction's cursors are ended
+// with it, not with the "read-only" a pager without a writer answers.
+// SQLite's pager_error stores only an SQLITE_IOERR or SQLITE_FULL
+// (pager.c:1955-1958), a failed WAL commit returns pagerWalFrames' code
+// without entering the error state (pager.c:6512), and sqlite3BtreeRollback
+// trips the cursors with SQLITE_ABORT_ROLLBACK or saves them
+// (btree.c:4524-4533).
+// DRIFT: a failed commit's error, whatever it is, is stored in errCode and ends the transaction's cursors; C's failed WAL commit never enters PAGER_ERROR, and its rollback trips cursors with SQLITE_ABORT_ROLLBACK See docs/btree/NOTES.md#drift-2026-11-24-5-a-failed-commit-ends-its-cursors-with-its-error
 func (p *pager) pagerError(err error) {
-	// The error that ends the transaction is its error state's
-	// (pager_error stores rc in Pager.errCode, pager.c:1947-1960), unless
-	// a failed spill has set one already: the cursors below are ended
-	// with it, as sqlite3BtreeRollback trips them with its tripCode, and
-	// not with the "read-only" a pager without a writer answers.
 	if p.errCode == nil {
 		p.errCode = err
 	}

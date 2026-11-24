@@ -2133,7 +2133,10 @@ func (w *wal) indexReadHdr(haveWriteLock, haveCkptLock bool) (WalIndexHdr, error
 		// rebuilds, and a header still invalid after a recovery that
 		// returned no error is no evidence about the database or the log.
 		// walIndexReadHdr has no check of its own after walIndexRecover
-		// (wal.c:2724): what it returns is the recovery's result.
+		// (wal.c:2724): it returns the recovery's result, whose only
+		// SQLITE_CORRUPT is walIndexAppend's hash-chain guard
+		// (wal.c:1506-1507, 1335), and with unreliable shared memory it
+		// turns a recovery's short read into WAL_RETRY (wal.c:2751).
 		return WalIndexHdr{}, errWalIndexUnpublished
 	}
 	return hdr, nil

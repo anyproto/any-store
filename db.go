@@ -123,9 +123,10 @@ type DB interface {
 	// ErrNotEncrypted or ErrWrongKey.
 	//
 	// Backup returns the destination's errors as well as the source's: a
-	// file at path that is damaged, or encrypted with another key, can give
-	// an error that matches ErrCorrupt while this database is sound. Rule
-	// that out before discarding this database.
+	// file at path that is damaged can give an error that matches
+	// ErrCorrupt while this database is sound. Rule that out before
+	// discarding this database. A file at path encrypted with another key
+	// is ErrWrongKey, as at Open.
 	//
 	// Backup never removes the file at path. If it fails before the copy is
 	// committed, the destination's transaction is rolled back: a destination

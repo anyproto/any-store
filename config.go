@@ -204,6 +204,13 @@ type Config struct {
 	// page-1 read (which happens inside Open) are observable. There is
 	// no post-Open setter — the codebase favors config-at-Open over
 	// runtime mutation.
+	//
+	// Under encryption, Open's authentication of page 1 is not reported
+	// as it happens: a page 1 that fails it may be a wrong key, and Open
+	// tells the two apart first (see ErrWrongKey). A wrong key calls the
+	// callback for no page, neither page 1 nor the other pages Open
+	// tried. A right key with a damaged page 1 calls it once, for page
+	// 1, before Open returns ErrPageIntegrity.
 	OnIntegrityError func(IntegrityError)
 }
 

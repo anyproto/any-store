@@ -1,6 +1,7 @@
 package test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -183,4 +184,37 @@ func TestOpen_EncryptionRefusals(t *testing.T) {
 		err = src.Backup(ctx, plain)
 		require.ErrorIs(t, err, anystore.ErrNotEncrypted)
 	})
+}
+
+// The key salt in the header (bytes 72-87) is outside every page's tag. A
+// passphrase database whose salt was overwritten with another value that is
+// not all zeros derives another key from the passphrase: ErrWrongKey. A salt
+// overwritten with zeros is the mark of a file that is not encrypted:
+// ErrNotEncrypted. Neither is corruption.
+func TestOpen_OverwrittenSalt(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		salt byte
+		want error
+	}{
+		{"another salt", 0x5A, anystore.ErrWrongKey},
+		{"zeros", 0, anystore.ErrNotEncrypted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, cfg := encryptedDB(t)
+			f, err := os.OpenFile(path, os.O_RDWR, 0)
+			require.NoError(t, err)
+			_, err = f.WriteAt(bytes.Repeat([]byte{tc.salt}, 16), 72)
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+
+			var calls integrityCalls
+			cfg.OnIntegrityError = calls.hook
+			_, err = anystore.Open(ctx, path, &cfg)
+			require.ErrorIs(t, err, tc.want)
+			require.NotErrorIs(t, err, anystore.ErrCorrupt)
+			require.Empty(t, calls.get())
+		})
+	}
 }
