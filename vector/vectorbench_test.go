@@ -63,8 +63,11 @@ func TestVectorbench(t *testing.T) {
 }
 
 // vectorbenchBuild generates the dataset and the queries and builds the
-// in-memory graph, measuring recall at ef when -vectorbench.recall is set.
-func vectorbenchBuild(t *testing.T, m Metric) (g *FlatHNSW, qVecs [][]float32) {
+// in-memory graph. With -vectorbench.recall set it measures recall against
+// exact brute force at ef, and with sweep also at 2·ef and 4·ef, as
+// cmd/vectorbench's paged run did, over one set of brute-force results; the
+// graph is left at ef, which the timed searches and the paged index use.
+func vectorbenchBuild(t *testing.T, m Metric, sweep bool) (g *FlatHNSW, qVecs [][]float32) {
 	t0 := time.Now()
 	vecs, ids, _, avgBytes := GenMDDataset(*vbN, *vbDim, *vbSeed)
 	qVecs, _, _, _ = GenMDDataset(*vbQueries, *vbDim, *vbSeed+1)
@@ -83,11 +86,23 @@ func vectorbenchBuild(t *testing.T, m Metric) (g *FlatHNSW, qVecs [][]float32) {
 		for i := range vecs {
 			brute.Add(ids[i], vecs[i])
 		}
-		var r float64
-		for _, q := range qVecs {
-			r += recallAt(g.Search(q, *vbK), brute.Search(q, *vbK))
+		truth := make([][]SearchResult, len(qVecs))
+		for i, q := range qVecs {
+			truth[i] = brute.Search(q, *vbK)
 		}
-		t.Logf("recall@%d ef=%d: %.3f", *vbK, *vbEf, r/float64(len(qVecs)))
+		efs := []int{*vbEf}
+		if sweep {
+			efs = append(efs, 2**vbEf, 4**vbEf)
+		}
+		for _, ef := range efs {
+			g.EfSearch = ef
+			var r float64
+			for i, q := range qVecs {
+				r += recallAt(g.Search(q, *vbK), truth[i])
+			}
+			t.Logf("recall@%d ef=%-4d: %.3f", *vbK, ef, r/float64(len(qVecs)))
+		}
+		g.EfSearch = *vbEf
 	}
 	return g, qVecs
 }
@@ -95,7 +110,7 @@ func vectorbenchBuild(t *testing.T, m Metric) (g *FlatHNSW, qVecs [][]float32) {
 // vectorbenchPaged is the -paged mode: A, B and B′ over an in-memory btree,
 // with btree reads per query.
 func vectorbenchPaged(t *testing.T, m Metric) {
-	g, qVecs := vectorbenchBuild(t, m)
+	g, qVecs := vectorbenchBuild(t, m, true)
 	k := *vbK
 	memNs := timeSearchN(func(q []float32) { g.Search(q, k) }, qVecs, 2000)
 	t.Logf("A  in-memory arena     : %9.1f us/q   RAM=%7.1f MiB (full)             0 reads/q",
@@ -158,7 +173,7 @@ func vectorbenchDisk(t *testing.T, m Metric) {
 	}
 
 	t.Logf("BUILD run: building and persisting to %s", path)
-	g, qVecs := vectorbenchBuild(t, m)
+	g, qVecs := vectorbenchBuild(t, m, false)
 	tp := time.Now()
 	require.NoError(t, persistPaged(g, db, "emb", m))
 	require.NoError(t, db.Checkpoint(btree.CheckpointFull))

@@ -177,21 +177,20 @@ func TestStoreStoredNProbeZeroIsTheDefault(t *testing.T) {
 			require.NoError(t, wtx.Put(vmeta, metaKey, encodeMeta(mt)))
 			require.NoError(t, wtx.Commit())
 
-			rtx, err := db.BeginRead()
-			require.NoError(t, err)
-			ix, err := OpenTx(rtx, "ivf")
-			require.NoError(t, err)
-			require.Equal(t, defaultNProbe, ix.NProbe())
-			cands, err := ix.SearchCandidates(rtx, vecs[17], 5)
-			require.NoError(t, err)
-			require.NotEmpty(t, cands)
-			require.Equal(t, bid(17), cands[0].DocID)
-			require.NoError(t, rtx.Rollback())
+			inRead(t, db, func(rtx *btree.ReadTx) {
+				ix, err := OpenTx(rtx, "ivf")
+				require.NoError(t, err)
+				require.Equal(t, defaultNProbe, ix.NProbe())
+				cands, err := ix.SearchCandidates(rtx, vecs[17], 5)
+				require.NoError(t, err)
+				require.NotEmpty(t, cands)
+				require.Equal(t, bid(17), cands[0].DocID)
+			})
 
 			if emptied {
 				wtx, err = db.BeginWrite()
 				require.NoError(t, err)
-				ix, err = OpenTx(&wtx.ReadTx, "ivf")
+				ix, err := OpenTx(&wtx.ReadTx, "ivf")
 				require.NoError(t, err)
 				for i := range n {
 					_, err = ix.Delete(wtx, bid(i))
@@ -205,19 +204,30 @@ func TestStoreStoredNProbeZeroIsTheDefault(t *testing.T) {
 			_, err = Rebuild(wtx, "ivf")
 			require.NoError(t, err)
 			require.NoError(t, wtx.Commit())
-			rtx, err = db.BeginRead()
-			require.NoError(t, err)
-			defer func() { require.NoError(t, rtx.Rollback()) }()
-			ix, err = OpenTx(rtx, "ivf")
-			require.NoError(t, err)
-			st, err := ix.Stats(rtx)
-			require.NoError(t, err)
-			require.Equal(t, defaultNProbe, st.NProbe, "the rebuilt record")
-			if emptied {
-				require.Zero(t, st.Count)
-			}
+			inRead(t, db, func(rtx *btree.ReadTx) {
+				ix, err := OpenTx(rtx, "ivf")
+				require.NoError(t, err)
+				st, err := ix.Stats(rtx)
+				require.NoError(t, err)
+				require.Equal(t, defaultNProbe, st.NProbe, "the rebuilt record")
+				if emptied {
+					require.Zero(t, st.Count)
+				}
+			})
 		})
 	}
+}
+
+// inRead runs check in a read transaction of db, rolled back whatever check
+// does: a failed require ends the test's goroutine, and a read transaction
+// it left open would make the cleanup's db.Close wait for it until the
+// package timed out.
+func inRead(t *testing.T, db *btree.DB, check func(rtx *btree.ReadTx)) {
+	t.Helper()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	check(rtx)
 }
 
 // TestStoreRecallReal builds the index on the real export and confirms its
