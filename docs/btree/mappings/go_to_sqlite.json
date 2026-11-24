@@ -2011,8 +2011,10 @@
     "note": "fans out the per-page update to all attached Backups for every page the source logs: a commit's pages and each spilled page (pager.c:3219-3225)"
   },
   "pager.go:*pager.downgradeDBLock": {
-    "sqlite": [],
-    "note": "exclusive to shared in the open; a flock conversion can be refused, so it waits with a count of its own"
+    "sqlite": [
+      "pager.c:pagerUnlockDb"
+    ],
+    "note": "partial: exclusive to shared in the open, pagerUnlockDb(SHARED_LOCK); SQLite's is one unlock call that asks no busy handler, and with flock only records the new level (os_unix.c:flockUnlock, 2747-2750), while a flock conversion here can be refused, so it waits with a count of its own (drift-63)"
   },
   "pager.go:*pager.effectiveReaderDbSize": {
     "sqlite": [

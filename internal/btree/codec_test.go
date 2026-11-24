@@ -2,8 +2,16 @@ package btree
 
 import (
 	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestCodec_SharedCodecConcurrentEncrypt drives one codec object from
@@ -218,4 +226,86 @@ func TestPager_InstallCodec_NilIsNoop(t *testing.T) {
 	if p.header.ReservedSpace != 0 {
 		t.Fatalf("nil install changed ReservedSpace")
 	}
+}
+
+// One codec object in Options.Codec serving three databases: A and B each
+// with an OnIntegrityError of its own, C with none. A damaged page is
+// reported to the callback of the database it belongs to and to no other,
+// whatever order the databases were opened in: the callback is the
+// database's (installCodec stores it on the pager), not the codec's, which
+// is installed as given and so serves all three. The public API gives each
+// database a codec of its own; Options.Codec is the one place one object can
+// be shared.
+func TestCodec_SharedCodecIntegrityCallbackPerDatabase(t *testing.T) {
+	codec, err := NewAESCodec(bytes.Repeat([]byte{0x5a}, KeyLen))
+	require.NoError(t, err)
+	dir := t.TempDir()
+	pathA, pathB, pathC := filepath.Join(dir, "a.db"), filepath.Join(dir, "b.db"), filepath.Join(dir, "c.db")
+	for _, path := range []string{pathA, pathB, pathC} {
+		db, err := testOpen(t, path, Options{Codec: codec})
+		require.NoError(t, err)
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := tx.CreateNamespace("data")
+		require.NoError(t, err)
+		for i := range 200 {
+			require.NoError(t, tx.Put(ns, fmt.Appendf(nil, "k%05d", i), bytes.Repeat([]byte{byte(i)}, 300)))
+		}
+		require.NoError(t, tx.Commit())
+		require.NoError(t, db.Checkpoint(CheckpointTruncate))
+		require.NoError(t, db.Close())
+	}
+	// Damage page 2 of A and of C; B stays intact.
+	const pageSize, damaged = 4096, 2
+	for _, path := range []string{pathA, pathC} {
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		data[(damaged-1)*pageSize+200] ^= 0x01
+		require.NoError(t, os.WriteFile(path, data, 0o644))
+	}
+
+	type hits struct {
+		calls atomic.Int32
+		page  atomic.Uint32
+	}
+	var hitA, hitB hits
+	record := func(h *hits) func(uint32, error) {
+		return func(pgno uint32, inner error) {
+			h.page.Store(pgno)
+			h.calls.Add(1)
+		}
+	}
+	// Opened in the order A, B, C, all with the one codec: B's callback is
+	// the last one given, and C gives none.
+	dbA, err := testOpen(t, pathA, Options{Codec: codec, OnIntegrityError: record(&hitA)})
+	require.NoError(t, err)
+	defer dbA.Close()
+	dbB, err := testOpen(t, pathB, Options{Codec: codec, OnIntegrityError: record(&hitB)})
+	require.NoError(t, err)
+	defer dbB.Close()
+	dbC, err := testOpen(t, pathC, Options{Codec: codec})
+	require.NoError(t, err)
+	defer dbC.Close()
+
+	// A's damaged page, read by the sweep, goes to A's callback only.
+	rep, err := dbA.VerifyIntegrity(context.Background())
+	require.NoError(t, err)
+	require.NotEmpty(t, rep.Errors, "A's damaged page must fail verification")
+	require.ErrorIs(t, rep.Errors[0].Inner, ErrPageIntegrity)
+	assert.Positive(t, hitA.calls.Load(), "A's failure must reach A's callback")
+	assert.Equal(t, uint32(damaged), hitA.page.Load())
+	assert.Zero(t, hitB.calls.Load(), "A's failure must not reach B's callback")
+
+	// C has no callback: its failures reach no one.
+	before := hitA.calls.Load()
+	rep, err = dbC.VerifyIntegrity(context.Background())
+	require.NoError(t, err)
+	require.NotEmpty(t, rep.Errors, "C's damaged page must fail verification")
+	assert.Equal(t, before, hitA.calls.Load(), "C's failure must not reach A's callback")
+	assert.Zero(t, hitB.calls.Load(), "C's failure must not reach B's callback")
+
+	rep, err = dbB.VerifyIntegrity(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, rep.Errors)
+	assert.Zero(t, hitB.calls.Load())
 }

@@ -2,7 +2,8 @@ package test
 
 // What a backup is for: the copy reopens with the credentials of its source
 // and holds the same documents. One round trip per kind of database (plain,
-// checksummed, encrypted by passphrase or by raw key), per
+// checksummed, encrypted by passphrase or by raw key, each built-in cipher
+// among them), per
 // kind of source (file, in-memory) and per state of the destination (absent,
 // a database of the same kind, a database of another kind).
 
@@ -67,6 +68,7 @@ var roundTripKinds = []roundTripKind{
 	}, anystore.IntegrityAEAD},
 	{"passphrase-xchacha", passphraseConfig("correct horse", anystore.CipherXChaCha20Poly1305), passphraseConfig("correct horse", anystore.CipherXChaCha20Poly1305), anystore.IntegrityAEAD},
 	{"raw-key-32", passphraseConfig("0123456789abcdef0123456789abcdef", ""), passphraseConfig("0123456789abcdef0123456789abcdef", ""), anystore.IntegrityAEAD},
+	{"raw-key-32-chacha", passphraseConfig("0123456789abcdef0123456789abcdef", anystore.CipherChaCha20Poly1305), passphraseConfig("0123456789abcdef0123456789abcdef", anystore.CipherChaCha20Poly1305), anystore.IntegrityAEAD},
 	{"in-memory", inMemory(defaultConfig), defaultConfig, anystore.IntegrityNone},
 	{"in-memory-passphrase", inMemory(passphraseConfig("correct horse", "")), passphraseConfig("correct horse", ""), anystore.IntegrityAEAD},
 	{"in-memory-raw-key-32", inMemory(passphraseConfig("0123456789abcdef0123456789abcdef", "")), passphraseConfig("0123456789abcdef0123456789abcdef", ""), anystore.IntegrityAEAD},

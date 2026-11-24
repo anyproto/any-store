@@ -2954,3 +2954,30 @@ func TestCollection_DocumentDepthBounded(t *testing.T) {
 		})
 	}
 }
+
+// Integers past 2^53 are float64, and as ids one key: with the document of
+// id 2^53 stored, an Insert of id 2^53+1 fails with ErrDocExists, an
+// UpsertOne with it replaces that one document, and FindId and UpsertId with
+// it reach that document.
+func TestCollection_IdsPast2To53AreOneKey(t *testing.T) {
+	const above = int64(1<<53 + 1)
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":9007199254740992,"n":1}`)))
+	require.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":9007199254740993,"n":2}`)), anystore.ErrDocExists)
+
+	require.NoError(t, coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":9007199254740993,"n":3}`)))
+	assertQueryCount(t, coll.Find(nil), 1)
+	doc, err := coll.FindId(ctx, above)
+	require.NoError(t, err)
+	assert.Equal(t, 3, doc.Value().GetInt("n"))
+
+	res, err := coll.UpsertId(ctx, above, query.MustParseModifier(`{"$inc":{"n":1}}`))
+	require.NoError(t, err)
+	assert.Equal(t, anystore.ModifyResult{Matched: 1, Modified: 1}, res)
+	assertQueryCount(t, coll.Find(nil), 1)
+	doc, err = coll.FindId(ctx, int64(1<<53))
+	require.NoError(t, err)
+	assert.Equal(t, 4, doc.Value().GetInt("n"))
+}

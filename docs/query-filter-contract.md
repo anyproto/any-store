@@ -394,7 +394,8 @@ build per query and carry no such guarantee.
     `UpsertOne` with it replaces that document, and `FindId(2^53+1)` returns
     it. There is no integer type next to the float (MongoDB has int, long and
     decimal); integers that can go past 2^53 belong in strings. The
-    aggregation arithmetic has the same limit (docs/aggregation.md).
+    aggregation arithmetic has the same limit (docs/aggregation.md). Pinned
+    by `TestCollection_IdsPast2To53AreOneKey` (test/collection_test.go).
 
 19. **A `$text` query enforces at most 64 required clauses.** The required
     clauses are the clauses of `$search` under `"$defaultOperator": "and"`

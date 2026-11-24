@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"slices"
 	"strings"
 	"testing"
 
@@ -376,21 +377,56 @@ func TestFtsProbe_WeightedDifferential(t *testing.T) {
 	}
 }
 
-// >64 required clauses exhaust the 64-bit mask; the tail degrades to ungated
-// OR identically on both sides.
+// A $text query enforces its first 64 required clauses; a required clause
+// past them still matches and scores but no longer gates (query contract,
+// item 19). With 65 required clauses, as 65 $require entries or as 63 and
+// one entry "req64 req65" that parses into two, a document with the first 64
+// matches, one missing the 64th does not though it has the 65th, and one with
+// all 65 matches and scores above the one with 64. Every plan, the driver
+// scan and the primary-key probe among them, gives those rows and scores.
 func TestFtsProbe_RequiredBitExhaustion(t *testing.T) {
-	fx, coll := ftsProbeColl(t)
+	fx := newFixture(t)
 	defer fx.finish()
-	req := make([]any, 0, 70)
-	req = append(req, "alpha", "gamma")
-	for i := 0; i < 68; i++ {
-		req = append(req, fmt.Sprintf("filler%d", i)) // df==0 fillers
+	coll, err := fx.CreateCollection(ctx, "req")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ft", Kind: IndexKindFulltext, Fields: []string{"body"}}))
+	term := func(i int) string { return fmt.Sprintf("req%02d", i) }
+	body := func(skip int, upTo int) string {
+		var words []string
+		for i := 1; i <= upTo; i++ {
+			if i != skip {
+				words = append(words, term(i))
+			}
+		}
+		return strings.Join(words, " ")
 	}
-	cond := map[string]any{
-		"$text": map[string]any{"$search": "", "$require": req},
-		"id":    map[string]any{"$in": manyIds(40)},
+	insertJSON(t, coll,
+		fmt.Sprintf(`{"id":"first64","body":%q}`, body(0, 64)),
+		fmt.Sprintf(`{"id":"miss64","body":%q}`, body(64, 65)),
+		fmt.Sprintf(`{"id":"all65","body":%q}`, body(0, 65)),
+		`{"id":"only65","body":"req65"}`,
+		`{"id":"other","body":"unrelated words"}`,
+	)
+
+	entries65 := make([]any, 0, 65)
+	for i := 1; i <= 65; i++ {
+		entries65 = append(entries65, term(i))
 	}
-	assertSamePlanResults(t, coll, cond, 0, 0, nil)
+	entries64 := append(slices.Clone(entries65[:63]), term(64)+" "+term(65))
+	for name, req := range map[string][]any{"65 entries": entries65, "64 entries, the last two clauses": entries64} {
+		t.Run(name, func(t *testing.T) {
+			text := map[string]any{"$search": "", "$require": req}
+			for _, cond := range []map[string]any{
+				{"$text": text},
+				{"$text": text, "id": map[string]any{"$in": []any{"first64", "miss64", "all65", "only65", "other"}}},
+			} {
+				ids, scores := collectIter(t, coll.Find(cond))
+				require.Equal(t, []string{"all65", "first64"}, ids, "%v", cond)
+				assert.Greater(t, scores[0], scores[1], "the 65th clause scores")
+				assertSamePlanResults(t, coll, cond, 0, 0, nil)
+			}
+		})
+	}
 }
 
 // A REVERSE-declared unique index chosen as the probe driver goes through

@@ -144,8 +144,15 @@ func TestVerifyPageChecksum_BadPage(t *testing.T) {
 	}
 }
 
+// A buffer whose length is not a page size fails, even with a valid trailer:
+// the 100 bytes are stamped first, so only the size check can refuse them.
 func TestVerifyPageChecksum_RejectsBadSize(t *testing.T) {
-	if VerifyPageChecksum(make([]byte, 100)) {
+	buf := make([]byte, 100)
+	for i := range buf {
+		buf[i] = byte(i)
+	}
+	StampPageChecksum(buf)
+	if VerifyPageChecksum(buf) {
 		t.Fatal("non-page-sized buffer should not pass")
 	}
 }
