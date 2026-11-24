@@ -60,3 +60,17 @@ func TestConfig_KDFIterationsBound(t *testing.T) {
 	require.NoError(t, (&Config{Encryption: EncryptionConfig{Passphrase: make([]byte, 32), KDFIterations: math.MaxInt}}).validate())
 	require.NoError(t, (&Config{Encryption: EncryptionConfig{KDFIterations: math.MaxInt}}).validate())
 }
+
+// An unknown CipherType is refused with a passphrase, raw key or not, and
+// ignored without one, as the rest of EncryptionConfig is.
+func TestConfig_CipherTypeKnown(t *testing.T) {
+	for _, pass := range [][]byte{[]byte("correct horse"), make([]byte, 32)} {
+		for _, ct := range []CipherType{CipherAES256GCM, CipherChaCha20Poly1305, CipherXChaCha20Poly1305} {
+			require.NoError(t, (&Config{Encryption: EncryptionConfig{Passphrase: pass, CipherType: ct}}).validate())
+		}
+		err := (&Config{Encryption: EncryptionConfig{Passphrase: pass, CipherType: "rot13"}}).validate()
+		require.ErrorIs(t, err, ErrInvalidConfig)
+		require.ErrorContains(t, err, "Encryption.CipherType")
+	}
+	require.NoError(t, (&Config{Encryption: EncryptionConfig{CipherType: "rot13"}}).validate())
+}

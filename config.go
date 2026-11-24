@@ -255,7 +255,9 @@ type EncryptionConfig struct {
 	KDFIterations int
 
 	// CipherType selects the built-in AEAD when Passphrase is set.
-	// Zero value (CipherAES256GCM) is the default.
+	// Zero value (CipherAES256GCM) is the default. A value other than the
+	// Cipher constants fails Open with ErrInvalidConfig when Passphrase is
+	// set; without a Passphrase it is ignored.
 	CipherType CipherType
 }
 
@@ -354,18 +356,25 @@ const maxKDFIterations = 100_000_000
 // ErrInvalidConfig. It runs before Open resolves the path or touches a file,
 // so a refused Config leaves nothing open. Sizes past what the code can
 // allocate are clamped instead (cacheSizes); a value with no nearest valid
-// one, as an unknown FlushMode, or one that would derive another key, as a
-// KDFIterations past maxKDFIterations, is an error.
+// one, as an unknown FlushMode or CipherType, or one that would derive
+// another key, as a KDFIterations past maxKDFIterations, is an error.
 func (c *Config) validate() error {
 	switch c.Durability.FlushMode {
 	case "", FlushModeCheckpointPassive, FlushModeCheckpointFull, FlushModeCheckpointRestart, FlushModeCheckpointTruncate:
 	default:
 		return fmt.Errorf("%w: Durability.FlushMode %q is not one of the FlushModeCheckpoint modes", ErrInvalidConfig, c.Durability.FlushMode)
 	}
-	// Only a passphrase goes through the KDF: a 32-byte one is the key itself
-	// and ignores the count.
-	if e := c.Encryption; e.Passphrase != nil && len(e.Passphrase) != btree.KeyLen && e.KDFIterations > maxKDFIterations {
-		return fmt.Errorf("%w: Encryption.KDFIterations is %d, more than %d", ErrInvalidConfig, e.KDFIterations, maxKDFIterations)
+	if e := c.Encryption; e.Passphrase != nil {
+		switch e.CipherType {
+		case CipherAES256GCM, CipherChaCha20Poly1305, CipherXChaCha20Poly1305:
+		default:
+			return fmt.Errorf("%w: Encryption.CipherType %q is not one of the Cipher constants", ErrInvalidConfig, e.CipherType)
+		}
+		// Only a passphrase goes through the KDF: a 32-byte one is the key
+		// itself and ignores the count.
+		if len(e.Passphrase) != btree.KeyLen && e.KDFIterations > maxKDFIterations {
+			return fmt.Errorf("%w: Encryption.KDFIterations is %d, more than %d", ErrInvalidConfig, e.KDFIterations, maxKDFIterations)
+		}
 	}
 	return nil
 }

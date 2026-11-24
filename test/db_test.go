@@ -1236,3 +1236,17 @@ func TestOpen_KDFIterationsBounded(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, d.Close())
 }
+
+// An unknown CipherType is an ErrInvalidConfig error of Open, with a
+// passphrase or a 32-byte key, and creates no file.
+func TestOpen_UnknownCipherType(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	for _, pass := range [][]byte{[]byte("pw"), make([]byte, 32)} {
+		d, err := anystore.Open(ctx, path, &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: pass, CipherType: "rot13", KDFIterations: 1000}})
+		require.ErrorIs(t, err, anystore.ErrInvalidConfig)
+		require.ErrorContains(t, err, "Encryption.CipherType")
+		require.Nil(t, d)
+	}
+	_, statErr := os.Stat(path)
+	require.ErrorIs(t, statErr, os.ErrNotExist, "a refused Open creates no file")
+}
