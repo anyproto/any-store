@@ -2,6 +2,7 @@ package btree
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -114,16 +115,8 @@ func TestOpen_WrongKeyFails(t *testing.T) {
 	}
 
 	opts.Key = []byte("wrong-passphrase")
-	db2, err := Open(path, opts)
-	if err != nil {
-		// Clean fail at open — acceptable.
-		return
-	}
-	// Open succeeded; a subsequent page read should surface the error.
-	defer db2.Close()
-	_, gnErr := db2.GetNamespace("x")
-	if gnErr == nil {
-		t.Fatalf("GetNamespace with wrong key returned nil error")
+	if _, err := Open(path, opts); !errors.Is(err, ErrWrongKey) {
+		t.Fatalf("Open with the wrong key: got %v, want ErrWrongKey", err)
 	}
 }
 

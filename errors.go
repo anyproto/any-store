@@ -219,6 +219,31 @@ var (
 	// docs/migration-v1-to-v2.md for moving the data across.
 	ErrV1Database = errors.New("any-store: file is an any-store v1 database, not readable by v2; use github.com/anyproto/any-store or migrate (docs/migration-v1-to-v2.md)")
 
+	// ErrWrongKey is returned (wrapped) by Open when Config.Encryption holds a passphrase, key
+	// or codec that does not open the file. The file is left unchanged, and Open with the right
+	// key opens it. It does not match ErrCorrupt or ErrPageIntegrity, and Config.OnIntegrityError
+	// is not called.
+	//
+	// Open authenticates page 1 with the key. When that fails, it tries up to 16 other pages,
+	// spread over the database, with the same key:
+	//
+	//   - if one of them authenticates, the key is right and page 1 is damaged: Open returns an
+	//     error that matches ErrPageIntegrity and ErrCorrupt, and Config.OnIntegrityError is
+	//     called for page 1;
+	//   - if none does, Open returns ErrWrongKey.
+	//
+	// A wrong key is never reported as corruption: it would have to pass a page's
+	// authentication tag, a chance of about 2^-128. The reverse can happen: a database that is
+	// damaged on page 1 and on every other page tried, or that has no other page (a new, empty
+	// database is one page), is reported as ErrWrongKey although the key is right. So does a
+	// file whose key salt in the header (bytes 72-87) was overwritten, when the key is derived
+	// from a passphrase. ErrWrongKey therefore means "this key does not open this file", and
+	// never "discard the file".
+	//
+	// Once Open has returned a database the key is proven, and a page that fails its
+	// authentication later is damaged: ErrPageIntegrity.
+	ErrWrongKey = btree.ErrWrongKey
+
 	// ErrCorrupt is the umbrella for damaged database files: every error below that names a kind
 	// of damage matches it, as does a broken structure found while reading. Match it when the kind
 	// does not matter, for instance to discard and rebuild the database:
@@ -228,9 +253,8 @@ var (
 	// It is not returned for a v1 file (ErrV1Database), a file from a newer release
 	// (ErrIncompatibleVersion) or a closed database.
 	//
-	// An encrypted database opened with the wrong key also matches: the page authentication fails
-	// the same way as for a damaged page 1, and the two cannot be told apart. Rule out a key
-	// mismatch before discarding the file.
+	// It is not returned for a wrong encryption key either: that is ErrWrongKey, which Open
+	// tells from a damaged page 1 (see there).
 	//
 	// A damaged page that nothing has read yet is not found by Open: it surfaces on the read that
 	// meets it, as ErrPageIntegrity.

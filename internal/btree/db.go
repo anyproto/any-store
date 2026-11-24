@@ -767,6 +767,9 @@ func Open(path string, opts Options) (*DB, error) {
 				}
 			}
 			p.setCodec(codec, salt, opts.OnIntegrityError)
+			// A codec made from Options.Key or Options.Codec: the open
+			// proves the key on page 1 (readPage1AtOpen).
+			p.keyed = wantEncryption && codec != nil
 			settled.done, settled.exists, settled.salt, settled.cksum = true, fileExists, salt, useCksum
 			return nil
 		}

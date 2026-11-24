@@ -386,6 +386,11 @@ type pager struct {
 	// WAL's checkpoint into the main file), and no image of page 1 sets it
 	// (adoptHeader).
 	keySalt [SaltLen]byte
+	// keyed reports a codec made from the caller's key (Options.Key or
+	// Options.Codec), as opposed to none or the checksum codec. Set by
+	// Open's codec settle; the open of a keyed file proves the key on
+	// page 1 (readPage1AtOpen).
+	keyed bool
 	// codecScratch is a reusable page-sized scratch buffer used on the
 	// writer side (createPage1, getPageWriter, wal.writeFrame) to hold
 	// ciphertext while the source plaintext stays live in the pcache.
@@ -907,9 +912,22 @@ func (p *pager) readPage1AtOpen() error {
 	// read (dbHeader.deserialize), and it must name the same magic family:
 	// no commit moves a file between them.
 	fileVersioned := p.header.versioned
+	// Under a key, page 1 is the page the open proves the key on: its
+	// failed authentication goes to keyCheck, not to the integrity hook,
+	// until page1Unauthenticated has told a wrong key from a damaged page.
+	var keyCheck page1KeyCheck
 	if frame > 0 {
 		walBuf := make([]byte, p.pageSize)
-		if err := p.wal.readFramePage(frame, 1, walBuf, nil, nil); err != nil {
+		if err := p.wal.readFramePageHook(frame, 1, walBuf, nil, nil, p.page1Hook(&keyCheck)); err != nil {
+			if p.keyed && errors.Is(err, ErrPageIntegrity) {
+				// The frame is read again for its header, which is not
+				// encrypted and is judged before the key is: a file of
+				// another format is that, whatever the key.
+				if herr := p.page1FrameHeader(frame, &header); herr != nil {
+					return herr
+				}
+				return p.page1Unauthenticated(err, &keyCheck, hdr.nPage, maxFrame, minFrame)
+			}
 			return err
 		}
 		if err := header.deserialize(walBuf[:dbHeaderSize]); err != nil {
@@ -935,6 +953,24 @@ func (p *pager) readPage1AtOpen() error {
 		if err := header.deserialize(buf[:dbHeaderSize]); err != nil {
 			return err
 		}
+		// BEGIN ENCRYPTION
+		// Under a key the rest of page 1 is authenticated here, as
+		// SQLCipher's codec decrypts page 1 when lockBtree fetches it
+		// (sqlite3Codec from readDbPage; sqlcipher.c:3262-3290, v4.14.0).
+		// A page 1 cut short reads as zeros past its end and fails the
+		// same way. The checksum codec's page 1 is not verified by the
+		// open: it is by the first read of it, as before.
+		if p.keyed {
+			scratch := make([]byte, p.pageSize)
+			if _, derr := decryptPageWithCodec(p.codec, scratch, buf, 1, new(aeadScratch), p.page1Hook(&keyCheck)); derr != nil {
+				derr = fmt.Errorf("btree: page 1: %w", derr)
+				if !errors.Is(derr, ErrPageIntegrity) {
+					return derr
+				}
+				return p.page1Unauthenticated(derr, &keyCheck, hdr.nPage, maxFrame, minFrame)
+			}
+		}
+		// END ENCRYPTION
 	}
 
 	if header.versioned != fileVersioned {
@@ -957,6 +993,125 @@ func (p *pager) readPage1AtOpen() error {
 	p.dbFileVers.Store(header.FileChangeCount)
 	return nil
 }
+
+// BEGIN ENCRYPTION
+
+// page1KeyCheck holds what the codec reported for page 1 while the open
+// was proving its key: the detail it would have given the integrity hook.
+type page1KeyCheck struct {
+	failed bool
+	inner  error
+}
+
+// page1Hook is the integrity hook readPage1AtOpen reads page 1 with: under
+// a key it records the failure in kc and tells the database's hook nothing,
+// otherwise it is the database's hook.
+func (p *pager) page1Hook(kc *page1KeyCheck) integrityHook {
+	if !p.keyed {
+		return p.onIntegrityError
+	}
+	return func(_ uint32, inner error) {
+		kc.failed, kc.inner = true, inner
+	}
+}
+
+// page1FrameHeader decodes into h the header of page 1 as WAL frame holds
+// it, read without the codec: the first dbHeaderSize bytes of page 1 are
+// not encrypted (encryptPageWithCodec).
+func (p *pager) page1FrameHeader(frame uint32, h *dbHeader) error {
+	var buf [dbHeaderSize]byte
+	if err := p.readWalFrameDataRaw(frame, buf[:]); err != nil {
+		return fmt.Errorf("btree: read page-1 header (WAL frame %d): %w", frame, err)
+	}
+	return h.deserialize(buf[:])
+}
+
+// keyProbePages bounds the pages proveKeyAtOpen tries.
+const keyProbePages = 16
+
+// page1Unauthenticated decides what a page 1 that failed its authentication
+// at open means, and returns the open's error. perr is the failed read's
+// error, which matches ErrPageIntegrity; walNPage is the size the
+// snapshot's last WAL commit recorded, and maxFrame and minFrame are the
+// snapshot's bounds.
+//
+// A key that authenticates any page of the database is the right key: a
+// wrong one passes a page's tag with probability about 2^-128. So the open
+// tries other pages under the same key (proveKeyAtOpen). When one
+// authenticates, page 1 is damaged: the database's integrity hook is told,
+// as it is for any damaged page, and perr is returned. When none does, the
+// open returns ErrWrongKey and the hook is told nothing, of page 1 or of
+// the pages tried. The misreport that remains is on the side that keeps
+// the file: a database of one page, or one damaged on every page tried,
+// reports a wrong key.
+// DRIFT: a page 1 that fails its authentication at open is reported as a wrong key only when no other page tried authenticates either, and as a damaged page otherwise; SQLCipher reports SQLITE_NOTADB for both and never looks at another page. See docs/btree/NOTES.md#drift-2026-11-24-3-open-tells-a-wrong-key-from-a-damaged-page-1
+func (p *pager) page1Unauthenticated(perr error, kc *page1KeyCheck, walNPage, maxFrame, minFrame uint32) error {
+	// The pager's count (pagerPagecount): the pages there are to try.
+	nPage, _, err := p.pagerPageCount(walNPage)
+	if err != nil {
+		return err
+	}
+	proven, tried := p.proveKeyAtOpen(nPage, maxFrame, minFrame)
+	if !proven {
+		return fmt.Errorf("%w: page 1 and %d other page(s) tried do not authenticate under it", ErrWrongKey, tried)
+	}
+	if kc.failed {
+		p.onIntegrityError.fire(1, kc.inner)
+	}
+	return perr
+}
+
+// proveKeyAtOpen reports whether a page other than page 1 authenticates
+// under the pager's codec, and how many it tried. It tries up to
+// keyProbePages pages spread evenly over pages 2..nPage, so that damage to
+// one stretch of the file leaves some of them outside it, each as the
+// snapshot holds it: from its WAL frame when it has one in [minFrame,
+// maxFrame], else from the database file. A page that cannot be read is
+// passed over. No failure here reaches the integrity hook: with a wrong key
+// every page fails, and none of them is damaged.
+func (p *pager) proveKeyAtOpen(nPage, maxFrame, minFrame uint32) (proven bool, tried int) {
+	if nPage < 2 {
+		return false, 0
+	}
+	n := nPage - 1 // pages 2..nPage
+	count := min(n, keyProbePages)
+	buf := make([]byte, p.pageSize)
+	scratch := make([]byte, p.pageSize)
+	var aead aeadScratch
+	for i := uint32(0); i < count; i++ {
+		pgno := 2 + i
+		if count > 1 && n > count {
+			pgno = 2 + uint32(uint64(i)*uint64(n-1)/uint64(count-1))
+		}
+		var frame uint32
+		if maxFrame > 0 {
+			var err error
+			if frame, err = p.wal.index.get(pgno, maxFrame, minFrame); err != nil {
+				continue
+			}
+		}
+		if frame > 0 {
+			tried++
+			if p.wal.readFramePageHook(frame, pgno, buf, scratch, &aead, nil) == nil {
+				return true, tried
+			}
+			continue
+		}
+		if p.file == nil {
+			continue
+		}
+		if _, err := p.file.ReadAt(buf, int64(pgno-1)*int64(p.pageSize)); err != nil {
+			continue
+		}
+		tried++
+		if _, err := decryptPageWithCodec(p.codec, scratch, buf, pgno, &aead, nil); err == nil {
+			return true, tried
+		}
+	}
+	return false, tried
+}
+
+// END ENCRYPTION
 
 // testOpenAfterWALOpenHook runs in open between the WAL attach and the
 // page-1 / page-count read. Tests use it to let a peer checkpoint in that

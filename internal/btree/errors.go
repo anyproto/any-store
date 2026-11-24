@@ -13,6 +13,14 @@ var (
 	// database, bad field values, or a size that disagrees with the file. It wraps ErrCorrupt.
 	ErrHeaderCorrupt = fmt.Errorf("%w: header", ErrCorrupt)
 
+	// ErrWrongKey is returned (wrapped) by Open when the key does not open
+	// the file: page 1 failed its authentication, and so did every other
+	// page the open then tried under the same key (pager.proveKeyAtOpen).
+	// Deliberately NOT wrapping ErrCorrupt or ErrPageIntegrity: nothing
+	// shows the file to be damaged, and a caller that discards a corrupt
+	// database must not discard one it only failed to unlock.
+	ErrWrongKey = errors.New("btree: wrong encryption key")
+
 	// ErrSQLiteFormat reports a file carrying SQLite's header magic — an
 	// any-store v1 database. Deliberately NOT wrapping ErrCorrupt: the file is
 	// intact, only older, and a caller that responds to corruption by discarding

@@ -9259,3 +9259,191 @@ func TestPagerClose_RemovesOnlyOwnRegistryEntry(t *testing.T) {
 	_, held = openDBs.Load(key)
 	require.False(t, held)
 }
+
+// ============================================================
+// The key proof at open (readPage1AtOpen, page1Unauthenticated)
+// ============================================================
+
+// keyProofDB creates an encrypted database of about a hundred pages at a new
+// path and returns the path and the options that open it. With checkpoint
+// the pages are in the database file and the log is gone; without, the
+// returned path is a copy taken while the database was open, whose pages
+// past the first are only in its WAL.
+func keyProofDB(t *testing.T, checkpoint bool, hook func(uint32, error)) (string, Options) {
+	t.Helper()
+	encTestSetup(t)
+	path := tmpEncryptedFile(t, "enc.db")
+	opts := DefaultOptions()
+	opts.Key = []byte("right-passphrase")
+	opts.KDFIterations = 1000
+	opts.InProcess = true
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("x")
+	require.NoError(t, err)
+	val := bytes.Repeat([]byte("v"), 1000)
+	for i := 0; i < 400; i++ {
+		require.NoError(t, wtx.Put(ns, []byte(fmt.Sprintf("key-%04d", i)), val))
+	}
+	require.NoError(t, wtx.Commit())
+	if checkpoint {
+		require.NoError(t, db.Checkpoint(CheckpointFull))
+		require.NoError(t, db.Close())
+	} else {
+		cp := tmpEncryptedFile(t, "copy.db")
+		for _, suffix := range []string{"", "-wal"} {
+			data, err := os.ReadFile(path + suffix)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(cp+suffix, data, 0o600))
+		}
+		require.NoError(t, db.Close())
+		path = cp
+	}
+	opts.OnIntegrityError = hook
+	return path, opts
+}
+
+// damageFile flips one byte of the file at off.
+func damageFile(t *testing.T, path string, off int64) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer f.Close()
+	var b [1]byte
+	_, err = f.ReadAt(b[:], off)
+	require.NoError(t, err)
+	b[0] ^= 0xFF
+	_, err = f.WriteAt(b[:], off)
+	require.NoError(t, err)
+}
+
+// A wrong key is ErrWrongKey, not a kind of corruption, and tells the
+// integrity hook nothing: of page 1 or of the pages the open tried.
+func TestOpen_WrongKeyIsErrWrongKey(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		checkpoint bool
+	}{
+		{"pages in the database file", true},
+		{"pages in the WAL", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var fired atomic.Int32
+			path, opts := keyProofDB(t, tc.checkpoint, func(uint32, error) { fired.Add(1) })
+			opts.Key = []byte("wrong-passphrase")
+			_, err := Open(path, opts)
+			require.ErrorIs(t, err, ErrWrongKey)
+			require.NotErrorIs(t, err, ErrCorrupt)
+			require.NotErrorIs(t, err, ErrPageIntegrity)
+			require.Zero(t, fired.Load(), "a wrong key must not fire the integrity hook")
+
+			// The file is as it was: the right key opens it.
+			opts.Key = []byte("right-passphrase")
+			db, err := Open(path, opts)
+			require.NoError(t, err)
+			require.NoError(t, db.Close())
+			require.Zero(t, fired.Load())
+		})
+	}
+}
+
+// A wrong raw key (no KDF) and a wrong caller-made codec are wrong keys too.
+func TestOpen_WrongRawKeyAndCodec(t *testing.T) {
+	encTestSetup(t)
+	path := tmpEncryptedFile(t, "enc.db")
+	opts := DefaultOptions()
+	opts.Key = bytes.Repeat([]byte{1}, KeyLen)
+	opts.InProcess = true
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("x")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns, []byte("k"), bytes.Repeat([]byte("v"), 20000)))
+	require.NoError(t, wtx.Commit())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+	require.NoError(t, db.Close())
+
+	opts.Key = bytes.Repeat([]byte{2}, KeyLen)
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrWrongKey)
+	require.NotErrorIs(t, err, ErrCorrupt)
+
+	codec, err := NewAESCodec(bytes.Repeat([]byte{3}, KeyLen))
+	require.NoError(t, err)
+	opts.Key, opts.Codec = nil, codec
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrWrongKey)
+	require.NotErrorIs(t, err, ErrCorrupt)
+}
+
+// A page 1 damaged under the right key is damage: another page
+// authenticates, so the key is proven. The integrity hook hears of page 1,
+// once, and of no other page.
+func TestOpen_DamagedPage1UnderRightKeyIsCorrupt(t *testing.T) {
+	var pages []uint32
+	path, opts := keyProofDB(t, true, nil)
+	opts.OnIntegrityError = func(pgno uint32, _ error) { pages = append(pages, pgno) }
+	damageFile(t, path, 1000)
+
+	_, err := Open(path, opts)
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, ErrWrongKey)
+	require.Equal(t, []uint32{1}, pages)
+}
+
+// The pages tried are spread over the file: with its first quarter damaged,
+// page 1 included, the key is still proven on a later page.
+func TestOpen_DamagedHeadOfFileUnderRightKeyIsCorrupt(t *testing.T) {
+	path, opts := keyProofDB(t, true, nil)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	pageSize := int64(opts.PageSize)
+	nPage := info.Size() / pageSize
+	require.Greater(t, nPage, int64(4*keyProbePages), "the test needs more pages than the open tries")
+	for pg := int64(0); pg < nPage/4; pg++ {
+		damageFile(t, path, pg*pageSize+1000)
+	}
+
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, ErrWrongKey)
+}
+
+// What the open cannot tell apart is reported as a wrong key, the answer
+// that keeps the file: a database of one page whose page 1 is damaged has
+// no other page to prove the key on.
+func TestOpen_DamagedOnePageFileIsErrWrongKey(t *testing.T) {
+	encTestSetup(t)
+	path := tmpEncryptedFile(t, "enc.db")
+	opts := DefaultOptions()
+	opts.Key = []byte("right-passphrase")
+	opts.KDFIterations = 1000
+	opts.InProcess = true
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, int64(opts.PageSize), info.Size())
+	damageFile(t, path, 1000)
+
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrWrongKey)
+	require.NotErrorIs(t, err, ErrCorrupt)
+}
+
+// A later page damaged under the right key does not fail the open: the
+// open authenticates page 1 only, and the read that meets the page reports
+// it, as before.
+func TestOpen_DamagedLaterPageOpens(t *testing.T) {
+	path, opts := keyProofDB(t, true, nil)
+	damageFile(t, path, 2*int64(opts.PageSize)+1000)
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+}

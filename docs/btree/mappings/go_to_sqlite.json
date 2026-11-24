@@ -2163,9 +2163,21 @@
     ],
     "note": "page 1 and the page count are read at one snapshot in readPage1AtOpen"
   },
+  "pager.go:*pager.page1FrameHeader": {
+    "sqlite": [],
+    "note": "the plaintext header of page 1's WAL frame, for the format checks that come before the key's (drift-2026-11-24-3)"
+  },
+  "pager.go:*pager.page1Hook": {
+    "sqlite": [],
+    "note": "under a key, page 1's failed authentication at open is kept from the integrity hook until it is known to be damage (drift-2026-11-24-3)"
+  },
   "pager.go:*pager.page1OnChange": {
     "sqlite": [],
     "note": "schema format 6 and later write page 1 only when needed"
+  },
+  "pager.go:*pager.page1Unauthenticated": {
+    "sqlite": [],
+    "note": "a page 1 that fails its authentication at open: ErrWrongKey unless another page proves the key; SQLCipher returns SQLITE_NOTADB for both (sqlcipher.c:3273-3290, btree.c:3306-3311, v4.14.0; drift-2026-11-24-3)"
   },
   "pager.go:*pager.pagerError": {
     "sqlite": [
@@ -2184,6 +2196,10 @@
       "pager.c:pagerStress"
     ],
     "note": "a failed write stores pager.errCode and sets pagerError, pager_error's part (pager.c:1947-1960), inline"
+  },
+  "pager.go:*pager.proveKeyAtOpen": {
+    "sqlite": [],
+    "note": "tries up to keyProbePages other pages under the open's key; no SQLCipher counterpart (drift-2026-11-24-3)"
   },
   "pager.go:*pager.readDBPage": {
     "sqlite": [],
@@ -2897,6 +2913,18 @@
       "wal.c:sqlite3WalReadFrame"
     ],
     "note": ""
+  },
+  "wal.go:*wal.readFramePage": {
+    "sqlite": [
+      "wal.c:sqlite3WalReadFrame"
+    ],
+    "note": "readFrame for a page number the caller resolved; decrypts with the database's integrity hook"
+  },
+  "wal.go:*wal.readFramePageHook": {
+    "sqlite": [
+      "wal.c:sqlite3WalReadFrame"
+    ],
+    "note": "readFramePage with the integrity hook as an argument: the open's key proof passes its own (drift-2026-11-24-3)"
   },
   "wal.go:*wal.readFramePgno": {
     "sqlite": [],

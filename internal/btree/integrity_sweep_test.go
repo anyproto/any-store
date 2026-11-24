@@ -241,16 +241,26 @@ func TestVerifyIntegrity_DamagedPage1Listed(t *testing.T) {
 				t.Fatal(err)
 			}
 			pages := len(data) / int(tc.opts.PageSize)
-			data[dbHeaderSize+100] ^= 0x01
-			if err := os.WriteFile(path, data, 0644); err != nil {
-				t.Fatal(err)
-			}
 
+			// The page is damaged under the open database: an open under a
+			// key authenticates page 1 and refuses a damaged one
+			// (readPage1AtOpen).
 			db, err := Open(path, tc.opts)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer db.Close()
+			f, err := os.OpenFile(path, os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = f.WriteAt([]byte{data[dbHeaderSize+100] ^ 0x01}, dbHeaderSize+100)
+			if cerr := f.Close(); err == nil {
+				err = cerr
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
 			rep, err := db.VerifyIntegrity(context.Background())
 			if err != nil {
 				t.Fatalf("VerifyIntegrity: %v", err)

@@ -3277,6 +3277,14 @@ func (w *wal) readFrame(frame uint32, buf, scratchBuf []byte, aeadScratchBuf *ae
 // pgno binds the codec's AAD, so the content read is the only I/O
 // (sqlite3WalReadFrame, wal.c:3649). pgno 0 reads it from the frame header.
 func (w *wal) readFramePage(frame, pgno uint32, buf, scratchBuf []byte, aeadScratchBuf *aeadScratch) error {
+	return w.readFramePageHook(frame, pgno, buf, scratchBuf, aeadScratchBuf, w.onIntegrityError)
+}
+
+// readFramePageHook is readFramePage with the integrity hook a failed
+// decrypt is reported to. Every read passes the database's hook, except
+// the reads by which an open proves its key (pager.readPage1AtOpen), whose
+// failures are not yet known to be damage.
+func (w *wal) readFramePageHook(frame, pgno uint32, buf, scratchBuf []byte, aeadScratchBuf *aeadScratch, onError integrityHook) error {
 	if frame == 0 {
 		return ErrWALCorrupt
 	}
@@ -3350,7 +3358,7 @@ func (w *wal) readFramePage(frame, pgno uint32, buf, scratchBuf []byte, aeadScra
 		if aeadS == nil {
 			aeadS = new(aeadScratch)
 		}
-		plain, derr := decryptPageWithCodec(w.codec, scratch, buf[:w.pageSize], pgno, aeadS, w.onIntegrityError)
+		plain, derr := decryptPageWithCodec(w.codec, scratch, buf[:w.pageSize], pgno, aeadS, onError)
 		if derr != nil {
 			if ownScratch {
 				freePageBuffer(scratch, false)

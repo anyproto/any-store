@@ -71,13 +71,9 @@ func TestEncryption_WrongPassphraseFails(t *testing.T) {
 	require.NoError(t, db.Close())
 
 	cfg.Encryption.Passphrase = []byte("wrong")
-	db2, err := Open(context.Background(), path, cfg)
-	// Either Open itself or the first query fails — both acceptable.
-	if err == nil {
-		defer db2.Close()
-		_, openErr := db2.OpenCollection(context.Background(), "any")
-		assert.Error(t, openErr, "expected failure when opening collection with wrong key")
-	}
+	_, err = Open(context.Background(), path, cfg)
+	require.ErrorIs(t, err, ErrWrongKey)
+	require.NotErrorIs(t, err, ErrCorrupt)
 }
 
 func TestEncryption_MissingPassphraseFails(t *testing.T) {
