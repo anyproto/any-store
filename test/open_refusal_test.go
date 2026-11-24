@@ -2,6 +2,7 @@ package test
 
 import (
 	"context"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 // A second Open of a file this process has open is refused with
@@ -94,4 +96,49 @@ func TestOpen_PanickingIntegrityCallbackReleasesTheFile(t *testing.T) {
 	_, err = anystore.Open(ctx, path, cfg(nil))
 	require.ErrorIs(t, err, anystore.ErrQuickCheckFailed)
 	require.NotErrorIs(t, err, anystore.ErrDBAlreadyOpen)
+}
+
+// A write-ahead log written by a newer release is ErrIncompatibleVersion,
+// as a newer database file is, and the log is left as it was: it holds
+// commits this release cannot read.
+func TestOpen_NewerWAL(t *testing.T) {
+	// given: a database and its log, copied while it is open
+	dir := t.TempDir()
+	path := filepath.Join(dir, "live.db")
+	db, err := anystore.Open(ctx, path, &anystore.Config{DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	coll, err := db.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"1"}`)))
+	cp := filepath.Join(dir, "copy.db")
+	for _, suffix := range []string{"", "-wal"} {
+		data, err := os.ReadFile(path + suffix)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(cp+suffix, data, 0o644))
+	}
+	require.NoError(t, db.Close())
+
+	// the log's version one above this release's, under a valid header checksum
+	wal, err := os.ReadFile(cp + "-wal")
+	require.NoError(t, err)
+	require.Greater(t, len(wal), 32)
+	binary.BigEndian.PutUint32(wal[4:8], binary.BigEndian.Uint32(wal[4:8])+1)
+	var s1, s2 uint32
+	for i := 0; i < 24; i += 8 {
+		s1 += binary.BigEndian.Uint32(wal[i:]) + s2
+		s2 += binary.BigEndian.Uint32(wal[i+4:]) + s1
+	}
+	binary.BigEndian.PutUint32(wal[24:28], s1)
+	binary.BigEndian.PutUint32(wal[28:32], s2)
+	require.NoError(t, os.WriteFile(cp+"-wal", wal, 0o644))
+
+	// when
+	_, err = anystore.Open(ctx, cp, nil)
+
+	// then
+	require.ErrorIs(t, err, anystore.ErrIncompatibleVersion)
+	require.NotErrorIs(t, err, anystore.ErrCorrupt)
+	after, err := os.ReadFile(cp + "-wal")
+	require.NoError(t, err)
+	require.Equal(t, wal, after, "a refused open must leave the log as it was")
 }

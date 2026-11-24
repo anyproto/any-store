@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -283,15 +284,16 @@ func TestWALDecryptFailurePropagatesFromReadFrame(t *testing.T) {
 	require.Equal(t, targetPgno, gotPgno.Load(), "OnIntegrityError must report the failing page")
 }
 
-// TestWALFrameReadErrorsThroughEveryReader drives a failed ReadAt of a frame
-// above this process's frame count, one a peer may have committed, through
-// each reader of WAL frames: the decoding one (readFramePage), the raw one
-// (readFrameRaw) and the pager's header reader (readWalFrameData). A read
-// past the end of the file is ErrWALShortRead, as SQLite's
-// sqlite3WalReadFrame gives SQLITE_IOERR_SHORT_READ (wal.c:3649-3664;
-// docs/btree/NOTES.md
-// #drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt).
-// Any other failure is the read's own error. Neither is corruption.
+// TestWALFrameReadErrorsThroughEveryReader drives a failed ReadAt of a WAL
+// frame through each reader of WAL frames: the decoding one (readFramePage),
+// the raw one (readFrameRaw) and the pager's header reader
+// (readWalFrameData). A read past the end of the file is ErrWALShortRead, as
+// SQLite's sqlite3WalReadFrame gives SQLITE_IOERR_SHORT_READ
+// (wal.c:3649-3664), and keeps the read's io.EOF: a frame the index holds
+// that the log was cut inside, on every target, and, in the multi-process
+// mode, a frame above this process's count, which a peer may have
+// committed. Any other failure is the read's own error. Neither is
+// corruption.
 func TestWALFrameReadErrorsThroughEveryReader(t *testing.T) {
 	dir := t.TempDir()
 	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096, DisableAutoCheckpoint: true})
@@ -313,13 +315,31 @@ func TestWALFrameReadErrorsThroughEveryReader(t *testing.T) {
 		{"page-1 header", func(frame uint32) error { return db.pager.readWalFrameData(frame, buf[:dbHeaderSize]) }},
 	}
 
+	// The log cut inside the page of its last frame, which the index
+	// holds: within this process's count, so every target reads it.
+	logBytes, err := os.ReadFile(w.path)
+	require.NoError(t, err)
+	cut := int64(walHeaderSize) + int64(nf-1)*int64(walFrameSize+len(buf)) + walFrameSize + dbHeaderSize/2
+	require.Less(t, cut, int64(len(logBytes)))
+	require.NoError(t, os.Truncate(w.path, cut))
+	for _, r := range readers {
+		err := r.read(nf)
+		require.ErrorIs(t, err, ErrWALShortRead, r.name)
+		require.ErrorIs(t, err, io.EOF, r.name)
+		require.NotErrorIs(t, err, ErrCorrupt, r.name)
+	}
+	require.NoError(t, os.WriteFile(w.path, logBytes, 0o644))
+
 	// Multi-process mode: a frame beyond the local nFrame is attempted
 	// against the file (a peer may have committed it); here nothing did, so
-	// the read comes up short.
-	for _, r := range readers {
-		err := r.read(nf + 100)
-		require.ErrorIs(t, err, ErrWALShortRead, r.name)
-		require.NotErrorIs(t, err, ErrCorrupt, r.name)
+	// the read comes up short. In the in-process mode, which the targets
+	// without shared memory are in, the frame is outside the log.
+	if hasMmapShm {
+		for _, r := range readers {
+			err := r.read(nf + 100)
+			require.ErrorIs(t, err, ErrWALShortRead, r.name)
+			require.NotErrorIs(t, err, ErrCorrupt, r.name)
+		}
 	}
 
 	// A ReadAt that fails for another reason: the read's error as it is.
@@ -330,7 +350,7 @@ func TestWALFrameReadErrorsThroughEveryReader(t *testing.T) {
 	w.file = closed
 	defer func() { w.file = walFile }()
 	for _, r := range readers {
-		err := r.read(nf + 1)
+		err := r.read(nf)
 		require.ErrorIs(t, err, os.ErrClosed, r.name)
 		require.NotErrorIs(t, err, ErrWALShortRead, r.name)
 		require.NotErrorIs(t, err, ErrCorrupt, r.name)

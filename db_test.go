@@ -3990,8 +3990,9 @@ func TestOpen_DirtyQuickCheckErrors(t *testing.T) {
 	})
 }
 
-// Backup refuses a destination that holds a database of another kind with
-// an exported error, and leaves it as it was.
+// Backup refuses a destination that holds a database of another schema
+// format with an exported error, and leaves it as it was. Another page
+// layout: test/backup_roundtrip_test.go.
 func TestBackup_DestinationOfAnotherKind(t *testing.T) {
 	ctx := context.Background()
 	newDB := func(t *testing.T, path string, conf *Config) {
@@ -4014,14 +4015,6 @@ func TestBackup_DestinationOfAnotherKind(t *testing.T) {
 		require.Equal(t, before, after)
 	}
 
-	t.Run("plain pages over checksummed ones", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "dst.db")
-		newDB(t, path, nil)
-		src, err := Open(ctx, "", &Config{InMemory: true})
-		require.NoError(t, err)
-		defer src.Close()
-		backupRefused(t, src, path, ErrBackupCodecMismatch)
-	})
 	t.Run("another schema format", func(t *testing.T) {
 		dir := t.TempDir()
 		src, err := Open(ctx, filepath.Join(dir, "src.db"), nil)
@@ -4098,4 +4091,42 @@ func TestIntegrityCheck_BusyMatchesErrBusy(t *testing.T) {
 	require.ErrorIs(t, err, btree.ErrBusyRecovery)
 	require.NotErrorIs(t, err, ErrCorrupt)
 	require.NoError(t, d.IntegrityCheck(ctx))
+}
+
+// A busy error of the initialization Open runs once the btree has opened
+// (here the write begin of init, its snapshot overtaken by another
+// process's commit at every attempt) matches ErrBusy and keeps the btree's
+// error.
+func TestOpen_BusyInitializationMatchesErrBusy(t *testing.T) {
+	if !mmapShm() {
+		t.Skip("the wal-index is this process's memory: no other process commits")
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "a.db")
+	d, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+
+	testHookAfterBtreeOpen = func(bdb *btree.DB) {
+		bdb.TestSeam().SetBusyTimeout(100 * time.Millisecond)
+		btree.SetTestBeforeBeginWriteHook(func(s btree.TestSeam) {
+			if s.Path() == bdb.TestSeam().Path() {
+				s.PeerPublish()
+			}
+		})
+	}
+	defer func() {
+		testHookAfterBtreeOpen = nil
+		btree.SetTestBeforeBeginWriteHook(nil)
+	}()
+	_, err = Open(ctx, path, nil)
+	require.ErrorIs(t, err, ErrBusy)
+	require.ErrorIs(t, err, btree.ErrBusySnapshot)
+	require.NotErrorIs(t, err, ErrCorrupt)
+
+	testHookAfterBtreeOpen = nil
+	btree.SetTestBeforeBeginWriteHook(nil)
+	d, err = Open(ctx, path, nil)
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
 }

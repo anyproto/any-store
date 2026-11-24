@@ -350,6 +350,9 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 	if ds.btreeDB, err = btree.Open(path, opts); err != nil {
 		return nil, openErr(err)
 	}
+	if testHookAfterBtreeOpen != nil {
+		testHookAfterBtreeOpen(ds.btreeDB)
+	}
 	// ContinueOnIntegrityError only applies to checksum mode. AEAD mode
 	// ignores it by design (disabling AEAD verification would return
 	// attacker-controlled plaintext); plain mode has nothing to verify.
@@ -1037,6 +1040,10 @@ var testHookFoundRegistered func(c *collection)
 // testHookBeforeBtreeOpen, when set, runs in open after the path is resolved
 // and the sentinel is set up, just before btree.Open. Tests only.
 var testHookBeforeBtreeOpen func()
+
+// testHookAfterBtreeOpen, when set, runs in open with the btree handle it
+// has just opened, before the initialization that follows. Tests only.
+var testHookAfterBtreeOpen func(*btree.DB)
 
 // errHandleGone tells openCollection that the handle it found registered is
 // not live any more.

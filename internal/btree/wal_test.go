@@ -2988,6 +2988,45 @@ func TestWALClosedFileReadIsErrClosed(t *testing.T) {
 	require.NotErrorIs(t, err, ErrCorrupt)
 }
 
+// copyRegionShm is a wal-index whose region 0 is handed out as a fresh copy
+// on every call: a write to it is lost, and every read sees the region as
+// it was. A publication of the header into it succeeds, and the header read
+// back after it is the one before.
+type copyRegionShm struct{ shm }
+
+func (s *copyRegionShm) region(index int, create bool) ([]byte, error) {
+	r, err := s.shm.region(index, create)
+	if err != nil || index != 0 {
+		return r, err
+	}
+	return append([]byte(nil), r...), nil
+}
+
+// A wal-index header still invalid after a recovery that published it
+// without an error is errWalIndexUnpublished, not ErrCorrupt: the wal-index
+// is shared memory, and walIndexReadHdr has no check of its own after
+// walIndexRecover (wal.c:2724).
+func TestIndexReadHdr_HeaderInvalidAfterRecoveryIsNotCorrupt(t *testing.T) {
+	w := newWal(filepath.Join(t.TempDir(), "test.db-wal"), 4096)
+	w.inProcess = true
+	require.NoError(t, w.open())
+	real := w.index.shm
+	defer func() {
+		w.index.shm = real
+		_ = w.close(false)
+	}()
+	region, err := real.region(0, false)
+	require.NoError(t, err)
+	clear(region[:2*walIndexHdrSize]) // both copies of the header
+	_, valid := w.index.readHeader()
+	require.False(t, valid)
+
+	w.index.shm = &copyRegionShm{shm: real}
+	_, err = w.indexReadHdr(false, false)
+	require.ErrorIs(t, err, errWalIndexUnpublished)
+	require.NotErrorIs(t, err, ErrCorrupt)
+}
+
 // A recovery of the wal-index that cannot publish its header returns the
 // publication's error, as walIndexReadHdr returns walIndexRecover's
 // (wal.c:2724), not a header that is merely still invalid.
