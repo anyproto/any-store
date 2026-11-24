@@ -244,6 +244,18 @@ var (
 	// authentication later is damaged: ErrPageIntegrity.
 	ErrWrongKey = btree.ErrWrongKey
 
+	// ErrEncryptionKeyRequired is returned by Open, and (wrapped) by Backup for its destination,
+	// when the file is encrypted and Config.Encryption is empty: no Passphrase and no Codec.
+	// Nothing past the file's header was read, and the file is left unchanged. Open it with the
+	// Config.Encryption it was created with. It does not match ErrCorrupt.
+	ErrEncryptionKeyRequired = errors.New("any-store: database file is encrypted: set Config.Encryption")
+
+	// ErrNotEncrypted is returned by Open, and (wrapped) by Backup for its destination, when
+	// the file is not encrypted and Config.Encryption holds a Passphrase or a Codec. The file
+	// is left unchanged; it is not encrypted in place. Open it with an empty Config.Encryption.
+	// It does not match ErrCorrupt.
+	ErrNotEncrypted = errors.New("any-store: database file is not encrypted: clear Config.Encryption")
+
 	// ErrCorrupt is the umbrella for damaged database files: every error below that names a kind
 	// of damage matches it, as does a broken structure found while reading. Match it when the kind
 	// does not matter, for instance to discard and rebuild the database:
@@ -308,6 +320,24 @@ type nestedError struct {
 
 func (e *nestedError) Error() string { return e.msg }
 func (e *nestedError) Unwrap() error { return e.parent }
+
+// openErr gives an error of btree.Open the identity this package exports
+// for it, where the btree's own names its options and not Config's.
+func openErr(err error) error {
+	switch {
+	case errors.Is(err, btree.ErrPageSlabNotInitialized):
+		return ErrPageBufferNotInitialized
+	case errors.Is(err, btree.ErrSQLiteFormat):
+		return ErrV1Database
+	case errors.Is(err, btree.ErrNewerFormat):
+		return fmt.Errorf("%w: %w", ErrIncompatibleVersion, err)
+	case errors.Is(err, btree.ErrKeyRequired):
+		return ErrEncryptionKeyRequired
+	case errors.Is(err, btree.ErrNotEncrypted):
+		return ErrNotEncrypted
+	}
+	return err
+}
 
 // isBusyErr reports one of the storage layer's "not now" errors: a lock that
 // stayed busy, a snapshot another process's commit overtook, a wal-index

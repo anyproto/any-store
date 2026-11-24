@@ -94,7 +94,8 @@ func TestEncryption_MissingPassphraseFails(t *testing.T) {
 
 	// Reopen without passphrase.
 	_, err = Open(context.Background(), path, &Config{})
-	assert.Error(t, err)
+	require.ErrorIs(t, err, ErrEncryptionKeyRequired)
+	require.NotErrorIs(t, err, ErrCorrupt)
 }
 
 func TestEncryption_DisabledByDefault(t *testing.T) {

@@ -302,16 +302,7 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		testHookBeforeBtreeOpen()
 	}
 	if ds.btreeDB, err = btree.Open(path, opts); err != nil {
-		if errors.Is(err, btree.ErrPageSlabNotInitialized) {
-			return nil, ErrPageBufferNotInitialized
-		}
-		if errors.Is(err, btree.ErrSQLiteFormat) {
-			return nil, ErrV1Database
-		}
-		if errors.Is(err, btree.ErrNewerFormat) {
-			return nil, fmt.Errorf("%w: %w", ErrIncompatibleVersion, err)
-		}
-		return nil, err
+		return nil, openErr(err)
 	}
 	// ContinueOnIntegrityError only applies to checksum mode. AEAD mode
 	// ignores it by design (disabling AEAD verification would return
@@ -1391,7 +1382,7 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 	}
 	dstDB, err := btree.Open(path, dstOpts)
 	if err != nil {
-		return fmt.Errorf("open backup destination: %w", err)
+		return fmt.Errorf("open backup destination: %w", openErr(err))
 	}
 	if testBackupOpenHook != nil {
 		testBackupOpenHook(dstDB)

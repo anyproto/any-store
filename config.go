@@ -233,10 +233,13 @@ type Config struct {
 // nil Passphrase to disable encryption.
 //
 // Once a database is created with encryption, it must always be opened
-// with matching Encryption config. Reopening without the passphrase (or
-// with the wrong one) returns an error. There is no in-place rekey in
-// v1; changing a passphrase requires exporting to a freshly-opened
-// database.
+// with matching Encryption config. Open returns ErrEncryptionKeyRequired
+// for an encrypted file opened with no Passphrase and no Codec,
+// ErrNotEncrypted for a file that is not encrypted opened with one, and
+// ErrWrongKey for a Passphrase, key, cipher or Codec that does not open
+// the file. None of the three matches ErrCorrupt, and each leaves the
+// file unchanged. There is no in-place rekey; changing a passphrase
+// requires exporting to a freshly-opened database.
 //
 // An InMemory database keeps its pages unencrypted in memory (there is
 // no at-rest artifact to protect). Its Backup is encrypted only when

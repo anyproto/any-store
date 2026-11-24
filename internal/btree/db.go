@@ -736,9 +736,9 @@ func Open(path string, opts Options) (*DB, error) {
 				fileCksum := !fileEncrypted && hdr.ReservedSpace == cksumOverhead
 				switch {
 				case fileEncrypted && !wantEncryption:
-					return fmt.Errorf("btree: database file is encrypted, Options.Key or Options.Codec required")
+					return ErrKeyRequired
 				case !fileEncrypted && wantEncryption:
-					return fmt.Errorf("btree: database file is not encrypted, remove Options.Key/Codec")
+					return ErrNotEncrypted
 				}
 				useCksum = fileCksum
 			}

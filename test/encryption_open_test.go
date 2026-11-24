@@ -128,3 +128,59 @@ func TestOpen_DamagedPage1UnderRightKey(t *testing.T) {
 	require.NotErrorIs(t, err, anystore.ErrWrongKey)
 	require.Equal(t, []uint32{1}, calls.get())
 }
+
+// The two refusals of a Config.Encryption that does not fit the file are
+// matchable, name the public config, are not corruption, and leave the file
+// as it was.
+func TestOpen_EncryptionRefusals(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("encrypted file, no key", func(t *testing.T) {
+		path, cfg := encryptedDB(t)
+		_, err := anystore.Open(ctx, path, nil)
+		require.ErrorIs(t, err, anystore.ErrEncryptionKeyRequired)
+		require.NotErrorIs(t, err, anystore.ErrCorrupt)
+		require.NotErrorIs(t, err, anystore.ErrWrongKey)
+		require.Contains(t, err.Error(), "Config.Encryption")
+
+		db, err := anystore.Open(ctx, path, &cfg)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+	})
+
+	t.Run("plain file, key given", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "plain.db")
+		db, err := anystore.Open(ctx, path, nil)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+
+		_, err = anystore.Open(ctx, path, &anystore.Config{Encryption: anystore.EncryptionConfig{
+			Passphrase:    []byte("a passphrase"),
+			KDFIterations: 1000,
+		}})
+		require.ErrorIs(t, err, anystore.ErrNotEncrypted)
+		require.NotErrorIs(t, err, anystore.ErrCorrupt)
+		require.NotErrorIs(t, err, anystore.ErrWrongKey)
+		require.Contains(t, err.Error(), "Config.Encryption")
+
+		db, err = anystore.Open(ctx, path, nil)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+	})
+
+	// A backup's destination is opened with the source's encryption: one
+	// that exists and does not fit is refused with the same errors.
+	t.Run("backup destination", func(t *testing.T) {
+		path, cfg := encryptedDB(t)
+		plain := filepath.Join(t.TempDir(), "plain.db")
+		db, err := anystore.Open(ctx, plain, nil)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+
+		src, err := anystore.Open(ctx, path, &cfg)
+		require.NoError(t, err)
+		defer src.Close()
+		err = src.Backup(ctx, plain)
+		require.ErrorIs(t, err, anystore.ErrNotEncrypted)
+	})
+}
