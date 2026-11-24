@@ -62,3 +62,36 @@ func TestOpen_SecondOpenInProcess(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db2.Close())
 }
+
+// An OnIntegrityError that panics inside Open, after the file is open (in
+// the quick check of a dirty open, which reads the damaged catalog page),
+// leaves nothing of the open behind: a caller that recovers opens the file
+// again, and is not refused as a second open of it.
+func TestOpen_PanickingIntegrityCallbackReleasesTheFile(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "a.db")
+	cfg := func(cb func(anystore.IntegrityError)) *anystore.Config {
+		return &anystore.Config{Durability: anystore.DurabilityConfig{Sentinel: true}, OnIntegrityError: cb}
+	}
+	db, err := anystore.Open(ctx, path, cfg(nil))
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	// Page 2 is the catalog's root, which the quick check reads; the open
+	// before it reads page 1 only. The marker is what a process that died
+	// after a write leaves.
+	flipByte(t, path, 4096+1000)
+	require.NoError(t, os.WriteFile(path+".lock", nil, 0o644))
+
+	func() {
+		defer func() { require.Equal(t, "integrity callback", recover()) }()
+		db, err := anystore.Open(ctx, path, cfg(func(anystore.IntegrityError) { panic("integrity callback") }))
+		if err == nil {
+			_ = db.Close()
+		}
+		t.Fatalf("Open returned (%v) without calling the callback", err)
+	}()
+
+	_, err = anystore.Open(ctx, path, cfg(nil))
+	require.ErrorIs(t, err, anystore.ErrQuickCheckFailed)
+	require.NotErrorIs(t, err, anystore.ErrDBAlreadyOpen)
+}

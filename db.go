@@ -268,6 +268,23 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		openedCollections: make(map[string]Collection),
 		byIdentity:        make(map[string]*collection),
 	}
+	// The open's cleanup is armed until it returns the handle, not only on
+	// its error returns: a panic out of it (Config.OnIntegrityError is the
+	// caller's code, and the open's reads call it, in the write begin of
+	// init and in the quick check of a dirty open) would otherwise leave the
+	// file held by this process, and a caller that recovers would get
+	// ErrDBAlreadyOpen from every later Open of it. Closing a btree handle
+	// an error return closed already does nothing.
+	opened := false
+	defer func() {
+		if opened || ds.btreeDB == nil {
+			return
+		}
+		if ds.recoveryController != nil {
+			_ = ds.recoveryController.Stop()
+		}
+		_ = ds.btreeDB.Close()
+	}()
 
 	var quickCheckNeeded bool
 	ds.recoveryController, quickCheckNeeded = ds.createRecoveryController(ctx, path)
@@ -403,6 +420,7 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		return nil, err
 	}
 
+	opened = true
 	return ds, nil
 }
 
