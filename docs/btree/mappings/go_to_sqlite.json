@@ -286,7 +286,7 @@
       "btree.c:sqlite3BtreeIndexMoveto",
       "btree.c:sqlite3BtreeInsert"
     ],
-    "note": ""
+    "note": "tests the record size limit before the descent (recordSizeErr); SQLite tests SQLITE_LIMIT_LENGTH above the b-tree, in OP_MakeRecord (vdbe.c:3697), and sqlite3BtreeInsert only asserts its lengths"
   },
   "btree.go:*btree.balanceDeeper": {
     "sqlite": [
@@ -587,6 +587,10 @@
       "btree.c:btreeParseCellPtrIndex"
     ],
     "note": ""
+  },
+  "btree.go:recordSizeErr": {
+    "sqlite": [],
+    "note": "no b-tree counterpart: the write side of payloadFits, for Put, CreateNamespace and RenameNamespace. SQLite's is OP_MakeRecord's SQLITE_LIMIT_LENGTH test (vdbe.c:3697), which returns SQLITE_TOOBIG; here ErrKeyTooLarge when the key alone is over the limit, else ErrValueTooLarge"
   },
   "btree.go:searchInteriorPage": {
     "sqlite": [
@@ -1249,6 +1253,13 @@
     "sqlite": [],
     "note": ""
   },
+  "integrity_sweep.go:*DB.sweepPageCount": {
+    "sqlite": [
+      "btree.c:lockBtree",
+      "pager.c:sqlite3PagerPagecount"
+    ],
+    "note": "the page count the codec sweep covers: lockBtree's rule on the raw page-1 header, cross-checked against the size a WAL commit recorded"
+  },
   "integrity_sweep.go:verifyAEADPage": {
     "sqlite": [],
     "note": ""
@@ -1502,12 +1513,29 @@
     "sqlite": [],
     "note": ""
   },
+  "page.go:payloadFits": {
+    "sqlite": [],
+    "note": "no C counterpart: the 1 GiB cap on key length plus value length, tested on the 64-bit declared lengths without forming their sum; the cell parsers answer ErrCorrupt over it and Put refuses a record over it. btreeParseCellPtrIndex reads the payload length into a u32 and caps nothing; SQLite's write limit is SQLITE_LIMIT_LENGTH in OP_MakeRecord (vdbe.c:3697)"
+  },
+  "page.go:payloadInFile": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeMaxRecordSize",
+      "vdbemem.c:sqlite3VdbeMemFromBtree"
+    ],
+    "note": "sqlite3VdbeMemFromBtree's amt+offset > sqlite3BtreeMaxRecordSize test (vdbemem.c:1428), made by the b-tree's readers before they size a buffer from a declared length; a reader's page count is the pager's, not lockBtree's page-1 nPage"
+  },
   "page.go:putVarint": {
     "sqlite": [
       "util.c:putVarint64",
       "util.c:sqlite3PutVarint"
     ],
     "note": "putVarint64 is the static encoder; sqlite3PutVarint the public wrapper (util.c)"
+  },
+  "page.go:spilledLocalSize": {
+    "sqlite": [
+      "btree.c:btreePayloadToLocal"
+    ],
+    "note": "a key length and a value length, taken modulo usable-4 term by term, for a payload over maxLocal"
   },
   "page.go:tableLeafLimits": {
     "sqlite": [
@@ -1910,6 +1938,10 @@
   "pager.go:*pager.readRawPage": {
     "sqlite": [],
     "note": ""
+  },
+  "pager.go:*pager.readRawPage1Header": {
+    "sqlite": [],
+    "note": "page 1's header alone, for a page 1 the codec sweep cannot read whole"
   },
   "pager.go:*pager.readTempPage": {
     "sqlite": [

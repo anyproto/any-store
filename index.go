@@ -617,7 +617,22 @@ func (idx *index) putEntries(tx *btree.WriteTx, id []byte) error {
 			}
 			var err error
 			idx.seekBuf, err = tx.AppendSeekKey(idx.ns, seekKey, idx.seekBuf[:0])
-			if err == nil && qplanner.HasExactFieldPrefix(idx.seekBuf, key, lastInverted) {
+			if err != nil {
+				// ErrKeyNotFound: no key at or after the value, so no
+				// duplicate. A seek that failed found none and ruled none
+				// out: it seeks the bare value and the Put below the full
+				// key, which at a divider take different paths down the
+				// tree (the divider is at or below every key of its right
+				// child, and equal to the first when a leaf split has just
+				// copied it up from the new right leaf; the probe goes left
+				// of it), so the Put can succeed where
+				// the probe failed. As SQLite's OP_NoConflict, which aborts
+				// on a failed seek before it looks at the seek's result
+				// (vdbe.c:5414).
+				if err != btree.ErrKeyNotFound && !errors.Is(err, btree.ErrKeyNotFound) {
+					return err
+				}
+			} else if qplanner.HasExactFieldPrefix(idx.seekBuf, key, lastInverted) {
 				if !bytes.Equal(idx.seekBuf, idx.fullKeyBuf) {
 					return ErrUniqueConstraint
 				}
@@ -665,6 +680,11 @@ func (idx *index) markMultiKey(tx *btree.WriteTx) error {
 	idx.mkBuf, err = tx.AppendValue(idx.c.db.systemNS, key, idx.mkBuf[:0])
 	if err == nil && len(idx.mkBuf) == 1 && idx.mkBuf[0] == mkValMultiKey[0] {
 		return nil // already flagged in this tx's view
+	}
+	// An absent record (an index older than the flag) is set like a scalar
+	// one; a read that failed is the write's error.
+	if err != nil && err != btree.ErrKeyNotFound && !errors.Is(err, btree.ErrKeyNotFound) {
+		return err
 	}
 	return tx.Put(idx.c.db.systemNS, key, mkValMultiKey)
 }
