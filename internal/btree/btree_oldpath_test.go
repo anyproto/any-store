@@ -616,7 +616,7 @@ func TestOldPath_InsertIntoParent_RightChildBranch(t *testing.T) {
 	}
 	// Fisher-Yates-like deterministic shuffle using XOR
 	for i := n - 1; i > 0; i-- {
-		j := (i * 2654435761) % (i + 1) // deterministic pseudo-random
+		j := int(uint64(i) * 2654435761 % uint64(i+1)) // deterministic pseudo-random; uint64, as the constant is past a 32-bit int
 		perm[i], perm[j] = perm[j], perm[i]
 	}
 

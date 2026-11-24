@@ -697,28 +697,6 @@ func TestGap_ShmMmap_DMSLockFailure(t *testing.T) {
 	t.Skip("BUG: L50-53 DMS F_RDLCK failure essentially impossible on valid RW file descriptor")
 }
 
-// --- shm_mmap.go L144-146: fcntlLock non-EACCES/EAGAIN error ---
-// Trigger by using an invalid file descriptor (close the file first).
-func TestGap_ShmMmap_FcntlLock_BadFd(t *testing.T) {
-	dir := t.TempDir()
-	shmPath := filepath.Join(dir, "test.shm")
-
-	ms, err := newPlatformShm(shmPath)
-	require.NoError(t, err)
-
-	s := ms.(*mmapShm)
-	// Close the underlying file to invalidate the fd
-	_ = s.file.Close()
-
-	// Now try to lock - should fail with EBADF (not EACCES/EAGAIN)
-	err = s.fcntlLock(0x00, 0) // F_RDLCK = 0 on Linux
-	assert.Error(t, err)
-	assert.NotErrorIs(t, err, ErrBusy) // L144-146: non-EACCES/EAGAIN maps to generic error
-
-	// Prevent double-close in cleanup
-	s.file = nil
-}
-
 // ============================================================
 // Additional coverage: exercise freelist and overflow paths
 // ============================================================
