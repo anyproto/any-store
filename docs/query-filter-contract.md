@@ -373,8 +373,11 @@ build per query and carry no such guarantee.
     fields with the update applied: `{"id":1,"tags":["a"]}` for the `$push`
     above, and `{"id":1}` alone for a modifier that reports no change (a
     lone `$pull` or `$unset`), built from the id whatever such a modifier
-    did to the document it was handed. A modifier that changes the id fails
-    with `ErrPrimaryKeyModification` there as on an existing document.
+    did to the document it was handed. The id is immutable there as on an
+    existing document: a modifier that changes it to another value fails
+    with `ErrPrimaryKeyModification`, one that removes it (`$unset`) with
+    `ErrDocWithoutId`, and one that makes it an array with
+    `ErrArrayPrimaryKey`.
     Pinned by `TestModifierPush_Modify` and its siblings,
     `TestModifier_RemovalsCreateNoPath`,
     `TestModifier_RemovalPathViability`,
@@ -397,21 +400,22 @@ build per query and carry no such guarantee.
 
 18. **Numbers are float64.** anyenc stores every number as a float64, so an
     integer is exact up to 2^53 (9,007,199,254,740,992) in magnitude and a
-    larger one, given as a Go integer or written as a plain integer literal
-    in JSON, is the nearest float64 — in a stored document, a filter
-    operand, an index key and a document id alike. (The JSON parser rounds
-    a number written with an exponent twice, the digits and then the
-    scaling, so `9007199254740993e1` becomes `90071992547409920` where
+    larger one, given as one of Go's built-in integer types (`int`,
+    `int64`, `uint64`, …) or written as a plain integer literal in JSON, is
+    the nearest float64 — in a stored document, a filter operand, an index
+    key and a document id alike. (The JSON parser rounds a number written
+    with an exponent twice, the digits and then the scaling, so
+    `9007199254740993e1` becomes `90071992547409920` where
     `90071992547409930`, the same integer, becomes `90071992547409936`.)
-    Two such integers can be
-    one value: `{"n":9007199254740993}` matches a document whose `n` is
-    `9007199254740992`, and as ids they are one key: with a document of id
-    2^53 in the collection, `Insert` of id 2^53+1 fails with `ErrDocExists`,
-    `UpsertOne` with it replaces that document, and `FindId(2^53+1)` returns
-    it. There is no integer type next to the float (MongoDB has int, long and
-    decimal); integers that can go past 2^53 belong in strings. The
-    aggregation arithmetic has the same limit (docs/aggregation.md). Pinned
-    by `TestCollection_IdsPast2To53AreOneKey` (test/collection_test.go).
+    Two such integers can be one value: `{"n":9007199254740993}` matches a
+    document whose `n` is `9007199254740992`, and as ids they are one key:
+    with a document of id 2^53 in the collection, `Insert` of id 2^53+1
+    fails with `ErrDocExists`, `UpsertOne` with it replaces that document,
+    and `FindId(2^53+1)` returns it. There is no integer type next to the
+    float (MongoDB has int, long and decimal); integers that can go past
+    2^53 belong in strings. The aggregation arithmetic has the same limit
+    (docs/aggregation.md). Pinned by `TestCollection_IdsPast2To53AreOneKey`
+    (test/collection_test.go).
 
 19. **A `$text` query enforces at most 64 required clauses.** The required
     clauses are the clauses of `$search` under `"$defaultOperator": "and"`

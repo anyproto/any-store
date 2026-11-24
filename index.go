@@ -133,11 +133,13 @@ type VectorParams struct {
 	// M is at most 32,767 and EfConstruction and EfSearch at most 65,536.
 	//
 	// Creating an index (CreateIndex, or EnsureIndex of a name with no index)
-	// refuses with ErrInvalidConfig, and creates nothing: a negative M,
-	// EfConstruction, EfSearch, NList, NProbe or Closure; one past its bound
-	// in its field's doc; and a NaN CompactRatio. An index an earlier release
-	// created past these bounds keeps working, and EnsureIndex of its
-	// identical definition keeps it.
+	// refuses with ErrInvalidConfig, and creates nothing: an empty Field, a
+	// Dim not above 0, a Metric, Quantization or Mode that is none of its
+	// constants, a negative M, EfConstruction, EfSearch, NList, NProbe or
+	// Closure, one past its bound in its field's doc, and a NaN
+	// CompactRatio. The checks apply to an index being created: EnsureIndex
+	// of a definition identical to one in the catalog keeps that index
+	// without them.
 	M              int `json:"m,omitempty"`
 	EfConstruction int `json:"efConstruction,omitempty"`
 	EfSearch       int `json:"efSearch,omitempty"`

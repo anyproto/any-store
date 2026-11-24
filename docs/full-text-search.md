@@ -95,6 +95,12 @@ A query becomes a full-text search when it contains a `$text` clause:
 ```go
 // Ranked by relevance (BM25), most relevant first — the default order.
 iter, err := coll.Find(`{"$text":{"$search":"zeppelin disaster"}}`).Limit(10).Iter(ctx)
+if err != nil {
+    return err
+}
+// The iterator holds a read transaction until Close, and DB.Close waits
+// for every one.
+defer iter.Close()
 ```
 
 The search is **bag-of-words** (OR) by default: a document matches if it contains
@@ -104,11 +110,15 @@ filter is applied as a normal predicate on the ranked candidates:
 
 ```go
 // $text + ordinary filters (implicit AND).
-coll.Find(map[string]any{
+iter, err := coll.Find(map[string]any{
     "$text":  map[string]any{"$search": "crash"},
     "year":   map[string]any{"$gte": 1940},
     "status": "open",
 }).Limit(10).Iter(ctx)
+if err != nil {
+    return err
+}
+defer iter.Close()
 ```
 
 `$search` accepts a `$language`/`$caseSensitive`/`$diacriticSensitive` companion
@@ -219,8 +229,8 @@ for iter.Next() {
 }
 
 // Relevance is the default order; this is the explicit, MongoDB-compatible form:
-coll.Find(`{"$text":{"$search":"crash"}}`).
-    Sort(`{"score":{"$meta":"textScore"}}`).Iter(ctx)
+q := coll.Find(`{"$text":{"$search":"crash"}}`).
+    Sort(`{"score":{"$meta":"textScore"}}`)
 ```
 
 `Iterator.Score()` returns the row's BM25 score (0 for non-`$text` queries).
@@ -232,8 +242,8 @@ score order. Sorting on a **real field** overrides relevance and re-orders the
 matches:
 
 ```go
-coll.Find(`{"$text":{"$search":"london"}}`).Sort("year").Iter(ctx)   // oldest first
-coll.Find(`{"$text":{"$search":"london"}}`).Sort("-year").Iter(ctx)  // newest first
+oldest := coll.Find(`{"$text":{"$search":"london"}}`).Sort("year")   // oldest first
+newest := coll.Find(`{"$text":{"$search":"london"}}`).Sort("-year")  // newest first
 ```
 
 `Limit`/`Offset` apply *after* the residual filter and any sort, so
@@ -311,7 +321,7 @@ Searching works the same across scripts. A CJK query is split into the same
 bigrams used at index time, so `"東京"` matches documents containing 東京:
 
 ```go
-coll.Find(`{"$text":{"$search":"東京"}}`).Iter(ctx)
+q := coll.Find(`{"$text":{"$search":"東京"}}`)
 ```
 
 A CJK run is matched as a phrase of its bigrams, so `東京都` matches documents
@@ -426,10 +436,13 @@ coll.Insert(ctx,
 )
 
 // Relevance-ranked $text + a residual filter, newest first.
-iter, _ := coll.Find(map[string]any{
+iter, err := coll.Find(map[string]any{
     "$text": map[string]any{"$search": "london crash"},
     "year":  map[string]any{"$gte": 1950},
 }).Sort("-year").Limit(10).Iter(ctx)
+if err != nil {
+    log.Fatal(err)
+}
 defer iter.Close()
 
 for iter.Next() {

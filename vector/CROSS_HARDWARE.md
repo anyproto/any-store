@@ -16,8 +16,9 @@ reopen-from-disk). All runs: `n=20000`, `dim=768`, cosine, ef=64, k=10.
 > and `any-store-vector/RESULTS.md`.
 
 ```
-# The binary these runs used had the disk mode as its -db flag, up to v2.5.0:
-git checkout v2.5.0
+# The commit these runs were made at: its distance kernels are vek's, as the
+# tables below measured (v2.5.0 already runs internal/simd's).
+git checkout 4ba1543c
 go build -o vectorbench ./cmd/vectorbench
 ./vectorbench -n 20000 -dim 768 -db ~/vb.db      # run 1: build + persist
 ./vectorbench -n 20000 -dim 768 -db ~/vb.db      # run 2: cold reload from disk

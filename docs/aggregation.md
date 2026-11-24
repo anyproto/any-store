@@ -15,6 +15,9 @@ iter, err := coll.Aggregate(`[
     {"$sort":   {"n": -1}},
     {"$limit":  10}
 ]`).Iter(ctx)
+if err != nil {
+    return err
+}
 defer iter.Close()
 for iter.Next() {
     doc, _ := iter.Doc() // e.g. {"id":"go","n":42,"lastEdit":17498}

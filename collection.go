@@ -30,15 +30,15 @@ import (
 // accessors that take no context, have the committed schema.
 //
 // Numbers, document ids among them, are float64: an integer above 2^53
-// (9,007,199,254,740,992) in magnitude, given as a Go integer or as a plain
-// integer in JSON, is stored, looked up and compared as the nearest float64,
-// so two such integers can be one value. (JSON written with an exponent, as
-// 9007199254740993e1, is rounded twice by the parser and can land on another
-// float64; see docs/query-filter-contract.md, item 18.) As ids they are
-// one key: with a document of id 2^53 in the collection, an Insert of id
-// 2^53+1 fails with ErrDocExists, an UpsertOne with it replaces that
-// document, and FindId(2^53+1) returns it. Keep ids that can go past 2^53 as
-// strings.
+// (9,007,199,254,740,992) in magnitude, given as one of Go's built-in integer
+// types (int, int64, uint64, …) or as a plain integer in JSON, is stored,
+// looked up and compared as the nearest float64, so two such integers can be
+// one value. (JSON written with an exponent, as 9007199254740993e1, is
+// rounded twice by the parser and can land on another float64; see
+// docs/query-filter-contract.md, item 18.) As ids they are one key: with a
+// document of id 2^53 in the collection, an Insert of id 2^53+1 fails with
+// ErrDocExists, an UpsertOne with it replaces that document, and
+// FindId(2^53+1) returns it. Keep ids that can go past 2^53 as strings.
 type Collection interface {
 	// Name returns the committed name of the collection: a rename made in an
 	// open write transaction shows once it commits.
@@ -78,6 +78,10 @@ type Collection interface {
 
 	// UpdateId updates a single document in the collection with provided modifier
 	// Returns a modify result or error.
+	// The id is immutable: a mod that changes it to another value fails with
+	// ErrPrimaryKeyModification, one that removes it ($unset) with
+	// ErrDocWithoutId, and one that makes it an array with
+	// ErrArrayPrimaryKey; the document is left as it was.
 	UpdateId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error)
 
 	// UpsertOne inserts a document if it does not exist, or replaces it if it
@@ -91,9 +95,10 @@ type Collection interface {
 	// does, and when there is none inserts what mod makes of the document
 	// {<primary key>: id}, as MongoDB's upsert does: {id} alone, built from
 	// id, when mod reports no change, whatever it did to the document it was
-	// handed. An insert returns Matched 0 and Modified 1. A mod
-	// that changes the id fails with ErrPrimaryKeyModification and writes
-	// nothing, as it does for an existing document.
+	// handed. An insert returns Matched 0 and Modified 1. A mod that
+	// changes the id fails as UpdateId's does (ErrPrimaryKeyModification,
+	// ErrDocWithoutId or ErrArrayPrimaryKey) and writes nothing, whether a
+	// document has the id or not.
 	// An integer id above 2^53 in magnitude is the nearest float64, which can
 	// be another document's id: that document is then the one updated (see
 	// Collection).

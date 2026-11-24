@@ -92,7 +92,7 @@ The full end-to-end example lives in [`example/`](example) and the [API docs](ht
 
 > **Choosing document ids.** Unlike SQLite there is no hidden rowid — the document id is the btree key. Increment-like ids (`anyenc.NewObjectID()`, timestamps, sequences) keep inserts append-ordered and reads cache-friendly; fully random ids (e.g. UUIDv4) scatter them. In practice this only matters for very hot write/read paths or huge collections.
 
-> **Numbers are float64.** Every number is stored as a float64, as in JSON: integers are exact up to 2^53 (9,007,199,254,740,992) in magnitude, and a larger one, given as a Go integer or written as a plain integer in JSON, becomes the nearest float64, in a document, a filter and an id alike (a JSON number with an exponent can round to another one: [query contract](docs/query-filter-contract.md), item 18). Two such integers can then be one value, and as ids one document: with a document of id 2^53 in the collection, inserting id 2^53+1 fails with `ErrDocExists`, `UpsertOne` with it replaces that document, and `FindId(2^53+1)` returns it. Store integers that can go past 2^53, such as 64-bit hashes, as strings.
+> **Numbers are float64.** Every number is stored as a float64, as in JSON: integers are exact up to 2^53 (9,007,199,254,740,992) in magnitude, and a larger one, given as one of Go's built-in integer types (`int`, `int64`, `uint64`, …) or written as a plain integer in JSON, becomes the nearest float64, in a document, a filter and an id alike (a JSON number with an exponent can round to another one: [query contract](docs/query-filter-contract.md), item 18). Two such integers can then be one value, and as ids one document: with a document of id 2^53 in the collection, inserting id 2^53+1 fails with `ErrDocExists`, `UpsertOne` with it replaces that document, and `FindId(2^53+1)` returns it. Store integers that can go past 2^53, such as 64-bit hashes, as strings.
 
 ## Transactions
 
@@ -146,7 +146,10 @@ _ = docs.EnsureIndex(ctx, anystore.IndexInfo{
     Fields: []string{"title", "body"},
 })
 
-res, _ := docs.Find(`{"$text": {"$search": "wal checkpoint"}}`).Limit(10).Iter(ctx)
+res, err := docs.Find(`{"$text": {"$search": "wal checkpoint"}}`).Limit(10).Iter(ctx)
+if err != nil {
+    log.Fatal(err)
+}
 defer res.Close()
 ```
 
@@ -155,17 +158,31 @@ BM25-ranked, transactional (a `$text` write is visible to queries in the same tx
 ## Vector search
 
 ```go
-_ = docs.EnsureIndex(ctx, anystore.IndexInfo{
+// IVF-SQ trains its cells on the vectors already stored: insert first.
+err := docs.Insert(ctx,
+    anyenc.MustParseJson(`{"id": 1, "embedding": [0.9, 0.1, 0.0, 0.2]}`),
+    anyenc.MustParseJson(`{"id": 2, "embedding": [0.0, 0.1, 0.9, 0.7]}`),
+)
+if err != nil {
+    log.Fatal(err)
+}
+err = docs.EnsureIndex(ctx, anystore.IndexInfo{
     Kind: anystore.IndexKindVector,
     Vector: &anystore.VectorParams{
         Field:  "embedding",
-        Dim:    768,
+        Dim:    4, // the length of every vector: 768, 1536, … for a real embedding model
         Metric: anystore.VectorCosine, // or VectorL2 (VectorDot: HNSW/brute-force modes only)
         Mode:   anystore.VectorModeIVFSQ, // or BTree/Hybrid (HNSW), BruteForce
     },
 })
+if err != nil {
+    log.Fatal(err)
+}
 
-res, _ := docs.Find(`{"embedding": {"$knn": {"$query": [0.1, 0.2, ...], "$k": 10}}}`).Iter(ctx)
+res, err := docs.Find(`{"embedding": {"$knn": {"$query": [0.85, 0.15, 0.05, 0.15], "$k": 10}}}`).Iter(ctx)
+if err != nil {
+    log.Fatal(err)
+}
 defer res.Close()
 ```
 
@@ -174,11 +191,14 @@ ANN results stream in distance order and compose with filters; `$ef` tunes recal
 ## Aggregation
 
 ```go
-res, _ := orders.Aggregate(`[
+res, err := orders.Aggregate(`[
     {"$match": {"status": "paid"}},
     {"$group": {"_id": "$region", "total": {"$sum": "$amount"}}},
     {"$sort": {"total": -1}}
 ]`).Iter(ctx)
+if err != nil {
+    log.Fatal(err)
+}
 defer res.Close()
 ```
 
@@ -186,13 +206,15 @@ defer res.Close()
 
 ## Multi-process
 
-On Linux (Android included) and Darwin (macOS, iOS), on amd64 and arm64, the database file behaves like SQLite in WAL mode: any process may open it at any moment and read or write concurrently. Coordination runs through file locks and a shared-memory WAL index; snapshot reads are never blocked, and writers serialize. A lock another process holds, where a transaction's begin, `Open`, or a `Full`, `Restart` or `Truncate` checkpoint waits for one, is retried by the busy handler, with SQLite's backoff, for a fixed 5 seconds before it returns `ErrBusy`; there is no option to change it. Not every lock goes through it, as in SQLite: a passive checkpoint waits for none, a checkpoint (`Flush`) that finds another process checkpointing returns `ErrBusy` at once, and an `Open` that finds another process setting up the shared-memory index retries for about a second. DDL from a peer process (created/dropped collections and indexes) is reconciled automatically on the next transaction.
+On Linux (Android included) and Darwin (macOS, iOS), on amd64 and arm64, the database file behaves like SQLite in WAL mode: any process may open it at any moment and read or write concurrently. Coordination runs through file locks and a shared-memory WAL index; a snapshot read is not blocked by a writer or a checkpoint, and writers serialize. A lock another process holds, where a transaction's begin, `Open`, or a `Full`, `Restart` or `Truncate` checkpoint waits for one, is retried by the busy handler, with SQLite's backoff, for a fixed 5 seconds before it returns `ErrBusy`; there is no option to change it. Not every lock goes through it, as in SQLite: a passive checkpoint waits for none, a checkpoint (`Flush`) that finds another process checkpointing returns `ErrBusy` at once, and an `Open` that finds another process setting up the shared-memory index retries for about a second. A read waits too, as in SQLite, when it begins while another process rebuilds the shared-memory index after a crash: through the busy handler, and it fails once the 5 seconds pass. DDL from a peer process (created/dropped collections and indexes) is reconciled automatically on the next transaction.
 
 Every other target runs a database in one process at a time, with its WAL index in that process's memory. On Windows and the other Unix systems — FreeBSD and the other BSDs, illumos, and Linux on other architectures, 32-bit ones included — the process that opens the file first holds an exclusive lock on it, and another process's `Open` fails. `js/wasm`, `wasip1` and Plan 9 take no lock at all: nothing stops a second process, or a second browser tab, from opening the file, so the application has to prevent it. AIX and Solaris are not supported: their `syscall` package has no `flock`, and the library does not build there.
 
 ## Durability
 
-By default a commit is written to the WAL and not synced, as in SQLite's WAL mode at `synchronous=NORMAL`. The WAL is synced when a checkpoint copies frames from it into the database file, and a checkpoint is attempted automatically once the WAL holds `Config.AutoCheckpointAfter` frames (10,000 by default), on `Flush`, and on the last `Close` of the database. An attempt can copy nothing and then syncs nothing: a passive checkpoint — the automatic one, and a flush in `FlushModeCheckpointPassive`, auto-flush's default — stops at the oldest snapshot a reader still holds, and leaves the frames it did not copy unsynced until a later checkpoint. (A write that starts the WAL over also syncs the new WAL header.) A process crash loses no committed transaction: the operating system has the write. That holds for a file of the operating system; the IndexedDB file system of the [wasm](wasm) example keeps each file in memory and stores it in IndexedDB only when the file is synced or closed, so there a closed tab or a killed worker loses the commits since the last sync, as a power loss does elsewhere, unless `CommitSync` is set. A power loss or an OS crash leaves the database consistent, but the commits made since the last sync can be lost although they returned without error. `Config.CommitSync` syncs the WAL on every commit, as `synchronous=FULL` does: a commit that returned survives a power loss, at the cost of a sync per commit. It is the only per-commit guarantee.
+By default a commit is written to the WAL and not synced, as in SQLite's WAL mode at `synchronous=NORMAL`. A checkpoint that copies frames from the WAL into the database file syncs the whole WAL first, and one is attempted automatically once the WAL holds `Config.AutoCheckpointAfter` frames (10,000 by default), on `Flush`, and on the last `Close` of the database. A passive checkpoint — the automatic one, and a flush in `FlushModeCheckpointPassive`, auto-flush's default — copies frames only up to the oldest snapshot a reader still holds: with frames to copy below it, it syncs the whole WAL, the frames past the snapshot included; with none, it returns before the sync, and the commits since the last sync stay unsynced until a later checkpoint. (A write that starts the WAL over also syncs the new WAL header.) On the file system of an operating system, a process crash loses no committed transaction: the operating system has the write. A power loss or an OS crash leaves the database consistent, but the commits made since the last sync can be lost although they returned without error. `Config.CommitSync` syncs the WAL on every commit, as `synchronous=FULL` does: a commit that returned survives a power loss, at the cost of a sync per commit. It is the only per-commit guarantee.
+
+The IndexedDB file system of the [wasm](wasm) example gives no durability guarantee, with `CommitSync` or without: it keeps each file in memory and stores it in IndexedDB only when the file is synced or closed, and its sync returns before IndexedDB has committed what it stores. A closed tab or a killed worker can lose commits that returned without error, as a power loss can elsewhere.
 
 Auto-flush (`Durability.AutoFlush`, off by default) attempts a checkpoint, in its `FlushMode`, once the database has been idle for `IdleAfter`:
 
@@ -206,8 +228,13 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
     },
 })
 
-// Manual flush, e.g. before app suspension (waits up to 100ms for pending writes to settle).
-db.Flush(ctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive)
+// Manual flush, e.g. before app suspension: a checkpoint once no write has come
+// for 100ms. Flush retries until such a pause, so the context bounds the wait.
+fctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+defer cancel()
+if err := db.Flush(fctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive); err != nil {
+    log.Printf("flush: %v", err)
+}
 ```
 
 **Sentinel:** when enabled, a `.lock` file marks not-explicitly-persisted writes so an unclean shutdown triggers an integrity quick check on open. A flush removes the file, and so does a `Close` that checkpointed as the last handle on the database; a `Close` while another process still has the database open leaves it. An in-memory database has no sentinel file.
@@ -249,9 +276,9 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 })
 ```
 
-Whole-file page-level AEAD with a built-in cipher. A nil `Passphrase` means no encryption, and an empty non-nil one fails `Open`. A `Passphrase` of exactly 32 bytes is used as the key itself; any other nonempty length is stretched with PBKDF2-HMAC-SHA256 against a salt stored in the file, at `KDFIterations` rounds (256,000 by default, at most 100,000,000). The cipher and the count are not stored in the file: a database opens only with the `CipherType` and `KDFIterations` it was created with.
+Whole-file page-level AEAD with a built-in cipher. A nil `Passphrase` means no encryption, and an empty non-nil one fails `Open`. A `Passphrase` of exactly 32 bytes is used as the key itself; any other nonempty length is stretched with PBKDF2-HMAC-SHA256 against a salt stored in the file, at `KDFIterations` rounds (256,000 by default, at most 100,000,000). The cipher and the count are not stored in the file: a database opens only with the `CipherType` it was created with and, when its passphrase goes through PBKDF2, the same effective `KDFIterations` (0 and 256,000 are one count; a 32-byte key ignores it).
 
-`Backup` of an encrypted database writes an encrypted copy that opens with the source's `EncryptionConfig`: the same passphrase or key, `CipherType` and `KDFIterations`. A copy that `Backup` creates has a salt of its own, so with a passphrase its derived key differs from the source's. A file that already exists at the path keeps the salt it has, which is the source's when that file is a copy of the source made outside `Backup`.
+`Backup` of an encrypted database writes an encrypted copy that opens with the source's `EncryptionConfig`: the same passphrase or key and `CipherType`, and with a passphrase the same effective `KDFIterations`. A copy that `Backup` creates has a salt of its own, so with a passphrase its derived key differs from the source's. A file that already exists at the path keeps the salt it has, which is the source's when that file is a copy of the source made outside `Backup`.
 
 An independent Go implementation following design conventions from [SQLCipher](https://www.zetetic.net/sqlcipher/) (BSD-3-Clause) — reserved-tail page overhead, the page-1 plaintext-prefix rule, PBKDF2-HMAC-SHA256 key derivation. No SQLCipher code is included; the cryptography is Go-native and uses AEAD rather than SQLCipher's encrypt-then-MAC construction. Not SQLCipher-compatible on disk. See [NOTICE.md](NOTICE.md).
 

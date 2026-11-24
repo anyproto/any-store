@@ -250,8 +250,9 @@ type EncryptionConfig struct {
 	// KDFIterations overrides the PBKDF2 cost. Zero means 256,000 (the
 	// SQLCipher v4 default). Ignored when Passphrase is exactly 32 bytes
 	// (raw-key path). Use lower values only in tests. A count above
-	// 100,000,000 fails Open with ErrInvalidConfig. The count is part of the
-	// key: a database opens only with the count it was created with.
+	// 100,000,000 fails Open with ErrInvalidConfig. When the passphrase goes
+	// through PBKDF2 the count is part of the key: the database opens only
+	// with the effective count it was created with (0 and 256,000 are one).
 	KDFIterations int
 
 	// CipherType selects the built-in AEAD when Passphrase is set.
