@@ -3,6 +3,8 @@ package anystore
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -1432,6 +1434,56 @@ func collectIdsString(t testing.TB, q Query) []string {
 	}
 	require.NoError(t, iter.Err())
 	return out
+}
+
+// A covering lookup over an index page that fails its checksum reports the
+// damage: an equality count over a unique index is not 0 for a document
+// that exists, and errors.Is matches ErrCorrupt. The data tree is intact,
+// so the document is still found by id.
+func TestCoverLookup_CorruptIndexPage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "corrupt.db")
+	d, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	coll, err := d.CreateCollection(ctx, "users")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"email"}, Unique: true}))
+	docs := make([]*anyenc.Value, 0, 3000)
+	for i := 0; i < 3000; i++ {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"email":"user%05d@test.com"}`, i, i)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+	const eq = `{"email":"user01500@test.com"}`
+	explain, err := coll.Find(eq).Explain(ctx)
+	require.NoError(t, err)
+	require.Contains(t, explain.Plan, "CoverLookup(email)")
+	root := int64(coll.(*collection).loadIndexes()[0].ns.RootPage())
+	pageSize := int64(d.(*db).btreeDB.PageSize())
+	require.NoError(t, d.Close())
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte(strings.Repeat("\xab", int(pageSize))), (root-1)*pageSize)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	d, err = Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer func() { _ = d.Close() }()
+	coll, err = d.OpenCollection(ctx, "users")
+	require.NoError(t, err)
+	n, err := coll.Find(eq).Count(ctx)
+	assert.ErrorIs(t, err, ErrCorrupt, "count %d", n)
+	iter, err := coll.Find(eq).Iter(ctx)
+	require.NoError(t, err)
+	rows := 0
+	for iter.Next() {
+		rows++
+	}
+	assert.ErrorIs(t, iter.Err(), ErrCorrupt, "rows %d", rows)
+	require.NoError(t, iter.Close())
+	doc, err := coll.FindId(ctx, 1500)
+	require.NoError(t, err)
+	assert.Equal(t, "user01500@test.com", doc.Value().GetString("email"))
 }
 
 // A bulk write whose commit fails wrote nothing: Modified is 0 and Matched

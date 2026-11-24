@@ -2,7 +2,6 @@ package anystore
 
 import (
 	"errors"
-	"io"
 	"sync/atomic"
 	"time"
 
@@ -36,6 +35,13 @@ import (
 // CompactVectorIndex of the collection fail with ErrIterOpen until the
 // iterator is closed, advanced or not: they free the trees it reads.
 //
+// An Iterator must be closed. Opened with a context that carries no
+// transaction, it can hold a read transaction of its own until its Close,
+// and DB.Close waits for that with no timeout: an iterator never closed can
+// make DB.Close block forever. Opened inside a transaction an Iterator holds
+// none: DB.Close waits for a ReadTx until its Commit and does not wait for a
+// WriteTx (see DB.Close). Close is safe to defer and to call twice.
+//
 // An Iterator belongs to one goroutine at a time. Opened with the context
 // of a transaction, its methods are calls on the transaction (see
 // commonTx), and once the transaction has ended Next and Doc fail with
@@ -63,7 +69,10 @@ type Iterator interface {
 	// Err returns any error encountered during the lifetime of the iterator.
 	Err() error
 
-	// Close closes the iterator and releases any associated resources.
+	// Close closes the iterator and releases any associated resources: the
+	// read transaction the iterator opened for itself, if it did. It must be
+	// called, also after Next has returned false or Err an error; see
+	// Iterator.
 	Close() error
 }
 
@@ -84,6 +93,10 @@ type planIterator struct {
 	// memory.
 	tripped atomic.Bool
 	tripErr error
+	// closeState tells whether DB.Close rolled the write transaction back
+	// under its owner. Taken as the iterator is built: Doc reads it outside
+	// a call, when data.Tx may already be another transaction's.
+	closeState btree.CloseState
 	// mark is the transaction's savepoint mark as the iterator was opened
 	// or last moved (iterOpened, savepointMark): the savepoints whose
 	// rollback trips it are the ones opened by then and still open
@@ -111,6 +124,14 @@ func (pi *planIterator) Next() bool {
 		defer pi.shared.exit()
 		if err := pi.trippedErr(); err != nil {
 			pi.err = err
+			return false
+		}
+		// A write transaction that DB.Close rolled back under its owner
+		// still looks open to its handle. The plan may have rows in memory
+		// (a sort, a vector or text search) that no storage call stands
+		// behind any more.
+		if pi.closeState.EndedByClose() {
+			pi.err = ErrDBIsClosed
 			return false
 		}
 		pi.mark = pi.shared.savepointMark()
@@ -172,7 +193,7 @@ func (pi *planIterator) Doc() (Doc, error) {
 	if pi.closed {
 		return nil, ErrIterClosed
 	}
-	if pi.err != nil && !errors.Is(pi.err, io.EOF) {
+	if pi.err != nil {
 		return nil, pi.err
 	}
 	var doc *anyenc.Value
@@ -185,6 +206,10 @@ func (pi *planIterator) Doc() (Doc, error) {
 			}
 			if pi.shared.Done() {
 				return nil, ErrTxIsUsed
+			}
+			// Rolled back by DB.Close: see Next.
+			if pi.closeState.EndedByClose() {
+				return nil, ErrDBIsClosed
 			}
 		}
 		if perf {
@@ -252,10 +277,16 @@ func (pi *planIterator) Doc() (Doc, error) {
 	return pi.qb.coll.newItem(doc)
 }
 
+// Err returns the error that ended the iteration, or nil when the iteration
+// reached its end. The end is never an error value: the plan reports it by
+// returning no document and no error (Next). An error that wraps io.EOF is
+// a read error like any other, and Err returns it: the pager returns one for
+// a short read of a database file shorter than its page count, where SQLite
+// zero-fills the page (pager.c:3042; see
+// docs/btree/NOTES.md#drift-7-short-db-file-read-treated-as-hard-error).
+// SQLite ends a loop on SQLITE_DONE alone (OP_Next: "if( rc!=SQLITE_DONE )
+// goto abort_due_to_error", vdbe.c).
 func (pi *planIterator) Err() error {
-	if pi.err != nil && errors.Is(pi.err, io.EOF) {
-		return nil
-	}
 	return pi.err
 }
 

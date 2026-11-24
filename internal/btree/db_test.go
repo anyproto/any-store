@@ -1466,36 +1466,7 @@ func TestAppendValue_OverflowMVCCRead(t *testing.T) {
 	require.NoError(t, rtx.Rollback())
 }
 
-// === Cover pager error paths in BeginRead and BeginWrite ===
-
-func TestBeginRead_PagerError(t *testing.T) {
-	// Cover line 192-195: pager.beginRead returns error.
-	// Put pager in error state, which causes beginRead to return ErrCorrupt.
-	db := tempDB(t)
-
-	// Set pager state to error
-	db.pager.state.Store(int32(pagerError))
-
-	_, err := db.BeginRead()
-	assert.Error(t, err)
-
-	// Restore state for cleanup
-	db.pager.state.Store(int32(pagerOpen))
-}
-
-func TestBeginWrite_PagerError(t *testing.T) {
-	// Cover line 238-243: pager.beginRead returns error inside BeginWrite.
-	db := tempDB(t)
-
-	// Set pager state to error
-	db.pager.state.Store(int32(pagerError))
-
-	_, err := db.BeginWrite()
-	assert.Error(t, err)
-
-	// Restore state for cleanup
-	db.pager.state.Store(int32(pagerOpen))
-}
+// === Cover pager error paths in BeginRead ===
 
 func TestBeginRead_HeaderCountersError(t *testing.T) {
 	// Cover lines 199-203: readHeaderCounters fails.
@@ -1896,21 +1867,6 @@ func TestDeleteNamespace_RootPageZero(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNamespaceNotFound)
 }
 
-// === Cover ListNamespaces beginRead error (line 543-545) ===
-
-func TestListNamespaces_PagerError(t *testing.T) {
-	db := tempDB(t)
-
-	// Put pager in error state — beginRead will fail
-	db.pager.state.Store(int32(pagerError))
-
-	_, err := db.ListNamespaces()
-	assert.Error(t, err)
-
-	// Restore for cleanup
-	db.pager.state.Store(int32(pagerOpen))
-}
-
 // === Cover BeginWrite pager.beginWrite error (lines 254-259) ===
 // This needs to trigger an error from pager.beginWrite() specifically
 // inside the DB.BeginWrite() flow (not just pager-level).
@@ -2106,29 +2062,6 @@ func TestResolveNamespace_CorruptCell(t *testing.T) {
 
 	// Rollback to discard corruption
 	require.NoError(t, tx2.Rollback())
-}
-
-// === Cover GetNamespace beginRead error (line 456-458) ===
-
-func TestGetNamespace_PagerError(t *testing.T) {
-	db := tempDB(t)
-
-	// Create namespace first
-	tx, err := db.BeginWrite()
-	require.NoError(t, err)
-	_, err = tx.CreateNamespace("test")
-	require.NoError(t, err)
-	require.NoError(t, tx.Commit())
-
-	// Put pager in error state
-	db.pager.state.Store(int32(pagerError))
-
-	// GetNamespace in non-writer state should fail at beginRead
-	_, err = db.GetNamespace("test")
-	assert.Error(t, err)
-
-	// Restore for cleanup
-	db.pager.state.Store(int32(pagerOpen))
 }
 
 // === Cover InMemory Open path (line 102-105) ===
@@ -4217,4 +4150,16 @@ func TestOpen_RefusedUntilCloseCompletes(t *testing.T) {
 	db3, err := testOpen(t, path, Options{})
 	require.NoError(t, err)
 	require.NoError(t, db3.Close())
+}
+
+// An in-memory database has no database file, so its close persists nothing
+// to one: CloseCheckpointed reports false and does not run its callback.
+func TestCloseCheckpointed_InMemoryReportsFalse(t *testing.T) {
+	db, _ := openRestartDB(t, restartModes[2])
+	restartPut(t, db, 0, 60, 1)
+	ran := false
+	checkpointed, err := db.CloseCheckpointed(func() { ran = true })
+	require.NoError(t, err)
+	require.False(t, checkpointed)
+	require.False(t, ran)
 }

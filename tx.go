@@ -51,6 +51,11 @@ type WriteTx interface {
 }
 
 // ReadTx represents a read-only transaction.
+//
+// A ReadTx must be ended with Commit (it has no Rollback; Commit releases
+// it and writes nothing). Until then it pins its snapshot and a reader
+// slot, and DB.Close waits for it with no timeout: a read transaction that
+// is never committed makes DB.Close block forever.
 type ReadTx interface {
 	// Context returns the context associated with the transaction.
 	Context() context.Context
@@ -149,6 +154,11 @@ type commonTx struct {
 	// name another savepoint by now, and its log mark cuts the log at a
 	// position that pairs nothing. Single-writer state, like the log.
 	savepoints []*savepointTx
+
+	// sketchTx names this write transaction to the collections whose live
+	// sketches it brought up or wrote to (collection.sketchTx): its version,
+	// kept to the end of the commit, where version is cleared first.
+	sketchTx uint64
 
 	// sketches is the indexes whose live sketch the commit persisted
 	// (persistSketches): settled as the commit becomes visible

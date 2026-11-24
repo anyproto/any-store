@@ -170,7 +170,7 @@ func parseLeafCell(data []byte, offset int) (cellData, int, error) {
 // c.key may be a prefix (not the full key). Callers needing the full key must
 // check c.overflowPg != 0 and use leafFullKey.
 // DRIFT: leaf cell-size computation omits SQLite's `if nSize<4 nSize=4` clamp See docs/btree/NOTES.md#drift-26-leaf-cell-size-missing-four-byte-minimum-clamp
-// DRIFT: payload lengths are capped at maxPayloadAlloc, not checked against the database size. See docs/btree/NOTES.md#old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation
+// DRIFT: a cell whose key and value lengths sum over maxPayloadAlloc (1 GiB) is ErrCorrupt (payloadFits); SQLite's cell parsers cap no payload length. See docs/btree/NOTES.md#old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation
 func parseLeafCellWithSize(data []byte, offset int, lim payloadLimits) (cellData, int, error) {
 	var c cellData
 	pos := offset
@@ -198,13 +198,10 @@ func parseLeafCellWithSize(data []byte, offset int, lim payloadLimits) (cellData
 	}
 	pos += n
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc || int(valLen) < 0 || int(valLen) > maxPayloadAlloc {
+	if !payloadFits(keyLen, valLen) {
 		return c, 0, ErrCorrupt
 	}
 	totalPayload := int(keyLen) + int(valLen)
-	if totalPayload < 0 || totalPayload > maxPayloadAlloc {
-		return c, 0, ErrCorrupt
-	}
 	maxLocal := 0
 	if lim.usable > 0 {
 		maxLocal = lim.maxLocal
@@ -279,7 +276,7 @@ func parseInteriorCell(data []byte, offset int, usableSize ...int) (cellData, in
 	}
 	pos += n
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
+	if !payloadFits(keyLen, 0) {
 		return c, 0, ErrCorrupt
 	}
 
@@ -401,7 +398,7 @@ func interiorCellPrefixSizes(cells []cellData, usableSize int) []int {
 // whose child is childPgno, and returns the path to that page, its entry last.
 // The balance paths carry their path down from Put or Delete; this is for the
 // one place that needs a parent again after the tree above it was rewritten.
-// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
+// The path is bounded as Put's is.
 func (bt *btree) pathToChild(key []byte, childPgno uint32) ([]pathEntry, error) {
 	var path []pathEntry
 	pg, err := bt.getPage(bt.rootPage)
@@ -419,6 +416,9 @@ func (bt *btree) pathToChild(key []byte, childPgno uint32) ([]pathEntry, error) 
 		bt.pager.releasePage(pg)
 		if serr != nil {
 			return nil, serr
+		}
+		if len(path) >= btCursorMaxDepth-1 {
+			return nil, ErrCorrupt
 		}
 		path = append(path, pathEntry{pgno: pgno, cellIdx: uint16(idx), nCell: nCell})
 		if child == childPgno {
@@ -665,23 +665,28 @@ func searchLeafWithOverflow(pg *page, key []byte, lim payloadLimits, p *pager, w
 		}
 		payloadStart := pos + vn
 
-		// The same bounds as parseLeafCellWithSize, before the lengths are
-		// added or used as slice bounds.
-		if keyLen > maxPayloadAlloc || valLen > maxPayloadAlloc {
+		// A probe reads the cell's key and nothing else, so only the key's
+		// length is bounded here. The value's length, whatever it declares,
+		// only places the key's local part, and is used without adding it
+		// to the key's: a damaged length can wrap the sum. leafFullKey,
+		// which rebuilds a spilled key for the compare, tests the same way
+		// and holds only the key to the file size. SQLite's index probe sizes
+		// what it reads from the key alone (btree.c:6159-6168). A match is
+		// tested below.
+		if keyLen > uint64(payloadLimit) {
 			return 0, false, ErrCorrupt
 		}
-		totalPayload := int(keyLen) + int(valLen)
 		var cellKey []byte
-		if totalPayload <= maxLocal {
+		if valLen <= uint64(maxLocal) && keyLen <= uint64(maxLocal)-valLen {
 			// Fast path: no overflow, key fully on-page
 			end := payloadStart + int(keyLen)
-			if int(keyLen) < 0 || end > dataLen {
+			if end > dataLen {
 				return 0, false, ErrCorrupt
 			}
 			cellKey = data[payloadStart:end]
 		} else {
 			// Overflow cell — may need to read full key
-			nLocal := localPayloadSize(totalPayload, lim)
+			nLocal := spilledLocalSize(keyLen, valLen, lim)
 			localKeyBytes := min(nLocal, int(keyLen))
 			if localKeyBytes == int(keyLen) {
 				// Key fits fully in local portion
@@ -724,6 +729,18 @@ func searchLeafWithOverflow(pg *page, key []byte, lim payloadLimits, p *pager, w
 
 		cmp := bytes.Compare(cellKey, key)
 		if cmp == 0 {
+			// The cell found is the one a Get goes on to parse whole:
+			// report it only if its key and value together are within the
+			// record size limit, which that parse requires. The test is
+			// the search's, so every exact match is held to it, Has and an
+			// exact seek included. The value is not tested against the
+			// file here; that runs where the value is read, so Has can
+			// answer true for a record whose Get is ErrCorrupt by that
+			// bound. SQLite's table seek skips a cell's payload size and
+			// compares its rowid only (btree.c:5880-5886).
+			if !payloadFits(keyLen, valLen) {
+				return 0, false, ErrCorrupt
+			}
 			return mid, true, nil
 		}
 		if cmp < 0 {
@@ -911,6 +928,29 @@ func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, 
 	return pg.header.rightChild, n, nil
 }
 
+// leafKeySpills reports whether leafFullKey reads the key of the leaf cell
+// at offset from its overflow chain, through the pager. A cell header that
+// does not parse reports true, so the caller takes the path that returns
+// leafFullKey's error.
+func leafKeySpills(data []byte, offset int, lim payloadLimits) bool {
+	if offset >= len(data) {
+		return true
+	}
+	keyLen, n, err := getVarintSafe(data[offset:])
+	if err != nil || offset+n >= len(data) {
+		return true
+	}
+	valLen, _, err := getVarintSafe(data[offset+n:])
+	if err != nil || keyLen > uint64(payloadLimit) {
+		return true
+	}
+	maxLocal := uint64(lim.maxLocal)
+	if valLen <= maxLocal && keyLen <= maxLocal-valLen {
+		return false
+	}
+	return spilledLocalSize(keyLen, valLen, lim) < int(keyLen)
+}
+
 // leafFullKey reads the full key from a leaf cell, reading overflow pages
 // if the key spills. Returns a slice into data whenever the key is wholly
 // local, including cells whose value alone spills, and an allocated copy
@@ -935,20 +975,19 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	}
 	pos += n
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
-		return nil, ErrCorrupt
-	}
-	if int(valLen) < 0 || int(valLen) > maxPayloadAlloc {
+	// The key is what this reads, so the key is what is bounded: its length
+	// here, as searchLeafWithOverflow tests it, and its bytes against the
+	// file below. The value's length, whatever it declares, only places the
+	// local part, and is not added to the key's (spilledLocalSize): its
+	// bounds are tested where a value is read. SQLite's index probe sizes
+	// the key it rebuilds the same way (btree.c:6159-6168), and
+	// sqlite3VdbeMemFromBtree tests the range it reads (vdbemem.c:1428).
+	if keyLen > uint64(payloadLimit) {
 		return nil, ErrCorrupt
 	}
 
-	totalPayload := int(keyLen) + int(valLen)
-	if totalPayload < 0 || totalPayload > maxPayloadAlloc {
-		return nil, ErrCorrupt
-	}
-	maxLocal := lim.maxLocal
-
-	if totalPayload <= maxLocal {
+	maxLocal := uint64(lim.maxLocal)
+	if valLen <= maxLocal && keyLen <= maxLocal-valLen {
 		// No overflow: key is fully on-page
 		if pos+int(keyLen) > dataLen {
 			return nil, ErrCorrupt
@@ -957,7 +996,7 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	}
 
 	// Overflow cell
-	nLocal := localPayloadSize(totalPayload, lim)
+	nLocal := spilledLocalSize(keyLen, valLen, lim)
 	localKeyBytes := min(nLocal, int(keyLen))
 
 	if localKeyBytes == int(keyLen) {
@@ -969,12 +1008,21 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	}
 
 	// Key overflows: allocate and reconstruct
-	if pos+nLocal+4 > dataLen {
+	if pos+nLocal+4 > dataLen || !payloadInFile(p, cache, int(keyLen)) {
+		return nil, ErrCorrupt
+	}
+	// The first overflow pointer gets the chain readers' page test before
+	// the key's buffers are allocated: a pointer they would refuse (0, 1,
+	// or past the page count) fails here, not after an allocation sized by
+	// the declared key. accessPayload tests each page against the page
+	// count (btree.c:5227), and a chain that ends early is corrupt
+	// (btree.c:5309-5311).
+	overflowPg := binary.BigEndian.Uint32(data[pos+nLocal : pos+nLocal+4])
+	if overflowPg < 2 || overflowPg > p.readerDbSizeBound(cache) {
 		return nil, ErrCorrupt
 	}
 	fullKey := make([]byte, int(keyLen))
 	copy(fullKey, data[pos:pos+localKeyBytes])
-	overflowPg := binary.BigEndian.Uint32(data[pos+nLocal : pos+nLocal+4])
 
 	// Read key remainder from overflow chain.
 	// The overflow chain contains (keyRemainder || valueRemainder).
@@ -1017,17 +1065,11 @@ func leafFullValue(data []byte, offset int, lim payloadLimits, p *pager, walMaxF
 	}
 	pos += n
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
-		return nil, ErrCorrupt
-	}
-	if int(valLen) < 0 || int(valLen) > maxPayloadAlloc {
+	if !payloadFits(keyLen, valLen) {
 		return nil, ErrCorrupt
 	}
 
 	totalPayload := int(keyLen) + int(valLen)
-	if totalPayload < 0 || totalPayload > maxPayloadAlloc {
-		return nil, ErrCorrupt
-	}
 	maxLocal := lim.maxLocal
 
 	if totalPayload <= maxLocal {
@@ -1053,6 +1095,9 @@ func leafFullValue(data []byte, offset int, lim payloadLimits, p *pager, walMaxF
 		return data[pos+localKeyBytes : pos+localKeyBytes+int(valLen)], nil
 	}
 
+	if !payloadInFile(p, cache, totalPayload) {
+		return nil, ErrCorrupt
+	}
 	fullVal := make([]byte, int(valLen))
 	copy(fullVal, data[pos+localKeyBytes:pos+nLocal])
 	overflowPg := binary.BigEndian.Uint32(data[pos+nLocal : pos+nLocal+4])
@@ -1081,7 +1126,7 @@ func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFr
 	keyStart := offset + 4 + n
 	maxLocal := maxLocalPayload(usableSize)
 
-	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
+	if !payloadFits(keyLen, 0) {
 		return nil, ErrCorrupt
 	}
 
@@ -1094,7 +1139,7 @@ func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFr
 
 	// Overflow: read local portion + overflow chain
 	localSize := interiorLocalPayloadSize(int(keyLen), usableSize)
-	if keyStart+localSize+4 > dataLen {
+	if keyStart+localSize+4 > dataLen || !payloadInFile(p, cache, int(keyLen)) {
 		return nil, ErrCorrupt
 	}
 	fullKey := make([]byte, int(keyLen))
@@ -1181,7 +1226,6 @@ func (bt *btree) searchInterior(pg *page, key []byte) (childPgno uint32, cellIdx
 // AppendValue looks up a key in the B-tree and appends its value to buf.
 // The returned slice is safe to retain after the page is released.
 // Pass nil for buf to allocate a new slice (equivalent to Get).
-// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 	maxFrame, slot, err := bt.pager.beginRead()
 	if err != nil {
@@ -1212,6 +1256,9 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 	}
 
 	lim := bt.leafLimits()
+	// depth counts the child pointers followed, SQLite's pCur->iPage: see
+	// btCursorMaxDepth.
+	depth := 0
 	for {
 		if pg.header.isLeaf() {
 			idx, found, serr := searchLeafWithOverflow(pg, key, lim, bt.pager, maxFrame, bt.cache)
@@ -1251,6 +1298,10 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 				keyOverflow := int(keyLen) - localKeyBytes
 				overflowSize := totalPayload - nLocal
 
+				if !payloadInFile(bt.pager, bt.cache, totalPayload) {
+					bt.pager.releasePage(pg)
+					return buf, ErrCorrupt
+				}
 				start := len(buf)
 				buf = append(buf, make([]byte, int(valLen))...)
 				fullVal := buf[start:]
@@ -1291,6 +1342,10 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 			return buf, serr
 		}
 		bt.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return buf, ErrCorrupt
+		}
+		depth++
 		// Reject an out-of-range child pointer as corruption before fetching
 		// (~ getAndInitPage's pgno>btreePagecount guard, btree.c:2396-2399);
 		// see descendChild. Inlined here because this path reads with the
@@ -1327,19 +1382,34 @@ func (bt *btree) Has(key []byte) (bool, error) {
 	return true, nil
 }
 
-// maxKeySize returns the maximum key size. Since both leaf and interior cells
-// support overflow (matching SQLite's index btrees), the key can be very large.
-// We limit it to prevent absurd allocations. SQLite limits index keys to about
-// 1/4 of SQLITE_MAX_LENGTH. We use a generous 1GB limit.
-const maxKeySize = 1 << 30 // 1GB
+// maxKeySize is the maximum key size. Both leaf and interior cells support
+// overflow (matching SQLite's index btrees), so a key may be as large as a
+// whole record: the record size limit, with an empty value.
+const maxKeySize = maxPayloadAlloc
 
-// Put inserts or updates a key-value pair in the B-tree.
-// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
-func (bt *btree) Put(key, value []byte) error {
-	// Validate key size. Both leaf and interior cells support overflow,
-	// so this is just a sanity limit to prevent absurd allocations.
-	if len(key) > maxKeySize {
+// recordSizeErr is the write side of payloadFits: nil for a record that may
+// be written, ErrKeyTooLarge when the key alone is over the record size limit
+// and ErrValueTooLarge when the key and the value together are.
+// DRIFT: two errors, by whether the key alone is over the limit; OP_MakeRecord returns SQLITE_TOOBIG for any record over SQLITE_LIMIT_LENGTH. See docs/btree/NOTES.md#drift-2026-11-24-1-put-refuses-a-record-over-the-record-size-limit
+func recordSizeErr(keyLen, valLen int) error {
+	if payloadFits(uint64(keyLen), uint64(valLen)) {
+		return nil
+	}
+	if keyLen > payloadLimit {
 		return ErrKeyTooLarge
+	}
+	return ErrValueTooLarge
+}
+
+// Put inserts or updates a key-value pair in the B-tree. A record over the
+// record size limit is refused with ErrKeyTooLarge or ErrValueTooLarge and
+// nothing is written.
+// DRIFT: every record is tested here against the record size limit (key plus value, 1 GiB); SQLite tests SQLITE_LIMIT_LENGTH (10^9) in OP_MakeRecord, above sqlite3BtreeInsert. See docs/btree/NOTES.md#drift-2026-11-24-1-put-refuses-a-record-over-the-record-size-limit
+func (bt *btree) Put(key, value []byte) error {
+	// A record the cell parsers would reject is refused here, before a
+	// page is touched: see payloadFits.
+	if err := recordSizeErr(len(key), len(value)); err != nil {
+		return err
 	}
 
 	// The cursors open on this tree are saved before a page of it changes
@@ -1380,6 +1450,12 @@ func (bt *btree) Put(key, value []byte) error {
 		if serr != nil {
 			bt.pager.releasePage(pg)
 			return serr
+		}
+		// The path is SQLite's cursor stack (apPage/aiIdx): moveToChild
+		// refuses to push past it (btree.c:5448), see btCursorMaxDepth.
+		if len(path) >= btCursorMaxDepth-1 {
+			bt.pager.releasePage(pg)
+			return ErrCorrupt
 		}
 		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
@@ -1773,6 +1849,11 @@ func (bt *btree) cellFullKey(c *cellData) ([]byte, error) {
 	localKeyBytes := min(nLocal, int(keyLen))
 	keyOverflow := int(keyLen) - localKeyBytes
 
+	// Only the key is read, so only the key's bytes are tested against the
+	// file, as in leafFullKey.
+	if !payloadInFile(bt.pager, bt.cache, int(keyLen)) {
+		return nil, ErrCorrupt
+	}
 	fullKey := make([]byte, int(keyLen))
 	copy(fullKey, c.key[:localKeyBytes])
 	overflowBuf := make([]byte, keyOverflow)
@@ -1851,6 +1932,10 @@ func (bt *btree) collectInteriorCellsKeepBuf(pg *page) ([]cellData, []byte, erro
 			keyLen, kn := getVarint(pg.data[pos:])
 			pos += kn
 			localSize := interiorLocalPayloadSize(int(keyLen), usable)
+			if !payloadInFile(bt.pager, bt.cache, int(keyLen)) {
+				bt.pager.recycleCellBuf(buf)
+				return nil, nil, ErrCorrupt
+			}
 			fullKey := make([]byte, int(keyLen))
 			copy(fullKey, pg.data[pos:pos+localSize])
 			overflowPg := binary.BigEndian.Uint32(pg.data[pos+localSize : pos+localSize+4])
@@ -2506,6 +2591,14 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 // Modeled after SQLite's balance_deeper(): copies root content to a new child
 // page, then converts the root into an interior page pointing to the new child
 // and the right sibling. Handles both leaf and interior roots correctly.
+// Like SQLite's balance, which calls balance_deeper on an over-full root
+// (btree.c:9134-9145), it does not look at the height of the tree: a tree of
+// btCursorMaxDepth levels grows to one more, and from then on a lookup, a
+// write or a cursor that has to go below level btCursorMaxDepth (the root is
+// level 1) returns ErrCorrupt; countPage, walkSize and keyRank go one level
+// further. On a tree whose branches differ in depth, a leaf the split moves
+// to level btCursorMaxDepth or less still reads. See the known limitations in
+// docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 // DRIFT: splitRoot omits SQLite's anotherValidCursor() guard before deepening root See docs/btree/NOTES.md#drift-34-splitroot-missing-anothervalidcursor-corruption-guard
 func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) error {
 	// Allocate a new page for the old root's content
@@ -2566,7 +2659,6 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 //
 // When fragmentation exceeds the threshold (60 bytes, matching SQLite's limit),
 // a full rebuild is triggered to defragment the page.
-// DRIFT: the descent carries no depth bound. See docs/btree/NOTES.md#drift-2026-06-25-04-point-lookup-mutation-descent-loops-omit-sqlite-s-btcursor-max-depth-b
 // DRIFT: the under-full trigger counts fragment bytes as used. See docs/btree/NOTES.md#drift-37-delete-rebalance-underfull-trigger-counts-fragbytes-as-used
 // DRIFT: a dropped cell's space becomes fragment bytes, not a freeblock. See docs/btree/NOTES.md#old-drift-no-freeblock-chain-fragbytes-rebuild
 func (bt *btree) Delete(key []byte) error {
@@ -2598,6 +2690,10 @@ func (bt *btree) Delete(key []byte) error {
 		if serr != nil {
 			bt.pager.releasePage(pg)
 			return serr
+		}
+		if len(path) >= btCursorMaxDepth-1 { // as in Put
+			bt.pager.releasePage(pg)
+			return ErrCorrupt
 		}
 		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
@@ -3507,6 +3603,17 @@ func (bt *btree) countPage(ctx context.Context, pgno uint32, depth int) (int, er
 // Matches SQLite's BTCURSOR_MAX_DEPTH (btreeInt.h). Any B-tree deeper than
 // this is considered corrupt. This limit also catches circular page references
 // that would otherwise cause infinite loops during cursor traversal.
+//
+// The rule is moveToChild's (btree.c:5448, inlined in sqlite3BtreeIndexMoveto
+// at btree.c:6227): with iPage the number of child pointers followed from the
+// root, a further step is refused once iPage >= BTCURSOR_MAX_DEPTH-1. A chain
+// of btCursorMaxDepth pages, root and leaf included, is the deepest one read.
+// It is applied by cursor navigation, the point lookups, the namespace
+// lookup and the descents of Put and Delete. SQLite's seeks, inserts and
+// deletes all go down through a cursor, so that one line bounds them. The
+// walks over a whole tree are not held to it: countPage, walkSize and keyRank
+// stop one level later, freeTreePages at its own bound, as SQLite's
+// clearDatabasePage recurses without a cursor (btree.c:10225).
 const btCursorMaxDepth = 20
 
 // Cursor provides ordered iteration over a B-tree.
@@ -3544,7 +3651,10 @@ type Cursor struct {
 	skipNext int8
 	// nextCursor links the writer's open cursors (BtCursor.pNext,
 	// pager.cursors); linked says the cursor is on the list.
-	linked     bool
+	linked bool
+	// gated says a call on this cursor of a write transaction is in flight
+	// and counted at the writer gate (enterGate).
+	gated      bool
 	nextCursor *Cursor
 	// faultErr is what every use of a cursorFault reports; faultSeq is the
 	// schema event that tripped it (pager.schemaSeq), 0 for a failed move
@@ -3576,6 +3686,14 @@ type cursorFrame struct {
 
 // Close releases all pinned pages and invalidates the cursor.
 func (c *Cursor) Close() {
+	if c.bt.writable {
+		if c.bt.pager.wgate.enter() != nil {
+			c.abandon()
+			c.clearSaved()
+			return
+		}
+		defer c.bt.pager.wgate.leave()
+	}
 	c.releasePages()
 	c.clearSaved()
 	c.state = cursorInvalid
@@ -3600,6 +3718,193 @@ func (c *Cursor) releasePages() {
 	// truncate keeps the pre-allocated stackBuf backing array, so no allocation
 	// churn is introduced.
 	c.stack = c.stack[:0]
+}
+
+// enterGate counts a call on a write transaction's cursor in at the writer
+// gate, and marks the cursor so (gated): the calls the cursor makes on
+// itself while the call runs — SeekExact is a SeekNear, which is a Seek;
+// CountUntil reads a key and steps for every entry — are part of it and do
+// not come here again. Paired with leaveGate, deferred, in the gated
+// functions below. A move that DB.Close refused there ends the cursor's pin
+// of its leaf (abandon): the key or value the cursor handed out is valid
+// until its next move, which this was.
+func (c *Cursor) enterGate() error {
+	err := c.bt.pager.wgate.enter()
+	if err == nil {
+		c.gated = true
+	}
+	return err
+}
+
+// readsPinnedLeaf reports whether a read or an in-leaf step of this write
+// transaction's cursor can run outside the writer gate: the cursor is on the
+// writer's list and stands on an entry, so what the call reads is the leaf
+// the cursor pins, and Close has not ended the transaction. Such a call
+// makes no call into the pager; one that needs more than that leaf, an
+// overflow chain or a step off it, takes the gate. Close can come while it
+// runs, and finds no call in flight; that is safe because the pager keeps
+// back the leaf of every cursor on the list when it disposes of the cache
+// (destroyEndedWriterCache), for the slices earlier calls returned, and
+// writes neither that page nor the cursor. The call then completes on the
+// leaf as the transaction left it, as a call in flight does. A cursor that
+// is saved, tripped, off the list or of an ended transaction takes the
+// gate, which restores it or refuses it.
+func (c *Cursor) readsPinnedLeaf() bool {
+	return c.linked && c.state == cursorValid && !c.bt.pager.wgate.closed()
+}
+
+// leaveGate counts the call that enterGate counted in out again.
+func (c *Cursor) leaveGate() {
+	c.gated = false
+	c.bt.pager.wgate.leave()
+}
+
+// The gated functions run a call on a write transaction's cursor inside the
+// writer gate: they count it in, mark the cursor gated and make the call
+// again, which then takes its ordinary path, as every call the cursor makes
+// on itself meanwhile does. The gate's defer lives here, a panic in a b-tree
+// operation must not leave the call counted, and so the cursor's methods
+// themselves have none: a read transaction's cursor, which never comes
+// here, runs them as it would without the gate. The calls of a scan have
+// their own; the others share one per signature. The reads and in-leaf
+// steps of a positioned cursor come here only when they need more than the
+// pinned leaf (readsPinnedLeaf).
+
+func (c *Cursor) gatedMove(move func(*Cursor) error) error {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return err
+	}
+	defer c.leaveGate()
+	return move(c)
+}
+
+func (c *Cursor) gatedNext() error {
+	if testGatedPinnedLeafHook != nil {
+		testGatedPinnedLeafHook(c, 1)
+	}
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return err
+	}
+	defer c.leaveGate()
+	return c.Next()
+}
+
+func (c *Cursor) gatedPrevious() error {
+	if testGatedPinnedLeafHook != nil {
+		testGatedPinnedLeafHook(c, -1)
+	}
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return err
+	}
+	defer c.leaveGate()
+	return c.Previous()
+}
+
+func (c *Cursor) gatedSeek(seek func(*Cursor, []byte) error, key []byte) error {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return err
+	}
+	defer c.leaveGate()
+	return seek(c, key)
+}
+
+func (c *Cursor) gatedSkip(skip func(*Cursor, int) error, n int) error {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return err
+	}
+	defer c.leaveGate()
+	return skip(c, n)
+}
+
+// testGatedPinnedLeafHook, when non-nil, runs as a write transaction's
+// cursor takes the writer gate for one of the calls that can run on the
+// pinned leaf alone (readsPinnedLeaf), with the cursor and the call: step
+// is 1 for a Next, -1 for a Previous and 0 for a read. Test-only.
+var testGatedPinnedLeafHook func(c *Cursor, step int)
+
+func (c *Cursor) gatedKey() ([]byte, error) {
+	if testGatedPinnedLeafHook != nil {
+		testGatedPinnedLeafHook(c, 0)
+	}
+	if err := c.enterGate(); err != nil {
+		return nil, err
+	}
+	defer c.leaveGate()
+	return c.Key()
+}
+
+func (c *Cursor) gatedValue() ([]byte, error) {
+	if testGatedPinnedLeafHook != nil {
+		testGatedPinnedLeafHook(c, 0)
+	}
+	if err := c.enterGate(); err != nil {
+		return nil, err
+	}
+	defer c.leaveGate()
+	return c.Value()
+}
+
+func (c *Cursor) gatedAppendValue(buf []byte) ([]byte, error) {
+	if testGatedPinnedLeafHook != nil {
+		testGatedPinnedLeafHook(c, 0)
+	}
+	if err := c.enterGate(); err != nil {
+		return buf, err
+	}
+	defer c.leaveGate()
+	return c.AppendValue(buf)
+}
+
+func (c *Cursor) gatedAppendValueByKey(key, buf []byte) ([]byte, error) {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return buf, err
+	}
+	defer c.leaveGate()
+	return c.AppendValueByKey(key, buf)
+}
+
+func (c *Cursor) gatedCountUntil(endKey []byte, endInclusive bool) (int, error) {
+	if err := c.enterGate(); err != nil {
+		c.abandon()
+		return 0, err
+	}
+	defer c.leaveGate()
+	return c.CountUntil(endKey, endInclusive)
+}
+
+func (c *Cursor) gatedRangeFraction(low, high []byte) (float64, error) {
+	if err := c.enterGate(); err != nil {
+		return 0, err
+	}
+	defer c.leaveGate()
+	return c.RangeFraction(low, high)
+}
+
+// abandon is what a move or a Close does to the cursor of a write
+// transaction that DB.Close ended: the cursor lets go of its pages without
+// releasing them to the cache, which is not this goroutine's any more, and
+// stands nowhere. A page whose buffer the pager kept back for this cursor
+// gives it back (pager.destroyEndedWriterCache). lentMu, not the gate, is
+// what excludes DB.Close here: it reads the stacks of the transaction's
+// cursors as it disposes of the cache.
+func (c *Cursor) abandon() {
+	p := c.bt.pager
+	p.lentMu.Lock()
+	for i := range c.stack {
+		if pg := c.stack[i].pg; pg != nil {
+			p.returnLent(pg)
+			c.stack[i].pg = nil
+		}
+	}
+	c.stack = c.stack[:0]
+	p.lentMu.Unlock()
+	c.state = cursorInvalid
 }
 
 // clearSaved drops a saved position (sqlite3BtreeClearCursor, btree.c:848):
@@ -3650,11 +3955,34 @@ func (c *Cursor) trip(err error, seq uint64) {
 	c.state = cursorFault
 }
 
+// fault ends the cursor for good without saving its position: the
+// CURSOR_FAULT branch of sqlite3BtreeTripAllCursors (sqlite3BtreeClearCursor,
+// then eState = CURSOR_FAULT, btree.c:4484-4486), its pages released
+// (btreeReleaseAllCursorPages, btree.c:4488). Every use reports err.
+func (c *Cursor) fault(err error) {
+	c.releasePages()
+	c.clearSaved()
+	c.faultErr = err
+	c.faultSeq = 0
+	c.state = cursorFault
+}
+
 // fail is the error exit of a move that left the cursor without a
 // position it can be saved from: the cursor is ended with err, and
 // reports it from then on.
 func (c *Cursor) fail(err error) error {
 	c.trip(err, 0)
+	return c.halt(err)
+}
+
+// halt is the error exit of a call on a write transaction's cursor: when
+// the call left the transaction in the error state, the transaction's
+// cursors are ended (pager.halt). A faulted cursor reports its fault
+// through it too. It returns err.
+func (c *Cursor) halt(err error) error {
+	if c.linked {
+		c.bt.pager.halt()
+	}
 	return err
 }
 
@@ -3677,12 +4005,13 @@ func (c *Cursor) revive() {
 // on the last entry when none follows, and cursorSkipNext records the
 // side, so that the move onward in that direction yields that entry
 // without stepping. A skipNext kept from an earlier restore stays unless
-// the seek sets one. A seek that fails ends the cursor.
+// the seek sets one. A seek that fails ends the cursor. A faulted cursor
+// reports its fault (halt).
 func (c *Cursor) restorePosition() error {
 	switch c.state {
 	case cursorRequireSeek:
 	case cursorFault:
-		return c.faultErr
+		return c.halt(c.faultErr)
 	default:
 		return nil
 	}
@@ -3727,13 +4056,16 @@ func (c *Cursor) restored() error {
 
 // First positions the cursor at the first (smallest) key.
 func (c *Cursor) First() error {
+	if c.bt.writable && !c.gated {
+		return c.gatedMove((*Cursor).First)
+	}
 	if c.state == cursorFault {
-		return c.faultErr
+		return c.halt(c.faultErr)
 	}
 	c.clearSaved()
 	if err := c.first(); err != nil {
 		c.releasePages()
-		return err
+		return c.halt(err)
 	}
 	return nil
 }
@@ -3804,13 +4136,16 @@ func (c *Cursor) first() error {
 
 // Last positions the cursor at the last (largest) key.
 func (c *Cursor) Last() error {
+	if c.bt.writable && !c.gated {
+		return c.gatedMove((*Cursor).Last)
+	}
 	if c.state == cursorFault {
-		return c.faultErr
+		return c.halt(c.faultErr)
 	}
 	c.clearSaved()
 	if err := c.last(); err != nil {
 		c.releasePages()
-		return err
+		return c.halt(err)
 	}
 	return nil
 }
@@ -3861,13 +4196,16 @@ func (c *Cursor) last() error {
 
 // Seek positions the cursor at the first key >= the given key.
 func (c *Cursor) Seek(key []byte) error {
+	if c.bt.writable && !c.gated {
+		return c.gatedSeek((*Cursor).Seek, key)
+	}
 	if c.state == cursorFault {
-		return c.faultErr
+		return c.halt(c.faultErr)
 	}
 	c.clearSaved()
 	if err := c.seek(key); err != nil {
 		c.releasePages()
-		return err
+		return c.halt(err)
 	}
 	return nil
 }
@@ -3955,7 +4293,7 @@ func leafKeyAt(pg *page, idx int, lim payloadLimits) ([]byte, error) {
 		pos++
 	} else {
 		kl, n, kerr := getVarintSafe(data[pos:])
-		if kerr != nil || kl > maxPayloadAlloc {
+		if kerr != nil || kl > uint64(payloadLimit) {
 			return nil, ErrCorrupt
 		}
 		keyLen = int(kl)
@@ -3969,16 +4307,16 @@ func leafKeyAt(pg *page, idx int, lim payloadLimits) ([]byte, error) {
 		pos++
 	} else {
 		vl, n, verr := getVarintSafe(data[pos:])
-		if verr != nil || vl > maxPayloadAlloc {
+		if verr != nil || vl > uint64(payloadLimit) {
 			return nil, ErrCorrupt
 		}
 		valLen = int(vl)
 		pos += n
 	}
-	totalPayload := keyLen + valLen
-	if totalPayload > maxPayloadAlloc {
+	if !payloadFits(uint64(keyLen), uint64(valLen)) {
 		return nil, ErrCorrupt
 	}
+	totalPayload := keyLen + valLen
 	if totalPayload > lim.maxLocal {
 		nLocal := localPayloadSize(totalPayload, lim)
 		if pos+nLocal+overflowPtrSize > dataLen {
@@ -3999,6 +4337,9 @@ func leafKeyAt(pg *page, idx int, lim payloadLimits) ([]byte, error) {
 // It optimises for the case where the target key falls within the currently
 // pinned leaf page, avoiding a full root-to-leaf traversal.
 func (c *Cursor) SeekNear(key []byte) error {
+	if c.bt.writable && !c.gated {
+		return c.gatedSeek((*Cursor).SeekNear, key)
+	}
 	// Fast path: check if key falls within the pinned leaf page. A saved or
 	// tripped cursor pins none and takes the full seek.
 	if c.state == cursorValid && len(c.stack) > 0 {
@@ -4020,7 +4361,7 @@ func (c *Cursor) SeekNear(key []byte) error {
 				if bytes.Compare(key, firstKey) >= 0 && bytes.Compare(key, lastKey) <= 0 {
 					idx, _, serr := c.bt.searchLeaf(leaf.pg, key)
 					if serr != nil {
-						return serr
+						return c.halt(serr)
 					}
 					leaf.cellIdx = idx
 					if idx < n {
@@ -4040,6 +4381,9 @@ func (c *Cursor) SeekNear(key []byte) error {
 // SeekExact positions the cursor at the entry matching key exactly.
 // Returns ErrKeyNotFound if the key does not exist.
 func (c *Cursor) SeekExact(key []byte) error {
+	if c.bt.writable && !c.gated {
+		return c.gatedSeek((*Cursor).SeekExact, key)
+	}
 	if err := c.SeekNear(key); err != nil {
 		return err
 	}
@@ -4061,6 +4405,9 @@ func (c *Cursor) SeekExact(key []byte) error {
 // allowing cursor-based callers to avoid extra key/value parsing work.
 // DRIFT: an API with no SQLite counterpart. See docs/btree/NOTES.md#drift-115-cursor-skip-and-appendvaluebykey-new-apis-beyond-sqlite-surf
 func (c *Cursor) AppendValueByKey(key []byte, buf []byte) ([]byte, error) {
+	if c.bt.writable && !c.gated {
+		return c.gatedAppendValueByKey(key, buf)
+	}
 	if err := c.SeekNear(key); err != nil {
 		return buf, err
 	}
@@ -4123,6 +4470,9 @@ func (c *Cursor) currentKeyEqual(key []byte) (bool, error) {
 // transaction to the tree (which saves the cursor), or Close().
 // For overflow cells where the key spills, a new slice is allocated.
 func (c *Cursor) Key() ([]byte, error) {
+	if c.bt.writable && !c.gated && !c.readsPinnedLeaf() {
+		return c.gatedKey()
+	}
 	if err := c.restored(); err != nil {
 		return nil, err
 	}
@@ -4134,20 +4484,25 @@ func (c *Cursor) Key() ([]byte, error) {
 		return nil, ErrCorrupt
 	}
 
-	lim := c.bt.leafLimits()
 	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
 	if oerr != nil {
 		return nil, oerr
 	}
-	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), lim)
-	if cerr != nil {
-		return nil, cerr
+	lim := c.bt.leafLimits()
+	if c.bt.writable && !c.gated && leafKeySpills(frame.pg.data, int(off), lim) {
+		// The key's overflow chain is read through the pager: a call of the
+		// write transaction (readsPinnedLeaf).
+		return c.gatedKey()
 	}
-	if cell.overflowPg != 0 {
-		// Key may be partial — use leafFullKey to reconstruct
-		return leafFullKey(frame.pg.data, int(off), lim, c.bt.pager, c.bt.walMaxFrame, c.bt.cache)
+	// A read of the key bounds the key only (leafFullKey); Value tests the
+	// value's declared length. A SQLite table cursor likewise reads the
+	// rowid of a row whose payload is corrupt (sqlite3BtreeIntegerKey
+	// returns the parsed nKey, btree.c:4917-4923).
+	k, err := leafFullKey(frame.pg.data, int(off), lim, c.bt.pager, c.bt.walMaxFrame, c.bt.cache)
+	if err != nil {
+		return nil, c.halt(err)
 	}
-	return cell.key, nil
+	return k, nil
 }
 
 // Value returns the current value.
@@ -4156,6 +4511,9 @@ func (c *Cursor) Key() ([]byte, error) {
 // transaction to the tree (which saves the cursor), or Close().
 // For overflow values, a new slice is allocated and returned.
 func (c *Cursor) Value() ([]byte, error) {
+	if c.bt.writable && !c.gated && !c.readsPinnedLeaf() {
+		return c.gatedValue()
+	}
 	if err := c.restored(); err != nil {
 		return nil, err
 	}
@@ -4179,6 +4537,11 @@ func (c *Cursor) Value() ([]byte, error) {
 	}
 
 	if cell.overflowPg != 0 {
+		// The overflow chain is read through the pager: a call of the
+		// write transaction (readsPinnedLeaf).
+		if c.bt.writable && !c.gated {
+			return c.gatedValue()
+		}
 		// Unified payload format: read keyLen, valLen from header varints,
 		// compute nLocal, then reconstruct the full value.
 		pos := int(off)
@@ -4201,6 +4564,9 @@ func (c *Cursor) Value() ([]byte, error) {
 		valOverflow := int(valLen) - localValBytes
 
 		// Allocate full value buffer and copy local portion
+		if !payloadInFile(c.bt.pager, c.bt.cache, totalPayload) {
+			return nil, ErrCorrupt
+		}
 		fullVal := make([]byte, int(valLen))
 		if localValBytes > 0 {
 			copy(fullVal, cell.value)
@@ -4214,7 +4580,7 @@ func (c *Cursor) Value() ([]byte, error) {
 				fullVal[localValBytes:], c.bt.walMaxFrame, c.bt.cache,
 			)
 			if err != nil {
-				return nil, err
+				return nil, c.halt(err)
 			}
 		}
 		return fullVal, nil
@@ -4228,6 +4594,9 @@ func (c *Cursor) Value() ([]byte, error) {
 // For overflow values, reads directly into buf with no intermediate allocation,
 // matching SQLite's accessPayload() offset approach.
 func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
+	if c.bt.writable && !c.gated && !c.readsPinnedLeaf() {
+		return c.gatedAppendValue(buf)
+	}
 	if err := c.restored(); err != nil {
 		return buf, err
 	}
@@ -4251,6 +4620,11 @@ func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
 	}
 
 	if cell.overflowPg != 0 {
+		// The overflow chain is read through the pager: a call of the
+		// write transaction (readsPinnedLeaf). buf is untouched so far.
+		if c.bt.writable && !c.gated {
+			return c.gatedAppendValue(buf)
+		}
 		pos := int(off)
 		keyLen, kn, verr := getVarintSafe(frame.pg.data[pos:])
 		if verr != nil {
@@ -4271,6 +4645,9 @@ func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
 		valOverflow := int(valLen) - localValBytes
 
 		// Grow buf to hold the full value
+		if !payloadInFile(c.bt.pager, c.bt.cache, totalPayload) {
+			return buf, ErrCorrupt
+		}
 		start := len(buf)
 		buf = slices.Grow(buf, int(valLen))[:start+int(valLen)]
 		fullVal := buf[start:]
@@ -4287,7 +4664,7 @@ func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
 				fullVal[localValBytes:], c.bt.walMaxFrame, c.bt.cache,
 			)
 			if err != nil {
-				return buf[:start], err
+				return buf[:start], c.halt(err)
 			}
 		}
 		return buf, nil
@@ -4303,6 +4680,21 @@ func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
 // past a leaf's last entry) continues from them.
 // DRIFT: B+tree (leaf-only keys) drops interior-cell positions that SQLite B-tree visits See docs/btree/NOTES.md#drift-14-b-plus-tree-traversal-drops-interior-cell-keys-versus-sqlite
 func (c *Cursor) Next() error {
+	if c.bt.writable && !c.gated {
+		// A step within the pinned leaf moves the cursor's index on that
+		// leaf and reads nothing else, so it runs outside the gate, as a
+		// Key does (readsPinnedLeaf); a step off the leaf takes the gate.
+		// sqlite3BtreeNext too steps within a leaf without btreeNext
+		// (btree.c:6376-6383).
+		if c.readsPinnedLeaf() && len(c.stack) > 0 {
+			frame := &c.stack[len(c.stack)-1]
+			if frame.pg != nil && frame.cellIdx+1 < int(frame.pg.header.cellCount) {
+				frame.cellIdx++
+				return nil
+			}
+		}
+		return c.gatedNext()
+	}
 	if c.state != cursorValid {
 		if err := c.restored(); err != nil {
 			return err
@@ -4416,6 +4808,18 @@ func (c *Cursor) Next() error {
 // index; on an interior page we descend into the previous child's rightmost
 // leaf.
 func (c *Cursor) Previous() error {
+	if c.bt.writable && !c.gated {
+		// A step within the pinned leaf runs outside the gate, as in Next
+		// (sqlite3BtreePrevious, btree.c:6467-6474).
+		if c.readsPinnedLeaf() && len(c.stack) > 0 {
+			frame := &c.stack[len(c.stack)-1]
+			if frame.pg != nil && frame.cellIdx > 0 {
+				frame.cellIdx--
+				return nil
+			}
+		}
+		return c.gatedPrevious()
+	}
 	if c.state != cursorValid {
 		if err := c.restored(); err != nil {
 			return err
@@ -4534,6 +4938,9 @@ func (c *Cursor) Previous() error {
 // A restored cursor that landed after its saved key has taken the first
 // step already.
 func (c *Cursor) Skip(n int) error {
+	if c.bt.writable && !c.gated {
+		return c.gatedSkip((*Cursor).Skip, n)
+	}
 	if n <= 0 {
 		return nil
 	}
@@ -4576,6 +4983,9 @@ func (c *Cursor) Skip(n int) error {
 // SkipBackward moves the cursor backward by n positions.
 // Mirror of Skip for reverse traversal.
 func (c *Cursor) SkipBackward(n int) error {
+	if c.bt.writable && !c.gated {
+		return c.gatedSkip((*Cursor).SkipBackward, n)
+	}
 	if n <= 0 {
 		return nil
 	}
@@ -4625,6 +5035,9 @@ func (c *Cursor) Valid() bool {
 // The cursor must be positioned at or after the start of the range.
 // After this call, the cursor is positioned past the end key (or invalid).
 func (c *Cursor) CountUntil(endKey []byte, endInclusive bool) (int, error) {
+	if c.bt.writable && !c.gated {
+		return c.gatedCountUntil(endKey, endInclusive)
+	}
 	count := 0
 	lim := c.bt.leafLimits()
 
@@ -4671,11 +5084,12 @@ func (c *Cursor) CountUntil(endKey []byte, endInclusive bool) (int, error) {
 				return count, oerr
 			}
 			lastCell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(lastOff), lim)
-			if cerr != nil {
-				return count, cerr
-			}
 
-			if lastCell.overflowPg == 0 {
+			// A last cell that does not parse whole is left to the
+			// per-entry path, which reads keys only (Cursor.Key), as
+			// SeekNear's and currentKeyEqual's fast paths fall back on a
+			// leafKeyAt error.
+			if cerr == nil && lastCell.overflowPg == 0 {
 				cmp := bytes.Compare(lastCell.key, endKey)
 				if cmp < 0 || (cmp == 0 && endInclusive) {
 					// All remaining entries on this page are within bounds
@@ -4779,18 +5193,21 @@ func (c *Cursor) keyRank(key []byte) (float64, error) {
 // to [0,1]; bound inclusivity is ignored (an at-most-one-entry rounding the cost
 // model does not care about). It does not move the cursor.
 func (c *Cursor) RangeFraction(low, high []byte) (float64, error) {
+	if c.bt.writable && !c.gated {
+		return c.gatedRangeFraction(low, high)
+	}
 	var lo, hi float64 = 0, 1
 	if len(low) > 0 {
 		r, err := c.keyRank(low)
 		if err != nil {
-			return 0, err
+			return 0, c.halt(err)
 		}
 		lo = r
 	}
 	if len(high) > 0 {
 		r, err := c.keyRank(high)
 		if err != nil {
-			return 0, err
+			return 0, c.halt(err)
 		}
 		hi = r
 	}

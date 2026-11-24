@@ -101,10 +101,10 @@ func TestIterator_String(t *testing.T) {
 		"planIterator.String must return plan.String() verbatim (no wrapping/composition)")
 }
 
-// TestIterator_Err_HidesEOF pins iterator.go:114-118 — when pi.err is io.EOF
-// (used internally to signal normal termination), the public Err() returns
-// nil rather than surfacing the sentinel.
-func TestIterator_Err_HidesEOF(t *testing.T) {
+// TestIterator_Err_ReturnsEOF: the end of an iteration is the plan returning
+// no document and no error, so an io.EOF the plan returned is an error (a
+// short page read wraps it) and Err returns it as it is.
+func TestIterator_Err_ReturnsEOF(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "iter_eof")
 	require.NoError(t, err)
@@ -113,16 +113,21 @@ func TestIterator_Err_HidesEOF(t *testing.T) {
 	require.NoError(t, err)
 	defer it.Close()
 
+	// An iteration that reaches its end has no error.
+	assert.False(t, it.Next())
+	assert.NoError(t, it.Err())
+
 	pi, ok := it.(*planIterator)
 	require.True(t, ok)
 
-	// Inject io.EOF directly and verify Err() returns nil.
 	pi.err = io.EOF
-	assert.Nil(t, it.Err(), "Err must treat io.EOF as normal termination → nil")
+	assert.ErrorIs(t, it.Err(), io.EOF)
 
-	// With a non-EOF sentinel, Err() must propagate.
+	pi.err = fmt.Errorf("short page read: %w", io.EOF)
+	assert.ErrorIs(t, it.Err(), io.EOF)
+
 	pi.err = errors.New("other-error")
-	assert.NotNil(t, it.Err())
+	assert.EqualError(t, it.Err(), "other-error")
 }
 
 // TestIterator_NextAfterClose pins iterator.go:43-45 — once Close() has set
@@ -313,6 +318,51 @@ func TestIterator_Doc_FallbackPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, `{"id":1,"a":"hello"}`, doc2.Value().String(),
 		"fallback must re-read the same document via docId")
+}
+
+// Doc of the document the iterator holds in memory is not a call on its
+// transaction, so another goroutine can end the transaction while it runs,
+// and the next write transaction then takes the ended one's storage handle
+// from the pool and rewrites it. Doc must read nothing of that handle: run
+// under -race.
+func TestIterator_DocOfHeldDocumentWhileTxEnds(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	for i := 0; i < 10; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":1}`, i))))
+	}
+	for round := 0; round < 20; round++ {
+		wtx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		it, err := coll.Find(`{"a":1}`).Iter(wtx.Context())
+		require.NoError(t, err)
+		require.True(t, it.Next())
+		require.NotNil(t, it.(*planIterator).plan.DocParsed, "Doc does not take the held-document path")
+
+		started, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(done)
+			for i := 0; ; i++ {
+				if i == 10 {
+					close(started)
+				}
+				if _, err := it.Doc(); err != nil {
+					if i < 10 {
+						close(started)
+					}
+					return
+				}
+			}
+		}()
+		<-started
+		require.NoError(t, wtx.Commit())
+		next, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		<-done
+		require.NoError(t, next.Rollback())
+		_ = it.Close()
+	}
 }
 
 func TestIterator_DocAfterClose(t *testing.T) {

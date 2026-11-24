@@ -345,7 +345,9 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, s *collS
 	if err = q.validateSources(s); err != nil {
 		return nil, nil, err
 	}
-	q.c.refreshSketches(btx, s)
+	if err = q.c.refreshSketches(btx, s); err != nil {
+		return nil, nil, err
+	}
 
 	// $text drives the query when present (CBO bypassed). The residual filter
 	// runs as a downstream FilterIter; a relevance/textScore sort is the
@@ -580,13 +582,14 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	}
 
 	pi := &planIterator{
-		plan:   plan,
-		tx:     tx,
-		shared: shared,
-		s:      s,
-		buf:    buf,
-		qb:     qb,
-		data:   qplanner.CursorSource{Tx: btx, Ns: s.ns},
+		plan:       plan,
+		tx:         tx,
+		shared:     shared,
+		closeState: btx.CloseState(),
+		s:          s,
+		buf:        buf,
+		qb:         qb,
+		data:       qplanner.CursorSource{Tx: btx, Ns: s.ns},
 	}
 	if shared != nil {
 		shared.iterOpened(pi)

@@ -20,7 +20,7 @@ func TestPcacheFetchAndMakeDirty_Clean(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	// Create a clean page and release it (goes to LRU)
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.release(pg)
 	assert.Equal(t, 1, pc.nRecyclable)
 	assert.False(t, pg.dirty)
@@ -38,7 +38,7 @@ func TestPcacheFetchAndMakeDirty_Clean(t *testing.T) {
 func TestPcacheFetchAndMakeDirty_AlreadyDirty(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.makeDirty(pg)
 	assert.True(t, pg.dirty)
 	assert.Equal(t, 1, pc.nDirty)
@@ -63,9 +63,9 @@ func TestPcacheFetchAndMakeDirty_MultipleDirty(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	// Create two clean pages
-	pg1 := pc.create(1, 2)
+	pg1 := testCreate(pc, 1, 2)
 	pc.release(pg1)
-	pg2 := pc.create(2, 2)
+	pg2 := testCreate(pc, 2, 2)
 	pc.release(pg2)
 
 	// fetch + makeDirty both — second should chain in front of first
@@ -86,14 +86,14 @@ func TestPcacheEvictOne_SingleElement(t *testing.T) {
 	pc := newPcache(4096, 1, true) // max 1 page
 
 	// Create and release one clean page
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.release(pg)
 	assert.Equal(t, 1, pc.nRecyclable)
 	assert.NotNil(t, pc.lruHead)
 	assert.NotNil(t, pc.lruTail)
 
 	// Creating a second page should evict the first (single element eviction)
-	pg2 := pc.create(2, 2)
+	pg2 := testCreate(pc, 2, 2)
 	require.NotNil(t, pg2)
 	assert.Nil(t, pc.hashFind(1)) // page 1 evicted
 	assert.Nil(t, pc.lruHead)     // LRU list empty
@@ -116,7 +116,7 @@ func TestPcacheLruRemove_NotInLRU(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	// Create a page that is pinned (never released, so not in LRU)
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	assert.Equal(t, 0, pc.nRecyclable)
 
 	// lruRemove on a page not in LRU should be a no-op
@@ -129,9 +129,9 @@ func TestPcacheLruRemove_Head(t *testing.T) {
 	// With lruPrepend, most recently released is at HEAD.
 	pc := newPcache(4096, 100, true)
 
-	pg1 := pc.create(1, 2)
-	pg2 := pc.create(2, 2)
-	pg3 := pc.create(3, 2)
+	pg1 := testCreate(pc, 1, 2)
+	pg2 := testCreate(pc, 2, 2)
+	pg3 := testCreate(pc, 3, 2)
 	pc.release(pg1) // LRU: HEAD -> pg1 -> TAIL
 	pc.release(pg2) // LRU: HEAD -> pg2 -> pg1 -> TAIL
 	pc.release(pg3) // LRU: HEAD -> pg3 -> pg2 -> pg1 -> TAIL
@@ -149,8 +149,8 @@ func TestPcacheLruRemove_Tail(t *testing.T) {
 	// With lruPrepend: release(pg1) then release(pg2) gives HEAD -> pg2 -> pg1 -> TAIL
 	pc := newPcache(4096, 100, true)
 
-	pg1 := pc.create(1, 2)
-	pg2 := pc.create(2, 2)
+	pg1 := testCreate(pc, 1, 2)
+	pg2 := testCreate(pc, 2, 2)
 	pc.release(pg1) // LRU: HEAD -> pg1 -> TAIL
 	pc.release(pg2) // LRU: HEAD -> pg2 -> pg1 -> TAIL
 	assert.Equal(t, 2, pc.nRecyclable)
@@ -169,7 +169,7 @@ func TestPcacheLruRemove_Middle(t *testing.T) {
 	// With lruPrepend: HEAD -> pgs[2] -> pgs[1] -> pgs[0] -> TAIL
 	pgs := make([]*page, 3)
 	for i := range pgs {
-		pgs[i] = pc.create(uint32(i+1), 2)
+		pgs[i] = testCreate(pc, uint32(i+1), 2)
 	}
 	for _, p := range pgs {
 		pc.release(p)
@@ -188,7 +188,7 @@ func TestPcacheNonPurgeable(t *testing.T) {
 	pc := newPcache(4096, 2, false) // max 2 pages, not purgeable
 
 	for i := uint32(1); i <= 5; i++ {
-		pg := pc.create(i, 2)
+		pg := testCreate(pc, i, 2)
 		pc.release(pg)
 	}
 
@@ -199,8 +199,8 @@ func TestPcacheNonPurgeable(t *testing.T) {
 func TestPcacheAppendDirtyPages(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg1 := pc.create(1, 2)
-	pg2 := pc.create(2, 2)
+	pg1 := testCreate(pc, 1, 2)
+	pg2 := testCreate(pc, 2, 2)
 	pc.makeDirty(pg1)
 	pc.makeDirty(pg2)
 
@@ -212,7 +212,7 @@ func TestPcacheAppendDirtyPages(t *testing.T) {
 func TestPcacheFetch_Clean(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.release(pg)
 
 	// fetch on a clean page: dirty=false
@@ -224,7 +224,7 @@ func TestPcacheFetch_Clean(t *testing.T) {
 func TestPcacheFetch_Dirty(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.makeDirty(pg)
 	pc.release(pg)
 
@@ -244,11 +244,11 @@ func TestPcacheFetch_NotFound(t *testing.T) {
 func TestPcacheCreateExistingDirty(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.makeDirty(pg)
 
 	// create(1) again should return the same dirty page
-	pg2 := pc.create(1, 2)
+	pg2 := testCreate(pc, 1, 2)
 	assert.Equal(t, pg, pg2)
 	assert.True(t, pg2.dirty)
 }
@@ -3230,7 +3230,7 @@ func TestPageCacheBackpointer_SetOnCreate(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	// Creating a page should set pg.cache to the owning pcache.
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	assert.Equal(t, pc, pg.cache, "page.cache should point to owning pcache after create")
 	assert.Equal(t, uint32(1), pg.pgno)
 	assert.Equal(t, 1, pg.pinCount)
@@ -3239,7 +3239,7 @@ func TestPageCacheBackpointer_SetOnCreate(t *testing.T) {
 func TestPageCacheBackpointer_PreservedOnFetch(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	pc.release(pg)
 
 	// Fetching should preserve the cache backpointer.
@@ -3251,7 +3251,7 @@ func TestPageCacheBackpointer_PreservedOnFetch(t *testing.T) {
 func TestPageCacheBackpointer_ReleaseRoutesViaCache(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1, 2)
+	pg := testCreate(pc, 1, 2)
 	assert.Equal(t, pc, pg.cache)
 
 	// Release via the page's cache backpointer (simulating releasePage routing).
@@ -3286,8 +3286,8 @@ func TestPageCacheBackpointer_DifferentCaches(t *testing.T) {
 	pc1 := newPcache(4096, 100, true)
 	pc2 := newPcache(4096, 100, true)
 
-	pg1 := pc1.create(1, 2)
-	pg2 := pc2.create(1, 2)
+	pg1 := testCreate(pc1, 1, 2)
+	pg2 := testCreate(pc2, 1, 2)
 
 	assert.Equal(t, pc1, pg1.cache, "pg1 should point to pc1")
 	assert.Equal(t, pc2, pg2.cache, "pg2 should point to pc2")
@@ -4005,125 +4005,67 @@ func assertPcacheConsistent(t *testing.T, pc *pcache) {
 	}
 }
 
-// TestXStressReentrantClear_CacheStaysConsistentAndNoOrphan is a regression PIN
-// for the by-design drift documented at
-// docs/btree/NOTES.md#old-drift-pcache-create-drops-xstress-error.
-//
-// THE DRIFT: pcache.create() (pcache.go:create) has no error return. When the
-// cache is full of dirty pages it calls pc.xStress(victim) (pcache.go:352) to
-// spill one to the WAL, and it DISCARDS xStress's error. SQLite's
-// sqlite3PcacheFetchStress (pcache.c:481-485) instead propagates a non-BUSY
-// xStress error, and getPageNormal (pager.c:5552-5556) aborts the page
-// acquisition via pager_acquire_err — dropping the half-built page. Go keeps the
-// page and the in-flight b-tree op keeps mutating it.
-//
-// In production the xStress callback is pager.pagerStress. On a WAL-write failure
-// mid-transaction (disk full / I/O error), pagerStress calls pager.pagerError()
-// (pager.go:2084) BEFORE returning the (dropped) error. pagerError() runs, among
-// other cleanup, p.writerCache.clear() (pager.go:2352) — i.e. the cache is
-// cleared RE-ENTRANTLY, from inside the pc.xStress(victim) call, while create()
-// is still mid-flight. create() then resumes its retry-eviction loop, allocates
-// a page struct, resetPage()s it, and hashInsert()s it into the just-cleared
-// cache before returning.
-//
-// THE RELIED-UPON INVARIANT (what this test pins): that re-entrant clear() during
-// xStress must leave the cache internally consistent and must NOT leak an orphan
-// page into a future transaction. Specifically:
-//   - clear() resets nPage to 0, so create()'s post-stress retry-eviction loop
-//     (pcache.go:354, `for pc.nPage >= pc.maxPages`) becomes a no-op — it must not
-//     touch the now-empty LRU/dirty lists or a recycled victim that clear() already
-//     routed to pFree (no double-free).
-//   - the single page create() returns afterward is the ONLY page in the cache,
-//     correctly hash-linked (inCache, right bucket), with nPage/nRecyclable/nDirty
-//     all agreeing with the actual lists.
-//
-// If a future refactor breaks this (e.g. clear() forgets to zero nPage, or
-// create() retains a recycled victim across the clear and double-frees its
-// buffer, or the retry loop runs against the cleared lists and orphans a page),
-// assertPcacheConsistent fails. That, combined with the separate guarantee that
-// commit() is state-gated (pager.go:2102) and a second spill is a no-op in error
-// state (pager.go:2041), is what makes the dropped xStress error harmless.
-//
-// This is a pure-pcache unit test: it needs no production fault-injection hook
-// because xStress is an assignable field on the pcache. It simulates pagerError's
-// re-entrant clear() directly inside the callback, which is the exact ordering
-// the production drop relies on.
-func TestXStressReentrantClear_CacheStaysConsistentAndNoOrphan(t *testing.T) {
+// A failed spill fails the create: sqlite3PcacheFetchStress returns a non-BUSY
+// xStress error (pcache.c:481-484) and getPageNormal gives the fetch up
+// (pager.c:5555-5556). No page is created, the victim stays dirty, and the
+// cache is consistent, so the caller's rollback finds every page of the
+// transaction and nothing of it outlives the transaction.
+func TestCreate_FailedSpillFailsTheCreate(t *testing.T) {
 	const maxPages = 3
 	pc := newPcache(4096, maxPages, true)
 
-	// errSpill stands in for the WAL-write failure (disk full / I/O error) that
-	// pagerStress hits mid-transaction. The production code drops this exact
-	// return value.
 	errSpill := errors.New("simulated WAL write failure during spill")
-
 	var stressCalls int
 	var victimPgno uint32
-	var clearedDuringStress bool
 	pc.xStress = func(victim *page) error {
 		stressCalls++
 		victimPgno = victim.pgno
-
-		// Reproduce pagerStress's failure path: pagerError() purges the writer
-		// cache BEFORE the (dropped) error is returned. The observable cache
-		// effect of pager.pagerError() (pager.go:2348-2352) is a full clear()
-		// that tears the cache down to empty. We invoke clear() directly so that
-		// its own counter/list reset (nPage=0, nRecyclable=0, dirty/LRU heads
-		// nil) is the sole thing keeping create()'s post-stress retry-eviction
-		// loop (pcache.go:354) a safe no-op — exactly the invariant the dropped
-		// error relies on.
-		pc.clear()
-		clearedDuringStress = true
-
-		// The error is what production drops. Returning it documents that the
-		// scenario is the error path; create() discards it by design.
 		return errSpill
 	}
 
-	// Fill the cache to maxPages with dirty, unpinned pages so the next create()
-	// finds no clean eviction candidate and must invoke xStress to spill.
-	for i := uint32(1); i <= maxPages; i++ {
-		pg := pc.create(i, 2)
-		require.NotNil(t, pg)
+	// A cache full of dirty, unpinned pages: the next create has no clean
+	// page to evict and spills.
+	for i := uint32(2); i < 2+maxPages; i++ {
+		pg := testCreate(pc, i, 2)
 		pc.makeDirty(pg)
 		pc.release(pg)
 	}
 	require.Equal(t, maxPages, pc.nDirty)
-	require.Equal(t, 0, pc.nRecyclable)
 	assertPcacheConsistent(t, pc)
 
-	// Hard-create page 4 (createFlag=2, the writer path). The cache is full of
-	// dirty pages, so create() invokes xStress, which re-entrantly clears the
-	// cache and returns the dropped error. create() must still return a usable,
-	// hash-linked page.
-	pg4 := pc.create(4, 2)
+	pg, err := pc.create(9, 2)
+	require.ErrorIs(t, err, errSpill)
+	require.Nil(t, pg, "no page is created by a fetch whose spill failed")
+	require.Equal(t, 1, stressCalls)
+	require.Equal(t, uint32(2), victimPgno, "the oldest dirty page is the victim")
 
-	require.Equal(t, 1, stressCalls, "xStress must have been invoked exactly once")
-	require.NotZero(t, victimPgno, "a dirty spill victim must have been chosen")
-	require.True(t, clearedDuringStress, "the re-entrant clear() must have run")
+	require.Nil(t, pc.hashFind(9), "the page of the failed fetch is not in the cache")
+	require.Equal(t, maxPages, pc.nPage)
+	require.Equal(t, maxPages, pc.nDirty, "the victim is still dirty")
+	assertPcacheConsistent(t, pc)
 
-	require.NotNil(t, pg4, "create() must still return a page after the dropped xStress error")
-	require.Equal(t, uint32(4), pg4.pgno)
-	require.Equal(t, 1, pg4.pinCount, "returned page must be pinned exactly once")
-	require.Len(t, pg4.data, 4096)
-	require.True(t, pg4.inCache, "the returned page must be linked into the cleared cache's hash")
-	require.False(t, pg4.dirty, "freshly created page must start clean")
+	// A clean page evicted before the spill was tried is out of the hash
+	// when the create fails: the cache still agrees with its lists.
+	pc.makeClean(pc.hashFind(4))
+	pc.maxPages = 2
+	pg, err = pc.create(9, 2)
+	require.ErrorIs(t, err, errSpill)
+	require.Nil(t, pg)
+	require.Nil(t, pc.hashFind(4), "the clean page was evicted")
+	require.Equal(t, 2, pc.nPage)
+	require.Equal(t, 2, pc.nDirty)
+	assertPcacheConsistent(t, pc)
 
-	// The cleared cache must now hold EXACTLY the one page create() returned —
-	// no orphan from the wiped dirty set, no stale hash link, no buffer leak.
-	require.Equal(t, 1, pc.nPage, "cache must hold exactly the one page create() returned")
-	require.Same(t, pg4, pc.hashFind(4), "page 4 must be findable in the hash")
-	for i := uint32(1); i <= maxPages; i++ {
-		require.Nil(t, pc.hashFind(i),
-			"page %d was wiped by the re-entrant clear() and must not be served from cache", i)
+	// Once the spill works the same create succeeds.
+	pc.xStress = func(victim *page) error {
+		pc.makeClean(victim)
+		return nil
 	}
-	assertPcacheConsistent(t, pc)
-
-	// The page must round-trip a normal release back onto the LRU, proving it is
-	// a fully-initialized cache citizen (not a half-built orphan).
-	pc.release(pg4)
-	require.Equal(t, 0, pg4.pinCount)
-	require.Equal(t, 1, pc.nRecyclable, "released clean page must enter the LRU")
+	pg, err = pc.create(9, 2)
+	require.NoError(t, err)
+	require.NotNil(t, pg)
+	require.True(t, pg.inCache)
+	pc.release(pg)
 	assertPcacheConsistent(t, pc)
 }
 
@@ -4144,14 +4086,14 @@ func TestXStressNonReentrant_BaselineConsistent(t *testing.T) {
 	}
 
 	for i := uint32(1); i <= maxPages; i++ {
-		pg := pc.create(i, 2)
+		pg := testCreate(pc, i, 2)
 		require.NotNil(t, pg)
 		pc.makeDirty(pg)
 		pc.release(pg)
 	}
 	assertPcacheConsistent(t, pc)
 
-	pg4 := pc.create(4, 2)
+	pg4 := testCreate(pc, 4, 2)
 	require.NotNil(t, pg4)
 	require.Equal(t, 1, stressCalls)
 	// Spill made the victim clean+evictable, so the cache stays at maxPages and

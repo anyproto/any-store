@@ -621,13 +621,17 @@ func (wi *walIndex) set(pgno, frame uint32) error {
 		wi.pageMap[pgno] = append(frames, frame)
 		wi.mu.Unlock()
 	}
-	if frame > wi.maxFrame.Load() {
+	// mxFrame is the last frame of the log before this append: pWal->hdr.mxFrame
+	// while walFrames runs its walIndexAppend loop (it is advanced after the
+	// loop, wal.c:4243).
+	mxFrame := wi.maxFrame.Load()
+	if frame > mxFrame {
 		wi.maxFrame.Store(frame)
 	}
 	// Propagate an ErrCorrupt (full/over-probed hash segment) so a single-frame
 	// write aborts like C's walFrames loop (wal.c:4229) instead of silently
 	// dropping the mapping.
-	return wi.shmHashWrite(pgno, frame)
+	return wi.shmHashWrite(pgno, frame, mxFrame)
 }
 
 // setBatch records multiple page->frame mappings under a single lock and
@@ -647,15 +651,24 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) erro
 		}
 		wi.mu.Unlock()
 	}
-	if f := startFrame + uint32(len(pages)) - 1; f > wi.maxFrame.Load() {
+	// last is the last frame whose index entry is this log's: the last frame
+	// before the batch, then each frame of the batch once it is indexed. It
+	// is the limit of the dead-writer cleanup in shmHashWrite.
+	// DRIFT: the cleanup limit follows the batch; C's is pWal->hdr.mxFrame for the whole batch See docs/btree/NOTES.md#drift-2026-11-19-dead-writer-cleanup-limit-follows-the-batch
+	last := wi.maxFrame.Load()
+	if f := startFrame + uint32(len(pages)) - 1; f > last {
 		wi.maxFrame.Store(f)
 	}
 	// Propagate the first ErrCorrupt (full/over-probed hash segment) so the
 	// commit aborts like C's walFrames loop (wal.c:4229 stops the loop, skips
 	// walIndexWriteHdr, returns rc) instead of silently dropping the mapping.
 	for i, p := range pages {
-		if err := wi.shmHashWrite(p.pgno, startFrame+uint32(i)); err != nil {
+		frame := startFrame + uint32(i)
+		if err := wi.shmHashWrite(p.pgno, frame, last); err != nil {
 			return err
+		}
+		if frame > last {
+			last = frame
 		}
 	}
 	return nil
@@ -737,20 +750,42 @@ func (wi *walIndex) shmCleanupFromFrame(target, maxFrame uint32) {
 			clear(region[htHashArrayOff : htHashArrayOff+htNSlot*2])
 			continue
 		}
-		// SQLite's walCleanupHash: selectively zero slots whose indexed frame
-		// is beyond iLimit, then memset the tail of aPgno.
-		iLimit := uint16(target - iZero) // target's idx within this segment, 1-based
-		for h := 0; h < htNSlot; h++ {
-			slotOff := htHashArrayOff + h*2
-			v := binary.LittleEndian.Uint16(region[slotOff:])
-			if v > iLimit {
-				binary.LittleEndian.PutUint16(region[slotOff:], 0)
-			}
+		shmCleanupHashSegment(region, seg, target)
+	}
+}
+
+// shmCleanupHashSegment is SQLite's walCleanupHash (wal.c:1233-1288) on the
+// hash table that holds frame mxFrame, mapped as region: it zeroes every
+// aHash slot whose frame is above mxFrame (`if( sLoc.aHash[i]>iLimit )
+// sLoc.aHash[i] = 0`, wal.c:1260-1264) and the aPgno entries of those frames
+// (`memset(&sLoc.aPgno[iLimit], 0, nByte)`, wal.c:1271). The slots of
+// frames up to mxFrame keep their places, so their probe chains still end at
+// the first empty slot after them. seg must be mxFrame's segment
+// (htFrameSegIdx) and the caller holds the write lock.
+func shmCleanupHashSegment(region []byte, seg int, mxFrame uint32) {
+	pgnoBase, nEntry, iZero := htSegmentInfo(seg)
+	iLimit := uint16(mxFrame - iZero) // mxFrame's 1-based index in this segment
+	// The slots, two to a word, are stored like htSlotStore's: readers of
+	// this process and of others probe the table meanwhile. They never use
+	// what is removed here, which is above every snapshot, and the entries
+	// they do use keep their places. The page numbers removed are never
+	// read by a reader (shmHashGet tests the bounds first) and are cleared
+	// as C's memset clears them.
+	for h := 0; h < htNSlot; h += 2 {
+		p, _ := htSlotWord(region, h)
+		w := atomic.LoadUint32(p)
+		nw := w
+		if uint16(w) > iLimit {
+			nw &^= 0xffff
 		}
-		for i := int(iLimit); i < nEntry; i++ {
-			binary.LittleEndian.PutUint32(region[pgnoBase+i*4:], 0)
+		if uint16(w>>16) > iLimit {
+			nw &^= 0xffff0000
+		}
+		if nw != w {
+			atomic.StoreUint32(p, nw)
 		}
 	}
+	clear(region[pgnoBase+int(iLimit)*4 : pgnoBase+nEntry*4])
 }
 
 // getInTxRange returns the frame for pgno within [minFrame, maxFrame],
@@ -766,6 +801,9 @@ func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) (uint32, error
 		if err := f(); err != nil {
 			return 0, err
 		}
+	}
+	if minFrame > maxFrame {
+		return 0, nil // an empty window, see shmHashGet
 	}
 	if wi.inProcess {
 		wi.mu.RLock()
@@ -865,6 +903,9 @@ func (wi *walIndex) synthHdr(mxFrame, nPage uint32) WalIndexHdr {
 // DRIFT: WAL hash-probe full-chain (nCollide) CORRUPT signal dropped in get/shmHashGet See docs/btree/NOTES.md#drift-93-wal-hash-probe-full-chain-corruption-signal-dropped
 // DRIFT: in-process WAL lookup via Go map (O(1)) vs SQLite hash scan; cross-process still uses SHM See docs/btree/NOTES.md#old-drift-pagemap-same-process-lookup
 func (wi *walIndex) get(pgno, maxFrame, minFrame uint32) (uint32, error) {
+	if minFrame > maxFrame {
+		return 0, nil // an empty window, see shmHashGet
+	}
 	if wi.inProcess {
 		// In-process: no SHM to consult; pageMap is the sole source of truth.
 		wi.mu.RLock()
@@ -1224,7 +1265,14 @@ func htSegmentInfo(seg int) (pgnoBase int, nEntry int, iZero uint32) {
 // stored aPgno[idx]. That is harmless: the transaction aborts and the frame
 // is never published via mxFrame/mxCommitFrame, so no reader can reach it,
 // and shmCleanupFromFrame/reset scrubs the slot on rollback.
-func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
+//
+// mxFrame is the last frame whose entry is this log's: the entries of the
+// frames above it are not, whatever the hash table says about them. For the
+// first frame of a batch it is the last frame of the log before the batch,
+// pWal->hdr.mxFrame in walIndexAppend; for the following ones the frame
+// indexed just before (setBatch), where C keeps pWal->hdr.mxFrame for the
+// whole batch.
+func (wi *walIndex) shmHashWrite(pgno, frame, mxFrame uint32) error {
 	seg, idx := htFrameSegIdx(frame)
 
 	region, err := wi.shm.region(seg, true)
@@ -1233,8 +1281,8 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
 	}
 
 	// Lazily zero the segment's aPgno+aHash area when writing its FIRST
-	// entry, matching SQLite walIndexAppend (wal.c:1324-1330
-	// `if( idx==1 ){ memset((void*)&aPgno[1], 0, nByte); }`). A WAL reset
+	// entry, matching SQLite walIndexAppend (wal.c:1315-1319
+	// `if( idx==1 ){ ... memset((void*)sLoc.aPgno, 0, nByte); }`). A WAL reset
 	// (shmClearHash) only clears the segments the resetting connection has
 	// mapped; a WAL that previously grew further left stale entries from
 	// the prior generation in the higher segments, and those occupied slots
@@ -1247,8 +1295,24 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
 		clear(region[pgnoBase:])
 	}
 
-	// Write pgno to aPgno[idx] first (SQLite wal.c:1337). u32-aligned.
+	// A frame slot that is already set is left over from a writer that died
+	// inside a transaction, after it had written dirty pages to the WAL to
+	// free memory: nothing rolled its frames back, so their entries are still
+	// in the hash table, above the log's last frame. They are removed before
+	// the new entry goes in (wal.c:1327-1330 `if( sLoc.aPgno[idx-1] ){
+	// walCleanupHash(pWal); }`). Left in place they sit in their pages' probe
+	// chains ahead of the entries appended now: enough of them overflow the
+	// bounded probe below (a false ErrCorrupt), and a later rollback that
+	// zeroes one of them (shmCleanupFromFrame) cuts the chain in front of a
+	// committed entry, which shmHashGet then no longer finds.
 	pgnoOff := htPgnoOffset(seg, idx)
+	if atomic.LoadUint32((*uint32)(unsafe.Pointer(&region[pgnoOff]))) != 0 {
+		if err := wi.shmCleanupHash(mxFrame, seg, region); err != nil {
+			return err
+		}
+	}
+
+	// Write pgno to aPgno[idx] first (SQLite wal.c:1337). u32-aligned.
 	atomic.StoreUint32((*uint32)(unsafe.Pointer(&region[pgnoOff])), pgno)
 
 	// Release barrier between aPgno and the hash slot publish, matching
@@ -1257,9 +1321,10 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
 		walShmBarrier()
 	}
 
-	// Insert into hash table (linear probing). aHash entries are u16; we
-	// publish via a plain store here because writes are serialized under
-	// lockWrite and the preceding barrier ordered aPgno before us.
+	// Insert into hash table (linear probing). aHash entries are u16,
+	// published with htSlotStore (C: AtomicStore, wal.c:1338): writes are
+	// serialized under lockWrite, readers probe meanwhile, and the preceding
+	// barrier ordered aPgno before the slot.
 	//
 	// Bound the probe like C's walIndexAppend (wal.c:1333-1336). C uses
 	// `nCollide = idx` where its idx is 1-based (`iFrame - sLoc.iZero`); Go's
@@ -1270,9 +1335,8 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
 	nCollide := idx + 1
 	h := int(pgno*htHash1) & (htNSlot - 1)
 	for range htNSlot {
-		slotOff := htHashArrayOff + h*2
-		if binary.LittleEndian.Uint16(region[slotOff:]) == 0 {
-			binary.LittleEndian.PutUint16(region[slotOff:], uint16(idx+1))
+		if htSlotLoad(region, h) == 0 {
+			htSlotStore(region, h, uint16(idx+1))
 			return nil
 		}
 		if nCollide--; nCollide < 0 {
@@ -1286,6 +1350,30 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
 	return nil
 }
 
+// shmCleanupHash is walCleanupHash (wal.c:1233-1288) as walIndexAppend calls
+// it: it removes from the hash table that holds frame mxFrame every entry of
+// a frame above mxFrame. With no frame in the log there is nothing to keep
+// and nothing is done (`if( pWal->hdr.mxFrame==0 ) return;`, wal.c:1244): the
+// first frame of a segment has zeroed the segment already. seg and region are
+// the segment being appended to, which is mxFrame's segment whenever a slot
+// in it is found set (an append into a later segment starts at its first
+// entry, which zeroes it); any other segment is mapped here, as walHashGet
+// does (wal.c:1252).
+func (wi *walIndex) shmCleanupHash(mxFrame uint32, seg int, region []byte) error {
+	if mxFrame == 0 {
+		return nil
+	}
+	mxSeg, _ := htFrameSegIdx(mxFrame)
+	if mxSeg != seg {
+		var err error
+		if region, err = wi.shm.region(mxSeg, true); err != nil {
+			return err
+		}
+	}
+	shmCleanupHashSegment(region, mxSeg, mxFrame)
+	return nil
+}
+
 // shmHashGet looks up the latest frame for pgno from shm hash tables.
 // Returns 0 if not found. Only frames <= maxFrame are considered.
 // This is the cross-process read path; same-process readers use the Go map.
@@ -1293,13 +1381,13 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
 // [minFrame, maxFrame]. This is the cross-process fallback when pageMap
 // doesn't contain the page — another process may have written WAL frames.
 //
-// Matches SQLite's walFindFrame (wal.c:3554-3581): only scan hash segments
+// Matches SQLite's walFindFrame (wal.c:3519-3618): only scan hash segments
 // that could contain frames in [minFrame, maxFrame], searching backwards
 // from the newest segment. This avoids scanning already-checkpointed
 // segments, which is critical for performance on large WALs.
 // Returns ErrCorrupt when a probe chain walks past nCollide occupied slots
 // without hitting an empty slot, mirroring walFindFrame's bounded probe
-// (wal.c:3580 `nCollide = HASHTABLE_NSLOT`, wal.c:3592-3595
+// (wal.c:3580 `nCollide = HASHTABLE_NSLOT`, wal.c:3589-3592
 // `if((nCollide--)==0){ *piRead = 0; return SQLITE_CORRUPT_BKPT; }`). nCollide
 // is reset per segment (C resets inside the iHash loop, wal.c:3580) so a
 // multi-segment scan bounds each hash table independently, not cumulatively.
@@ -1307,30 +1395,42 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
 // caller legitimately read the page from the DB file; only an over-probed
 // non-empty chain is corruption — the read FAILS instead of silently
 // returning 0 and reading a pre-commit page from the DB file (a stale read
-// that would mask the corruption).
-// DRIFT: shmHashGet silently skips segment on SHM map/IO error vs C abort See docs/btree/NOTES.md#drift-92-shmhashget-skips-segment-on-map-io-error
+// that would mask the corruption). A segment that cannot be mapped fails the
+// lookup with the mapping error, for the same reason.
 func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) {
-	if maxFrame == 0 {
+	// No frame, or an empty window: a snapshot that is entirely in the
+	// database file (a reader on slot 0 has minFrame == maxFrame+1). No
+	// segment is mapped or read for it, as walFindFrame returns before its
+	// loop (wal.c:3538-3541 `if( iLast==0 || (pWal->readLock==0 &&
+	// pWal->bShmUnreliable==0) ){ *piRead = 0; return SQLITE_OK; }`): a
+	// segment it cannot map is none of its business, and the hash tables of
+	// a log that is being started over are read by nobody.
+	if maxFrame == 0 || minFrame > maxFrame {
 		return 0, nil
 	}
 
 	lastSeg, _ := htFrameSegIdx(maxFrame)
-	// Match SQLite wal.c:3554 — skip segments before minFrame.
+	// Skip the segments before minFrame's (wal.c:3568 `iMinHash =
+	// walFramePage(pWal->minFrame);`).
 	minSeg, _ := htFrameSegIdx(minFrame)
 
 	for seg := lastSeg; seg >= minSeg; seg-- {
-		// Map segment on demand (create=true). A peer writer may have just
-		// extended SHM with a new segment containing frames <= maxFrame that
-		// this reader hasn't yet mapped. SQLite's walFindFrame (wal.c:3562)
-		// always calls walHashGet → walIndexPage → sqlite3OsShmMap, which
-		// maps/extends the wal-index page — it never silently skips a
-		// segment. Skipping here was the root cause of cross-process
-		// row-loss: hdr.mxFrame advertised frames in a segment we hadn't
-		// mapped, shmHashGet returned 0, and the read path fell through to
-		// the DB file which still held the pre-commit page.
-		region, err := wi.shm.region(seg, true)
+		// A segment this process has not mapped yet is mapped on demand: a
+		// peer writer may have extended the wal-index with a segment that
+		// holds frames <= maxFrame. walFindFrame always goes through
+		// walHashGet → walIndexPage → sqlite3OsShmMap; it never skips a
+		// segment.
+		//
+		// A segment that cannot be mapped fails the lookup, as walFindFrame
+		// returns walHashGet's error (wal.c:3576-3579 `rc = walHashGet(pWal,
+		// iHash, &sLoc); if( rc!=SQLITE_OK ){ return rc; }`). Going on to
+		// the older segments, or reporting the page as not in the WAL, would
+		// hand the caller the page from before a commit.
+		region, err := wi.shm.region(seg, false)
 		if err != nil {
-			continue
+			if region, err = wi.mapSegmentForLookup(seg); err != nil {
+				return 0, fmt.Errorf("btree: wal-index segment %d: %w", seg, err)
+			}
 		}
 
 		pgnoBase, nEntry, iZero := htSegmentInfo(seg)
@@ -1341,22 +1441,27 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 		nCollide := htNSlot
 		var bestFrame uint32
 		for range htNSlot {
-			slotOff := htHashArrayOff + h*2
-			entry := binary.LittleEndian.Uint16(region[slotOff:])
+			entry := htSlotLoad(region, h)
 			if entry == 0 {
 				break // end of probe chain (genuine miss)
 			}
-			idx := int(entry) - 1
-			if idx < nEntry {
-				storedPgno := binary.LittleEndian.Uint32(region[pgnoBase+idx*4:])
-				if storedPgno == pgno {
-					frame := iZero + uint32(idx) + 1
-					if frame <= maxFrame && frame >= minFrame && frame > bestFrame {
-						bestFrame = frame
-					}
-				}
+			// The frame is tested against the snapshot's bounds before
+			// its page number is read, in C's order (wal.c:3585 `if(
+			// iFrame<=iLast && iFrame>=pWal->minFrame &&
+			// sLoc.aPgno[iH-1]==pgno )`): the entries above maxFrame are
+			// the writer's to change (an append in progress, a rollback,
+			// the removal of a dead writer's entries), and their page
+			// numbers are not read at all. Those of the window were
+			// written before the snapshot was published and do not
+			// change while it is in use, so they are read plainly, as C
+			// reads them.
+			frame := iZero + uint32(entry)
+			if frame <= maxFrame && frame >= minFrame && int(entry) <= nEntry &&
+				binary.LittleEndian.Uint32(region[pgnoBase+(int(entry)-1)*4:]) == pgno &&
+				frame > bestFrame {
+				bestFrame = frame
 			}
-			// Bound the probe AFTER the match check, like C (wal.c:3592-3595):
+			// Bound the probe AFTER the match check, like C (wal.c:3589-3592):
 			// walking past nCollide occupied slots = full/corrupt chain.
 			if nCollide--; nCollide == 0 {
 				if debugTrace {
@@ -1373,6 +1478,79 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 	}
 
 	return 0, nil
+}
+
+// mapSegmentForLookup maps a wal-index segment this process has not mapped
+// yet, for a lookup. A lookup never extends the wal-index file: the segment
+// of a frame in the caller's window was created by the writer of that frame
+// before it published it, so one that is not in the file is damage, and a
+// freshly allocated segment of zeros would answer "not in the WAL" for every
+// page. A reader's walIndexPage passes pWal->writeLock as the extend flag
+// (wal.c:784-786), unixShmMap leaves a region past the end of the file
+// unmapped for it (os_unix.c:5163-5164 `if( !bExtend ){ goto shmpage_out;
+// }`), and walHashGet makes the missing page an error (wal.c:1185-1187).
+//
+// shm.region(seg, false) cannot serve here: it returns only what this process
+// has mapped already (docs/btree/NOTES.md, region(create=false)). The file's
+// size is checked instead, for a shm that has a file. The size it must reach
+// is the end of the segment's mapping group, which is what region(seg, true)
+// maps and would extend the file to: unixShmMap compares st_size with
+// nReqRegion*szRegion, nReqRegion being rounded up to a whole group
+// (os_unix.c:5140-5165). A group is one segment unless the OS page is larger
+// than a segment (64 KiB pages). The heap shms have no file and no other
+// process: their segments are this process's own.
+// DRIFT: a writer's lookup does not extend the wal-index file either, where walIndexPageRealloc passes pWal->writeLock as the extend flag (wal.c:784-786); a segment missing from the file fails a writer's lookup too. See docs/btree/NOTES.md#drift-92-shmhashget-skips-segment-on-map-io-error
+func (wi *walIndex) mapSegmentForLookup(seg int) ([]byte, error) {
+	if f, ok := wi.shm.(shmFile); ok {
+		info, err := f.fileInfo()
+		if err != nil {
+			return nil, err
+		}
+		if need := shmLookupFileSize(seg, f.regionsPerMap()); info.Size() < need {
+			return nil, fmt.Errorf("%w: the wal-index file has %d bytes, the segment's mapping ends at %d", errShmSegmentMissing, info.Size(), need)
+		}
+	}
+	return wi.shm.region(seg, true)
+}
+
+// shmLookupFileSize is the size a wal-index file must have for a lookup to
+// map segment seg: the end of the group of regionsPerMap segments that holds
+// it, `nReqRegion = ((iRegion+nShmPerMap) / nShmPerMap) * nShmPerMap`
+// (os_unix.c:5140).
+func shmLookupFileSize(seg, regionsPerMap int) int64 {
+	return int64((seg+regionsPerMap)/regionsPerMap*regionsPerMap) * shmRegionSize
+}
+
+// errShmSegmentMissing is the failure of a lookup whose wal-index segment is
+// not in the wal-index file.
+var errShmSegmentMissing = errors.New("btree: wal-index segment missing")
+
+// htSlotWord returns the 32-bit word that holds hash slot h and the slot's
+// bit offset in it. Go has no 16-bit atomics, so the slots, which are
+// 16-bit, are loaded and stored through the aligned word that holds two of
+// them (aHash starts at a multiple of 4 in a region whose start is aligned).
+// Slots are little-endian, as everywhere in this file: the even slot is the
+// word's low half on the little-endian machines the shared wal-index is
+// built for.
+func htSlotWord(region []byte, h int) (*uint32, uint) {
+	return (*uint32)(unsafe.Pointer(&region[htHashArrayOff+(h&^1)*2])), uint(h&1) * 16
+}
+
+// htSlotLoad reads hash slot h, as walFindFrame does with AtomicLoad
+// (wal.c:3583): a reader probes the table while the writer appends to it.
+func htSlotLoad(region []byte, h int) uint16 {
+	p, shift := htSlotWord(region, h)
+	return uint16(atomic.LoadUint32(p) >> shift)
+}
+
+// htSlotStore writes hash slot h, as walIndexAppend does with AtomicStore
+// (wal.c:1338). The caller holds the write lock: no one else stores into the
+// table, so rewriting the neighbouring slot with the value just loaded
+// changes nothing a reader can see.
+func htSlotStore(region []byte, h int, v uint16) {
+	p, shift := htSlotWord(region, h)
+	w := atomic.LoadUint32(p)
+	atomic.StoreUint32(p, w&^(0xffff<<shift)|uint32(v)<<shift)
 }
 
 // shmClearHash zeros out all hash table data in shm regions.
@@ -1554,6 +1732,12 @@ type wal struct {
 	ckptLatest map[uint32]uint32
 	ckptPgnos  []uint32
 
+	// dirSync is set when open opens the WAL file, with the create flag, as
+	// unixOpen sets UNIXFILE_DIRSYNC on every WAL it opens so
+	// (os_unix.c:6569-6573, 6777; sqlite3WalOpen, wal.c:1719-1720): the
+	// first sync of the file also syncs its directory (syncFile).
+	dirSync dirSync
+
 	// headerOnDisk is false when the WAL file is empty (0 bytes) and the
 	// header has not yet been written to disk. The header is written lazily
 	// on the first writeFrames call. This matches SQLite's behavior where
@@ -1643,13 +1827,22 @@ type wal struct {
 	// them on read. Propagated from the pager after wal creation via
 	// p.wal.codec = p.codec; see pager.open / pager.initNewDB.
 	codec Codec
+	// onIntegrityError is the database's integrity hook, propagated from
+	// the pager with codec; readFramePage passes it to every Decrypt.
+	onIntegrityError integrityHook
+	// keySalt is the pager's keySalt, propagated with codec: the KDF salt
+	// every frame of page 1 this WAL writes carries (encryptPageWithCodec),
+	// and page 1 as the checkpoint copies it into the main file.
+	keySalt [SaltLen]byte
 	// codecScratch is a page-sized scratch used by writeFrame to hold
 	// ciphertext. Allocated lazily on first use. Writes are
 	// single-writer-serialized, so one buffer is safe.
 	codecScratch []byte
-	// codecAEAD is the nonce/AAD scratch for writeFrame's codec call.
-	// Embedded by value so nonce/aad slices live on the wal's heap
-	// allocation rather than escaping per-call.
+	// codecAEAD is the nonce/AAD scratch for writeFrame's codec call, and
+	// the nonce pool its encrypts draw from: this WAL's own, never shared
+	// with another database that has the same codec. Embedded by value so
+	// nonce/aad slices live on the wal's heap allocation rather than
+	// escaping per-call.
 	codecAEAD aeadScratch
 	// END ENCRYPTION
 }
@@ -1702,6 +1895,7 @@ func (w *wal) open() (err error) {
 		return err
 	}
 	w.file = f
+	w.dirSync.set(w.path)
 
 	// Release the WAL file/shm on any error after this point so a failed open
 	// doesn't leak fds (see the equivalent guard in pager.open for why a leaked
@@ -2205,11 +2399,21 @@ func (w *wal) flushHeader() error {
 	if _, err := w.file.WriteAt(buf, 0); err != nil {
 		return err
 	}
-	if err := fdatasync(w.file); err != nil {
+	if err := w.syncFile(); err != nil {
 		return err
 	}
 	w.headerOnDisk = true
 	return nil
+}
+
+// syncFile syncs the WAL file, and, at the first sync since open, its
+// directory after it (dirSync): unixSync on a descriptor marked
+// UNIXFILE_DIRSYNC (os_unix.c:3936-3954). So the WAL's name, and every name
+// created or removed in the directory before it (a creation journal's
+// delete in particular, creationJournal.commit), is durable before anything
+// synced to the WAL through this handle is relied on.
+func (w *wal) syncFile() error {
+	return w.dirSync.sync(w.file)
 }
 
 // writeHeader writes a fresh WAL header to disk. There is no log to
@@ -2231,7 +2435,7 @@ func (w *wal) writeHeader() error {
 	if _, err := w.file.WriteAt(buf, 0); err != nil {
 		return err
 	}
-	if err := fdatasync(w.file); err != nil {
+	if err := w.syncFile(); err != nil {
 		return err
 	}
 
@@ -2407,7 +2611,13 @@ func (w *wal) recoverLocked() error {
 	// we skip the first htHdrSize (=136) bytes so the OLD header + ckpt info
 	// stay in place; they are overwritten only by writeHeader and the
 	// counter/mark publishes at the end, matching SQLite wal.c:1524-1533
-	// commentary.
+	// commentary. The copy is plain, as walIndexRecover's memcpy is in C's
+	// default build (wal.c:1524-1533), and a reader of this process may be
+	// probing the segment: the copy rewrites the entries of every frame in a
+	// reader's window with the bytes they already have. This is the one plain
+	// store into the slots of a table a reader may be probing: an append
+	// stores through htSlotStore, and shmCleanupHashSegment stores whole
+	// words with atomic.StoreUint32.
 	for seg, b := range priv {
 		region, err := w.index.shm.region(seg, true)
 		if err != nil {
@@ -2511,10 +2721,12 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	defer w.mu.Unlock()
 
 	// walFrames asserts that its caller holds the write lock (wal.c:4049).
-	// A spill's caller may have lost it since it checked: DB.Close's rescue
-	// (rollbackForClose) ends the transaction under a writer still inside an
-	// operation, and pagerStress's test of the writer state can come just
-	// before it. The rescue sets writeEndedByClose, rewinds the log and
+	// A spill's caller may have lost it since it checked: rollbackForClose
+	// ends the transaction, and when it runs under a writer still inside an
+	// operation (DB.Close runs it only once the writer gate is empty; the
+	// tests of this guard run it from inside a spill), pagerStress's test
+	// of the writer state can come just before it. The rescue sets
+	// writeEndedByClose, rewinds the log and
 	// releases the write lock under w.mu, so testing the flag here, before
 	// anything is written, leaves no frame of this call past the rewound
 	// base. A commit cannot get here so: it holds writerOpMu, which the
@@ -2565,7 +2777,26 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	// last-committed state at tx begin. Within a tx, spills don't
 	// update mxCommitFrame (commit=false skips the Store), so iFirst
 	// stays stable across spills.
+	//
+	// The lookup's ceiling is nf, the last frame in the wal-index when this
+	// call began, for every page of the call: walFindFrame searches up to
+	// pWal->hdr.mxFrame (`u32 iLast = pWal->hdr.mxFrame;`, wal.c:3525), and
+	// walFrames advances that only after it has indexed the whole batch
+	// (wal.c:4243). The frames this call appends are not in the index yet
+	// (setBatch runs after the loop), so an entry the index has for one of
+	// their numbers is not this transaction's: it is left over from a writer
+	// that died. Writing the page into that frame and leaving it out of the
+	// appended set would lose it: the staged batch writes another page over
+	// the same frame. In C iFirst stays 0 until the transaction has written
+	// frames (pWal->hdr differs from the live header, wal.c:4062-4064); here
+	// the first call of a transaction has iFirst == nf+1, an empty window.
+	// iFirst == 0 is the wrapped sum of a committed frame 0xffffffff: C's
+	// `if( iFirst && ...` (wal.c:4138) reuses nothing then, and so does this.
+	// The frame counter itself has no bound, here or in C (`iFrame++`,
+	// wal.c:4225-4229; 0xffffffff is also READMARK_NOT_USED, wal.c:401): a
+	// log of 2^32 frames is not supported.
 	iFirst := w.index.mxCommitFrame.LoadLocal() + 1
+	canReuse := iFirst != 0 && iFirst <= nf && !DiagDisableReuse.Load()
 
 	// Track appended frames separately from the input slice index.
 	// Reused pages don't advance the append cursor nor the checksum
@@ -2599,8 +2830,8 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		// Reuse check — mirrors SQLite wal.c:4124-4140. Only allowed
 		// for non-last-of-commit pages; the last commit frame must
 		// be a fresh append carrying the dbSize commit marker.
-		if !(commit && isLast) && iFirst > 0 && !DiagDisableReuse.Load() {
-			iWrite, err := w.index.getInTxRange(p.pgno, nf+nAppended, iFirst)
+		if !(commit && isLast) && canReuse {
+			iWrite, err := w.index.getInTxRange(p.pgno, nf, iFirst)
 			if err != nil {
 				return err
 			}
@@ -2625,7 +2856,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 					if w.codecScratch == nil {
 						w.codecScratch = make([]byte, w.pageSize)
 					}
-					ct, eerr := encryptPageWithCodec(w.codec, w.codecScratch, p.data, p.pgno, &w.codecAEAD)
+					ct, eerr := encryptPageWithCodec(w.codec, w.codecScratch, p.data, p.pgno, &w.codecAEAD, &w.keySalt)
 					if eerr != nil {
 						return eerr
 					}
@@ -2667,7 +2898,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 			if w.codecScratch == nil {
 				w.codecScratch = make([]byte, w.pageSize)
 			}
-			ct, eerr := encryptPageWithCodec(w.codec, w.codecScratch, p.data, p.pgno, &w.codecAEAD)
+			ct, eerr := encryptPageWithCodec(w.codec, w.codecScratch, p.data, p.pgno, &w.codecAEAD, &w.keySalt)
 			if eerr != nil {
 				return eerr
 			}
@@ -2756,7 +2987,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		}
 
 		if !w.noCommitSync {
-			if err := fdatasync(w.file); err != nil {
+			if err := w.syncFile(); err != nil {
 				return err
 			}
 		}
@@ -2841,8 +3072,10 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	pageSz := int(w.pageSize)
 
 	// iFirst — first frame written by the current tx. Same logic as
-	// disk-mode writeFrames; reuse only allowed for frames in this tx.
+	// disk-mode writeFrames; reuse only allowed for frames in this tx,
+	// looked up among the frames indexed before this call (ceiling nf).
 	iFirst := w.index.mxCommitFrame.LoadLocal() + 1
+	canReuse := iFirst != 0 && iFirst <= nf
 
 	// Ensure arena has enough space for all pages in this batch (worst
 	// case: no reuse). We may over-reserve when reuse fires; that's fine
@@ -2864,8 +3097,8 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 		isLast := i == len(pages)-1
 
 		// Reuse check — same semantics as disk-mode writeFrames.
-		if !(commit && isLast) && iFirst > 0 {
-			iWrite, err := w.index.getInTxRange(p.pgno, nf+nAppended, iFirst)
+		if !(commit && isLast) && canReuse {
+			iWrite, err := w.index.getInTxRange(p.pgno, nf, iFirst)
 			if err != nil {
 				// Return as the file path does: nFrame not advanced and
 				// w.mu released. The frames this call appended go too; the
@@ -3117,7 +3350,7 @@ func (w *wal) readFramePage(frame, pgno uint32, buf, scratchBuf []byte, aeadScra
 		if aeadS == nil {
 			aeadS = new(aeadScratch)
 		}
-		plain, derr := decryptPageWithCodec(w.codec, scratch, buf[:w.pageSize], pgno, aeadS)
+		plain, derr := decryptPageWithCodec(w.codec, scratch, buf[:w.pageSize], pgno, aeadS, w.onIntegrityError)
 		if derr != nil {
 			if ownScratch {
 				freePageBuffer(scratch, false)
@@ -4254,7 +4487,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	// Always sync regardless of noCommitSync: noCommitSync only skips per-commit
 	// syncs (like SQLite synchronous=NORMAL), but checkpoint always syncs.
 	if w.file != nil {
-		if err := fdatasync(w.file); err != nil {
+		if err := w.syncFile(); err != nil {
 			_ = w.index.unlock(lockRead0, lockExclusive)
 			return err
 		}
@@ -4379,7 +4612,8 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			// nonce — and (b) WAL ciphertext and DB-file ciphertext share
 			// codec, key, and layout. See any-store-tests:docs/any-store/btree/plans/encryption-plan.md Task 8.
 			// Matches SQLCipher wal.c:2309-2315 (OsRead → OsWrite with no
-			// codec hook between them).
+			// codec hook between them), except for the KDF salt in page 1's
+			// header, below.
 			// END ENCRYPTION
 			for _, pgno := range pgnos {
 				// Skip orphan frames past the committed DB size (iDbpage>mxPage,
@@ -4399,6 +4633,21 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 				if n != len(pageData) {
 					backfillErr = io.ErrUnexpectedEOF
 					break
+				}
+				// Page 1 reaches the main file with the keyed salt, as every
+				// write of page 1 does (encryptPageWithCodec), whatever its
+				// frame names: a frame of page 1 written before every write
+				// carried the keyed salt can name another (a backup's copy of
+				// its source's), and the next Open derives its key from the
+				// main file's salt. Bytes 72-87 are in the plaintext header,
+				// which the AEAD does not cover (drift-2026-06-25-14), so the
+				// page stays valid. In its default header mode SQLCipher
+				// writes the ctx's salt into every frame of page 1
+				// (sqlcipher.c:3312), so its checkpoint copies each selected
+				// frame as it is (wal.c:2306-2315).
+				// DRIFT: the checkpoint writes the keyed KDF salt over page 1's salt bytes; SQLite copies each selected frame verbatim. See docs/btree/NOTES.md#drift-2026-11-21-19-the-kdf-salt-belongs-to-the-key-setup-not-to-page-1
+				if pgno == 1 && w.keySalt != ([SaltLen]byte{}) {
+					copy(pageData[dbHeaderSaltOff:dbHeaderSaltOff+SaltLen], w.keySalt[:])
 				}
 				pageOffset := int64(pgno-1) * pageSz
 				n, err = dbFile.WriteAt(pageData, pageOffset)

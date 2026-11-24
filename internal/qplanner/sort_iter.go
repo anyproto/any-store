@@ -9,6 +9,7 @@ import (
 	"slices"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
@@ -219,7 +220,10 @@ func (it *SortIter) collectAndSort() error {
 				var verr error
 				it.Buf.DocBuf, verr = it.Data.AppendValue(docId, it.Buf.DocBuf[:0])
 				if verr != nil {
-					continue
+					if verr == btree.ErrKeyNotFound {
+						continue // doc gone since the index entry — skip
+					}
+					return verr
 				}
 				if it.rawSorter != nil {
 					if d, derr := it.Buf.Parser.DecodedDoc(it.Buf.DocBuf); derr == nil {

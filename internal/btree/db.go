@@ -198,9 +198,11 @@ type Options struct {
 	// concurrent use.
 	Codec Codec
 
-	// OnIntegrityError, if non-nil, is fired by the installed codec
-	// (cksum or AEAD) on every per-page integrity failure. Same hook
-	// for both modes. Runs on the I/O goroutine; must not block.
+	// OnIntegrityError, if non-nil, is called on every per-page integrity
+	// failure of this database (cksum or AEAD; same hook for both modes)
+	// and of no other: the pager keeps it and passes it to the codec with
+	// each decrypt, so two databases sharing one Codec each get their own
+	// failures. Runs on the I/O goroutine; must not block.
 	OnIntegrityError func(pgno uint32, inner error)
 	// END ENCRYPTION
 }
@@ -289,6 +291,9 @@ func buildCodec(opts Options, salt []byte, useCksum bool) (Codec, error) {
 		if len(opts.Key) == KeyLen {
 			raw = opts.Key
 		} else {
+			if h := testDeriveKeyHook; h != nil {
+				h()
+			}
 			raw = DeriveKey(opts.Key, salt, opts.KDFIterations)
 		}
 		return newCodecFromType(opts.CipherType, raw)
@@ -298,6 +303,10 @@ func buildCodec(opts Options, salt []byte, useCksum bool) (Codec, error) {
 	}
 	return nil, nil
 }
+
+// testDeriveKeyHook, when non-nil, runs inside buildCodec each time it
+// derives a key from a passphrase. Test-only.
+var testDeriveKeyHook func()
 
 // readInitialHeader opens the file at path and reads the database header.
 // Returns ErrNotExist if the file doesn't exist (distinguished by callers).
@@ -466,11 +475,35 @@ func (db *DB) LastWriterUnwindError() error {
 // locks would be permanent — the exact bug class this function exists to end.
 // A panic there now propagates with the mutexes released. Reports whether
 // this call won the CAS.
-func (db *DB) releaseWriterLocks(pager *pager, slot int, pre, post func()) bool {
+//
+// gate is the writer gate the calling Commit or Rollback entered, nil for
+// Close's call, which is not a call of the transaction. It is left here,
+// whichever way this goes, and before the write lock passes on: the gate
+// counts calls, not transactions, and a count of this transaction still in
+// it when the next writer begins would let that writer's calls in as
+// nested ones after Close has closed the gate, its Commit included. In
+// SQLite the COMMIT's step releases the write lock under the connection
+// mutex (sqlite3VdbeHalt, vdbe.c:4042, down to
+// sqlite3WalEndWriteTransaction, pager.c:2142; the mutex from
+// vdbeapi.c:923), and the next BEGIN is another step, which takes it first.
+// A Close waiting at the gate goes on before the write lock is released,
+// and waits for it in its turn.
+func (db *DB) releaseWriterLocks(pager *pager, slot int, gate *writerGate, pre, post func()) bool {
 	if !db.writerLocksDone.CompareAndSwap(false, true) {
+		if gate != nil {
+			gate.leave()
+		}
 		return false
 	}
-	defer db.unlockWriter()
+	defer func() {
+		db.unlockWriter()
+		if gate != nil && testWriterLocksReleasedHook != nil {
+			testWriterLocksReleasedHook()
+		}
+	}()
+	if gate != nil {
+		defer gate.leave()
+	}
 	defer db.mu.RUnlock()
 	defer db.unregisterWriter()
 	if pre != nil {
@@ -615,10 +648,16 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 
+	// The database's full name, resolved once (sqlite3OsFullPathname,
+	// pager.c:4792): the first look at the header below and the pager open
+	// the database by it.
 	// canonicalPath is the lexical absolute path, used for db.path.
 	var canonicalPath string
 	if !opts.InMemory {
 		var err error
+		if path, err = FullPathname(path); err != nil {
+			return nil, err
+		}
 		canonicalPath, err = filepath.Abs(path)
 		if err != nil {
 			return nil, fmt.Errorf("btree: cannot resolve path: %w", err)
@@ -644,22 +683,33 @@ func Open(path string, opts Options) (*DB, error) {
 	p.mmapSize = opts.MmapSize
 
 	// BEGIN ENCRYPTION
-	// Build and install codec before p.open(). For an existing file we read
-	// the header first to discover the salt; for a new file we generate a
-	// fresh salt. InMemory databases skip encryption entirely (encryption.md §7).
+	// The codec goes with the file's header: a passphrase key is derived
+	// from the header's salt, and the checksum mode is read from it. For an
+	// existing file the header is read to discover them; for a new file a
+	// fresh salt is drawn. InMemory databases skip encryption entirely
+	// (encryption.md §7).
 	//
 	// The encryption marker on disk is a non-zero Salt field (bytes 72-87
 	// of page 1). ReservedSpace alone is NOT the marker, because the same
 	// byte is used by SQLite-compat tests that exercise reserve-related
 	// code paths on plaintext databases.
 	//
-	// Note: there is a TOCTOU window between readInitialHeader (which
-	// opens/reads/closes the file) and p.open() (which reopens and locks).
-	// An external process swapping the file in that window would surface
-	// as a decrypt error on the first page read — not silent corruption.
-	// The openDBs registration in p.open() refuses a same-process double-open.
-	// A future hardening could hold a shared lock across readInitialHeader
-	// and p.open().
+	// The codec is settled twice. Here, before p.open() and with no lock,
+	// from a first look at the file: a key option that cannot make a codec
+	// for a new file is refused before anything is created, and a key
+	// derivation is usually done before any lock is held. Then by p.open(),
+	// with the DB-file lock held, on the header it read under that lock;
+	// a file with content whose header is unreadable, or that the options
+	// do not fit, is refused there, before the WAL is opened.
+	// The second call does nothing while the file carries the salt the
+	// codec was built for: in every open of a database that already
+	// existed, and in an open that created the database, whose page 1
+	// carries the salt drawn for it. So an open derives a passphrase key
+	// once, as SQLCipher derives a codec context's key once, at its first
+	// use (sqlcipher_codec_key_derive, sqlcipher.c:1849-1880, v4.14.0).
+	// Between the two calls another process may create the database, or
+	// win its creation from this open; the second call then builds the
+	// codec again, from the salt that is in the file.
 	wantEncryption := opts.Key != nil || opts.Codec != nil
 	var zeroSalt [SaltLen]byte
 	// Resolve effective codec mode. Encryption is opt-in (errors if it
@@ -667,48 +717,77 @@ func Open(path string, opts Options) (*DB, error) {
 	// ReservedSpace marker on existing DBs and honored from Options.Checksum
 	// on new DBs — file state is authoritative on reopen, so users can't
 	// accidentally upgrade or downgrade a live database via config drift.
-	useCksum := false
 	if !opts.InMemory {
-		existingHeader, herr := readInitialHeader(path)
-		fileExists := herr == nil
-		if herr != nil && !errors.Is(herr, os.ErrNotExist) && !errors.Is(herr, errEmptyFile) {
-			return nil, fmt.Errorf("btree: read header: %w", herr)
+		// What the installed codec was built for.
+		var settled struct {
+			done   bool
+			exists bool
+			salt   [SaltLen]byte
+			cksum  bool
 		}
-		if fileExists {
-			fileEncrypted := existingHeader.Salt != zeroSalt
-			// Checksum-mode marker: zero salt + ReservedSpace == cksumOverhead (16).
-			// Any other non-zero ReservedSpace is left to higher-level
-			// integrity validation (e.g. tests synthesizing off-page cells).
-			fileCksum := !fileEncrypted && existingHeader.ReservedSpace == cksumOverhead
-			switch {
-			case fileEncrypted && !wantEncryption:
-				return nil, fmt.Errorf("btree: database file is encrypted, Options.Key or Options.Codec required")
-			case !fileEncrypted && wantEncryption:
-				return nil, fmt.Errorf("btree: database file is not encrypted, remove Options.Key/Codec")
-			}
-			useCksum = fileCksum
-		} else {
-			useCksum = opts.Checksum
-		}
-		wantCodec := wantEncryption || useCksum
-		if wantCodec {
-			var salt [SaltLen]byte
+		p.settleCodec = func(hdr *dbHeader) error {
+			fileExists := hdr != nil
+			useCksum := opts.Checksum
 			if fileExists {
-				salt = existingHeader.Salt
-			} else if wantEncryption {
-				if _, err := rand.Read(salt[:]); err != nil {
-					return nil, fmt.Errorf("btree: generate salt: %w", err)
+				fileEncrypted := hdr.Salt != zeroSalt
+				// Checksum-mode marker: zero salt + ReservedSpace == cksumOverhead (16).
+				// Any other non-zero ReservedSpace is left to higher-level
+				// integrity validation (e.g. tests synthesizing off-page cells).
+				fileCksum := !fileEncrypted && hdr.ReservedSpace == cksumOverhead
+				switch {
+				case fileEncrypted && !wantEncryption:
+					return fmt.Errorf("btree: database file is encrypted, Options.Key or Options.Codec required")
+				case !fileEncrypted && wantEncryption:
+					return fmt.Errorf("btree: database file is not encrypted, remove Options.Key/Codec")
+				}
+				useCksum = fileCksum
+			}
+			// The codec stays while it was built for the salt the file
+			// carries: the salt in the header of a database, or, for a file
+			// with no database yet, a salt drawn for a new file. A database
+			// this open created carries the salt drawn for it.
+			if settled.done && settled.cksum == useCksum &&
+				(fileExists && settled.salt == hdr.Salt || !fileExists && !settled.exists) {
+				return nil
+			}
+			var salt [SaltLen]byte
+			var codec Codec
+			if wantEncryption || useCksum {
+				if fileExists {
+					salt = hdr.Salt
+				} else if wantEncryption {
+					if _, err := rand.Read(salt[:]); err != nil {
+						return fmt.Errorf("btree: generate salt: %w", err)
+					}
+				}
+				var cerr error
+				codec, cerr = buildCodec(opts, salt[:], useCksum)
+				if cerr != nil {
+					return cerr
 				}
 			}
-			codec, cerr := buildCodec(opts, salt[:], useCksum)
-			if cerr != nil {
-				return nil, cerr
+			p.setCodec(codec, salt, opts.OnIntegrityError)
+			settled.done, settled.exists, settled.salt, settled.cksum = true, fileExists, salt, useCksum
+			return nil
+		}
+		// A file with content is not judged by this look. Whatever it
+		// finds (a header the options refuse, one that does not parse, a
+		// file that ends before its header) can be gone by the time
+		// p.open() holds the DB-file lock: another process may roll a dead
+		// creator's page 1 back and create the database in between. So
+		// this look only builds a codec when it can, and p.open() settles
+		// it on the header it reads under the lock and returns that read's
+		// errors, as sqlite3PagerSharedLock reads the header only once it
+		// holds SHARED (pager.c:5272-5282). The options of a new file are
+		// checked here, before anything is created.
+		existingHeader, herr := readInitialHeader(path)
+		switch {
+		case herr == nil:
+			_ = p.settleCodec(&existingHeader)
+		case errors.Is(herr, os.ErrNotExist) || errors.Is(herr, errEmptyFile):
+			if err := p.settleCodec(nil); err != nil {
+				return nil, err
 			}
-			if sink, ok := codec.(OnErrorSink); ok && opts.OnIntegrityError != nil {
-				sink.SetOnError(opts.OnIntegrityError)
-			}
-			p.header.Salt = salt
-			p.installCodec(codec)
 		}
 	} else if opts.InMemory && (wantEncryption || opts.Checksum) {
 		// InMemory: build codec from zero salt; no on-disk marker.
@@ -717,10 +796,7 @@ func Open(path string, opts Options) (*DB, error) {
 		if cerr != nil {
 			return nil, cerr
 		}
-		if sink, ok := codec.(OnErrorSink); ok && opts.OnIntegrityError != nil {
-			sink.SetOnError(opts.OnIntegrityError)
-		}
-		p.installCodec(codec)
+		p.installCodec(codec, opts.OnIntegrityError)
 	}
 	// END ENCRYPTION
 
@@ -790,9 +866,71 @@ func Open(path string, opts Options) (*DB, error) {
 }
 
 // Close closes the database.
+//
+// Close waits for every read transaction of this handle to end
+// (db.mu.Lock against the RLock each ReadTx holds), with no timeout and no
+// error: a ReadTx that is never rolled back blocks Close forever, and Close
+// called on the goroutine that holds one deadlocks. In serialized mode, the
+// default build, SQLite's sqlite3_close and sqlite3_close_v2 wait for the
+// connection mutex, so for a step running on another thread (main.c:1263,
+// vdbeapi.c:923). Neither waits for a statement to be finalized: with a
+// statement unfinalized, or a backup that reads from the connection
+// unfinished (backup.c:204), sqlite3_close returns SQLITE_BUSY
+// (main.c:1283) and sqlite3_close_v2 leaves a zombie that is closed with
+// the last of them (main.c:1307, 1371). On the way a close takes other
+// mutexes too, and can wait for them: the shared b-tree mutexes of a shared
+// cache (disconnectAllVtab, main.c:1213), the Unix VFS's global mutex as it
+// closes a file (unixClose, os_unix.c:2350). In multi-thread mode an
+// ordinary build gives the connection no mutex (main.c:3388-3393), and a
+// close during another thread's step is the application's error.
+// DRIFT: Close waits, with no timeout, for every read transaction to end; C waits for none: an unfinalized statement makes sqlite3_close return SQLITE_BUSY and sqlite3_close_v2 leave a zombie See docs/btree/NOTES.md#drift-2026-11-21-26-close-waits-for-every-read-transaction-to-end
+//
+// A registered write transaction is not waited for: Close rolls it back and
+// releases its locks, as sqlite3Close rolls back a transaction left open
+// with no statement running (sqlite3RollbackAll, main.c:1386). What Close
+// does wait for is the one call of that transaction that is in flight
+// (writerGate): a Put, a cursor move, a Commit, a Rollback, a Backup.Step
+// into this database. That call completes, a Commit included: a Commit in
+// flight when Close closed the gate runs to its end and returns its own
+// result, nil once the transaction is committed.
+// Every call of the transaction that comes later returns ErrClosed and
+// touches nothing, its Commit returns ErrClosed and its Rollback nil. The
+// wait has no bound of its own: a call is as long as its work, a Count or
+// the drop of a namespace walks a whole tree, and a Step copies as many
+// pages as it was asked to. A cursor's read or step served entirely from
+// the leaf it pins is not waited for: it runs outside the gate, on a page
+// the teardown keeps back (Cursor.readsPinnedLeaf). An overflow read
+// enters the gate.
+//
+// Close must therefore not be called from inside a call of the write
+// transaction on that call's goroutine: it would wait for itself. That is
+// any code a call runs synchronously: Options.OnIntegrityError, a method of
+// the VFS a page read goes through, the Err of a caller's context, which a
+// count polls. Between two calls of its transaction the writer's goroutine
+// may call Close.
+// See docs/btree/NOTES.md#drift-2026-11-21-25-close-waits-for-the-writers-call-in-flight.
+//
+// A second Close returns ErrClosed.
 func (db *DB) Close() error {
+	_, err := db.CloseCheckpointed(nil)
+	return err
+}
+
+// CloseCheckpointed closes the database and reports whether the close
+// checkpointed the whole log into the database file as the last client: it
+// held the exclusive DB-file lock, so no other process was attached, and its
+// checkpoint completed (the branch of sqlite3WalClose that sets isDelete,
+// wal.c:2522-2540). It reports false for a close that left the log to the
+// processes still attached, for a database file that was moved, and for a
+// checkpoint that failed: commits may then exist only in the log. An
+// in-memory database has no database file and reports false.
+//
+// When the close checkpointed, onCheckpointed (if not nil) runs after the
+// checkpoint, while the close still holds the exclusive DB-file lock: no
+// other process can attach, and so none can commit, until it has returned.
+func (db *DB) CloseCheckpointed(onCheckpointed func()) (checkpointed bool, err error) {
 	if !db.closed.CompareAndSwap(false, true) {
-		return ErrClosed
+		return false, ErrClosed
 	}
 	db.closing.Store(true)
 	db.closeOnce.Do(func() { close(db.closeCh) })
@@ -809,28 +947,43 @@ func (db *DB) Close() error {
 			testCloseWriterCheckedHook(registered)
 		}
 		if registered {
-			// Force-rollback the abandoned/in-flight tx.
-			// writerOpMu serializes with commit/rollback so we don't interleave
-			// with a concurrent Commit or Rollback call.
-			// Use rollbackForClose which skips writerCache operations to avoid
-			// racing with the writer's B-tree ops (pcache has no mutex).
-			db.pager.writerOpMu.Lock()
-			if pagerState(db.pager.state.Load()) == pagerWriter {
-				db.pager.rollbackForClose()
+			// The transaction's goroutine may be inside a call: a b-tree
+			// operation, which holds no lock, or its Commit or Rollback.
+			// Wait for that one call to return, and refuse every later call
+			// of the transaction, its Commit included, before anything it
+			// uses is taken from under it (writerGate). Closing the gate is
+			// the one decision: from here the transaction neither changes
+			// nor commits anything, so what it holds is rolled back.
+			db.pager.wgate.close()
+			if testWriterGateDrainedHook != nil {
+				testWriterGateDrainedHook()
 			}
+			// Force-rollback the abandoned tx. A Commit or a Rollback that
+			// was in flight has ended it already, and released its locks:
+			// rollbackForClose and releaseWriterLocks then find nothing to
+			// do. writerOpMu is rollbackForClose's contract; nothing
+			// contends for it once the gate is empty.
+			// rollbackForClose ends a transaction in pagerWriter or in
+			// pagerError (a failed spill, which holds the WAL write lock
+			// until its rollback) and leaves any other state alone.
+			db.pager.writerOpMu.Lock()
+			db.pager.rollbackForClose()
 			db.pager.writerOpMu.Unlock()
 
 			// Exactly-once writer lock cleanup (endRead + RUnlock + Unlock) via
-			// the shared teardown: a writer goroutine completing concurrently
-			// could race with Close, and the writerLocksDone CAS inside
-			// releaseWriterLocks prevents the double-release.
-			db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil)
+			// the shared teardown: the writerLocksDone CAS inside
+			// releaseWriterLocks makes it a no-op after a Commit or a
+			// Rollback that ended the transaction while Close waited.
+			db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil, nil)
 		}
 		// A plain send, not lockWriter: closeCh is closed already, and this
 		// wait is for the holder to leave.
 		db.writeSem <- struct{}{}
 	}
 	db.unlockWriter()
+	if testCloseWaitingReadersHook != nil {
+		testCloseWaitingReadersHook()
+	}
 	// Wait for all active readers to finish
 	db.mu.Lock()
 	db.mu.Unlock()
@@ -844,8 +997,15 @@ func (db *DB) Close() error {
 		}
 	}
 drained:
-	return db.pager.close()
+	db.pager.onCloseCheckpointed = onCheckpointed
+	err = db.pager.close()
+	return db.pager.closeCheckpointed, err
 }
+
+// testCloseWaitingReadersHook, when non-nil, runs in Close once the write
+// transaction is dealt with, before the wait for the read transactions.
+// Test-only.
+var testCloseWaitingReadersHook func()
 
 // SetClosing marks the database as closing, causing new transactions to fail.
 // Also unblocks the goroutines waiting for a reader slot or the write lock.
@@ -869,10 +1029,9 @@ func (db *DB) Path() string {
 // OpenFiles is what DB.OpenFiles reports: the files a database has open,
 // identified by their descriptors, and the spelling they were opened by.
 type OpenFiles struct {
-	// Path is the database's path as Open was given it, neither made
-	// absolute nor cleaned: the spelling the database file and the files
-	// beside it (Path+"-wal", Path+"-wal-shm") were opened by, which the
-	// system resolves as it did then. Path() is its lexically cleaned
+	// Path is the database's full name (FullPathname), not cleaned: the
+	// spelling the database file and the files beside it (Path+"-wal",
+	// Path+"-wal-shm") were opened by. Path() is its lexically cleaned
 	// absolute form, which names another file when a ".." in it follows a
 	// symbolic link to a directory: the system resolves the link first.
 	Path string
@@ -1367,6 +1526,10 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := db.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer db.pager.wgate.leave()
 
 	// Check if namespace already exists using proper tree traversal
 	// (page 1 may be an interior node after splits).
@@ -1376,13 +1539,19 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 		return ErrNamespaceExists
 	}
 	if !errors.Is(err, ErrNamespaceNotFound) {
+		return tx.halt(err)
+	}
+	// The master-table record is the name and the 4-byte root page number.
+	// Put would refuse one over the record size limit; refuse it before the
+	// root page is allocated.
+	if err = recordSizeErr(len(name), 4); err != nil {
 		return err
 	}
 
 	// Allocate a new page for the namespace's B-tree root
 	rootPg, err := db.pager.allocatePage()
 	if err != nil {
-		return err
+		return tx.halt(err)
 	}
 	db.pager.rootCreated(rootPg.pgno)
 
@@ -1401,7 +1570,7 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	binary.BigEndian.PutUint32(rootPgBuf[:], rootPgno)
 
 	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
-	return bt.Put([]byte(name), rootPgBuf[:])
+	return tx.halt(bt.Put([]byte(name), rootPgBuf[:]))
 }
 
 // DeleteNamespace deletes a namespace. Must be called within a write transaction.
@@ -1410,20 +1579,24 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := db.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer db.pager.wgate.leave()
 
 	// Look up the namespace's root page using proper tree traversal
 	// (page 1 may be an interior node after splits).
 	// Uses getNamespaceLocked which sees dirty pages from the current write tx.
 	ns, err := db.getNamespaceLocked(name)
 	if err != nil {
-		return err
+		return tx.halt(err)
 	}
 	rootPage := ns.rootPage
 
 	// Delete namespace entry from master table
 	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	if err := bt.Delete([]byte(name)); err != nil {
-		return err
+		return tx.halt(err)
 	}
 
 	// Free all pages in the namespace's B-tree. A cursor still open on it
@@ -1433,7 +1606,7 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	// statement is running (vdbe.c OP_Destroy, SQLITE_LOCKED).
 	if rootPage != 0 {
 		db.pager.rootDropped(rootPage)
-		return db.freeTreePages(rootPage)
+		return tx.halt(db.freeTreePages(rootPage))
 	}
 	return nil
 }
@@ -1454,12 +1627,16 @@ func (db *DB) RenameNamespace(tx *WriteTx, oldName, newName string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := db.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer db.pager.wgate.leave()
 
 	// Resolve the old namespace via the writer path (sees dirty pages from
 	// the current write tx; page 1 may be an interior node after splits).
 	ns, err := db.getNamespaceLocked(oldName)
 	if err != nil {
-		return err
+		return tx.halt(err)
 	}
 	if oldName == newName {
 		return nil
@@ -1471,32 +1648,42 @@ func (db *DB) RenameNamespace(tx *WriteTx, oldName, newName string) error {
 		return ErrNamespaceExists
 	}
 	if !errors.Is(err, ErrNamespaceNotFound) {
+		return tx.halt(err)
+	}
+
+	// The Put below would refuse a name over the record size limit; refuse
+	// it before the old name is deleted.
+	if err = recordSizeErr(len(newName), 4); err != nil {
 		return err
 	}
 
 	// Re-key the master-table cell; the root page is reused, no pages freed.
 	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	if err = bt.Delete([]byte(oldName)); err != nil {
-		return err
+		return tx.halt(err)
 	}
 	var rootPgBuf [4]byte
 	binary.BigEndian.PutUint32(rootPgBuf[:], ns.rootPage)
 	if err = bt.Put([]byte(newName), rootPgBuf[:]); err != nil {
-		return err
+		return tx.halt(err)
 	}
 
 	// Read-back guard: the rename must be resolvable before it is allowed to
 	// commit. A Put that succeeds but cannot be read back (e.g. a master-cell
 	// read defect) would otherwise durably brick the namespace — the caller
 	// rolls back on error per the contract above.
-	// The inner error is flattened (%v, not %w) deliberately: a read-back
-	// failure of the ErrNamespaceNotFound class must NOT satisfy
-	// errors.Is(err, ErrNamespaceNotFound) — callers tolerate not-found on
+	// A missing entry is corruption, and is reported without
+	// ErrNamespaceNotFound in the chain: callers tolerate not-found on
 	// rename (already-missing index namespaces) and would swallow the guard,
-	// committing the very brick it exists to prevent.
+	// committing the very brick it exists to prevent. Any other error is the
+	// lookup's own (a read error, the error of a spill the lookup needed)
+	// and is returned as it is.
 	readBack, err := db.getNamespaceLocked(newName)
+	if errors.Is(err, ErrNamespaceNotFound) {
+		return fmt.Errorf("%w: rename read-back found no entry for %q", ErrCorrupt, newName)
+	}
 	if err != nil {
-		return fmt.Errorf("%w: rename read-back failed for %q: %v", ErrCorrupt, newName, err)
+		return tx.halt(err)
 	}
 	if readBack.rootPage != ns.rootPage {
 		return fmt.Errorf("%w: rename read-back for %q resolved root %d, want %d",
@@ -1683,6 +1870,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 
 	usableSize := bt.usablePageSize()
 	lim := bt.leafLimits()
+	depth := 0 // child pointers followed: see btCursorMaxDepth
 	for {
 		if pg.header.isLeaf() {
 			idx, found, serr := searchLeafWithOverflow(pg, nameKey, lim, bt.pager, bt.walMaxFrame, bt.cache)
@@ -1731,6 +1919,10 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 			return nil, serr
 		}
 		bt.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return nil, ErrCorrupt
+		}
+		depth++
 		pg, err = bt.descendChild(childPgno)
 		if err != nil {
 			return nil, err
@@ -1824,6 +2016,17 @@ type ReadTx struct {
 // walHdr.mxFrame per the per-connection-hdr spec.
 func (tx *ReadTx) WalMaxFrame() uint32 { return tx.walHdr.mxFrame }
 
+// halt is the error exit of a call of a write transaction: when the call
+// left the transaction in the error state, the transaction's cursors are
+// ended (pager.halt). A read transaction has no error state. It returns
+// err.
+func (tx *ReadTx) halt(err error) error {
+	if err != nil && tx.writable && !tx.closed {
+		tx.pager.halt()
+	}
+	return err
+}
+
 // txGetPage fetches a page respecting MVCC snapshot isolation.
 // For write transactions, pages are fetched from the writer cache or WAL.
 // For read transactions, getPageReader uses a private cache for snapshot isolation.
@@ -1862,20 +2065,27 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 	if tx.closed {
 		return buf, ErrTxClosed
 	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return buf, err
+		}
+		defer tx.pager.wgate.leave()
+	}
 	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
-		return buf, err
+		return buf, tx.halt(err)
 	}
 
 	// Search without starting a new read tx (we're already in one)
 	usableSize := tx.pager.usableSize()
 	lim := tx.pager.leafLimits()
+	depth := 0 // child pointers followed: see btCursorMaxDepth
 	for {
 		if pg.header.isLeaf() {
 			idx, found, serr := searchLeafWithOverflow(pg, key, lim, tx.pager, tx.walHdr.mxFrame, tx.cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
-				return buf, serr
+				return buf, tx.halt(serr)
 			}
 			if !found {
 				tx.pager.releasePage(pg)
@@ -1910,6 +2120,10 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				valOverflow := int(valLen) - localValBytes
 
 				// Grow buf to hold the full value — no intermediate allocations.
+				if !payloadInFile(tx.pager, tx.cache, totalPayload) {
+					tx.pager.releasePage(pg)
+					return buf, ErrCorrupt
+				}
 				start := len(buf)
 				buf = slices.Grow(buf, int(valLen))[:start+int(valLen)]
 				fullVal := buf[start:]
@@ -1928,7 +2142,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 						fullVal[localValBytes:], tx.walHdr.mxFrame, tx.cache,
 					); err != nil {
 						tx.pager.releasePage(pg)
-						return buf[:start], err
+						return buf[:start], tx.halt(err)
 					}
 				}
 				tx.pager.releasePage(pg)
@@ -1941,12 +2155,16 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walHdr.mxFrame, tx.cache)
 		if serr != nil {
 			tx.pager.releasePage(pg)
-			return buf, serr
+			return buf, tx.halt(serr)
 		}
 		tx.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return buf, ErrCorrupt
+		}
+		depth++
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
-			return buf, err
+			return buf, tx.halt(err)
 		}
 	}
 }
@@ -1967,13 +2185,20 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 	if tx.closed {
 		return false, ErrTxClosed
 	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return false, err
+		}
+		defer tx.pager.wgate.leave()
+	}
 	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
-		return false, err
+		return false, tx.halt(err)
 	}
 
 	usableSize := tx.pager.usableSize()
 	lim := tx.pager.leafLimits()
+	depth := 0 // child pointers followed: see btCursorMaxDepth
 	for {
 		if pg.header.isLeaf() {
 			_, found, serr := searchLeafWithOverflow(
@@ -1981,7 +2206,7 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 			)
 			tx.pager.releasePage(pg)
 			if serr != nil {
-				return false, serr
+				return false, tx.halt(serr)
 			}
 			return found, nil
 		}
@@ -1990,12 +2215,16 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 		)
 		if serr != nil {
 			tx.pager.releasePage(pg)
-			return false, serr
+			return false, tx.halt(serr)
 		}
 		tx.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return false, ErrCorrupt
+		}
+		depth++
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
-			return false, err
+			return false, tx.halt(err)
 		}
 	}
 }
@@ -2015,9 +2244,15 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 	if tx.closed {
 		return buf, ErrTxClosed
 	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return buf, err
+		}
+		defer tx.pager.wgate.leave()
+	}
 	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
-		return buf, err
+		return buf, tx.halt(err)
 	}
 
 	usableSize := tx.pager.usableSize()
@@ -2029,15 +2264,19 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 	// page number and cell index. If the leaf search overshoots (idx >= n),
 	// we re-read this interior page and descend into the next sibling subtree
 	// to find its leftmost key — no cursor allocation needed.
+	// depth counts the child pointers followed (see btCursorMaxDepth);
+	// fallbackDepth is its value on the saved page, where the walk into the
+	// next subtree resumes — the cursor's pop back to that ancestor.
 	var fallbackPgno uint32
 	var fallbackIdx int
+	var depth, fallbackDepth int
 
 	for {
 		if pg.header.isLeaf() {
 			idx, _, serr := searchLeafWithOverflow(pg, prefix, lim, tx.pager, tx.walHdr.mxFrame, cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
-				return buf, serr
+				return buf, tx.halt(serr)
 			}
 			n := int(pg.header.cellCount)
 			if idx >= n {
@@ -2049,45 +2288,39 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 				}
 				// Non-rightmost leaf: navigate to the leftmost key of
 				// the next sibling subtree (saved during descent).
-				return tx.leftmostKeyAfter(fallbackPgno, fallbackIdx, buf)
+				buf, err = tx.leftmostKeyAfter(fallbackPgno, fallbackIdx, buf, fallbackDepth)
+				return buf, tx.halt(err)
 			}
-			off := pg.getCellOffset(idx)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
-			if cerr != nil {
-				tx.pager.releasePage(pg)
-				return buf, cerr
+			// A read of the key bounds the key only (leafFullKey), as
+			// Cursor.Key does. leafFullKey returns a slice into pg.data
+			// when the key is local: copy before the release.
+			key, kerr := leafFullKey(pg.data, int(pg.getCellOffset(idx)), lim, tx.pager, tx.walHdr.mxFrame, cache)
+			if kerr == nil {
+				buf = append(buf, key...)
 			}
-			if cell.overflowPg != 0 {
-				// leafFullKey returns a slice into pg.data when the key is
-				// local: copy before the release.
-				fullKey, kerr := leafFullKey(pg.data, int(off), lim, tx.pager, tx.walHdr.mxFrame, cache)
-				if kerr != nil {
-					tx.pager.releasePage(pg)
-					return buf, kerr
-				}
-				buf = append(buf, fullKey...)
-				tx.pager.releasePage(pg)
-				return buf, nil
-			}
-			buf = append(buf, cell.key...)
 			tx.pager.releasePage(pg)
-			return buf, nil
+			return buf, tx.halt(kerr)
 		}
 		childPgno, cellIdx, serr := searchInteriorWithOverflow(pg, prefix, usableSize, tx.pager, tx.walHdr.mxFrame, cache)
 		if serr != nil {
 			tx.pager.releasePage(pg)
-			return buf, serr
+			return buf, tx.halt(serr)
 		}
 		// Track the deepest non-rightChild branch for cross-page navigation.
 		if childPgno != pg.header.rightChild {
 			rightmost = false
 			fallbackPgno = pg.pgno
 			fallbackIdx = cellIdx
+			fallbackDepth = depth
 		}
 		tx.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return buf, ErrCorrupt
+		}
+		depth++
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
-			return buf, err
+			return buf, tx.halt(err)
 		}
 	}
 }
@@ -2095,8 +2328,11 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 // leftmostKeyAfter navigates to the first key in the subtree immediately
 // following cell[cellIdx].leftChild on interior page interiorPgno.
 // Used when a leaf search overshoots and needs the next sibling's first key.
+// depth is the number of child pointers the caller followed from the root to
+// reach interiorPgno; the walk below it counts on from there, so the whole
+// chain is held to btCursorMaxDepth.
 // DRIFT: descent omits moveToChild's per-child nCell>=1 corruption guard See docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-
-func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte) ([]byte, error) {
+func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte, depth int) ([]byte, error) {
 	pg, err := tx.txGetPage(interiorPgno)
 	if err != nil {
 		return buf, err
@@ -2124,6 +2360,10 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 	// Descend to the leftmost key of this subtree.
 	lim := tx.pager.leafLimits()
 	cache := tx.cache // nil for writers, per-connection pcache for readers
+	if depth >= btCursorMaxDepth-1 {
+		return buf, ErrCorrupt
+	}
+	depth++
 	pg, err = tx.txDescendChild(nextPgno)
 	if err != nil {
 		return buf, err
@@ -2134,27 +2374,13 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 				tx.pager.releasePage(pg)
 				return buf, ErrKeyNotFound
 			}
-			off := pg.getCellOffset(0)
-			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), lim)
-			if cerr != nil {
-				tx.pager.releasePage(pg)
-				return buf, cerr
+			// The key alone is read and bounded, as in AppendSeekKey.
+			key, kerr := leafFullKey(pg.data, int(pg.getCellOffset(0)), lim, tx.pager, tx.walHdr.mxFrame, cache)
+			if kerr == nil {
+				buf = append(buf, key...)
 			}
-			if cell.overflowPg != 0 {
-				// leafFullKey returns a slice into pg.data when the key is
-				// local: copy before the release.
-				fullKey, kerr := leafFullKey(pg.data, int(off), lim, tx.pager, tx.walHdr.mxFrame, cache)
-				if kerr != nil {
-					tx.pager.releasePage(pg)
-					return buf, kerr
-				}
-				buf = append(buf, fullKey...)
-				tx.pager.releasePage(pg)
-				return buf, nil
-			}
-			buf = append(buf, cell.key...)
 			tx.pager.releasePage(pg)
-			return buf, nil
+			return buf, kerr
 		}
 		// Interior page: descend to cell[0].leftChild.
 		off, oerr := pg.getCellOffsetSafe(0)
@@ -2168,6 +2394,10 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 		}
 		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
 		tx.pager.releasePage(pg)
+		if depth >= btCursorMaxDepth-1 {
+			return buf, ErrCorrupt
+		}
+		depth++
 		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return buf, err
@@ -2204,8 +2434,12 @@ func (tx *ReadTx) newCursor(ns *Namespace) *Cursor {
 	// The page stack lives in the cursor (BtCursor.apPage/aiIdx, btreeInt.h);
 	// without it every descent regrows the stack from nil.
 	c.stack = c.stackBuf[:0]
-	if tx.writable && !tx.closed {
+	// Joining the writer's list is a call of the write transaction: a
+	// cursor made after DB.Close ended the transaction stays off the list,
+	// which Close has disposed of, and every use of it is refused.
+	if tx.writable && !tx.closed && tx.pager.wgate.enter() == nil {
 		tx.pager.linkCursor(c)
+		tx.pager.wgate.leave()
 	}
 	return c
 }
@@ -2222,8 +2456,15 @@ func (tx *ReadTx) CountContext(ctx context.Context, ns *Namespace) (int, error) 
 	if tx.closed {
 		return 0, ErrTxClosed
 	}
+	if tx.writable {
+		if err := tx.pager.wgate.enter(); err != nil {
+			return 0, err
+		}
+		defer tx.pager.wgate.leave()
+	}
 	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
-	return bt.CountContext(ctx)
+	n, err := bt.CountContext(ctx)
+	return n, tx.halt(err)
 }
 
 // DatabaseSize returns the number of pages in the database, including page 1
@@ -2243,6 +2484,11 @@ func (tx *ReadTx) CountContext(ctx context.Context, ns *Namespace) (int, error) 
 // which matches sqlite3BtreeLastPage's pBt->nPage for the writing connection.
 func (tx *ReadTx) DatabaseSize() (uint32, error) {
 	if tx.cache == nil {
+		// Once DB.Close has ended the transaction the count is one of a
+		// transaction that was rolled back.
+		if tx.pager.wgate.closed() {
+			return 0, ErrClosed
+		}
 		return tx.pager.dbSize.Load(), nil
 	}
 	pg, err := tx.pager.getPageReader(1, tx.walMaxFrame, tx.cache)
@@ -2256,6 +2502,18 @@ func (tx *ReadTx) DatabaseSize() (uint32, error) {
 		return 0, err
 	}
 	return lockBtreePageCount(&h, tx.pager.readerDbSizeBound(tx.cache))
+}
+
+// CloseState returns the handle that tells whether DB.Close has ended this
+// write transaction under its owner (CloseState.EndedByClose). Take it while
+// the transaction is open; it stays valid after the transaction ends, when
+// the transaction goes back to the pool and the next one rewrites it. A read
+// transaction's is the zero CloseState: Close waits for readers.
+func (tx *ReadTx) CloseState() CloseState {
+	if !tx.writable {
+		return CloseState{}
+	}
+	return CloseState{g: &tx.pager.wgate}
 }
 
 // GetNamespace returns a Namespace handle for the given name, respecting the
@@ -2275,7 +2533,14 @@ func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 		return nil, ErrTxClosed
 	}
 	if tx.writable {
-		return tx.db.getNamespaceLocked(name)
+		if err := tx.pager.wgate.enter(); err != nil {
+			return nil, err
+		}
+		defer tx.pager.wgate.leave()
+	}
+	if tx.writable {
+		ns, err := tx.db.getNamespaceLocked(name)
+		return ns, tx.halt(err)
 	}
 	return tx.db.getNamespaceAt(name, tx.walHdr.mxFrame, tx.cache)
 }
@@ -2408,7 +2673,12 @@ func (tx *WriteTx) GetNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
-	return tx.db.getNamespaceLocked(name)
+	if err := tx.pager.wgate.enter(); err != nil {
+		return nil, err
+	}
+	defer tx.pager.wgate.leave()
+	ns, err := tx.db.getNamespaceLocked(name)
+	return ns, tx.halt(err)
 }
 
 // MarkDataChanged signals that this transaction modifies data, causing
@@ -2434,6 +2704,10 @@ func (tx *WriteTx) MarkSchemaChanged() {
 // A commit without changes is empty: FileChangeCount and SchemaCookie stay
 // as they are whatever MarkDataChanged and MarkSchemaChanged said.
 func (tx *WriteTx) HasChanges() bool {
+	if tx.pager.wgate.enter() != nil {
+		return false // ended by DB.Close: rolled back
+	}
+	defer tx.pager.wgate.leave()
 	return tx.pager.hasChanges()
 }
 
@@ -2442,8 +2716,12 @@ func (tx *WriteTx) Put(ns *Namespace, key, value []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: true}
-	return bt.Put(key, value)
+	return tx.halt(bt.Put(key, value))
 }
 
 // Delete removes a key from the given namespace.
@@ -2451,8 +2729,12 @@ func (tx *WriteTx) Delete(ns *Namespace, key []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: true}
-	return bt.Delete(key)
+	return tx.halt(bt.Delete(key))
 }
 
 // AutoCheckpointThreshold is the default number of WAL frames after which
@@ -2474,6 +2756,12 @@ var testBeginWriteRetryHook func(err error)
 // pager panic used to leak the writer locks. Test-only.
 var testWriterFinishHook func()
 
+// testWriterLocksReleasedHook, when non-nil, runs in the releaseWriterLocks
+// of a Commit or a Rollback, in the deferred release of the write lock,
+// right after it: the next write transaction can begin while it runs, and
+// finds the writer gate as the handoff left it. Test-only.
+var testWriterLocksReleasedHook func()
+
 // Commit commits the transaction, writing all changes to the WAL.
 //
 // Lock ownership is NOT tied to the operation's success (the SQLite shape:
@@ -2488,6 +2776,19 @@ var testWriterFinishHook func()
 func (tx *WriteTx) Commit() error {
 	if tx.closed {
 		return ErrTxClosed
+	}
+	// A Commit is a call of the transaction like any other (writerGate):
+	// DB.Close waits for one in flight, through the release of the locks
+	// and the unwind of a panic, and refuses one that comes after it closed
+	// the gate. The refused transaction is Close's to roll back and to
+	// release; this handle only ends. The call leaves the gate in
+	// releaseWriterLocks, deferred below, before the write lock passes on.
+	gate := &tx.pager.wgate
+	if err := gate.enter(); err != nil {
+		tx.closed = true
+		tx.aux = nil
+		tx.onCommitted = nil
+		return err
 	}
 	tx.closed = true
 	tx.aux = nil
@@ -2524,7 +2825,7 @@ func (tx *WriteTx) Commit() error {
 				db.lastAutoCheckpointErr.Store(autoCheckpointResult{err: cpErr})
 			}
 		}
-		db.releaseWriterLocks(pager, slot, pre, post)
+		db.releaseWriterLocks(pager, slot, gate, pre, post)
 	}()
 	if testWriterFinishHook != nil {
 		testWriterFinishHook()
@@ -2563,6 +2864,16 @@ func (tx *WriteTx) Rollback() error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	// As in Commit: a Rollback that DB.Close refused has nothing to do,
+	// Close rolls the transaction back and releases its locks. One let in
+	// leaves the gate in releaseWriterLocks, before the write lock passes on.
+	gate := &tx.pager.wgate
+	if gate.enter() != nil {
+		tx.closed = true
+		tx.aux = nil
+		tx.onCommitted = nil
+		return nil
+	}
 	tx.closed = true
 	tx.aux = nil
 	tx.onCommitted = nil
@@ -2577,7 +2888,7 @@ func (tx *WriteTx) Rollback() error {
 		if !completed {
 			pre = db.writerUnwind(pager)
 		}
-		db.releaseWriterLocks(pager, slot, pre, nil)
+		db.releaseWriterLocks(pager, slot, gate, pre, nil)
 	}()
 	if testWriterFinishHook != nil {
 		testWriterFinishHook()
@@ -2596,7 +2907,12 @@ func (tx *WriteTx) Savepoint() (int, error) {
 	if tx.closed {
 		return 0, ErrTxClosed
 	}
-	return tx.pager.savepoint()
+	if err := tx.pager.wgate.enter(); err != nil {
+		return 0, err
+	}
+	defer tx.pager.wgate.leave()
+	id, err := tx.pager.savepoint()
+	return id, tx.halt(err)
 }
 
 // RollbackToSavepoint rolls back all changes made since the given savepoint.
@@ -2610,10 +2926,14 @@ func (tx *WriteTx) RollbackToSavepoint(id int) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	if _, err := tx.pager.saveAllCursors(0); err != nil {
+	if err := tx.pager.wgate.enter(); err != nil {
 		return err
 	}
-	return tx.pager.rollbackToSavepoint(id)
+	defer tx.pager.wgate.leave()
+	if _, err := tx.pager.saveAllCursors(0); err != nil {
+		return tx.halt(err)
+	}
+	return tx.halt(tx.pager.rollbackToSavepoint(id))
 }
 
 // ReleaseSavepoint releases a savepoint, merging its changes into the parent.
@@ -2621,7 +2941,11 @@ func (tx *WriteTx) ReleaseSavepoint(id int) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	return tx.pager.releaseSavepoint(id)
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
+	return tx.halt(tx.pager.releaseSavepoint(id))
 }
 
 // CreateNamespace creates a new namespace within this transaction.
@@ -2629,10 +2953,15 @@ func (tx *WriteTx) CreateNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return nil, err
+	}
+	defer tx.pager.wgate.leave()
 	if err := tx.db.CreateNamespace(tx, name); err != nil {
 		return nil, err
 	}
-	return tx.db.getNamespaceLocked(name)
+	ns, err := tx.db.getNamespaceLocked(name)
+	return ns, tx.halt(err)
 }
 
 // DeleteNamespace deletes a namespace within this transaction.
@@ -2640,6 +2969,10 @@ func (tx *WriteTx) DeleteNamespace(name string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	return tx.db.DeleteNamespace(tx, name)
 }
 
@@ -2650,5 +2983,9 @@ func (tx *WriteTx) RenameNamespace(oldName, newName string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	if err := tx.pager.wgate.enter(); err != nil {
+		return err
+	}
+	defer tx.pager.wgate.leave()
 	return tx.db.RenameNamespace(tx, oldName, newName)
 }

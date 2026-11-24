@@ -39,7 +39,7 @@ func TestCksumCodec_RoundTrip(t *testing.T) {
 		t.Fatalf("trailer = %x, want %x", out[pageSize-16:], want)
 	}
 	dst2 := make([]byte, pageSize)
-	plain, err := c.Decrypt(dst2, out, 2, &s)
+	plain, err := c.Decrypt(dst2, out, 2, &s, nil)
 	if err != nil {
 		t.Fatalf("Decrypt: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestCksumCodec_TamperReturnsErr(t *testing.T) {
 	out, _ := c.Encrypt(dst, src, 2, &s)
 	out[100] ^= 0x01
 	dst2 := make([]byte, pageSize)
-	if _, err := c.Decrypt(dst2, out, 2, &s); !errors.Is(err, ErrPageIntegrity) {
+	if _, err := c.Decrypt(dst2, out, 2, &s, nil); !errors.Is(err, ErrPageIntegrity) {
 		t.Fatalf("Decrypt: want ErrPageIntegrity, got %v", err)
 	}
 }
@@ -75,7 +75,7 @@ func TestCksumCodec_VerifyOff_NoError(t *testing.T) {
 	out, _ := c.Encrypt(dst, src, 2, &s)
 	out[100] ^= 0x01
 	dst2 := make([]byte, pageSize)
-	if _, err := c.Decrypt(dst2, out, 2, &s); err != nil {
+	if _, err := c.Decrypt(dst2, out, 2, &s, nil); err != nil {
 		t.Fatalf("verify-off: want nil err, got %v", err)
 	}
 }
@@ -84,10 +84,10 @@ func TestCksumCodec_OnErrorCallback(t *testing.T) {
 	c := newCksumCodec()
 	var fired uint32
 	var gotPgno uint32
-	c.SetOnError(func(pgno uint32, _ error) {
+	onError := func(pgno uint32, _ error) {
 		atomic.StoreUint32(&fired, 1)
 		atomic.StoreUint32(&gotPgno, pgno)
-	})
+	}
 	pageSize := 4096
 	src := make([]byte, pageSize)
 	dst := make([]byte, pageSize)
@@ -95,12 +95,12 @@ func TestCksumCodec_OnErrorCallback(t *testing.T) {
 	out, _ := c.Encrypt(dst, src, 17, &s)
 	out[200] ^= 0x01
 	dst2 := make([]byte, pageSize)
-	_, _ = c.Decrypt(dst2, out, 17, &s)
+	_, _ = c.Decrypt(dst2, out, 17, &s, onError)
 	if atomic.LoadUint32(&fired) != 1 {
-		t.Fatal("OnError did not fire")
+		t.Fatal("onError did not fire")
 	}
 	if got := atomic.LoadUint32(&gotPgno); got != 17 {
-		t.Fatalf("OnError pgno = %d, want 17", got)
+		t.Fatalf("onError pgno = %d, want 17", got)
 	}
 }
 
@@ -108,7 +108,7 @@ func TestCksumCodec_OnError_FiresWhenVerifyOff(t *testing.T) {
 	c := newCksumCodec()
 	c.SetVerify(false)
 	var fired uint32
-	c.SetOnError(func(uint32, error) { atomic.StoreUint32(&fired, 1) })
+	onError := func(uint32, error) { atomic.StoreUint32(&fired, 1) }
 	pageSize := 4096
 	src := make([]byte, pageSize)
 	dst := make([]byte, pageSize)
@@ -116,10 +116,10 @@ func TestCksumCodec_OnError_FiresWhenVerifyOff(t *testing.T) {
 	out, _ := c.Encrypt(dst, src, 1, &s)
 	out[300] ^= 0x80
 	dst2 := make([]byte, pageSize)
-	if _, err := c.Decrypt(dst2, out, 1, &s); err != nil {
+	if _, err := c.Decrypt(dst2, out, 1, &s, onError); err != nil {
 		t.Fatalf("verify-off should suppress err, got %v", err)
 	}
 	if atomic.LoadUint32(&fired) != 1 {
-		t.Fatal("OnError should fire even with verify off")
+		t.Fatal("onError should fire even with verify off")
 	}
 }

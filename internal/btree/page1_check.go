@@ -17,15 +17,16 @@ import (
 // memo has the ones its snapshot's page 1 holds.
 //
 //   - At write begin, after the refresh: the committed page 1, read past the
-//     writer cache, decodes to p.header field for field; p.dbSize is what
+//     writer cache, decodes to p.header field for field, the KDF salt
+//     aside (it is the key setup's, adoptHeader); p.dbSize is what
 //     lockBtreePageCount makes of it against the pager's count; and
 //     VersionValidFor is 0 (a new database, or a file that never kept it) or
 //     equal to FileChangeCount.
 //   - Right after a commit is published: the committed page 1 decodes to
-//     p.header, its DatabaseSize is the commit's page count, and if the
-//     commit wrote page 1 its change counter and VersionValidFor are equal
-//     (0 included: the counter is a u32 and dbFileVers+1 wraps, as SQLite's
-//     does, pager.c:3089).
+//     p.header, the salt aside, its DatabaseSize is the commit's page count,
+//     and if the commit wrote page 1 its change counter and VersionValidFor
+//     are equal (0 included: the counter is a u32 and dbFileVers+1 wraps, as
+//     SQLite's does, pager.c:3089) and its salt is the keyed one.
 //   - At a read begin the memo served: page 1 read within the snapshot's own
 //     frame bounds, from its WAL frame or the database file, carries the
 //     FileChangeCount and SchemaCookie the memo gave.
@@ -67,6 +68,9 @@ func (p *pager) checkPage1AtBegin() error {
 	if !ok {
 		return nil
 	}
+	// A page 1 committed before every write of it carried the keyed salt can
+	// name another.
+	h.Salt = p.keySalt
 	if h != p.header {
 		return fmt.Errorf("%w at write begin: committed %+v, header %+v", errPage1Invariant, h, p.header)
 	}
@@ -88,6 +92,10 @@ func (p *pager) assertPage1AfterCommit(wrotePage1 bool) {
 	if !ok {
 		return
 	}
+	if wrotePage1 && h.Salt != p.keySalt {
+		panic(fmt.Sprintf("btree: page 1 after commit: salt %x, the keyed salt %x", h.Salt, p.keySalt))
+	}
+	h.Salt = p.keySalt
 	if h != p.header {
 		panic(fmt.Sprintf("btree: page 1 after commit (written: %v): committed %+v, header %+v", wrotePage1, h, p.header))
 	}

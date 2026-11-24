@@ -191,7 +191,10 @@ type Config struct {
 	// OnIntegrityError, when non-nil, is invoked from the read path on
 	// every per-page integrity failure (XXH3 trailer mismatch in cksum
 	// mode, AEAD auth-tag failure in encryption mode). Plain databases
-	// never fire it.
+	// never fire it. It receives the failures of the database it was
+	// opened with and no other, also when several databases share one
+	// Encryption.Codec. The destination of a Backup is another database:
+	// its failures come back as Backup's error.
 	//
 	// The callback runs synchronously on the I/O goroutine and must not
 	// block. Push to a buffered channel + drain elsewhere if you need
@@ -235,8 +238,11 @@ type Config struct {
 // v1; changing a passphrase requires exporting to a freshly-opened
 // database.
 //
-// InMemory databases ignore Encryption (there is no at-rest artifact
-// to protect).
+// An InMemory database keeps its pages unencrypted in memory (there is
+// no at-rest artifact to protect). Its Backup is encrypted only when
+// Enabled reports true: it is then an encrypted file that opens with the
+// same EncryptionConfig. With the zero EncryptionConfig, the default, its
+// Backup is a plain file.
 type EncryptionConfig struct {
 	// Passphrase is the user-supplied secret. Nil = no encryption.
 	Passphrase []byte
@@ -294,7 +300,11 @@ const (
 
 type DurabilityConfig struct {
 	// Sentinel enables the sentinel file (.lock) that tracks database dirty state
-	// When true (default is false), the sentinel file is used to detect unclean shutdowns and perform QuickCheck on open
+	// When true (default is false), the sentinel file is used to detect unclean shutdowns and perform QuickCheck on open.
+	// A write creates the file. A flush removes it, and so does a Close that checkpointed as the last
+	// handle on the database file. A Close while another process still has the database open leaves it:
+	// that close runs no checkpoint, so if the remaining processes are killed the next open runs the check.
+	// An InMemory database has no sentinel file.
 	Sentinel bool
 
 	// Enable auto-flush according to IdleAfter and FlushMode

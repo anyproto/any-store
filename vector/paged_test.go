@@ -71,7 +71,12 @@ func TestPersistReloadParity(t *testing.T) {
 	db, err := btree.Open(path, btree.Options{})
 	require.NoError(t, err)
 	defer db.Close()
-	require.True(t, PagedExists(db, "emb"))
+	exists, err := PagedExists(db, "emb")
+	require.NoError(t, err)
+	require.True(t, exists)
+	exists, err = PagedExists(db, "none")
+	require.NoError(t, err)
+	require.False(t, exists)
 	p, err := OpenPaged(db, "emb")
 	require.NoError(t, err)
 	require.Equal(t, n, p.PhysLen())
@@ -85,6 +90,69 @@ func TestPersistReloadParity(t *testing.T) {
 			require.Equal(t, mem[j].Key, rel[j].Key, "reloaded paged result mismatch")
 		}
 	}
+}
+
+// PagedExists for a name with no :pmeta namespace takes no reader slot: a
+// caller that holds the only one gets the answer instead of waiting for
+// itself.
+func TestPagedExists_MissingNamespaceTakesNoReaderSlot(t *testing.T) {
+	db, err := btree.Open(filepath.Join(t.TempDir(), "p.db"), btree.Options{MaxReaders: 1})
+	require.NoError(t, err)
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	_, err = db.TryBeginRead()
+	require.ErrorIs(t, err, btree.ErrReadersBusy, "setup: the one reader slot is taken")
+
+	type result struct {
+		exists bool
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		exists, err := PagedExists(db, "none")
+		done <- result{exists, err}
+	}()
+	select {
+	case r := <-done:
+		require.NoError(t, r.err)
+		require.False(t, r.exists)
+	case <-time.After(10 * time.Second):
+		t.Fatal("PagedExists waits for a reader slot to look up a name with no :pmeta namespace")
+	}
+}
+
+// A :pmeta namespace dropped after PagedExists found it, before its read
+// transaction began, reads as absent: the namespace is resolved again in that
+// transaction, so the dropped root, now a free page, is not read.
+func TestPagedExists_NamespaceDroppedBeforeRead(t *testing.T) {
+	const n, dim = 20, 8
+	vecs, keys := randVectors(n, dim, 5)
+	g := NewFlatHNSW(dim, L2, 1)
+	for i := range vecs {
+		g.Add(keys[i], vecs[i])
+	}
+	db, err := btree.Open(filepath.Join(t.TempDir(), "p.db"), btree.Options{})
+	require.NoError(t, err)
+	defer db.Close()
+	require.NoError(t, PersistPaged(g, db, "emb", L2))
+
+	dropped := false
+	testPagedExistsLookedUpHook = func() {
+		dropped = true
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		require.NoError(t, wtx.DeleteNamespace("emb:pmeta"))
+		wtx.MarkSchemaChanged()
+		require.NoError(t, wtx.Commit())
+	}
+	defer func() { testPagedExistsLookedUpHook = nil }()
+
+	exists, err := PagedExists(db, "emb")
+	require.True(t, dropped, "setup: the namespace is dropped between the lookup and the read")
+	require.NoError(t, err)
+	require.False(t, exists)
 }
 
 // TestPagedVsMemory measures the latency and RAM trade of paging vectors from
