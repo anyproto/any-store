@@ -34,17 +34,20 @@ import "sync/atomic"
 // The count is of calls, not of transactions, and nests: a gated call may
 // make another (a write saves the transaction's cursors, and each reads its
 // key). Only the outermost call is refused once the gate is closed; a call
-// that was let in before runs to its end, calls it makes included. A cursor
-// counts the calls it makes on itself as one (Cursor.enterGate). Calls of
-// two transactions are never in the count together: a Commit or a Rollback
-// leaves the gate before the write lock passes on (releaseWriterLocks), as
-// SQLite's COMMIT releases its locks inside the step that holds the
-// connection mutex, and the next BEGIN is another step.
+// that was let in before runs to its end, calls it makes included. A refused
+// call is not counted, so once the count is down to zero every call is
+// refused, whatever goroutine makes it (enter). A cursor counts the calls
+// it makes on itself as one (Cursor.enterGate). Calls of two transactions
+// are never in the count together: a Commit or a Rollback leaves the gate
+// before the write lock passes on (releaseWriterLocks), as SQLite's COMMIT
+// releases its locks inside the step that holds the connection mutex, and
+// the next BEGIN is another step.
 //
-// Only the write transaction pays: two atomic adds per call, on a word no
-// other goroutine writes until Close. A read transaction never comes here;
-// Close waits for readers on db.mu. A writer cursor's read or step served
-// entirely from the leaf it pins stays outside too (Cursor.readsPinnedLeaf).
+// Only the write transaction pays: an atomic load and a compare-and-swap in
+// and an atomic add out per call, on a word no other goroutine writes until
+// Close. A read transaction never comes here; Close waits for readers on
+// db.mu. A writer cursor's read or step served entirely from the leaf it
+// pins stays outside too (Cursor.readsPinnedLeaf).
 type writerGate struct {
 	// n is the number of calls in flight, with writerGateClosed set once
 	// Close has closed the gate.
@@ -64,12 +67,18 @@ func newWriterGate() writerGate {
 // counts nothing, once Close has closed the gate and no call is in flight.
 // A nil error is paired with leave, deferred: a b-tree operation can panic
 // on a damaged page, and a count left behind would keep Close waiting.
+//
+// The count goes up by compare-and-swap, never past a closed, empty gate: a
+// refused call that counted itself in and out again would be, for that
+// moment, a call in flight, and a call of another goroutine would pass for
+// one nested in it and be let in, and let the next one in after it.
 func (g *writerGate) enter() error {
-	if g.n.Add(1) == writerGateClosed+1 {
-		g.leave()
-		return ErrClosed
+	for n := g.n.Load(); n != writerGateClosed; n = g.n.Load() {
+		if g.n.CompareAndSwap(n, n+1) {
+			return nil
+		}
 	}
-	return nil
+	return ErrClosed
 }
 
 // leave counts a call out, and tells a waiting Close when it was the last.
