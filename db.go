@@ -1101,6 +1101,11 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 					return err
 				}
 			}
+		} else {
+			// A read failure, not an empty catalog: a prefix nothing
+			// matches leaves the cursor on the next key, or invalid past
+			// the last one, with a nil error.
+			return err
 		}
 		if err := cursor.Seek([]byte("idx:")); err == nil {
 			for cursor.Valid() {
@@ -1116,6 +1121,11 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 					return err
 				}
 			}
+		} else {
+			// A read failure, not an empty catalog: a prefix nothing
+			// matches leaves the cursor on the next key, or invalid past
+			// the last one, with a nil error.
+			return err
 		}
 		return nil
 	})
@@ -2114,6 +2124,8 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 			return fmt.Errorf("%w: %w", ErrIndexMismatch, ErrVectorIndexUnsupported)
 		}
 		return ErrIndexMismatch
+	} else if !errors.Is(err, btree.ErrKeyNotFound) {
+		return err
 	}
 	var a anyenc.Arena
 	obj := a.NewObject()
@@ -2197,6 +2209,35 @@ func (db *db) removeIndex(tx *btree.WriteTx, collName, indexName string) error {
 	return nil
 }
 
+// deleteOptionalRecord deletes a record of the system namespace that a
+// collection or an index may not have (its config, a sketch, a multikey
+// flag). An absent record is not an error; every other error is the
+// caller's, so the DDL transaction rolls back and no half of it commits.
+func (db *db) deleteOptionalRecord(tx *btree.WriteTx, key []byte) error {
+	if err := tx.Delete(db.systemNS, key); err != nil && !errors.Is(err, btree.ErrKeyNotFound) {
+		return err
+	}
+	return nil
+}
+
+// moveOptionalRecord moves such a record from one key to another. A record
+// that is absent stays absent; one that was read is moved or the error is
+// returned: a failed read is not an absent record, and a record deleted
+// under the old key and not written under the new one is lost.
+func (db *db) moveOptionalRecord(tx *btree.WriteTx, from, to []byte) error {
+	val, err := tx.AppendValue(db.systemNS, from, nil)
+	if err != nil {
+		if errors.Is(err, btree.ErrKeyNotFound) {
+			return nil
+		}
+		return err
+	}
+	if err = tx.Delete(db.systemNS, from); err != nil {
+		return err
+	}
+	return tx.Put(db.systemNS, to, val)
+}
+
 // removeCollection removes collection metadata from the system namespace
 func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 	tx.MarkSchemaChanged()
@@ -2208,8 +2249,11 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 	prefix := indexKeyPrefix(collName)
 	cursor := tx.NewCursor(db.systemNS)
 	defer cursor.Close()
+	// A Seek error is a read failure, not a collection without indexes (a
+	// prefix nothing matches leaves the cursor on the next key, or invalid
+	// past the last one, with a nil error).
 	if err := cursor.Seek([]byte(prefix)); err != nil {
-		return nil
+		return err
 	}
 	var keysToDelete [][]byte
 	var idxNames []string
@@ -2243,12 +2287,15 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 	// keyed by collection name; the multikey flag is keyed by the namespace
 	// name.
 	for _, name := range idxNames {
-		_ = tx.Delete(db.systemNS, sketchKey(collName, name))
-		_ = tx.Delete(db.systemNS, multikeyKey(indexNsName(collName, name)))
+		if err := db.deleteOptionalRecord(tx, sketchKey(collName, name)); err != nil {
+			return err
+		}
+		if err := db.deleteOptionalRecord(tx, multikeyKey(indexNsName(collName, name))); err != nil {
+			return err
+		}
 	}
 	// Remove collection config
-	_ = tx.Delete(db.systemNS, collConfigKey(collName))
-	return nil
+	return db.deleteOptionalRecord(tx, collConfigKey(collName))
 }
 
 // renameCollection renames a collection: the catalog metadata in the system
@@ -2338,10 +2385,10 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 		return err
 	}
 
-	// Rename collection config
-	if cfgData, err := tx.AppendValue(db.systemNS, collConfigKey(oldName), nil); err == nil {
-		_ = tx.Delete(db.systemNS, collConfigKey(oldName))
-		_ = tx.Put(db.systemNS, collConfigKey(newName), cfgData)
+	// Rename collection config: it holds the primary key, and a collection
+	// that lost it reopens under the default one.
+	if err = db.moveOptionalRecord(tx, collConfigKey(oldName), collConfigKey(newName)); err != nil {
+		return err
 	}
 
 	// Rename index keys. A Seek error is a real read failure (an empty or
@@ -2398,18 +2445,11 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 		// rename back resurrect a stale record — for the multikey flag that
 		// means tight seeks against an index that has since seen arrays,
 		// i.e. silently dropped docs. Moved (delete+put), never copied.
-		if skData, err := tx.AppendValue(db.systemNS, sketchKey(oldName, e.name), nil); err == nil {
-			_ = tx.Delete(db.systemNS, sketchKey(oldName, e.name))
-			if err = tx.Put(db.systemNS, sketchKey(newName, e.name), skData); err != nil {
-				return err
-			}
+		if err := db.moveOptionalRecord(tx, sketchKey(oldName, e.name), sketchKey(newName, e.name)); err != nil {
+			return err
 		}
-		oldMk := multikeyKey(indexNsName(oldName, e.name))
-		if mkVal, err := tx.AppendValue(db.systemNS, oldMk, nil); err == nil {
-			_ = tx.Delete(db.systemNS, oldMk)
-			if err = tx.Put(db.systemNS, multikeyKey(indexNsName(newName, e.name)), mkVal); err != nil {
-				return err
-			}
+		if err := db.moveOptionalRecord(tx, multikeyKey(indexNsName(oldName, e.name)), multikeyKey(indexNsName(newName, e.name))); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -2441,7 +2481,7 @@ func (db *db) listCollectionNames(tx *btree.ReadTx) ([]string, error) {
 	defer cursor.Close()
 	prefix := []byte("coll:")
 	if err := cursor.Seek(prefix); err != nil {
-		return nil, nil
+		return nil, err
 	}
 	var names []string
 	for cursor.Valid() {
