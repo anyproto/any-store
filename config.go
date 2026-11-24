@@ -1,6 +1,8 @@
 package anystore
 
 import (
+	"fmt"
+	"math"
 	"runtime"
 	"time"
 
@@ -90,6 +92,8 @@ type Config struct {
 	// CacheSize overrides the default per-DB page cache size (in pages,
 	// default 5000). Primarily for tests that need to force pagerStress /
 	// cache-spill behavior at low data volumes. Zero means use the default.
+	// A value above 2,147,418,112 pages (on a 32-bit target, above 524,288)
+	// is taken as that bound, as SQLite clamps its cache_size.
 	CacheSize int
 
 	// ReadConcurrency caps the number of concurrent read transactions. Reads
@@ -98,7 +102,7 @@ type Config struct {
 	// page cache (≈ CacheSize × PageSize), created lazily, so peak reader RAM is
 	// ReadConcurrency × that — only realized under actual concurrent load. Zero
 	// means the default, max(NumCPU-1, 4), which scales with the host while staying
-	// modest on small devices.
+	// modest on small devices. A value above 65,536 is taken as 65,536.
 	ReadConcurrency int
 
 	// CommitSync forces fsync on every WAL commit (like SQLite synchronous=FULL in WAL mode).
@@ -315,8 +319,65 @@ type DurabilityConfig struct {
 	IdleAfter time.Duration
 
 	// FlushMode specifies how to autoflush data during idle periods
-	// Default: FlushModeCheckpointPassive
+	// Default: FlushModeCheckpointPassive. A value other than the
+	// FlushModeCheckpoint constants fails Open with ErrInvalidConfig.
 	FlushMode FlushMode
+}
+
+// maxCacheSize is the largest CacheSize Open uses; a larger one is taken as
+// it. SQLite clamps cache_size rather than refusing it: pcache1Cachesize holds
+// the page count of a cache's group at 0x7fff0000 (pcache1.c:820-822), the
+// cache's own count when each cache has a group of its own, as here. A 32-bit
+// target is held lower, at the pages its address space can hold (2 GiB of
+// 4 KiB pages), which also keeps the cache's int arithmetic (90% of the page
+// count) in range there. Nothing is allocated in proportion to the bound: a
+// cache allocates pages as it fills, and its hash table grows with them past
+// a fixed initial size (btree newPcache).
+const maxCacheSize = min(0x7fff0000, math.MaxInt/4096)
+
+// maxReadConcurrency is the largest ReadConcurrency Open uses; a larger one is
+// taken as it. Open allocates the pool of idle reader caches at the full
+// number of readers, 8 bytes a slot, whether or not they are ever used, so the
+// number has to be one every Open can allocate: at this bound it is 512 KiB.
+// The readers themselves cost far more: with the default cache size each one
+// that runs takes 20 pages (80 KiB) at its first read, so 65,536 running at
+// once would hold more than 5 GiB of page cache, and a process with that many
+// is bound by its memory before it is by this cap.
+const maxReadConcurrency = 1 << 16
+
+// validate reports the first field of c that Open cannot run with, wrapped in
+// ErrInvalidConfig. It runs before Open resolves the path or touches a file,
+// so a refused Config leaves nothing open. Sizes past what the code can
+// allocate are clamped instead (cacheSizes); a value with no nearest valid
+// one, as an unknown FlushMode, is an error.
+func (c *Config) validate() error {
+	switch c.Durability.FlushMode {
+	case "", FlushModeCheckpointPassive, FlushModeCheckpointFull, FlushModeCheckpointRestart, FlushModeCheckpointTruncate:
+	default:
+		return fmt.Errorf("%w: Durability.FlushMode %q is not one of the FlushModeCheckpoint modes", ErrInvalidConfig, c.Durability.FlushMode)
+	}
+	return nil
+}
+
+// cacheSizes returns the page cache size and the reader limit Open uses: the
+// configured ones, their defaults for zero or a negative value, and the
+// bounds for a value past them.
+func (c *Config) cacheSizes() (cacheSize, readConcurrency int) {
+	cacheSize = c.CacheSize
+	if cacheSize <= 0 {
+		cacheSize = 5000
+	}
+	// Concurrent read transactions are bounded by a semaphore (each live
+	// reader holds its own page cache). The default scales with the host —
+	// max(NumCPU-1, 4) — so concurrent $text/Find reads aren't artificially
+	// serialized on a multi-core machine, while staying modest on small
+	// devices. Reader caches are created lazily up to this cap, so RAM follows
+	// actual concurrency, not the cap.
+	readConcurrency = c.ReadConcurrency
+	if readConcurrency <= 0 {
+		readConcurrency = max(runtime.NumCPU()-1, 4)
+	}
+	return min(cacheSize, maxCacheSize), min(readConcurrency, maxReadConcurrency)
 }
 
 func (c *Config) setDefaults() {

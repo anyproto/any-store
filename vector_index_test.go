@@ -214,6 +214,56 @@ func TestVectorIndex_BuildOnExisting(t *testing.T) {
 	assert.Equal(t, idBytesOf(123), hits[0].DocId)
 }
 
+// Index creation refuses a tuning value the index cannot be built or stored
+// with, wrapped in ErrInvalidConfig, and creates nothing. Before, a negative M
+// panicked in the build, an M past the bound ran out of memory, a Closure past
+// 255 wrapped the one-byte cell count of each vector's record, and an NList
+// past the vectors to train on sized the centroid table by it.
+func TestVectorIndex_TuningValidated(t *testing.T) {
+	const (
+		n   = 50
+		dim = 4
+	)
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	for i, vc := range vrand(n, dim, 7) {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+	for _, c := range []struct {
+		name  string
+		p     VectorParams
+		field string
+	}{
+		{"negative M", VectorParams{M: -1}, "VectorParams.M "},
+		{"M past its bound", VectorParams{M: maxVectorM + 1}, "VectorParams.M "},
+		{"negative EfConstruction", VectorParams{EfConstruction: -1}, "VectorParams.EfConstruction"},
+		{"EfSearch past its bound", VectorParams{EfSearch: maxVectorEf + 1}, "VectorParams.EfSearch"},
+		{"negative NList", VectorParams{Mode: VectorModeIVFSQ, NList: -1}, "VectorParams.NList"},
+		{"negative NProbe", VectorParams{Mode: VectorModeIVFSQ, NProbe: -1}, "VectorParams.NProbe"},
+		{"negative Closure", VectorParams{Mode: VectorModeIVFSQ, Closure: -1}, "VectorParams.Closure"},
+		{"Closure past its bound", VectorParams{Mode: VectorModeIVFSQ, Closure: maxVectorClosure + 1}, "VectorParams.Closure"},
+		{"NList past the vectors", VectorParams{Mode: VectorModeIVFSQ, NList: n + 1}, "VectorParams.NList"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := c.p
+			p.Field, p.Dim = "v", dim
+			for _, create := range []func(context.Context, ...IndexInfo) error{coll.CreateIndex, coll.EnsureIndex} {
+				err := create(ctx, IndexInfo{Name: "emb", Kind: IndexKindVector, Vector: &p})
+				require.ErrorIs(t, err, ErrInvalidConfig)
+				require.ErrorContains(t, err, c.field)
+				require.ErrorIs(t, coll.DropIndex(ctx, "emb"), ErrIndexNotFound)
+			}
+		})
+	}
+
+	// The bounds themselves are accepted.
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Name: "ivf", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Mode: VectorModeIVFSQ, NList: n, Closure: maxVectorClosure}}))
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Name: "hnsw", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, EfConstruction: maxVectorEf, EfSearch: maxVectorEf}}))
+}
+
 func TestVectorIndex_Stats(t *testing.T) {
 	const (
 		n   = 500

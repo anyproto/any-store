@@ -130,6 +130,9 @@ type VectorParams struct {
 	// Dim is the embedding dimension.
 	Dim int `json:"dim"`
 	// M / EfConstruction / EfSearch tune the HNSW graph; 0 = sensible defaults.
+	// M is at most 32,767 and EfConstruction and EfSearch at most 65,536.
+	// CreateIndex and EnsureIndex refuse a value past its bound, or a negative
+	// value in any of the integer tuning fields here, with ErrInvalidConfig.
 	M              int `json:"m,omitempty"`
 	EfConstruction int `json:"efConstruction,omitempty"`
 	EfSearch       int `json:"efSearch,omitempty"`
@@ -188,15 +191,17 @@ type VectorParams struct {
 	//
 	// NList is the number of coarse cells (k-means centroids); 0 ⇒ ~4·√N at build.
 	// More cells = finer partition = fewer vectors scanned per probe, but more
-	// centroids to compare and a larger training requirement.
+	// centroids to compare and a larger training requirement. It is at most the
+	// number of documents with a vector when the index is created.
 	NList int `json:"nList,omitempty"`
 	// NProbe is how many cells a search scans (the recall/speed dial); 0 ⇒ 16.
 	// Higher = more recall, more cells scanned.
 	NProbe int `json:"nProbe,omitempty"`
 	// Closure is the multi-assignment factor: each vector is placed in its Closure
 	// nearest cells so boundary vectors are found at lower NProbe (SPANN closure).
-	// 0/1 = single assignment. Every extra cell stores a full int8 record, so the
-	// index grows ~Closure×; a higher NProbe is usually the cheaper dial.
+	// 0/1 = single assignment, and at most 255. Every extra cell stores a full
+	// int8 record, so the index grows ~Closure×; a higher NProbe is usually the
+	// cheaper dial.
 	Closure int `json:"closure,omitempty"`
 }
 

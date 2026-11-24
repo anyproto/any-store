@@ -4396,17 +4396,21 @@ cost and a behavioral divergence (stale buffer contents are always cleared in Go
 <a id="drift-130-newpcache-hash-table-pre-sized-to-capacity"></a>
 ### Drift: newPcache Hash Table Pre Sized To Capacity
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `pcache.go:newPcache` (`internal/btree/pcache.go:135`; hashSizeFor at `pcache.go:160-166`;
-  minHashSize at `pcache.go:156`).
+- **Affected functions:** `pcache.go:newPcache` (`internal/btree/pcache.go:141`; hashSizeFor at `pcache.go:176-182`;
+  minHashSize at `pcache.go:164`; maxHashPresize at `pcache.go:172`).
 
 SQLite always seeds the pcache hash table to exactly 256 buckets — `pcache1Create` (`pcache1.c:789`) calls
 `pcache1ResizeHash` once and grows the table on demand thereafter (`pcache1.c:894`, with the 256 floor at
-`pcache1.c:543-544`). Go's `newPcache` (`pcache.go:135`) instead pre-sizes
-`apHash := make([]*page, hashSizeFor(maxPages))`, where `hashSizeFor` (`pcache.go:160-166`) returns the smallest power
-of two `>= maxPages` and `>= minHashSize` (256, `pcache.go:156`). With the default `defaultCacheSize=5000` this
-allocates 8192 buckets up front, and a larger configured cache allocates proportionally more. The consequence is a
-larger eager hash-table allocation at cache creation than SQLite's fixed 256-bucket seed — an intentional
-memory-vs-rehash tradeoff, now recorded in an in-code DRIFT comment at `pcache.go:134`.
+`pcache1.c:543-544`). Go's `newPcache` (`pcache.go:141`) instead pre-sizes
+`apHash := make([]*page, hashSizeFor(min(maxPages, maxHashPresize)))`, where `hashSizeFor` (`pcache.go:176-182`) returns
+the smallest power of two `>= n` and `>= minHashSize` (256, `pcache.go:164`). With the default `defaultCacheSize=5000`
+this allocates 8192 buckets up front, and a larger configured cache allocates proportionally more, up to
+`maxHashPresize` (65,536 buckets, 512 KiB); a cache configured for more pages starts there and grows on demand as
+SQLite's does. The consequence is a larger eager hash-table allocation at cache creation than SQLite's fixed 256-bucket
+seed — an intentional memory-vs-rehash tradeoff, recorded in an in-code DRIFT comment at `pcache.go:140`. The bound
+keeps a configured cache size from becoming an allocation made up front for every cache, readers' included: before
+it, a cache size past what the process could allocate failed at Open, and one past 2^62 pages never returned from
+`hashSizeFor`.
 
 <a id="drift-131-build-tag-gated-test-fault-hooks"></a>
 ### Drift: Build-Tag-Gated Test Fault Hooks

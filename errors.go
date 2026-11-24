@@ -276,6 +276,11 @@ var (
 	ErrPageBufferNotInitialized = errors.New("any-store: global page buffer not initialized (call InitPageBuffer first)")
 )
 
+// ErrInvalidConfig is returned, wrapped with the name of the field at fault,
+// by Open for a Config it cannot run with, and by CreateIndex and EnsureIndex
+// for an index definition with such a value. Nothing is opened or created.
+var ErrInvalidConfig = errors.New("any-store: invalid configuration")
+
 // nestedError keeps its own text and matches parent under errors.Is.
 type nestedError struct {
 	msg    string

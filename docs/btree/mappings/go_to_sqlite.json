@@ -2567,7 +2567,7 @@
       "pcache1.c:pcache1Create",
       "pcache1.c:pcache1ResizeHash"
     ],
-    "note": "seeds apHash to a power-of-two size (>= maxPages, floor 256), mirroring pcache1Create which calls pcache1ResizeHash at creation (pcache1.c:789) to seed nHash=256"
+    "note": "seeds apHash to a power-of-two size (>= maxPages up to maxHashPresize, floor 256), mirroring pcache1Create which calls pcache1ResizeHash at creation (pcache1.c:789) to seed nHash=256"
   },
   "shm.go:*inProcessShm.close": {
     "sqlite": [

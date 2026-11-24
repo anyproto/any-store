@@ -105,6 +105,49 @@ func validateVectorParams(p *VectorParams) error {
 	return nil
 }
 
+// Bounds of the VectorParams tuning fields, checked when an index is created
+// (validateVectorTuning).
+const (
+	// maxVectorM is the largest HNSW M: layer 0 keeps up to 2·M neighbours per
+	// node, and the adjacency record stores each layer's neighbour count in
+	// two bytes (vindex encodeAdj).
+	maxVectorM = (1<<16 - 1) / 2
+	// maxVectorEf is the largest EfConstruction and EfSearch, the bound a
+	// query's own $ef has (query.KnnMaxEf).
+	maxVectorEf = query.KnnMaxEf
+	// maxVectorClosure is the largest IVF Closure: a vector's :doc record
+	// stores the number of cells it was placed in in one byte (vivf
+	// appendDocCells).
+	maxVectorClosure = 1<<8 - 1
+)
+
+// validateVectorTuning refuses, wrapped in ErrInvalidConfig, a tuning value of
+// p that an index cannot be built or stored with: a negative one (zero picks
+// the default), or an M, EfConstruction, EfSearch or Closure past its bound.
+// It runs when an index is created, not when one an earlier release created is
+// opened.
+func validateVectorTuning(p *VectorParams) error {
+	for _, f := range [...]struct {
+		name   string
+		v, max int
+	}{
+		{"M", p.M, maxVectorM},
+		{"EfConstruction", p.EfConstruction, maxVectorEf},
+		{"EfSearch", p.EfSearch, maxVectorEf},
+		{"NList", p.NList, math.MaxInt},
+		{"NProbe", p.NProbe, math.MaxInt},
+		{"Closure", p.Closure, maxVectorClosure},
+	} {
+		if f.v < 0 {
+			return fmt.Errorf("%w: VectorParams.%s is %d, a negative value", ErrInvalidConfig, f.name, f.v)
+		}
+		if f.v > f.max {
+			return fmt.Errorf("%w: VectorParams.%s is %d, more than %d", ErrInvalidConfig, f.name, f.v, f.max)
+		}
+	}
+	return nil
+}
+
 // ErrVectorMetricUnsupported is returned when an index declares a metric the
 // selected mode cannot rank by. Validation runs on both create and open, so a
 // persisted index with an unsupported combination fails loudly instead of
@@ -490,6 +533,9 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info In
 	if err := validateVectorParams(info.Vector); err != nil {
 		return nil, err
 	}
+	if err := validateVectorTuning(info.Vector); err != nil {
+		return nil, err
+	}
 	tx.MarkSchemaChanged()
 	if info.Name == "" {
 		info.Name = info.Vector.Field
@@ -550,6 +596,13 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info In
 	if info.Vector.Mode.isIVF() {
 		if len(vecs) == 0 {
 			return nil, fmt.Errorf("vector index: IVF requires existing documents to train — insert documents before creating the index")
+		}
+		if info.Vector.NList > len(vecs) {
+			// k-means cannot make more cells than it has vectors to train on,
+			// and sizes its centroid table by NList: FAISS refuses the same
+			// ("Number of training points should be at least as large as
+			// number of clusters").
+			return nil, fmt.Errorf("%w: VectorParams.NList is %d, more than the %d vectors to train on", ErrInvalidConfig, info.Vector.NList, len(vecs))
 		}
 		ivf, err := vivf.BulkBuild(tx, prefix, ivfStoreParams(info.Vector, len(vecs)), ids, vecs)
 		if err != nil {

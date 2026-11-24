@@ -1076,3 +1076,28 @@ func BenchmarkPcacheCreateRecycle(b *testing.B) {
 		pc.release(pg)
 	}
 }
+
+// A new cache's hash table is sized to its page count up to maxHashPresize:
+// a cache configured for more pages starts there and grows as pages arrive,
+// so a configured size is never an allocation made up front, and one past
+// 2^62 pages no longer spins in hashSizeFor.
+func TestNewPcache_HashPresizeBounded(t *testing.T) {
+	assert.Len(t, newPcache(4096, 10, true).apHash, minHashSize)
+	assert.Len(t, newPcache(4096, 5000, true).apHash, 8192)
+	assert.Len(t, newPcache(4096, maxHashPresize, true).apHash, maxHashPresize)
+	assert.Len(t, newPcache(4096, maxHashPresize+1, true).apHash, maxHashPresize)
+	assert.Len(t, newPcache(4096, 1<<62+1, true).apHash, maxHashPresize)
+
+	// Past the presize the table grows with the pages, at load factor 1.0.
+	// Small pages keep the 65,537 of them to 32 MiB.
+	pc := newPcache(512, maxHashPresize+1, false)
+	for pgno := uint32(1); pgno <= maxHashPresize+1; pgno++ {
+		pg := testCreate(pc, pgno, 2)
+		require.NotNil(t, pg)
+		pc.release(pg)
+	}
+	assert.Len(t, pc.apHash, 2*maxHashPresize)
+	for pgno := uint32(1); pgno <= maxHashPresize+1; pgno++ {
+		require.NotNil(t, pc.hashFind(pgno), "page %d", pgno)
+	}
+}
