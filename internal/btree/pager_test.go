@@ -9455,6 +9455,8 @@ func TestOpen_DamagedOnePageFileIsErrWrongKey(t *testing.T) {
 // A later page damaged under the right key does not fail the open: the
 // open authenticates page 1 only, and the read that meets the page reports
 // it as ErrPageIntegrity, as before; the integrity hook hears of that page.
+// Every row's value is read: in schema format 5 the damaged page holds part
+// of a value, which a walk of the keys does not read.
 func TestOpen_DamagedLaterPageOpens(t *testing.T) {
 	var pages []uint32
 	path, opts := keyProofDB(t, true, nil)
@@ -9473,6 +9475,9 @@ func TestOpen_DamagedLaterPageOpens(t *testing.T) {
 	cur := rtx.NewCursor(ns)
 	defer cur.Close()
 	for err = cur.First(); err == nil && cur.Valid(); err = cur.Next() {
+		if _, err = cur.Value(); err != nil {
+			break
+		}
 	}
 	require.ErrorIs(t, err, ErrPageIntegrity)
 	require.ErrorIs(t, err, ErrCorrupt)
@@ -9721,8 +9726,10 @@ func TestOpen_KeyProbeStaysInsideTheDatabase(t *testing.T) {
 // tried on: where the snapshot's WAL commit records the database's size,
 // that size bounds them, and a page under it proves the key. Page 1 here is
 // in the database file, and the commit that recorded the size, in the WAL,
-// did not write it.
+// did not write it: schema format 6, as format 5 writes page 1 on every
+// commit.
 func TestOpen_KeyProbeTakesTheWALCommitsSize(t *testing.T) {
+	useCurrentFormat(t)
 	path, opts := keyProofDB(t, true, nil)
 	db, err := Open(path, opts)
 	require.NoError(t, err)
