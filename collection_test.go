@@ -355,6 +355,28 @@ func BenchmarkCollection_UpdateId(b *testing.B) {
 	}
 }
 
+// UpsertOne of a document that is stored already, as it is: a flat array
+// of 10,000 numbers, the shape whose depth walk visits every element.
+func BenchmarkCollection_UpsertOneExisting(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(b, err)
+	a := &anyenc.Arena{}
+	doc := a.NewObject()
+	doc.Set("id", a.NewNumberInt(1))
+	arr := a.NewArray()
+	for i := range 10_000 {
+		arr.SetArrayItem(i, a.NewNumberInt(i))
+	}
+	doc.Set("arr", arr)
+	require.NoError(b, coll.Insert(ctx, doc))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		require.NoError(b, coll.UpsertOne(ctx, doc))
+	}
+}
+
 func BenchmarkCollection_FindId(b *testing.B) {
 	fx := newFixture(b)
 	coll, err := fx.CreateCollection(ctx, "test")

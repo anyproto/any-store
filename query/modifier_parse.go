@@ -240,8 +240,8 @@ func newPopModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 // elements. Refusing every such key keeps those forms free to be implemented
 // later without changing what an accepted update does.
 func refuseEachForm(op, mods string, v *anyenc.Value) error {
-	obj, err := v.Object()
-	if err != nil {
+	obj := v.GetObject()
+	if obj == nil {
 		return nil
 	}
 	var dollarKey string

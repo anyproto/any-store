@@ -3,6 +3,8 @@ package query
 import (
 	"fmt"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -647,6 +649,67 @@ func BenchmarkModifier(b *testing.B) {
 		// An object key past the limit: the modifier is staged.
 		bench(b, `{"$set":{"m.1500001":1}}`)
 	})
+}
+
+// A $set of the value the field holds, to the order of its objects' fields,
+// keeps the document's own value and reports no change. A value that is
+// equal but orders an object's fields otherwise is stored, so the field
+// order a later write keeps is the operand's, and still reports no change.
+func TestModifierSet_IdenticalKeepsTheValue(t *testing.T) {
+	for _, tc := range []struct {
+		mod, doc string
+		kept     bool
+	}{
+		{`{"$set":{"a":[1,2,{"x":1,"y":[3]}]}}`, `{"a":[1,2,{"x":1,"y":[3]}]}`, true},
+		{`{"$set":{"a":{"x":1,"y":"s"}}}`, `{"a":{"x":1,"y":"s"}}`, true},
+		{`{"$set":{"a":5}}`, `{"a":5}`, true},
+		{`{"$set":{"a":{"y":"s","x":1}}}`, `{"a":{"x":1,"y":"s"}}`, false},
+		{`{"$set":{"a":[{"y":1,"x":1}]}}`, `{"a":[{"x":1,"y":1}]}`, false},
+	} {
+		mod := MustParseModifier(tc.mod)
+		doc := anyenc.MustParseJson(tc.doc)
+		before := doc.Get("a")
+		res, modified, err := mod.Modify(&anyenc.Arena{}, doc)
+		require.NoError(t, err)
+		assert.False(t, modified, tc.mod)
+		assert.Equal(t, tc.kept, res.Get("a") == before, tc.mod)
+		assert.Equal(t, anyenc.MustParseJson(tc.mod).Get("$set", "a").String(), res.Get("a").String(), tc.mod)
+	}
+}
+
+// A filtered $set that matches documents already holding its value: a
+// 10,000-number array set to itself. The document is given its own array
+// back before each run, so every run starts from the same document.
+func BenchmarkModifier_SetIdenticalArray(b *testing.B) {
+	nums := make([]string, 10_000)
+	for i := range nums {
+		nums[i] = strconv.Itoa(i)
+	}
+	arr := "[" + strings.Join(nums, ",") + "]"
+	mod := MustParseModifier(`{"$set":{"arr":` + arr + `}}`)
+	doc := anyenc.MustParseJson(`{"id":1,"arr":` + arr + `}`)
+	orig := doc.Get("arr")
+	a := &anyenc.Arena{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		doc.Set("arr", orig)
+		a.Reset()
+		if _, modified, err := mod.Modify(a, doc); err != nil || modified {
+			b.Fatal(modified, err)
+		}
+	}
+}
+
+// Parsing a $push and an $addToSet of a scalar, which refuseEachForm looks
+// at for a '$' key only when it is an object.
+func BenchmarkParseModifier_ScalarPush(b *testing.B) {
+	b.ReportAllocs()
+	for range b.N {
+		if _, err := ParseModifier(`{"$push":{"tags":"a"},"$addToSet":{"seen":3}}`); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 // $pull with a condition uses query semantics: ordering ops are type-bracketed,

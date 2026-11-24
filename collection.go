@@ -613,9 +613,10 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 const maxDocDepth = 511
 
 // checkDocDepth refuses a document nested deeper than maxDocDepth, which
-// every write checks before it stores one (insertItem, update): an insert of
-// a value built in an Arena, or a modifier's path, can nest deeper than the
-// parser reads, and the document stored would fail every later read.
+// every write checks before it stores one (insertItem and update, or their
+// caller once before insertDepthChecked and updateDepthChecked): an insert
+// of a value built in an Arena, or a modifier's path, can nest deeper than
+// the parser reads, and the document stored would fail every later read.
 func checkDocDepth(v *anyenc.Value) error {
 	if nestsDeeper(v, maxDocDepth) {
 		return fmt.Errorf("any-store: document is nested deeper than %d levels", maxDocDepth)
@@ -655,6 +656,15 @@ func (c *collection) insertItem(tx *btree.WriteTx, s *collSchema, buf *syncpool.
 	if err = checkDocDepth(it.Value()); err != nil {
 		return err
 	}
+	return c.insertDepthChecked(tx, s, buf, it)
+}
+
+// insertDepthChecked is insertItem for a document the caller has held to
+// the depth bound (checkDocDepth) already: the walk visits every value of
+// the document, and a caller that may store it twice over (UpsertOne, which
+// updates when the insert finds the id) or has checked it before encoding
+// its id (UpsertId) need not pay it again.
+func (c *collection) insertDepthChecked(tx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, it item) (err error) {
 	buf.SmallBuf = c.appendId(buf.SmallBuf[:0], it.Value())
 	if c.compressionDisabled() {
 		buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
@@ -947,7 +957,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 			return false, ErrPrimaryKeyModification
 		}
 		res.Modified = 1
-		return true, c.insertItem(tx, s, buf2, newIt)
+		return true, c.insertDepthChecked(tx, s, buf2, newIt)
 	})
 	returned = true
 	if err != nil {
@@ -975,6 +985,12 @@ func (c *collection) update(tx *btree.WriteTx, s *collSchema, it, prevIt item) (
 	if err = checkDocDepth(it.Value()); err != nil {
 		return false, err
 	}
+	return c.updateDepthChecked(tx, s, it, prevIt)
+}
+
+// updateDepthChecked is update for a document the caller has held to the
+// depth bound already (insertDepthChecked).
+func (c *collection) updateDepthChecked(tx *btree.WriteTx, s *collSchema, it, prevIt item) (modified bool, err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -1059,15 +1075,20 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 	if it, err = c.newItem(doc); err != nil {
 		return
 	}
+	// One depth walk for the document, whether it is inserted or replaces
+	// the one stored under its id.
+	if err = checkDocDepth(doc); err != nil {
+		return
+	}
 
 	err = c.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		s, txErr := c.resolve(&tx.ReadTx)
 		if txErr != nil {
 			return false, txErr
 		}
-		insErr := c.insertItem(tx, s, buf, it)
+		insErr := c.insertDepthChecked(tx, s, buf, it)
 		if errors.Is(insErr, ErrDocExists) {
-			return c.update(tx, s, it, item{})
+			return c.updateDepthChecked(tx, s, it, item{})
 		}
 		if insErr != nil {
 			return false, insErr
