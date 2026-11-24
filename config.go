@@ -247,7 +247,9 @@ type Config struct {
 // same EncryptionConfig. With the zero EncryptionConfig, the default, its
 // Backup is a plain file.
 type EncryptionConfig struct {
-	// Passphrase is the user-supplied secret. Nil = no encryption.
+	// Passphrase is the user-supplied secret. Nil = no encryption. Open
+	// keeps a copy of it, which Backup uses, so the caller may clear its
+	// slice once Open returns.
 	Passphrase []byte
 
 	// KDFIterations overrides the PBKDF2 cost. Zero means 256,000 (the

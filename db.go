@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -250,6 +251,12 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 	ds.recoveryController, quickCheckNeeded = ds.createRecoveryController(ctx, path)
 
 	cacheSize, readConcurrency := config.cacheSizes()
+	// The btree keeps a copy of the caller's passphrase or key, which the
+	// caller may clear once Open returns: Backup opens its destination with
+	// it (BackupDestinationOptions), and a cleared buffer would encrypt the
+	// copy with another key. nil stays nil, no encryption.
+	key := bytes.Clone(config.Encryption.Passphrase)
+
 	// Page-level integrity is on by default for non-encrypted databases.
 	// XXH3-128 trailer per page costs <1% on writes and is invisible on
 	// reads. Encrypted databases get stronger integrity from the
@@ -266,7 +273,7 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		DisableAutoCheckpoint: config.DisableAutoCheckpoint,
 		AutoCheckpointAfter:   config.AutoCheckpointAfter,
 		UsePageSlab:           config.UseGlobalPageBuffer,
-		Key:                   config.Encryption.Passphrase,
+		Key:                   key,
 		KDFIterations:         config.Encryption.KDFIterations,
 		CipherType:            config.Encryption.CipherType,
 		MmapSize:              config.MmapSize,

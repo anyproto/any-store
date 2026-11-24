@@ -194,6 +194,33 @@ func TestBackupRoundTrip(t *testing.T) {
 	}
 }
 
+// The passphrase or key in Config is the caller's buffer, which the caller
+// may clear once Open returns. The database keeps a copy of its own, so a
+// backup made after that is encrypted with the passphrase or key the
+// database was opened with, and opens with it.
+func TestBackupRoundTrip_CallerClearsItsKey(t *testing.T) {
+	ctx := context.Background()
+	for _, kind := range roundTripKinds {
+		if conf := kind.open(t); conf == nil || conf.Encryption.Passphrase == nil {
+			continue
+		}
+		t.Run(kind.name, func(t *testing.T) {
+			dir := t.TempDir()
+			conf := kind.open(t)
+			src, err := anystore.Open(ctx, filepath.Join(dir, "src.db"), conf)
+			require.NoError(t, err)
+			defer func() { _ = src.Close() }()
+			clear(conf.Encryption.Passphrase)
+			want := fillRoundTrip(t, src, 0, 50)
+
+			copyPath := filepath.Join(dir, "copy.db")
+			require.NoError(t, src.Backup(ctx, copyPath))
+			require.NoError(t, src.Close())
+			requireCopy(t, copyPath, kind.reopen(t), kind.mode, want)
+		})
+	}
+}
+
 // A backup over a database of the same kind replaces its content, under the
 // destination's own key.
 func TestBackupRoundTrip_OverExistingOfSameKind(t *testing.T) {
