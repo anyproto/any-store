@@ -829,13 +829,9 @@ the 64-bit lengths a cell declares before they are converted to `int` (on a 32-b
 declared length of `1<<32+1` would convert to 1). The leaf-cell parsers that test both
 lengths (`parseLeafCellWithSize`, `leafFullValue`, `leafKeyAt`) answer `ErrCorrupt` for a
 cell that fails it, and so do `parseInteriorCell` and `interiorFullKey` for a key over the
-cap. `Put` refuses such a record with `ErrKeyTooLarge` (the key alone is over) or
-`ErrValueTooLarge` before it touches a page, so it never writes a record that its own parse
-would reject, and `CreateNamespace` / `RenameNamespace` apply it to the master-table record
-(the name and a 4-byte root) before they allocate the root or delete the old name. Only
-`Put` brings a new record into a tree, and it tests that record at entry, before any path
-writes it; the rest of what a split or a rebuild writes, under `Put` or `Delete`, comes from
-cells already in the tree.
+cap. `Put` refuses such a record before it touches a page, so it never writes a record that
+its own parse would reject: see
+[drift-2026-11-24-1](#drift-2026-11-24-1-put-refuses-a-record-over-the-record-size-limit).
 
 A read of a leaf cell's key bounds the key only; the value's declared length is tested where
 the value is read. That length still places the key's local part, and `spilledLocalSize`
@@ -873,14 +869,7 @@ file size, so it can be true for a record whose `Get` fails the file-size bound.
 table seek skips a cell's payload size and compares its rowid only (`btree.c:5880-5886`);
 a later read of the payload fails at `vdbemem.c:1428`.
 
-SQLite draws the write-side line above the b-tree: `SQLITE_MAX_LENGTH` is 1,000,000,000
-(`sqliteLimit.h:24`) and is tested where a value or a record is built. In `OP_MakeRecord`
-the test is `nByte+nZero>db->aLimit[SQLITE_LIMIT_LENGTH]` (`vdbe.c:3697`, `too_big:` at
-`vdbe.c:9298`), and it runs when the output register must grow to hold the record: it is in
-the `else` of `if( nByte+nZero<=pOut->szMalloc )` (`vdbe.c:3690`). `sqlite3BtreeInsert`
-only asserts its lengths (`btree.c:9485`, `9540`). The value differs (2^30 here, 10^9
-there) and so does the layer, the b-tree being the lowest one every writer here passes
-through. Tests: `TestPayloadLimit_RealConstants`,
+Tests: `TestPayloadLimit_RealConstants`,
 `TestPayloadLimit_LengthsCheckedBeforeNarrowing`, `TestPayloadLimit_SpilledLocalSize`,
 `TestPayloadLimit_PutRefusesWhatReadRejects`, `TestPayloadLimit_NamespaceName`,
 `TestPayloadLimit_DeclaredLengthOverFileSize`,
@@ -4258,3 +4247,12 @@ Three further rules of the same SQLite routines were ported with it (2026-11-11)
 - **A wal-index of another version is refused, not rebuilt.** `readHeader` reported a consistent, checksummed header with a foreign `iVersion` as invalid, which `indexReadHdr` would have "repaired" over another build's live index. `walIndexReadHdr` returns `SQLITE_CANTOPEN` for it without recovery (`wal.c:2740-2741`); `readHeaderState` separates the case and `indexReadHdr` returns an error matching `ErrWALVersion`. `wal.open` refuses it the same way, under its recovery locks and before it rebuilds anything: a process attaching to a database a newer build keeps open must not overwrite that build's index. On a fresh attach `region(create=false)` maps none of the peer's index ([drift-2026-07-10-3](#drift-2026-07-10-3-region-create-false-never-maps-existing-content)), so the gate maps region 0 first, as `walIndexReadHdr` does through `walIndexPage`; a consistent header of this version still goes to recovery, as before. Tests: `TestWalIndexFutureVersionRefused`, `TestWalIndexFutureVersionRefusedAtOpen` (two processes).
 
 Regression tests (`internal/btree/walindex_torn_header_test.go`): `TestTornWalIndexHeader_CheckpointKeepsPeerCommits`, `_PassiveCheckpointKeepsPeerCommits`, `_CloseKeepsPeerCommits`, `_ReaderRecovers`, `_WriterRecovers` (two processes: the writer dies between the header copies), `_ReaderRetriesWhileWriteLockBusy`, `_BusyRecoveryWhenRecoverLockHeld`, `_CheckpointBusyWhenWriteLockHeld`.
+
+<a id="drift-2026-11-24-1-put-refuses-a-record-over-the-record-size-limit"></a>
+### Drift: Put Refuses A Record Over The Record Size Limit; SQLite Tests Its Length Limit Above The B-Tree
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.Put`, `btree.go:recordSizeErr`, `page.go:payloadFits`; `db.go:*DB.CreateNamespace`, `db.go:*DB.RenameNamespace` (the master-table record).
+
+SQLite's length limit is `SQLITE_LIMIT_LENGTH`, `SQLITE_MAX_LENGTH` by default, 1,000,000,000 (`sqliteLimit.h:24`), and it is tested where a value or a record is built, above the b-tree. `OP_MakeRecord` tests `nByte+nZero>db->aLimit[SQLITE_LIMIT_LENGTH]` (`vdbe.c:3697`) and jumps to `too_big:`, which sets "string or blob too big" and returns `SQLITE_TOOBIG` (`vdbe.c:9298-9300`). That test runs only when the output register must grow to hold the record: it is in the `else` of `if( nByte+nZero<=pOut->szMalloc )` (`vdbe.c:3690`). `sqlite3BtreeInsert` only asserts its lengths (`btree.c:9485`, `9540`).
+
+Here the limit is in the b-tree, and it is the cell parsers' cap ([old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation](#old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation)): key length plus value length at most `maxPayloadAlloc`, 2^30 bytes (`payloadFits`). `Put` tests every record against it before it touches a page, and refuses one over it with one of two errors (`recordSizeErr`): `ErrKeyTooLarge` when the key alone is over the limit, `ErrValueTooLarge` otherwise, where SQLite has the one code. `CreateNamespace` and `RenameNamespace` apply the same test to the master-table record (the name and a 4-byte root page number) before they allocate the root or delete the old name. Holding writes to the parsers' cap means `Put` never writes a record its own parse would reject, and the b-tree is the lowest layer every writer here passes through. Only `Put` brings a new record into a tree, and it tests that record at entry, before any path writes it; the rest of what a split or a rebuild writes, under `Put` or `Delete`, comes from cells already in the tree. Tests: `TestPayloadLimit_RealConstants`, `TestPayloadLimit_PutRefusesWhatReadRejects`, `TestPayloadLimit_NamespaceName`.

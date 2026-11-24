@@ -286,7 +286,7 @@
       "btree.c:sqlite3BtreeIndexMoveto",
       "btree.c:sqlite3BtreeInsert"
     ],
-    "note": ""
+    "note": "tests the record size limit before the descent (recordSizeErr); SQLite tests SQLITE_LIMIT_LENGTH above the b-tree, in OP_MakeRecord (vdbe.c:3697), and sqlite3BtreeInsert only asserts its lengths"
   },
   "btree.go:*btree.balanceDeeper": {
     "sqlite": [
@@ -587,6 +587,10 @@
       "btree.c:btreeParseCellPtrIndex"
     ],
     "note": ""
+  },
+  "btree.go:recordSizeErr": {
+    "sqlite": [],
+    "note": "no b-tree counterpart: the write side of payloadFits, for Put, CreateNamespace and RenameNamespace. SQLite's is OP_MakeRecord's SQLITE_LIMIT_LENGTH test (vdbe.c:3697), which returns SQLITE_TOOBIG; here ErrKeyTooLarge when the key alone is over the limit, else ErrValueTooLarge"
   },
   "btree.go:searchInteriorPage": {
     "sqlite": [

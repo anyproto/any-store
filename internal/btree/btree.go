@@ -1367,6 +1367,7 @@ const maxKeySize = maxPayloadAlloc
 // recordSizeErr is the write side of payloadFits: nil for a record that may
 // be written, ErrKeyTooLarge when the key alone is over the record size limit
 // and ErrValueTooLarge when the key and the value together are.
+// DRIFT: two errors, by whether the key alone is over the limit; OP_MakeRecord returns SQLITE_TOOBIG for any record over SQLITE_LIMIT_LENGTH. See docs/btree/NOTES.md#drift-2026-11-24-1-put-refuses-a-record-over-the-record-size-limit
 func recordSizeErr(keyLen, valLen int) error {
 	if payloadFits(uint64(keyLen), uint64(valLen)) {
 		return nil
@@ -1380,6 +1381,7 @@ func recordSizeErr(keyLen, valLen int) error {
 // Put inserts or updates a key-value pair in the B-tree. A record over the
 // record size limit is refused with ErrKeyTooLarge or ErrValueTooLarge and
 // nothing is written.
+// DRIFT: every record is tested here against the record size limit (key plus value, 1 GiB); SQLite tests SQLITE_LIMIT_LENGTH (10^9) in OP_MakeRecord, above sqlite3BtreeInsert. See docs/btree/NOTES.md#drift-2026-11-24-1-put-refuses-a-record-over-the-record-size-limit
 func (bt *btree) Put(key, value []byte) error {
 	// A record the cell parsers would reject is refused here, before a
 	// page is touched: see payloadFits.
