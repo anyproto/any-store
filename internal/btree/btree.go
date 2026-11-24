@@ -993,7 +993,7 @@ func leafFullKey(data []byte, offset int, lim payloadLimits, p *pager, walMaxFra
 	// or past the page count) fails here, not after an allocation sized by
 	// the declared key. accessPayload tests each page against the page
 	// count (btree.c:5227), and a chain that ends early is corrupt
-	// (btree.c:5327-5330).
+	// (btree.c:5309-5311).
 	overflowPg := binary.BigEndian.Uint32(data[pos+nLocal : pos+nLocal+4])
 	if overflowPg < 2 || overflowPg > p.readerDbSizeBound(cache) {
 		return nil, ErrCorrupt
@@ -4225,7 +4225,7 @@ func (c *Cursor) Key() ([]byte, error) {
 	// A read of the key bounds the key only (leafFullKey); Value tests the
 	// value's declared length. A SQLite table cursor likewise reads the
 	// rowid of a row whose payload is corrupt (sqlite3BtreeIntegerKey
-	// returns the parsed nKey, btree.c:4917-4923).
+	// returns the parsed nKey, btree.c:4916-4922).
 	return leafFullKey(frame.pg.data, int(off), c.bt.leafLimits(), c.bt.pager, c.bt.walMaxFrame, c.bt.cache)
 }
 

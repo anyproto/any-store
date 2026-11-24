@@ -181,7 +181,7 @@ func payloadFits(keyLen, valLen uint64) bool {
 // a gigabyte before the overflow chain is found short. ~
 // sqlite3VdbeMemFromBtree, which returns SQLITE_CORRUPT_BKPT when
 // amt+offset > sqlite3BtreeMaxRecordSize, before it resizes the Mem
-// (vdbemem.c:1428-1429), that size being pageSize*nPage (btree.c:4981-4985).
+// (vdbemem.c:1428-1429), that size being pageSize*nPage (btree.c:4978-4982).
 // The page count is the snapshot's for a reader (cache) and the live one for
 // the writer, as readerDbSizeBound resolves it.
 // DRIFT: a reader's page count is the pager's (readerDbSizeBound), not the page-1 nPage that sqlite3BtreeMaxRecordSize multiplies. See docs/btree/NOTES.md#drift-2026-11-24-2-a-readers-file-size-bound-takes-the-pagers-page-count
