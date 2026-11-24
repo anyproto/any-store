@@ -610,6 +610,12 @@ func TestTx_NestedCalls(t *testing.T) {
 			assert.ErrorIs(t, err, ErrWriteInModifier)
 			_, err = m.coll.Find(nil).Delete(tctx)
 			assert.ErrorIs(t, err, ErrWriteInModifier)
+			// A filter that matches nothing is refused the same way: the
+			// write is checked before the filter is.
+			_, err = m.coll.Find(`{"a":{"$in":[]}}`).Update(tctx, query.MustParseModifier(`{"$set":{"a":1}}`))
+			assert.ErrorIs(t, err, ErrWriteInModifier)
+			_, err = m.coll.Find(`{"a":{"$all":[]}}`).Delete(tctx)
+			assert.ErrorIs(t, err, ErrWriteInModifier)
 			assert.ErrorIs(t, m.coll.EnsureIndex(tctx, IndexInfo{Fields: []string{"b"}}), ErrWriteInModifier)
 			assert.ErrorIs(t, m.coll.DropIndex(tctx, "a"), ErrWriteInModifier)
 			assert.ErrorIs(t, m.coll.Rename(tctx, "renamed"), ErrWriteInModifier)

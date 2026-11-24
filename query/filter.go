@@ -542,8 +542,39 @@ func (e Key) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
+// String renders the path condition, with the joined path quoted by
+// jsonQuoteBytes. A path condition whose inner filter matches every value
+// renders as {"<path>": {"$nin": []}}, which parses back to a path condition
+// whose inner filter matches every value too, on the same path. The field
+// form {"a": {}} would parse back as an equality to the empty object, and the
+// document-level {} would drop the path, which the query layer validates:
+// {"_distance": ...} without a $knn is an error, where {} matches every
+// document.
 func (e Key) String() string {
-	return fmt.Sprintf(`{"%s": %s}`, strings.Join(e.Path, "."), e.Filter.String())
+	path := jsonQuoteBytes(strings.Join(e.Path, "."))
+	if matchesEverything(e.Filter) {
+		return fmt.Sprintf(`{%s: {"$nin": []}}`, path)
+	}
+	return fmt.Sprintf(`{%s: %s}`, path, e.Filter.String())
+}
+
+// matchesEverything reports whether f is one of the filters that match every
+// value: All, or an And or a Nor with no entries. An And of nil entries is
+// not one: And.Ok calls each entry.
+func matchesEverything(f Filter) bool {
+	switch ft := f.(type) {
+	case All, *All:
+		return true
+	case And:
+		return len(ft) == 0
+	case *And:
+		return ft != nil && len(*ft) == 0
+	case Nor:
+		return len(ft) == 0
+	case *Nor:
+		return ft != nil && len(*ft) == 0
+	}
+	return false
 }
 
 type And []Filter
@@ -593,12 +624,18 @@ func (e And) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
+// String renders the conjunction. An And with no conditions matches every
+// document and renders as {}, the filter that parses back to that: the parser
+// rejects {"$and":[]}.
 func (e And) String() string {
 	var subS []string
 	for _, f := range e {
 		if f != nil {
 			subS = append(subS, f.String())
 		}
+	}
+	if len(subS) == 0 {
+		return "{}"
 	}
 	return fmt.Sprintf(`{"$and":[%s]}`, strings.Join(subS, ", "))
 }
@@ -803,7 +840,13 @@ func (e Or) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return result.SortAndMerge()
 }
 
+// String renders the disjunction. An Or with no conditions matches no
+// document; the parser rejects {"$or":[]}, so it renders as {"$nor":[{}]},
+// which parses back to a filter that matches nothing.
 func (e Or) String() string {
+	if len(e) == 0 {
+		return `{"$nor":[{}]}`
+	}
 	var subS []string
 	for _, f := range e {
 		subS = append(subS, f.String())
@@ -826,7 +869,13 @@ func (e Nor) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
+// String renders the negated disjunction. A Nor with no conditions matches
+// every document and renders as {}, which parses back to that: the parser
+// rejects {"$nor":[]}.
 func (e Nor) String() string {
+	if len(e) == 0 {
+		return "{}"
+	}
 	var subS []string
 	for _, f := range e {
 		subS = append(subS, f.String())
@@ -860,8 +909,10 @@ func (a All) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
 }
 
+// String renders the match-all condition as the empty object, the filter that
+// parses back to it.
 func (a All) String() string {
-	return "null"
+	return "{}"
 }
 
 // Text is the {"$text":{"$search":"..."}} full-text predicate. Matching and
@@ -1024,6 +1075,26 @@ func jsonQuote(s string) string {
 		return fmt.Sprintf("%q", s)
 	}
 	return string(b)
+}
+
+// jsonQuoteBytes quotes s as a string the parser reads back byte for byte: '"',
+// '\' and the control bytes are escaped, and every other byte is kept as it
+// is, one of invalid UTF-8 too, which json.Marshal would replace.
+func jsonQuoteBytes(s string) string {
+	const hex = "0123456789abcdef"
+	b := make([]byte, 0, len(s)+2)
+	b = append(b, '"')
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"' || c == '\\':
+			b = append(b, '\\', c)
+		case c < 0x20:
+			b = append(b, '\\', 'u', '0', '0', hex[c>>4], hex[c&0xf])
+		default:
+			b = append(b, c)
+		}
+	}
+	return string(append(b, '"'))
 }
 
 // Knn is the {"<field>":{"$knn":{"$query":[…],"$k":N}}} approximate-nearest-neighbour

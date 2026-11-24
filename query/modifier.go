@@ -39,15 +39,142 @@ func (mRoot ModifierChain) Modify(a *anyenc.Arena, v *anyenc.Value) (result *any
 	return
 }
 
+// paddingStaged is a parsed modifier with a path segment that names an array
+// index past anyencutil.MaxArrayPadding. On an array that segment is refused,
+// and the operations run in order: on the caller's document, a refusal in the
+// middle would leave the operations before it applied, and a $rename whose
+// destination is refused would already have removed its source. Modify
+// therefore applies the modifier once, to an in-memory copy of the document
+// (anyenc.Arena.Copy), and the copy is the result: on success it replaces the
+// document, and on a refusal it is dropped and the document is as it was.
+// MongoDB applies an update the same way, to a mutable copy that is stored
+// only when every operation succeeds. A modifier without such a segment is
+// never refused by the padding limit and runs on the document directly.
+//
+// The chain stores copies of its operands (ownOperands), as MongoDB copies an
+// operand from the immutable update spec into the document
+// (update/set_node.cpp: setValueBSONElement(val)), so applying it does not
+// change its operands.
+type paddingStaged struct {
+	ModifierChain
+}
+
+// ownOperands returns chain with its $set, $push and $addToSet replaced by
+// forms that store a copy of their operand on every application. The forms
+// are types of their own, not a flag, so that the plain modifiers every other
+// update parses keep their size.
+func ownOperands(chain ModifierChain) ModifierChain {
+	owned := make(ModifierChain, len(chain))
+	for i, m := range chain {
+		switch mt := m.(type) {
+		case modifierSet:
+			m = ownedSet(mt)
+		case modifierPush:
+			m = ownedPush(mt)
+		case modifierAddToSet:
+			m = ownedAddToSet(mt)
+		case ModifierChain:
+			m = ownOperands(mt)
+		}
+		owned[i] = m
+	}
+	return owned
+}
+
+// ownedSet, ownedPush and ownedAddToSet are $set, $push and $addToSet storing
+// a copy of their operand (ownOperands).
+type (
+	ownedSet      modifierSet
+	ownedPush     modifierPush
+	ownedAddToSet modifierAddToSet
+)
+
+func (m ownedSet) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+	return modifierSet(m).modify(a, v, true)
+}
+
+func (m ownedPush) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+	return modifierPush(m).modify(a, v, true)
+}
+
+func (m ownedAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+	return modifierAddToSet(m).modify(a, v, true)
+}
+
+// stored is the value an operation stores for operand val: val itself, or a
+// copy of it in a when the chain owns its operands (ownOperands).
+func stored(a *anyenc.Arena, val *anyenc.Value, copyVal bool) *anyenc.Value {
+	if copyVal {
+		return a.Copy(val)
+	}
+	return val
+}
+
+func (m paddingStaged) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	if v == nil {
+		return m.ModifierChain.Modify(a, v)
+	}
+	return m.ModifierChain.Modify(a, a.Copy(v))
+}
+
+// mayExceedPadding reports whether a path of the chain has a segment naming
+// an array index the padding limit can refuse: past
+// anyencutil.MaxArrayPadding, or too large for an int. A segment naming a
+// smaller index needs at most MaxArrayPadding nulls whatever the array.
+func mayExceedPadding(chain ModifierChain) bool {
+	for _, m := range chain {
+		var paths [][]string
+		switch mt := m.(type) {
+		case modifierSet:
+			paths = [][]string{mt.fieldPath}
+		case modifierUnset:
+			paths = [][]string{mt.fieldPath}
+		case modifierInc:
+			paths = [][]string{mt.fieldPath}
+		case modifierRename:
+			paths = [][]string{mt.fieldPath, mt.val}
+		case modifierPop:
+			paths = [][]string{mt.fieldPath}
+		case modifierPush:
+			paths = [][]string{mt.fieldPath}
+		case modifierPull:
+			paths = [][]string{mt.fieldPath}
+		case modifierPullAll:
+			paths = [][]string{mt.fieldPath}
+		case modifierAddToSet:
+			paths = [][]string{mt.fieldPath}
+		case ModifierChain:
+			if mayExceedPadding(mt) {
+				return true
+			}
+		}
+		for _, path := range paths {
+			for _, seg := range path {
+				// ParseIndexSegment reports an index too large for an int as
+				// n = -1, a negative one too; only the latter starts with '-'.
+				n, ok := anyenc.ParseIndexSegment(seg)
+				if ok && seg[0] != '-' && (n < 0 || n > anyencutil.MaxArrayPadding) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 type modifierSet struct {
 	fieldPath []string
 	val       *anyenc.Value
 }
 
 func (m modifierSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	return m.modify(a, v, false)
+}
+
+func (m modifierSet) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		modified = !anyencutil.Equal(value, m.val)
-		return m.val, nil
+		return stored(a, m.val, copyVal), nil
 	})
 	if err != nil {
 		return nil, false, err
@@ -173,6 +300,10 @@ type modifierPush struct {
 }
 
 func (m modifierPush) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	return m.modify(a, v, false)
+}
+
+func (m modifierPush) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			return nil, nil
@@ -181,7 +312,7 @@ func (m modifierPush) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.V
 		if err != nil {
 			return nil, fmt.Errorf("failed to pop item, %w", err)
 		}
-		value.SetArrayItem(len(arrayOfValues), m.val)
+		value.SetArrayItem(len(arrayOfValues), stored(a, m.val, copyVal))
 		modified = true
 		return value, nil
 	})
@@ -280,6 +411,10 @@ type modifierAddToSet struct {
 }
 
 func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	return m.modify(a, v, false)
+}
+
+func (m modifierAddToSet) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			value = a.NewArray()
@@ -288,7 +423,7 @@ func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anye
 		if err != nil {
 			return nil, fmt.Errorf("failed to pop item, %w", err)
 		}
-		modified = m.addElements(value, m.val)
+		modified = m.addElements(a, value, copyVal)
 		return value, nil
 	})
 	if err != nil {
@@ -298,13 +433,13 @@ func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anye
 	return
 }
 
-func (m modifierAddToSet) addElements(value *anyenc.Value, addElem *anyenc.Value) bool {
+func (m modifierAddToSet) addElements(a *anyenc.Arena, value *anyenc.Value, copyVal bool) bool {
 	arrayOfValues := value.GetArray()
 	if slices.ContainsFunc(arrayOfValues, func(val *anyenc.Value) bool {
-		return anyencutil.Equal(addElem, val)
+		return anyencutil.Equal(m.val, val)
 	}) {
 		return false
 	}
-	value.SetArrayItem(len(arrayOfValues), addElem)
+	value.SetArrayItem(len(arrayOfValues), stored(a, m.val, copyVal))
 	return true
 }

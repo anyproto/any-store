@@ -2,10 +2,15 @@ package aggregate
 
 import (
 	"fmt"
+	"math"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 func TestSortStage(t *testing.T) {
@@ -142,4 +147,286 @@ func TestSortTopK(t *testing.T) {
 			"a stage between sort and limit blocks folding")
 		assert.Equal(t, 0, foldTopK(nil))
 	})
+}
+
+// runSortStage drains a SortStage over rows and returns the emitted "id"
+// fields, the first error, and the closed stage.
+func runSortStage(t *testing.T, topK int, rows ...string) ([]string, error, *SortStage) {
+	t.Helper()
+	spec := MustParsePipeline(`[{"$sort": {"v": 1}}]`)[0].(SortSpec)
+	st := &SortStage{Src: newSliceSource(rows...), Spec: spec, TopK: topK}
+	defer st.Close()
+	ctx := newTestCtx()
+	var ids []string
+	for {
+		v, err := st.Next(ctx)
+		if err != nil {
+			return ids, err, st
+		}
+		if v == nil {
+			return ids, nil, st
+		}
+		ids = append(ids, v.GetString("id"))
+	}
+}
+
+// setSortArenaLimit lowers the arena limit for one test.
+func setSortArenaLimit(t *testing.T, n int) {
+	old := sortArenaLimit
+	sortArenaLimit = uint64(n)
+	t.Cleanup(func() { sortArenaLimit = old })
+}
+
+// The $sort stage applies its 32-bit arena limit as qplanner.SortIter does:
+// to the rows it keeps, when it keeps them. A top-K loser is no error, a
+// winner whose tail does not fit is kept after packing, and only rows that do
+// not fit even packed are an error. Close releases the arena.
+func TestSortStage_ArenaLimitAppliesOnAdmission(t *testing.T) {
+	spec := MustParsePipeline(`[{"$sort": {"v": 1}}]`)[0].(SortSpec)
+	rowLen := func(j string, topK bool) int {
+		v := anyenc.MustParseJson(j)
+		n := len(spec.Sort.AppendKey(nil, v)) + len(v.MarshalTo(nil))
+		if topK {
+			n += 4 // the sequence number
+		}
+		return n
+	}
+	kept := []string{`{"id":"1","v":"b1"}`, `{"id":"2","v":"b2"}`, `{"id":"3","v":"b3"}`, `{"id":"4","v":"b4"}`}
+	loser := `{"id":"9","v":"c-loses-to-every-kept-row"}`
+	winner := `{"id":"0x","v":"a0"}` // one byte longer than a kept row
+	e := rowLen(kept[0], true)
+	require.Equal(t, e+1, rowLen(winner, true))
+
+	t.Run("a loser past the limit", func(t *testing.T) {
+		setSortArenaLimit(t, 4*e)
+		ids, err, _ := runSortStage(t, 4, append(slices.Clone(kept), loser)...)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"1", "2", "3", "4"}, ids)
+	})
+	t.Run("a winner whose tail is past the limit", func(t *testing.T) {
+		setSortArenaLimit(t, 4*e+1)
+		ids, err, _ := runSortStage(t, 4, append(slices.Clone(kept), winner, loser)...)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"0x", "1", "2", "3"}, ids)
+	})
+	t.Run("a winner that does not fit even packed", func(t *testing.T) {
+		setSortArenaLimit(t, 4*e)
+		_, err, st := runSortStage(t, 4, append(slices.Clone(kept), winner)...)
+		require.ErrorIs(t, err, errSortTooLarge)
+		assert.Nil(t, st.arena, "Close releases the arena")
+	})
+	t.Run("full sort at and past the limit", func(t *testing.T) {
+		full := 0
+		for _, r := range kept {
+			full += rowLen(r, false)
+		}
+		setSortArenaLimit(t, full)
+		ids, err, _ := runSortStage(t, 0, kept...)
+		require.NoError(t, err)
+		assert.Len(t, ids, 4)
+		setSortArenaLimit(t, full-1)
+		_, err, st := runSortStage(t, 0, kept...)
+		require.ErrorIs(t, err, errSortTooLarge)
+		assert.Nil(t, st.arena, "Close releases the arena")
+	})
+}
+
+// The compaction guard does not double liveBytes, which overflows an int from
+// half its range on.
+func TestSortStage_NeedsCompactDoesNotOverflow(t *testing.T) {
+	assert.False(t, sortNeedsCompact(math.MaxInt/2+1+1<<20, math.MaxInt/2+1))
+	assert.True(t, sortNeedsCompact(3<<16, 1<<16))
+	assert.False(t, sortNeedsCompact(2<<16, 1<<16))
+}
+
+// An error from the source leaves the rows collected so far in place, and the
+// next Next resumes collecting: a $facet feed pauses the chain with
+// errFacetPause after every row it feeds.
+func TestSortStage_ResumesAfterSourceError(t *testing.T) {
+	spec := MustParsePipeline(`[{"$sort": {"v": 1}}]`)[0].(SortSpec)
+	for _, topK := range []int{0, 2} {
+		feed := &facetFeed{}
+		st := &SortStage{Src: feed, Spec: spec, TopK: topK}
+		ctx := newTestCtx()
+		for _, row := range []string{`{"id":"a","v":3}`, `{"id":"b","v":1}`, `{"id":"c","v":2}`} {
+			feed.row = anyenc.MustParseJson(row)
+			_, err := st.Next(ctx)
+			require.ErrorIs(t, err, errFacetPause)
+		}
+		feed.done = true
+		var ids []string
+		for {
+			v, err := st.Next(ctx)
+			require.NoError(t, err)
+			if v == nil {
+				break
+			}
+			ids = append(ids, v.GetString("id"))
+		}
+		want := []string{"b", "c", "a"}
+		if topK > 0 {
+			want = want[:topK]
+		}
+		assert.Equal(t, want, ids, "TopK %d", topK)
+		st.Close()
+	}
+}
+
+// A row that crosses both the MemoryLimit budget and the arena limit is
+// ErrMemoryLimitExceeded, the error callers match: the stage charges the
+// budget for the row before it reports that the row does not fit.
+func TestSortStage_MemoryLimitBeforeArenaLimit(t *testing.T) {
+	spec := MustParsePipeline(`[{"$sort": {"v": 1}}]`)[0].(SortSpec)
+	rowLen := func(j string, topK bool) int {
+		v := anyenc.MustParseJson(j)
+		n := len(spec.Sort.AppendKey(nil, v)) + len(v.MarshalTo(nil))
+		if topK {
+			n += 4 // the sequence number
+		}
+		return n
+	}
+	kept := []string{`{"id":"1","v":"b1"}`, `{"id":"2","v":"b2"}`, `{"id":"3","v":"b3"}`, `{"id":"4","v":"b4"}`}
+	run := func(topK, memLimit int, rows ...string) error {
+		st := &SortStage{Src: newSliceSource(rows...), Spec: spec, TopK: topK}
+		defer st.Close()
+		ctx := newTestCtx()
+		ctx.Mem = NewMemAccount(memLimit)
+		for {
+			v, err := st.Next(ctx)
+			if err != nil || v == nil {
+				return err
+			}
+		}
+	}
+
+	t.Run("full sort", func(t *testing.T) {
+		full := 0
+		for _, r := range kept {
+			full += rowLen(r, false)
+		}
+		setSortArenaLimit(t, full-1)
+		// The fourth row crosses the arena limit, and its charge (the row and
+		// its entry) the budget.
+		err := run(0, full+4*sortEntryOverhead-1, kept...)
+		require.ErrorIs(t, err, ErrMemoryLimitExceeded)
+		require.ErrorIs(t, run(0, full+4*sortEntryOverhead, kept...), errSortTooLarge)
+	})
+	t.Run("a top-K winner that does not fit even packed", func(t *testing.T) {
+		e := rowLen(kept[0], true)
+		winner := `{"id":"0x","v":"a0"}` // one byte longer than a kept row
+		setSortArenaLimit(t, 4*e)
+		// Kept, the four rows charge 4e and four entries. The winner is
+		// charged what keeping it at the tail charges, e+1 and an entry (the
+		// evicted row's e dead bytes are not more than the live ones, so the
+		// compaction guard would not run), before it is found not to fit
+		// even packed.
+		used := 5*e + 5*sortEntryOverhead + 1
+		err := run(4, used-1, append(slices.Clone(kept), winner)...)
+		require.ErrorIs(t, err, ErrMemoryLimitExceeded)
+		require.ErrorIs(t, run(4, used, append(slices.Clone(kept), winner)...), errSortTooLarge)
+	})
+}
+
+// A top-K winner that does not fit at the arena's tail but fits packed is
+// kept, and charged for the packed arena: two successive winners, each
+// replacing one of the two rows first kept, are admitted within a budget of
+// the packed rows and their entries. Charged as kept at the tail, the second
+// winner crossed a budget the packed arena fits.
+func TestSortStage_TopKWinnerFitsPacked(t *testing.T) {
+	spec := MustParsePipeline(`[{"$sort": {"v": 1}}]`)[0].(SortSpec)
+	rowLen := func(j string) int {
+		v := anyenc.MustParseJson(j)
+		return len(spec.Sort.AppendKey(nil, v)) + len(v.MarshalTo(nil)) + 4 // the sequence number
+	}
+	// row is a document sorted by v whose row in the arena is size bytes.
+	row := func(v string, size int) string {
+		for n := size; n > 0; n-- {
+			j := fmt.Sprintf(`{"v":%q,"p":%q}`, v, strings.Repeat("x", n))
+			if rowLen(j) == size {
+				return j
+			}
+		}
+		t.Fatalf("no row of %d bytes", size)
+		return ""
+	}
+	const e = 65536
+	rows := []string{row("b1", e), row("b2", e), row("a1", e+1), row("a0", e-2)}
+	setSortArenaLimit(t, 2*e+1)
+	packed := (e + 1) + (e - 2) + 4*sortEntryOverhead
+	for _, tc := range []struct {
+		name     string
+		memLimit int
+		wantErr  error
+	}{
+		{"the packed charge", packed, nil},
+		// The tail charge of the first winner: the two rows, three entries
+		// and the winner. The second one's tail charge crosses it.
+		{"the first winner's tail charge", 3*e + 3*sortEntryOverhead + 1, nil},
+		{"one byte less than the packed charge", packed - 1, ErrMemoryLimitExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &SortStage{Src: newSliceSource(rows...), Spec: spec, TopK: 2}
+			defer st.Close()
+			ctx := newTestCtx()
+			ctx.Mem = NewMemAccount(tc.memLimit)
+			var got []string
+			for {
+				v, err := st.Next(ctx)
+				if tc.wantErr != nil {
+					require.ErrorIs(t, err, tc.wantErr)
+					return
+				}
+				require.NoError(t, err)
+				if v == nil {
+					break
+				}
+				got = append(got, string(v.GetStringBytes("v")))
+			}
+			assert.Equal(t, []string{"a0", "a1"}, got)
+			assert.Equal(t, packed, ctx.Mem.Used())
+		})
+	}
+}
+
+// A top-K winner that does not fit even packed is refused before the live
+// entries are packed, whichever error it returns: after the error the kept
+// rows are still at their offsets, at full length, and the winner at the
+// tail. The evicted root is the first row in the arena, so packing would move
+// every other row.
+func TestSortStage_RejectedWinnerPacksNothing(t *testing.T) {
+	spec := MustParsePipeline(`[{"$sort": {"v": 1}}]`)[0].(SortSpec)
+	rowLen := func(j string) int {
+		v := anyenc.MustParseJson(j)
+		return len(spec.Sort.AppendKey(nil, v)) + len(v.MarshalTo(nil)) + 4 // the sequence number
+	}
+	// b4 sorts last: it is the heap's root, at offset 0.
+	kept := []string{`{"id":"4","v":"b4"}`, `{"id":"1","v":"b1"}`, `{"id":"2","v":"b2"}`, `{"id":"3","v":"b3"}`}
+	winner := `{"id":"0x","v":"a0"}`
+	e := rowLen(kept[0])
+	require.Equal(t, e+1, rowLen(winner))
+	setSortArenaLimit(t, 4*e)
+	for _, tc := range []struct {
+		name     string
+		memLimit int
+		wantErr  error
+	}{
+		// The budget is the kept rows' charge, so the winner's crosses it.
+		{"the budget", 4*e + 4*sortEntryOverhead, ErrMemoryLimitExceeded},
+		{"the arena limit", DefaultMemoryLimit, errSortTooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &SortStage{Src: newSliceSource(append(slices.Clone(kept), winner)...), Spec: spec, TopK: 4}
+			defer st.Close()
+			ctx := newTestCtx()
+			ctx.Mem = NewMemAccount(tc.memLimit)
+			_, err := st.Next(ctx)
+			require.ErrorIs(t, err, tc.wantErr)
+			assert.Equal(t, 5*e+1, len(st.arena))
+			rows := map[int]int{}
+			for _, en := range st.entries {
+				rows[int(en.off)] = int(en.keyLen + en.docLen)
+			}
+			assert.Equal(t, map[int]int{0: e, e: e, 2 * e: e, 3 * e: e}, rows)
+		})
+	}
 }

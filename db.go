@@ -1624,6 +1624,19 @@ func (db *db) usable(tx ReadTx) error {
 	return nil
 }
 
+// ctxTxUsable is usable for the transaction ctx carries, a read one too; nil
+// when ctx carries none.
+func (db *db) ctxTxUsable(ctx context.Context) error {
+	v := ctx.Value(ctxKeyTx)
+	if h, ok := v.(heldTx); ok {
+		v = h.ReadTx
+	}
+	if tx, ok := v.(ReadTx); ok {
+		return db.usable(tx)
+	}
+	return nil
+}
+
 // enterCtxTx begins this call on the transaction ctx carries: tx is that
 // transaction, nil when ctx carries none; entered is the transaction to
 // exit when this call ends, nil when an enclosing call holds it. The

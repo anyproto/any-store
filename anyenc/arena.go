@@ -1,6 +1,8 @@
 package anyenc
 
 import (
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/valyala/fastjson"
@@ -168,6 +170,48 @@ func (a *Arena) NewBool(v bool) *Value {
 		return valueTrue
 	}
 	return valueFalse
+}
+
+// Copy returns a deep copy of v, allocated in a, so v may come from a parser
+// or arena that is reused afterwards. Every value is copied as it is, a key
+// "\x1f" or a -0 number included, and nesting has no depth limit; an
+// object's entries are copied in order without Set's search for an existing
+// key, so the copy takes time linear in the size of v. A true, false or null
+// copies to the shared value NewTrue, NewFalse or NewNull returns. A nil v
+// returns nil.
+//
+// The returned value is valid until Reset is called on a.
+func (a *Arena) Copy(v *Value) *Value {
+	if v == nil {
+		return nil
+	}
+	switch v.t {
+	case TypeNull:
+		return valueNull
+	case TypeTrue:
+		return valueTrue
+	case TypeFalse:
+		return valueFalse
+	}
+	c := a.c.getValue()
+	c.t = v.t
+	switch v.t {
+	case TypeNumber:
+		c.n = v.n
+	case TypeArray:
+		c.a = slices.Grow(c.a[:0], len(v.a))
+		for _, el := range v.a {
+			c.a = append(c.a, a.Copy(el))
+		}
+	case TypeObject:
+		c.o.kvs = slices.Grow(c.o.kvs[:0], len(v.o.kvs))
+		for _, kv := range v.o.kvs {
+			c.o.kvs = append(c.o.kvs, keyValue{key: strings.Clone(kv.key), value: a.Copy(kv.value)})
+		}
+	default:
+		c.v = append(c.v[:0], v.v...)
+	}
+	return c
 }
 
 // NewFromFastJson creates Value from passed fastjson.Value

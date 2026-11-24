@@ -468,6 +468,38 @@ func TestCollQuery_Update(t *testing.T) {
 	assert.Equal(t, `{"id":2,"a":2,"b":1}`, doc.Value().String())
 }
 
+// The id list of a bulk write stores each id after its length as a uvarint.
+// An encoded string id is 2 bytes longer than the string (type byte and
+// terminator), so these ids are 3, 127, 128, 16383, 16384 and 20002 bytes:
+// a 1-, 2- and 3-byte length, on both sides of each boundary.
+func TestCollQuery_BulkWriteIdLengths(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	lens := []int{1, 125, 126, 16381, 16382, 20000}
+	ids := make([]string, len(lens))
+	for i, l := range lens {
+		ids[i] = strings.Repeat(string(rune('a'+i)), l)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%q,"a":1}`, ids[i]))))
+	}
+
+	res, err := coll.Find(`{"a":1}`).Update(ctx, `{"$set":{"b":1}}`)
+	require.NoError(t, err)
+	assert.Equal(t, len(ids), res.Modified)
+	for _, id := range ids {
+		doc, err := coll.FindId(ctx, id)
+		require.NoError(t, err, "id of length %d", len(id))
+		assert.Equal(t, 1, doc.Value().GetInt("b"), "id of length %d", len(id))
+	}
+
+	res, err = coll.Find(`{"b":1}`).Delete(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, len(ids), res.Modified)
+	n, err := coll.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n)
+}
+
 func TestCollQuery_Sort(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
@@ -1008,7 +1040,7 @@ func TestQuery_Unsatisfiable_Iter_EmptyIn(t *testing.T) {
 
 // TestQuery_Unsatisfiable_Update_EmptyIn pins that UpdateMany with an
 // empty-$in filter parses the modifier (so a malformed modifier still
-// errors) but then short-circuits to ModifyResult{} with no write tx.
+// errors) but then short-circuits to ModifyResult{}, writing nothing.
 func TestQuery_Unsatisfiable_Update_EmptyIn(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "unsat_update")
@@ -1040,8 +1072,8 @@ func TestQuery_Unsatisfiable_Update_EmptyIn(t *testing.T) {
 }
 
 // TestQuery_Unsatisfiable_Delete_EmptyIn pins that DeleteMany with an
-// empty-$in filter returns a zero ModifyResult without opening a write
-// tx, and leaves the collection contents untouched.
+// empty-$in filter returns a zero ModifyResult and leaves the collection
+// contents untouched.
 func TestQuery_Unsatisfiable_Delete_EmptyIn(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "unsat_delete")
@@ -1452,4 +1484,42 @@ func TestCoverLookup_CorruptIndexPage(t *testing.T) {
 	doc, err := coll.FindId(ctx, 1500)
 	require.NoError(t, err)
 	assert.Equal(t, "user01500@test.com", doc.Value().GetString("email"))
+}
+
+// A bulk write whose commit fails wrote nothing: Modified is 0 and Matched
+// still reports the documents it matched, as for a failure inside the loop.
+// Rolling the btree transaction back under the commit makes the commit fail
+// as an I/O error would.
+func TestQuery_BulkWriteFailedCommitReportsNothingModified(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"n":1}`),
+		anyenc.MustParseJson(`{"id":2,"n":2}`),
+	))
+	failCommit := func() {
+		testHookBeforeBtreeCommit = func(btx *btree.WriteTx) { require.NoError(t, btx.Rollback()) }
+	}
+	t.Cleanup(func() { testHookBeforeBtreeCommit = nil })
+
+	failCommit()
+	res, err := coll.Find(nil).Update(ctx, `{"$inc":{"n":10}}`)
+	testHookBeforeBtreeCommit = nil
+	require.ErrorIs(t, err, btree.ErrTxClosed)
+	assert.Equal(t, 2, res.Matched, "Update")
+	assert.Equal(t, 0, res.Modified, "Update")
+
+	failCommit()
+	res, err = coll.Find(nil).Delete(ctx)
+	testHookBeforeBtreeCommit = nil
+	require.ErrorIs(t, err, btree.ErrTxClosed)
+	assert.Equal(t, 2, res.Matched, "Delete")
+	assert.Equal(t, 0, res.Modified, "Delete")
+
+	for id, want := range map[int]int{1: 1, 2: 2} {
+		doc, err := coll.FindId(ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, want, doc.Value().GetInt("n"))
+	}
 }

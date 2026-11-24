@@ -454,8 +454,11 @@ sentinel error:
 | `$push`/`$addToSet` length | 10 000 | `AccumArrayLimit(n)` | `ErrAccumArrayLimitExceeded` |
 | Retained bytes (blocking stages + the `$merge`/`$out` result buffer) | 256 MiB | `MemoryLimit(n)` | `ErrAggMemoryLimitExceeded` |
 
-Negative values mean unlimited. There is no spill-to-disk: a pipeline that
-needs more than the budget should filter earlier or raise the limit
+Negative values mean unlimited, with one bound that holds whatever the
+budget: the rows one in-pipeline `$sort` keeps must fit in 4 GiB, and past
+that the sort returns an error (a row that also crosses `MemoryLimit`
+returns `ErrAggMemoryLimitExceeded`). There is no spill-to-disk: a pipeline
+that needs more than the budget should filter earlier or raise the limit
 explicitly.
 
 ```go

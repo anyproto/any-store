@@ -49,6 +49,15 @@ func MustParseModifier(modifier any) Modifier {
 
 // ParseModifier parses an update modifier document. Rejections are reported
 // as *ParseError with Source "modifier"; see ParseError.
+//
+// Modify returns the modified document as its result; read that, not the
+// document passed in. A modifier with a path segment that names an array
+// index past the padding limit (anyencutil.MaxArrayPadding) is applied once to
+// a copy of the document, and the copy is the result: the document passed in
+// is left as it was, whether the modifier succeeds or Modify returns an error.
+// Such a modifier stores copies of its operands, so applying it does not
+// change them. Any other modifier changes the document passed in and returns
+// it, and its $set, $push and $addToSet store their operands themselves.
 func ParseModifier(modifier any) (Modifier, error) {
 	if m, ok := modifier.(Modifier); ok {
 		return m, nil
@@ -61,6 +70,9 @@ func ParseModifier(modifier any) (Modifier, error) {
 	m, err := parseModRoot(v)
 	if err != nil {
 		return nil, withSource(err, "modifier")
+	}
+	if chain, ok := m.(ModifierChain); ok && mayExceedPadding(chain) {
+		return paddingStaged{ModifierChain: ownOperands(chain)}, nil
 	}
 	return m, nil
 }

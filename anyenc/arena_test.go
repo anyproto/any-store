@@ -1,6 +1,7 @@
 package anyenc
 
 import (
+	"math"
 	"sync"
 	"testing"
 
@@ -98,4 +99,87 @@ func TestArena_ApproxSize(t *testing.T) {
 		"ApproxSize must strictly grow after allocating a non-empty value")
 	assert.GreaterOrEqual(t, after-emptySize, 11,
 		"delta must cover at least the 11 payload bytes of 'hello world'")
+}
+
+// Copy keeps every value as it is in memory, and a change to its source's
+// keys and payloads does not reach the copy, including what an encode and
+// parse would change or refuse: a key "\x1f" (encoded like the empty key), a
+// -0 number (encoded as +0) and nesting past the parser's depth limit.
+func TestArena_Copy(t *testing.T) {
+	src := &Arena{}
+	v := testObject(src)
+	v.Set("\x1f", src.NewString("wart"))
+	v.Set("negzero", src.NewNumberFloat64(math.Copysign(0, -1)))
+	v.Set("vec", src.NewVectorF32([]float32{1, 2.5}))
+	v.Set("oid", src.NewObjectID(NewObjectID()))
+	v.Set("dt", src.NewDateTimeMillis(1_700_000_000_000))
+	v.Set("t", src.NewTrue())
+	v.Set("f", src.NewFalse())
+	v.Set("null", src.NewNull())
+	deep := src.NewArray()
+	for cur, i := deep, 0; i < 2*maxParseDepth; i++ {
+		next := src.NewArray()
+		cur.SetArrayItem(0, next)
+		cur = next
+	}
+	v.Set("deep", deep)
+	want := v.String()
+
+	a := &Arena{}
+	c := a.Copy(v)
+	assert.Equal(t, want, c.String())
+	assert.Equal(t, "wart", c.GetString("\x1f"))
+	assert.True(t, math.Signbit(c.GetFloat64("negzero")))
+	assert.Nil(t, a.Copy(nil))
+
+	// The copy and the source are independent both ways.
+	c.Set("s", a.NewString("changed"))
+	c.GetArray("a")[0] = a.NewNumberInt(9)
+	c.Del("i")
+	assert.Equal(t, want, v.String())
+	src.Reset()
+	testObject(src)
+	assert.Equal(t, "changed", c.GetString("s"))
+	assert.Equal(t, 9, c.GetInt("a", "0"))
+	assert.Equal(t, "wart", c.GetString("\x1f"))
+
+	// The keys of a value ParseOwned returns are in the bytes it was given,
+	// and its string and binary payloads in the parser's values; the copy
+	// shares neither, so it outlives a change to both.
+	buf := testObject(src).MarshalTo(nil)
+	var p Parser
+	pv, err := p.ParseOwned(buf)
+	assert.NoError(t, err)
+	parsed := pv.String()
+	pc := a.Copy(pv)
+	for _, k := range []string{"s", "b"} {
+		payload := pv.Get(k).v
+		assert.NotEmpty(t, payload, k)
+		for i := range payload {
+			payload[i] = 'X'
+		}
+	}
+	for i := range buf {
+		buf[i] = 'X'
+	}
+	assert.Equal(t, parsed, pc.String())
+}
+
+// A true, false or null in storage the caller owns copies to a value of the
+// arena's, so a later change to that storage does not reach the copy.
+func TestArena_CopyScalarTheCallerOwns(t *testing.T) {
+	a := &Arena{}
+	for _, tc := range []struct {
+		from, to *Value
+	}{
+		{a.NewTrue(), a.NewFalse()},
+		{a.NewFalse(), a.NewNull()},
+		{a.NewNull(), a.NewTrue()},
+	} {
+		v := *tc.from
+		c := a.Copy(&v)
+		v = *tc.to
+		assert.Equal(t, tc.from.Type(), c.Type())
+		assert.NotSame(t, &v, c)
+	}
 }

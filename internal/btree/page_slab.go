@@ -17,6 +17,7 @@ package btree
 // which dispatch to the appropriate mode.
 
 import (
+	"math"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -76,9 +77,22 @@ func resetPageBufferPool() {
 }
 
 // allocPageBuffer returns a page-sized buffer. useSlab is a local bool
-// resolved once at pcache/pager creation time — no global reads on hot path.
+// resolved once at open (btree.Open): true only when the database opted in
+// and the slab serves its page size.
+//
+// The slab serves a request only when the request is for the slab's own slot
+// size; any other size takes the default allocator, at the requested size.
+// This is the per-request guard of pcache1Alloc (pcache1.c:344,
+// `if( nByte<=pcache1.szSlot )`, else sqlite3Malloc(nByte) at 361): a slab
+// configured for another page size, or with no slots, is never the source of a
+// wrong-sized page. Go asks for equality where C asks for "fits": C compares
+// the whole allocation, page plus header and extra bytes (szAlloc,
+// pcache1.c:787), with a slot it addresses by pointer, so any slot at least
+// that large serves; a Go page buffer is a slice whose length is the page
+// size, and a larger slot would have to be cut down on Get and restored on Put.
+// DRIFT: the slab serves a request of exactly its slot size, C one that fits See docs/btree/NOTES.md#drift-2026-06-25-22-slab-get-has-no-per-request-size-guard-and-its-initialized-pagesize-va
 func allocPageBuffer(pageSize int, useSlab bool) []byte {
-	if useSlab {
+	if useSlab && globalPageSlab.serves(pageSize) {
 		return globalPageSlab.Get()
 	}
 	if buf, ok := pageBufferPool.Get().([]byte); ok {
@@ -87,7 +101,10 @@ func allocPageBuffer(pageSize int, useSlab bool) []byte {
 	return make([]byte, pageSize)
 }
 
-// freePageBuffer returns a buffer to the slab or sync.Pool.
+// freePageBuffer returns a buffer to the slab or sync.Pool. In slab mode a
+// buffer that did not come out of the slab (an overflow buffer, or every
+// buffer when the slab does not serve this page size) goes to the sync.Pool:
+// pageSlab.Put keeps only slices of its own backing array.
 //
 // BEGIN ENCRYPTION
 // Note: pageBufferPool stores []byte directly, which causes a 24-byte eface
@@ -108,9 +125,35 @@ func freePageBuffer(buf []byte, useSlab bool) {
 	pageBufferPool.Put(buf)
 }
 
+// serves reports whether the slab hands out buffers of pageSize bytes. False
+// for an empty slab (pageSize 0). s.pageSize is immutable once the slab is
+// initialized, which btree.Open checks before it resolves useSlab.
+func (s *pageSlab) serves(pageSize int) bool {
+	return s.pageSize != 0 && pageSize == s.pageSize
+}
+
+// slabUsable reports whether Init allocates slots for these arguments: a slot
+// of at least MinPageSize bytes, at least one of them, a slot of at most
+// MaxPageSize bytes, and a slab whose byte size an int can hold. The first
+// two are SQLite's rule, sqlite3MallocInit's `szPage<512 || nPage<=0`
+// (malloc.c:165-168), which clears the configured buffer; the last two are
+// Go's, since Go allocates the slab where C is handed one: a larger slot
+// serves no database (allocPageBuffer serves only a page of the slot's
+// size), and a slab past an int cannot be allocated. A slot is larger than a
+// slice header, so the free list's size fits whenever the slab's does.
+// DRIFT: Go-only slab bounds, a slot above MaxPageSize and a slab past an int See docs/btree/NOTES.md#drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl
+func slabUsable(pageSize, nPages int) bool {
+	return pageSize >= MinPageSize && pageSize <= MaxPageSize && nPages > 0 && nPages <= math.MaxInt/pageSize
+}
+
 // Init allocates one nPages*pageSize buffer and fills the free list with its
-// page slices. If already initialized, this is a no-op.
-// Matches sqlite3PCacheBufferSetup (pcache1.c:271-291).
+// page slices. If already initialized, this is a no-op: the first call's
+// arguments stay, whatever a later call passes.
+// Matches sqlite3PCacheBufferSetup (pcache1.c:271-291). Arguments slabUsable
+// rejects leave an initialized slab with no slots and slot size 0, as SQLite
+// leaves a configuration sqlite3MallocInit cleared (pPage = 0, szPage = 0):
+// sqlite3PCacheBufferSetup then sets no slots (pcache1.c:274-275), and every
+// allocation takes the default allocator.
 // DRIFT: pageSlab.Init/ConfigPageCache idempotent & no-disable vs C re-configurable setup See docs/btree/NOTES.md#drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl
 func (s *pageSlab) Init(pageSize, nPages int) {
 	if s.initialized.Load() {
@@ -120,6 +163,9 @@ func (s *pageSlab) Init(pageSize, nPages int) {
 	defer s.mu.Unlock()
 	if s.initialized.Load() {
 		return
+	}
+	if !slabUsable(pageSize, nPages) {
+		pageSize, nPages = 0, 0
 	}
 	s.pageSize = pageSize
 	s.nSlab = nPages
@@ -247,6 +293,15 @@ func (s *pageSlab) Reset() {
 // ConfigPageCache initializes the global page slab with the given page size
 // and number of pages. This mirrors sqlite3_config(SQLITE_CONFIG_PAGECACHE).
 // Must be called before opening any databases.
+//
+// pageSize must be the page size of the databases that opt in. A database of
+// another page size opens and runs as if it had not opted in: Open resolves
+// its useSlab to false, and allocPageBuffer would refuse it the slab anyway
+// (pcache1Alloc's fallback). So does every database when the arguments leave
+// no slots: a pageSize below MinPageSize or an nPages below 1, as
+// sqlite3MallocInit clears such a configuration (malloc.c:165-168), or a slab
+// too large for an int to describe. The first call configures the slab for
+// the life of the process; later calls are no-ops.
 //
 // By default (without calling this and setting UsePageSlab), page buffers are
 // allocated via sync.Pool (like SQLite's default malloc mode). Calling this

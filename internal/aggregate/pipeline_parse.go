@@ -374,7 +374,17 @@ func parseMatch(v *anyenc.Value) (StageSpec, error) {
 		// and ParsePipeline prefix "$match" and the stage index onto it.
 		return nil, err
 	}
-	return MatchSpec{Filter: f}, nil
+	return MatchSpec{Filter: noMatchAll(f)}, nil
+}
+
+// noMatchAll maps the match-all filter of an empty $match object to nil,
+// MatchSpec's "no filter": the stage then adds no predicate to the pushed-down
+// query and no per-document check to the pipeline.
+func noMatchAll(f query.Filter) query.Filter {
+	if _, ok := f.(query.All); ok {
+		return nil
+	}
+	return f
 }
 
 // filterHasExpr reports whether a filter object carries "$expr" at a filter
@@ -426,6 +436,7 @@ func splitMatchExpr(v *anyenc.Value) (StageSpec, error) {
 		if spec.Filter, err = query.ParseCondition(rest); err != nil {
 			return nil, remapAndPath(err, remap)
 		}
+		spec.Filter = noMatchAll(spec.Filter)
 	}
 	return spec, nil
 }

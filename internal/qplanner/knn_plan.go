@@ -384,11 +384,23 @@ func (it *VectorScoreIter) init() error {
 				root = &it.kept[0]
 			}
 			it.keptBytes += len(docId) - int(root.ln)
+			if !fitsSortArena(len(it.arena) + len(docId)) {
+				// Past the 32-bit offsets: pack the kept ids, the evicted
+				// one's bytes now dead, before appending.
+				root.ln = 0
+				it.compact()
+				if !fitsSortArena(len(it.arena) + len(docId)) {
+					return errRankedTooLarge
+				}
+			}
 			nc := scoredVecCand{off: uint32(len(it.arena)), ln: uint32(len(docId)), dist: dist}
 			it.arena = append(it.arena, docId...)
 			it.kept[0] = nc
 			it.siftDown(0)
 			continue
+		}
+		if !fitsSortArena(len(it.arena) + len(docId)) {
+			return errRankedTooLarge
 		}
 		nc := scoredVecCand{off: uint32(len(it.arena)), ln: uint32(len(docId)), dist: dist}
 		it.arena = append(it.arena, docId...)

@@ -1,6 +1,7 @@
 package test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -233,4 +234,353 @@ func testFile(t *testing.T, filename string) {
 		})
 	}
 
+}
+
+// emptyLogicalColl holds five documents {id:i, a:i}, i = 1..5, and a
+// full-text index, so a $text filter is a valid source next to the logical
+// operators under test.
+func emptyLogicalColl(t *testing.T) anystore.Collection {
+	_, coll := ftsTestColl(t, "body")
+	for i := 1; i <= 5; i++ {
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"body":"hello world"}`, i, i))))
+	}
+	return coll
+}
+
+// An empty object matches every document wherever a filter is expected: as
+// the whole filter and as an element of $and, $or or $nor. Every verb gives
+// the same answer, and none panics.
+func TestQuery_EmptyObjectInLogicalOperator(t *testing.T) {
+	for _, tc := range []struct {
+		filter string
+		want   int
+	}{
+		{`{}`, 5},
+		{`{"$or":[{},{"a":1}]}`, 5},
+		{`{"$and":[{},{"a":1}]}`, 1},
+		{`{"$nor":[{}]}`, 0},
+		{`{"$nor":[{},{"a":1}]}`, 0},
+		{`{"$or":[{}]}`, 5},
+		{`{"$and":[{}]}`, 5},
+		{`{"$or":[{"$and":[{}]},{"a":5}]}`, 5},
+		{`{"$text":{"$search":"hello"},"$and":[{}]}`, 5},
+	} {
+		t.Run(tc.filter, func(t *testing.T) {
+			coll := emptyLogicalColl(t)
+
+			n, err := coll.Find(tc.filter).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, n, "Count")
+
+			assert.Len(t, writeOrderIterIds(t, coll.Find(tc.filter)), tc.want, "Iter")
+
+			n, err = coll.Aggregate(fmt.Sprintf(`[{"$match":%s}]`, tc.filter)).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, n, "Aggregate $match")
+
+			res, err := coll.Find(tc.filter).Update(ctx, `{"$set":{"touched":true}}`)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, res.Modified, "Update")
+			assertQueryCount(t, coll.Find(`{"touched":true}`), tc.want)
+
+			res, err = coll.Find(tc.filter).Delete(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, res.Modified, "Delete")
+			assertQueryCount(t, coll.Find(nil), 5-tc.want)
+		})
+	}
+}
+
+// A Go-built query.And with no children is a filter, not JSON: it never meets
+// the parser's empty-array rule and matches every document, alone or nested.
+// Callers build one when no field of their own filter is set.
+func TestQuery_GoEmptyAndMatchesAll(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		filter query.Filter
+		want   int
+	}{
+		{"And{}", query.And{}, 5},
+		{"And{And{}}", query.And{query.And{}}, 5},
+		{"And{And{}, a=1}", query.And{query.And{}, query.MustParseCondition(`{"a":1}`)}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coll := emptyLogicalColl(t)
+
+			n, err := coll.Find(tc.filter).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, n, "Count")
+
+			assert.Len(t, writeOrderIterIds(t, coll.Find(tc.filter)), tc.want, "Iter")
+
+			res, err := coll.Find(tc.filter).Update(ctx, `{"$set":{"touched":true}}`)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, res.Modified, "Update")
+			assertQueryCount(t, coll.Find(`{"touched":true}`), tc.want)
+
+			res, err = coll.Find(tc.filter).Delete(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, res.Modified, "Delete")
+			assertQueryCount(t, coll.Find(nil), 5-tc.want)
+		})
+	}
+}
+
+// A path condition that matches every value keeps its path when it is
+// rendered: {"_distance":{"$nin":[]}} without a $knn is an error, and so is
+// its rendering, which a Delete must not run as {}.
+func TestQuery_MatchAllPathRenderingKeepsValidation(t *testing.T) {
+	coll := emptyLogicalColl(t)
+	f, err := query.ParseCondition(`{"_distance":{"$nin":[]}}`)
+	require.NoError(t, err)
+	for _, filter := range []any{f, f.String()} {
+		_, err = coll.Find(filter).Delete(ctx)
+		require.ErrorIs(t, err, anystore.ErrDistanceWithoutVector, "%v", filter)
+	}
+	assertQueryCount(t, coll.Find(nil), 5)
+}
+
+// An empty array under $and, $or or $nor is a parse error from every verb,
+// at every level and next to any other key. No verb treats it as "no filter":
+// a Delete or Update with it changes nothing.
+func TestQuery_EmptyLogicalArrayIsParseError(t *testing.T) {
+	for _, filter := range []string{
+		`{"$or":[]}`,
+		`{"$and":[]}`,
+		`{"$nor":[]}`,
+		`{"$and":[],"a":1}`,
+		`{"$or":[],"a":1}`,
+		`{"$nor":[],"a":1}`,
+		`{"$or":[{"$and":[]},{"a":5}]}`,
+		`{"$text":{"$search":"hello"},"$and":[]}`,
+	} {
+		t.Run(filter, func(t *testing.T) {
+			coll := emptyLogicalColl(t)
+			requireParseError := func(verb string, err error) {
+				t.Helper()
+				var pe *query.ParseError
+				require.ErrorAs(t, err, &pe, verb)
+				assert.Contains(t, pe.Reason, "must be a non-empty array", verb)
+			}
+
+			_, err := coll.Find(filter).Count(ctx)
+			requireParseError("Count", err)
+
+			_, err = coll.Find(filter).Iter(ctx)
+			requireParseError("Iter", err)
+
+			_, err = coll.Find(filter).Explain(ctx)
+			requireParseError("Explain", err)
+
+			_, err = coll.Aggregate(fmt.Sprintf(`[{"$match":%s}]`, filter)).Count(ctx)
+			requireParseError("Aggregate $match", err)
+
+			_, err = coll.Find(filter).Update(ctx, `{"$set":{"touched":true}}`)
+			requireParseError("Update", err)
+			assertQueryCount(t, coll.Find(`{"touched":true}`), 0)
+
+			_, err = coll.Find(filter).Delete(ctx)
+			requireParseError("Delete", err)
+			assertQueryCount(t, coll.Find(nil), 5)
+		})
+	}
+}
+
+// {"$all": []} matches no document (MongoDB's rule), alone and in a compound
+// filter, with and without an index on the field: next to the match-all {} a
+// conjunction of no equalities would have let a Delete empty the collection.
+// The verbs and Explain answer a filter that provably matches nothing
+// without planning it; a $match before a $lookup is planned (its
+// transaction must know the iterator), so its count comes from a plan built
+// with each index among the candidates, next to a selective conjunct on the
+// same field too. The test checks the count, not which access path the plan
+// takes.
+func TestQuery_AllWithEmptyArrayMatchesNothing(t *testing.T) {
+	for _, index := range []string{"", "tags", "sparse tags"} {
+		for _, filter := range []string{
+			`{"tags":{"$all":[]}}`,
+			`{"$and":[{},{"tags":{"$all":[]}}]}`,
+			`{"$and":[{"a":{"$gte":1}},{"tags":{"$all":[]}}]}`,
+			`{"$and":[{"tags":"x"},{"tags":{"$all":[]}}]}`,
+			`{"$or":[{"tags":{"$all":[]}},{"a":1}]}`,
+		} {
+			t.Run(index+"/"+filter, func(t *testing.T) {
+				fx := newFixture(t)
+				coll, err := fx.CreateCollection(ctx, "all_empty")
+				require.NoError(t, err)
+				switch index {
+				case "tags":
+					require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}}))
+				case "sparse tags":
+					require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"tags"}, Sparse: true}))
+				}
+				insertJSON(t, coll,
+					`{"id":1,"a":1,"tags":["x","y"]}`,
+					`{"id":2,"a":2,"tags":[]}`,
+					`{"id":3,"a":3,"tags":"x"}`,
+					`{"id":4,"a":4}`,
+				)
+				want := 0
+				if strings.Contains(filter, `"$or"`) {
+					want = 1 // the {"a":1} branch
+				}
+
+				n, err := coll.Find(filter).Count(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, want, n, "Count")
+				assert.Len(t, writeOrderIterIds(t, coll.Find(filter)), want, "Iter")
+				n, err = coll.Aggregate(fmt.Sprintf(`[{"$match":%s}]`, filter)).Count(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, want, n, "Aggregate $match")
+				n, err = coll.Aggregate(fmt.Sprintf(
+					`[{"$match":%s},{"$lookup":{"localField":"id","foreignField":"id","as":"self"}}]`, filter)).Count(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, want, n, "Aggregate $match, $lookup")
+
+				res, err := coll.Find(filter).Update(ctx, `{"$set":{"touched":true}}`)
+				require.NoError(t, err)
+				assert.Equal(t, want, res.Modified, "Update")
+				assertQueryCount(t, coll.Find(`{"touched":true}`), want)
+
+				res, err = coll.Find(filter).Delete(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, want, res.Modified, "Delete")
+				assertQueryCount(t, coll.Find(nil), 4-want)
+			})
+		}
+	}
+}
+
+// A $text that names no usable full-text index is an error from every verb,
+// even when another conjunct makes the filter match nothing: MongoDB looks
+// the text index up when it parses $text, before it folds {"$all":[]} or
+// {"$in":[]} into a filter that matches nothing. An $out after such a $match
+// keeps its destination.
+func TestQuery_TextSourceErrorsBeforeEmptyResult(t *testing.T) {
+	for _, tc := range []struct {
+		name, text string
+		ftsIndex   bool
+		want       error
+	}{
+		{"no full-text index", `{"$search":"hello"}`, false, anystore.ErrNoFulltextIndex},
+		{"unknown field", `{"$search":"hello","$fields":"nope"}`, true, anystore.ErrFulltextUnknownField},
+	} {
+		for _, empty := range []string{`{"$all":[]}`, `{"$in":[]}`} {
+			filter := fmt.Sprintf(`{"$text":%s,"tags":%s}`, tc.text, empty)
+			t.Run(tc.name+"/"+filter, func(t *testing.T) {
+				fx := newFixture(t)
+				coll, err := fx.CreateCollection(ctx, "docs")
+				require.NoError(t, err)
+				if tc.ftsIndex {
+					require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
+						Kind: anystore.IndexKindFulltext, Fields: []string{"body"}}))
+				}
+				insertJSON(t, coll, `{"id":1,"body":"hello world","tags":["x"]}`)
+				dst, err := fx.CreateCollection(ctx, "published")
+				require.NoError(t, err)
+				insertJSON(t, dst, `{"id":"kept"}`)
+
+				_, err = coll.Find(filter).Count(ctx)
+				assert.ErrorIs(t, err, tc.want, "Count")
+				_, err = coll.Find(filter).Iter(ctx)
+				assert.ErrorIs(t, err, tc.want, "Iter")
+				_, err = coll.Find(filter).Explain(ctx)
+				assert.ErrorIs(t, err, tc.want, "Explain")
+				_, err = coll.Find(filter).Update(ctx, `{"$set":{"touched":true}}`)
+				assert.ErrorIs(t, err, tc.want, "Update")
+				_, err = coll.Find(filter).Delete(ctx)
+				assert.ErrorIs(t, err, tc.want, "Delete")
+				_, err = coll.Aggregate(fmt.Sprintf(`[{"$match":%s},{"$out":"published"}]`, filter)).Count(ctx)
+				assert.ErrorIs(t, err, tc.want, "Aggregate $match, $out")
+
+				assertQueryCount(t, coll.Find(nil), 1)
+				assertQueryCount(t, dst.Find(`{"id":"kept"}`), 1)
+			})
+		}
+	}
+}
+
+// A Delete or an Update checks its $text source in its own write transaction
+// and takes no reader slot for it: with ReadConcurrency 1 and the one slot
+// held by the caller's read transaction, the verb returns the source's error
+// instead of waiting for the slot.
+func TestQuery_WriteSourceErrorTakesNoReaderSlot(t *testing.T) {
+	fx := newFixture(t, &anystore.Config{ReadConcurrency: 1})
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1,"body":"hello world","tags":["x"]}`)
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rtx.Commit()) }()
+
+	// One deadline for every call: a verb that waits for the slot ends with
+	// it, and so do the calls after it.
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	for _, filter := range []string{
+		`{"$text":{"$search":"hello"}}`,
+		`{"$text":{"$search":"hello"},"tags":{"$all":[]}}`,
+	} {
+		_, err = coll.Find(filter).Delete(wctx)
+		require.ErrorIs(t, err, anystore.ErrNoFulltextIndex, "Delete %s", filter)
+		_, err = coll.Find(filter).Update(wctx, `{"$set":{"touched":true}}`)
+		require.ErrorIs(t, err, anystore.ErrNoFulltextIndex, "Update %s", filter)
+	}
+}
+
+// A Delete or an Update declares its write before it looks at its filter: in
+// a read transaction it returns ErrTxIsReadOnly even when the filter matches
+// nothing, as a SQLite DELETE or UPDATE begins its write transaction before
+// it evaluates WHERE.
+func TestQuery_WriteVerbInReadTxIsReadOnlyForEmptyFilter(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1,"tags":["x"]}`)
+	for _, filter := range []string{`{"tags":{"$all":[]}}`, `{"tags":{"$in":[]}}`, `{"tags":"x"}`} {
+		t.Run(filter, func(t *testing.T) {
+			rtx, err := fx.ReadTx(ctx)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, rtx.Commit()) }()
+			_, err = coll.Find(filter).Delete(rtx.Context())
+			assert.ErrorIs(t, err, anystore.ErrTxIsReadOnly, "Delete")
+			_, err = coll.Find(filter).Update(rtx.Context(), `{"$set":{"y":1}}`)
+			assert.ErrorIs(t, err, anystore.ErrTxIsReadOnly, "Update")
+		})
+	}
+	assertQueryCount(t, coll.Find(`{"y":1}`), 0)
+	assertQueryCount(t, coll.Find(nil), 1)
+}
+
+// Update and Delete refuse another database's read transaction with
+// ErrTxOtherInstance, and an ended one with ErrTxIsUsed, before they refuse a
+// read transaction as read-only, whatever the filter matches.
+func TestQuery_WriteVerbChecksTxBeforeReadOnly(t *testing.T) {
+	fx := newFixture(t)
+	other := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	insertJSON(t, coll, `{"id":1,"tags":["x"]}`)
+	for _, filter := range []string{`{"tags":{"$in":[]}}`, `{"tags":"x"}`} {
+		t.Run(filter, func(t *testing.T) {
+			foreign, err := other.ReadTx(ctx)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, foreign.Commit()) }()
+			_, err = coll.Find(filter).Delete(foreign.Context())
+			assert.ErrorIs(t, err, anystore.ErrTxOtherInstance, "Delete")
+			_, err = coll.Find(filter).Update(foreign.Context(), `{"$set":{"y":1}}`)
+			assert.ErrorIs(t, err, anystore.ErrTxOtherInstance, "Update")
+
+			ended, err := fx.ReadTx(ctx)
+			require.NoError(t, err)
+			require.NoError(t, ended.Commit())
+			_, err = coll.Find(filter).Delete(ended.Context())
+			assert.ErrorIs(t, err, anystore.ErrTxIsUsed, "Delete")
+			_, err = coll.Find(filter).Update(ended.Context(), `{"$set":{"y":1}}`)
+			assert.ErrorIs(t, err, anystore.ErrTxIsUsed, "Update")
+		})
+	}
+	assertQueryCount(t, coll.Find(`{"y":1}`), 0)
+	assertQueryCount(t, coll.Find(nil), 1)
 }

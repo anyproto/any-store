@@ -1,11 +1,12 @@
 package query
 
 import (
+	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/parser"
@@ -559,16 +560,26 @@ func TestModifierAddToSet_Modify(t *testing.T) {
 
 func BenchmarkModifier(b *testing.B) {
 	bench := func(b *testing.B, query string) {
-		doc := fastjson.MustParse(`{"a":2,"b":[3,2,1],"c":"test"}`)
-		a := &anyenc.Arena{}
-		d, err := parser.Parse(doc)
 		modifier, err := ParseModifier(query)
 		require.NoError(b, err)
+		// Every iteration modifies a document of its own, parsed outside the
+		// timer a batch at a time: a modifier that changes the document it is
+		// given would otherwise give each later iteration a different one.
+		const src = `{"a":2,"b":[3,2,1],"c":"test"}`
+		docs := make([]*anyenc.Value, 1024)
+		a := &anyenc.Arena{}
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
+			if i%len(docs) == 0 {
+				b.StopTimer()
+				for j := range docs {
+					docs[j] = anyenc.MustParseJson(src)
+				}
+				b.StartTimer()
+			}
 			a.Reset()
-			_, _, err := modifier.Modify(a, d)
+			_, _, err := modifier.Modify(a, docs[i%len(docs)])
 			require.NoError(b, err)
 		}
 	}
@@ -606,6 +617,10 @@ func BenchmarkModifier(b *testing.B) {
 	b.Run("add to set", func(b *testing.B) {
 		bench(b, `{"$addToSet":{"b":[1,2,5]}}`)
 	})
+	b.Run("set past the padding limit", func(b *testing.B) {
+		// An object key past the limit: the modifier is staged.
+		bench(b, `{"$set":{"m.1500001":1}}`)
+	})
 }
 
 // $pull with a condition uses query semantics: ordering ops are type-bracketed,
@@ -619,4 +634,178 @@ func TestPullConditionIsTypeBracketed(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, modified)
 	assert.Equal(t, `{"tags":["a",3,true,null]}`, res.String())
+}
+
+// A modifier whose path indexes past the end of an array pads it with nulls,
+// up to MongoDB's limit of 1,500,000 padding elements; past it the modifier
+// returns an error and the document is not changed.
+func TestModifier_ArrayPaddingIsBounded(t *testing.T) {
+	const limit = 1_500_000
+	a := &anyenc.Arena{}
+	for _, tc := range []struct {
+		name, modFmt string
+	}{
+		{"$set", `{"$set":{"arr.%d":1}}`},
+		{"$inc", `{"$inc":{"arr.%d":1}}`},
+		{"$set through an intermediate segment", `{"$set":{"arr.%d.x":1}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// arr has two elements: index 2+limit needs exactly limit nulls.
+			doc := anyenc.MustParseJson(`{"arr":[1,2]}`)
+			res, modified, err := MustParseModifier(fmt.Sprintf(tc.modFmt, 2+limit)).Modify(a, doc)
+			require.NoError(t, err)
+			assert.True(t, modified)
+			assert.Len(t, res.GetArray("arr"), 2+limit+1)
+
+			doc = anyenc.MustParseJson(`{"arr":[1,2]}`)
+			_, modified, err = MustParseModifier(fmt.Sprintf(tc.modFmt, 2+limit+1)).Modify(a, doc)
+			require.ErrorContains(t, err, "can't backfill more than 1500000 elements")
+			assert.False(t, modified)
+			assert.Equal(t, `{"arr":[1,2]}`, doc.String())
+		})
+	}
+}
+
+// A modifier refused by the padding limit leaves the document it was given
+// as it was, whichever of its operations is refused: a $rename whose
+// destination is refused keeps its source, and the operations before the
+// refused one in a chain are not applied either.
+func TestModifier_PaddingRefusalLeavesDocumentUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name, doc, mod string
+	}{
+		{"$rename destination", `{"x":7,"arr":[]}`, `{"$rename":{"x":"arr.1500001"}}`},
+		{"$rename destination, nested", `{"x":7,"o":{"arr":[]}}`, `{"$rename":{"x":"o.arr.1500001.y"}}`},
+		{"$set fields after a change", `{"arr":[1,2]}`, `{"$set":{"a":1,"arr.1500003":1}}`},
+		{"operators after a change", `{"n":1,"arr":[1,2]}`, `{"$inc":{"n":1},"$unset":{"x":""},"$set":{"arr.1500003":1}}`},
+		{"$unset before a refusal", `{"x":1,"arr":[1,2]}`, `{"$unset":{"x":""},"$addToSet":{"arr.1500003":1}}`},
+		{"an index too large for an int", `{"a":0,"arr":[1,2]}`, `{"$set":{"a":1,"arr.99999999999999999999":1}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := anyenc.MustParseJson(tc.doc)
+			res, modified, err := MustParseModifier(tc.mod).Modify(&anyenc.Arena{}, doc)
+			require.Error(t, err)
+			assert.Nil(t, res)
+			assert.False(t, modified)
+			assert.Equal(t, anyenc.MustParseJson(tc.doc).String(), doc.String())
+		})
+	}
+}
+
+// A modifier that could be refused but is not runs once, on a copy of the
+// document it was given: the copy is the result and the document is
+// unchanged. A counting operation added to the staged chain is called once.
+func TestModifier_PaddingStagedAppliesOnce(t *testing.T) {
+	const src = `{"x":7,"arr":[1,2]}`
+	doc := anyenc.MustParseJson(src)
+	staged, ok := MustParseModifier(`{"$set":{"o":{"n":1},"arr.1500002":true},"$inc":{"o.n":1},"$rename":{"x":"y"}}`).(paddingStaged)
+	require.True(t, ok)
+	calls := 0
+	staged.ModifierChain = append(slices.Clone(staged.ModifierChain), ModifyFunc(func(_ *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+		calls++
+		return v, false, nil
+	}))
+	res, modified, err := staged.Modify(&anyenc.Arena{}, doc)
+	require.NoError(t, err)
+	assert.Equal(t, 1, calls, "the chain is applied once")
+	assert.True(t, modified)
+	assert.NotSame(t, doc, res, "the result is a copy")
+	assert.Equal(t, anyenc.MustParseJson(src).String(), doc.String(), "the document given is unchanged")
+	assert.Equal(t, 2, res.GetInt("o", "n"))
+	assert.Equal(t, 7, res.GetInt("y"))
+	assert.Nil(t, res.Get("x"))
+	arr := res.GetArray("arr")
+	require.Len(t, arr, 1_500_003)
+	assert.Equal(t, anyenc.TypeTrue, arr[len(arr)-1].Type())
+}
+
+// The copy a staged modifier runs on is the document as it is in memory,
+// not an encode and parse of it: a branch nested deeper than the parser's 512
+// levels does not fail the modifier, and a key "\x1f", which anyenc's
+// encoding reads back as "", keeps its value, so a refusal on a path through
+// it is seen and leaves the document unchanged.
+func TestModifier_PaddingStagedCopiesTheDocumentAsItIs(t *testing.T) {
+	t.Run("a branch deeper than 512 levels", func(t *testing.T) {
+		a := &anyenc.Arena{}
+		deep := a.NewArray()
+		for cur, i := deep, 0; i < 600; i++ {
+			next := a.NewArray()
+			cur.SetArrayItem(0, next)
+			cur = next
+		}
+		doc := a.NewObject()
+		doc.Set("deep", deep)
+		doc.Set("labels", a.NewObject())
+		res, modified, err := MustParseModifier(`{"$set":{"labels.1500001":1}}`).Modify(a, doc)
+		require.NoError(t, err)
+		assert.True(t, modified)
+		assert.Equal(t, 1, res.GetInt("labels", "1500001"))
+		assert.Equal(t, anyenc.TypeArray, res.Get("deep").Type())
+	})
+	t.Run(`a key "\x1f"`, func(t *testing.T) {
+		const src = `{"x":7,"\u001f":[]}`
+		doc := anyenc.MustParseJson(src)
+		require.NotNil(t, doc.Get("\x1f"))
+		res, modified, err := MustParseModifier(`{"$rename":{"x":"\u001f.1500001"}}`).Modify(&anyenc.Arena{}, doc)
+		require.ErrorContains(t, err, "can't backfill more than 1500000 elements")
+		assert.Nil(t, res)
+		assert.False(t, modified)
+		assert.Equal(t, anyenc.MustParseJson(src).String(), doc.String())
+		assert.Equal(t, 7, doc.GetInt("x"))
+	})
+}
+
+// A staged modifier stores copies of its operands. Its own earlier result,
+// passed back in, is left as it was when the modifier is refused: the first
+// application below stores {"n":1} at "o", increments it there, and turns
+// "arr" into an array; on the second, the copy's "o" is a new copy of the
+// operand, so the increment does not reach the earlier result's "o" before
+// the padding refusal. Applying the modifier does not change its operands,
+// so every application to the same document gives the same result.
+func TestModifier_PaddingStagedStoresCopiesOfItsOperands(t *testing.T) {
+	const src = `{"arr":{},"next":[]}`
+	mod := MustParseModifier(`{"$set":{"o":{"n":1}},"$inc":{"o.n":1,"arr.1500001":1},"$rename":{"next":"arr"}}`)
+	first, _, err := mod.Modify(&anyenc.Arena{}, anyenc.MustParseJson(src))
+	require.NoError(t, err)
+	require.Equal(t, 2, first.GetInt("o", "n"))
+	require.Equal(t, anyenc.TypeArray, first.Get("arr").Type())
+	want := first.String()
+
+	res, modified, err := mod.Modify(&anyenc.Arena{}, first)
+	require.ErrorContains(t, err, "can't backfill more than 1500000 elements")
+	assert.Nil(t, res)
+	assert.False(t, modified)
+	assert.Equal(t, want, first.String(), "the earlier result passed back in")
+
+	again, _, err := mod.Modify(&anyenc.Arena{}, anyenc.MustParseJson(src))
+	require.NoError(t, err)
+	assert.Equal(t, want, again.String(), "a later application")
+
+	// $push and $addToSet store copies too.
+	mod = MustParseModifier(`{"$push":{"p":{"n":1}},"$addToSet":{"s":{"n":1}},"$inc":{"p.0.n":1,"s.0.n":1,"m.1500001":1}}`)
+	for range 2 {
+		res, _, err = mod.Modify(&anyenc.Arena{}, anyenc.MustParseJson(`{"p":[],"s":[]}`))
+		require.NoError(t, err)
+		assert.Equal(t, 2, res.GetInt("p", "0", "n"))
+		assert.Equal(t, 2, res.GetInt("s", "0", "n"))
+	}
+}
+
+// Only a modifier with a segment past the padding limit, or too large for an
+// int, takes the staged path; every other modifier runs as the plain chain.
+func TestParseModifier_StagesOnlyPathsPastThePaddingLimit(t *testing.T) {
+	for mod, staged := range map[string]bool{
+		`{"$set":{"a":1,"b.c":2}}`:                                false,
+		`{"$set":{"arr.1500000":1}}`:                              false,
+		`{"$set":{"arr.+5":1,"arr.-1":1,"arr.x":1}}`:              false,
+		`{"$unset":{"arr.1500000.x":""}}`:                         false,
+		`{"$set":{"arr.1500001":1}}`:                              true,
+		`{"$inc":{"o.arr.2147483647.n":1}}`:                       true,
+		`{"$rename":{"x":"arr.1500001"}}`:                         true,
+		`{"$rename":{"arr.1500001":"x"}}`:                         true,
+		`{"$set":{"a":1},"$push":{"arr.99999999999999999999":1}}`: true,
+	} {
+		_, isStaged := MustParseModifier(mod).(paddingStaged)
+		assert.Equal(t, staged, isStaged, mod)
+	}
 }

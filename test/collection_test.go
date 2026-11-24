@@ -3,6 +3,7 @@ package test
 import (
 	"context"
 	"fmt"
+	"math"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -2614,4 +2615,80 @@ func TestDrop_RefusedUnderOpenIterator(t *testing.T) {
 	_, err = fx.OpenCollection(ctx, "d")
 	assert.ErrorIs(t, err, anystore.ErrCollectionNotFound)
 	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// An update whose path indexes far past the end of an array is refused with
+// an error: the array is not padded, the document is not changed, and the
+// database stays usable.
+func TestCollection_Update_ArrayPaddingIsBounded(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"arr":[1,2]}`)))
+
+	// Every index here is a valid int on 32-bit platforms too.
+	for _, mod := range []string{
+		`{"$set":{"arr.1500003":1}}`,
+		`{"$inc":{"arr.1500003":1}}`,
+		`{"$set":{"arr.1500003.x":1}}`,
+		fmt.Sprintf(`{"$set":{"arr.%d":1}}`, math.MaxInt32),
+		fmt.Sprintf(`{"$set":{"arr.%d.x":1}}`, math.MaxInt),
+	} {
+		_, err = coll.UpdateId(ctx, 1, query.MustParseModifier(mod))
+		require.ErrorContains(t, err, "can't backfill more than 1500000 elements", mod)
+
+		_, err = coll.Find(`{"id":1}`).Update(ctx, mod)
+		require.ErrorContains(t, err, "can't backfill more than 1500000 elements", mod)
+	}
+
+	doc, err := coll.FindId(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, `{"id":1,"arr":[1,2]}`, doc.Value().String())
+
+	// A small pad is ordinary.
+	_, err = coll.UpdateId(ctx, 1, query.MustParseModifier(`{"$set":{"arr.4":5}}`))
+	require.NoError(t, err)
+	doc, err = coll.FindId(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, `{"id":1,"arr":[1,2,null,null,5]}`, doc.Value().String())
+}
+
+// A bulk write that fails part way rolls back every document it changed and
+// reports no modified document: it wrote nothing. Matched reports what it
+// matched before the failure, as TestIndex_Maintenance_FindUpdateUniqueConstraintEnforced
+// pins.
+func TestQuery_FailedBulkWriteReportsNothingModified(t *testing.T) {
+	for _, tc := range []struct {
+		name, mod string
+	}{
+		// id 1: "arr" is an object, the numeric key is an ordinary field;
+		// id 2: "arr" is an array, and the index is past the padding limit.
+		{"padding refused on the second document", `{"$set":{"arr.1500001":1}}`},
+		// id 2: "n" is a string.
+		{"$inc on a string in the second document", `{"$inc":{"n":1}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			require.NoError(t, coll.Insert(ctx,
+				anyenc.MustParseJson(`{"id":1,"arr":{},"n":1}`),
+				anyenc.MustParseJson(`{"id":2,"arr":[],"n":"s"}`),
+			))
+
+			res, err := coll.Find(nil).Sort("id").Update(ctx, tc.mod)
+			require.Error(t, err)
+			assert.Equal(t, 1, res.Matched, "the write failed on the second document, after it changed the first")
+			assert.Equal(t, 0, res.Modified)
+
+			for id, want := range map[int]string{
+				1: `{"id":1,"arr":{},"n":1}`,
+				2: `{"id":2,"arr":[],"n":"s"}`,
+			} {
+				doc, err := coll.FindId(ctx, id)
+				require.NoError(t, err)
+				assert.Equal(t, want, doc.Value().String())
+			}
+		})
+	}
 }

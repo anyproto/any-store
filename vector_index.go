@@ -633,10 +633,11 @@ var ErrDistanceWithoutVector = errors.New("any-store: _distance is only availabl
 // NOTE: the result is deliberately NOT memoized across calls. The spec's
 // Search closure captures the resolved *vectorIndex HANDLE, and which handle
 // that is depends on the transaction — a spec detected before the verb's tx
-// opens (validateSources runs pre-tx, ahead of the unsatisfiable()
-// short-circuit) would search a peer-rebuilt index through its dead gen-0
-// namespaces (caught by the multiprocess IVF consistency test). compilePlan
-// re-detects after the tx begins, on the version resolved for it.
+// opens (a read verb's validateSources runs pre-tx, ahead of the
+// unsatisfiable() short-circuit) would search a peer-rebuilt index through
+// its dead gen-0 namespaces (caught by the multiprocess IVF consistency
+// test). compilePlan re-detects after the tx begins, on the version resolved
+// for it.
 func (q *collQuery) detectKnnQuery(s *collSchema) (*qplanner.VectorQuerySpec, query.Filter, error) {
 	if q.cond == nil || !query.ContainsKnn(q.cond) {
 		return nil, q.cond, nil
