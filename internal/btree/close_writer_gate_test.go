@@ -690,7 +690,7 @@ func TestClose_CommitAfterFailedSpillAndClose(t *testing.T) {
 	ns, err := tx.GetNamespace("t")
 	require.NoError(t, err)
 	require.NoError(t, tx.Put(ns, closeRescueKey(1), []byte("x")))
-	db.pager.pagerError()
+	db.pager.pagerError(errors.New("injected commit failure"))
 
 	require.NoError(t, db.Close())
 	require.ErrorIs(t, tx.Commit(), ErrClosed)

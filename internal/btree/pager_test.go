@@ -58,7 +58,7 @@ func TestPagerError(t *testing.T) {
 	p.releasePage(pg)
 
 	// Trigger pagerError
-	p.pagerError()
+	p.pagerError(errors.New("injected commit failure"))
 
 	// State should be back to open (pagerError transitions to open)
 	assert.Equal(t, int32(pagerOpen), p.state.Load())
@@ -9465,4 +9465,42 @@ func TestOpen_EncryptionRefusalsAreSentinels(t *testing.T) {
 	_, err = Open(plainPath, opts)
 	require.ErrorIs(t, err, ErrNotEncrypted)
 	require.NotErrorIs(t, err, ErrCorrupt)
+}
+
+// A cursor of a write transaction whose commit failed reports the commit's
+// error, the one the pager's error state holds (Pager.errCode), not
+// corruption and not a read-only refusal: the database is sound.
+func TestPagerError_CursorReportsTheCommitError(t *testing.T) {
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "a.db"), Options{})
+	require.NoError(t, err)
+	defer db.Close()
+	commitRows(t, db, "t", 8, 16)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.GetNamespace("t")
+	require.NoError(t, err)
+	cur := tx.NewCursor(ns)
+	defer cur.Close()
+	require.NoError(t, cur.First())
+
+	diskFull := errors.New("injected: no space left on device")
+	db.pager.pagerError(diskFull)
+
+	_, err = cur.Key()
+	require.ErrorIs(t, err, diskFull)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, ErrReadOnly)
+	require.Nil(t, db.pager.errCode, "the error state ends with the cleanup")
+	_ = tx.Rollback()
+
+	// The next transaction sees a sound database.
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	rns, err := rtx.GetNamespace("t")
+	require.NoError(t, err)
+	n, err := rtx.Count(rns)
+	require.NoError(t, err)
+	require.EqualValues(t, 8, n)
 }

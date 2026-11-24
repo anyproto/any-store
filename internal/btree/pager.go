@@ -3519,7 +3519,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	if writePage1 {
 		pg1, err := p.getWritablePage(1)
 		if err != nil {
-			p.pagerError()
+			p.pagerError(err)
 			return 0, 0, 0, err
 		}
 		if page1OnChange {
@@ -3563,7 +3563,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 
 	// Write all dirty pages to WAL
 	if err := p.wal.writeFrames(p.dirtyBuf, true, p.dbSize.Load()); err != nil {
-		p.pagerError()
+		p.pagerError(err)
 		return 0, 0, 0, err
 	}
 
@@ -3798,8 +3798,8 @@ func (p *pager) rollbackForClose() {
 	w.endWrite()
 }
 
-// pagerError ends the write transaction after a failed commit: the error
-// state and its cleanup at once. It ensures the WAL
+// pagerError ends the write transaction after a failed commit, whose error
+// is err: the error state and its cleanup at once. It ensures the WAL
 // write lock is released (fix 2.2) so that other connections are not blocked
 // indefinitely. Modeled after SQLite's pager_error() + pager_unlock() which
 // calls sqlite3WalEndWriteTransaction() when in PAGER_ERROR state.
@@ -3815,7 +3815,15 @@ func (p *pager) rollbackForClose() {
 // subsequent transactions (anystore's failed-commit DDL unwind gates itself
 // for exactly this reason; see db.ddlUnwindGate).
 // DRIFT: pagerError eager-cleans a failed commit (purge/WAL-rollback/unlock); C pager_error only sets errCode, defers See docs/btree/NOTES.md#old-drift-pagererror-eager-cleanup
-func (p *pager) pagerError() {
+func (p *pager) pagerError(err error) {
+	// The error that ends the transaction is its error state's
+	// (pager_error stores rc in Pager.errCode, pager.c:1947-1960), unless
+	// a failed spill has set one already: the cursors below are ended
+	// with it, as sqlite3BtreeRollback trips them with its tripCode, and
+	// not with the "read-only" a pager without a writer answers.
+	if p.errCode == nil {
+		p.errCode = err
+	}
 	p.state.Store(int32(pagerError))
 
 	// The transaction's cursors are ended before the cache is purged
