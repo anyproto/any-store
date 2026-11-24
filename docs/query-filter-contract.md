@@ -345,31 +345,47 @@ build per query and carry no such guarantee.
     `{"id":1,"tags":["a"]}`. `$unset`, `$rename`, `$pop`, `$pull` and
     `$pullAll` leave a missing field missing and create no part of a missing
     path: `{"$pull":{"meta.old":"x"},"$set":{"seen":true}}` on `{"id":1}`
-    gives `{"id":1,"seen":true}`, with no `meta`. An array operator (`$push`,
-    `$addToSet`, `$pop`, `$pull`, `$pullAll`) on a field that holds anything
-    else, `null` included, is an error (`$push: field 'tags' must be an
-    array: …`), and `$inc` on a non-number is one too; the update then
-    writes nothing. `$push` and `$addToSet` take one value: MongoDB's
+    gives `{"id":1,"seen":true}`, with no `meta`, and so does a path through
+    an index past an array's end (`items.3.tags` on `{"items":[]}`). A path
+    the document cannot hold, through a field of a scalar or a name in an
+    array (`a.b` on `{"a":1}`, `items.bad.tags` on `{"items":[]}`), is a
+    no-op for `$unset` and an error for `$rename`'s source, `$pop`, `$pull`
+    and `$pullAll`, as in MongoDB (`PathNotViable`). An array operator
+    (`$push`, `$addToSet`, `$pop`, `$pull`, `$pullAll`) on a field that
+    holds anything else, `null` included, is an error (`$push: field 'tags'
+    must be an array: …`), and `$inc` on a non-number is one too; the update
+    then writes nothing. `$push` and `$addToSet` take one value: MongoDB's
     modifiers (`$each`, and for `$push` `$position`, `$slice` and `$sort`)
     are not supported, and an operand object with a key that starts with
     `$` is a parse error, not a value to store. `$set`, `$push` and
-    `$addToSet` store a copy of an object or array operand, as MongoDB
-    copies it into each document: every document an update reaches gets a
-    value of its own, and a later operation of the same modifier that
-    changes it (`{"$push":{"p":{"n":1}},"$inc":{"p.0.n":1}}`) changes that
-    document's copy, never the modifier or the next document. `UpsertId` of
-    an id with no document inserts what the modifier makes of
+    `$addToSet` store a copy of their operand, as MongoDB copies it into
+    each document (a number, a bool, null, an object id or a date, which
+    nothing changes in place, is stored as itself): every document an
+    update reaches gets a value of its own, and a later operation of the
+    same modifier that changes it
+    (`{"$push":{"p":{"n":1}},"$inc":{"p.0.n":1}}`), or a write through the
+    bytes a result's `GetStringBytes`, `GetBytes` or `GetVectorF32` returns,
+    changes that document's copy, never the modifier or the next document.
+    A modifier given as an `*anyenc.Value` is copied when it is parsed, and
+    nests at most 512 levels, the modifier object being the first.
+    `UpsertId` of an id with no document inserts what the modifier makes of
     `{<primary key>: id}`, as MongoDB's upsert inserts the query's equality
     fields with the update applied: `{"id":1,"tags":["a"]}` for the `$push`
-    above, and `{"id":1}` alone for a modifier that changes nothing (a lone
-    `$pull` or `$unset`). A modifier that changes the id fails with
-    `ErrPrimaryKeyModification` there as on an existing document. Pinned by
-    `TestModifierPush_Modify` and its siblings,
+    above, and `{"id":1}` alone for a modifier that reports no change (a
+    lone `$pull` or `$unset`), built from the id whatever such a modifier
+    did to the document it was handed. A modifier that changes the id fails
+    with `ErrPrimaryKeyModification` there as on an existing document.
+    Pinned by `TestModifierPush_Modify` and its siblings,
     `TestModifier_RemovalsCreateNoPath`,
-    `TestParseModifier_PushModifiersRefused` and
-    `TestModifier_ObjectOperandsAreCopied` (query/modifier_test.go), and
+    `TestModifier_RemovalPathViability`,
+    `TestParseModifier_PushModifiersRefused`,
+    `TestModifier_ObjectOperandsAreCopied`,
+    `TestModifier_ByteOperandsAreCopied` and
+    `TestParseModifier_GoValueBoundAndCopied` (query/modifier_test.go), and
     through the collection by `TestCollection_PushMissingField`,
-    `TestCollection_UpsertIdNoOpInsertsId` and
+    `TestCollection_RemovalPathViability`,
+    `TestCollection_UpsertIdNoOpInsertsId`,
+    `TestCollection_UpsertIdUnchangedInsertsId` and
     `TestCollection_UpsertIdKeepsTheId` (test/collection_test.go).
     A numeric path segment sets an array element, padding the array with
     nulls up to it (`{"$set":{"arr.3":1}}` on `{"arr":[]}` gives
@@ -417,5 +433,9 @@ build per query and carry no such guarantee.
     object one level below its wrapper, so 511 is what every stored
     document reads back with. MongoDB refuses documents nested past 100
     levels; JSON input stops at 300 (the parser's limit), so only a value
-    built in Go or a modifier gets near the bound. Pinned by
-    `TestCollection_DocumentDepthBounded` (test/collection_test.go).
+    built in Go or a modifier gets near the bound. A value built in Go that
+    contains itself is refused the same way, before anything walks it to
+    the end: the document a `query.ModifyFunc` returns, and an operand of a
+    modifier given as an `*anyenc.Value` (item 17). Pinned by
+    `TestCollection_DocumentDepthBounded` and
+    `TestCollection_SelfContainingValuesRefused` (test/collection_test.go).

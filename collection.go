@@ -89,8 +89,9 @@ type Collection interface {
 
 	// UpsertId applies mod to the document with the given id, as UpdateId
 	// does, and when there is none inserts what mod makes of the document
-	// {<primary key>: id}, as MongoDB's upsert does: {id} alone when mod
-	// changes nothing. An insert returns Matched 0 and Modified 1. A mod
+	// {<primary key>: id}, as MongoDB's upsert does: {id} alone, built from
+	// id, when mod reports no change, whatever it did to the document it was
+	// handed. An insert returns Matched 0 and Modified 1. A mod
 	// that changes the id fails with ErrPrimaryKeyModification and writes
 	// nothing, as it does for an existing document.
 	// An integer id above 2^53 in magnitude is the nearest float64, which can
@@ -886,14 +887,9 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 		it, loadErr := c.loadById(tx, s, buf, buf.SmallBuf)
 		if loadErr != nil {
 			if errors.Is(loadErr, ErrDocNotFound) {
-				var idVal *anyenc.Value
-				buf.Arena.Reset()
-				modValue = buf.Arena.NewObject()
-				idVal, txErr = buf.Parser.Parse(buf.SmallBuf)
-				if txErr != nil {
+				if modValue, txErr = c.idDoc(buf, buf.SmallBuf); txErr != nil {
 					return false, txErr
 				}
-				modValue.Set(c.primaryKey, idVal)
 				isInsert = true
 			} else {
 				return false, loadErr
@@ -920,16 +916,28 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 			}
 			return c.update(tx, s, newIt, prevItem)
 		}
-		// A new id inserts what the modifier made of {id}, changed or not:
-		// {id} alone when it changes nothing (a lone $pull, $unset or $pop of
-		// a missing field), as MongoDB's upsert inserts the query's equality
-		// fields with the update applied to them.
-		if !modified && newVal == nil {
-			newVal = modValue
+		// A new id inserts what the modifier made of {id}, as MongoDB's
+		// upsert inserts the query's equality fields with the update applied
+		// to them: {id} alone when it changes nothing (a lone $pull, $unset
+		// or $pop of a missing field). That {id} is built again from the id
+		// looked up, not taken from the modifier: a modifier that reports no
+		// change can still have changed the value it was handed or returned
+		// another (a ModifyFunc's edits; $set of an object id with its fields
+		// in another order, which compares equal).
+		if !modified {
+			if newVal, txErr = c.idDoc(buf, buf.SmallBuf); txErr != nil {
+				return false, txErr
+			}
 		}
 		newIt, vErr := c.newItem(newVal)
 		if vErr != nil {
 			return false, vErr
+		}
+		// The depth bound comes before the id is encoded: a modifier's result
+		// can nest without bound, or contain itself, and encoding it would
+		// recurse until the stack ran out.
+		if txErr = checkDocDepth(newVal); txErr != nil {
+			return false, txErr
 		}
 		// The id is immutable on this branch too, as update checks for an
 		// existing document: a modifier that changed it ($push into a field
@@ -946,6 +954,21 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 		return ModifyResult{}, err
 	}
 	return
+}
+
+// idDoc returns the document {<primary key>: id} for the encoded id key,
+// built in buf's arena with its parser, both reset: what UpsertId of an id
+// with no document hands its modifier, and inserts when the modifier changes
+// nothing.
+func (c *collection) idDoc(buf *syncpool.DocBuffer, key []byte) (*anyenc.Value, error) {
+	idVal, err := buf.Parser.Parse(key)
+	if err != nil {
+		return nil, err
+	}
+	buf.Arena.Reset()
+	doc := buf.Arena.NewObject()
+	doc.Set(c.primaryKey, idVal)
+	return doc, nil
 }
 
 func (c *collection) update(tx *btree.WriteTx, s *collSchema, it, prevIt item) (modified bool, err error) {

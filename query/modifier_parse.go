@@ -2,6 +2,7 @@ package query
 
 import (
 	"bytes"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -56,9 +57,15 @@ func MustParseModifier(modifier any) Modifier {
 // a copy of the document, and the copy is the result: the document passed in
 // is left as it was, whether the modifier succeeds or Modify returns an error.
 // Any other modifier changes the document passed in and returns it. $set,
-// $push and $addToSet store a copy of an object or array operand, so
-// applying a modifier never changes it, and every document gets a value of
-// its own.
+// $push and $addToSet store a copy of an operand that can be changed in
+// place, so applying a modifier never changes it, and every document gets a
+// value of its own.
+//
+// A modifier given as an *anyenc.Value is copied, so the parsed modifier does
+// not depend on the caller's value after the call. It may nest at most 512
+// levels, the modifier object being the first, as anyenc's parser reads, so
+// an operand is at most 510 levels deep; a deeper one, or a value that
+// contains itself, is a *ParseError.
 func ParseModifier(modifier any) (Modifier, error) {
 	if m, ok := modifier.(Modifier); ok {
 		return m, nil
@@ -68,6 +75,15 @@ func ParseModifier(modifier any) (Modifier, error) {
 	if err != nil {
 		return nil, err
 	}
+	if goValue, ok := modifier.(*anyenc.Value); ok {
+		// Built in Go, the value has no parser's depth bound: copied, or
+		// stored into a document, a value that contains itself would recurse
+		// until the stack ran out. The check stops at the bound.
+		if nestsDeeper(goValue, maxModifierDepth) {
+			return nil, &ParseError{Source: "modifier", Reason: fmt.Sprintf("modifier is nested deeper than %d levels", maxModifierDepth)}
+		}
+		v = (&anyenc.Arena{}).Copy(goValue)
+	}
 	m, err := parseModRoot(v)
 	if err != nil {
 		return nil, withSource(err, "modifier")
@@ -76,6 +92,38 @@ func ParseModifier(modifier any) (Modifier, error) {
 		return paddingStaged{ModifierChain: chain}, nil
 	}
 	return m, nil
+}
+
+// maxModifierDepth is the deepest a modifier given as an *anyenc.Value may
+// nest, the modifier object being the first level: the depth anyenc's parser
+// reads, to which a modifier given as JSON or bytes is held by its parse.
+const maxModifierDepth = 512
+
+// nestsDeeper reports whether v nests objects and arrays more than levels
+// deep, v included. It stops at the bound, so a value that contains itself
+// is reported deeper rather than walked forever.
+func nestsDeeper(v *anyenc.Value, levels int) bool {
+	switch v.Type() {
+	case anyenc.TypeObject:
+		if levels == 0 {
+			return true
+		}
+		deeper := false
+		v.GetObject().Visit(func(_ []byte, f *anyenc.Value) {
+			deeper = deeper || nestsDeeper(f, levels-1)
+		})
+		return deeper
+	case anyenc.TypeArray:
+		if levels == 0 {
+			return true
+		}
+		for _, e := range v.GetArray() {
+			if nestsDeeper(e, levels-1) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func parseModRoot(v *anyenc.Value) (m Modifier, err error) {

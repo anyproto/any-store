@@ -56,21 +56,24 @@ type paddingStaged struct {
 }
 
 // stored is the value $set, $push and $addToSet store for their operand val:
-// a copy of it in a when it is an object or an array, val itself otherwise.
+// a copy of it in a, or val itself when nothing can change it in place.
 // MongoDB copies an operand from the immutable update spec into the document
 // (update/set_node.cpp: setValueBSONElement(val)). Stored as itself, an
-// object or array operand would be shared by every document the modifier is
-// applied to — the matches of a filtered Update, or the documents of a caller
-// that reuses the parsed modifier — and a later operation of the same
-// modifier that changes it in place ($inc into the object $push appended,
-// $push into the array $set stored) would change the modifier, and through it
-// the next document. A scalar is never changed in place.
+// operand would be shared by every document the modifier is applied to — the
+// matches of a filtered Update, or the documents of a caller that reuses the
+// parsed modifier — and a change to it in place would change the modifier,
+// and through it the next document: a later operation of the same modifier
+// ($inc into the object $push appended, $push into the array $set stored), or
+// the caller writing through the slice a result's GetStringBytes, GetBytes
+// or GetVectorF32 returns. A number, a bool, null, an object id and a date
+// hand out no storage of their own, and are stored as themselves.
 func stored(a *anyenc.Arena, val *anyenc.Value) *anyenc.Value {
 	switch val.Type() {
-	case anyenc.TypeObject, anyenc.TypeArray:
-		return a.Copy(val)
+	case anyenc.TypeNumber, anyenc.TypeTrue, anyenc.TypeFalse, anyenc.TypeNull,
+		anyenc.TypeObjectID, anyenc.TypeDateTime:
+		return val
 	}
-	return val
+	return a.Copy(val)
 }
 
 func (m paddingStaged) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
@@ -147,8 +150,8 @@ type modifierUnset struct {
 }
 
 func (m modifierUnset) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = anyencutil.Walk(a, v, m.fieldPath, false, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
-		modified = value != nil
+	err = walkExisting(v, m.fieldPath, "$unset", true, func(value *anyenc.Value) (*anyenc.Value, error) {
+		modified = true
 		return nil, nil
 	})
 	if err != nil {
@@ -187,21 +190,75 @@ type modifierRename struct {
 	val       []string
 }
 
-// The walks to the field that $rename moves and to the array that $pop,
-// $pull and $pullAll change do not create the path: on a document without
-// it they leave the document as it was, as MongoDB does. Walked with
-// creation, a missing parent was set to {} — kept, and stored, once another
+// walkExisting is the walk of the operators that remove: $unset, $pop, $pull,
+// $pullAll and the source of $rename. It walks v to the field path names,
+// creating nothing, and when the field is there calls finalize with it: a
+// nil result removes the field, another value takes its place. A document
+// without the field is left as it was, as MongoDB does; walked with
+// creation, a missing parent was set to {}, kept, and stored once another
 // operation of the modifier changed the document.
+//
+// Where the walk stops matters as in MongoDB. A path that stops at an object,
+// or at an array whose next part is an index past its end, could be created,
+// and is a no-op. One whose next part is a field of a scalar or a name in an
+// array could not: allowNonViable ($unset) makes it a no-op too
+// (UnsetNode::allowNonViablePath), and every other remover refuses it, as
+// MongoDB's PathNotViable does (UpdateLeafNode::checkViability for $pop,
+// $pull and $pullAll; pathsupport::findLongestPrefix for the source of
+// $rename).
+func walkExisting(v *anyenc.Value, path []string, op string, allowNonViable bool, finalize func(value *anyenc.Value) (*anyenc.Value, error)) error {
+	parent := v
+	for i, part := range path {
+		field := parent.Get(part)
+		if field == nil {
+			if allowNonViable || canHoldField(parent, part) {
+				return nil
+			}
+			return fmt.Errorf("%s: cannot use the part '%s' of '%s' to traverse the element %s",
+				op, part, strings.Join(path, "."), parent.String())
+		}
+		if i < len(path)-1 {
+			parent = field
+			continue
+		}
+		newVal, err := finalize(field)
+		if err != nil {
+			return err
+		}
+		if newVal == nil {
+			parent.Del(part)
+		} else if newVal != field {
+			parent.Set(part, newVal)
+		}
+	}
+	return nil
+}
+
+// canHoldField reports whether part could name a field of v that v does not
+// have: v is an object, or an array and part an index, which a creating walk
+// would pad the array to (anyencutil.Walk). A scalar holds no field, and an
+// array none by name.
+func canHoldField(v *anyenc.Value, part string) bool {
+	switch v.Type() {
+	case anyenc.TypeObject:
+		return true
+	case anyenc.TypeArray:
+		idx, err := strconv.Atoi(part)
+		return err == nil && idx >= 0
+	}
+	return false
+}
 
 func (m modifierRename) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
 	var oldFieldValue *anyenc.Value
-	err = anyencutil.Walk(a, v, m.fieldPath, false, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
-		if value != nil {
-			modified = true
-			oldFieldValue = value
-		}
+	err = walkExisting(v, m.fieldPath, "$rename", false, func(value *anyenc.Value) (*anyenc.Value, error) {
+		modified = true
+		oldFieldValue = value
 		return nil, nil
 	})
+	if err != nil {
+		return nil, false, err
+	}
 	if modified {
 		err = anyencutil.Walk(a, v, m.val, true, func(prevValue, newFieldValue *anyenc.Value) (res *anyenc.Value, err error) {
 			modified = modified || !anyencutil.Equal(newFieldValue, oldFieldValue)
@@ -221,10 +278,7 @@ type modifierPop struct {
 }
 
 func (m modifierPop) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = anyencutil.Walk(a, v, m.fieldPath, false, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
-		if value == nil {
-			return nil, nil
-		}
+	err = walkExisting(v, m.fieldPath, "$pop", false, func(value *anyenc.Value) (*anyenc.Value, error) {
 		arrayOfValues, err := value.Array()
 		if err != nil {
 			return nil, notArrayError("$pop", m.fieldPath, err)
@@ -293,10 +347,7 @@ type modifierPull struct {
 }
 
 func (m modifierPull) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = anyencutil.Walk(a, v, m.fieldPath, false, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
-		if value == nil {
-			return nil, nil
-		}
+	err = walkExisting(v, m.fieldPath, "$pull", false, func(value *anyenc.Value) (*anyenc.Value, error) {
 		arrayOfValues, err := value.Array()
 		if err != nil {
 			return nil, notArrayError("$pull", m.fieldPath, err)
@@ -328,10 +379,7 @@ type modifierPullAll struct {
 }
 
 func (m modifierPullAll) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = anyencutil.Walk(a, v, m.fieldPath, false, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
-		if value == nil {
-			return nil, nil
-		}
+	err = walkExisting(v, m.fieldPath, "$pullAll", false, func(value *anyenc.Value) (*anyenc.Value, error) {
 		arrayOfValues, err := value.Array()
 		if err != nil {
 			return nil, notArrayError("$pullAll", m.fieldPath, err)

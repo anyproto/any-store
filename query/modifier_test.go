@@ -904,3 +904,132 @@ func TestParseModifier_PushModifiersRefused(t *testing.T) {
 		{`{"$push":{"tags":["$each"]}}`, `{}`, `{"tags":[["$each"]]}`, true},
 	}...)
 }
+
+// Where a removal's path stops matters as in MongoDB. A path the document
+// could hold but does not (a missing field of an object, an index past an
+// array's end) is a no-op for $unset, $pop, $pull, $pullAll and the source of
+// $rename. A path it cannot hold — a field of a scalar, a name in an array —
+// is a no-op for $unset (UnsetNode::allowNonViablePath) and an error for the
+// others (PathNotViable), and the error fails the whole modifier, a sibling
+// $set included.
+func TestModifier_RemovalPathViability(t *testing.T) {
+	testModCases(t, []modifierCase{
+		{`{"$pull":{"items.3.x":1},"$set":{"seen":true}}`, `{"items":[]}`, `{"items":[],"seen":true}`, true},
+		{`{"$pop":{"items.3.x":1},"$set":{"seen":true}}`, `{"items":[]}`, `{"items":[],"seen":true}`, true},
+		{`{"$pullAll":{"items.3.x":[1]},"$set":{"seen":true}}`, `{"items":[]}`, `{"items":[],"seen":true}`, true},
+		{`{"$rename":{"items.3.x":"y"},"$set":{"seen":true}}`, `{"items":[]}`, `{"items":[],"seen":true}`, true},
+		{`{"$pull":{"items.3":1}}`, `{"items":[]}`, `{"items":[]}`, false},
+		{`{"$unset":{"a.b":""}}`, `{"a":1}`, `{"a":1}`, false},
+		{`{"$unset":{"a.b.c":""}}`, `{"a":{"b":null}}`, `{"a":{"b":null}}`, false},
+		{`{"$unset":{"items.bad.x":""},"$set":{"seen":true}}`, `{"items":[]}`, `{"items":[],"seen":true}`, true},
+		{`{"$unset":{"items.bad":""}}`, `{"items":[1]}`, `{"items":[1]}`, false},
+	}...)
+	testModCasesErr(t, []modifierCaseError{
+		{`{"$pull":{"items.bad.x":1},"$set":{"seen":true}}`, `{"items":[]}`,
+			`$pull: cannot use the part 'bad' of 'items.bad.x' to traverse the element []`},
+		{`{"$pop":{"items.bad.x":1},"$set":{"seen":true}}`, `{"items":[]}`,
+			`$pop: cannot use the part 'bad' of 'items.bad.x' to traverse the element []`},
+		{`{"$pullAll":{"items.bad.x":[1]},"$set":{"seen":true}}`, `{"items":[]}`,
+			`$pullAll: cannot use the part 'bad' of 'items.bad.x' to traverse the element []`},
+		{`{"$rename":{"items.bad.x":"y"},"$set":{"seen":true}}`, `{"items":[]}`,
+			`$rename: cannot use the part 'bad' of 'items.bad.x' to traverse the element []`},
+		{`{"$pull":{"items.bad":1}}`, `{"items":[1]}`,
+			`$pull: cannot use the part 'bad' of 'items.bad' to traverse the element [1]`},
+		{`{"$pull":{"a.b":1}}`, `{"a":1}`,
+			`$pull: cannot use the part 'b' of 'a.b' to traverse the element 1`},
+		{`{"$pop":{"a.b.c":1}}`, `{"a":{"b":null}}`,
+			`$pop: cannot use the part 'c' of 'a.b.c' to traverse the element null`},
+		{`{"$rename":{"a.b":"c"}}`, `{"a":"s"}`,
+			`$rename: cannot use the part 'b' of 'a.b' to traverse the element "s"`},
+	}...)
+}
+
+// Strings, binary values and packed vectors hand out their bytes
+// (GetStringBytes, GetBytes, GetVectorF32), so $set, $push and $addToSet
+// store a copy of them too: a change made through one document's value
+// reaches neither the modifier nor the next document.
+func TestModifier_ByteOperandsAreCopied(t *testing.T) {
+	a := &anyenc.Arena{}
+	set := a.NewObject()
+	set.Set("s", a.NewString("abc"))
+	set.Set("b", a.NewBinary([]byte{1, 2, 3}))
+	set.Set("v", a.NewVectorF32([]float32{1, 2}))
+	push := a.NewObject()
+	push.Set("ps", a.NewString("abc"))
+	add := a.NewObject()
+	add.Set("as", a.NewBinary([]byte{1, 2, 3}))
+	src := a.NewObject()
+	src.Set("$set", set)
+	src.Set("$push", push)
+	src.Set("$addToSet", add)
+	mod := MustParseModifier(src)
+	_, staged := mod.(paddingStaged)
+	require.False(t, staged)
+
+	apply := func() *anyenc.Value {
+		res, modified, err := mod.Modify(&anyenc.Arena{}, anyenc.MustParseJson(`{}`))
+		require.NoError(t, err)
+		require.True(t, modified)
+		return res
+	}
+	first := apply()
+	want := first.String()
+	first.GetStringBytes("s")[0] = 'x'
+	first.GetBytes("b")[0] = 0xff
+	first.GetVectorF32("v")[0] = 42
+	first.GetStringBytes("ps", "0")[0] = 'x'
+	first.GetBytes("as", "0")[0] = 0xff
+	require.NotEqual(t, want, first.String())
+	assert.Equal(t, want, apply().String(), "the next document")
+}
+
+// A modifier given as an *anyenc.Value is copied, so changing the caller's
+// value afterwards changes nothing the modifier writes. Built in Go, the
+// value has no parser bound: one nested past 512 levels, or one that
+// contains itself, is refused when it is parsed, before anything copies it.
+func TestParseModifier_GoValueBoundAndCopied(t *testing.T) {
+	a := &anyenc.Arena{}
+	operand := a.NewObject()
+	operand.Set("n", a.NewNumberInt(1))
+	push := a.NewObject()
+	push.Set("p", operand)
+	src := a.NewObject()
+	src.Set("$push", push)
+	mod, err := ParseModifier(src)
+	require.NoError(t, err)
+	operand.Set("n", a.NewNumberInt(2))
+	res, _, err := mod.Modify(&anyenc.Arena{}, anyenc.MustParseJson(`{}`))
+	require.NoError(t, err)
+	assert.Equal(t, `{"p":[{"n":1}]}`, res.String())
+
+	// nested is a modifier {"$push":{"p":[[...]]}} of the given depth, the
+	// modifier object being the first level.
+	nested := func(depth int) *anyenc.Value {
+		inner := a.NewArray()
+		for cur, i := inner, 3; i < depth; i++ {
+			next := a.NewArray()
+			cur.SetArrayItem(0, next)
+			cur = next
+		}
+		push := a.NewObject()
+		push.Set("p", inner)
+		mod := a.NewObject()
+		mod.Set("$push", push)
+		return mod
+	}
+	_, err = ParseModifier(nested(512))
+	require.NoError(t, err)
+	_, err = ParseModifier(nested(513))
+	var pe *ParseError
+	require.ErrorAs(t, err, &pe)
+	require.EqualError(t, err, "parse modifier: modifier is nested deeper than 512 levels")
+
+	self := a.NewArray()
+	self.SetArrayItem(0, self)
+	push = a.NewObject()
+	push.Set("p", self)
+	src = a.NewObject()
+	src.Set("$push", push)
+	_, err = ParseModifier(src)
+	require.ErrorAs(t, err, &pe)
+}
