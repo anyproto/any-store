@@ -1394,32 +1394,11 @@ Additionally, the following Go-specific mechanisms have no SQLite analogue:
   (drift-2026-11-21-25 below). SQLite's connection mutex does this for it.
 - `db.writerLocksDone`: atomic CAS guard ensuring Close/Commit/Rollback lock
   cleanup runs exactly once despite concurrent goroutines
-- `DB.Close` waits for open read transactions (`db.mu.Lock` against the
-  `RLock` each `ReadTx` holds), with no timeout: a reader that is never ended
-  blocks it forever. In serialized mode, the default build (`bFullMutex =
-  SQLITE_THREADSAFE==1`, `global.c:241`; `main.c:3346-3354`, `3388-3393`),
-  `sqlite3_close` and `sqlite3_close_v2` both wait for the connection mutex
-  (`sqlite3Close`, `main.c:1263`), which `sqlite3_step` holds for the step it
-  runs (`vdbeapi.c:923`). Neither waits for a statement to be finalized. On
-  the way a close takes other mutexes too, and can wait for them: the shared
-  b-tree mutexes of a shared cache (`disconnectAllVtab`, `main.c:1269`, takes
-  them through `sqlite3BtreeEnterAll`, `main.c:1213`, `btmutex.c:200-201`),
-  and the Unix VFS's global mutex as it closes a file (`unixClose`,
-  `os_unix.c:2350`, `unixEnterMutex`, `901`). In multi-thread mode, or under
-  `SQLITE_OPEN_NOMUTEX`, an ordinary build gives the connection no mutex
-  (`main.c:3388-3393`), and a close during another thread's step is the
-  application's error. With the mutex held, an unfinalized statement, or an
-  unfinished backup that reads from the connection, makes `sqlite3_close` return
-  `SQLITE_BUSY` (`connectionIsBusy`, `main.c:1240-1250`, `1283`) and
-  `sqlite3_close_v2` leave a zombie that is closed when the last of them goes
-  (`main.c:1307`, `1371`). A backup counts on its source only
-  (`p->pSrc->nBackup++`, `backup.c:204`; `btree.c:11342`): the destination
-  must not be passed to any API until `sqlite3_backup_finish`
-  (`sqlite.h.in:9712-9715`). A transaction left open with every statement
-  finalized is no reason to refuse: it is rolled back (`sqlite3RollbackAll`,
-  `main.c:1386`), as `DB.Close` rolls back a write transaction. The wait is
-  the documented contract of `DB.Close` (godoc, README "Transactions"),
-  pinned by `TestDb_Close` in the root package.
+- `DB.Close` waits, with no timeout, for every open read transaction to end
+  (`db.mu.Lock` against the `RLock` each `ReadTx` holds); SQLite's close
+  waits at most for the step running on another thread, and refuses or
+  defers the close while a statement is unfinalized (drift-2026-11-21-26
+  below).
 - In-memory WAL `memFrames` truncation on rollback (no SQLite equivalent since
   SQLite's in-memory WAL is a separate VFS shim)
 
@@ -3469,6 +3448,28 @@ What differs from SQLite, and what follows from it:
 - The two-step spill guard of [drift-2026-11-16-2](#drift-2026-11-16-2-pagerstress-spills-only-for-the-live-writer) is not reached through `DB.Close`: the guard is for a rescue that runs under an operation.
 
 Regression tests, in `close_writer_gate_test.go`: `TestClose_WaitsForWriterCallInFlight` (Close started from inside a page rebuild and from inside a spill returns only after that `Put`, which completes; every later call is `ErrClosed`), `TestClose_CommitRefusedOnceGateClosed` and `TestClose_CommitRightAfterCallInFlight` (Close held between the gate and the forced rollback), `TestClose_NextWriterCommitRefusedAfterHandoff` (the next writer begins as the write lock passes on, and Close comes after its first call), `TestClose_WaitsForCommitThatPanicsAfterPublish`, `TestClose_CommitAfterFailedSpillAndClose`, `TestClose_WaitsForBackupWritingDestination`, `TestClose_KeepsBackTheLeavesCursorsLent` and `TestClose_CursorAbandonedBeforeCacheDisposal` (the lent leaves, slab and pool), `TestClose_ReleasesSavepointsAndCommitPageList`, `TestClose_DuringKeyAndValueOfPinnedLeaf` and `TestClose_DuringInLeafStepsAndAppendValue` (the calls outside the gate, for `-race`), `TestWriterGate_PinnedLeafCallsStayOutside` (which calls take the gate), `TestClose_DuringRunningWriter` (the race, for `-race`), `TestClose_ByWriterGoroutineBetweenCalls`, `TestClose_AfterWriterCallPanicked`, `TestWriterGate`, `TestWriterGate_DrainedRefusesRacingCalls` (two goroutines on a closed, empty gate); through the public API `TestDb_Close` and `TestIterator_DocOfHeldDocumentWhileTxEnds` (for `-race`) in the root package and `TestDb_CloseDuringWrite`, `TestDb_CloseFromModifier` in `test/`.
+
+<a id="drift-2026-11-21-26-close-waits-for-every-read-transaction-to-end"></a>
+### Drift: Close Waits For Every Read Transaction To End
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `db.go:*DB.Close` (the `db.mu.Lock` once the write transaction is dealt with), `*DB.beginRead` (a read transaction holds `db.mu.RLock` from its begin), `*ReadTx.Rollback` (which releases it).
+
+SQLite's close waits for no read transaction and no statement. `sqlite3Close` enters the connection mutex (`sqlite3_mutex_enter(db->mutex);`, `main.c:1263`). In serialized mode, the default build (`bFullMutex` is `SQLITE_THREADSAFE==1`, `global.c:241`; `main.c:3346-3354`, `3388-3393`), `sqlite3_step` holds that mutex for the step it runs (`vdbeapi.c:923`), so a close waits for a step running on another thread, not for its statement to be reset or finalized. On the way a close takes other mutexes too, and can wait for them: the shared b-tree mutexes of a shared cache (`disconnectAllVtab`, `main.c:1269`, takes them through `sqlite3BtreeEnterAll`, `main.c:1213`, `btmutex.c:200-201`), and the Unix VFS's global mutex as it closes a file (`unixClose`, `os_unix.c:2350`, `unixEnterMutex`, `901`). In multi-thread mode, or under `SQLITE_OPEN_NOMUTEX`, an ordinary build gives the connection no mutex (`main.c:3388-3393`), and a close during another thread's step is the application's error.
+
+With the mutex held, `connectionIsBusy` (`main.c:1240-1250`) is true while a statement is unfinalized (`if( db->pVdbe ) return 1;`, `main.c:1243`) or a backup that reads from the connection is unfinished (`p->pSrc->nBackup++`, `backup.c:204`). There the two closes part (`int sqlite3_close(sqlite3 *db){ return sqlite3Close(db,0); }` and `int sqlite3_close_v2(sqlite3 *db){ return sqlite3Close(db,1); }`, `main.c:1351-1352`):
+
+- `sqlite3_close` refuses and leaves the connection open: `if( !forceZombie && connectionIsBusy(db) ){`, then `sqlite3ErrorWithMsg(db, SQLITE_BUSY, "unable to close due to unfinalized "` `"statements or unfinished backups");` and `return SQLITE_BUSY;` (`main.c:1283-1288`).
+- `sqlite3_close_v2` returns `SQLITE_OK` and leaves a zombie: `db->eOpenState = SQLITE_STATE_ZOMBIE;` and `sqlite3LeaveMutexAndCloseZombie(db);` (`main.c:1307-1308`), which only leaves the mutex while the connection is busy (`if( db->eOpenState!=SQLITE_STATE_ZOMBIE || connectionIsBusy(db) ){`, `main.c:1371-1374`). The last `sqlite3_finalize` frees it (`vdbeapi.c:115`), or the last backup's finish (`backup.c:608`, `617`).
+
+A transaction left open with every statement finalized, a `BEGIN` that has read among them, is no reason to refuse: the close rolls it back (`sqlite3RollbackAll(db, SQLITE_OK);`, `main.c:1386`), as `DB.Close` rolls back a write transaction.
+
+`DB.Close` here waits for every read transaction of the handle to end. Once the write transaction is dealt with, it takes `db.mu.Lock` against the `db.mu.RLock` that each read transaction holds from `beginRead` to `ReadTx.Rollback`, with no timeout and no error, and only then destroys the reader caches and closes the pager. It neither refuses, as `sqlite3_close` does, nor returns and leaves the close to the last reader, as `sqlite3_close_v2` does. What follows from it:
+
+- A `ReadTx` that is never rolled back blocks `Close` forever, and `Close` called on a goroutine that holds one deadlocks on itself. In the root package an `Iterator` opened with a context that carries no transaction holds a read transaction of its own until its `Close`, so a `defer it.Close()` that runs after `db.Close()` deadlocks.
+- While `Close` waits, the handle is closing (`SetClosing`): a new transaction fails with `ErrClosed`, and a reader waiting for a slot is woken with it. The open read transactions go on reading their snapshots until they end.
+- The wait keeps the teardown from running under a reader: its cache, and the wal-index mapping and the files its page reads go through, are what `Close` frees after it.
+
+The wait is the documented contract of `DB.Close` (its godoc here and in the root package, README "Transactions"). Regression tests: `TestDb_Close` in the root package (`waits for an open read transaction`, `waits for an open iterator`).
 
 <a id="drift-102-reader-slot-tie-break-selects-lowest-not-highest"></a>
 ### Drift: Reader Slot Tie Break Selects Lowest Not Highest

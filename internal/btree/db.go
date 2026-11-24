@@ -825,6 +825,7 @@ func Open(path string, opts Options) (*DB, error) {
 // closes a file (unixClose, os_unix.c:2350). In multi-thread mode an
 // ordinary build gives the connection no mutex (main.c:3388-3393), and a
 // close during another thread's step is the application's error.
+// DRIFT: Close waits, with no timeout, for every read transaction to end; C waits for none: an unfinalized statement makes sqlite3_close return SQLITE_BUSY and sqlite3_close_v2 leave a zombie See docs/btree/NOTES.md#drift-2026-11-21-26-close-waits-for-every-read-transaction-to-end
 //
 // A registered write transaction is not waited for: Close rolls it back and
 // releases its locks, as sqlite3Close rolls back a transaction left open
