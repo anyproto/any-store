@@ -4037,10 +4037,10 @@ The consequence is that a database whose read-version byte is greater than 2 (a 
 
 <a id="drift-2026-06-25-22-slab-get-has-no-per-request-size-guard-and-its-initialized-pagesize-va"></a>
 ### Drift: Slab Get Has No Per-Request Size Guard And Its Initialized PageSize Validator Is Dead Code
-- **Category:** missing-feature  -  **Severity:** low
+- **Category:** missing-feature  -  **Severity:** low  -  **Status:** RESOLVED: the per-request guard is ported.
 - **Affected functions:** `page_slab.go:allocPageBuffer`, `page_slab.go:*pageSlab.serves`, `db.go:Open`.
 
-**Resolved (2026-11-19)**: the per-request guard is ported. `pcache1Alloc(nByte)` (`pcache1.c:341-374`) serves a request from the buffer only under `if( nByte<=pcache1.szSlot )` (`pcache1.c:344`) and otherwise calls `sqlite3Malloc(nByte)` (`pcache1.c:361`). `allocPageBuffer(pageSize, useSlab)` takes a buffer from the slab only when `globalPageSlab.serves(pageSize)`, and otherwise takes the default allocator (`pageBufferPool`, then `make`) at the requested size. `freePageBuffer` needs no guard: `pageSlab.Put` keeps only slices of the slab's backing array and passes everything else to the pool. A slab configured for one page size is never the source of a page for a database of another. Pinned by `TestAllocPageBuffer_SlabServesOnlyItsOwnPageSize` and, through the public API in one process per configuration, by `TestInitPageBuffer_MisSizedPoolIsNotUsed`.
+`pcache1Alloc(nByte)` (`pcache1.c:341-374`) serves a request from the buffer only under `if( nByte<=pcache1.szSlot )` (`pcache1.c:344`) and otherwise calls `sqlite3Malloc(nByte)` (`pcache1.c:361`). `allocPageBuffer(pageSize, useSlab)` takes a buffer from the slab only when `globalPageSlab.serves(pageSize)`, and otherwise takes the default allocator (`pageBufferPool`, then `make`) at the requested size. `freePageBuffer` needs no guard: `pageSlab.Put` keeps only slices of the slab's backing array and passes everything else to the pool. A slab configured for one page size is never the source of a page for a database of another. Pinned by `TestAllocPageBuffer_SlabServesOnlyItsOwnPageSize` and, through the public API in one process per configuration, by `TestInitPageBuffer_MisSizedPoolIsNotUsed`.
 
 What remains different:
 
