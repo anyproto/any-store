@@ -3,6 +3,7 @@ package anystore
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -900,4 +901,26 @@ func TestCookieLE_Wraps(t *testing.T) {
 	assert.True(t, cookieLE(top-1, 1))
 	assert.False(t, cookieLE(0, top))
 	assert.False(t, cookieLE(1, top-1))
+}
+
+// A rollback gives a handle back its mark however far into the log the mark
+// is: the entry keeps it as wide as collection.logLast. The mark is set by
+// hand, as no test makes a log of 2^31 entries.
+func TestDiscardLog_RestoresAMarkOfAnySize(t *testing.T) {
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	c := coll.(*collection)
+
+	const mark = math.MaxInt
+	c.logLast = mark
+	var log txSchema
+	s := c.cur()
+	log.add(dbi, logEntry{c: c, s: s, prev: s, kind: logVersion})
+	require.Equal(t, 1, c.logLast, "setup: the entry is the handle's last")
+	dbi.discardLog(&log, 0)
+	require.Equal(t, mark, c.logLast, "the rollback gives the handle its mark back")
+	require.Zero(t, c.pinned, "setup: the entry's pin is released")
+	c.logLast = 0
 }

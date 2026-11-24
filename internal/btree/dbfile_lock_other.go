@@ -12,4 +12,5 @@ package btree
 func acquireSharedDBLock(_ fileHandle) error               { return nil }
 func tryUpgradeDBLockExclusive(_ fileHandle) (bool, error) { return true, nil }
 func downgradeDBLockToShared(_ fileHandle) error           { return nil }
+func unlockDBFile(_ fileHandle) error                      { return nil }
 func acquireExclusiveDBLock(_ fileHandle) error            { return nil }

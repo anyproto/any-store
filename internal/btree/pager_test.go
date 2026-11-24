@@ -3447,7 +3447,7 @@ func TestShmHashWrite_RegionError(t *testing.T) {
 	// TestWalIndex_ShmHashWrite_RegionError.
 	idx.close(false)
 
-	err = idx.shmHashWrite(1, 1)
+	err = idx.shmHashWrite(1, 1, 0)
 	require.NoError(t, err)
 }
 
@@ -3671,7 +3671,7 @@ func TestPagerOpen_WALOpenError(t *testing.T) {
 	}
 }
 
-// --- pager.go:235-240 initNewDB() file WriteAt/Sync error ---
+// --- createPage1() file WriteAt/Sync error ---
 func TestPagerInitNewDB_WriteError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
@@ -3685,17 +3685,24 @@ func TestPagerInitNewDB_WriteError(t *testing.T) {
 	p.file = f
 	f.Close() // Close the fd so WriteAt fails
 
-	err = p.initNewDB()
+	err = p.createPage1()
 	assert.Error(t, err)
 }
 
-// --- pager.go:261-263 initNewDB() WAL open error ---
+// --- open(): WAL open error on a database that has its page 1 ---
 func TestPagerInitNewDB_WALOpenError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	// Create a directory where the WAL file should be.
+	// A database of one page, as its creation leaves it, and a directory
+	// where its WAL file should be. (Beside an empty file the open would
+	// delete a WAL first; an empty directory goes the same way.)
+	created := newPager(path, 4096, 100, true)
+	created.inProcess = true
+	require.NoError(t, created.open())
+	require.NoError(t, created.close())
 	walPath := path + "-wal"
+	_ = os.Remove(walPath)
 	require.NoError(t, os.MkdirAll(walPath, 0755))
 	t.Cleanup(func() { os.RemoveAll(walPath) })
 
@@ -5861,7 +5868,7 @@ func TestWalIndex_ShmHashWrite_RegionError(t *testing.T) {
 	// region error to its caller (previously it returned void/silently). This
 	// mirrors C's walIndexAppend returning the walHashGet failure rc
 	// (wal.c:1299-1304), letting writeFrames/writeFramesMem abort the commit.
-	err := w.index.shmHashWrite(1, 4097)
+	err := w.index.shmHashWrite(1, 4097, 4096)
 	require.ErrorIs(t, err, os.ErrClosed)
 }
 
@@ -8132,28 +8139,24 @@ func TestWriteOverflowChain_ContiguousOnFreshFreelist(t *testing.T) {
 // Merged from initnewdb_page1_test.go
 // ============================================================
 
-// Regression tests pinning the by-design behavior of initNewDB writing page 1
-// directly to the main DB file (bypassing the WAL).
+// Regression tests for the creation of a new database's page 1, which is
+// written to the main file and synced in place, under the exclusive DB-file
+// lock, before the WAL is opened.
 // See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
 //
-// SQLite defers page-1 creation to the first write transaction so the new
-// page 1 reaches the main file only through a checksum-protected WAL frame.
-// Go's initNewDB instead builds the empty page-1 image and writes it straight
-// to the main file via WriteAt+fdatasync inside Open(), before opening the WAL.
-// That is intentional and kept; these tests pin the two properties that make it
-// safe:
+// SQLite puts a WAL database's page 1 into the main file under the EXCLUSIVE
+// lock too, through a rollback journal, as the creation here does
+// (creation_journal.go). These tests pin:
 //
-//  1. A crash during initial page-1 creation puts no pre-existing user data at
-//     risk: a zero-length leftover re-initializes cleanly, and the only image
-//     the direct write can produce is the fully-deterministic empty page 1,
-//     which is trivially re-derivable and opens as a valid empty DB even with
-//     no WAL present.
+//  1. A crash during the creation puts no user data at risk: a zero-length
+//     leftover is created again, and the complete page-1 image opens as a
+//     valid empty DB with no WAL present. A crash that leaves anything else
+//     in the file leaves the creation journal hot beside it, and the next
+//     open rolls the file back (creation_journal_test.go).
 //
-//  2. Cross-process creation is harmless even though Go takes only a shared
-//     flock (not C's exclusive write lock) while deciding "new DB": the empty
-//     page-1 image is byte-for-byte deterministic for an unencrypted DB, so
-//     concurrent creators write identical bytes and the racing-creator window
-//     cannot corrupt the file.
+//  2. Processes creating one path at once end with the image a single creator
+//     writes. Two-process tests of the creation itself, with one process held
+//     inside it, are in multiprocess_create_test.go.
 
 // referenceEmptyPage1 returns the exact bytes initNewDB writes to the main file
 // for a fresh unencrypted DB created with the given options. It opens a fresh DB
@@ -8197,21 +8200,16 @@ func assertValidEmptyDB(t *testing.T, path string, opts Options) {
 	require.Equal(t, []byte("v"), got)
 }
 
-// TestInitNewDB_Page1_CrashRecoverable pins that a crash during the initial
-// direct-to-file page-1 creation leaves a recoverable / trivially re-derivable
-// empty page 1 with no pre-existing user data at risk.
+// TestInitNewDB_Page1_CrashRecoverable pins two states a creation can leave
+// when no journal is beside the file, and that Open accepts both:
+//   - a zero-length file (the creator died before it wrote page 1, or its
+//     file was rolled back), which the next open creates again; and
+//   - the complete page-1 image of a committed creation, which is a valid
+//     empty DB on its own with no WAL frame required.
 //
-// Because initNewDB writes the new page 1 straight to the main file (not through
-// the WAL), the only crash states reachable mid-creation are:
-//   - a zero-length leftover file (WriteAt never landed / fdatasync skipped),
-//     which Open re-initializes cleanly on the next open, identical to C; and
-//   - the complete deterministic page-1 image (WriteAt+fdatasync completed),
-//     which is a valid empty DB on its own with no WAL frame required.
-//
-// A torn intermediate (header written, body still zero) is not produced by the
-// happy path; the recoverable invariant tested here is that the only persisted
-// new-DB image is one Open accepts as a clean empty DB, and that no earlier
-// user data ever existed to be lost.
+// A creator that dies with page 1 partly or wholly in the file and the
+// creation not committed leaves its journal hot; those states are covered in
+// creation_journal_test.go and multiprocess_create_test.go.
 func TestInitNewDB_Page1_CrashRecoverable(t *testing.T) {
 	opts := DefaultOptions()
 
@@ -8229,13 +8227,13 @@ func TestInitNewDB_Page1_CrashRecoverable(t *testing.T) {
 		_ = os.Remove(path + "-wal")
 		_ = os.Remove(path + "-shm")
 
-		// Reopen: Open must re-run initNewDB (no pre-existing user data) and the
-		// result must be a valid empty DB.
+		// Reopen: Open must create the database again (no pre-existing user
+		// data) and the result must be a valid empty DB.
 		assertValidEmptyDB(t, path, opts)
 	})
 
 	t.Run("completed direct write opens with no WAL", func(t *testing.T) {
-		// Model "crash right after page-1 WriteAt+fdatasync, before any write
+		// Model "crash right after the creation committed, before any write
 		// transaction / WAL activity": only the bare deterministic page-1 image
 		// is on disk, with no WAL or shm. It must open as a valid empty DB,
 		// proving the direct-to-file image is self-consistent and re-derivable
@@ -8255,17 +8253,14 @@ func TestInitNewDB_Page1_CrashRecoverable(t *testing.T) {
 // carries the target DB path for TestInitNewDB_Page1_CrossProcessSerialization.
 const childCreateEnvVar = "TEST_INITNEWDB_PAGE1_CREATE_PATH"
 
-// TestInitNewDB_Page1_CrossProcessSerialization pins that cross-process
-// creation of the initial page 1 behaves as intended even though Go only holds
-// a shared flock (not C's exclusive write lock) while deciding "new DB".
+// TestInitNewDB_Page1_CrossProcessSerialization pins the outcome of
+// cross-process creation of the initial page 1.
 //
 // Several OS processes race to Open the same brand-new path with
-// InProcess:false. Each independently sees info.Size()==0 and writes the empty
-// page-1 image directly to the main file. Because that image is byte-for-byte
-// deterministic for an unencrypted DB, every concurrent creator writes the
-// identical 4096 bytes, so the missing exclusive lock cannot corrupt the file:
-// the final on-disk image equals the single-creator reference image, and the DB
-// opens as a valid empty DB.
+// InProcess:false. One of them writes page 1 under the exclusive DB-file lock;
+// the others find the file non-empty and open it. The final on-disk image
+// equals the single-creator reference image, and the DB opens as a valid empty
+// DB.
 func TestInitNewDB_Page1_CrossProcessSerialization(t *testing.T) {
 	opts := Options{PageSize: 4096, CacheSize: 100, InProcess: false}
 
@@ -8307,9 +8302,8 @@ func TestInitNewDB_Page1_CrossProcessSerialization(t *testing.T) {
 		require.NoError(t, err, "child %d failed to create page 1", i)
 	}
 
-	// The racing creators must have produced exactly the deterministic
-	// single-creator image — no torn or divergent bytes from the missing
-	// exclusive lock.
+	// The racing openers must have produced exactly the single-creator
+	// image: no torn or divergent bytes.
 	got, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(reference, got),

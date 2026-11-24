@@ -15,6 +15,8 @@ type File interface {
 
 // VFS allows replacing OS-level operations for fault injection in tests.
 // Nil fields keep their default (real OS) implementations.
+// OpenFile and Remove may get full names (FullPathname): absolute on Unix
+// and Windows.
 type VFS struct {
 	OpenFile  func(name string, flag int, perm os.FileMode) (File, error)
 	Remove    func(name string) error

@@ -155,6 +155,8 @@ func TestReadRawPageWALErrorPropagates(t *testing.T) {
 	opts := DefaultOptions()
 	opts.Checksum = true
 	opts.DisableAutoCheckpoint = true
+	var mismatches atomic.Int32
+	opts.OnIntegrityError = func(uint32, error) { mismatches.Add(1) }
 	db, err := testOpen(t, filepath.Join(dir, "test.db"), opts)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -188,25 +190,25 @@ func TestReadRawPageWALErrorPropagates(t *testing.T) {
 	})
 
 	// Direct: readRawPage must propagate, not fall back to the disk copy.
-	_, err = db.pager.readRawPage(targetPgno, walMaxFrame)
+	_, err = db.pager.readRawPage(targetPgno, walMaxFrame, rtx.cache)
 	require.ErrorIs(t, err, sentinel, "readRawPage readFrameRaw failure must propagate")
 	require.Contains(t, err.Error(), "WAL frame")
 	require.NoError(t, rtx.Rollback())
 
-	// End-to-end: the sweep reports the failing page and keeps sweeping.
+	// End-to-end: the sweep lists the failing page, as a page it could not
+	// read, and goes on to the last page of the snapshot.
+	nPages := db.pager.dbSize.Load()
+	require.Less(t, targetPgno, nPages, "setup: pages follow the failing one")
 	res, err := db.VerifyIntegrity(context.Background())
 	require.NoError(t, err, "the sweep itself must not abort on a per-page read error")
-	require.Greater(t, res.Pages, 0)
-	var found bool
-	for _, se := range res.Errors {
-		if se.PageNo == targetPgno && se.Inner != nil && errors.Is(se.Inner, sentinel) {
-			found = true
-			break
-		}
-	}
-	require.True(t, found,
-		"VerifyIntegrity must report a SweepError for page %d wrapping the WAL read failure; got %+v",
-		targetPgno, res.Errors)
+	require.Equal(t, int(nPages), res.Pages, "the sweep goes on after the page it could not read")
+	require.Len(t, res.Errors, 1)
+	require.Equal(t, targetPgno, res.Errors[0].PageNo)
+	require.Equal(t, IntegrityKindUnknown, res.Errors[0].Kind)
+	require.ErrorIs(t, res.Errors[0].Inner, sentinel)
+	// The checksum of a page that could not be read was never compared:
+	// the codec's hook, which reports checksum mismatches, stays silent.
+	require.Zero(t, mismatches.Load(), "no checksum-mismatch notification for a read error")
 }
 
 // TestWALDecryptFailurePropagatesFromReadFrame pins the highest-severity case

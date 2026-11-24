@@ -120,19 +120,48 @@ func PersistPaged(g *FlatHNSW, db *btree.DB, name string, metric Metric) error {
 }
 
 // PagedExists reports whether a persisted paged index named name is present.
-func PagedExists(db *btree.DB, name string) bool {
-	ns, err := db.GetNamespace(name + ":pmeta")
-	if err != nil {
-		return false
+// Absent is a namespace or a meta record that is not there; a read that
+// fails is returned, and says nothing about the index.
+//
+// A missing :pmeta namespace is answered before a read transaction begins,
+// so it takes no reader slot (btree.Options.MaxReaders). Otherwise the
+// namespace and its meta record are read in one read transaction, which
+// waits for a slot.
+func PagedExists(db *btree.DB, name string) (bool, error) {
+	if _, err := db.GetNamespace(name + ":pmeta"); err != nil {
+		if errors.Is(err, btree.ErrNamespaceNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if testPagedExistsLookedUpHook != nil {
+		testPagedExistsLookedUpHook()
 	}
 	rtx, err := db.BeginRead()
 	if err != nil {
-		return false
+		return false, err
 	}
 	defer rtx.Rollback()
-	_, err = rtx.Get(ns, []byte(btreeMetaKey))
-	return err == nil
+	ns, err := rtx.GetNamespace(name + ":pmeta")
+	if err != nil {
+		if errors.Is(err, btree.ErrNamespaceNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if _, err = rtx.Get(ns, []byte(btreeMetaKey)); err != nil {
+		if errors.Is(err, btree.ErrKeyNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
+
+// testPagedExistsLookedUpHook, when non-nil, runs inside PagedExists after
+// the namespace lookup that takes no reader slot found the namespace, before
+// the read transaction begins. Test-only.
+var testPagedExistsLookedUpHook func()
 
 // OpenPaged reopens a persisted paged index, loading only its topology into RAM.
 func OpenPaged(db *btree.DB, name string) (*PagedHNSW, error) {

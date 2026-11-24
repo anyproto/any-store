@@ -82,6 +82,8 @@ func main() {
 
 The full end-to-end example lives in [`example/`](example) and the [API docs](https://pkg.go.dev/github.com/anyproto/any-store/v2).
 
+> **Document size.** Each key/value pair a write stores is limited to 1 GiB (`1<<30` bytes): a document's encoded id with its stored body, each range-index entry's key with its one-byte value, and each record a full-text or vector index stores. A write over the limit stores nothing and fails with `ErrValueTooLarge`, or with `ErrKeyTooLarge` when a key alone is over it; the two are separate errors, check for both.
+
 > **Choosing document ids.** Unlike SQLite there is no hidden rowid — the document id is the btree key. Increment-like ids (`anyenc.NewObjectID()`, timestamps, sequences) keep inserts append-ordered and reads cache-friendly; fully random ids (e.g. UUIDv4) scatter them. In practice this only matters for very hot write/read paths or huge collections.
 
 ## Transactions
@@ -189,7 +191,7 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 db.Flush(ctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive)
 ```
 
-**Sentinel:** when enabled, a `.lock` file marks not-explicitly-persisted writes so an unclean shutdown triggers an integrity quick check on open.
+**Sentinel:** when enabled, a `.lock` file marks not-explicitly-persisted writes so an unclean shutdown triggers an integrity quick check on open. A flush removes the file, and so does a `Close` that checkpointed as the last handle on the database; a `Close` while another process still has the database open leaves it. An in-memory database has no sentinel file.
 
 **Lifetime:** the idle flush runs until `Close`. It is not bound to the context passed to `Open`, which only bounds the open itself; a DB that is never closed keeps the flush goroutine alive.
 
