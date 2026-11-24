@@ -578,11 +578,17 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info In
 	// 65,536) is ErrIndexExists, which EnsureIndex keeps, as before. A
 	// refusal here returns before anything is built, and the operation's
 	// rollback takes the catalog record back out. A copy keeps the source's
-	// definition, which an earlier release may have created past them.
+	// definition, which an earlier release may have created past them, and
+	// refuses only an HNSW M the graph cannot be built with: the build sizes
+	// a node's neighbour lists by M (2·M on layer 0, 0 picking the default),
+	// and a negative M, which an earlier release took on an empty collection,
+	// would size them below zero.
 	if !copied {
 		if err := validateVectorTuning(info.Vector); err != nil {
 			return nil, err
 		}
+	} else if !info.Vector.Mode.isBruteForce() && !info.Vector.Mode.isIVF() && info.Vector.M < 0 {
+		return nil, fmt.Errorf("%w: VectorParams.M is %d, a negative value: an HNSW graph cannot be built with it", ErrInvalidConfig, info.Vector.M)
 	}
 	if info.Vector.Mode.isBruteForce() {
 		// Brute-force: no namespaces, no graph, nothing to build from documents.
@@ -646,10 +652,16 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info In
 		}
 		// A copied index whose collection has fewer vectors than its NList
 		// (some were deleted since it was built) trains one cell per
-		// vector, as a rebuild of the source would (vivf ivfRebuildNList);
-		// its catalog record keeps the source's NList.
+		// vector, as a rebuild of the source would (vivf ivfRebuildNList),
+		// and a copied Closure above 255 places a vector in at most 255
+		// cells, the count its :doc record holds in one byte
+		// (maxVectorClosure): placed in 256, the count would read 0, and a
+		// delete would leave its entries in the cells. The index's meta
+		// record keeps the 255 it was built with, and its catalog record
+		// the source's NList and Closure.
 		sp := ivfStoreParams(info.Vector, len(vecs))
 		sp.NList = min(sp.NList, len(vecs))
+		sp.Assign = min(sp.Assign, maxVectorClosure)
 		ivf, err := vivf.BulkBuild(tx, prefix, sp, ids, vecs)
 		if err != nil {
 			return nil, err

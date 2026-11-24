@@ -91,9 +91,12 @@ created nothing:
 The tuning checks apply to an index being created only: `EnsureIndex` of a
 definition identical to one in the catalog keeps that index without them, so a
 definition an earlier release created past them is not refused at startup, and
-`CopyToLatestFormat` copies such an index with its definition. The checks
-before them are not skipped: `EnsureIndex` of a quarantined `ivfpq` index's
-own definition returns `ErrVectorIndexUnsupported`.
+`CopyToLatestFormat` copies such an index with its definition, placing each
+vector of an IVF index whose `Closure` is above 255 in at most 255 cells. It
+refuses an HNSW index with a negative `M` (`ErrInvalidConfig`), which no graph
+can be built with (docs/migration-format-5-to-6.md). The checks before them are
+not skipped: `EnsureIndex` of a quarantined `ivfpq` index's own definition
+returns `ErrVectorIndexUnsupported`.
 
 An index built by an earlier release in the removed `ivfpq` mode still opens with
 its collection but is quarantined: `$knn` on its field and `CompactVectorIndex`

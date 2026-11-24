@@ -69,13 +69,15 @@ type CopyReport struct {
 // and every index is built under today's rules, so what an older release
 // stored can come out different, as the guide lists. A definition keeps the
 // values it has in src, also where creating it anew would be refused: a
-// vector index is not held to the bounds of a new one, and an IVF index
-// whose collection has fewer vectors than its NList trains one cell per
-// vector. Anything that cannot be copied fails the call with an error naming
-// the collection and the index or document: an index that does not build
-// again (a unique index the current rules find duplicate, an IVF index whose
-// collection holds no vectors to train on), a document Insert refuses (one
-// whose primary key is an array).
+// vector index is not held to the bounds of a new one, an IVF index whose
+// collection has fewer vectors than its NList trains one cell per vector,
+// and an IVF Closure above 255 places each vector in at most 255 cells.
+// Anything that cannot be copied fails the call with an error naming the
+// collection and the index or document: an index that does not build again
+// (a unique index the current rules find duplicate, an IVF index whose
+// collection holds no vectors to train on, an HNSW index with a negative M,
+// ErrInvalidConfig), a document Insert refuses (one whose primary key is an
+// array).
 //
 // The source is read in one read transaction, from the catalog to the last
 // document, as VACUUM INTO reads its source: commits made to src while the
