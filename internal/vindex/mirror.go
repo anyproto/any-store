@@ -63,6 +63,20 @@ func (b *l0Base) isDeleted(label uint32) bool {
 	return b.deleted[label>>6]&(1<<(label&63)) != 0
 }
 
+// maxL0EdgesReserve is the most edges buildL0Base reserves up front: 2^24
+// (64 MiB). n·m0 is a ceiling, not a count: a node holds at most m0 layer-0
+// neighbours and a sparse graph far fewer, and at the largest M (m0 = 65,534)
+// the product passes what a 32-bit int holds at 32,770 labels. Past the
+// reservation the slice grows with the records read.
+const maxL0EdgesReserve = 1 << 24
+
+// l0EdgesReserve is the capacity buildL0Base gives its edges: n·m0, the
+// layer-0 degree cap times the labels, computed without overflow, up to
+// maxL0EdgesReserve.
+func l0EdgesReserve(n uint32, m0 int) int {
+	return int(min(uint64(n)*uint64(max(m0, 0)), maxL0EdgesReserve))
+}
+
 // buildL0Base scans the adjacency namespace at rtx's snapshot and materialises the
 // layer-0 CSR + tombstone set, tagged with gen. Records are keyed by big-endian
 // label so the cursor yields labels in ascending order; the label space is dense
@@ -78,7 +92,7 @@ func buildL0Base(rtx *btree.ReadTx, ix *Index, gen uint64) (*l0Base, error) {
 		gen:     gen,
 		n:       n,
 		offsets: make([]uint32, n+1),
-		edges:   make([]uint32, 0, int(n)*ix.m0), // m0 is the layer-0 degree cap
+		edges:   make([]uint32, 0, l0EdgesReserve(n, ix.m0)),
 		deleted: make([]uint64, n/64+1),
 	}
 	cur := rtx.NewCursor(ix.vadj)

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -1151,4 +1153,86 @@ func TestDb_CloseFromModifier(t *testing.T) {
 	require.NoError(t, err)
 	assertQueryCount(t, coll.Find(`{"touched":1}`), 0)
 	assertQueryCount(t, coll.Find(nil), 10)
+}
+
+// An unknown Durability.FlushMode fails Open with ErrInvalidConfig, AutoFlush
+// on or off, before anything is created or registered: it used to panic in
+// Open and leave the path registered as open, refusing every later Open of it
+// in the process.
+func TestOpen_InvalidFlushMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	for _, autoFlush := range []bool{true, false} {
+		d, err := anystore.Open(ctx, path, &anystore.Config{Durability: anystore.DurabilityConfig{AutoFlush: autoFlush, FlushMode: "CHECKPOINT_SOMETIMES"}})
+		require.ErrorIs(t, err, anystore.ErrInvalidConfig)
+		require.ErrorContains(t, err, "Durability.FlushMode")
+		require.Nil(t, d)
+	}
+	_, statErr := os.Stat(path)
+	require.ErrorIs(t, statErr, os.ErrNotExist, "a refused Open creates no file")
+
+	for _, mode := range []anystore.FlushMode{"", anystore.FlushModeCheckpointPassive, anystore.FlushModeCheckpointFull, anystore.FlushModeCheckpointRestart, anystore.FlushModeCheckpointTruncate} {
+		d, err := anystore.Open(ctx, path, &anystore.Config{Durability: anystore.DurabilityConfig{AutoFlush: true, FlushMode: mode}})
+		require.NoError(t, err, "flush mode %q", mode)
+		require.NoError(t, d.Close())
+	}
+}
+
+// Open with the largest CacheSize and ReadConcurrency returns promptly and the
+// database works: the cache size used to hang Open, and the reader count to
+// panic in it, leaving the path registered as open.
+func TestOpen_HugeCacheSizeAndReadConcurrency(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	type opened struct {
+		d   anystore.DB
+		err error
+	}
+	done := make(chan opened, 1)
+	go func() {
+		d, err := anystore.Open(ctx, path, &anystore.Config{CacheSize: math.MaxInt, ReadConcurrency: math.MaxInt})
+		done <- opened{d, err}
+	}()
+	var o opened
+	select {
+	case o = <-done:
+	case <-time.After(time.Minute):
+		t.Fatal("Open with the largest CacheSize and ReadConcurrency did not return")
+	}
+	require.NoError(t, o.err)
+	coll, err := o.d.Collection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	n, err := coll.Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	require.NoError(t, o.d.Close())
+
+	d, err := anystore.Open(ctx, path, nil)
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+}
+
+// A passphrase's KDFIterations past 100,000,000 fails Open with
+// ErrInvalidConfig at once, before anything is created: the count is part of
+// the key, so it is not clamped, and PBKDF2 never returned with the largest
+// int. A 32-byte passphrase is the key itself and ignores the count. The path
+// then opens with a valid count.
+func TestOpen_KDFIterationsBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	for _, n := range []int{100_000_001, math.MaxInt} {
+		d, err := anystore.Open(ctx, path, &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: []byte("pw"), KDFIterations: n}})
+		require.ErrorIs(t, err, anystore.ErrInvalidConfig)
+		require.ErrorContains(t, err, "Encryption.KDFIterations")
+		require.Nil(t, d)
+	}
+	_, statErr := os.Stat(path)
+	require.ErrorIs(t, statErr, os.ErrNotExist, "a refused Open creates no file")
+
+	d, err := anystore.Open(ctx, path, &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: []byte("pw"), KDFIterations: 1000}})
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+
+	raw := filepath.Join(t.TempDir(), "raw")
+	d, err = anystore.Open(ctx, raw, &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: make([]byte, 32), KDFIterations: math.MaxInt}})
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
 }

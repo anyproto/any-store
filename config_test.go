@@ -12,11 +12,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -149,84 +147,4 @@ func pageBufferChildUse(t *testing.T, ctx context.Context, path string, id, roun
 	require.Equal(t, 300, n)
 	require.NoError(t, fresh.QuickCheck(ctx))
 	require.NoError(t, fresh.Close())
-}
-
-// An unknown Durability.FlushMode fails Open with ErrInvalidConfig, AutoFlush
-// on or off, before anything is created or registered: it used to panic in
-// Open and leave the path registered as open, refusing every later Open of it
-// in the process.
-func TestOpen_InvalidFlushMode(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db")
-	for _, autoFlush := range []bool{true, false} {
-		d, err := Open(ctx, path, &Config{Durability: DurabilityConfig{AutoFlush: autoFlush, FlushMode: "CHECKPOINT_SOMETIMES"}})
-		require.ErrorIs(t, err, ErrInvalidConfig)
-		require.ErrorContains(t, err, "Durability.FlushMode")
-		require.Nil(t, d)
-	}
-	_, statErr := os.Stat(path)
-	require.ErrorIs(t, statErr, os.ErrNotExist, "a refused Open creates no file")
-
-	for _, mode := range []FlushMode{"", FlushModeCheckpointPassive, FlushModeCheckpointFull, FlushModeCheckpointRestart, FlushModeCheckpointTruncate} {
-		d, err := Open(ctx, path, &Config{Durability: DurabilityConfig{AutoFlush: true, FlushMode: mode}})
-		require.NoError(t, err, "flush mode %q", mode)
-		require.NoError(t, d.Close())
-	}
-}
-
-// A CacheSize or ReadConcurrency past what Open can allocate is taken as its
-// bound; zero and negative values take the defaults.
-func TestConfig_CacheSizes(t *testing.T) {
-	cs, rc := (&Config{}).cacheSizes()
-	require.Equal(t, 5000, cs)
-	require.Equal(t, max(runtime.NumCPU()-1, 4), rc)
-
-	cs, rc = (&Config{CacheSize: -1, ReadConcurrency: -1}).cacheSizes()
-	require.Equal(t, 5000, cs)
-	require.Equal(t, max(runtime.NumCPU()-1, 4), rc)
-
-	cs, rc = (&Config{CacheSize: 7, ReadConcurrency: 3}).cacheSizes()
-	require.Equal(t, 7, cs)
-	require.Equal(t, 3, rc)
-
-	cs, rc = (&Config{CacheSize: maxCacheSize, ReadConcurrency: maxReadConcurrency}).cacheSizes()
-	require.Equal(t, maxCacheSize, cs)
-	require.Equal(t, maxReadConcurrency, rc)
-
-	cs, rc = (&Config{CacheSize: math.MaxInt, ReadConcurrency: math.MaxInt}).cacheSizes()
-	require.Equal(t, maxCacheSize, cs)
-	require.Equal(t, maxReadConcurrency, rc)
-}
-
-// Open with the largest CacheSize and ReadConcurrency returns promptly and the
-// database works: the cache size used to hang Open, and the reader count to
-// panic in it, leaving the path registered as open.
-func TestOpen_HugeCacheSizeAndReadConcurrency(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db")
-	type opened struct {
-		d   DB
-		err error
-	}
-	done := make(chan opened, 1)
-	go func() {
-		d, err := Open(ctx, path, &Config{CacheSize: math.MaxInt, ReadConcurrency: math.MaxInt})
-		done <- opened{d, err}
-	}()
-	var o opened
-	select {
-	case o = <-done:
-	case <-time.After(time.Minute):
-		t.Fatal("Open with the largest CacheSize and ReadConcurrency did not return")
-	}
-	require.NoError(t, o.err)
-	coll, err := o.d.Collection(ctx, "c")
-	require.NoError(t, err)
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
-	n, err := coll.Count(ctx)
-	require.NoError(t, err)
-	require.Equal(t, 1, n)
-	require.NoError(t, o.d.Close())
-
-	d, err := Open(ctx, path, nil)
-	require.NoError(t, err)
-	require.NoError(t, d.Close())
 }

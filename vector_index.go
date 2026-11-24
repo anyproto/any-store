@@ -119,24 +119,32 @@ const (
 	// stores the number of cells it was placed in in one byte (vivf
 	// appendDocCells).
 	maxVectorClosure = 1<<8 - 1
+	// maxVectorUint32 is the largest Dim, NList and NProbe: the index's meta
+	// record stores each in four bytes (vindex and vivf encodeMeta), so a
+	// larger one would come back from it wrapped once the index is reopened.
+	maxVectorUint32 = math.MaxUint32
 )
 
-// validateVectorTuning refuses, wrapped in ErrInvalidConfig, a tuning value of
-// p that an index cannot be built or stored with: a negative one (zero picks
-// the default), or an M, EfConstruction, EfSearch or Closure past its bound.
-// It runs when an index is created, not when one an earlier release created is
-// opened.
+// validateVectorTuning refuses, wrapped in ErrInvalidConfig, a value of p
+// that an index cannot be built or stored with: a negative tuning value
+// (zero picks the default), an M, EfConstruction, EfSearch or Closure past
+// its bound, a Dim, NList or NProbe its meta record cannot hold, or a NaN
+// CompactRatio, which no ratio reaches and which matches no definition, its
+// own included, when EnsureIndex compares one. It runs when an index is
+// created, not when one an earlier release created is opened or ensured
+// (createVectorIndex).
 func validateVectorTuning(p *VectorParams) error {
 	for _, f := range [...]struct {
 		name   string
-		v, max int
+		v, max int64
 	}{
-		{"M", p.M, maxVectorM},
-		{"EfConstruction", p.EfConstruction, maxVectorEf},
-		{"EfSearch", p.EfSearch, maxVectorEf},
-		{"NList", p.NList, math.MaxInt},
-		{"NProbe", p.NProbe, math.MaxInt},
-		{"Closure", p.Closure, maxVectorClosure},
+		{"Dim", int64(p.Dim), maxVectorUint32},
+		{"M", int64(p.M), maxVectorM},
+		{"EfConstruction", int64(p.EfConstruction), maxVectorEf},
+		{"EfSearch", int64(p.EfSearch), maxVectorEf},
+		{"NList", int64(p.NList), maxVectorUint32},
+		{"NProbe", int64(p.NProbe), maxVectorUint32},
+		{"Closure", int64(p.Closure), maxVectorClosure},
 	} {
 		if f.v < 0 {
 			return fmt.Errorf("%w: VectorParams.%s is %d, a negative value", ErrInvalidConfig, f.name, f.v)
@@ -144,6 +152,9 @@ func validateVectorTuning(p *VectorParams) error {
 		if f.v > f.max {
 			return fmt.Errorf("%w: VectorParams.%s is %d, more than %d", ErrInvalidConfig, f.name, f.v, f.max)
 		}
+	}
+	if math.IsNaN(p.CompactRatio) {
+		return fmt.Errorf("%w: VectorParams.CompactRatio is NaN", ErrInvalidConfig)
 	}
 	return nil
 }
@@ -533,9 +544,6 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info In
 	if err := validateVectorParams(info.Vector); err != nil {
 		return nil, err
 	}
-	if err := validateVectorTuning(info.Vector); err != nil {
-		return nil, err
-	}
 	tx.MarkSchemaChanged()
 	if info.Name == "" {
 		info.Name = info.Vector.Field
@@ -544,6 +552,15 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info In
 		return nil, err
 	}
 	if err := c.db.registerIndex(tx, s.name, info); err != nil {
+		return nil, err
+	}
+	// The tuning bounds apply to an index being created, so they are checked
+	// once registerIndex has found no index of the name: an identical
+	// definition an earlier release created past them (an EfSearch above
+	// 65,536) is ErrIndexExists, which EnsureIndex keeps, as before. A
+	// refusal here returns before anything is built, and the operation's
+	// rollback takes the catalog record back out.
+	if err := validateVectorTuning(info.Vector); err != nil {
 		return nil, err
 	}
 	if info.Vector.Mode.isBruteForce() {
@@ -594,15 +611,17 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info In
 	// populated collection (the documented bulk-load pattern); creating it empty
 	// has no data to learn the centroids from.
 	if info.Vector.Mode.isIVF() {
-		if len(vecs) == 0 {
-			return nil, fmt.Errorf("vector index: IVF requires existing documents to train — insert documents before creating the index")
-		}
 		if info.Vector.NList > len(vecs) {
 			// k-means cannot make more cells than it has vectors to train on,
 			// and sizes its centroid table by NList: FAISS refuses the same
 			// ("Number of training points should be at least as large as
-			// number of clusters").
+			// number of clusters"). Checked before the empty case below, so
+			// an explicit NList on a collection with no usable vector is
+			// this error too.
 			return nil, fmt.Errorf("%w: VectorParams.NList is %d, more than the %d vectors to train on", ErrInvalidConfig, info.Vector.NList, len(vecs))
+		}
+		if len(vecs) == 0 {
+			return nil, fmt.Errorf("vector index: IVF requires existing documents to train — insert documents before creating the index")
 		}
 		ivf, err := vivf.BulkBuild(tx, prefix, ivfStoreParams(info.Vector, len(vecs)), ids, vecs)
 		if err != nil {
@@ -748,7 +767,10 @@ func (q *collQuery) detectKnnQuery(s *collSchema) (*qplanner.VectorQuerySpec, qu
 		// IVF: probe a few cells (contiguous range scans), re-rank by exact
 		// distance. ef is the candidate count kept from the scan; nprobe is fixed
 		// in the index.
-		spec.Ef = knnEf(knn.Ef, captured.ivf.NProbe()*8, knn.K, hasResidual)
+		// The default depth is 8 per probed cell. NProbe is bounded first:
+		// knnEf caps the default at vectorEfCap anyway, and a large NProbe
+		// (up to 2^32-1 is stored) times 8 overflows a 32-bit int.
+		spec.Ef = knnEf(knn.Ef, min(captured.ivf.NProbe(), vectorEfCap)*8, knn.K, hasResidual)
 		// ~2.2 cost units per ef candidate measured on the vector_restrict
 		// benchmark (cell scans, amortized).
 		spec.SearchCostPerCand = 2.5

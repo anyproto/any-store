@@ -214,54 +214,47 @@ func TestVectorIndex_BuildOnExisting(t *testing.T) {
 	assert.Equal(t, idBytesOf(123), hits[0].DocId)
 }
 
-// Index creation refuses a tuning value the index cannot be built or stored
-// with, wrapped in ErrInvalidConfig, and creates nothing. Before, a negative M
-// panicked in the build, an M past the bound ran out of memory, a Closure past
-// 255 wrapped the one-byte cell count of each vector's record, and an NList
-// past the vectors to train on sized the centroid table by it.
-func TestVectorIndex_TuningValidated(t *testing.T) {
-	const (
-		n   = 50
-		dim = 4
-	)
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "docs")
+// An index an earlier release created with a tuning value past today's bounds
+// stays usable: EnsureIndex of its identical definition finds it and keeps
+// it, as before the bounds; only creating the definition, under another
+// name, is refused. A brute-force index is its catalog record alone, so the
+// test writes the record an earlier release's CreateIndex wrote, unchecked.
+func TestVectorIndex_EnsureKeepsEarlierDefinition(t *testing.T) {
+	const dim = 4
+	path := filepath.Join(t.TempDir(), "db")
+	d, err := Open(ctx, path, nil)
 	require.NoError(t, err)
-	for i, vc := range vrand(n, dim, 7) {
+	coll, err := d.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	vecs := vrand(20, dim, 7)
+	for i, vc := range vecs {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
 	}
-	for _, c := range []struct {
-		name  string
-		p     VectorParams
-		field string
-	}{
-		{"negative M", VectorParams{M: -1}, "VectorParams.M "},
-		{"M past its bound", VectorParams{M: maxVectorM + 1}, "VectorParams.M "},
-		{"negative EfConstruction", VectorParams{EfConstruction: -1}, "VectorParams.EfConstruction"},
-		{"EfSearch past its bound", VectorParams{EfSearch: maxVectorEf + 1}, "VectorParams.EfSearch"},
-		{"negative NList", VectorParams{Mode: VectorModeIVFSQ, NList: -1}, "VectorParams.NList"},
-		{"negative NProbe", VectorParams{Mode: VectorModeIVFSQ, NProbe: -1}, "VectorParams.NProbe"},
-		{"negative Closure", VectorParams{Mode: VectorModeIVFSQ, Closure: -1}, "VectorParams.Closure"},
-		{"Closure past its bound", VectorParams{Mode: VectorModeIVFSQ, Closure: maxVectorClosure + 1}, "VectorParams.Closure"},
-		{"NList past the vectors", VectorParams{Mode: VectorModeIVFSQ, NList: n + 1}, "VectorParams.NList"},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			p := c.p
-			p.Field, p.Dim = "v", dim
-			for _, create := range []func(context.Context, ...IndexInfo) error{coll.CreateIndex, coll.EnsureIndex} {
-				err := create(ctx, IndexInfo{Name: "emb", Kind: IndexKindVector, Vector: &p})
-				require.ErrorIs(t, err, ErrInvalidConfig)
-				require.ErrorContains(t, err, c.field)
-				require.ErrorIs(t, coll.DropIndex(ctx, "emb"), ErrIndexNotFound)
-			}
-		})
-	}
+	old := IndexInfo{Name: "old", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Mode: VectorModeBruteForce, EfSearch: maxVectorEf + 1}}
+	dd := d.(*db)
+	require.NoError(t, dd.doWriteTxModified(ctx, func(tx *btree.WriteTx) (bool, error) {
+		tx.MarkSchemaChanged()
+		return true, dd.registerIndex(tx, "docs", old)
+	}))
+	require.NoError(t, d.Close())
 
-	// The bounds themselves are accepted.
-	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Name: "ivf", Kind: IndexKindVector,
-		Vector: &VectorParams{Field: "v", Dim: dim, Mode: VectorModeIVFSQ, NList: n, Closure: maxVectorClosure}}))
-	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Name: "hnsw", Kind: IndexKindVector,
-		Vector: &VectorParams{Field: "v", Dim: dim, EfConstruction: maxVectorEf, EfSearch: maxVectorEf}}))
+	d, err = Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer d.Close()
+	coll, err = d.Collection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, old))
+	require.ErrorIs(t, coll.CreateIndex(ctx, old), ErrIndexExists)
+	hits, err := vsearch(coll, "v", vecs[3], 1, 0)
+	require.NoError(t, err)
+	require.Len(t, hits, 1)
+	assert.Equal(t, idBytesOf(3), hits[0].DocId)
+
+	fresh := old
+	fresh.Name = "new"
+	require.ErrorIs(t, coll.EnsureIndex(ctx, fresh), ErrInvalidConfig)
+	require.ErrorIs(t, coll.DropIndex(ctx, "new"), ErrIndexNotFound)
 }
 
 func TestVectorIndex_Stats(t *testing.T) {

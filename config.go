@@ -248,7 +248,9 @@ type EncryptionConfig struct {
 
 	// KDFIterations overrides the PBKDF2 cost. Zero means 256,000 (the
 	// SQLCipher v4 default). Ignored when Passphrase is exactly 32 bytes
-	// (raw-key path). Use lower values only in tests.
+	// (raw-key path). Use lower values only in tests. A count above
+	// 100,000,000 fails Open with ErrInvalidConfig. The count is part of the
+	// key: a database opens only with the count it was created with.
 	KDFIterations int
 
 	// CipherType selects the built-in AEAD when Passphrase is set.
@@ -319,12 +321,12 @@ type DurabilityConfig struct {
 // it. SQLite clamps cache_size rather than refusing it: pcache1Cachesize holds
 // the page count of a cache's group at 0x7fff0000 (pcache1.c:820-822), the
 // cache's own count when each cache has a group of its own, as here. A 32-bit
-// target is held lower, at the pages its address space can hold (2 GiB of
-// 4 KiB pages), which also keeps the cache's int arithmetic (90% of the page
-// count) in range there. Nothing is allocated in proportion to the bound: a
-// cache allocates pages as it fills, and its hash table grows with them past
-// a fixed initial size (btree newPcache).
-const maxCacheSize = min(0x7fff0000, math.MaxInt/4096)
+// target is held lower, at the pages its address space can hold, 2 GiB of
+// 4 KiB pages: (math.MaxInt+1)/4096, 524,288. That also keeps the cache's int
+// arithmetic (90% of the page count) in range there. Nothing is allocated in
+// proportion to the bound: a cache allocates pages as it fills, and its hash
+// table grows with them past a fixed initial size (btree newPcache).
+const maxCacheSize = min(0x7fff0000, math.MaxInt/4096+1)
 
 // maxReadConcurrency is the largest ReadConcurrency Open uses; a larger one is
 // taken as it. Open allocates the pool of idle reader caches at the full
@@ -336,16 +338,33 @@ const maxCacheSize = min(0x7fff0000, math.MaxInt/4096)
 // is bound by its memory before it is by this cap.
 const maxReadConcurrency = 1 << 16
 
+// maxKDFIterations is the largest Encryption.KDFIterations Open derives a key
+// with. The count is part of the key, so a database opens only with the count
+// it was created with: a larger one is refused, not clamped to another key.
+// SQLCipher takes any positive int for kdf_iter. Go's PBKDF2 loop never ends
+// at the largest int, though, and a count near it costs Open minutes (one
+// PBKDF2-HMAC-SHA256 iteration takes 0.3 to 0.8 µs on an Apple M2 core, so
+// 2^31 is 11 to 27 minutes). 100,000,000, 390 times the default, takes 33 to
+// 75 seconds there, and is far past the counts deployments use (OWASP
+// recommends 600,000 for PBKDF2-HMAC-SHA256).
+const maxKDFIterations = 100_000_000
+
 // validate reports the first field of c that Open cannot run with, wrapped in
 // ErrInvalidConfig. It runs before Open resolves the path or touches a file,
 // so a refused Config leaves nothing open. Sizes past what the code can
 // allocate are clamped instead (cacheSizes); a value with no nearest valid
-// one, as an unknown FlushMode, is an error.
+// one, as an unknown FlushMode, or one that would derive another key, as a
+// KDFIterations past maxKDFIterations, is an error.
 func (c *Config) validate() error {
 	switch c.Durability.FlushMode {
 	case "", FlushModeCheckpointPassive, FlushModeCheckpointFull, FlushModeCheckpointRestart, FlushModeCheckpointTruncate:
 	default:
 		return fmt.Errorf("%w: Durability.FlushMode %q is not one of the FlushModeCheckpoint modes", ErrInvalidConfig, c.Durability.FlushMode)
+	}
+	// Only a passphrase goes through the KDF: a 32-byte one is the key itself
+	// and ignores the count.
+	if e := c.Encryption; e.Passphrase != nil && len(e.Passphrase) != btree.KeyLen && e.KDFIterations > maxKDFIterations {
+		return fmt.Errorf("%w: Encryption.KDFIterations is %d, more than %d", ErrInvalidConfig, e.KDFIterations, maxKDFIterations)
 	}
 	return nil
 }
