@@ -4010,6 +4010,28 @@ func TestIntegrityCheck_MissingDataNamespaceMatchesErrCorrupt(t *testing.T) {
 	require.Contains(t, err.Error(), "data namespace missing")
 }
 
+// IntegrityCheck consults its ctx between the btree's walk, which does not,
+// and the catalog's check, and before it returns success: a ctx cancelled
+// while the walk ran ends the check with the ctx's error, not with nil.
+func TestIntegrityCheck_CancelledDuringTheWalk(t *testing.T) {
+	d, err := Open(context.Background(), filepath.Join(t.TempDir(), "a.db"), nil)
+	require.NoError(t, err)
+	defer d.Close()
+	_, err = d.CreateCollection(context.Background(), "c")
+	require.NoError(t, err)
+
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	testIntegrityCheckWalkedHook = cancel
+	defer func() { testIntegrityCheckWalkedHook = nil }()
+	err = d.IntegrityCheck(cctx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, ErrCorrupt)
+
+	testIntegrityCheckWalkedHook = nil
+	require.NoError(t, d.IntegrityCheck(context.Background()))
+}
+
 // mmapShm reports whether the wal-index is shared memory other processes
 // map (linux, android, darwin and ios on amd64 and arm64): only there can a
 // test tear its header, as a writer between its two copies leaves it.

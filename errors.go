@@ -241,15 +241,16 @@ var (
 
 	// ErrCopyVerifyFailed is returned (wrapped) by CopyToLatestFormat when the copy it built
 	// fails its verification: a collection's options, document count or index definitions
-	// differ from the source's snapshot, a collection's data is missing, or the copy's
-	// integrity check found damage in it. It is returned too for damage the copy meets in
-	// itself while it is built: a page of the copy that fails its checksum when the copy reads
-	// it back, to add the next documents or to build an index. The fault is the copy's, not
-	// the source's: nothing is published at the destination, the staging files are removed,
-	// and the source is as it was. It does not match ErrCorrupt, even when what was found in
-	// the copy would: do not discard the source on it. Damage met reading the source is
-	// returned as the source's, and matches ErrCorrupt. Run the copy again; one that keeps
-	// failing points at the storage the copy is written to.
+	// differ from the source's snapshot, a record of its catalog does not decode, a
+	// collection's data is missing, or the copy's integrity check found damage in it. It is
+	// returned too for damage the copy meets in itself while it is built: a page of the copy
+	// that fails its checksum when the copy reads it back, to add the next documents or to
+	// build an index. The fault is the copy's, not the source's: nothing is published at the
+	// destination, the staging files are removed, and the source is as it was. It does not
+	// match ErrCorrupt, even when what was found in the copy would: do not discard the source
+	// on it. Damage met reading the source is returned as the source's, and matches
+	// ErrCorrupt. Run the copy again; one that keeps failing points at the storage the copy is
+	// written to.
 	ErrCopyVerifyFailed = errors.New("any-store: copy to latest format: the copy failed its verification")
 
 	// ErrBackupFormatMismatch is returned (wrapped) by Backup when the file at its path is a

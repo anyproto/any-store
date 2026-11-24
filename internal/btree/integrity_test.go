@@ -1,12 +1,14 @@
 package btree
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -494,6 +496,55 @@ func TestIntegrityCheck_FailedReadIsNotErrCorrupt(t *testing.T) {
 
 	setWalReadFrameFaultHook(nil)
 	require.NoError(t, db.IntegrityCheck())
+}
+
+// A key on overflow pages whose read fails once is listed as a read that
+// failed, with the read's error, and not as a corrupt key: when the check
+// of the overflow chain then reads the page, that line is all the report
+// says of it, and the report matches the read's error, not ErrCorrupt.
+func TestIntegrityCheck_FailedKeyReadIsNamedWithItsError(t *testing.T) {
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("k")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns, bytes.Repeat([]byte("k"), 6000), []byte("v")))
+	require.NoError(t, wtx.Commit())
+	require.NoError(t, db.IntegrityCheck())
+
+	// The first overflow page of the key, and its frame.
+	nf := db.pager.wal.nFrame.Load()
+	pg, err := db.pager.getPageReader(ns.RootPage(), nf, nil)
+	require.NoError(t, err)
+	bt := &btree{pager: db.pager, rootPage: ns.RootPage()}
+	cell, _, err := parseLeafCellWithSize(pg.data, int(pg.getCellOffset(0)), bt.leafLimits())
+	db.pager.releasePage(pg)
+	require.NoError(t, err)
+	require.NotZero(t, cell.overflowPg)
+	frame := mustWiGet(t, db.pager.wal.index, cell.overflowPg, nf)
+	require.NotZero(t, frame)
+
+	ioErr := errors.New("injected input/output error")
+	var failed atomic.Bool
+	setWalReadFrameFaultHook(func(f uint32) error {
+		if f == frame && failed.CompareAndSwap(false, true) {
+			return ioErr
+		}
+		return nil
+	})
+	err = db.IntegrityCheck()
+	setWalReadFrameFaultHook(nil)
+	require.True(t, failed.Load())
+	var ie *IntegrityError
+	require.ErrorAs(t, err, &ie)
+	require.ErrorIs(t, err, ioErr)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.Len(t, ie.Errors, 1)
+	require.Contains(t, ie.Errors[0], "cell 0: reading the leaf key failed: ")
+	require.Contains(t, ie.Errors[0], ioErr.Error())
 }
 
 // IntegrityCheck on a closed handle is ErrClosed, in either shared-memory

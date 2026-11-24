@@ -441,7 +441,9 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 			if cell.overflowPg != 0 {
 				fk, fkerr := leafFullKey(pg.data, cellOff, leafLim, ic.pager, ic.walMaxFrame, ic.cache)
 				if fkerr != nil {
-					ic.reportRead(fkerr, "%s cell %d: corrupt leaf key", context, i)
+					// The read's error is in the line: a read that failed
+					// once is not a key found corrupt.
+					ic.reportRead(fkerr, "%s cell %d: reading the leaf key failed: %v", context, i, fkerr)
 				} else {
 					fullKey = fk
 				}
@@ -528,7 +530,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 			// This is the divider key D_i for this interior cell.
 			fullKey, fkerr := interiorFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, ic.cache)
 			if fkerr != nil {
-				ic.reportRead(fkerr, "%s cell %d: corrupt interior key", context, i)
+				ic.reportRead(fkerr, "%s cell %d: reading the interior key failed: %v", context, i, fkerr)
 			} else {
 				if prevKey != nil && bytes.Compare(prevKey, fullKey) >= 0 {
 					ic.report("%s cell %d: key out of order", context, i)

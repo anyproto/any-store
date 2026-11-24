@@ -145,7 +145,10 @@ type CopyReport struct {
 // built, is not published, and the call returns ErrCopyVerifyFailed, which
 // does not match ErrCorrupt even when the copy is damaged: the copy is what
 // failed, not src. The copy's pages are verified whatever
-// config.ContinueOnIntegrityError says. The files at
+// config.ContinueOnIntegrityError says, and config.OnIntegrityError is not
+// called for them. Damage met reading src is src's: an error that matches
+// ErrCorrupt, as from src's IntegrityCheck (a collection the catalog lists
+// whose data is missing included), and src's own callback. The files at
 // and beside dstPath are checked again right before the rename, so a file
 // that appeared there while the copy ran also gives ErrDestinationExists. The
 // check and the rename are not one step, and the locks exclude only other
@@ -222,6 +225,11 @@ func CopyToLatestFormat(ctx context.Context, src DB, dstPath string, config *Con
 	// its checksum would pass the verification, and the copy published
 	// would fail its first read.
 	cfg.ContinueOnIntegrityError = false
+	// Damage the copy meets in itself is ErrCopyVerifyFailed, and the
+	// caller's integrity callback hears of src's pages, from src's own
+	// Config: given to the copy, it would report the copy's pages as if
+	// they were src's.
+	cfg.OnIntegrityError = nil
 	if cfg.InMemory {
 		return CopyReport{}, errors.New("any-store: copy to latest format: Config.InMemory is not supported, the copy is a file")
 	}
@@ -401,6 +409,11 @@ func copyCollection(ctx, rctx context.Context, s, dst *db, c *copiedCollection, 
 	defer func() { _ = dc.Close() }()
 	err = s.doReadTx(rctx, func(tx *btree.ReadTx) error {
 		ns, err := tx.GetNamespace(c.name)
+		if errors.Is(err, btree.ErrNamespaceNotFound) {
+			// The catalog listed it in this same snapshot: the source is
+			// damaged, as IntegrityCheck reports it (checkCatalog).
+			return fmt.Errorf("any-store: copy to latest format: %w", dataNamespaceMissing(c.name))
+		}
 		if err != nil {
 			return fail(err)
 		}
@@ -528,7 +541,7 @@ func verifyCopy(ctx context.Context, dst *db, want []copiedCollection) error {
 			}
 			cfg, err := dst.loadCollConfig(tx, w.name)
 			if err != nil {
-				return err
+				return fmt.Errorf("collection %q: %w", w.name, err)
 			}
 			if cfg.Compression != w.cfg.Compression || primaryKeyOf(cfg) != primaryKeyOf(w.cfg) {
 				return mismatch("collection %q: options %+v, the source has %+v", w.name, cfg, w.cfg)
@@ -566,10 +579,12 @@ func verifyCopy(ctx context.Context, dst *db, want []copiedCollection) error {
 		err = dst.IntegrityCheck(ctx)
 	}
 	if err != nil {
-		// A copy that differs from its source, or that is damaged, failed
-		// its verification. A check that could not run (a cancelled ctx,
-		// a read error) is returned as it is.
-		if errors.Is(err, errCopyDiffers) || errors.Is(err, ErrCorrupt) {
+		// A copy that differs from its source, or that is damaged (a page
+		// that fails its check, a catalog record that was read and does
+		// not decode), failed its verification. A check that could not
+		// run (a cancelled ctx, a read error) is returned as it is.
+		var undecoded *recordDecodeError
+		if errors.Is(err, errCopyDiffers) || errors.Is(err, ErrCorrupt) || errors.As(err, &undecoded) {
 			return fmt.Errorf("any-store: copy to latest format: %w", &copyVerifyError{finding: err})
 		}
 		return fmt.Errorf("any-store: copy to latest format: verifying the copy: %w", err)

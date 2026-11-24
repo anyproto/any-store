@@ -74,7 +74,9 @@ type DB interface {
 	// carries, which it uses without waiting for a reader slot, or else that
 	// of a read transaction of its own, whose wait for a slot ends with ctx.
 	// A write transaction that ctx carries is not checked: the check reads
-	// the committed state, in a read transaction of its own.
+	// the committed state, in a read transaction of its own. The walk of the
+	// btree does not consult ctx: a ctx that ends while it runs ends the
+	// check after it, with ctx's error.
 	//
 	// The error matches ErrCorrupt when the check found damage: a broken
 	// structure, a page that fails its checksum or authentication, or a
@@ -1423,9 +1425,25 @@ func (db *db) IntegrityCheck(ctx context.Context) (err error) {
 		if err := tx.IntegrityCheck(); err != nil {
 			return err
 		}
-		return db.checkCatalog(tx)
+		// The walk does not consult ctx: a ctx that ended while it ran
+		// ends the check here, and one that ends in the catalog's check
+		// ends it before it can return success.
+		if testIntegrityCheckWalkedHook != nil {
+			testIntegrityCheckWalkedHook()
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := db.checkCatalog(tx); err != nil {
+			return err
+		}
+		return ctx.Err()
 	})
 }
+
+// testIntegrityCheckWalkedHook runs in IntegrityCheck once the btree's walk
+// has passed, before the check of the catalog. Nil outside tests.
+var testIntegrityCheckWalkedHook func()
 
 // checkCatalog is IntegrityCheck's check of the catalog in tx: every
 // cataloged collection must have its data namespace. A missing one is the
@@ -1440,7 +1458,7 @@ func (db *db) checkCatalog(tx *btree.ReadTx) error {
 	for _, name := range names {
 		if _, nsErr := tx.GetNamespace(name); nsErr != nil {
 			if errors.Is(nsErr, btree.ErrNamespaceNotFound) {
-				return fmt.Errorf("%w: collection %q: data namespace missing (renamed by a pre-fix version); its data survives under the pre-rename namespace name", ErrCorrupt, name)
+				return dataNamespaceMissing(name)
 			}
 			// Any other failure to resolve the namespace is itself an
 			// integrity problem — never mask it as a clean result.
@@ -1448,6 +1466,13 @@ func (db *db) checkCatalog(tx *btree.ReadTx) error {
 		}
 	}
 	return nil
+}
+
+// dataNamespaceMissing is the error of a collection that the catalog lists
+// and whose data namespace the same snapshot does not hold: damage, which
+// matches ErrCorrupt.
+func dataNamespaceMissing(name string) error {
+	return fmt.Errorf("%w: collection %q: data namespace missing (renamed by a pre-fix version); its data survives under the pre-rename namespace name", ErrCorrupt, name)
 }
 
 func (db *db) Backup(ctx context.Context, path string) (err error) {
@@ -2211,7 +2236,7 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 		}
 		v, err := p.Parse(val)
 		if err != nil {
-			return nil, err
+			return nil, &recordDecodeError{err}
 		}
 		info := IndexInfo{
 			Name:   v.GetString("name"),
@@ -2770,6 +2795,15 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 }
 
 // loadCollConfig loads per-collection config from the system namespace.
+// recordDecodeError is the error of a record of the catalog (a
+// collection's config, an index definition) that was read and does not
+// decode. Its text and its chain are the parser's; it tells such a record
+// from a read that failed (CopyToLatestFormat's verification of its copy).
+type recordDecodeError struct{ err error }
+
+func (e *recordDecodeError) Error() string { return e.err.Error() }
+func (e *recordDecodeError) Unwrap() error { return e.err }
+
 func (db *db) loadCollConfig(tx *btree.ReadTx, collName string) (collConfig, error) {
 	var cfg collConfig
 	data, err := tx.AppendValue(db.systemNS, collConfigKey(collName), nil)
@@ -2782,7 +2816,7 @@ func (db *db) loadCollConfig(tx *btree.ReadTx, collName string) (collConfig, err
 	var p anyenc.Parser
 	val, err := p.Parse(data)
 	if err != nil {
-		return cfg, err
+		return cfg, &recordDecodeError{err}
 	}
 	cfg.Compression = Compression(val.GetInt("compression"))
 	cfg.PrimaryKey = val.GetString("primaryKey")

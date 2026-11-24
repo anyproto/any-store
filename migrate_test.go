@@ -2053,16 +2053,101 @@ func TestCopyToLatestFormat_DamageInTheCopyWhileItIsBuilt(t *testing.T) {
 	defer func() { testHookCopiedCollection = nil }()
 
 	// A small cache, so that the index build reads the documents' pages
-	// back from the files.
-	_, err = CopyToLatestFormat(ctx, src, dstPath, &Config{CacheSize: 10})
+	// back from the files. The caller's integrity callback hears nothing
+	// of the copy's pages, which it would take for the source's.
+	var called atomic.Int32
+	_, err = CopyToLatestFormat(ctx, src, dstPath, &Config{
+		CacheSize:        10,
+		OnIntegrityError: func(IntegrityError) { called.Add(1) },
+	})
 	require.True(t, damaged)
 	require.ErrorIs(t, err, ErrCopyVerifyFailed)
 	require.NotErrorIs(t, err, ErrCorrupt)
 	require.NotErrorIs(t, err, ErrPageIntegrity)
 	require.Contains(t, err.Error(), `index "n"`)
+	require.Zero(t, called.Load())
 	_, err = os.Stat(dstPath)
 	require.ErrorIs(t, err, os.ErrNotExist)
 	require.NoError(t, src.IntegrityCheck(ctx))
+}
+
+// A source whose catalog lists a collection with no data namespace is
+// damaged, as its IntegrityCheck says: the copy fails with an error that
+// matches ErrCorrupt and names the collection, and not with the b-tree's
+// missing-namespace error, nor as the copy's own failure.
+func TestCopyToLatestFormat_MissingSourceNamespaceIsErrCorrupt(t *testing.T) {
+	src, _ := openSource(t, nil)
+	coll, err := src.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	require.NoError(t, coll.Close())
+	// The collection's data goes; its catalog entry stays.
+	wtx, err := src.(*db).btreeDB.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, wtx.DeleteNamespace("c"))
+	require.NoError(t, wtx.Commit())
+	require.ErrorIs(t, src.IntegrityCheck(ctx), ErrCorrupt)
+
+	dstPath := filepath.Join(t.TempDir(), "copy.db")
+	_, err = CopyToLatestFormat(ctx, src, dstPath, nil)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, ErrCopyVerifyFailed)
+	require.NotErrorIs(t, err, btree.ErrNamespaceNotFound)
+	require.Contains(t, err.Error(), `collection "c"`)
+	_, err = os.Stat(dstPath)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// A record of the copy's catalog that was read and does not decode (a
+// collection's config, an index definition), in a page whose checksum is
+// valid, is a copy that failed its verification: ErrCopyVerifyFailed,
+// naming the collection, and not the parser's error alone.
+func TestCopyToLatestFormat_UndecodableCatalogRecordIsVerifyFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		key  func() []byte
+	}{
+		// A collection of the default options has no config record:
+		// one is written.
+		{"collection config", func() []byte { return collConfigKey("c") }},
+		{"index definition", func() []byte { return []byte(indexKeyPrefix("c") + "n") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dst, err := open(ctx, filepath.Join(t.TempDir(), "copy.db"), &Config{}, LatestSchemaFormat)
+			require.NoError(t, err)
+			defer dst.Close()
+			coll, err := dst.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Name: "n", Fields: []string{"n"}}))
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"n":1}`)))
+			var want []copiedCollection
+			require.NoError(t, dst.doReadTx(ctx, func(tx *btree.ReadTx) error {
+				cfg, err := dst.loadCollConfig(tx, "c")
+				if err != nil {
+					return err
+				}
+				indexes, err := dst.getIndexInfos(tx, "c")
+				if err != nil {
+					return err
+				}
+				want = append(want, copiedCollection{name: "c", cfg: cfg, indexes: indexes, docs: 1})
+				return nil
+			}))
+			require.NoError(t, verifyCopy(ctx, dst, want))
+
+			// The record is written as any record is: its page's checksum
+			// is valid, and what it holds does not decode.
+			wtx, err := dst.btreeDB.BeginWrite()
+			require.NoError(t, err)
+			require.NoError(t, wtx.Put(dst.systemNS, tc.key(), []byte{0xEE, 0xEE}))
+			require.NoError(t, wtx.Commit())
+
+			err = verifyCopy(ctx, dst, want)
+			require.ErrorIs(t, err, ErrCopyVerifyFailed)
+			require.NotErrorIs(t, err, ErrCorrupt)
+			require.Contains(t, err.Error(), `collection "c"`)
+		})
+	}
 }
 
 // The copy's pages are verified whatever Config.ContinueOnIntegrityError
