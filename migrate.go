@@ -140,7 +140,10 @@ type CopyReport struct {
 // js/wasm and wasip1 have no such lock to try, and open nothing. The copy is
 // checkpointed, verified (each collection's options, document count and index
 // definitions against the source's snapshot, then IntegrityCheck) and closed,
-// and then published by renaming the staging file to dstPath. The files at
+// and then published by renaming the staging file to dstPath. A copy that
+// fails the verification is not published, and the call returns
+// ErrCopyVerifyFailed, which does not match ErrCorrupt even when the copy is
+// damaged: the copy is what failed, not src. The files at
 // and beside dstPath are checked again right before the rename, so a file
 // that appeared there while the copy ran also gives ErrDestinationExists. The
 // check and the rename are not one step, and the locks exclude only other
@@ -498,10 +501,13 @@ func documentName(key []byte, doc *anyenc.Value, pk string) string {
 // definitions, then the btree's IntegrityCheck.
 func verifyCopy(ctx context.Context, dst *db, want []copiedCollection) error {
 	if err := dst.Flush(ctx, 0, FlushModeCheckpointTruncate); err != nil {
+		if errors.Is(err, ErrCorrupt) {
+			return &copyVerifyError{finding: fmt.Errorf("checkpoint of the copy: %w", err)}
+		}
 		return fmt.Errorf("any-store: copy to latest format: checkpoint of the copy: %w", err)
 	}
 	mismatch := func(format string, args ...any) error {
-		return fmt.Errorf("the copy differs from the source: "+format, args...)
+		return fmt.Errorf("%w: "+format, append([]any{errCopyDiffers}, args...)...)
 	}
 	err := dst.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		names, err := dst.collectionNames(tx)
@@ -552,10 +558,32 @@ func verifyCopy(ctx context.Context, dst *db, want []copiedCollection) error {
 		err = dst.IntegrityCheck(ctx)
 	}
 	if err != nil {
+		// A copy that differs from its source, or that is damaged, failed
+		// its verification. A check that could not run (a cancelled ctx,
+		// a read error) is returned as it is.
+		if errors.Is(err, errCopyDiffers) || errors.Is(err, ErrCorrupt) {
+			return &copyVerifyError{finding: err}
+		}
 		return fmt.Errorf("any-store: copy to latest format: verifying the copy: %w", err)
 	}
 	return nil
 }
+
+// errCopyDiffers marks a finding of verifyCopy that the copy differs from
+// its source's snapshot.
+var errCopyDiffers = errors.New("the copy differs from the source")
+
+// copyVerifyError is the error of a copy that failed its verification
+// (verifyCopy). Its text has the finding; it matches ErrCopyVerifyFailed and
+// nothing the finding matches, ErrCorrupt included: what is damaged is the
+// copy, and a caller that acts on ErrCorrupt acts on the source.
+type copyVerifyError struct{ finding error }
+
+func (e *copyVerifyError) Error() string {
+	return ErrCopyVerifyFailed.Error() + ": " + e.finding.Error()
+}
+
+func (e *copyVerifyError) Unwrap() error { return ErrCopyVerifyFailed }
 
 // primaryKeyOf is the primary key a stored collection config gives: "id"
 // when it names none.

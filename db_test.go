@@ -3989,3 +3989,47 @@ func TestOpen_DirtyQuickCheckErrors(t *testing.T) {
 		require.NoError(t, db.Close())
 	})
 }
+
+// Backup refuses a destination that holds a database of another kind with
+// an exported error, and leaves it as it was.
+func TestBackup_DestinationOfAnotherKind(t *testing.T) {
+	ctx := context.Background()
+	newDB := func(t *testing.T, path string, conf *Config) {
+		t.Helper()
+		db, err := Open(ctx, path, conf)
+		require.NoError(t, err)
+		_, err = db.CreateCollection(ctx, "dst")
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+	}
+	backupRefused := func(t *testing.T, src DB, path string, want error) {
+		t.Helper()
+		before, err := os.ReadFile(path)
+		require.NoError(t, err)
+		err = src.Backup(ctx, path)
+		require.ErrorIs(t, err, want)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		after, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Equal(t, before, after)
+	}
+
+	t.Run("plain pages over checksummed ones", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "dst.db")
+		newDB(t, path, nil)
+		src, err := Open(ctx, "", &Config{InMemory: true})
+		require.NoError(t, err)
+		defer src.Close()
+		backupRefused(t, src, path, ErrBackupCodecMismatch)
+	})
+	t.Run("another schema format", func(t *testing.T) {
+		dir := t.TempDir()
+		src, err := Open(ctx, filepath.Join(dir, "src.db"), nil)
+		require.NoError(t, err)
+		defer src.Close()
+		path := filepath.Join(dir, "dst.db")
+		createFormat(t, os.Getenv("ANYSTORE_TEST_LEGACY_FORMAT") != "1")
+		newDB(t, path, nil)
+		backupRefused(t, src, path, ErrBackupFormatMismatch)
+	})
+}

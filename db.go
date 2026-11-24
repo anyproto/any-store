@@ -116,7 +116,11 @@ type DB interface {
 	// the file, so a new copy of a passphrase database has a key of its
 	// own. A file at path that already holds a database of another kind is
 	// not replaced: Backup returns an error and leaves its content as it
-	// was.
+	// was. The error matches ErrBackupCodecMismatch for a database whose
+	// pages are laid out another way (plain, checksummed, encrypted),
+	// ErrBackupFormatMismatch for one of another schema format, and, for one
+	// whose encryption does not fit the source's, ErrEncryptionKeyRequired,
+	// ErrNotEncrypted or ErrWrongKey.
 	//
 	// Backup returns the destination's errors as well as the source's: a
 	// file at path that is damaged, or encrypted with another key, can give
@@ -228,8 +232,12 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 
 // open is Open with the schema format a file it creates gets: 0 for the
 // default, or a format the btree writes (btree.Options.SchemaFormat). An
-// existing file keeps its own.
-func open(ctx context.Context, path string, config *Config, createFormat uint32) (*db, error) {
+// existing file keeps its own. Every busy error it returns matches ErrBusy:
+// the btree's busy errors (a peer's recovery, a snapshot a peer's commit
+// overtook) are kinds of it, as SQLITE_BUSY_RECOVERY and
+// SQLITE_BUSY_SNAPSHOT are of SQLITE_BUSY.
+func open(ctx context.Context, path string, config *Config, createFormat uint32) (_ *db, err error) {
+	defer func() { err = busyErr(err) }()
 	if config == nil {
 		config = &Config{}
 	}
@@ -238,7 +246,6 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 	// One name for the database file, its WAL and its sentinel file, as
 	// SQLite resolves the name once and opens every file by it
 	// (pager.c:4792, pager.c:4929, pager.c:4948).
-	var err error
 	if !config.InMemory {
 		if path, err = btree.FullPathname(path); err != nil {
 			return nil, fmt.Errorf("cannot resolve the database path: %w", err)

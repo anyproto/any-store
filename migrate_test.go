@@ -1904,3 +1904,66 @@ func TestCopyToLatestFormat_StagingFileNotClosed(t *testing.T) {
 		})
 	}
 }
+
+// A copy that fails its verification is ErrCopyVerifyFailed, also when what
+// failed is damage in the copy: it does not match ErrCorrupt, which would
+// send a caller to discard the source.
+func TestCopyToLatestFormat_VerificationFailureIsNotErrCorrupt(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "copy.db")
+	dst, err := open(ctx, path, &Config{}, LatestSchemaFormat)
+	require.NoError(t, err)
+	coll, err := dst.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	for i := 0; i < 300; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%0400d"}`, i, i))))
+	}
+	// What the copy holds, as copyCollections would have recorded it.
+	var want []copiedCollection
+	require.NoError(t, dst.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		cfg, err := dst.loadCollConfig(tx, "c")
+		if err != nil {
+			return err
+		}
+		indexes, err := dst.getIndexInfos(tx, "c")
+		if err != nil {
+			return err
+		}
+		want = append(want, copiedCollection{name: "c", cfg: cfg, indexes: indexes, docs: 300})
+		return nil
+	}))
+	require.NoError(t, verifyCopy(ctx, dst, want))
+
+	t.Run("differs", func(t *testing.T) {
+		differs := append([]copiedCollection(nil), want...)
+		differs[0].docs++
+		err := verifyCopy(ctx, dst, differs)
+		require.ErrorIs(t, err, ErrCopyVerifyFailed)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		require.Contains(t, err.Error(), "301")
+	})
+	require.NoError(t, dst.Close())
+
+	t.Run("damaged", func(t *testing.T) {
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
+		require.NoError(t, err)
+		var b [1]byte
+		off := info.Size() - 2000 // a page of the collection
+		_, err = f.ReadAt(b[:], off)
+		require.NoError(t, err)
+		b[0] ^= 0xFF
+		_, err = f.WriteAt(b[:], off)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+
+		dst, err := open(ctx, path, &Config{}, LatestSchemaFormat)
+		require.NoError(t, err)
+		defer dst.Close()
+		err = verifyCopy(ctx, dst, want)
+		require.ErrorIs(t, err, ErrCopyVerifyFailed)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		require.NotErrorIs(t, err, ErrPageIntegrity)
+	})
+}

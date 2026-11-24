@@ -237,9 +237,33 @@ var (
 	// error. To make its name durable, sync its directory.
 	ErrCopyPublished = errors.New("any-store: the copy is published, but a step after its publication failed")
 
-	// ErrIncompatibleVersion is returned (wrapped) by Open when the file was written in a format
-	// newer than this release reads. The file is intact and is left unchanged; open it with a
-	// release that knows the format. It does not match ErrCorrupt.
+	// ErrCopyVerifyFailed is returned (wrapped) by CopyToLatestFormat when the copy it built
+	// fails its verification: a collection's options, document count or index definitions
+	// differ from the source's snapshot, or the copy's integrity check found damage in it. The
+	// fault is the copy's, not the source's: nothing is published at the destination, the
+	// staging files are removed, and the source is as it was. It does not match ErrCorrupt,
+	// even when what the check found in the copy would: do not discard the source on it. Run
+	// the copy again; one that keeps failing points at the storage the copy is written to.
+	ErrCopyVerifyFailed = errors.New("any-store: copy to latest format: the copy failed its verification")
+
+	// ErrBackupFormatMismatch is returned (wrapped) by Backup when the file at its path is a
+	// database of another schema format than this one's (SchemaFormat). A backup copies the
+	// pages as they are, so it would turn the file into one of this database's format under
+	// whatever has it open. Nothing is written to the file. Back up to a new path, or to a
+	// database of this one's format.
+	ErrBackupFormatMismatch = btree.ErrBackupFormatMismatch
+
+	// ErrBackupCodecMismatch is returned (wrapped) by Backup when the file at its path is a
+	// database whose pages are laid out another way than this one's: plain, with checksums,
+	// or encrypted (an in-memory database's pages are plain). Nothing is written to the file.
+	// Back up to a new path, or to a database of this one's kind.
+	ErrBackupCodecMismatch = btree.ErrBackupCodecMismatch
+
+	// ErrIncompatibleVersion is returned (wrapped) by Open, and by Backup for its destination,
+	// when the file was written in a format newer than this release reads, or its write-ahead log
+	// was, or a process that has the file open uses an index of the log (path+"-wal-shm") of a
+	// newer format. The files are intact and are left unchanged; open them with a release that
+	// knows the format. It does not match ErrCorrupt.
 	ErrIncompatibleVersion = errors.New("any-store: incompatible version")
 
 	// ErrV1Database is returned by Open when the file was created by any-store
@@ -371,21 +395,25 @@ func (e *nestedError) Error() string { return e.msg }
 func (e *nestedError) Unwrap() error { return e.parent }
 
 // openErr gives an error of btree.Open the identity this package exports
-// for it, where the btree's own names its options and not Config's.
+// for it, where the btree's own names its options and not Config's: a
+// newer format of the file, of its WAL or of a live wal-index is
+// ErrIncompatibleVersion, as SQLite's version checks of the WAL and its
+// index give SQLITE_CANTOPEN (wal.c:1467, 2741), and every busy error
+// matches ErrBusy.
 func openErr(err error) error {
 	switch {
 	case errors.Is(err, btree.ErrPageSlabNotInitialized):
 		return ErrPageBufferNotInitialized
 	case errors.Is(err, btree.ErrSQLiteFormat):
 		return ErrV1Database
-	case errors.Is(err, btree.ErrNewerFormat):
+	case errors.Is(err, btree.ErrNewerFormat), errors.Is(err, btree.ErrWALVersion):
 		return fmt.Errorf("%w: %w", ErrIncompatibleVersion, err)
 	case errors.Is(err, btree.ErrKeyRequired):
 		return ErrEncryptionKeyRequired
 	case errors.Is(err, btree.ErrNotEncrypted):
 		return ErrNotEncrypted
 	}
-	return err
+	return busyErr(err)
 }
 
 // isBusyErr reports one of the storage layer's "not now" errors: a lock that
