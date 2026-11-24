@@ -216,12 +216,12 @@ func without(state []string, drop func(string) bool) []string {
 	return out
 }
 
-// A rename moves every catalog record of the collection or none: a read
-// that fails while it moves them fails the rename, and the collection is
-// still there under its old name with its primary key, in this process and
-// after a reopen. Before the fix the rename committed after deleting the
-// config record under the old name and failing to read or write it under
-// the new one: the collection reopened under the default primary key.
+// A rename moves every catalog record of the collection or none. A read
+// that fails while it moves them fails the rename, and the catalog is as it
+// was: the collection is under its old name, with the primary key its config
+// record holds, in this process and after a reopen. A rename that succeeds
+// has moved every record, the config record included, so the collection
+// opens under the new name with that primary key, not the default one.
 func TestReadFault_Rename(t *testing.T) {
 	for _, sh := range ddlShapes {
 		t.Run(sh.String(), func(t *testing.T) { testReadFaultRename(t, sh) })

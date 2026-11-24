@@ -11,9 +11,10 @@ import (
 )
 
 // A covering lookup whose seek fails returns the error: it is not a key
-// that is absent. Before the fix an equality count over the unique index
-// found 0 documents for one that exists, and an $in found the matches of
-// the healthy branches only.
+// that is absent. An equality and an $in over the unique index, counted and
+// iterated, return either the read error or the whole result (one document
+// for the equality, three for the $in, whose fourth value matches nothing),
+// never part of it.
 func TestReadFault_CoverLookup(t *testing.T) {
 	const docs = 3000
 	in := `{"email":{"$in":["` + userEmail(10) + `","` + userEmail(1500) + `","` + userEmail(2990) + `","nobody@test.com"]}}`

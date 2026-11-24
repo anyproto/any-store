@@ -226,10 +226,11 @@ func abs(n int) int {
 // A fan-out write reads the index's multikey flag before it sets it. A
 // read of the flag that fails is the write's error: the flag record is the
 // planner's licence for tight seeks, and an I/O error under it is not a
-// record to overwrite and go on from. Before the fix the write took the
-// failure for an absent record, set the flag again and committed: the
-// state was right (the flag only ever goes to multikey) and the read error
-// was lost.
+// record to overwrite and go on from. Every run whose fault hits the read
+// of the flag (markMultiKey) must return that error rather than take it for
+// an absent flag and commit, and at least one run must hit it. A failed
+// insert leaves the collection as it was, in this process and after a
+// reopen.
 func TestReadFault_MultiKeyFlag(t *testing.T) {
 	build := func(t *testing.T, db DB) {
 		coll, err := db.CreateCollection(ctx, "docs")

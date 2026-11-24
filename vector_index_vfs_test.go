@@ -24,10 +24,12 @@ func faultVec(i, dim int) string {
 
 // A vector search, or an insert into a vector index, that fails to read a
 // stored vector returns the read error: it neither ranks the candidate by
-// another vector nor reports the record as malformed. Before the fix a
-// quantized record that could not be read was decoded as one of length 0,
-// and the search failed with "bad quantized vector record len 0", an error
-// errors.Is matches to no read error.
+// another vector nor reports the record as malformed. For HNSW (int8 and
+// float32) and IVF-SQ, a search returns an error that errors.Is matches to
+// the injected read error, or the ranking of the stored vectors. An insert
+// returns that error and leaves the collection and its index as they were,
+// in this process and after a reopen, or succeeds with the new vector among
+// the nearest to itself.
 func TestReadFault_VectorIndex(t *testing.T) {
 	const docs, dim = 400, 16
 	knn := fmt.Sprintf(`{"v":{"$knn":{"$query":%s,"$k":10}}}`, faultVec(1234, dim))
