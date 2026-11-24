@@ -1506,6 +1506,13 @@
     "sqlite": [],
     "note": ""
   },
+  "page.go:payloadInFile": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeMaxRecordSize",
+      "vdbemem.c:sqlite3VdbeMemFromBtree"
+    ],
+    "note": "sqlite3VdbeMemFromBtree's amt+offset > sqlite3BtreeMaxRecordSize test (vdbemem.c:1428), made by the b-tree's readers before they size a buffer from a declared length; a reader's page count is the pager's, not lockBtree's page-1 nPage"
+  },
   "page.go:putVarint": {
     "sqlite": [
       "util.c:putVarint64",
