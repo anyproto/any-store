@@ -86,6 +86,8 @@ The full end-to-end example lives in [`example/`](example) and the [API docs](ht
 
 > **Choosing document ids.** Unlike SQLite there is no hidden rowid — the document id is the btree key. Increment-like ids (`anyenc.NewObjectID()`, timestamps, sequences) keep inserts append-ordered and reads cache-friendly; fully random ids (e.g. UUIDv4) scatter them. In practice this only matters for very hot write/read paths or huge collections.
 
+> **Numbers are float64.** Every number is stored as a float64, as in JSON: integers are exact up to 2^53 (9,007,199,254,740,992) in magnitude, and a larger one becomes the nearest float64, in a document, a filter and an id alike. Two such integers can then be one value, and as ids one document: with a document of id 2^53 in the collection, inserting id 2^53+1 fails with `ErrDocExists`, `UpsertOne` with it replaces that document, and `FindId(2^53+1)` returns it. Store integers that can go past 2^53, such as 64-bit hashes, as strings.
+
 ## Transactions
 
 ```go

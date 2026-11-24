@@ -28,6 +28,14 @@ import (
 // write transaction — a collection or index created or dropped, a rename —
 // is that transaction's own until it commits: every other caller, and the
 // accessors that take no context, have the committed schema.
+//
+// Numbers, document ids among them, are float64: an integer above 2^53
+// (9,007,199,254,740,992) in magnitude is stored, looked up and compared as
+// the nearest float64, so two such integers can be one value. As ids they are
+// one key: with a document of id 2^53 in the collection, an Insert of id
+// 2^53+1 fails with ErrDocExists, an UpsertOne with it replaces that
+// document, and FindId(2^53+1) returns it. Keep ids that can go past 2^53 as
+// strings.
 type Collection interface {
 	// Name returns the committed name of the collection: a rename made in an
 	// open write transaction shows once it commits.
@@ -38,6 +46,8 @@ type Collection interface {
 
 	// FindId finds a document by its ID.
 	// Returns the document or an error if the document is not found.
+	// An integer id above 2^53 in magnitude is looked up as the nearest
+	// float64, which can be another document's id (see Collection).
 	FindId(ctx context.Context, id any) (Doc, error)
 
 	// FindIdWithParser finds a document by its ID. Uses provided anyenc parser.
@@ -53,6 +63,9 @@ type Collection interface {
 
 	// Insert inserts multiple documents into the collection.
 	// Returns an error if the insertion fails.
+	// A document's integer id above 2^53 in magnitude is stored as the
+	// nearest float64, which can be another document's id: the insert then
+	// fails with ErrDocExists (see Collection).
 	Insert(ctx context.Context, docs ...*anyenc.Value) (err error)
 
 	// UpdateOne updates a single document in the collection.
@@ -66,10 +79,16 @@ type Collection interface {
 
 	// UpsertOne inserts a document if it does not exist, or updates it if it does.
 	// Returns the ID of the upserted document or an error if the operation fails.
+	// An integer id above 2^53 in magnitude is the nearest float64, which can
+	// be another document's id: that document is then replaced (see
+	// Collection).
 	UpsertOne(ctx context.Context, doc *anyenc.Value) (err error)
 
 	// UpsertId updates a single document or creates new one
 	// Returns a modify result or error.
+	// An integer id above 2^53 in magnitude is the nearest float64, which can
+	// be another document's id: that document is then the one updated (see
+	// Collection).
 	UpsertId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error)
 
 	// DeleteId deletes a single document by its ID.

@@ -348,3 +348,15 @@ build per query and carry no such guarantee.
     `$pull` or `$unset` alone) inserts no document, where MongoDB inserts
     `{_id: id}`. Pinned by `TestModifierPush_Modify` and its siblings
     (query/modifier_test.go) and `TestCollection_PushMissingField`.
+
+18. **Numbers are float64.** anyenc stores every number as a float64, so an
+    integer is exact up to 2^53 (9,007,199,254,740,992) in magnitude and a
+    larger one is the nearest float64 — in a stored document, a filter
+    operand, an index key and a document id alike. Two such integers can be
+    one value: `{"n":9007199254740993}` matches a document whose `n` is
+    `9007199254740992`, and as ids they are one key: with a document of id
+    2^53 in the collection, `Insert` of id 2^53+1 fails with `ErrDocExists`,
+    `UpsertOne` with it replaces that document, and `FindId(2^53+1)` returns
+    it. There is no integer type next to the float (MongoDB has int, long and
+    decimal); integers that can go past 2^53 belong in strings. The
+    aggregation arithmetic has the same limit (docs/aggregation.md).
