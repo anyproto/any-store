@@ -283,14 +283,16 @@ func TestWALDecryptFailurePropagatesFromReadFrame(t *testing.T) {
 	require.Equal(t, targetPgno, gotPgno.Load(), "OnIntegrityError must report the failing page")
 }
 
-// TestWALReadFramePastTailRemapsToErrWALCorrupt pins the documented drift
-// (docs/btree/NOTES.md
-// #drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt):
-// a ReadAt failure at frame > nFrame returns ErrWALCorrupt, where C would
-// surface the raw short-read error (sqlite3WalReadFrame is a bare
-// sqlite3OsRead, wal.c:3649-3664). Now user-visible since read errors
-// propagate.
-func TestWALReadFramePastTailRemapsToErrWALCorrupt(t *testing.T) {
+// TestWALFrameReadErrorsThroughEveryReader drives a failed ReadAt of a frame
+// above this process's frame count, one a peer may have committed, through
+// each reader of WAL frames: the decoding one (readFramePage), the raw one
+// (readFrameRaw) and the pager's header reader (readWalFrameData). A read
+// past the end of the file is ErrWALShortRead, as SQLite's
+// sqlite3WalReadFrame gives SQLITE_IOERR_SHORT_READ (wal.c:3649-3664;
+// docs/btree/NOTES.md
+// #drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt).
+// Any other failure is the read's own error. Neither is corruption.
+func TestWALFrameReadErrorsThroughEveryReader(t *testing.T) {
 	dir := t.TempDir()
 	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096, DisableAutoCheckpoint: true})
 	require.NoError(t, err)
@@ -301,15 +303,38 @@ func TestWALReadFramePastTailRemapsToErrWALCorrupt(t *testing.T) {
 	w := db.pager.wal
 	nf := w.nFrame.Load()
 	require.Greater(t, nf, uint32(0))
+	buf := make([]byte, db.pager.pageSize)
+	readers := []struct {
+		name string
+		read func(frame uint32) error
+	}{
+		{"decoded", func(frame uint32) error { return w.readFrame(frame, buf, nil, nil) }},
+		{"raw", func(frame uint32) error { return w.readFrameRaw(frame, buf) }},
+		{"page-1 header", func(frame uint32) error { return db.pager.readWalFrameData(frame, buf[:dbHeaderSize]) }},
+	}
 
 	// Multi-process mode: a frame beyond the local nFrame is attempted
 	// against the file (a peer may have committed it); here nothing did, so
-	// ReadAt fails past EOF and the failure is remapped.
-	buf := make([]byte, db.pager.pageSize)
-	err = w.readFrame(nf+100, buf, nil, nil)
-	require.ErrorIs(t, err, ErrWALCorrupt)
-	err = w.readFrameRaw(nf+100, buf)
-	require.ErrorIs(t, err, ErrWALCorrupt)
+	// the read comes up short.
+	for _, r := range readers {
+		err := r.read(nf + 100)
+		require.ErrorIs(t, err, ErrWALShortRead, r.name)
+		require.NotErrorIs(t, err, ErrCorrupt, r.name)
+	}
+
+	// A ReadAt that fails for another reason: the read's error as it is.
+	walFile := w.file
+	closed, err := os.Open(w.path)
+	require.NoError(t, err)
+	require.NoError(t, closed.Close())
+	w.file = closed
+	defer func() { w.file = walFile }()
+	for _, r := range readers {
+		err := r.read(nf + 1)
+		require.ErrorIs(t, err, os.ErrClosed, r.name)
+		require.NotErrorIs(t, err, ErrWALShortRead, r.name)
+		require.NotErrorIs(t, err, ErrCorrupt, r.name)
+	}
 }
 
 // TestReadFrameNoBenignFailuresUnderTruncateStress is the multi-process-mode

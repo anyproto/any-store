@@ -289,10 +289,9 @@ var (
 	ErrNotEncrypted = errors.New("any-store: database file is not encrypted: clear Config.Encryption")
 
 	// ErrCorrupt is the umbrella for damaged database files: every error below that names a kind
-	// of damage matches it (ErrHeaderCorrupt, ErrPageIntegrity, ErrWALCorrupt,
-	// ErrQuickCheckFailed), as do a broken structure found while reading and the report of
-	// IntegrityCheck. Match it when the kind does not matter, for instance to discard and
-	// rebuild the database:
+	// of damage matches it (ErrHeaderCorrupt, ErrPageIntegrity, ErrQuickCheckFailed), as do a
+	// broken structure found while reading and the report of IntegrityCheck. Match it when the
+	// kind does not matter, for instance to discard and rebuild the database:
 	//
 	//	if errors.Is(err, anystore.ErrCorrupt) { ... }
 	//
@@ -304,8 +303,12 @@ var (
 	//   - a v1 file (ErrV1Database) or a file from a newer release (ErrIncompatibleVersion);
 	//   - a file that is open already (ErrDBAlreadyOpen, ErrDBOpenInOtherProcess), a busy lock
 	//     (ErrBusy), a closed database (ErrDBIsClosed);
+	//   - a write-ahead log index that points past the end of the log (ErrWALShortRead);
 	//   - a cancelled context, an I/O error, a full disk: these are returned as themselves,
 	//     also when they end a commit, the quick check of a dirty Open, or an IntegrityCheck.
+	//
+	// A damaged index of the write-ahead log (path+"-wal-shm", shared memory) matches it too, as
+	// in SQLite; closing every handle on the file, in every process, rebuilds the index.
 	//
 	// A damaged page that nothing has read yet is not found by Open: it surfaces on the read that
 	// meets it, as ErrPageIntegrity.
@@ -316,16 +319,15 @@ var (
 	// It matches ErrCorrupt.
 	ErrHeaderCorrupt = btree.ErrHeaderCorrupt
 
-	// ErrWALCorrupt is returned (wrapped) by a read when the index of the write-ahead log points
-	// at a frame the log file does not hold: the file ends before it. It matches ErrCorrupt.
-	// An I/O error while reading a frame is not this error. Recovery itself repairs a bad WAL
-	// header and drops torn frames silently.
+	// ErrWALShortRead is returned (wrapped) by a read when the index of the write-ahead log
+	// (path+"-wal-shm") points at a frame past the end of the log file (path+"-wal"): the read of
+	// the frame comes up short, as SQLite's does with SQLITE_IOERR_SHORT_READ. An I/O error while
+	// reading a frame is not this error. Recovery itself repairs a bad WAL header and drops torn
+	// frames silently.
 	//
-	// What it reports is in the log (path+"-wal") and its index (path+"-wal-shm"), not in the
-	// database file: the index is rebuilt from the log when the database is next opened with no
-	// other process attached. Before discarding a database on ErrCorrupt, check for
-	// ErrWALCorrupt, close every handle on the file and open it again.
-	ErrWALCorrupt = btree.ErrWALCorrupt
+	// The database is not damaged, and the error does not match ErrCorrupt. Close every handle on
+	// the file, in every process, and open it again: the index is rebuilt from the log.
+	ErrWALShortRead = btree.ErrWALShortRead
 
 	// ErrValueTooLarge is returned (wrapped) by a write of a record over the record size limit:
 	// a stored key and its value together may take 1 GiB (1<<30 bytes). The limit applies to each

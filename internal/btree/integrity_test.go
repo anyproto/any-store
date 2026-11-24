@@ -495,6 +495,32 @@ func TestIntegrityCheck_FailedReadIsNotErrCorrupt(t *testing.T) {
 	require.NoError(t, db.IntegrityCheck())
 }
 
+// A page reached through a wal-index that points past the end of the log
+// is a short read, and the report keeps that identity: it matches
+// ErrWALShortRead and not ErrCorrupt, so a caller can tell an index to
+// rebuild from a database to discard.
+func TestIntegrityCheck_ShortWALReadKeepsItsIdentity(t *testing.T) {
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	commitRows(t, db, "t1", 64, 200)
+	require.NoError(t, db.IntegrityCheck())
+
+	// The log ends after page 1's last frame; the index still points at
+	// the frames past it, as a peer's stale index would.
+	walPath := db.pager.wal.path
+	pageSize := int(db.pager.pageSize)
+	page1Frame, off := lastWALFrame(t, walPath, pageSize, 1)
+	require.Less(t, page1Frame, db.pager.wal.nFrame.Load(), "the walk must meet a frame past page 1's")
+	require.NoError(t, os.Truncate(walPath, off+int64(walFrameSize+pageSize)))
+
+	err = db.IntegrityCheck()
+	var ie *IntegrityError
+	require.ErrorAs(t, err, &ie)
+	require.ErrorIs(t, err, ErrWALShortRead)
+	require.NotErrorIs(t, err, ErrCorrupt)
+}
+
 // TestCheckListOverlargeTrunkContinuesWalk is a regression test for the drift
 // where checkList() aborted the entire freelist walk on an over-large trunk
 // leaf-count (early return) instead of reporting and continuing to the next

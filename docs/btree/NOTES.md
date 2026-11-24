@@ -2329,15 +2329,17 @@ substitutes the older committed-DB-file version instead of surfacing the WAL err
 which can return outdated page content as if it were current.
 
 <a id="drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt"></a>
-### Drift: readFrame Past-Tail Read Failure Remapped To ErrWALCorrupt
-- **Category:** error-handling  -  **Severity:** low
-- **Affected functions:** `wal.go:*wal.readFrame` (`internal/btree/wal.go`, past-tail remap in the `ReadAt` error branch), `wal.go:*wal.readFrameRaw` (same pattern).
+### Drift: A Short Read Of A WAL Frame
+- **Category:** error-handling  -  **Severity:** low  -  **Status:** RESOLVED: a short read of a WAL frame is `ErrWALShortRead`, the counterpart of `SQLITE_IOERR_SHORT_READ`, and it does not match `ErrCorrupt`.
+- **Affected functions:** `wal.go:frameReadErr`, `wal.go:*wal.readFramePageHook`, `wal.go:*wal.readFrameRaw`, `wal.go:*wal.readFramePgno`, `pager.go:*pager.readWalFrameDataRaw`.
 
 C `sqlite3WalReadFrame` (`wal.c:3649-3664`) is a bare `sqlite3OsRead` with no bounds check: `return sqlite3OsRead(pWal->pWalFd, pOut, (nOut>sz ? sz : nOut), iOffset);`. A read past the physical WAL tail surfaces as the OS layer's code (`SQLITE_IOERR_SHORT_READ` from `unixRead`), and `readDbPage` forgives short reads only on the DB-file branch, never the WAL branch (`pager.c:3042-3045`).
 
-`readFramePage` and `readFrameRaw` pass a failed `ReadAt` through `frameReadErr`. It returns `ErrWALCorrupt` for one case: a short read (`io.EOF`, `io.ErrUnexpectedEOF`) of a frame above this process's `nFrame`, that is, a frame the lookup resolved from a peer's wal-index entries and the file does not hold. The index and the tail disagree, which `ErrWALCorrupt` names more exactly than a short-read error. Every other failure of the read is returned as it is, as in C: an I/O error on a frame says nothing about the log's content, and `ErrWALCorrupt` matches `ErrCorrupt`, on which a caller may discard the database. The frame count is not what makes the difference there: in a process that has only read since a peer committed, every frame the peer added is above `nFrame`.
+Every reader of a WAL frame passes a failed `ReadAt` through `frameReadErr`. A short read (`io.EOF`, `io.ErrUnexpectedEOF`) is `ErrWALShortRead`: the wal-index points at a frame the file does not hold. Like `SQLITE_IOERR_SHORT_READ` it is an I/O error and not damage: the database file is sound, and an open after every handle has closed rebuilds the index from the log. Every other failure of the read is returned as it is, as in C.
 
-Test: `TestFrameReadErr` (`wal_test.go`).
+The frame-number guards in front of the read (frame 0, a frame above the count of a log only this process writes, an in-memory frame that is missing) are assertions in SQLite's terms: they return `errWalFrameRange`, which matches no exported error.
+
+Tests: `TestFrameReadErr`, `TestWALClosedFileReadIsErrClosed` (`wal_test.go`), `TestWALFrameReadErrorsThroughEveryReader` (`pager_readfault_test.go`), `TestIntegrityCheck_ShortWALReadKeepsItsIdentity` (`integrity_test.go`).
 
 
 <a id="drift-7-short-db-file-read-treated-as-hard-error"></a>
@@ -4605,7 +4607,7 @@ When walking an interior page, Go's `checkTreePage` anchors the expected subtree
 
 <a id="drift-2026-06-25-13-checksum-sweep-fires-the-onerror-errcksummismatch-hook-even-for-plain-"></a>
 ### Drift: Checksum Sweep Fires The OnError(errCksumMismatch) Hook Even For Plain File-I/O Read Errors
-- **Category:** error-handling  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-19: the sweep fires the hook only for a page whose checksum was compared and differed (`Kind == IntegrityChecksumMismatch`); a page it could not read is listed and fires nothing (`TestReadRawPageWALErrorPropagates`). What remains is in the report, not the hook: for a frame above this process's `nFrame`, `wal.readFrameRaw` returns `ErrWALCorrupt` in place of the read's own error (drift-2026-07-10-1), so `SweepError.Inner` does not carry the cause there when the read was short; any other read error is carried.
+- **Category:** error-handling  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-19: the sweep fires the hook only for a page whose checksum was compared and differed (`Kind == IntegrityChecksumMismatch`); a page it could not read is listed and fires nothing (`TestReadRawPageWALErrorPropagates`). A page whose WAL frame cannot be read is listed with the read's error: `ErrWALShortRead` for a short read ([drift-2026-07-10-1](#drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt)), any other error as it is.
 - **Affected functions:** `integrity_sweep.go:*DB.VerifyIntegrity`, `integrity_sweep.go:verifyCksumPage`.
 
 In `VerifyIntegrity`'s checksum branch, any non-nil `SweepError` returned by `verifyCksumPage` triggered the database's integrity hook (`Options.OnIntegrityError`, which the pager holds) with a hard-coded `errCksumMismatch`, regardless of which failure produced it. But `verifyCksumPage` returns two distinct error shapes: a genuine trailer mismatch carries `Kind: IntegrityChecksumMismatch` (its `want != got` compare mirrors `cksumCodec.Decrypt`), while a failed raw-page read returns `&SweepError{PageNo: pgno, Inner: err}` with `Kind` left at the zero value `IntegrityKindUnknown`. The sweep loop did not inspect the kind before firing the hook, so a transient file-I/O read fault was reported through the same `errCksumMismatch` notification as an actual corrupt page.
@@ -4921,7 +4923,7 @@ Tests: `TestOpen_WrongKeyIsErrWrongKey`, `TestOpen_WrongRawKeyAndCodec`, `TestOp
 
 `sqlite3BtreeIntegrityCheck` returns its findings as text and a count (`*pnErr = sCheck.nErr;`, `btree.c:11263`) and returns `sCheck.rc` (`btree.c:11273`), which is only ever `SQLITE_NOMEM` or `SQLITE_INTERRUPT` (`btree.c:10567`, `10579`, `10590`). `OP_IntegrityCk` puts the text in a register (`vdbe.c:7273-7285`) and `PRAGMA integrity_check` returns it as rows: a damaged database is a successful statement whose result is not `ok`. A page the check cannot fetch is one more row, `"unable to get the page. error code=%d"` (`btree.c:10883-10884`), whatever the code; only `SQLITE_IOERR_NOMEM` is kept as the check's own result (`btree.c:10885`).
 
-`IntegrityCheck` returns an error, `*IntegrityError`, with the same lines. An error needs a kind a caller can match, and the kind of damage here is `ErrCorrupt`, on which a caller may discard and rebuild the database. So the report matches it, with one exception that SQLite's rows do not need: a page that failed to read for a reason other than damage. `reportRead` lists it like SQLite does and keeps the read's error unless that error is itself damage (`ErrCorrupt`, which a page failing its checksum or authentication matches, or `ErrInvalidPage`, a pointer out of the database). A report with such a read is inconclusive as a whole, not only on that line: the pages under an unread interior page are then listed as never used, and its subtree as of another depth. It matches the read's error and not `ErrCorrupt`.
+`IntegrityCheck` returns an error, `*IntegrityError`, with the same lines. An error needs a kind a caller can match, and the kind of damage here is `ErrCorrupt`, on which a caller may discard and rebuild the database. So the report matches it, with one exception that SQLite's rows do not need: a page that failed to read for a reason other than damage. `reportRead` lists it like SQLite does and keeps the read's error unless that error is itself damage (`ErrCorrupt`, which a page failing its checksum or authentication matches, or `ErrInvalidPage`, a pointer out of the database). A short read of a WAL frame (`ErrWALShortRead`) is kept: the index points past the log, which an open after every handle has closed rebuilds. A report with such a read is inconclusive as a whole, not only on that line: the pages under an unread interior page are then listed as never used, and its subtree as of another depth. It matches the read's error and not `ErrCorrupt`.
 
 No new sentinel: the check's caller knows where the error came from, and the action on its findings is the action on `ErrCorrupt`.
 

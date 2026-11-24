@@ -1371,7 +1371,8 @@ func TestReadWalFrameData_InMemory(t *testing.T) {
 
 	// Invalid frame
 	err = p.readWalFrameData(999, buf)
-	assert.ErrorIs(t, err, ErrWALCorrupt)
+	assert.ErrorIs(t, err, errWalFrameRange)
+	assert.NotErrorIs(t, err, ErrCorrupt)
 }
 
 func TestReadWalFrameData_NilFile(t *testing.T) {
@@ -2947,7 +2948,8 @@ func TestReadFrame_InMemoryOutOfRange(t *testing.T) {
 	buf := make([]byte, 4096)
 	// Frame 3 passes nFrame check (3 <= 5) but idx=2 >= len(memFrames)=1
 	err := w.readFrame(3, buf, nil, nil)
-	assert.ErrorIs(t, err, ErrWALCorrupt)
+	assert.ErrorIs(t, err, errWalFrameRange)
+	assert.NotErrorIs(t, err, ErrCorrupt)
 
 	// Restore
 	w.nFrame.Store(1)
@@ -8394,7 +8396,7 @@ func TestRefreshHeaderFromPage1_DoubleIOFailure(t *testing.T) {
 	require.Greater(t, mustWiGet(t, p.wal.index, 1, effectiveMaxFrame), uint32(0))
 
 	// Force the double I/O failure: WAL-frame read fails (file-backed WAL with
-	// nil file => ErrWALCorrupt) AND the DB-file fallback is unavailable.
+	// nil file => ErrClosed) AND the DB-file fallback is unavailable.
 	walFile := p.wal.file
 	require.NotNil(t, walFile)
 	_ = walFile.Close()
@@ -8410,7 +8412,8 @@ func TestRefreshHeaderFromPage1_DoubleIOFailure(t *testing.T) {
 	p.writerCache.clear() // as beginWrite does before the refresh
 	err = p.refreshHeaderFromPage1()
 	require.Error(t, err, "refreshHeaderFromPage1 must propagate the double I/O read failure")
-	assert.ErrorIs(t, err, ErrWALCorrupt)
+	assert.ErrorIs(t, err, ErrClosed)
+	assert.NotErrorIs(t, err, ErrCorrupt)
 }
 
 // TestBeginWriteHeaderRefreshError_DoubleIOFailure exercises the end-to-end
@@ -8475,7 +8478,8 @@ func TestBeginWriteHeaderRefreshError_DoubleIOFailure(t *testing.T) {
 
 	err = p.beginWrite(readSnap)
 	require.Error(t, err, "beginWrite must propagate the page-1 re-read failure on the stateChanged edge")
-	assert.ErrorIs(t, err, ErrWALCorrupt)
+	assert.ErrorIs(t, err, ErrClosed)
+	assert.NotErrorIs(t, err, ErrCorrupt)
 	// The pager must NOT have transitioned to a writer state on the aborted
 	// begin (no half-open write transaction left behind).
 	assert.NotEqual(t, int32(pagerWriter), p.state.Load(),

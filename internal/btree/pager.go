@@ -3299,15 +3299,17 @@ func (p *pager) readWalFrameDataRaw(frame uint32, buf []byte) error {
 			copy(buf, p.wal.memFrames[idx].data)
 			return nil
 		}
-		return ErrWALCorrupt
+		return errWalFrameRange
 	}
 	if p.wal.file == nil {
 		return ErrClosed
 	}
 	frameSize := int64(walFrameSize) + int64(p.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
-	_, err := p.wal.file.ReadAt(buf, offset)
-	return err
+	if _, err := p.wal.file.ReadAt(buf, offset); err != nil {
+		return frameReadErr(err)
+	}
+	return nil
 }
 
 // pagerStress is the pcache stress callback invoked when the writer's cache

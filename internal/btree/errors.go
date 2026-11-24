@@ -86,14 +86,20 @@ var (
 	// written.
 	ErrValueTooLarge = errors.New("btree: value too large")
 
-	// ErrWALCorrupt indicates the WAL index points at a frame the file does not hold.
-	ErrWALCorrupt = nestedError("btree: WAL is corrupt", ErrCorrupt)
+	// ErrWALShortRead is the error of a read of a WAL frame that comes up
+	// short: the wal-index points at a frame past the end of the log file,
+	// as SQLite's read of it gives SQLITE_IOERR_SHORT_READ
+	// (sqlite3WalReadFrame, wal.c:3649-3664; unixRead). Deliberately NOT
+	// wrapping ErrCorrupt: the database file is not damaged, and the
+	// wal-index is rebuilt from the log when every handle has closed it.
+	ErrWALShortRead = errors.New("btree: WAL frame read came up short: the wal-index points past the end of the log")
 
 	// ErrWALVersion indicates the WAL was written by an incompatible (newer)
-	// any-store version. Unlike ErrWALCorrupt it must never trigger
-	// recovery's start-fresh truncation: the WAL holds committed
-	// transactions this binary cannot read, and destroying it would lose
-	// them. Open fails instead; upgrade the binary to proceed.
+	// any-store version. Unlike a WAL header that fails its checks
+	// (errWalHeaderInvalid) it must never trigger recovery's start-fresh
+	// truncation: the WAL holds committed transactions this binary cannot
+	// read, and destroying it would lose them. Open fails instead; upgrade
+	// the binary to proceed.
 	ErrWALVersion = errors.New("btree: incompatible WAL version")
 
 	// ErrOldFormat indicates the database was created with an older schema format

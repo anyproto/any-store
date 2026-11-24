@@ -233,12 +233,11 @@ The page-1 DB header (first 100 bytes) is outside the per-page hash; its invaria
 |---|---|
 | `ErrHeaderCorrupt` | `Open`: the file header is unusable. |
 | `ErrPageIntegrity` | A page fails its checksum or its AEAD authentication, on the read that meets it. |
-| `ErrWALCorrupt` | The write-ahead log's index points at a frame the log does not hold. The damage is in the log, not in the database file: close every handle and open again before discarding anything. |
 | `ErrQuickCheckFailed` | `Open` after an unclean shutdown (`Durability.Sentinel`): the quick check found damage. |
 
-`IntegrityCheck` returns an error that matches `ErrCorrupt` when it found damage.
+`IntegrityCheck` returns an error that matches `ErrCorrupt` when it found damage. A damaged write-ahead log index (`-wal-shm`, shared memory) matches `ErrCorrupt` too, as in SQLite; closing every handle on the file rebuilds it.
 
-Errors that are not damage do not match `ErrCorrupt` and are returned as themselves: a cancelled context, an I/O error or a full disk (also when they stop a commit, the quick check of a dirty `Open`, or an `IntegrityCheck`), `ErrBusy`, `ErrDBIsClosed`, `ErrV1Database`, `ErrIncompatibleVersion`, `ErrDBAlreadyOpen`, `ErrDBOpenInOtherProcess`, and the encryption errors below.
+Errors that are not damage do not match `ErrCorrupt` and are returned as themselves: a cancelled context, an I/O error or a full disk (also when they stop a commit, the quick check of a dirty `Open`, or an `IntegrityCheck`), `ErrBusy`, `ErrDBIsClosed`, `ErrV1Database`, `ErrIncompatibleVersion`, `ErrDBAlreadyOpen`, `ErrDBOpenInOtherProcess`, and the encryption errors below. So does `ErrWALShortRead`: the write-ahead log's index points past the end of the log; close every handle on the file and open it again.
 
 ## Encryption
 

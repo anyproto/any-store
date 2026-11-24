@@ -35,7 +35,10 @@ import (
 // rest of the report inconclusive: the pages below an unread page are
 // reported as never used, and its subtree's depth as differing. The error
 // then matches the first such read's error and not ErrCorrupt, whatever
-// else it lists; run the check again once the reads work.
+// else it lists; run the check again once the reads work. A WAL frame read
+// that comes up short is such a read (ErrWALShortRead): the wal-index
+// points past the log, and an open after every handle has closed rebuilds
+// the index.
 // DRIFT: the findings are an error that matches ErrCorrupt; sqlite3BtreeIntegrityCheck returns them as text with SQLITE_OK. See docs/btree/NOTES.md#drift-2026-11-24-4-integrity-checks-findings-are-an-error-that-matches-errcorrupt
 type IntegrityError struct {
 	Errors []string

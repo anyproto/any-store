@@ -2904,11 +2904,11 @@
     "sqlite": [
       "wal.c:walIndexReadHdr"
     ],
-    "note": "validated header read; rebuilds the wal-index under the write lock when the header is invalid"
+    "note": "validated header read; rebuilds the wal-index under the write lock when the header is invalid, and returns the rebuild's error as walIndexReadHdr returns walIndexRecover's (wal.c:2724)"
   },
   "wal.go:*wal.initHeaderStateLocked": {
     "sqlite": [],
-    "note": "lazy WAL header init without disk write"
+    "note": "lazy WAL header init without disk write; returns the wal-index header's publication error"
   },
   "wal.go:*wal.open": {
     "sqlite": [
@@ -2970,7 +2970,7 @@
     "sqlite": [
       "wal.c:walRestartHdr"
     ],
-    "note": "header half of a WAL restart: mxFrame 0, hdr.nPage kept, salt1+1 and a random salt2; nCkpt stays 0 and aFrameCksum is the new WAL header's checksum (drift-98)"
+    "note": "header half of a WAL restart: mxFrame 0, hdr.nPage kept, salt1+1 and a random salt2; nCkpt stays 0 and aFrameCksum is the new WAL header's checksum (drift-98). Returns the publication's error, which walRestartHdr, writing the mapped header in place, cannot have"
   },
   "wal.go:*wal.restartLogLocked": {
     "sqlite": [
@@ -3229,7 +3229,7 @@
     "sqlite": [
       "wal.c:sqlite3WalReadFrame"
     ],
-    "note": "the error of a failed frame read: ErrWALCorrupt only for a short read of a frame above the local frame count, the read's own error otherwise (drift-2026-07-10-1)"
+    "note": "the error of a failed frame read: ErrWALShortRead for a short read (SQLITE_IOERR_SHORT_READ from unixRead), the read's own error otherwise (drift-2026-07-10-1)"
   },
   "wal.go:htFrameSegIdx": {
     "sqlite": [

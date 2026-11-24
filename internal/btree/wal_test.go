@@ -47,19 +47,22 @@ func TestWALHeaderDeserializeCorrupt(t *testing.T) {
 	var h walHeader
 
 	// Too short
-	assert.ErrorIs(t, h.deserialize(make([]byte, 10)), ErrWALCorrupt)
+	assert.ErrorIs(t, h.deserialize(make([]byte, 10)), errWalHeaderInvalid)
 
 	// Wrong magic
 	buf := make([]byte, walHeaderSize)
 	binary.BigEndian.PutUint32(buf[0:4], 0x12345678)
-	assert.ErrorIs(t, h.deserialize(buf), ErrWALCorrupt)
+	assert.ErrorIs(t, h.deserialize(buf), errWalHeaderInvalid)
 
 	// Bad checksum
 	buf2 := make([]byte, walHeaderSize)
 	binary.BigEndian.PutUint32(buf2[0:4], walMagic)
 	binary.BigEndian.PutUint32(buf2[24:28], 0xbad)
 	binary.BigEndian.PutUint32(buf2[28:32], 0xbad)
-	assert.ErrorIs(t, h.deserialize(buf2), ErrWALCorrupt)
+	assert.ErrorIs(t, h.deserialize(buf2), errWalHeaderInvalid)
+
+	// None of them reaches a caller as damage: recovery starts the log over.
+	assert.NotErrorIs(t, errWalHeaderInvalid, ErrCorrupt)
 }
 
 func TestWALChecksum(t *testing.T) {
@@ -179,8 +182,9 @@ func TestWALReadFrameInvalid(t *testing.T) {
 	require.NoError(t, w.open())
 
 	buf := make([]byte, 4096)
-	assert.ErrorIs(t, w.readFrame(0, buf, nil, nil), ErrWALCorrupt)
-	assert.ErrorIs(t, w.readFrame(999, buf, nil, nil), ErrWALCorrupt)
+	assert.ErrorIs(t, w.readFrame(0, buf, nil, nil), errWalFrameRange)
+	// Past the end of the file: a short read.
+	assert.ErrorIs(t, w.readFrame(999, buf, nil, nil), ErrWALShortRead)
 
 	require.NoError(t, w.close(false))
 }
@@ -1572,9 +1576,9 @@ func TestWalHeaderDeserialize_GoodHeader(t *testing.T) {
 
 // TestWalHeaderDeserialize_RejectsBadVersion mirrors SQLite's
 // walIndexRecover rejection at wal.c:1441-1446 (SQLITE_CANTOPEN). The error
-// must be ErrWALVersion, NOT ErrWALCorrupt: recoverLocked truncates the WAL
-// on corruption but must refuse to open on a version mismatch (a newer
-// binary's WAL holds committed transactions this binary cannot read).
+// must be ErrWALVersion, NOT errWalHeaderInvalid: recoverLocked truncates the
+// WAL on an invalid header but must refuse to open on a version mismatch (a
+// newer binary's WAL holds committed transactions this binary cannot read).
 func TestWalHeaderDeserialize_RejectsBadVersion(t *testing.T) {
 	buf := buildWalHeader(t, walVersion+1, DefaultPageSize)
 	var h walHeader
@@ -1582,8 +1586,8 @@ func TestWalHeaderDeserialize_RejectsBadVersion(t *testing.T) {
 	if !errors.Is(err, ErrWALVersion) {
 		t.Fatalf("bad version should be ErrWALVersion, got %v", err)
 	}
-	if errors.Is(err, ErrWALCorrupt) {
-		t.Fatalf("version mismatch must not map to ErrWALCorrupt (would trigger destructive recovery), got %v", err)
+	if errors.Is(err, errWalHeaderInvalid) {
+		t.Fatalf("version mismatch must not map to errWalHeaderInvalid (would trigger destructive recovery), got %v", err)
 	}
 }
 
@@ -1605,8 +1609,8 @@ func TestWalHeaderDeserialize_RejectsBadPageSize(t *testing.T) {
 			buf := buildWalHeader(t, walVersion, tc.ps)
 			var h walHeader
 			err := h.deserialize(buf)
-			if !errors.Is(err, ErrWALCorrupt) {
-				t.Fatalf("bad pageSize %d should be ErrWALCorrupt, got %v", tc.ps, err)
+			if !errors.Is(err, errWalHeaderInvalid) {
+				t.Fatalf("bad pageSize %d should be errWalHeaderInvalid, got %v", tc.ps, err)
 			}
 		})
 	}
@@ -2946,21 +2950,63 @@ func TestWriteFramesMem_InTxRangeErrorDropsAppendedFrames(t *testing.T) {
 	require.Equal(t, byte('c'), buf[0], "frame %d reads back a page of the failed write", nf+1)
 }
 
-// frameReadErr: only a short read of a frame above the local frame count
-// is ErrWALCorrupt, the index pointing at a frame the file does not hold.
-// An I/O error on such a frame is returned as it is, and is not corruption.
+// frameReadErr: a short read of a frame is ErrWALShortRead, the index
+// pointing at a frame the file does not hold, as SQLite's read gives
+// SQLITE_IOERR_SHORT_READ; it is not corruption. Any other failure of the
+// read is returned as it is.
 func TestFrameReadErr(t *testing.T) {
+	for _, short := range []error{io.EOF, io.ErrUnexpectedEOF} {
+		err := frameReadErr(short)
+		require.ErrorIs(t, err, ErrWALShortRead)
+		require.NotErrorIs(t, err, ErrCorrupt)
+	}
+
 	eio := errors.New("input/output error")
-	pathErr := &os.PathError{Op: "read", Path: "db-wal", Err: eio}
-
-	require.ErrorIs(t, frameReadErr(11, 10, io.EOF), ErrWALCorrupt)
-	require.ErrorIs(t, frameReadErr(11, 10, io.ErrUnexpectedEOF), ErrWALCorrupt)
-
-	err := frameReadErr(11, 10, pathErr)
+	err := frameReadErr(&os.PathError{Op: "read", Path: "db-wal", Err: eio})
 	require.ErrorIs(t, err, eio)
+	require.NotErrorIs(t, err, ErrWALShortRead)
 	require.NotErrorIs(t, err, ErrCorrupt)
+}
 
-	// Within the local count the read's error is returned whatever it is.
-	require.Equal(t, io.EOF, frameReadErr(10, 10, io.EOF))
-	require.NotErrorIs(t, frameReadErr(10, 10, pathErr), ErrCorrupt)
+// A frame read on a closed log is ErrClosed, raw or decoded, before any
+// bound on the frame number: the in-process mode's count of frames says
+// nothing about a log that is gone.
+func TestWALClosedFileReadIsErrClosed(t *testing.T) {
+	w := newWal(filepath.Join(t.TempDir(), "test.db-wal"), 4096)
+	w.inProcess = true
+	require.NoError(t, w.open())
+	require.NoError(t, w.close(false))
+	require.Zero(t, w.nFrame.Load())
+
+	buf := make([]byte, 4096)
+	err := w.readFrame(1, buf, nil, nil)
+	require.ErrorIs(t, err, ErrClosed)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	err = w.readFrameRaw(1, buf)
+	require.ErrorIs(t, err, ErrClosed)
+	require.NotErrorIs(t, err, ErrCorrupt)
+}
+
+// A recovery of the wal-index that cannot publish its header returns the
+// publication's error, as walIndexReadHdr returns walIndexRecover's
+// (wal.c:2724), not a header that is merely still invalid.
+func TestIndexReadHdr_RecoveryReturnsThePublicationError(t *testing.T) {
+	w := newWal(filepath.Join(t.TempDir(), "test.db-wal"), 4096)
+	w.inProcess = true
+	require.NoError(t, w.open())
+	real := w.index.shm
+	defer func() {
+		w.index.shm = real
+		_ = w.close(false)
+	}()
+	info, err := w.file.Stat()
+	require.NoError(t, err)
+	require.Less(t, info.Size(), int64(walHeaderSize), "the log is empty: recovery takes the fresh-header branch")
+
+	injected := errors.New("injected: wal-index segment unavailable")
+	w.index.shm = &errorRegionShm{shm: real, failRegion: 0, regionErr: injected}
+	_, err = w.indexReadHdr(false, false)
+	require.ErrorIs(t, err, injected)
+	require.NotErrorIs(t, err, errWalIndexUnpublished)
+	require.NotErrorIs(t, err, ErrCorrupt)
 }
