@@ -1149,6 +1149,7 @@ func (p *pager) createIfEmpty(f fileHandle) (created bool, err error) {
 // lock is refused only while a creator is at work or a late arrival is
 // between its shared lock and its own request. A creation that stays pending
 // with the file locked by another process for BusyTimeout is ErrBusy.
+// DRIFT: a flock has no RESERVED step, so a creator refused the exclusive lock drops its shared one, sleeps 1-3 ms holding nothing and asks again until BusyTimeout; the same loop serves a hot-journal playback, for which SQLite asks for EXCLUSIVE once (pager.c:5308). See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
 func (p *pager) lockDBForCreate(f fileHandle) (bool, error) {
 	deadline := time.Now().Add(BusyTimeout)
 	for {
