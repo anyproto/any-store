@@ -811,7 +811,7 @@ The Go implementation has:
 | Aspect | SQLite | Go |
 |--------|--------|-----|
 | Max local payload | `BT_MAX_LOCAL = 65501` | `payloadLimits.maxLocal` computed from usableSize: the index limit for interior cells, the file's leaf limit (`pager.leafLimits`) for leaf cells |
-| Max total payload | Validated against `nPage * usableSize` | `maxPayloadAlloc = 1 << 30` |
+| Max total payload | Validated against `nPage * pageSize` (`sqlite3BtreeMaxRecordSize`) | `maxPayloadAlloc = 1 << 30` in the parsers and for writes; `payloadInFile` (`nPage * pageSize`) before a reader allocates |
 | Approach | Per-access bounds checking with macros | Per-access bounds checking with error returns |
 | Overflow protection | Trust chain structure | `maxIter` + bounds checks |
 | Max tree depth | `BTCURSOR_MAX_DEPTH = 20` | `btCursorMaxDepth` (same value) |
@@ -819,9 +819,74 @@ The Go implementation has:
 <a id="old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation"></a>
 **Severity:** low
 
-**Classification: Divergent** -- Both implementations protect against corruption, but
-the specific cap values differ. SQLite's `nCell/usableSize > nPage` check is more
-precise (validates against actual database size), while Go uses a fixed 1 GB cap.
+**Classification: Divergent** -- Go's cell parsers refuse, with `ErrCorrupt`, a cell whose
+key and value lengths sum over 1 GiB (`maxPayloadAlloc`, tested by `payloadFits`); SQLite's
+parsers read the payload length into a `u32` and test it against nothing
+(`btreeParseCellPtr`, `btree.c:1280-1287`; `btreeParseCellPtrIndex`, `btree.c:1359-1366`).
+The bound against the database size is SQLite's in both: a reader tests a declared length
+against `pageSize * nPage` before it sizes a buffer by it (`payloadInFile`, below), though a
+reader's page count is the pager's
+([drift-2026-11-24-2](#drift-2026-11-24-2-a-readers-file-size-bound-takes-the-pagers-page-count)).
+
+The cap is also the write-side limit: reads and writes apply one rule, `payloadFits`
+(`page.go`). Key length plus value length is at most `maxPayloadAlloc` (`1<<30`), tested on
+the 64-bit lengths a cell declares before they are converted to `int` (on a 32-bit build a
+declared length of `1<<32+1` would convert to 1). The leaf-cell parsers that test both
+lengths (`parseLeafCellWithSize`, `leafFullValue`, `leafKeyAt`) answer `ErrCorrupt` for a
+cell that fails it, and so do `parseInteriorCell` and `interiorFullKey` for a key over the
+cap. `Put` refuses such a record before it touches a page, so it never writes a record that
+its own parse would reject: see
+[drift-2026-11-24-1](#drift-2026-11-24-1-put-refuses-a-record-over-the-record-size-limit).
+
+A read of a leaf cell's key bounds the key only; the value's declared length is tested where
+the value is read. That length still places the key's local part, and `spilledLocalSize`
+(`page.go`) computes that part without adding the two lengths, which a damaged one could
+wrap. The search tests the sum only for the cell it reports as found, so every exact match
+is held to it, `Has` and an exact seek included. A damaged value length therefore need not
+make the cell's key, or a search for a neighbouring key, fail; a read of the value reports a
+length over its bounds. A SQLite table cursor reads the rowid of a row whose payload is
+corrupt the same way (`sqlite3BtreeIntegerKey`, `btree.c:4917-4923`). `leafCellPayloadLen`
+(`walkSize`) tests the two lengths singly. These tests are looser than `payloadFits`, never
+stricter, so nothing `Put` accepts fails there. The overflow-chain readers have no cap of
+their own (their `maxIter` follows from the length asked for), and the 9-byte varint holds
+any length under the cap.
+
+A reader that allocates from a declared length first tests it against the size of the
+database it reads, so that a few damaged bytes in a small file cannot ask for up to 1 GiB
+before the overflow chain is found short. The test is SQLite's: `sqlite3VdbeMemFromBtree`
+returns `SQLITE_CORRUPT_BKPT` when `amt+offset > sqlite3BtreeMaxRecordSize(pCur)` before it
+resizes the Mem (`vdbemem.c:1428-1429`), and that size is `pageSize * nPage`
+(`btree.c:4978-4982`). `payloadInFile` (`page.go`) makes it with the page count of the
+reader's snapshot (`readerDbSizeBound`: the read transaction's, or the live count for the
+writer); a reader's count is the pager's, not page 1's
+([drift-2026-11-24-2](#drift-2026-11-24-2-a-readers-file-size-bound-takes-the-pagers-page-count)).
+It runs before every allocation sized by a declared length, on the bytes that are
+read: key and value for the value readers (`btree.AppendValue`, `ReadTx.AppendValue`,
+`Cursor.Value`, `Cursor.AppendValue`, `leafFullValue`), the key alone for the key readers
+(`leafFullKey`, `interiorFullKey`, `cellFullKey`, `collectInteriorCellsKeepBuf`).
+`leafFullKey` also gives its first overflow pointer the chain readers' page test before it
+allocates. SQLite's index probe likewise sizes the key it rebuilds from the key alone
+(`btree.c:6159-6168`). A value length over the file therefore fails the read of that value,
+not a read of the cell's key. The test is made where the bytes are asked for, as in SQLite,
+not in the cell parsers, which have no pager. The 1 GiB cap is the limit of what is written,
+and the tighter bound of the two in a file over 1 GiB.
+
+`Has` answers from the cell its search finds: it tests the record size limit there, not the
+file size, so it can be true for a record whose `Get` fails the file-size bound. SQLite's
+table seek skips a cell's payload size and compares its rowid only (`btree.c:5880-5886`);
+a later read of the payload fails at `vdbemem.c:1428`.
+
+Tests: `TestPayloadLimit_RealConstants`,
+`TestPayloadLimit_LengthsCheckedBeforeNarrowing`, `TestPayloadLimit_SpilledLocalSize`,
+`TestPayloadLimit_PutRefusesWhatReadRejects`, `TestPayloadLimit_NamespaceName`,
+`TestPayloadLimit_DeclaredLengthOverFileSize`,
+`TestPayloadLimit_NeighbourOfDamagedCellIsFound`,
+`TestPayloadLimit_CursorKeyOfDamagedCell`, `TestPayloadLimit_SeekKeyOfDamagedCell`,
+`TestPayloadLimit_SeekKeyNextLeafStartsWithDamagedCell`,
+`TestPayloadLimit_CountUntilOverDamagedCell`,
+`TestPayloadLimit_SpilledKeyWithNoOverflowPage`,
+`TestPayloadLimit_SplitBesideDamagedValueLengths`,
+`TestPayloadLimit_OverflowRecordWithinFileSize`, `TestCov_LeafFullKeyBoundsTheKeyOnly`.
 
 <a id="old-drift-additive-maxiter-circular-chain-guard"></a>
 **Severity:** low
@@ -4238,3 +4303,23 @@ Three further rules of the same SQLite routines were ported with it (2026-11-11)
 - **A wal-index of another version is refused, not rebuilt.** `readHeader` reported a consistent, checksummed header with a foreign `iVersion` as invalid, which `indexReadHdr` would have "repaired" over another build's live index. `walIndexReadHdr` returns `SQLITE_CANTOPEN` for it without recovery (`wal.c:2740-2741`); `readHeaderState` separates the case and `indexReadHdr` returns an error matching `ErrWALVersion`. `wal.open` refuses it the same way, under its recovery locks and before it rebuilds anything: a process attaching to a database a newer build keeps open must not overwrite that build's index. On a fresh attach `region(create=false)` maps none of the peer's index ([drift-2026-07-10-3](#drift-2026-07-10-3-region-create-false-never-maps-existing-content)), so the gate maps region 0 first, as `walIndexReadHdr` does through `walIndexPage`; a consistent header of this version still goes to recovery, as before. Tests: `TestWalIndexFutureVersionRefused`, `TestWalIndexFutureVersionRefusedAtOpen` (two processes).
 
 Regression tests (`internal/btree/walindex_torn_header_test.go`): `TestTornWalIndexHeader_CheckpointKeepsPeerCommits`, `_PassiveCheckpointKeepsPeerCommits`, `_CloseKeepsPeerCommits`, `_ReaderRecovers`, `_WriterRecovers` (two processes: the writer dies between the header copies), `_ReaderRetriesWhileWriteLockBusy`, `_BusyRecoveryWhenRecoverLockHeld`, `_CheckpointBusyWhenWriteLockHeld`.
+
+<a id="drift-2026-11-24-1-put-refuses-a-record-over-the-record-size-limit"></a>
+### Drift: Put Refuses A Record Over The Record Size Limit; SQLite Tests Its Length Limit Above The B-Tree
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.Put`, `btree.go:recordSizeErr`, `page.go:payloadFits`; `db.go:*DB.CreateNamespace`, `db.go:*DB.RenameNamespace` (the master-table record).
+
+SQLite's length limit is `SQLITE_LIMIT_LENGTH`, `SQLITE_MAX_LENGTH` by default, 1,000,000,000 (`sqliteLimit.h:24`), and it is tested where a value or a record is built, above the b-tree. `OP_MakeRecord` tests `nByte+nZero>db->aLimit[SQLITE_LIMIT_LENGTH]` (`vdbe.c:3697`) and jumps to `too_big:`, which sets "string or blob too big" and returns `SQLITE_TOOBIG` (`vdbe.c:9298-9300`). That test runs only when the output register must grow to hold the record: it is in the `else` of `if( nByte+nZero<=pOut->szMalloc )` (`vdbe.c:3690`). `sqlite3BtreeInsert` only asserts its lengths (`btree.c:9485`, `9540`).
+
+Here the limit is in the b-tree, and it is the cell parsers' cap ([old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation](#old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation)): key length plus value length at most `maxPayloadAlloc`, 2^30 bytes (`payloadFits`). `Put` tests every record against it before it touches a page, and refuses one over it with one of two errors (`recordSizeErr`): `ErrKeyTooLarge` when the key alone is over the limit, `ErrValueTooLarge` otherwise, where SQLite has the one code. `CreateNamespace` and `RenameNamespace` apply the same test to the master-table record (the name and a 4-byte root page number) before they allocate the root or delete the old name. Holding writes to the parsers' cap means `Put` never writes a record its own parse would reject, and the b-tree is the lowest layer every writer here passes through. Only `Put` brings a new record into a tree, and it tests that record at entry, before any path writes it; the rest of what a split or a rebuild writes, under `Put` or `Delete`, comes from cells already in the tree. Tests: `TestPayloadLimit_RealConstants`, `TestPayloadLimit_PutRefusesWhatReadRejects`, `TestPayloadLimit_NamespaceName`.
+
+<a id="drift-2026-11-24-2-a-readers-file-size-bound-takes-the-pagers-page-count"></a>
+### Drift: A Reader's File-Size Bound On A Declared Length Takes The Pager's Page Count, Not Page 1's
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `page.go:payloadInFile` (its page count is `pager.go:*pager.readerDbSizeBound`'s).
+
+`sqlite3BtreeMaxRecordSize` is `pCur->pBt->pageSize * (sqlite3_int64)pCur->pBt->nPage` (`btree.c:4978-4982`). `pBt->nPage` is the count `lockBtree` sets at the start of every transaction (`btree.c:3707`, `3448`): page 1's in-header size (offset 28) when it is non-zero and the change counter equals the version-valid-for number, else the pager's count (`btree.c:3294-3298`); a trusted size larger than the pager's count is `SQLITE_CORRUPT_BKPT` (`btree.c:3401-3407`). A write then grows it as it allocates pages (`allocateBtreePage`, `btree.c:6763-6786`).
+
+`payloadInFile` multiplies the page size by `readerDbSizeBound`. For the writer that is `pager.dbSize`, which a write begin sets by the same rule (`refreshHeaderFromPage1` through `lockBtreePageCount`) and `allocatePage` grows: SQLite's count. For a reader it is `pcache.dbSize`, the pager's count at its snapshot (`effectiveReaderDbSize`: the size the WAL's last commit records, else the database file's size), and page 1 is not read for it. In a file any-store writes the two agree: a commit that changes the page count writes page 1 with it (`commitNeedsPage1`). They differ when page 1's size field is damaged, or when the count is the database file's size and the file holds pages past its committed size. A trusted page-1 size below the pager's count then bounds a SQLite reader more tightly than this one, and one above it ends the SQLite transaction at its start with `SQLITE_CORRUPT`, where this reader goes on under the pager's count. Where page 1's size is untrusted, SQLite takes the pager's count too. The bound decides only whether a declared length is refused before a buffer is sized by it; a length within it whose bytes are not in the file still fails on the overflow chain.
+
+The key readers bound a key's length by `payloadInFile` too, `pageSize * nPage`, where SQLite's index probe uses `nCell/usableSize > nPage` (`btree.c:6164`), with the same `nPage`. Both bounds are at least `nPage * usableSize`, more than the file's pages can hold of one payload, so a key whose length falls between them fails on the overflow chain under either. The page numbers a reader follows (`descendChild`, the overflow-chain readers) are bounded by the same pager's count, where SQLite tests `btreePagecount`, that is `pBt->nPage` (`btree.c:2365`, `2386`, `5227`). Tests: `TestPayloadLimit_DeclaredLengthOverFileSize`, `TestPayloadLimit_OverflowRecordWithinFileSize`.

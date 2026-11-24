@@ -139,11 +139,55 @@ const (
 	// overflowPtrSize is the size of the overflow page pointer at the end
 	// of a leaf cell that has overflowed.
 	overflowPtrSize = 4
-	// maxPayloadAlloc is the maximum allocation size for key/value payloads
-	// read from disk. Protects against OOM from corrupted varints that decode
-	// to absurdly large values. 1 GB is generous for any real workload.
+	// maxPayloadAlloc is the largest record, key and value together, in
+	// bytes: 1 GiB. A cell read from disk that declares more is corruption
+	// (the cap protects against a corrupted varint that decodes to an
+	// absurd allocation), and Put refuses to write more; see payloadFits.
 	maxPayloadAlloc = 1 << 30
 )
+
+// payloadLimit is maxPayloadAlloc. It is a variable only so that a test can
+// lower it: what is written and what is read are held to the one value.
+var payloadLimit = maxPayloadAlloc
+
+// payloadFits reports whether a record with a key of keyLen bytes and a
+// value of valLen bytes is within the record size limit: their sum is at
+// most payloadLimit. It is the one rule of both sides. The cell parsers
+// answer ErrCorrupt for a cell that fails it, so Put refuses such a record
+// before it writes anything: a record that could be written and not read
+// back would make its own file corrupt.
+//
+// The lengths are the 64-bit values a cell declares, tested before they are
+// narrowed: on a 32-bit int a declared length of 1<<32+1 converts to 1. A
+// pair that passes fits an int of either width, and so does its sum.
+//
+// SQLite draws its line above the b-tree: SQLITE_LIMIT_LENGTH
+// (SQLITE_MAX_LENGTH, 1,000,000,000, sqliteLimit.h:24) is tested where a
+// value or a record is built. In OP_MakeRecord the test runs only when the
+// output register must grow to hold the record (vdbe.c:3690-3699); a record
+// that fits the register's allocation is not tested, and sqlite3BtreeInsert
+// only asserts its lengths (btree.c:9485, 9540). Put tests every record.
+// DRIFT: a 1 GiB cap on key plus value, for the cell parsers and for Put; SQLite's parsers cap no payload length and its write limit is SQLITE_LIMIT_LENGTH, above the b-tree. See docs/btree/NOTES.md#old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation
+func payloadFits(keyLen, valLen uint64) bool {
+	limit := uint64(payloadLimit)
+	// The sum is not formed: two 64-bit lengths can wrap it.
+	return valLen <= limit && keyLen <= limit-valLen
+}
+
+// payloadInFile reports whether a payload of total bytes can be stored in the
+// database as the reader sees it: no more than its page count times the page
+// size. A reader that is about to allocate from a length a cell declares
+// tests it first, so that a few damaged bytes in a small file cannot ask for
+// a gigabyte before the overflow chain is found short. ~
+// sqlite3VdbeMemFromBtree, which returns SQLITE_CORRUPT_BKPT when
+// amt+offset > sqlite3BtreeMaxRecordSize, before it resizes the Mem
+// (vdbemem.c:1428-1429), that size being pageSize*nPage (btree.c:4978-4982).
+// The page count is the snapshot's for a reader (cache) and the live one for
+// the writer, as readerDbSizeBound resolves it.
+// DRIFT: a reader's page count is the pager's (readerDbSizeBound), not the page-1 nPage that sqlite3BtreeMaxRecordSize multiplies. See docs/btree/NOTES.md#drift-2026-11-24-2-a-readers-file-size-bound-takes-the-pagers-page-count
+func payloadInFile(p *pager, cache *pcache, total int) bool {
+	return total >= 0 && uint64(total) <= uint64(p.readerDbSizeBound(cache))*uint64(p.pageSize)
+}
 
 // maxLocalPayload returns the max payload stored locally before overflow.
 // Matches SQLite's formula for index B-trees.
@@ -218,6 +262,26 @@ func localPayloadSize(totalPayload int, lim payloadLimits) int {
 	surplus := lim.minLocal + (totalPayload-lim.minLocal)%overflowPageUsable(lim.usable)
 	if surplus <= lim.maxLocal {
 		return surplus
+	}
+	return lim.minLocal
+}
+
+// spilledLocalSize is localPayloadSize for a leaf cell that declares a key
+// of keyLen bytes and a value of valLen bytes whose sum is over lim.maxLocal,
+// computed without forming that sum. A reader that reads only the key does
+// not bound the value's length (see leafFullKey), and two 64-bit lengths can
+// wrap a sum; btreePayloadToLocal's (nPayload-minLocal) % (usable-4) is taken
+// term by term instead. When an int holds that sum, the result is
+// localPayloadSize's. SQLite has one payload length per cell, which its cell
+// parsers read into a u32 (btreeParseCellPtr, btree.c:1280-1287), so it has
+// no sum to wrap.
+func spilledLocalSize(keyLen, valLen uint64, lim payloadLimits) int {
+	m := uint64(overflowPageUsable(lim.usable))
+	minLocal := uint64(lim.minLocal)
+	// The sum is over maxLocal, so over minLocal: the difference is positive.
+	surplus := minLocal + (keyLen%m+valLen%m+m-minLocal%m)%m
+	if surplus <= uint64(lim.maxLocal) {
+		return int(surplus)
 	}
 	return lim.minLocal
 }
