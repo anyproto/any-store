@@ -150,6 +150,12 @@ type DBStats struct {
 // Open opens a database at the specified path with the given configuration.
 // The config parameter can be nil for default settings.
 // Returns a DB instance or an error.
+//
+// The path is resolved to a full name once, when the database is opened
+// (btree.FullPathname), and the database file, its WAL and its sentinel file
+// are named from it. On Unix a relative path is joined to the working
+// directory, on Windows the name is GetFullPathNameW's, and on js/wasm and
+// wasip1 it is the path as given.
 func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	ds, err := open(ctx, path, config, 0)
 	if err != nil {
@@ -166,6 +172,16 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		config = &Config{}
 	}
 	config.setDefaults()
+
+	// One name for the database file, its WAL and its sentinel file, as
+	// SQLite resolves the name once and opens every file by it
+	// (pager.c:4792, pager.c:4929, pager.c:4948).
+	var err error
+	if !config.InMemory {
+		if path, err = btree.FullPathname(path); err != nil {
+			return nil, fmt.Errorf("cannot resolve the database path: %w", err)
+		}
+	}
 
 	sPool := syncpool.NewSyncPool(config.SyncPoolElementMaxSize)
 
@@ -232,7 +248,9 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		}
 	}
 
-	var err error
+	if testHookBeforeBtreeOpen != nil {
+		testHookBeforeBtreeOpen()
+	}
 	if ds.btreeDB, err = btree.Open(path, opts); err != nil {
 		if errors.Is(err, btree.ErrPageSlabNotInitialized) {
 			return nil, ErrPageBufferNotInitialized
@@ -298,7 +316,7 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		if ds.recoveryController != nil {
 			_ = ds.recoveryController.Stop()
 		}
-		_ = ds.btreeDB.Close()
+		_ = ds.closeBtree()
 		return nil, err
 	}
 
@@ -906,6 +924,10 @@ var testHookRegistered func(name string)
 // registry, before it resolves the handle. Tests only.
 var testHookFoundRegistered func(c *collection)
 
+// testHookBeforeBtreeOpen, when set, runs in open after the path is resolved
+// and the sentinel is set up, just before btree.Open. Tests only.
+var testHookBeforeBtreeOpen func()
+
 // errHandleGone tells openCollection that the handle it found registered is
 // not live any more.
 var errHandleGone = errors.New("any-store: registered handle is gone")
@@ -1236,9 +1258,18 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 	return
 }
 
+// testQuickCheckReadHook, when set, is called inside the quick check's read
+// transaction; an error from it is the check's failure.
+var testQuickCheckReadHook func() error
+
 func (db *db) QuickCheck(ctx context.Context) (err error) {
 	// btree doesn't have a built-in quick check, just verify we can read
 	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		if f := testQuickCheckReadHook; f != nil {
+			if err := f(); err != nil {
+				return err
+			}
+		}
 		cursor := tx.NewCursor(db.systemNS)
 		defer cursor.Close()
 		if err := cursor.First(); err != nil {
@@ -1774,7 +1805,24 @@ func (db *db) Close() error {
 		log.Printf("recovery controller stop error: %v", err)
 	}
 
-	return db.btreeDB.Close()
+	return db.closeBtree()
+}
+
+// closeBtree closes the btree and clears the durability sentinel when that
+// close checkpointed the whole log as the last client of the file. The
+// sentinel goes inside the btree close, after the checkpoint and while the
+// close still holds the exclusive DB-file lock, so no other process can open
+// the file and commit before it is gone. A close that is not the last runs no
+// checkpoint and leaves the sentinel set: the commits of this handle and of
+// the handles still attached can be in the log alone, and if those processes
+// are killed the next open must run the quick check.
+func (db *db) closeBtree() error {
+	var onCheckpointed func()
+	if db.recoveryController != nil {
+		onCheckpointed = db.recoveryController.MarkCleanAfterClose
+	}
+	_, err := db.btreeDB.CloseCheckpointed(onCheckpointed)
+	return err
 }
 
 func (db *db) createRecoveryController(ctx context.Context, path string) (*durability.Controller, bool) {
@@ -1792,7 +1840,9 @@ func (db *db) createRecoveryController(ctx context.Context, path string) (*durab
 		AutoFlushFunc: flushFunc,
 	}
 
-	if db.config.Durability.Sentinel {
+	// An in-memory database has no files on disk, and no close of it
+	// persists anything: it gets no sentinel file.
+	if db.config.Durability.Sentinel && !db.config.InMemory {
 		opts.Sentinel = sentinel.New(path)
 	}
 	controller := durability.NewController(opts)

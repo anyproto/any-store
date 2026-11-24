@@ -841,8 +841,25 @@ func Open(path string, opts Options) (*DB, error) {
 
 // Close closes the database.
 func (db *DB) Close() error {
+	_, err := db.CloseCheckpointed(nil)
+	return err
+}
+
+// CloseCheckpointed closes the database and reports whether the close
+// checkpointed the whole log into the database file as the last client: it
+// held the exclusive DB-file lock, so no other process was attached, and its
+// checkpoint completed (the branch of sqlite3WalClose that sets isDelete,
+// wal.c:2522-2540). It reports false for a close that left the log to the
+// processes still attached, for a database file that was moved, and for a
+// checkpoint that failed: commits may then exist only in the log. An
+// in-memory database has no database file and reports false.
+//
+// When the close checkpointed, onCheckpointed (if not nil) runs after the
+// checkpoint, while the close still holds the exclusive DB-file lock: no
+// other process can attach, and so none can commit, until it has returned.
+func (db *DB) CloseCheckpointed(onCheckpointed func()) (checkpointed bool, err error) {
 	if !db.closed.CompareAndSwap(false, true) {
-		return ErrClosed
+		return false, ErrClosed
 	}
 	db.closing.Store(true)
 	db.closeOnce.Do(func() { close(db.closeCh) })
@@ -894,7 +911,9 @@ func (db *DB) Close() error {
 		}
 	}
 drained:
-	return db.pager.close()
+	db.pager.onCloseCheckpointed = onCheckpointed
+	err = db.pager.close()
+	return db.pager.closeCheckpointed, err
 }
 
 // SetClosing marks the database as closing, causing new transactions to fail.

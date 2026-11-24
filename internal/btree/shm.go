@@ -151,9 +151,11 @@ type shm interface {
 }
 
 // shmFile is a shm backed by a file of its own (mmapShm): fileInfo returns
-// the FileInfo, from fstat, of that file while it is open.
+// the FileInfo, from fstat, of that file while it is open, and regionsPerMap
+// the number of segments one mapping of it covers (unixShmRegionPerMap).
 type shmFile interface {
 	fileInfo() (os.FileInfo, error)
+	regionsPerMap() int
 }
 
 // Lock types for shm.lock/unlock.

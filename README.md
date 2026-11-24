@@ -191,7 +191,7 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 db.Flush(ctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive)
 ```
 
-**Sentinel:** when enabled, a `.lock` file marks not-explicitly-persisted writes so an unclean shutdown triggers an integrity quick check on open.
+**Sentinel:** when enabled, a `.lock` file marks not-explicitly-persisted writes so an unclean shutdown triggers an integrity quick check on open. A flush removes the file, and so does a `Close` that checkpointed as the last handle on the database; a `Close` while another process still has the database open leaves it. An in-memory database has no sentinel file.
 
 **Lifetime:** the idle flush runs until `Close`. It is not bound to the context passed to `Open`, which only bounds the open itself; a DB that is never closed keeps the flush goroutine alive.
 

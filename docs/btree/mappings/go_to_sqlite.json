@@ -857,6 +857,14 @@
     ],
     "note": ""
   },
+  "db.go:*DB.CloseCheckpointed": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeClose",
+      "pager.c:sqlite3PagerClose",
+      "wal.c:sqlite3WalClose"
+    ],
+    "note": "Close's body; also reports whether the close took sqlite3WalClose's last-connection branch and its checkpoint completed (the isDelete arm, wal.c:2531-2540), and then runs its callback while the close still holds the exclusive DB-file lock. any-store-only use: the durability sentinel is cleared only then, in that callback"
+  },
   "db.go:*DB.CreateNamespace": {
     "sqlite": [
       "btree.c:btreeCreateTable",
@@ -2485,6 +2493,12 @@
     ],
     "note": ""
   },
+  "shm_mmap.go:*mmapShm.regionsPerMap": {
+    "sqlite": [
+      "os_unix.c:unixShmRegionPerMap"
+    ],
+    "note": "the segments one mapping covers, for the size check of a lookup (shmFile)"
+  },
   "shm_mmap.go:*mmapShm.unlock": {
     "sqlite": [
       "os_unix.c:unixShmLock"
@@ -2919,6 +2933,13 @@
     "sqlite": [],
     "note": ""
   },
+  "wal.go:*walIndex.mapSegmentForLookup": {
+    "sqlite": [
+      "wal.c:walHashGet",
+      "wal.c:walIndexPage"
+    ],
+    "note": "a segment missing from the file fails the lookup; a writer's lookup does not extend the file either, where C's extend flag is pWal->writeLock (drift-92)"
+  },
   "wal.go:*walIndex.prepareHeader": {
     "sqlite": [
       "wal.c:walIndexWriteHdr"
@@ -2965,6 +2986,12 @@
   },
   "wal.go:*walIndex.shmCleanupFromFrame": {
     "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.shmCleanupHash": {
+    "sqlite": [
+      "wal.c:walCleanupHash"
+    ],
     "note": ""
   },
   "wal.go:*walIndex.shmClearHash": {
@@ -3044,6 +3071,22 @@
     ],
     "note": ""
   },
+  "wal.go:htSlotLoad": {
+    "sqlite": [
+      "wal.c:walFindFrame"
+    ],
+    "note": "AtomicLoad of a hash slot"
+  },
+  "wal.go:htSlotStore": {
+    "sqlite": [
+      "wal.c:walIndexAppend"
+    ],
+    "note": "AtomicStore of a hash slot"
+  },
+  "wal.go:htSlotWord": {
+    "sqlite": [],
+    "note": ""
+  },
   "wal.go:newWal": {
     "sqlite": [],
     "note": ""
@@ -3051,6 +3094,18 @@
   "wal.go:newWalIndex": {
     "sqlite": [],
     "note": ""
+  },
+  "wal.go:shmCleanupHashSegment": {
+    "sqlite": [
+      "wal.c:walCleanupHash"
+    ],
+    "note": ""
+  },
+  "wal.go:shmLookupFileSize": {
+    "sqlite": [
+      "os_unix.c:unixShmMap"
+    ],
+    "note": "nReqRegion*szRegion: the file size a lookup needs before it maps a segment, the end of the segment's mapping group"
   },
   "wal.go:walBusyLock": {
     "sqlite": [

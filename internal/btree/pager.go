@@ -214,6 +214,19 @@ type pager struct {
 	// inProcess uses heap-backed shm (faster, single-process only)
 	inProcess bool
 
+	// closeCheckpointed is set by close when it was the last client's close
+	// and its checkpoint completed: the arm of sqlite3WalClose that sets
+	// isDelete (wal.c:2531-2540). Every commit is then in the synced database
+	// file, and no other process was attached to add one. Read after close.
+	// An in-memory pager never sets it: the branch that does is the one for
+	// a database file.
+	closeCheckpointed bool
+	// onCloseCheckpointed, when set, is run by close once it has set
+	// closeCheckpointed, while it still holds the exclusive lock on the
+	// database file: no other process can attach, and so none can commit,
+	// before it returns. DB.CloseCheckpointed sets it.
+	onCloseCheckpointed func()
+
 	// registryKey is the key this handle holds in openDBs from open until
 	// close, "" when it holds none; registryPath is the absolute path the
 	// key falls back to; unstableLocked is set while this open holds
@@ -4287,101 +4300,126 @@ func (p *pager) close() error {
 		if p.inMemory {
 			// InMemory: no peers, always last.
 			isLastClient = true
+		} else if !p.databaseIsUnmoved() {
+			// databaseIsUnmoved gate: matches SQLite's sqlite3PagerClose
+			// (pager.c:4189-4191), which passes a non-NULL buffer to
+			// sqlite3WalClose (enabling the close-time checkpoint) only when
+			// databaseIsUnmoved(pPager)==SQLITE_OK. A NULL buffer (moved DB)
+			// skips the WHOLE lock+checkpoint+truncate arm in sqlite3WalClose
+			// (the `if( zBuf!=0 && ...)` gate at wal.c:2522). Skipping is the
+			// safe behavior: if the DB file was renamed/unlinked/relinked
+			// out from under this fd, checkpointing into p.file would write
+			// committed WAL frames into a path that is no longer the real
+			// database — silently losing the transaction on the visible
+			// path or clobbering an unrelated file now living at p.path.
+			if debugTrace {
+				trace("close: skipping close-time checkpoint, DB file moved/unlinked since open (path=%s)", p.path)
+			}
 		} else {
-			// Hold WAL_WRITE_LOCK across checkpoint+truncate so a peer
-			// process cannot be mid-writeFrames. withWriteLock defers the
-			// unlock, so any early-return / panic inside the closure cannot
-			// leak the lock. Matches SQLite's sqlite3WalClose which guards
-			// walLimitSize with an exclusive DB-file lock (wal.c:2509-2534).
-			_ = p.withWriteLock(func(lockedWrite bool) error {
-				// databaseIsUnmoved gate: matches SQLite's sqlite3PagerClose
-				// (pager.c:4189-4191), which passes a non-NULL buffer to
-				// sqlite3WalClose (enabling the close-time checkpoint) only when
-				// databaseIsUnmoved(pPager)==SQLITE_OK. A NULL buffer (moved DB)
-				// skips the WHOLE checkpoint+truncate arm in sqlite3WalClose
-				// (the `if(zBuf!=0 ...)` gate at wal.c:2522). Skipping is the
-				// safe behavior: if the DB file was renamed/unlinked/relinked
-				// out from under this fd, checkpointing into p.file would write
-				// committed WAL frames into a path that is no longer the real
-				// database — silently losing the transaction on the visible
-				// path or clobbering an unrelated file now living at p.path.
-				// We therefore skip both the checkpoint and the dependent
-				// truncate (truncate stays gated on cpErr==nil below, and cpErr
-				// is left non-nil for the moved case).
-				moved := !p.databaseIsUnmoved()
-				if moved {
+			// The exclusive lock on the database file comes first, as in
+			// sqlite3WalClose (wal.c:2522-2523 `SQLITE_OK==(rc =
+			// sqlite3OsLock(pWal->pDbFd, SQLITE_LOCK_EXCLUSIVE))`): every
+			// attached process holds the file shared for as long as it is
+			// attached (pager.open), so with the lock this connection is the
+			// only one, and stays the only one until the file is closed. The
+			// checkpoint and the truncate both run under it: no other process
+			// can commit between the checkpoint's last look at the log and
+			// the truncate. Without the lock neither runs (the body of that
+			// `if` is skipped) and the WAL is left to the processes still
+			// attached.
+			//
+			// In-process mode has held the file exclusively since open
+			// (acquireExclusiveDBLock).
+			if p.inProcess {
+				isLastClient = true
+			} else if p.file != nil {
+				ok, err := tryUpgradeDBLockExclusive(p.file)
+				if err != nil {
 					if debugTrace {
-						trace("close: skipping close-time checkpoint, DB file moved/unlinked since open (path=%s)", p.path)
+						trace("close: DB-file exclusive upgrade error: %v", err)
 					}
-					return nil
+				} else {
+					isLastClient = ok
 				}
+			}
+			if !isLastClient {
 				if debugTrace {
-					trace("close: starting passive checkpoint before WAL truncation, dbSize=%d lockedWrite=%v", p.dbSize.Load(), lockedWrite)
+					trace("close: not the last client, no checkpoint, WAL left alone")
 				}
-				// A torn wal-index header must be repaired before the
-				// checkpoint reads its frontier. The PASSIVE checkpoint
-				// would take the write lock for that itself, but this
-				// close already holds it, so do it here, as
-				// walIndexReadHdr does for a caller with
-				// pWal->writeLock set (wal.c:2706-2711). On failure the
-				// checkpoint and the truncate are skipped.
-				var cpErr error
-				if lockedWrite {
-					_, cpErr = p.wal.indexReadHdr(true, false)
-				}
-				if cpErr == nil {
-					cpErr = p.wal.checkpointPassive(p.file, p.master)
-				}
-				if cpErr != nil {
+			} else {
+				// WAL_WRITE_LOCK is held across checkpoint+truncate.
+				// sqlite3WalClose switches the connection to exclusive
+				// locking mode instead (wal.c:2525-2527), where its wal-index
+				// locks are not taken at all; here the lock is free, its
+				// last holder being gone, and taking it lets the torn-header
+				// repair below run as a writer's. withWriteLock defers the
+				// unlock, so an early return or a panic inside the closure
+				// cannot leak it.
+				_ = p.withWriteLock(func(lockedWrite bool) error {
 					if debugTrace {
-						trace("close: checkpointPassive incomplete or failed: %v", cpErr)
+						trace("close: starting passive checkpoint before WAL truncation, dbSize=%d lockedWrite=%v", p.dbSize.Load(), lockedWrite)
 					}
-				}
-				// Truncate gating: matches SQLite's sqlite3WalClose (wal.c:2487-2551),
-				// which calls walLimitSize (wal.c:2534) only after obtaining an
-				// exclusive DB-file lock (wal.c:2509). We use a DB-file flock
-				// upgrade as the analog; failure leaves the WAL intact so peer
-				// readers can still find frames in the file.
-				if p.inProcess {
-					isLastClient = true
-				} else if p.file != nil {
-					ok, err := tryUpgradeDBLockExclusive(p.file)
-					if err != nil {
+					// A torn wal-index header must be repaired before the
+					// checkpoint reads its frontier. The PASSIVE checkpoint
+					// would take the write lock for that itself, but this
+					// close already holds it, so do it here, as
+					// walIndexReadHdr does for a caller with
+					// pWal->writeLock set (wal.c:2706-2711). On failure the
+					// checkpoint and the truncate are skipped.
+					var cpErr error
+					if lockedWrite {
+						_, cpErr = p.wal.indexReadHdr(true, false)
+					}
+					if cpErr == nil {
+						cpErr = p.wal.checkpointPassive(p.file, p.master)
+					}
+					// The WAL is truncated only after a checkpoint that
+					// completed (wal.c:2531 `if( rc==SQLITE_OK )`). What C
+					// does then depends on the persistent-WAL setting: it
+					// deletes the file unless the WAL is persistent
+					// (wal.c:2536-2540), and truncates a persistent one to
+					// zero only under a non-negative size limit (`else if(
+					// pWal->mxWalSize>=0 )`, wal.c:2541-2548), leaving it as
+					// it is otherwise. Here it is always truncated, never
+					// deleted (drift-55). With a shared wal-index the
+					// truncate also needs the write lock: a close that could
+					// not take it does not know the log is not being
+					// written.
+					if cpErr == nil && (lockedWrite || p.inProcess) {
 						if debugTrace {
-							trace("close: DB-file exclusive upgrade error: %v", err)
+							trace("close: TRUNCATING WAL (cpErr=nil isLastClient=true) nBackfill=%d mxFrame=%d",
+								p.wal.index.nBackfill.Load(), p.wal.authoritativeMxFrame())
 						}
-					} else {
-						isLastClient = ok
-					}
-				}
-				if cpErr == nil && isLastClient {
-					if debugTrace {
-						trace("close: TRUNCATING WAL (cpErr=nil isLastClient=true) nBackfill=%d mxFrame=%d",
-							p.wal.index.nBackfill.Load(), p.wal.authoritativeMxFrame())
-					}
-					// Forensic aid: BTREE_KEEP_WAL_ON_CLOSE=1 keeps the exact WAL
-					// bytes the close-time checkpoint consumed, so a post-mortem can
-					// replay the backfill decision after truncation. Deliberately NOT
-					// tied to debugtrace: trace logging serializes the hot paths
-					// (logger mutex + write syscalls) and suppresses the very races
-					// being hunted. One getenv + one file copy at close is inert.
-					// O_EXCL: first close wins (the workload process), so a later
-					// verifier open+close cannot clobber the evidence with its
-					// already-truncated WAL.
-					if os.Getenv("BTREE_KEEP_WAL_ON_CLOSE") == "1" {
-						if walBytes, rerr := os.ReadFile(p.path + "-wal"); rerr == nil {
-							if f, ferr := os.OpenFile(p.path+"-wal.pretruncate", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644); ferr == nil {
-								_, _ = f.Write(walBytes)
-								_ = f.Close()
+						// Forensic aid: BTREE_KEEP_WAL_ON_CLOSE=1 keeps the exact WAL
+						// bytes the close-time checkpoint consumed, so a post-mortem can
+						// replay the backfill decision after truncation. Deliberately NOT
+						// tied to debugtrace: trace logging serializes the hot paths
+						// (logger mutex + write syscalls) and suppresses the very races
+						// being hunted. One getenv + one file copy at close is inert.
+						// O_EXCL: first close wins (the workload process), so a later
+						// verifier open+close cannot clobber the evidence with its
+						// already-truncated WAL.
+						if os.Getenv("BTREE_KEEP_WAL_ON_CLOSE") == "1" {
+							if walBytes, rerr := os.ReadFile(p.path + "-wal"); rerr == nil {
+								if f, ferr := os.OpenFile(p.path+"-wal.pretruncate", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644); ferr == nil {
+									_, _ = f.Write(walBytes)
+									_ = f.Close()
+								}
 							}
 						}
+						p.wal.truncateFile()
+						p.closeCheckpointed = true
+					} else if debugTrace {
+						trace("close: NOT truncating WAL (cpErr=%v lockedWrite=%v)", cpErr, lockedWrite)
 					}
-					p.wal.truncateFile()
-				} else if debugTrace {
-					trace("close: NOT truncating WAL (cpErr=%v isLastClient=%v)", cpErr, isLastClient)
+					return nil
+				})
+				// Still under the exclusive lock on the database file, which
+				// goes only with p.file.Close below.
+				if p.closeCheckpointed && p.onCloseCheckpointed != nil {
+					p.onCloseCheckpointed()
 				}
-				return nil
-			})
+			}
 		}
 		_ = p.wal.close(isLastClient)
 	}

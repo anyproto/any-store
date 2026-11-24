@@ -271,7 +271,11 @@ const (
 
 type DurabilityConfig struct {
 	// Sentinel enables the sentinel file (.lock) that tracks database dirty state
-	// When true (default is false), the sentinel file is used to detect unclean shutdowns and perform QuickCheck on open
+	// When true (default is false), the sentinel file is used to detect unclean shutdowns and perform QuickCheck on open.
+	// A write creates the file. A flush removes it, and so does a Close that checkpointed as the last
+	// handle on the database file. A Close while another process still has the database open leaves it:
+	// that close runs no checkpoint, so if the remaining processes are killed the next open runs the check.
+	// An InMemory database has no sentinel file.
 	Sentinel bool
 
 	// Enable auto-flush according to IdleAfter and FlushMode
