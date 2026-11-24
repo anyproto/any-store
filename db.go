@@ -74,8 +74,10 @@ type DB interface {
 	// carries, which it uses without waiting for a reader slot, or else that
 	// of a read transaction of its own, whose wait for a slot ends with ctx.
 	// A write transaction that ctx carries is not checked: the check reads
-	// the committed state, in a read transaction of its own. The walk of the
-	// btree does not consult ctx: a ctx that ends while it runs ends the
+	// the committed state, in a read transaction of its own, which does not
+	// wait for a reader slot: with every slot held (one may be the caller's
+	// own) the check returns an error matching ErrBusy at once. The walk of
+	// the btree does not consult ctx: a ctx that ends while it runs ends the
 	// check after it, with ctx's error.
 	//
 	// The error matches ErrCorrupt when the check found damage: a broken
@@ -1412,10 +1414,13 @@ func (db *db) IntegrityCheck(ctx context.Context) (err error) {
 	// its own, whose wait for a reader slot ends with ctx. A Close waits for
 	// the whole check. A write transaction that ctx carries is not checked:
 	// the check reads a committed snapshot, through a read transaction of
-	// its own.
+	// its own, which does not wait for a reader slot: its caller holds the
+	// writer, and may hold the slot it would wait for in a read transaction
+	// it releases only once the check returns. With every slot held the
+	// check is busy (ErrBusy).
 	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		if tx.IsWriteTx() {
-			rtx, err := db.btreeDB.BeginReadContext(ctx)
+			rtx, err := db.btreeDB.TryBeginRead()
 			if err != nil {
 				return err
 			}

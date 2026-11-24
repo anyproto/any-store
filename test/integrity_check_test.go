@@ -116,4 +116,26 @@ func TestIntegrityCheck_ReadSlot(t *testing.T) {
 		require.NoError(t, coll.Insert(wtx.Context(), anyenc.MustParseJson(`{"id":"uncommitted"}`)))
 		require.NoError(t, within(t, 10*time.Second, func() error { return db.IntegrityCheck(wtx.Context()) }))
 	})
+	// Beside a write transaction the check does not wait for the slot: its
+	// caller holds the writer, and here the slot too, in a read transaction
+	// it ends only once the check has returned. With no deadline in ctx a
+	// wait would never end.
+	t.Run("beside the caller's write transaction, the slot held", func(t *testing.T) {
+		rtx, err := db.ReadTx(ctx)
+		require.NoError(t, err)
+		wtx, err := db.WriteTx(ctx)
+		if err != nil {
+			_ = rtx.Commit()
+			require.NoError(t, err)
+		}
+		defer wtx.Rollback()
+		// First: the slot given back ends a check that waits for it.
+		defer rtx.Commit()
+		err = within(t, 10*time.Second, func() error { return db.IntegrityCheck(wtx.Context()) })
+		require.ErrorIs(t, err, anystore.ErrBusy)
+		require.NotErrorIs(t, err, anystore.ErrCorrupt)
+		require.NoError(t, wtx.Rollback())
+		require.NoError(t, rtx.Commit())
+		require.NoError(t, db.IntegrityCheck(ctx))
+	})
 }
