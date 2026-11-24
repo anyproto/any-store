@@ -4010,6 +4010,57 @@ func TestIntegrityCheck_MissingDataNamespaceMatchesErrCorrupt(t *testing.T) {
 	require.Contains(t, err.Error(), "data namespace missing")
 }
 
+// IntegrityCheck checks one snapshot: that of the read transaction its ctx
+// carries, which does not hold a defect committed after it, and the
+// committed state beside a write transaction its ctx carries, which does
+// not hold that transaction's own defect until it commits. The defect is a
+// collection in the catalog with no data namespace.
+func TestIntegrityCheck_TheSnapshotItChecks(t *testing.T) {
+	ctx := context.Background()
+	newDB := func(t *testing.T) *db {
+		t.Helper()
+		d, err := Open(ctx, filepath.Join(t.TempDir(), "a.db"), nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = d.Close() })
+		coll, err := d.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+		require.NoError(t, coll.Close())
+		require.NoError(t, d.IntegrityCheck(ctx))
+		return d.(*db)
+	}
+
+	t.Run("the read transaction's", func(t *testing.T) {
+		d := newDB(t)
+		rtx, err := d.ReadTx(ctx)
+		require.NoError(t, err)
+		wtx, err := d.btreeDB.BeginWrite()
+		require.NoError(t, err)
+		require.NoError(t, wtx.DeleteNamespace("c"))
+		require.NoError(t, wtx.Commit())
+
+		err = d.IntegrityCheck(rtx.Context())
+		require.NoError(t, rtx.Commit())
+		require.NoError(t, err, "the snapshot before the commit")
+		require.ErrorIs(t, d.IntegrityCheck(ctx), ErrCorrupt)
+	})
+	t.Run("beside the write transaction", func(t *testing.T) {
+		d := newDB(t)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		err = d.doWriteTx(wtx.Context(), func(tx *btree.WriteTx) error { return tx.DeleteNamespace("c") })
+		if err == nil {
+			err = d.IntegrityCheck(wtx.Context())
+		}
+		if err != nil {
+			_ = wtx.Rollback()
+		}
+		require.NoError(t, err, "the committed state")
+		require.NoError(t, wtx.Commit())
+		require.ErrorIs(t, d.IntegrityCheck(ctx), ErrCorrupt)
+	})
+}
+
 // IntegrityCheck consults its ctx between the btree's walk, which does not,
 // and the catalog's check, and before it returns success: a ctx cancelled
 // while the walk ran ends the check with the ctx's error, not with nil.

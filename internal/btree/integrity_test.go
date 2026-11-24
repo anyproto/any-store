@@ -569,8 +569,9 @@ func TestIntegrityCheck_ClosedHandleIsErrClosed(t *testing.T) {
 // The check in a read transaction the caller holds takes no other reader
 // slot: with one slot, held by that transaction, it runs, where a check
 // that began a read of its own waited for the slot its caller held. It
-// checks that transaction's snapshot. A write transaction's read view and
-// an ended transaction are refused.
+// checks that transaction's snapshot: not damage committed after it, which
+// a check of a later snapshot finds. A write transaction's read view and an
+// ended transaction are refused.
 func TestIntegrityCheck_InTheCallersReadTx(t *testing.T) {
 	db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), Options{PageSize: 4096, MaxReaders: 1})
 	require.NoError(t, err)
@@ -585,19 +586,34 @@ func TestIntegrityCheck_InTheCallersReadTx(t *testing.T) {
 	case err := <-done:
 		require.NoError(t, err)
 	case <-time.After(10 * time.Second):
+		// The caller's transaction gives the slot back, so that the check
+		// that waits for it ends, and the cleanup's Close with it.
+		_ = tx.Rollback()
 		t.Fatal("the check waits for the reader slot its caller holds")
 	}
-	// A commit after the snapshot is not the snapshot's.
-	commitRows(t, db, "t2", 8, 100)
-	require.NoError(t, tx.IntegrityCheckN(0))
-	require.NoError(t, tx.Rollback())
-	require.ErrorIs(t, tx.IntegrityCheck(), ErrTxClosed)
-
+	// A commit after the snapshot is not the snapshot's: one that leaves a
+	// namespace with a root of 0, damage a check of the newer state finds.
 	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, wtx.pager.wgate.enter())
+	master := &btree{pager: db.pager, rootPage: 1, walMaxFrame: wtx.walHdr.mxFrame, writable: true}
+	require.NoError(t, master.Put([]byte("x"), []byte{0, 0, 0, 0}))
+	wtx.pager.wgate.leave()
+	require.NoError(t, wtx.Commit())
+	err = tx.IntegrityCheckN(0)
+	require.NoError(t, tx.Rollback())
+	require.NoError(t, err, "the snapshot before the commit is checked")
+	require.ErrorIs(t, tx.IntegrityCheck(), ErrTxClosed)
+	fresh, err := db.BeginRead()
+	require.NoError(t, err)
+	err = fresh.IntegrityCheckN(0)
+	require.NoError(t, fresh.Rollback())
+	require.ErrorIs(t, err, ErrCorrupt, "the snapshot after the commit")
+
+	wtx, err = db.BeginWrite()
 	require.NoError(t, err)
 	require.ErrorIs(t, wtx.ReadTx.IntegrityCheck(), errIntegrityCheckWriteTx)
 	require.NoError(t, wtx.Rollback())
-	require.NoError(t, db.IntegrityCheck())
 }
 
 // A namespace whose master entry gives root 0 is reported, also when its

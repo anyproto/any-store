@@ -5608,12 +5608,18 @@ func TestCheckpointWithMode_FileReadPageDataError(t *testing.T) {
 	require.NoError(t, err)
 	p.endRead(slot)
 
-	// Truncate the WAL to remove page data but keep frame headers intact
+	// Cut the WAL inside the page of its last frame: every frame header is
+	// whole, so the checkpoint's scan of the headers (buildBackfillMap)
+	// passes and its copy of the pages reads the last one short. The
+	// commit wrote the allocated page and page 1, a frame each.
 	walPath := path + "-wal"
-	// The WAL has: header (32) + frame_header (24) + page_data (4096)
-	// Truncate to just header + frame_header (without page data)
-	truncateSize := int64(walHeaderSize + walFrameSize + 100) // partial page data
+	nf := p.wal.nFrame.Load()
+	require.Greater(t, nf, uint32(1))
+	frameSize := int64(walFrameSize) + 4096
+	truncateSize := int64(walHeaderSize) + int64(nf-1)*frameSize + walFrameSize + 100
 	require.NoError(t, os.Truncate(walPath, truncateSize))
+	_, err = p.wal.buildBackfillMap(0, nf)
+	require.NoError(t, err, "the frame headers are whole")
 
 	// Re-open the WAL file to reflect truncated size
 	p.wal.file.Close()
@@ -9610,15 +9616,26 @@ func TestOpen_DamagedPage1FrameUnderRightKeyIsCorrupt(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(opts.PageSize), info.Size(), "every page but the first is only in the WAL")
 	walPath := path + "-wal"
-	_, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
+	page1Frame, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
 	damageFile(t, walPath, off+walFrameSize+1000)
 	resealWAL(t, walPath, int(opts.PageSize))
+	firstProbe, _ := lastWALFrame(t, walPath, int(opts.PageSize), 2)
 
+	// The frames the open reads, in order: page 1's, then the first page
+	// the probe tries, which proves the key.
+	var frames []uint32
+	setWalReadFrameFaultHook(func(frame uint32) error {
+		frames = append(frames, frame)
+		return nil
+	})
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
 	_, err = Open(path, opts)
+	setWalReadFrameFaultHook(nil)
 	require.ErrorIs(t, err, ErrPageIntegrity)
 	require.ErrorIs(t, err, ErrCorrupt)
 	require.NotErrorIs(t, err, ErrWrongKey)
 	require.Equal(t, []uint32{1}, pages)
+	require.Equal(t, []uint32{page1Frame, firstProbe}, frames)
 }
 
 // A database whose page 1 and every page the open tries are damaged cannot
@@ -9973,8 +9990,12 @@ func TestOpen_UnreadableProbePageThenAProvingOne(t *testing.T) {
 	firstProbe, _ := lastWALFrame(t, walPath, int(opts.PageSize), 2)
 	require.NotEqual(t, page1Frame, firstProbe)
 
+	// The frames the open reads, in order: page 1's, the first page the
+	// probe tries, which fails, then a later one, which proves the key.
 	eio := errors.New("injected: input/output error")
+	var frames []uint32
 	setWalReadFrameFaultHook(func(frame uint32) error {
+		frames = append(frames, frame)
 		if frame == firstProbe {
 			return eio
 		}
@@ -9982,9 +10003,13 @@ func TestOpen_UnreadableProbePageThenAProvingOne(t *testing.T) {
 	})
 	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
 	_, err := Open(path, opts)
+	setWalReadFrameFaultHook(nil)
 	require.ErrorIs(t, err, ErrPageIntegrity)
 	require.NotErrorIs(t, err, eio)
 	require.Equal(t, []uint32{1}, pages)
+	require.Len(t, frames, 3)
+	require.Equal(t, []uint32{page1Frame, firstProbe}, frames[:2])
+	require.NotContains(t, []uint32{page1Frame, firstProbe}, frames[2])
 }
 
 // An integrity hook that panics inside Open (the key check calls it for a

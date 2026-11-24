@@ -355,6 +355,17 @@ func TestWALFrameReadErrorsThroughEveryReader(t *testing.T) {
 		require.NotErrorIs(t, err, ErrWALShortRead, r.name)
 		require.NotErrorIs(t, err, ErrCorrupt, r.name)
 	}
+	// Above this process's count too, in the multi-process mode, where the
+	// read is tried: a failure that is not a short read is not one there
+	// either.
+	if hasMmapShm {
+		for _, r := range readers {
+			err := r.read(nf + 100)
+			require.ErrorIs(t, err, os.ErrClosed, r.name)
+			require.NotErrorIs(t, err, ErrWALShortRead, r.name)
+			require.NotErrorIs(t, err, ErrCorrupt, r.name)
+		}
+	}
 }
 
 // TestReadFrameNoBenignFailuresUnderTruncateStress is the multi-process-mode

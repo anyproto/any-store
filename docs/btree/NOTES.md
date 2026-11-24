@@ -4952,7 +4952,7 @@ Tests: `TestOpen_WrongKeyIsErrWrongKey`, `TestOpen_WrongRawKeyAndCodec`, `TestOp
 
 No new sentinel: the check's caller knows where the error came from, and the action on its findings is the action on `ErrCorrupt`.
 
-Tests: `TestIntegrityErrorMatches`, `TestIntegrityCheck_DamagedPageMatchesErrCorrupt`, `TestIntegrityCheck_FailedReadIsNotErrCorrupt` (`integrity_test.go`), `test/integrity_check_test.go`.
+Tests: `TestIntegrityErrorMatches`, `TestIntegrityCheck_DamagedPageMatchesErrCorrupt`, `TestIntegrityCheck_FailedReadIsNotErrCorrupt`, `TestIntegrityCheck_FailedKeyReadIsNamedWithItsError` (`integrity_test.go`), `test/integrity_check_test.go`.
 
 <a id="drift-2026-11-24-5-a-failed-commit-ends-its-cursors-with-its-error"></a>
 ### Drift: A Failed Commit Ends Its Cursors With Its Error
@@ -4974,4 +4974,4 @@ Test: `TestPagerError_CursorReportsTheCommitError` (`pager_test.go`).
 
 `ReadTx.IntegrityCheckN` runs in the read transaction it is called on, and takes no other transaction or reader slot, so a caller that holds the only slot can check, and the check and its caller see one snapshot. It reads that snapshot through a page cache of its own, bounded by the transaction's frame window and page count. The read view of a write transaction is refused: it has no reader cache to bound such a walk, and its uncommitted pages are in the writer's cache, which only the writer's goroutine may read. `DB.IntegrityCheckN` begins a read transaction for the check, as `PRAGMA integrity_check` begins one when the connection has none. The public `IntegrityCheck` checks in the read transaction its context carries, and in one of its own otherwise, also when the context carries a write transaction: that transaction's changes are not checked.
 
-Tests: `TestIntegrityCheck_InTheCallersReadTx` (`integrity_test.go`), `TestIntegrityCheck_ReadSlot` (`test/integrity_check_test.go`).
+Tests: `TestIntegrityCheck_InTheCallersReadTx` (`integrity_test.go`), `TestIntegrityCheck_TheSnapshotItChecks` (`db_test.go`), `TestIntegrityCheck_ReadSlot` (`test/integrity_check_test.go`).
