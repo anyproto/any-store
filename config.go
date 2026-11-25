@@ -1,6 +1,8 @@
 package anystore
 
 import (
+	"fmt"
+	"math"
 	"runtime"
 	"time"
 
@@ -89,7 +91,11 @@ type Config struct {
 
 	// CacheSize overrides the default per-DB page cache size (in pages,
 	// default 5000). Primarily for tests that need to force pagerStress /
-	// cache-spill behavior at low data volumes. Zero means use the default.
+	// cache-spill behavior at low data volumes. Zero or a negative value
+	// means the default: a negative value is not a size in KiB, as it is for
+	// SQLite's cache_size. A value above 2,147,418,112 pages (on a 32-bit
+	// target, above 524,288) is taken as that bound, as SQLite clamps its
+	// cache_size.
 	CacheSize int
 
 	// ReadConcurrency caps the number of concurrent read transactions. Reads
@@ -97,8 +103,9 @@ type Config struct {
 	// throttles concurrent Find/$text throughput. Each live reader holds its own
 	// page cache (≈ CacheSize × PageSize), created lazily, so peak reader RAM is
 	// ReadConcurrency × that — only realized under actual concurrent load. Zero
-	// means the default, max(NumCPU-1, 4), which scales with the host while staying
-	// modest on small devices.
+	// or a negative value means the default, max(NumCPU-1, 4), which scales with
+	// the host while staying modest on small devices. A value above 65,536 is
+	// taken as 65,536.
 	ReadConcurrency int
 
 	// CommitSync forces fsync on every WAL commit (like SQLite synchronous=FULL in WAL mode).
@@ -114,6 +121,9 @@ type Config struct {
 	// The database does not survive process crashes. When true, InProcess
 	// and CommitSync=false are forced on automatically.
 	// The path argument to Open is ignored and can be any string (e.g. ":memory:").
+	// Without InMemory the path is an ordinary file path: ":memory:" has no
+	// special meaning, unlike in SQLite, and the filesystem's naming rules
+	// apply to it (Windows refuses ':' in a file name).
 	InMemory bool
 
 	// DisableCompression disables S2 compression for document values.
@@ -184,17 +194,19 @@ type Config struct {
 	// DurabilityConfig provides configuration for crash recovery and idle auto-flush
 	Durability DurabilityConfig
 
-	// Encryption, when non-empty, enables page-level AES-256-GCM encryption
-	// of the on-disk database file. Zero value means no encryption.
+	// Encryption configures page-level encryption of the database file. A
+	// Passphrase (or a 32-byte raw key passed as one) enables it; CipherType
+	// only selects the cipher, AES-256-GCM by default, and without a
+	// Passphrase the file is plain whatever CipherType says. The zero value
+	// means no encryption.
 	Encryption EncryptionConfig
 
 	// OnIntegrityError, when non-nil, is invoked from the read path on
 	// every per-page integrity failure (XXH3 trailer mismatch in cksum
 	// mode, AEAD auth-tag failure in encryption mode). Plain databases
 	// never fire it. It receives the failures of the database it was
-	// opened with and no other, also when several databases share one
-	// Encryption.Codec. The destination of a Backup is another database:
-	// its failures come back as Backup's error.
+	// opened with and no other. The destination of a Backup is another
+	// database: its failures come back as Backup's error.
 	//
 	// The callback runs synchronously on the I/O goroutine and must not
 	// block. Push to a buffered channel + drain elsewhere if you need
@@ -222,28 +234,22 @@ type Config struct {
 
 // EncryptionConfig enables page-level encryption of the database file.
 //
-// Three ways to enable encryption, in increasing order of control:
+// Encryption is enabled by a passphrase, or by a key given as a passphrase
+// of exactly 32 bytes, and uses one of the built-in ciphers:
 //
-//  1. Passphrase (common case):
-//     cfg.Encryption.Passphrase = []byte("my-pass")
-//     Default cipher is AES-256-GCM. Set CipherType to pick a different
-//     built-in (ChaCha20-Poly1305 / XChaCha20-Poly1305).
+//	cfg.Encryption.Passphrase = []byte("my-pass")
+//	cfg.Encryption.CipherType = anystore.CipherChaCha20Poly1305 // optional
 //
-//  2. Passphrase + CipherType (pick cipher, keep passphrase KDF):
-//     cfg.Encryption.Passphrase = []byte("my-pass")
-//     cfg.Encryption.CipherType = anystore.CipherChaCha20Poly1305
+// The default cipher is AES-256-GCM; CipherType picks another built-in
+// (ChaCha20-Poly1305 / XChaCha20-Poly1305).
 //
-//  3. Bring-your-own Codec (HSM, external KMS, custom AEAD):
-//     cfg.Encryption.Codec = myCodec  // must implement anystore.Codec
-//     Passphrase / CipherType / KDFIterations are ignored in this mode.
-//
-// Passphrase treatment (modes 1 and 2):
+// Passphrase treatment:
+//   - nil → no encryption.
+//   - Empty (length 0) and not nil → Open fails.
 //   - Exactly 32 bytes → raw key, no KDF.
 //   - Any other length → PBKDF2-HMAC-SHA256 stretches it to 32 bytes
-//     against the 16-byte salt stored in the database header.
-//
-// An empty (length 0) non-nil Passphrase is rejected with an error; use
-// nil Passphrase to disable encryption.
+//     against the 16-byte salt stored in the database header, at
+//     KDFIterations rounds.
 //
 // Once a database is created with encryption, it must always be opened
 // with matching Encryption config. Open returns ErrEncryptionKeyRequired
@@ -261,27 +267,31 @@ type Config struct {
 // same EncryptionConfig. With the zero EncryptionConfig, the default, its
 // Backup is a plain file.
 type EncryptionConfig struct {
-	// Passphrase is the user-supplied secret. Nil = no encryption.
+	// Passphrase is the user-supplied secret. Nil = no encryption. Open
+	// keeps a copy of it, which Backup uses, so the caller may clear its
+	// slice once Open returns.
 	Passphrase []byte
 
 	// KDFIterations overrides the PBKDF2 cost. Zero means 256,000 (the
 	// SQLCipher v4 default). Ignored when Passphrase is exactly 32 bytes
-	// (raw-key path). Use lower values only in tests.
+	// (raw-key path). Use lower values only in tests. A count above
+	// 2,147,483,647 (2^31-1; 2,147,483,646 on a 32-bit target) fails Open
+	// with ErrInvalidConfig. When the passphrase goes through PBKDF2 the
+	// count is part of the key: the database opens only with the effective
+	// count it was created with (0 and 256,000 are one).
 	KDFIterations int
 
 	// CipherType selects the built-in AEAD when Passphrase is set.
-	// Zero value (CipherAES256GCM) is the default.
+	// Zero value (CipherAES256GCM) is the default. A value other than the
+	// Cipher constants fails Open with ErrInvalidConfig when Passphrase is
+	// set; without a Passphrase it is ignored.
 	CipherType CipherType
-
-	// Codec, when non-nil, bypasses Passphrase / KDFIterations / CipherType
-	// and is used verbatim. Use this for HSM-backed or other externally-
-	// keyed codecs.
-	Codec Codec
 }
 
-// Enabled reports whether this config will install a codec on Open.
+// Enabled reports whether this config encrypts the database: whether
+// Passphrase is set.
 func (e EncryptionConfig) Enabled() bool {
-	return e.Passphrase != nil || e.Codec != nil
+	return e.Passphrase != nil
 }
 
 // FlushMode controls checkpoint behavior during flush, matching SQLite's
@@ -332,8 +342,88 @@ type DurabilityConfig struct {
 	IdleAfter time.Duration
 
 	// FlushMode specifies how to autoflush data during idle periods
-	// Default: FlushModeCheckpointPassive
+	// Default: FlushModeCheckpointPassive. A value other than the
+	// FlushModeCheckpoint constants fails Open with ErrInvalidConfig.
 	FlushMode FlushMode
+}
+
+// maxCacheSize is the largest CacheSize Open uses; a larger one is taken as
+// it. SQLite clamps cache_size rather than refusing it: pcache1Cachesize holds
+// the page count of a cache's group at 0x7fff0000 (pcache1.c:820-822), the
+// cache's own count when each cache has a group of its own, as here. A 32-bit
+// target is held lower, at the pages its address space can hold, 2 GiB of
+// 4 KiB pages: (math.MaxInt+1)/4096, 524,288. That also keeps the cache's int
+// arithmetic (90% of the page count) in range there. Nothing is allocated in
+// proportion to the bound: a cache allocates pages as it fills, and its hash
+// table grows with them past a fixed initial size (btree newPcache).
+const maxCacheSize = min(0x7fff0000, math.MaxInt/4096+1)
+
+// maxReadConcurrency is the largest ReadConcurrency Open uses; a larger one is
+// taken as it. Open allocates the pool of idle reader caches at the full
+// number of readers, 8 bytes a slot, whether or not they are ever used, so the
+// number has to be one every Open can allocate: at this bound it is 512 KiB.
+// The readers themselves cost far more: with the default cache size each one
+// that runs takes 20 pages (80 KiB) at its first read, so 65,536 running at
+// once would hold more than 5 GiB of page cache, and a process with that many
+// is bound by its memory before it is by this cap.
+const maxReadConcurrency = 1 << 16
+
+// maxKDFIterations is the largest Encryption.KDFIterations Open derives a key
+// with: 2^31-1, the largest kdf_iter SQLCipher takes (a C int). The count is
+// part of the key, so a database opens only with the count it was created
+// with: a larger one is refused, not clamped to another key. Go's PBKDF2 loop
+// never ends at the largest int, so on a 32-bit target, where that is 2^31-1,
+// the bound is one less. One PBKDF2-HMAC-SHA256 iteration takes about 0.1 µs
+// on an AMD Ryzen 9 9950X core and 0.11 µs on an Apple M2 core, so the
+// default 256,000 costs Open about 30 ms and the bound about 4 minutes.
+const maxKDFIterations = min(math.MaxInt32, math.MaxInt-1)
+
+// validate reports the first field of c that Open cannot run with, wrapped in
+// ErrInvalidConfig. It runs before Open resolves the path or touches a file,
+// so a refused Config leaves nothing open. Sizes past what the code can
+// allocate are clamped instead (cacheSizes); a value with no nearest valid
+// one, as an unknown FlushMode or CipherType, or one that would derive
+// another key, as a KDFIterations past maxKDFIterations, is an error.
+func (c *Config) validate() error {
+	switch c.Durability.FlushMode {
+	case "", FlushModeCheckpointPassive, FlushModeCheckpointFull, FlushModeCheckpointRestart, FlushModeCheckpointTruncate:
+	default:
+		return fmt.Errorf("%w: Durability.FlushMode %q is not one of the FlushModeCheckpoint modes", ErrInvalidConfig, c.Durability.FlushMode)
+	}
+	if e := c.Encryption; e.Passphrase != nil {
+		switch e.CipherType {
+		case CipherAES256GCM, CipherChaCha20Poly1305, CipherXChaCha20Poly1305:
+		default:
+			return fmt.Errorf("%w: Encryption.CipherType %q is not one of the Cipher constants", ErrInvalidConfig, e.CipherType)
+		}
+		// Only a passphrase goes through the KDF: a 32-byte one is the key
+		// itself and ignores the count.
+		if len(e.Passphrase) != btree.KeyLen && e.KDFIterations > maxKDFIterations {
+			return fmt.Errorf("%w: Encryption.KDFIterations is %d, more than %d", ErrInvalidConfig, e.KDFIterations, maxKDFIterations)
+		}
+	}
+	return nil
+}
+
+// cacheSizes returns the page cache size and the reader limit Open uses: the
+// configured ones, their defaults for zero or a negative value, and the
+// bounds for a value past them.
+func (c *Config) cacheSizes() (cacheSize, readConcurrency int) {
+	cacheSize = c.CacheSize
+	if cacheSize <= 0 {
+		cacheSize = 5000
+	}
+	// Concurrent read transactions are bounded by a semaphore (each live
+	// reader holds its own page cache). The default scales with the host —
+	// max(NumCPU-1, 4) — so concurrent $text/Find reads aren't artificially
+	// serialized on a multi-core machine, while staying modest on small
+	// devices. Reader caches are created lazily up to this cap, so RAM follows
+	// actual concurrency, not the cap.
+	readConcurrency = c.ReadConcurrency
+	if readConcurrency <= 0 {
+		readConcurrency = max(runtime.NumCPU()-1, 4)
+	}
+	return min(cacheSize, maxCacheSize), min(readConcurrency, maxReadConcurrency)
 }
 
 func (c *Config) setDefaults() {

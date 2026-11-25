@@ -7,6 +7,7 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/pipeperf"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
@@ -186,9 +187,9 @@ func (pi *planIterator) Score() float64 {
 }
 
 func (pi *planIterator) Doc() (Doc, error) {
-	perf := pipelinePerfEnabled()
+	perf := pipeperf.Enabled()
 	if perf {
-		pipePerf.docCalls.Add(1)
+		pipeperf.DocCalls.Add(1)
 	}
 	if pi.closed {
 		return nil, ErrIterClosed
@@ -213,12 +214,12 @@ func (pi *planIterator) Doc() (Doc, error) {
 			}
 		}
 		if perf {
-			pipePerf.docParsedHits.Add(1)
+			pipeperf.DocParsedHits.Add(1)
 		}
 		doc = pi.plan.DocParsed
 	} else {
 		if perf {
-			pipePerf.docFallbacks.Add(1)
+			pipeperf.DocFallbacks.Add(1)
 		}
 		if pi.shared != nil {
 			pi.shared.enter()
@@ -243,7 +244,7 @@ func (pi *planIterator) Doc() (Doc, error) {
 			return nil, err
 		}
 		if perf {
-			pipePerf.docFallbackSeekNs.Add(perfSinceNs(seekStart))
+			pipeperf.DocFallbackSeekNs.Add(pipeperf.SinceNs(seekStart))
 		}
 		val, err := pi.dataCursor.Value()
 		if err != nil {
@@ -257,7 +258,7 @@ func (pi *planIterator) Doc() (Doc, error) {
 		var perr error
 		doc, perr = pi.buf.Parser.ParseOwned(pi.buf.DocBuf)
 		if perf {
-			pipePerf.docFallbackParseNs.Add(perfSinceNs(parseStart))
+			pipeperf.DocFallbackParseNs.Add(pipeperf.SinceNs(parseStart))
 		}
 		if perr != nil {
 			return nil, perr

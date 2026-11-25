@@ -127,9 +127,20 @@ func (m VectorMode) isBruteForce() bool { return m == VectorModeBruteForce }
 type VectorParams struct {
 	// Field is the path to the embedding field (an array of numbers).
 	Field string `json:"field"`
-	// Dim is the embedding dimension.
+	// Dim is the embedding dimension, at most 4,294,967,295 (2^32-1).
 	Dim int `json:"dim"`
 	// M / EfConstruction / EfSearch tune the HNSW graph; 0 = sensible defaults.
+	// M is at most 32,767 and EfConstruction and EfSearch at most 65,536.
+	//
+	// Creating an index (CreateIndex, or EnsureIndex of a name with no index)
+	// refuses with ErrInvalidConfig, and creates nothing: an empty Field, a
+	// Dim not above 0, a Metric, Quantization or Mode that is none of its
+	// constants, a negative M, EfConstruction, EfSearch, NList, NProbe or
+	// Closure, one past its bound in its field's doc, and a NaN
+	// CompactRatio. The checks of Field, Dim and Mode run on every
+	// definition; the others apply to an index being created only:
+	// EnsureIndex of a definition identical to one in the catalog keeps that
+	// index without them.
 	M              int `json:"m,omitempty"`
 	EfConstruction int `json:"efConstruction,omitempty"`
 	EfSearch       int `json:"efSearch,omitempty"`
@@ -150,8 +161,9 @@ type VectorParams struct {
 	// CompactRatio enables automatic compaction of the HNSW graph. Deletes and
 	// replaces only tombstone nodes; when tombstones reach CompactRatio × live
 	// nodes, the index is rebuilt to reclaim them (dropping dead nodes, superseded
-	// vectors, and re-densifying labels). 0 (the default) disables auto-compaction
-	// — the index is then only compacted via Collection.CompactVectorIndex.
+	// vectors, and re-densifying labels). 0 (the default), or any value not
+	// above it, disables auto-compaction — the index is then only compacted via
+	// Collection.CompactVectorIndex. NaN is refused.
 	//
 	// Choosing a value (measured — see TestVectorCompactThreshold): tombstoned
 	// nodes are still traversed during search, so latency rises roughly linearly
@@ -188,15 +200,19 @@ type VectorParams struct {
 	//
 	// NList is the number of coarse cells (k-means centroids); 0 ⇒ ~4·√N at build.
 	// More cells = finer partition = fewer vectors scanned per probe, but more
-	// centroids to compare and a larger training requirement.
+	// centroids to compare and a larger training requirement. It is at most the
+	// number of documents with a vector of the index's Dim when the index is
+	// created (none is a refusal too), and at most 2^32-1.
 	NList int `json:"nList,omitempty"`
 	// NProbe is how many cells a search scans (the recall/speed dial); 0 ⇒ 16.
-	// Higher = more recall, more cells scanned.
+	// Higher = more recall, more cells scanned; at most 2^32-1, and past NList
+	// it scans every cell.
 	NProbe int `json:"nProbe,omitempty"`
 	// Closure is the multi-assignment factor: each vector is placed in its Closure
 	// nearest cells so boundary vectors are found at lower NProbe (SPANN closure).
-	// 0/1 = single assignment. Every extra cell stores a full int8 record, so the
-	// index grows ~Closure×; a higher NProbe is usually the cheaper dial.
+	// 0/1 = single assignment, and at most 255. Every extra cell stores a full
+	// int8 record, so the index grows ~Closure×; a higher NProbe is usually the
+	// cheaper dial.
 	Closure int `json:"closure,omitempty"`
 }
 

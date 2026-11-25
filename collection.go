@@ -28,6 +28,31 @@ import (
 // write transaction — a collection or index created or dropped, a rename —
 // is that transaction's own until it commits: every other caller, and the
 // accessors that take no context, have the committed schema.
+//
+// Numbers, document ids among them, are float64: an integer above 2^53
+// (9,007,199,254,740,992) in magnitude, written as a plain integer in JSON or
+// given as a Go integer, is stored, looked up and compared as the nearest
+// float64, so two such integers can be one value. (JSON written with an
+// exponent, as 9007199254740993e1, is rounded twice by the parser and can
+// land on another float64; see docs/query-filter-contract.md, item 18.) As
+// ids they are one key: with a document of id 2^53 in the collection, an
+// Insert of id 2^53+1 fails with ErrDocExists, an UpsertOne with it replaces
+// that document, and FindId(2^53+1) returns it. Keep ids that can go past
+// 2^53 as strings.
+//
+// A filter given as a Go value is encoded as JSON, which takes every integer
+// type, uintptr and named types included. An integer id given to FindId,
+// FindIdWithParser, UpdateId, UpsertId or DeleteId is an int, uint or sized
+// integer (int64, uint64, …): a uintptr, or a value of a named type such as
+// type myInt int64, panics.
+//
+// An id given as an *anyenc.Value to FindId, FindIdWithParser, UpdateId,
+// UpsertId or DeleteId nests at most 511 levels, the deepest id a stored
+// document that reads back can have (an earlier release could store one); a
+// deeper one, or one that contains itself, is an error. A write stores a
+// document of at most 511 levels, so the id of a document written today
+// nests at most 510, and an UpdateId of a document an earlier release stored
+// deeper is refused.
 type Collection interface {
 	// Name returns the committed name of the collection: a rename made in an
 	// open write transaction shows once it commits.
@@ -38,6 +63,8 @@ type Collection interface {
 
 	// FindId finds a document by its ID.
 	// Returns the document or an error if the document is not found.
+	// An integer id above 2^53 in magnitude is looked up as the nearest
+	// float64, which can be another document's id (see Collection).
 	FindId(ctx context.Context, id any) (Doc, error)
 
 	// FindIdWithParser finds a document by its ID. Uses provided anyenc parser.
@@ -53,6 +80,9 @@ type Collection interface {
 
 	// Insert inserts multiple documents into the collection.
 	// Returns an error if the insertion fails.
+	// A document's integer id above 2^53 in magnitude is stored as the
+	// nearest float64, which can be another document's id: the insert then
+	// fails with ErrDocExists (see Collection).
 	Insert(ctx context.Context, docs ...*anyenc.Value) (err error)
 
 	// UpdateOne updates a single document in the collection.
@@ -62,14 +92,32 @@ type Collection interface {
 
 	// UpdateId updates a single document in the collection with provided modifier
 	// Returns a modify result or error.
+	// The id is immutable: a mod that changes it to another value fails with
+	// ErrPrimaryKeyModification, one that removes it ($unset) with
+	// ErrDocWithoutId, and one that makes it an array with
+	// ErrArrayPrimaryKey; the document is left as it was.
 	UpdateId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error)
 
-	// UpsertOne inserts a document if it does not exist, or updates it if it does.
-	// Returns the ID of the upserted document or an error if the operation fails.
+	// UpsertOne inserts a document if it does not exist, or replaces it if it
+	// does. Returns an error if the operation fails.
+	// An integer id above 2^53 in magnitude is the nearest float64, which can
+	// be another document's id: that document is then replaced (see
+	// Collection).
 	UpsertOne(ctx context.Context, doc *anyenc.Value) (err error)
 
-	// UpsertId updates a single document or creates new one
-	// Returns a modify result or error.
+	// UpsertId applies mod to the document with the given id, as UpdateId
+	// does, and when there is none inserts what mod makes of the document
+	// {<primary key>: id}, as MongoDB's upsert does: {id} alone, built from
+	// id, when mod reports no change, whatever it did to the document it was
+	// handed. An insert returns Matched 0 and Modified 1. A mod that
+	// changes the id fails as UpdateId's does (ErrPrimaryKeyModification,
+	// ErrDocWithoutId or ErrArrayPrimaryKey) and writes nothing, whether a
+	// document has the id or not. A mod that must write nothing for an id
+	// with no document returns an error: reporting no change still inserts
+	// {id}.
+	// An integer id above 2^53 in magnitude is the nearest float64, which can
+	// be another document's id: that document is then the one updated (see
+	// Collection).
 	UpsertId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error)
 
 	// DeleteId deletes a single document by its ID.
@@ -133,12 +181,21 @@ type Collection interface {
 	// Returns a WriteTx or an error if there is an issue starting the transaction.
 	WriteTx(ctx context.Context) (WriteTx, error)
 
-	// Close releases the handle: later operations through it fail with
-	// ErrCollectionClosed. If the open write transaction has used the
+	// Close releases the handle: later operations on the collection through
+	// it (its reads, writes, queries and schema changes) fail with
+	// ErrCollectionClosed. ReadTx and WriteTx only begin a transaction of
+	// the DB, and work as before. If the open write transaction has used the
 	// handle (an open by the transaction counts), the release waits until
 	// that transaction ends, or until a savepoint that encloses that first
 	// use rolls back. An open of the collection before then keeps the
 	// handle open.
+	//
+	// The handle is shared: every OpenCollection and Collection of this
+	// collection in the DB returns the same one (see Collection). Close
+	// ends it for every holder, so code that shares the collection with
+	// other code in the process should leave it open: DB.Close closes every
+	// handle. A later open of the collection returns a new handle; the
+	// closed one stays closed.
 	Close() error
 }
 
@@ -462,6 +519,9 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 	if err = c.alive(); err != nil {
 		return
 	}
+	if err = checkIdDepth(docId); err != nil {
+		return
+	}
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -568,7 +628,96 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 	return
 }
 
+// maxDocDepth is the deepest nesting of objects and arrays a stored document
+// may have, the document itself being the first level. anyenc's parser reads
+// containers 512 levels deep, and a compressed document's object sits one
+// level below its wrapper, so 511 levels read back whether the document is
+// stored compressed or not. MongoDB refuses a document nested past 100
+// levels on write; here the bound is what the reader reads.
+const maxDocDepth = 511
+
+// checkDocDepth refuses a document nested deeper than maxDocDepth, which
+// every write checks before it stores one (insertItem and update, or their
+// caller once before insertDepthChecked and updateDepthChecked): an insert
+// of a value built in an Arena, or a modifier's path, can nest deeper than
+// the parser reads, and the document stored would fail every later read.
+func checkDocDepth(v *anyenc.Value) error {
+	if nestsDeeper(v, maxDocDepth) {
+		return fmt.Errorf("any-store: document is nested deeper than %d levels", maxDocDepth)
+	}
+	return nil
+}
+
+// maxIdLookupDepth is the deepest an id given to FindId, FindIdWithParser,
+// UpdateId, UpsertId or DeleteId may nest: the deepest id a stored document
+// that reads back can have, one level below a document of 512 levels, the
+// parser's bound. A file can hold such a document, stored uncompressed,
+// though no write stores one: a write is held to maxDocDepth, so the id of a
+// document it stores nests at most 510 levels.
+const maxIdLookupDepth = 511
+
+// checkIdDepth refuses an id given as an *anyenc.Value that nests deeper
+// than maxIdLookupDepth. FindId, FindIdWithParser, UpdateId, UpsertId and
+// DeleteId check it before they encode the id: built in Go, the value has no
+// parser's bound, and encoding one that contains itself would recurse until
+// the stack ran out. A document an UpdateId or UpsertId writes is held to
+// maxDocDepth on its own (checkDocDepth).
+func checkIdDepth(id any) error {
+	if v, ok := id.(*anyenc.Value); ok && nestsDeeper(v, maxIdLookupDepth) {
+		return fmt.Errorf("any-store: id is nested deeper than %d levels", maxIdLookupDepth)
+	}
+	return nil
+}
+
+// nestsDeeper reports whether v nests objects and arrays more than levels
+// deep, v included. Only a container is walked into: a scalar adds no level,
+// and the call it would take costs more than the check on a document of
+// many scalars.
+func nestsDeeper(v *anyenc.Value, levels int) bool {
+	switch v.Type() {
+	case anyenc.TypeObject:
+		if levels == 0 {
+			return true
+		}
+		obj, _ := v.Object()
+		deeper := false
+		obj.Visit(func(_ []byte, f *anyenc.Value) {
+			deeper = deeper || isContainer(f) && nestsDeeper(f, levels-1)
+		})
+		return deeper
+	case anyenc.TypeArray:
+		if levels == 0 {
+			return true
+		}
+		arr, _ := v.Array()
+		for _, e := range arr {
+			if isContainer(e) && nestsDeeper(e, levels-1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isContainer reports whether v is an object or an array.
+func isContainer(v *anyenc.Value) bool {
+	t := v.Type()
+	return t == anyenc.TypeObject || t == anyenc.TypeArray
+}
+
 func (c *collection) insertItem(tx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, it item) (err error) {
+	if err = checkDocDepth(it.Value()); err != nil {
+		return err
+	}
+	return c.insertDepthChecked(tx, s, buf, it)
+}
+
+// insertDepthChecked is insertItem for a document the caller has held to
+// the depth bound (checkDocDepth) already: the walk visits every value of
+// the document, and a caller that may store it twice over (UpsertOne, which
+// updates when the insert finds the id) or has checked it before encoding
+// its id (UpsertId) need not pay it again.
+func (c *collection) insertDepthChecked(tx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, it item) (err error) {
 	buf.SmallBuf = c.appendId(buf.SmallBuf[:0], it.Value())
 	if c.compressionDisabled() {
 		buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
@@ -724,6 +873,9 @@ func (c *collection) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx
 }
 
 func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error) {
+	if err = checkIdDepth(id); err != nil {
+		return
+	}
 	// mod.Modify (user code) runs inside the write tx below. A panic there unwinds
 	// through here with err still nil, so gate on a normal return: compaction opens
 	// its own write tx and must never run mid-panic. See Insert and doWriteTxW.
@@ -774,6 +926,9 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 }
 
 func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error) {
+	if err = checkIdDepth(id); err != nil {
+		return
+	}
 	// mod.Modify (user code) runs inside the write tx below; see UpdateId.
 	returned := false
 	defer func() {
@@ -801,14 +956,9 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 		it, loadErr := c.loadById(tx, s, buf, buf.SmallBuf)
 		if loadErr != nil {
 			if errors.Is(loadErr, ErrDocNotFound) {
-				var idVal *anyenc.Value
-				buf.Arena.Reset()
-				modValue = buf.Arena.NewObject()
-				idVal, txErr = buf.Parser.Parse(buf.SmallBuf)
-				if txErr != nil {
+				if modValue, txErr = c.idDoc(buf, buf.SmallBuf); txErr != nil {
 					return false, txErr
 				}
-				modValue.Set(c.primaryKey, idVal)
 				isInsert = true
 			} else {
 				return false, loadErr
@@ -823,24 +973,50 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 		if txErr != nil {
 			return
 		}
-		if !modified {
-			if !isInsert {
-				res.Matched = 1
+		if !isInsert {
+			res.Matched = 1
+			if !modified {
+				return
 			}
-			return
+			res.Modified = 1
+			newIt, vErr := c.newItem(newVal)
+			if vErr != nil {
+				return false, vErr
+			}
+			return c.update(tx, s, newIt, prevItem)
 		}
-		res.Modified = 1
+		// A new id inserts what the modifier made of {id}, as MongoDB's
+		// upsert inserts the query's equality fields with the update applied
+		// to them: {id} alone when it changes nothing (a lone $pull, $unset
+		// or $pop of a missing field). That {id} is built again from the id
+		// looked up, not taken from the modifier: a modifier that reports no
+		// change can still have changed the value it was handed or returned
+		// another (a ModifyFunc's edits; $set of an object id with its fields
+		// in another order, which compares equal).
+		if !modified {
+			if newVal, txErr = c.idDoc(buf, buf.SmallBuf); txErr != nil {
+				return false, txErr
+			}
+		}
 		newIt, vErr := c.newItem(newVal)
 		if vErr != nil {
 			return false, vErr
 		}
-		if isInsert {
-			txErr = c.insertItem(tx, s, buf2, newIt)
-			return true, txErr
-		} else {
-			res.Matched = 1
-			return c.update(tx, s, newIt, prevItem)
+		// The depth bound comes before the id is encoded: a modifier's result
+		// can nest without bound, or contain itself, and encoding it would
+		// recurse until the stack ran out.
+		if txErr = checkDocDepth(newVal); txErr != nil {
+			return false, txErr
 		}
+		// The id is immutable on this branch too, as update checks for an
+		// existing document: a modifier that changed it ($push into a field
+		// of an object id) would store the document under a key the lookup
+		// by id does not find.
+		if !bytes.Equal(c.appendId(buf2.SmallBuf[:0], newVal), buf.SmallBuf) {
+			return false, ErrPrimaryKeyModification
+		}
+		res.Modified = 1
+		return true, c.insertDepthChecked(tx, s, buf2, newIt)
 	})
 	returned = true
 	if err != nil {
@@ -849,7 +1025,31 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 	return
 }
 
+// idDoc returns the document {<primary key>: id} for the encoded id key,
+// built in buf's arena with its parser, both reset: what UpsertId of an id
+// with no document hands its modifier, and inserts when the modifier changes
+// nothing.
+func (c *collection) idDoc(buf *syncpool.DocBuffer, key []byte) (*anyenc.Value, error) {
+	idVal, err := buf.Parser.Parse(key)
+	if err != nil {
+		return nil, err
+	}
+	buf.Arena.Reset()
+	doc := buf.Arena.NewObject()
+	doc.Set(c.primaryKey, idVal)
+	return doc, nil
+}
+
 func (c *collection) update(tx *btree.WriteTx, s *collSchema, it, prevIt item) (modified bool, err error) {
+	if err = checkDocDepth(it.Value()); err != nil {
+		return false, err
+	}
+	return c.updateDepthChecked(tx, s, it, prevIt)
+}
+
+// updateDepthChecked is update for a document the caller has held to the
+// depth bound already (insertDepthChecked).
+func (c *collection) updateDepthChecked(tx *btree.WriteTx, s *collSchema, it, prevIt item) (modified bool, err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -934,15 +1134,20 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 	if it, err = c.newItem(doc); err != nil {
 		return
 	}
+	// One depth walk for the document, whether it is inserted or replaces
+	// the one stored under its id.
+	if err = checkDocDepth(doc); err != nil {
+		return
+	}
 
 	err = c.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		s, txErr := c.resolve(&tx.ReadTx)
 		if txErr != nil {
 			return false, txErr
 		}
-		insErr := c.insertItem(tx, s, buf, it)
+		insErr := c.insertDepthChecked(tx, s, buf, it)
 		if errors.Is(insErr, ErrDocExists) {
-			return c.update(tx, s, it, item{})
+			return c.updateDepthChecked(tx, s, it, item{})
 		}
 		if insErr != nil {
 			return false, insErr
@@ -954,6 +1159,9 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 }
 
 func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
+	if err = checkIdDepth(id); err != nil {
+		return
+	}
 	// See Insert: gated on a normal return, not on err == nil alone.
 	returned := false
 	defer func() {
@@ -1022,14 +1230,24 @@ func (c *collection) Count(ctx context.Context) (count int, err error) {
 }
 
 func (c *collection) CreateIndex(ctx context.Context, info ...IndexInfo) (err error) {
-	return c.createIndexes(ctx, false, info...)
+	return c.createIndexes(ctx, false, false, info...)
 }
 
 func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err error) {
-	return c.createIndexes(ctx, true, info...)
+	return c.createIndexes(ctx, true, false, info...)
 }
 
-func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...IndexInfo) (err error) {
+// copyIndex is CreateIndex for CopyToLatestFormat: info is the definition of
+// an index the source's catalog holds, and the copy is created with it as it
+// is, without the bounds a new vector index is held to (createVectorIndex).
+func (c *collection) copyIndex(ctx context.Context, info IndexInfo) error {
+	return c.createIndexes(ctx, false, true, info)
+}
+
+// createIndexes creates the indexes info defines: ensure keeps an identical
+// index the catalog has (EnsureIndex), and copied creates a source's
+// definition (copyIndex).
+func (c *collection) createIndexes(ctx context.Context, ensure, copied bool, info ...IndexInfo) (err error) {
 	if len(info) == 0 {
 		return nil
 	}
@@ -1057,7 +1275,7 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 				continue
 			}
 			if idxInfo.Kind == IndexKindVector {
-				vi, viErr := c.createVectorIndex(tx, s, idxInfo)
+				vi, viErr := c.createVectorIndex(tx, s, idxInfo, copied)
 				if viErr != nil {
 					if ensure && errors.Is(viErr, ErrIndexExists) {
 						continue

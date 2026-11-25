@@ -98,8 +98,8 @@ func main() {
 // false positive lands in the gen.json and the differ surfaces it for
 // human triage.
 //
-//	crypto_*.c    — alternate cipher implementations (any-store users supply
-//	                their own Codec via the Options.Codec interface)
+//	crypto_*.c    — alternate cipher implementations (any-store has its own
+//	                built-in AEAD ciphers, chosen by CipherType)
 //	sqlcipher.{c,h} — SQLCipher's own context-management API; not exposed
 //	                  by the btree layer
 //	tclsqlite.c   — TCL bindings (not part of the Go port)

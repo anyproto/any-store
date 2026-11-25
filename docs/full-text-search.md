@@ -95,6 +95,12 @@ A query becomes a full-text search when it contains a `$text` clause:
 ```go
 // Ranked by relevance (BM25), most relevant first — the default order.
 iter, err := coll.Find(`{"$text":{"$search":"zeppelin disaster"}}`).Limit(10).Iter(ctx)
+if err != nil {
+    return err
+}
+// The iterator holds a read transaction until Close, and DB.Close waits
+// for every one.
+defer iter.Close()
 ```
 
 The search is **bag-of-words** (OR) by default: a document matches if it contains
@@ -104,11 +110,15 @@ filter is applied as a normal predicate on the ranked candidates:
 
 ```go
 // $text + ordinary filters (implicit AND).
-coll.Find(map[string]any{
+iter, err := coll.Find(map[string]any{
     "$text":  map[string]any{"$search": "crash"},
     "year":   map[string]any{"$gte": 1940},
     "status": "open",
 }).Limit(10).Iter(ctx)
+if err != nil {
+    return err
+}
+defer iter.Close()
 ```
 
 `$search` accepts a `$language`/`$caseSensitive`/`$diacriticSensitive` companion
@@ -185,7 +195,12 @@ coll.Find(map[string]any{"$text": map[string]any{
 
 `$require`/`$exclude` take a string or an array of strings; each entry uses the
 clause syntax above. There is deliberately no inline `+`/`-` syntax: `-9` stays
-the term `9`, and boolean intent lives in these typed fields.
+the term `9`, and boolean intent lives in these typed fields. At most 64
+required clauses are enforced, counted after parsing: the clauses of `$search`
+under `"and"`, then those of the `$require` entries, where one entry can be
+several (`"red blue"` is two clauses); a required clause past the 64th matches
+and scores but no longer gates ([query contract](query-filter-contract.md),
+item 19).
 
 **`$fields`** scopes every clause to the listed fields of the index (names as
 given in `IndexInfo.Fields`, nested paths included; an unknown name fails with
@@ -214,8 +229,8 @@ for iter.Next() {
 }
 
 // Relevance is the default order; this is the explicit, MongoDB-compatible form:
-coll.Find(`{"$text":{"$search":"crash"}}`).
-    Sort(`{"score":{"$meta":"textScore"}}`).Iter(ctx)
+q := coll.Find(`{"$text":{"$search":"crash"}}`).
+    Sort(`{"score":{"$meta":"textScore"}}`)
 ```
 
 `Iterator.Score()` returns the row's BM25 score (0 for non-`$text` queries).
@@ -227,8 +242,8 @@ score order. Sorting on a **real field** overrides relevance and re-orders the
 matches:
 
 ```go
-coll.Find(`{"$text":{"$search":"london"}}`).Sort("year").Iter(ctx)   // oldest first
-coll.Find(`{"$text":{"$search":"london"}}`).Sort("-year").Iter(ctx)  // newest first
+oldest := coll.Find(`{"$text":{"$search":"london"}}`).Sort("year")   // oldest first
+newest := coll.Find(`{"$text":{"$search":"london"}}`).Sort("-year")  // newest first
 ```
 
 `Limit`/`Offset` apply *after* the residual filter and any sort, so
@@ -306,7 +321,7 @@ Searching works the same across scripts. A CJK query is split into the same
 bigrams used at index time, so `"東京"` matches documents containing 東京:
 
 ```go
-coll.Find(`{"$text":{"$search":"東京"}}`).Iter(ctx)
+q := coll.Find(`{"$text":{"$search":"東京"}}`)
 ```
 
 A CJK run is matched as a phrase of its bigrams, so `東京都` matches documents
@@ -382,8 +397,8 @@ every insert, update, and delete.
 - **Batch your writes.** A batch insert (one `Insert(docs...)` call or one
   `WriteTx`) collapses the per-term postings rewrites to once-per-touched-chunk
   at commit — substantially faster and lower-allocation than per-document
-  transactions. Each commit also pays the durability flush once for the whole
-  batch.
+  transactions. Each commit also pays its WAL write (and, with `CommitSync`,
+  its sync) once for the whole batch.
 - **Interactive edits are cheap.** The diff-based update touches only changed
   terms, so editing a small note runs at tens of thousands of edits/second.
 - **Queries are interactive.** BM25 ranking over the postings is sub-millisecond
@@ -404,7 +419,7 @@ every insert, update, and delete.
 
 ```go
 ctx := context.Background()
-db, _ := anystore.Open(ctx, ":memory:", nil)
+db, _ := anystore.Open(ctx, ":memory:", &anystore.Config{InMemory: true}) // InMemory, not the path, keeps it in memory
 defer db.Close()
 
 coll, _ := db.CreateCollection(ctx, "pages")
@@ -421,10 +436,13 @@ coll.Insert(ctx,
 )
 
 // Relevance-ranked $text + a residual filter, newest first.
-iter, _ := coll.Find(map[string]any{
+iter, err := coll.Find(map[string]any{
     "$text": map[string]any{"$search": "london crash"},
     "year":  map[string]any{"$gte": 1950},
 }).Sort("-year").Limit(10).Iter(ctx)
+if err != nil {
+    log.Fatal(err)
+}
 defer iter.Close()
 
 for iter.Next() {

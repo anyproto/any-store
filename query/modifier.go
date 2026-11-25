@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
@@ -50,64 +51,29 @@ func (mRoot ModifierChain) Modify(a *anyenc.Arena, v *anyenc.Value) (result *any
 // MongoDB applies an update the same way, to a mutable copy that is stored
 // only when every operation succeeds. A modifier without such a segment is
 // never refused by the padding limit and runs on the document directly.
-//
-// The chain stores copies of its operands (ownOperands), as MongoDB copies an
-// operand from the immutable update spec into the document
-// (update/set_node.cpp: setValueBSONElement(val)), so applying it does not
-// change its operands.
 type paddingStaged struct {
 	ModifierChain
 }
 
-// ownOperands returns chain with its $set, $push and $addToSet replaced by
-// forms that store a copy of their operand on every application. The forms
-// are types of their own, not a flag, so that the plain modifiers every other
-// update parses keep their size.
-func ownOperands(chain ModifierChain) ModifierChain {
-	owned := make(ModifierChain, len(chain))
-	for i, m := range chain {
-		switch mt := m.(type) {
-		case modifierSet:
-			m = ownedSet(mt)
-		case modifierPush:
-			m = ownedPush(mt)
-		case modifierAddToSet:
-			m = ownedAddToSet(mt)
-		case ModifierChain:
-			m = ownOperands(mt)
-		}
-		owned[i] = m
+// stored is the value $set, $push and $addToSet store for their operand val:
+// a copy of it in a, or val itself when nothing can change it in place.
+// MongoDB copies an operand from the immutable update spec into the document
+// (update/set_node.cpp: setValueBSONElement(val)). Stored as itself, an
+// operand would be shared by every document the modifier is applied to — the
+// matches of a filtered Update, or the documents of a caller that reuses the
+// parsed modifier — and a change to it in place would change the modifier,
+// and through it the next document: a later operation of the same modifier
+// ($inc into the object $push appended, $push into the array $set stored), or
+// the caller writing through the slice a result's GetStringBytes, GetBytes
+// or GetVectorF32 returns. A number, a bool, null, an object id and a date
+// hand out no storage of their own, and are stored as themselves.
+func stored(a *anyenc.Arena, val *anyenc.Value) *anyenc.Value {
+	switch val.Type() {
+	case anyenc.TypeNumber, anyenc.TypeTrue, anyenc.TypeFalse, anyenc.TypeNull,
+		anyenc.TypeObjectID, anyenc.TypeDateTime:
+		return val
 	}
-	return owned
-}
-
-// ownedSet, ownedPush and ownedAddToSet are $set, $push and $addToSet storing
-// a copy of their operand (ownOperands).
-type (
-	ownedSet      modifierSet
-	ownedPush     modifierPush
-	ownedAddToSet modifierAddToSet
-)
-
-func (m ownedSet) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
-	return modifierSet(m).modify(a, v, true)
-}
-
-func (m ownedPush) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
-	return modifierPush(m).modify(a, v, true)
-}
-
-func (m ownedAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
-	return modifierAddToSet(m).modify(a, v, true)
-}
-
-// stored is the value an operation stores for operand val: val itself, or a
-// copy of it in a when the chain owns its operands (ownOperands).
-func stored(a *anyenc.Arena, val *anyenc.Value, copyVal bool) *anyenc.Value {
-	if copyVal {
-		return a.Copy(val)
-	}
-	return val
+	return a.Copy(val)
 }
 
 func (m paddingStaged) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
@@ -168,13 +134,9 @@ type modifierSet struct {
 }
 
 func (m modifierSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	return m.modify(a, v, false)
-}
-
-func (m modifierSet) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		modified = !anyencutil.Equal(value, m.val)
-		return stored(a, m.val, copyVal), nil
+		return stored(a, m.val), nil
 	})
 	if err != nil {
 		return nil, false, err
@@ -188,8 +150,8 @@ type modifierUnset struct {
 }
 
 func (m modifierUnset) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = anyencutil.Walk(a, v, m.fieldPath, false, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
-		modified = value != nil
+	err = walkExisting(v, m.fieldPath, "$unset", true, func(value *anyenc.Value) (*anyenc.Value, error) {
+		modified = true
 		return nil, nil
 	})
 	if err != nil {
@@ -228,15 +190,99 @@ type modifierRename struct {
 	val       []string
 }
 
+// walkExisting is the walk of the operators that remove: $unset, $pop, $pull,
+// $pullAll and the source of $rename. It walks v to the field path names,
+// creating nothing, and when the field is there calls finalize with it: a
+// nil result removes the field, another value takes its place. A document
+// without the field is left as it was, as MongoDB does.
+//
+// Where the walk stops matters as in MongoDB. A path that stops at an object,
+// or at an array whose next part is an index past its end, could be created,
+// and is a no-op. One whose next part is a field of a scalar or a name in an
+// array could not: allowNonViable ($unset) makes it a no-op too
+// (UnsetNode::allowNonViablePath), and every other remover refuses it, as
+// MongoDB's PathNotViable does (UpdateLeafNode::checkViability for $pop,
+// $pull and $pullAll; pathsupport::findLongestPrefix for the source of
+// $rename). In an array a part is an index only as arrayIndex reads it: a
+// signed part, "+0" or "-0", is a name, which no array holds.
+func walkExisting(v *anyenc.Value, path []string, op string, allowNonViable bool, finalize func(value *anyenc.Value) (*anyenc.Value, error)) error {
+	parent := v
+	for i, part := range path {
+		field := existingChild(parent, part)
+		if field == nil {
+			if allowNonViable || canHoldField(parent, part) {
+				return nil
+			}
+			return fmt.Errorf("%s: cannot use the part '%s' of '%s' to traverse the element %s",
+				op, part, strings.Join(path, "."), parent.String())
+		}
+		if i < len(path)-1 {
+			parent = field
+			continue
+		}
+		newVal, err := finalize(field)
+		if err != nil {
+			return err
+		}
+		if newVal == nil {
+			parent.Del(part)
+		} else if newVal != field {
+			parent.Set(part, newVal)
+		}
+	}
+	return nil
+}
+
+// existingChild is what part names in v, or nil when v holds nothing by it:
+// the field of an object, or the element of an array at the index part is
+// (arrayIndex). A scalar holds nothing, and an array nothing by any other
+// part, a signed number included.
+func existingChild(v *anyenc.Value, part string) *anyenc.Value {
+	if v.Type() != anyenc.TypeArray {
+		return v.Get(part)
+	}
+	idx, ok := arrayIndex(part)
+	elems := v.GetArray()
+	if !ok || idx >= uint64(len(elems)) {
+		return nil
+	}
+	return elems[idx]
+}
+
+// arrayIndex reads part as an array index the way MongoDB's
+// str::parseUnsignedBase10Integer does at r8.0.0: decimal digits, no sign,
+// that an unsigned 32-bit int holds. The host's int plays no part, so an
+// update's outcome does not depend on the word size: items.2147483648 is an
+// index past the end on a 32-bit target too, though no int there holds it.
+func arrayIndex(part string) (uint64, bool) {
+	idx, err := strconv.ParseUint(part, 10, 32)
+	return idx, err == nil
+}
+
+// canHoldField reports whether part could name a field of v that v does not
+// have: v is an object, or an array and part an index (arrayIndex) past its
+// end. A scalar holds no field, and an array none by name.
+func canHoldField(v *anyenc.Value, part string) bool {
+	switch v.Type() {
+	case anyenc.TypeObject:
+		return true
+	case anyenc.TypeArray:
+		_, ok := arrayIndex(part)
+		return ok
+	}
+	return false
+}
+
 func (m modifierRename) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
 	var oldFieldValue *anyenc.Value
-	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
-		if value != nil {
-			modified = true
-			oldFieldValue = value
-		}
+	err = walkExisting(v, m.fieldPath, "$rename", false, func(value *anyenc.Value) (*anyenc.Value, error) {
+		modified = true
+		oldFieldValue = value
 		return nil, nil
 	})
+	if err != nil {
+		return nil, false, err
+	}
 	if modified {
 		err = anyencutil.Walk(a, v, m.val, true, func(prevValue, newFieldValue *anyenc.Value) (res *anyenc.Value, err error) {
 			modified = modified || !anyencutil.Equal(newFieldValue, oldFieldValue)
@@ -256,13 +302,10 @@ type modifierPop struct {
 }
 
 func (m modifierPop) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
-		if value == nil {
-			return nil, nil
-		}
+	err = walkExisting(v, m.fieldPath, "$pop", false, func(value *anyenc.Value) (*anyenc.Value, error) {
 		arrayOfValues, err := value.Array()
 		if err != nil {
-			return nil, fmt.Errorf("failed to pop item, %w", err)
+			return nil, notArrayError("$pop", m.fieldPath, err)
 		}
 		if len(arrayOfValues) == 0 {
 			return value, nil
@@ -300,19 +343,17 @@ type modifierPush struct {
 }
 
 func (m modifierPush) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	return m.modify(a, v, false)
-}
-
-func (m modifierPush) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
-			return nil, nil
+			// A missing field becomes an array holding the value, as in
+			// MongoDB; through an upsert, so does the new document's field.
+			value = a.NewArray()
 		}
 		arrayOfValues, err := value.Array()
 		if err != nil {
-			return nil, fmt.Errorf("failed to pop item, %w", err)
+			return nil, notArrayError("$push", m.fieldPath, err)
 		}
-		value.SetArrayItem(len(arrayOfValues), stored(a, m.val, copyVal))
+		value.SetArrayItem(len(arrayOfValues), stored(a, m.val))
 		modified = true
 		return value, nil
 	})
@@ -330,13 +371,10 @@ type modifierPull struct {
 }
 
 func (m modifierPull) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
-		if value == nil {
-			return nil, nil
-		}
+	err = walkExisting(v, m.fieldPath, "$pull", false, func(value *anyenc.Value) (*anyenc.Value, error) {
 		arrayOfValues, err := value.Array()
 		if err != nil {
-			return nil, fmt.Errorf("failed to pop item, %w", err)
+			return nil, notArrayError("$pull", m.fieldPath, err)
 		}
 		if len(arrayOfValues) == 0 {
 			return value, nil
@@ -365,13 +403,10 @@ type modifierPullAll struct {
 }
 
 func (m modifierPullAll) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
-		if value == nil {
-			return nil, nil
-		}
+	err = walkExisting(v, m.fieldPath, "$pullAll", false, func(value *anyenc.Value) (*anyenc.Value, error) {
 		arrayOfValues, err := value.Array()
 		if err != nil {
-			return nil, fmt.Errorf("failed to pop item, %w", err)
+			return nil, notArrayError("$pullAll", m.fieldPath, err)
 		}
 		modified = removeElements(arrayOfValues, value, func(value *anyenc.Value) bool {
 			return slices.ContainsFunc(m.removedValues, func(removedValue *anyenc.Value) bool {
@@ -405,25 +440,28 @@ func removeElements(arrayOfValues []*anyenc.Value, value *anyenc.Value, shouldRe
 	return modified
 }
 
+// notArrayError is the error of an array operator applied to a field that
+// holds something other than an array, which MongoDB refuses as well ("The
+// field 'a' must be an array but is of type string").
+func notArrayError(op string, fieldPath []string, err error) error {
+	return fmt.Errorf("%s: field '%s' must be an array: %w", op, strings.Join(fieldPath, "."), err)
+}
+
 type modifierAddToSet struct {
 	fieldPath []string
 	val       *anyenc.Value
 }
 
 func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	return m.modify(a, v, false)
-}
-
-func (m modifierAddToSet) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool) (result *anyenc.Value, modified bool, err error) {
 	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			value = a.NewArray()
 		}
 		_, err = value.Array()
 		if err != nil {
-			return nil, fmt.Errorf("failed to pop item, %w", err)
+			return nil, notArrayError("$addToSet", m.fieldPath, err)
 		}
-		modified = m.addElements(a, value, copyVal)
+		modified = m.addElements(a, value)
 		return value, nil
 	})
 	if err != nil {
@@ -433,13 +471,13 @@ func (m modifierAddToSet) modify(a *anyenc.Arena, v *anyenc.Value, copyVal bool)
 	return
 }
 
-func (m modifierAddToSet) addElements(a *anyenc.Arena, value *anyenc.Value, copyVal bool) bool {
+func (m modifierAddToSet) addElements(a *anyenc.Arena, value *anyenc.Value) bool {
 	arrayOfValues := value.GetArray()
 	if slices.ContainsFunc(arrayOfValues, func(val *anyenc.Value) bool {
 		return anyencutil.Equal(m.val, val)
 	}) {
 		return false
 	}
-	value.SetArrayItem(len(arrayOfValues), stored(a, m.val, copyVal))
+	value.SetArrayItem(len(arrayOfValues), stored(a, m.val))
 	return true
 }

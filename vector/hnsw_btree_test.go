@@ -45,7 +45,7 @@ func TestBtreeHNSWPersistAndReload(t *testing.T) {
 	{
 		db, err := btree.Open(path, btree.Options{})
 		require.NoError(t, err)
-		idx, err := OpenBtreeHNSW(db, "emb", dim, L2)
+		idx, err := openBtreeHNSW(db, "emb", dim, L2)
 		require.NoError(t, err)
 		idx.SetEf(64)
 		for i := range vecs {
@@ -63,7 +63,7 @@ func TestBtreeHNSWPersistAndReload(t *testing.T) {
 	db, err := btree.Open(path, btree.Options{})
 	require.NoError(t, err)
 	defer db.Close()
-	idx, err := OpenBtreeHNSW(db, "emb", dim, L2)
+	idx, err := openBtreeHNSW(db, "emb", dim, L2)
 	require.NoError(t, err)
 	idx.SetEf(64)
 	require.Equal(t, n, idx.Len())
@@ -86,7 +86,7 @@ func TestBtreeHNSWPersistAndReload(t *testing.T) {
 func TestBtreeHNSWIncrementalFlush(t *testing.T) {
 	const dim = 16
 	db := openTestDB(t, true)
-	idx, err := OpenBtreeHNSW(db, "emb", dim, L2)
+	idx, err := openBtreeHNSW(db, "emb", dim, L2)
 	require.NoError(t, err)
 
 	vecs, keys := randVectors(300, dim, 3)
@@ -102,7 +102,7 @@ func TestBtreeHNSWIncrementalFlush(t *testing.T) {
 	require.Equal(t, 300, idx.Len())
 
 	// reopen against the same in-memory db handle
-	idx2, err := OpenBtreeHNSW(db, "emb", dim, L2)
+	idx2, err := openBtreeHNSW(db, "emb", dim, L2)
 	require.NoError(t, err)
 	require.Equal(t, 300, idx2.Len())
 }

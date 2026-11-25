@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -66,11 +67,17 @@ type CopyReport struct {
 // indexes, vector and full-text ones included, are built again from their
 // complete definitions. A document is stored as today's encoder writes it,
 // and every index is built under today's rules, so what an older release
-// stored can come out different, as the guide lists. Anything that cannot be
-// copied fails the call with an error naming the collection and the index or
-// document: an index that does not build again (a unique index the current
-// rules find duplicate, an IVF index whose collection holds no vectors to
-// train on), a document Insert refuses (one whose primary key is an array).
+// stored can come out different, as the guide lists. A definition keeps the
+// values it has in src, also where creating it anew would be refused: a
+// vector index is not held to the bounds of a new one, an IVF index whose
+// collection has fewer vectors than its NList trains one cell per vector,
+// and an IVF Closure above 255 places each vector in at most 255 cells.
+// Anything that cannot be copied fails the call with an error naming the
+// collection and the index or document: an index that does not build again
+// (a unique index the current rules find duplicate, an IVF index whose
+// collection holds no vectors to train on, an HNSW index with a negative M,
+// ErrInvalidConfig), a document Insert refuses (one whose primary key is an
+// array).
 //
 // The source is read in one read transaction, from the catalog to the last
 // document, as VACUUM INTO reads its source: commits made to src while the
@@ -351,7 +358,9 @@ type copiedCollection struct {
 // the collection does. No handle of s is opened: the handles are shared with
 // s's other callers, and a handle the copy closed again could be one another
 // caller had just been given. The documents go into dst through the
-// collection API (Insert), and the indexes are built there (CreateIndex).
+// collection API (Insert), and the indexes are built there with the
+// source's definitions (copyIndex, CreateIndex without the bounds of a new
+// vector index).
 func copyCollections(ctx context.Context, s, dst *db, report *CopyReport) ([]copiedCollection, error) {
 	rtx, err := s.ReadTx(ctx)
 	if err != nil {
@@ -432,7 +441,7 @@ func copyCollection(ctx, rctx context.Context, s, dst *db, c *copiedCollection, 
 		testHookCopiedCollection(c.name)
 	}
 	for _, info := range c.indexes {
-		if err = dc.CreateIndex(ctx, info); err != nil {
+		if err = dc.(*collection).copyIndex(ctx, info); err != nil {
 			return fmt.Errorf("any-store: copy to latest format: collection %q: index %q: %w", c.name, info.Name, inCopy(err))
 		}
 		report.Indexes++
@@ -637,7 +646,7 @@ func sameIndexDefinition(a, b IndexInfo) bool {
 	if !indexInfoEqual(a, b) || a.Kind != b.Kind {
 		return false
 	}
-	if (a.Vector == nil) != (b.Vector == nil) || a.Vector != nil && *a.Vector != *b.Vector {
+	if (a.Vector == nil) != (b.Vector == nil) || a.Vector != nil && !sameVectorParams(*a.Vector, *b.Vector) {
 		return false
 	}
 	if (a.Fulltext == nil) != (b.Fulltext == nil) {
@@ -645,6 +654,16 @@ func sameIndexDefinition(a, b IndexInfo) bool {
 	}
 	return a.Fulltext == nil || a.Fulltext.B == b.Fulltext.B && a.Fulltext.K1 == b.Fulltext.K1 &&
 		maps.Equal(a.Fulltext.Weights, b.Fulltext.Weights)
+}
+
+// sameVectorParams reports whether two vector index definitions are the
+// same. A NaN CompactRatio, which an earlier release stored and a copy keeps,
+// is the same as another NaN, as in vectorDefMatches.
+func sameVectorParams(a, b VectorParams) bool {
+	if math.IsNaN(a.CompactRatio) && math.IsNaN(b.CompactRatio) {
+		a.CompactRatio, b.CompactRatio = 0, 0
+	}
+	return a == b
 }
 
 // destinationFree returns ErrDestinationExists if path or a file a database

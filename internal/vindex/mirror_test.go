@@ -390,3 +390,16 @@ func TestVindexHybridStaleSnapshot(t *testing.T) {
 	}
 	ix.SetHybrid(false)
 }
+
+// The edges a layer-0 base reserves are n·m0 computed without overflow, up to
+// maxL0EdgesReserve: at the largest M (m0 = 65,534) and 32,770 labels the
+// product passes a 32-bit int, which made a negative capacity and a panic on
+// the first hybrid search there.
+func TestL0EdgesReserve(t *testing.T) {
+	require.Equal(t, 0, l0EdgesReserve(0, 32))
+	require.Equal(t, 3200, l0EdgesReserve(100, 32))
+	require.Equal(t, 1<<24, l0EdgesReserve(1<<19, 32))
+	require.Equal(t, maxL0EdgesReserve, l0EdgesReserve(32770, 65534))
+	require.Equal(t, maxL0EdgesReserve, l0EdgesReserve(1<<32-1, 65534))
+	require.Equal(t, 0, l0EdgesReserve(100, -1))
+}

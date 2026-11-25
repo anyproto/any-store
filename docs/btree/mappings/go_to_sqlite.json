@@ -2049,16 +2049,18 @@
     ],
     "note": "fans out the per-page update to all attached Backups for every page the source logs: a commit's pages and each spilled page (pager.c:3219-3225)"
   },
+  "pager.go:*pager.downgradeDBLock": {
+    "sqlite": [
+      "pager.c:pagerUnlockDb"
+    ],
+    "note": "partial: exclusive to shared in the open, pagerUnlockDb(SHARED_LOCK); SQLite's is one unlock call that asks no busy handler, and with flock only records the new level (os_unix.c:flockUnlock, 2747-2750), while a flock conversion here can be refused, so it waits with a count of its own (drift-63)"
+  },
   "pager.go:*pager.effectiveReaderDbSize": {
     "sqlite": [
       "pager.c:pagerPagecount",
       "wal.c:sqlite3WalDbsize"
     ],
     "note": "a reader's page count for its snapshot; the file-size fallback is memoized per wal-index header (drift-2026-11-11-3)"
-  },
-  "pager.go:*pager.downgradeDBLock": {
-    "sqlite": [],
-    "note": "exclusive to shared in the open; a flock conversion can be refused, so it waits with a count of its own"
   },
   "pager.go:*pager.encryptPage": {
     "sqlite": [],
@@ -2641,7 +2643,7 @@
       "pcache1.c:pcache1Create",
       "pcache1.c:pcache1ResizeHash"
     ],
-    "note": "seeds apHash to a power-of-two size (>= maxPages, floor 256), mirroring pcache1Create which calls pcache1ResizeHash at creation (pcache1.c:789) to seed nHash=256"
+    "note": "seeds apHash to a power-of-two size (>= maxPages up to maxHashPresize, floor 256), mirroring pcache1Create which calls pcache1ResizeHash at creation (pcache1.c:789) to seed nHash=256"
   },
   "shm.go:*inProcessShm.close": {
     "sqlite": [

@@ -2340,3 +2340,159 @@ func TestKnn_DeletedSinceKept(t *testing.T) {
 	assert.Equal(t, 1, missing)
 	assert.Equal(t, append([]int{expect[0], expect[1]}, expect[3:]...), got)
 }
+
+// Index creation refuses a value the index cannot be built or stored with,
+// wrapped in ErrInvalidConfig, from CreateIndex and EnsureIndex alike, and
+// creates nothing: a negative tuning value, M past 32,767, EfConstruction or
+// EfSearch past 65,536, Closure past 255, an explicit NList past the vectors
+// to train on, a Dim, NList or NProbe past 2^32-1 (the meta record's four
+// bytes), a NaN CompactRatio. The bounds themselves are accepted.
+func TestVectorIndex_TuningValidated(t *testing.T) {
+	const (
+		n   = 50
+		dim = 4
+	)
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	for i, vc := range vrand(n, dim, 7) {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+	ivf := anystore.VectorModeIVFSQ
+	type refusal struct {
+		name  string
+		p     anystore.VectorParams
+		field string
+	}
+	refused := []refusal{
+		{"M -1", anystore.VectorParams{M: -1}, "VectorParams.M "},
+		{"M 32768", anystore.VectorParams{M: 32768}, "VectorParams.M "},
+		{"EfConstruction -1", anystore.VectorParams{EfConstruction: -1}, "VectorParams.EfConstruction"},
+		{"EfConstruction 65537", anystore.VectorParams{EfConstruction: 65537}, "VectorParams.EfConstruction"},
+		{"EfSearch -1", anystore.VectorParams{EfSearch: -1}, "VectorParams.EfSearch"},
+		{"EfSearch 65537", anystore.VectorParams{EfSearch: 65537}, "VectorParams.EfSearch"},
+		{"NList -1", anystore.VectorParams{Mode: ivf, NList: -1}, "VectorParams.NList"},
+		{"NProbe -1", anystore.VectorParams{Mode: ivf, NProbe: -1}, "VectorParams.NProbe"},
+		{"Closure -1", anystore.VectorParams{Mode: ivf, Closure: -1}, "VectorParams.Closure"},
+		{"Closure 256", anystore.VectorParams{Mode: ivf, Closure: 256}, "VectorParams.Closure"},
+		{"NList past the vectors", anystore.VectorParams{Mode: ivf, NList: n + 1}, "VectorParams.NList"},
+		{"CompactRatio NaN", anystore.VectorParams{CompactRatio: math.NaN()}, "VectorParams.CompactRatio"},
+		{"Dim -1", anystore.VectorParams{Dim: -1}, "VectorParams.Dim"},
+		{"Metric 3", anystore.VectorParams{Metric: 3}, "VectorParams.Metric"},
+		{"Metric 99 IVF", anystore.VectorParams{Mode: ivf, Metric: 99}, "VectorParams.Metric"},
+		{"Quantization 2", anystore.VectorParams{Quantization: 2}, "VectorParams.Quantization"},
+		{"Mode 99", anystore.VectorParams{Mode: 99}, "VectorParams.Mode"},
+	}
+	if math.MaxInt > math.MaxUint32 {
+		width := int64(math.MaxUint32) // a variable: past it is no int constant on a 32-bit target
+		past := int(width + 1)
+		refused = append(refused,
+			refusal{"NProbe 2^32", anystore.VectorParams{Mode: ivf, NProbe: past}, "VectorParams.NProbe"},
+			refusal{"NList 2^32", anystore.VectorParams{Mode: ivf, NList: past}, "VectorParams.NList"},
+			refusal{"Dim 2^32", anystore.VectorParams{Dim: past}, "VectorParams.Dim"},
+		)
+	}
+	for _, c := range refused {
+		t.Run(c.name, func(t *testing.T) {
+			p := c.p
+			p.Field = "v"
+			if p.Dim == 0 {
+				p.Dim = dim
+			}
+			for _, create := range []func(context.Context, ...anystore.IndexInfo) error{coll.CreateIndex, coll.EnsureIndex} {
+				err := create(ctx, anystore.IndexInfo{Name: "emb", Kind: anystore.IndexKindVector, Vector: &p})
+				require.ErrorIs(t, err, anystore.ErrInvalidConfig)
+				require.ErrorContains(t, err, c.field)
+				require.ErrorIs(t, coll.DropIndex(ctx, "emb"), anystore.ErrIndexNotFound)
+			}
+		})
+	}
+	for name, p := range map[string]*anystore.VectorParams{
+		"Dim 0":     {Field: "v"},
+		"no Field":  {Dim: dim},
+		"no params": nil,
+	} {
+		err := coll.CreateIndex(ctx, anystore.IndexInfo{Name: "emb", Kind: anystore.IndexKindVector, Vector: p})
+		require.ErrorIs(t, err, anystore.ErrInvalidConfig, name)
+		require.ErrorIs(t, coll.DropIndex(ctx, "emb"), anystore.ErrIndexNotFound)
+	}
+
+	require.NoError(t, coll.CreateIndex(ctx, anystore.IndexInfo{Name: "ivf", Kind: anystore.IndexKindVector,
+		Vector: &anystore.VectorParams{Field: "v", Dim: dim, Mode: ivf, NList: n, Closure: 255}}))
+	require.NoError(t, coll.CreateIndex(ctx, anystore.IndexInfo{Name: "hnsw", Kind: anystore.IndexKindVector,
+		Vector: &anystore.VectorParams{Field: "v", Dim: dim, M: 32767, EfConstruction: 65536, EfSearch: 65536, CompactRatio: -1}}))
+}
+
+// An explicit NList is checked against the vectors to train on before an
+// IVF index looks for any: on a collection with no document, or with only
+// vectors of another dimension, it is ErrInvalidConfig. Without an NList
+// the collection's lack of vectors is the training error it was.
+func TestVectorIndex_IVFNListWithoutVectors(t *testing.T) {
+	const dim = 4
+	for name, docs := range map[string][]string{
+		"empty":           nil,
+		"wrong dimension": {`{"id":1,"v":[1,2,3]}`, `{"id":2,"v":[1,2,3,4,5]}`, `{"id":3}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fx := newFixture(t)
+			coll, err := fx.CreateCollection(ctx, "docs")
+			require.NoError(t, err)
+			for _, d := range docs {
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+			}
+			err = coll.CreateIndex(ctx, anystore.IndexInfo{Name: "ivf", Kind: anystore.IndexKindVector,
+				Vector: &anystore.VectorParams{Field: "v", Dim: dim, Mode: anystore.VectorModeIVFSQ, NList: 1}})
+			require.ErrorIs(t, err, anystore.ErrInvalidConfig)
+			require.ErrorContains(t, err, "VectorParams.NList is 1, more than the 0 vectors to train on")
+
+			err = coll.CreateIndex(ctx, anystore.IndexInfo{Name: "ivf", Kind: anystore.IndexKindVector,
+				Vector: &anystore.VectorParams{Field: "v", Dim: dim, Mode: anystore.VectorModeIVFSQ}})
+			require.Error(t, err)
+			require.NotErrorIs(t, err, anystore.ErrInvalidConfig)
+		})
+	}
+}
+
+// The largest NProbe an IVF index stores comes back from its meta record as
+// it went in: the index probes every cell before and after a reopen. A larger
+// one, which the record's four bytes would hold wrapped, is refused when the
+// index is created (TestVectorIndex_TuningValidated).
+func TestVectorIndex_IVFNProbeSurvivesReopen(t *testing.T) {
+	const (
+		n   = 200
+		dim = 8
+	)
+	nprobe := int(min(int64(math.MaxUint32), int64(math.MaxInt)))
+	path := filepath.Join(t.TempDir(), "db")
+	d, err := anystore.Open(ctx, path, nil)
+	require.NoError(t, err)
+	coll, err := d.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	vecs := vrand(n, dim, 3)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+	require.NoError(t, coll.CreateIndex(ctx, anystore.IndexInfo{Name: "ivf", Kind: anystore.IndexKindVector,
+		Vector: &anystore.VectorParams{Field: "v", Dim: dim, Metric: anystore.VectorL2, Mode: anystore.VectorModeIVFSQ, NList: 8, NProbe: nprobe}}))
+	hits, err := vsearch(coll, "v", vecs[17], 5, 0)
+	require.NoError(t, err)
+	require.Len(t, hits, 5)
+	assert.Equal(t, idBytesOf(17), hits[0].DocId)
+	require.NoError(t, d.Close())
+
+	d, err = anystore.Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer d.Close()
+	coll, err = d.Collection(ctx, "docs")
+	require.NoError(t, err)
+	hits, err = vsearch(coll, "v", vecs[17], 5, 0)
+	require.NoError(t, err)
+	require.Len(t, hits, 5)
+	assert.Equal(t, idBytesOf(17), hits[0].DocId)
+	// The default depth is 8 candidates per probed cell, capped at 4,096: the
+	// count is bounded before the multiply, which past 2^28 cells overflows a
+	// 32-bit int.
+	exp, err := coll.Find(fmt.Sprintf(`{"v":%s}`, vknnJSON(vecs[17], 5, 0))).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, exp.Sql, "KnnSearch(k=5,ef=4096)", exp.Sql)
+}

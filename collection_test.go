@@ -355,6 +355,76 @@ func BenchmarkCollection_UpdateId(b *testing.B) {
 	}
 }
 
+// UpsertOne of a document that is stored already, as it is: a flat array
+// of 10,000 numbers, the shape whose depth walk visits every element.
+func BenchmarkCollection_UpsertOneExisting(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(b, err)
+	a := &anyenc.Arena{}
+	doc := a.NewObject()
+	doc.Set("id", a.NewNumberInt(1))
+	arr := a.NewArray()
+	for i := range 10_000 {
+		arr.SetArrayItem(i, a.NewNumberInt(i))
+	}
+	doc.Set("arr", arr)
+	require.NoError(b, coll.Insert(ctx, doc))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		require.NoError(b, coll.UpsertOne(ctx, doc))
+	}
+}
+
+// A filtered Update whose $set stores an object of 200 fields in each of 100
+// documents. "unchanged" applies one modifier to documents that hold its
+// value already, so nothing is written: the cost is the reads and the
+// modifier's work on each document. "changed" alternates two modifiers, so
+// every document is written each time.
+func BenchmarkCollection_UpdateSetLargeObject(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(b, err)
+	for i := range 100 {
+		require.NoError(b, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"g":1}`, i))))
+	}
+	var mods [2]query.Modifier
+	for m := range mods {
+		src := []byte(`{"$set":{"o":{`)
+		for f := range 200 {
+			if f > 0 {
+				src = append(src, ',')
+			}
+			src = fmt.Appendf(src, `"field%d":%d`, f, m)
+		}
+		src = append(src, `}}}`...)
+		mods[m] = query.MustParseModifier(string(src))
+	}
+	q := coll.Find(`{"g":1}`)
+	_, err = q.Update(ctx, mods[0])
+	require.NoError(b, err)
+	b.Run("unchanged", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			res, err := q.Update(ctx, mods[0])
+			require.NoError(b, err)
+			require.Equal(b, 0, res.Modified)
+		}
+	})
+	b.Run("changed", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := range b.N {
+			res, err := q.Update(ctx, mods[(i+1)%2])
+			require.NoError(b, err)
+			require.Equal(b, 100, res.Modified)
+		}
+		// Leave the documents as "unchanged" expects them.
+		_, err := q.Update(ctx, mods[0])
+		require.NoError(b, err)
+	})
+}
+
 func BenchmarkCollection_FindId(b *testing.B) {
 	fx := newFixture(b)
 	coll, err := fx.CreateCollection(ctx, "test")
@@ -1756,4 +1826,64 @@ func TestSketch_ReadersLoadIntoOneCopy(t *testing.T) {
 	require.True(t, idx.loadPubSketch() == readers, "the next load decodes into the readers' copy")
 	require.Equal(t, uint64(52), readers.GetDocCount())
 	require.Equal(t, uint64(52), live.GetDocCount())
+}
+
+// An earlier release checked no depth on a write, so it could store,
+// uncompressed, a document of 512 levels, the parser's bound, whose id nests
+// 511. The id-taking methods look such an id up, as a scan reads the
+// document: FindId returns it and DeleteId removes it. A write of the
+// document is held to today's bound, 511 levels: UpdateId of it is refused
+// and leaves it as it was. An id one level deeper is refused before the
+// lookup.
+func TestCollection_LegacyDeepIdIsLookedUp(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	deepId := func(levels int) *anyenc.Value {
+		a := &anyenc.Arena{}
+		id := a.NewObject()
+		for cur, i := id, 1; i < levels; i++ {
+			next := a.NewObject()
+			cur.Set("a", next)
+			cur = next
+		}
+		return id
+	}
+	id := deepId(maxIdLookupDepth)
+	doc := (&anyenc.Arena{}).NewObject()
+	doc.Set("id", id)
+	putStored(t, fx.DB, "c", id.MarshalTo(nil), doc.MarshalTo(nil))
+	assert.Equal(t, []string{doc.String()}, scanAll(t, coll), "the scan reads it")
+
+	got, err := coll.FindId(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, doc.String(), got.Value().String())
+	_, err = coll.UpdateId(ctx, id, query.MustParseModifier(`{"$set":{"x":1}}`))
+	require.ErrorContains(t, err, "document is nested deeper than 511 levels")
+	got, err = coll.FindId(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, doc.String(), got.Value().String())
+
+	_, err = coll.FindId(ctx, deepId(maxIdLookupDepth+1))
+	require.ErrorContains(t, err, "id is nested deeper than 511 levels")
+	require.NoError(t, coll.DeleteId(ctx, id))
+	assert.Empty(t, scanAll(t, coll))
+}
+
+// scanAll returns the documents of coll in a full scan, as JSON. The
+// iterator is closed whatever an assertion does: left open, it would hold
+// its read transaction, and the fixture's Close would wait for it.
+func scanAll(t *testing.T, coll Collection) []string {
+	t.Helper()
+	iter, err := coll.Find(nil).Iter(ctx)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, iter.Close()) }()
+	var docs []string
+	for iter.Next() {
+		doc, err := iter.Doc()
+		require.NoError(t, err)
+		docs = append(docs, doc.Value().String())
+	}
+	require.NoError(t, iter.Err())
+	return docs
 }

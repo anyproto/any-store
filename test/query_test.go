@@ -292,10 +292,12 @@ func TestQuery_EmptyObjectInLogicalOperator(t *testing.T) {
 	}
 }
 
-// A Go-built query.And with no children is a filter, not JSON: it never meets
-// the parser's empty-array rule and matches every document, alone or nested.
-// Callers build one when no field of their own filter is set.
-func TestQuery_GoEmptyAndMatchesAll(t *testing.T) {
+// A Go-built query.And, Or or Nor with no children is a filter, not JSON: it
+// never meets the parser's empty-array rule and keeps the arithmetic of an
+// empty list, on every verb, Delete included: And{} and Nor{} match every
+// document, Or{} none. Callers build an And when no field of their own
+// filter is set.
+func TestQuery_GoEmptyLogicalFilters(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		filter query.Filter
@@ -304,6 +306,10 @@ func TestQuery_GoEmptyAndMatchesAll(t *testing.T) {
 		{"And{}", query.And{}, 5},
 		{"And{And{}}", query.And{query.And{}}, 5},
 		{"And{And{}, a=1}", query.And{query.And{}, query.MustParseCondition(`{"a":1}`)}, 1},
+		{"Nor{}", query.Nor{}, 5},
+		{"Or{}", query.Or{}, 0},
+		{"Or{Or{}, a=1}", query.Or{query.Or{}, query.MustParseCondition(`{"a":1}`)}, 1},
+		{"Nor{Or{}}", query.Nor{query.Or{}}, 5},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			coll := emptyLogicalColl(t)

@@ -214,6 +214,56 @@ func TestVectorIndex_BuildOnExisting(t *testing.T) {
 	assert.Equal(t, idBytesOf(123), hits[0].DocId)
 }
 
+// An index an earlier release created with a tuning value past today's bounds
+// stays usable: EnsureIndex of its identical definition finds it and keeps
+// it, as before the bounds; only creating the definition, under another
+// name, is refused. A brute-force index is its catalog record alone, so the
+// test writes the record an earlier release's CreateIndex wrote, unchecked:
+// one with an EfSearch past 65,536, and one with a NaN CompactRatio, which
+// matches the same definition although NaN != NaN.
+func TestVectorIndex_EnsureKeepsEarlierDefinition(t *testing.T) {
+	const dim = 4
+	path := filepath.Join(t.TempDir(), "db")
+	d, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	coll, err := d.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	vecs := vrand(20, dim, 7)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+	olds := []IndexInfo{
+		{Name: "old", Kind: IndexKindVector,
+			Vector: &VectorParams{Field: "v", Dim: dim, Mode: VectorModeBruteForce, EfSearch: maxVectorEf + 1}},
+		{Name: "oldnan", Kind: IndexKindVector,
+			Vector: &VectorParams{Field: "v", Dim: dim, Mode: VectorModeBruteForce, CompactRatio: math.NaN()}},
+	}
+	dd := d.(*db)
+	for _, old := range olds {
+		require.NoError(t, dd.doWriteTxModified(ctx, func(tx *btree.WriteTx) (bool, error) {
+			tx.MarkSchemaChanged()
+			return true, dd.registerIndex(tx, "docs", old)
+		}))
+	}
+	require.NoError(t, d.Close())
+
+	d, err = Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer d.Close()
+	coll, err = d.Collection(ctx, "docs")
+	require.NoError(t, err)
+	for _, old := range olds {
+		require.NoError(t, coll.EnsureIndex(ctx, old), old.Name)
+		require.ErrorIs(t, coll.CreateIndex(ctx, old), ErrIndexExists, old.Name)
+		assert.Equal(t, 3, nearestId(t, coll, fmt.Sprintf(`{"v":{"$knn":{"$query":%s,"$k":1,"$index":%q}}}`, vqJSON(vecs[3]), old.Name)), old.Name)
+
+		fresh := old
+		fresh.Name = "new"
+		require.ErrorIs(t, coll.EnsureIndex(ctx, fresh), ErrInvalidConfig, old.Name)
+		require.ErrorIs(t, coll.DropIndex(ctx, "new"), ErrIndexNotFound)
+	}
+}
+
 func TestVectorIndex_Stats(t *testing.T) {
 	const (
 		n   = 500
@@ -754,6 +804,22 @@ func makeVectorIndex(t *testing.T, coll Collection, mode VectorMode, dim int) {
 // the downstream indexer uses (no JSON involved).
 func vectorKnnFilter(qv []float32, k int) query.Filter {
 	return query.Key{Path: []string{"v"}, Filter: query.NewKnn(qv, k)}
+}
+
+// nearestId runs filter, a $knn query that selects one document, and returns
+// that document's id. The iterator is closed whatever an assertion does: left
+// open, it would hold its read transaction, and DB.Close would wait for it.
+func nearestId(t *testing.T, coll Collection, filter string) int {
+	t.Helper()
+	iter, err := coll.Find(filter).Iter(ctx)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, iter.Close()) }()
+	require.True(t, iter.Next(), "no document: %v", iter.Err())
+	doc, err := iter.Doc()
+	require.NoError(t, err)
+	id := doc.Value().GetInt("id")
+	require.False(t, iter.Next(), "more than one document")
+	return id
 }
 
 func vqJSON(vec []float32) string {

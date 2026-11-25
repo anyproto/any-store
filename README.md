@@ -15,12 +15,12 @@ Schema-less documents, rich indexes, full-text and vector search, ACID transacti
 * **Full-text search** — btree-resident inverted index with BM25 ranking via `$text`: phrases, prefixes, anchored and per-field matching for search-as-you-type. See [docs/full-text-search.md](docs/full-text-search.md).
 * **Vector search** — btree-resident ANN indexes (IVF-SQ, HNSW, brute-force) via `$knn`. See [docs/vector-search.md](docs/vector-search.md) and [docs/vector-engine.md](docs/vector-engine.md).
 * **Aggregation** — MongoDB-style pipelines: shaping (`$match`, `$group`, `$sort`, `$unwind`, `$facet`, ...), computed expressions (arithmetic, conditionals, comparisons, date math), field-to-field `$expr` predicates, primary-key `$lookup` joins, and materialization via `$merge`/`$out` — with planner pushdown. See [docs/aggregation.md](docs/aggregation.md).
-* **ACID transactions** — snapshot-isolated read transactions, single-writer write transactions.
-* **Multi-process** — SQLite-like contract: any number of OS processes may open, read and write the same database file at any time (WAL + shared-memory index, busy handling, cross-process DDL reconciliation).
-* **Durability** — idle auto-flush, explicit checkpointing, crash-safe WAL recovery, sentinel-triggered quick check after unclean shutdown.
+* **ACID transactions** — snapshot-isolated read transactions, single-writer write transactions. On an operating system's file system, a commit survives a process crash by default and reaches the disk with a later checkpoint, as in SQLite's WAL mode at `synchronous=NORMAL`, and `CommitSync` syncs every commit, the per-commit guarantee; the wasm example's IndexedDB file system gives neither (see [Durability](#durability)).
+* **Multi-process** — SQLite-like contract on Linux and Darwin, amd64 and arm64: any number of OS processes may open, read and write the same database file at any time (WAL + shared-memory index, busy handling, cross-process DDL reconciliation). Other targets run one process at a time (see [Multi-process](#multi-process)).
+* **Durability** — SQLite's WAL durability levels, crash-safe WAL recovery, explicit checkpointing, opt-in idle auto-flush, sentinel-triggered quick check after unclean shutdown.
 * **Integrity & encryption** — per-page XXH3-128 checksums by default; optional AES-GCM or (X)ChaCha20-Poly1305 (AEAD doubles as integrity).
 * **Streaming iterators** — low-memory scans with a cursor API; [AnyEnc](anyenc) arena encoding minimizes GC churn.
-* **Cross-platform** — pure Go, no CGO; runs anywhere Go runs, including `js/wasm` (see [wasm/](wasm)).
+* **Cross-platform** — pure Go, no CGO; builds for every Go target but AIX and Solaris, `js/wasm` and `wasip1` included (see [wasm/](wasm)), with multi-process access on Linux and Darwin, amd64 and arm64.
 * **CLI** — inspection, import/export and interactive shell.
 
 ## Quick start
@@ -67,7 +67,13 @@ func main() {
         anyenc.MustParseJson(`{"id": 2, "name": "Jane"}`),
     )
 
-    res, _ := users.Find(`{"id": {"$in": [1,2]}}`).Sort("-name").Iter(ctx)
+    res, err := users.Find(`{"id": {"$in": [1,2]}}`).Sort("-name").Iter(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    // An iterator holds a read transaction until its Close, and db.Close
+    // waits for every read transaction: close it before the DB.
+    defer res.Close()
     for res.Next() {
         doc, _ := res.Doc()
         fmt.Println(doc.Value().String())
@@ -86,6 +92,8 @@ The full end-to-end example lives in [`example/`](example) and the [API docs](ht
 
 > **Choosing document ids.** Unlike SQLite there is no hidden rowid — the document id is the btree key. Increment-like ids (`anyenc.NewObjectID()`, timestamps, sequences) keep inserts append-ordered and reads cache-friendly; fully random ids (e.g. UUIDv4) scatter them. In practice this only matters for very hot write/read paths or huge collections.
 
+> **Numbers are float64.** Every number is stored as a float64, as in JSON: integers are exact up to 2^53 (9,007,199,254,740,992) in magnitude, and a larger one, written as a plain integer in JSON or given as a Go integer, becomes the nearest float64, in a document, a filter and an id alike (a JSON number with an exponent can round to another one: [query contract](docs/query-filter-contract.md), item 18). A filter given as a Go value is encoded as JSON, which takes every integer type, `uintptr` and named types included. An integer id given to `FindId` and the other id calls, or an integer operand of `query.NewComp`, is an `int`, `uint` or sized integer (`int64`, `uint64`, …): a `uintptr`, or a value of a named type such as `type myInt int64`, panics. Two such integers can then be one value, and as ids one document: with a document of id 2^53 in the collection, inserting id 2^53+1 fails with `ErrDocExists`, `UpsertOne` with it replaces that document, and `FindId(2^53+1)` returns it. Store integers that can go past 2^53, such as 64-bit hashes, as strings.
+
 ## Transactions
 
 ```go
@@ -101,7 +109,7 @@ Any operation run with `tx.Context()` joins the transaction. Read transactions (
 
 A transaction begins with a context, as does an operation run without one, which opens its own. The wait for this process's writer lock, or for a reader slot once `Config.ReadConcurrency` of them are held, ends with the context's error when the context ends first; a context that has ended already begins nothing; a context that never ends waits until the database closes (`ErrDBIsClosed`). The wait behind another process's writer is the busy handler's: it ends with the busy error (`ErrBusy`) after the busy timeout, not with the context. `Commit` and `Rollback` do not consult the context. `TxFromContext` returns the transaction a context carries.
 
-`db.Close` waits for every read transaction of the database to end, and has no timeout. Commit each `ReadTx`, and close each `Iterator`: one opened without a transaction can hold a read transaction of its own until its `Close`. (An iterator opened inside a transaction holds none; it ends with the transaction.) A read transaction that is never ended blocks `Close` forever, and `Close` called by the goroutine that still holds one deadlocks on itself, as when a deferred `it.Close()` runs after `db.Close()`. While `Close` waits, an operation on a collection already fails with `ErrDBIsClosed`, and an open iterator's `Next` and `Doc` go on until it is closed; a call on the `DB` itself through an open read transaction may go on too (`GetCollectionNames` does) or fail with `ErrDBIsClosed`. A write transaction does not hold `Close` back. `Close` waits for the one step of storage work the transaction is in, which is as long as that step (a count walks its whole tree), and rolls the transaction back: its writes are discarded, an operation that was running ends with `ErrDBIsClosed` unless it was already in or past its last step, later ones fail with `ErrDBIsClosed`, as do the transaction's iterators that read through it and its `Commit`, and its `Rollback` returns nil (the `Rollback` of a `WriteTx` opened inside it returns `ErrDBIsClosed`). A `Commit` that runs while `Close` does may commit the transaction or fail with `ErrDBIsClosed`. Do not call `Close` from code that runs inside a storage step: `Config.OnIntegrityError`, the methods of a custom VFS, or the methods of a context passed to an operation.
+`db.Close` waits for every read transaction of the database to end; it has no timeout and takes no context. Commit each `ReadTx`, and close each `Iterator`: one opened without a transaction can hold a read transaction of its own until its `Close`. (An iterator opened inside a transaction holds none; it ends with the transaction.) A read transaction that is never ended blocks `Close` forever, and `Close` called by the goroutine that still holds one deadlocks on itself, as when a deferred `it.Close()` runs after `db.Close()`. While `Close` waits, an operation on a collection already fails with `ErrDBIsClosed`, and an open iterator's `Next` and `Doc` go on until it is closed; a call on the `DB` itself through an open read transaction may go on too (`GetCollectionNames` does) or fail with `ErrDBIsClosed`. A write transaction does not hold `Close` back. `Close` waits for the one step of storage work the transaction is in, which is as long as that step (a count walks its whole tree), and rolls the transaction back: its writes are discarded, an operation that was running ends with `ErrDBIsClosed` unless it was already in or past its last step, later ones fail with `ErrDBIsClosed`, as do the transaction's iterators that read through it and its `Commit`, and its `Rollback` returns nil (the `Rollback` of a `WriteTx` opened inside it returns `ErrDBIsClosed`). A `Commit` that runs while `Close` does may commit the transaction or fail with `ErrDBIsClosed`. Do not call `Close` from code that runs inside a storage step: `Config.OnIntegrityError`, the methods of a custom VFS, or the methods of a context passed to an operation.
 
 `db.Backup` is the exception to the waits: it does not wait for this process's writer lock or for a reader slot. The copy advances between this process's write transactions; if one stays open, or no reader slot is free, for the busy timeout, `Backup` returns an error that matches `ErrBusy` (`errors.Is`) and can be called again. With a context that carries a write transaction of the same database it returns that error at once: it would be waiting for its caller. It looks at its context between the batches of the copy, not inside one. The destination file is never removed. If `Backup` fails before the copy is committed, a destination that existed keeps its content and a new one is an empty database; the copy is committed in one step at the end, and an error after that leaves the completed copy. A batch of the copy begins its transactions with the ordinary waits behind another process, so `Backup` can return later than the busy timeout after it last copied. Two backups in opposite directions between the same two databases are busy for each other until one has ended.
 
@@ -138,7 +146,11 @@ _ = docs.EnsureIndex(ctx, anystore.IndexInfo{
     Fields: []string{"title", "body"},
 })
 
-res, _ := docs.Find(`{"$text": {"$search": "wal checkpoint"}}`).Limit(10).Iter(ctx)
+res, err := docs.Find(`{"$text": {"$search": "wal checkpoint"}}`).Limit(10).Iter(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+defer res.Close()
 ```
 
 BM25-ranked, transactional (a `$text` write is visible to queries in the same tx), combinable with any other filter, sort and limit.
@@ -146,17 +158,32 @@ BM25-ranked, transactional (a `$text` write is visible to queries in the same tx
 ## Vector search
 
 ```go
-_ = docs.EnsureIndex(ctx, anystore.IndexInfo{
+// IVF-SQ trains its cells on the vectors already stored: insert first.
+err := docs.Insert(ctx,
+    anyenc.MustParseJson(`{"id": 1, "embedding": [0.9, 0.1, 0.0, 0.2]}`),
+    anyenc.MustParseJson(`{"id": 2, "embedding": [0.0, 0.1, 0.9, 0.7]}`),
+)
+if err != nil {
+    log.Fatal(err)
+}
+err = docs.EnsureIndex(ctx, anystore.IndexInfo{
     Kind: anystore.IndexKindVector,
     Vector: &anystore.VectorParams{
         Field:  "embedding",
-        Dim:    768,
+        Dim:    4, // the length of every vector: 768, 1536, … for a real embedding model
         Metric: anystore.VectorCosine, // or VectorL2 (VectorDot: HNSW/brute-force modes only)
         Mode:   anystore.VectorModeIVFSQ, // or BTree/Hybrid (HNSW), BruteForce
     },
 })
+if err != nil {
+    log.Fatal(err)
+}
 
-res, _ := docs.Find(`{"embedding": {"$knn": {"$query": [0.1, 0.2, ...], "$k": 10}}}`).Iter(ctx)
+res, err := docs.Find(`{"embedding": {"$knn": {"$query": [0.85, 0.15, 0.05, 0.15], "$k": 10}}}`).Iter(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+defer res.Close()
 ```
 
 ANN results stream in distance order and compose with filters; `$ef` tunes recall per query, int8 quantization and IVF cell counts are per-index options. Large deployments run IVF-SQ; the API default is `VectorModeBTree`.
@@ -164,24 +191,34 @@ ANN results stream in distance order and compose with filters; `$ef` tunes recal
 ## Aggregation
 
 ```go
-res, _ := orders.Aggregate(`[
+res, err := orders.Aggregate(`[
     {"$match": {"status": "paid"}},
     {"$group": {"_id": "$region", "total": {"$sum": "$amount"}}},
     {"$sort": {"total": -1}}
 ]`).Iter(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+defer res.Close()
 ```
 
 `$match`/`$sort`/`$limit` prefixes are pushed down into the index planner; the rest streams through the pipeline. Expressions compute derived values in `$project`/`$addFields`/`$group` (arithmetic, `$cond`/`$switch`, comparisons, `$dateDiff`-family date math over the first-class dateTime type); `$expr` brings field-to-field predicates into `$match`; `$lookup` resolves object-id relations as primary-key point lookups; `$facet` runs N sub-pipelines over one scan; `$merge`/`$out` materialize results into a collection where they are indexable like any other data. Operator reference and Mongo divergences: [docs/aggregation.md](docs/aggregation.md).
 
 ## Multi-process
 
-The database file behaves like SQLite in WAL mode: any process may open it at any moment and read or write concurrently. Coordination runs through file locks and a shared-memory WAL index; snapshot reads are never blocked, writers serialize, and busy situations back off through a configurable handler. DDL from a peer process (created/dropped collections and indexes) is reconciled automatically on the next transaction.
+On Linux (Android included) and Darwin (macOS, iOS), on amd64 and arm64, the database file behaves like SQLite in WAL mode: any process may open it at any moment and read or write concurrently. Coordination runs through file locks and a shared-memory WAL index; a snapshot read is not blocked by a writer or a checkpoint, and writers serialize. A lock another process holds, where a transaction's begin, `Open`, or a `Full`, `Restart` or `Truncate` checkpoint waits for one, is retried by the busy handler, with SQLite's backoff, for a fixed 5 seconds before it returns a busy error; there is no option to change it. `Open`, `Backup` and `IntegrityCheck` return every busy error as one that matches `ErrBusy`. A transaction's begin (`ReadTx`, `WriteTx`, and the transaction an operation begins for itself) returns `ErrBusy` when another process's writer or checkpoint held the lock, and the storage layer's other busy errors as they are: that of a begin that waited out another process's rebuild of the shared-memory index after a crash, and that of a write begin whose snapshot other processes' commits kept overtaking. Not every lock goes through the busy handler, as in SQLite: a passive checkpoint waits for none, a checkpoint (`Flush`) that finds another process checkpointing returns `ErrBusy` at once, and an `Open` that finds another process setting up the shared-memory index retries for about a second. A read waits too, as in SQLite, when it begins while another process rebuilds the shared-memory index after a crash: through the busy handler, and it fails with that rebuild's busy error once the 5 seconds pass. DDL from a peer process (created/dropped collections and indexes) is reconciled automatically on the next transaction.
+
+Every other target runs a database in one process at a time, with its WAL index in that process's memory. On Windows and the other Unix systems — FreeBSD and the other BSDs, illumos, and Linux on other architectures, 32-bit ones included — the process that opens the file first holds an exclusive lock on it, and another process's `Open` fails. On `js/wasm`, `wasip1` and Plan 9 any-store takes no lock: it does not stop a second process, or a second browser tab, from opening the file. The file system can: the OPFS file system of the [wasm](wasm) example opens a file through an exclusive sync access handle, which the browser refuses to a second opener. Where the file system does not, the application has to prevent it. AIX and Solaris are not supported: their `syscall` package has no `flock`, and the library does not build there.
 
 One process holds one handle on a database file: a second `Open` of a file the process has open returns `ErrDBAlreadyOpen` (on Windows, a second `Open` through another path to the file, such as a link, returns `ErrDBOpenInOtherProcess`). Where multi-process access is not available (anything but linux, android, darwin and ios on amd64 and arm64), `Open` of a file that another process has open returns `ErrDBOpenInOtherProcess` at once; js/wasm, wasip1 and plan9 take no file lock and do not detect the other process.
 
 ## Durability
 
-Any Store performs WAL checkpoints and fsync after idle periods.
+By default a commit is written to the WAL and not synced, as in SQLite's WAL mode at `synchronous=NORMAL`. A checkpoint that copies frames from the WAL into the database file syncs the whole WAL first, and one is attempted automatically once the WAL holds `Config.AutoCheckpointAfter` frames (10,000 by default), on `Flush`, and on the last `Close` of the database. A passive checkpoint — the automatic one, and a flush in `FlushModeCheckpointPassive`, auto-flush's default — copies frames only up to the oldest snapshot a reader still holds: with frames to copy below it, it syncs the whole WAL, the frames past the snapshot included; with none, it returns before the sync, and the commits since the last sync stay unsynced until a later checkpoint. (A write that starts the WAL over also syncs the new WAL header.) On the file system of an operating system, a process crash loses no committed transaction: the operating system has the write. A power loss or an OS crash leaves the database consistent, but the commits made since the last sync can be lost although they returned without error. `Config.CommitSync` syncs the WAL on every commit, as `synchronous=FULL` does: a commit that returned survives a power loss, at the cost of a sync per commit. It is the only per-commit guarantee.
+
+The IndexedDB file system of the [wasm](wasm) example gives no durability guarantee, with `CommitSync` or without: it keeps each file in memory and stores it in IndexedDB only when the file is synced or closed, and its sync returns before IndexedDB has committed what it stores. A closed tab or a killed worker can lose commits that returned without error, as a power loss can elsewhere.
+
+Auto-flush (`Durability.AutoFlush`, off by default) attempts a checkpoint, in its `FlushMode`, once the database has been idle for `IdleAfter`:
 
 ```go
 db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
@@ -193,8 +230,16 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
     },
 })
 
-// Manual flush, e.g. before app suspension (waits up to 100ms for pending writes to settle).
-db.Flush(ctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive)
+// Manual flush, e.g. before app suspension: a checkpoint once this handle has
+// seen no write for 100ms (another process's writes do not count). Flush
+// retries until such a pause, and the context bounds that wait. A checkpoint
+// that has started does not take the context and runs to its end: the
+// deadline bounds when the checkpoint starts, not when Flush returns.
+fctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+defer cancel()
+if err := db.Flush(fctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive); err != nil {
+    log.Printf("flush: %v", err)
+}
 ```
 
 **Sentinel:** when enabled, a `.lock` file marks not-explicitly-persisted writes so an unclean shutdown triggers an integrity quick check on open. A flush removes the file, and so does a `Close` that checkpointed as the last handle on the database; a `Close` while another process still has the database open leaves it. An in-memory database has no sentinel file.
@@ -203,7 +248,7 @@ db.Flush(ctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive)
 
 ## Integrity
 
-Every non-encrypted database carries an XXH3-128 page-trailer checksum (16 bytes/page) by default — corruption is caught on read. There is no opt-out; the cost is <1% on writes and effectively zero on reads. Encrypted databases derive integrity from the cipher's AEAD tag instead. File state is authoritative on reopen — existing plain databases stay plain, existing checksum databases auto-install the codec regardless of caller config. An in-memory database has no checksums: its `Backup` is a plain file, or an encrypted one when the database was opened with `Encryption`. `Backup` copies a database as the kind of file it is, and returns an error, leaving the destination as it was, when the file at the destination path is a database of another kind (plain, checksummed, encrypted).
+Every non-encrypted database carries an XXH3-128 page-trailer checksum (16 bytes/page) by default — corruption is caught on read. There is no opt-out; the cost is <1% on writes and effectively zero on reads. Encrypted databases derive integrity from the cipher's AEAD tag instead. File state is authoritative on reopen — existing plain databases stay plain, existing checksum databases keep their checksums, whatever the caller's config. An in-memory database has no checksums: its `Backup` is a plain file, or an encrypted one when the database was opened with `Encryption`. `Backup` copies a database as the kind of file it is, and returns an error, leaving the destination as it was, when the file at the destination path is a database of another kind (plain, checksummed, encrypted).
 
 Conceptually mirrors SQLite's [`cksumvfs`](https://sqlite.org/cksumvfs.html), generalized to also surface AEAD failures via the same API.
 
@@ -250,7 +295,7 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 })
 ```
 
-Whole-file page-level AEAD; bring-your-own key management via `EncryptionConfig.Codec`.
+Whole-file page-level AEAD with a built-in cipher. A nil `Passphrase` means no encryption, and an empty non-nil one fails `Open`. A `Passphrase` of exactly 32 bytes is used as the key itself; any other nonempty length is stretched with PBKDF2-HMAC-SHA256 against a salt stored in the file, at `KDFIterations` rounds (256,000 by default, at most 2,147,483,647, or 2,147,483,646 on a 32-bit target). The cipher and the count are not stored in the file: a database opens only with the `CipherType` it was created with and, when its passphrase goes through PBKDF2, the same effective `KDFIterations` (0 and 256,000 are one count; a 32-byte key ignores it).
 
 `Open` refuses an `Encryption` config that does not fit the file, with an error to match with `errors.Is`. None of them matches `ErrCorrupt`, and the file is left unchanged:
 
@@ -262,7 +307,7 @@ Whole-file page-level AEAD; bring-your-own key management via `EncryptionConfig.
 
 A damaged first page under the right key is not `ErrWrongKey`: `Open` proves the key on other pages and reports `ErrPageIntegrity`, which matches `ErrCorrupt`. See `ErrWrongKey` for the cases it cannot tell apart, which it reports as a wrong key.
 
-`Backup` of an encrypted database writes an encrypted copy that opens with the same passphrase, key or codec. A copy that `Backup` creates has a salt of its own, so with a passphrase its derived key differs from the source's. A file that already exists at the path keeps the salt it has, which is the source's when that file is a copy of the source made outside `Backup`.
+`Backup` of an encrypted database writes an encrypted copy that opens with the source's `EncryptionConfig`: the same passphrase or key and `CipherType`, and with a passphrase the same effective `KDFIterations`. A copy that `Backup` creates has a salt of its own, so with a passphrase its derived key differs from the source's. A file that already exists at the path keeps the salt it has, which is the source's when that file is a copy of the source made outside `Backup`.
 
 An independent Go implementation following design conventions from [SQLCipher](https://www.zetetic.net/sqlcipher/) (BSD-3-Clause) — reserved-tail page overhead, the page-1 plaintext-prefix rule, PBKDF2-HMAC-SHA256 key derivation. No SQLCipher code is included; the cryptography is Go-native and uses AEAD rather than SQLCipher's encrypt-then-MAC construction. Not SQLCipher-compatible on disk. See [NOTICE.md](NOTICE.md).
 

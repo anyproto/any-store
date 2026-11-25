@@ -78,7 +78,7 @@ func BenchmarkBuildBtreeHNSW(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		idx, err := OpenBtreeHNSW(db, "emb", benchDim, L2)
+		idx, err := openBtreeHNSW(db, "emb", benchDim, L2)
 		if err != nil {
 			b.Fatal(err)
 		}

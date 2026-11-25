@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/pipeperf"
 )
 
 func TestIterator_Doc(t *testing.T) {
@@ -179,9 +180,9 @@ func TestIterator_NextAfterError(t *testing.T) {
 // 84-86, 90-91, 99-100, 104-105). Uses the same fallback trick as
 // TestIterator_Doc_FallbackPath to also cover the fallback perf sections.
 func TestIterator_Doc_PerfCountersPath(t *testing.T) {
-	setPipelinePerfEnabled(true)
-	defer setPipelinePerfEnabled(false)
-	resetPipelinePerfCounters()
+	pipeperf.Enable(true)
+	defer pipeperf.Enable(false)
+	pipeperf.Reset()
 
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "iter_perf")
@@ -211,7 +212,7 @@ func TestIterator_Doc_PerfCountersPath(t *testing.T) {
 	// Verify the perf counters actually recorded our calls — exactly two
 	// Doc() invocations, one hit, one fallback. Tight equality so a
 	// reimplementation that double-counted would fail.
-	snap := snapshotPipelinePerfCounters()
+	snap := pipeperf.Snapshot()
 	assert.Equal(t, uint64(2), snap.DocCalls)
 	assert.Equal(t, uint64(1), snap.DocParsedHits)
 	assert.Equal(t, uint64(1), snap.DocFallbacks)
@@ -412,9 +413,9 @@ func TestIterator_DocAfterSortWithLongIds(t *testing.T) {
 	}
 
 	// The counters show that every Doc() took the re-seek path.
-	EnablePipelinePerfCounters(true)
-	t.Cleanup(func() { EnablePipelinePerfCounters(false) })
-	resetPipelinePerfCounters()
+	pipeperf.Enable(true)
+	t.Cleanup(func() { pipeperf.Enable(false) })
+	pipeperf.Reset()
 
 	iter, err := coll.Find(nil).Sort("-v").Iter(ctx)
 	require.NoError(t, err)
@@ -428,5 +429,5 @@ func TestIterator_DocAfterSortWithLongIds(t *testing.T) {
 	}
 	require.NoError(t, iter.Err())
 	assert.Equal(t, n, rows)
-	assert.EqualValues(t, n, pipePerf.docFallbacks.Load(), "Doc() re-seeks by id after an in-memory sort")
+	assert.EqualValues(t, n, pipeperf.DocFallbacks.Load(), "Doc() re-seeks by id after an in-memory sort")
 }

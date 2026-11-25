@@ -17,7 +17,10 @@ to the query.
 
 ## 1. Create a vector index
 
-Register an index of kind `IndexKindVector` with `VectorParams`:
+Register an index of kind `IndexKindVector` with `VectorParams`. The examples
+of sections 1 to 3 use 4-dimensional vectors, to stay readable; a text
+embedding model gives hundreds of dimensions (768, 1536, …), and `Dim` is
+whatever the model gives.
 
 ```go
 err := coll.EnsureIndex(ctx, anystore.IndexInfo{
@@ -25,7 +28,7 @@ err := coll.EnsureIndex(ctx, anystore.IndexInfo{
     Kind: anystore.IndexKindVector,
     Vector: &anystore.VectorParams{
         Field:  "embedding",           // path to the embedding field (required)
-        Dim:    768,                   // embedding dimension (required)
+        Dim:    4,                     // embedding dimension (required)
         Metric: anystore.VectorCosine, // VectorCosine (default) | VectorL2 | VectorDot
     },
 })
@@ -59,12 +62,42 @@ Only `Field` and `Dim` are required. Other `VectorParams`:
 | Field | Default | Purpose |
 |---|---|---|
 | `Metric` | `VectorCosine` | distance measure: `VectorCosine`, `VectorL2`, `VectorDot`. `VectorDot` is not supported by the IVF mode (index creation and open fail with `ErrVectorMetricUnsupported`) |
-| `M`, `EfConstruction`, `EfSearch` | sensible defaults (0) | HNSW graph/search tuning |
+| `M`, `EfConstruction`, `EfSearch` | sensible defaults (0) | HNSW graph/search tuning; `M` at most 32,767, the other two at most 65,536 |
 | `Quantization` | `VectorQuantNone` | `VectorQuantInt8` ≈ 4× smaller, RAM-resident vectors |
 | `Mode` | `VectorModeBTree` | `VectorModeHybrid` (RAM layer-0 cache), `VectorModeBruteForce` (exact O(N) scan, no graph), `VectorModeIVFSQ` (inverted-file cells of int8 vectors; Cosine/L2 only, always int8) |
 | `HybridCacheVectors` | `false` | hybrid only: also cache vectors in RAM for faster search |
-| `CompactRatio` | `0` (off) | HNSW: auto-compact the graph when tombstones reach this ratio of live nodes; `IVFSQ`: auto-rebuild (re-train the centroids) when the drift score reaches it |
-| `NList`, `NProbe`, `Closure` | `~4·√N`, `16`, `1` | `IVFSQ` only: coarse cells; cells scanned per query (the recall dial), plus up to 64 more whose centroid is exactly as near as the farthest of them; cells each vector is placed in |
+| `CompactRatio` | `0` (off) | HNSW: auto-compact the graph when tombstones reach this ratio of live nodes; `IVFSQ`: auto-rebuild (re-train the centroids) when the drift score reaches it. A value not above 0 is off; NaN is refused |
+| `NList`, `NProbe`, `Closure` | `~4·√N`, `16`, `1` | `IVFSQ` only: coarse cells, at most the number of documents with a vector of the index's `Dim` at creation; cells scanned per query (the recall dial), plus up to 64 more whose centroid is exactly as near as the farthest of them; cells each vector is placed in, at most 255 |
+
+`CreateIndex` and `EnsureIndex` check a definition first, `EnsureIndex` of one
+identical to the catalog's included. It is refused with `ErrInvalidConfig` for
+no `Vector` params, an empty `Field`, a `Dim` not above 0, or a `Mode` that is
+none of its constants; with `ErrVectorIndexUnsupported` for `VectorMode(3)`,
+the value of the removed IVF-PQ mode, which stays reserved; and with
+`ErrVectorMetricUnsupported` for `VectorDot` in the IVF mode.
+
+Creating an index (`CreateIndex`, or `EnsureIndex` of a name with no index)
+also holds it to the tuning checks, and refuses with `ErrInvalidConfig`, having
+created nothing:
+- a `Metric` or `Quantization` that is none of its constants;
+- a negative `M`, `EfConstruction`, `EfSearch`, `NList`, `NProbe` or `Closure`;
+- one past its bound in the table;
+- a `Dim`, `NList` or `NProbe` past 4,294,967,295 (2^32−1), which the index's
+  record stores in four bytes;
+- an explicit `NList` on a collection with no document holding a vector of the
+  index's `Dim`;
+- a NaN `CompactRatio`.
+
+The tuning checks apply to an index being created only: `EnsureIndex` of a
+definition identical to one in the catalog keeps that index without them, so a
+definition an earlier release created past them is not refused at startup, and
+`CopyToLatestFormat` copies such an index with its definition. It refuses an
+HNSW index with a negative `M` (`ErrInvalidConfig`), which no graph can be
+built with (docs/migration-format-5-to-6.md). An IVF index whose `Closure` is
+above 255 places each vector it inserts, rebuilds or copies in at most 255
+cells, the count a vector's record holds. The checks before the tuning checks
+are not skipped: `EnsureIndex` of a quarantined `ivfpq` index's own definition
+returns `ErrVectorIndexUnsupported`.
 
 An index built by an earlier release in the removed `ivfpq` mode still opens with
 its collection but is quarantined: `$knn` on its field and `CompactVectorIndex`
@@ -101,12 +134,16 @@ obj := arena.NewObject()
 obj.Set("id", arena.NewNumberFloat64(1))
 obj.Set("title", arena.NewString("cat"))
 obj.Set("lang", arena.NewString("en"))
-obj.Set("embedding", arena.NewVectorF32([]float32{0.12, -0.03, /* ... Dim values */}))
-coll.Insert(ctx, obj)
+obj.Set("embedding", arena.NewVectorF32([]float32{0.12, -0.03, 0.41, 0.27})) // Dim values
+if err := coll.Insert(ctx, obj); err != nil {
+    return err
+}
 
 // Or a plain JSON array, when that's what you already have:
-coll.Insert(ctx, anyenc.MustParseJson(
-    `{"id":2, "title":"dog", "lang":"en", "embedding":[0.12, -0.03, ...]}`))
+if err := coll.Insert(ctx, anyenc.MustParseJson(
+    `{"id":2, "title":"dog", "lang":"en", "embedding":[0.15, -0.01, 0.38, 0.30]}`)); err != nil {
+    return err
+}
 ```
 
 The two encodings are interchangeable within a collection — the index reads both,
@@ -122,8 +159,15 @@ A query becomes a vector search when a **vector-indexed field** carries a `$knn`
 clause:
 
 ```go
-// The 10 nearest neighbours, closest first (the default order).
-iter, err := coll.Find(`{"embedding":{"$knn":{"$query":[0.1, 0.2, ...], "$k":10}}}`).Iter(ctx)
+// The 10 nearest neighbours, closest first (the default order). The query
+// vector has the index's Dim numbers.
+iter, err := coll.Find(`{"embedding":{"$knn":{"$query":[0.1, 0.2, 0.3, 0.4], "$k":10}}}`).Iter(ctx)
+if err != nil {
+    return err
+}
+// The iterator holds a read transaction until Close, and DB.Close waits
+// for every one.
+defer iter.Close()
 ```
 
 `$knn` takes an options object — this is the only accepted form:
@@ -141,6 +185,10 @@ wrapped in a `query.Key` naming the field — no JSON involved:
 ```go
 filter := query.Key{Path: []string{"embedding"}, Filter: query.NewKnn(vec, 10)}
 iter, err := coll.Find(filter).Iter(ctx)
+if err != nil {
+    return err
+}
+defer iter.Close()
 ```
 
 Everything else in the filter is applied as a residual predicate **before** the
@@ -148,7 +196,7 @@ k-cut — the query denotes the k nearest *matching* documents (hybrid search):
 
 ```go
 // ANN + ordinary filters: the 10 nearest docs among those matching lang/year.
-coll.Find(`{"embedding":{"$knn":{"$query":[...], "$k":10}}, "lang":"en", "year":{"$gt":2020}}`).Iter(ctx)
+q := coll.Find(`{"embedding":{"$knn":{"$query":[0.1, 0.2, 0.3, 0.4], "$k":10}}, "lang":"en", "year":{"$gt":2020}}`)
 ```
 
 ### `$knn` is a ranked source, not a predicate
@@ -193,14 +241,14 @@ for iter.Next() {
 // Filter by a distance threshold — note this is a threshold WITHIN the k
 // nearest (a residual filter over the $knn candidates), NOT "all documents
 // within 0.35": there is no radius search at any layer.
-coll.Find(`{"embedding":{"$knn":{"$query":[...], "$k":100}}, "_distance":{"$lt":0.35}}`).Iter(ctx)
+near := coll.Find(`{"embedding":{"$knn":{"$query":[...], "$k":100}}, "_distance":{"$lt":0.35}}`)
 
 // Sort by distance (ascending is the default when no Sort is given):
-coll.Find(`{"embedding":{"$knn":{...}}}`).Sort("_distance").Iter(ctx)   // closest first
-coll.Find(`{"embedding":{"$knn":{...}}}`).Sort("-_distance").Iter(ctx)  // farthest first
+closest := coll.Find(`{"embedding":{"$knn":{...}}}`).Sort("_distance")    // closest first
+farthest := coll.Find(`{"embedding":{"$knn":{...}}}`).Sort("-_distance") // farthest first
 
 // Multi-key sort: distance, then a tie-breaker field:
-coll.Find(`{"a":{"$gt":42}, "embedding":{"$knn":{...}}}`).Sort("_distance", "-name").Iter(ctx)
+byName := coll.Find(`{"a":{"$gt":42}, "embedding":{"$knn":{...}}}`).Sort("_distance", "-name")
 ```
 
 `Iterator.Distance()` returns the row's distance (0 for non-vector queries).
@@ -218,7 +266,7 @@ filter is present, capped at ~4096 but never below `$k`). An explicit `$ef` is
 used verbatim and never capped:
 
 ```go
-coll.Find(`{"embedding":{"$knn":{"$query":[...], "$k":20, "$ef":200}}, "lang":"en"}`).Iter(ctx)
+q := coll.Find(`{"embedding":{"$knn":{"$query":[...], "$k":20, "$ef":200}}, "lang":"en"}`)
 ```
 
 Because `ef` never depends on `Limit`/`Offset`/`Sort` or the verb, every verb
@@ -358,14 +406,16 @@ O(live); for very large indexes prefer `0` and schedule
   see §1.
 - **Document encoding** — store the embedding as `anyenc.TypeVectorF32` (not a
   number array): ~2× smaller docs and a faster pipeline, recall unchanged.
-- **`:memory:`** keeps the whole DB resident — fastest, but many× the RAM of a
-  file-backed DB.
+- **`Config{InMemory: true}`** keeps the whole DB resident — fastest, but many×
+  the RAM of a file-backed DB. The path `":memory:"` has no special meaning: without
+  `InMemory` it is an ordinary file path, under the filesystem's naming rules
+  (Windows refuses `:` in a file name).
 
 ## 7. End-to-end example
 
 ```go
 ctx := context.Background()
-db, _ := anystore.Open(ctx, ":memory:", nil)
+db, _ := anystore.Open(ctx, ":memory:", &anystore.Config{InMemory: true}) // InMemory, not the path, keeps it in memory
 defer db.Close()
 
 coll, _ := db.CreateCollection(ctx, "docs")
@@ -390,8 +440,11 @@ coll.Insert(ctx,
     mkDoc(3, "fr", []float32{0.0, 0.1, 0.9, 0.7}),
 )
 
-iter, _ := coll.Find(`{"embedding":{"$knn":{"$query":[0.85,0.15,0.05,0.15],"$k":2}}, "lang":"en"}`).
+iter, err := coll.Find(`{"embedding":{"$knn":{"$query":[0.85,0.15,0.05,0.15],"$k":2}}, "lang":"en"}`).
     Sort("_distance").Iter(ctx)
+if err != nil {
+    log.Fatal(err)
+}
 defer iter.Close()
 
 for iter.Next() {

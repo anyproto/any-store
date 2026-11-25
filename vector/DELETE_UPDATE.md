@@ -148,7 +148,7 @@ analogue of the latency curve above.
 
 ## 4. btree storage impact & write amplification
 
-Persistence (`BtreeHNSW`) keeps node records in `<name>:nodes` (keyed by dense
+Persistence (`btreeHNSW`) keeps node records in `<name>:nodes` (keyed by dense
 id) and now adds `<name>:tomb` for tombstones. Deleting a node **keeps its node
 record** (it's still a waypoint) and writes a 1-byte tombstone; reload re-applies
 tombstones after loading the graph.
@@ -255,7 +255,7 @@ demonstrates the composition (dict + arena graph, returning `[]byte` ids).
 
 - Cheap `Compact` drops edges to deleted nodes without replenishing; a smarter
   compaction would re-link 2-hop survivors to recover some of the lost recall.
-- `BtreeHNSW` still stores vector+adjacency in one record (the split in §4 is
+- `btreeHNSW` still stores vector+adjacency in one record (the split in §4 is
   measured but not yet implemented) and keys by arena id, so on-disk Compact
   would rewrite everything — both noted as the next storage steps.
 - The forward id map is an in-memory `map[string]uint32`; the resident-RAM

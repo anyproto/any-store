@@ -21,6 +21,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/pipeperf"
 )
 
 var ctx = context.Background()
@@ -233,14 +234,14 @@ func bruteIDs(vecs [][]float32, q []float32, k int) map[string]bool {
 
 // qplannerEnableCounters turns the pipeline profiling counters on for one test.
 func qplannerEnableCounters(t *testing.T) {
-	anystore.ResetPipelinePerfCounters()
-	anystore.EnablePipelinePerfCounters(true)
-	t.Cleanup(func() { anystore.EnablePipelinePerfCounters(false) })
+	pipeperf.Reset()
+	pipeperf.Enable(true)
+	t.Cleanup(func() { pipeperf.Enable(false) })
 }
 
 // qplannerSnapshot reads the planner counters off the public pipeline export.
-func qplannerSnapshot() anystore.PipelinePerfCounters {
-	return anystore.SnapshotPipelinePerfCounters()
+func qplannerSnapshot() pipeperf.Counters {
+	return pipeperf.Snapshot()
 }
 
 // skipIfInMemory skips a test that the in-memory backend cannot run; reason

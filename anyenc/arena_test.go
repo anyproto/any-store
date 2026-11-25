@@ -1,6 +1,7 @@
 package anyenc
 
 import (
+	"fmt"
 	"math"
 	"sync"
 	"testing"
@@ -163,6 +164,38 @@ func TestArena_Copy(t *testing.T) {
 		buf[i] = 'X'
 	}
 	assert.Equal(t, parsed, pc.String())
+}
+
+// Copy takes an object's keys in one allocation, however many keys it has,
+// and the keys stay as they are when the arena is reset and reused: the
+// arena does not hand their bytes out again.
+func TestArena_CopyKeysOneAllocation(t *testing.T) {
+	src := &Arena{}
+	v := src.NewObject()
+	for i := range 100 {
+		v.Set(fmt.Sprintf("key%d", i), src.NewNumberInt(i))
+	}
+	a := &Arena{}
+	a.Copy(v) // the arena's values, which a reset keeps for reuse
+	assert.Equal(t, 1.0, testing.AllocsPerRun(10, func() {
+		a.Reset()
+		a.Copy(v)
+	}))
+
+	a.Reset()
+	keys := a.Copy(v).GoType().(map[string]any)
+	a.Reset()
+	for range 3 {
+		w := a.NewObject()
+		for i := range 100 {
+			w.Set(fmt.Sprintf("other%d", i), a.NewNumberInt(i))
+		}
+		a.Copy(w)
+	}
+	assert.Len(t, keys, 100)
+	for k, n := range keys {
+		assert.Equal(t, fmt.Sprintf("key%v", n), k)
+	}
 }
 
 // A true, false or null in storage the caller owns copies to a value of the

@@ -2,7 +2,8 @@ package test
 
 // What a backup is for: the copy reopens with the credentials of its source
 // and holds the same documents. One round trip per kind of database (plain,
-// checksummed, encrypted by passphrase, by raw key, by a caller's codec), per
+// checksummed, encrypted by passphrase or by raw key, each built-in cipher
+// among them), per
 // kind of source (file, in-memory) and per state of the destination (absent,
 // a database of the same kind, a database of another kind).
 
@@ -25,8 +26,8 @@ import (
 )
 
 // roundTripKind is one kind of database: how it is opened, and how a copy of
-// it is opened again. The two differ only where a config cannot be reused (a
-// caller's codec, the in-memory flag).
+// it is opened again. The two differ only where a config cannot be reused
+// (the in-memory flag).
 type roundTripKind struct {
 	name   string
 	open   func(t *testing.T) *anystore.Config
@@ -42,12 +43,6 @@ func passphraseConfig(pass string, cipher anystore.CipherType) func(*testing.T) 
 			CipherType:    cipher,
 		}}
 	}
-}
-
-func codecConfig(t *testing.T) *anystore.Config {
-	codec, err := anystore.NewChaCha20Poly1305Codec(bytes.Repeat([]byte{0x5a}, 32))
-	require.NoError(t, err)
-	return &anystore.Config{Encryption: anystore.EncryptionConfig{Codec: codec}}
 }
 
 func defaultConfig(*testing.T) *anystore.Config { return nil }
@@ -73,7 +68,7 @@ var roundTripKinds = []roundTripKind{
 	}, anystore.IntegrityAEAD},
 	{"passphrase-xchacha", passphraseConfig("correct horse", anystore.CipherXChaCha20Poly1305), passphraseConfig("correct horse", anystore.CipherXChaCha20Poly1305), anystore.IntegrityAEAD},
 	{"raw-key-32", passphraseConfig("0123456789abcdef0123456789abcdef", ""), passphraseConfig("0123456789abcdef0123456789abcdef", ""), anystore.IntegrityAEAD},
-	{"caller-codec", codecConfig, codecConfig, anystore.IntegrityAEAD},
+	{"raw-key-32-chacha", passphraseConfig("0123456789abcdef0123456789abcdef", anystore.CipherChaCha20Poly1305), passphraseConfig("0123456789abcdef0123456789abcdef", anystore.CipherChaCha20Poly1305), anystore.IntegrityAEAD},
 	{"in-memory", inMemory(defaultConfig), defaultConfig, anystore.IntegrityNone},
 	{"in-memory-passphrase", inMemory(passphraseConfig("correct horse", "")), passphraseConfig("correct horse", ""), anystore.IntegrityAEAD},
 	{"in-memory-raw-key-32", inMemory(passphraseConfig("0123456789abcdef0123456789abcdef", "")), passphraseConfig("0123456789abcdef0123456789abcdef", ""), anystore.IntegrityAEAD},
@@ -195,6 +190,33 @@ func TestBackupRoundTrip(t *testing.T) {
 			require.NoError(t, restored.Backup(ctx, againPath))
 			require.NoError(t, restored.Close())
 			requireCopy(t, againPath, kind.reopen(t), kind.mode, want)
+		})
+	}
+}
+
+// The passphrase or key in Config is the caller's buffer, which the caller
+// may clear once Open returns. The database keeps a copy of its own, so a
+// backup made after that is encrypted with the passphrase or key the
+// database was opened with, and opens with it.
+func TestBackupRoundTrip_CallerClearsItsKey(t *testing.T) {
+	ctx := context.Background()
+	for _, kind := range roundTripKinds {
+		if conf := kind.open(t); conf == nil || conf.Encryption.Passphrase == nil {
+			continue
+		}
+		t.Run(kind.name, func(t *testing.T) {
+			dir := t.TempDir()
+			conf := kind.open(t)
+			src, err := anystore.Open(ctx, filepath.Join(dir, "src.db"), conf)
+			require.NoError(t, err)
+			defer func() { _ = src.Close() }()
+			clear(conf.Encryption.Passphrase)
+			want := fillRoundTrip(t, src, 0, 50)
+
+			copyPath := filepath.Join(dir, "copy.db")
+			require.NoError(t, src.Backup(ctx, copyPath))
+			require.NoError(t, src.Close())
+			requireCopy(t, copyPath, kind.reopen(t), kind.mode, want)
 		})
 	}
 }

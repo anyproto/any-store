@@ -78,16 +78,12 @@ func TestOpen_WrongKey(t *testing.T) {
 	for i := range key {
 		key[i] = byte(i)
 	}
-	codec, err := anystore.NewAESCodec(key)
-	require.NoError(t, err)
-
 	for _, tc := range []struct {
 		name string
 		enc  anystore.EncryptionConfig
 	}{
 		{"passphrase", anystore.EncryptionConfig{Passphrase: []byte("wrong passphrase"), KDFIterations: 1000}},
 		{"raw key", anystore.EncryptionConfig{Passphrase: key}},
-		{"codec", anystore.EncryptionConfig{Codec: codec}},
 		{"cipher", anystore.EncryptionConfig{Passphrase: cfg.Encryption.Passphrase, KDFIterations: 1000, CipherType: anystore.CipherChaCha20Poly1305}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

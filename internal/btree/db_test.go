@@ -224,12 +224,34 @@ func TestOpen_CacheSizeDefault(t *testing.T) {
 	// Should use default cache size
 }
 
+// DisableAutoCheckpoint turns commit-time checkpoints off whatever
+// AutoCheckpointAfter says, as wal_autocheckpoint=0 does in SQLite: with a
+// threshold of one frame set alongside it, commits leave every frame in the
+// WAL, none backfilled.
 func TestOpen_AutoCheckpointDisabled(t *testing.T) {
-	dir := t.TempDir()
-	db, err := testOpen(t, filepath.Join(dir, "t.db"), Options{DisableAutoCheckpoint: true})
-	require.NoError(t, err)
-	defer db.Close()
-	assert.Equal(t, 0, db.opts.AutoCheckpointAfter)
+	for _, after := range []int{0, 1} {
+		db, err := testOpen(t, filepath.Join(t.TempDir(), "t.db"),
+			Options{DisableAutoCheckpoint: true, AutoCheckpointAfter: after, InProcess: true})
+		require.NoError(t, err)
+		assert.Equal(t, 0, db.opts.AutoCheckpointAfter)
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		_, err = tx.CreateNamespace("data")
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+		for i := range 10 {
+			tx, err := db.BeginWrite()
+			require.NoError(t, err)
+			ns, err := tx.GetNamespace("data")
+			require.NoError(t, err)
+			require.NoError(t, tx.Put(ns, fmt.Appendf(nil, "key-%04d", i), make([]byte, 100)))
+			require.NoError(t, tx.Commit())
+		}
+		idx := db.pager.wal.index
+		assert.Zero(t, idx.nBackfill.Load(), "AutoCheckpointAfter %d: a checkpoint ran", after)
+		assert.GreaterOrEqual(t, idx.maxFrame.Load(), uint32(11), "AutoCheckpointAfter %d", after)
+		require.NoError(t, db.Close())
+	}
 }
 
 // === CreateNamespace error paths (line 323) — 85% ===

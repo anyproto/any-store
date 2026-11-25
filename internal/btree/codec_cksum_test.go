@@ -123,3 +123,36 @@ func TestCksumCodec_OnError_FiresWhenVerifyOff(t *testing.T) {
 		t.Fatal("onError should fire even with verify off")
 	}
 }
+
+func TestVerifyPageChecksum_GoodPage(t *testing.T) {
+	page := make([]byte, 4096)
+	for i := range page[:4080] {
+		page[i] = byte(i)
+	}
+	StampPageChecksum(page)
+	if !VerifyPageChecksum(page) {
+		t.Fatal("good page reported as bad")
+	}
+}
+
+func TestVerifyPageChecksum_BadPage(t *testing.T) {
+	page := make([]byte, 4096)
+	StampPageChecksum(page)
+	page[100] ^= 0xff
+	if VerifyPageChecksum(page) {
+		t.Fatal("corrupted page reported as good")
+	}
+}
+
+// A buffer whose length is not a page size fails, even with a valid trailer:
+// the 100 bytes are stamped first, so only the size check can refuse them.
+func TestVerifyPageChecksum_RejectsBadSize(t *testing.T) {
+	buf := make([]byte, 100)
+	for i := range buf {
+		buf[i] = byte(i)
+	}
+	StampPageChecksum(buf)
+	if VerifyPageChecksum(buf) {
+		t.Fatal("non-page-sized buffer should not pass")
+	}
+}

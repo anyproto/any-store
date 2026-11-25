@@ -18,7 +18,7 @@ func TestBtreeHNSWDeletePersist(t *testing.T) {
 	queries, _ := randVectors(40, dim, 88)
 
 	db := openTestDB(t, true)
-	idx, err := OpenBtreeHNSW(db, "emb", dim, L2)
+	idx, err := openBtreeHNSW(db, "emb", dim, L2)
 	require.NoError(t, err)
 	idx.SetEf(64)
 	for i := range vecs {
@@ -44,7 +44,7 @@ func TestBtreeHNSWDeletePersist(t *testing.T) {
 	}
 
 	// reopen: tombstones must survive
-	idx2, err := OpenBtreeHNSW(db, "emb", dim, L2)
+	idx2, err := openBtreeHNSW(db, "emb", dim, L2)
 	require.NoError(t, err)
 	idx2.SetEf(64)
 	require.Equal(t, n-len(del), idx2.Len(), "live count after reload")
@@ -72,7 +72,7 @@ func TestBtreeWriteAmplification(t *testing.T) {
 	db, err := btree.Open(":memory:", btree.Options{InMemory: true})
 	require.NoError(t, err)
 	defer db.Close()
-	idx, err := OpenBtreeHNSW(db, "emb", dim, L2)
+	idx, err := openBtreeHNSW(db, "emb", dim, L2)
 	require.NoError(t, err)
 
 	// --- inserts: flush one at a time to attribute cost per insert ---

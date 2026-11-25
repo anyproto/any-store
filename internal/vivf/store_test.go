@@ -151,6 +151,159 @@ func TestStoreSearchDimMismatch(t *testing.T) {
 	}
 }
 
+// An earlier release stored an NProbe of 2^32 in the meta record's four bytes
+// as 0. The index opens with the default instead, as a definition with
+// NProbe 0 does, and a search probes cells and finds a stored vector; a
+// rebuild writes the default to the record, also a rebuild of an index whose
+// vectors were all deleted, which keeps its centroids and rewrites the
+// record.
+func TestStoreStoredNProbeZeroIsTheDefault(t *testing.T) {
+	const dim, n = 16, 200
+	for _, emptied := range []bool{false, true} {
+		t.Run(fmt.Sprintf("emptied=%v", emptied), func(t *testing.T) {
+			vecs := clusteredVecs(n, dim, 4, 3)
+			db := openMem(t)
+			buildStore(t, db, StoreParams{Dim: dim, NList: 4, Assign: 1, NProbe: 4, Seed: 1}, vecs)
+
+			wtx, err := db.BeginWrite()
+			require.NoError(t, err)
+			vmeta, err := wtx.GetNamespace("ivf" + nsMeta)
+			require.NoError(t, err)
+			b, err := wtx.Get(vmeta, metaKey)
+			require.NoError(t, err)
+			mt, err := decodeMeta(b)
+			require.NoError(t, err)
+			mt.nprobe = 0
+			require.NoError(t, wtx.Put(vmeta, metaKey, encodeMeta(mt)))
+			require.NoError(t, wtx.Commit())
+
+			inRead(t, db, func(rtx *btree.ReadTx) {
+				ix, err := OpenTx(rtx, "ivf")
+				require.NoError(t, err)
+				require.Equal(t, defaultNProbe, ix.NProbe())
+				cands, err := ix.SearchCandidates(rtx, vecs[17], 5)
+				require.NoError(t, err)
+				require.NotEmpty(t, cands)
+				require.Equal(t, bid(17), cands[0].DocID)
+			})
+
+			if emptied {
+				wtx, err = db.BeginWrite()
+				require.NoError(t, err)
+				ix, err := OpenTx(&wtx.ReadTx, "ivf")
+				require.NoError(t, err)
+				for i := range n {
+					_, err = ix.Delete(wtx, bid(i))
+					require.NoError(t, err)
+				}
+				require.NoError(t, wtx.Commit())
+			}
+
+			wtx, err = db.BeginWrite()
+			require.NoError(t, err)
+			_, err = Rebuild(wtx, "ivf")
+			require.NoError(t, err)
+			require.NoError(t, wtx.Commit())
+			inRead(t, db, func(rtx *btree.ReadTx) {
+				ix, err := OpenTx(rtx, "ivf")
+				require.NoError(t, err)
+				st, err := ix.Stats(rtx)
+				require.NoError(t, err)
+				require.Equal(t, defaultNProbe, st.NProbe, "the rebuilt record")
+				if emptied {
+					require.Zero(t, st.Count)
+				}
+			})
+		})
+	}
+}
+
+// A closure above 255, which an earlier release took and stored in an index's
+// meta record, places a vector in at most 255 cells, the count its :doc
+// record holds in one byte: an insert into such an index writes 255 entries
+// and a delete removes all of them, where 300 left the cells it could not
+// count behind. A build and a rebuild of the closure place every vector in
+// 255 cells, and write 255 to the record.
+func TestStoreClosureAbove255(t *testing.T) {
+	const dim, n, closure = 2, 300, 300
+	vecs := clusteredVecs(n, dim, n, 5)
+	db := openMem(t)
+	buildStore(t, db, StoreParams{Dim: dim, NList: n, Assign: closure, NProbe: 4, Seed: 1}, vecs)
+	cellsAre := func(want int) {
+		t.Helper()
+		inRead(t, db, func(rtx *btree.ReadTx) {
+			ns, err := rtx.GetNamespace("ivf" + nsCell)
+			require.NoError(t, err)
+			got, err := rtx.Count(ns)
+			require.NoError(t, err)
+			require.Equal(t, want, got)
+			ix, err := OpenTx(rtx, "ivf")
+			require.NoError(t, err)
+			st, err := ix.Stats(rtx)
+			require.NoError(t, err)
+			require.Equal(t, maxDocCells, st.Assign)
+		})
+	}
+	cellsAre(n * maxDocCells)
+
+	// The meta record as an earlier release wrote it.
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	vmeta, err := wtx.GetNamespace("ivf" + nsMeta)
+	require.NoError(t, err)
+	b, err := wtx.Get(vmeta, metaKey)
+	require.NoError(t, err)
+	mt, err := decodeMeta(b)
+	require.NoError(t, err)
+	mt.assign = closure
+	require.NoError(t, wtx.Put(vmeta, metaKey, encodeMeta(mt)))
+	require.NoError(t, wtx.Commit())
+
+	extra := clusteredVecs(1, dim, 1, 9)[0]
+	wtx, err = db.BeginWrite()
+	require.NoError(t, err)
+	ix, err := OpenTx(&wtx.ReadTx, "ivf")
+	require.NoError(t, err)
+	require.NoError(t, ix.Insert(wtx, bid(n), extra))
+	vdoc, err := wtx.GetNamespace("ivf" + nsDoc)
+	require.NoError(t, err)
+	rec, err := wtx.Get(vdoc, bid(n))
+	require.NoError(t, err)
+	_, cells := decodeDocCells(rec)
+	require.Len(t, cells, maxDocCells)
+	vcell, err := wtx.GetNamespace("ivf" + nsCell)
+	require.NoError(t, err)
+	got, err := wtx.Count(vcell)
+	require.NoError(t, err)
+	require.Equal(t, (n+1)*maxDocCells, got)
+	removed, err := ix.Delete(wtx, bid(n))
+	require.NoError(t, err)
+	require.True(t, removed)
+	got, err = wtx.Count(vcell)
+	require.NoError(t, err)
+	require.Equal(t, n*maxDocCells, got, "a delete removes every entry the insert wrote")
+	require.NoError(t, wtx.Commit())
+
+	wtx, err = db.BeginWrite()
+	require.NoError(t, err)
+	_, err = Rebuild(wtx, "ivf")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Commit())
+	cellsAre(n * maxDocCells)
+}
+
+// inRead runs check in a read transaction of db, rolled back whatever check
+// does: a failed require ends the test's goroutine, and a read transaction
+// it left open would make the cleanup's db.Close wait for it until the
+// package timed out.
+func inRead(t *testing.T, db *btree.DB, check func(rtx *btree.ReadTx)) {
+	t.Helper()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	check(rtx)
+}
+
 // TestStoreRecallReal builds the index on the real export and confirms its
 // recall@10 against the exact ground truth (HNSW reaches ~0.97 on it).
 func TestStoreRecallReal(t *testing.T) {

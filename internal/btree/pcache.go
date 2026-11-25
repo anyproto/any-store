@@ -137,18 +137,20 @@ type pcache struct {
 	// END ENCRYPTION
 }
 
-// DRIFT: newPcache pre-sizes hash to capacity; SQLite always seeds exactly 256 buckets See docs/btree/NOTES.md#drift-130-newpcache-hash-table-pre-sized-to-capacity
+// DRIFT: newPcache pre-sizes hash to capacity, up to maxHashPresize; SQLite always seeds exactly 256 buckets See docs/btree/NOTES.md#drift-130-newpcache-hash-table-pre-sized-to-capacity
 func newPcache(pageSize, maxPages int, purgeable bool) *pcache {
 	if maxPages <= 0 {
 		maxPages = defaultCacheSize
 	}
 	return &pcache{
 		// Seed apHash from maxPages rounded up to a power of two (floor 256, the
-		// same floor pcache1ResizeHash uses, pcache1.c:543). Sizing the table to
-		// the configured cache up front avoids the early doublings a cache would
-		// otherwise pay while filling. The hash still grows via resizeHash if a
-		// hard-create burst pushes nPage past nHash (load factor 1.0).
-		apHash:    make([]*page, hashSizeFor(maxPages)),
+		// same floor pcache1ResizeHash uses, pcache1.c:543), up to
+		// maxHashPresize. Sizing the table to the configured cache up front
+		// avoids the early doublings a cache would otherwise pay while filling.
+		// The hash grows via resizeHash when nPage reaches nHash (load factor
+		// 1.0): past maxHashPresize, and when a hard-create burst pushes the
+		// cache past maxPages.
+		apHash:    make([]*page, hashSizeFor(min(maxPages, maxHashPresize))),
 		maxPages:  maxPages,
 		pageSize:  pageSize,
 		purgeable: purgeable,
@@ -160,6 +162,15 @@ func newPcache(pageSize, maxPages int, purgeable bool) *pcache {
 // minHashSize is the smallest apHash table size, matching SQLite's
 // pcache1ResizeHash floor (pcache1.c:543: "if( nNew<256 ) nNew = 256").
 const minHashSize = 256
+
+// maxHashPresize is the largest apHash a new cache is given (65,536 buckets:
+// 512 KiB of pointers on a 64-bit target, 256 KiB on a 32-bit one). A cache
+// configured for more pages starts at it and grows the table as pages
+// arrive, as SQLite's grows from 256 (pcache1ResizeHash): the doublings past
+// it cost little next to reading that many pages in, and a configured size
+// is not an allocation the process has to be able to make up front, once
+// per cache, readers included.
+const maxHashPresize = 1 << 16
 
 // hashSizeFor returns the smallest power of two >= n that is also >= minHashSize.
 // Used to seed apHash so pgno & (nHash-1) is a valid bucket mask.

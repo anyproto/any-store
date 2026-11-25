@@ -110,7 +110,7 @@ plain DBs simply stay plain.
 | `PRAGMA checksum_verification = ON` (default) | default — corrupt reads fail with `ErrCodecTamper` |
 | `PRAGMA checksum_verification = OFF` (forensic) | `Config.ContinueOnIntegrityError = true` (cksum mode only) |
 | `SELECT count(*), verify_checksum(data) FROM sqlite_dbpage GROUP BY 2` | `(*DB).VerifyIntegrity(ctx) (IntegrityReport, error)` |
-| `verify_checksum(BLOB)` SQL function | `anystore.VerifyPageChecksum([]byte) bool` |
+| `verify_checksum(BLOB)` SQL function | none exported (`btree.VerifyPageChecksum` inside the module); `VerifyIntegrity` checks every page in checksum and AEAD modes, and reports `IntegrityNone`, with no page scanned, for a plain or in-memory database |
 | auto-enable on open with reserve_bytes==8 | automatic: `IntegrityMode()` reports state |
 | `SQLITE_IOERR_DATA` on read | `ErrCodecTamper` returned + `OnIntegrityError` callback fires |
 
@@ -132,10 +132,14 @@ attack). We refuse and return `ErrAEADIntegrityVerifyMandatory`.
 
 ## How `OnIntegrityError` works
 
-The hook belongs to the database, not to the codec: one codec object
-can serve several databases (`Options.Codec` is installed as given),
-so a hook stored in the codec would go to whichever database set it
-last. `installCodec` stores `Options.OnIntegrityError` on the pager
+The hook belongs to the database, not to the codec. A database opened
+through `anystore.Open` gets a codec of its own, from its
+`Config.Encryption` or its checksum mode, and its `Config.OnIntegrityError`
+receives that database's failures. Inside the module one codec object can
+serve several databases: the b-tree's `Options.Codec`, a hook for the
+b-tree's own tests that `anystore` does not expose, is installed as given,
+so a hook stored in the codec would go to whichever database set it last.
+`installCodec` stores `Options.OnIntegrityError` on the pager
 (`pager.onIntegrityError`), which copies it to its WAL, and every
 `Decrypt` the pager or the WAL makes passes it in (`codec.go`,
 `integrityHook`). The codec reports to the hook of the call:

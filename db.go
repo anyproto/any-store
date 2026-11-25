@@ -1,12 +1,13 @@
 package anystore
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
 	"log"
-	"runtime"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -122,7 +123,7 @@ type DB interface {
 	// Wait".
 	//
 	// The copy is a database of the source's kind: checksummed, encrypted
-	// with the same passphrase, key or codec, or plain when the source is
+	// with the same passphrase or key, or plain when the source is
 	// plain. An in-memory database has no checksums, so its copy is plain,
 	// or encrypted when it was opened with Encryption. An encrypted copy
 	// keeps the KDF salt of the file at path, or draws one when it creates
@@ -160,8 +161,8 @@ type DB interface {
 	// Close closes the database connection.
 	// Returns an error if there is an issue closing the connection.
 	//
-	// Close waits, with no timeout, for every read transaction of this DB
-	// to end. A ReadTx ends with its Commit. An Iterator opened with a
+	// Close waits, with no timeout and no context to end the wait, for
+	// every read transaction of this DB to end. A ReadTx ends with its Commit. An Iterator opened with a
 	// context that carries no transaction can hold a read transaction of
 	// its own until its Close. An Iterator opened inside a transaction
 	// holds none, and ends with that transaction. A read transaction that
@@ -256,6 +257,9 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 	if config == nil {
 		config = &Config{}
 	}
+	if err := config.validate(); err != nil {
+		return nil, err
+	}
 	config.setDefaults()
 
 	// One name for the database file, its WAL and its sentinel file, as
@@ -297,20 +301,13 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 	var quickCheckNeeded bool
 	ds.recoveryController, quickCheckNeeded = ds.createRecoveryController(ctx, path)
 
-	cacheSize := config.CacheSize
-	if cacheSize <= 0 {
-		cacheSize = 5000
-	}
-	// Concurrent read transactions are bounded by a semaphore (each live reader
-	// holds its own page cache). The default scales with the host — max(NumCPU-1,
-	// 4) — so concurrent $text/Find reads aren't artificially serialized on a
-	// multi-core machine, while staying modest on small devices. Reader caches are
-	// created lazily up to this cap, so RAM follows actual concurrency, not the
-	// cap. Override via Config.ReadConcurrency.
-	readConcurrency := config.ReadConcurrency
-	if readConcurrency <= 0 {
-		readConcurrency = max(runtime.NumCPU()-1, 4)
-	}
+	cacheSize, readConcurrency := config.cacheSizes()
+	// The btree keeps a copy of the caller's passphrase or key, which the
+	// caller may clear once Open returns: Backup opens its destination with
+	// it (BackupDestinationOptions), and a cleared buffer would encrypt the
+	// copy with another key. nil stays nil, no encryption.
+	key := bytes.Clone(config.Encryption.Passphrase)
+
 	// Page-level integrity is on by default for non-encrypted databases.
 	// XXH3-128 trailer per page costs <1% on writes and is invisible on
 	// reads. Encrypted databases get stronger integrity from the
@@ -327,10 +324,9 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		DisableAutoCheckpoint: config.DisableAutoCheckpoint,
 		AutoCheckpointAfter:   config.AutoCheckpointAfter,
 		UsePageSlab:           config.UseGlobalPageBuffer,
-		Key:                   config.Encryption.Passphrase,
+		Key:                   key,
 		KDFIterations:         config.Encryption.KDFIterations,
 		CipherType:            config.Encryption.CipherType,
-		Codec:                 config.Encryption.Codec,
 		MmapSize:              config.MmapSize,
 		Checksum:              !config.Encryption.Enabled() && !config.InMemory,
 		SchemaFormat:          createFormat,
@@ -2394,7 +2390,9 @@ func vectorDefMatches(vv *anyenc.Value, p *VectorParams) bool {
 		quant == int(p.Quantization) &&
 		mode == int(p.Mode) &&
 		hvc == p.HybridCacheVectors &&
-		cr == p.CompactRatio &&
+		// A NaN ratio is refused for a new index, but an earlier release
+		// stored it; NaN != NaN, so two NaNs are compared as the same value.
+		(cr == p.CompactRatio || math.IsNaN(cr) && math.IsNaN(p.CompactRatio)) &&
 		nlist == p.NList &&
 		nprobe == p.NProbe &&
 		closure == p.Closure

@@ -627,7 +627,12 @@ func Open(path string, opts Options) (*DB, error) {
 	if opts.CacheSize <= 0 {
 		opts.CacheSize = defaultCacheSize
 	}
-	if opts.AutoCheckpointAfter == 0 && !opts.DisableAutoCheckpoint {
+	// DisableAutoCheckpoint wins over a threshold set alongside it: no commit
+	// checkpoints, as with SQLite's wal_autocheckpoint=0. The commit-time
+	// check (WriteTx.Commit) reads only the threshold.
+	if opts.DisableAutoCheckpoint {
+		opts.AutoCheckpointAfter = 0
+	} else if opts.AutoCheckpointAfter == 0 {
 		opts.AutoCheckpointAfter = AutoCheckpointThreshold
 	}
 

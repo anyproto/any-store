@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1153,6 +1154,105 @@ func TestDb_CloseFromModifier(t *testing.T) {
 	require.NoError(t, err)
 	assertQueryCount(t, coll.Find(`{"touched":1}`), 0)
 	assertQueryCount(t, coll.Find(nil), 10)
+}
+
+// An unknown Durability.FlushMode fails Open with ErrInvalidConfig, AutoFlush
+// on or off, before anything is created or registered, so a later Open of the
+// path in the process opens it.
+func TestOpen_InvalidFlushMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	for _, autoFlush := range []bool{true, false} {
+		d, err := anystore.Open(ctx, path, &anystore.Config{Durability: anystore.DurabilityConfig{AutoFlush: autoFlush, FlushMode: "CHECKPOINT_SOMETIMES"}})
+		require.ErrorIs(t, err, anystore.ErrInvalidConfig)
+		require.ErrorContains(t, err, "Durability.FlushMode")
+		require.Nil(t, d)
+	}
+	_, statErr := os.Stat(path)
+	require.ErrorIs(t, statErr, os.ErrNotExist, "a refused Open creates no file")
+
+	for _, mode := range []anystore.FlushMode{"", anystore.FlushModeCheckpointPassive, anystore.FlushModeCheckpointFull, anystore.FlushModeCheckpointRestart, anystore.FlushModeCheckpointTruncate} {
+		d, err := anystore.Open(ctx, path, &anystore.Config{Durability: anystore.DurabilityConfig{AutoFlush: true, FlushMode: mode}})
+		require.NoError(t, err, "flush mode %q", mode)
+		require.NoError(t, d.Close())
+	}
+}
+
+// Open with the largest CacheSize and ReadConcurrency returns promptly and the
+// database works: both are clamped (Config.CacheSize, Config.ReadConcurrency),
+// and the path opens again once it is closed.
+func TestOpen_HugeCacheSizeAndReadConcurrency(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	type opened struct {
+		d   anystore.DB
+		err error
+	}
+	done := make(chan opened, 1)
+	go func() {
+		d, err := anystore.Open(ctx, path, &anystore.Config{CacheSize: math.MaxInt, ReadConcurrency: math.MaxInt})
+		done <- opened{d, err}
+	}()
+	var o opened
+	select {
+	case o = <-done:
+	case <-time.After(time.Minute):
+		t.Fatal("Open with the largest CacheSize and ReadConcurrency did not return")
+	}
+	require.NoError(t, o.err)
+	coll, err := o.d.Collection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	n, err := coll.Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	require.NoError(t, o.d.Close())
+
+	d, err := anystore.Open(ctx, path, nil)
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+}
+
+// A passphrase's KDFIterations past 2^31-1 (on a 32-bit target, the largest
+// int) fails Open with ErrInvalidConfig at once, before anything is created:
+// the count is part of the key, so it is not clamped, and PBKDF2 never
+// returned with the largest int. A 32-byte passphrase is the key itself and
+// ignores the count. The path then opens with a valid count.
+func TestOpen_KDFIterationsBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	counts := []int{math.MaxInt}
+	if over := int64(math.MaxInt32) + 1; over <= math.MaxInt {
+		counts = append(counts, int(over))
+	}
+	for _, n := range counts {
+		d, err := anystore.Open(ctx, path, &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: []byte("pw"), KDFIterations: n}})
+		require.ErrorIs(t, err, anystore.ErrInvalidConfig)
+		require.ErrorContains(t, err, "Encryption.KDFIterations")
+		require.Nil(t, d)
+	}
+	_, statErr := os.Stat(path)
+	require.ErrorIs(t, statErr, os.ErrNotExist, "a refused Open creates no file")
+
+	d, err := anystore.Open(ctx, path, &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: []byte("pw"), KDFIterations: 1000}})
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+
+	raw := filepath.Join(t.TempDir(), "raw")
+	d, err = anystore.Open(ctx, raw, &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: make([]byte, 32), KDFIterations: math.MaxInt}})
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+}
+
+// An unknown CipherType is an ErrInvalidConfig error of Open, with a
+// passphrase or a 32-byte key, and creates no file.
+func TestOpen_UnknownCipherType(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	for _, pass := range [][]byte{[]byte("pw"), make([]byte, 32)} {
+		d, err := anystore.Open(ctx, path, &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: pass, CipherType: "rot13", KDFIterations: 1000}})
+		require.ErrorIs(t, err, anystore.ErrInvalidConfig)
+		require.ErrorContains(t, err, "Encryption.CipherType")
+		require.Nil(t, d)
+	}
+	_, statErr := os.Stat(path)
+	require.ErrorIs(t, statErr, os.ErrNotExist, "a refused Open creates no file")
 }
 
 // A checkpoint that meets a frame the log does not hold (the wal-index

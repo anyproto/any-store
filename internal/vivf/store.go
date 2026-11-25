@@ -26,19 +26,23 @@ type Candidate struct {
 type StoreParams struct {
 	Dim       int
 	NList     int
-	Assign    int  // closure factor: each vector placed in its Assign nearest cells
+	Assign    int  // closure factor: each vector placed in its Assign nearest cells, at most maxDocCells
 	NProbe    int  // default cells scanned per search
 	Normalize bool // cosine: store/query unit-normalized vectors
 	KMeansPP  bool
 	Seed      int64
 }
 
+// defaultNProbe is the cells a search probes when the index names none.
+const defaultNProbe = 16
+
 func (p *StoreParams) withDefaults() {
 	if p.Assign < 1 {
 		p.Assign = 1
 	}
+	p.Assign = min(p.Assign, maxDocCells)
 	if p.NProbe < 1 {
-		p.NProbe = 16
+		p.NProbe = defaultNProbe
 	}
 }
 
@@ -452,8 +456,14 @@ func (ix *StoreIndex) putDocCells(wtx *btree.WriteTx, docID []byte, label uint32
 	return wtx.Put(ix.vdoc, docID, appendDocCells(make([]byte, 0, 4+1+4*len(cells)), label, cells))
 }
 
+// maxDocCells is the most cells a vector is placed in: its :doc record holds
+// the count in one byte. A larger closure, which an earlier release took and
+// stored in an index's meta record, is taken as this one: placed in 256 cells,
+// a vector's count would read 0, and a delete would leave its entries in them.
+const maxDocCells = 1<<8 - 1
+
 // appendDocCells appends the :doc record of a vector to buf: label(le32), the
-// cell count (one byte), then each cell(le32).
+// cell count (one byte, at most maxDocCells), then each cell(le32).
 func appendDocCells[C int | int32](buf []byte, label uint32, cells []C) []byte {
 	buf = binary.LittleEndian.AppendUint32(buf, label)
 	buf = append(buf, byte(len(cells)))
@@ -499,7 +509,16 @@ func OpenTx(rtx *btree.ReadTx, prefix string) (*StoreIndex, error) {
 	}
 	ix.build = mt.build
 	ix.dim, ix.nlist = mt.dim, mt.nlist
-	ix.nprobe, ix.assign, ix.normalize = mt.nprobe, mt.assign, mt.normalize
+	ix.nprobe, ix.assign, ix.normalize = mt.nprobe, min(mt.assign, maxDocCells), mt.normalize
+	if ix.nprobe < 1 {
+		// No build stores 0 (withDefaults), but an earlier release stored an
+		// NProbe of 2^32 or a multiple of it in four bytes, as 0: a search
+		// probing no cell finds nothing. Take the default, as a definition
+		// with NProbe 0 does. A count past NList needs no bound here: the
+		// search ranks the NList cells and probes at most all of them
+		// (nearestCellsInto).
+		ix.nprobe = defaultNProbe
+	}
 	ix.byteDist = simd.AcceleratedFloatByte()
 
 	cb, err := rtx.Get(ix.vcb, coarseKey)
@@ -682,6 +701,10 @@ func Rebuild(wtx *btree.WriteTx, prefix string) (*StoreIndex, error) {
 			return nil, err
 		}
 		mt.count, mt.nextLabel = 0, 0
+		// The count of cells a search probes, as the index opened with it:
+		// a 0 an earlier release stored is written back as the default, as
+		// the build below writes it for an index with vectors.
+		mt.nprobe = old.nprobe
 		mt.churn, mt.driftSum, mt.driftN = 0, 0, 0
 		mt.buildCount = 1 // churn-ratio denominator; a build never has n=0 otherwise
 		mt.build = newBuild()

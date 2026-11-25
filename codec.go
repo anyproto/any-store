@@ -2,25 +2,6 @@ package anystore
 
 import "github.com/anyproto/any-store/v2/internal/btree"
 
-// Codec is the pluggable page-encryption interface. Implement this to
-// provide a custom AEAD (HSM-backed, external key management, or any
-// authenticated cipher not offered by the built-in CipherType values).
-//
-// The pager installs one Codec per DB and routes every file / WAL I/O
-// site through it. Implementations must be safe for concurrent use:
-// a single Codec serves the writer and all reader goroutines.
-//
-// Overhead() bytes are reserved at the end of every page for codec
-// metadata (nonce, tag, any padding). The btree cell layout automatically
-// respects this via (page_size - reserve_size). Must be constant for the
-// codec's lifetime and a multiple of 16 (AES block size) for alignment.
-//
-// Encrypt/Decrypt operate on full-page buffers. src and dst are both
-// exactly pageSize; dst must not alias src. The 1-based page number pgno
-// is bound into the authentication tag as associated data so that moving
-// a page to a different file offset invalidates its MAC.
-type Codec = btree.Codec
-
 // CipherType selects a built-in AEAD. See the individual constants for
 // trade-offs.
 type CipherType = btree.CipherType
@@ -39,10 +20,9 @@ const CipherChaCha20Poly1305 = btree.CipherChaCha20Poly1305
 // is a concern.
 const CipherXChaCha20Poly1305 = btree.CipherXChaCha20Poly1305
 
-// ErrPageIntegrity is the umbrella error returned (wrapped) by every
-// codec when a page fails its on-disk integrity check, regardless of
-// mode. Callers match it with errors.Is to handle both the cksum-only
-// and AEAD modes uniformly:
+// ErrPageIntegrity is the umbrella error returned (wrapped) when a page
+// fails its on-disk integrity check, regardless of mode. Callers match it
+// with errors.Is to handle both the cksum-only and AEAD modes uniformly:
 //
 //	if errors.Is(err, anystore.ErrPageIntegrity) { ... }
 //
@@ -55,34 +35,6 @@ const CipherXChaCha20Poly1305 = btree.CipherXChaCha20Poly1305
 // but ErrWrongKey; a page that fails its authentication once Open has
 // returned is damaged, the key being proven by then.
 var ErrPageIntegrity = btree.ErrPageIntegrity
-
-// NewAESCodec constructs a codec using AES-256-GCM with a raw 32-byte key.
-// Prefer EncryptionConfig.Passphrase for the common passphrase-based case;
-// use this directly when managing key material externally (HSM, KMS, etc).
-func NewAESCodec(key []byte) (Codec, error) {
-	return btree.NewAESCodec(key)
-}
-
-// NewChaCha20Poly1305Codec constructs a ChaCha20-Poly1305 codec with a
-// raw 32-byte key.
-func NewChaCha20Poly1305Codec(key []byte) (Codec, error) {
-	return btree.NewChaCha20Poly1305Codec(key)
-}
-
-// NewXChaCha20Poly1305Codec constructs an XChaCha20-Poly1305 codec with a
-// raw 32-byte key. 24-byte nonce.
-func NewXChaCha20Poly1305Codec(key []byte) (Codec, error) {
-	return btree.NewXChaCha20Poly1305Codec(key)
-}
-
-// DeriveKey stretches a user passphrase to a 32-byte AES key using
-// PBKDF2-HMAC-SHA256 against the supplied salt. Iterations defaults to
-// 256,000 (SQLCipher v4 default) when <= 0. Exposed for users who need
-// to derive keys for BYO codecs; normal usage should set
-// EncryptionConfig.Passphrase directly.
-func DeriveKey(passphrase, salt []byte, iterations int) []byte {
-	return btree.DeriveKey(passphrase, salt, iterations)
-}
 
 // DefaultKDFIterations is the PBKDF2 iteration count used when
 // EncryptionConfig.KDFIterations is zero.

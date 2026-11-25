@@ -188,11 +188,15 @@ build per query and carry no such guarantee.
     shape would make a filter built from an empty list match nothing or
     everything depending on the operator, and a `Delete` with it could empty
     the collection; a caller that means "every document" passes `{}` or a
-    nil filter. Pinned by `TestParseCondition_EmptyObjectMatchesAll` and
+    nil filter. The Go values are not parsed and keep that arithmetic:
+    `query.And{}` and `query.Nor{}` match every document and `query.Or{}`
+    none, on every verb, `Delete` included; build one from a list only
+    where an empty list should mean that. Pinned by
+    `TestParseCondition_EmptyObjectMatchesAll` and
     `TestParseCondition_EmptyLogicalArrayRejected` (query/cond_parse_test.go)
     and, through every verb, by `TestQuery_EmptyObjectInLogicalOperator` and
     `TestQuery_EmptyLogicalArrayIsParseError` (test/query_test.go).
-    `{"$all":[]}` is accepted and matches no document, as in MongoDB: not
+    `{"tags":{"$all":[]}}` is accepted and matches no document, as in MongoDB: not
     one whose array is empty, not one without the field. It is the empty
     `$in`, so a conjunct of it makes the whole filter match nothing (the
     query layer answers without a scan, as for `{"$in":[]}`), and its
@@ -333,3 +337,132 @@ build per query and carry no such guarantee.
     differently under two plans, and a `Limit` that cuts through the group
     returns different rows. A total order needs a unique last sort field:
     `Sort("field", "id")`.
+
+17. **Update modifiers treat missing and mistyped fields as MongoDB does.**
+    A missing field is created by `$set`, by `$inc` (with the increment as
+    its value), and by `$push` and `$addToSet`, which make it an array
+    holding the value: `{"$push":{"tags":"a"}}` on `{"id":1}` gives
+    `{"id":1,"tags":["a"]}`. `$unset`, `$rename`, `$pop`, `$pull` and
+    `$pullAll` leave a missing field missing and create no part of a missing
+    path: `{"$pull":{"meta.old":"x"},"$set":{"seen":true}}` on `{"id":1}`
+    gives `{"id":1,"seen":true}`, with no `meta`, and so does a path through
+    an index past an array's end (`items.3.tags` on `{"items":[]}`). A path
+    the document cannot hold, through a field of a scalar or a name in an
+    array (`a.b` on `{"a":1}`, `items.bad.tags` on `{"items":[]}`), is a
+    no-op for `$unset` and an error for `$rename`'s source, `$pop`, `$pull`
+    and `$pullAll`, as in MongoDB (`PathNotViable`). For these five, a part
+    is an index into an array only when it is decimal digits, with no sign,
+    up to 2^32−1, as MongoDB reads one: `items.+0` and `items.-0` are names,
+    so on `{"items":[[1,2]]}` a `$pull` of `items.+0` is an error and an
+    `$unset` of it changes nothing. An array operator
+    (`$push`, `$addToSet`, `$pop`, `$pull`, `$pullAll`) on a field that
+    holds anything else, `null` included, is an error (`$push: field 'tags'
+    must be an array: …`), and `$inc` on a non-number is one too; the update
+    then writes nothing. `$push` and `$addToSet` take one value: MongoDB's
+    `$each` form (with `$position`, `$slice` and `$sort` for `$push`) is not
+    supported, and an operand MongoDB reads as that form is a parse error,
+    not a value to store: for `$push` an object with an `$each` key, for
+    `$addToSet` one whose first key is `$each`. Any other operand is a
+    value, an object with keys that start with `$` included:
+    `{"$push":{"refs":{"$ref":"users","$id":7}}}` appends the reference, as
+    MongoDB does. `$set`, `$push` and
+    `$addToSet` store a copy of their operand, as MongoDB copies it into
+    each document (a number, a bool, null, an object id or a date, which
+    nothing changes in place, is stored as itself): every document an
+    update reaches gets a value of its own, and a later operation of the
+    same modifier that changes it
+    (`{"$push":{"p":{"n":1}},"$inc":{"p.0.n":1}}`), or a write through the
+    bytes a result's `GetStringBytes`, `GetBytes` or `GetVectorF32` returns,
+    changes that document's copy, never the modifier or the next document.
+    A modifier given as an `*anyenc.Value` is copied when it is parsed, and
+    nests at most 512 levels, the modifier object being the first.
+    `UpsertId` of an id with no document inserts what the modifier makes of
+    `{<primary key>: id}`, as MongoDB's upsert inserts the query's equality
+    fields with the update applied: `{"id":1,"tags":["a"]}` for the `$push`
+    above, and `{"id":1}` alone for a modifier that reports no change (a
+    lone `$pull` or `$unset`), built from the id whatever such a modifier
+    did to the document it was handed. The id is immutable there as on an
+    existing document: a modifier that changes it to another value fails
+    with `ErrPrimaryKeyModification`, one that removes it (`$unset`) with
+    `ErrDocWithoutId`, and one that makes it an array with
+    `ErrArrayPrimaryKey`.
+    Pinned by `TestModifierPush_Modify` and its siblings,
+    `TestModifier_RemovalsCreateNoPath`,
+    `TestModifier_RemovalPathViability`,
+    `TestParseModifier_PushModifiersRefused`,
+    `TestModifier_ObjectOperandsAreCopied`,
+    `TestModifier_ByteOperandsAreCopied` and
+    `TestParseModifier_GoValueBoundAndCopied` (query/modifier_test.go), and
+    through the collection by `TestCollection_PushMissingField`,
+    `TestCollection_RemovalPathViability`,
+    `TestCollection_UpsertIdNoOpInsertsId`,
+    `TestCollection_UpsertIdUnchangedInsertsId` and
+    `TestCollection_UpsertIdKeepsTheId` (test/collection_test.go).
+    A numeric path segment sets an array element, padding the array with
+    nulls up to it (`{"$set":{"arr.3":1}}` on `{"arr":[]}` gives
+    `[null,null,null,1]`), but by no more than 1,500,000 nulls, MongoDB's
+    limit: a segment that needs more is an error (`can't backfill more than
+    1500000 elements`) and the update writes nothing. Pinned by
+    `TestModifier_ArrayPaddingIsBounded` and
+    `TestModifier_PaddingRefusalLeavesDocumentUnchanged`.
+
+18. **Numbers are float64.** anyenc stores every number as a float64, so an
+    integer is exact up to 2^53 (9,007,199,254,740,992) in magnitude and a
+    larger one, written as a plain integer literal in JSON or given as a Go
+    integer, is the nearest float64 — in a stored document, a filter
+    operand, an index key and a document id alike. A filter given as a Go
+    value is encoded as JSON, which takes every integer type, `uintptr` and
+    named types included. An integer id given to `FindId`,
+    `FindIdWithParser`, `UpdateId`, `UpsertId` or `DeleteId`, or an integer
+    operand of `query.NewComp`, is an `int`, `uint` or sized integer (`int64`, `uint64`, …): a
+    `uintptr`, or a value of a named type such as `type myInt int64`,
+    panics. (The JSON parser rounds a number written with an exponent
+    twice, the digits and then the scaling, so `9007199254740993e1` becomes
+    `90071992547409920` where `90071992547409930`, the same integer,
+    becomes `90071992547409936`.)
+    Two such integers can be one value: `{"n":9007199254740993}` matches a
+    document whose `n` is `9007199254740992`, and as ids they are one key:
+    with a document of id 2^53 in the collection, `Insert` of id 2^53+1
+    fails with `ErrDocExists`, `UpsertOne` with it replaces that document,
+    and `FindId(2^53+1)` returns it. There is no integer type next to the
+    float (MongoDB has int, long and decimal); integers that can go past
+    2^53 belong in strings. The aggregation arithmetic has the same limit
+    (docs/aggregation.md). Pinned by `TestCollection_IdsPast2To53AreOneKey`
+    and `TestCollection_FilterIntegerTypesPast2To53`
+    (test/collection_test.go).
+
+19. **A `$text` query enforces at most 64 required clauses.** The required
+    clauses are the clauses of `$search` under `"$defaultOperator": "and"`
+    and then those of the `$require` entries, in that order. Each `$require`
+    entry is parsed with the clause syntax, so one entry can be several
+    clauses: `"red blue"` is two, `"\"red blue\""` one phrase. A clause the
+    analyzer reduces to no terms does not count. The first 64 are enforced;
+    every required clause after them still matches and scores, but a
+    document need not satisfy it, as if it were a `$search` clause under the
+    default `or`. `$exclude` entries have no such limit. Pinned by
+    `TestFtsProbe_RequiredBitExhaustion` and, with 63 `$search` clauses and
+    a `$require` entry holding the 64th and 65th,
+    `TestFtsOps_RequiredClausesBudgetSpansSearchAndRequire`
+    (test/fulltext_test.go).
+
+20. **A stored document nests at most 511 levels.** The document is the
+    first level and each object or array in it one more. A write that would
+    store a deeper one — an `Insert`, `UpsertOne` or `UpdateOne` of a value
+    built in an `anyenc.Arena`, a modifier whose path or operand reaches
+    past it, a `$merge`/`$out` result — fails and stores nothing. The
+    parser reads containers 512 levels deep and a compressed document's
+    object one level below its wrapper, so 511 is what every stored
+    document reads back with. MongoDB refuses documents nested past 100
+    levels; JSON input stops at 300 (the parser's limit), so only a value
+    built in Go or a modifier gets near the bound. A value built in Go that
+    contains itself is refused the same way, before anything walks it to
+    the end: the document a `query.ModifyFunc` returns, and an operand of a
+    modifier given as an `*anyenc.Value` (item 17). An id given as an
+    `*anyenc.Value` to `FindId`, `FindIdWithParser`, `UpdateId`, `UpsertId`
+    or `DeleteId` nests at most 511 levels, the id of a 512-level document
+    an earlier release could store uncompressed and that still reads back:
+    such a document is found and deleted by its id, and an update of it is
+    refused like any write past the bound. Pinned by
+    `TestCollection_DocumentDepthBounded` and
+    `TestCollection_SelfContainingValuesRefused` (test/collection_test.go),
+    and `TestCollection_LegacyDeepIdIsLookedUp` (collection_test.go).
