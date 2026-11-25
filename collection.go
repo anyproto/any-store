@@ -663,7 +663,9 @@ func checkIdDepth(id any) error {
 }
 
 // nestsDeeper reports whether v nests objects and arrays more than levels
-// deep, v included.
+// deep, v included. Only a container is walked into: a scalar adds no level,
+// and the call it would take costs more than the check on a document of
+// many scalars.
 func nestsDeeper(v *anyenc.Value, levels int) bool {
 	switch v.Type() {
 	case anyenc.TypeObject:
@@ -673,7 +675,7 @@ func nestsDeeper(v *anyenc.Value, levels int) bool {
 		obj, _ := v.Object()
 		deeper := false
 		obj.Visit(func(_ []byte, f *anyenc.Value) {
-			deeper = deeper || nestsDeeper(f, levels-1)
+			deeper = deeper || isContainer(f) && nestsDeeper(f, levels-1)
 		})
 		return deeper
 	case anyenc.TypeArray:
@@ -682,12 +684,18 @@ func nestsDeeper(v *anyenc.Value, levels int) bool {
 		}
 		arr, _ := v.Array()
 		for _, e := range arr {
-			if nestsDeeper(e, levels-1) {
+			if isContainer(e) && nestsDeeper(e, levels-1) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// isContainer reports whether v is an object or an array.
+func isContainer(v *anyenc.Value) bool {
+	t := v.Type()
+	return t == anyenc.TypeObject || t == anyenc.TypeArray
 }
 
 func (c *collection) insertItem(tx *btree.WriteTx, s *collSchema, buf *syncpool.DocBuffer, it item) (err error) {
