@@ -315,6 +315,31 @@ func TestBackupRoundTrip_OverExistingOfAnotherKind(t *testing.T) {
 	}
 }
 
+// A backup of an in-memory database, whose pages are plain, over a file of
+// checksummed pages is refused with ErrBackupCodecMismatch, which is not
+// corruption, and the file is left as it was.
+func TestBackup_PlainOverChecksummedIsCodecMismatch(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "dst.db")
+	dst, err := anystore.Open(ctx, path, nil)
+	require.NoError(t, err)
+	_, err = dst.CreateCollection(ctx, "dst")
+	require.NoError(t, err)
+	require.NoError(t, dst.Close())
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	src, err := anystore.Open(ctx, "", &anystore.Config{InMemory: true})
+	require.NoError(t, err)
+	defer src.Close()
+	err = src.Backup(ctx, path)
+	require.ErrorIs(t, err, anystore.ErrBackupCodecMismatch)
+	require.NotErrorIs(t, err, anystore.ErrCorrupt)
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+}
+
 // A backup taken while a writer commits is one committed state of the
 // source: with one document per transaction, the documents 0..k-1 for some k.
 func TestBackupRoundTrip_WhileWriting(t *testing.T) {

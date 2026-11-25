@@ -73,6 +73,28 @@ func (s TestSeam) PeerPublish() {
 	copy(region[0:walIndexHdrSize], buf[:])
 }
 
+// PublishIndexVersion writes both copies of the wal-index header as a
+// consistent, checksummed header of the wal-index version this release uses
+// plus delta: what a build of another wal-index version attached to the
+// database publishes.
+func (s TestSeam) PublishIndexVersion(delta int) {
+	w := s.db.pager.wal
+	hdr, valid := w.index.readHeader()
+	if !valid {
+		return
+	}
+	hdr.iVersion = uint32(int(walVersion) + delta)
+	hdr.computeCksum()
+	var buf [walIndexHdrSize]byte
+	hdr.serialize(buf[:])
+	region, err := w.index.shm.region(0, true)
+	if err != nil {
+		return
+	}
+	copy(region[walIndexHdrSize:walIndexHdrSize*2], buf[:])
+	copy(region[0:walIndexHdrSize], buf[:])
+}
+
 // SetBusyTimeout replaces the handle's busy handler with one of the given
 // timeout.
 func (s TestSeam) SetBusyTimeout(d time.Duration) {

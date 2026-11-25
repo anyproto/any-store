@@ -69,7 +69,7 @@
     "sqlite": [
       "backup.c:setDestPgsz"
     ],
-    "note": "the Options a backup's destination is created with: the handle's, with page size, checksum mode and schema format read from the open source file (drift-2026-11-19-2); SQLite tries to give the destination the source's page size here (an existing or WAL destination keeps its own, backup.c:361, 378-383) and takes the reserved bytes from the copied page 1"
+    "note": "the Options a backup's destination is created with: the handle's, with page size, checksum mode and schema format read from the open source file (drift-2026-11-19-2), and a file's locking, not the in-process mode an in-memory source is forced into; SQLite tries to give the destination the source's page size here (an existing or WAL destination keeps its own, backup.c:361, 378-383) and takes the reserved bytes from the copied page 1"
   },
   "backup.go:*DB.BackupInit": {
     "sqlite": [
@@ -892,7 +892,7 @@
       "pager.c:hasHotJournal",
       "pager.c:readJournalHdr"
     ],
-    "note": "hot only with a whole creation header of any-store's magic and an original size of zero; the reserved-lock test is the caller's DB-file lock"
+    "note": "hot only with a whole creation header of any-store's magic and an original size of zero; the reserved-lock test is the caller's DB-file lock; a short read of a journal that holds its header fails the open (drift-2026-11-21-7)"
   },
   "creation_journal.go:*pager.openCreationJournal": {
     "sqlite": [
@@ -1059,6 +1059,10 @@
     "sqlite": [],
     "note": ""
   },
+  "db.go:*DB.pagerBeginWrite": {
+    "sqlite": [],
+    "note": "BeginWriteContext's pager.beginWrite; a panic out of it (the integrity hook) releases the read slot, db.mu and the writer lock"
+  },
   "db.go:*DB.putReadTx": {
     "sqlite": [],
     "note": ""
@@ -1068,8 +1072,11 @@
     "note": ""
   },
   "db.go:*DB.resolveNamespace": {
-    "sqlite": [],
-    "note": "any-store master-table traversal for namespace->rootPage"
+    "sqlite": [
+      "btree.c:btreeCursor",
+      "prepare.c:sqlite3InitCallback"
+    ],
+    "note": "any-store master-table traversal for namespace->rootPage; a root outside 2..nPage (the reader's snapshot size from page 1, the writer's live count) is ErrCorrupt, as the schema load refuses a root past the database (prepare.c:135-140); a root of 1 too, where btreeCursor opens root 1, the schema table's (drift-a-namespace-whose-root-is-page-1-is-corrupt)"
   },
   "db.go:*DB.unregisterWriter": {
     "sqlite": [],
@@ -1382,6 +1389,22 @@
     "sqlite": [],
     "note": ""
   },
+  "integrity.go:*IntegrityError.Unwrap": {
+    "sqlite": [],
+    "note": "the report matches ErrCorrupt, or the error of a read that failed for a reason other than damage; SQLite returns the report as text with SQLITE_OK (drift-2026-11-24-4)"
+  },
+  "integrity.go:*ReadTx.IntegrityCheck": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeIntegrityCheck"
+    ],
+    "note": "the check in the caller's read transaction, as sqlite3BtreeIntegrityCheck runs in its connection's (btree.c:11156)"
+  },
+  "integrity.go:*ReadTx.IntegrityCheckN": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeIntegrityCheck"
+    ],
+    "note": "the check in the caller's read transaction, as sqlite3BtreeIntegrityCheck runs in its connection's (btree.c:11156); the read view of a write transaction is refused"
+  },
   "integrity.go:*integrityChecker.checkList": {
     "sqlite": [
       "btree.c:checkList"
@@ -1427,6 +1450,12 @@
       "btree.c:checkAppendMsg"
     ],
     "note": ""
+  },
+  "integrity.go:*integrityChecker.reportRead": {
+    "sqlite": [
+      "btree.c:checkAppendMsg"
+    ],
+    "note": "a finding that came out of a failed page read; keeps the read's error when it is not damage (btree.c:10883-10885 lists the failure as a line and sets the check's rc only for SQLITE_IOERR_NOMEM, as SQLITE_NOMEM; drift-2026-11-24-4)"
   },
   "integrity.go:*integrityChecker.setReferenced": {
     "sqlite": [
@@ -1689,6 +1718,10 @@
   "page.go:getVarintSafe": {
     "sqlite": [],
     "note": "bounds-checked wrapper around getVarint; same util.c decoder"
+  },
+  "page.go:headerFamily": {
+    "sqlite": [],
+    "note": "the any-store magic family of a header; SQLite has one magic"
   },
   "page.go:indexLimits": {
     "sqlite": [
@@ -1975,6 +2008,12 @@
     ],
     "note": "page 1 is written after the creation journal and its directory are synced and before the journal's delete commits the creation, as a PGHDR_NEED_SYNC page is"
   },
+  "pager.go:*pager.dbFileReadErr": {
+    "sqlite": [
+      "pager.c:readDbPage"
+    ],
+    "note": "a read of a page of the database file that came up short: the read's error when the file holds the page, ErrCorrupt (errPageCutShort) when the file ends inside it; SQLite reads zeros for both: unixRead zero-fills what it did not read (os_unix.c:3576) and readDbPage takes the short read for success (pager.c:3042-3044; drift-7)"
+  },
   "pager.go:*pager.decryptPage": {
     "sqlite": [],
     "note": ""
@@ -2159,19 +2198,32 @@
     "sqlite": [
       "btree.c:lockBtree",
       "pager.c:pagerPagecount",
-      "pager.c:sqlite3PagerOpen"
+      "pager.c:sqlite3PagerOpen",
+      "pager.c:sqlite3PagerReadFileheader"
     ],
-    "note": "page 1 and the page count are read at one snapshot in readPage1AtOpen"
+    "note": "page 1 and the page count are read at one snapshot in readPage1AtOpen; the first read of the header, under the DB-file lock, that comes up short is judged by the file's size: the read's error when the file holds the header, ErrHeaderCorrupt when it is shorter (drift-7)"
+  },
+  "pager.go:*pager.page1FrameHeader": {
+    "sqlite": [],
+    "note": "the plaintext header of page 1's WAL frame, for the format checks that come before the key's (drift-2026-11-24-3)"
+  },
+  "pager.go:*pager.page1Hook": {
+    "sqlite": [],
+    "note": "under a key, page 1's failed authentication at open is kept from the integrity hook until it is known to be damage (drift-2026-11-24-3)"
   },
   "pager.go:*pager.page1OnChange": {
     "sqlite": [],
     "note": "schema format 6 and later write page 1 only when needed"
   },
+  "pager.go:*pager.page1Unauthenticated": {
+    "sqlite": [],
+    "note": "a page 1 that fails its authentication at open, judged after the header and the page count: ErrWrongKey unless another page proves the key or could not be read; SQLCipher returns SQLITE_NOTADB for both (sqlcipher.c:3263-3295, btree.c:3306, 3361-3362, v4.14.0; drift-2026-11-24-3)"
+  },
   "pager.go:*pager.pagerError": {
     "sqlite": [
       "pager.c:pager_error"
     ],
-    "note": "a failed commit's end: the state and the cleanup at once. errCode is nil when the commit's frame write fails; when its fetch of page 1 meets a failed spill, pagerStress has set errCode already, and pagerError trips the cursors with it and clears it. SQLite's failed WAL commit never enters PAGER_ERROR: pagerWalFrames returns the error (pager.c:6512, 3219-3236) and the transaction is rolled back as any other (sqlite3PagerRollback, pager.c:6779-6782). A failed spill only records the error (pagerStress, pager.errCode) and rollbackLocked cleans up"
+    "note": "a failed commit's end: the state and the cleanup at once. errCode is the commit's error, or, when its fetch of page 1 met a failed spill, the one pagerStress set already; pagerError trips the cursors with it and clears it (drift-2026-11-24-5). SQLite's failed WAL commit never enters PAGER_ERROR: pagerWalFrames returns the error (pager.c:6512, 3219-3236), pager_error stores only IOERR/FULL (pager.c:1955-1958), and sqlite3VdbeHalt rolls the transaction back with sqlite3RollbackAll(db, SQLITE_OK) (vdbeaux.c:3417-3425, main.c:1505), with which sqlite3BtreeRollback saves the cursors, which go on unless a save fails and trips them all with its error (btree.c:4526-4533), then rolls the pager back (sqlite3PagerRollback, pager.c:6779-6782); a statement that fails before its commit rolls back the statement alone on FULL/NOMEM with a statement journal (vdbeaux.c:3372-3373), the transaction with trip code SQLITE_ABORT_ROLLBACK otherwise (vdbeaux.c:3378). A failed spill only records the error (pagerStress, pager.errCode) and rollbackLocked cleans up"
   },
   "pager.go:*pager.pagerPageCount": {
     "sqlite": [
@@ -2185,9 +2237,15 @@
     ],
     "note": "a failed write stores pager.errCode and sets pagerError, pager_error's part (pager.c:1947-1960), inline"
   },
-  "pager.go:*pager.readDBPage": {
+  "pager.go:*pager.proveKeyAtOpen": {
     "sqlite": [],
-    "note": ""
+    "note": "tries up to keyProbePages other pages of the database (up to lockBtreePageCount's size) under the open's key, and keeps the first read error; no SQLCipher counterpart (drift-2026-11-24-3)"
+  },
+  "pager.go:*pager.readDBPage": {
+    "sqlite": [
+      "pager.c:readDbPage"
+    ],
+    "note": "the database-file branch of readDbPage; a read that did not return the whole page goes to dbFileReadErr (drift-7)"
   },
   "pager.go:*pager.readHeaderCounters": {
     "sqlite": [],
@@ -2228,7 +2286,7 @@
   },
   "pager.go:*pager.readRawPage1Header": {
     "sqlite": [],
-    "note": "page 1's header alone, for a page 1 the codec sweep cannot read whole"
+    "note": "page 1's header alone, for a page 1 the codec sweep cannot read whole; the file is read through readDBPage, a frame by its count (drift-7)"
   },
   "pager.go:*pager.readTempPage": {
     "sqlite": [
@@ -2390,6 +2448,10 @@
     "sqlite": [],
     "note": "test hook: create schema format 5 files"
   },
+  "pager.go:keyProbePgno": {
+    "sqlite": [],
+    "note": "the pages proveKeyAtOpen tries, spread over the database's pages; no SQLCipher counterpart (drift-2026-11-24-3)"
+  },
   "pager.go:lockBtreePageCount": {
     "sqlite": [
       "btree.c:lockBtree"
@@ -2401,6 +2463,18 @@
       "pager.c:sqlite3PagerOpen"
     ],
     "note": ""
+  },
+  "pager.go:page1DatabaseSize": {
+    "sqlite": [
+      "btree.c:lockBtree"
+    ],
+    "note": "lockBtreePageCount's size from a page-1 image's three fields, for a reader's bound on a namespace root (resolveNamespace)"
+  },
+  "pager.go:page1HeaderAtOpen": {
+    "sqlite": [
+      "btree.c:lockBtree"
+    ],
+    "note": "page 1 read again at open must name the file's magic family before its header is decoded (drift-2026-11-24-3), and declare the page size and reserved bytes the file was opened with: ErrHeaderCorrupt, where lockBtree adopts page 1's page size (btree.c:3384-3399) and usable size (btree.c:3417) (drift-page-1-read-again-at-open-keeps-the-files-geometry)"
   },
   "pcache.go:*pcache.appendDirtyPages": {
     "sqlite": [
@@ -2730,6 +2804,10 @@
     "sqlite": [],
     "note": "test seam: another process's commit, as a begin sees it"
   },
+  "testseam.go:TestSeam.PublishIndexVersion": {
+    "sqlite": [],
+    "note": "test seam: the wal-index header of another build's version, as walIndexReadHdr refuses it (wal.c:2740-2741)"
+  },
   "testseam.go:TestSeam.SetBusyTimeout": {
     "sqlite": [],
     "note": "test seam"
@@ -2874,11 +2952,11 @@
     "sqlite": [
       "wal.c:walIndexReadHdr"
     ],
-    "note": "validated header read; rebuilds the wal-index under the write lock when the header is invalid"
+    "note": "validated header read; rebuilds the wal-index under the write lock when the header is invalid, and returns the rebuild's error as walIndexReadHdr returns walIndexRecover's (wal.c:2724)"
   },
   "wal.go:*wal.initHeaderStateLocked": {
     "sqlite": [],
-    "note": "lazy WAL header init without disk write"
+    "note": "lazy WAL header init without disk write; returns the wal-index header's publication error"
   },
   "wal.go:*wal.open": {
     "sqlite": [
@@ -2897,6 +2975,18 @@
       "wal.c:sqlite3WalReadFrame"
     ],
     "note": ""
+  },
+  "wal.go:*wal.readFramePage": {
+    "sqlite": [
+      "wal.c:sqlite3WalReadFrame"
+    ],
+    "note": "readFrame for a page number the caller resolved; decrypts with the database's integrity hook"
+  },
+  "wal.go:*wal.readFramePageHook": {
+    "sqlite": [
+      "wal.c:sqlite3WalReadFrame"
+    ],
+    "note": "readFramePage with the integrity hook as an argument: the open's key proof passes its own (drift-2026-11-24-3)"
   },
   "wal.go:*wal.readFramePgno": {
     "sqlite": [],
@@ -2928,7 +3018,7 @@
     "sqlite": [
       "wal.c:walRestartHdr"
     ],
-    "note": "header half of a WAL restart: mxFrame 0, hdr.nPage kept, salt1+1 and a random salt2; nCkpt stays 0 and aFrameCksum is the new WAL header's checksum (drift-98)"
+    "note": "header half of a WAL restart: mxFrame 0, hdr.nPage kept, salt1+1 and a random salt2; nCkpt stays 0 and aFrameCksum is the new WAL header's checksum (drift-98). Returns the publication's error, which walRestartHdr, writing the mapped header in place, cannot have"
   },
   "wal.go:*wal.restartLogLocked": {
     "sqlite": [
@@ -3183,6 +3273,18 @@
     "sqlite": [],
     "note": "port of sqliteDefaultBusyCallback (main.c) — not in canonical sqlite_funcs list"
   },
+  "wal.go:frameReadErr": {
+    "sqlite": [
+      "wal.c:sqlite3WalReadFrame"
+    ],
+    "note": "the error of a failed frame read: ErrWALShortRead for a short read (SQLITE_IOERR_SHORT_READ from unixRead), the read's own error otherwise (drift-2026-07-10-1)"
+  },
+  "wal.go:frameReadResult": {
+    "sqlite": [
+      "wal.c:sqlite3WalReadFrame"
+    ],
+    "note": "a frame read judged by its count and its error: all the bytes with io.EOF succeed, fewer are a short read (frameReadErr), io.ErrUnexpectedEOF when no error came with them (drift-2026-07-10-1)"
+  },
   "wal.go:htFrameSegIdx": {
     "sqlite": [
       "wal.c:walFramePage"
@@ -3222,6 +3324,12 @@
   "wal.go:newWalIndex": {
     "sqlite": [],
     "note": ""
+  },
+  "wal.go:recoveryReadErr": {
+    "sqlite": [
+      "wal.c:walIndexRecover"
+    ],
+    "note": "a read of the log's header or of a frame by recovery, within the file's size, judged by its count and its error: all the bytes with io.EOF succeed, fewer are the read's error (io.ErrUnexpectedEOF when it gave none) and not ErrWALShortRead; walIndexRecover returns the read's code (wal.c:1429-1431, 1502-1503)"
   },
   "wal.go:shmCleanupHashSegment": {
     "sqlite": [

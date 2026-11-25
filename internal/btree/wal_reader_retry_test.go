@@ -127,7 +127,7 @@ func TestTryBeginReadInProcessHdr_Slot0FallbackClaims(t *testing.T) {
 // acquisition could hand the reader a stale [minFrame, maxFrame] window that
 // matches NEW-generation frames — a snapshot-isolation hole, and (once WAL
 // frame read errors propagate — drift-6 resolution) a source of spurious
-// ErrWALCorrupt.
+// frame-range errors (errWalFrameRange: a frame above the local count).
 //
 // Readers verify every value is self-consistent (key/seq echo + fill byte),
 // so serving a new-generation frame inside an old snapshot, a torn read, or

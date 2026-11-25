@@ -205,6 +205,19 @@ func (db *DB) codecKind() IntegrityMode {
 // differs.
 func (db *DB) BackupDestinationOptions() Options {
 	opts := db.opts
+	if opts.InMemory {
+		// The in-process mode and NoCommitSync are forced on an in-memory
+		// database (Open), and they are no settings of the file: the
+		// destination takes a file's. Its locking is the platform's (Open
+		// forces the in-process mode only where there is no shared memory
+		// to map), so a destination another process has open is shared
+		// with it, as a file opened by itself is. Its commits are synced,
+		// as a file's are by default: the backup's commit is durable once
+		// it is made, and does not wait for a checkpoint, which a close
+		// that is not the last one on the file does not run.
+		opts.InProcess = false
+		opts.NoCommitSync = false
+	}
 	opts.InMemory = false
 	opts.OnIntegrityError = nil
 	opts.PageSize = db.pager.pageSize

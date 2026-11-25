@@ -177,6 +177,8 @@ res, _ := orders.Aggregate(`[
 
 The database file behaves like SQLite in WAL mode: any process may open it at any moment and read or write concurrently. Coordination runs through file locks and a shared-memory WAL index; snapshot reads are never blocked, writers serialize, and busy situations back off through a configurable handler. DDL from a peer process (created/dropped collections and indexes) is reconciled automatically on the next transaction.
 
+One process holds one handle on a database file: a second `Open` of a file the process has open returns `ErrDBAlreadyOpen` (on Windows, a second `Open` through another path to the file, such as a link, returns `ErrDBOpenInOtherProcess`). Where multi-process access is not available (anything but linux, android, darwin and ios on amd64 and arm64), `Open` of a file that another process has open returns `ErrDBOpenInOtherProcess` at once; js/wasm, wasip1 and plan9 take no file lock and do not detect the other process.
+
 ## Durability
 
 Any Store performs WAL checkpoints and fsync after idle periods.
@@ -223,6 +225,20 @@ fmt.Printf("scanned %d pages, %d errors\n", rep.Pages, len(rep.Errors))
 
 The page-1 DB header (first 100 bytes) is outside the per-page hash; its invariants are validated separately at open. Full design: [docs/btree/specs/integrity.md](docs/btree/specs/integrity.md).
 
+### Corruption errors
+
+`ErrCorrupt` means damage that is in the files and will still be there at the next `Open`; a caller may discard and rebuild the database on it. Match it with `errors.Is`. The damage is in the database the call read: `Backup` also reads the file at its path, and can return `ErrCorrupt` or `ErrHeaderCorrupt` for a damaged destination while the source is sound, so rule that out before discarding the source. The kinds of damage match it too:
+
+| Error | When |
+|---|---|
+| `ErrHeaderCorrupt` | `Open`: the file header is unusable. |
+| `ErrPageIntegrity` | A page fails its checksum or its AEAD authentication, on the read that meets it. |
+| `ErrQuickCheckFailed` | `Open` after an unclean shutdown (`Durability.Sentinel`): the quick check, or the open's read of the catalog before it, found damage. |
+
+A read of a page that the database file ends inside (a file cut short) matches `ErrCorrupt` too; a read that came up short of bytes the file holds is that read's error. `IntegrityCheck` returns an error that matches `ErrCorrupt` when it found damage. A damaged write-ahead log index (`-wal-shm`, shared memory) matches `ErrCorrupt` too, as in SQLite; closing every handle on the file rebuilds it.
+
+Errors that are not damage do not match `ErrCorrupt` and are returned as themselves: a cancelled context, an I/O error or a full disk (also when they stop a commit, the quick check of a dirty `Open`, or an `IntegrityCheck`), `ErrBusy`, `ErrDBIsClosed`, `ErrV1Database`, `ErrIncompatibleVersion`, `ErrDBAlreadyOpen`, `ErrDBOpenInOtherProcess`, `ErrCopyVerifyFailed` (`CopyToLatestFormat`'s copy failed its verification, not the source), and the encryption errors below. So does `ErrWALShortRead`: the write-ahead log's index points past the end of the log; close every handle on the file and open it again. It keeps the short read's own error (`io.EOF`, or `io.ErrUnexpectedEOF`).
+
 ## Encryption
 
 ```go
@@ -235,6 +251,16 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 ```
 
 Whole-file page-level AEAD; bring-your-own key management via `EncryptionConfig.Codec`.
+
+`Open` refuses an `Encryption` config that does not fit the file, with an error to match with `errors.Is`. None of them matches `ErrCorrupt`, and the file is left unchanged:
+
+| Error | When |
+|---|---|
+| `ErrEncryptionKeyRequired` | The file is encrypted and `Config.Encryption` is empty. |
+| `ErrNotEncrypted` | The file is not encrypted and `Config.Encryption` is not empty. |
+| `ErrWrongKey` | `Config.Encryption` does not open the file: another passphrase or key than the file's, or another cipher. |
+
+A damaged first page under the right key is not `ErrWrongKey`: `Open` proves the key on other pages and reports `ErrPageIntegrity`, which matches `ErrCorrupt`. See `ErrWrongKey` for the cases it cannot tell apart, which it reports as a wrong key.
 
 `Backup` of an encrypted database writes an encrypted copy that opens with the same passphrase, key or codec. A copy that `Backup` creates has a salt of its own, so with a passphrase its derived key differs from the source's. A file that already exists at the path keeps the salt it has, which is the source's when that file is a copy of the source made outside `Backup`.
 

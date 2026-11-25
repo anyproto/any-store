@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,7 +59,7 @@ func TestPagerError(t *testing.T) {
 	p.releasePage(pg)
 
 	// Trigger pagerError
-	p.pagerError()
+	p.pagerError(errors.New("injected commit failure"))
 
 	// State should be back to open (pagerError transitions to open)
 	assert.Equal(t, int32(pagerOpen), p.state.Load())
@@ -1371,7 +1372,8 @@ func TestReadWalFrameData_InMemory(t *testing.T) {
 
 	// Invalid frame
 	err = p.readWalFrameData(999, buf)
-	assert.ErrorIs(t, err, ErrWALCorrupt)
+	assert.ErrorIs(t, err, errWalFrameRange)
+	assert.NotErrorIs(t, err, ErrCorrupt)
 }
 
 func TestReadWalFrameData_NilFile(t *testing.T) {
@@ -2947,7 +2949,8 @@ func TestReadFrame_InMemoryOutOfRange(t *testing.T) {
 	buf := make([]byte, 4096)
 	// Frame 3 passes nFrame check (3 <= 5) but idx=2 >= len(memFrames)=1
 	err := w.readFrame(3, buf, nil, nil)
-	assert.ErrorIs(t, err, ErrWALCorrupt)
+	assert.ErrorIs(t, err, errWalFrameRange)
+	assert.NotErrorIs(t, err, ErrCorrupt)
 
 	// Restore
 	w.nFrame.Store(1)
@@ -4049,7 +4052,7 @@ func TestReadWalFrameData_FileNil(t *testing.T) {
 
 	buf := make([]byte, 100)
 	err := p.readWalFrameData(1, buf)
-	assert.ErrorIs(t, err, ErrWALCorrupt)
+	assert.ErrorIs(t, err, ErrClosed)
 }
 
 // --- pager.go commit() debugTrace zero-content detection ---
@@ -5605,12 +5608,18 @@ func TestCheckpointWithMode_FileReadPageDataError(t *testing.T) {
 	require.NoError(t, err)
 	p.endRead(slot)
 
-	// Truncate the WAL to remove page data but keep frame headers intact
+	// Cut the WAL inside the page of its last frame: every frame header is
+	// whole, so the checkpoint's scan of the headers (buildBackfillMap)
+	// passes and its copy of the pages reads the last one short. The
+	// commit wrote the allocated page and page 1, a frame each.
 	walPath := path + "-wal"
-	// The WAL has: header (32) + frame_header (24) + page_data (4096)
-	// Truncate to just header + frame_header (without page data)
-	truncateSize := int64(walHeaderSize + walFrameSize + 100) // partial page data
+	nf := p.wal.nFrame.Load()
+	require.Greater(t, nf, uint32(1))
+	frameSize := int64(walFrameSize) + 4096
+	truncateSize := int64(walHeaderSize) + int64(nf-1)*frameSize + walFrameSize + 100
 	require.NoError(t, os.Truncate(walPath, truncateSize))
+	_, err = p.wal.buildBackfillMap(0, nf)
+	require.NoError(t, err, "the frame headers are whole")
 
 	// Re-open the WAL file to reflect truncated size
 	p.wal.file.Close()
@@ -5618,8 +5627,12 @@ func TestCheckpointWithMode_FileReadPageDataError(t *testing.T) {
 	require.NoError(t, err)
 	p.wal.file = f
 
+	// The frame's page is cut short: a short read, as a page read of the
+	// frame gives it, not a raw EOF.
 	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
-	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrWALShortRead)
+	assert.ErrorIs(t, err, io.EOF)
+	assert.NotErrorIs(t, err, ErrCorrupt)
 
 	p.wal.close(false)
 	if p.file != nil {
@@ -8394,7 +8407,7 @@ func TestRefreshHeaderFromPage1_DoubleIOFailure(t *testing.T) {
 	require.Greater(t, mustWiGet(t, p.wal.index, 1, effectiveMaxFrame), uint32(0))
 
 	// Force the double I/O failure: WAL-frame read fails (file-backed WAL with
-	// nil file => ErrWALCorrupt) AND the DB-file fallback is unavailable.
+	// nil file => ErrClosed) AND the DB-file fallback is unavailable.
 	walFile := p.wal.file
 	require.NotNil(t, walFile)
 	_ = walFile.Close()
@@ -8410,7 +8423,8 @@ func TestRefreshHeaderFromPage1_DoubleIOFailure(t *testing.T) {
 	p.writerCache.clear() // as beginWrite does before the refresh
 	err = p.refreshHeaderFromPage1()
 	require.Error(t, err, "refreshHeaderFromPage1 must propagate the double I/O read failure")
-	assert.ErrorIs(t, err, ErrWALCorrupt)
+	assert.ErrorIs(t, err, ErrClosed)
+	assert.NotErrorIs(t, err, ErrCorrupt)
 }
 
 // TestBeginWriteHeaderRefreshError_DoubleIOFailure exercises the end-to-end
@@ -8475,7 +8489,8 @@ func TestBeginWriteHeaderRefreshError_DoubleIOFailure(t *testing.T) {
 
 	err = p.beginWrite(readSnap)
 	require.Error(t, err, "beginWrite must propagate the page-1 re-read failure on the stateChanged edge")
-	assert.ErrorIs(t, err, ErrWALCorrupt)
+	assert.ErrorIs(t, err, ErrClosed)
+	assert.NotErrorIs(t, err, ErrCorrupt)
 	// The pager must NOT have transitioned to a writer state on the aborted
 	// begin (no half-open write transaction left behind).
 	assert.NotEqual(t, int32(pagerWriter), p.state.Load(),
@@ -9258,4 +9273,812 @@ func TestPagerClose_RemovesOnlyOwnRegistryEntry(t *testing.T) {
 	require.NoError(t, newer.close())
 	_, held = openDBs.Load(key)
 	require.False(t, held)
+}
+
+// ============================================================
+// The key proof at open (readPage1AtOpen, page1Unauthenticated)
+// ============================================================
+
+// keyProofDB creates an encrypted database of about a hundred pages at a new
+// path and returns the path and the options that open it. With checkpoint
+// the pages are in the database file and the log is gone; without, the
+// returned path is a copy taken while the database was open, whose pages
+// past the first are only in its WAL.
+func keyProofDB(t *testing.T, checkpoint bool, hook func(uint32, error)) (string, Options) {
+	t.Helper()
+	encTestSetup(t)
+	path := tmpEncryptedFile(t, "enc.db")
+	opts := DefaultOptions()
+	opts.Key = []byte("right-passphrase")
+	opts.KDFIterations = 1000
+	opts.InProcess = true
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("x")
+	require.NoError(t, err)
+	val := bytes.Repeat([]byte("v"), 1000)
+	for i := 0; i < 400; i++ {
+		require.NoError(t, wtx.Put(ns, []byte(fmt.Sprintf("key-%04d", i)), val))
+	}
+	require.NoError(t, wtx.Commit())
+	if checkpoint {
+		require.NoError(t, db.Checkpoint(CheckpointFull))
+		require.NoError(t, db.Close())
+	} else {
+		cp := tmpEncryptedFile(t, "copy.db")
+		for _, suffix := range []string{"", "-wal"} {
+			data, err := os.ReadFile(path + suffix)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(cp+suffix, data, 0o600))
+		}
+		require.NoError(t, db.Close())
+		path = cp
+	}
+	opts.OnIntegrityError = hook
+	return path, opts
+}
+
+// damageFile flips one byte of the file at off.
+func damageFile(t *testing.T, path string, off int64) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer f.Close()
+	var b [1]byte
+	_, err = f.ReadAt(b[:], off)
+	require.NoError(t, err)
+	b[0] ^= 0xFF
+	_, err = f.WriteAt(b[:], off)
+	require.NoError(t, err)
+}
+
+// A wrong key is ErrWrongKey, not a kind of corruption, and tells the
+// integrity hook nothing: of page 1 or of the pages the open tried.
+func TestOpen_WrongKeyIsErrWrongKey(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		checkpoint bool
+	}{
+		{"pages in the database file", true},
+		{"pages in the WAL", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var fired atomic.Int32
+			path, opts := keyProofDB(t, tc.checkpoint, func(uint32, error) { fired.Add(1) })
+			opts.Key = []byte("wrong-passphrase")
+			_, err := Open(path, opts)
+			require.ErrorIs(t, err, ErrWrongKey)
+			require.NotErrorIs(t, err, ErrCorrupt)
+			require.NotErrorIs(t, err, ErrPageIntegrity)
+			require.Zero(t, fired.Load(), "a wrong key must not fire the integrity hook")
+
+			// The file is as it was: the right key opens it.
+			opts.Key = []byte("right-passphrase")
+			db, err := Open(path, opts)
+			require.NoError(t, err)
+			require.NoError(t, db.Close())
+			require.Zero(t, fired.Load())
+		})
+	}
+}
+
+// A wrong raw key (no KDF) and a wrong caller-made codec are wrong keys too.
+func TestOpen_WrongRawKeyAndCodec(t *testing.T) {
+	encTestSetup(t)
+	path := tmpEncryptedFile(t, "enc.db")
+	opts := DefaultOptions()
+	opts.Key = bytes.Repeat([]byte{1}, KeyLen)
+	opts.InProcess = true
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("x")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns, []byte("k"), bytes.Repeat([]byte("v"), 20000)))
+	require.NoError(t, wtx.Commit())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+	require.NoError(t, db.Close())
+
+	opts.Key = bytes.Repeat([]byte{2}, KeyLen)
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrWrongKey)
+	require.NotErrorIs(t, err, ErrCorrupt)
+
+	codec, err := NewAESCodec(bytes.Repeat([]byte{3}, KeyLen))
+	require.NoError(t, err)
+	opts.Key, opts.Codec = nil, codec
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrWrongKey)
+	require.NotErrorIs(t, err, ErrCorrupt)
+}
+
+// A page 1 damaged under the right key is damage: another page
+// authenticates, so the key is proven. The integrity hook hears of page 1,
+// once, and of no other page.
+func TestOpen_DamagedPage1UnderRightKeyIsCorrupt(t *testing.T) {
+	var pages []uint32
+	path, opts := keyProofDB(t, true, nil)
+	opts.OnIntegrityError = func(pgno uint32, _ error) { pages = append(pages, pgno) }
+	damageFile(t, path, 1000)
+
+	_, err := Open(path, opts)
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, ErrWrongKey)
+	require.Equal(t, []uint32{1}, pages)
+}
+
+// The pages tried are spread over the file: with its first quarter damaged,
+// page 1 included, the key is still proven on a later page.
+func TestOpen_DamagedHeadOfFileUnderRightKeyIsCorrupt(t *testing.T) {
+	path, opts := keyProofDB(t, true, nil)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	pageSize := int64(opts.PageSize)
+	nPage := info.Size() / pageSize
+	require.Greater(t, nPage, int64(4*keyProbePages), "the test needs more pages than the open tries")
+	for pg := int64(0); pg < nPage/4; pg++ {
+		damageFile(t, path, pg*pageSize+1000)
+	}
+
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, ErrWrongKey)
+}
+
+// What the open cannot tell apart is reported as a wrong key, the answer
+// that keeps the file: a database of one page whose page 1 is damaged has
+// no other page to prove the key on.
+func TestOpen_DamagedOnePageFileIsErrWrongKey(t *testing.T) {
+	encTestSetup(t)
+	path := tmpEncryptedFile(t, "enc.db")
+	opts := DefaultOptions()
+	opts.Key = []byte("right-passphrase")
+	opts.KDFIterations = 1000
+	opts.InProcess = true
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, int64(opts.PageSize), info.Size())
+	damageFile(t, path, 1000)
+
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrWrongKey)
+	require.NotErrorIs(t, err, ErrCorrupt)
+}
+
+// A later page damaged under the right key does not fail the open: the
+// open authenticates page 1 only, and the read that meets the page reports
+// it as ErrPageIntegrity, as before; the integrity hook hears of that page.
+// Every row's value is read: in schema format 5 the damaged page holds part
+// of a value, which a walk of the keys does not read.
+func TestOpen_DamagedLaterPageOpens(t *testing.T) {
+	var pages []uint32
+	path, opts := keyProofDB(t, true, nil)
+	opts.OnIntegrityError = func(pgno uint32, _ error) { pages = append(pages, pgno) }
+	damageFile(t, path, 2*int64(opts.PageSize)+1000) // page 3
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	defer db.Close()
+	require.Empty(t, pages, "the open reads no page but page 1")
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns, err := rtx.GetNamespace("x")
+	require.NoError(t, err)
+	cur := rtx.NewCursor(ns)
+	defer cur.Close()
+	for err = cur.First(); err == nil && cur.Valid(); err = cur.Next() {
+		if _, err = cur.Value(); err != nil {
+			break
+		}
+	}
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, ErrWrongKey)
+	require.Equal(t, []uint32{3}, pages)
+}
+
+// lastWALFrame returns the number of the last frame of the WAL at walPath
+// that holds pgno, and the offset of its frame header in the file.
+func lastWALFrame(t *testing.T, walPath string, pageSize int, pgno uint32) (frame uint32, off int64) {
+	t.Helper()
+	data, err := os.ReadFile(walPath)
+	require.NoError(t, err)
+	frameSize := walFrameSize + pageSize
+	for o, f := walHeaderSize, uint32(1); o+frameSize <= len(data); o, f = o+frameSize, f+1 {
+		if binary.BigEndian.Uint32(data[o:]) == pgno {
+			frame, off = f, int64(o)
+		}
+	}
+	require.NotZero(t, frame, "no frame of page %d in the WAL", pgno)
+	return frame, off
+}
+
+// resealWAL recomputes the checksum chain of every frame of the WAL at
+// walPath, so that a frame whose bytes a test changed is still part of the
+// log for recovery: what is damaged is the page, not the log.
+func resealWAL(t *testing.T, walPath string, pageSize int) {
+	t.Helper()
+	data, err := os.ReadFile(walPath)
+	require.NoError(t, err)
+	frameSize := walFrameSize + pageSize
+	s1, s2 := walChecksum(data[:24], 0, 0)
+	for o := walHeaderSize; o+frameSize <= len(data); o += frameSize {
+		s1, s2 = walChecksum(data[o:o+8], s1, s2)
+		s1, s2 = walChecksum(data[o+walFrameSize:o+frameSize], s1, s2)
+		binary.BigEndian.PutUint32(data[o+16:], s1)
+		binary.BigEndian.PutUint32(data[o+20:], s2)
+	}
+	require.NoError(t, os.WriteFile(walPath, data, 0o600))
+}
+
+// A page of the database that the database file holds only in part is
+// damage: its read is ErrCorrupt, where SQLite reads zeros past the end of
+// the file (unixRead zero-fills what it did not read, os_unix.c:3576, and
+// readDbPage takes the short read for success, pager.c:3042-3044). In a
+// plain database nothing would report those zeros: here the file is cut
+// inside the last overflow page of a value, after its link to the next
+// page and the first bytes of the value it holds, and the value is not
+// returned with zeros in their place. A file cut at a page boundary is a
+// page count the header's check refuses, not this. A read that comes up
+// short of bytes the file holds is the read's error
+// (pager_short_read_vfs_test.go).
+func TestReadDBPage_PageCutShortIsCorrupt(t *testing.T) {
+	for _, checksum := range []bool{false, true} {
+		t.Run(fmt.Sprintf("checksum=%v", checksum), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "test.db")
+			opts := DefaultOptions()
+			opts.Checksum = checksum
+			db, err := testOpen(t, path, opts)
+			require.NoError(t, err)
+			wtx, err := db.BeginWrite()
+			require.NoError(t, err)
+			ns, err := wtx.CreateNamespace("t")
+			require.NoError(t, err)
+			val := bytes.Repeat([]byte{0xAB}, 5*int(opts.PageSize))
+			require.NoError(t, wtx.Put(ns, []byte("k"), val))
+			require.NoError(t, wtx.Commit())
+			require.NoError(t, db.Checkpoint(CheckpointTruncate))
+			require.NoError(t, db.Close())
+			info, err := os.Stat(path)
+			require.NoError(t, err)
+			pageSize := int64(opts.PageSize)
+			last := uint32(info.Size() / pageSize)
+			require.NoError(t, os.Truncate(path, info.Size()-pageSize+8))
+
+			db, err = testOpen(t, path, opts)
+			require.NoError(t, err)
+			defer db.Close()
+			buf := make([]byte, pageSize)
+			err = db.pager.readDBPage(last, buf)
+			require.ErrorIs(t, err, ErrCorrupt)
+			require.NotErrorIs(t, err, io.EOF)
+
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			defer rtx.Rollback()
+			ns, err = rtx.GetNamespace("t")
+			require.NoError(t, err)
+			got, err := rtx.Get(ns, []byte("k"))
+			require.ErrorIs(t, err, ErrCorrupt, "the value came back, %d bytes", len(got))
+
+			err = db.IntegrityCheck()
+			require.ErrorIs(t, err, ErrCorrupt)
+			require.NotErrorIs(t, err, io.EOF)
+			require.NotErrorIs(t, err, io.ErrUnexpectedEOF)
+		})
+	}
+}
+
+// Page number 0 is no page: a getter asked for it was handed a page number
+// the file holds and that is damaged, as sqlite3PagerGet answers it with
+// SQLITE_CORRUPT_BKPT (pager.c:5551). A namespace whose master entry gives
+// root 0 does not resolve, ErrCorrupt, and a cursor on a root 0 reads as
+// ErrCorrupt.
+func TestGetPage_PageZeroIsCorrupt(t *testing.T) {
+	db := tempDB(t)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("x")
+	require.NoError(t, err)
+	// The master entry of "x" with root 0, as damage would leave it.
+	require.NoError(t, tx.pager.wgate.enter())
+	master := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
+	require.NoError(t, master.Put([]byte("x"), []byte{0, 0, 0, 0}))
+	tx.pager.wgate.leave()
+	require.NoError(t, tx.Commit())
+
+	_, err = db.pager.getPageReader(0, 0, nil)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.ErrorIs(t, err, ErrInvalidPage)
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	_, err = rtx.GetNamespace("x")
+	require.ErrorIs(t, err, ErrCorrupt)
+	ns := &Namespace{db: db, name: "x"}
+	cur := rtx.NewCursor(ns)
+	defer cur.Close()
+	err = cur.First()
+	require.ErrorIs(t, err, ErrCorrupt)
+}
+
+// A page 1 damaged in its WAL frame under the right key is damage, as in
+// the database file: the frame is part of the log (its WAL checksum is
+// valid), and a page that is only in the WAL proves the key. The integrity
+// hook hears of page 1, once.
+func TestOpen_DamagedPage1FrameUnderRightKeyIsCorrupt(t *testing.T) {
+	path, opts := keyProofDB(t, false, nil)
+	var pages []uint32
+	opts.OnIntegrityError = func(pgno uint32, _ error) { pages = append(pages, pgno) }
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, int64(opts.PageSize), info.Size(), "every page but the first is only in the WAL")
+	walPath := path + "-wal"
+	page1Frame, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
+	damageFile(t, walPath, off+walFrameSize+1000)
+	resealWAL(t, walPath, int(opts.PageSize))
+	firstProbe, _ := lastWALFrame(t, walPath, int(opts.PageSize), 2)
+
+	// The frames the open reads, in order: page 1's, then the first page
+	// the probe tries, which proves the key.
+	var frames []uint32
+	setWalReadFrameFaultHook(func(frame uint32) error {
+		frames = append(frames, frame)
+		return nil
+	})
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
+	_, err = Open(path, opts)
+	setWalReadFrameFaultHook(nil)
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, ErrWrongKey)
+	require.Equal(t, []uint32{1}, pages)
+	require.Equal(t, []uint32{page1Frame, firstProbe}, frames)
+}
+
+// A database whose page 1 and every page the open tries are damaged cannot
+// prove the right key: it is reported as a wrong key, and the integrity hook
+// hears of none of the pages.
+func TestOpen_EveryPageTriedDamagedIsErrWrongKey(t *testing.T) {
+	path, opts := keyProofDB(t, true, nil)
+	var fired atomic.Int32
+	opts.OnIntegrityError = func(uint32, error) { fired.Add(1) }
+	head, err := os.ReadFile(path)
+	require.NoError(t, err)
+	nPage := binary.BigEndian.Uint32(head[28:32])
+	require.Greater(t, nPage, uint32(2*keyProbePages))
+	pageSize := int64(opts.PageSize)
+	damageFile(t, path, 1000)
+	count := min(nPage-1, keyProbePages)
+	for i := uint32(0); i < count; i++ {
+		damageFile(t, path, int64(keyProbePgno(i, count, nPage)-1)*pageSize+1000)
+	}
+
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrWrongKey)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.Zero(t, fired.Load())
+}
+
+// The pages the open tries are the database's, up to the size its header
+// records, not whatever the file holds past it. A database encrypted under
+// key A written over the head of a longer file under key B leaves B's pages
+// at the end of the file: B, which opens none of A's pages, is a wrong key
+// and not a key proven on a damaged page 1.
+func TestOpen_KeyProbeStaysInsideTheDatabase(t *testing.T) {
+	encTestSetup(t)
+	keyA := bytes.Repeat([]byte{0xA}, KeyLen)
+	keyB := bytes.Repeat([]byte{0xB}, KeyLen)
+	create := func(name string, key []byte, rows int) string {
+		path := tmpEncryptedFile(t, name)
+		opts := DefaultOptions()
+		opts.Key = key
+		opts.InProcess = true
+		db, err := Open(path, opts)
+		require.NoError(t, err)
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := wtx.CreateNamespace("x")
+		require.NoError(t, err)
+		for i := 0; i < rows; i++ {
+			require.NoError(t, wtx.Put(ns, []byte(fmt.Sprintf("key-%04d", i)), bytes.Repeat([]byte("v"), 1000)))
+		}
+		require.NoError(t, wtx.Commit())
+		require.NoError(t, db.Checkpoint(CheckpointFull))
+		require.NoError(t, db.Close())
+		return path
+	}
+	path := create("long.db", keyB, 400)
+	short, err := os.ReadFile(create("short.db", keyA, 1))
+	require.NoError(t, err)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt(short, 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	opts := DefaultOptions()
+	opts.InProcess = true
+	var fired atomic.Int32
+	opts.OnIntegrityError = func(uint32, error) { fired.Add(1) }
+	opts.Key = keyB
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrWrongKey)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.Zero(t, fired.Load())
+
+	opts.Key = keyA
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	require.Zero(t, fired.Load())
+}
+
+// A page 1 that fails its authentication, its count damaged down to 1 with
+// its change counters intact, does not take away the pages the key is
+// tried on: where the snapshot's WAL commit records the database's size,
+// that size bounds them, and a page under it proves the key. Page 1 here is
+// in the database file, and the commit that recorded the size, in the WAL,
+// did not write it: schema format 6, as format 5 writes page 1 on every
+// commit.
+func TestOpen_KeyProbeTakesTheWALCommitsSize(t *testing.T) {
+	useCurrentFormat(t)
+	path, opts := keyProofDB(t, true, nil)
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.GetNamespace("x")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns, []byte("key-0000"), bytes.Repeat([]byte("w"), 1000)))
+	require.NoError(t, wtx.Commit())
+	cp := tmpEncryptedFile(t, "copy.db")
+	for _, suffix := range []string{"", "-wal"} {
+		data, err := os.ReadFile(path + suffix)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(cp+suffix, data, 0o600))
+	}
+	require.NoError(t, db.Close())
+
+	wal, err := os.ReadFile(cp + "-wal")
+	require.NoError(t, err)
+	frameSize := walFrameSize + int(opts.PageSize)
+	var commitSize uint32
+	for o := walHeaderSize; o+frameSize <= len(wal); o += frameSize {
+		require.NotEqual(t, uint32(1), binary.BigEndian.Uint32(wal[o:]), "the commit wrote page 1")
+		if n := binary.BigEndian.Uint32(wal[o+4:]); n != 0 {
+			commitSize = n
+		}
+	}
+	require.Greater(t, commitSize, uint32(1), "no commit in the WAL")
+
+	var one [4]byte
+	binary.BigEndian.PutUint32(one[:], 1)
+	f, err := os.OpenFile(cp, os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt(one[:], 28) // DatabaseSize
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	damageFile(t, cp, 1000)
+
+	var pages []uint32
+	opts.OnIntegrityError = func(pgno uint32, _ error) { pages = append(pages, pgno) }
+	_, err = Open(cp, opts)
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.NotErrorIs(t, err, ErrWrongKey)
+	require.Equal(t, []uint32{1}, pages)
+}
+
+// The header and the size are judged before the key, whatever page 1's
+// authentication says: a header that does not fit the file is
+// ErrHeaderCorrupt under any key.
+func TestOpen_HeaderIsJudgedBeforeTheKey(t *testing.T) {
+	t.Run("file cut inside page 1", func(t *testing.T) {
+		path, opts := keyProofDB(t, true, nil)
+		require.NoError(t, os.Truncate(path, 2000))
+		for _, key := range [][]byte{opts.Key, []byte("wrong-passphrase")} {
+			o := opts
+			o.Key = key
+			_, err := Open(path, o)
+			require.ErrorIs(t, err, ErrHeaderCorrupt, "key %q", key)
+			require.NotErrorIs(t, err, ErrWrongKey)
+		}
+	})
+	t.Run("WAL page 1 larger than the log's commit", func(t *testing.T) {
+		path, opts := keyProofDB(t, false, nil)
+		walPath := path + "-wal"
+		_, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
+		f, err := os.OpenFile(walPath, os.O_RDWR, 0)
+		require.NoError(t, err)
+		var size [4]byte
+		binary.BigEndian.PutUint32(size[:], 1<<30)
+		_, err = f.WriteAt(size[:], off+walFrameSize+28) // DatabaseSize
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+		resealWAL(t, walPath, int(opts.PageSize))
+		for _, key := range [][]byte{opts.Key, []byte("wrong-passphrase")} {
+			o := opts
+			o.Key = key
+			_, err := Open(path, o)
+			require.ErrorIs(t, err, ErrHeaderCorrupt, "key %q", key)
+			require.NotErrorIs(t, err, ErrWrongKey)
+		}
+	})
+	t.Run("WAL page 1 of another magic family", func(t *testing.T) {
+		// Each header is valid on its own: the file's of this format, the
+		// frame's SQLite's, which alone would be a v1 database. The header
+		// is outside the authentication, so the frame still authenticates
+		// under the right key.
+		path, opts := keyProofDB(t, false, nil)
+		var fired atomic.Int32
+		opts.OnIntegrityError = func(uint32, error) { fired.Add(1) }
+		walPath := path + "-wal"
+		_, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
+		f, err := os.OpenFile(walPath, os.O_RDWR, 0)
+		require.NoError(t, err)
+		_, err = f.WriteAt([]byte(sqliteMagic), off+walFrameSize)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+		resealWAL(t, walPath, int(opts.PageSize))
+		for _, key := range [][]byte{opts.Key, []byte("wrong-passphrase")} {
+			o := opts
+			o.Key = key
+			_, err := Open(path, o)
+			require.ErrorIs(t, err, ErrHeaderCorrupt, "key %q", key)
+			require.NotErrorIs(t, err, ErrSQLiteFormat)
+			require.NotErrorIs(t, err, ErrWrongKey)
+		}
+		require.Zero(t, fired.Load())
+	})
+	// Each header is valid on its own, of one family, but the frame's
+	// declares another page size, or other reserved bytes, than the file
+	// the pager was set up from, whose page size the WAL's frames have.
+	// Under the right key the frame authenticates: adopted, its header
+	// would reach the database file at the next checkpoint.
+	for _, tc := range []struct {
+		name  string
+		off   int
+		value []byte
+	}{
+		{"WAL page 1 of another page size", 16, []byte{0x20, 0x00}}, // 8192
+		{"WAL page 1 of other reserved bytes", 20, []byte{0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, opts := keyProofDB(t, false, nil)
+			var fired atomic.Int32
+			opts.OnIntegrityError = func(uint32, error) { fired.Add(1) }
+			walPath := path + "-wal"
+			_, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
+			f, err := os.OpenFile(walPath, os.O_RDWR, 0)
+			require.NoError(t, err)
+			_, err = f.WriteAt(tc.value, off+walFrameSize+int64(tc.off))
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+			resealWAL(t, walPath, int(opts.PageSize))
+			for _, key := range [][]byte{opts.Key, []byte("wrong-passphrase")} {
+				o := opts
+				o.Key = key
+				_, err := Open(path, o)
+				require.ErrorIs(t, err, ErrHeaderCorrupt, "key %q", key)
+				require.NotErrorIs(t, err, ErrWrongKey)
+			}
+			require.Zero(t, fired.Load())
+		})
+	}
+}
+
+// A page the open could not read might have proved the key: when no page
+// it tried authenticates and one could not be read, the open returns that
+// read's error, not ErrWrongKey, and not corruption.
+func TestOpen_UnreadableProbePageIsNotAWrongKey(t *testing.T) {
+	path, opts := keyProofDB(t, false, nil)
+	var fired atomic.Int32
+	opts.OnIntegrityError = func(uint32, error) { fired.Add(1) }
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, int64(opts.PageSize), info.Size(), "every page but the first is only in the WAL")
+	walPath := path + "-wal"
+	page1Frame, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
+	damageFile(t, walPath, off+walFrameSize+1000)
+	resealWAL(t, walPath, int(opts.PageSize))
+
+	eio := errors.New("injected: input/output error")
+	setWalReadFrameFaultHook(func(frame uint32) error {
+		if frame == page1Frame {
+			return nil
+		}
+		return eio
+	})
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, eio)
+	require.NotErrorIs(t, err, ErrWrongKey)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.Zero(t, fired.Load())
+
+	// Once the pages read, the key is proven and page 1 is damage.
+	setWalReadFrameFaultHook(nil)
+	_, err = Open(path, opts)
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.EqualValues(t, 1, fired.Load())
+}
+
+// faultCodec is a codec that fails its Decrypt of the pages in fail with
+// their error, as a codec whose key service is not available does, and
+// otherwise decrypts as the codec it wraps.
+type faultCodec struct {
+	Codec
+	fail map[uint32]error
+}
+
+func (c *faultCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch, onError integrityHook) ([]byte, error) {
+	if err := c.fail[pgno]; err != nil {
+		return nil, err
+	}
+	return c.Codec.Decrypt(dst, src, pgno, s, onError)
+}
+
+// A codec's error that is not a failed authentication proves nothing about
+// the key, in the database file as in the WAL: the open goes on to the
+// next page, and when no page authenticates it returns that error, not
+// ErrWrongKey. A page after it that authenticates, in the same open, proves
+// the key.
+func TestOpen_CodecErrorOnAProbePageIsNotAWrongKey(t *testing.T) {
+	encTestSetup(t)
+	codec, err := newCodecFromType(CipherAES256GCM, bytes.Repeat([]byte{0x5A}, KeyLen))
+	require.NoError(t, err)
+	unavailable := errors.New("injected: key service unavailable")
+	create := func(t *testing.T, rows int) (string, Options) {
+		t.Helper()
+		path := tmpEncryptedFile(t, "enc.db")
+		opts := DefaultOptions()
+		opts.Codec = codec
+		opts.InProcess = true
+		db, err := Open(path, opts)
+		require.NoError(t, err)
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := wtx.CreateNamespace("x")
+		require.NoError(t, err)
+		for i := 0; i < rows; i++ {
+			require.NoError(t, wtx.Put(ns, []byte(fmt.Sprintf("key-%04d", i)), bytes.Repeat([]byte("v"), 1000)))
+		}
+		require.NoError(t, wtx.Commit())
+		require.NoError(t, db.Checkpoint(CheckpointFull))
+		require.NoError(t, db.Close())
+		damageFile(t, path, 1000)
+		return path, opts
+	}
+
+	t.Run("the only other page", func(t *testing.T) {
+		path, opts := create(t, 0)
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		require.Equal(t, 2*int64(opts.PageSize), info.Size())
+		var fired atomic.Int32
+		opts.OnIntegrityError = func(uint32, error) { fired.Add(1) }
+		opts.Codec = &faultCodec{Codec: codec, fail: map[uint32]error{2: unavailable}}
+		_, err = Open(path, opts)
+		require.ErrorIs(t, err, unavailable)
+		require.NotErrorIs(t, err, ErrWrongKey)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		require.Zero(t, fired.Load())
+	})
+	t.Run("a page after it proves the key", func(t *testing.T) {
+		path, opts := create(t, 400)
+		var pages []uint32
+		opts.OnIntegrityError = func(pgno uint32, _ error) { pages = append(pages, pgno) }
+		opts.Codec = &faultCodec{Codec: codec, fail: map[uint32]error{2: unavailable}}
+		_, err := Open(path, opts)
+		require.ErrorIs(t, err, ErrPageIntegrity)
+		require.NotErrorIs(t, err, unavailable)
+		require.Equal(t, []uint32{1}, pages)
+	})
+}
+
+// A page that could not be read is skipped, and a page after it that
+// authenticates, in the same open, proves the key: page 1 in the WAL is
+// damage.
+func TestOpen_UnreadableProbePageThenAProvingOne(t *testing.T) {
+	path, opts := keyProofDB(t, false, nil)
+	var pages []uint32
+	opts.OnIntegrityError = func(pgno uint32, _ error) { pages = append(pages, pgno) }
+	walPath := path + "-wal"
+	page1Frame, off := lastWALFrame(t, walPath, int(opts.PageSize), 1)
+	damageFile(t, walPath, off+walFrameSize+1000)
+	resealWAL(t, walPath, int(opts.PageSize))
+	firstProbe, _ := lastWALFrame(t, walPath, int(opts.PageSize), 2)
+	require.NotEqual(t, page1Frame, firstProbe)
+
+	// The frames the open reads, in order: page 1's, the first page the
+	// probe tries, which fails, then a later one, which proves the key.
+	eio := errors.New("injected: input/output error")
+	var frames []uint32
+	setWalReadFrameFaultHook(func(frame uint32) error {
+		frames = append(frames, frame)
+		if frame == firstProbe {
+			return eio
+		}
+		return nil
+	})
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
+	_, err := Open(path, opts)
+	setWalReadFrameFaultHook(nil)
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.NotErrorIs(t, err, eio)
+	require.Equal(t, []uint32{1}, pages)
+	require.Len(t, frames, 3)
+	require.Equal(t, []uint32{page1Frame, firstProbe}, frames[:2])
+	require.NotContains(t, []uint32{page1Frame, firstProbe}, frames[2])
+}
+
+// An integrity hook that panics inside Open (the key check calls it for a
+// damaged page 1) leaves nothing of the open behind: the file is not held
+// by the process, and the next Open reads it again.
+func TestOpen_PanickingIntegrityHookReleasesTheFile(t *testing.T) {
+	path, opts := keyProofDB(t, true, nil)
+	damageFile(t, path, 1000)
+	opts.OnIntegrityError = func(uint32, error) { panic("integrity hook") }
+	func() {
+		defer func() { require.Equal(t, "integrity hook", recover()) }()
+		_, _ = Open(path, opts)
+	}()
+
+	opts.OnIntegrityError = nil
+	_, err := Open(path, opts)
+	require.ErrorIs(t, err, ErrPageIntegrity)
+	require.NotErrorIs(t, err, ErrDatabaseOpen)
+}
+
+// A cursor of a write transaction whose commit failed reports the commit's
+// error, the one the pager's error state holds (pager.errCode), not
+// corruption and not a read-only refusal: the database is sound. The commit
+// fails for real, in its WAL write, after its frames are written.
+func TestPagerError_CursorReportsTheCommitError(t *testing.T) {
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "a.db"), Options{})
+	require.NoError(t, err)
+	defer db.Close()
+	commitRows(t, db, "t", 8, 16)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.GetNamespace("t")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("not committed"), []byte("v")))
+	cur := tx.NewCursor(ns)
+	defer cur.Close()
+	require.NoError(t, cur.First())
+
+	diskFull := errors.New("injected: no space left on device")
+	testCommitPublishErrHook = func() error { return diskFull }
+	t.Cleanup(func() { testCommitPublishErrHook = nil })
+	commitErr := tx.Commit()
+	testCommitPublishErrHook = nil
+	require.ErrorIs(t, commitErr, diskFull)
+
+	_, err = cur.Key()
+	require.ErrorIs(t, err, diskFull, "the cursor reports the commit's error")
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, ErrReadOnly)
+	require.Nil(t, db.pager.errCode, "the error state ends with the cleanup")
+	_ = tx.Rollback()
+
+	// The next transaction sees a sound database.
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	rns, err := rtx.GetNamespace("t")
+	require.NoError(t, err)
+	n, err := rtx.Count(rns)
+	require.NoError(t, err)
+	require.EqualValues(t, 8, n)
 }

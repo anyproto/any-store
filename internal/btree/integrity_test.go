@@ -1,11 +1,16 @@
 package btree
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -141,6 +146,7 @@ func TestIntegrityCheckCorruptPageType(t *testing.T) {
 
 	err = db.IntegrityCheck()
 	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCorrupt)
 	ie, ok := err.(*IntegrityError)
 	require.True(t, ok)
 	found := false
@@ -410,6 +416,253 @@ func TestIntegrityCheckOverflowAfterDeletes(t *testing.T) {
 func TestIntegrityErrorFormat(t *testing.T) {
 	ie := &IntegrityError{Errors: []string{"error 1", "error 2"}}
 	assert.Equal(t, "error 1\nerror 2", ie.Error())
+}
+
+// === What an IntegrityError matches ===
+
+// Findings match ErrCorrupt. A report with a page the check could not read
+// is inconclusive: it matches the read's error and not ErrCorrupt.
+func TestIntegrityErrorMatches(t *testing.T) {
+	ioErr := errors.New("input/output error")
+
+	damage := &IntegrityError{Errors: []string{"page 3: never used"}}
+	require.ErrorIs(t, damage, ErrCorrupt)
+
+	unread := &IntegrityError{Errors: []string{"unable to get page", "page 3: never used"}, unread: ioErr}
+	require.NotErrorIs(t, unread, ErrCorrupt)
+	require.ErrorIs(t, unread, ioErr)
+
+	// Wrapped, as the public IntegrityCheck may return it.
+	require.ErrorIs(t, fmt.Errorf("check: %w", damage), ErrCorrupt)
+}
+
+// A page that fails its checksum is damage the check reports: the report
+// matches ErrCorrupt and ErrPageIntegrity's parent, not a plain string.
+func TestIntegrityCheck_DamagedPageMatchesErrCorrupt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	opts := DefaultOptions()
+	opts.Checksum = true
+	opts.InProcess = true
+	setupSweepDB(t, path, opts)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, info.Size(), int64(2*opts.PageSize))
+	damageFile(t, path, int64(opts.PageSize)+200) // page 2
+
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	defer db.Close()
+	err = db.IntegrityCheck()
+	require.ErrorIs(t, err, ErrCorrupt)
+	var ie *IntegrityError
+	require.ErrorAs(t, err, &ie)
+	require.NotEmpty(t, ie.Errors)
+}
+
+// A page the check cannot read for a reason other than damage is listed,
+// and the report does not match ErrCorrupt: the file may be sound. It
+// matches the read's error.
+func TestIntegrityCheck_FailedReadIsNotErrCorrupt(t *testing.T) {
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
+
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	commitRows(t, db, "t1", 64, 200)
+	require.NoError(t, db.IntegrityCheck())
+
+	// A frame of a page other than page 1: page 1's read failing ends the
+	// check before it starts, with the read's error as it is.
+	nf := db.pager.wal.nFrame.Load()
+	var target uint32
+	for p := uint32(2); p <= db.pager.dbSize.Load() && target == 0; p++ {
+		target = mustWiGet(t, db.pager.wal.index, p, nf)
+	}
+	require.NotZero(t, target)
+
+	ioErr := errors.New("injected input/output error")
+	setWalReadFrameFaultHook(func(frame uint32) error {
+		if frame == target {
+			return ioErr
+		}
+		return nil
+	})
+	err = db.IntegrityCheck()
+	var ie *IntegrityError
+	require.ErrorAs(t, err, &ie)
+	require.NotEmpty(t, ie.Errors)
+	require.ErrorIs(t, err, ioErr)
+	require.NotErrorIs(t, err, ErrCorrupt)
+
+	setWalReadFrameFaultHook(nil)
+	require.NoError(t, db.IntegrityCheck())
+}
+
+// A key on overflow pages whose read fails once is listed as a read that
+// failed, with the read's error, and not as a corrupt key: when the check
+// of the overflow chain then reads the page, that line is all the report
+// says of it, and the report matches the read's error, not ErrCorrupt.
+func TestIntegrityCheck_FailedKeyReadIsNamedWithItsError(t *testing.T) {
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("k")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns, bytes.Repeat([]byte("k"), 6000), []byte("v")))
+	require.NoError(t, wtx.Commit())
+	require.NoError(t, db.IntegrityCheck())
+
+	// The first overflow page of the key, and its frame.
+	nf := db.pager.wal.nFrame.Load()
+	pg, err := db.pager.getPageReader(ns.RootPage(), nf, nil)
+	require.NoError(t, err)
+	bt := &btree{pager: db.pager, rootPage: ns.RootPage()}
+	cell, _, err := parseLeafCellWithSize(pg.data, int(pg.getCellOffset(0)), bt.leafLimits())
+	db.pager.releasePage(pg)
+	require.NoError(t, err)
+	require.NotZero(t, cell.overflowPg)
+	frame := mustWiGet(t, db.pager.wal.index, cell.overflowPg, nf)
+	require.NotZero(t, frame)
+
+	ioErr := errors.New("injected input/output error")
+	var failed atomic.Bool
+	setWalReadFrameFaultHook(func(f uint32) error {
+		if f == frame && failed.CompareAndSwap(false, true) {
+			return ioErr
+		}
+		return nil
+	})
+	err = db.IntegrityCheck()
+	setWalReadFrameFaultHook(nil)
+	require.True(t, failed.Load())
+	var ie *IntegrityError
+	require.ErrorAs(t, err, &ie)
+	require.ErrorIs(t, err, ioErr)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.Len(t, ie.Errors, 1)
+	require.Contains(t, ie.Errors[0], "cell 0: reading the leaf key failed: ")
+	require.Contains(t, ie.Errors[0], ioErr.Error())
+}
+
+// IntegrityCheck on a closed handle is ErrClosed, in either shared-memory
+// mode. In the in-process mode the heap wal-index outlives the files, and a
+// check that bypassed the read admission read page 1 as zeros:
+// ErrHeaderCorrupt, which matches ErrCorrupt.
+func TestIntegrityCheck_ClosedHandleIsErrClosed(t *testing.T) {
+	for _, inProcess := range []bool{false, true} {
+		t.Run(fmt.Sprintf("inProcess=%v", inProcess), func(t *testing.T) {
+			db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), Options{PageSize: 4096, InProcess: inProcess})
+			require.NoError(t, err)
+			commitRows(t, db, "t1", 8, 100)
+			require.NoError(t, db.Close())
+
+			err = db.IntegrityCheck()
+			require.ErrorIs(t, err, ErrClosed)
+			require.NotErrorIs(t, err, ErrCorrupt)
+		})
+	}
+}
+
+// The check in a read transaction the caller holds takes no other reader
+// slot: with one slot, held by that transaction, it runs, where a check
+// that began a read of its own waited for the slot its caller held. It
+// checks that transaction's snapshot: not damage committed after it, which
+// a check of a later snapshot finds. A write transaction's read view and an
+// ended transaction are refused.
+func TestIntegrityCheck_InTheCallersReadTx(t *testing.T) {
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), Options{PageSize: 4096, MaxReaders: 1})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	commitRows(t, db, "t1", 8, 100)
+
+	tx, err := db.BeginRead()
+	require.NoError(t, err)
+	done := make(chan error, 1)
+	go func() { done <- tx.IntegrityCheck() }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		// The caller's transaction gives the slot back, so that the check
+		// that waits for it ends, and the cleanup's Close with it.
+		_ = tx.Rollback()
+		t.Fatal("the check waits for the reader slot its caller holds")
+	}
+	// A commit after the snapshot is not the snapshot's: one that leaves a
+	// namespace with a root of 0, damage a check of the newer state finds.
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, wtx.pager.wgate.enter())
+	master := &btree{pager: db.pager, rootPage: 1, walMaxFrame: wtx.walHdr.mxFrame, writable: true}
+	require.NoError(t, master.Put([]byte("x"), []byte{0, 0, 0, 0}))
+	wtx.pager.wgate.leave()
+	require.NoError(t, wtx.Commit())
+	err = tx.IntegrityCheckN(0)
+	require.NoError(t, tx.Rollback())
+	require.NoError(t, err, "the snapshot before the commit is checked")
+	require.ErrorIs(t, tx.IntegrityCheck(), ErrTxClosed)
+	fresh, err := db.BeginRead()
+	require.NoError(t, err)
+	err = fresh.IntegrityCheckN(0)
+	require.NoError(t, fresh.Rollback())
+	require.ErrorIs(t, err, ErrCorrupt, "the snapshot after the commit")
+
+	wtx, err = db.BeginWrite()
+	require.NoError(t, err)
+	require.ErrorIs(t, wtx.ReadTx.IntegrityCheck(), errIntegrityCheckWriteTx)
+	require.NoError(t, wtx.Rollback())
+}
+
+// A namespace whose master entry gives root 0 is reported, also when its
+// former pages went to the freelist and nothing else is out of place: no
+// namespace has root 0, and resolving it is ErrCorrupt, as a scan of it
+// is.
+func TestIntegrityCheck_NamespaceRootZeroIsReported(t *testing.T) {
+	db := tempDB(t)
+	commitRows(t, db, "x", 64, 200)
+	require.NoError(t, db.IntegrityCheck())
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, db.DeleteNamespace(tx, "x"))
+	require.NoError(t, tx.pager.wgate.enter())
+	master := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
+	require.NoError(t, master.Put([]byte("x"), []byte{0, 0, 0, 0}))
+	tx.pager.wgate.leave()
+	require.NoError(t, tx.Commit())
+
+	err = db.IntegrityCheck()
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.Contains(t, err.Error(), `"x": namespace root page 0 out of range`)
+}
+
+// A page reached through a wal-index that points past the end of the log
+// is a short read, and the report keeps that identity: it matches
+// ErrWALShortRead and not ErrCorrupt, so a caller can tell an index to
+// rebuild from a database to discard.
+func TestIntegrityCheck_ShortWALReadKeepsItsIdentity(t *testing.T) {
+	db, err := testOpen(t, filepath.Join(t.TempDir(), "test.db"), Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	commitRows(t, db, "t1", 64, 200)
+	require.NoError(t, db.IntegrityCheck())
+
+	// The log ends after page 1's last frame; the index still points at
+	// the frames past it, as a peer's stale index would.
+	walPath := db.pager.wal.path
+	pageSize := int(db.pager.pageSize)
+	page1Frame, off := lastWALFrame(t, walPath, pageSize, 1)
+	require.Less(t, page1Frame, db.pager.wal.nFrame.Load(), "the walk must meet a frame past page 1's")
+	require.NoError(t, os.Truncate(walPath, off+int64(walFrameSize+pageSize)))
+
+	err = db.IntegrityCheck()
+	var ie *IntegrityError
+	require.ErrorAs(t, err, &ie)
+	require.ErrorIs(t, err, ErrWALShortRead)
+	require.NotErrorIs(t, err, ErrCorrupt)
 }
 
 // TestCheckListOverlargeTrunkContinuesWalk is a regression test for the drift

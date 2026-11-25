@@ -3839,3 +3839,352 @@ func TestSketchPasses_SkipUnverifiedHead(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
 }
+
+// The quick check of a dirty open fails the open as ErrQuickCheckFailed,
+// and so as ErrCorrupt, only when it met damage. A check that did not
+// finish returns what stopped it, and that is not corruption: the caller
+// must not discard a file over a cancelled context or an I/O error. In
+// every case the sentinel stays and the next open checks again.
+func TestOpen_DirtyQuickCheckErrors(t *testing.T) {
+	ctx := context.Background()
+	cfg := func() *Config { return &Config{Durability: DurabilityConfig{Sentinel: true}} }
+	path := filepath.Join(t.TempDir(), "a.db")
+	db, err := Open(ctx, path, cfg())
+	require.NoError(t, err)
+	_, err = db.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	// The marker a process that died after a write leaves behind.
+	marker := path + ".lock"
+	require.NoError(t, os.WriteFile(marker, nil, 0o644))
+	t.Cleanup(func() { testQuickCheckReadHook = nil })
+
+	open := func(ctx context.Context, injected error) error {
+		testQuickCheckReadHook = nil
+		if injected != nil {
+			testQuickCheckReadHook = func() error { return injected }
+		}
+		db, err := Open(ctx, path, cfg())
+		testQuickCheckReadHook = nil
+		if err == nil {
+			require.NoError(t, db.Close())
+		}
+		return err
+	}
+	stillDirty := func() {
+		t.Helper()
+		_, err := os.Stat(marker)
+		require.NoError(t, err, "a failed quick check cleared the sentinel")
+	}
+
+	t.Run("damage", func(t *testing.T) {
+		damage := fmt.Errorf("page 7: %w", ErrPageIntegrity)
+		err := open(ctx, damage)
+		require.ErrorIs(t, err, ErrQuickCheckFailed)
+		require.ErrorIs(t, err, ErrCorrupt)
+		require.ErrorIs(t, err, ErrPageIntegrity)
+		stillDirty()
+	})
+	t.Run("io error", func(t *testing.T) {
+		eio := errors.New("input/output error")
+		err := open(ctx, &os.PathError{Op: "read", Path: path, Err: eio})
+		require.ErrorIs(t, err, eio)
+		require.NotErrorIs(t, err, ErrQuickCheckFailed)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		stillDirty()
+	})
+	t.Run("cancelled in the check", func(t *testing.T) {
+		err := open(ctx, context.Canceled)
+		require.ErrorIs(t, err, context.Canceled)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		stillDirty()
+	})
+	t.Run("deadline", func(t *testing.T) {
+		err := open(ctx, context.DeadlineExceeded)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		stillDirty()
+	})
+	t.Run("busy", func(t *testing.T) {
+		err := open(ctx, btree.ErrBusySnapshot)
+		require.ErrorIs(t, err, ErrBusy)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		stillDirty()
+	})
+	// The read does not consult the ctx once it has begun: a read that
+	// succeeds after the ctx ended is a check that did not finish in time.
+	t.Run("cancelled during a read that succeeds", func(t *testing.T) {
+		cctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		testQuickCheckReadHook = func() error { cancel(); return nil }
+		db, err := Open(cctx, path, cfg())
+		testQuickCheckReadHook = nil
+		if err == nil {
+			require.NoError(t, db.Close())
+		}
+		require.ErrorIs(t, err, context.Canceled)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		stillDirty()
+	})
+	t.Run("deadline passed during a read that succeeds", func(t *testing.T) {
+		dctx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		testQuickCheckReadHook = func() error { <-dctx.Done(); return nil }
+		db, err := Open(dctx, path, cfg())
+		testQuickCheckReadHook = nil
+		if err == nil {
+			require.NoError(t, db.Close())
+		}
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		stillDirty()
+	})
+	t.Run("clean", func(t *testing.T) {
+		db, err := Open(ctx, path, cfg())
+		require.NoError(t, err)
+		stats, err := db.Stats(ctx)
+		require.NoError(t, err)
+		require.True(t, stats.DirtyOnOpen)
+		require.NoError(t, db.Close())
+	})
+}
+
+// Backup refuses a destination that holds a database of another schema
+// format with an exported error, and leaves it as it was. Another page
+// layout: test/backup_roundtrip_test.go.
+func TestBackup_DestinationOfAnotherKind(t *testing.T) {
+	ctx := context.Background()
+	newDB := func(t *testing.T, path string, conf *Config) {
+		t.Helper()
+		db, err := Open(ctx, path, conf)
+		require.NoError(t, err)
+		_, err = db.CreateCollection(ctx, "dst")
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+	}
+	backupRefused := func(t *testing.T, src DB, path string, want error) {
+		t.Helper()
+		before, err := os.ReadFile(path)
+		require.NoError(t, err)
+		err = src.Backup(ctx, path)
+		require.ErrorIs(t, err, want)
+		require.NotErrorIs(t, err, ErrCorrupt)
+		after, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Equal(t, before, after)
+	}
+
+	t.Run("another schema format", func(t *testing.T) {
+		dir := t.TempDir()
+		src, err := Open(ctx, filepath.Join(dir, "src.db"), nil)
+		require.NoError(t, err)
+		defer src.Close()
+		path := filepath.Join(dir, "dst.db")
+		createFormat(t, os.Getenv("ANYSTORE_TEST_LEGACY_FORMAT") != "1")
+		newDB(t, path, nil)
+		backupRefused(t, src, path, ErrBackupFormatMismatch)
+	})
+}
+
+// IntegrityCheck's catalog check: a collection in the catalog with no data
+// namespace is damage, and the error matches ErrCorrupt, as the b-tree
+// check's findings do.
+func TestIntegrityCheck_MissingDataNamespaceMatchesErrCorrupt(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(ctx, filepath.Join(t.TempDir(), "a.db"), nil)
+	require.NoError(t, err)
+	defer d.Close()
+	coll, err := d.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	require.NoError(t, d.IntegrityCheck(ctx))
+
+	// The collection's data goes; its catalog entry stays.
+	wtx, err := d.(*db).btreeDB.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, wtx.DeleteNamespace("c"))
+	require.NoError(t, wtx.Commit())
+
+	err = d.IntegrityCheck(ctx)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.Contains(t, err.Error(), "data namespace missing")
+}
+
+// IntegrityCheck checks one snapshot: that of the read transaction its ctx
+// carries, which does not hold a defect committed after it, and the
+// committed state beside a write transaction its ctx carries, which does
+// not hold that transaction's own defect until it commits. The defect is a
+// collection in the catalog with no data namespace.
+func TestIntegrityCheck_TheSnapshotItChecks(t *testing.T) {
+	ctx := context.Background()
+	newDB := func(t *testing.T) *db {
+		t.Helper()
+		d, err := Open(ctx, filepath.Join(t.TempDir(), "a.db"), nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = d.Close() })
+		coll, err := d.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+		require.NoError(t, coll.Close())
+		require.NoError(t, d.IntegrityCheck(ctx))
+		return d.(*db)
+	}
+
+	t.Run("the read transaction's", func(t *testing.T) {
+		d := newDB(t)
+		rtx, err := d.ReadTx(ctx)
+		require.NoError(t, err)
+		wtx, err := d.btreeDB.BeginWrite()
+		require.NoError(t, err)
+		require.NoError(t, wtx.DeleteNamespace("c"))
+		require.NoError(t, wtx.Commit())
+
+		err = d.IntegrityCheck(rtx.Context())
+		require.NoError(t, rtx.Commit())
+		require.NoError(t, err, "the snapshot before the commit")
+		require.ErrorIs(t, d.IntegrityCheck(ctx), ErrCorrupt)
+	})
+	t.Run("beside the write transaction", func(t *testing.T) {
+		d := newDB(t)
+		wtx, err := d.WriteTx(ctx)
+		require.NoError(t, err)
+		err = d.doWriteTx(wtx.Context(), func(tx *btree.WriteTx) error { return tx.DeleteNamespace("c") })
+		if err == nil {
+			err = d.IntegrityCheck(wtx.Context())
+		}
+		if err != nil {
+			_ = wtx.Rollback()
+		}
+		require.NoError(t, err, "the committed state")
+		require.NoError(t, wtx.Commit())
+		require.ErrorIs(t, d.IntegrityCheck(ctx), ErrCorrupt)
+	})
+}
+
+// IntegrityCheck consults its ctx between the btree's walk, which does not,
+// and the catalog's check, and before it returns success: a ctx cancelled
+// while the walk ran ends the check with the ctx's error, not with nil.
+func TestIntegrityCheck_CancelledDuringTheWalk(t *testing.T) {
+	d, err := Open(context.Background(), filepath.Join(t.TempDir(), "a.db"), nil)
+	require.NoError(t, err)
+	defer d.Close()
+	_, err = d.CreateCollection(context.Background(), "c")
+	require.NoError(t, err)
+
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	testIntegrityCheckWalkedHook = cancel
+	defer func() { testIntegrityCheckWalkedHook = nil }()
+	err = d.IntegrityCheck(cctx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, ErrCorrupt)
+
+	testIntegrityCheckWalkedHook = nil
+	require.NoError(t, d.IntegrityCheck(context.Background()))
+}
+
+// mmapShm reports whether the wal-index is shared memory other processes
+// map (linux, android, darwin and ios on amd64 and arm64): only there can a
+// test tear its header, as a writer between its two copies leaves it.
+func mmapShm() bool {
+	switch runtime.GOOS {
+	case "linux", "android", "darwin", "ios":
+		return runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64"
+	}
+	return false
+}
+
+// A busy IntegrityCheck matches ErrBusy, as every busy error of the package
+// does, and keeps the btree's busy error: here a rebuild of the wal-index
+// that another connection holds past the busy timeout.
+func TestIntegrityCheck_BusyMatchesErrBusy(t *testing.T) {
+	if !mmapShm() {
+		t.Skip("the wal-index is this process's memory: no other connection rebuilds it")
+	}
+	ctx := context.Background()
+	d, err := Open(ctx, filepath.Join(t.TempDir(), "a.db"), nil)
+	require.NoError(t, err)
+	defer d.Close()
+	_, err = d.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+
+	seam := d.(*db).btreeDB.TestSeam()
+	seam.SetBusyTimeout(100 * time.Millisecond)
+	restore := seam.TearHeader()
+	unlockWrite, err := seam.Lock("write")
+	require.NoError(t, err)
+	unlockRecover, err := seam.Lock("recover")
+	require.NoError(t, err)
+	err = d.IntegrityCheck(ctx)
+	restore()
+	unlockRecover()
+	unlockWrite()
+	require.ErrorIs(t, err, ErrBusy)
+	require.ErrorIs(t, err, btree.ErrBusyRecovery)
+	require.NotErrorIs(t, err, ErrCorrupt)
+	require.NoError(t, d.IntegrityCheck(ctx))
+}
+
+// A busy error of the initialization Open runs once the btree has opened
+// (here the write begin of init, its snapshot overtaken by another
+// process's commit at every attempt) matches ErrBusy and keeps the btree's
+// error.
+func TestOpen_BusyInitializationMatchesErrBusy(t *testing.T) {
+	if !mmapShm() {
+		t.Skip("the wal-index is this process's memory: no other process commits")
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "a.db")
+	d, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+
+	testHookAfterBtreeOpen = func(bdb *btree.DB) {
+		bdb.TestSeam().SetBusyTimeout(100 * time.Millisecond)
+		btree.SetTestBeforeBeginWriteHook(func(s btree.TestSeam) {
+			if s.Path() == bdb.TestSeam().Path() {
+				s.PeerPublish()
+			}
+		})
+	}
+	defer func() {
+		testHookAfterBtreeOpen = nil
+		btree.SetTestBeforeBeginWriteHook(nil)
+	}()
+	_, err = Open(ctx, path, nil)
+	require.ErrorIs(t, err, ErrBusy)
+	require.ErrorIs(t, err, btree.ErrBusySnapshot)
+	require.NotErrorIs(t, err, ErrCorrupt)
+
+	testHookAfterBtreeOpen = nil
+	btree.SetTestBeforeBeginWriteHook(nil)
+	d, err = Open(ctx, path, nil)
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+}
+
+// A wal-index of another version that a peer publishes after btree.Open
+// has returned, before the write begin of Open's initialization, is the
+// version refusal it is at btree.Open: ErrIncompatibleVersion, keeping the
+// btree's error, for a newer wal-index and an older one.
+func TestOpen_WalIndexVersionAfterTheBtreeOpenIsIncompatible(t *testing.T) {
+	if !mmapShm() {
+		t.Skip("the wal-index is this process's memory: no other build publishes one")
+	}
+	ctx := context.Background()
+	for _, delta := range []int{1, -1} {
+		t.Run(fmt.Sprintf("version %+d", delta), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "a.db")
+			d, err := Open(ctx, path, nil)
+			require.NoError(t, err)
+			require.NoError(t, d.Close())
+
+			testHookAfterBtreeOpen = func(bdb *btree.DB) { bdb.TestSeam().PublishIndexVersion(delta) }
+			_, err = Open(ctx, path, nil)
+			testHookAfterBtreeOpen = nil
+			require.ErrorIs(t, err, ErrIncompatibleVersion)
+			require.ErrorIs(t, err, btree.ErrWALVersion)
+			require.NotErrorIs(t, err, ErrCorrupt)
+		})
+	}
+}

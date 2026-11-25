@@ -1023,3 +1023,26 @@ func TestBackup_LongStepEndsWithItsCtx(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, len(fat))
 }
+
+// The destination of a backup of an in-memory database is a file, and
+// syncs its commits as a file does by default, not as the in-memory
+// database, which is forced to skip it: the backup's commit is then synced
+// by itself, and not only by a checkpoint that a close which is not the
+// last one on the file does not run. A file's own setting is kept.
+func TestBackupDestinationOptions_InMemorySourceSyncsItsCommits(t *testing.T) {
+	src, err := testOpen(t, "", Options{InMemory: true})
+	require.NoError(t, err)
+	defer src.Close()
+	opts := src.BackupDestinationOptions()
+	require.False(t, opts.NoCommitSync)
+
+	dst, err := testOpen(t, filepath.Join(t.TempDir(), "dst.db"), opts)
+	require.NoError(t, err)
+	require.False(t, dst.pager.wal.noCommitSync)
+	require.NoError(t, dst.Close())
+
+	file, err := testOpen(t, filepath.Join(t.TempDir(), "src.db"), Options{NoCommitSync: true})
+	require.NoError(t, err)
+	defer file.Close()
+	require.True(t, file.BackupDestinationOptions().NoCommitSync)
+}

@@ -273,13 +273,19 @@ func (wh *walHeader) serialize(buf []byte) {
 	binary.BigEndian.PutUint32(buf[28:32], c2)
 }
 
+// errWalHeaderInvalid is walHeader.deserialize's error for a header that is
+// not a WAL header of this format: too short, another magic, a checksum
+// that does not match, a page size that is not one. Recovery treats the log
+// as empty and starts it over (recoverLocked); it reaches no caller.
+var errWalHeaderInvalid = errors.New("btree: WAL header is not valid")
+
 func (wh *walHeader) deserialize(buf []byte) error {
 	if len(buf) < walHeaderSize {
-		return ErrWALCorrupt
+		return errWalHeaderInvalid
 	}
 	wh.magic = binary.BigEndian.Uint32(buf[0:4])
 	if wh.magic != walMagic {
-		return ErrWALCorrupt
+		return errWalHeaderInvalid
 	}
 	wh.version = binary.BigEndian.Uint32(buf[4:8])
 	wh.pageSize = binary.BigEndian.Uint32(buf[8:12])
@@ -292,7 +298,7 @@ func (wh *walHeader) deserialize(buf []byte) error {
 	// Verify header checksum
 	c1, c2 := walChecksum(buf[0:24], 0, 0)
 	if c1 != wh.checksum1 || c2 != wh.checksum2 {
-		return ErrWALCorrupt
+		return errWalHeaderInvalid
 	}
 
 	// Validate version — matches SQLite walIndexRecover (wal.c:1441-1446):
@@ -311,7 +317,7 @@ func (wh *walHeader) deserialize(buf []byte) error {
 	// value would mislead recovery's frame-size arithmetic and could cause
 	// out-of-bounds allocation.
 	if wh.pageSize < MinPageSize || wh.pageSize > MaxPageSize || wh.pageSize&(wh.pageSize-1) != 0 {
-		return ErrWALCorrupt
+		return errWalHeaderInvalid
 	}
 
 	return nil
@@ -1885,7 +1891,9 @@ func (w *wal) open() (err error) {
 			return err
 		}
 		w.index = idx
-		w.initHeaderStateLocked(false)
+		if err := w.initHeaderStateLocked(false); err != nil {
+			return err
+		}
 		w.memFrames = make([]memFrame, 0, 1024)
 		return nil
 	}
@@ -2028,9 +2036,7 @@ func (w *wal) open() (err error) {
 
 	// No SHM to adopt and no on-disk WAL. Initialize fresh state. The on-disk
 	// header is written lazily on the first writeFrames call (flushHeader).
-	w.initHeaderStateLocked(false)
-
-	return nil
+	return w.initHeaderStateLocked(false)
 }
 
 // indexReadHdr returns the validated wal-index header. When the header is
@@ -2115,16 +2121,30 @@ func (w *wal) indexReadHdr(haveWriteLock, haveCkptLock bool) (WalIndexHdr, error
 		if err := w.recoverLocked(); err != nil {
 			return WalIndexHdr{}, err
 		}
-	} else {
+	} else if err := w.initHeaderStateLocked(false); err != nil {
 		// No WAL content: nothing is committed beyond the database file.
-		w.initHeaderStateLocked(false)
+		// The error is the publication's, as walIndexReadHdr returns
+		// walIndexRecover's result (wal.c:2724).
+		return WalIndexHdr{}, err
 	}
 	hdr, valid := w.index.readHeader()
 	if !valid {
-		return WalIndexHdr{}, fmt.Errorf("%w: wal-index header invalid after recovery", ErrCorrupt)
+		// Not ErrCorrupt: the wal-index is shared memory that recovery
+		// rebuilds, and a header still invalid after a recovery that
+		// returned no error is no evidence about the database or the log.
+		// walIndexReadHdr has no check of its own after walIndexRecover
+		// (wal.c:2724): it returns the recovery's result, whose only
+		// SQLITE_CORRUPT is walIndexAppend's hash-chain guard
+		// (wal.c:1506-1507, 1335), and with unreliable shared memory it
+		// turns a recovery's short read into WAL_RETRY (wal.c:2751).
+		return WalIndexHdr{}, errWalIndexUnpublished
 	}
 	return hdr, nil
 }
+
+// errWalIndexUnpublished is indexReadHdr's error when the wal-index header
+// is still not valid after recovery ran. It matches no exported error.
+var errWalIndexUnpublished = errors.New("btree: wal-index header invalid after recovery")
 
 // errWalIndexVersion is indexReadHdr's refusal of a wal-index written with
 // another wal-index version: the shared memory belongs to a build this one
@@ -2168,10 +2188,10 @@ func (w *wal) adoptSHMState(hdr WalIndexHdr, walHasHeader bool) {
 // The published wal-index header carries no database size: the WAL holds no
 // commit, and readers take the database file's size (pagerPagecount,
 // pager.c:3292-3306). The restart path uses restartHeaderStateLocked.
-func (w *wal) initHeaderStateLocked(readMarksLocked bool) {
+func (w *wal) initHeaderStateLocked(readMarksLocked bool) error {
 	// No log to continue: both salts are drawn, as SQLite draws them for the
 	// first frame of a WAL it has no checkpoint sequence for (wal.c:4087).
-	w.restartHeaderStateLocked(readMarksLocked, 0, rand.Uint32(), nil)
+	return w.restartHeaderStateLocked(readMarksLocked, 0, rand.Uint32(), nil)
 }
 
 // restartHeaderStateLocked is initHeaderStateLocked with the database size
@@ -2206,7 +2226,12 @@ func (w *wal) initHeaderStateLocked(readMarksLocked bool) {
 // (wal.announce). Nil when there is none to continue (initHeaderStateLocked):
 // the header was invalid, and its rebuild is a recovery to this process's
 // readers (wal.c:2724-2725).
-func (w *wal) restartHeaderStateLocked(readMarksLocked bool, nPage uint32, salt1 uint32, replaced *WalIndexHdr) {
+//
+// The error is the publication's (the header's segment of the wal-index
+// could not be had). The in-memory state is reset either way; the caller
+// returns the error, and a recovery (indexReadHdr) reports it in place of
+// the header it could not publish.
+func (w *wal) restartHeaderStateLocked(readMarksLocked bool, nPage uint32, salt1 uint32, replaced *WalIndexHdr) error {
 	w.header = walHeader{
 		magic:      walMagic,
 		version:    walVersion,
@@ -2241,7 +2266,7 @@ func (w *wal) restartHeaderStateLocked(readMarksLocked bool, nPage uint32, salt1
 	if !recovery {
 		prev = *replaced
 	}
-	_ = w.publishHeader(&prev, recovery, prev.iChange, 0, nPage,
+	return w.publishHeader(&prev, recovery, prev.iChange, 0, nPage,
 		[2]uint32{w.cksum1, w.cksum2},
 		[2]uint32{w.header.salt1, w.header.salt2})
 }
@@ -2475,9 +2500,16 @@ func (w *wal) writeHeader() error {
 func (w *wal) recoverLocked() error {
 	w.headerOnDisk = true
 
+	// The caller has found the file to hold the header (its Stat, under the
+	// locks it holds), so a read of it that comes up short came up short on
+	// its own (recoveryReadErr), and is not a header of zeros, which would
+	// start the log over. walIndexRecover returns the header read's code
+	// (wal.c:1429-1431).
 	buf := make([]byte, walHeaderSize)
-	if _, err := w.file.ReadAt(buf, 0); err != nil {
-		return err
+	if n, err := w.file.ReadAt(buf, 0); err != nil || n < len(buf) {
+		if err = recoveryReadErr(len(buf), n, err); err != nil {
+			return fmt.Errorf("btree: WAL recovery: read the WAL header: %w", err)
+		}
 	}
 	if err := w.header.deserialize(buf); err != nil {
 		if errors.Is(err, ErrWALVersion) {
@@ -2534,15 +2566,19 @@ func (w *wal) recoverLocked() error {
 	// The loop is bounded by the file size taken above (SQLite: iLastFrame
 	// from sqlite3OsFileSize, wal.c:1467), so every frame it asks for lies
 	// inside the file and a failed read is an I/O error, not the end of the
-	// log. It aborts recovery with nothing published, as walIndexRecover
-	// keeps the read's rc (wal.c:1502-1503) and writes the header only under
-	// rc==SQLITE_OK (wal.c:1561-1566). Publishing the prefix read so far
-	// would present an earlier commit as the end of the log, and the next
-	// checkpoint would truncate the acknowledged commits behind it. Only a
-	// frame that fails validation (salts, pgno, checksum) ends the scan.
+	// log; one that comes up short came up short on its own, as the
+	// header's (recoveryReadErr). It aborts recovery with nothing
+	// published, as walIndexRecover keeps the read's rc (wal.c:1502-1503)
+	// and writes the header only under rc==SQLITE_OK (wal.c:1561-1566).
+	// Publishing the prefix read so far would present an earlier commit as
+	// the end of the log, and the next checkpoint would truncate the
+	// acknowledged commits behind it. Only a frame that fails validation
+	// (salts, pgno, checksum) ends the scan.
 	for offset+frameSize <= info.Size() {
-		if _, err := w.file.ReadAt(scratch, offset); err != nil {
-			return fmt.Errorf("btree: WAL recovery: read frame %d: %w", len(parsed)+1, err)
+		if n, err := w.file.ReadAt(scratch, offset); err != nil || n < len(scratch) {
+			if err = recoveryReadErr(len(scratch), n, err); err != nil {
+				return fmt.Errorf("btree: WAL recovery: read frame %d: %w", len(parsed)+1, err)
+			}
 		}
 		fr.deserialize(scratch[:walFrameSize])
 		if fr.salt1 != w.header.salt1 || fr.salt2 != w.header.salt2 {
@@ -3189,7 +3225,7 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 // contract matches readFrame.
 func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 	if frame == 0 {
-		return ErrWALCorrupt
+		return errWalFrameRange
 	}
 	// Test-only fault-injection hook, shared with readFrame; see
 	// walReadFrameFaultHook.
@@ -3201,7 +3237,7 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 	nf := w.nFrame.Load()
 	if w.inMemory {
 		if frame > nf {
-			return ErrWALCorrupt
+			return errWalFrameRange
 		}
 		w.mu.RLock()
 		idx := frame - 1
@@ -3211,25 +3247,89 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 			return nil
 		}
 		w.mu.RUnlock()
-		return ErrWALCorrupt
+		return errWalFrameRange
+	}
+	// A closed log first: it holds no frame, whatever the count says.
+	if w.file == nil {
+		return ErrClosed
 	}
 	if w.inProcess && frame > nf {
-		return ErrWALCorrupt
-	}
-	if w.file == nil {
-		return ErrWALCorrupt
+		return errWalFrameRange
 	}
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
-	if _, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil {
-		// DRIFT: past-tail ReadAt failure remapped to ErrWALCorrupt; C propagates the raw short-read error See docs/btree/NOTES.md#drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt
-		if frame > nf {
-			return ErrWALCorrupt
+	if n, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil || n < int(w.pageSize) {
+		if err = frameReadResult(int(w.pageSize), n, err); err != nil {
+			return err
 		}
-		return err
 	}
 	return nil
 }
+
+// frameReadErr is the error of a failed read of a frame from the WAL file,
+// err. A short read (the file ends before the frame) is ErrWALShortRead:
+// the wal-index points at a frame the file does not hold, as SQLite's read
+// gives SQLITE_IOERR_SHORT_READ (sqlite3WalReadFrame returns
+// sqlite3OsRead's result, wal.c:3649-3664; unixRead), and the read's own
+// error stays in the chain (io.EOF, or io.ErrUnexpectedEOF), as
+// SQLITE_IOERR_SHORT_READ is a kind of SQLITE_IOERR. Any other failure of
+// the read is returned as it is: an I/O error says nothing about the log's
+// content. Every read of a frame outside recovery goes through it
+// (frameReadResult): the page readers, the checkpoint's (walCheckpoint
+// returns sqlite3OsRead's code, wal.c:2311-2312) and a commit's reread of
+// the frames whose checksums it rewrites (walRewriteChecksums keeps it,
+// wal.c:4002, 4010). Recovery's reads, which rebuild the wal-index from
+// the log within the file's size, do not (recoveryReadErr).
+func frameReadErr(err error) error {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("%w: %w", ErrWALShortRead, err)
+	}
+	return err
+}
+
+// frameReadResult judges a read of size bytes of a WAL frame that did not
+// return them all with no error: ReadAt returned n bytes and err. The
+// readers call it only then. All size bytes with io.EOF, which ReadAt may
+// return for a read that ends at the end of the file, are a read that
+// succeeded: nil. Fewer are a short read, whatever ReadAt said with them
+// (frameReadErr): of its io.EOF, or of io.ErrUnexpectedEOF when it gave no
+// error, as a file system that returns a short count with no error does
+// (io.ReaderAt does not allow it). Any other error is returned as it is.
+func frameReadResult(size, n int, err error) error {
+	if n >= size && (err == nil || errors.Is(err, io.EOF)) {
+		return nil
+	}
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	return frameReadErr(err)
+}
+
+// recoveryReadErr judges a read by recovery, of size bytes of the log's
+// header or of a frame, that did not return them all with no error:
+// ReadAt returned n bytes and err. All size bytes with io.EOF are a read
+// that succeeded: nil. Recovery reads only within the file's size it took
+// under its locks, so a read that returns fewer came up short on its own:
+// the read's error, io.ErrUnexpectedEOF when it gave none. It is not
+// ErrWALShortRead, a wal-index that points past the end of the log, whose
+// remedy, closing every handle so that recovery rebuilds the index, is
+// what failed here. walIndexRecover returns the read's code
+// (wal.c:1429-1431, 1502-1503).
+func recoveryReadErr(size, n int, err error) error {
+	if n >= size && (err == nil || errors.Is(err, io.EOF)) {
+		return nil
+	}
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	return err
+}
+
+// errWalFrameRange is the error of a frame read the wal-index cannot have
+// asked for: frame 0, a frame above the count of a log only this process
+// writes (in memory, or in the in-process mode), an in-memory frame that is
+// not there. A bug, not a state of the files: it matches no exported error.
+var errWalFrameRange = errors.New("btree: WAL frame outside the log (internal error)")
 
 // END ENCRYPTION
 
@@ -3277,8 +3377,16 @@ func (w *wal) readFrame(frame uint32, buf, scratchBuf []byte, aeadScratchBuf *ae
 // pgno binds the codec's AAD, so the content read is the only I/O
 // (sqlite3WalReadFrame, wal.c:3649). pgno 0 reads it from the frame header.
 func (w *wal) readFramePage(frame, pgno uint32, buf, scratchBuf []byte, aeadScratchBuf *aeadScratch) error {
+	return w.readFramePageHook(frame, pgno, buf, scratchBuf, aeadScratchBuf, w.onIntegrityError)
+}
+
+// readFramePageHook is readFramePage with the integrity hook a failed
+// decrypt is reported to. Every read passes the database's hook, except
+// the reads by which an open proves its key (pager.readPage1AtOpen), whose
+// failures are not yet known to be damage.
+func (w *wal) readFramePageHook(frame, pgno uint32, buf, scratchBuf []byte, aeadScratchBuf *aeadScratch, onError integrityHook) error {
 	if frame == 0 {
-		return ErrWALCorrupt
+		return errWalFrameRange
 	}
 	// Test-only fault-injection hook. nil in production (zero overhead beyond
 	// a pointer load). When set, a non-nil return forces readFrame to fail for
@@ -3295,7 +3403,7 @@ func (w *wal) readFramePage(frame, pgno uint32, buf, scratchBuf []byte, aeadScra
 	// slice header to avoid a data race with writeFramesMem's append.
 	if w.inMemory {
 		if frame > nf {
-			return ErrWALCorrupt
+			return errWalFrameRange
 		}
 		w.mu.RLock()
 		idx := frame - 1
@@ -3305,29 +3413,27 @@ func (w *wal) readFramePage(frame, pgno uint32, buf, scratchBuf []byte, aeadScra
 			return nil
 		}
 		w.mu.RUnlock()
-		return ErrWALCorrupt
+		return errWalFrameRange
+	}
+	// A closed log first: it holds no frame, whatever the count says.
+	if w.file == nil {
+		return ErrClosed
 	}
 	// File path: in multi-process mode, a peer may have committed frames beyond
 	// our process-local nFrame. In that case, do not reject the frame number up
 	// front — attempt the immutable file read directly and let ReadAt validate
 	// whether the frame exists on disk.
 	if w.inProcess && frame > nf {
-		return ErrWALCorrupt
-	}
-	if w.file == nil {
-		return ErrWALCorrupt
+		return errWalFrameRange
 	}
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
-	if _, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil {
+	if n, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil || n < int(w.pageSize) {
 		// Multi-process: a stale nFrame view may have let us try to read
-		// past the peer's actual WAL tail. Treat that as corruption
-		// rather than leaking the raw I/O error.
-		// DRIFT: past-tail ReadAt failure remapped to ErrWALCorrupt; C propagates the raw short-read error See docs/btree/NOTES.md#drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt
-		if frame > nf {
-			return ErrWALCorrupt
+		// past the peer's actual WAL tail (frameReadErr).
+		if err = frameReadResult(int(w.pageSize), n, err); err != nil {
+			return err
 		}
-		return err
 	}
 	// BEGIN ENCRYPTION
 	// Decrypt frame payload if a codec is installed. The page number binds
@@ -3350,7 +3456,7 @@ func (w *wal) readFramePage(frame, pgno uint32, buf, scratchBuf []byte, aeadScra
 		if aeadS == nil {
 			aeadS = new(aeadScratch)
 		}
-		plain, derr := decryptPageWithCodec(w.codec, scratch, buf[:w.pageSize], pgno, aeadS, w.onIntegrityError)
+		plain, derr := decryptPageWithCodec(w.codec, scratch, buf[:w.pageSize], pgno, aeadS, onError)
 		if derr != nil {
 			if ownScratch {
 				freePageBuffer(scratch, false)
@@ -3375,8 +3481,10 @@ func (w *wal) readFramePgno(frame uint32) (uint32, error) {
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	headerOffset := int64(walHeaderSize) + int64(frame-1)*frameSize
 	var hdr [4]byte
-	if _, err := w.file.ReadAt(hdr[:], headerOffset); err != nil {
-		return 0, err
+	if n, err := w.file.ReadAt(hdr[:], headerOffset); err != nil || n < len(hdr) {
+		if err = frameReadResult(len(hdr), n, err); err != nil {
+			return 0, err
+		}
 	}
 	return binary.BigEndian.Uint32(hdr[:4]), nil
 }
@@ -4119,12 +4227,10 @@ func (w *wal) buildBackfillMap(lo, hi uint32) (map[uint32]uint32, error) {
 	var frame walFrame
 	for i := lo; i < hi; i++ {
 		off := int64(walHeaderSize) + int64(i)*frameSize
-		n, err := w.file.ReadAt(frameBuf, off)
-		if err != nil {
-			return nil, err
-		}
-		if n != len(frameBuf) {
-			return nil, io.ErrUnexpectedEOF
+		if n, err := w.file.ReadAt(frameBuf, off); err != nil || n < len(frameBuf) {
+			if err = frameReadResult(len(frameBuf), n, err); err != nil {
+				return nil, err
+			}
 		}
 		frame.deserialize(frameBuf)
 		// Overwrite keeps the latest frame, since i increases monotonically.
@@ -4168,8 +4274,10 @@ func (w *wal) rewriteChecksums(iLast uint32) error {
 		// Read cksum1/cksum2 from the WAL header (bytes 24..31 of the
 		// 32-byte walHeader).
 		var hdrCksumBuf [8]byte
-		if _, err := w.file.ReadAt(hdrCksumBuf[:], 24); err != nil {
-			return err
+		if n, err := w.file.ReadAt(hdrCksumBuf[:], 24); err != nil || n < len(hdrCksumBuf) {
+			if err = frameReadResult(len(hdrCksumBuf), n, err); err != nil {
+				return err
+			}
 		}
 		s1 = binary.BigEndian.Uint32(hdrCksumBuf[0:4])
 		s2 = binary.BigEndian.Uint32(hdrCksumBuf[4:8])
@@ -4178,8 +4286,10 @@ func (w *wal) rewriteChecksums(iLast uint32) error {
 		// 16..23 of the 24-byte walFrame struct.
 		prevOff := int64(walHeaderSize) + int64(w.iReCksum-2)*frameSize
 		var prevCksumBuf [8]byte
-		if _, err := w.file.ReadAt(prevCksumBuf[:], prevOff+16); err != nil {
-			return err
+		if n, err := w.file.ReadAt(prevCksumBuf[:], prevOff+16); err != nil || n < len(prevCksumBuf) {
+			if err = frameReadResult(len(prevCksumBuf), n, err); err != nil {
+				return err
+			}
 		}
 		s1 = binary.BigEndian.Uint32(prevCksumBuf[0:4])
 		s2 = binary.BigEndian.Uint32(prevCksumBuf[4:8])
@@ -4193,12 +4303,17 @@ func (w *wal) rewriteChecksums(iLast uint32) error {
 	for i := w.iReCksum; i <= iLast; i++ {
 		off := int64(walHeaderSize) + int64(i-1)*frameSize
 
-		// Read the existing frame header + page data.
-		if _, err := w.file.ReadAt(frameHdr[:], off); err != nil {
-			return err
+		// Read the existing frame header + page data. A read that comes
+		// up short is ErrWALShortRead, as for every reader of a frame.
+		if n, err := w.file.ReadAt(frameHdr[:], off); err != nil || n < len(frameHdr) {
+			if err = frameReadResult(len(frameHdr), n, err); err != nil {
+				return err
+			}
 		}
-		if _, err := w.file.ReadAt(pageData, off+walFrameSize); err != nil {
-			return err
+		if n, err := w.file.ReadAt(pageData, off+walFrameSize); err != nil || n < len(pageData) {
+			if err = frameReadResult(len(pageData), n, err); err != nil {
+				return err
+			}
 		}
 
 		// Recompute checksums over (header-first-8 + page data).
@@ -4625,14 +4740,10 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 				}
 				frameIdx := latest[pgno]
 				off := int64(walHeaderSize) + int64(frameIdx)*frameSize
-				n, err := w.file.ReadAt(pageData, off+walFrameSize)
-				if err != nil {
-					backfillErr = err
-					break
-				}
-				if n != len(pageData) {
-					backfillErr = io.ErrUnexpectedEOF
-					break
+				if n, err := w.file.ReadAt(pageData, off+walFrameSize); err != nil || n < len(pageData) {
+					if backfillErr = frameReadResult(len(pageData), n, err); backfillErr != nil {
+						break
+					}
 				}
 				// Page 1 reaches the main file with the keyed salt, as every
 				// write of page 1 does (encryptPageWithCodec), whatever its
@@ -4650,7 +4761,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 					copy(pageData[dbHeaderSaltOff:dbHeaderSaltOff+SaltLen], w.keySalt[:])
 				}
 				pageOffset := int64(pgno-1) * pageSz
-				n, err = dbFile.WriteAt(pageData, pageOffset)
+				n, err := dbFile.WriteAt(pageData, pageOffset)
 				if err != nil {
 					backfillErr = err
 					break
@@ -4864,7 +4975,12 @@ func (w *wal) doResetWAL(truncate bool) error {
 	//
 	// readMarksLocked: the caller holds reader slots 1-4 exclusive across
 	// this call (wal.c:2361 and wal.c:3876, before walRestartHdr).
-	w.restartHeaderStateLocked(true, nPage, salt1+1, replaced)
+	if err := w.restartHeaderStateLocked(true, nPage, salt1+1, replaced); err != nil {
+		// The reset header is not published: peers still read the old
+		// one, which describes the log as it is, so the log is not
+		// truncated under it.
+		return err
+	}
 	if w.inMemory {
 		w.memFrames = w.memFrames[:0]
 		w.memArenaOff = 0

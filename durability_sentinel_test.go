@@ -10,6 +10,7 @@ package anystore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -121,9 +122,9 @@ func TestDurabilitySentinel_CloseThatIsNotTheLastKeepsIt(t *testing.T) {
 	sentinelWaitFile(t, path+".peer-done")
 	kill()
 
-	// The next open finds the sentinel and runs the quick check: a failure
+	// The next open finds the sentinel and runs the quick check: damage
 	// injected into the check's read fails the open with ErrQuickCheckFailed.
-	errInjected := errors.New("injected failure of the quick check's read")
+	errInjected := fmt.Errorf("%w: injected into the quick check's read", ErrPageIntegrity)
 	testQuickCheckReadHook = func() error { return errInjected }
 	t.Cleanup(func() { testQuickCheckReadHook = nil })
 	failed, err := Open(ctx, path, sentinelConfig())
