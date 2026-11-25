@@ -338,9 +338,9 @@ func TestBackupRoundTrip_OverExistingOfAnotherKind(t *testing.T) {
 }
 
 // A backup of an in-memory database, whose pages are plain, over a file of
-// checksummed pages is refused with ErrBackupCodecMismatch, which is not
-// corruption, and the file is left as it was.
-func TestBackup_PlainOverChecksummedIsCodecMismatch(t *testing.T) {
+// checksummed pages is refused with ErrBackupIntegrityModeMismatch, which is
+// not corruption, and the file is left as it was.
+func TestBackup_PlainOverChecksummedIsIntegrityModeMismatch(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "dst.db")
 	dst, err := anystore.Open(ctx, path, nil)
@@ -355,7 +355,7 @@ func TestBackup_PlainOverChecksummedIsCodecMismatch(t *testing.T) {
 	require.NoError(t, err)
 	defer src.Close()
 	err = src.Backup(ctx, path)
-	require.ErrorIs(t, err, anystore.ErrBackupCodecMismatch)
+	require.ErrorIs(t, err, anystore.ErrBackupIntegrityModeMismatch)
 	require.NotErrorIs(t, err, anystore.ErrCorrupt)
 	after, err := os.ReadFile(path)
 	require.NoError(t, err)

@@ -34,7 +34,7 @@ var (
 	// codec and usable size are fixed when it is opened, so a destination
 	// that exists as such a file cannot receive the source's pages. Create
 	// the destination with the source's BackupDestinationOptions.
-	ErrBackupCodecMismatch = errors.New("btree: backup source and destination must have the same reserved space and kind of page codec (plain, checksum or encrypted)")
+	ErrBackupCodecMismatch = errors.New("btree: backup source and destination must have the same reserved space and integrity mode (plain, checksum or encrypted)")
 
 	// ErrBackupDstBusy — ~ checkReadTransaction (backup.c:124–130)
 	// ("destination database is in use"). Raised when dst already has an

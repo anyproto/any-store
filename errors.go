@@ -267,13 +267,14 @@ var (
 	// may. Back up to a new path, or to a database of this one's format.
 	ErrBackupFormatMismatch = btree.ErrBackupFormatMismatch
 
-	// ErrBackupCodecMismatch is returned (wrapped) by Backup when the file at its path is a
-	// database whose pages are laid out another way than this one's: plain, with checksums,
-	// or encrypted (an in-memory database's pages are plain). No page of this database is
-	// copied, and the file keeps its contents; closing it may checkpoint its write-ahead log
-	// into it, as closing any database may. Back up to a new path, or to a database of this
-	// one's kind.
-	ErrBackupCodecMismatch = btree.ErrBackupCodecMismatch
+	// ErrBackupIntegrityModeMismatch is returned (wrapped) by Backup when the file at its path
+	// is a database whose pages are sealed another way than this one's: plain, with checksums,
+	// or encrypted (see IntegrityMode). An in-memory database counts as plain, or as encrypted
+	// when it was opened with Encryption, although its IntegrityMode is IntegrityNone. No page
+	// of this database is copied, and the file keeps its contents; closing it may checkpoint
+	// its write-ahead log into it, as closing any database may. Back up to a new path, or to a
+	// database of this one's kind.
+	ErrBackupIntegrityModeMismatch = btree.ErrBackupCodecMismatch
 
 	// ErrIncompatibleVersion is returned (wrapped) by Open, and by Backup for its destination,
 	// when the file was written in a format newer than this release reads, or its write-ahead log

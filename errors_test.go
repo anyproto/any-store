@@ -45,7 +45,7 @@ func TestOpenErr_VersionAndBusy(t *testing.T) {
 // errors under exported names.
 func TestBackupRefusals_MatchTheBtreeErrors(t *testing.T) {
 	require.ErrorIs(t, fmt.Errorf("backup: %w", btree.ErrBackupFormatMismatch), ErrBackupFormatMismatch)
-	require.ErrorIs(t, fmt.Errorf("backup: %w", btree.ErrBackupCodecMismatch), ErrBackupCodecMismatch)
+	require.ErrorIs(t, fmt.Errorf("backup: %w", btree.ErrBackupCodecMismatch), ErrBackupIntegrityModeMismatch)
 	require.NotErrorIs(t, ErrBackupFormatMismatch, ErrCorrupt)
-	require.NotErrorIs(t, ErrBackupCodecMismatch, ErrCorrupt)
+	require.NotErrorIs(t, ErrBackupIntegrityModeMismatch, ErrCorrupt)
 }
