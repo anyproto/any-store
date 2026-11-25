@@ -41,7 +41,7 @@ it to the target box and run it.
 | `-recall` | true | measure recall vs exact brute force (O(n)/query) |
 | `-seed` | 2024 | dataset RNG seed |
 
-### Btree-backed modes: `-paged`, `-db`, `-cache`
+### Btree-backed modes: `-vectorbench.paged`, `-vectorbench.db`, `-vectorbench.cache`
 
 The btree-paged index, the route-in-RAM + paged-rerank hybrid and the
 disk-backed run are the `vector` package's own: they take the module's internal

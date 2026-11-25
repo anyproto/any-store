@@ -91,9 +91,11 @@ type Config struct {
 
 	// CacheSize overrides the default per-DB page cache size (in pages,
 	// default 5000). Primarily for tests that need to force pagerStress /
-	// cache-spill behavior at low data volumes. Zero means use the default.
-	// A value above 2,147,418,112 pages (on a 32-bit target, above 524,288)
-	// is taken as that bound, as SQLite clamps its cache_size.
+	// cache-spill behavior at low data volumes. Zero or a negative value
+	// means the default: a negative value is not a size in KiB, as it is for
+	// SQLite's cache_size. A value above 2,147,418,112 pages (on a 32-bit
+	// target, above 524,288) is taken as that bound, as SQLite clamps its
+	// cache_size.
 	CacheSize int
 
 	// ReadConcurrency caps the number of concurrent read transactions. Reads
@@ -101,8 +103,9 @@ type Config struct {
 	// throttles concurrent Find/$text throughput. Each live reader holds its own
 	// page cache (≈ CacheSize × PageSize), created lazily, so peak reader RAM is
 	// ReadConcurrency × that — only realized under actual concurrent load. Zero
-	// means the default, max(NumCPU-1, 4), which scales with the host while staying
-	// modest on small devices. A value above 65,536 is taken as 65,536.
+	// or a negative value means the default, max(NumCPU-1, 4), which scales with
+	// the host while staying modest on small devices. A value above 65,536 is
+	// taken as 65,536.
 	ReadConcurrency int
 
 	// CommitSync forces fsync on every WAL commit (like SQLite synchronous=FULL in WAL mode).

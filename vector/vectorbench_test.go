@@ -161,7 +161,7 @@ func vectorbenchDisk(t *testing.T, m Metric) {
 		// that built it, whatever the flags of this one: the queries are
 		// generated for its dimension, and the settings logged are its own.
 		meta := vbPersistedMeta(t, db, "emb")
-		t.Logf("index: dim=%d metric=%s ef=%d (as built; -vectorbench.dim, -metric and -ef do not apply to a reload)",
+		t.Logf("index: dim=%d metric=%s ef=%d (as built; -vectorbench.dim, -vectorbench.metric and -vectorbench.ef do not apply to a reload)",
 			meta.dim, meta.metric, meta.EfSearch)
 		qVecs, _, _, _ := GenMDDataset(*vbQueries, meta.dim, *vbSeed+1)
 		gets0, calls := p.Gets(), 0
