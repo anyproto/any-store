@@ -649,6 +649,52 @@ func BenchmarkModifier(b *testing.B) {
 	})
 }
 
+// $set of a large operand to a field the document does not have: the
+// modifier stores a copy of the operand in every document it changes. An
+// object of 1,000 fields, whose keys the copy takes, and an array of 5,000
+// numbers.
+func BenchmarkModifier_SetLargeOperand(b *testing.B) {
+	bench := func(b *testing.B, operand string) {
+		modifier, err := ParseModifier(`{"$set":{"o":` + operand + `}}`)
+		require.NoError(b, err)
+		docs := make([]*anyenc.Value, 256)
+		a := &anyenc.Arena{}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if i%len(docs) == 0 {
+				b.StopTimer()
+				for j := range docs {
+					docs[j] = anyenc.MustParseJson(`{"a":1}`)
+				}
+				b.StartTimer()
+			}
+			a.Reset()
+			if _, _, err := modifier.Modify(a, docs[i%len(docs)]); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	obj := []byte{'{'}
+	for i := range 1000 {
+		if i > 0 {
+			obj = append(obj, ',')
+		}
+		obj = fmt.Appendf(obj, `"field%d":%d`, i, i)
+	}
+	obj = append(obj, '}')
+	arr := []byte{'['}
+	for i := range 5000 {
+		if i > 0 {
+			arr = append(arr, ',')
+		}
+		arr = fmt.Appendf(arr, "%d", i)
+	}
+	arr = append(arr, ']')
+	b.Run("object of 1000 fields", func(b *testing.B) { bench(b, string(obj)) })
+	b.Run("array of 5000 numbers", func(b *testing.B) { bench(b, string(arr)) })
+}
+
 // $set stores a copy of its operand also where the field holds an equal
 // value, and reports no change for that. The field's own value is not kept:
 // in a document built in Go it can be shared with another field, and a later

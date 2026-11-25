@@ -377,6 +377,54 @@ func BenchmarkCollection_UpsertOneExisting(b *testing.B) {
 	}
 }
 
+// A filtered Update whose $set stores an object of 200 fields in each of 100
+// documents. "unchanged" applies one modifier to documents that hold its
+// value already, so nothing is written: the cost is the reads and the
+// modifier's work on each document. "changed" alternates two modifiers, so
+// every document is written each time.
+func BenchmarkCollection_UpdateSetLargeObject(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(b, err)
+	for i := range 100 {
+		require.NoError(b, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"g":1}`, i))))
+	}
+	var mods [2]query.Modifier
+	for m := range mods {
+		src := []byte(`{"$set":{"o":{`)
+		for f := range 200 {
+			if f > 0 {
+				src = append(src, ',')
+			}
+			src = fmt.Appendf(src, `"field%d":%d`, f, m)
+		}
+		src = append(src, `}}}`...)
+		mods[m] = query.MustParseModifier(string(src))
+	}
+	q := coll.Find(`{"g":1}`)
+	_, err = q.Update(ctx, mods[0])
+	require.NoError(b, err)
+	b.Run("unchanged", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			res, err := q.Update(ctx, mods[0])
+			require.NoError(b, err)
+			require.Equal(b, 0, res.Modified)
+		}
+	})
+	b.Run("changed", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := range b.N {
+			res, err := q.Update(ctx, mods[(i+1)%2])
+			require.NoError(b, err)
+			require.Equal(b, 100, res.Modified)
+		}
+		// Leave the documents as "unchanged" expects them.
+		_, err := q.Update(ctx, mods[0])
+		require.NoError(b, err)
+	})
+}
+
 func BenchmarkCollection_FindId(b *testing.B) {
 	fx := newFixture(b)
 	coll, err := fx.CreateCollection(ctx, "test")

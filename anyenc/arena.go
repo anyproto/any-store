@@ -2,7 +2,6 @@ package anyenc
 
 import (
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/valyala/fastjson"
@@ -180,6 +179,10 @@ func (a *Arena) NewBool(v bool) *Value {
 // copies to the shared value NewTrue, NewFalse or NewNull returns. A nil v
 // returns nil.
 //
+// The keys of each object are copied into one buffer of their own, allocated
+// for that object, so an object costs one allocation for all its keys, not
+// one a key. They share no bytes with v, and the arena does not reuse them.
+//
 // The returned value is valid until Reset is called on a.
 func (a *Arena) Copy(v *Value) *Value {
 	if v == nil {
@@ -204,9 +207,21 @@ func (a *Arena) Copy(v *Value) *Value {
 			c.a = append(c.a, a.Copy(el))
 		}
 	case TypeObject:
+		size := 0
+		for _, kv := range v.o.kvs {
+			size += len(kv.key)
+		}
+		var keys []byte
+		if size > 0 {
+			keys = make([]byte, 0, size)
+		}
 		c.o.kvs = slices.Grow(c.o.kvs[:0], len(v.o.kvs))
 		for _, kv := range v.o.kvs {
-			c.o.kvs = append(c.o.kvs, keyValue{key: strings.Clone(kv.key), value: a.Copy(kv.value)})
+			// keys has room for every key, so append never moves it, and
+			// each key stays a view of the bytes it was copied to.
+			start := len(keys)
+			keys = append(keys, kv.key...)
+			c.o.kvs = append(c.o.kvs, keyValue{key: b2s(keys[start:]), value: a.Copy(kv.value)})
 		}
 	default:
 		c.v = append(c.v[:0], v.v...)
