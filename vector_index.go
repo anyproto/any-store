@@ -123,7 +123,8 @@ const (
 	maxVectorEf = query.KnnMaxEf
 	// maxVectorClosure is the largest IVF Closure: a vector's :doc record
 	// stores the number of cells it was placed in in one byte (vivf
-	// appendDocCells).
+	// maxDocCells, which an index an earlier release made with a larger
+	// one is held to).
 	maxVectorClosure = 1<<8 - 1
 	// maxVectorUint32 is the largest Dim, NList and NProbe: the index's meta
 	// record stores each in four bytes (vindex and vivf encodeMeta), so a
@@ -652,16 +653,13 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, s *collSchema, info In
 		}
 		// A copied index whose collection has fewer vectors than its NList
 		// (some were deleted since it was built) trains one cell per
-		// vector, as a rebuild of the source would (vivf ivfRebuildNList),
-		// and a copied Closure above 255 places a vector in at most 255
-		// cells, the count its :doc record holds in one byte
-		// (maxVectorClosure): placed in 256, the count would read 0, and a
-		// delete would leave its entries in the cells. The index's meta
-		// record keeps the 255 it was built with, and its catalog record
-		// the source's NList and Closure.
+		// vector, as a rebuild of the source would (vivf ivfRebuildNList).
+		// A copied Closure above 255 places a vector in at most 255 cells,
+		// as every build, insert and rebuild of vivf does (maxDocCells).
+		// The index's meta record keeps the 255 it was built with, and its
+		// catalog record the source's NList and Closure.
 		sp := ivfStoreParams(info.Vector, len(vecs))
 		sp.NList = min(sp.NList, len(vecs))
-		sp.Assign = min(sp.Assign, maxVectorClosure)
 		ivf, err := vivf.BulkBuild(tx, prefix, sp, ids, vecs)
 		if err != nil {
 			return nil, err

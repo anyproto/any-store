@@ -218,6 +218,80 @@ func TestStoreStoredNProbeZeroIsTheDefault(t *testing.T) {
 	}
 }
 
+// A closure above 255, which an earlier release took and stored in an index's
+// meta record, places a vector in at most 255 cells, the count its :doc
+// record holds in one byte: an insert into such an index writes 255 entries
+// and a delete removes all of them, where 300 left the cells it could not
+// count behind. A build and a rebuild of the closure place every vector in
+// 255 cells, and write 255 to the record.
+func TestStoreClosureAbove255(t *testing.T) {
+	const dim, n, closure = 2, 300, 300
+	vecs := clusteredVecs(n, dim, n, 5)
+	db := openMem(t)
+	buildStore(t, db, StoreParams{Dim: dim, NList: n, Assign: closure, NProbe: 4, Seed: 1}, vecs)
+	cellsAre := func(want int) {
+		t.Helper()
+		inRead(t, db, func(rtx *btree.ReadTx) {
+			ns, err := rtx.GetNamespace("ivf" + nsCell)
+			require.NoError(t, err)
+			got, err := rtx.Count(ns)
+			require.NoError(t, err)
+			require.Equal(t, want, got)
+			ix, err := OpenTx(rtx, "ivf")
+			require.NoError(t, err)
+			st, err := ix.Stats(rtx)
+			require.NoError(t, err)
+			require.Equal(t, maxDocCells, st.Assign)
+		})
+	}
+	cellsAre(n * maxDocCells)
+
+	// The meta record as an earlier release wrote it.
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	vmeta, err := wtx.GetNamespace("ivf" + nsMeta)
+	require.NoError(t, err)
+	b, err := wtx.Get(vmeta, metaKey)
+	require.NoError(t, err)
+	mt, err := decodeMeta(b)
+	require.NoError(t, err)
+	mt.assign = closure
+	require.NoError(t, wtx.Put(vmeta, metaKey, encodeMeta(mt)))
+	require.NoError(t, wtx.Commit())
+
+	extra := clusteredVecs(1, dim, 1, 9)[0]
+	wtx, err = db.BeginWrite()
+	require.NoError(t, err)
+	ix, err := OpenTx(&wtx.ReadTx, "ivf")
+	require.NoError(t, err)
+	require.NoError(t, ix.Insert(wtx, bid(n), extra))
+	vdoc, err := wtx.GetNamespace("ivf" + nsDoc)
+	require.NoError(t, err)
+	rec, err := wtx.Get(vdoc, bid(n))
+	require.NoError(t, err)
+	_, cells := decodeDocCells(rec)
+	require.Len(t, cells, maxDocCells)
+	vcell, err := wtx.GetNamespace("ivf" + nsCell)
+	require.NoError(t, err)
+	got, err := wtx.Count(vcell)
+	require.NoError(t, err)
+	require.Equal(t, (n+1)*maxDocCells, got)
+	removed, err := ix.Delete(wtx, bid(n))
+	require.NoError(t, err)
+	require.True(t, removed)
+	got, err = wtx.Count(vcell)
+	require.NoError(t, err)
+	require.Equal(t, n*maxDocCells, got, "a delete removes every entry the insert wrote")
+	require.NoError(t, wtx.Commit())
+
+	wtx, err = db.BeginWrite()
+	require.NoError(t, err)
+	_, err = Rebuild(wtx, "ivf")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Commit())
+	cellsAre(n * maxDocCells)
+}
+
 // inRead runs check in a read transaction of db, rolled back whatever check
 // does: a failed require ends the test's goroutine, and a read transaction
 // it left open would make the cleanup's db.Close wait for it until the
