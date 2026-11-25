@@ -2943,6 +2943,42 @@ func TestCollection_RemovalPathViability(t *testing.T) {
 	}
 }
 
+// In an array a remover's part is an index only when it is unsigned decimal
+// digits, as in MongoDB: "+0", "-0" and "+3" are names, which no array holds.
+// $pull, $pullAll, $pop and $rename's source refuse them (PathNotViable), and
+// $unset skips them, so no element is changed or removed.
+func TestCollection_RemovalSignedPartIsAName(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	const stored = `{"id":1,"items":[[1,2],{"x":[1]},3,[4]]}`
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(stored)))
+	for _, mod := range []string{
+		`{"$pull":{"items.+0":1}}`,
+		`{"$pullAll":{"items.-0":[1]}}`,
+		`{"$pop":{"items.+0":1}}`,
+		`{"$pop":{"items.+1.x":1}}`,
+		`{"$rename":{"items.-0":"y"}}`,
+		`{"$pull":{"items.+3":4}}`,
+	} {
+		_, err := coll.UpdateId(ctx, 1, query.MustParseModifier(mod))
+		require.ErrorContains(t, err, "cannot use the part", mod)
+	}
+	for _, mod := range []string{
+		`{"$unset":{"items.+0":""}}`,
+		`{"$unset":{"items.-0":""}}`,
+		`{"$unset":{"items.+1.x":""}}`,
+		`{"$unset":{"items.+3":""}}`,
+	} {
+		res, err := coll.UpdateId(ctx, 1, query.MustParseModifier(mod))
+		require.NoError(t, err, mod)
+		assert.Equal(t, anystore.ModifyResult{Matched: 1}, res, mod)
+	}
+	doc, err := coll.FindId(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, stored, doc.Value().String())
+}
+
 // An UpsertId whose modifier reports no change inserts {id}, built from the
 // id it looked up, whatever the modifier did to the value it was handed or
 // returned instead; on an existing document it writes nothing. A ModifyFunc

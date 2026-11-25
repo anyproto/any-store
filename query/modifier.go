@@ -194,9 +194,7 @@ type modifierRename struct {
 // $pullAll and the source of $rename. It walks v to the field path names,
 // creating nothing, and when the field is there calls finalize with it: a
 // nil result removes the field, another value takes its place. A document
-// without the field is left as it was, as MongoDB does; walked with
-// creation, a missing parent was set to {}, kept, and stored once another
-// operation of the modifier changed the document.
+// without the field is left as it was, as MongoDB does.
 //
 // Where the walk stops matters as in MongoDB. A path that stops at an object,
 // or at an array whose next part is an index past its end, could be created,
@@ -205,11 +203,12 @@ type modifierRename struct {
 // (UnsetNode::allowNonViablePath), and every other remover refuses it, as
 // MongoDB's PathNotViable does (UpdateLeafNode::checkViability for $pop,
 // $pull and $pullAll; pathsupport::findLongestPrefix for the source of
-// $rename).
+// $rename). In an array a part is an index only as arrayIndex reads it: a
+// signed part, "+0" or "-0", is a name, which no array holds.
 func walkExisting(v *anyenc.Value, path []string, op string, allowNonViable bool, finalize func(value *anyenc.Value) (*anyenc.Value, error)) error {
 	parent := v
 	for i, part := range path {
-		field := parent.Get(part)
+		field := existingChild(parent, part)
 		if field == nil {
 			if allowNonViable || canHoldField(parent, part) {
 				return nil
@@ -234,21 +233,42 @@ func walkExisting(v *anyenc.Value, path []string, op string, allowNonViable bool
 	return nil
 }
 
+// existingChild is what part names in v, or nil when v holds nothing by it:
+// the field of an object, or the element of an array at the index part is
+// (arrayIndex). A scalar holds nothing, and an array nothing by any other
+// part, a signed number included.
+func existingChild(v *anyenc.Value, part string) *anyenc.Value {
+	if v.Type() != anyenc.TypeArray {
+		return v.Get(part)
+	}
+	idx, ok := arrayIndex(part)
+	elems := v.GetArray()
+	if !ok || idx >= uint64(len(elems)) {
+		return nil
+	}
+	return elems[idx]
+}
+
+// arrayIndex reads part as an array index the way MongoDB's
+// str::parseUnsignedBase10Integer does at r8.0.0: decimal digits, no sign,
+// that an unsigned 32-bit int holds. The host's int plays no part, so an
+// update's outcome does not depend on the word size: items.2147483648 is an
+// index past the end on a 32-bit target too, though no int there holds it.
+func arrayIndex(part string) (uint64, bool) {
+	idx, err := strconv.ParseUint(part, 10, 32)
+	return idx, err == nil
+}
+
 // canHoldField reports whether part could name a field of v that v does not
-// have: v is an object, or an array and part an index past its end. A scalar
-// holds no field, and an array none by name. An index is what MongoDB's
-// UpdateLeafNode::checkViability takes for one (str::parseUnsignedBase10Integer
-// at r8.0.0): decimal digits, no sign, that an unsigned 32-bit int holds. The
-// host's int plays no part, so an update's outcome does not depend on the word
-// size: items.2147483648 is an index past the end on a 32-bit target too,
-// though no int there holds it.
+// have: v is an object, or an array and part an index (arrayIndex) past its
+// end. A scalar holds no field, and an array none by name.
 func canHoldField(v *anyenc.Value, part string) bool {
 	switch v.Type() {
 	case anyenc.TypeObject:
 		return true
 	case anyenc.TypeArray:
-		_, err := strconv.ParseUint(part, 10, 32)
-		return err == nil
+		_, ok := arrayIndex(part)
+		return ok
 	}
 	return false
 }

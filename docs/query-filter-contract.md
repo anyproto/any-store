@@ -350,7 +350,11 @@ build per query and carry no such guarantee.
     the document cannot hold, through a field of a scalar or a name in an
     array (`a.b` on `{"a":1}`, `items.bad.tags` on `{"items":[]}`), is a
     no-op for `$unset` and an error for `$rename`'s source, `$pop`, `$pull`
-    and `$pullAll`, as in MongoDB (`PathNotViable`). An array operator
+    and `$pullAll`, as in MongoDB (`PathNotViable`). For these five, a part
+    is an index into an array only when it is decimal digits, with no sign,
+    up to 2^32−1, as MongoDB reads one: `items.+0` and `items.-0` are names,
+    so on `{"items":[[1,2]]}` a `$pull` of `items.+0` is an error and an
+    `$unset` of it changes nothing. An array operator
     (`$push`, `$addToSet`, `$pop`, `$pull`, `$pullAll`) on a field that
     holds anything else, `null` included, is an error (`$push: field 'tags'
     must be an array: …`), and `$inc` on a non-number is one too; the update

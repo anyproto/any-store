@@ -975,8 +975,27 @@ func TestModifier_RemovalPathViability(t *testing.T) {
 		{`{"$unset":{"a.b.c":""}}`, `{"a":{"b":null}}`, `{"a":{"b":null}}`, false},
 		{`{"$unset":{"items.bad.x":""},"$set":{"seen":true}}`, `{"items":[]}`, `{"items":[],"seen":true}`, true},
 		{`{"$unset":{"items.bad":""}}`, `{"items":[1]}`, `{"items":[1]}`, false},
+		// In an array only an unsigned decimal part is an index, leading
+		// zeros included; a signed one is a name, which $unset skips.
+		{`{"$pull":{"items.00":1}}`, `{"items":[[1,2]]}`, `{"items":[[2]]}`, true},
+		{`{"$unset":{"items.+0":""}}`, `{"items":[[1,2]]}`, `{"items":[[1,2]]}`, false},
+		{`{"$unset":{"items.-0":""}}`, `{"items":[[1,2]]}`, `{"items":[[1,2]]}`, false},
+		{`{"$unset":{"items.-0.x":""}}`, `{"items":[{"x":1}]}`, `{"items":[{"x":1}]}`, false},
+		{`{"$unset":{"items.+3":""}}`, `{"items":[1,2,3,4]}`, `{"items":[1,2,3,4]}`, false},
 	}...)
 	testModCasesErr(t, []modifierCaseError{
+		{`{"$pull":{"items.+0":1}}`, `{"items":[[1,2]]}`,
+			`$pull: cannot use the part '+0' of 'items.+0' to traverse the element [[1,2]]`},
+		{`{"$pullAll":{"items.-0":[1]}}`, `{"items":[[1,2]]}`,
+			`$pullAll: cannot use the part '-0' of 'items.-0' to traverse the element [[1,2]]`},
+		{`{"$pop":{"items.+0":1}}`, `{"items":[[1,2]]}`,
+			`$pop: cannot use the part '+0' of 'items.+0' to traverse the element [[1,2]]`},
+		{`{"$rename":{"items.-0":"y"}}`, `{"items":[[1,2]]}`,
+			`$rename: cannot use the part '-0' of 'items.-0' to traverse the element [[1,2]]`},
+		{`{"$pull":{"items.+3":1}}`, `{"items":[1,2,3,[4]]}`,
+			`$pull: cannot use the part '+3' of 'items.+3' to traverse the element [1,2,3,[4]]`},
+		{`{"$pop":{"items.-0.x":1}}`, `{"items":[{"x":[1]}]}`,
+			`$pop: cannot use the part '-0' of 'items.-0.x' to traverse the element [{"x":[1]}]`},
 		{`{"$pull":{"items.bad.x":1},"$set":{"seen":true}}`, `{"items":[]}`,
 			`$pull: cannot use the part 'bad' of 'items.bad.x' to traverse the element []`},
 		{`{"$pop":{"items.bad.x":1},"$set":{"seen":true}}`, `{"items":[]}`,
