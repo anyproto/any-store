@@ -13,7 +13,7 @@ import (
 // zero on reads.
 //
 // File state is authoritative on reopen: existing plain databases stay plain,
-// existing checksum databases auto-install the codec regardless of caller
+// existing checksum databases keep their checksums, whatever the caller's
 // configuration. Conceptually mirrors SQLite's cksumvfs extension
 // (https://sqlite.org/cksumvfs.html), generalized to also surface AEAD
 // authentication failures via VerifyIntegrity / IntegrityMode.
@@ -41,7 +41,8 @@ type IntegrityError struct {
 	Inner  error
 }
 
-// IntegrityMode is the codec mode of a DB.
+// IntegrityMode is how a DB's pages are protected: not at all, by a
+// checksum, or by the cipher's AEAD tag.
 type IntegrityMode int
 
 const (
@@ -113,7 +114,7 @@ func (db *db) VerifyIntegrity(ctx context.Context) (IntegrityReport, error) {
 	return rep, nil
 }
 
-// IntegrityMode reports the codec currently installed on the DB.
+// IntegrityMode reports how the DB's pages are protected.
 func (db *db) IntegrityMode() IntegrityMode {
 	return IntegrityMode(db.btreeDB.IntegrityMode())
 }

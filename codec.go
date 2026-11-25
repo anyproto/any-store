@@ -20,10 +20,9 @@ const CipherChaCha20Poly1305 = btree.CipherChaCha20Poly1305
 // is a concern.
 const CipherXChaCha20Poly1305 = btree.CipherXChaCha20Poly1305
 
-// ErrPageIntegrity is the umbrella error returned (wrapped) by every
-// codec when a page fails its on-disk integrity check, regardless of
-// mode. Callers match it with errors.Is to handle both the cksum-only
-// and AEAD modes uniformly:
+// ErrPageIntegrity is the umbrella error returned (wrapped) when a page
+// fails its on-disk integrity check, regardless of mode. Callers match it
+// with errors.Is to handle both the cksum-only and AEAD modes uniformly:
 //
 //	if errors.Is(err, anystore.ErrPageIntegrity) { ... }
 //
