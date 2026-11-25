@@ -1073,9 +1073,10 @@
   },
   "db.go:*DB.resolveNamespace": {
     "sqlite": [
+      "btree.c:btreeCursor",
       "prepare.c:sqlite3InitCallback"
     ],
-    "note": "any-store master-table traversal for namespace->rootPage; a root outside 2..nPage (the reader's snapshot size from page 1, the writer's live count) is ErrCorrupt, as the schema load refuses a root past the database (prepare.c:135-140)"
+    "note": "any-store master-table traversal for namespace->rootPage; a root outside 2..nPage (the reader's snapshot size from page 1, the writer's live count) is ErrCorrupt, as the schema load refuses a root past the database (prepare.c:135-140); a root of 1 too, where btreeCursor opens root 1, the schema table's (drift-a-namespace-whose-root-is-page-1-is-corrupt)"
   },
   "db.go:*DB.unregisterWriter": {
     "sqlite": [],
@@ -2470,8 +2471,10 @@
     "note": "lockBtreePageCount's size from a page-1 image's three fields, for a reader's bound on a namespace root (resolveNamespace)"
   },
   "pager.go:page1HeaderAtOpen": {
-    "sqlite": [],
-    "note": "page 1 read again at open must name the file's magic family before its header is decoded, and declare the file's page size and reserved bytes; no SQLite counterpart (drift-2026-11-24-3)"
+    "sqlite": [
+      "btree.c:lockBtree"
+    ],
+    "note": "page 1 read again at open must name the file's magic family before its header is decoded (drift-2026-11-24-3), and declare the page size and reserved bytes the file was opened with: ErrHeaderCorrupt, where lockBtree adopts page 1's page size (btree.c:3384-3399) and usable size (btree.c:3417) (drift-page-1-read-again-at-open-keeps-the-files-geometry)"
   },
   "pcache.go:*pcache.appendDirtyPages": {
     "sqlite": [

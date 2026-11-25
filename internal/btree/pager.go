@@ -1145,6 +1145,7 @@ func (p *pager) page1FrameHeader(frame uint32, h, first *dbHeader) error {
 // that declares others is ErrHeaderCorrupt too, under any key (the header
 // is outside the page's authentication), and is not adopted, nor written
 // to the database file by a checkpoint.
+// DRIFT: a page 1 read again at open that declares another page size or other reserved bytes than the file's first read is ErrHeaderCorrupt; lockBtree adopts them. See docs/btree/NOTES.md#drift-page-1-read-again-at-open-keeps-the-files-geometry
 func page1HeaderAtOpen(buf []byte, h, first *dbHeader) error {
 	if len(buf) < dbHeaderSize {
 		return ErrHeaderCorrupt

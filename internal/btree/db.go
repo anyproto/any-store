@@ -1952,6 +1952,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 			// and a write would build on that page. A root of 1 is the
 			// master table itself: a check of the namespace would walk the
 			// master and pass.
+			// DRIFT: a namespace whose root is page 1 is ErrCorrupt; btreeCursor opens a b-tree on root 1, the schema table's. See docs/btree/NOTES.md#drift-a-namespace-whose-root-is-page-1-is-corrupt
 			if rootPage < 2 || rootPage > nPage {
 				return nil, fmt.Errorf("%w: namespace %q: root page %d is outside the database's pages 2..%d", ErrCorrupt, name, rootPage, nPage)
 			}
