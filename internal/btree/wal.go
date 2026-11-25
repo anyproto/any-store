@@ -2502,17 +2502,12 @@ func (w *wal) recoverLocked() error {
 
 	// The caller has found the file to hold the header (its Stat, under the
 	// locks it holds), so a read of it that comes up short came up short on
-	// its own: the read's error, io.ErrUnexpectedEOF when it gave none, and
-	// not a header of zeros, which would start the log over. It is not
-	// ErrWALShortRead: no wal-index has pointed at a frame, and a frame read
-	// that comes up short is what that error means. walIndexRecover returns
-	// the header read's code (wal.c:1429-1431).
+	// its own (recoveryReadErr), and is not a header of zeros, which would
+	// start the log over. walIndexRecover returns the header read's code
+	// (wal.c:1429-1431).
 	buf := make([]byte, walHeaderSize)
 	if n, err := w.file.ReadAt(buf, 0); err != nil || n < len(buf) {
-		if n < len(buf) || !errors.Is(err, io.EOF) {
-			if err == nil {
-				err = io.ErrUnexpectedEOF
-			}
+		if err = recoveryReadErr(len(buf), n, err); err != nil {
 			return fmt.Errorf("btree: WAL recovery: read the WAL header: %w", err)
 		}
 	}
@@ -2571,15 +2566,17 @@ func (w *wal) recoverLocked() error {
 	// The loop is bounded by the file size taken above (SQLite: iLastFrame
 	// from sqlite3OsFileSize, wal.c:1467), so every frame it asks for lies
 	// inside the file and a failed read is an I/O error, not the end of the
-	// log. It aborts recovery with nothing published, as walIndexRecover
-	// keeps the read's rc (wal.c:1502-1503) and writes the header only under
-	// rc==SQLITE_OK (wal.c:1561-1566). Publishing the prefix read so far
-	// would present an earlier commit as the end of the log, and the next
-	// checkpoint would truncate the acknowledged commits behind it. Only a
-	// frame that fails validation (salts, pgno, checksum) ends the scan.
+	// log; one that comes up short came up short on its own, as the
+	// header's (recoveryReadErr). It aborts recovery with nothing
+	// published, as walIndexRecover keeps the read's rc (wal.c:1502-1503)
+	// and writes the header only under rc==SQLITE_OK (wal.c:1561-1566).
+	// Publishing the prefix read so far would present an earlier commit as
+	// the end of the log, and the next checkpoint would truncate the
+	// acknowledged commits behind it. Only a frame that fails validation
+	// (salts, pgno, checksum) ends the scan.
 	for offset+frameSize <= info.Size() {
 		if n, err := w.file.ReadAt(scratch, offset); err != nil || n < len(scratch) {
-			if err = frameReadResult(len(scratch), n, err); err != nil {
+			if err = recoveryReadErr(len(scratch), n, err); err != nil {
 				return fmt.Errorf("btree: WAL recovery: read frame %d: %w", len(parsed)+1, err)
 			}
 		}
@@ -3277,10 +3274,12 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 // error stays in the chain (io.EOF, or io.ErrUnexpectedEOF), as
 // SQLITE_IOERR_SHORT_READ is a kind of SQLITE_IOERR. Any other failure of
 // the read is returned as it is: an I/O error says nothing about the log's
-// content. Every read of a frame goes through it (frameReadResult): the
-// page readers, the checkpoint's (walCheckpoint returns sqlite3OsRead's
-// code, wal.c:2311-2312) and a commit's reread of the frames whose
-// checksums it rewrites (walRewriteChecksums keeps it, wal.c:4002, 4010).
+// content. Every read of a frame outside recovery goes through it
+// (frameReadResult): the page readers, the checkpoint's (walCheckpoint
+// returns sqlite3OsRead's code, wal.c:2311-2312) and a commit's reread of
+// the frames whose checksums it rewrites (walRewriteChecksums keeps it,
+// wal.c:4002, 4010). Recovery's reads, which rebuild the wal-index from
+// the log within the file's size, do not (recoveryReadErr).
 func frameReadErr(err error) error {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return fmt.Errorf("%w: %w", ErrWALShortRead, err)
@@ -3304,6 +3303,26 @@ func frameReadResult(size, n int, err error) error {
 		err = io.ErrUnexpectedEOF
 	}
 	return frameReadErr(err)
+}
+
+// recoveryReadErr judges a read by recovery, of size bytes of the log's
+// header or of a frame, that did not return them all with no error:
+// ReadAt returned n bytes and err. All size bytes with io.EOF are a read
+// that succeeded: nil. Recovery reads only within the file's size it took
+// under its locks, so a read that returns fewer came up short on its own:
+// the read's error, io.ErrUnexpectedEOF when it gave none. It is not
+// ErrWALShortRead, a wal-index that points past the end of the log, whose
+// remedy, closing every handle so that recovery rebuilds the index, is
+// what failed here. walIndexRecover returns the read's code
+// (wal.c:1429-1431, 1502-1503).
+func recoveryReadErr(size, n int, err error) error {
+	if n >= size && (err == nil || errors.Is(err, io.EOF)) {
+		return nil
+	}
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	return err
 }
 
 // errWalFrameRange is the error of a frame read the wal-index cannot have

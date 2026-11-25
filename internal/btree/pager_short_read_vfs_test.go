@@ -485,6 +485,76 @@ func TestWALRecovery_ShortReadOfTheHeader(t *testing.T) {
 	require.Equal(t, 16, rows)
 }
 
+// WAL recovery reads the log's frames within the file's size it took, and a
+// read of one that comes up short is the read's error (io.ErrUnexpectedEOF
+// when it gave none), as the header's is: not ErrWALShortRead, whose remedy,
+// an open after every handle has closed, runs the recovery that failed, and
+// not the end of the log. The open fails, the log is as it was, and the
+// next open recovers its commits.
+func TestWALRecovery_ShortReadOfAFrame(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
+	opts := DefaultOptions()
+	opts.InProcess = true
+	opts.DisableAutoCheckpoint = true
+	db, err := testOpen(t, src, opts)
+	require.NoError(t, err)
+	commitRows(t, db, "t", 16, 100)
+	path := filepath.Join(dir, "test.db")
+	for _, suffix := range []string{"", "-wal"} {
+		data, err := os.ReadFile(src + suffix)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(path+suffix, data, 0o600))
+	}
+	require.NoError(t, db.Close())
+	wal, err := os.ReadFile(path + "-wal")
+	require.NoError(t, err)
+	frameSize := walFrameSize + int(opts.PageSize)
+	nFrames := (len(wal) - walHeaderSize) / frameSize
+	require.Greater(t, nFrames, 1)
+	last := int64(walHeaderSize + (nFrames-1)*frameSize)
+
+	var reply atomic.Pointer[readReply]
+	shortReadVFS(t, path+"-wal", &reply)
+	for _, tc := range []struct {
+		name string
+		n    int
+		err  error
+		want error
+	}{
+		{"none, io.EOF", 0, io.EOF, io.EOF},
+		{"half the frame, no error", frameSize / 2, nil, io.ErrUnexpectedEOF},
+	} {
+		reply.Store(onceReply(func(b []byte, off int64) bool { return off == last && len(b) == frameSize }, tc.n, tc.err))
+		_, err := Open(path, opts)
+		reply.Store(nil)
+		require.ErrorIs(t, err, tc.want, tc.name)
+		require.ErrorContains(t, err, "WAL recovery: read frame", tc.name)
+		require.NotErrorIs(t, err, ErrWALShortRead, tc.name)
+		require.NotErrorIs(t, err, ErrCorrupt, tc.name)
+		after, err := os.ReadFile(path + "-wal")
+		require.NoError(t, err)
+		require.Equal(t, wal, after, tc.name)
+	}
+
+	db, err = Open(path, opts)
+	require.NoError(t, err)
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns, err := rtx.GetNamespace("t")
+	require.NoError(t, err)
+	cur := rtx.NewCursor(ns)
+	defer cur.Close()
+	rows := 0
+	for err = cur.First(); err == nil && cur.Valid(); err = cur.Next() {
+		rows++
+	}
+	require.NoError(t, err)
+	require.Equal(t, 16, rows)
+}
+
 // A creation journal that holds its whole header and reads short is not
 // taken for one that is not hot: the open fails with the read's error
 // (io.ErrUnexpectedEOF when it gave none) and leaves the database file and
