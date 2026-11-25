@@ -272,9 +272,10 @@ type EncryptionConfig struct {
 	// KDFIterations overrides the PBKDF2 cost. Zero means 256,000 (the
 	// SQLCipher v4 default). Ignored when Passphrase is exactly 32 bytes
 	// (raw-key path). Use lower values only in tests. A count above
-	// 100,000,000 fails Open with ErrInvalidConfig. When the passphrase goes
-	// through PBKDF2 the count is part of the key: the database opens only
-	// with the effective count it was created with (0 and 256,000 are one).
+	// 2,147,483,647 (2^31-1; 2,147,483,646 on a 32-bit target) fails Open
+	// with ErrInvalidConfig. When the passphrase goes through PBKDF2 the
+	// count is part of the key: the database opens only with the effective
+	// count it was created with (0 and 256,000 are one).
 	KDFIterations int
 
 	// CipherType selects the built-in AEAD when Passphrase is set.
@@ -365,15 +366,14 @@ const maxCacheSize = min(0x7fff0000, math.MaxInt/4096+1)
 const maxReadConcurrency = 1 << 16
 
 // maxKDFIterations is the largest Encryption.KDFIterations Open derives a key
-// with. The count is part of the key, so a database opens only with the count
-// it was created with: a larger one is refused, not clamped to another key.
-// SQLCipher takes any positive int for kdf_iter. Go's PBKDF2 loop never ends
-// at the largest int, though, and a count near it costs Open minutes (one
-// PBKDF2-HMAC-SHA256 iteration takes 0.3 to 0.8 µs on an Apple M2 core, so
-// 2^31 is 11 to 27 minutes). 100,000,000, 390 times the default, takes 33 to
-// 75 seconds there, and is far past the counts deployments use (OWASP
-// recommends 600,000 for PBKDF2-HMAC-SHA256).
-const maxKDFIterations = 100_000_000
+// with: 2^31-1, the largest kdf_iter SQLCipher takes (a C int). The count is
+// part of the key, so a database opens only with the count it was created
+// with: a larger one is refused, not clamped to another key. Go's PBKDF2 loop
+// never ends at the largest int, so on a 32-bit target, where that is 2^31-1,
+// the bound is one less. One PBKDF2-HMAC-SHA256 iteration takes about 0.1 µs
+// on an AMD Ryzen 9 9950X core and 0.11 µs on an Apple M2 core, so the
+// default 256,000 costs Open about 30 ms and the bound about 4 minutes.
+const maxKDFIterations = min(math.MaxInt32, math.MaxInt-1)
 
 // validate reports the first field of c that Open cannot run with, wrapped in
 // ErrInvalidConfig. It runs before Open resolves the path or touches a file,

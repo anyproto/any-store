@@ -424,8 +424,8 @@ var (
 //   - by Open, for a Durability.FlushMode other than the FlushModeCheckpoint
 //     constants and "" (the default, FlushModeCheckpointPassive), and, with
 //     an Encryption.Passphrase, for a CipherType other than the Cipher
-//     constants or a KDFIterations above 100,000,000 when the passphrase is
-//     not a 32-byte key;
+//     constants or a KDFIterations above 2^31-1 (2^31-2 on a 32-bit target)
+//     when the passphrase is not a 32-byte key;
 //   - by CreateIndex, and EnsureIndex of a name with no index, for a vector
 //     index with no Vector params, an empty Field, a Dim not above 0 or past
 //     2^32-1, a Metric, Quantization or Mode other than its constants (the

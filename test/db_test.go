@@ -1212,14 +1212,18 @@ func TestOpen_HugeCacheSizeAndReadConcurrency(t *testing.T) {
 	require.NoError(t, d.Close())
 }
 
-// A passphrase's KDFIterations past 100,000,000 fails Open with
-// ErrInvalidConfig at once, before anything is created: the count is part of
-// the key, so it is not clamped, and PBKDF2 never returned with the largest
-// int. A 32-byte passphrase is the key itself and ignores the count. The path
-// then opens with a valid count.
+// A passphrase's KDFIterations past 2^31-1 (on a 32-bit target, the largest
+// int) fails Open with ErrInvalidConfig at once, before anything is created:
+// the count is part of the key, so it is not clamped, and PBKDF2 never
+// returned with the largest int. A 32-byte passphrase is the key itself and
+// ignores the count. The path then opens with a valid count.
 func TestOpen_KDFIterationsBounded(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db")
-	for _, n := range []int{100_000_001, math.MaxInt} {
+	counts := []int{math.MaxInt}
+	if over := int64(math.MaxInt32) + 1; over <= math.MaxInt {
+		counts = append(counts, int(over))
+	}
+	for _, n := range counts {
 		d, err := anystore.Open(ctx, path, &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: []byte("pw"), KDFIterations: n}})
 		require.ErrorIs(t, err, anystore.ErrInvalidConfig)
 		require.ErrorContains(t, err, "Encryption.KDFIterations")

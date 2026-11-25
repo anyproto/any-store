@@ -295,7 +295,7 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 })
 ```
 
-Whole-file page-level AEAD with a built-in cipher. A nil `Passphrase` means no encryption, and an empty non-nil one fails `Open`. A `Passphrase` of exactly 32 bytes is used as the key itself; any other nonempty length is stretched with PBKDF2-HMAC-SHA256 against a salt stored in the file, at `KDFIterations` rounds (256,000 by default, at most 100,000,000). The cipher and the count are not stored in the file: a database opens only with the `CipherType` it was created with and, when its passphrase goes through PBKDF2, the same effective `KDFIterations` (0 and 256,000 are one count; a 32-byte key ignores it).
+Whole-file page-level AEAD with a built-in cipher. A nil `Passphrase` means no encryption, and an empty non-nil one fails `Open`. A `Passphrase` of exactly 32 bytes is used as the key itself; any other nonempty length is stretched with PBKDF2-HMAC-SHA256 against a salt stored in the file, at `KDFIterations` rounds (256,000 by default, at most 2,147,483,647, or 2,147,483,646 on a 32-bit target). The cipher and the count are not stored in the file: a database opens only with the `CipherType` it was created with and, when its passphrase goes through PBKDF2, the same effective `KDFIterations` (0 and 256,000 are one count; a 32-byte key ignores it).
 
 `Open` refuses an `Encryption` config that does not fit the file, with an error to match with `errors.Is`. None of them matches `ErrCorrupt`, and the file is left unchanged:
 

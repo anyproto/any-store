@@ -45,14 +45,23 @@ func TestConfig_CacheSizes(t *testing.T) {
 	require.Equal(t, 65_536, rc)
 }
 
-// KDFIterations is refused past 100,000,000 when a passphrase goes through
-// the KDF, and only then: a 32-byte passphrase is the key itself, and no
-// passphrase is no encryption.
+// KDFIterations is refused past 2^31-1, SQLCipher's kdf_iter range, or on a
+// 32-bit target past 2^31-2, as Go's PBKDF2 loop never ends at the largest
+// int, when a passphrase goes through the KDF, and only then: a 32-byte
+// passphrase is the key itself, and no passphrase is no encryption. A count
+// an earlier release created a database with, above 100,000,000 included,
+// is taken.
 func TestConfig_KDFIterationsBound(t *testing.T) {
-	require.Equal(t, 100_000_000, maxKDFIterations)
+	if math.MaxInt == math.MaxInt32 {
+		require.Equal(t, math.MaxInt32-1, maxKDFIterations)
+	} else {
+		require.Equal(t, math.MaxInt32, maxKDFIterations)
+	}
 	pass := []byte("correct horse")
-	require.NoError(t, (&Config{Encryption: EncryptionConfig{Passphrase: pass, KDFIterations: 100_000_000}}).validate())
-	for _, n := range []int{100_000_001, math.MaxInt} {
+	for _, n := range []int{100_000_001, maxKDFIterations} {
+		require.NoError(t, (&Config{Encryption: EncryptionConfig{Passphrase: pass, KDFIterations: n}}).validate())
+	}
+	for _, n := range []int{maxKDFIterations + 1, math.MaxInt} {
 		err := (&Config{Encryption: EncryptionConfig{Passphrase: pass, KDFIterations: n}}).validate()
 		require.ErrorIs(t, err, ErrInvalidConfig)
 		require.ErrorContains(t, err, "Encryption.KDFIterations")
