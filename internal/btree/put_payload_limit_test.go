@@ -556,7 +556,7 @@ func TestPayloadLimit_DeclaredLengthOverFileSize(t *testing.T) {
 					return fmt.Errorf("not an integrity report: %v", err)
 				}
 				for _, msg := range ie.Errors {
-					if strings.HasSuffix(msg, "cell 0: corrupt leaf key") {
+					if strings.Contains(msg, "cell 0: reading the leaf key failed: ") {
 						return ErrCorrupt
 					}
 				}

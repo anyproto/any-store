@@ -213,6 +213,19 @@ type Config struct {
 	// page-1 read (which happens inside Open) are observable. There is
 	// no post-Open setter — the codebase favors config-at-Open over
 	// runtime mutation.
+	//
+	// Under encryption, Open's authentication of page 1 is not reported
+	// as it happens: a page 1 that fails it may be a wrong key, and Open
+	// tells the two apart first (see ErrWrongKey). A wrong key calls the
+	// callback for no page, neither page 1 nor the other pages Open
+	// tried. A damaged page 1 calls it once, for page 1, before Open
+	// returns ErrPageIntegrity, when another page Open tried authenticates
+	// under the key and so proves it. When none does, Open calls the
+	// callback for no page, also when the key is right: it returns
+	// ErrWrongKey when every page it tried was read and failed its
+	// authentication, as a wrong key makes them all fail, and the error of
+	// the read when a page could not be read (an I/O error), since that page
+	// might have proved the key.
 	OnIntegrityError func(IntegrityError)
 }
 
@@ -236,10 +249,14 @@ type Config struct {
 //     KDFIterations rounds.
 //
 // Once a database is created with encryption, it must always be opened
-// with matching Encryption config. Reopening without the passphrase (or
-// with the wrong one) returns an error. There is no in-place rekey in
-// v1; changing a passphrase requires exporting to a freshly-opened
-// database.
+// with matching Encryption config. Open returns ErrEncryptionKeyRequired
+// for an encrypted file opened with an empty EncryptionConfig (Enabled
+// reports false), ErrNotEncrypted for a file that is not encrypted opened
+// with one that is not empty, and ErrWrongKey for an EncryptionConfig that
+// does not open the file: another passphrase or key than the file's, or
+// another cipher. None of the three matches ErrCorrupt, and each leaves the
+// file unchanged. There is no in-place rekey; changing a passphrase
+// requires exporting to a freshly-opened database.
 //
 // An InMemory database keeps its pages unencrypted in memory (there is
 // no at-rest artifact to protect). Its Backup is encrypted only when

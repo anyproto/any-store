@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -1249,4 +1250,43 @@ func TestOpen_UnknownCipherType(t *testing.T) {
 	}
 	_, statErr := os.Stat(path)
 	require.ErrorIs(t, statErr, os.ErrNotExist, "a refused Open creates no file")
+}
+
+// A checkpoint that meets a frame the log does not hold (the wal-index
+// points past the end of -wal) is ErrWALShortRead, as a read of the page
+// is, whether the log ends inside the frame's header or inside its page.
+// The short read's own error stays in the chain, and it is not corruption.
+func TestFlush_ShortWALReadIsErrWALShortRead(t *testing.T) {
+	const pageSize, walHeader, frameHeader = 4096, 32, 24
+	for _, tc := range []struct {
+		name string
+		into int64 // where in the last frame the log is cut
+	}{
+		{"in the frame header", 10},
+		{"in the frame's page", frameHeader + 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "a.db")
+			db, err := anystore.Open(ctx, path, &anystore.Config{DisableAutoCheckpoint: true})
+			require.NoError(t, err)
+			defer func() { _ = db.Close() }()
+			coll, err := db.CreateCollection(ctx, "c")
+			require.NoError(t, err)
+			for i := 0; i < 20; i++ {
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i))))
+			}
+
+			info, err := os.Stat(path + "-wal")
+			require.NoError(t, err)
+			frames := (info.Size() - walHeader) / (frameHeader + pageSize)
+			require.Greater(t, frames, int64(1))
+			last := walHeader + (frames-1)*(frameHeader+pageSize)
+			require.NoError(t, os.Truncate(path+"-wal", last+tc.into))
+
+			err = db.Flush(ctx, 0, anystore.FlushModeCheckpointFull)
+			require.ErrorIs(t, err, anystore.ErrWALShortRead)
+			require.ErrorIs(t, err, io.EOF)
+			require.NotErrorIs(t, err, anystore.ErrCorrupt)
+		})
+	}
 }

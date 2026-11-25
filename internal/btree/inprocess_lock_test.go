@@ -154,3 +154,36 @@ func TestInProcess_MmapRejectedWhilePeerHoldsExclusive(t *testing.T) {
 	require.Error(t, err, "mmap open must be rejected while an in-process peer holds the exclusive lock")
 	require.Nil(t, got, "no DB handle must be returned on a rejected open")
 }
+
+// The destination of a backup of an in-memory database is a file, and
+// takes a file's locking, not the in-process mode an in-memory database is
+// forced into: a destination another process has open is shared with it
+// where the platform has shared memory to map, and is not refused with
+// ErrInProcessLocked.
+func TestBackupDestinationOptions_InMemorySourceTakesTheFilesLocking(t *testing.T) {
+	src, err := testOpen(t, "", Options{InMemory: true})
+	require.NoError(t, err)
+	defer src.Close()
+	opts := src.BackupDestinationOptions()
+	require.False(t, opts.InMemory)
+	require.False(t, opts.InProcess)
+
+	path := filepath.Join(t.TempDir(), "dst.db")
+	db, err := testOpen(t, path, DefaultOptions())
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	// "Another process" has the file open, as a process attached to it
+	// holds it: shared.
+	peer, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer peer.Close()
+	require.NoError(t, syscall.Flock(int(peer.Fd()), syscall.LOCK_SH|syscall.LOCK_NB))
+
+	dst, err := testOpen(t, path, opts)
+	if !hasMmapShm {
+		require.ErrorIs(t, err, ErrInProcessLocked)
+		return
+	}
+	require.NoError(t, err)
+	require.NoError(t, dst.Close())
+}

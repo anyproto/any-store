@@ -6,12 +6,35 @@ import (
 )
 
 var (
-	// ErrCorrupt indicates the database file is corrupted.
+	// ErrCorrupt indicates the database file is corrupted: damage that is in
+	// the files and will be there at the next open. Callers discard and
+	// rebuild a database on it, so no transient state may return it or an
+	// error that wraps it: not an I/O error, a full disk, a cancelled
+	// context, a busy lock, a wrong key or a closed handle.
 	ErrCorrupt = errors.New("btree: database is corrupt")
 
 	// ErrHeaderCorrupt indicates the file header is unusable: a file cut inside it or never a
 	// database, bad field values, or a size that disagrees with the file. It wraps ErrCorrupt.
 	ErrHeaderCorrupt = fmt.Errorf("%w: header", ErrCorrupt)
+
+	// ErrWrongKey is returned (wrapped) by Open when the key does not open
+	// the file: page 1 failed its authentication, and so did every other
+	// page the open then tried under the same key (pager.proveKeyAtOpen).
+	// Deliberately NOT wrapping ErrCorrupt or ErrPageIntegrity: nothing
+	// shows the file to be damaged, and a caller that discards a corrupt
+	// database must not discard one it only failed to unlock.
+	ErrWrongKey = errors.New("btree: wrong encryption key")
+
+	// ErrKeyRequired is returned by Open for a file that is encrypted when
+	// the options carry neither Key nor Codec. It is decided from the
+	// file's header alone, and the file is left unchanged. It does not wrap
+	// ErrCorrupt.
+	ErrKeyRequired = errors.New("btree: database file is encrypted, Options.Key or Options.Codec required")
+
+	// ErrNotEncrypted is returned by Open for a file that is not encrypted
+	// when the options carry Key or Codec. The file is left unchanged. It
+	// does not wrap ErrCorrupt.
+	ErrNotEncrypted = errors.New("btree: database file is not encrypted, remove Options.Key/Codec")
 
 	// ErrSQLiteFormat reports a file carrying SQLite's header magic — an
 	// any-store v1 database. Deliberately NOT wrapping ErrCorrupt: the file is
@@ -64,14 +87,22 @@ var (
 	// written.
 	ErrValueTooLarge = errors.New("btree: value too large")
 
-	// ErrWALCorrupt indicates the WAL index points at a frame the file does not hold.
-	ErrWALCorrupt = nestedError("btree: WAL is corrupt", ErrCorrupt)
+	// ErrWALShortRead is the error of a read of a WAL frame that comes up
+	// short: the wal-index points at a frame past the end of the log file,
+	// as SQLite's read of it gives SQLITE_IOERR_SHORT_READ
+	// (sqlite3WalReadFrame, wal.c:3649-3664; unixRead). A read returns it
+	// wrapped with the short read's own error, io.EOF or io.ErrUnexpectedEOF
+	// (frameReadErr, frameReadResult). Deliberately NOT
+	// wrapping ErrCorrupt: the database file is not damaged, and the
+	// wal-index is rebuilt from the log when every handle has closed it.
+	ErrWALShortRead = errors.New("btree: WAL frame read came up short: the wal-index points past the end of the log")
 
 	// ErrWALVersion indicates the WAL was written by an incompatible (newer)
-	// any-store version. Unlike ErrWALCorrupt it must never trigger
-	// recovery's start-fresh truncation: the WAL holds committed
-	// transactions this binary cannot read, and destroying it would lose
-	// them. Open fails instead; upgrade the binary to proceed.
+	// any-store version. Unlike a WAL header that fails its checks
+	// (errWalHeaderInvalid) it must never trigger recovery's start-fresh
+	// truncation: the WAL holds committed transactions this binary cannot
+	// read, and destroying it would lose them. Open fails instead; upgrade
+	// the binary to proceed.
 	ErrWALVersion = errors.New("btree: incompatible WAL version")
 
 	// ErrOldFormat indicates the database was created with an older schema format

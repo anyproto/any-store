@@ -67,8 +67,33 @@ type DB interface {
 	// reachable-page coverage, orphan detection, freelist consistency,
 	// overflow-chain validation, key ordering, and master-page consistency.
 	// Returns nil if the database is structurally consistent, or an error
-	// aggregating up to 100 issues found. More expensive than QuickCheck —
-	// intended for stress tests and offline diagnostics, not normal opens.
+	// aggregating up to 100 issues found, one per line of its text. More
+	// expensive than QuickCheck — intended for stress tests and offline
+	// diagnostics, not normal opens.
+	//
+	// The check reads one snapshot: that of the read transaction ctx
+	// carries, which it uses without waiting for a reader slot, or else that
+	// of a read transaction of its own, whose wait for a slot ends with ctx.
+	// A write transaction that ctx carries is not checked: the check reads
+	// the committed state, in a read transaction of its own, which does not
+	// wait for a reader slot: with every slot held (one may be the caller's
+	// own) the check returns an error matching ErrBusy at once. The walk of
+	// the btree does not consult ctx: a ctx that ends while it runs ends the
+	// check after it, with ctx's error.
+	//
+	// The error matches ErrCorrupt when the check found damage: a broken
+	// structure, a page that fails its checksum or authentication, or a
+	// collection in the catalog that has no data. With
+	// Config.ContinueOnIntegrityError on, checksums are not verified: a page
+	// that fails its checksum is found only when what it holds breaks the
+	// structure (Config.OnIntegrityError is still called for it). It does not match
+	// ErrCorrupt when the check could not run or could not read: a closed
+	// database (ErrDBIsClosed), a cancelled ctx, a busy error (ErrBusy), or a report
+	// that lists a page that failed to read with an I/O error or a short
+	// read of the write-ahead log (ErrWALShortRead). Such a report matches
+	// that error, and what else it lists is inconclusive (the pages below
+	// an unread page are listed as never used): run the check again, for
+	// ErrWALShortRead once every handle has closed the file.
 	IntegrityCheck(ctx context.Context) (err error)
 
 	// Flush perform checkpoint on the btree database
@@ -105,12 +130,17 @@ type DB interface {
 	// the file, so a new copy of a passphrase database has a key of its
 	// own. A file at path that already holds a database of another kind is
 	// not replaced: Backup returns an error and leaves its content as it
-	// was.
+	// was. The error matches ErrBackupCodecMismatch for a database whose
+	// pages are laid out another way (plain, checksummed, encrypted),
+	// ErrBackupFormatMismatch for one of another schema format, and, for one
+	// whose encryption does not fit the source's, ErrEncryptionKeyRequired,
+	// ErrNotEncrypted or ErrWrongKey.
 	//
 	// Backup returns the destination's errors as well as the source's: a
-	// file at path that is damaged, or encrypted with another key, can give
-	// an error that matches ErrCorrupt while this database is sound. Rule
-	// that out before discarding this database.
+	// file at path that is damaged can give an error that matches
+	// ErrCorrupt while this database is sound. Rule that out before
+	// discarding this database. A file at path encrypted with another key
+	// is ErrWrongKey, as at Open.
 	//
 	// Backup never removes the file at path. If it fails before the copy is
 	// committed, the destination's transaction is rolled back: a destination
@@ -217,8 +247,13 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 
 // open is Open with the schema format a file it creates gets: 0 for the
 // default, or a format the btree writes (btree.Options.SchemaFormat). An
-// existing file keeps its own.
-func open(ctx context.Context, path string, config *Config, createFormat uint32) (*db, error) {
+// existing file keeps its own. Every busy error it returns matches ErrBusy:
+// the btree's busy errors (a peer's recovery, a snapshot a peer's commit
+// overtook) are kinds of it, as SQLITE_BUSY_RECOVERY and
+// SQLITE_BUSY_SNAPSHOT are of SQLITE_BUSY. Every version refusal matches
+// ErrIncompatibleVersion, also one met after btree.Open has returned.
+func open(ctx context.Context, path string, config *Config, createFormat uint32) (_ *db, err error) {
+	defer func() { err = busyErr(versionErr(err)) }()
 	if config == nil {
 		config = &Config{}
 	}
@@ -230,7 +265,6 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 	// One name for the database file, its WAL and its sentinel file, as
 	// SQLite resolves the name once and opens every file by it
 	// (pager.c:4792, pager.c:4929, pager.c:4948).
-	var err error
 	if !config.InMemory {
 		if path, err = btree.FullPathname(path); err != nil {
 			return nil, fmt.Errorf("cannot resolve the database path: %w", err)
@@ -246,6 +280,23 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		openedCollections: make(map[string]Collection),
 		byIdentity:        make(map[string]*collection),
 	}
+	// The open's cleanup is armed until it returns the handle, not only on
+	// its error returns: a panic out of it (Config.OnIntegrityError is the
+	// caller's code, and the open's reads call it, in the write begin of
+	// init and in the quick check of a dirty open) would otherwise leave the
+	// file held by this process, and a caller that recovers would get
+	// ErrDBAlreadyOpen from every later Open of it. Closing a btree handle
+	// an error return closed already does nothing.
+	opened := false
+	defer func() {
+		if opened || ds.btreeDB == nil {
+			return
+		}
+		if ds.recoveryController != nil {
+			_ = ds.recoveryController.Stop()
+		}
+		_ = ds.btreeDB.Close()
+	}()
 
 	var quickCheckNeeded bool
 	ds.recoveryController, quickCheckNeeded = ds.createRecoveryController(ctx, path)
@@ -298,16 +349,10 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		testHookBeforeBtreeOpen()
 	}
 	if ds.btreeDB, err = btree.Open(path, opts); err != nil {
-		if errors.Is(err, btree.ErrPageSlabNotInitialized) {
-			return nil, ErrPageBufferNotInitialized
-		}
-		if errors.Is(err, btree.ErrSQLiteFormat) {
-			return nil, ErrV1Database
-		}
-		if errors.Is(err, btree.ErrNewerFormat) {
-			return nil, fmt.Errorf("%w: %w", ErrIncompatibleVersion, err)
-		}
-		return nil, err
+		return nil, openErr(err)
+	}
+	if testHookAfterBtreeOpen != nil {
+		testHookAfterBtreeOpen(ds.btreeDB)
 	}
 	// ContinueOnIntegrityError only applies to checksum mode. AEAD mode
 	// ignores it by design (disabling AEAD verification would return
@@ -323,6 +368,12 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 	if err = ds.init(ctx); err != nil {
 		_ = ds.recoveryController.Stop()
 		_ = ds.btreeDB.Close()
+		// init resolves the catalog's root, which the quick check of a
+		// dirty open then reads: damage init meets there is what the
+		// check would have met, and the open reports it as the check's.
+		if quickCheckNeeded && errors.Is(err, ErrCorrupt) {
+			return nil, fmt.Errorf("%w: %w", ErrQuickCheckFailed, err)
+		}
 		return nil, err
 	}
 
@@ -332,12 +383,28 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		start := time.Now()
 		quickCheckCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
-		if err := ds.QuickCheck(quickCheckCtx); err != nil {
+		err := ds.QuickCheck(quickCheckCtx)
+		if err == nil {
+			// The read does not consult the ctx once it has begun: a check
+			// that ended after its ctx did (cancelled, or past its five
+			// minutes) did not finish in time, and does not mark the
+			// database clean.
+			err = quickCheckCtx.Err()
+		}
+		if err != nil {
 			if ds.recoveryController != nil {
 				_ = ds.recoveryController.Stop()
 			}
 			_ = ds.btreeDB.Close()
-			return nil, fmt.Errorf("%w: %w", ErrQuickCheckFailed, err)
+			// Only a check that met damage is ErrQuickCheckFailed, and so
+			// ErrCorrupt. One that did not finish (a cancelled ctx, its
+			// own time limit, a busy lock, an I/O error) says nothing
+			// about the file, and returns that error; the sentinel
+			// stays, so the next open checks again.
+			if errors.Is(err, ErrCorrupt) {
+				return nil, fmt.Errorf("%w: %w", ErrQuickCheckFailed, err)
+			}
+			return nil, fmt.Errorf("any-store: quick check on db open did not complete: %w", busyErr(err))
 		}
 		ds.dirtyQuickCheckDuration = time.Since(start)
 		if ds.recoveryController != nil {
@@ -366,6 +433,7 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		return nil, err
 	}
 
+	opened = true
 	return ds, nil
 }
 
@@ -974,6 +1042,10 @@ var testHookFoundRegistered func(c *collection)
 // and the sentinel is set up, just before btree.Open. Tests only.
 var testHookBeforeBtreeOpen func()
 
+// testHookAfterBtreeOpen, when set, runs in open with the btree handle it
+// has just opened, before the initialization that follows. Tests only.
+var testHookAfterBtreeOpen func(*btree.DB)
+
 // errHandleGone tells openCollection that the handle it found registered is
 // not live any more.
 var errHandleGone = errors.New("any-store: registered handle is gone")
@@ -1326,40 +1398,89 @@ func (db *db) QuickCheck(ctx context.Context) (err error) {
 }
 
 func (db *db) IntegrityCheck(ctx context.Context) (err error) {
+	// A busy error of the check's read begin matches ErrBusy, as every
+	// busy error of this package does.
+	defer func() { err = busyErr(err) }()
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if err = db.btreeDB.IntegrityCheck(); err != nil {
+	// Both checks run in one read transaction, as sqlite3BtreeIntegrityCheck
+	// runs inside the transaction of its connection (btree.c:11156): the
+	// one ctx carries, which the check waits for nothing to use, or one of
+	// its own, whose wait for a reader slot ends with ctx. A Close waits for
+	// the whole check. A write transaction that ctx carries is not checked:
+	// the check reads a committed snapshot, through a read transaction of
+	// its own, which does not wait for a reader slot: its caller holds the
+	// writer, and may hold the slot it would wait for in a read transaction
+	// it releases only once the check returns. With every slot held the
+	// check is busy (ErrBusy).
+	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		if tx.IsWriteTx() {
+			rtx, err := db.btreeDB.TryBeginRead()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = rtx.Rollback() }()
+			tx = rtx
+		}
+		if err := tx.IntegrityCheck(); err != nil {
+			return err
+		}
+		// The walk does not consult ctx: a ctx that ended while it ran
+		// ends the check here, and one that ends in the catalog's check
+		// ends it before it can return success.
+		if testIntegrityCheckWalkedHook != nil {
+			testIntegrityCheckWalkedHook()
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := db.checkCatalog(tx); err != nil {
+			return err
+		}
+		return ctx.Err()
+	})
+}
+
+// testIntegrityCheckWalkedHook runs in IntegrityCheck once the btree's walk
+// has passed, before the check of the catalog. Nil outside tests.
+var testIntegrityCheckWalkedHook func()
+
+// checkCatalog is IntegrityCheck's check of the catalog in tx: every
+// cataloged collection must have its data namespace. A missing one is the
+// signature of a rename performed by a pre-fix version (catalog re-keyed to
+// the new name, data left under the old); its data survives as an orphan
+// namespace but the collection is unopenable until manually repaired.
+func (db *db) checkCatalog(tx *btree.ReadTx) error {
+	names, err := db.listCollectionNames(tx)
+	if err != nil {
 		return err
 	}
-	// Catalog consistency: every cataloged collection must have its data
-	// namespace. A missing one is the signature of a rename performed by a
-	// pre-fix version (catalog re-keyed to the new name, data left under the
-	// old); its data survives as an orphan
-	// namespace but the collection is unopenable until manually repaired.
-	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		names, lErr := db.listCollectionNames(tx)
-		if lErr != nil {
-			return lErr
-		}
-		for _, name := range names {
-			if _, nsErr := tx.GetNamespace(name); nsErr != nil {
-				if errors.Is(nsErr, btree.ErrNamespaceNotFound) {
-					return fmt.Errorf("collection %q: data namespace missing (renamed by a pre-fix version); its data survives under the pre-rename namespace name", name)
-				}
-				// Any other failure to resolve the namespace is itself an
-				// integrity problem — never mask it as a clean result.
-				return fmt.Errorf("collection %q: resolving data namespace: %w", name, nsErr)
+	for _, name := range names {
+		if _, nsErr := tx.GetNamespace(name); nsErr != nil {
+			if errors.Is(nsErr, btree.ErrNamespaceNotFound) {
+				return dataNamespaceMissing(name)
 			}
+			// Any other failure to resolve the namespace is itself an
+			// integrity problem — never mask it as a clean result.
+			return fmt.Errorf("collection %q: resolving data namespace: %w", name, nsErr)
 		}
-		return nil
-	})
+	}
+	return nil
+}
+
+// dataNamespaceMissing is the error of a collection that the catalog lists
+// and whose data namespace the same snapshot does not hold: damage, which
+// matches ErrCorrupt.
+func dataNamespaceMissing(name string) error {
+	return fmt.Errorf("%w: collection %q: data namespace missing (renamed by a pre-fix version); its data survives under the pre-rename namespace name", ErrCorrupt, name)
 }
 
 func (db *db) Backup(ctx context.Context, path string) (err error) {
 	// Whatever busy error ends the backup, at any step of it, is the one
-	// the caller matches.
-	defer func() { err = busyErr(err) }()
+	// the caller matches, and so is a version refusal met after the
+	// destination's open (a peer's wal-index of another version).
+	defer func() { err = busyErr(versionErr(err)) }()
 
 	// ~ backup.c:337-344: "If the source pager is currently in a
 	// write-transaction, return SQLITE_BUSY immediately." A Step would say
@@ -1387,7 +1508,7 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 	}
 	dstDB, err := btree.Open(path, dstOpts)
 	if err != nil {
-		return fmt.Errorf("open backup destination: %w", err)
+		return fmt.Errorf("open backup destination: %w", openErr(err))
 	}
 	if testBackupOpenHook != nil {
 		testBackupOpenHook(dstDB)
@@ -2116,7 +2237,7 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 		}
 		v, err := p.Parse(val)
 		if err != nil {
-			return nil, err
+			return nil, &recordDecodeError{err}
 		}
 		info := IndexInfo{
 			Name:   v.GetString("name"),
@@ -2676,6 +2797,15 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 	return nil
 }
 
+// recordDecodeError is the error of a record of the catalog (a
+// collection's config, an index definition) that was read and does not
+// decode. Its text and its chain are the parser's; it tells such a record
+// from a read that failed (CopyToLatestFormat's verification of its copy).
+type recordDecodeError struct{ err error }
+
+func (e *recordDecodeError) Error() string { return e.err.Error() }
+func (e *recordDecodeError) Unwrap() error { return e.err }
+
 // loadCollConfig loads per-collection config from the system namespace.
 func (db *db) loadCollConfig(tx *btree.ReadTx, collName string) (collConfig, error) {
 	var cfg collConfig
@@ -2689,7 +2819,7 @@ func (db *db) loadCollConfig(tx *btree.ReadTx, collName string) (collConfig, err
 	var p anyenc.Parser
 	val, err := p.Parse(data)
 	if err != nil {
-		return cfg, err
+		return cfg, &recordDecodeError{err}
 	}
 	cfg.Compression = Compression(val.GetInt("compression"))
 	cfg.PrimaryKey = val.GetString("primaryKey")

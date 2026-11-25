@@ -2270,7 +2270,7 @@ func TestIntegrityCheck_InteriorCorruptKey(t *testing.T) {
 	// Strategy: craft an interior cell with keyLen > maxPayloadAlloc (1<<30).
 	// parseInteriorCell validates keyLen against maxPayloadAlloc and returns
 	// ErrCorrupt, so the integrity check reports "corrupt cell data" before it ever
-	// reaches interiorFullKey's "corrupt interior key" path.
+	// reaches interiorFullKey's "reading the interior key failed" path.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()

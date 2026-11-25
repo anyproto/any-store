@@ -1856,9 +1856,9 @@ func TestTxGetPage_WritableGetPageAt(t *testing.T) {
 	require.NoError(t, tx2.Rollback())
 }
 
-// === Cover DeleteNamespace with rootPage == 0 (line 388) ===
-// Manually insert a master btree entry with rootPage=0, then delete it.
-
+// A master entry whose root page is 0 is damage: resolving its name is
+// ErrCorrupt, in a read transaction and in a write one, so neither a read
+// nor a drop of the namespace uses the root. The entry stays.
 func TestDeleteNamespace_RootPageZero(t *testing.T) {
 	db := tempDB(t)
 
@@ -1873,20 +1873,135 @@ func TestDeleteNamespace_RootPageZero(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 
-	// Verify it exists
-	ns, err := db.GetNamespace("zero_root_ns")
-	require.NoError(t, err)
-	assert.Equal(t, uint32(0), ns.RootPage())
+	_, err = db.GetNamespace("zero_root_ns")
+	require.ErrorIs(t, err, ErrCorrupt)
 
-	// Delete it — should take the rootPage==0 path (line 388: return nil)
 	tx2, err := db.BeginWrite()
 	require.NoError(t, err)
-	require.NoError(t, db.DeleteNamespace(tx2, "zero_root_ns"))
-	require.NoError(t, tx2.Commit())
+	require.ErrorIs(t, db.DeleteNamespace(tx2, "zero_root_ns"), ErrCorrupt)
+	require.NoError(t, tx2.Rollback())
 
-	// Verify it's gone
-	_, err = db.GetNamespace("zero_root_ns")
-	assert.ErrorIs(t, err, ErrNamespaceNotFound)
+	names, err := db.ListNamespaces()
+	require.NoError(t, err)
+	assert.Contains(t, names, "zero_root_ns")
+}
+
+// A namespace root past the database's page count is damage: it would
+// read as a zero page, an empty tree. Resolving the name is ErrCorrupt, in
+// a read transaction and in a write one, and the integrity check reports
+// the root.
+func TestGetNamespace_RootPastTheDatabaseIsCorrupt(t *testing.T) {
+	db := tempDB(t)
+	commitRows(t, db, "x", 8, 100)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, tx.pager.wgate.enter())
+	var root [4]byte
+	binary.BigEndian.PutUint32(root[:], db.pager.dbSize.Load()+1)
+	master := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
+	require.NoError(t, master.Put([]byte("x"), root[:]))
+	tx.pager.wgate.leave()
+	require.NoError(t, tx.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	_, err = rtx.GetNamespace("x")
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.NoError(t, rtx.Rollback())
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = wtx.GetNamespace("x")
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.ErrorIs(t, db.DeleteNamespace(wtx, "x"), ErrCorrupt)
+	require.NoError(t, wtx.Rollback())
+
+	err = db.IntegrityCheck()
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.Contains(t, err.Error(), "out of range")
+}
+
+// A namespace root of 1 is the master table, which no namespace has:
+// resolving it is ErrCorrupt, for a reader and for the writer, and a
+// namespace that resolved to it would be checked as the master and pass.
+func TestGetNamespace_RootOfTheMasterIsCorrupt(t *testing.T) {
+	db := tempDB(t)
+	commitRows(t, db, "x", 8, 100)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, tx.pager.wgate.enter())
+	master := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
+	require.NoError(t, master.Put([]byte("x"), []byte{0, 0, 0, 1}))
+	tx.pager.wgate.leave()
+	require.NoError(t, tx.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	_, err = rtx.GetNamespace("x")
+	require.NoError(t, rtx.Rollback())
+	require.ErrorIs(t, err, ErrCorrupt)
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = wtx.GetNamespace("x")
+	require.NoError(t, wtx.Rollback())
+	require.ErrorIs(t, err, ErrCorrupt)
+
+	require.ErrorIs(t, db.IntegrityCheck(), ErrCorrupt)
+}
+
+// A reader's bound on a namespace root is the database's size at its
+// snapshot, page 1's count, not the pager's count: with no commit in the
+// WAL that is the file's length, and a file can hold a page past the
+// database. A root on such a stale page, here a copy of another
+// namespace's root with its records, is ErrCorrupt, and its records are
+// not read as the namespace's.
+func TestGetNamespace_RootPastPage1sCountIsCorrupt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	opts := Options{PageSize: 4096}
+	db, err := testOpen(t, path, opts)
+	require.NoError(t, err)
+	commitRows(t, db, "x", 8, 100)
+	nPage := db.pager.dbSize.Load()
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	xns, err := tx.GetNamespace("x")
+	require.NoError(t, err)
+	require.NoError(t, tx.pager.wgate.enter())
+	var root [4]byte
+	binary.BigEndian.PutUint32(root[:], nPage+1)
+	master := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
+	require.NoError(t, master.Put([]byte("y"), root[:]))
+	tx.pager.wgate.leave()
+	require.NoError(t, tx.Commit())
+	require.Equal(t, nPage, db.pager.dbSize.Load())
+	require.NoError(t, db.Checkpoint(CheckpointTruncate))
+	require.NoError(t, db.Close())
+
+	// The file gets a page past the database: a copy of x's root.
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.EqualValues(t, int(nPage)*4096, len(data))
+	stale := data[int(xns.RootPage()-1)*4096 : int(xns.RootPage())*4096]
+	require.NoError(t, os.WriteFile(path, append(data, stale...), 0o644))
+
+	db, err = testOpen(t, path, opts)
+	require.NoError(t, err)
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	n, sizeErr := rtx.DatabaseSize()
+	_, err = rtx.GetNamespace("y")
+	require.NoError(t, rtx.Rollback())
+	require.NoError(t, sizeErr)
+	require.Equal(t, nPage, n)
+	require.ErrorIs(t, err, ErrCorrupt)
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = wtx.GetNamespace("y")
+	require.NoError(t, wtx.Rollback())
+	require.ErrorIs(t, err, ErrCorrupt)
 }
 
 // === Cover BeginWrite pager.beginWrite error (lines 254-259) ===
@@ -4184,4 +4299,24 @@ func TestCloseCheckpointed_InMemoryReportsFalse(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, checkpointed)
 	require.False(t, ran)
+}
+
+// The two refusals of the codec settle (Open's settleCodec) are matchable
+// and are not corruption.
+func TestOpen_EncryptionRefusalsAreSentinels(t *testing.T) {
+	path, opts := keyProofDB(t, true, nil)
+	plain := opts
+	plain.Key = nil
+	_, err := Open(path, plain)
+	require.ErrorIs(t, err, ErrKeyRequired)
+	require.NotErrorIs(t, err, ErrCorrupt)
+
+	encTestSetup(t)
+	plainPath := tmpEncryptedFile(t, "plain.db")
+	db, err := Open(plainPath, plain)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	_, err = Open(plainPath, opts)
+	require.ErrorIs(t, err, ErrNotEncrypted)
+	require.NotErrorIs(t, err, ErrCorrupt)
 }

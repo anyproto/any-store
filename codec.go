@@ -31,6 +31,10 @@ const CipherXChaCha20Poly1305 = btree.CipherXChaCha20Poly1305
 // ("checksum mismatch" or "AEAD authentication failed"); callers that
 // need a programmatic discriminator should use SweepError.Kind from
 // VerifyIntegrity instead of parsing strings.
+//
+// It matches ErrCorrupt. A wrong encryption key at Open is not this error
+// but ErrWrongKey; a page that fails its authentication once Open has
+// returned is damaged, the key being proven by then.
 var ErrPageIntegrity = btree.ErrPageIntegrity
 
 // DefaultKDFIterations is the PBKDF2 iteration count used when

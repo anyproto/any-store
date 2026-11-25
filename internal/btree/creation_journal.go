@@ -82,6 +82,19 @@ func creationJournalHdr(pageSize uint32) []byte {
 // Beyond those, the header must be a whole creation header that records an
 // original size of zero pages: the only rollback this journal describes is
 // the truncation to nothing, and nothing else is ever rolled back from it.
+//
+// A read of the header that comes up short is judged by the journal's
+// size, and only then: a journal shorter than its header is not hot; one
+// that holds it had the read come up short on its own, and the open fails
+// with the read's error (io.ErrUnexpectedEOF when it gave none). Taken for
+// a journal that is not hot, a dead creator's journal would be left beside
+// the database the handle then commits to, and a later open would play it
+// back and truncate the database to nothing. readJournalHdr reads a header
+// only within the journal's size (pager.c:1597-1599) and returns a failed
+// read's code (pager.c:1608-1611); hasHotJournal takes a short read of the
+// journal's first byte for a zero, a journal that is not hot
+// (pager.c:5198-5205).
+// DRIFT: a short read of a creation journal that holds its header fails the open, where hasHotJournal takes a short read of the first byte for a journal that is not hot. See docs/btree/NOTES.md#drift-2026-11-21-7-creation-journal
 func (p *pager) hasHotCreationJournal() (bool, error) {
 	jf, err := osOpenFile(p.path+creationJournalSuffix, os.O_RDONLY, 0)
 	if err != nil {
@@ -96,7 +109,20 @@ func (p *pager) hasHotCreationJournal() (bool, error) {
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return false, fmt.Errorf("btree: read the creation journal: %w", err)
 	}
-	if n < creationJournalHdrSize || !bytes.Equal(hdr[:8], creationJournalMagic[:]) {
+	if n < creationJournalHdrSize {
+		info, serr := jf.Stat()
+		if serr != nil {
+			return false, fmt.Errorf("btree: read the creation journal: %w", serr)
+		}
+		if info.Size() < creationJournalHdrSize {
+			return false, nil
+		}
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		return false, fmt.Errorf("btree: read the creation journal: %w", err)
+	}
+	if !bytes.Equal(hdr[:8], creationJournalMagic[:]) {
 		return false, nil
 	}
 	return binary.BigEndian.Uint32(hdr[16:]) == 0, nil

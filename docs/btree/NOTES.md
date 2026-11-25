@@ -1429,12 +1429,14 @@ comments in source):
    returns the error (`pager.c:6512`, `3219-3236`), and the VDBE rolls the
    transaction back as any other (`sqlite3PagerRollback` →
    `sqlite3PagerSavepoint`, `pager.c:6779-6782`, → `sqlite3WalUndo`). Here
-   a commit whose frame write fails passes through `pagerError` with
-   `errCode` nil, a state SQLite has no counterpart of. A commit whose fetch
+   a commit whose frame write fails passes through `pagerError`, which stores
+   the commit's error in `errCode` and trips the cursors with it
+   ([drift-2026-11-24-5](#drift-2026-11-24-5-a-failed-commit-ends-its-cursors-with-its-error)),
+   a state SQLite has no counterpart of. A commit whose fetch
    of page 1 meets a failed spill (page 1 can be evicted here,
    [entry 2](#old-drift-pagerstress-page1-exclusion)) is in the error state of a failed spill already, with `errCode`
-   set by `pagerStress`: `pagerError` trips the cursors with that error and
-   clears it as it cleans up.
+   set by `pagerStress`: `pagerError` keeps that error, trips the cursors
+   with it and clears it as it cleans up.
    A failed spill does not run this cleanup: `pagerStress` only sets the error
    state, and the rollback cleans up; see
    [the error state of a failed spill](#drift-2026-11-21-13-the-error-state-of-a-failed-spill).
@@ -2329,29 +2331,76 @@ substitutes the older committed-DB-file version instead of surfacing the WAL err
 which can return outdated page content as if it were current.
 
 <a id="drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt"></a>
-### Drift: readFrame Past-Tail Read Failure Remapped To ErrWALCorrupt
-- **Category:** error-handling  -  **Severity:** low
-- **Affected functions:** `wal.go:*wal.readFrame` (`internal/btree/wal.go`, past-tail remap in the `ReadAt` error branch), `wal.go:*wal.readFrameRaw` (same pattern).
+### Drift: A Short Read Of A WAL Frame
+- **Category:** error-handling  -  **Severity:** low  -  **Status:** RESOLVED: a short read of a WAL frame is `ErrWALShortRead`, the counterpart of `SQLITE_IOERR_SHORT_READ`, and it does not match `ErrCorrupt`.
+- **Affected functions:** `wal.go:frameReadErr`, `wal.go:frameReadResult`, `wal.go:*wal.readFramePageHook`, `wal.go:*wal.readFrameRaw`, `wal.go:*wal.readFramePgno`, `wal.go:*wal.buildBackfillMap`, `wal.go:*wal.checkpointWithMode`, `wal.go:*wal.rewriteChecksums`, `wal.go:*wal.recoverLocked`, `pager.go:*pager.readWalFrameDataRaw`.
 
-C `sqlite3WalReadFrame` (`sqlitec/src/wal.c:3649-3664`, 3.52.0) is a bare `sqlite3OsRead` with no bounds check — a read past the physical WAL tail surfaces as the raw OS error (typically `SQLITE_IOERR_SHORT_READ` from `unixRead`), and `readDbPage` forgives short reads only on the DB-file branch, never the WAL branch (`pager.c:3042-3045`). Go's `readFrame`/`readFrameRaw` instead remap a `ReadAt` failure at `frame > nFrame` (a stale process-local tail view in multi-process mode) to `ErrWALCorrupt` rather than leaking the raw I/O error. Both C and Go treat the condition as an error; the divergence is only the error identity. Since the drift-6 resolution these errors propagate to page-get callers, so the remap is now user-visible: callers see `ErrWALCorrupt` where C would surface an I/O error code. Kept deliberately — a lookup-resolved frame that cannot be read within the reader's validated snapshot implies index/tail inconsistency, which `ErrWALCorrupt` describes more accurately than a short-read errno.
+C `sqlite3WalReadFrame` (`wal.c:3649-3664`) is a bare `sqlite3OsRead` with no bounds check: `return sqlite3OsRead(pWal->pWalFd, pOut, (nOut>sz ? sz : nOut), iOffset);`. A read past the physical WAL tail surfaces as the OS layer's code (`SQLITE_IOERR_SHORT_READ` from `unixRead`), and `readDbPage` forgives short reads only on the DB-file branch, never the WAL branch (`pager.c:3042-3045`). The checkpoint's reads and a commit's reread of the frames whose checksums it rewrites return `sqlite3OsRead`'s code too (`walCheckpoint`, `wal.c:2311-2312`; `walRewriteChecksums`, `wal.c:4002`, `4010`).
+
+Every read of a WAL frame outside recovery that does not return all its bytes with no error goes through `frameReadResult`, and nothing else does: the page readers, the checkpoint's reads of the frame headers and pages, and the commit's reread in `rewriteChecksums`. It judges the read by its count as well as its error. All the bytes with `io.EOF`, which `ReadAt` may return for a read that ends at the end of the file, are a read that succeeded. Fewer are a short read (`frameReadErr`), whatever the error that came with them: `ErrWALShortRead`, with the read's `io.EOF` or `io.ErrUnexpectedEOF` in the chain, and `io.ErrUnexpectedEOF` when a file system returned a short count with no error, as some do, which would otherwise hand a partial page to the codec, a checksum failure, damage. `ErrWALShortRead` means the wal-index points at a frame the file does not hold. Like `SQLITE_IOERR_SHORT_READ` it is an I/O error and not damage: the database file is sound, and an open after every handle has closed rebuilds the index from the log. Every other failure of the read is returned as it is, as in C. Recovery reads the log's header and its frames only within the file's size, which it took under its locks, and judges each read by its count too (`recoveryReadErr`): all the bytes with `io.EOF` are a read that succeeded, and fewer came up short on their own: the read's error (`io.ErrUnexpectedEOF` when it gave none), not a header of zeros, which would start the log over, and not `ErrWALShortRead`, whose remedy, an open after every handle has closed, runs the recovery that failed. `walIndexRecover` returns the read's code (`wal.c:1429-1431`, `1502-1503`).
+
+The frame-number guards in front of the read (frame 0, a frame above the count of a log only this process writes, an in-memory frame that is missing) are assertions in SQLite's terms: they return `errWalFrameRange`, which matches no exported error.
+
+Tests: `TestFrameReadErr`, `TestWALClosedFileReadIsErrClosed`, `TestRewriteChecksums_ShortReadIsErrWALShortRead` (`wal_test.go`), `TestWALFrameReadErrorsThroughEveryReader` (`pager_readfault_test.go`), `TestWALFrameRead_CountsItsBytes`, `TestWALRecovery_ShortReadOfTheHeader`, `TestWALRecovery_ShortReadOfAFrame` (`pager_short_read_vfs_test.go`), `TestCheckpointWithMode_FileReadPageDataError` (`pager_test.go`), `TestIntegrityCheck_ShortWALReadKeepsItsIdentity` (`integrity_test.go`), `TestFlush_ShortWALReadIsErrWALShortRead` (`test/db_test.go`).
 
 
 <a id="drift-7-short-db-file-read-treated-as-hard-error"></a>
-### Drift: Short DB File Read Treated As Hard Error
+### Drift: A Short Read Of A Page Of The Database File Is An Error, Not Zeros
 - **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `pager.go:*pager.readTempPage` (`internal/btree/pager.go:1085-1178`; hard-error path `1126-1132`; underlying `readDBPage` `internal/btree/pager.go:339-368`).
+- **Affected functions:** `pager.go:*pager.dbFileReadErr`, and its callers `pager.go:*pager.readDBPage` (every page getter's read of the database file, `readRawPage` and `readRawPage1Header` included), `pager.go:*pager.readPage1AtOpen`, `pager.go:*pager.proveKeyAtOpen`; the open's first read of the header, `pager.go:*pager.open`, and `pager.go:*pager.headerErrorOfUnwritableFile`.
 
-C `readDbPage` explicitly maps a short read of an in-bounds DB page to success: after
+C `readDbPage` maps a short read of a page of the database file to success: after
 `sqlite3OsRead`, `if( rc==SQLITE_IOERR_SHORT_READ ){ rc = SQLITE_OK; }`
-(`pager.c:3042-3044`), and because the pcache buffer is pre-zeroed the page is returned
-zero-padded rather than as an error (`os_unix.c:3575-3577` zero-fills the unread tail).
-Go's `readTempPage` instead treats a short read of an in-bounds page (`pgno <= dbSizeBound`)
-in a physically-short DB file as a hard error. The consequence is divergent error
-behavior for a physically-truncated-but-logically-valid file: Go fails where SQLite
-returns a partially-read, zero-padded page as success. Load-bearing only for files written
-before the dontWrite removal (resolved entry 5 under Known Implementation Gaps): their
-freed-leaf holes read as EOF here (`Backup`, `VerifyIntegrity`) until the next full
-checkpoint, where C would zero-fill.
+(`pager.c:3042-3044`), and `unixRead` has zero-filled what it did not read
+(`os_unix.c:3576`). The page getters call it only for a page within the database's
+size (`getPageNormal`, `pager.c:5590`, `5620`), so the zeros stand in for bytes the file does not
+hold. A checksum, an authentication tag or the page's format can catch them; in a plain
+database nothing does when they fall in a payload: a value whose last overflow page the file
+ends inside reads back with zeros for its missing bytes, and a backup copies them.
+
+Here a read of a page of the database file that does not return the whole page with no error
+goes to `dbFileReadErr`, and nothing else does: a read that succeeds pays nothing.
+
+- The whole page with `io.EOF`, which `ReadAt` may return for a read that ends at the end of
+  the file, is a read that succeeded.
+- Fewer bytes, with `io.EOF`, `io.ErrUnexpectedEOF` or no error: the file's size (`Stat` on the
+  descriptor) decides. A file that holds the page's bytes had a read come up short on its own,
+  as a file system that can return a short read does: the read's error is returned
+  (`io.ErrUnexpectedEOF` when it gave none), and the page is not damaged. A file that ends
+  inside or before the page holds it only in part: `errPageCutShort`, which matches
+  `ErrCorrupt`, for a plain page as for one with a checksum or a tag.
+- Any other error of the read is returned as it is, as in C.
+
+At open, the first read of the header, under the DB-file lock, is judged by the file's size
+that the open took under the lock: a file shorter than the header is `ErrHeaderCorrupt`, and a
+read that comes up short of a header the file holds is the read's error, where
+`sqlite3PagerReadFileheader` zero-fills its buffer before the read (`memset(pDest, 0, N);`,
+`pager.c:3899`) and takes a short read for success (`pager.c:3911-3913`), and `lockBtree` then
+fails the zeros' magic. A file that opens only for reading has its header judged only from a
+read that returned all of it (`headerErrorOfUnwritableFile`); any other read leaves the open's
+own error.
+Page 1 is then read the same way as every page, and a page 1 the file ends inside past its
+header is reported after the header and the size have been judged, which it does not change
+(`readPage1AtOpen`). The key probe counts a page the file ends inside with the pages that fail
+their authentication, and a short read of bytes the file holds as a page it could not read
+([drift-2026-11-24-3](#drift-2026-11-24-3-open-tells-a-wrong-key-from-a-damaged-page-1)).
+`VerifyIntegrity`'s read of page 1's header alone, for a page 1 that cannot be read whole, is a
+read of the database file as every other (`readRawPage1Header`).
+
+A database written by a release before the dontWrite removal (resolved entry 5 under Known
+Implementation Gaps) can have a freed page at the end that is in neither the WAL nor the file
+until its next full checkpoint extends the file. A read of it (`Backup`, `VerifyIntegrity`) is
+`ErrCorrupt` here, where C reads zeros.
+
+**Known, left as is:**
+- After that checkpoint the page is zeros on disk.
+- In a plain file it reads as zeros.
+- In a checksummed or encrypted file its checksum or tag fails. `Backup` and `VerifyIntegrity` then report `ErrPageIntegrity` until a write reuses the page.
+- `IntegrityCheck`, which does not read freelist leaves, passes.
+- SQLite's cksumvfs would pass such a page: the checksum of a page of zeros is zero (`cksmCompute`, `ext/misc/cksumvfs.c`).
+- Only files written by v2.0.0-v2.2.1 can hold such a page. v2.3.0 writes every freed page's frame.
+
+Tests: `TestReadDBPage_PageCutShortIsCorrupt` (`pager_test.go`), `TestReadDBPage_ShortReadOfBytesTheFileHolds`, `TestOpen_ShortReadInTheKeyProofIsAReadError`, `TestOpen_ShortReadOfPage1IsAReadError`, `TestOpen_ShortReadOfTheHeaderIsAReadError`, `TestOpen_ShortReadOfAnUnwritableFilesHeader`, `TestVerifyIntegrity_ShortReadOfPage1sHeader` (`pager_short_read_vfs_test.go`), `TestOpen_DirtyCatalogPageCutShort` (`test/dirty_open_test.go`), `TestReadFault_IterShortRead` (`iterator_vfs_test.go`).
 
 <a id="drift-nocontent-realloc-savepoint-copy"></a>
 ### Drift: NOCONTENT Freelist Reallocation Under A Savepoint Is Journaled
@@ -3202,10 +3251,20 @@ point. It differs from `pager.c` in these points.
    with `fdatasync`, the package's sync primitive
    ([drift-121](#drift-121-fdatasync-durability-primitive-platform-split-undocumented)), which is
    `F_FULLFSYNC` on Darwin, where SQLite's default is a plain `fsync`.
+5. *A short read of the header is judged by the journal's size.* `hasHotJournal` reads the
+   journal's first byte and takes a short read for a zero byte, a journal that is not hot
+   (`pager.c:5198-5205`). `hasHotCreationJournal` reads the whole header, and when the read comes
+   up short it looks at the journal's size, and only then: a journal shorter than its header is
+   not hot, and one that holds it fails the open with the read's error (`io.ErrUnexpectedEOF`
+   when it gave none). A dead creator's journal taken for one that is not hot would stay beside
+   the database the handle commits to, and the next open would play it back and truncate the
+   database to nothing. `readJournalHdr` reads a header only within the journal's size
+   (`pager.c:1597-1599`) and returns a failed read's code (`pager.c:1608-1611`).
 
 Tests: `creation_journal_test.go` (`TestCreationJournal_WhichHeaderIsHot`,
 `_HotJournalRollsBackWhateverIsInTheFile`, `_JournalThatIsNotHotIsLeftAlone`,
-`_JournalBesideEmptyFileIsDeleted`), and the process-kill and power-loss tests listed under
+`_JournalBesideEmptyFileIsDeleted`), `TestCreationJournal_ShortReadOfAHotJournalFailsTheOpen`
+(`pager_short_read_vfs_test.go`), and the process-kill and power-loss tests listed under
 drift-63.
 
 <a id="drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl"></a>
@@ -4605,7 +4664,7 @@ When walking an interior page, Go's `checkTreePage` anchors the expected subtree
 
 <a id="drift-2026-06-25-13-checksum-sweep-fires-the-onerror-errcksummismatch-hook-even-for-plain-"></a>
 ### Drift: Checksum Sweep Fires The OnError(errCksumMismatch) Hook Even For Plain File-I/O Read Errors
-- **Category:** error-handling  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-19: the sweep fires the hook only for a page whose checksum was compared and differed (`Kind == IntegrityChecksumMismatch`); a page it could not read is listed and fires nothing (`TestReadRawPageWALErrorPropagates`). What remains is in the report, not the hook: for a frame above this process's `nFrame`, `wal.readFrameRaw` returns `ErrWALCorrupt` in place of the read's own error (drift-2026-07-10-1), so `SweepError.Inner` does not carry the cause there.
+- **Category:** error-handling  -  **Severity:** low  -  **Status:** RESOLVED 2026-11-19: the sweep fires the hook only for a page whose checksum was compared and differed (`Kind == IntegrityChecksumMismatch`); a page it could not read is listed and fires nothing (`TestReadRawPageWALErrorPropagates`). A page whose WAL frame cannot be read is listed with the read's error: `ErrWALShortRead` for a short read ([drift-2026-07-10-1](#drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt)), any other error as it is.
 - **Affected functions:** `integrity_sweep.go:*DB.VerifyIntegrity`, `integrity_sweep.go:verifyCksumPage`.
 
 In `VerifyIntegrity`'s checksum branch, any non-nil `SweepError` returned by `verifyCksumPage` triggered the database's integrity hook (`Options.OnIntegrityError`, which the pager holds) with a hard-coded `errCksumMismatch`, regardless of which failure produced it. But `verifyCksumPage` returns two distinct error shapes: a genuine trailer mismatch carries `Kind: IntegrityChecksumMismatch` (its `want != got` compare mirrors `cksumCodec.Decrypt`), while a failed raw-page read returns `&SweepError{PageNo: pgno, Inner: err}` with `Kind` left at the zero value `IntegrityKindUnknown`. The sweep loop did not inspect the kind before firing the hook, so a transient file-I/O read fault was reported through the same `errCksumMismatch` notification as an actual corrupt page.
@@ -4873,7 +4932,7 @@ Here the limit is in the b-tree, and it is the cell parsers' cap ([old-drift-cor
 
 `payloadInFile` multiplies the page size by `readerDbSizeBound`. For the writer that is `pager.dbSize`, which a write begin sets by the same rule (`refreshHeaderFromPage1` through `lockBtreePageCount`) and `allocatePage` grows: SQLite's count. For a reader it is `pcache.dbSize`, the pager's count at its snapshot (`effectiveReaderDbSize`: the size the WAL's last commit records, else the database file's size), and page 1 is not read for it. In a file any-store writes the two agree: a commit that changes the page count writes page 1 with it (`commitNeedsPage1`). They differ when page 1's size field is damaged, or when the count is the database file's size and the file holds pages past its committed size. A trusted page-1 size below the pager's count then bounds a SQLite reader more tightly than this one, and one above it ends the SQLite transaction at its start with `SQLITE_CORRUPT`, where this reader goes on under the pager's count. Where page 1's size is untrusted, SQLite takes the pager's count too. The bound decides only whether a declared length is refused before a buffer is sized by it; a length within it whose bytes are not in the file still fails on the overflow chain.
 
-The key readers bound a key's length by `payloadInFile` too, `pageSize * nPage`, where SQLite's index probe uses `nCell/usableSize > nPage` (`btree.c:6164`), with the same `nPage`. Both bounds are at least `nPage * usableSize`, more than the file's pages can hold of one payload, so a key whose length falls between them fails on the overflow chain under either. The page numbers a reader follows (`descendChild`, the overflow-chain readers) are bounded by the same pager's count, where SQLite tests `btreePagecount`, that is `pBt->nPage` (`btree.c:2365`, `2386`, `5227`). Tests: `TestPayloadLimit_DeclaredLengthOverFileSize`, `TestPayloadLimit_OverflowRecordWithinFileSize`.
+The key readers bound a key's length by `payloadInFile` too, `pageSize * nPage`, where SQLite's index probe uses `nCell/usableSize > nPage` (`btree.c:6164`), with the same `nPage`. Both bounds are at least `nPage * usableSize`, more than the file's pages can hold of one payload, so a key whose length falls between them fails on the overflow chain under either. The page numbers a reader follows (`descendChild`, the overflow-chain readers) are bounded by the same pager's count, where SQLite tests `btreePagecount`, that is `pBt->nPage` (`btree.c:2365`, `2386`, `5227`). A namespace's root is the exception: `resolveNamespace` bounds it by `pBt->nPage`'s rule, from the page 1 its search starts on (`page1DatabaseSize`), once per resolution, so a root on a page the file holds past the database is `ErrCorrupt` and not a tree of stale records (test `TestGetNamespace_RootPastPage1sCountIsCorrupt`). Tests: `TestPayloadLimit_DeclaredLengthOverFileSize`, `TestPayloadLimit_OverflowRecordWithinFileSize`.
 
 <a id="drift-2026-11-23-1-full-pathname-follows-no-symbolic-link"></a>
 ### Drift: The Full Pathname Follows No Symbolic Link And Keeps Its "." And ".." Elements
@@ -4889,3 +4948,84 @@ SQLite resolves a database's name once, `rc = sqlite3OsFullPathname(pVfs, zFilen
 On Unix two things differ. `unixFullPathname` appends the name element by element: it drops a `.` element, backs up one element at a `..` (`os_unix.c:6930-6939`), and after each element it appends it calls `osLstat` and, for a symbolic link, `osReadlink`, and goes on from the link's target (`os_unix.c:6953-6975`). `FullPathname` follows no link, and so it removes no `.` or `..` either: a `..` after a link names the parent of the link's target, which only the OS resolves. The full name is therefore not SQLite's string, and the OS resolves each `.` and `..` it keeps: a database reached through a link has its `-wal` beside the link, where SQLite puts it beside the target. A name too long for the OS is not measured: it fails when the file is opened by it, where `unixFullPathname` returns `SQLITE_CANTOPEN` for a name that does not fit its buffer (`os_unix.c:6940-6942`, `7030`).
 
 Tests: `TestFullPathname_Unix`, `_UnixWorkingDirectoryOfTheCall` (`fullpath_unix_test.go`), `TestFullPathname_Windows` (`fullpath_windows_test.go`), `TestFullPathname_AsGiven` (`fullpath_other_test.go`).
+
+<a id="drift-2026-11-24-3-open-tells-a-wrong-key-from-a-damaged-page-1"></a>
+### Drift: Open Tells A Wrong Key From A Damaged Page 1
+- **Category:** added-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.readPage1AtOpen`, `pager.go:*pager.page1Unauthenticated`, `pager.go:*pager.proveKeyAtOpen`, `pager.go:keyProbePgno`, `pager.go:page1HeaderAtOpen`.
+
+SQLCipher cannot tell the two apart and does not try. Its codec decrypts page 1 when `lockBtree` first fetches it (`sqlite3Codec`, `sqlcipher.c:3263-3295`, v4.14.0). In the default header mode the first 16 bytes of page 1 in the buffer are the SQLite magic, put there in place of the salt (`memcpy(ctx->buffer, ctx->plaintext_header_sz ? pData : (void *) SQLITE_FILE_HEADER, offset)`, `sqlcipher.c:3270-3271`). A page whose HMAC does not match is an error of `sqlcipher_page_cipher` (`if(sqlcipher_memcmp(hmac_in, hmac_out, ctx->hmac_sz) != 0)`, `sqlcipher.c:1685-1699`), on which `sqlite3Codec` zeroes the rest of the buffer, sets the codec's error, and copies the buffer back (`sqlcipher.c:3286-3295`). `lockBtree` then finds the magic (`btree.c:3310`), but the payload fractions at bytes 21-23 are zeros and not 64, 32, 32 (`if( memcmp(&page1[21], "\100\040\040",3)!=0 )`, `btree.c:3361-3362`), and it returns the `SQLITE_NOTADB` it set before the checks (`btree.c:3306`). So a wrong key and a page 1 with a broken HMAC both give "file is not a database" (`wont-open-with-invalid-derived-key`, `test/sqlcipher-core.test:139-145`; `hmac-tamper-resistence-first-page`, `test/sqlcipher-integrity.test:44-75`). A broken HMAC on a later page is not one code: the codec returns `SQLITE_ERROR` for it (`sqlcipher_page_cipher`'s `error:` label, `sqlcipher.c:1723-1725`) and records that code as the pager's error (`sqlcipher_codec_ctx_set_error` → `sqlite3pager_error`, `sqlcipher.c:1385-1389`), which the pager's later fetches return (`getPageError`, `pager.c:5710-5721`); the zeroed page the fetch hands back can fail the b-tree's checks first. The cited test of a tree page, `hmac-tamper-resistence` (`test/sqlcipher-integrity.test:123-154`), gets `SQLITE_CORRUPT`, "database disk image is malformed", from its `SELECT count(*)`.
+
+any-store reports damage as `ErrCorrupt`, and a caller is told it may discard and rebuild a database on that error. A wrong key must not reach that branch, and a damaged page 1 must. So `Open` of a file opened under a key (`Options.Key` or `Options.Codec`; `pager.keyed`) authenticates page 1 where it reads it (`readPage1AtOpen`, the counterpart of the codec's decrypt under `lockBtree`), and when that fails it looks further:
+
+- **The probe.** `proveKeyAtOpen` tries up to `keyProbePages` (16) other pages under the same codec, spread evenly over pages 2..N (`keyProbePgno`), where N is the database's size at the snapshot. Where the snapshot's WAL commit recorded a size (the pager's count, `sqlite3WalDbsize`), N is that size: page 1, which failed its authentication, has a count of its own in its plaintext header, and a damaged one smaller than the commit's (1, say, with the change counters intact) would leave no page to try under the right key. Where the WAL has no commit, N is `lockBtreePageCount` of page 1's header against the file's length, the size a successful open adopts, which keeps out the pages the file holds past the database. Pages past N are not the database's, and a page there sealed under another key proves nothing (`sweepPageCount` takes the commit's size over page 1's the same way). Each page is read as the open's snapshot holds it: from its WAL frame when the wal-index resolves one, else from the database file, where a page the file ends inside is damaged whatever the key and proves nothing, as a page that fails its authentication does not, and a read that came up short of bytes the file holds is a page that could not be read ([drift-7](#drift-7-short-db-file-read-treated-as-hard-error)).
+- **One page authenticates: the key is right.** A wrong key passes a page's tag with probability about 2^-128. Page 1 is then damaged, and the open returns the page-1 error, which matches `ErrPageIntegrity` and `ErrCorrupt`. `Options.OnIntegrityError` is called for page 1, as for any damaged page.
+- **None authenticates: `ErrWrongKey`.** It does not match `ErrCorrupt`. `Options.OnIntegrityError` is not called, for page 1 or for the pages tried: with a wrong key every page fails, and none of them is damaged.
+- **A page cannot be read.** An I/O error, a failed wal-index lookup, a WAL frame the log does not hold, or a codec error that is not a failed authentication (`ErrPageIntegrity`), in the file or in the WAL, leaves that page untried, and the probe goes on to the next. When no page authenticates, the open returns the first such error and not `ErrWrongKey`: the unread page might have proved the key, as SQLite returns the read's code from `readDbPage`.
+
+The pages are spread and not the first ones because damage tends to be a contiguous stretch: with the head of the file overwritten, page 1 and its neighbours fail together. The bound keeps a wrong key cheap on a large file: 16 page reads, not a scan.
+
+What is still misreported is reported as a wrong key, the answer on which a caller keeps the file: a database of one page, a database damaged on page 1 and on every page tried, and a file whose header salt (bytes 72-87, outside the tag: [drift-2026-06-25-14](#drift-2026-06-25-14-page-1-db-header-bytes-0-99-is-excluded-from-both-checksum-and-aead-in)) was overwritten with another value that is not all zeros, since the key derived from a passphrase is then another key. A salt overwritten with zeros is the marker of a file that is not encrypted, and the codec settle refuses the key on the header's fields alone (`ErrNotEncrypted`). A wrong key is never reported as damage.
+
+The header is judged before the key: a file of another format, a header that does not decode, a page 1 read again at open (from a WAL frame or the file) whose magic is not of the file's family or whose page size or reserved bytes are not the ones the file was opened with, or a header whose trusted size exceeds the pager's count is refused with that error (`ErrHeaderCorrupt` for the last three) whatever the key, as before. The family is compared before the page-1 copy is decoded (`page1HeaderAtOpen`): a WAL page 1 with SQLite's magic over an any-store file is `ErrHeaderCorrupt`, not a v1 file. The geometry is compared after: the pager and the codec are set up from the file's first read, the WAL's frames have its page size, and a header declaring another would be adopted under the right key (it is outside the authentication) and written to the database file by the next checkpoint ([drift-page-1-read-again-at-open-keeps-the-files-geometry](#drift-page-1-read-again-at-open-keeps-the-files-geometry)). Page 1's authentication is decided only after these checks, which read nothing the key protects. The checksum codec's page 1 in the database file is not verified by the open; the first read of it does that, as before. A page 1 in a WAL frame was read through the codec at open before, under any codec, and still is. After a successful open the key is proven, and every later authentication failure is damage. A successful open whose page 1 is in the database file pays one extra decrypt of it, and no probe.
+
+`VerifyIntegrity` could list a damaged page 1 of an encrypted database only on a handle opened before the damage: an open after it now fails. The public `Open` failed there already, at its first write begin.
+
+Tests: `TestOpen_WrongKeyIsErrWrongKey`, `TestOpen_WrongRawKeyAndCodec`, `TestOpen_DamagedPage1UnderRightKeyIsCorrupt`, `TestOpen_DamagedHeadOfFileUnderRightKeyIsCorrupt`, `TestOpen_DamagedOnePageFileIsErrWrongKey`, `TestOpen_DamagedLaterPageOpens`, `TestOpen_DamagedPage1FrameUnderRightKeyIsCorrupt`, `TestOpen_EveryPageTriedDamagedIsErrWrongKey`, `TestOpen_KeyProbeStaysInsideTheDatabase`, `TestOpen_KeyProbeTakesTheWALCommitsSize`, `TestOpen_HeaderIsJudgedBeforeTheKey`, `TestOpen_UnreadableProbePageIsNotAWrongKey`, `TestOpen_UnreadableProbePageThenAProvingOne`, `TestOpen_CodecErrorOnAProbePageIsNotAWrongKey`, `TestOpen_PanickingIntegrityHookReleasesTheFile` (`pager_test.go`), `test/encryption_open_test.go`.
+
+<a id="drift-2026-11-24-4-integrity-checks-findings-are-an-error-that-matches-errcorrupt"></a>
+### Drift: The Integrity Check's Findings Are An Error That Matches ErrCorrupt
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `integrity.go:*DB.IntegrityCheckN`, `integrity.go:*IntegrityError.Unwrap`, `integrity.go:*integrityChecker.reportRead`.
+
+`sqlite3BtreeIntegrityCheck` returns its findings as text (`*pzOut = sqlite3StrAccumFinish(&sCheck.errMsg);`, `btree.c:11268`) and a count (`*pnErr = sCheck.nErr;`, `btree.c:11263`) and returns `sCheck.rc` (`btree.c:11273`), which a finding leaves at `SQLITE_OK` (`sCheck` starts zeroed, `btree.c:11159`): its only other values are `SQLITE_NOMEM` and `SQLITE_INTERRUPT` (`btree.c:10567`, `10579`, `10590`, `10885`). `checkAppendMsg` adds each finding to one text, a line each (`btree.c:10601-10624`). `OP_IntegrityCk` puts that text in a register (`vdbe.c:7273-7285`), and `PRAGMA integrity_check` returns it as one result row for the b-tree checks of a database (`pragma.c:1782-1789`): a damaged database is a successful statement whose result is not `ok`. A page the check cannot fetch is one more line, `"unable to get the page. error code=%d"` (`btree.c:10883-10884`), whatever the code; a fetch that failed with `SQLITE_IOERR_NOMEM` also sets the check's result, as `SQLITE_NOMEM` (`btree.c:10885`).
+
+`IntegrityCheck` returns an error, `*IntegrityError`, with the same lines. An error needs a kind a caller can match, and the kind of damage here is `ErrCorrupt`, on which a caller may discard and rebuild the database. So the report matches it, with one exception that SQLite's rows do not need: a page that failed to read for a reason other than damage. `reportRead` lists it like SQLite does and keeps the read's error unless that error is itself damage (`ErrCorrupt`, which a page failing its checksum or authentication matches, or `ErrInvalidPage`, a pointer out of the database). A short read of a WAL frame (`ErrWALShortRead`) is kept: the index points past the log, which an open after every handle has closed rebuilds. A report with such a read is inconclusive as a whole, not only on that line: the pages under an unread interior page are then listed as never used, and its subtree as of another depth. It matches the read's error and not `ErrCorrupt`.
+
+No new sentinel: the check's caller knows where the error came from, and the action on its findings is the action on `ErrCorrupt`.
+
+Tests: `TestIntegrityErrorMatches`, `TestIntegrityCheck_DamagedPageMatchesErrCorrupt`, `TestIntegrityCheck_FailedReadIsNotErrCorrupt`, `TestIntegrityCheck_FailedKeyReadIsNamedWithItsError` (`integrity_test.go`), `test/integrity_check_test.go`.
+
+<a id="drift-2026-11-24-5-a-failed-commit-ends-its-cursors-with-its-error"></a>
+### Drift: A Failed Commit Ends Its Cursors With Its Error
+- **Category:** error-handling  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.pagerError`.
+
+SQLite's `pager_error` moves the pager to `PAGER_ERROR` and stores the code in `Pager.errCode` only for an `SQLITE_IOERR` or `SQLITE_FULL` (`if( rc2==SQLITE_FULL || rc2==SQLITE_IOERR )`, `pager.c:1955-1958`), and `pager_unlock` clears it (`pager.c:1919`). A failed WAL commit does not pass through it: `sqlite3PagerCommitPhaseOne` returns `pagerWalFrames`' code (`pager.c:6512`). `sqlite3VdbeHalt` then rolls the transaction back with `sqlite3RollbackAll(db, SQLITE_OK)` (`rc = vdbeCommit(db, p);` ... `sqlite3RollbackAll(db, SQLITE_OK);`, `vdbeaux.c:3417-3425`), which hands `SQLITE_OK` to `sqlite3BtreeRollback` (`main.c:1505`). With it the rollback saves every cursor (`rc = tripCode = saveAllCursors(pBt, 0, 0);`, `btree.c:4526-4527`): the cursors go on when the save succeeds. A save that fails sets `writeOnly` to 0 and trips all of them with its error (`btree.c:4528`, `4532-4533`), the ones saved before it included. A statement that fails before it reaches its commit takes another path in `sqlite3VdbeHalt`: an `SQLITE_FULL` or `SQLITE_NOMEM` of a statement with a statement journal rolls back that statement alone (`eStatementOp = SAVEPOINT_ROLLBACK;`, `vdbeaux.c:3372-3373`), and otherwise the transaction is rolled back with trip code `SQLITE_ABORT_ROLLBACK` (`sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);`, `vdbeaux.c:3378`).
+
+`pagerError` ends a failed commit at once ([the eager cleanup](#old-drift-pagererror-eager-cleanup)). It stores the commit's error in `errCode`, whatever the error is, unless a failed spill has stored one already, and trips the transaction's cursors with it (`tripCursors` with `writeStateErr`) before the cleanup clears it. A cursor of the failed transaction reports why the commit failed (an I/O error, a full disk), where it reported the read-only refusal of a pager without a writer, and where SQLite's would have been saved by the rollback, unless a save failed. That error is not damage: it matches `ErrCorrupt` only when the commit's error did.
+
+Test: `TestPagerError_CursorReportsTheCommitError` (`pager_test.go`).
+
+<a id="drift-2026-11-24-6-the-integrity-check-runs-in-a-read-transaction"></a>
+### Drift: The Integrity Check Runs In A Read Transaction
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `integrity.go:*ReadTx.IntegrityCheckN`, `integrity.go:*DB.IntegrityCheckN`.
+
+`sqlite3BtreeIntegrityCheck` runs inside the transaction its connection has open (`assert( p->inTrans>TRANS_NONE && pBt->inTransaction>TRANS_NONE );`, `btree.c:11156`), a read or a write one, and reads the pages through the connection's pager: in a write transaction it checks the transaction's own pages, committed or not.
+
+`ReadTx.IntegrityCheckN` runs in the read transaction it is called on, and takes no other transaction or reader slot, so a caller that holds the only slot can check, and the check and its caller see one snapshot. It reads that snapshot through a page cache of its own, bounded by the transaction's frame window and page count. The read view of a write transaction is refused: it has no reader cache to bound such a walk, and its uncommitted pages are in the writer's cache, which only the writer's goroutine may read. `DB.IntegrityCheckN` begins a read transaction for the check, as `PRAGMA integrity_check` begins one when the connection has none. The public `IntegrityCheck` checks in the read transaction its context carries, and in one of its own otherwise, also when the context carries a write transaction: that transaction's changes are not checked, and its read transaction does not wait for a reader slot (`TryBeginRead`): the caller holds the writer, and may hold the only slot in a read transaction it ends once the check returns. With every slot held the check is busy.
+
+Tests: `TestIntegrityCheck_InTheCallersReadTx` (`integrity_test.go`), `TestIntegrityCheck_TheSnapshotItChecks` (`db_test.go`), `TestIntegrityCheck_ReadSlot` (`test/integrity_check_test.go`).
+
+<a id="drift-page-1-read-again-at-open-keeps-the-files-geometry"></a>
+### Drift: Page 1 Read Again At Open Must Declare The File's Page Size And Reserved Bytes
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:page1HeaderAtOpen` (for `pager.go:*pager.readPage1AtOpen` and `pager.go:*pager.page1FrameHeader`).
+
+`lockBtree` takes the page size and the reserved bytes from the page 1 it fetches, which under a WAL is the snapshot's newest frame of page 1. A page size other than the pager's is adopted: `lockBtree` releases page 1, sets the size and the reserve on the pager and returns (`if( (u32)pageSize!=pBt->pageSize ){` ... `rc = sqlite3PagerSetPagesize(pBt->pPager, &pBt->pageSize, pageSize-usableSize);`, `btree.c:3384-3399`), and `sqlite3BtreeBeginTrans` calls it again (`while( pBt->pPage1==0 && SQLITE_OK==(rc = lockBtree(pBt)) );`, `btree.c:3707`). With the same page size, the usable size is page 1's (`pBt->usableSize = usableSize;`, `btree.c:3417`).
+
+Here the pager and the codec are set up from the open's first read of the header, from the database file, and the WAL's frames have that page size (recovery refuses a WAL whose header declares another). Page 1 read again at open (`readPage1AtOpen`), from a WAL frame or from the file, must declare the same page size and reserved bytes: one that declares others is `ErrHeaderCorrupt`, whatever the codec and the key, and is not adopted. No write here changes either: a file keeps the page size and the reserve it was created with. A header that declared others would size the pager's pages and the codec's trailer by bytes that are outside the page's checksum and authentication, and the next checkpoint would write it to the database file.
+
+Test: `TestOpen_HeaderIsJudgedBeforeTheKey` (`pager_test.go`: a WAL page 1 of another page size, and of other reserved bytes, under the right key and a wrong one).
+
+<a id="drift-a-namespace-whose-root-is-page-1-is-corrupt"></a>
+### Drift: A Namespace Whose Root Is Page 1 Is ErrCorrupt
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `db.go:*DB.resolveNamespace`.
+
+SQLite opens a b-tree on a root of 1: `btreeCursor` refuses only a root below 1 (`if( iTable<1 ){ return SQLITE_CORRUPT_BKPT; }`, `btree.c:4715-4717`), and the schema load, with its extra checks on (the default), refuses a root that does not parse or lies past the database (`prepare.c:135-140`), not 1. Root 1 is the schema table's, so a table whose schema row names it reads and writes the b-tree of `sqlite_schema` as its own.
+
+`resolveNamespace` refuses a namespace whose root is outside 2..N, where N is the database's size, with `ErrCorrupt` when the name is resolved: 1 with 0 and with a root past N. Page 1 is the root of the master table, which holds the namespaces' names and roots, and `CreateNamespace` gives every namespace a page of its own. A namespace on page 1 is damage: a check of it would walk the master table and pass, and a write to it would put its records among the namespaces'.
+
+Tests: `TestGetNamespace_RootOfTheMasterIsCorrupt` (`db_test.go`), `TestOpen_DirtyCatalogRootOutsideTheDatabase` (`test/dirty_open_test.go`).

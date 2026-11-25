@@ -140,17 +140,19 @@ func TestErrCorrupt_NotCorruption(t *testing.T) {
 
 func TestErrCorrupt_Nesting(t *testing.T) {
 	// every kind of damage is also the umbrella, with its own text kept
-	for _, err := range []error{ErrHeaderCorrupt, ErrWALCorrupt, ErrPageIntegrity, ErrQuickCheckFailed} {
+	for _, err := range []error{ErrHeaderCorrupt, ErrPageIntegrity, ErrQuickCheckFailed} {
 		assert.ErrorIs(t, fmt.Errorf("open: %w", err), ErrCorrupt, "%v", err)
 	}
 	assert.Equal(t, "any-store: quick check failed on db open", ErrQuickCheckFailed.Error())
-	assert.Equal(t, "btree: WAL is corrupt", ErrWALCorrupt.Error())
 	assert.Equal(t, "btree: page integrity check failed", ErrPageIntegrity.Error())
 
 	// the kinds stay apart
-	assert.NotErrorIs(t, ErrWALCorrupt, ErrPageIntegrity)
 	assert.NotErrorIs(t, ErrPageIntegrity, ErrHeaderCorrupt)
 	assert.NotErrorIs(t, ErrCorrupt, ErrHeaderCorrupt)
+
+	// a short read of the log is not damage: the index is rebuilt from the
+	// log by an open after every handle has closed
+	assert.NotErrorIs(t, fmt.Errorf("read: %w", ErrWALShortRead), ErrCorrupt)
 }
 
 func TestOpen_NewerFormat(t *testing.T) {

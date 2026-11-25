@@ -210,6 +210,8 @@ On Linux (Android included) and Darwin (macOS, iOS), on amd64 and arm64, the dat
 
 Every other target runs a database in one process at a time, with its WAL index in that process's memory. On Windows and the other Unix systems — FreeBSD and the other BSDs, illumos, and Linux on other architectures, 32-bit ones included — the process that opens the file first holds an exclusive lock on it, and another process's `Open` fails. On `js/wasm`, `wasip1` and Plan 9 any-store takes no lock: it does not stop a second process, or a second browser tab, from opening the file. The file system can: the OPFS file system of the [wasm](wasm) example opens a file through an exclusive sync access handle, which the browser refuses to a second opener. Where the file system does not, the application has to prevent it. AIX and Solaris are not supported: their `syscall` package has no `flock`, and the library does not build there.
 
+One process holds one handle on a database file: a second `Open` of a file the process has open returns `ErrDBAlreadyOpen` (on Windows, a second `Open` through another path to the file, such as a link, returns `ErrDBOpenInOtherProcess`). Where multi-process access is not available (anything but linux, android, darwin and ios on amd64 and arm64), `Open` of a file that another process has open returns `ErrDBOpenInOtherProcess` at once; js/wasm, wasip1 and plan9 take no file lock and do not detect the other process.
+
 ## Durability
 
 By default a commit is written to the WAL and not synced, as in SQLite's WAL mode at `synchronous=NORMAL`. A checkpoint that copies frames from the WAL into the database file syncs the whole WAL first, and one is attempted automatically once the WAL holds `Config.AutoCheckpointAfter` frames (10,000 by default), on `Flush`, and on the last `Close` of the database. A passive checkpoint — the automatic one, and a flush in `FlushModeCheckpointPassive`, auto-flush's default — copies frames only up to the oldest snapshot a reader still holds: with frames to copy below it, it syncs the whole WAL, the frames past the snapshot included; with none, it returns before the sync, and the commits since the last sync stay unsynced until a later checkpoint. (A write that starts the WAL over also syncs the new WAL header.) On the file system of an operating system, a process crash loses no committed transaction: the operating system has the write. A power loss or an OS crash leaves the database consistent, but the commits made since the last sync can be lost although they returned without error. `Config.CommitSync` syncs the WAL on every commit, as `synchronous=FULL` does: a commit that returned survives a power loss, at the cost of a sync per commit. It is the only per-commit guarantee.
@@ -268,6 +270,20 @@ fmt.Printf("scanned %d pages, %d errors\n", rep.Pages, len(rep.Errors))
 
 The page-1 DB header (first 100 bytes) is outside the per-page hash; its invariants are validated separately at open. Full design: [docs/btree/specs/integrity.md](docs/btree/specs/integrity.md).
 
+### Corruption errors
+
+`ErrCorrupt` means damage that is in the files and will still be there at the next `Open`; a caller may discard and rebuild the database on it. Match it with `errors.Is`. The damage is in the database the call read: `Backup` also reads the file at its path, and can return `ErrCorrupt` or `ErrHeaderCorrupt` for a damaged destination while the source is sound, so rule that out before discarding the source. The kinds of damage match it too:
+
+| Error | When |
+|---|---|
+| `ErrHeaderCorrupt` | `Open`: the file header is unusable. |
+| `ErrPageIntegrity` | A page fails its checksum or its AEAD authentication, on the read that meets it. |
+| `ErrQuickCheckFailed` | `Open` after an unclean shutdown (`Durability.Sentinel`): the quick check, or the open's read of the catalog before it, found damage. |
+
+A read of a page that the database file ends inside (a file cut short) matches `ErrCorrupt` too; a read that came up short of bytes the file holds is that read's error. `IntegrityCheck` returns an error that matches `ErrCorrupt` when it found damage. A damaged write-ahead log index (`-wal-shm`, shared memory) matches `ErrCorrupt` too, as in SQLite; closing every handle on the file rebuilds it.
+
+Errors that are not damage do not match `ErrCorrupt` and are returned as themselves: a cancelled context, an I/O error or a full disk (also when they stop a commit, the quick check of a dirty `Open`, or an `IntegrityCheck`), `ErrBusy`, `ErrDBIsClosed`, `ErrV1Database`, `ErrIncompatibleVersion`, `ErrDBAlreadyOpen`, `ErrDBOpenInOtherProcess`, `ErrCopyVerifyFailed` (`CopyToLatestFormat`'s copy failed its verification, not the source), and the encryption errors below. So does `ErrWALShortRead`: the write-ahead log's index points past the end of the log; close every handle on the file and open it again. It keeps the short read's own error (`io.EOF`, or `io.ErrUnexpectedEOF`).
+
 ## Encryption
 
 ```go
@@ -280,6 +296,16 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 ```
 
 Whole-file page-level AEAD with a built-in cipher. A nil `Passphrase` means no encryption, and an empty non-nil one fails `Open`. A `Passphrase` of exactly 32 bytes is used as the key itself; any other nonempty length is stretched with PBKDF2-HMAC-SHA256 against a salt stored in the file, at `KDFIterations` rounds (256,000 by default, at most 100,000,000). The cipher and the count are not stored in the file: a database opens only with the `CipherType` it was created with and, when its passphrase goes through PBKDF2, the same effective `KDFIterations` (0 and 256,000 are one count; a 32-byte key ignores it).
+
+`Open` refuses an `Encryption` config that does not fit the file, with an error to match with `errors.Is`. None of them matches `ErrCorrupt`, and the file is left unchanged:
+
+| Error | When |
+|---|---|
+| `ErrEncryptionKeyRequired` | The file is encrypted and `Config.Encryption` is empty. |
+| `ErrNotEncrypted` | The file is not encrypted and `Config.Encryption` is not empty. |
+| `ErrWrongKey` | `Config.Encryption` does not open the file: another passphrase or key than the file's, or another cipher. |
+
+A damaged first page under the right key is not `ErrWrongKey`: `Open` proves the key on other pages and reports `ErrPageIntegrity`, which matches `ErrCorrupt`. See `ErrWrongKey` for the cases it cannot tell apart, which it reports as a wrong key.
 
 `Backup` of an encrypted database writes an encrypted copy that opens with the source's `EncryptionConfig`: the same passphrase or key and `CipherType`, and with a passphrase the same effective `KDFIterations`. A copy that `Backup` creates has a salt of its own, so with a passphrase its derived key differs from the source's. A file that already exists at the path keeps the salt it has, which is the source's when that file is a copy of the source made outside `Backup`.
 
