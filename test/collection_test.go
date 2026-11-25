@@ -3203,3 +3203,24 @@ func TestCollection_IdsPast2To53AreOneKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 4, doc.Value().GetInt("n"))
 }
+
+// namedInt is an integer type of the caller's own.
+type namedInt int64
+
+// A filter given as a Go value is encoded as JSON, which takes every integer
+// type: above 2^53 a value of a named type and a uintptr are the nearest
+// float64, as an int64 is, and match the document holding it.
+func TestCollection_FilterIntegerTypesPast2To53(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"n":9007199254740992}`)))
+	const above = 1<<53 + 1
+	operands := []any{int64(above), namedInt(above)}
+	if big := uint64(above); uint64(uintptr(big)) == big {
+		operands = append(operands, uintptr(big))
+	}
+	for _, v := range operands {
+		assertQueryCount(t, coll.Find(map[string]any{"n": v}), 1)
+	}
+}

@@ -408,13 +408,18 @@ build per query and carry no such guarantee.
 
 18. **Numbers are float64.** anyenc stores every number as a float64, so an
     integer is exact up to 2^53 (9,007,199,254,740,992) in magnitude and a
-    larger one, given as a Go `int`, `uint` or sized integer (`int64`,
-    `uint64`, …; not `uintptr` or a named type) or written as a plain
-    integer literal in JSON, is the nearest float64 — in a stored document,
-    a filter operand, an index key and a document id alike. (The JSON parser
-    rounds a number written with an exponent twice, the digits and then the
-    scaling, so `9007199254740993e1` becomes `90071992547409920` where
-    `90071992547409930`, the same integer, becomes `90071992547409936`.)
+    larger one, written as a plain integer literal in JSON or given as a Go
+    integer, is the nearest float64 — in a stored document, a filter
+    operand, an index key and a document id alike. A filter given as a Go
+    value is encoded as JSON, which takes every integer type, `uintptr` and
+    named types included. An integer id given to `FindId`,
+    `FindIdWithParser`, `UpdateId`, `UpsertId` or `DeleteId`, or an integer
+    operand of `query.NewComp`, is an `int`, `uint` or sized integer (`int64`, `uint64`, …): a
+    `uintptr`, or a value of a named type such as `type myInt int64`,
+    panics. (The JSON parser rounds a number written with an exponent
+    twice, the digits and then the scaling, so `9007199254740993e1` becomes
+    `90071992547409920` where `90071992547409930`, the same integer,
+    becomes `90071992547409936`.)
     Two such integers can be one value: `{"n":9007199254740993}` matches a
     document whose `n` is `9007199254740992`, and as ids they are one key:
     with a document of id 2^53 in the collection, `Insert` of id 2^53+1
@@ -423,6 +428,7 @@ build per query and carry no such guarantee.
     float (MongoDB has int, long and decimal); integers that can go past
     2^53 belong in strings. The aggregation arithmetic has the same limit
     (docs/aggregation.md). Pinned by `TestCollection_IdsPast2To53AreOneKey`
+    and `TestCollection_FilterIntegerTypesPast2To53`
     (test/collection_test.go).
 
 19. **A `$text` query enforces at most 64 required clauses.** The required

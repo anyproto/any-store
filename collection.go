@@ -30,16 +30,21 @@ import (
 // accessors that take no context, have the committed schema.
 //
 // Numbers, document ids among them, are float64: an integer above 2^53
-// (9,007,199,254,740,992) in magnitude, given as a Go int, uint or sized
-// integer (int64, uint64, …; an id of a named type or uintptr is not taken)
-// or as a plain integer in JSON, is stored, looked up and compared as the
-// nearest float64, so two such integers can be one value. (JSON written with
-// an exponent, as 9007199254740993e1, is rounded twice by the parser and can
+// (9,007,199,254,740,992) in magnitude, written as a plain integer in JSON or
+// given as a Go integer, is stored, looked up and compared as the nearest
+// float64, so two such integers can be one value. (JSON written with an
+// exponent, as 9007199254740993e1, is rounded twice by the parser and can
 // land on another float64; see docs/query-filter-contract.md, item 18.) As
 // ids they are one key: with a document of id 2^53 in the collection, an
 // Insert of id 2^53+1 fails with ErrDocExists, an UpsertOne with it replaces
 // that document, and FindId(2^53+1) returns it. Keep ids that can go past
 // 2^53 as strings.
+//
+// A filter given as a Go value is encoded as JSON, which takes every integer
+// type, uintptr and named types included. An integer id given to FindId,
+// FindIdWithParser, UpdateId, UpsertId or DeleteId is an int, uint or sized
+// integer (int64, uint64, …): a uintptr, or a value of a named type such as
+// type myInt int64, panics.
 //
 // An id given as an *anyenc.Value to FindId, FindIdWithParser, UpdateId,
 // UpsertId or DeleteId nests at most 511 levels, the deepest id a stored
