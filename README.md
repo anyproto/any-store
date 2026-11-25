@@ -177,7 +177,7 @@ res, _ := orders.Aggregate(`[
 
 The database file behaves like SQLite in WAL mode: any process may open it at any moment and read or write concurrently. Coordination runs through file locks and a shared-memory WAL index; snapshot reads are never blocked, writers serialize, and busy situations back off through a configurable handler. DDL from a peer process (created/dropped collections and indexes) is reconciled automatically on the next transaction.
 
-One process holds one handle on a database file: a second `Open` of a file the process has open returns `ErrDBAlreadyOpen` (on Windows, a second `Open` through another path to the file, such as a link, returns `ErrDBOpenInOtherProcess`). Where multi-process access is not available (anything but linux, android, darwin and ios on amd64 and arm64), `Open` of a file that another process has open returns `ErrDBOpenInOtherProcess` at once; js/wasm and wasip1 take no file lock and do not detect the other process.
+One process holds one handle on a database file: a second `Open` of a file the process has open returns `ErrDBAlreadyOpen` (on Windows, a second `Open` through another path to the file, such as a link, returns `ErrDBOpenInOtherProcess`). Where multi-process access is not available (anything but linux, android, darwin and ios on amd64 and arm64), `Open` of a file that another process has open returns `ErrDBOpenInOtherProcess` at once; js/wasm, wasip1 and plan9 take no file lock and do not detect the other process.
 
 ## Durability
 
@@ -257,8 +257,8 @@ Whole-file page-level AEAD; bring-your-own key management via `EncryptionConfig.
 | Error | When |
 |---|---|
 | `ErrEncryptionKeyRequired` | The file is encrypted and `Config.Encryption` is empty. |
-| `ErrNotEncrypted` | The file is not encrypted and `Config.Encryption` holds a passphrase or a codec. |
-| `ErrWrongKey` | The passphrase, key, cipher or codec does not open the file. |
+| `ErrNotEncrypted` | The file is not encrypted and `Config.Encryption` is not empty. |
+| `ErrWrongKey` | `Config.Encryption` does not open the file: another passphrase or key than the file's, or another cipher. |
 
 A damaged first page under the right key is not `ErrWrongKey`: `Open` proves the key on other pages and reports `ErrPageIntegrity`, which matches `ErrCorrupt`. See `ErrWrongKey` for the cases it cannot tell apart, which it reports as a wrong key.
 

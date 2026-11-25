@@ -2799,7 +2799,6 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 	return nil
 }
 
-// loadCollConfig loads per-collection config from the system namespace.
 // recordDecodeError is the error of a record of the catalog (a
 // collection's config, an index definition) that was read and does not
 // decode. Its text and its chain are the parser's; it tells such a record
@@ -2809,6 +2808,7 @@ type recordDecodeError struct{ err error }
 func (e *recordDecodeError) Error() string { return e.err.Error() }
 func (e *recordDecodeError) Unwrap() error { return e.err }
 
+// loadCollConfig loads per-collection config from the system namespace.
 func (db *db) loadCollConfig(tx *btree.ReadTx, collName string) (collConfig, error) {
 	var cfg collConfig
 	data, err := tx.AppendValue(db.systemNS, collConfigKey(collName), nil)

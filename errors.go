@@ -162,9 +162,15 @@ var (
 	// ErrBusy is returned when a lock stayed held past the busy timeout:
 	// another process's writer or checkpoint, or, for Backup, a write
 	// transaction of this process. The operation can be tried again. Match
-	// it with errors.Is: the busy errors of the storage layer that are not
-	// this value wrap it by the time they leave Backup. What a Backup that
-	// returned it has done is described at DB.Backup.
+	// it with errors.Is. Open, Backup and IntegrityCheck return every busy
+	// error of the storage layer as one that matches it: a lock that stayed
+	// held, a snapshot that another process's commit overtook, a recovery of
+	// the write-ahead log that another process is running, no free reader
+	// slot. The begin of a transaction does not (ReadTx, WriteTx, and the
+	// transaction an operation begins for itself): it returns this error for
+	// a lock that stayed held, and the storage layer's other busy errors as
+	// they are. What a Backup that returned it has done is described at
+	// DB.Backup.
 	//
 	// CopyToLatestFormat returns it (wrapped) at once, without waiting, when
 	// another call holds a copy lock it needs, as a call copying to the same
@@ -181,8 +187,8 @@ var (
 	// ErrDBAlreadyOpen is returned by Open, and (wrapped) by Backup for its destination, when
 	// this process already has the file open, or is opening it: one process holds one handle
 	// on a database file. The file is recognised by its identity, not by its name, so a second
-	// path to it (a hard link or a symbolic link) is refused too; on Windows, js/wasm and
-	// wasip1 it is recognised by its full path. Nothing was locked or changed. Use the handle
+	// path to it (a hard link or a symbolic link) is refused too; on Windows, js/wasm, wasip1
+	// and plan9 it is recognised by its full path. Nothing was locked or changed. Use the handle
 	// that is open, or close it first.
 	ErrDBAlreadyOpen = btree.ErrDatabaseOpen
 
@@ -195,8 +201,8 @@ var (
 	// (a link) is refused with this error too.
 	//
 	// It is not returned on linux, android, darwin or ios on amd64 or arm64, where a second
-	// process opens the file, nor on js/wasm and wasip1, which take no lock on the file: there
-	// a second process is not detected.
+	// process opens the file, nor on js/wasm, wasip1 and plan9, which take no lock on the file:
+	// there a second process is not detected.
 	ErrDBOpenInOtherProcess = btree.ErrInProcessLocked
 
 	// ErrUnsupportedDB is returned by a package function that takes a DB,
@@ -281,10 +287,11 @@ var (
 	// docs/migration-v1-to-v2.md for moving the data across.
 	ErrV1Database = errors.New("any-store: file is an any-store v1 database, not readable by v2; use github.com/anyproto/any-store or migrate (docs/migration-v1-to-v2.md)")
 
-	// ErrWrongKey is returned (wrapped) by Open when Config.Encryption holds a passphrase, key
-	// or codec that does not open the file. The file is left unchanged, and Open with the right
-	// key opens it. It does not match ErrCorrupt or ErrPageIntegrity, and Config.OnIntegrityError
-	// is not called.
+	// ErrWrongKey is returned (wrapped) by Open when Config.Encryption does not open the file:
+	// its passphrase or key, or its cipher, is not the one the file was encrypted with. The file
+	// is left unchanged, and Open with the Config.Encryption the file was created with opens it.
+	// It does not match ErrCorrupt or ErrPageIntegrity, and Config.OnIntegrityError is not
+	// called.
 	//
 	// Open authenticates page 1 with the key once the file header and the database size it
 	// records have passed their checks, which do not depend on the key: a header that is
@@ -315,15 +322,15 @@ var (
 	ErrWrongKey = btree.ErrWrongKey
 
 	// ErrEncryptionKeyRequired is returned by Open, and (wrapped) by Backup for its destination,
-	// when the file is encrypted and Config.Encryption is empty: no Passphrase and no Codec.
+	// when the file is encrypted and Config.Encryption is empty (its Enabled reports false).
 	// Open decides it from the file's header alone, and the file is left unchanged. Open it with
 	// the Config.Encryption it was created with. It does not match ErrCorrupt.
 	ErrEncryptionKeyRequired = errors.New("any-store: database file is encrypted: set Config.Encryption")
 
 	// ErrNotEncrypted is returned by Open, and (wrapped) by Backup for its destination, when
-	// the file is not encrypted and Config.Encryption holds a Passphrase or a Codec. The file
-	// is left unchanged; it is not encrypted in place. Open it with an empty Config.Encryption.
-	// It does not match ErrCorrupt.
+	// the file is not encrypted and Config.Encryption is not empty (its Enabled reports true).
+	// The file is left unchanged; it is not encrypted in place. Open it with an empty
+	// Config.Encryption. It does not match ErrCorrupt.
 	ErrNotEncrypted = errors.New("any-store: database file is not encrypted: clear Config.Encryption")
 
 	// ErrCorrupt is the umbrella for damaged database files: every error below that names a kind

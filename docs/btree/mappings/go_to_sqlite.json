@@ -2011,7 +2011,7 @@
     "sqlite": [
       "pager.c:readDbPage"
     ],
-    "note": "a read of a page of the database file that came up short: the read's error when the file holds the page, ErrCorrupt (errPageCutShort) when the file ends inside it; readDbPage zero-fills both (pager.c:3042-3044; drift-7)"
+    "note": "a read of a page of the database file that came up short: the read's error when the file holds the page, ErrCorrupt (errPageCutShort) when the file ends inside it; SQLite reads zeros for both: unixRead zero-fills what it did not read (os_unix.c:3576) and readDbPage takes the short read for success (pager.c:3042-3044; drift-7)"
   },
   "pager.go:*pager.decryptPage": {
     "sqlite": [],

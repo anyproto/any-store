@@ -9520,14 +9520,16 @@ func resealWAL(t *testing.T, walPath string, pageSize int) {
 }
 
 // A page of the database that the database file holds only in part is
-// damage: its read is ErrCorrupt, where readDbPage reads zeros past the end
-// of the file (pager.c:3041-3044). In a plain database nothing would report
-// those zeros: here the file is cut inside the last overflow page of a
-// value, after its link to the next page and the first bytes of the value
-// it holds, and the value is not returned with zeros in their place. A
-// file cut at a page boundary is a page count the header's check refuses,
-// not this. A read that comes up short of bytes the file holds is the
-// read's error (pager_short_read_vfs_test.go).
+// damage: its read is ErrCorrupt, where SQLite reads zeros past the end of
+// the file (unixRead zero-fills what it did not read, os_unix.c:3576, and
+// readDbPage takes the short read for success, pager.c:3042-3044). In a
+// plain database nothing would report those zeros: here the file is cut
+// inside the last overflow page of a value, after its link to the next
+// page and the first bytes of the value it holds, and the value is not
+// returned with zeros in their place. A file cut at a page boundary is a
+// page count the header's check refuses, not this. A read that comes up
+// short of bytes the file holds is the read's error
+// (pager_short_read_vfs_test.go).
 func TestReadDBPage_PageCutShortIsCorrupt(t *testing.T) {
 	for _, checksum := range []bool{false, true} {
 		t.Run(fmt.Sprintf("checksum=%v", checksum), func(t *testing.T) {

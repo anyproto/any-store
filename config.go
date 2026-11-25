@@ -247,10 +247,11 @@ type Config struct {
 //
 // Once a database is created with encryption, it must always be opened
 // with matching Encryption config. Open returns ErrEncryptionKeyRequired
-// for an encrypted file opened with no Passphrase and no Codec,
-// ErrNotEncrypted for a file that is not encrypted opened with one, and
-// ErrWrongKey for a Passphrase, key, cipher or Codec that does not open
-// the file. None of the three matches ErrCorrupt, and each leaves the
+// for an encrypted file opened with an empty EncryptionConfig (Enabled
+// reports false), ErrNotEncrypted for a file that is not encrypted opened
+// with one that is not empty, and ErrWrongKey for an EncryptionConfig that
+// does not open the file: another passphrase or key than the file's, or
+// another cipher. None of the three matches ErrCorrupt, and each leaves the
 // file unchanged. There is no in-place rekey; changing a passphrase
 // requires exporting to a freshly-opened database.
 //

@@ -817,8 +817,10 @@ func (p *pager) open() (err error) {
 	// holds no database, ErrHeaderCorrupt; a file that holds the header had
 	// the read come up short on its own, and the read's error is returned
 	// (io.ErrUnexpectedEOF when it gave none), as for a read of a page of
-	// the file (dbFileReadErr). sqlite3PagerReadFileheader zero-fills both
-	// (pager.c:3910-3913), and lockBtree then fails the zeros' magic.
+	// the file (dbFileReadErr). sqlite3PagerReadFileheader reads zeros for
+	// both: it zero-fills its buffer before the read (pager.c:3899) and
+	// takes a short read for success (pager.c:3911-3913), and lockBtree then
+	// fails the zeros' magic.
 	// DRIFT: a read of the header at open that comes up short of bytes the file holds is the read's error, not zeros. See docs/btree/NOTES.md#drift-7-short-db-file-read-treated-as-hard-error
 	readSize := p.pageSize
 	if readSize == 0 {
