@@ -2392,6 +2392,14 @@ Implementation Gaps) can have a freed page at the end that is in neither the WAL
 until its next full checkpoint extends the file. A read of it (`Backup`, `VerifyIntegrity`) is
 `ErrCorrupt` here, where C reads zeros.
 
+**Known, left as is:**
+- After that checkpoint the page is zeros on disk.
+- In a plain file it reads as zeros.
+- In a checksummed or encrypted file its checksum or tag fails. `Backup` and `VerifyIntegrity` then report `ErrPageIntegrity` until a write reuses the page.
+- `IntegrityCheck`, which does not read freelist leaves, passes.
+- SQLite's cksumvfs would pass such a page: the checksum of a page of zeros is zero (`cksmCompute`, `ext/misc/cksumvfs.c`).
+- Only files written by v2.0.0-v2.2.1 can hold such a page. v2.3.0 writes every freed page's frame.
+
 Tests: `TestReadDBPage_PageCutShortIsCorrupt` (`pager_test.go`), `TestReadDBPage_ShortReadOfBytesTheFileHolds`, `TestOpen_ShortReadInTheKeyProofIsAReadError`, `TestOpen_ShortReadOfPage1IsAReadError`, `TestOpen_ShortReadOfTheHeaderIsAReadError`, `TestOpen_ShortReadOfAnUnwritableFilesHeader`, `TestVerifyIntegrity_ShortReadOfPage1sHeader` (`pager_short_read_vfs_test.go`), `TestOpen_DirtyCatalogPageCutShort` (`test/dirty_open_test.go`), `TestReadFault_IterShortRead` (`iterator_vfs_test.go`).
 
 <a id="drift-nocontent-realloc-savepoint-copy"></a>

@@ -362,6 +362,12 @@ var (
 	//
 	// A damaged page that nothing has read yet is not found by Open: it surfaces on the read that
 	// meets it, as ErrPageIntegrity.
+	//
+	// Known: a file written by v2.0.0-v2.2.1 can hold a freed page whose bytes were never
+	// written. Backup and VerifyIntegrity, which read every page, report it as ErrCorrupt (before
+	// the file's next checkpoint) or, in a checksummed or encrypted file, as ErrPageIntegrity
+	// (after it) until a write reuses the page; IntegrityCheck passes. For such a file, don't
+	// discard it on the result of those two calls alone.
 	ErrCorrupt = btree.ErrCorrupt
 
 	// ErrHeaderCorrupt is returned (wrapped) by Open when the file header is unusable: a file cut
