@@ -130,8 +130,8 @@ type DB interface {
 	// the file, so a new copy of a passphrase database has a key of its
 	// own. A file at path that already holds a database of another kind is
 	// not replaced: Backup returns an error and leaves its content as it
-	// was. The error matches ErrBackupCodecMismatch for a database whose
-	// pages are laid out another way (plain, checksummed, encrypted),
+	// was. The error matches ErrBackupIntegrityModeMismatch for a database
+	// whose pages are sealed another way (plain, checksummed, encrypted),
 	// ErrBackupFormatMismatch for one of another schema format, and, for one
 	// whose encryption does not fit the source's, ErrEncryptionKeyRequired,
 	// ErrNotEncrypted or ErrWrongKey.
