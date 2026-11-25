@@ -112,7 +112,9 @@ type Collection interface {
 	// handed. An insert returns Matched 0 and Modified 1. A mod that
 	// changes the id fails as UpdateId's does (ErrPrimaryKeyModification,
 	// ErrDocWithoutId or ErrArrayPrimaryKey) and writes nothing, whether a
-	// document has the id or not.
+	// document has the id or not. A mod that must write nothing for an id
+	// with no document returns an error: reporting no change still inserts
+	// {id}.
 	// An integer id above 2^53 in magnitude is the nearest float64, which can
 	// be another document's id: that document is then the one updated (see
 	// Collection).
