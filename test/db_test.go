@@ -1157,9 +1157,8 @@ func TestDb_CloseFromModifier(t *testing.T) {
 }
 
 // An unknown Durability.FlushMode fails Open with ErrInvalidConfig, AutoFlush
-// on or off, before anything is created or registered: it used to panic in
-// Open and leave the path registered as open, refusing every later Open of it
-// in the process.
+// on or off, before anything is created or registered, so a later Open of the
+// path in the process opens it.
 func TestOpen_InvalidFlushMode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db")
 	for _, autoFlush := range []bool{true, false} {
@@ -1179,8 +1178,8 @@ func TestOpen_InvalidFlushMode(t *testing.T) {
 }
 
 // Open with the largest CacheSize and ReadConcurrency returns promptly and the
-// database works: the cache size used to hang Open, and the reader count to
-// panic in it, leaving the path registered as open.
+// database works: both are clamped (Config.CacheSize, Config.ReadConcurrency),
+// and the path opens again once it is closed.
 func TestOpen_HugeCacheSizeAndReadConcurrency(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db")
 	type opened struct {

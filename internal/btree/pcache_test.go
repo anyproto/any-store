@@ -1081,7 +1081,7 @@ func BenchmarkPcacheCreateRecycle(b *testing.B) {
 // A new cache's hash table is sized to its page count up to maxHashPresize:
 // a cache configured for more pages starts there and grows as pages arrive,
 // so a configured size is never an allocation made up front, and the largest
-// int, whose power of two overflows, no longer spins in hashSizeFor.
+// int, whose power of two overflows, gets the presize too.
 func TestNewPcache_HashPresizeBounded(t *testing.T) {
 	assert.Len(t, newPcache(4096, 10, true).apHash, minHashSize)
 	assert.Len(t, newPcache(4096, 5000, true).apHash, 8192)

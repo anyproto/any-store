@@ -4467,9 +4467,9 @@ this allocates 8192 buckets up front, and a larger configured cache allocates pr
 `maxHashPresize` (65,536 buckets: 512 KiB of pointers on a 64-bit target, 256 KiB on a 32-bit one); a cache
 configured for more pages starts there and grows on demand as SQLite's does. The consequence is a larger eager hash-table allocation at cache creation than SQLite's fixed 256-bucket
 seed — an intentional memory-vs-rehash tradeoff, recorded in an in-code DRIFT comment at `pcache.go:140`. The bound
-keeps a configured cache size from becoming an allocation made up front for every cache, readers' included: before
-it, a cache size past what the process could allocate failed at Open, and one past 2^62 pages never returned from
-`hashSizeFor`.
+keeps a configured cache size from becoming an allocation made up front for every cache, readers' included, so a
+cache size past what the process could allocate, or past 2^62 pages (whose power of two `hashSizeFor` could not
+reach), gets the same presize.
 
 <a id="drift-131-build-tag-gated-test-fault-hooks"></a>
 ### Drift: Build-Tag-Gated Test Fault Hooks

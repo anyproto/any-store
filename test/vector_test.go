@@ -2454,9 +2454,9 @@ func TestVectorIndex_IVFNListWithoutVectors(t *testing.T) {
 }
 
 // The largest NProbe an IVF index stores comes back from its meta record as
-// it went in: the index probes every cell before and after a reopen. A value
-// one past it used to be stored wrapped, as 0, and the reopened index probed
-// no cell and found nothing.
+// it went in: the index probes every cell before and after a reopen. A larger
+// one, which the record's four bytes would hold wrapped, is refused when the
+// index is created (TestVectorIndex_TuningValidated).
 func TestVectorIndex_IVFNProbeSurvivesReopen(t *testing.T) {
 	const (
 		n   = 200

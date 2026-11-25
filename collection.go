@@ -649,9 +649,9 @@ func checkDocDepth(v *anyenc.Value) error {
 // maxIdLookupDepth is the deepest an id given to FindId, FindIdWithParser,
 // UpdateId, UpsertId or DeleteId may nest: the deepest id a stored document
 // that reads back can have, one level below a document of 512 levels, the
-// parser's bound. An earlier release checked no depth on a write and could
-// store such a document uncompressed; a write today is held to maxDocDepth,
-// so the id of a document it stores nests at most 510 levels.
+// parser's bound. A file can hold such a document, stored uncompressed,
+// though no write stores one: a write is held to maxDocDepth, so the id of a
+// document it stores nests at most 510 levels.
 const maxIdLookupDepth = 511
 
 // checkIdDepth refuses an id given as an *anyenc.Value that nests deeper
