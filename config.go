@@ -303,9 +303,11 @@ type EncryptionConfig struct {
 	// Backup makes of it included, draws a random nonce under that key for
 	// each page it encrypts. AES-256-GCM's nonces are 96 bits, and with
 	// random ones NIST SP 800-38D §8.3 limits a key to 2^32 encryptions.
-	// ChaCha20-Poly1305's nonces are 96 bits too; for it the same collision
-	// bound is a guideline, not a hard limit. XChaCha20-Poly1305's 192-bit
-	// nonces have no practical limit. A key per database is the safer use.
+	// ChaCha20-Poly1305's nonces are 96 bits too, too short to draw at
+	// random past 2^32 encryptions under one key, so the same ceiling holds
+	// for it. XChaCha20-Poly1305's 192-bit nonces have no practical limit:
+	// use it, or a fresh key, past that count. A key per database is the
+	// safer use.
 	//
 	// A file that a release before v2.6.1 encrypted under a Passphrase of
 	// exactly 32 bytes, with no Codec in its place, has those bytes as its
