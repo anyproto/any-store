@@ -70,7 +70,7 @@ var p1CrashInflight = p1CrashCommit{keys: []int{1000, 1001, 1002, 1003, 1004, 10
 func p1CrashOpts(codec bool) Options {
 	opts := Options{PageSize: 4096, CacheSize: 10, DisableAutoCheckpoint: true}
 	if codec {
-		opts.Key = []byte("page-1 crash test passphrase")
+		opts.Passphrase = []byte("page-1 crash test passphrase")
 		opts.KDFIterations = 2
 	}
 	return opts

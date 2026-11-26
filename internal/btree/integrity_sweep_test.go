@@ -80,7 +80,7 @@ func TestVerifyIntegrity_AEAD_AllGood(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "db")
 	opts := DefaultOptions()
-	opts.Key = []byte("p")
+	opts.Passphrase = []byte("p")
 	opts.KDFIterations = 1000
 	opts.InProcess = true
 	setupSweepDB(t, path, opts)
@@ -174,7 +174,7 @@ func TestVerifyIntegrity_AEAD_DetectsCorruption(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "db")
 	opts := DefaultOptions()
-	opts.Key = []byte("p")
+	opts.Passphrase = []byte("p")
 	opts.KDFIterations = 1000
 	opts.InProcess = true
 	setupSweepDB(t, path, opts)
@@ -221,7 +221,7 @@ func TestVerifyIntegrity_DamagedPage1Listed(t *testing.T) {
 	cksum.Checksum = true
 	cksum.InProcess = true
 	aead := DefaultOptions()
-	aead.Key = []byte("p")
+	aead.Passphrase = []byte("p")
 	aead.KDFIterations = 1000
 	aead.InProcess = true
 	cases := []struct {
@@ -281,7 +281,7 @@ func TestVerifyIntegrity_DamagedPage1Listed(t *testing.T) {
 // is that of the stored pages: none.
 func TestVerifyIntegrity_InMemoryHasNoMode(t *testing.T) {
 	cksum := Options{PageSize: 4096, InMemory: true, Checksum: true}
-	aead := Options{PageSize: 4096, InMemory: true, Key: []byte("p"), KDFIterations: 1000}
+	aead := Options{PageSize: 4096, InMemory: true, Passphrase: []byte("p"), KDFIterations: 1000}
 	for name, opts := range map[string]Options{"checksum": cksum, "aead": aead} {
 		t.Run(name, func(t *testing.T) {
 			resetPageBufferPool()

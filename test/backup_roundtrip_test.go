@@ -45,6 +45,20 @@ func passphraseConfig(pass string, cipher anystore.CipherType) func(*testing.T) 
 	}
 }
 
+// keyConfig opens with key as the raw cipher key.
+func keyConfig(key string, cipher anystore.CipherType) func(*testing.T) *anystore.Config {
+	return func(*testing.T) *anystore.Config {
+		return &anystore.Config{Encryption: anystore.EncryptionConfig{
+			Key:        []byte(key),
+			CipherType: cipher,
+		}}
+	}
+}
+
+// key32 is 32 bytes: a raw key as Key, and a passphrase like any other as
+// Passphrase.
+const key32 = "0123456789abcdef0123456789abcdef"
+
 func defaultConfig(*testing.T) *anystore.Config { return nil }
 
 func inMemory(conf func(*testing.T) *anystore.Config) func(*testing.T) *anystore.Config {
@@ -67,11 +81,12 @@ var roundTripKinds = []roundTripKind{
 		return &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: []byte("correct horse")}}
 	}, anystore.IntegrityAEAD},
 	{"passphrase-xchacha", passphraseConfig("correct horse", anystore.CipherXChaCha20Poly1305), passphraseConfig("correct horse", anystore.CipherXChaCha20Poly1305), anystore.IntegrityAEAD},
-	{"raw-key-32", passphraseConfig("0123456789abcdef0123456789abcdef", ""), passphraseConfig("0123456789abcdef0123456789abcdef", ""), anystore.IntegrityAEAD},
-	{"raw-key-32-chacha", passphraseConfig("0123456789abcdef0123456789abcdef", anystore.CipherChaCha20Poly1305), passphraseConfig("0123456789abcdef0123456789abcdef", anystore.CipherChaCha20Poly1305), anystore.IntegrityAEAD},
+	{"passphrase-32", passphraseConfig(key32, ""), passphraseConfig(key32, ""), anystore.IntegrityAEAD},
+	{"key", keyConfig(key32, ""), keyConfig(key32, ""), anystore.IntegrityAEAD},
+	{"key-chacha", keyConfig(key32, anystore.CipherChaCha20Poly1305), keyConfig(key32, anystore.CipherChaCha20Poly1305), anystore.IntegrityAEAD},
 	{"in-memory", inMemory(defaultConfig), defaultConfig, anystore.IntegrityNone},
 	{"in-memory-passphrase", inMemory(passphraseConfig("correct horse", "")), passphraseConfig("correct horse", ""), anystore.IntegrityAEAD},
-	{"in-memory-raw-key-32", inMemory(passphraseConfig("0123456789abcdef0123456789abcdef", "")), passphraseConfig("0123456789abcdef0123456789abcdef", ""), anystore.IntegrityAEAD},
+	{"in-memory-key", inMemory(keyConfig(key32, "")), keyConfig(key32, ""), anystore.IntegrityAEAD},
 }
 
 // Kinds that are only destinations: the source's kind in everything the file
@@ -80,6 +95,7 @@ var roundTripKinds = []roundTripKind{
 var roundTripForeignKinds = []roundTripKind{
 	{"another-passphrase", passphraseConfig("battery staple", ""), passphraseConfig("battery staple", ""), anystore.IntegrityAEAD},
 	{"passphrase-chacha", passphraseConfig("correct horse", anystore.CipherChaCha20Poly1305), passphraseConfig("correct horse", anystore.CipherChaCha20Poly1305), anystore.IntegrityAEAD},
+	{"another-key", keyConfig("fedcba9876543210fedcba9876543210", ""), keyConfig("fedcba9876543210fedcba9876543210", ""), anystore.IntegrityAEAD},
 }
 
 // fillRoundTrip puts n documents of a few sizes (some past one page) and an
@@ -201,7 +217,7 @@ func TestBackupRoundTrip(t *testing.T) {
 func TestBackupRoundTrip_CallerClearsItsKey(t *testing.T) {
 	ctx := context.Background()
 	for _, kind := range roundTripKinds {
-		if conf := kind.open(t); conf == nil || conf.Encryption.Passphrase == nil {
+		if conf := kind.open(t); conf == nil || !conf.Encryption.Enabled() {
 			continue
 		}
 		t.Run(kind.name, func(t *testing.T) {
@@ -211,6 +227,7 @@ func TestBackupRoundTrip_CallerClearsItsKey(t *testing.T) {
 			require.NoError(t, err)
 			defer func() { _ = src.Close() }()
 			clear(conf.Encryption.Passphrase)
+			clear(conf.Encryption.Key)
 			want := fillRoundTrip(t, src, 0, 50)
 
 			copyPath := filepath.Join(dir, "copy.db")
@@ -293,7 +310,10 @@ func TestBackupRoundTrip_OverExistingOfAnotherKind(t *testing.T) {
 		{"in-memory", "passphrase"},
 		{"passphrase", "another-passphrase"},
 		{"passphrase", "passphrase-chacha"},
-		{"in-memory-raw-key-32", "passphrase"},
+		{"in-memory-key", "passphrase"},
+		{"key", "passphrase-32"},
+		{"passphrase-32", "key"},
+		{"key", "another-key"},
 	} {
 		t.Run(tc.src+"-over-"+tc.dst, func(t *testing.T) {
 			// given

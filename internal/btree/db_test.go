@@ -4306,7 +4306,7 @@ func TestCloseCheckpointed_InMemoryReportsFalse(t *testing.T) {
 func TestOpen_EncryptionRefusalsAreSentinels(t *testing.T) {
 	path, opts := keyProofDB(t, true, nil)
 	plain := opts
-	plain.Key = nil
+	plain.Passphrase = nil
 	_, err := Open(path, plain)
 	require.ErrorIs(t, err, ErrKeyRequired)
 	require.NotErrorIs(t, err, ErrCorrupt)

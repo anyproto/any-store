@@ -268,7 +268,7 @@ func p1PropOpts(mode string, codec bool) Options {
 		opts.InMemory = true
 	}
 	if codec {
-		opts.Key = []byte("page-1 property test passphrase")
+		opts.Passphrase = []byte("page-1 property test passphrase")
 		opts.KDFIterations = 2
 	}
 	return opts

@@ -3,7 +3,9 @@ package test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -83,7 +85,7 @@ func TestOpen_WrongKey(t *testing.T) {
 		enc  anystore.EncryptionConfig
 	}{
 		{"passphrase", anystore.EncryptionConfig{Passphrase: []byte("wrong passphrase"), KDFIterations: 1000}},
-		{"raw key", anystore.EncryptionConfig{Passphrase: key}},
+		{"raw key", anystore.EncryptionConfig{Key: key}},
 		{"cipher", anystore.EncryptionConfig{Passphrase: cfg.Encryption.Passphrase, KDFIterations: 1000, CipherType: anystore.CipherChaCha20Poly1305}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -245,5 +247,170 @@ func TestOpen_OverwrittenSalt(t *testing.T) {
 			require.NotErrorIs(t, err, anystore.ErrCorrupt)
 			require.Empty(t, calls.get())
 		})
+	}
+}
+
+// fileState is the content of a database file and of its WAL ("" when there
+// is none).
+func fileState(t *testing.T, path string) [2]string {
+	t.Helper()
+	var st [2]string
+	for i, p := range []string{path, path + "-wal"} {
+		b, err := os.ReadFile(p)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		require.NoError(t, err)
+		st[i] = string(b)
+	}
+	return st
+}
+
+// writeDocs creates the database at path with cfg, puts n documents into
+// collection "c", and closes it.
+func writeDocs(t *testing.T, path string, cfg anystore.Config, n int) {
+	t.Helper()
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, path, &cfg)
+	require.NoError(t, err)
+	coll, err := db.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	for i := 0; i < n; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"pad":"%0400d"}`, i, i))))
+	}
+	require.NoError(t, db.Close())
+}
+
+// requireDocs opens the database at path with cfg and requires n documents
+// in collection "c".
+func requireDocs(t *testing.T, path string, cfg anystore.Config, n int) {
+	t.Helper()
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, path, &cfg)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	require.Equal(t, anystore.IntegrityAEAD, db.IntegrityMode())
+	coll, err := db.OpenCollection(ctx, "c")
+	require.NoError(t, err)
+	got, err := coll.Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, n, got)
+}
+
+// A Key is the cipher key itself: a database created with it opens with it,
+// and KDFIterations, which only a Passphrase uses, makes no difference. The
+// encryption errors are those of a passphrase database.
+func TestOpen_KeyRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	key := bytes.Repeat([]byte{0x42}, 32)
+	path := filepath.Join(t.TempDir(), "enc.db")
+	writeDocs(t, path, anystore.Config{Encryption: anystore.EncryptionConfig{Key: bytes.Clone(key), KDFIterations: 1000}}, 100)
+
+	for _, iter := range []int{0, 1000, math.MaxInt} {
+		requireDocs(t, path, anystore.Config{Encryption: anystore.EncryptionConfig{Key: bytes.Clone(key), KDFIterations: iter}}, 100)
+	}
+	for _, ct := range []anystore.CipherType{anystore.CipherAES256GCM, anystore.CipherChaCha20Poly1305} {
+		ctPath := filepath.Join(t.TempDir(), "enc.db")
+		writeDocs(t, ctPath, anystore.Config{Encryption: anystore.EncryptionConfig{Key: bytes.Clone(key), CipherType: ct}}, 10)
+		requireDocs(t, ctPath, anystore.Config{Encryption: anystore.EncryptionConfig{Key: bytes.Clone(key), CipherType: ct}}, 10)
+	}
+
+	_, err := anystore.Open(ctx, path, nil)
+	require.ErrorIs(t, err, anystore.ErrEncryptionKeyRequired)
+	other := bytes.Clone(key)
+	other[0] ^= 1
+	_, err = anystore.Open(ctx, path, &anystore.Config{Encryption: anystore.EncryptionConfig{Key: other}})
+	require.ErrorIs(t, err, anystore.ErrWrongKey)
+	require.NotErrorIs(t, err, anystore.ErrCorrupt)
+
+	plain := filepath.Join(t.TempDir(), "plain.db")
+	writeDocs(t, plain, anystore.Config{}, 1)
+	_, err = anystore.Open(ctx, plain, &anystore.Config{Encryption: anystore.EncryptionConfig{Key: key}})
+	require.ErrorIs(t, err, anystore.ErrNotEncrypted)
+}
+
+// A Passphrase is stretched whatever its length, so a Passphrase and a Key
+// of the same 32 bytes are two keys. A file created with a Key, as a
+// 32-byte Passphrase was used before v2.6.1, is ErrWrongKey with a
+// Passphrase of the same bytes; a file created with a 32-byte Passphrase is
+// ErrWrongKey with a Key of the same bytes. Neither is corruption, and
+// neither changes the file.
+func TestOpen_KeyAndPassphraseOfTheSameBytes(t *testing.T) {
+	ctx := context.Background()
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	require.Len(t, secret, 32)
+	asKey := anystore.Config{Encryption: anystore.EncryptionConfig{Key: secret}}
+	asPassphrase := anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: secret, KDFIterations: 1000}}
+	asPassphraseDefaultKDF := anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: secret}}
+
+	for _, tc := range []struct {
+		name   string
+		create anystore.Config
+		wrong  []anystore.Config
+	}{
+		{"created with Key", asKey, []anystore.Config{asPassphrase, asPassphraseDefaultKDF}},
+		{"created with a 32-byte Passphrase", asPassphrase, []anystore.Config{asKey}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "enc.db")
+			writeDocs(t, path, tc.create, 100)
+			before := fileState(t, path)
+			for _, wrong := range tc.wrong {
+				var calls integrityCalls
+				wrong.OnIntegrityError = calls.hook
+				_, err := anystore.Open(ctx, path, &wrong)
+				require.ErrorIs(t, err, anystore.ErrWrongKey)
+				require.NotErrorIs(t, err, anystore.ErrCorrupt)
+				require.NotErrorIs(t, err, anystore.ErrPageIntegrity)
+				require.Empty(t, calls.get())
+				require.Equal(t, before, fileState(t, path), "a wrong key leaves the file as it was")
+			}
+			requireDocs(t, path, tc.create, 100)
+		})
+	}
+}
+
+// Open refuses a Key that is not 32 bytes long, an empty one included, and
+// a Key set together with a Passphrase, with ErrInvalidConfig naming the
+// field, before it creates anything.
+func TestOpen_InvalidKey(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db")
+	for _, enc := range []anystore.EncryptionConfig{
+		{Key: []byte{}},
+		{Key: make([]byte, 31)},
+		{Key: make([]byte, 33)},
+		{Key: make([]byte, 64)},
+		{Key: make([]byte, 32), Passphrase: []byte("pw")},
+		{Key: make([]byte, 32), Passphrase: make([]byte, 32)},
+	} {
+		d, err := anystore.Open(ctx, path, &anystore.Config{Encryption: enc})
+		require.ErrorIs(t, err, anystore.ErrInvalidConfig, "Key of %d bytes, Passphrase %q", len(enc.Key), enc.Passphrase)
+		require.ErrorContains(t, err, "Encryption.Key")
+		require.Nil(t, d)
+		d, err = anystore.Open(ctx, "", &anystore.Config{InMemory: true, Encryption: enc})
+		require.ErrorIs(t, err, anystore.ErrInvalidConfig)
+		require.Nil(t, d)
+	}
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Empty(t, entries, "a refused Open creates no file")
+}
+
+// Enabled reports a Passphrase or a Key, and nothing else.
+func TestEncryptionConfig_Enabled(t *testing.T) {
+	for _, tc := range []struct {
+		enc  anystore.EncryptionConfig
+		want bool
+	}{
+		{anystore.EncryptionConfig{}, false},
+		{anystore.EncryptionConfig{KDFIterations: 1000, CipherType: anystore.CipherChaCha20Poly1305}, false},
+		{anystore.EncryptionConfig{Passphrase: []byte("pw")}, true},
+		{anystore.EncryptionConfig{Passphrase: []byte{}}, true},
+		{anystore.EncryptionConfig{Key: make([]byte, 32)}, true},
+		{anystore.EncryptionConfig{Key: []byte{}}, true},
+	} {
+		require.Equal(t, tc.want, tc.enc.Enabled(), "%+v", tc.enc)
 	}
 }

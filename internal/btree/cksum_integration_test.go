@@ -79,7 +79,7 @@ func TestCksum_CannotCombineWithEncryption(t *testing.T) {
 	path := filepath.Join(dir, "db")
 	opts := DefaultOptions()
 	opts.Checksum = true
-	opts.Key = []byte("passphrase")
+	opts.Passphrase = []byte("passphrase")
 	if _, err := Open(path, opts); err == nil {
 		t.Fatal("expected error: Checksum + Key both set")
 	} else if !strings.Contains(err.Error(), "cannot be combined") {

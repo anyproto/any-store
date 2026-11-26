@@ -167,35 +167,39 @@ type Options struct {
 	// BEGIN ENCRYPTION
 	// Checksum, when true, installs a no-encryption page-checksum codec
 	// (XXH3-128 trailer, 16 bytes per page). Mutually exclusive with
-	// Key and Codec — combining them returns an error from Open.
-	// Conceptually mirrors SQLite's cksumvfs extension. See
+	// Key, Passphrase and Codec — combining them returns an error from
+	// Open. Conceptually mirrors SQLite's cksumvfs extension. See
 	// docs/btree/specs/integrity.md.
 	Checksum bool
 
-	// Key enables page-level AES-256-GCM encryption when non-nil.
-	// Accepted forms:
-	//   - len 32: raw AES-256 key, used directly (no KDF).
-	//   - any other len: treated as a passphrase; PBKDF2-HMAC-SHA256 derives
-	//     a 32-byte key using the file's salt and KDFIterations rounds.
-	// An empty slice (len 0) is rejected with an error; use nil for "no
-	// encryption".
+	// Key, when non-nil, enables page-level encryption with a raw cipher
+	// key, used as it is, with no key derivation: it must be KeyLen bytes,
+	// and any other length, empty included, fails Open. KDFIterations does
+	// not apply to it. Setting both Key and Passphrase fails Open.
 	Key []byte
 
-	// KDFIterations controls PBKDF2 cost. Ignored when Key is a raw
-	// 32-byte key. Zero means DefaultKDFIterations (256,000). Use lower
-	// values only in tests.
+	// Passphrase, when non-nil, enables page-level encryption with a key
+	// that PBKDF2-HMAC-SHA256 derives from it, whatever its length, with
+	// the salt in the file's header and KDFIterations rounds. An empty
+	// slice (len 0) fails Open; use nil for "no encryption".
+	Passphrase []byte
+
+	// KDFIterations controls the PBKDF2 cost of a Passphrase; Key ignores
+	// it. Zero means DefaultKDFIterations (256,000). Use lower values only
+	// in tests.
 	KDFIterations int
 
-	// CipherType selects the built-in cipher when Key is set. Zero value
-	// (CipherAES256GCM) is the default. See CipherType constants for the
-	// available options.
+	// CipherType selects the built-in cipher when Key or Passphrase is
+	// set. Zero value (CipherAES256GCM) is the default. See CipherType
+	// constants for the available options.
 	CipherType CipherType
 
 	// Codec, when non-nil, replaces the built-in cipher with a caller-
-	// provided implementation (e.g. HSM-backed). When both Key and Codec
-	// are set, Codec wins and Key/CipherType are ignored. Callers own the
-	// codec's lifetime and must supply an implementation safe for
-	// concurrent use.
+	// provided implementation (e.g. HSM-backed). When Codec is set with
+	// one of Key and Passphrase, Codec wins and that field and CipherType
+	// are ignored; Key and Passphrase both set fail Open, with a Codec as
+	// without one. Callers own the codec's lifetime and must supply an
+	// implementation safe for concurrent use.
 	Codec Codec
 
 	// OnIntegrityError, if non-nil, is called on every per-page integrity
@@ -263,45 +267,71 @@ func DefaultOptions() Options {
 
 // buildCodec constructs the Codec from Options. Returns (nil, nil) when no
 // encryption is configured. Input modes:
+//   - Options.Key and Options.Passphrase both set: rejected, whether
+//     Options.Codec is set or not.
 //   - Options.Codec set: used as-is.
-//   - Options.Key set with len == KeyLen: raw AES-256 key, used directly.
-//   - Options.Key set with any other non-zero length: treated as a passphrase,
-//     derived via PBKDF2 using the supplied salt and KDFIterations.
-//   - Options.Key set with length 0: rejected.
+//   - Options.Key set: the raw key, used as it is; any length but KeyLen is
+//     rejected.
+//   - Options.Passphrase set: the key is derived via PBKDF2 using the
+//     supplied salt and KDFIterations, whatever the passphrase's length; an
+//     empty one is rejected.
+//
+// The field that carries a secret says which of the two it is, never its
+// length. SQLCipher never takes a password as a raw key by its length
+// either (sqlcipher_cipher_ctx_key_derive, v4.14.0): it takes a raw key
+// only as an explicit blob literal, x'...' (the x in either case), of
+// exactly 64, 96 or 160 hex digits for its 32-byte key and 16-byte salt,
+// which hold the key; the key, then the salt; or the key, the HMAC key,
+// then the salt (sqlcipher.c:1767-1798). With 64 or 96 digits it still
+// derives the HMAC key from the key, by PBKDF2 at its fast count, when HMAC
+// is on, its default (sqlcipher.c:1809-1835). Any other key material, a
+// blob literal of another length included, goes through PBKDF2
+// (sqlcipher.c:1799-1807). Options.Key does not use the salt, and the file
+// carries one all the same: Open draws it for a new file whatever the key
+// (settleCodec), as SQLCipher loads its salt from the header or draws one
+// before it looks at the key's form (sqlcipher.c:1756-1761, 1392-1411), and
+// a non-zero salt is the marker of an encrypted file.
 //
 // buildCodec constructs the Codec for the resolved mode. `useCksum` is the
 // caller's effective checksum decision (file-state-authoritative on reopen,
 // opts.Checksum on new DBs). buildCodec rejects combining checksum mode with
 // explicit AEAD configuration, but is otherwise mechanical.
 func buildCodec(opts Options, salt []byte, useCksum bool) (Codec, error) {
+	if opts.Key != nil && opts.Passphrase != nil {
+		return nil, fmt.Errorf("btree: Options.Key and Options.Passphrase are both set")
+	}
 	if opts.Codec != nil {
 		if useCksum {
 			return nil, fmt.Errorf("btree: Options.Checksum cannot be combined with Options.Codec")
 		}
 		return opts.Codec, nil
 	}
-	if opts.Key != nil {
+	if opts.Key == nil && opts.Passphrase == nil {
 		if useCksum {
-			return nil, fmt.Errorf("btree: Options.Checksum cannot be combined with Options.Key")
+			return newCksumCodec(), nil
 		}
-		if len(opts.Key) == 0 {
-			return nil, fmt.Errorf("btree: Options.Key is empty (use nil for no encryption)")
-		}
-		var raw []byte
-		if len(opts.Key) == KeyLen {
-			raw = opts.Key
-		} else {
-			if h := testDeriveKeyHook; h != nil {
-				h()
-			}
-			raw = DeriveKey(opts.Key, salt, opts.KDFIterations)
-		}
-		return newCodecFromType(opts.CipherType, raw)
+		return nil, nil
 	}
 	if useCksum {
-		return newCksumCodec(), nil
+		return nil, fmt.Errorf("btree: Options.Checksum cannot be combined with Options.Key or Options.Passphrase")
 	}
-	return nil, nil
+	var key []byte
+	switch {
+	case opts.Key != nil:
+		if len(opts.Key) != KeyLen {
+			return nil, fmt.Errorf("btree: Options.Key is %d bytes, not %d", len(opts.Key), KeyLen)
+		}
+		key = opts.Key
+	default:
+		if len(opts.Passphrase) == 0 {
+			return nil, fmt.Errorf("btree: Options.Passphrase is empty (use nil for no encryption)")
+		}
+		if h := testDeriveKeyHook; h != nil {
+			h()
+		}
+		key = DeriveKey(opts.Passphrase, salt, opts.KDFIterations)
+	}
+	return newCodecFromType(opts.CipherType, key)
 }
 
 // testDeriveKeyHook, when non-nil, runs inside buildCodec each time it
@@ -691,8 +721,9 @@ func Open(path string, opts Options) (*DB, error) {
 	// The codec goes with the file's header: a passphrase key is derived
 	// from the header's salt, and the checksum mode is read from it. For an
 	// existing file the header is read to discover them; for a new file a
-	// fresh salt is drawn. InMemory databases skip encryption entirely
-	// (encryption.md §7).
+	// fresh salt is drawn, also for a raw Options.Key, which does not use
+	// it: the salt is the file's encryption marker. InMemory databases skip
+	// encryption entirely (encryption.md §7).
 	//
 	// The encryption marker on disk is a non-zero Salt field (bytes 72-87
 	// of page 1). ReservedSpace alone is NOT the marker, because the same
@@ -715,7 +746,7 @@ func Open(path string, opts Options) (*DB, error) {
 	// Between the two calls another process may create the database, or
 	// win its creation from this open; the second call then builds the
 	// codec again, from the salt that is in the file.
-	wantEncryption := opts.Key != nil || opts.Codec != nil
+	wantEncryption := opts.Key != nil || opts.Passphrase != nil || opts.Codec != nil
 	var zeroSalt [SaltLen]byte
 	// Resolve effective codec mode. Encryption is opt-in (errors if it
 	// doesn't match the file). Checksum is auto-detected from the file's
@@ -772,8 +803,9 @@ func Open(path string, opts Options) (*DB, error) {
 				}
 			}
 			p.setCodec(codec, salt, opts.OnIntegrityError)
-			// A codec made from Options.Key or Options.Codec: the open
-			// proves the key on page 1 (readPage1AtOpen).
+			// A codec made from Options.Key, Options.Passphrase or
+			// Options.Codec: the open proves the key on page 1
+			// (readPage1AtOpen).
 			p.keyed = wantEncryption && codec != nil
 			settled.done, settled.exists, settled.salt, settled.cksum = true, fileExists, salt, useCksum
 			return nil

@@ -18,9 +18,10 @@ const SaltLen = 16
 // DeriveKey runs PBKDF2-HMAC-SHA256 to derive a KeyLen-byte AES key from
 // a user passphrase. When iterations is zero, DefaultKDFIterations is used.
 //
-// PBKDF2 is a password-stretching KDF; if the caller is providing a raw
-// 32-byte key (not a passphrase), they should skip this entirely and
-// install the codec directly with the raw key material.
+// PBKDF2 is a password-stretching KDF. Open runs it on Options.Passphrase,
+// whatever its length, unless Options.Codec is set, which buildCodec
+// returns first, and never on Options.Key, a raw key the codec takes as it
+// is.
 func DeriveKey(passphrase, salt []byte, iterations int) []byte {
 	if iterations <= 0 {
 		iterations = DefaultKDFIterations

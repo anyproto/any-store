@@ -846,7 +846,7 @@
   },
   "codec_kdf.go:DeriveKey": {
     "sqlite": [],
-    "note": ""
+    "note": "no SQLite counterpart; SQLCipher's PBKDF2 branch of sqlcipher_cipher_ctx_key_derive (sqlcipher.c:1799-1807, v4.14.0). buildCodec runs it on Options.Passphrase, whatever its length, unless Options.Codec is set, which it returns first, and never on Options.Key"
   },
   "creation_journal.go:*creationJournal.abandon": {
     "sqlite": [],
@@ -1285,7 +1285,7 @@
   },
   "db.go:buildCodec": {
     "sqlite": [],
-    "note": ""
+    "note": "no SQLite counterpart; ~ sqlcipher_cipher_ctx_key_derive (sqlcipher.c:1743-1835, v4.14.0). SQLCipher takes a raw key only as an explicit blob literal x'...' of exactly 64, 96 or 160 hex digits: the key; the key, then the salt; or the key, the HMAC key, then the salt (sqlcipher.c:1767-1798). With 64 or 96 digits it still derives the HMAC key from the key when HMAC is on, its default (sqlcipher.c:1809-1835); any other key material goes through PBKDF2 (sqlcipher.c:1799-1807). Options.Key is a cipher key used with no KDF, as the encryption key of SQLCipher's 64-digit form is; Options.Passphrase always takes the PBKDF2 branch, whatever its length. The field says which, never the length. buildCodec refuses Key and Passphrase both set before it looks at Options.Codec, which wins over either one alone"
   },
   "db.go:newCodecFromType": {
     "sqlite": [],

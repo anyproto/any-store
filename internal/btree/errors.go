@@ -26,15 +26,15 @@ var (
 	ErrWrongKey = errors.New("btree: wrong encryption key")
 
 	// ErrKeyRequired is returned by Open for a file that is encrypted when
-	// the options carry neither Key nor Codec. It is decided from the
-	// file's header alone, and the file is left unchanged. It does not wrap
-	// ErrCorrupt.
-	ErrKeyRequired = errors.New("btree: database file is encrypted, Options.Key or Options.Codec required")
+	// the options carry none of Key, Passphrase and Codec. It is decided
+	// from the file's header alone, and the file is left unchanged. It does
+	// not wrap ErrCorrupt.
+	ErrKeyRequired = errors.New("btree: database file is encrypted, Options.Key, Options.Passphrase or Options.Codec required")
 
 	// ErrNotEncrypted is returned by Open for a file that is not encrypted
-	// when the options carry Key or Codec. The file is left unchanged. It
-	// does not wrap ErrCorrupt.
-	ErrNotEncrypted = errors.New("btree: database file is not encrypted, remove Options.Key/Codec")
+	// when the options carry Key, Passphrase or Codec. The file is left
+	// unchanged. It does not wrap ErrCorrupt.
+	ErrNotEncrypted = errors.New("btree: database file is not encrypted, remove Options.Key/Passphrase/Codec")
 
 	// ErrSQLiteFormat reports a file carrying SQLite's header magic — an
 	// any-store v1 database. Deliberately NOT wrapping ErrCorrupt: the file is
