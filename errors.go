@@ -291,8 +291,10 @@ var (
 	// ErrWrongKey is returned (wrapped) by Open when Config.Encryption does not open the file:
 	// its passphrase or key, or its cipher, is not the one the file was encrypted with. A
 	// Passphrase and a Key of the same bytes are two keys, so a file created with one is
-	// ErrWrongKey with the other. The file is left unchanged, and Open with the
-	// Config.Encryption the file was created with opens it.
+	// ErrWrongKey with the other. The file is left unchanged. It opens with the key and the
+	// cipher it was created with: the same Key, or the same Passphrase at the same effective
+	// KDFIterations, and the same CipherType. A file that a release before v2.6.1 keyed with a
+	// Passphrase of exactly 32 bytes opens with EncryptionConfig.Key set to those bytes.
 	// It does not match ErrCorrupt or ErrPageIntegrity, and Config.OnIntegrityError is not
 	// called.
 	//
@@ -326,8 +328,10 @@ var (
 
 	// ErrEncryptionKeyRequired is returned by Open, and (wrapped) by Backup for its destination,
 	// when the file is encrypted and Config.Encryption is empty (its Enabled reports false).
-	// Open decides it from the file's header alone, and the file is left unchanged. Open it with
-	// the Config.Encryption it was created with. It does not match ErrCorrupt.
+	// Open decides it from the file's header alone, and the file is left unchanged. It opens
+	// with the key and the cipher it was created with, as ErrWrongKey says: a file that a
+	// release before v2.6.1 keyed with a Passphrase of exactly 32 bytes opens with
+	// EncryptionConfig.Key set to those bytes. It does not match ErrCorrupt.
 	ErrEncryptionKeyRequired = errors.New("any-store: database file is encrypted: set Config.Encryption")
 
 	// ErrNotEncrypted is returned by Open, and (wrapped) by Backup for its destination, when

@@ -257,8 +257,12 @@ type Config struct {
 //     32 bytes long, empty included. An empty Passphrase that is not nil
 //     fails Open too.
 //
-// SQLCipher has the same rule: a raw key must be spelled as a blob literal,
-// x'<64 hex>', so a passphrase never becomes a raw key by its length.
+// SQLCipher never takes a password as a raw key by its length either: it
+// takes a raw key only as an explicit blob literal, x'...', of exactly 64,
+// 96 or 160 hex digits, which hold the key; the key and the salt; or the
+// key, the HMAC key and the salt. With 64 or 96 digits it still derives the
+// HMAC key from the key when HMAC is on, its default. Any other key
+// material goes through PBKDF2.
 //
 // Once a database is created with encryption, it must always be opened
 // with matching Encryption config. Open returns ErrEncryptionKeyRequired
@@ -296,15 +300,19 @@ type EncryptionConfig struct {
 	// key store, or one it derived itself, for example with HKDF from a
 	// master key, one per database. A password belongs in Passphrase,
 	// which stretches it. Every database encrypted with one Key, the copies
-	// Backup makes of it included, draws its random nonces under that key,
-	// so they all share one budget of random nonces: about 2^32 page
-	// writes per key with AES-GCM and ChaCha20-Poly1305, whose nonces are
-	// 12 bytes. A key per database is the safer use.
+	// Backup makes of it included, draws a random nonce under that key for
+	// each page it encrypts. AES-256-GCM's nonces are 96 bits, and with
+	// random ones NIST SP 800-38D §8.3 limits a key to 2^32 encryptions.
+	// ChaCha20-Poly1305's nonces are 96 bits too; for it the same collision
+	// bound is a guideline, not a hard limit. XChaCha20-Poly1305's 192-bit
+	// nonces have no practical limit. A key per database is the safer use.
 	//
-	// A file that a release before v2.6.1 created with a Passphrase of
-	// exactly 32 bytes was encrypted with those bytes as the raw key: it
-	// opens with Key set to them, and with that Passphrase it is
-	// ErrWrongKey.
+	// A file that a release before v2.6.1 encrypted under a Passphrase of
+	// exactly 32 bytes, with no Codec in its place, has those bytes as its
+	// raw key: it opens with Key set to them, whatever KDFIterations it was
+	// created with. With that Passphrase, a config that passes validation
+	// is ErrWrongKey for it; one with a KDFIterations past the limit is
+	// ErrInvalidConfig.
 	//
 	// Open keeps a copy of it, which Backup uses, so the caller may clear
 	// its slice once Open returns.

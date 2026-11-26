@@ -277,14 +277,20 @@ func DefaultOptions() Options {
 //     empty one is rejected.
 //
 // The field that carries a secret says which of the two it is, never its
-// length. SQLCipher has the same rule in another spelling: a raw key is a
-// blob literal, x'<64 hex>' (or x'<64 hex key><32 hex salt>'), and any other
-// key material goes through PBKDF2 (sqlcipher_cipher_ctx_key_derive,
-// sqlcipher.c:1743-1807, v4.14.0). A raw key does not use the salt, and the
-// file carries one all the same: Open draws it for a new file whatever the
-// key (settleCodec), as SQLCipher loads its salt from the header or draws
-// one before it looks at the key's form (sqlcipher.c:1756-1761, 1392-1411),
-// and a non-zero salt is the marker of an encrypted file.
+// length. SQLCipher never takes a password as a raw key by its length
+// either (sqlcipher_cipher_ctx_key_derive, v4.14.0): it takes a raw key
+// only as an explicit blob literal, x'...' (the x in either case), of
+// exactly 64, 96 or 160 hex digits for its 32-byte key and 16-byte salt,
+// which hold the key; the key, then the salt; or the key, the HMAC key,
+// then the salt (sqlcipher.c:1767-1798). With 64 or 96 digits it still
+// derives the HMAC key from the key, by PBKDF2 at its fast count, when HMAC
+// is on, its default (sqlcipher.c:1809-1835). Any other key material, a
+// blob literal of another length included, goes through PBKDF2
+// (sqlcipher.c:1799-1807). Options.Key does not use the salt, and the file
+// carries one all the same: Open draws it for a new file whatever the key
+// (settleCodec), as SQLCipher loads its salt from the header or draws one
+// before it looks at the key's form (sqlcipher.c:1756-1761, 1392-1411), and
+// a non-zero salt is the marker of an encrypted file.
 //
 // buildCodec constructs the Codec for the resolved mode. `useCksum` is the
 // caller's effective checksum decision (file-state-authoritative on reopen,

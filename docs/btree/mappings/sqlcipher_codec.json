@@ -140,7 +140,7 @@
   },
   "pragma.c:444-446": {
     "code": [],
-    "note": "PRAGMA key = '...' / PRAGMA hexkey = '...' — sets the encryption key for the DB. No port: any-store has no SQL surface. Keys are passed at Open time, a passphrase as Options.Passphrase (always PBKDF2) and a raw key as Options.Key (no KDF); SQLCipher tells a raw key by its spelling as a blob literal, x'<64 hex>' (sqlcipher_cipher_ctx_key_derive, sqlcipher.c:1743-1807, v4.14.0), never by its length. Rekey is not supported. See also pragma.c:520-525, pragma.c:2783-2829."
+    "note": "PRAGMA key = '...' / PRAGMA hexkey = '...' — sets the encryption key for the DB. No port: any-store has no SQL surface. Keys are passed at Open time, a passphrase as Options.Passphrase (always PBKDF2) and a raw key as Options.Key (no KDF); SQLCipher takes a raw key only as an explicit blob literal x'...' of exactly 64, 96 or 160 hex digits (the key; the key, then the salt; or the key, the HMAC key, then the salt; with 64 or 96 digits it still derives the HMAC key from the key when HMAC is on, its default), and any other key material goes through PBKDF2 (sqlcipher_cipher_ctx_key_derive, sqlcipher.c:1767-1835, v4.14.0): never a password by its length. Rekey is not supported. See also pragma.c:520-525, pragma.c:2783-2829."
   },
   "pragma.c:520-525": {
     "code": [],
