@@ -3,6 +3,8 @@ package btree
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -29,7 +31,7 @@ func TestOpen_KeyRoundTrip(t *testing.T) {
 	encTestSetup(t)
 	path := tmpEncryptedFile(t, "enc.db")
 	opts := DefaultOptions()
-	opts.Key = []byte("correct horse battery staple")
+	opts.Passphrase = []byte("correct horse battery staple")
 	opts.KDFIterations = 1000
 	opts.InProcess = true
 
@@ -86,7 +88,7 @@ func TestOpen_WrongKeyFails(t *testing.T) {
 	encTestSetup(t)
 	path := tmpEncryptedFile(t, "enc.db")
 	opts := DefaultOptions()
-	opts.Key = []byte("right-passphrase")
+	opts.Passphrase = []byte("right-passphrase")
 	opts.KDFIterations = 1000
 	opts.InProcess = true
 	db, err := Open(path, opts)
@@ -114,7 +116,7 @@ func TestOpen_WrongKeyFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	opts.Key = []byte("wrong-passphrase")
+	opts.Passphrase = []byte("wrong-passphrase")
 	if _, err := Open(path, opts); !errors.Is(err, ErrWrongKey) {
 		t.Fatalf("Open with the wrong key: got %v, want ErrWrongKey", err)
 	}
@@ -149,7 +151,7 @@ func TestOpen_PassphraseKeyDerivedOncePerOpen(t *testing.T) {
 					require.NoError(t, os.WriteFile(path, nil, 0o644))
 				}
 				opts := DefaultOptions()
-				opts.Key = []byte("correct horse battery staple")
+				opts.Passphrase = []byte("correct horse battery staple")
 				opts.KDFIterations = 1000
 				opts.InProcess = inProcess
 
@@ -187,7 +189,7 @@ func TestOpen_MissingKeyOnEncryptedFile(t *testing.T) {
 	encTestSetup(t)
 	path := tmpEncryptedFile(t, "enc.db")
 	opts := DefaultOptions()
-	opts.Key = []byte("pw")
+	opts.Passphrase = []byte("pw")
 	opts.KDFIterations = 1000
 	opts.InProcess = true
 	db, err := Open(path, opts)
@@ -209,7 +211,7 @@ func TestOpen_MissingKeyOnEncryptedFile(t *testing.T) {
 	}
 
 	// Reopen without any key — must fail.
-	opts.Key = nil
+	opts.Passphrase = nil
 	_, err = Open(path, opts)
 	if err == nil {
 		t.Fatalf("Open encrypted DB without key returned nil error")
@@ -240,7 +242,7 @@ func TestOpen_KeyOnPlainFile(t *testing.T) {
 	}
 
 	// Reopen with key — must fail.
-	opts.Key = []byte("pw")
+	opts.Passphrase = []byte("pw")
 	opts.KDFIterations = 1000
 	_, err = Open(path, opts)
 	if err == nil {
@@ -252,7 +254,7 @@ func TestEncryption_SpillCheckpointReopen(t *testing.T) {
 	encTestSetup(t)
 	path := tmpEncryptedFile(t, "spill.db")
 	opts := DefaultOptions()
-	opts.Key = []byte("spill-test")
+	opts.Passphrase = []byte("spill-test")
 	opts.KDFIterations = 1000
 	opts.CacheSize = 50 // tiny cache to force spill
 	opts.InProcess = true
@@ -356,7 +358,7 @@ func benchCommit(b *testing.B, key []byte, cipher CipherType) {
 	opts.NoCommitSync = true // measure CPU, not fsync
 	opts.InProcess = true
 	if key != nil {
-		opts.Key = key
+		opts.Passphrase = key
 		opts.KDFIterations = 1000
 		opts.CipherType = cipher
 	}
@@ -404,7 +406,7 @@ func TestEncryption_TamperDetected(t *testing.T) {
 	encTestSetup(t)
 	path := tmpEncryptedFile(t, "tamper.db")
 	opts := DefaultOptions()
-	opts.Key = []byte("tamper-test")
+	opts.Passphrase = []byte("tamper-test")
 	opts.KDFIterations = 1000
 	opts.InProcess = true
 
@@ -481,5 +483,176 @@ func TestEncryption_TamperDetected(t *testing.T) {
 	}
 	if !sawError {
 		t.Fatalf("no error observed after tampering page 2 body")
+	}
+}
+
+// requireCodecsShareKey seals a page with one codec and opens it with the
+// other: it opens when both were made from one key, and fails its
+// authentication when they were not.
+func requireCodecsShareKey(t *testing.T, seal, open Codec, same bool) {
+	t.Helper()
+	const pageSize = 4096
+	src := bytes.Repeat([]byte{0xA5}, pageSize)
+	ct := make([]byte, pageSize)
+	pt := make([]byte, pageSize)
+	var w, r aeadScratch
+	_, err := seal.Encrypt(ct, src, 2, &w)
+	require.NoError(t, err)
+	_, err = open.Decrypt(pt, ct, 2, &r, nil)
+	if !same {
+		require.ErrorIs(t, err, ErrPageIntegrity)
+		return
+	}
+	require.NoError(t, err)
+	body := pageSize - seal.Overhead()
+	require.Equal(t, src[:body], pt[:body])
+}
+
+// Options.Key is a raw key, used as it is, whatever KDFIterations says.
+// Options.Passphrase is always stretched with PBKDF2, one of KeyLen bytes
+// too, so the same bytes in the two fields are two keys. The field says
+// which a secret is, never its length: a Key of another length is refused,
+// and so are both fields set and an empty passphrase.
+func TestBuildCodec_KeyIsRawPassphraseIsDerived(t *testing.T) {
+	var derived atomic.Int32
+	testDeriveKeyHook = func() { derived.Add(1) }
+	t.Cleanup(func() { testDeriveKeyHook = nil })
+	salt := bytes.Repeat([]byte{0x5a}, SaltLen)
+	secret := bytes.Repeat([]byte{0x42}, KeyLen)
+	raw, err := NewAESCodec(secret)
+	require.NoError(t, err)
+	stretched, err := NewAESCodec(DeriveKey(secret, salt, 1000))
+	require.NoError(t, err)
+
+	for _, iter := range []int{0, 1000, math.MaxInt} {
+		c, err := buildCodec(Options{Key: secret, KDFIterations: iter}, salt, false)
+		require.NoError(t, err)
+		requireCodecsShareKey(t, c, raw, true)
+	}
+	require.Zero(t, derived.Load(), "a raw key is not derived")
+
+	c, err := buildCodec(Options{Passphrase: secret, KDFIterations: 1000}, salt, false)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, derived.Load(), "a passphrase of KeyLen bytes is derived")
+	requireCodecsShareKey(t, c, stretched, true)
+	requireCodecsShareKey(t, c, raw, false)
+
+	derived.Store(0)
+	for _, tc := range []struct {
+		name string
+		opts Options
+		msg  string
+	}{
+		{"empty key", Options{Key: []byte{}}, "Options.Key is 0 bytes"},
+		{"key one byte short", Options{Key: secret[:KeyLen-1]}, "Options.Key is 31 bytes"},
+		{"key one byte long", Options{Key: append(bytes.Clone(secret), 0)}, "Options.Key is 33 bytes"},
+		{"key and passphrase", Options{Key: secret, Passphrase: []byte("pw")}, "both set"},
+		{"empty passphrase", Options{Passphrase: []byte{}}, "Options.Passphrase is empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := buildCodec(tc.opts, salt, false)
+			require.ErrorContains(t, err, tc.msg)
+		})
+	}
+	for _, opts := range []Options{{Key: secret}, {Passphrase: secret}} {
+		_, err := buildCodec(opts, salt, true)
+		require.ErrorContains(t, err, "cannot be combined")
+	}
+	require.Zero(t, derived.Load(), "a refused option derives nothing")
+}
+
+// encFileState is the content of a database file and of its WAL ("" when
+// there is none).
+func encFileState(t *testing.T, path string) [2]string {
+	t.Helper()
+	var st [2]string
+	for i, p := range []string{path, path + "-wal"} {
+		b, err := os.ReadFile(p)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		require.NoError(t, err)
+		st[i] = string(b)
+	}
+	return st
+}
+
+// A database created with a Key opens with that Key, and one created with a
+// Passphrase of KeyLen bytes with that Passphrase; the same bytes in the
+// other field are a wrong key, which leaves the file as it was. A file
+// created with a raw key carries a salt all the same, its encryption marker.
+func TestOpen_KeyAndPassphraseOfTheSameBytesAreTwoKeys(t *testing.T) {
+	encTestSetup(t)
+	secret := bytes.Repeat([]byte{0x42}, KeyLen)
+	asKey := DefaultOptions()
+	asKey.InProcess = true
+	asKey.Key = secret
+	asPassphrase := DefaultOptions()
+	asPassphrase.InProcess = true
+	asPassphrase.Passphrase = secret
+	asPassphrase.KDFIterations = 1000
+
+	for _, tc := range []struct {
+		name          string
+		create, other Options
+	}{
+		{"created with Key", asKey, asPassphrase},
+		{"created with Passphrase", asPassphrase, asKey},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := tmpEncryptedFile(t, "enc.db")
+			db, err := Open(path, tc.create)
+			require.NoError(t, err)
+			wtx, err := db.BeginWrite()
+			require.NoError(t, err)
+			ns, err := wtx.CreateNamespace("x")
+			require.NoError(t, err)
+			for i := 0; i < 50; i++ {
+				require.NoError(t, wtx.Put(ns, []byte(fmt.Sprintf("k%03d", i)), bytes.Repeat([]byte("v"), 500)))
+			}
+			require.NoError(t, wtx.Commit())
+			require.NoError(t, db.Close())
+			hdr, err := readInitialHeader(path)
+			require.NoError(t, err)
+			require.NotEqual(t, [SaltLen]byte{}, hdr.Salt, "an encrypted file carries a salt")
+
+			before := encFileState(t, path)
+			_, err = Open(path, tc.other)
+			require.ErrorIs(t, err, ErrWrongKey)
+			require.NotErrorIs(t, err, ErrCorrupt)
+			require.Equal(t, before, encFileState(t, path), "a wrong key leaves the file as it was")
+
+			db, err = Open(path, tc.create)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, db.Close()) }()
+			ns, err = db.GetNamespace("x")
+			require.NoError(t, err)
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			defer rtx.Rollback()
+			v, err := rtx.Get(ns, []byte("k049"))
+			require.NoError(t, err)
+			require.Equal(t, bytes.Repeat([]byte("v"), 500), v)
+		})
+	}
+}
+
+// A Key that is not KeyLen bytes, or set with a Passphrase, is refused
+// before a new file is created.
+func TestOpen_BadKeyCreatesNoFile(t *testing.T) {
+	encTestSetup(t)
+	for _, opts := range []Options{
+		{Key: []byte{}},
+		{Key: make([]byte, KeyLen-1)},
+		{Key: make([]byte, KeyLen+1)},
+		{Key: make([]byte, KeyLen), Passphrase: []byte("pw")},
+	} {
+		path := tmpEncryptedFile(t, "enc.db")
+		opts.PageSize = DefaultPageSize
+		opts.InProcess = true
+		_, err := Open(path, opts)
+		require.Error(t, err)
+		_, statErr := os.Stat(path)
+		require.ErrorIs(t, statErr, os.ErrNotExist)
 	}
 }

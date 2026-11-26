@@ -66,7 +66,7 @@ func codecRequire(t *testing.T, db *DB, n int) {
 
 func passphraseOptions(cipher CipherType) Options {
 	opts := DefaultOptions()
-	opts.Key = []byte("correct horse") // not KeyLen bytes: derived with the file's salt
+	opts.Passphrase = []byte("correct horse") // derived with the file's salt
 	opts.KDFIterations = 1000
 	opts.CipherType = cipher
 	return opts
@@ -712,7 +712,7 @@ func TestBackup_BetweenCiphersOfOneReserve(t *testing.T) {
 	defer func() { require.NoError(t, src.Close()) }()
 	codecFill(t, src, 0, 40)
 	dstOpts := passphraseOptions(CipherChaCha20Poly1305)
-	dstOpts.Key = []byte("another passphrase")
+	dstOpts.Passphrase = []byte("another passphrase")
 	dstPath := filepath.Join(dir, "dst.db")
 	dst, err := testOpen(t, dstPath, dstOpts)
 	require.NoError(t, err)

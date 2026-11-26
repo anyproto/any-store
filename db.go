@@ -305,8 +305,13 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 	// The btree keeps a copy of the caller's passphrase or key, which the
 	// caller may clear once Open returns: Backup opens its destination with
 	// it (BackupDestinationOptions), and a cleared buffer would encrypt the
-	// copy with another key. nil stays nil, no encryption.
+	// copy with another key. nil stays nil, no encryption. A passphrase of
+	// exactly 32 bytes is the raw key.
 	key := bytes.Clone(config.Encryption.Passphrase)
+	var passphrase []byte
+	if len(key) != btree.KeyLen {
+		key, passphrase = nil, key
+	}
 
 	// Page-level integrity is on by default for non-encrypted databases.
 	// XXH3-128 trailer per page costs <1% on writes and is invisible on
@@ -324,6 +329,7 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 		DisableAutoCheckpoint: config.DisableAutoCheckpoint,
 		AutoCheckpointAfter:   config.AutoCheckpointAfter,
 		UsePageSlab:           config.UseGlobalPageBuffer,
+		Passphrase:            passphrase,
 		Key:                   key,
 		KDFIterations:         config.Encryption.KDFIterations,
 		CipherType:            config.Encryption.CipherType,

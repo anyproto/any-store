@@ -846,7 +846,7 @@
   },
   "codec_kdf.go:DeriveKey": {
     "sqlite": [],
-    "note": ""
+    "note": "no SQLite counterpart; SQLCipher's PBKDF2 branch of sqlcipher_cipher_ctx_key_derive (sqlcipher.c:1798-1807, v4.14.0). Open runs it on every Options.Passphrase, whatever its length, and never on Options.Key"
   },
   "creation_journal.go:*creationJournal.abandon": {
     "sqlite": [],
@@ -1285,7 +1285,7 @@
   },
   "db.go:buildCodec": {
     "sqlite": [],
-    "note": ""
+    "note": "no SQLite counterpart; ~ sqlcipher_cipher_ctx_key_derive (sqlcipher.c:1743-1807, v4.14.0): Options.Key is SQLCipher's raw key, spelled there as a blob literal x'<64 hex>' and used with no KDF; Options.Passphrase is its PBKDF2 branch. The field says which, never the length"
   },
   "db.go:newCodecFromType": {
     "sqlite": [],

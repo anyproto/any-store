@@ -9289,7 +9289,7 @@ func keyProofDB(t *testing.T, checkpoint bool, hook func(uint32, error)) (string
 	encTestSetup(t)
 	path := tmpEncryptedFile(t, "enc.db")
 	opts := DefaultOptions()
-	opts.Key = []byte("right-passphrase")
+	opts.Passphrase = []byte("right-passphrase")
 	opts.KDFIterations = 1000
 	opts.InProcess = true
 	db, err := Open(path, opts)
@@ -9347,7 +9347,7 @@ func TestOpen_WrongKeyIsErrWrongKey(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var fired atomic.Int32
 			path, opts := keyProofDB(t, tc.checkpoint, func(uint32, error) { fired.Add(1) })
-			opts.Key = []byte("wrong-passphrase")
+			opts.Passphrase = []byte("wrong-passphrase")
 			_, err := Open(path, opts)
 			require.ErrorIs(t, err, ErrWrongKey)
 			require.NotErrorIs(t, err, ErrCorrupt)
@@ -9355,7 +9355,7 @@ func TestOpen_WrongKeyIsErrWrongKey(t *testing.T) {
 			require.Zero(t, fired.Load(), "a wrong key must not fire the integrity hook")
 
 			// The file is as it was: the right key opens it.
-			opts.Key = []byte("right-passphrase")
+			opts.Passphrase = []byte("right-passphrase")
 			db, err := Open(path, opts)
 			require.NoError(t, err)
 			require.NoError(t, db.Close())
@@ -9436,7 +9436,7 @@ func TestOpen_DamagedOnePageFileIsErrWrongKey(t *testing.T) {
 	encTestSetup(t)
 	path := tmpEncryptedFile(t, "enc.db")
 	opts := DefaultOptions()
-	opts.Key = []byte("right-passphrase")
+	opts.Passphrase = []byte("right-passphrase")
 	opts.KDFIterations = 1000
 	opts.InProcess = true
 	db, err := Open(path, opts)
@@ -9785,9 +9785,9 @@ func TestOpen_HeaderIsJudgedBeforeTheKey(t *testing.T) {
 	t.Run("file cut inside page 1", func(t *testing.T) {
 		path, opts := keyProofDB(t, true, nil)
 		require.NoError(t, os.Truncate(path, 2000))
-		for _, key := range [][]byte{opts.Key, []byte("wrong-passphrase")} {
+		for _, key := range [][]byte{opts.Passphrase, []byte("wrong-passphrase")} {
 			o := opts
-			o.Key = key
+			o.Passphrase = key
 			_, err := Open(path, o)
 			require.ErrorIs(t, err, ErrHeaderCorrupt, "key %q", key)
 			require.NotErrorIs(t, err, ErrWrongKey)
@@ -9805,9 +9805,9 @@ func TestOpen_HeaderIsJudgedBeforeTheKey(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, f.Close())
 		resealWAL(t, walPath, int(opts.PageSize))
-		for _, key := range [][]byte{opts.Key, []byte("wrong-passphrase")} {
+		for _, key := range [][]byte{opts.Passphrase, []byte("wrong-passphrase")} {
 			o := opts
-			o.Key = key
+			o.Passphrase = key
 			_, err := Open(path, o)
 			require.ErrorIs(t, err, ErrHeaderCorrupt, "key %q", key)
 			require.NotErrorIs(t, err, ErrWrongKey)
@@ -9829,9 +9829,9 @@ func TestOpen_HeaderIsJudgedBeforeTheKey(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, f.Close())
 		resealWAL(t, walPath, int(opts.PageSize))
-		for _, key := range [][]byte{opts.Key, []byte("wrong-passphrase")} {
+		for _, key := range [][]byte{opts.Passphrase, []byte("wrong-passphrase")} {
 			o := opts
-			o.Key = key
+			o.Passphrase = key
 			_, err := Open(path, o)
 			require.ErrorIs(t, err, ErrHeaderCorrupt, "key %q", key)
 			require.NotErrorIs(t, err, ErrSQLiteFormat)
@@ -9864,9 +9864,9 @@ func TestOpen_HeaderIsJudgedBeforeTheKey(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, f.Close())
 			resealWAL(t, walPath, int(opts.PageSize))
-			for _, key := range [][]byte{opts.Key, []byte("wrong-passphrase")} {
+			for _, key := range [][]byte{opts.Passphrase, []byte("wrong-passphrase")} {
 				o := opts
-				o.Key = key
+				o.Passphrase = key
 				_, err := Open(path, o)
 				require.ErrorIs(t, err, ErrHeaderCorrupt, "key %q", key)
 				require.NotErrorIs(t, err, ErrWrongKey)

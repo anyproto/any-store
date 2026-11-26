@@ -386,10 +386,10 @@ type pager struct {
 	// WAL's checkpoint into the main file), and no image of page 1 sets it
 	// (adoptHeader).
 	keySalt [SaltLen]byte
-	// keyed reports a codec made from the caller's key (Options.Key or
-	// Options.Codec), as opposed to none or the checksum codec. Set by
-	// Open's codec settle; the open of a keyed file proves the key on
-	// page 1 (readPage1AtOpen).
+	// keyed reports a codec made from the caller's key (Options.Key,
+	// Options.Passphrase or Options.Codec), as opposed to none or the
+	// checksum codec. Set by Open's codec settle; the open of a keyed file
+	// proves the key on page 1 (readPage1AtOpen).
 	keyed bool
 	// codecScratch is a reusable page-sized scratch buffer used on the
 	// writer side (createPage1, getPageWriter, wal.writeFrame) to hold

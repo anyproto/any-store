@@ -134,7 +134,7 @@ func TestTableLeafFormat_PayloadBoundaries(t *testing.T) {
 	}{
 		{name: "plain", opts: Options{PageSize: 4096}},
 		{name: "checksum", opts: Options{PageSize: 4096, Checksum: true}},
-		{name: "encrypted", opts: Options{PageSize: 4096, Key: []byte("passphrase")}},
+		{name: "encrypted", opts: Options{PageSize: 4096, Passphrase: []byte("passphrase")}},
 		{name: "512-byte pages", opts: Options{PageSize: 512}},
 		{name: "64 KiB pages", opts: Options{PageSize: 65536}},
 		{name: "in memory", opts: Options{PageSize: 4096, InMemory: true}},

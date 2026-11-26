@@ -40,7 +40,7 @@ func createOpts(pass string) Options {
 		DisableAutoCheckpoint: true,
 	}
 	if pass != "" {
-		opts.Key = []byte(pass)
+		opts.Passphrase = []byte(pass)
 		opts.KDFIterations = 1000
 	}
 	return opts
