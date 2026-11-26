@@ -196,8 +196,9 @@ type Options struct {
 
 	// Codec, when non-nil, replaces the built-in cipher with a caller-
 	// provided implementation (e.g. HSM-backed). When Codec is set with
-	// Key or Passphrase, Codec wins and Key, Passphrase and CipherType are
-	// ignored. Callers own the codec's lifetime and must supply an
+	// one of Key and Passphrase, Codec wins and that field and CipherType
+	// are ignored; Key and Passphrase both set fail Open, with a Codec as
+	// without one. Callers own the codec's lifetime and must supply an
 	// implementation safe for concurrent use.
 	Codec Codec
 
@@ -266,13 +267,14 @@ func DefaultOptions() Options {
 
 // buildCodec constructs the Codec from Options. Returns (nil, nil) when no
 // encryption is configured. Input modes:
+//   - Options.Key and Options.Passphrase both set: rejected, whether
+//     Options.Codec is set or not.
 //   - Options.Codec set: used as-is.
 //   - Options.Key set: the raw key, used as it is; any length but KeyLen is
 //     rejected.
 //   - Options.Passphrase set: the key is derived via PBKDF2 using the
 //     supplied salt and KDFIterations, whatever the passphrase's length; an
 //     empty one is rejected.
-//   - Options.Key and Options.Passphrase both set: rejected.
 //
 // The field that carries a secret says which of the two it is, never its
 // length. SQLCipher has the same rule in another spelling: a raw key is a
@@ -289,6 +291,9 @@ func DefaultOptions() Options {
 // opts.Checksum on new DBs). buildCodec rejects combining checksum mode with
 // explicit AEAD configuration, but is otherwise mechanical.
 func buildCodec(opts Options, salt []byte, useCksum bool) (Codec, error) {
+	if opts.Key != nil && opts.Passphrase != nil {
+		return nil, fmt.Errorf("btree: Options.Key and Options.Passphrase are both set")
+	}
 	if opts.Codec != nil {
 		if useCksum {
 			return nil, fmt.Errorf("btree: Options.Checksum cannot be combined with Options.Codec")
@@ -306,8 +311,6 @@ func buildCodec(opts Options, salt []byte, useCksum bool) (Codec, error) {
 	}
 	var key []byte
 	switch {
-	case opts.Key != nil && opts.Passphrase != nil:
-		return nil, fmt.Errorf("btree: Options.Key and Options.Passphrase are both set")
 	case opts.Key != nil:
 		if len(opts.Key) != KeyLen {
 			return nil, fmt.Errorf("btree: Options.Key is %d bytes, not %d", len(opts.Key), KeyLen)

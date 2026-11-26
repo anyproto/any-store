@@ -778,26 +778,32 @@ func TestCopyToLatestFormat_Sources(t *testing.T) {
 		for i := 0; i < 50; i++ {
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"n":%d}`, i, i%7))))
 		}
+		// A config that does not fit the copy, and the error Open refuses it with.
+		type wrongConf struct {
+			conf *Config
+			err  error
+		}
+		noKey := wrongConf{nil, ErrEncryptionKeyRequired}
+		wrongKey := func(conf *Config) wrongConf { return wrongConf{conf, ErrWrongKey} }
 		for _, tc := range []struct {
 			name  string
 			conf  *Config
-			wrong []*Config
+			wrong []wrongConf
 		}{
-			{"unencrypted", nil, []*Config{withKey(keyA)}},
-			{"same key", withKey(keyA), []*Config{nil, withKey(keyB), withPassphrase(keyA)}},
-			{"other key", withKey(keyB), []*Config{nil, withKey(keyA)}},
-			{"passphrase", withPassphrase(keyA), []*Config{nil, withKey(keyA), withPassphrase(keyB)}},
+			{"unencrypted", nil, []wrongConf{{withKey(keyA), ErrNotEncrypted}}},
+			{"same key", withKey(keyA), []wrongConf{noKey, wrongKey(withKey(keyB)), wrongKey(withPassphrase(keyA))}},
+			{"other key", withKey(keyB), []wrongConf{noKey, wrongKey(withKey(keyA))}},
+			{"passphrase", withPassphrase(keyA), []wrongConf{noKey, wrongKey(withKey(keyA)), wrongKey(withPassphrase(keyB))}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				dstPath := filepath.Join(t.TempDir(), "copy.db")
 				_, err := CopyToLatestFormat(ctx, src, dstPath, tc.conf)
 				require.NoError(t, err)
-				for _, wrongConf := range tc.wrong {
-					if d, err := Open(ctx, dstPath, wrongConf); err == nil {
-						_, err = d.GetCollectionNames(ctx)
-						require.NoError(t, d.Close())
-						require.Error(t, err, "opened with the wrong key")
-					}
+				for _, w := range tc.wrong {
+					d, err := Open(ctx, dstPath, w.conf)
+					require.ErrorIs(t, err, w.err)
+					require.NotErrorIs(t, err, ErrCorrupt)
+					require.Nil(t, d)
 				}
 				dst := openCopy(t, dstPath, tc.conf)
 				assert.Equal(t, tc.conf != nil, dst.IntegrityMode() == IntegrityAEAD)

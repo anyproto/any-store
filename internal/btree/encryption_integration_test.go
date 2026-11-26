@@ -27,60 +27,74 @@ func encTestSetup(t testing.TB) {
 	resetPageBufferPool()
 }
 
+// A database created with a Passphrase or with a raw Key opens again with
+// the same option and reads back what it wrote.
 func TestOpen_KeyRoundTrip(t *testing.T) {
-	encTestSetup(t)
-	path := tmpEncryptedFile(t, "enc.db")
-	opts := DefaultOptions()
-	opts.Passphrase = []byte("correct horse battery staple")
-	opts.KDFIterations = 1000
-	opts.InProcess = true
+	for _, tc := range []struct {
+		name   string
+		secret func(*Options)
+	}{
+		{"Passphrase", func(o *Options) {
+			o.Passphrase = []byte("correct horse battery staple")
+			o.KDFIterations = 1000
+		}},
+		{"Key", func(o *Options) { o.Key = bytes.Repeat([]byte{0x42}, KeyLen) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encTestSetup(t)
+			path := tmpEncryptedFile(t, "enc.db")
+			opts := DefaultOptions()
+			tc.secret(&opts)
+			opts.InProcess = true
 
-	db, err := Open(path, opts)
-	if err != nil {
-		t.Fatalf("Open (create): %v", err)
-	}
-	wtx, err := db.BeginWrite()
-	if err != nil {
-		t.Fatalf("BeginWrite: %v", err)
-	}
-	ns, err := wtx.CreateNamespace("default")
-	if err != nil {
-		t.Fatalf("CreateNamespace: %v", err)
-	}
-	if err := wtx.Put(ns, []byte("k1"), []byte("v1")); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	if err := wtx.Commit(); err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
-	if err := db.Checkpoint(CheckpointFull); err != nil {
-		t.Fatalf("Checkpoint: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+			db, err := Open(path, opts)
+			if err != nil {
+				t.Fatalf("Open (create): %v", err)
+			}
+			wtx, err := db.BeginWrite()
+			if err != nil {
+				t.Fatalf("BeginWrite: %v", err)
+			}
+			ns, err := wtx.CreateNamespace("default")
+			if err != nil {
+				t.Fatalf("CreateNamespace: %v", err)
+			}
+			if err := wtx.Put(ns, []byte("k1"), []byte("v1")); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+			if err := wtx.Commit(); err != nil {
+				t.Fatalf("Commit: %v", err)
+			}
+			if err := db.Checkpoint(CheckpointFull); err != nil {
+				t.Fatalf("Checkpoint: %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
 
-	// Reopen with correct key.
-	db2, err := Open(path, opts)
-	if err != nil {
-		t.Fatalf("Open (reopen): %v", err)
-	}
-	defer db2.Close()
-	rtx, err := db2.BeginRead()
-	if err != nil {
-		t.Fatalf("BeginRead: %v", err)
-	}
-	defer rtx.Rollback()
-	ns2, err := db2.GetNamespace("default")
-	if err != nil {
-		t.Fatalf("GetNamespace: %v", err)
-	}
-	val, err := rtx.Get(ns2, []byte("k1"))
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if !bytes.Equal(val, []byte("v1")) {
-		t.Fatalf("wrong value: got %q want v1", val)
+			// Reopen with correct key.
+			db2, err := Open(path, opts)
+			if err != nil {
+				t.Fatalf("Open (reopen): %v", err)
+			}
+			defer db2.Close()
+			rtx, err := db2.BeginRead()
+			if err != nil {
+				t.Fatalf("BeginRead: %v", err)
+			}
+			defer rtx.Rollback()
+			ns2, err := db2.GetNamespace("default")
+			if err != nil {
+				t.Fatalf("GetNamespace: %v", err)
+			}
+			val, err := rtx.Get(ns2, []byte("k1"))
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if !bytes.Equal(val, []byte("v1")) {
+				t.Fatalf("wrong value: got %q want v1", val)
+			}
+		})
 	}
 }
 
@@ -512,7 +526,8 @@ func requireCodecsShareKey(t *testing.T, seal, open Codec, same bool) {
 // Options.Passphrase is always stretched with PBKDF2, one of KeyLen bytes
 // too, so the same bytes in the two fields are two keys. The field says
 // which a secret is, never its length: a Key of another length is refused,
-// and so are both fields set and an empty passphrase.
+// and so are both fields set, with an Options.Codec too, and an empty
+// passphrase. An Options.Codec set with one of the two is used as it is.
 func TestBuildCodec_KeyIsRawPassphraseIsDerived(t *testing.T) {
 	var derived atomic.Int32
 	testDeriveKeyHook = func() { derived.Add(1) }
@@ -547,6 +562,7 @@ func TestBuildCodec_KeyIsRawPassphraseIsDerived(t *testing.T) {
 		{"key one byte short", Options{Key: secret[:KeyLen-1]}, "Options.Key is 31 bytes"},
 		{"key one byte long", Options{Key: append(bytes.Clone(secret), 0)}, "Options.Key is 33 bytes"},
 		{"key and passphrase", Options{Key: secret, Passphrase: []byte("pw")}, "both set"},
+		{"codec, key and passphrase", Options{Codec: raw, Key: secret, Passphrase: []byte("pw")}, "both set"},
 		{"empty passphrase", Options{Passphrase: []byte{}}, "Options.Passphrase is empty"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -559,6 +575,13 @@ func TestBuildCodec_KeyIsRawPassphraseIsDerived(t *testing.T) {
 		require.ErrorContains(t, err, "cannot be combined")
 	}
 	require.Zero(t, derived.Load(), "a refused option derives nothing")
+
+	for _, opts := range []Options{{Codec: stretched, Key: secret}, {Codec: stretched, Passphrase: secret}} {
+		c, err := buildCodec(opts, salt, false)
+		require.NoError(t, err)
+		require.True(t, c == stretched, "the codec is used as it is")
+	}
+	require.Zero(t, derived.Load(), "a codec's options derive nothing")
 }
 
 // encFileState is the content of a database file and of its WAL ("" when
@@ -637,21 +660,29 @@ func TestOpen_KeyAndPassphraseOfTheSameBytesAreTwoKeys(t *testing.T) {
 	}
 }
 
-// A Key that is not KeyLen bytes, or set with a Passphrase, is refused
-// before a new file is created.
+// A Key that is not KeyLen bytes, or set with a Passphrase, with a Codec
+// too, is refused before a new file is created.
 func TestOpen_BadKeyCreatesNoFile(t *testing.T) {
 	encTestSetup(t)
-	for _, opts := range []Options{
-		{Key: []byte{}},
-		{Key: make([]byte, KeyLen-1)},
-		{Key: make([]byte, KeyLen+1)},
-		{Key: make([]byte, KeyLen), Passphrase: []byte("pw")},
+	codec, err := NewAESCodec(make([]byte, KeyLen))
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		opts Options
+		msg  string
+	}{
+		{Options{Key: []byte{}}, "Options.Key is 0 bytes"},
+		{Options{Key: make([]byte, KeyLen-1)}, "Options.Key is 31 bytes"},
+		{Options{Key: make([]byte, KeyLen+1)}, "Options.Key is 33 bytes"},
+		{Options{Key: make([]byte, KeyLen), Passphrase: []byte("pw")}, "both set"},
+		{Options{Codec: codec, Key: make([]byte, KeyLen), Passphrase: []byte("pw")}, "both set"},
 	} {
 		path := tmpEncryptedFile(t, "enc.db")
+		opts := tc.opts
 		opts.PageSize = DefaultPageSize
 		opts.InProcess = true
-		_, err := Open(path, opts)
-		require.Error(t, err)
+		db, err := Open(path, opts)
+		require.ErrorContains(t, err, tc.msg)
+		require.Nil(t, db)
 		_, statErr := os.Stat(path)
 		require.ErrorIs(t, statErr, os.ErrNotExist)
 	}
