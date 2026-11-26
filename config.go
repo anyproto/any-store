@@ -195,10 +195,10 @@ type Config struct {
 	Durability DurabilityConfig
 
 	// Encryption configures page-level encryption of the database file. A
-	// Passphrase (or a 32-byte raw key passed as one) enables it; CipherType
-	// only selects the cipher, AES-256-GCM by default, and without a
-	// Passphrase the file is plain whatever CipherType says. The zero value
-	// means no encryption.
+	// Passphrase or a raw 32-byte Key enables it; CipherType only selects
+	// the cipher, AES-256-GCM by default, and without a Passphrase or a Key
+	// the file is plain whatever CipherType says. The zero value means no
+	// encryption.
 	Encryption EncryptionConfig
 
 	// OnIntegrityError, when non-nil, is invoked from the read path on
@@ -234,22 +234,31 @@ type Config struct {
 
 // EncryptionConfig enables page-level encryption of the database file.
 //
-// Encryption is enabled by a passphrase, or by a key given as a passphrase
-// of exactly 32 bytes, and uses one of the built-in ciphers:
+// Encryption is enabled by a passphrase or by a raw key, and uses one of the
+// built-in ciphers:
 //
 //	cfg.Encryption.Passphrase = []byte("my-pass")
 //	cfg.Encryption.CipherType = anystore.CipherChaCha20Poly1305 // optional
 //
+// or, with a 32-byte key the application holds:
+//
+//	cfg.Encryption.Key = key
+//
 // The default cipher is AES-256-GCM; CipherType picks another built-in
 // (ChaCha20-Poly1305 / XChaCha20-Poly1305).
 //
-// Passphrase treatment:
-//   - nil → no encryption.
-//   - Empty (length 0) and not nil → Open fails.
-//   - Exactly 32 bytes → raw key, no KDF.
-//   - Any other length → PBKDF2-HMAC-SHA256 stretches it to 32 bytes
+// The field that carries the secret says what it is, never its length:
+//   - Passphrase is stretched with PBKDF2-HMAC-SHA256 to a 32-byte key
 //     against the 16-byte salt stored in the database header, at
-//     KDFIterations rounds.
+//     KDFIterations rounds, whatever its length, 32 bytes included.
+//   - Key is the 32-byte cipher key itself, used with no key derivation.
+//   - Set one of them. Both nil means no encryption. Open fails with
+//     ErrInvalidConfig for both set, and for a Key that is not nil and not
+//     32 bytes long, empty included. An empty Passphrase that is not nil
+//     fails Open too.
+//
+// SQLCipher has the same rule: a raw key must be spelled as a blob literal,
+// x'<64 hex>', so a passphrase never becomes a raw key by its length.
 //
 // Once a database is created with encryption, it must always be opened
 // with matching Encryption config. Open returns ErrEncryptionKeyRequired
@@ -257,9 +266,11 @@ type Config struct {
 // reports false), ErrNotEncrypted for a file that is not encrypted opened
 // with one that is not empty, and ErrWrongKey for an EncryptionConfig that
 // does not open the file: another passphrase or key than the file's, or
-// another cipher. None of the three matches ErrCorrupt, and each leaves the
-// file unchanged. There is no in-place rekey; changing a passphrase
-// requires exporting to a freshly-opened database.
+// another cipher. A Passphrase and a Key of the same bytes are two keys:
+// a file created with one is ErrWrongKey with the other. None of the three
+// errors matches ErrCorrupt, and each leaves the file unchanged. There is
+// no in-place rekey; changing a passphrase or key requires exporting to a
+// freshly-opened database.
 //
 // An InMemory database keeps its pages unencrypted in memory (there is
 // no at-rest artifact to protect). Its Backup is encrypted only when
@@ -267,31 +278,58 @@ type Config struct {
 // same EncryptionConfig. With the zero EncryptionConfig, the default, its
 // Backup is a plain file.
 type EncryptionConfig struct {
-	// Passphrase is the user-supplied secret. Nil = no encryption. Open
-	// keeps a copy of it, which Backup uses, so the caller may clear its
-	// slice once Open returns.
+	// Passphrase is a secret such as a password. PBKDF2-HMAC-SHA256
+	// stretches it to the cipher key against the salt in the database
+	// header, at KDFIterations rounds, whatever its length. Nil = no
+	// passphrase; an empty one that is not nil fails Open. Open keeps a
+	// copy of it, which Backup uses, so the caller may clear its slice once
+	// Open returns.
 	Passphrase []byte
 
-	// KDFIterations overrides the PBKDF2 cost. Zero means 256,000 (the
-	// SQLCipher v4 default). Ignored when Passphrase is exactly 32 bytes
-	// (raw-key path). Use lower values only in tests. A count above
-	// 2,147,483,647 (2^31-1; 2,147,483,646 on a 32-bit target) fails Open
-	// with ErrInvalidConfig. When the passphrase goes through PBKDF2 the
-	// count is part of the key: the database opens only with the effective
-	// count it was created with (0 and 256,000 are one).
+	// Key is a raw cipher key, used as it is, with no key derivation. It
+	// must be exactly 32 bytes: Open fails with ErrInvalidConfig for a Key
+	// that is not nil and of another length, empty included, and for a Key
+	// set together with Passphrase. KDFIterations does not apply to it.
+	// Nil = no key.
+	//
+	// Key is for key material the application already has: a key from a
+	// key store, or one it derived itself, for example with HKDF from a
+	// master key, one per database. A password belongs in Passphrase,
+	// which stretches it. Every database encrypted with one Key, the copies
+	// Backup makes of it included, draws its random nonces under that key,
+	// so they all share one budget of random nonces: about 2^32 page
+	// writes per key with AES-GCM and ChaCha20-Poly1305, whose nonces are
+	// 12 bytes. A key per database is the safer use.
+	//
+	// A file that a release before v2.6.1 created with a Passphrase of
+	// exactly 32 bytes was encrypted with those bytes as the raw key: it
+	// opens with Key set to them, and with that Passphrase it is
+	// ErrWrongKey.
+	//
+	// Open keeps a copy of it, which Backup uses, so the caller may clear
+	// its slice once Open returns.
+	Key []byte
+
+	// KDFIterations overrides the PBKDF2 cost of Passphrase. Zero means
+	// 256,000 (the SQLCipher v4 default). Key does not use it. Use lower
+	// values only in tests. With a Passphrase, a count above 2,147,483,647
+	// (2^31-1; 2,147,483,646 on a 32-bit target) fails Open with
+	// ErrInvalidConfig. The count is part of the key: a database created
+	// with a Passphrase opens only with the effective count it was created
+	// with (0 and 256,000 are one).
 	KDFIterations int
 
-	// CipherType selects the built-in AEAD when Passphrase is set.
+	// CipherType selects the built-in AEAD when Passphrase or Key is set.
 	// Zero value (CipherAES256GCM) is the default. A value other than the
-	// Cipher constants fails Open with ErrInvalidConfig when Passphrase is
-	// set; without a Passphrase it is ignored.
+	// Cipher constants fails Open with ErrInvalidConfig when Passphrase or
+	// Key is set; without either it is ignored.
 	CipherType CipherType
 }
 
 // Enabled reports whether this config encrypts the database: whether
-// Passphrase is set.
+// Passphrase or Key is set.
 func (e EncryptionConfig) Enabled() bool {
-	return e.Passphrase != nil
+	return e.Passphrase != nil || e.Key != nil
 }
 
 // FlushMode controls checkpoint behavior during flush, matching SQLite's
@@ -382,23 +420,30 @@ const maxKDFIterations = min(math.MaxInt32, math.MaxInt-1)
 // ErrInvalidConfig. It runs before Open resolves the path or touches a file,
 // so a refused Config leaves nothing open. Sizes past what the code can
 // allocate are clamped instead (cacheSizes); a value with no nearest valid
-// one, as an unknown FlushMode or CipherType, or one that would derive
-// another key, as a KDFIterations past maxKDFIterations, is an error.
+// one, as an unknown FlushMode or CipherType or a Key that is not 32 bytes
+// long, two that exclude each other, as a Key and a Passphrase, or one that
+// would derive another key, as a KDFIterations past maxKDFIterations, is an
+// error.
 func (c *Config) validate() error {
 	switch c.Durability.FlushMode {
 	case "", FlushModeCheckpointPassive, FlushModeCheckpointFull, FlushModeCheckpointRestart, FlushModeCheckpointTruncate:
 	default:
 		return fmt.Errorf("%w: Durability.FlushMode %q is not one of the FlushModeCheckpoint modes", ErrInvalidConfig, c.Durability.FlushMode)
 	}
-	if e := c.Encryption; e.Passphrase != nil {
+	if e := c.Encryption; e.Enabled() {
+		if e.Key != nil && e.Passphrase != nil {
+			return fmt.Errorf("%w: Encryption.Key and Encryption.Passphrase are both set", ErrInvalidConfig)
+		}
+		if e.Key != nil && len(e.Key) != btree.KeyLen {
+			return fmt.Errorf("%w: Encryption.Key is %d bytes, not %d", ErrInvalidConfig, len(e.Key), btree.KeyLen)
+		}
 		switch e.CipherType {
 		case CipherAES256GCM, CipherChaCha20Poly1305, CipherXChaCha20Poly1305:
 		default:
 			return fmt.Errorf("%w: Encryption.CipherType %q is not one of the Cipher constants", ErrInvalidConfig, e.CipherType)
 		}
-		// Only a passphrase goes through the KDF: a 32-byte one is the key
-		// itself and ignores the count.
-		if len(e.Passphrase) != btree.KeyLen && e.KDFIterations > maxKDFIterations {
+		// Only a passphrase goes through the KDF: a Key ignores the count.
+		if e.Passphrase != nil && e.KDFIterations > maxKDFIterations {
 			return fmt.Errorf("%w: Encryption.KDFIterations is %d, more than %d", ErrInvalidConfig, e.KDFIterations, maxKDFIterations)
 		}
 	}

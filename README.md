@@ -295,7 +295,14 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 })
 ```
 
-Whole-file page-level AEAD with a built-in cipher. A nil `Passphrase` means no encryption, and an empty non-nil one fails `Open`. A `Passphrase` of exactly 32 bytes is used as the key itself; any other nonempty length is stretched with PBKDF2-HMAC-SHA256 against a salt stored in the file, at `KDFIterations` rounds (256,000 by default, at most 2,147,483,647, or 2,147,483,646 on a 32-bit target). The cipher and the count are not stored in the file: a database opens only with the `CipherType` it was created with and, when its passphrase goes through PBKDF2, the same effective `KDFIterations` (0 and 256,000 are one count; a 32-byte key ignores it).
+Whole-file page-level AEAD with a built-in cipher, keyed by a `Passphrase` or by a raw `Key`. Set one of them; with both nil the database is not encrypted.
+
+- `Passphrase` is stretched with PBKDF2-HMAC-SHA256 against a salt stored in the file, at `KDFIterations` rounds (256,000 by default, at most 2,147,483,647, or 2,147,483,646 on a 32-bit target), whatever its length. An empty non-nil one fails `Open`.
+- `Key` is the cipher key itself, exactly 32 bytes, used with no key derivation; `KDFIterations` does not apply to it. It is for a key from a key store, or one the application derives itself, for example with HKDF from a master key, one per database. Databases that share a key share its budget of random nonces (about 2^32 page writes per key with AES-GCM and ChaCha20-Poly1305), so a key per database is the safer use.
+
+`Open` returns `ErrInvalidConfig` for a `Key` that is not 32 bytes long, an empty non-nil one included, and for `Key` and `Passphrase` both set. A raw key is always explicit, as in SQLCipher, where it must be spelled as a blob literal, `x'<64 hex>'`: a passphrase never becomes a raw key by its length. A `Passphrase` and a `Key` of the same bytes are two different keys. A file that a release before v2.6.1 created with a `Passphrase` of exactly 32 bytes used those bytes as the raw key: open it with `Key` set to them.
+
+The cipher and the count are not stored in the file: a database opens only with the `CipherType` it was created with and, with a `Passphrase`, the same effective `KDFIterations` (0 and 256,000 are one count).
 
 `Open` refuses an `Encryption` config that does not fit the file, with an error to match with `errors.Is`. None of them matches `ErrCorrupt`, and the file is left unchanged:
 
@@ -307,7 +314,7 @@ Whole-file page-level AEAD with a built-in cipher. A nil `Passphrase` means no e
 
 A damaged first page under the right key is not `ErrWrongKey`: `Open` proves the key on other pages and reports `ErrPageIntegrity`, which matches `ErrCorrupt`. See `ErrWrongKey` for the cases it cannot tell apart, which it reports as a wrong key.
 
-`Backup` of an encrypted database writes an encrypted copy that opens with the source's `EncryptionConfig`: the same passphrase or key and `CipherType`, and with a passphrase the same effective `KDFIterations`. A copy that `Backup` creates has a salt of its own, so with a passphrase its derived key differs from the source's. A file that already exists at the path keeps the salt it has, which is the source's when that file is a copy of the source made outside `Backup`.
+`Backup` of an encrypted database writes an encrypted copy that opens with the source's `EncryptionConfig`: the same passphrase or key and `CipherType`, and with a passphrase the same effective `KDFIterations`. A copy that `Backup` creates has a salt of its own, so with a passphrase its derived key differs from the source's; with a `Key` it is the same key. A file that already exists at the path keeps the salt it has, which is the source's when that file is a copy of the source made outside `Backup`.
 
 An independent Go implementation following design conventions from [SQLCipher](https://www.zetetic.net/sqlcipher/) (BSD-3-Clause) — reserved-tail page overhead, the page-1 plaintext-prefix rule, PBKDF2-HMAC-SHA256 key derivation. No SQLCipher code is included; the cryptography is Go-native and uses AEAD rather than SQLCipher's encrypt-then-MAC construction. Not SQLCipher-compatible on disk. See [NOTICE.md](NOTICE.md).
 

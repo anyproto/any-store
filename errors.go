@@ -289,8 +289,10 @@ var (
 	ErrV1Database = errors.New("any-store: file is an any-store v1 database, not readable by v2; use github.com/anyproto/any-store or migrate (docs/migration-v1-to-v2.md)")
 
 	// ErrWrongKey is returned (wrapped) by Open when Config.Encryption does not open the file:
-	// its passphrase or key, or its cipher, is not the one the file was encrypted with. The file
-	// is left unchanged, and Open with the Config.Encryption the file was created with opens it.
+	// its passphrase or key, or its cipher, is not the one the file was encrypted with. A
+	// Passphrase and a Key of the same bytes are two keys, so a file created with one is
+	// ErrWrongKey with the other. The file is left unchanged, and Open with the
+	// Config.Encryption the file was created with opens it.
 	// It does not match ErrCorrupt or ErrPageIntegrity, and Config.OnIntegrityError is not
 	// called.
 	//
@@ -423,10 +425,12 @@ var (
 // ErrInvalidConfig is returned, wrapped with the name of the field at fault,
 // for a value nothing can be opened or created with, and nothing is:
 //   - by Open, for a Durability.FlushMode other than the FlushModeCheckpoint
-//     constants and "" (the default, FlushModeCheckpointPassive), and, with
-//     an Encryption.Passphrase, for a CipherType other than the Cipher
-//     constants or a KDFIterations above 2^31-1 (2^31-2 on a 32-bit target)
-//     when the passphrase is not a 32-byte key;
+//     constants and "" (the default, FlushModeCheckpointPassive), for an
+//     Encryption.Key that is not nil and not 32 bytes long, empty included,
+//     for an Encryption.Key and an Encryption.Passphrase both set, with
+//     either of them for a CipherType other than the Cipher constants, and
+//     with a Passphrase for a KDFIterations above 2^31-1 (2^31-2 on a 32-bit
+//     target);
 //   - by CreateIndex, and EnsureIndex of a name with no index, for a vector
 //     index with no Vector params, an empty Field, a Dim not above 0 or past
 //     2^32-1, a Metric, Quantization or Mode other than its constants (the

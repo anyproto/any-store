@@ -1214,8 +1214,9 @@ func TestOpen_HugeCacheSizeAndReadConcurrency(t *testing.T) {
 // A passphrase's KDFIterations past 2^31-1 (on a 32-bit target, the largest
 // int) fails Open with ErrInvalidConfig at once, before anything is created:
 // the count is part of the key, so it is not clamped, and PBKDF2 never
-// returned with the largest int. A 32-byte passphrase is the key itself and
-// ignores the count. The path then opens with a valid count.
+// returned with the largest int. A 32-byte passphrase is a passphrase like
+// any other; a Key is the cipher key itself and ignores the count. The path
+// then opens with a valid count.
 func TestOpen_KDFIterationsBounded(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db")
 	counts := []int{math.MaxInt}
@@ -1223,10 +1224,12 @@ func TestOpen_KDFIterationsBounded(t *testing.T) {
 		counts = append(counts, int(over))
 	}
 	for _, n := range counts {
-		d, err := anystore.Open(ctx, path, &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: []byte("pw"), KDFIterations: n}})
-		require.ErrorIs(t, err, anystore.ErrInvalidConfig)
-		require.ErrorContains(t, err, "Encryption.KDFIterations")
-		require.Nil(t, d)
+		for _, pass := range [][]byte{[]byte("pw"), make([]byte, 32)} {
+			d, err := anystore.Open(ctx, path, &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: pass, KDFIterations: n}})
+			require.ErrorIs(t, err, anystore.ErrInvalidConfig)
+			require.ErrorContains(t, err, "Encryption.KDFIterations")
+			require.Nil(t, d)
+		}
 	}
 	_, statErr := os.Stat(path)
 	require.ErrorIs(t, statErr, os.ErrNotExist, "a refused Open creates no file")
@@ -1236,17 +1239,18 @@ func TestOpen_KDFIterationsBounded(t *testing.T) {
 	require.NoError(t, d.Close())
 
 	raw := filepath.Join(t.TempDir(), "raw")
-	d, err = anystore.Open(ctx, raw, &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: make([]byte, 32), KDFIterations: math.MaxInt}})
+	d, err = anystore.Open(ctx, raw, &anystore.Config{Encryption: anystore.EncryptionConfig{Key: make([]byte, 32), KDFIterations: math.MaxInt}})
 	require.NoError(t, err)
 	require.NoError(t, d.Close())
 }
 
 // An unknown CipherType is an ErrInvalidConfig error of Open, with a
-// passphrase or a 32-byte key, and creates no file.
+// passphrase or a key, and creates no file.
 func TestOpen_UnknownCipherType(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db")
-	for _, pass := range [][]byte{[]byte("pw"), make([]byte, 32)} {
-		d, err := anystore.Open(ctx, path, &anystore.Config{Encryption: anystore.EncryptionConfig{Passphrase: pass, CipherType: "rot13", KDFIterations: 1000}})
+	for _, enc := range []anystore.EncryptionConfig{{Passphrase: []byte("pw")}, {Passphrase: make([]byte, 32)}, {Key: make([]byte, 32)}} {
+		enc.CipherType, enc.KDFIterations = "rot13", 1000
+		d, err := anystore.Open(ctx, path, &anystore.Config{Encryption: enc})
 		require.ErrorIs(t, err, anystore.ErrInvalidConfig)
 		require.ErrorContains(t, err, "Encryption.CipherType")
 		require.Nil(t, d)

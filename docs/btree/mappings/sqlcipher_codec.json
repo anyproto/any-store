@@ -67,7 +67,7 @@
   },
   "pager.c:4334-4336": {
     "code": [],
-    "note": "sqlite3PagerClose — invokes xCodecFree on close. GAP: the Codec interface (codec.go) has no Close / io.Closer method. The bundled codecs (aes / chacha / cksum / kdf), the only ones a database gets, are memory-only and fine under GC. Options.Codec is a b-tree test hook, not reachable from outside the module: public callers configure encryption through anystore's EncryptionConfig (a passphrase or a 32-byte key, and a built-in CipherType). A codec holding external resources (KMS handle, HSM session, file descriptor) would need an optional Close() error on the Codec interface, type-asserted from db.Close and called after the pager has fully released the codec reference."
+    "note": "sqlite3PagerClose — invokes xCodecFree on close. GAP: the Codec interface (codec.go) has no Close / io.Closer method. The bundled codecs (aes / chacha / cksum / kdf), the only ones a database gets, are memory-only and fine under GC. Options.Codec is a b-tree test hook, not reachable from outside the module: public callers configure encryption through anystore's EncryptionConfig (a Passphrase or a raw 32-byte Key, and a built-in CipherType). A codec holding external resources (KMS handle, HSM session, file descriptor) would need an optional Close() error on the Codec interface, type-asserted from db.Close and called after the pager has fully released the codec reference."
   },
   "pager.c:4681-4685": {
     "code": [],
@@ -100,7 +100,7 @@
   },
   "main.c:3318-3352": {
     "code": [],
-    "note": "sqlite3CodecQueryParameters — parses `?key=`, `?hexkey=`, `?textkey=` URI parameters and forwards to sqlite3_key_v2. No port: any-store does not accept URI-encoded keys; public callers pass a passphrase or a 32-byte key in anystore's EncryptionConfig, which reaches the btree as Options.Key. Options.Codec, a fully-built codec, is a b-tree test hook, not reachable from outside the module. URI parameter routing is intentionally outside the btree layer."
+    "note": "sqlite3CodecQueryParameters — parses `?key=`, `?hexkey=`, `?textkey=` URI parameters and forwards to sqlite3_key_v2. No port: any-store does not accept URI-encoded keys; public callers pass EncryptionConfig.Passphrase or EncryptionConfig.Key, a raw 32-byte key, which reach the btree as Options.Passphrase and Options.Key. Options.Codec, a fully-built codec, is a b-tree test hook, not reachable from outside the module. URI parameter routing is intentionally outside the btree layer."
   },
   "main.c:3716-3718": {
     "code": [],
@@ -120,7 +120,7 @@
   },
   "attach.c:230-272": {
     "code": [],
-    "note": "ATTACH ... KEY 'x' — extracts the key argument from the SQL ATTACH statement, builds the attached connection, and forwards the key via sqlite3CodecAttach. No port: any-store has no SQL surface, no ATTACH semantics, and no per-connection multi-database namespace. Each *DB is opened independently with its own Options.Key/Options.Codec."
+    "note": "ATTACH ... KEY 'x' — extracts the key argument from the SQL ATTACH statement, builds the attached connection, and forwards the key via sqlite3CodecAttach. No port: any-store has no SQL surface, no ATTACH semantics, and no per-connection multi-database namespace. Each *DB is opened independently with its own Options.Key/Options.Passphrase/Options.Codec."
   },
   "backup.c:156-175": {
     "code": [],
@@ -140,7 +140,7 @@
   },
   "pragma.c:444-446": {
     "code": [],
-    "note": "PRAGMA key = '...' / PRAGMA hexkey = '...' — sets the encryption key for the DB. No port: any-store has no SQL surface. Keys are passed via Options.Key at Open time; rekey is not supported. See also pragma.c:520-525, pragma.c:2783-2829."
+    "note": "PRAGMA key = '...' / PRAGMA hexkey = '...' — sets the encryption key for the DB. No port: any-store has no SQL surface. Keys are passed at Open time, a passphrase as Options.Passphrase (always PBKDF2) and a raw key as Options.Key (no KDF); SQLCipher tells a raw key by its spelling as a blob literal, x'<64 hex>' (sqlcipher_cipher_ctx_key_derive, sqlcipher.c:1743-1807, v4.14.0), never by its length. Rekey is not supported. See also pragma.c:520-525, pragma.c:2783-2829."
   },
   "pragma.c:520-525": {
     "code": [],
@@ -160,6 +160,6 @@
   },
   "sqlite.h.in:6776-6832": {
     "code": [],
-    "note": "Public API: sqlite3_key / sqlite3_key_v2 / sqlite3_rekey / sqlite3_rekey_v2 / sqlite3_activate_see. SQLCipher's runtime entrypoints to install or rotate the encryption key on an open connection. PARTIAL GAP: keys ARE passed via Options.Key at btree.Open (sqlite3_key analog), but there is no rekey analog — see pragma.c:520-525. sqlite3_activate_see is a no-op (SEE is the closed-source SQLite Encryption Extension; SQLCipher provides this stub for binary compatibility). The any-store equivalent of sqlite3_key would be a (currently absent) DB.SetKey method that rebuilds the codec on an already-open DB; today the key is immutable post-Open."
+    "note": "Public API: sqlite3_key / sqlite3_key_v2 / sqlite3_rekey / sqlite3_rekey_v2 / sqlite3_activate_see. SQLCipher's runtime entrypoints to install or rotate the encryption key on an open connection. PARTIAL GAP: keys ARE passed via Options.Key or Options.Passphrase at btree.Open (sqlite3_key analog), but there is no rekey analog — see pragma.c:520-525. sqlite3_activate_see is a no-op (SEE is the closed-source SQLite Encryption Extension; SQLCipher provides this stub for binary compatibility). The any-store equivalent of sqlite3_key would be a (currently absent) DB.SetKey method that rebuilds the codec on an already-open DB; today the key is immutable post-Open."
   }
 }

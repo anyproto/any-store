@@ -302,16 +302,13 @@ func open(ctx context.Context, path string, config *Config, createFormat uint32)
 	ds.recoveryController, quickCheckNeeded = ds.createRecoveryController(ctx, path)
 
 	cacheSize, readConcurrency := config.cacheSizes()
-	// The btree keeps a copy of the caller's passphrase or key, which the
+	// The btree keeps a copy of the caller's passphrase and key, which the
 	// caller may clear once Open returns: Backup opens its destination with
-	// it (BackupDestinationOptions), and a cleared buffer would encrypt the
-	// copy with another key. nil stays nil, no encryption. A passphrase of
-	// exactly 32 bytes is the raw key.
-	key := bytes.Clone(config.Encryption.Passphrase)
-	var passphrase []byte
-	if len(key) != btree.KeyLen {
-		key, passphrase = nil, key
-	}
+	// them (BackupDestinationOptions), and a cleared buffer would encrypt
+	// the copy with another key. nil stays nil, and an empty passphrase
+	// stays empty.
+	passphrase := bytes.Clone(config.Encryption.Passphrase)
+	key := bytes.Clone(config.Encryption.Key)
 
 	// Page-level integrity is on by default for non-encrypted databases.
 	// XXH3-128 trailer per page costs <1% on writes and is invisible on

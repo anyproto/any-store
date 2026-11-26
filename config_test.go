@@ -192,39 +192,62 @@ func TestConfig_CacheSizes(t *testing.T) {
 
 // KDFIterations is refused past 2^31-1, SQLCipher's kdf_iter range, or on a
 // 32-bit target past 2^31-2, as Go's PBKDF2 loop never ends at the largest
-// int, when a passphrase goes through the KDF, and only then: a 32-byte
-// passphrase is the key itself, and no passphrase is no encryption. A count
-// an earlier release created a database with, above 100,000,000 included,
-// is taken.
+// int, when a passphrase goes through the KDF, and only then: a Key is the
+// cipher key itself, and no passphrase or key is no encryption. A
+// passphrase of 32 bytes is stretched as any other. A count an earlier
+// release created a database with, above 100,000,000 included, is taken.
 func TestConfig_KDFIterationsBound(t *testing.T) {
 	if math.MaxInt == math.MaxInt32 {
 		require.Equal(t, math.MaxInt32-1, maxKDFIterations)
 	} else {
 		require.Equal(t, math.MaxInt32, maxKDFIterations)
 	}
-	pass := []byte("correct horse")
-	for _, n := range []int{100_000_001, maxKDFIterations} {
-		require.NoError(t, (&Config{Encryption: EncryptionConfig{Passphrase: pass, KDFIterations: n}}).validate())
+	for _, pass := range [][]byte{[]byte("correct horse"), make([]byte, 32)} {
+		for _, n := range []int{100_000_001, maxKDFIterations} {
+			require.NoError(t, (&Config{Encryption: EncryptionConfig{Passphrase: pass, KDFIterations: n}}).validate())
+		}
+		for _, n := range []int{maxKDFIterations + 1, math.MaxInt} {
+			err := (&Config{Encryption: EncryptionConfig{Passphrase: pass, KDFIterations: n}}).validate()
+			require.ErrorIs(t, err, ErrInvalidConfig)
+			require.ErrorContains(t, err, "Encryption.KDFIterations")
+		}
 	}
-	for _, n := range []int{maxKDFIterations + 1, math.MaxInt} {
-		err := (&Config{Encryption: EncryptionConfig{Passphrase: pass, KDFIterations: n}}).validate()
-		require.ErrorIs(t, err, ErrInvalidConfig)
-		require.ErrorContains(t, err, "Encryption.KDFIterations")
-	}
-	require.NoError(t, (&Config{Encryption: EncryptionConfig{Passphrase: make([]byte, 32), KDFIterations: math.MaxInt}}).validate())
+	require.NoError(t, (&Config{Encryption: EncryptionConfig{Key: make([]byte, 32), KDFIterations: math.MaxInt}}).validate())
 	require.NoError(t, (&Config{Encryption: EncryptionConfig{KDFIterations: math.MaxInt}}).validate())
 }
 
-// An unknown CipherType is refused with a passphrase, raw key or not, and
-// ignored without one, as the rest of EncryptionConfig is.
+// An unknown CipherType is refused with a passphrase or a key, and ignored
+// without either, as the rest of EncryptionConfig is.
 func TestConfig_CipherTypeKnown(t *testing.T) {
-	for _, pass := range [][]byte{[]byte("correct horse"), make([]byte, 32)} {
+	for _, enc := range []EncryptionConfig{{Passphrase: []byte("correct horse")}, {Passphrase: make([]byte, 32)}, {Key: make([]byte, 32)}} {
 		for _, ct := range []CipherType{CipherAES256GCM, CipherChaCha20Poly1305, CipherXChaCha20Poly1305} {
-			require.NoError(t, (&Config{Encryption: EncryptionConfig{Passphrase: pass, CipherType: ct}}).validate())
+			enc.CipherType = ct
+			require.NoError(t, (&Config{Encryption: enc}).validate())
 		}
-		err := (&Config{Encryption: EncryptionConfig{Passphrase: pass, CipherType: "rot13"}}).validate()
+		enc.CipherType = "rot13"
+		err := (&Config{Encryption: enc}).validate()
 		require.ErrorIs(t, err, ErrInvalidConfig)
 		require.ErrorContains(t, err, "Encryption.CipherType")
 	}
 	require.NoError(t, (&Config{Encryption: EncryptionConfig{CipherType: "rot13"}}).validate())
+}
+
+// A Key is 32 bytes: one of another length, an empty one included, is
+// refused, and so is a Key set together with a Passphrase. A nil Key is no
+// key. An empty Passphrase is not the config's to refuse: Open fails on it
+// when it builds the cipher.
+func TestConfig_Key(t *testing.T) {
+	require.NoError(t, (&Config{Encryption: EncryptionConfig{Key: make([]byte, 32)}}).validate())
+	require.NoError(t, (&Config{Encryption: EncryptionConfig{Key: nil, Passphrase: []byte("pw")}}).validate())
+	require.NoError(t, (&Config{Encryption: EncryptionConfig{Passphrase: []byte{}}}).validate())
+	for _, n := range []int{0, 1, 16, 31, 33, 64} {
+		err := (&Config{Encryption: EncryptionConfig{Key: make([]byte, n)}}).validate()
+		require.ErrorIs(t, err, ErrInvalidConfig, "a Key of %d bytes", n)
+		require.ErrorContains(t, err, "Encryption.Key")
+	}
+	for _, pass := range [][]byte{[]byte("pw"), make([]byte, 32), {}} {
+		err := (&Config{Encryption: EncryptionConfig{Key: make([]byte, 32), Passphrase: pass}}).validate()
+		require.ErrorIs(t, err, ErrInvalidConfig)
+		require.ErrorContains(t, err, "Encryption.Key and Encryption.Passphrase")
+	}
 }

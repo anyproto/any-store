@@ -56,6 +56,8 @@ func TestEncryption_DisabledByDefault(t *testing.T) {
 	assert.False(t, cfg.Enabled())
 	cfg.Passphrase = []byte("x")
 	assert.True(t, cfg.Enabled())
+	cfg = EncryptionConfig{Key: make([]byte, 32)}
+	assert.True(t, cfg.Enabled())
 }
 
 func TestEncryption_AllCipherTypes_RoundTrip(t *testing.T) {
@@ -135,20 +137,20 @@ func requireEncryptedDocs(t *testing.T, path string, cfg *Config, prefix string,
 	require.GreaterOrEqual(t, count, n)
 }
 
-// A database encrypted with a 32-byte key backed up while it is written to:
-// the source's writer and the destination's encrypt pages at the same time.
-// Run it with -race.
+// A database encrypted with a Key backed up while it is written to: the
+// source's writer and the destination's encrypt pages at the same time. Run
+// it with -race.
 //
-// A 32-byte key is used as it is, with no KDF, and the default page size and
-// no checksum mode give the destination the source's page geometry: the
-// copy, which has a salt of its own, opens with the same Config.
+// A Key is used as it is, with no KDF, and the default page size and no
+// checksum mode give the destination the source's page geometry: the copy,
+// which has a salt of its own, opens with the same Config.
 func TestEncryption_BackupWhileWriting(t *testing.T) {
 	ctx := context.Background()
 	key := make([]byte, 32)
 	_, err := rand.Read(key)
 	require.NoError(t, err)
 	// Uncompressed, so that the documents below fill hundreds of pages.
-	cfg := &Config{Encryption: EncryptionConfig{Passphrase: key}, DisableCompression: true}
+	cfg := &Config{Encryption: EncryptionConfig{Key: key}, DisableCompression: true}
 
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "src.db")

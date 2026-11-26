@@ -532,6 +532,7 @@ func TestIntegrity_InMemoryHasNoIntegrityMode(t *testing.T) {
 	}{
 		{name: "plain", cfg: Config{InMemory: true}},
 		{name: "passphrase", cfg: Config{InMemory: true, Encryption: EncryptionConfig{Passphrase: []byte("p"), KDFIterations: 1000}}},
+		{name: "key", cfg: Config{InMemory: true, Encryption: EncryptionConfig{Key: make([]byte, 32)}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

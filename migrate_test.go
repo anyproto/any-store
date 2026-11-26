@@ -762,13 +762,16 @@ func TestCopyToLatestFormat_OldReleaseData(t *testing.T) {
 // Sources of other kinds: encrypted, empty, each compression setting, a
 // custom primary key, a source already in the latest format.
 func TestCopyToLatestFormat_Sources(t *testing.T) {
-	keyA := bytes.Repeat([]byte{'a'}, 32) // a raw key: no KDF
+	keyA := bytes.Repeat([]byte{'a'}, 32)
 	keyB := bytes.Repeat([]byte{'b'}, 32)
-	encrypted := func(key []byte) *Config { return &Config{Encryption: EncryptionConfig{Passphrase: key}} }
+	withKey := func(key []byte) *Config { return &Config{Encryption: EncryptionConfig{Key: key}} }
+	withPassphrase := func(pass []byte) *Config {
+		return &Config{Encryption: EncryptionConfig{Passphrase: pass, KDFIterations: 1000}}
+	}
 
 	t.Run("encrypted", func(t *testing.T) {
 		skipIfInMemory(t, "the source is an encrypted file")
-		src, _ := openSource(t, encrypted(keyA))
+		src, _ := openSource(t, withKey(keyA))
 		coll, err := src.CreateCollection(ctx, "docs")
 		require.NoError(t, err)
 		require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Fields: []string{"n"}}))
@@ -776,35 +779,28 @@ func TestCopyToLatestFormat_Sources(t *testing.T) {
 			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"n":%d}`, i, i%7))))
 		}
 		for _, tc := range []struct {
-			name      string
-			key       []byte
-			wrongKeys [][]byte
+			name  string
+			conf  *Config
+			wrong []*Config
 		}{
-			{"unencrypted", nil, [][]byte{keyA}},
-			{"same passphrase", keyA, [][]byte{nil, keyB}},
-			{"other passphrase", keyB, [][]byte{nil, keyA}},
+			{"unencrypted", nil, []*Config{withKey(keyA)}},
+			{"same key", withKey(keyA), []*Config{nil, withKey(keyB), withPassphrase(keyA)}},
+			{"other key", withKey(keyB), []*Config{nil, withKey(keyA)}},
+			{"passphrase", withPassphrase(keyA), []*Config{nil, withKey(keyA), withPassphrase(keyB)}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				var conf *Config
-				if tc.key != nil {
-					conf = encrypted(tc.key)
-				}
 				dstPath := filepath.Join(t.TempDir(), "copy.db")
-				_, err := CopyToLatestFormat(ctx, src, dstPath, conf)
+				_, err := CopyToLatestFormat(ctx, src, dstPath, tc.conf)
 				require.NoError(t, err)
-				for _, wrong := range tc.wrongKeys {
-					var wrongConf *Config
-					if wrong != nil {
-						wrongConf = encrypted(wrong)
-					}
+				for _, wrongConf := range tc.wrong {
 					if d, err := Open(ctx, dstPath, wrongConf); err == nil {
 						_, err = d.GetCollectionNames(ctx)
 						require.NoError(t, d.Close())
 						require.Error(t, err, "opened with the wrong key")
 					}
 				}
-				dst := openCopy(t, dstPath, conf)
-				assert.Equal(t, tc.key != nil, dst.IntegrityMode() == IntegrityAEAD)
+				dst := openCopy(t, dstPath, tc.conf)
+				assert.Equal(t, tc.conf != nil, dst.IntegrityMode() == IntegrityAEAD)
 				assertSameDatabase(t, src, dst)
 			})
 		}

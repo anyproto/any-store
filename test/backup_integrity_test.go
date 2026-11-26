@@ -20,7 +20,7 @@ import (
 // reads there comes back as Backup's error, and the source's
 // OnIntegrityError, which receives the source's failures only, is not
 // called. Both kinds of database with page integrity are covered: the
-// default checksummed one, and one encrypted with a 32-byte key, which the
+// default checksummed one, and one encrypted with a Key, which the
 // destination is encrypted with too.
 func TestBackup_DestinationIntegrityFailureIsBackupsError(t *testing.T) {
 	key := make([]byte, 32)
@@ -32,7 +32,7 @@ func TestBackup_DestinationIntegrityFailureIsBackupsError(t *testing.T) {
 		enc  anystore.EncryptionConfig
 	}{
 		{"checksum", anystore.EncryptionConfig{}},
-		{"key", anystore.EncryptionConfig{Passphrase: key}},
+		{"key", anystore.EncryptionConfig{Key: key}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -85,7 +85,7 @@ func TestEncryption_IntegrityCallbackPerDatabase(t *testing.T) {
 	key := make([]byte, 32)
 	_, err := rand.Read(key)
 	require.NoError(t, err)
-	enc := anystore.EncryptionConfig{Passphrase: key}
+	enc := anystore.EncryptionConfig{Key: key}
 
 	dir := t.TempDir()
 	pathA := filepath.Join(dir, "a.db")
