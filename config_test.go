@@ -234,12 +234,13 @@ func TestConfig_CipherTypeKnown(t *testing.T) {
 
 // A Key is 32 bytes: one of another length, an empty one included, is
 // refused, and so is a Key set together with a Passphrase. A nil Key is no
-// key. An empty Passphrase is not the config's to refuse: Open fails on it
-// when it builds the cipher.
+// key. An empty Passphrase that is not nil is refused as well.
 func TestConfig_Key(t *testing.T) {
 	require.NoError(t, (&Config{Encryption: EncryptionConfig{Key: make([]byte, 32)}}).validate())
 	require.NoError(t, (&Config{Encryption: EncryptionConfig{Key: nil, Passphrase: []byte("pw")}}).validate())
-	require.NoError(t, (&Config{Encryption: EncryptionConfig{Passphrase: []byte{}}}).validate())
+	err := (&Config{Encryption: EncryptionConfig{Passphrase: []byte{}}}).validate()
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorContains(t, err, "Encryption.Passphrase")
 	for _, n := range []int{0, 1, 16, 31, 33, 64} {
 		err := (&Config{Encryption: EncryptionConfig{Key: make([]byte, n)}}).validate()
 		require.ErrorIs(t, err, ErrInvalidConfig, "a Key of %d bytes", n)

@@ -281,9 +281,9 @@ type EncryptionConfig struct {
 	// Passphrase is a secret such as a password. PBKDF2-HMAC-SHA256
 	// stretches it to the cipher key against the salt in the database
 	// header, at KDFIterations rounds, whatever its length. Nil = no
-	// passphrase; an empty one that is not nil fails Open. Open keeps a
-	// copy of it, which Backup uses, so the caller may clear its slice once
-	// Open returns.
+	// passphrase; an empty one that is not nil fails Open with
+	// ErrInvalidConfig. Open keeps a copy of it, which Backup uses, so the
+	// caller may clear its slice once Open returns.
 	Passphrase []byte
 
 	// Key is a raw cipher key, used as it is, with no key derivation. It
@@ -436,6 +436,9 @@ func (c *Config) validate() error {
 		}
 		if e.Key != nil && len(e.Key) != btree.KeyLen {
 			return fmt.Errorf("%w: Encryption.Key is %d bytes, not %d", ErrInvalidConfig, len(e.Key), btree.KeyLen)
+		}
+		if e.Passphrase != nil && len(e.Passphrase) == 0 {
+			return fmt.Errorf("%w: Encryption.Passphrase is empty and not nil", ErrInvalidConfig)
 		}
 		switch e.CipherType {
 		case CipherAES256GCM, CipherChaCha20Poly1305, CipherXChaCha20Poly1305:

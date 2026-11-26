@@ -427,7 +427,8 @@ var (
 //   - by Open, for a Durability.FlushMode other than the FlushModeCheckpoint
 //     constants and "" (the default, FlushModeCheckpointPassive), for an
 //     Encryption.Key that is not nil and not 32 bytes long, empty included,
-//     for an Encryption.Key and an Encryption.Passphrase both set, with
+//     for an Encryption.Passphrase that is empty and not nil, for an
+//     Encryption.Key and an Encryption.Passphrase both set, with
 //     either of them for a CipherType other than the Cipher constants, and
 //     with a Passphrase for a KDFIterations above 2^31-1 (2^31-2 on a 32-bit
 //     target);
