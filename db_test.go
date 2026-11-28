@@ -258,13 +258,10 @@ func (fx *fixture) finish() {
 func TestOpen_AnyStoreV2File(t *testing.T) {
 	dir := t.TempDir()
 
-	// Both magics any-store v2 has written, each zero-filled to the 16-byte
-	// header field. Verified against real v2 files:
-	//   00000000: 616e 792d 7374 6f72 6520 7632 0000 0000  any-store v2....
-	//   00000000: 4254 7265 6520 666f 726d 6174 2031 0000  BTree format 1..
 	for _, tc := range []struct{ name, magic string }{
-		{"current magic", "any-store v2\x00"},
-		{"legacy magic", "BTree format 1\x00"},
+		{"format 6 and later", "any-store v2 fmt"},
+		{"format 5", "any-store v2\x00\x00\x00\x00"},
+		{"legacy magic", "BTree format 1\x00\x00"},
 	} {
 		t.Run("v2 file is reported explicitly: "+tc.name, func(t *testing.T) {
 			path := filepath.Join(dir, tc.name+".db")
@@ -294,7 +291,7 @@ func TestOpen_AnyStoreV2File(t *testing.T) {
 
 	t.Run("other garbage keeps the generic error", func(t *testing.T) {
 		path := filepath.Join(dir, "garbage.db")
-		require.NoError(t, os.WriteFile(path, []byte("this is not a database at all"), 0o600))
+		require.NoError(t, os.WriteFile(path, []byte("any-store v2 fmx"), 0o600))
 
 		_, err := Open(ctx, path, nil)
 		require.Error(t, err)
