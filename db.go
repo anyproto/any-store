@@ -91,14 +91,10 @@ type DBStats struct {
 	DirtyQuickCheckDuration time.Duration // time spent in quickcheck if dirty
 }
 
-// Open opens a database at the specified path with the given configuration.
-// The config parameter can be nil for default settings.
-// Returns a DB instance or an error.
-// any-store v2 writes a 16-byte magic at offset 0. v2Magic is what current v2
-// builds write; v2MagicLegacy was written before the format was renamed and is
-// still present in databases created by earlier builds. Both are zero-padded to
-// the full field width. v1 files start with SQLite's "SQLite format 3\x00".
+// any-store v2 writes a 16-byte magic at offset 0. Schema formats 6 and later
+// use v2MagicFmt. Format 5 uses v2Magic or, in older files, v2MagicLegacy.
 const (
+	v2MagicFmt    = "any-store v2 fmt"
 	v2Magic       = "any-store v2\x00\x00\x00\x00"
 	v2MagicLegacy = "BTree format 1\x00\x00"
 )
@@ -120,12 +116,15 @@ func checkNotV2Database(path string) error {
 		return nil
 	}
 	switch string(hdr[:]) {
-	case v2Magic, v2MagicLegacy:
+	case v2MagicFmt, v2Magic, v2MagicLegacy:
 		return ErrV2Database
 	}
 	return nil
 }
 
+// Open opens a database at the specified path with the given configuration.
+// The config parameter can be nil for default settings.
+// Open returns ErrV2Database if the file has an any-store v2 header.
 func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	if err := checkNotV2Database(path); err != nil {
 		return nil, err
